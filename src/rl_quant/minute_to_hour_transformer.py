@@ -339,11 +339,17 @@ def build_action_mask(
     max_switches_per_day: int,
     min_hold_bars: int,
     action_count: int,
+    switches_episode: torch.Tensor | None = None,
+    max_switches_per_episode: int | None = None,
 ) -> torch.Tensor:
     mask = torch.ones(current_action.shape[0], action_count, dtype=torch.bool, device=current_action.device)
     must_hold = bars_held < int(min_hold_bars)
     in_cooldown = cooldown_remaining > 0
     trade_budget_exhausted = switches_today >= int(max_switches_per_day)
+    if max_switches_per_episode is not None:
+        if switches_episode is None:
+            raise ValueError("switches_episode is required when max_switches_per_episode is set.")
+        trade_budget_exhausted = trade_budget_exhausted | (switches_episode >= int(max_switches_per_episode))
     constrained = must_hold | in_cooldown | trade_budget_exhausted
     if bool(constrained.any().item()):
         mask[constrained, :] = False
@@ -564,6 +570,8 @@ class VectorizedMinuteToHourEnv:
             max_switches_per_day=self.config.constraints.max_switches_per_day,
             min_hold_bars=self.config.constraints.min_hold_bars,
             action_count=len(self.data.action_names),
+            switches_episode=self.switches_episode,
+            max_switches_per_episode=self.config.constraints.max_switches_per_episode,
         )
 
     def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -714,6 +722,8 @@ def evaluate_minute_to_hour_policy(
             max_switches_per_day=constraints.max_switches_per_day,
             min_hold_bars=constraints.min_hold_bars,
             action_count=len(data.action_names),
+            switches_episode=torch.tensor([switches_episode], dtype=torch.long, device=device),
+            max_switches_per_episode=constraints.max_switches_per_episode,
         )
         q_values = model(minute, mask, hour, prev_tensor, constraints_tensor)
         action = int(

@@ -239,6 +239,22 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(int(mask.sum().item()), 1)
         self.assertTrue(bool(mask[0, 4].item()))
 
+    def test_episode_switch_cap_masks_new_positions(self) -> None:
+        mask = build_action_mask(
+            current_action=torch.tensor([2]),
+            bars_held=torch.tensor([5]),
+            cooldown_remaining=torch.tensor([0]),
+            switches_today=torch.tensor([0]),
+            max_switches_per_day=5,
+            min_hold_bars=1,
+            action_count=6,
+            switches_episode=torch.tensor([3]),
+            max_switches_per_episode=3,
+        )
+
+        self.assertEqual(int(mask.sum().item()), 1)
+        self.assertTrue(bool(mask[0, 2].item()))
+
     def test_etf_to_etf_switch_counts_two_legs(self) -> None:
         self.assertEqual(float(trade_legs(torch.tensor([2]), torch.tensor([5]))[0].item()), 2.0)
 
