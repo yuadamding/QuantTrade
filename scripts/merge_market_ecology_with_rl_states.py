@@ -6,7 +6,7 @@ import csv
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT.parent
+PROJECT_ROOT = PACKAGE_ROOT
 
 
 def read_by_date(path: Path) -> tuple[list[str], dict[str, dict[str, str]]]:

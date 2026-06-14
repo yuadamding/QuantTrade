@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT.parent
+PROJECT_ROOT = PACKAGE_ROOT
 
 FIELDNAMES = [
     "DatetimeUTC",

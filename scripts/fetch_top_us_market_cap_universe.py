@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT.parent
+PROJECT_ROOT = PACKAGE_ROOT
 
 SCREENER_URL = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
 SOURCE_PAGE = "https://finance.yahoo.com/research-hub/screener/largest_market_cap/"
