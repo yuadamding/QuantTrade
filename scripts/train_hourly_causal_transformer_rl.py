@@ -9,58 +9,56 @@ from datetime import datetime
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT.parent
+PROJECT_ROOT = PACKAGE_ROOT
 SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-def default_state_features_path() -> Path:
-    ecology = PROJECT_ROOT / "derived" / "rl_daily" / "stock_top1000_2026" / "state_features_with_market_ecology.csv"
-    if ecology.exists():
-        return ecology
-    return PROJECT_ROOT / "derived" / "rl_daily" / "stock_top1000_2026" / "state_features.csv"
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a DQN strategy allocator on daily strategy returns.",
+        description="Train a causal-transformer DQN allocator on top-volume bar data.",
     )
-    parser.add_argument("--state-features", type=Path, default=default_state_features_path())
     parser.add_argument(
-        "--action-returns",
+        "--dataset",
         type=Path,
-        default=PROJECT_ROOT / "derived" / "rl_daily" / "stock_top1000_2026" / "action_returns.csv",
+        default=PROJECT_ROOT / "derived" / "rl_hourly" / "top_volume_2026" / "hourly_transformer_dataset.pt",
     )
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "derived" / "rl_daily_runs")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "derived" / "rl_hourly_runs")
     parser.add_argument("--run-name")
-    parser.add_argument("--lookback", type=int, default=20)
+    parser.add_argument("--lookback", type=int, default=64)
     parser.add_argument("--train-start")
-    parser.add_argument("--train-end", default="2026-04-30")
-    parser.add_argument("--val-end", default="2026-05-29")
-    parser.add_argument("--test-start", default="2026-06-01")
+    parser.add_argument("--train-end", default="2026-04-30T23:59:59+00:00")
+    parser.add_argument("--val-end", default="2026-05-29T23:59:59+00:00")
+    parser.add_argument("--test-start", default="2026-06-01T00:00:00+00:00")
     parser.add_argument("--test-end")
-    parser.add_argument("--initial-action", default="BH_QQQ")
-    parser.add_argument("--switch-cost-bps", type=float, default=5.0)
-    parser.add_argument("--num-envs", type=int, default=64)
-    parser.add_argument("--episode-length", type=int, default=32)
-    parser.add_argument("--replay-capacity", type=int, default=20_000)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--train-steps", type=int, default=1_000)
-    parser.add_argument("--warmup-steps", type=int, default=128)
-    parser.add_argument("--gamma", type=float, default=0.98)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--initial-action", default="CASH")
+    parser.add_argument("--switch-cost-bps", type=float, default=1.0)
+    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--episode-length", type=int, default=64)
+    parser.add_argument("--replay-capacity", type=int, default=50_000)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--train-steps", type=int, default=600)
+    parser.add_argument("--warmup-steps", type=int, default=256)
+    parser.add_argument("--gamma", type=float, default=0.995)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--target-update-interval", type=int, default=100)
     parser.add_argument("--epsilon-start", type=float, default=0.30)
-    parser.add_argument("--epsilon-end", type=float, default=0.03)
+    parser.add_argument("--epsilon-end", type=float, default=0.04)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--hidden-size", type=int, default=128)
-    parser.add_argument("--action-embedding-dim", type=int, default=16)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--n-heads", type=int, default=8)
+    parser.add_argument("--n-layers", type=int, default=4)
+    parser.add_argument("--feedforward-dim", type=int, default=768)
+    parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument("--action-embedding-dim", type=int, default=32)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>")
-    parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision during training")
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision")
+    parser.add_argument("--target-vram-gb", type=float, help="Reserve CUDA VRAM after warmup toward this total used amount.")
+    parser.add_argument("--vram-safety-gb", type=float, default=0.12)
+    parser.add_argument("--seed", type=int, default=11)
     return parser.parse_args()
 
 
@@ -79,24 +77,24 @@ def main() -> int:
     try:
         import torch
 
+        from rl_quant.hourly_transformer import (
+            HourlyEnvConfig,
+            HourlyTransformerTrainingConfig,
+            action_index,
+            build_hourly_splits,
+            evaluate_hourly_policy,
+            train_hourly_transformer_dqn,
+        )
         from rl_quant.core import (
             DQNLearningConfig,
             configure_torch_runtime,
             resolve_torch_device,
             torch_runtime_summary,
         )
-        from rl_quant.strategy_data import action_index, build_strategy_splits
-        from rl_quant.strategy_dqn import (
-            StrategyEnvConfig,
-            StrategyTrainingConfig,
-            evaluate_strategy_policy,
-            train_strategy_dqn_agent,
-        )
     except ModuleNotFoundError as exc:
         if exc.name == "torch":
             raise SystemExit(
-                "Torch is required to train the strategy allocator. "
-                "Use the ml1 conda environment, for example: conda run -n ml1 python scripts/train_strategy_allocator.py"
+                "Torch is required. Use: conda run -n ml1 python scripts/train_hourly_causal_transformer_rl.py"
             ) from exc
         raise
 
@@ -106,9 +104,8 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    train_split, val_split, test_split = build_strategy_splits(
-        state_features_path=args.state_features,
-        action_returns_path=args.action_returns,
+    train_split, val_split, test_split = build_hourly_splits(
+        dataset_path=args.dataset,
         lookback=args.lookback,
         train_start=args.train_start,
         train_end=args.train_end,
@@ -121,10 +118,15 @@ def main() -> int:
     print(f"Using device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {runtime['cuda_device_name']} | CUDA: {runtime['cuda_version']}")
-        print(f"TF32 matmul: {runtime['cuda_tf32_matmul']} | AMP: {args.amp}")
-    print(f"Actions: {len(train_split.action_names)} | Features: {len(train_split.feature_names)}")
+        print(f"Total memory: {runtime['cuda_total_memory_gb']} GiB | AMP: {args.amp}")
+    print(
+        f"Rows train/val/test: {len(train_split.timestamps)}/"
+        f"{len(val_split.timestamps)}/{len(test_split.timestamps)}"
+    )
+    print(f"Bar interval: {train_split.bar_interval} | periods/year: {train_split.periods_per_year:.1f}")
+    print(f"Features: {len(train_split.feature_names)} | Actions: {len(train_split.action_names)}")
 
-    env_config = StrategyEnvConfig(
+    env_config = HourlyEnvConfig(
         lookback=args.lookback,
         num_envs=args.num_envs,
         episode_length=args.episode_length,
@@ -148,33 +150,39 @@ def main() -> int:
         grad_clip=args.grad_clip,
         use_amp=args.amp,
     )
-    config = StrategyTrainingConfig(
+    config = HourlyTransformerTrainingConfig(
         env=env_config,
         learning=learning_config,
-        hidden_size=args.hidden_size,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        feedforward_dim=args.feedforward_dim,
+        dropout=args.dropout,
         action_embedding_dim=args.action_embedding_dim,
+        target_vram_gb=args.target_vram_gb,
+        vram_safety_gb=args.vram_safety_gb,
     )
-    model, artifacts = train_strategy_dqn_agent(
+    model, artifacts = train_hourly_transformer_dqn(
         train_split,
         val_split,
         device=device,
         config=config,
     )
-    train_result = evaluate_strategy_policy(
+    train_result = evaluate_hourly_policy(
         train_split.to(device),
         model,
         device=device,
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
     )
-    val_result = evaluate_strategy_policy(
+    val_result = evaluate_hourly_policy(
         val_split.to(device),
         model,
         device=device,
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
     )
-    test_result = evaluate_strategy_policy(
+    test_result = evaluate_hourly_policy(
         test_split.to(device),
         model,
         device=device,
@@ -183,7 +191,7 @@ def main() -> int:
         capture_rollout=True,
     )
 
-    run_name = args.run_name or datetime.now().strftime("strategy_dqn_%Y%m%d_%H%M%S")
+    run_name = args.run_name or f"{train_split.bar_interval}_causal_transformer_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir = args.output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     serializable_args = {
@@ -197,6 +205,8 @@ def main() -> int:
             "feature_std": train_split.feature_std.detach().cpu(),
             "feature_names": train_split.feature_names,
             "action_names": train_split.action_names,
+            "bar_interval": train_split.bar_interval,
+            "periods_per_year": train_split.periods_per_year,
             "config": serializable_args,
         },
         run_dir / "model.pt",
@@ -207,6 +217,8 @@ def main() -> int:
         "torch_version": torch.__version__,
         "torch_runtime": runtime,
         "config": serializable_args,
+        "bar_interval": train_split.bar_interval,
+        "periods_per_year": train_split.periods_per_year,
         "feature_names": train_split.feature_names,
         "action_names": train_split.action_names,
         "training": artifacts,
@@ -222,6 +234,13 @@ def main() -> int:
         f"Val TR: {val_result.total_return:.2%} | "
         f"Test TR: {test_result.total_return:.2%}"
     )
+    if artifacts.get("vram_reservation"):
+        print(f"VRAM reservation: {artifacts['vram_reservation']}")
+    if "cuda_device_used_end_gb" in artifacts:
+        print(
+            f"CUDA used end: {artifacts['cuda_device_used_end_gb']} GiB | "
+            f"peak reserved: {artifacts['cuda_peak_reserved_gb']} GiB"
+        )
     print(f"Artifacts written to {run_dir}")
     return 0
 
