@@ -1,0 +1,12 @@
+[project]
+name = "rl-quant"
+version = "0.1.0"
+description = "Compact reinforcement-learning trading framework for intraday, daily strategy, and hourly market-context experiments"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.4,<3",
+    "torch>=2.11.0,<3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
