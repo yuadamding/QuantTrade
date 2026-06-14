@@ -13,6 +13,9 @@ PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKA
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+SRC = PACKAGE_ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from build_hourly_transformer_dataset import (  # noqa: E402
     aggregate_stock_features,
@@ -23,6 +26,12 @@ from build_hourly_transformer_dataset import (  # noqa: E402
     load_symbol_features,
     parse_exchange_time,
     read_ranked_symbols,
+)
+from rl_quant.research_protocol import (  # noqa: E402
+    DatasetManifest,
+    hash_string_sequence,
+    stable_json_hash,
+    utc_now_iso,
 )
 
 
@@ -57,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-limit", type=int, default=1000)
     parser.add_argument("--action-count", type=int, default=16)
     parser.add_argument("--actions", help="Comma-separated ETF action symbols. CASH is added automatically.")
+    parser.add_argument(
+        "--universe-selection-date",
+        help="Optional ISO timestamp/date proving the universe was selected before the dataset starts.",
+    )
     parser.add_argument("--min-active-stock-fraction", type=float, default=0.30)
     parser.add_argument("--hours-lookback", type=int, default=4)
     parser.add_argument("--minutes-per-hour", type=int, default=60)
@@ -315,6 +328,21 @@ def main() -> int:
         dataset_path,
     )
     write_action_returns(args.output_dir / "action_returns.csv", action_names, decision_timestamps, action_return_rows)
+    source_metadata = {
+        "stock_minute_dir": str(args.stock_minute_dir),
+        "etf_minute_dir": str(args.etf_minute_dir),
+        "stock_universe": str(args.stock_universe),
+        "etf_universe": str(args.etf_universe),
+        "stock_limit": len(selected_stocks),
+        "action_symbols": etf_symbols,
+        "min_active_stock_fraction": args.min_active_stock_fraction,
+        "min_context_valid_fraction": args.min_context_valid_fraction,
+        "hours_lookback": args.hours_lookback,
+        "minutes_per_hour": args.minutes_per_hour,
+        "decision_stride_minutes": args.decision_stride_minutes,
+        "start": args.start,
+        "end_exclusive": args.end_exclusive,
+    }
     metadata = {
         "rows": len(decision_timestamps),
         "minute_shape": list(minute_features.shape),
@@ -329,6 +357,29 @@ def main() -> int:
         "dataset": str(dataset_path),
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    manifest = DatasetManifest(
+        dataset_id=f"minute_to_hour_{hash_string_sequence(decision_timestamps)[:12]}",
+        created_at_utc=utc_now_iso(),
+        source_vendor="Yahoo Finance chart",
+        symbols=[*selected_stocks, *etf_symbols],
+        universe_selection_date=args.universe_selection_date,
+        bar_interval=f"{args.decision_stride_minutes}m decision / 1m context",
+        timezone="UTC timestamps with exchange timestamp features",
+        adjustment="Adjusted close when available, otherwise close",
+        feature_names=[*minute_feature_names, *[f"hour_{name}" for name in hour_feature_names]],
+        action_names=action_names,
+        timestamps_hash=hash_string_sequence(decision_timestamps),
+        next_timestamps_hash=hash_string_sequence(next_timestamps),
+        first_timestamp=decision_timestamps[0],
+        last_timestamp=decision_timestamps[-1],
+        source_manifest_hash=stable_json_hash(source_metadata),
+        known_limitations=[
+            "Yahoo true 1m history is short and may contain missing bars.",
+            "Universe selection is not point-in-time unless universe_selection_date is provided.",
+            "US regular-session timing uses simplified 9:30-16:00 assumptions.",
+        ],
+    )
+    manifest.write_json(args.output_dir / "dataset_manifest.json")
     (args.output_dir / "README.md").write_text(
         f"""# Hourly Decisions From Minute Context Dataset
 

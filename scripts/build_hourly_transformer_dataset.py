@@ -17,6 +17,13 @@ SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from rl_quant.research_protocol import (  # noqa: E402
+    DatasetManifest,
+    hash_string_sequence,
+    stable_json_hash,
+    utc_now_iso,
+)
+
 SYMBOL_DATE_RE = re.compile(r"^(?P<symbol>.+?)_\d{4}-\d{2}-\d{2}_")
 
 
@@ -262,6 +269,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-limit", type=int, default=1000)
     parser.add_argument("--action-count", type=int, default=16)
     parser.add_argument("--actions", help="Comma-separated ETF action symbols. CASH is added automatically.")
+    parser.add_argument(
+        "--universe-selection-date",
+        help="Optional ISO timestamp/date proving the universe was selected before the dataset starts.",
+    )
     parser.add_argument("--min-active-stock-fraction", type=float, default=0.30)
     parser.add_argument(
         "--drop-session-gaps",
@@ -437,6 +448,20 @@ def main() -> int:
     )
     write_numeric_csv(args.output_dir / "state_features.csv", "Timestamp", feature_names, timestamps, feature_rows)
     write_numeric_csv(args.output_dir / "action_returns.csv", "Timestamp", action_names, timestamps, action_return_rows)
+    source_metadata = {
+        "stock_bar_dir": str(args.stock_bar_dir),
+        "etf_bar_dir": str(args.etf_bar_dir),
+        "stock_universe": str(args.stock_universe),
+        "etf_universe": str(args.etf_universe),
+        "stock_limit": len(selected_stocks),
+        "action_symbols": etf_symbols,
+        "bar_interval": bar_interval,
+        "drop_session_gaps": args.drop_session_gaps,
+        "require_same_session_lookback": args.require_same_session_lookback,
+        "periods_per_year": periods_per_year,
+        "start": args.start,
+        "end_exclusive": args.end_exclusive,
+    }
     metadata = {
         "rows": len(timestamps),
         "feature_count": len(feature_names),
@@ -457,6 +482,29 @@ def main() -> int:
         "action_returns_csv": str(args.output_dir / "action_returns.csv"),
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    manifest = DatasetManifest(
+        dataset_id=f"{interval_label(bar_interval)}_bar_{hash_string_sequence(timestamps)[:12]}",
+        created_at_utc=utc_now_iso(),
+        source_vendor="Yahoo Finance chart",
+        symbols=[*selected_stocks, *etf_symbols],
+        universe_selection_date=args.universe_selection_date,
+        bar_interval=bar_interval,
+        timezone="UTC timestamps with exchange timestamp features",
+        adjustment="Adjusted close when available, otherwise close",
+        feature_names=feature_names,
+        action_names=action_names,
+        timestamps_hash=hash_string_sequence(timestamps),
+        next_timestamps_hash=hash_string_sequence(next_timestamps),
+        first_timestamp=timestamps[0],
+        last_timestamp=timestamps[-1],
+        source_manifest_hash=stable_json_hash(source_metadata),
+        known_limitations=[
+            "Yahoo intraday history is short and may contain missing bars.",
+            "Universe selection is not point-in-time unless universe_selection_date is provided.",
+            "US regular-session timing uses simplified 9:30-16:00 assumptions.",
+        ],
+    )
+    manifest.write_json(args.output_dir / "dataset_manifest.json")
     (args.output_dir / "README.md").write_text(
         f"""# {interval_label(bar_interval).title()} Causal Transformer RL Dataset
 

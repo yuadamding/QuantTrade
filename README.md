@@ -9,6 +9,15 @@ This is research backtesting code under simplified data and execution
 assumptions. It is not live-trading-ready; broker credentials and live order
 placement must stay outside this repository and require explicit opt-in guards.
 
+QuantTrade is organized around a point-in-time research protocol. A valid
+experiment must declare the data manifest, feature fit windows, decision
+schedule, action universe, trading constraints, cost/execution model,
+validation protocol, baselines, and hyperparameter search space. A result is
+not reportable unless features are available at or before decision time, reward
+realization stays inside the split, schemas match exactly, trading constraints
+are applied during training and evaluation, costs are leg-aware, cost/frequency
+stress evidence is present, and registered baselines are included.
+
 Use the `ml1` conda environment:
 
 ```bash
@@ -24,6 +33,7 @@ conda run -n ml1 python scripts/check_torch_cuda.py --device auto --matrix-size 
 - `strategy_data.py`, `strategy_dqn.py`: daily strategy-allocation dataset loading and DQN allocator.
 - `hourly_transformer.py`: causal-transformer DQN allocator for hourly or minute market context.
 - `minute_to_hour_transformer.py`: hierarchical minute-to-hour causal transformer for hourly allocation decisions using causal minute context.
+- `research_protocol.py`: dataset/model manifests, fit-window validation, benchmark registry, stress evidence, and experiment registry helpers.
 - `bar_transformer.py`: interval-neutral aliases for the transformer allocator.
 - `quote_utils.py`: raw quote parsing, NBBO construction, session utilities, and bucket formatting.
 
@@ -91,6 +101,12 @@ Minute-to-hour dataset:
 - `minute_features`: tensor shaped `[decisions, hours_lookback, minutes_per_hour, minute_feature_count]`.
 - `minute_mask`: boolean tensor where `True` marks causal valid minute bars.
 - `action_returns`: close-to-close ETF returns from each hourly decision timestamp to the next hourly decision timestamp.
+
+Research protocol artifacts:
+
+- `dataset_manifest.json`: source/vendor, symbols, schema hashes, timestamp hashes, universe timing, known limitations, and feature fit-window metadata.
+- Model manifests: algorithm, encoder, training dataset, validation protocol, search-space hash, selected metric, baselines, and cost/frequency stress results.
+- `FitWindow`: every learned feature or normalizer should prove `fit_end < feature_asof`.
 
 Intraday NBBO dataset:
 
@@ -173,6 +189,13 @@ Train the hierarchical minute-to-hour causal transformer:
 ```bash
 conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
   --device auto --amp --target-vram-gb 9.5
+```
+
+Validate research manifests:
+
+```bash
+conda run -n ml1 python scripts/validate_research_protocol.py \
+  --dataset-manifest data/rl_hour_from_minute/top_volume_1m_recent/dataset_manifest.json
 ```
 
 Train the QQQ intraday DQN:
