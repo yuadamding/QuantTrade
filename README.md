@@ -23,6 +23,7 @@ conda run -n ml1 python scripts/check_torch_cuda.py --device auto --matrix-size 
 - `intraday_data.py`, `intraday_dqn.py`: QQQ NBBO feature loading and intraday DQN trading.
 - `strategy_data.py`, `strategy_dqn.py`: daily strategy-allocation dataset loading and DQN allocator.
 - `hourly_transformer.py`: causal-transformer DQN allocator for hourly or minute market context.
+- `minute_to_hour_transformer.py`: hierarchical minute-to-hour causal transformer for hourly allocation decisions using causal minute context.
 - `bar_transformer.py`: interval-neutral aliases for the transformer allocator.
 - `quote_utils.py`: raw quote parsing, NBBO construction, session utilities, and bucket formatting.
 
@@ -50,12 +51,22 @@ Bar causal-transformer allocator:
 - Model: masked transformer encoder with previous-action embedding; attention is causal across the lookback window.
 - Frequency: Yahoo Finance `1h` or `1m` exchange-session bars.
 
+Minute-to-hour causal-context allocator:
+
+- Decision frequency: hourly boundaries only.
+- State: `H` historical hour tokens, each encoded from up to `M` causal minute bars ending no later than the decision timestamp.
+- Actions: `CASH` plus selected liquid ETF actions.
+- Reward: selected ETF simple return from the decision close to the next hourly decision close.
+- Model: minute encoder learns intrahour path context; hour encoder learns multi-hour regime context.
+- Constraints: action masks, minimum hold, daily switch cap, cooldown, Q-value hysteresis, and ETF-to-ETF two-leg transaction costs.
+
 Correctness contract:
 
 - Trading rewards are simple returns because environments compound equity with `equity *= 1 + return`.
 - Log returns may appear as state features only, for example `bar_log_return`.
 - Bar datasets must store both `timestamps` and `next_timestamps`; split builders reject rewards realized after a split end.
 - Bar action rewards are computed from the current decision close to the next decision close, so filtered intermediate bars do not distort returns.
+- Minute-to-hour datasets must satisfy `max(context_minute_ts) <= decision_ts < next_ts`.
 - Evaluation walks `valid_start_indices` exactly and resets previous-action state when valid windows are not contiguous.
 - Strategy and bar loaders validate feature/action names and order across train, validation, and test splits.
 - Numeric strategy inputs are parsed strictly; missing action returns should be fixed upstream, not coerced to zero.
@@ -73,6 +84,13 @@ Bar transformer dataset:
 - `hourly_transformer_dataset.pt` or `minute_transformer_dataset.pt`: trusted local torch payload with `timestamps`, `next_timestamps`, `feature_names`, `action_names`, `features`, `action_returns`, `bar_interval`, and `periods_per_year`.
 - `state_features.csv`: human-readable copy of bar state features.
 - `action_returns.csv`: human-readable copy of bar action returns.
+
+Minute-to-hour dataset:
+
+- `hour_from_minute_dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `minute_features`, `minute_mask`, `hour_features`, `action_returns`, feature names, and action names.
+- `minute_features`: tensor shaped `[decisions, hours_lookback, minutes_per_hour, minute_feature_count]`.
+- `minute_mask`: boolean tensor where `True` marks causal valid minute bars.
+- `action_returns`: close-to-close ETF returns from each hourly decision timestamp to the next hourly decision timestamp.
 
 Intraday NBBO dataset:
 
@@ -141,6 +159,19 @@ Train the minute-level causal-transformer DQN:
 
 ```bash
 conda run -n ml1 python scripts/train_minute_causal_transformer_rl.py \
+  --device auto --amp --target-vram-gb 9.5
+```
+
+Build hourly decisions from minute-level context:
+
+```bash
+conda run -n ml1 python scripts/build_hourly_from_minute_context_dataset.py
+```
+
+Train the hierarchical minute-to-hour causal transformer:
+
+```bash
+conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
   --device auto --amp --target-vram-gb 9.5
 ```
 

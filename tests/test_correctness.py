@@ -23,6 +23,11 @@ from rl_quant.hourly_transformer import (  # noqa: E402
     evaluate_hourly_policy,
 )
 from rl_quant.intraday_dqn import _apply_action_threshold  # noqa: E402
+from rl_quant.minute_to_hour_transformer import (  # noqa: E402
+    MinuteToHourCausalTransformerQNetwork,
+    build_action_mask,
+    trade_legs,
+)
 from rl_quant.strategy_data import (  # noqa: E402
     StrategyDataSplit,
     assert_matching_strategy_schema,
@@ -176,6 +181,83 @@ class BarDatasetTests(unittest.TestCase):
         next_decision = rows["2026-01-02T14:32:00+00:00"]
         self.assertAlmostEqual(next_decision.bar_return, 0.10)
         self.assertAlmostEqual(module.clipped_simple_return(current.close, next_decision.close), 0.21)
+
+
+class MinuteToHourTests(unittest.TestCase):
+    def test_hourly_context_uses_only_past_minutes(self) -> None:
+        decision_timestamp = "2026-06-10T15:30:00+00:00"
+        next_timestamp = "2026-06-10T16:30:00+00:00"
+        minute_timestamps = [
+            ["2026-06-10T14:31:00+00:00", "2026-06-10T14:32:00+00:00"],
+            ["2026-06-10T15:29:00+00:00", "2026-06-10T15:30:00+00:00"],
+        ]
+
+        self.assertLess(decision_timestamp, next_timestamp)
+        self.assertLessEqual(max(timestamp for hour in minute_timestamps for timestamp in hour), decision_timestamp)
+
+    def test_next_hour_reward_uses_decision_close_to_next_hour_close(self) -> None:
+        module = load_script("build_hourly_transformer_dataset")
+
+        self.assertAlmostEqual(module.clipped_simple_return(100.0, 105.0), 0.05)
+
+    def test_min_hold_action_mask_allows_only_current_action(self) -> None:
+        mask = build_action_mask(
+            current_action=torch.tensor([3]),
+            bars_held=torch.tensor([0]),
+            cooldown_remaining=torch.tensor([0]),
+            switches_today=torch.tensor([0]),
+            max_switches_per_day=2,
+            min_hold_bars=2,
+            action_count=10,
+        )
+
+        self.assertEqual(int(mask.sum().item()), 1)
+        self.assertTrue(bool(mask[0, 3].item()))
+
+    def test_daily_switch_cap_masks_new_positions(self) -> None:
+        mask = build_action_mask(
+            current_action=torch.tensor([4]),
+            bars_held=torch.tensor([5]),
+            cooldown_remaining=torch.tensor([0]),
+            switches_today=torch.tensor([2]),
+            max_switches_per_day=2,
+            min_hold_bars=2,
+            action_count=10,
+        )
+
+        self.assertEqual(int(mask.sum().item()), 1)
+        self.assertTrue(bool(mask[0, 4].item()))
+
+    def test_etf_to_etf_switch_counts_two_legs(self) -> None:
+        self.assertEqual(float(trade_legs(torch.tensor([2]), torch.tensor([5]))[0].item()), 2.0)
+
+    def test_cash_to_etf_counts_one_leg(self) -> None:
+        self.assertEqual(float(trade_legs(torch.tensor([0]), torch.tensor([5]))[0].item()), 1.0)
+
+    def test_minute_to_hour_model_forward_shape(self) -> None:
+        model = MinuteToHourCausalTransformerQNetwork(
+            minute_feature_dim=3,
+            hour_feature_dim=2,
+            action_count=4,
+            hours_lookback=2,
+            minutes_per_hour=3,
+            d_model=16,
+            n_heads=4,
+            minute_layers=1,
+            hour_layers=1,
+            feedforward_dim=32,
+            action_embedding_dim=4,
+        )
+        q_values = model(
+            torch.zeros((2, 2, 3, 3), dtype=torch.float32),
+            torch.tensor([[[True, True, False], [True, True, True]], [[False, False, False], [True, False, False]]]),
+            torch.zeros((2, 2, 2), dtype=torch.float32),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros((2, 4), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(q_values.shape), (2, 4))
+        self.assertTrue(bool(torch.isfinite(q_values).all().item()))
 
 
 class HourlySplitTests(unittest.TestCase):

@@ -1,0 +1,975 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from os import PathLike
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from rl_quant.core import (
+    DQNLearningConfig,
+    annualized_sharpe,
+    autocast_context,
+    configure_torch_runtime,
+    epsilon_by_step,
+    fractional_max_drawdown,
+    make_grad_scaler,
+)
+from rl_quant.hourly_transformer import CudaVramReservation
+
+
+class TensorDictReplayBuffer:
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        device: torch.device,
+        fields: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = int(capacity)
+        self.device = device
+        self.storage = {
+            name: torch.zeros((capacity, *shape), dtype=dtype, device=device)
+            for name, (shape, dtype) in fields.items()
+        }
+        self.size = 0
+        self.cursor = 0
+
+    def add(self, **transition: torch.Tensor) -> None:
+        missing = set(self.storage) - set(transition)
+        if missing:
+            raise ValueError(f"Missing replay fields: {sorted(missing)}")
+        first_value = next(iter(transition.values()))
+        count = int(first_value.shape[0])
+        if count == 0:
+            return
+        if count >= self.capacity:
+            for name in self.storage:
+                transition[name] = transition[name][-self.capacity :]
+            count = self.capacity
+        first = min(count, self.capacity - self.cursor)
+        second = count - first
+        for name, target in self.storage.items():
+            values = transition[name].to(device=self.device, dtype=target.dtype)
+            target[self.cursor : self.cursor + first] = values[:first]
+            if second:
+                target[:second] = values[first:]
+        self.cursor = (self.cursor + count) % self.capacity
+        self.size = min(self.capacity, self.size + count)
+
+    def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
+        if self.size <= 0:
+            raise ValueError("Cannot sample from an empty replay buffer")
+        batch_ids = torch.randint(0, self.size, (batch_size,), device=self.device)
+        return {name: values[batch_ids] for name, values in self.storage.items()}
+
+
+@dataclass
+class TradingConstraintConfig:
+    max_switches_per_day: int = 2
+    max_switches_per_week: int | None = None
+    max_switches_per_episode: int | None = None
+    min_hold_bars: int = 1
+    cooldown_bars: int = 0
+    no_trade_last_minutes: int = 0
+    q_switch_margin_bps: float = 3.0
+    extra_switch_penalty_bps: float = 0.0
+    one_way_cost_bps: float = 1.0
+    count_etf_to_etf_as_two_legs: bool = True
+    cash_index: int = 0
+
+
+@dataclass
+class HourFromMinuteDataSplit:
+    name: str
+    decision_timestamps: list[str]
+    next_timestamps: list[str]
+    minute_feature_names: list[str]
+    hour_feature_names: list[str]
+    action_names: list[str]
+    minute_features: torch.Tensor
+    minute_mask: torch.Tensor
+    hour_features: torch.Tensor
+    action_returns: torch.Tensor
+    valid_start_indices: torch.Tensor
+    valid_index_mask: torch.Tensor
+    minute_feature_mean: torch.Tensor
+    minute_feature_std: torch.Tensor
+    hour_feature_mean: torch.Tensor
+    hour_feature_std: torch.Tensor
+    hours_lookback: int
+    minutes_per_hour: int
+    periods_per_year: float = 252.0 * 6.0
+
+    def to(self, device: torch.device | str) -> "HourFromMinuteDataSplit":
+        return replace(
+            self,
+            minute_features=self.minute_features.to(device),
+            minute_mask=self.minute_mask.to(device),
+            hour_features=self.hour_features.to(device),
+            action_returns=self.action_returns.to(device),
+            valid_start_indices=self.valid_start_indices.to(device),
+            valid_index_mask=self.valid_index_mask.to(device),
+            minute_feature_mean=self.minute_feature_mean.to(device),
+            minute_feature_std=self.minute_feature_std.to(device),
+            hour_feature_mean=self.hour_feature_mean.to(device),
+            hour_feature_std=self.hour_feature_std.to(device),
+        )
+
+    def state(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.minute_features[indices], self.minute_mask[indices], self.hour_features[indices]
+
+
+def _assert_increasing(values: list[str], *, name: str) -> None:
+    for left, right in zip(values, values[1:]):
+        if right <= left:
+            raise ValueError(f"{name} must be strictly increasing; got {left!r} before {right!r}.")
+
+
+def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    required = {
+        "decision_timestamps",
+        "next_timestamps",
+        "minute_feature_names",
+        "hour_feature_names",
+        "action_names",
+        "minute_features",
+        "minute_mask",
+        "hour_features",
+        "action_returns",
+    }
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(f"Minute-to-hour dataset is missing required keys: {sorted(missing)}")
+    return payload
+
+
+def _masked_mean_std(features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    valid = mask.unsqueeze(-1).to(features.dtype)
+    count = valid.sum(dim=(0, 1, 2)).clamp_min(1.0)
+    mean = (features * valid).sum(dim=(0, 1, 2)) / count
+    variance = (((features - mean) * valid) ** 2).sum(dim=(0, 1, 2)) / count
+    return mean, variance.sqrt().clamp_min(1e-6)
+
+
+def _build_split(
+    *,
+    name: str,
+    payload: dict[str, Any],
+    start_ts: str | None = None,
+    end_ts: str | None = None,
+    reward_start_ts: str | None = None,
+    reward_after_ts: str | None = None,
+    reward_end_ts: str | None = None,
+    minute_feature_mean: torch.Tensor | None = None,
+    minute_feature_std: torch.Tensor | None = None,
+    hour_feature_mean: torch.Tensor | None = None,
+    hour_feature_std: torch.Tensor | None = None,
+) -> HourFromMinuteDataSplit:
+    decisions = list(payload["decision_timestamps"])
+    next_timestamps = list(payload["next_timestamps"])
+    if not decisions:
+        raise ValueError("Minute-to-hour dataset has no decision_timestamps.")
+    _assert_increasing(decisions, name="decision_timestamps")
+    if len(next_timestamps) != len(decisions):
+        raise ValueError("next_timestamps length must match decision_timestamps length.")
+    for decision_ts, next_ts in zip(decisions, next_timestamps):
+        if next_ts <= decision_ts:
+            raise ValueError(f"next_timestamps must be after decisions; got {decision_ts!r} -> {next_ts!r}.")
+
+    all_minute_features = payload["minute_features"].float()
+    all_minute_mask = payload["minute_mask"].bool()
+    all_hour_features = payload["hour_features"].float()
+    all_returns = payload["action_returns"].float()
+    row_count = len(decisions)
+    if all_minute_features.shape[0] != row_count or all_minute_mask.shape[0] != row_count:
+        raise ValueError("minute feature/mask row counts must match decision_timestamps length.")
+    if all_hour_features.shape[0] != row_count or all_returns.shape[0] != row_count:
+        raise ValueError("hour_features and action_returns rows must match decision_timestamps length.")
+
+    selected = [
+        i
+        for i, ts in enumerate(decisions)
+        if (start_ts is None or ts >= start_ts) and (end_ts is None or ts <= end_ts)
+    ]
+    if not selected:
+        raise ValueError(f"No rows selected for split {name!r}.")
+
+    decision_subset = [decisions[i] for i in selected]
+    next_subset = [next_timestamps[i] for i in selected]
+    raw_minute = all_minute_features[selected]
+    raw_mask = all_minute_mask[selected]
+    raw_hour = all_hour_features[selected]
+    returns = all_returns[selected]
+
+    valid: list[int] = []
+    for index, decision_ts in enumerate(decision_subset):
+        next_ts = next_subset[index]
+        if reward_after_ts is not None and decision_ts <= reward_after_ts:
+            continue
+        if reward_start_ts is not None and decision_ts < reward_start_ts:
+            continue
+        if reward_end_ts is not None and next_ts > reward_end_ts:
+            continue
+        valid.append(index)
+    if not valid:
+        raise ValueError(f"No valid reward indices remain for split {name!r}.")
+
+    if minute_feature_mean is None or minute_feature_std is None:
+        minute_feature_mean, minute_feature_std = _masked_mean_std(raw_minute, raw_mask)
+    if hour_feature_mean is None:
+        hour_feature_mean = raw_hour.mean(dim=(0, 1))
+    if hour_feature_std is None:
+        hour_feature_std = raw_hour.std(dim=(0, 1), unbiased=False).clamp_min(1e-6)
+
+    minute = ((raw_minute - minute_feature_mean) / minute_feature_std).clamp_(-8.0, 8.0)
+    minute = minute.masked_fill(~raw_mask.unsqueeze(-1), 0.0)
+    hour = ((raw_hour - hour_feature_mean) / hour_feature_std).clamp_(-8.0, 8.0)
+    valid_start_indices = torch.tensor(valid, dtype=torch.long)
+    valid_index_mask = torch.zeros(len(decision_subset), dtype=torch.bool)
+    valid_index_mask[valid_start_indices] = True
+
+    return HourFromMinuteDataSplit(
+        name=name,
+        decision_timestamps=decision_subset,
+        next_timestamps=next_subset,
+        minute_feature_names=list(payload["minute_feature_names"]),
+        hour_feature_names=list(payload["hour_feature_names"]),
+        action_names=list(payload["action_names"]),
+        minute_features=minute,
+        minute_mask=raw_mask,
+        hour_features=hour,
+        action_returns=returns,
+        valid_start_indices=valid_start_indices,
+        valid_index_mask=valid_index_mask,
+        minute_feature_mean=minute_feature_mean,
+        minute_feature_std=minute_feature_std,
+        hour_feature_mean=hour_feature_mean,
+        hour_feature_std=hour_feature_std,
+        hours_lookback=int(payload.get("hours_lookback", raw_minute.shape[1])),
+        minutes_per_hour=int(payload.get("minutes_per_hour", raw_minute.shape[2])),
+        periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.0)),
+    )
+
+
+def build_hour_from_minute_splits(
+    *,
+    dataset_path,
+    train_end: str,
+    val_end: str,
+    test_start: str,
+    train_start: str | None = None,
+    test_end: str | None = None,
+) -> tuple[HourFromMinuteDataSplit, HourFromMinuteDataSplit, HourFromMinuteDataSplit]:
+    payload = _load_payload(dataset_path)
+    train = _build_split(
+        name="train",
+        payload=payload,
+        start_ts=train_start,
+        end_ts=train_end,
+        reward_end_ts=train_end,
+    )
+    val = _build_split(
+        name="val",
+        payload=payload,
+        start_ts=train_start,
+        end_ts=val_end,
+        reward_after_ts=train_end,
+        reward_end_ts=val_end,
+        minute_feature_mean=train.minute_feature_mean,
+        minute_feature_std=train.minute_feature_std,
+        hour_feature_mean=train.hour_feature_mean,
+        hour_feature_std=train.hour_feature_std,
+    )
+    test = _build_split(
+        name="test",
+        payload=payload,
+        start_ts=train_start,
+        end_ts=test_end,
+        reward_start_ts=test_start,
+        reward_end_ts=test_end,
+        minute_feature_mean=train.minute_feature_mean,
+        minute_feature_std=train.minute_feature_std,
+        hour_feature_mean=train.hour_feature_mean,
+        hour_feature_std=train.hour_feature_std,
+    )
+    assert_matching_hour_from_minute_schema(train, val, test)
+    return train, val, test
+
+
+def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) -> None:
+    if not splits:
+        return
+    reference = splits[0]
+    for split in splits[1:]:
+        if split.minute_feature_names != reference.minute_feature_names:
+            raise ValueError(f"Minute feature names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.hour_feature_names != reference.hour_feature_names:
+            raise ValueError(f"Hour feature names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.action_names != reference.action_names:
+            raise ValueError(f"Action names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.minute_features.shape[1:] != reference.minute_features.shape[1:]:
+            raise ValueError(f"Minute tensor shape differs between {reference.name!r} and {split.name!r}.")
+        if split.hour_features.shape[1:] != reference.hour_features.shape[1:]:
+            raise ValueError(f"Hour tensor shape differs between {reference.name!r} and {split.name!r}.")
+
+
+def trade_legs(previous_action: torch.Tensor, action: torch.Tensor, *, cash_index: int = 0) -> torch.Tensor:
+    changed = action != previous_action
+    prev_risky = previous_action != int(cash_index)
+    next_risky = action != int(cash_index)
+    legs = torch.zeros_like(action, dtype=torch.float32)
+    legs = torch.where(changed & prev_risky, legs + 1.0, legs)
+    legs = torch.where(changed & next_risky, legs + 1.0, legs)
+    return legs
+
+
+def build_action_mask(
+    *,
+    current_action: torch.Tensor,
+    bars_held: torch.Tensor,
+    cooldown_remaining: torch.Tensor,
+    switches_today: torch.Tensor,
+    max_switches_per_day: int,
+    min_hold_bars: int,
+    action_count: int,
+) -> torch.Tensor:
+    mask = torch.ones(current_action.shape[0], action_count, dtype=torch.bool, device=current_action.device)
+    must_hold = bars_held < int(min_hold_bars)
+    in_cooldown = cooldown_remaining > 0
+    trade_budget_exhausted = switches_today >= int(max_switches_per_day)
+    constrained = must_hold | in_cooldown | trade_budget_exhausted
+    if bool(constrained.any().item()):
+        mask[constrained, :] = False
+        mask[constrained, current_action[constrained].long()] = True
+    return mask
+
+
+def apply_hysteresis(
+    q_values: torch.Tensor,
+    current_action: torch.Tensor,
+    action_mask: torch.Tensor,
+    *,
+    switch_cost_bps: float,
+    q_switch_margin_bps: float,
+    reward_scale: float = 10_000.0,
+) -> torch.Tensor:
+    masked_q = q_values.masked_fill(~action_mask, torch.finfo(q_values.dtype).min)
+    best_action = torch.argmax(masked_q, dim=1)
+    current_q = q_values.gather(1, current_action.long().unsqueeze(1)).squeeze(1)
+    best_q = q_values.gather(1, best_action.unsqueeze(1)).squeeze(1)
+    required_edge = (float(switch_cost_bps) + float(q_switch_margin_bps)) * float(reward_scale) / 10_000.0
+    should_switch = best_action.ne(current_action.long()) & ((best_q - current_q) > required_edge)
+    return torch.where(should_switch, best_action, current_action.long())
+
+
+class MinuteToHourCausalTransformerQNetwork(nn.Module):
+    def __init__(
+        self,
+        *,
+        minute_feature_dim: int,
+        hour_feature_dim: int,
+        action_count: int,
+        hours_lookback: int,
+        minutes_per_hour: int,
+        d_model: int = 256,
+        n_heads: int = 8,
+        minute_layers: int = 2,
+        hour_layers: int = 4,
+        feedforward_dim: int = 768,
+        dropout: float = 0.05,
+        action_embedding_dim: int = 32,
+        constraint_feature_dim: int = 4,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
+        self.hours_lookback = int(hours_lookback)
+        self.minutes_per_hour = int(minutes_per_hour)
+        self.action_count = int(action_count)
+        self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+        self.minute_proj = nn.Sequential(nn.Linear(minute_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
+        self.minute_pos = nn.Parameter(torch.zeros(minutes_per_hour, d_model))
+        minute_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=feedforward_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.minute_encoder = nn.TransformerEncoder(minute_layer, num_layers=minute_layers)
+        self.hour_proj = nn.Sequential(
+            nn.Linear(d_model + hour_feature_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.hour_pos = nn.Parameter(torch.zeros(hours_lookback, d_model))
+        self.previous_action_embedding = nn.Embedding(action_count, action_embedding_dim)
+        self.action_context = nn.Linear(action_embedding_dim, d_model)
+        self.constraint_context = nn.Linear(constraint_feature_dim, d_model)
+        hour_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=feedforward_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.hour_encoder = nn.TransformerEncoder(hour_layer, num_layers=hour_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, feedforward_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feedforward_dim, action_count),
+        )
+
+    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
+        key = (length, device)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            mask = torch.triu(torch.ones((length, length), dtype=torch.bool, device=device), diagonal=1)
+            self._mask_cache[key] = mask
+        return mask
+
+    def forward(
+        self,
+        minute_features: torch.Tensor,
+        minute_mask: torch.Tensor,
+        hour_features: torch.Tensor,
+        previous_actions: torch.Tensor,
+        constraint_features: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, hours, minutes, _ = minute_features.shape
+        if hours > self.hours_lookback or minutes > self.minutes_per_hour:
+            raise ValueError("Input context exceeds configured hours_lookback or minutes_per_hour.")
+        x = self.minute_proj(minute_features)
+        x = x + self.minute_pos[:minutes][None, None, :, :]
+        x = x.reshape(batch * hours, minutes, -1)
+        flat_mask = minute_mask.reshape(batch * hours, minutes).bool()
+        safe_padding_mask = ~flat_mask
+        empty_rows = ~flat_mask.any(dim=1)
+        if bool(empty_rows.any().item()):
+            safe_padding_mask[empty_rows, 0] = False
+        minute_context = self.minute_encoder(
+            x,
+            mask=self._causal_mask(minutes, x.device),
+            src_key_padding_mask=safe_padding_mask,
+        )
+        last_valid = flat_mask.long().sum(dim=1).clamp_min(1) - 1
+        hour_context = minute_context[
+            torch.arange(batch * hours, device=x.device),
+            last_valid,
+        ].reshape(batch, hours, -1)
+
+        hour_tokens = self.hour_proj(torch.cat([hour_context, hour_features], dim=-1))
+        hour_tokens = hour_tokens + self.hour_pos[:hours][None, :, :]
+        action_ctx = self.action_context(self.previous_action_embedding(previous_actions.long()))
+        constraint_ctx = self.constraint_context(constraint_features.float())
+        hour_tokens = hour_tokens + action_ctx[:, None, :] + constraint_ctx[:, None, :]
+        encoded = self.hour_encoder(hour_tokens, mask=self._causal_mask(hours, x.device))
+        return self.head(encoded[:, -1, :])
+
+
+@dataclass
+class MinuteToHourEnvConfig:
+    num_envs: int
+    episode_length: int
+    reward_scale: float = 10_000.0
+    initial_action: int = 0
+    constraints: TradingConstraintConfig = field(default_factory=TradingConstraintConfig)
+
+
+@dataclass
+class MinuteToHourTrainingConfig:
+    env: MinuteToHourEnvConfig
+    learning: DQNLearningConfig
+    d_model: int = 256
+    n_heads: int = 8
+    minute_layers: int = 2
+    hour_layers: int = 4
+    feedforward_dim: int = 768
+    dropout: float = 0.05
+    action_embedding_dim: int = 32
+    target_vram_gb: float | None = None
+    vram_safety_gb: float = 0.12
+
+
+class VectorizedMinuteToHourEnv:
+    def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
+        if not (0 <= config.initial_action < len(data.action_names)):
+            raise ValueError("initial_action is outside the action space.")
+        self.data = data if data.minute_features.device == device else data.to(device)
+        self.config = config
+        self.device = device
+        self.start_indices = self._build_start_index_pool()
+        self.indices = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.previous_actions = torch.full((config.num_envs,), int(config.initial_action), dtype=torch.long, device=device)
+        self.bars_held = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.cooldown_remaining = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.switches_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.switches_episode = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.steps = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.reset()
+
+    def _build_start_index_pool(self) -> torch.Tensor:
+        starts = self.data.valid_start_indices
+        starts = starts[starts + 1 < self.data.action_returns.shape[0]]
+        if starts.numel() == 0:
+            raise ValueError("No valid minute-to-hour start indices remain.")
+        return starts.to(self.device)
+
+    def reset(self, mask: torch.Tensor | None = None) -> None:
+        if mask is None:
+            mask = torch.ones(self.config.num_envs, dtype=torch.bool, device=self.device)
+        count = int(mask.sum().item())
+        if count == 0:
+            return
+        random_ids = torch.randint(0, self.start_indices.shape[0], (count,), device=self.device)
+        self.indices[mask] = self.start_indices[random_ids]
+        self.previous_actions[mask] = int(self.config.initial_action)
+        self.bars_held[mask] = int(self.config.constraints.min_hold_bars)
+        self.cooldown_remaining[mask] = 0
+        self.switches_today[mask] = 0
+        self.switches_episode[mask] = 0
+        self.steps[mask] = 0
+
+    def constraint_features(self) -> torch.Tensor:
+        max_switches = max(float(self.config.constraints.max_switches_per_day), 1.0)
+        return torch.stack(
+            [
+                self.bars_held.float() / max(float(self.config.constraints.min_hold_bars), 1.0),
+                self.cooldown_remaining.float() / max(float(self.config.constraints.cooldown_bars), 1.0),
+                self.switches_today.float() / max_switches,
+                self.switches_episode.float() / max(float(self.config.episode_length), 1.0),
+            ],
+            dim=1,
+        ).clamp_(0.0, 8.0)
+
+    def action_mask(self) -> torch.Tensor:
+        return build_action_mask(
+            current_action=self.previous_actions,
+            bars_held=self.bars_held,
+            cooldown_remaining=self.cooldown_remaining,
+            switches_today=self.switches_today,
+            max_switches_per_day=self.config.constraints.max_switches_per_day,
+            min_hold_bars=self.config.constraints.min_hold_bars,
+            action_count=len(self.data.action_names),
+        )
+
+    def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        minute, mask, hour = self.data.state(self.indices)
+        return minute, mask, hour, self.previous_actions, self.constraint_features(), self.action_mask()
+
+    def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
+        current_indices = self.indices.clone()
+        previous_actions = self.previous_actions.clone()
+        constraint_features = self.constraint_features()
+        action_mask = self.action_mask()
+        actions = actions.long()
+        actions = torch.where(action_mask.gather(1, actions.unsqueeze(1)).squeeze(1), actions, previous_actions)
+        raw_returns = self.data.action_returns[current_indices, actions]
+        legs = trade_legs(previous_actions, actions, cash_index=self.config.constraints.cash_index)
+        is_switch = actions != previous_actions
+        cost_bps = legs * float(self.config.constraints.one_way_cost_bps)
+        cost_bps = cost_bps + is_switch.float() * float(self.config.constraints.extra_switch_penalty_bps)
+        rewards = raw_returns * float(self.config.reward_scale) - cost_bps * float(self.config.reward_scale) / 10_000.0
+
+        next_indices = current_indices + 1
+        self.indices = next_indices
+        self.previous_actions = actions
+        self.bars_held = torch.where(is_switch, torch.ones_like(self.bars_held), self.bars_held + 1)
+        self.cooldown_remaining = torch.where(
+            is_switch,
+            torch.full_like(self.cooldown_remaining, int(self.config.constraints.cooldown_bars)),
+            torch.clamp_min(self.cooldown_remaining - 1, 0),
+        )
+        self.switches_today = self.switches_today + is_switch.long()
+        self.switches_episode = self.switches_episode + is_switch.long()
+        self.steps = self.steps + 1
+
+        in_bounds = next_indices + 1 < self.data.action_returns.shape[0]
+        next_valid = torch.zeros_like(in_bounds)
+        if bool(in_bounds.any().item()):
+            next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
+        dones = (~next_valid) | (self.steps >= int(self.config.episode_length))
+        if bool(in_bounds.any().item()):
+            old_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in current_indices[in_bounds].detach().cpu()]
+            new_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in next_indices[in_bounds].detach().cpu()]
+            reset_today = torch.tensor([old != new for old, new in zip(old_dates, new_dates)], dtype=torch.bool, device=self.device)
+            valid_positions = torch.where(in_bounds)[0]
+            self.switches_today[valid_positions[reset_today]] = 0
+
+        next_constraint_features = self.constraint_features()
+        next_action_mask = self.action_mask()
+        return {
+            "indices": current_indices,
+            "previous_actions": previous_actions,
+            "constraint_features": constraint_features,
+            "action_mask": action_mask,
+            "actions": actions,
+            "rewards": rewards,
+            "next_indices": next_indices,
+            "next_previous_actions": self.previous_actions,
+            "next_constraint_features": next_constraint_features,
+            "next_action_mask": next_action_mask,
+            "dones": dones.float(),
+            "legs": legs,
+        }
+
+
+@dataclass
+class MinuteToHourEvaluationResult:
+    split_name: str
+    total_return: float
+    total_reward_bps: float
+    allocation_switches: int
+    market_order_legs: float
+    max_drawdown: float
+    annualized_sharpe: float | None
+    rollout_records: list[dict[str, float | str | int]]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "split_name": self.split_name,
+            "total_return": self.total_return,
+            "after_cost_return": self.total_return,
+            "total_reward_bps": self.total_reward_bps,
+            "allocation_switches": self.allocation_switches,
+            "market_order_legs": self.market_order_legs,
+            "max_drawdown": self.max_drawdown,
+            "annualized_sharpe": self.annualized_sharpe,
+            "rollout_records": self.rollout_records,
+        }
+
+
+@torch.no_grad()
+def evaluate_minute_to_hour_policy(
+    data: HourFromMinuteDataSplit,
+    model: nn.Module,
+    *,
+    device: torch.device,
+    initial_action: int = 0,
+    constraints: TradingConstraintConfig | None = None,
+    reward_scale: float = 10_000.0,
+    capture_rollout: bool = False,
+) -> MinuteToHourEvaluationResult:
+    constraints = constraints or TradingConstraintConfig()
+    data = data if data.minute_features.device == device else data.to(device)
+    model.eval()
+    previous_action = int(initial_action)
+    bars_held = int(constraints.min_hold_bars)
+    cooldown_remaining = 0
+    switches_today = 0
+    switches_episode = 0
+    previous_index: int | None = None
+    previous_date: str | None = None
+    equity = 1.0
+    equity_curve = [equity]
+    returns: list[float] = []
+    total_reward_bps = 0.0
+    allocation_switches = 0
+    order_legs = 0.0
+    records: list[dict[str, float | str | int]] = []
+    for index in data.valid_start_indices.detach().cpu().tolist():
+        current_date = data.decision_timestamps[index][:10]
+        segment_reset = previous_index is None or index != previous_index + 1
+        if segment_reset:
+            previous_action = int(initial_action)
+            bars_held = int(constraints.min_hold_bars)
+            cooldown_remaining = 0
+            switches_today = 0
+            switches_episode = 0
+        elif previous_date is not None and current_date != previous_date:
+            switches_today = 0
+        minute, mask, hour = data.state(torch.tensor([index], dtype=torch.long, device=device))
+        prev_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
+        bars_tensor = torch.tensor([bars_held], dtype=torch.long, device=device)
+        cooldown_tensor = torch.tensor([cooldown_remaining], dtype=torch.long, device=device)
+        switches_today_tensor = torch.tensor([switches_today], dtype=torch.long, device=device)
+        constraints_tensor = torch.tensor(
+            [[
+                bars_held / max(float(constraints.min_hold_bars), 1.0),
+                cooldown_remaining / max(float(constraints.cooldown_bars), 1.0),
+                switches_today / max(float(constraints.max_switches_per_day), 1.0),
+                switches_episode / max(float(data.valid_start_indices.numel()), 1.0),
+            ]],
+            dtype=torch.float32,
+            device=device,
+        )
+        action_mask = build_action_mask(
+            current_action=prev_tensor,
+            bars_held=bars_tensor,
+            cooldown_remaining=cooldown_tensor,
+            switches_today=switches_today_tensor,
+            max_switches_per_day=constraints.max_switches_per_day,
+            min_hold_bars=constraints.min_hold_bars,
+            action_count=len(data.action_names),
+        )
+        q_values = model(minute, mask, hour, prev_tensor, constraints_tensor)
+        action = int(
+            apply_hysteresis(
+                q_values,
+                prev_tensor,
+                action_mask,
+                switch_cost_bps=constraints.one_way_cost_bps,
+                q_switch_margin_bps=constraints.q_switch_margin_bps,
+                reward_scale=reward_scale,
+            )[0].item()
+        )
+        action_tensor = torch.tensor([action], dtype=torch.long, device=device)
+        legs = float(trade_legs(prev_tensor, action_tensor, cash_index=constraints.cash_index)[0].item())
+        is_switch = action != previous_action
+        cost_bps = legs * float(constraints.one_way_cost_bps)
+        cost_bps += float(is_switch) * float(constraints.extra_switch_penalty_bps)
+        gross_return = float(data.action_returns[index, action].item())
+        net_return = gross_return - cost_bps / 10_000.0
+        equity *= 1.0 + net_return
+        equity_curve.append(equity)
+        returns.append(net_return)
+        total_reward_bps += net_return * 10_000.0
+        allocation_switches += int(is_switch)
+        order_legs += legs
+        if capture_rollout:
+            records.append(
+                {
+                    "decision_timestamp": data.decision_timestamps[index],
+                    "next_timestamp": data.next_timestamps[index],
+                    "action": action,
+                    "asset": data.action_names[action],
+                    "previous_action": previous_action,
+                    "segment_reset": int(segment_reset),
+                    "market_order_legs": legs,
+                    "net_return": round(net_return, 8),
+                    "equity": round(equity, 8),
+                }
+            )
+        if is_switch:
+            bars_held = 1
+            cooldown_remaining = int(constraints.cooldown_bars)
+            switches_today += 1
+            switches_episode += 1
+        else:
+            bars_held += 1
+            cooldown_remaining = max(cooldown_remaining - 1, 0)
+        previous_action = action
+        previous_index = index
+        previous_date = current_date
+
+    return MinuteToHourEvaluationResult(
+        split_name=data.name,
+        total_return=equity - 1.0,
+        total_reward_bps=total_reward_bps,
+        allocation_switches=allocation_switches,
+        market_order_legs=order_legs,
+        max_drawdown=fractional_max_drawdown(equity_curve),
+        annualized_sharpe=annualized_sharpe(returns, periods_per_year=data.periods_per_year),
+        rollout_records=records,
+    )
+
+
+def _state_dict_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def train_minute_to_hour_dqn(
+    train_data: HourFromMinuteDataSplit,
+    val_data: HourFromMinuteDataSplit,
+    *,
+    device: torch.device,
+    config: MinuteToHourTrainingConfig,
+) -> tuple[nn.Module, dict[str, object]]:
+    configure_torch_runtime(device)
+    train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
+    val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
+    assert_matching_hour_from_minute_schema(train_data, val_data)
+    action_count = len(train_data.action_names)
+    q_network = MinuteToHourCausalTransformerQNetwork(
+        minute_feature_dim=train_data.minute_features.shape[-1],
+        hour_feature_dim=train_data.hour_features.shape[-1],
+        action_count=action_count,
+        hours_lookback=train_data.hours_lookback,
+        minutes_per_hour=train_data.minutes_per_hour,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        minute_layers=config.minute_layers,
+        hour_layers=config.hour_layers,
+        feedforward_dim=config.feedforward_dim,
+        dropout=config.dropout,
+        action_embedding_dim=config.action_embedding_dim,
+    ).to(device)
+    target_network = deepcopy(q_network).to(device)
+    target_network.eval()
+    optimizer = torch.optim.AdamW(
+        q_network.parameters(),
+        lr=config.learning.learning_rate,
+        weight_decay=config.learning.weight_decay,
+    )
+    scaler = make_grad_scaler(device, config.learning.use_amp)
+    replay = TensorDictReplayBuffer(
+        capacity=config.learning.replay_capacity,
+        device=device,
+        fields={
+            "indices": ((), torch.long),
+            "previous_actions": ((), torch.long),
+            "constraint_features": ((4,), torch.float32),
+            "action_mask": ((action_count,), torch.bool),
+            "actions": ((), torch.long),
+            "rewards": ((), torch.float32),
+            "next_indices": ((), torch.long),
+            "next_previous_actions": ((), torch.long),
+            "next_constraint_features": ((4,), torch.float32),
+            "next_action_mask": ((action_count,), torch.bool),
+            "dones": ((), torch.float32),
+        },
+    )
+    env = VectorizedMinuteToHourEnv(train_data, config.env, device)
+    reservation = CudaVramReservation(target_gb=config.target_vram_gb, safety_gb=config.vram_safety_gb)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    best_val_return = -float("inf")
+    best_val_legs = float("inf")
+    best_state = _state_dict_to_cpu(q_network)
+    loss_trace: list[float] = []
+    reward_trace: list[float] = []
+    eval_trace: list[dict[str, float | int | None | str]] = []
+    for step in range(1, config.learning.train_steps + 1):
+        minute, mask, hour, previous_actions, constraint_features, action_mask = env.observe()
+        epsilon = epsilon_by_step(
+            step=step,
+            train_steps=config.learning.train_steps,
+            start=config.learning.epsilon_start,
+            end=config.learning.epsilon_end,
+        )
+        with torch.no_grad():
+            with autocast_context(device, config.learning.use_amp):
+                q_values = q_network(minute, mask, hour, previous_actions, constraint_features)
+            greedy_actions = apply_hysteresis(
+                q_values,
+                previous_actions,
+                action_mask,
+                switch_cost_bps=config.env.constraints.one_way_cost_bps,
+                q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
+                reward_scale=config.env.reward_scale,
+            )
+            random_actions = torch.randint(0, action_count, greedy_actions.shape, device=device)
+            random_valid = action_mask.gather(1, random_actions.unsqueeze(1)).squeeze(1)
+            random_actions = torch.where(random_valid, random_actions, previous_actions)
+            explore = torch.rand(greedy_actions.shape, device=device) < epsilon
+            actions = torch.where(explore, random_actions, greedy_actions)
+        transition = env.step(actions)
+        replay.add(**{key: value for key, value in transition.items() if key in replay.storage})
+        reward_trace.append(float(transition["rewards"].mean().item()))
+        env.reset(transition["dones"].bool())
+
+        if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
+            batch = replay.sample(config.learning.batch_size)
+            current_minute, current_mask, current_hour = train_data.state(batch["indices"])
+            next_minute, next_mask, next_hour = train_data.state(batch["next_indices"])
+            with autocast_context(device, config.learning.use_amp):
+                q = q_network(current_minute, current_mask, current_hour, batch["previous_actions"], batch["constraint_features"])
+                chosen_q = q.gather(1, batch["actions"].unsqueeze(1)).squeeze(1)
+                with torch.no_grad():
+                    next_online = q_network(
+                        next_minute,
+                        next_mask,
+                        next_hour,
+                        batch["next_previous_actions"],
+                        batch["next_constraint_features"],
+                    )
+                    next_online = next_online.masked_fill(~batch["next_action_mask"], torch.finfo(next_online.dtype).min)
+                    next_actions = torch.argmax(next_online, dim=1)
+                    next_target = target_network(
+                        next_minute,
+                        next_mask,
+                        next_hour,
+                        batch["next_previous_actions"],
+                        batch["next_constraint_features"],
+                    )
+                    next_q = next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                    target_q = batch["rewards"] + config.learning.gamma * (1.0 - batch["dones"]) * next_q
+                loss = F.smooth_l1_loss(chosen_q, target_q)
+            optimizer.zero_grad(set_to_none=True)
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(q_network.parameters(), config.learning.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(q_network.parameters(), config.learning.grad_clip)
+                optimizer.step()
+            loss_trace.append(float(loss.item()))
+            reservation.maybe_reserve(device)
+
+        if step % config.learning.target_update_interval == 0:
+            target_network.load_state_dict(q_network.state_dict())
+
+        if step % config.learning.eval_interval == 0 or step == config.learning.train_steps:
+            val_result = evaluate_minute_to_hour_policy(
+                val_data,
+                q_network,
+                device=device,
+                initial_action=config.env.initial_action,
+                constraints=config.env.constraints,
+                reward_scale=config.env.reward_scale,
+            )
+            eval_trace.append(
+                {
+                    "step": step,
+                    "epsilon": epsilon,
+                    "val_return": val_result.total_return,
+                    "val_order_legs": val_result.market_order_legs,
+                    "val_sharpe": val_result.annualized_sharpe,
+                    "average_loss": sum(loss_trace[-200:]) / max(len(loss_trace[-200:]), 1),
+                    "average_train_reward": sum(reward_trace[-200:]) / max(len(reward_trace[-200:]), 1),
+                }
+            )
+            if val_result.total_return > best_val_return or (
+                abs(val_result.total_return - best_val_return) <= 1e-12
+                and val_result.market_order_legs < best_val_legs
+            ):
+                best_val_return = val_result.total_return
+                best_val_legs = val_result.market_order_legs
+                best_state = _state_dict_to_cpu(q_network)
+
+    q_network.load_state_dict(best_state)
+    artifacts: dict[str, object] = {
+        "best_val_return": best_val_return,
+        "best_val_order_legs": best_val_legs,
+        "amp_enabled": scaler.is_enabled(),
+        "loss_trace": loss_trace,
+        "train_reward_trace": reward_trace,
+        "eval_trace": eval_trace,
+        "vram_reservation": reservation.report,
+    }
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        free, total = torch.cuda.mem_get_info(device)
+        artifacts.update(
+            {
+                "cuda_peak_allocated_gb": round(torch.cuda.max_memory_allocated(device) / 1024**3, 4),
+                "cuda_peak_reserved_gb": round(torch.cuda.max_memory_reserved(device) / 1024**3, 4),
+                "cuda_device_used_end_gb": round((total - free) / 1024**3, 4),
+                "cuda_device_free_end_gb": round(free / 1024**3, 4),
+            }
+        )
+    return q_network, artifacts
+
+
+def action_index(action_names: list[str], action_name: str) -> int:
+    try:
+        return action_names.index(action_name)
+    except ValueError as exc:
+        raise ValueError(f"Unknown action {action_name!r}") from exc

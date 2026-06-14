@@ -13,6 +13,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+*.egg-info/
 
 data/
 derived/
@@ -23,4 +24,3 @@ wandb/
 *.pth
 *.ckpt
 *.onnx
-
