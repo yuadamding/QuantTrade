@@ -2,13 +2,15 @@
 
 Compact reinforcement-learning trading framework for the research in this
 workspace. The package code lives in `src/rl_quant`; executable workflows live
-in `scripts`. Scripts are designed to be run from the repository root, while
-reading and writing datasets under `derived`.
+in `scripts`. Scripts are designed to be run from this directory or from the
+parent project. In the local research workspace, large raw and RL-ready minute
+data lives under `/home/yding1995/quant/data`; a standalone QuantTrade checkout
+uses repo-relative `data/` and `derived/` paths unless explicit paths are passed.
 
 Use the `ml1` conda environment:
 
 ```bash
-cd /path/to/QuantTrade
+cd /path/to/QuantTrade  # local nested workspace: /home/yding1995/quant/rl_quant
 conda run -n ml1 python scripts/check_torch_cuda.py --device auto --matrix-size 1024 --repeats 1 --amp
 ```
 
@@ -41,9 +43,18 @@ Bar causal-transformer allocator:
 
 - State: rolling bar windows containing top-stock cross-section features, time features, and ETF context.
 - Actions: `CASH` plus selected liquid ETF actions.
-- Reward: next aligned bar return for the selected ETF action, net of switch cost.
+- Reward: next aligned simple bar return for the selected ETF action, net of switch cost.
 - Model: masked transformer encoder with previous-action embedding; attention is causal across the lookback window.
 - Frequency: Yahoo Finance `1h` or `1m` exchange-session bars.
+
+Correctness contract:
+
+- Trading rewards are simple returns because environments compound equity with `equity *= 1 + return`.
+- Log returns may appear as state features only, for example `bar_log_return`.
+- Bar datasets store both `timestamps` and `next_timestamps`; split builders reject rewards realized after a split end.
+- Evaluation walks `valid_start_indices` exactly and resets previous-action state when valid windows are not contiguous.
+- Strategy and bar loaders validate feature/action names and order across train, validation, and test splits.
+- Numeric strategy inputs are parsed strictly; missing action returns should be fixed upstream, not coerced to zero.
 
 ## Data Formats
 
@@ -55,13 +66,13 @@ Daily allocator dataset:
 
 Bar transformer dataset:
 
-- `hourly_transformer_dataset.pt` or `minute_transformer_dataset.pt`: torch payload with `timestamps`, `feature_names`, `action_names`, `features`, `action_returns`, `bar_interval`, and `periods_per_year`.
+- `hourly_transformer_dataset.pt` or `minute_transformer_dataset.pt`: torch payload with `timestamps`, `next_timestamps`, `feature_names`, `action_names`, `features`, `action_returns`, `bar_interval`, and `periods_per_year`.
 - `state_features.csv`: human-readable copy of bar state features.
 - `action_returns.csv`: human-readable copy of bar action returns.
 
 Intraday NBBO dataset:
 
-- Raw quote files are expected under `QQQ_2025`.
+- Raw quote files are expected under `/home/yding1995/quant/QQQ_2025`.
 - Extracted bucket files live under `derived/nbbo_features` and contain OHLC mid, spread, depth, imbalance, microprice, and quote-quality fields.
 
 ## Main Commands
@@ -95,14 +106,14 @@ Build the hourly transformer dataset:
 
 ```bash
 conda run -n ml1 python scripts/build_hourly_transformer_dataset.py \
-  --output-dir derived/rl_hourly/top_volume_2026
+  --output-dir /home/yding1995/quant/derived/rl_hourly/top_volume_2026
 ```
 
 Train the hourly causal-transformer DQN:
 
 ```bash
 conda run -n ml1 python scripts/train_hourly_causal_transformer_rl.py \
-  --dataset derived/rl_hourly/top_volume_2026/hourly_transformer_dataset.pt \
+  --dataset /home/yding1995/quant/derived/rl_hourly/top_volume_2026/hourly_transformer_dataset.pt \
   --device auto --amp --target-vram-gb 9.5
 ```
 
@@ -117,6 +128,11 @@ lookback windows, so valid `1m` transformer states do not silently span an
 exchange close. It uses the top 16 ETF actions by default for trainability; pass
 `--action-count 500` to build a full top-500 ETF action dataset from the same
 downloaded files.
+
+In the local nested workspace, default minute inputs are read from
+`/home/yding1995/quant/data/minute_ohlcv` and the RL-ready dataset is written to
+`/home/yding1995/quant/data/rl_minute/top_volume_1m_recent`. In a standalone
+root checkout, those defaults resolve under the checkout's `data/` directory.
 
 Train the minute-level causal-transformer DQN:
 
@@ -154,6 +170,10 @@ bars.
 ## Review Notes
 
 - Scripts use `PACKAGE_ROOT` for imports and script-to-script calls.
-- Scripts use `PROJECT_ROOT` for data, so outputs remain in the repository
-  `derived` tree.
-- New code should import from `rl_quant`.
+- Scripts use `PROJECT_ROOT` for data paths. The local nested workspace resolves
+  that root to `/home/yding1995/quant`; a standalone root checkout resolves it
+  to the checkout directory.
+- New RL work should import from `rl_quant`.
+- The market-ecology feature workflow is research-only unless it is run in a
+  prior-only rolling or expanding walk-forward mode. Do not fit ecological
+  context parameters on the full test period for backtest claims.

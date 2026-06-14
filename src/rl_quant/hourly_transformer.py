@@ -25,12 +25,14 @@ from rl_quant.core import (
 class HourlyDataSplit:
     name: str
     timestamps: list[str]
+    next_timestamps: list[str]
     feature_names: list[str]
     action_names: list[str]
     features: torch.Tensor
     action_returns: torch.Tensor
     session_dates: list[str] | None
     valid_start_indices: torch.Tensor
+    valid_index_mask: torch.Tensor
     feature_mean: torch.Tensor
     feature_std: torch.Tensor
     lookback: int
@@ -43,6 +45,7 @@ class HourlyDataSplit:
             features=self.features.to(device),
             action_returns=self.action_returns.to(device),
             valid_start_indices=self.valid_start_indices.to(device),
+            valid_index_mask=self.valid_index_mask.to(device),
             feature_mean=self.feature_mean.to(device),
             feature_std=self.feature_std.to(device),
         )
@@ -62,6 +65,12 @@ def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
     return payload
 
 
+def _assert_increasing(values: list[str], *, name: str) -> None:
+    for left, right in zip(values, values[1:]):
+        if right <= left:
+            raise ValueError(f"{name} must be strictly increasing; got {left!r} before {right!r}.")
+
+
 def _build_split(
     *,
     name: str,
@@ -76,8 +85,22 @@ def _build_split(
     feature_std: torch.Tensor | None = None,
 ) -> HourlyDataSplit:
     all_timestamps = list(payload["timestamps"])
+    if not all_timestamps:
+        raise ValueError("Transformer dataset has no timestamps.")
+    _assert_increasing(all_timestamps, name="timestamps")
+    all_next_timestamps = list(payload.get("next_timestamps") or [*all_timestamps[1:], all_timestamps[-1]])
+    if len(all_next_timestamps) != len(all_timestamps):
+        raise ValueError("next_timestamps length must match timestamps length.")
+    if payload.get("next_timestamps"):
+        for ts, next_ts in zip(all_timestamps, all_next_timestamps):
+            if next_ts <= ts:
+                raise ValueError(f"next_timestamps must be after timestamps; got {ts!r} -> {next_ts!r}.")
     all_features = payload["features"].float()
     all_returns = payload["action_returns"].float()
+    if all_features.shape[0] != len(all_timestamps):
+        raise ValueError("features row count must match timestamps length.")
+    if all_returns.shape[0] != len(all_timestamps):
+        raise ValueError("action_returns row count must match timestamps length.")
     all_session_dates = payload.get("session_dates")
     selected = [
         i
@@ -88,6 +111,7 @@ def _build_split(
         raise ValueError(f"Need at least lookback + 2 rows for split {name!r}, got {len(selected)}.")
 
     timestamps = [all_timestamps[i] for i in selected]
+    next_timestamps = [all_next_timestamps[i] for i in selected]
     session_dates = [all_session_dates[i] for i in selected] if all_session_dates is not None else None
     raw_features = all_features[selected]
     action_returns = all_returns[selected]
@@ -101,11 +125,12 @@ def _build_split(
     require_same_session = bool(payload.get("require_same_session_lookback", False))
     for index in range(lookback - 1, len(timestamps) - 1):
         reward_ts = timestamps[index]
+        next_reward_ts = next_timestamps[index]
         if reward_after_ts is not None and reward_ts <= reward_after_ts:
             continue
         if reward_start_ts is not None and reward_ts < reward_start_ts:
             continue
-        if reward_end_ts is not None and reward_ts > reward_end_ts:
+        if reward_end_ts is not None and next_reward_ts > reward_end_ts:
             continue
         if require_same_session and session_dates is not None:
             window_dates = session_dates[index - lookback + 1 : index + 1]
@@ -114,16 +139,21 @@ def _build_split(
         valid.append(index)
     if not valid:
         raise ValueError(f"No valid reward indices remain for split {name!r}.")
+    valid_start_indices = torch.tensor(valid, dtype=torch.long)
+    valid_index_mask = torch.zeros(len(timestamps), dtype=torch.bool)
+    valid_index_mask[valid_start_indices] = True
 
     return HourlyDataSplit(
         name=name,
         timestamps=timestamps,
+        next_timestamps=next_timestamps,
         feature_names=list(payload["feature_names"]),
         action_names=list(payload["action_names"]),
         features=features,
         action_returns=action_returns,
         session_dates=session_dates,
-        valid_start_indices=torch.tensor(valid, dtype=torch.long),
+        valid_start_indices=valid_start_indices,
+        valid_index_mask=valid_index_mask,
         feature_mean=feature_mean,
         feature_std=feature_std,
         lookback=lookback,
@@ -174,6 +204,23 @@ def build_hourly_splits(
         feature_std=train.feature_std,
     )
     return train, val, test
+
+
+def assert_matching_hourly_schema(*splits: HourlyDataSplit) -> None:
+    if not splits:
+        return
+    reference = splits[0]
+    for split in splits[1:]:
+        if split.feature_names != reference.feature_names:
+            raise ValueError(f"Feature names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.action_names != reference.action_names:
+            raise ValueError(f"Action names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.features.shape[1] != reference.features.shape[1]:
+            raise ValueError(f"Feature dimensions differ between {reference.name!r} and {split.name!r}.")
+        if split.action_returns.shape[1] != reference.action_returns.shape[1]:
+            raise ValueError(f"Action dimensions differ between {reference.name!r} and {split.name!r}.")
+        if split.bar_interval != reference.bar_interval:
+            raise ValueError(f"Bar intervals differ between {reference.name!r} and {split.name!r}.")
 
 
 class CausalTransformerQNetwork(nn.Module):
@@ -322,9 +369,11 @@ class VectorizedHourlyAllocationEnv:
         self.indices = next_indices
         self.previous_actions = actions.long()
         self.steps = self.steps + 1
-        dones = (next_indices + 1 >= self.data.action_returns.shape[0]) | (
-            self.steps >= int(self.config.episode_length)
-        )
+        in_bounds = next_indices + 1 < self.data.action_returns.shape[0]
+        next_valid = torch.zeros_like(in_bounds)
+        if bool(in_bounds.any().item()):
+            next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
+        dones = (~next_valid) | (self.steps >= int(self.config.episode_length))
         return {
             "indices": current_indices,
             "previous_actions": previous_actions,
@@ -378,9 +427,11 @@ def evaluate_hourly_policy(
     total_reward_bps = 0.0
     switches = 0
     records: list[dict[str, float | str | int]] = []
-    start = int(data.valid_start_indices[0].item())
-    end = data.action_returns.shape[0] - 1
-    for index in range(start, end):
+    previous_index: int | None = None
+    for index in data.valid_start_indices.detach().cpu().tolist():
+        segment_reset = previous_index is None or index != previous_index + 1
+        if segment_reset:
+            previous_action = int(initial_action)
         index_tensor = torch.tensor([index], dtype=torch.long, device=device)
         previous_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
         q_values = model(data.state_windows(index_tensor), previous_tensor)
@@ -398,9 +449,11 @@ def evaluate_hourly_policy(
             records.append(
                 {
                     "timestamp": data.timestamps[index],
+                    "next_timestamp": data.next_timestamps[index],
                     "action": action,
                     "asset": data.action_names[action],
                     "previous_action": previous_action,
+                    "segment_reset": int(segment_reset),
                     "bar_interval": data.bar_interval,
                     "bar_return": round(net_return, 8),
                     "hourly_return": round(net_return, 8),
@@ -408,6 +461,7 @@ def evaluate_hourly_policy(
                 }
             )
         previous_action = action
+        previous_index = index
     return HourlyEvaluationResult(
         split_name=data.name,
         total_return=equity - 1.0,
@@ -468,9 +522,8 @@ def train_hourly_transformer_dqn(
     configure_torch_runtime(device)
     train_data = train_data if train_data.features.device == device else train_data.to(device)
     val_data = val_data if val_data.features.device == device else val_data.to(device)
+    assert_matching_hourly_schema(train_data, val_data)
     action_count = len(train_data.action_names)
-    if action_count != len(val_data.action_names):
-        raise ValueError("Train and validation action spaces differ.")
 
     q_network = CausalTransformerQNetwork(
         feature_dim=train_data.features.shape[1],

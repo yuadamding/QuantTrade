@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT
+PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
 
 FIELDNAMES = [
     "DatetimeUTC",

@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT
+PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -17,15 +17,15 @@ DEFAULT_ARGS = [
     "--bar-interval",
     "1m",
     "--stock-bar-dir",
-    str(PROJECT_ROOT / "derived" / "minute_ohlcv" / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15"),
+    str(PROJECT_ROOT / "data" / "minute_ohlcv" / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15"),
     "--etf-bar-dir",
-    str(PROJECT_ROOT / "derived" / "minute_ohlcv" / "top_us_volume_etfs_500_2026-06-14_1m_2026-05-25_2026-06-15"),
+    str(PROJECT_ROOT / "data" / "minute_ohlcv" / "top_us_volume_etfs_500_2026-06-14_1m_2026-05-25_2026-06-15"),
     "--stock-universe",
     str(PROJECT_ROOT / "derived" / "universes" / "top_us_volume_stocks_nasdaq_1000_2026-06-14.csv"),
     "--etf-universe",
     str(PROJECT_ROOT / "derived" / "universes" / "top_us_volume_etfs_500_2026-06-14.csv"),
     "--output-dir",
-    str(PROJECT_ROOT / "derived" / "rl_minute" / "top_volume_1m_recent"),
+    str(PROJECT_ROOT / "data" / "rl_minute" / "top_volume_1m_recent"),
     "--dataset-file-name",
     "minute_transformer_dataset.pt",
     "--start",

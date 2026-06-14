@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT
+PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
 
 FIELDNAMES = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
 
@@ -63,7 +63,17 @@ def fetch_json(url: str, retries: int = 3) -> dict:
 def _fmt_float(value: object) -> str:
     if value is None:
         return ""
-    return f"{float(value):.6f}"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{number:.6f}"
+
+
+def _list_value(values: object, index: int, default: object = None) -> object:
+    if not isinstance(values, list) or index >= len(values):
+        return default
+    return values[index]
 
 
 def parse_chart_payload(payload: dict, symbol: str) -> list[dict[str, str]]:
@@ -83,15 +93,21 @@ def parse_chart_payload(payload: dict, symbol: str) -> list[dict[str, str]]:
 
     rows: list[dict[str, str]] = []
     for i, ts in enumerate(timestamps):
+        open_value = _list_value(quote.get("open"), i)
+        high = _list_value(quote.get("high"), i)
+        low = _list_value(quote.get("low"), i)
+        close = _list_value(quote.get("close"), i)
+        if open_value is None and high is None and low is None and close is None:
+            continue
         rows.append(
             {
                 "Date": datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat(),
-                "Open": _fmt_float((quote.get("open") or [None])[i]),
-                "High": _fmt_float((quote.get("high") or [None])[i]),
-                "Low": _fmt_float((quote.get("low") or [None])[i]),
-                "Close": _fmt_float((quote.get("close") or [None])[i]),
-                "Adj Close": _fmt_float(adj[i] if i < len(adj) else None),
-                "Volume": str((quote.get("volume") or [0])[i] or 0),
+                "Open": _fmt_float(open_value),
+                "High": _fmt_float(high),
+                "Low": _fmt_float(low),
+                "Close": _fmt_float(close),
+                "Adj Close": _fmt_float(_list_value(adj, i)),
+                "Volume": str(_list_value(quote.get("volume"), i, 0) or 0),
             }
         )
     return rows

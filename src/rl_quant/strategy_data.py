@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
@@ -40,16 +41,19 @@ class StrategyDataSplit:
         return self.action_returns[indices + 1]
 
 
-def _float_or_zero(value: str | None) -> float:
+def _parse_float(value: str | None, *, path: Path, date: str, column: str) -> float:
     if value is None:
-        return 0.0
+        raise ValueError(f"Missing numeric value in {path} at date {date}, column {column!r}.")
     text = value.strip()
     if not text:
-        return 0.0
+        raise ValueError(f"Blank numeric value in {path} at date {date}, column {column!r}.")
     try:
-        return float(text)
-    except ValueError:
-        return 0.0
+        number = float(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid numeric value {value!r} in {path} at date {date}, column {column!r}.") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"Non-finite numeric value {value!r} in {path} at date {date}, column {column!r}.")
+    return number
 
 
 def _read_numeric_table(path: Path) -> tuple[list[str], list[str], dict[str, list[float]]]:
@@ -61,13 +65,37 @@ def _read_numeric_table(path: Path) -> tuple[list[str], list[str], dict[str, lis
         names = header[1:]
         dates: list[str] = []
         rows: dict[str, list[float]] = {}
+        previous_date: str | None = None
         for row in reader:
             if not row:
                 continue
             date = row[0]
+            if previous_date is not None and date <= previous_date:
+                raise ValueError(f"{path} dates must be strictly increasing; got {previous_date!r} before {date!r}.")
+            if date in rows:
+                raise ValueError(f"{path} contains duplicate date {date!r}.")
             dates.append(date)
-            rows[date] = [_float_or_zero(row[i + 1] if i + 1 < len(row) else "") for i in range(len(names))]
+            rows[date] = [
+                _parse_float(row[i + 1] if i + 1 < len(row) else None, path=path, date=date, column=names[i])
+                for i in range(len(names))
+            ]
+            previous_date = date
     return dates, names, rows
+
+
+def assert_matching_strategy_schema(*splits: StrategyDataSplit) -> None:
+    if not splits:
+        return
+    reference = splits[0]
+    for split in splits[1:]:
+        if split.feature_names != reference.feature_names:
+            raise ValueError(f"Feature names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.action_names != reference.action_names:
+            raise ValueError(f"Action names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.features.shape[1] != reference.features.shape[1]:
+            raise ValueError(f"Feature dimensions differ between {reference.name!r} and {split.name!r}.")
+        if split.action_returns.shape[1] != reference.action_returns.shape[1]:
+            raise ValueError(f"Action dimensions differ between {reference.name!r} and {split.name!r}.")
 
 
 def build_strategy_split(
@@ -182,6 +210,7 @@ def build_strategy_splits(
         feature_mean=train.feature_mean,
         feature_std=train.feature_std,
     )
+    assert_matching_strategy_schema(train, val, test)
     return train, val, test
 
 

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT
+PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
 SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -81,6 +81,7 @@ def main() -> int:
             HourlyEnvConfig,
             HourlyTransformerTrainingConfig,
             action_index,
+            assert_matching_hourly_schema,
             build_hourly_splits,
             evaluate_hourly_policy,
             train_hourly_transformer_dqn,
@@ -113,6 +114,7 @@ def main() -> int:
         test_start=args.test_start,
         test_end=args.test_end,
     )
+    assert_matching_hourly_schema(train_split, val_split, test_split)
     initial_action = action_index(train_split.action_names, args.initial_action)
     runtime = torch_runtime_summary(device)
     print(f"Using device: {device}")

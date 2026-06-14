@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT
+PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
 
 FIELDNAMES = [
     "DatetimeUTC",
@@ -250,7 +250,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", type=parse_date, default=default_start())
     parser.add_argument("--end-exclusive", type=parse_date, default=default_end_exclusive())
     parser.add_argument("--chunk-days", type=int, help="Request chunk width in calendar days.")
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "derived" / "minute_ohlcv")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "minute_ohlcv")
     parser.add_argument("--manifest", type=Path, help="Manifest CSV path. Defaults inside output dir.")
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
