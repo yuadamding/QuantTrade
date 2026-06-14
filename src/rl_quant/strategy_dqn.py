@@ -19,6 +19,7 @@ from rl_quant.core import (
     make_grad_scaler,
 )
 from rl_quant.strategy_data import StrategyDataSplit
+from rl_quant.strategy_data import assert_matching_strategy_schema
 
 
 @dataclass
@@ -122,9 +123,11 @@ class VectorizedStrategyAllocationEnv:
         self.indices = next_indices
         self.previous_actions = actions.long()
         self.steps = self.steps + 1
-        dones = (next_indices + 1 >= self.data.action_returns.shape[0]) | (
-            self.steps >= int(self.config.episode_length)
-        )
+        in_bounds = next_indices + 1 < self.data.action_returns.shape[0]
+        next_valid = torch.zeros_like(in_bounds)
+        if bool(in_bounds.any().item()):
+            next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
+        dones = (~next_valid) | (self.steps >= int(self.config.episode_length))
 
         return {
             "indices": current_indices,
@@ -182,9 +185,11 @@ def evaluate_strategy_policy(
     switches = 0
     rollout_records: list[dict[str, float | str | int]] = []
 
-    start = int(data.valid_start_indices[0].item())
-    end = data.action_returns.shape[0] - 1
-    for index in range(start, end):
+    previous_index: int | None = None
+    for index in data.valid_start_indices.detach().cpu().tolist():
+        segment_reset = previous_index is None or index != previous_index + 1
+        if segment_reset:
+            previous_action = int(initial_action)
         index_tensor = torch.tensor([index], dtype=torch.long, device=device)
         previous_action_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
         q_values = model(data.state_windows(index_tensor), previous_action_tensor)
@@ -206,11 +211,13 @@ def evaluate_strategy_policy(
                     "action": action,
                     "strategy": data.action_names[action],
                     "previous_action": previous_action,
+                    "segment_reset": int(segment_reset),
                     "daily_return": round(net_return, 8),
                     "equity": round(equity, 8),
                 }
             )
         previous_action = action
+        previous_index = index
 
     return StrategyEvaluationResult(
         split_name=data.name,
@@ -233,13 +240,11 @@ def train_strategy_dqn_agent(
     configure_torch_runtime(device)
     train_data = train_data if train_data.features.device == device else train_data.to(device)
     val_data = val_data if val_data.features.device == device else val_data.to(device)
+    assert_matching_strategy_schema(train_data, val_data)
 
     action_count = len(train_data.action_names)
     if train_data.lookback != config.env.lookback:
         raise ValueError("Training config lookback must match the training split.")
-    if action_count != len(val_data.action_names):
-        raise ValueError("Train and validation action spaces differ.")
-
     q_network = StrategyQNetwork(
         feature_dim=train_data.features.shape[1],
         lookback=config.env.lookback,

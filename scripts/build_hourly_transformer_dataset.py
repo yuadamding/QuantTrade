@@ -22,6 +22,7 @@ SYMBOL_DATE_RE = re.compile(r"^(?P<symbol>.+?)_\d{4}-\d{2}-\d{2}_")
 
 @dataclass
 class BarFeature:
+    close: float
     bar_return: float
     bar_log_return: float
     intraday_ret: float
@@ -140,6 +141,7 @@ def load_symbol_features(path: Path, *, start: str, end_exclusive: str) -> dict[
         scale = max(close, 1e-8)
         dollar_volume = close * volume
         out[ts] = BarFeature(
+            close=close,
             bar_return=max(min(bar_return, 1.0), -1.0),
             bar_log_return=max(min(bar_log_return, 1.0), -1.0),
             intraday_ret=max(min(intraday, 1.0), -1.0),
@@ -176,6 +178,12 @@ def std(values: list[float]) -> float:
         return 0.0
     avg = sum(values) / len(values)
     return math.sqrt(sum((value - avg) ** 2 for value in values) / len(values))
+
+
+def clipped_simple_return(current_close: float, next_close: float) -> float:
+    if current_close <= 0 or next_close <= 0:
+        raise ValueError("Close prices must be positive to compute simple returns.")
+    return max(min(next_close / current_close - 1.0, 1.0), -1.0)
 
 
 def aggregate_stock_features(values: list[BarFeature], *, total_symbols: int) -> list[float]:
@@ -381,7 +389,7 @@ def main() -> int:
                     current.log_dollar_volume,
                 ]
             )
-            action_returns.append(max(min(next_bar.bar_return, 1.0), -1.0))
+            action_returns.append(clipped_simple_return(current.close, next_bar.close))
         if missing:
             continue
         timestamps.append(ts)

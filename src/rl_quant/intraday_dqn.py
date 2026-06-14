@@ -74,15 +74,16 @@ def initialize_flat_policy(model: ConvQNetwork) -> None:
             final_linear.bias.copy_(torch.tensor([0.0, 1.0, 0.0], device=final_linear.bias.device))
 
 
-def _apply_action_threshold(q_values: torch.Tensor, threshold: float) -> torch.Tensor:
+def _apply_action_threshold(q_values: torch.Tensor, current_positions: torch.Tensor, threshold: float) -> torch.Tensor:
     if threshold <= 0.0:
         return torch.argmax(q_values, dim=1)
 
     greedy_actions = torch.argmax(q_values, dim=1)
     greedy_values = q_values.gather(1, greedy_actions.unsqueeze(1)).squeeze(1)
-    flat_values = q_values[:, 1]
-    keep_flat = greedy_values < (flat_values + threshold)
-    return torch.where(keep_flat, torch.ones_like(greedy_actions), greedy_actions)
+    current_actions = (current_positions.long() + 1).clamp(0, q_values.shape[1] - 1)
+    current_values = q_values.gather(1, current_actions.unsqueeze(1)).squeeze(1)
+    should_switch = greedy_values > current_values + threshold
+    return torch.where(should_switch, greedy_actions, current_actions)
 
 
 def _fill_indices(indices: torch.Tensor, *, step_horizon: int, latency_steps: int) -> torch.Tensor:
@@ -485,7 +486,7 @@ def evaluate_policy(
             index_tensor = torch.tensor([index], dtype=torch.long, device=device)
             state = data.state_windows(index_tensor)
             q_values = model(state, position)
-            action = int(_apply_action_threshold(q_values, action_threshold)[0].item())
+            action = int(_apply_action_threshold(q_values, position, action_threshold)[0].item())
             new_position = int(action_to_position[action].item())
             old_position = int(position.item())
 
@@ -636,7 +637,7 @@ def train_dqn_agent(
         with torch.no_grad():
             with autocast_context(device, config.use_amp):
                 q_values = q_network(states, positions)
-            greedy_actions = _apply_action_threshold(q_values, config.action_threshold)
+            greedy_actions = _apply_action_threshold(q_values, positions, config.action_threshold)
             random_actions = torch.randint(0, 3, greedy_actions.shape, device=device)
             explore_mask = torch.rand(greedy_actions.shape, device=device) < epsilon
             actions = torch.where(explore_mask, random_actions, greedy_actions)

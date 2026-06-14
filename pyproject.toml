@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Compact reinforcement-learning trading framework for intraday, daily strategy, and hourly market-context experiments"
 requires-python = ">=3.11"
 dependencies = [
-    "numpy>=2.4.4,<3",
-    "torch>=2.11.0,<3",
+    "numpy>=2.2,<3",
+    "torch>=2.8,<3",
 ]
 
 [project.optional-dependencies]

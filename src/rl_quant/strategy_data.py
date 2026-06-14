@@ -18,6 +18,7 @@ class StrategyDataSplit:
     features: torch.Tensor
     action_returns: torch.Tensor
     valid_start_indices: torch.Tensor
+    valid_index_mask: torch.Tensor
     feature_mean: torch.Tensor
     feature_std: torch.Tensor
     lookback: int
@@ -28,6 +29,7 @@ class StrategyDataSplit:
             features=self.features.to(device),
             action_returns=self.action_returns.to(device),
             valid_start_indices=self.valid_start_indices.to(device),
+            valid_index_mask=self.valid_index_mask.to(device),
             feature_mean=self.feature_mean.to(device),
             feature_std=self.feature_std.to(device),
         )
@@ -151,6 +153,8 @@ def build_strategy_split(
     if not valid_indices:
         raise ValueError(f"No valid reward indices remain for split {name!r}.")
     valid_start_indices = torch.tensor(valid_indices, dtype=torch.long)
+    valid_index_mask = torch.zeros(len(dates), dtype=torch.bool)
+    valid_index_mask[valid_start_indices] = True
 
     return StrategyDataSplit(
         name=name,
@@ -160,6 +164,7 @@ def build_strategy_split(
         features=features,
         action_returns=action_returns,
         valid_start_indices=valid_start_indices,
+        valid_index_mask=valid_index_mask,
         feature_mean=feature_mean,
         feature_std=feature_std,
         lookback=lookback,

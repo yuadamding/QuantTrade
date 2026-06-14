@@ -57,8 +57,8 @@ class HourlyDataSplit:
 
 
 def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    required = {"timestamps", "feature_names", "action_names", "features", "action_returns"}
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    required = {"timestamps", "next_timestamps", "feature_names", "action_names", "features", "action_returns"}
     missing = required - set(payload)
     if missing:
         raise ValueError(f"Transformer dataset is missing required keys: {sorted(missing)}")
@@ -88,13 +88,12 @@ def _build_split(
     if not all_timestamps:
         raise ValueError("Transformer dataset has no timestamps.")
     _assert_increasing(all_timestamps, name="timestamps")
-    all_next_timestamps = list(payload.get("next_timestamps") or [*all_timestamps[1:], all_timestamps[-1]])
+    all_next_timestamps = list(payload["next_timestamps"])
     if len(all_next_timestamps) != len(all_timestamps):
         raise ValueError("next_timestamps length must match timestamps length.")
-    if payload.get("next_timestamps"):
-        for ts, next_ts in zip(all_timestamps, all_next_timestamps):
-            if next_ts <= ts:
-                raise ValueError(f"next_timestamps must be after timestamps; got {ts!r} -> {next_ts!r}.")
+    for ts, next_ts in zip(all_timestamps, all_next_timestamps):
+        if next_ts <= ts:
+            raise ValueError(f"next_timestamps must be after timestamps; got {ts!r} -> {next_ts!r}.")
     all_features = payload["features"].float()
     all_returns = payload["action_returns"].float()
     if all_features.shape[0] != len(all_timestamps):
@@ -244,6 +243,7 @@ class CausalTransformerQNetwork(nn.Module):
             raise ValueError("d_model must be divisible by n_heads")
         self.lookback = int(lookback)
         self.action_count = int(action_count)
+        self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.input_proj = nn.Sequential(
             nn.Linear(feature_dim, d_model),
             nn.LayerNorm(d_model),
@@ -271,10 +271,15 @@ class CausalTransformerQNetwork(nn.Module):
         )
 
     def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(
-            torch.full((length, length), torch.finfo(torch.float32).min, device=device),
-            diagonal=1,
-        )
+        key = (length, device)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            mask = torch.triu(
+                torch.full((length, length), torch.finfo(torch.float32).min, device=device),
+                diagonal=1,
+            )
+            self._mask_cache[key] = mask
+        return mask
 
     def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
         length = state_windows.shape[1]
