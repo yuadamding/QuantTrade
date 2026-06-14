@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT
+PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
 SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -85,7 +85,7 @@ def main() -> int:
             resolve_torch_device,
             torch_runtime_summary,
         )
-        from rl_quant.strategy_data import action_index, build_strategy_splits
+        from rl_quant.strategy_data import action_index, assert_matching_strategy_schema, build_strategy_splits
         from rl_quant.strategy_dqn import (
             StrategyEnvConfig,
             StrategyTrainingConfig,
@@ -116,6 +116,7 @@ def main() -> int:
         test_start=args.test_start,
         test_end=args.test_end,
     )
+    assert_matching_strategy_schema(train_split, val_split, test_split)
     initial_action = action_index(train_split.action_names, args.initial_action)
     runtime = torch_runtime_summary(device)
     print(f"Using device: {device}")

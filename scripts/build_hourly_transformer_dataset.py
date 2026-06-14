@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = PACKAGE_ROOT
+PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
 SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -23,6 +23,7 @@ SYMBOL_DATE_RE = re.compile(r"^(?P<symbol>.+?)_\d{4}-\d{2}-\d{2}_")
 @dataclass
 class BarFeature:
     bar_return: float
+    bar_log_return: float
     intraday_ret: float
     range_bps: float
     log_volume: float
@@ -131,13 +132,16 @@ def load_symbol_features(path: Path, *, start: str, end_exclusive: str) -> dict[
     for ts, _exchange_ts, open_value, high, low, close, volume in raw_rows:
         if previous_close is None or previous_close <= 0:
             bar_return = 0.0
+            bar_log_return = 0.0
         else:
-            bar_return = math.log(close / previous_close)
+            bar_return = close / previous_close - 1.0
+            bar_log_return = math.log(close / previous_close)
         intraday = math.log(close / open_value) if open_value > 0 else 0.0
         scale = max(close, 1e-8)
         dollar_volume = close * volume
         out[ts] = BarFeature(
             bar_return=max(min(bar_return, 1.0), -1.0),
+            bar_log_return=max(min(bar_log_return, 1.0), -1.0),
             intraday_ret=max(min(intraday, 1.0), -1.0),
             range_bps=max((high - low) / scale * 10_000.0, 0.0),
             log_volume=math.log1p(volume),
@@ -350,6 +354,7 @@ def main() -> int:
     feature_names = [*stock_feature_names, *time_feature_names, *etf_feature_names]
 
     timestamps: list[str] = []
+    next_timestamps: list[str] = []
     session_dates: list[str] = []
     feature_rows: list[list[float]] = []
     action_return_rows: list[list[float]] = []
@@ -380,6 +385,7 @@ def main() -> int:
         if missing:
             continue
         timestamps.append(ts)
+        next_timestamps.append(next_ts)
         session_dates.append(exchange_times[ts][:10])
         feature_rows.append([*stock_features, *time_features, *etf_row])
         action_return_rows.append(action_returns)
@@ -395,6 +401,7 @@ def main() -> int:
     torch.save(
         {
             "timestamps": timestamps,
+            "next_timestamps": next_timestamps,
             "feature_names": feature_names,
             "action_names": action_names,
             "features": features,
@@ -435,6 +442,8 @@ def main() -> int:
         "require_same_session_lookback": args.require_same_session_lookback,
         "first_timestamp": timestamps[0] if timestamps else None,
         "last_timestamp": timestamps[-1] if timestamps else None,
+        "first_next_timestamp": next_timestamps[0] if next_timestamps else None,
+        "last_next_timestamp": next_timestamps[-1] if next_timestamps else None,
         "dataset": str(dataset_path),
         "state_features_csv": str(args.output_dir / "state_features.csv"),
         "action_returns_csv": str(args.output_dir / "action_returns.csv"),
@@ -445,7 +454,7 @@ def main() -> int:
 
 This dataset aligns the top-volume stock cross-section with tradable ETF
 `{bar_interval}` bars. Each row is a decision point at bar `t`; action returns
-are realized from bar `t` to the next aligned exchange bar.
+are simple returns realized from bar `t` to the next aligned exchange bar.
 
 The state is causal: stock and ETF features use only the current and previous
 bars available by timestamp `t`. The transformer trainer applies an
