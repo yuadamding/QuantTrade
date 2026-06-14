@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from os import PathLike
 from typing import Any
 
@@ -11,13 +11,20 @@ from torch import nn
 
 from rl_quant.core import (
     DQNLearningConfig,
-    TensorReplayBuffer,
+    TensorDictReplayBuffer,
     annualized_sharpe,
     autocast_context,
     configure_torch_runtime,
     epsilon_by_step,
     fractional_max_drawdown,
     make_grad_scaler,
+)
+from rl_quant.trading_constraints import (
+    TradingConstraintConfig,
+    apply_leg_aware_hysteresis,
+    build_action_mask,
+    sample_valid_actions,
+    trade_legs,
 )
 
 
@@ -301,6 +308,11 @@ class HourlyEnvConfig:
     reward_scale: float = 10_000.0
     switch_cost_bps: float = 1.0
     initial_action: int = 0
+    constraints: TradingConstraintConfig = field(default_factory=TradingConstraintConfig)
+
+    def __post_init__(self) -> None:
+        if self.switch_cost_bps != 1.0 and self.constraints.one_way_cost_bps == 1.0:
+            self.constraints = replace(self.constraints, one_way_cost_bps=self.switch_cost_bps)
 
 
 @dataclass
@@ -334,6 +346,12 @@ class VectorizedHourlyAllocationEnv:
             dtype=torch.long,
             device=device,
         )
+        self.bars_held = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.cooldown_remaining = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.switches_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.switches_episode = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.order_legs_today = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
+        self.order_legs_episode = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
         self.steps = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.reset()
 
@@ -353,40 +371,103 @@ class VectorizedHourlyAllocationEnv:
         random_ids = torch.randint(0, self.start_indices.shape[0], (count,), device=self.device)
         self.indices[mask] = self.start_indices[random_ids]
         self.previous_actions[mask] = int(self.config.initial_action)
+        self.bars_held[mask] = int(self.config.constraints.min_hold_bars)
+        self.cooldown_remaining[mask] = 0
+        self.switches_today[mask] = 0
+        self.switches_episode[mask] = 0
+        self.order_legs_today[mask] = 0.0
+        self.order_legs_episode[mask] = 0.0
         self.steps[mask] = 0
 
-    def observe(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.data.state_windows(self.indices), self.previous_actions
+    def _date_labels(self, indices: torch.Tensor) -> list[str]:
+        if self.data.session_dates is not None:
+            source = self.data.session_dates
+        else:
+            source = [timestamp[:10] for timestamp in self.data.timestamps]
+        return [source[int(index.item())] for index in indices.detach().cpu()]
+
+    def action_mask(self) -> torch.Tensor:
+        return build_action_mask(
+            current_action=self.previous_actions,
+            bars_held=self.bars_held,
+            cooldown_remaining=self.cooldown_remaining,
+            switches_today=self.switches_today,
+            max_switches_per_day=self.config.constraints.max_switches_per_day,
+            min_hold_bars=self.config.constraints.min_hold_bars,
+            action_count=len(self.data.action_names),
+            switches_episode=self.switches_episode,
+            max_switches_per_episode=self.config.constraints.max_switches_per_episode,
+            order_legs_today=self.order_legs_today,
+            max_order_legs_per_day=self.config.constraints.max_order_legs_per_day,
+            order_legs_episode=self.order_legs_episode,
+            max_order_legs_per_episode=self.config.constraints.max_order_legs_per_episode,
+            cash_index=self.config.constraints.cash_index,
+            count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
+        )
+
+    def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.data.state_windows(self.indices), self.previous_actions, self.action_mask()
 
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
         previous_actions = self.previous_actions.clone()
+        action_mask = self.action_mask()
+        actions = actions.long()
+        actions = torch.where(action_mask.gather(1, actions.unsqueeze(1)).squeeze(1), actions, previous_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
-        switch_penalty = (
-            (actions != previous_actions).float()
-            * float(self.config.switch_cost_bps)
-            * float(self.config.reward_scale)
-            / 10_000.0
+        legs = trade_legs(
+            previous_actions,
+            actions,
+            cash_index=self.config.constraints.cash_index,
+            count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
-        rewards = raw_returns * float(self.config.reward_scale) - switch_penalty
+        is_switch = actions != previous_actions
+        cost_bps = legs * float(self.config.constraints.one_way_cost_bps)
+        cost_bps = cost_bps + is_switch.float() * float(self.config.constraints.extra_switch_penalty_bps)
+        rewards = raw_returns * float(self.config.reward_scale) - cost_bps * float(self.config.reward_scale) / 10_000.0
         next_indices = current_indices + 1
 
         self.indices = next_indices
         self.previous_actions = actions.long()
+        self.bars_held = torch.where(is_switch, torch.ones_like(self.bars_held), self.bars_held + 1)
+        self.cooldown_remaining = torch.where(
+            is_switch,
+            torch.full_like(self.cooldown_remaining, int(self.config.constraints.cooldown_bars)),
+            torch.clamp_min(self.cooldown_remaining - 1, 0),
+        )
+        self.switches_today = self.switches_today + is_switch.long()
+        self.switches_episode = self.switches_episode + is_switch.long()
+        self.order_legs_today = self.order_legs_today + legs
+        self.order_legs_episode = self.order_legs_episode + legs
         self.steps = self.steps + 1
         in_bounds = next_indices + 1 < self.data.action_returns.shape[0]
         next_valid = torch.zeros_like(in_bounds)
         if bool(in_bounds.any().item()):
             next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
         dones = (~next_valid) | (self.steps >= int(self.config.episode_length))
+        if bool(in_bounds.any().item()):
+            old_dates = self._date_labels(current_indices[in_bounds])
+            new_dates = self._date_labels(next_indices[in_bounds])
+            reset_today = torch.tensor(
+                [old != new for old, new in zip(old_dates, new_dates)],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            valid_positions = torch.where(in_bounds)[0]
+            self.switches_today[valid_positions[reset_today]] = 0
+            self.order_legs_today[valid_positions[reset_today]] = 0.0
+        next_action_mask = self.action_mask()
         return {
             "indices": current_indices,
             "previous_actions": previous_actions,
+            "action_mask": action_mask,
             "actions": actions,
             "rewards": rewards,
             "next_indices": next_indices,
             "next_previous_actions": self.previous_actions,
+            "next_action_mask": next_action_mask,
             "dones": dones.float(),
+            "legs": legs,
         }
 
 
@@ -396,6 +477,7 @@ class HourlyEvaluationResult:
     total_return: float
     total_reward_bps: float
     total_switches: int
+    market_order_legs: float
     max_drawdown: float
     hourly_sharpe: float | None
     rollout_records: list[dict[str, float | str | int]]
@@ -406,6 +488,7 @@ class HourlyEvaluationResult:
             "total_return": self.total_return,
             "total_reward_bps": self.total_reward_bps,
             "total_switches": self.total_switches,
+            "market_order_legs": self.market_order_legs,
             "max_drawdown": self.max_drawdown,
             "hourly_sharpe": self.hourly_sharpe,
             "annualized_sharpe": self.hourly_sharpe,
@@ -421,35 +504,102 @@ def evaluate_hourly_policy(
     device: torch.device,
     initial_action: int = 0,
     switch_cost_bps: float = 1.0,
+    constraints: TradingConstraintConfig | None = None,
+    episode_length: int | None = None,
     capture_rollout: bool = False,
 ) -> HourlyEvaluationResult:
+    constraints = constraints or TradingConstraintConfig(one_way_cost_bps=switch_cost_bps)
     data = data if data.features.device == device else data.to(device)
     model.eval()
     previous_action = int(initial_action)
+    bars_held = int(constraints.min_hold_bars)
+    cooldown_remaining = 0
+    switches_today = 0
+    switches_episode = 0
+    order_legs_today = 0.0
+    order_legs_episode = 0.0
     equity = 1.0
     equity_curve = [equity]
     bar_returns: list[float] = []
     total_reward_bps = 0.0
     switches = 0
+    order_legs = 0.0
     records: list[dict[str, float | str | int]] = []
     previous_index: int | None = None
+    previous_date: str | None = None
+    episode_steps = 0
     for index in data.valid_start_indices.detach().cpu().tolist():
+        current_date = data.session_dates[index] if data.session_dates is not None else data.timestamps[index][:10]
         segment_reset = previous_index is None or index != previous_index + 1
         if segment_reset:
             previous_action = int(initial_action)
+            bars_held = int(constraints.min_hold_bars)
+            cooldown_remaining = 0
+            switches_today = 0
+            switches_episode = 0
+            order_legs_today = 0.0
+            order_legs_episode = 0.0
+            episode_steps = 0
+        elif previous_date is not None and current_date != previous_date:
+            switches_today = 0
+            order_legs_today = 0.0
+        if episode_length is not None and episode_steps >= int(episode_length):
+            switches_episode = 0
+            order_legs_episode = 0.0
+            episode_steps = 0
         index_tensor = torch.tensor([index], dtype=torch.long, device=device)
         previous_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
+        action_mask = build_action_mask(
+            current_action=previous_tensor,
+            bars_held=torch.tensor([bars_held], dtype=torch.long, device=device),
+            cooldown_remaining=torch.tensor([cooldown_remaining], dtype=torch.long, device=device),
+            switches_today=torch.tensor([switches_today], dtype=torch.long, device=device),
+            max_switches_per_day=constraints.max_switches_per_day,
+            min_hold_bars=constraints.min_hold_bars,
+            action_count=len(data.action_names),
+            switches_episode=torch.tensor([switches_episode], dtype=torch.long, device=device),
+            max_switches_per_episode=constraints.max_switches_per_episode,
+            order_legs_today=torch.tensor([order_legs_today], dtype=torch.float32, device=device),
+            max_order_legs_per_day=constraints.max_order_legs_per_day,
+            order_legs_episode=torch.tensor([order_legs_episode], dtype=torch.float32, device=device),
+            max_order_legs_per_episode=constraints.max_order_legs_per_episode,
+            cash_index=constraints.cash_index,
+            count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+        )
         q_values = model(data.state_windows(index_tensor), previous_tensor)
-        action = int(torch.argmax(q_values, dim=1)[0].item())
+        action = int(
+            apply_leg_aware_hysteresis(
+                q_values,
+                previous_tensor,
+                action_mask,
+                one_way_cost_bps=constraints.one_way_cost_bps,
+                extra_switch_penalty_bps=constraints.extra_switch_penalty_bps,
+                q_switch_margin_bps=constraints.q_switch_margin_bps,
+                cash_index=constraints.cash_index,
+                count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+            )[0].item()
+        )
+        action_tensor = torch.tensor([action], dtype=torch.long, device=device)
+        legs = float(
+            trade_legs(
+                previous_tensor,
+                action_tensor,
+                cash_index=constraints.cash_index,
+                count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+            )[0].item()
+        )
         gross_return = float(data.action_returns[index, action].item())
-        switch_cost = float(switch_cost_bps) / 10_000.0 if action != previous_action else 0.0
-        net_return = gross_return - switch_cost
+        is_switch = action != previous_action
+        cost_bps = legs * float(constraints.one_way_cost_bps)
+        cost_bps += float(is_switch) * float(constraints.extra_switch_penalty_bps)
+        net_return = gross_return - cost_bps / 10_000.0
         equity *= 1.0 + net_return
         equity_curve.append(equity)
         bar_returns.append(net_return)
         total_reward_bps += net_return * 10_000.0
-        if action != previous_action:
+        if is_switch:
             switches += 1
+        order_legs += legs
         if capture_rollout:
             records.append(
                 {
@@ -459,19 +609,33 @@ def evaluate_hourly_policy(
                     "asset": data.action_names[action],
                     "previous_action": previous_action,
                     "segment_reset": int(segment_reset),
+                    "market_order_legs": legs,
                     "bar_interval": data.bar_interval,
                     "bar_return": round(net_return, 8),
                     "hourly_return": round(net_return, 8),
                     "equity": round(equity, 8),
                 }
             )
+        if is_switch:
+            bars_held = 1
+            cooldown_remaining = int(constraints.cooldown_bars)
+            switches_today += 1
+            switches_episode += 1
+        else:
+            bars_held += 1
+            cooldown_remaining = max(cooldown_remaining - 1, 0)
+        order_legs_today += legs
+        order_legs_episode += legs
         previous_action = action
         previous_index = index
+        previous_date = current_date
+        episode_steps += 1
     return HourlyEvaluationResult(
         split_name=data.name,
         total_return=equity - 1.0,
         total_reward_bps=total_reward_bps,
         total_switches=switches,
+        market_order_legs=order_legs,
         max_drawdown=fractional_max_drawdown(equity_curve),
         hourly_sharpe=annualized_sharpe(bar_returns, periods_per_year=data.periods_per_year),
         rollout_records=records,
@@ -549,17 +713,19 @@ def train_hourly_transformer_dqn(
         weight_decay=config.learning.weight_decay,
     )
     scaler = make_grad_scaler(device, config.learning.use_amp)
-    replay = TensorReplayBuffer(
+    replay = TensorDictReplayBuffer(
         capacity=config.learning.replay_capacity,
         device=device,
         fields={
-            "indices": torch.long,
-            "previous_actions": torch.long,
-            "actions": torch.long,
-            "rewards": torch.float32,
-            "next_indices": torch.long,
-            "next_previous_actions": torch.long,
-            "dones": torch.float32,
+            "indices": ((), torch.long),
+            "previous_actions": ((), torch.long),
+            "action_mask": ((action_count,), torch.bool),
+            "actions": ((), torch.long),
+            "rewards": ((), torch.float32),
+            "next_indices": ((), torch.long),
+            "next_previous_actions": ((), torch.long),
+            "next_action_mask": ((action_count,), torch.bool),
+            "dones": ((), torch.float32),
         },
     )
     env = VectorizedHourlyAllocationEnv(train_data, config.env, device)
@@ -576,10 +742,12 @@ def train_hourly_transformer_dqn(
     best_state = _state_dict_to_cpu(q_network)
     loss_trace: list[float] = []
     reward_trace: list[float] = []
+    valid_action_count_trace: list[float] = []
     eval_trace: list[dict[str, float | int | None | str]] = []
 
     for step in range(1, config.learning.train_steps + 1):
-        states, previous_actions = env.observe()
+        states, previous_actions, action_mask = env.observe()
+        valid_action_count_trace.append(float(action_mask.sum(dim=1).float().mean().item()))
         epsilon = epsilon_by_step(
             step=step,
             train_steps=config.learning.train_steps,
@@ -589,8 +757,18 @@ def train_hourly_transformer_dqn(
         with torch.no_grad():
             with autocast_context(device, config.learning.use_amp):
                 q_values = q_network(states, previous_actions)
-            greedy_actions = torch.argmax(q_values, dim=1)
-            random_actions = torch.randint(0, action_count, greedy_actions.shape, device=device)
+            greedy_actions = apply_leg_aware_hysteresis(
+                q_values,
+                previous_actions,
+                action_mask,
+                one_way_cost_bps=config.env.constraints.one_way_cost_bps,
+                extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
+                q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
+                cash_index=config.env.constraints.cash_index,
+                reward_scale=config.env.reward_scale,
+                count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
+            )
+            random_actions = sample_valid_actions(action_mask)
             explore = torch.rand(greedy_actions.shape, device=device) < epsilon
             actions = torch.where(explore, random_actions, greedy_actions)
 
@@ -609,10 +787,9 @@ def train_hourly_transformer_dqn(
                     batch["actions"].unsqueeze(1),
                 ).squeeze(1)
                 with torch.no_grad():
-                    next_actions = torch.argmax(
-                        q_network(next_states, batch["next_previous_actions"]),
-                        dim=1,
-                    )
+                    next_online = q_network(next_states, batch["next_previous_actions"])
+                    next_online = next_online.masked_fill(~batch["next_action_mask"], torch.finfo(next_online.dtype).min)
+                    next_actions = torch.argmax(next_online, dim=1)
                     next_q = target_network(next_states, batch["next_previous_actions"]).gather(
                         1,
                         next_actions.unsqueeze(1),
@@ -644,6 +821,8 @@ def train_hourly_transformer_dqn(
                 device=device,
                 initial_action=config.env.initial_action,
                 switch_cost_bps=config.env.switch_cost_bps,
+                constraints=config.env.constraints,
+                episode_length=config.env.episode_length,
             )
             avg_loss = sum(loss_trace[-200:]) / max(len(loss_trace[-200:]), 1)
             avg_reward = sum(reward_trace[-200:]) / max(len(reward_trace[-200:]), 1)
@@ -653,9 +832,12 @@ def train_hourly_transformer_dqn(
                     "epsilon": epsilon,
                     "val_return": val_result.total_return,
                     "val_switches": val_result.total_switches,
+                    "val_order_legs": val_result.market_order_legs,
                     "val_sharpe": val_result.hourly_sharpe,
                     "average_loss": avg_loss,
                     "average_train_reward": avg_reward,
+                    "average_valid_action_count": sum(valid_action_count_trace[-200:])
+                    / max(len(valid_action_count_trace[-200:]), 1),
                 }
             )
             if (
@@ -676,6 +858,7 @@ def train_hourly_transformer_dqn(
         "amp_enabled": scaler.is_enabled(),
         "loss_trace": loss_trace,
         "train_reward_trace": reward_trace,
+        "valid_action_count_trace": valid_action_count_trace,
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
     }

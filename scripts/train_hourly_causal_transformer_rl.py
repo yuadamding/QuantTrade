@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import sys
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a causal-transformer DQN allocator on top-volume bar data.",
     )
@@ -34,6 +35,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-end")
     parser.add_argument("--initial-action", default="CASH")
     parser.add_argument("--switch-cost-bps", type=float, default=1.0)
+    parser.add_argument("--min-hold-bars", type=int, default=1)
+    parser.add_argument("--cooldown-bars", type=int, default=0)
+    parser.add_argument("--max-switches-per-day", type=int)
+    parser.add_argument("--max-switches-per-episode", type=int)
+    parser.add_argument("--max-order-legs-per-day", type=float)
+    parser.add_argument("--max-order-legs-per-episode", type=float)
+    parser.add_argument("--q-switch-margin-bps", type=float, default=0.0)
+    parser.add_argument("--extra-switch-penalty-bps", type=float, default=0.0)
+    parser.add_argument(
+        "--cost-stress-bps",
+        type=float,
+        nargs="*",
+        default=[0.0, 1.0, 2.0, 5.0, 10.0],
+        help="One-way per-leg cost levels for post-training evaluation.",
+    )
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--episode-length", type=int, default=64)
     parser.add_argument("--replay-capacity", type=int, default=50_000)
@@ -59,7 +75,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-vram-gb", type=float, help="Reserve CUDA VRAM after warmup toward this total used amount.")
     parser.add_argument("--vram-safety-gb", type=float, default=0.12)
     parser.add_argument("--seed", type=int, default=11)
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def build_constraints_from_args(args: argparse.Namespace, *, cash_index: int = 0):
+    from rl_quant.trading_constraints import TradingConstraintConfig
+
+    return TradingConstraintConfig(
+        max_switches_per_day=args.max_switches_per_day,
+        max_switches_per_episode=args.max_switches_per_episode,
+        max_order_legs_per_day=args.max_order_legs_per_day,
+        max_order_legs_per_episode=args.max_order_legs_per_episode,
+        min_hold_bars=args.min_hold_bars,
+        cooldown_bars=args.cooldown_bars,
+        q_switch_margin_bps=args.q_switch_margin_bps,
+        extra_switch_penalty_bps=args.extra_switch_penalty_bps,
+        one_way_cost_bps=args.switch_cost_bps,
+        cash_index=cash_index,
+    )
+
+
+def unique_cost_stresses(values: list[float]) -> list[float]:
+    return sorted({float(value) for value in values})
 
 
 def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
@@ -116,6 +153,8 @@ def main() -> int:
     )
     assert_matching_hourly_schema(train_split, val_split, test_split)
     initial_action = action_index(train_split.action_names, args.initial_action)
+    cash_index = train_split.action_names.index("CASH") if "CASH" in train_split.action_names else initial_action
+    constraints = build_constraints_from_args(args, cash_index=cash_index)
     runtime = torch_runtime_summary(device)
     print(f"Using device: {device}")
     if device.type == "cuda":
@@ -134,6 +173,7 @@ def main() -> int:
         episode_length=args.episode_length,
         switch_cost_bps=args.switch_cost_bps,
         initial_action=initial_action,
+        constraints=constraints,
     )
     learning_config = DQNLearningConfig(
         num_envs=args.num_envs,
@@ -176,6 +216,8 @@ def main() -> int:
         device=device,
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
+        constraints=constraints,
+        episode_length=args.episode_length,
     )
     val_result = evaluate_hourly_policy(
         val_split.to(device),
@@ -183,6 +225,8 @@ def main() -> int:
         device=device,
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
+        constraints=constraints,
+        episode_length=args.episode_length,
     )
     test_result = evaluate_hourly_policy(
         test_split.to(device),
@@ -190,8 +234,22 @@ def main() -> int:
         device=device,
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
+        constraints=constraints,
+        episode_length=args.episode_length,
         capture_rollout=True,
     )
+    cost_stress = {
+        f"{cost_bps:g}bps": evaluate_hourly_policy(
+            test_split.to(device),
+            model,
+            device=device,
+            initial_action=initial_action,
+            switch_cost_bps=cost_bps,
+            constraints=replace(constraints, one_way_cost_bps=cost_bps),
+            episode_length=args.episode_length,
+        ).to_dict()
+        for cost_bps in unique_cost_stresses(args.cost_stress_bps)
+    }
 
     run_name = args.run_name or f"{train_split.bar_interval}_causal_transformer_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir = args.output_dir / run_name
@@ -210,6 +268,7 @@ def main() -> int:
             "bar_interval": train_split.bar_interval,
             "periods_per_year": train_split.periods_per_year,
             "config": serializable_args,
+            "constraints": asdict(constraints),
         },
         run_dir / "model.pt",
     )
@@ -219,6 +278,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "torch_runtime": runtime,
         "config": serializable_args,
+        "constraints": asdict(constraints),
         "bar_interval": train_split.bar_interval,
         "periods_per_year": train_split.periods_per_year,
         "feature_names": train_split.feature_names,
@@ -227,6 +287,7 @@ def main() -> int:
         "train_metrics": train_result.to_dict(),
         "val_metrics": val_result.to_dict(),
         "test_metrics": test_result.to_dict(),
+        "cost_stress": cost_stress,
     }
     with (run_dir / "summary.json").open("w") as sink:
         json.dump(summary, sink, indent=2)
@@ -235,6 +296,10 @@ def main() -> int:
         f"Train TR: {train_result.total_return:.2%} | "
         f"Val TR: {val_result.total_return:.2%} | "
         f"Test TR: {test_result.total_return:.2%}"
+    )
+    print(
+        f"Test switches: {test_result.total_switches} | "
+        f"order legs: {test_result.market_order_legs:.1f}"
     )
     if artifacts.get("vram_reservation"):
         print(f"VRAM reservation: {artifacts['vram_reservation']}")

@@ -4,7 +4,7 @@ import csv
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 

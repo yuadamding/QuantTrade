@@ -132,6 +132,56 @@ class TensorReplayBuffer:
         return {name: values[batch_ids] for name, values in self.storage.items()}
 
 
+class TensorDictReplayBuffer:
+    """Circular replay buffer for tensor transitions with scalar or shaped fields."""
+
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        device: torch.device,
+        fields: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = int(capacity)
+        self.device = device
+        self.storage = {
+            name: torch.zeros((capacity, *shape), dtype=dtype, device=device)
+            for name, (shape, dtype) in fields.items()
+        }
+        self.size = 0
+        self.cursor = 0
+
+    def add(self, **transition: torch.Tensor) -> None:
+        missing = set(self.storage) - set(transition)
+        if missing:
+            raise ValueError(f"Missing replay fields: {sorted(missing)}")
+        first_value = next(iter(transition.values()))
+        count = int(first_value.shape[0])
+        if count == 0:
+            return
+        if count >= self.capacity:
+            for name in self.storage:
+                transition[name] = transition[name][-self.capacity :]
+            count = self.capacity
+        first = min(count, self.capacity - self.cursor)
+        second = count - first
+        for name, target in self.storage.items():
+            values = transition[name].to(device=self.device, dtype=target.dtype)
+            target[self.cursor : self.cursor + first] = values[:first]
+            if second:
+                target[:second] = values[first:]
+        self.cursor = (self.cursor + count) % self.capacity
+        self.size = min(self.capacity, self.size + count)
+
+    def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
+        if self.size <= 0:
+            raise ValueError("Cannot sample from an empty replay buffer")
+        batch_ids = torch.randint(0, self.size, (batch_size,), device=self.device)
+        return {name: values[batch_ids] for name, values in self.storage.items()}
+
+
 def epsilon_by_step(*, step: int, train_steps: int, start: float, end: float) -> float:
     if train_steps <= 0:
         return end

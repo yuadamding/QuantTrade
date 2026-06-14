@@ -19,13 +19,19 @@ if str(SRC) not in sys.path:
 
 from rl_quant.hourly_transformer import (  # noqa: E402
     HourlyDataSplit,
+    HourlyEnvConfig,
+    VectorizedHourlyAllocationEnv,
     assert_matching_hourly_schema,
     evaluate_hourly_policy,
 )
 from rl_quant.intraday_dqn import _apply_action_threshold  # noqa: E402
 from rl_quant.minute_to_hour_transformer import (  # noqa: E402
     MinuteToHourCausalTransformerQNetwork,
+    TradingConstraintConfig,
+    apply_leg_aware_hysteresis,
     build_action_mask,
+    make_constraint_features,
+    sample_valid_actions,
     trade_legs,
 )
 from rl_quant.research_protocol import (  # noqa: E402
@@ -44,6 +50,7 @@ from rl_quant.strategy_data import (  # noqa: E402
     assert_matching_strategy_schema,
 )
 from rl_quant.strategy_dqn import evaluate_strategy_policy  # noqa: E402
+from rl_quant.trading_constraints import TradingConstraintConfig as BarTradingConstraintConfig  # noqa: E402
 
 
 def load_script(name: str):
@@ -211,6 +218,21 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertAlmostEqual(module.clipped_simple_return(100.0, 105.0), 0.05)
 
+    def test_minute_to_hour_periods_per_year_uses_actual_schedule(self) -> None:
+        module = load_script("build_hourly_from_minute_context_dataset")
+
+        periods = module.infer_periods_per_year(
+            [
+                "2026-06-10T15:30:00+00:00",
+                "2026-06-10T16:30:00+00:00",
+                "2026-06-11T15:30:00+00:00",
+                "2026-06-11T16:30:00+00:00",
+                "2026-06-11T17:30:00+00:00",
+            ]
+        )
+
+        self.assertEqual(periods, 630.0)
+
     def test_min_hold_action_mask_allows_only_current_action(self) -> None:
         mask = build_action_mask(
             current_action=torch.tensor([3]),
@@ -255,11 +277,83 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(int(mask.sum().item()), 1)
         self.assertTrue(bool(mask[0, 2].item()))
 
+    def test_order_leg_cap_blocks_two_leg_rotation(self) -> None:
+        mask = build_action_mask(
+            current_action=torch.tensor([2]),
+            bars_held=torch.tensor([5]),
+            cooldown_remaining=torch.tensor([0]),
+            switches_today=torch.tensor([0]),
+            max_switches_per_day=5,
+            min_hold_bars=1,
+            action_count=6,
+            order_legs_episode=torch.tensor([0.0]),
+            max_order_legs_per_episode=1.0,
+        )
+
+        self.assertTrue(bool(mask[0, 0].item()))
+        self.assertTrue(bool(mask[0, 2].item()))
+        self.assertFalse(bool(mask[0, 5].item()))
+
     def test_etf_to_etf_switch_counts_two_legs(self) -> None:
         self.assertEqual(float(trade_legs(torch.tensor([2]), torch.tensor([5]))[0].item()), 2.0)
 
     def test_cash_to_etf_counts_one_leg(self) -> None:
         self.assertEqual(float(trade_legs(torch.tensor([0]), torch.tensor([5]))[0].item()), 1.0)
+
+    def test_constraint_feature_scaling_uses_episode_cap(self) -> None:
+        constraints = TradingConstraintConfig(max_switches_per_day=4, max_switches_per_episode=3)
+        train_like = make_constraint_features(
+            bars_held=torch.tensor([1]),
+            cooldown_remaining=torch.tensor([0]),
+            switches_today=torch.tensor([1]),
+            switches_episode=torch.tensor([3]),
+            constraints=constraints,
+            episode_length=32,
+        )
+        eval_like = make_constraint_features(
+            bars_held=torch.tensor([1]),
+            cooldown_remaining=torch.tensor([0]),
+            switches_today=torch.tensor([1]),
+            switches_episode=torch.tensor([3]),
+            constraints=constraints,
+            episode_length=32,
+        )
+
+        self.assertTrue(bool(torch.allclose(train_like, eval_like)))
+        self.assertAlmostEqual(float(train_like[0, 3].item()), 1.0)
+
+    def test_leg_aware_hysteresis_uses_two_leg_etf_rotation_cost(self) -> None:
+        q_values = torch.tensor([[0.0, 10.0, 15.5]])
+        action = apply_leg_aware_hysteresis(
+            q_values,
+            torch.tensor([1]),
+            torch.tensor([[True, True, True]]),
+            one_way_cost_bps=1.0,
+            extra_switch_penalty_bps=1.0,
+            q_switch_margin_bps=3.0,
+            reward_scale=10_000.0,
+        )
+
+        self.assertEqual(action.tolist(), [1])
+
+    def test_leg_aware_hysteresis_uses_one_leg_cash_entry_cost(self) -> None:
+        q_values = torch.tensor([[10.0, 15.5]])
+        action = apply_leg_aware_hysteresis(
+            q_values,
+            torch.tensor([0]),
+            torch.tensor([[True, True]]),
+            one_way_cost_bps=1.0,
+            extra_switch_penalty_bps=1.0,
+            q_switch_margin_bps=3.0,
+            reward_scale=10_000.0,
+        )
+
+        self.assertEqual(action.tolist(), [1])
+
+    def test_sample_valid_actions_uses_valid_set_only(self) -> None:
+        actions = sample_valid_actions(torch.tensor([[False, True, False], [True, False, False]]))
+
+        self.assertEqual(actions.tolist(), [1, 0])
 
     def test_minute_to_hour_model_forward_shape(self) -> None:
         model = MinuteToHourCausalTransformerQNetwork(
@@ -285,6 +379,48 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual(tuple(q_values.shape), (2, 4))
         self.assertTrue(bool(torch.isfinite(q_values).all().item()))
+
+    def test_minute_timestamp_grid_future_context_is_rejected(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            torch.save(
+                {
+                    "decision_timestamps": ["2026-06-10T15:30:00+00:00"],
+                    "next_timestamps": ["2026-06-10T16:30:00+00:00"],
+                    "minute_timestamp_grid": [[["2026-06-10T15:31:00+00:00"]]],
+                    "minute_feature_names": ["x"],
+                    "hour_feature_names": ["h"],
+                    "action_names": ["CASH", "QQQ"],
+                    "minute_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+                    "minute_mask": torch.tensor([[[True]]]),
+                    "hour_features": torch.zeros((1, 1, 1), dtype=torch.float32),
+                    "action_returns": torch.zeros((1, 2), dtype=torch.float32),
+                },
+                path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "Minute context leakage"):
+                module._load_payload(path)
+
+    def test_train_cli_wires_episode_and_leg_caps(self) -> None:
+        module = load_script("train_hourly_from_minute_context_rl")
+
+        args = module.parse_args(
+            [
+                "--max-switches-per-episode",
+                "3",
+                "--max-order-legs-per-day",
+                "4",
+                "--max-order-legs-per-episode",
+                "5",
+            ]
+        )
+        constraints = module.build_constraints_from_args(args)
+
+        self.assertEqual(constraints.max_switches_per_episode, 3)
+        self.assertEqual(constraints.max_order_legs_per_day, 4)
+        self.assertEqual(constraints.max_order_legs_per_episode, 5)
 
 
 class HourlySplitTests(unittest.TestCase):
@@ -350,6 +486,142 @@ class HourlySplitTests(unittest.TestCase):
 
 
 class EvaluationTests(unittest.TestCase):
+    def _direct_bar_split(self) -> HourlyDataSplit:
+        valid = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        valid_mask = torch.zeros(6, dtype=torch.bool)
+        valid_mask[valid] = True
+        return HourlyDataSplit(
+            name="test",
+            timestamps=[f"2026-01-02T14:3{minute}:00+00:00" for minute in range(6)],
+            next_timestamps=[f"2026-01-02T14:3{minute + 1}:00+00:00" for minute in range(6)],
+            feature_names=["x"],
+            action_names=["CASH", "QQQ", "SPY"],
+            features=torch.zeros((6, 1), dtype=torch.float32),
+            action_returns=torch.zeros((6, 3), dtype=torch.float32),
+            session_dates=["2026-01-02"] * 6,
+            valid_start_indices=valid,
+            valid_index_mask=valid_mask,
+            feature_mean=torch.zeros(1),
+            feature_std=torch.ones(1),
+            lookback=1,
+            bar_interval="1m",
+        )
+
+    def test_direct_bar_env_min_hold_masks_to_current_action(self) -> None:
+        data = self._direct_bar_split()
+        env = VectorizedHourlyAllocationEnv(
+            data,
+            HourlyEnvConfig(
+                lookback=1,
+                num_envs=1,
+                episode_length=4,
+                initial_action=0,
+                constraints=BarTradingConstraintConfig(min_hold_bars=15),
+            ),
+            torch.device("cpu"),
+        )
+        env.previous_actions[:] = 1
+        env.bars_held[:] = 0
+
+        mask = env.action_mask()
+
+        self.assertEqual(mask.tolist(), [[False, True, False]])
+
+    def test_direct_bar_env_order_leg_cap_blocks_two_leg_rotation(self) -> None:
+        data = self._direct_bar_split()
+        env = VectorizedHourlyAllocationEnv(
+            data,
+            HourlyEnvConfig(
+                lookback=1,
+                num_envs=1,
+                episode_length=4,
+                initial_action=0,
+                constraints=BarTradingConstraintConfig(max_order_legs_per_day=8.0),
+            ),
+            torch.device("cpu"),
+        )
+        env.previous_actions[:] = 1
+        env.bars_held[:] = 10
+        env.order_legs_today[:] = 7.0
+
+        mask = env.action_mask()
+
+        self.assertEqual(mask.tolist(), [[True, True, False]])
+
+    def test_direct_hourly_eval_resets_episode_switch_cap_by_episode_length(self) -> None:
+        class OppositePolicy(nn.Module):
+            def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
+                q_values = torch.zeros((state_windows.shape[0], 3), device=state_windows.device)
+                q_values[previous_actions == 0, 1] = 1.0
+                q_values[previous_actions == 1, 0] = 1.0
+                return q_values
+
+        result = evaluate_hourly_policy(
+            self._direct_bar_split(),
+            OppositePolicy(),
+            device=torch.device("cpu"),
+            initial_action=0,
+            constraints=BarTradingConstraintConfig(max_switches_per_episode=1, one_way_cost_bps=0.0),
+            episode_length=2,
+        )
+
+        self.assertEqual(result.total_switches, 2)
+        self.assertEqual(result.market_order_legs, 2.0)
+
+    def test_direct_hourly_eval_applies_daily_switch_cap(self) -> None:
+        class FixedPolicy(nn.Module):
+            def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
+                return torch.tensor([[0.0, 1.0, 0.0]], device=state_windows.device).repeat(
+                    state_windows.shape[0],
+                    1,
+                )
+
+        result = evaluate_hourly_policy(
+            self._direct_bar_split(),
+            FixedPolicy(),
+            device=torch.device("cpu"),
+            initial_action=0,
+            constraints=BarTradingConstraintConfig(max_switches_per_day=0, one_way_cost_bps=0.0),
+            episode_length=4,
+        )
+
+        self.assertEqual(result.total_switches, 0)
+        self.assertEqual(result.market_order_legs, 0.0)
+
+    def test_direct_train_cli_wires_hard_constraints(self) -> None:
+        module = load_script("train_hourly_causal_transformer_rl")
+
+        args = module.parse_args(
+            [
+                "--switch-cost-bps",
+                "2",
+                "--min-hold-bars",
+                "15",
+                "--cooldown-bars",
+                "5",
+                "--max-switches-per-day",
+                "4",
+                "--max-switches-per-episode",
+                "8",
+                "--max-order-legs-per-day",
+                "8",
+                "--q-switch-margin-bps",
+                "5",
+                "--extra-switch-penalty-bps",
+                "1",
+            ]
+        )
+        constraints = module.build_constraints_from_args(args)
+
+        self.assertEqual(constraints.one_way_cost_bps, 2.0)
+        self.assertEqual(constraints.min_hold_bars, 15)
+        self.assertEqual(constraints.cooldown_bars, 5)
+        self.assertEqual(constraints.max_switches_per_day, 4)
+        self.assertEqual(constraints.max_switches_per_episode, 8)
+        self.assertEqual(constraints.max_order_legs_per_day, 8.0)
+        self.assertEqual(constraints.q_switch_margin_bps, 5.0)
+        self.assertEqual(constraints.extra_switch_penalty_bps, 1.0)
+
     def test_evaluation_uses_valid_indices_and_resets_at_gaps(self) -> None:
         class FixedPolicy(nn.Module):
             def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:

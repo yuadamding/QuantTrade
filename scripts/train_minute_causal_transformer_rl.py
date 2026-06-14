@@ -13,11 +13,20 @@ if str(SCRIPT_DIR) not in sys.path:
 from train_hourly_causal_transformer_rl import main as train_main  # noqa: E402
 
 
+def default_data_root() -> Path:
+    shared_data = PROJECT_ROOT.parent / "data"
+    if PROJECT_ROOT.name in {"QuantTrade", "rl_quant"} and shared_data.exists():
+        return shared_data
+    return PROJECT_ROOT / "data"
+
+
+DATA_ROOT = default_data_root()
+
 DEFAULT_ARGS = [
     "--dataset",
-    str(PROJECT_ROOT / "data" / "rl_minute" / "top_volume_1m_recent" / "minute_transformer_dataset.pt"),
+    str(DATA_ROOT / "rl_minute" / "top_volume_1m_recent" / "minute_transformer_dataset.pt"),
     "--output-dir",
-    str(PROJECT_ROOT / "data" / "rl_minute_runs"),
+    str(DATA_ROOT / "rl_minute_runs"),
     "--lookback",
     "128",
     "--train-end",
@@ -28,6 +37,24 @@ DEFAULT_ARGS = [
     "2026-06-11T00:00:00+00:00",
     "--episode-length",
     "128",
+    "--switch-cost-bps",
+    "2",
+    "--min-hold-bars",
+    "15",
+    "--cooldown-bars",
+    "5",
+    "--max-switches-per-day",
+    "4",
+    "--max-switches-per-episode",
+    "8",
+    "--max-order-legs-per-day",
+    "8",
+    "--max-order-legs-per-episode",
+    "16",
+    "--q-switch-margin-bps",
+    "5",
+    "--extra-switch-penalty-bps",
+    "1",
 ]
 
 

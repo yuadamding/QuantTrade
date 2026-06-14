@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from os import PathLike
 from typing import Any
 
@@ -72,11 +73,11 @@ class TensorDictReplayBuffer:
 @dataclass
 class TradingConstraintConfig:
     max_switches_per_day: int = 2
-    max_switches_per_week: int | None = None
     max_switches_per_episode: int | None = None
+    max_order_legs_per_day: float | None = None
+    max_order_legs_per_episode: float | None = None
     min_hold_bars: int = 1
     cooldown_bars: int = 0
-    no_trade_last_minutes: int = 0
     q_switch_margin_bps: float = 3.0
     extra_switch_penalty_bps: float = 0.0
     one_way_cost_bps: float = 1.0
@@ -127,8 +128,50 @@ class HourFromMinuteDataSplit:
 
 def _assert_increasing(values: list[str], *, name: str) -> None:
     for left, right in zip(values, values[1:]):
-        if right <= left:
+        if _parse_utc_timestamp(right) <= _parse_utc_timestamp(left):
             raise ValueError(f"{name} must be strictly increasing; got {left!r} before {right!r}.")
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"Timestamp {value!r} is not valid ISO format.") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"Timestamp {value!r} must include timezone information.")
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
+    decisions = list(payload["decision_timestamps"])
+    next_timestamps = list(payload["next_timestamps"])
+    grid = payload["minute_timestamp_grid"]
+    mask = payload["minute_mask"].bool()
+    if len(grid) != len(decisions):
+        raise ValueError("minute_timestamp_grid length must match decision_timestamps length.")
+    if mask.shape[0] != len(decisions):
+        raise ValueError("minute_mask row count must match decision_timestamps length.")
+    for row_id, (decision_ts, next_ts) in enumerate(zip(decisions, next_timestamps)):
+        decision_dt = _parse_utc_timestamp(decision_ts)
+        next_dt = _parse_utc_timestamp(next_ts)
+        if decision_dt >= next_dt:
+            raise ValueError(f"decision_timestamps must be before next_timestamps at row {row_id}.")
+        if len(grid[row_id]) != mask.shape[1]:
+            raise ValueError(f"minute_timestamp_grid hour count does not match minute_mask at row {row_id}.")
+        for hour_id, hour in enumerate(grid[row_id]):
+            if len(hour) != mask.shape[2]:
+                raise ValueError(
+                    f"minute_timestamp_grid minute count does not match minute_mask at row {row_id}, hour {hour_id}."
+                )
+            for minute_id, minute_ts in enumerate(hour):
+                if not minute_ts:
+                    continue
+                minute_dt = _parse_utc_timestamp(str(minute_ts))
+                if bool(mask[row_id, hour_id, minute_id]) and minute_dt > decision_dt:
+                    raise ValueError(
+                        "Minute context leakage at "
+                        f"row={row_id}, hour={hour_id}, minute={minute_id}: {minute_ts} > {decision_ts}."
+                    )
 
 
 def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
@@ -136,6 +179,7 @@ def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
     required = {
         "decision_timestamps",
         "next_timestamps",
+        "minute_timestamp_grid",
         "minute_feature_names",
         "hour_feature_names",
         "action_names",
@@ -147,6 +191,7 @@ def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
     missing = required - set(payload)
     if missing:
         raise ValueError(f"Minute-to-hour dataset is missing required keys: {sorted(missing)}")
+    validate_minute_timestamp_grid(payload)
     return payload
 
 
@@ -180,7 +225,7 @@ def _build_split(
     if len(next_timestamps) != len(decisions):
         raise ValueError("next_timestamps length must match decision_timestamps length.")
     for decision_ts, next_ts in zip(decisions, next_timestamps):
-        if next_ts <= decision_ts:
+        if _parse_utc_timestamp(next_ts) <= _parse_utc_timestamp(decision_ts):
             raise ValueError(f"next_timestamps must be after decisions; got {decision_ts!r} -> {next_ts!r}.")
 
     all_minute_features = payload["minute_features"].float()
@@ -320,14 +365,43 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError(f"Hour tensor shape differs between {reference.name!r} and {split.name!r}.")
 
 
-def trade_legs(previous_action: torch.Tensor, action: torch.Tensor, *, cash_index: int = 0) -> torch.Tensor:
+def trade_legs(
+    previous_action: torch.Tensor,
+    action: torch.Tensor,
+    *,
+    cash_index: int = 0,
+    count_etf_to_etf_as_two_legs: bool = True,
+) -> torch.Tensor:
     changed = action != previous_action
+    if not count_etf_to_etf_as_two_legs:
+        return changed.float()
     prev_risky = previous_action != int(cash_index)
     next_risky = action != int(cash_index)
     legs = torch.zeros_like(action, dtype=torch.float32)
     legs = torch.where(changed & prev_risky, legs + 1.0, legs)
     legs = torch.where(changed & next_risky, legs + 1.0, legs)
     return legs
+
+
+def make_constraint_features(
+    *,
+    bars_held: torch.Tensor,
+    cooldown_remaining: torch.Tensor,
+    switches_today: torch.Tensor,
+    switches_episode: torch.Tensor,
+    constraints: TradingConstraintConfig,
+    episode_length: int,
+) -> torch.Tensor:
+    episode_den = max(float(constraints.max_switches_per_episode or episode_length), 1.0)
+    return torch.stack(
+        [
+            bars_held.float() / max(float(constraints.min_hold_bars), 1.0),
+            cooldown_remaining.float() / max(float(constraints.cooldown_bars), 1.0),
+            switches_today.float() / max(float(constraints.max_switches_per_day), 1.0),
+            switches_episode.float() / episode_den,
+        ],
+        dim=1,
+    ).clamp(0.0, 8.0)
 
 
 def build_action_mask(
@@ -341,6 +415,12 @@ def build_action_mask(
     action_count: int,
     switches_episode: torch.Tensor | None = None,
     max_switches_per_episode: int | None = None,
+    order_legs_today: torch.Tensor | None = None,
+    max_order_legs_per_day: float | None = None,
+    order_legs_episode: torch.Tensor | None = None,
+    max_order_legs_per_episode: float | None = None,
+    cash_index: int = 0,
+    count_etf_to_etf_as_two_legs: bool = True,
 ) -> torch.Tensor:
     mask = torch.ones(current_action.shape[0], action_count, dtype=torch.bool, device=current_action.device)
     must_hold = bars_held < int(min_hold_bars)
@@ -350,11 +430,68 @@ def build_action_mask(
         if switches_episode is None:
             raise ValueError("switches_episode is required when max_switches_per_episode is set.")
         trade_budget_exhausted = trade_budget_exhausted | (switches_episode >= int(max_switches_per_episode))
+    if max_order_legs_per_day is not None or max_order_legs_per_episode is not None:
+        candidates = torch.arange(action_count, dtype=torch.long, device=current_action.device)
+        candidates = candidates.unsqueeze(0).expand(current_action.shape[0], -1)
+        previous = current_action.long().unsqueeze(1).expand_as(candidates)
+        candidate_legs = trade_legs(
+            previous,
+            candidates,
+            cash_index=cash_index,
+            count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+        )
+        if max_order_legs_per_day is not None:
+            if order_legs_today is None:
+                raise ValueError("order_legs_today is required when max_order_legs_per_day is set.")
+            mask = mask & ((order_legs_today.float().unsqueeze(1) + candidate_legs) <= float(max_order_legs_per_day))
+        if max_order_legs_per_episode is not None:
+            if order_legs_episode is None:
+                raise ValueError("order_legs_episode is required when max_order_legs_per_episode is set.")
+            mask = mask & (
+                (order_legs_episode.float().unsqueeze(1) + candidate_legs) <= float(max_order_legs_per_episode)
+            )
+        mask[torch.arange(current_action.shape[0], device=current_action.device), current_action.long()] = True
     constrained = must_hold | in_cooldown | trade_budget_exhausted
     if bool(constrained.any().item()):
         mask[constrained, :] = False
         mask[constrained, current_action[constrained].long()] = True
     return mask
+
+
+def apply_leg_aware_hysteresis(
+    q_values: torch.Tensor,
+    current_action: torch.Tensor,
+    action_mask: torch.Tensor,
+    *,
+    one_way_cost_bps: float,
+    extra_switch_penalty_bps: float,
+    q_switch_margin_bps: float,
+    cash_index: int = 0,
+    reward_scale: float = 10_000.0,
+    count_etf_to_etf_as_two_legs: bool = True,
+) -> torch.Tensor:
+    batch, action_count = q_values.shape
+    candidates = torch.arange(action_count, dtype=torch.long, device=q_values.device).unsqueeze(0).expand(batch, -1)
+    previous = current_action.long().unsqueeze(1).expand_as(candidates)
+    candidate_legs = trade_legs(
+        previous,
+        candidates,
+        cash_index=cash_index,
+        count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+    )
+    is_switch = candidates.ne(previous)
+    required_edge = (
+        candidate_legs * float(one_way_cost_bps)
+        + is_switch.float() * float(extra_switch_penalty_bps)
+        + is_switch.float() * float(q_switch_margin_bps)
+    ) * float(reward_scale) / 10_000.0
+    current_q = q_values.gather(1, current_action.long().unsqueeze(1))
+    adjusted_q = q_values - current_q - required_edge
+    adjusted_q = adjusted_q.masked_fill(~action_mask, torch.finfo(q_values.dtype).min)
+    best_action = torch.argmax(adjusted_q, dim=1)
+    best_edge = adjusted_q.gather(1, best_action.unsqueeze(1)).squeeze(1)
+    should_switch = best_action.ne(current_action.long()) & (best_edge > 0)
+    return torch.where(should_switch, best_action, current_action.long())
 
 
 def apply_hysteresis(
@@ -366,13 +503,23 @@ def apply_hysteresis(
     q_switch_margin_bps: float,
     reward_scale: float = 10_000.0,
 ) -> torch.Tensor:
-    masked_q = q_values.masked_fill(~action_mask, torch.finfo(q_values.dtype).min)
-    best_action = torch.argmax(masked_q, dim=1)
-    current_q = q_values.gather(1, current_action.long().unsqueeze(1)).squeeze(1)
-    best_q = q_values.gather(1, best_action.unsqueeze(1)).squeeze(1)
-    required_edge = (float(switch_cost_bps) + float(q_switch_margin_bps)) * float(reward_scale) / 10_000.0
-    should_switch = best_action.ne(current_action.long()) & ((best_q - current_q) > required_edge)
-    return torch.where(should_switch, best_action, current_action.long())
+    return apply_leg_aware_hysteresis(
+        q_values,
+        current_action,
+        action_mask,
+        one_way_cost_bps=switch_cost_bps,
+        extra_switch_penalty_bps=0.0,
+        q_switch_margin_bps=q_switch_margin_bps,
+        reward_scale=reward_scale,
+    )
+
+
+def sample_valid_actions(action_mask: torch.Tensor) -> torch.Tensor:
+    if not bool(action_mask.any(dim=1).all().item()):
+        raise ValueError("Each action-mask row must contain at least one valid action.")
+    weights = action_mask.float()
+    weights = weights / weights.sum(dim=1, keepdim=True)
+    return torch.multinomial(weights, num_samples=1).squeeze(1)
 
 
 class MinuteToHourCausalTransformerQNetwork(nn.Module):
@@ -524,6 +671,8 @@ class VectorizedMinuteToHourEnv:
         self.cooldown_remaining = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.switches_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.switches_episode = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.order_legs_today = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
+        self.order_legs_episode = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
         self.steps = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.reset()
 
@@ -547,19 +696,19 @@ class VectorizedMinuteToHourEnv:
         self.cooldown_remaining[mask] = 0
         self.switches_today[mask] = 0
         self.switches_episode[mask] = 0
+        self.order_legs_today[mask] = 0.0
+        self.order_legs_episode[mask] = 0.0
         self.steps[mask] = 0
 
     def constraint_features(self) -> torch.Tensor:
-        max_switches = max(float(self.config.constraints.max_switches_per_day), 1.0)
-        return torch.stack(
-            [
-                self.bars_held.float() / max(float(self.config.constraints.min_hold_bars), 1.0),
-                self.cooldown_remaining.float() / max(float(self.config.constraints.cooldown_bars), 1.0),
-                self.switches_today.float() / max_switches,
-                self.switches_episode.float() / max(float(self.config.episode_length), 1.0),
-            ],
-            dim=1,
-        ).clamp_(0.0, 8.0)
+        return make_constraint_features(
+            bars_held=self.bars_held,
+            cooldown_remaining=self.cooldown_remaining,
+            switches_today=self.switches_today,
+            switches_episode=self.switches_episode,
+            constraints=self.config.constraints,
+            episode_length=self.config.episode_length,
+        )
 
     def action_mask(self) -> torch.Tensor:
         return build_action_mask(
@@ -572,6 +721,12 @@ class VectorizedMinuteToHourEnv:
             action_count=len(self.data.action_names),
             switches_episode=self.switches_episode,
             max_switches_per_episode=self.config.constraints.max_switches_per_episode,
+            order_legs_today=self.order_legs_today,
+            max_order_legs_per_day=self.config.constraints.max_order_legs_per_day,
+            order_legs_episode=self.order_legs_episode,
+            max_order_legs_per_episode=self.config.constraints.max_order_legs_per_episode,
+            cash_index=self.config.constraints.cash_index,
+            count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
 
     def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -586,7 +741,12 @@ class VectorizedMinuteToHourEnv:
         actions = actions.long()
         actions = torch.where(action_mask.gather(1, actions.unsqueeze(1)).squeeze(1), actions, previous_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
-        legs = trade_legs(previous_actions, actions, cash_index=self.config.constraints.cash_index)
+        legs = trade_legs(
+            previous_actions,
+            actions,
+            cash_index=self.config.constraints.cash_index,
+            count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
+        )
         is_switch = actions != previous_actions
         cost_bps = legs * float(self.config.constraints.one_way_cost_bps)
         cost_bps = cost_bps + is_switch.float() * float(self.config.constraints.extra_switch_penalty_bps)
@@ -603,6 +763,8 @@ class VectorizedMinuteToHourEnv:
         )
         self.switches_today = self.switches_today + is_switch.long()
         self.switches_episode = self.switches_episode + is_switch.long()
+        self.order_legs_today = self.order_legs_today + legs
+        self.order_legs_episode = self.order_legs_episode + legs
         self.steps = self.steps + 1
 
         in_bounds = next_indices + 1 < self.data.action_returns.shape[0]
@@ -616,6 +778,7 @@ class VectorizedMinuteToHourEnv:
             reset_today = torch.tensor([old != new for old, new in zip(old_dates, new_dates)], dtype=torch.bool, device=self.device)
             valid_positions = torch.where(in_bounds)[0]
             self.switches_today[valid_positions[reset_today]] = 0
+            self.order_legs_today[valid_positions[reset_today]] = 0.0
 
         next_constraint_features = self.constraint_features()
         next_action_mask = self.action_mask()
@@ -668,10 +831,12 @@ def evaluate_minute_to_hour_policy(
     device: torch.device,
     initial_action: int = 0,
     constraints: TradingConstraintConfig | None = None,
+    episode_length: int | None = None,
     reward_scale: float = 10_000.0,
     capture_rollout: bool = False,
 ) -> MinuteToHourEvaluationResult:
     constraints = constraints or TradingConstraintConfig()
+    constraint_episode_length = int(episode_length or max(int(data.valid_start_indices.numel()), 1))
     data = data if data.minute_features.device == device else data.to(device)
     model.eval()
     previous_action = int(initial_action)
@@ -679,6 +844,8 @@ def evaluate_minute_to_hour_policy(
     cooldown_remaining = 0
     switches_today = 0
     switches_episode = 0
+    order_legs_today = 0.0
+    order_legs_episode = 0.0
     previous_index: int | None = None
     previous_date: str | None = None
     equity = 1.0
@@ -697,22 +864,24 @@ def evaluate_minute_to_hour_policy(
             cooldown_remaining = 0
             switches_today = 0
             switches_episode = 0
+            order_legs_today = 0.0
+            order_legs_episode = 0.0
         elif previous_date is not None and current_date != previous_date:
             switches_today = 0
+            order_legs_today = 0.0
         minute, mask, hour = data.state(torch.tensor([index], dtype=torch.long, device=device))
         prev_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
         bars_tensor = torch.tensor([bars_held], dtype=torch.long, device=device)
         cooldown_tensor = torch.tensor([cooldown_remaining], dtype=torch.long, device=device)
         switches_today_tensor = torch.tensor([switches_today], dtype=torch.long, device=device)
-        constraints_tensor = torch.tensor(
-            [[
-                bars_held / max(float(constraints.min_hold_bars), 1.0),
-                cooldown_remaining / max(float(constraints.cooldown_bars), 1.0),
-                switches_today / max(float(constraints.max_switches_per_day), 1.0),
-                switches_episode / max(float(data.valid_start_indices.numel()), 1.0),
-            ]],
-            dtype=torch.float32,
-            device=device,
+        switches_episode_tensor = torch.tensor([switches_episode], dtype=torch.long, device=device)
+        constraints_tensor = make_constraint_features(
+            bars_held=bars_tensor,
+            cooldown_remaining=cooldown_tensor,
+            switches_today=switches_today_tensor,
+            switches_episode=switches_episode_tensor,
+            constraints=constraints,
+            episode_length=constraint_episode_length,
         )
         action_mask = build_action_mask(
             current_action=prev_tensor,
@@ -722,22 +891,38 @@ def evaluate_minute_to_hour_policy(
             max_switches_per_day=constraints.max_switches_per_day,
             min_hold_bars=constraints.min_hold_bars,
             action_count=len(data.action_names),
-            switches_episode=torch.tensor([switches_episode], dtype=torch.long, device=device),
+            switches_episode=switches_episode_tensor,
             max_switches_per_episode=constraints.max_switches_per_episode,
+            order_legs_today=torch.tensor([order_legs_today], dtype=torch.float32, device=device),
+            max_order_legs_per_day=constraints.max_order_legs_per_day,
+            order_legs_episode=torch.tensor([order_legs_episode], dtype=torch.float32, device=device),
+            max_order_legs_per_episode=constraints.max_order_legs_per_episode,
+            cash_index=constraints.cash_index,
+            count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
         )
         q_values = model(minute, mask, hour, prev_tensor, constraints_tensor)
         action = int(
-            apply_hysteresis(
+            apply_leg_aware_hysteresis(
                 q_values,
                 prev_tensor,
                 action_mask,
-                switch_cost_bps=constraints.one_way_cost_bps,
+                one_way_cost_bps=constraints.one_way_cost_bps,
+                extra_switch_penalty_bps=constraints.extra_switch_penalty_bps,
                 q_switch_margin_bps=constraints.q_switch_margin_bps,
+                cash_index=constraints.cash_index,
                 reward_scale=reward_scale,
+                count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
             )[0].item()
         )
         action_tensor = torch.tensor([action], dtype=torch.long, device=device)
-        legs = float(trade_legs(prev_tensor, action_tensor, cash_index=constraints.cash_index)[0].item())
+        legs = float(
+            trade_legs(
+                prev_tensor,
+                action_tensor,
+                cash_index=constraints.cash_index,
+                count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+            )[0].item()
+        )
         is_switch = action != previous_action
         cost_bps = legs * float(constraints.one_way_cost_bps)
         cost_bps += float(is_switch) * float(constraints.extra_switch_penalty_bps)
@@ -771,6 +956,8 @@ def evaluate_minute_to_hour_policy(
         else:
             bars_held += 1
             cooldown_remaining = max(cooldown_remaining - 1, 0)
+        order_legs_today += legs
+        order_legs_episode += legs
         previous_action = action
         previous_index = index
         previous_date = current_date
@@ -852,9 +1039,11 @@ def train_minute_to_hour_dqn(
     best_state = _state_dict_to_cpu(q_network)
     loss_trace: list[float] = []
     reward_trace: list[float] = []
+    valid_action_count_trace: list[float] = []
     eval_trace: list[dict[str, float | int | None | str]] = []
     for step in range(1, config.learning.train_steps + 1):
         minute, mask, hour, previous_actions, constraint_features, action_mask = env.observe()
+        valid_action_count_trace.append(float(action_mask.sum(dim=1).float().mean().item()))
         epsilon = epsilon_by_step(
             step=step,
             train_steps=config.learning.train_steps,
@@ -864,17 +1053,18 @@ def train_minute_to_hour_dqn(
         with torch.no_grad():
             with autocast_context(device, config.learning.use_amp):
                 q_values = q_network(minute, mask, hour, previous_actions, constraint_features)
-            greedy_actions = apply_hysteresis(
+            greedy_actions = apply_leg_aware_hysteresis(
                 q_values,
                 previous_actions,
                 action_mask,
-                switch_cost_bps=config.env.constraints.one_way_cost_bps,
+                one_way_cost_bps=config.env.constraints.one_way_cost_bps,
+                extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
                 q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
+                cash_index=config.env.constraints.cash_index,
                 reward_scale=config.env.reward_scale,
+                count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
             )
-            random_actions = torch.randint(0, action_count, greedy_actions.shape, device=device)
-            random_valid = action_mask.gather(1, random_actions.unsqueeze(1)).squeeze(1)
-            random_actions = torch.where(random_valid, random_actions, previous_actions)
+            random_actions = sample_valid_actions(action_mask)
             explore = torch.rand(greedy_actions.shape, device=device) < epsilon
             actions = torch.where(explore, random_actions, greedy_actions)
         transition = env.step(actions)
@@ -933,6 +1123,7 @@ def train_minute_to_hour_dqn(
                 device=device,
                 initial_action=config.env.initial_action,
                 constraints=config.env.constraints,
+                episode_length=config.env.episode_length,
                 reward_scale=config.env.reward_scale,
             )
             eval_trace.append(
@@ -944,6 +1135,8 @@ def train_minute_to_hour_dqn(
                     "val_sharpe": val_result.annualized_sharpe,
                     "average_loss": sum(loss_trace[-200:]) / max(len(loss_trace[-200:]), 1),
                     "average_train_reward": sum(reward_trace[-200:]) / max(len(reward_trace[-200:]), 1),
+                    "average_valid_action_count": sum(valid_action_count_trace[-200:])
+                    / max(len(valid_action_count_trace[-200:]), 1),
                 }
             )
             if val_result.total_return > best_val_return or (
@@ -961,6 +1154,7 @@ def train_minute_to_hour_dqn(
         "amp_enabled": scaler.is_enabled(),
         "loss_trace": loss_trace,
         "train_reward_trace": reward_trace,
+        "valid_action_count_trace": valid_action_count_trace,
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
     }

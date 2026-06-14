@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a hierarchical minute-to-hour causal-transformer DQN allocator.",
     )
@@ -58,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extra-switch-penalty-bps", type=float, default=1.0)
     parser.add_argument("--q-switch-margin-bps", type=float, default=3.0)
     parser.add_argument("--max-switches-per-day", type=int, default=2)
+    parser.add_argument("--max-switches-per-episode", type=int)
+    parser.add_argument("--max-order-legs-per-day", type=float)
+    parser.add_argument("--max-order-legs-per-episode", type=float)
     parser.add_argument("--min-hold-bars", type=int, default=1)
     parser.add_argument("--cooldown-bars", type=int, default=0)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>")
@@ -65,7 +68,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-vram-gb", type=float, help="Reserve CUDA VRAM after warmup toward this total used amount.")
     parser.add_argument("--vram-safety-gb", type=float, default=0.12)
     parser.add_argument("--seed", type=int, default=17)
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def build_constraints_from_args(args: argparse.Namespace):
+    from rl_quant.minute_to_hour_transformer import TradingConstraintConfig
+
+    return TradingConstraintConfig(
+        max_switches_per_day=args.max_switches_per_day,
+        max_switches_per_episode=args.max_switches_per_episode,
+        max_order_legs_per_day=args.max_order_legs_per_day,
+        max_order_legs_per_episode=args.max_order_legs_per_episode,
+        min_hold_bars=args.min_hold_bars,
+        cooldown_bars=args.cooldown_bars,
+        q_switch_margin_bps=args.q_switch_margin_bps,
+        extra_switch_penalty_bps=args.extra_switch_penalty_bps,
+        one_way_cost_bps=args.one_way_cost_bps,
+    )
 
 
 def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
@@ -92,7 +111,6 @@ def main() -> int:
         from rl_quant.minute_to_hour_transformer import (
             MinuteToHourEnvConfig,
             MinuteToHourTrainingConfig,
-            TradingConstraintConfig,
             action_index,
             build_hour_from_minute_splits,
             evaluate_minute_to_hour_policy,
@@ -135,14 +153,7 @@ def main() -> int:
         f"Actions: {len(train_split.action_names)}"
     )
 
-    constraints = TradingConstraintConfig(
-        max_switches_per_day=args.max_switches_per_day,
-        min_hold_bars=args.min_hold_bars,
-        cooldown_bars=args.cooldown_bars,
-        q_switch_margin_bps=args.q_switch_margin_bps,
-        extra_switch_penalty_bps=args.extra_switch_penalty_bps,
-        one_way_cost_bps=args.one_way_cost_bps,
-    )
+    constraints = build_constraints_from_args(args)
     env_config = MinuteToHourEnvConfig(
         num_envs=args.num_envs,
         episode_length=args.episode_length,
@@ -186,6 +197,7 @@ def main() -> int:
         device=device,
         initial_action=initial_action,
         constraints=constraints,
+        episode_length=args.episode_length,
     )
     val_result = evaluate_minute_to_hour_policy(
         val_split.to(device),
@@ -193,6 +205,7 @@ def main() -> int:
         device=device,
         initial_action=initial_action,
         constraints=constraints,
+        episode_length=args.episode_length,
     )
     test_result = evaluate_minute_to_hour_policy(
         test_split.to(device),
@@ -200,6 +213,7 @@ def main() -> int:
         device=device,
         initial_action=initial_action,
         constraints=constraints,
+        episode_length=args.episode_length,
         capture_rollout=True,
     )
 

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 import json
+import statistics
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -85,6 +87,13 @@ def timestamp_add_minutes(value: str, minutes: int) -> str:
 def session_minutes(exchange_timestamp: str) -> int:
     dt = datetime.fromisoformat(exchange_timestamp)
     return dt.hour * 60 + dt.minute - (9 * 60 + 30)
+
+
+def infer_periods_per_year(decision_timestamps: list[str]) -> float:
+    if not decision_timestamps:
+        raise ValueError("decision_timestamps must not be empty.")
+    counts = Counter(timestamp[:10] for timestamp in decision_timestamps)
+    return 252.0 * float(statistics.median(counts.values()))
 
 
 def write_action_returns(path: Path, action_names: list[str], timestamps: list[str], rows: list[list[float]]) -> None:
@@ -169,7 +178,7 @@ def main() -> int:
     path_feature_names = [
         "minute_cumulative_stock_ret_ew",
         "minute_realized_stock_vol_so_far",
-        "minute_volume_share_so_far",
+        "minute_avg_log_dollar_volume_so_far",
     ]
     time_feature_names = [
         "session_progress_centered",
@@ -206,8 +215,8 @@ def main() -> int:
         volume_by_date[date_key] = volume_by_date.get(date_key, 0.0) + stock_features[10]
         avg = sum(returns) / len(returns)
         realized_vol = (sum((value - avg) ** 2 for value in returns) / max(len(returns), 1)) ** 0.5
-        volume_share_so_far = min(volume_by_date[date_key] / max(len(returns), 1.0), 1e6)
-        path_features = [cumulative_by_date[date_key], realized_vol, volume_share_so_far]
+        avg_log_dollar_volume_so_far = min(volume_by_date[date_key] / max(len(returns), 1.0), 1e6)
+        path_features = [cumulative_by_date[date_key], realized_vol, avg_log_dollar_volume_so_far]
         time_features = list(parse_exchange_time(exchange_timestamp))
         etf_row: list[float] = []
         missing = False
@@ -261,7 +270,8 @@ def main() -> int:
                 minute_rows.append(minute_feature_by_time[minute_ts] if is_valid else [0.0] * feature_dim)
                 valid_count += int(is_valid)
             valid_fraction = sum(mask_rows) / float(args.minutes_per_hour)
-            hour_rows.append([valid_fraction, parse_exchange_time(exchange_timestamp)[0]])
+            hour_exchange_timestamp = exchange_times.get(hour_end.isoformat(), exchange_timestamp)
+            hour_rows.append([valid_fraction, parse_exchange_time(hour_exchange_timestamp)[0]])
             timestamp_tensor.append(ts_rows)
             mask_tensor.append(mask_rows)
             minute_tensor.append(minute_rows)
@@ -295,7 +305,8 @@ def main() -> int:
     action_returns = torch.tensor(action_return_rows, dtype=torch.float32)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = args.output_dir / args.dataset_file_name
-    periods_per_year = 252.0 * 390.0 / float(args.decision_stride_minutes)
+    periods_per_year = infer_periods_per_year(decision_timestamps)
+    median_decisions_per_day = periods_per_year / 252.0
     torch.save(
         {
             "decision_timestamps": decision_timestamps,
@@ -312,6 +323,8 @@ def main() -> int:
             "minutes_per_hour": args.minutes_per_hour,
             "decision_stride_minutes": args.decision_stride_minutes,
             "periods_per_year": periods_per_year,
+            "periods_per_year_formula": "252 * median_decisions_per_utc_day",
+            "median_decisions_per_day": median_decisions_per_day,
             "source": {
                 "stock_minute_dir": str(args.stock_minute_dir),
                 "etf_minute_dir": str(args.etf_minute_dir),
@@ -340,6 +353,8 @@ def main() -> int:
         "hours_lookback": args.hours_lookback,
         "minutes_per_hour": args.minutes_per_hour,
         "decision_stride_minutes": args.decision_stride_minutes,
+        "periods_per_year_formula": "252 * median_decisions_per_utc_day",
+        "median_decisions_per_day": median_decisions_per_day,
         "start": args.start,
         "end_exclusive": args.end_exclusive,
     }
@@ -354,6 +369,8 @@ def main() -> int:
         "first_next_timestamp": next_timestamps[0],
         "last_next_timestamp": next_timestamps[-1],
         "periods_per_year": periods_per_year,
+        "periods_per_year_formula": "252 * median_decisions_per_utc_day",
+        "median_decisions_per_day": median_decisions_per_day,
         "dataset": str(dataset_path),
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -394,6 +411,7 @@ next hourly decision timestamp.
 - Actions: {", ".join(action_names)}
 - Decision stride minutes: {args.decision_stride_minutes}
 - Periods per year: {periods_per_year:.1f}
+- Median decisions per day: {median_decisions_per_day:.1f}
 """
     )
     print(f"Rows: {len(decision_timestamps)} | Minute tensor: {tuple(minute_features.shape)} | Actions: {len(action_names)}")

@@ -57,9 +57,10 @@ Bar causal-transformer allocator:
 
 - State: rolling bar windows containing top-stock cross-section features, time features, and ETF context.
 - Actions: `CASH` plus selected liquid ETF actions.
-- Reward: next aligned simple bar return for the selected ETF action, net of switch cost.
+- Reward: next aligned simple bar return for the selected ETF action, net of leg-aware order costs.
 - Model: masked transformer encoder with previous-action embedding; attention is causal across the lookback window.
 - Frequency: Yahoo Finance `1h` or `1m` exchange-session bars.
+- Constraints: optional action masks, minimum hold, cooldown, daily/episode switch caps, daily/episode order-leg caps, leg-aware Q-value hysteresis, and ETF-to-ETF two-leg transaction costs.
 
 Minute-to-hour causal-context allocator:
 
@@ -68,7 +69,7 @@ Minute-to-hour causal-context allocator:
 - Actions: `CASH` plus selected liquid ETF actions.
 - Reward: selected ETF simple return from the decision close to the next hourly decision close.
 - Model: minute encoder learns intrahour path context; hour encoder learns multi-hour regime context.
-- Constraints: action masks, minimum hold, daily switch cap, cooldown, Q-value hysteresis, and ETF-to-ETF two-leg transaction costs.
+- Constraints: action masks, minimum hold, daily/episode switch caps, daily/episode order-leg caps, cooldown, leg-aware Q-value hysteresis, and ETF-to-ETF two-leg transaction costs.
 
 Correctness contract:
 
@@ -178,6 +179,12 @@ conda run -n ml1 python scripts/train_minute_causal_transformer_rl.py \
   --device auto --amp --target-vram-gb 9.5
 ```
 
+The minute-level wrapper applies conservative direct-minute turnover defaults:
+15-bar minimum hold, 5-bar cooldown, 4 switches per day, 8 switches per
+episode, 8 order legs per day, 2 bps one-way leg cost, 1 bps extra switch
+penalty, and 5 bps Q-value switch margin. Its `summary.json` includes
+0/1/2/5/10 bps test cost stress under the same action-mask constraints.
+
 Build hourly decisions from minute-level context:
 
 ```bash
@@ -188,7 +195,8 @@ Train the hierarchical minute-to-hour causal transformer:
 
 ```bash
 conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
-  --device auto --amp --target-vram-gb 9.5
+  --device auto --amp --target-vram-gb 9.5 \
+  --max-switches-per-episode 3 --max-order-legs-per-episode 6
 ```
 
 Validate research manifests:
