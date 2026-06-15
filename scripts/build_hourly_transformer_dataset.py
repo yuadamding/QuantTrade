@@ -25,6 +25,7 @@ from rl_quant.research_protocol import (  # noqa: E402
 )
 
 SYMBOL_DATE_RE = re.compile(r"^(?P<symbol>.+?)_\d{4}-\d{2}-\d{2}_")
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 @dataclass
@@ -60,10 +61,31 @@ def symbol_from_bar_path(path: Path, *, interval: str) -> str:
     return stem.removesuffix(f"_{interval}")
 
 
+def infer_universe_selection_date(*paths: Path) -> str | None:
+    dates: list[str] = []
+    for path in paths:
+        matches = DATE_RE.findall(path.name)
+        if matches:
+            dates.append(matches[-1])
+    if not dates:
+        return None
+    return f"{max(dates)}T00:00:00+00:00"
+
+
+def resolve_universe_selection_date(args: argparse.Namespace) -> str | None:
+    return args.universe_selection_date or infer_universe_selection_date(args.stock_universe, args.etf_universe)
+
+
 def read_ranked_symbols(path: Path, *, symbol_column: str = "yahoo_symbol") -> list[str]:
     with path.open(newline="") as source:
         reader = csv.DictReader(source)
-        field = symbol_column if symbol_column in (reader.fieldnames or []) else "symbol"
+        fieldnames = reader.fieldnames or []
+        for candidate in (symbol_column, "symbol", "ticker"):
+            if candidate in fieldnames:
+                field = candidate
+                break
+        else:
+            raise ValueError(f"Universe file {path} must contain one of {symbol_column!r}, 'symbol', or 'ticker'.")
         return [row[field].strip().upper() for row in reader if row.get(field)]
 
 
@@ -233,7 +255,7 @@ def write_numeric_csv(path: Path, index_name: str, names: list[str], index: list
             writer.writerow([ts, *[f"{value:.10f}" for value in values]])
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a causal-transformer RL dataset from top-volume stock and ETF bars.",
     )
@@ -284,7 +306,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Mark datasets so training/evaluation only use state windows inside one exchange date.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -295,6 +317,7 @@ def main() -> int:
         raise SystemExit("Torch is required. Use: conda run -n ml1 python scripts/build_hourly_transformer_dataset.py") from exc
 
     bar_interval = args.bar_interval.strip().lower()
+    universe_selection_date = resolve_universe_selection_date(args)
     periods_per_year = periods_per_year_for_interval(bar_interval)
     stock_map = bar_file_map(args.stock_bar_dir, interval=bar_interval)
     etf_map = bar_file_map(args.etf_bar_dir, interval=bar_interval)
@@ -442,6 +465,7 @@ def main() -> int:
                 "periods_per_year": periods_per_year,
                 "start": args.start,
                 "end_exclusive": args.end_exclusive,
+                "universe_selection_date": universe_selection_date,
             },
         },
         dataset_path,
@@ -461,6 +485,7 @@ def main() -> int:
         "periods_per_year": periods_per_year,
         "start": args.start,
         "end_exclusive": args.end_exclusive,
+        "universe_selection_date": universe_selection_date,
     }
     metadata = {
         "rows": len(timestamps),
@@ -487,7 +512,7 @@ def main() -> int:
         created_at_utc=utc_now_iso(),
         source_vendor="Yahoo Finance chart",
         symbols=[*selected_stocks, *etf_symbols],
-        universe_selection_date=args.universe_selection_date,
+        universe_selection_date=universe_selection_date,
         bar_interval=bar_interval,
         timezone="UTC timestamps with exchange timestamp features",
         adjustment="Adjusted close when available, otherwise close",
@@ -500,7 +525,7 @@ def main() -> int:
         source_manifest_hash=stable_json_hash(source_metadata),
         known_limitations=[
             "Yahoo intraday history is short and may contain missing bars.",
-            "Universe selection is not point-in-time unless universe_selection_date is provided.",
+            "Universe selection date is validated to be no later than the first dataset timestamp.",
             "US regular-session timing uses simplified 9:30-16:00 assumptions.",
         ],
     )

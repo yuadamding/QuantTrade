@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from os import PathLike
 from typing import Any
 
@@ -110,8 +111,35 @@ def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
 
 def _assert_increasing(values: list[str], *, name: str) -> None:
     for left, right in zip(values, values[1:]):
-        if right <= left:
+        if _parse_utc_timestamp(right) <= _parse_utc_timestamp(left):
             raise ValueError(f"{name} must be strictly increasing; got {left!r} before {right!r}.")
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"Timestamp {value!r} is not valid ISO format.") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"Timestamp {value!r} must include timezone information.")
+    return parsed.astimezone(timezone.utc)
+
+
+def _optional_utc_timestamp(value: str | None) -> datetime | None:
+    return None if value is None else _parse_utc_timestamp(value)
+
+
+def _validate_action_return_contract(action_returns: torch.Tensor, action_valid_mask: torch.Tensor | None) -> None:
+    if action_valid_mask is None:
+        if not bool(torch.isfinite(action_returns).all().item()):
+            raise ValueError("action_returns must be finite when no action_valid_mask is provided.")
+        return
+    valid_returns = action_returns[action_valid_mask]
+    if valid_returns.numel() and not bool(torch.isfinite(valid_returns).all().item()):
+        raise ValueError("Valid action_returns must be finite.")
+    invalid_returns = action_returns[~action_valid_mask]
+    if invalid_returns.numel() and not bool(torch.isnan(invalid_returns).all().item()):
+        raise ValueError("Invalid action_returns must be NaN when action_valid_mask is false.")
 
 
 def _build_split(
@@ -131,11 +159,13 @@ def _build_split(
     if not all_timestamps:
         raise ValueError("Transformer dataset has no timestamps.")
     _assert_increasing(all_timestamps, name="timestamps")
+    all_timestamp_dt = [_parse_utc_timestamp(ts) for ts in all_timestamps]
     all_next_timestamps = list(payload["next_timestamps"])
     if len(all_next_timestamps) != len(all_timestamps):
         raise ValueError("next_timestamps length must match timestamps length.")
-    for ts, next_ts in zip(all_timestamps, all_next_timestamps):
-        if next_ts <= ts:
+    all_next_timestamp_dt = [_parse_utc_timestamp(ts) for ts in all_next_timestamps]
+    for ts, ts_dt, next_ts, next_dt in zip(all_timestamps, all_timestamp_dt, all_next_timestamps, all_next_timestamp_dt):
+        if next_dt <= ts_dt:
             raise ValueError(f"next_timestamps must be after timestamps; got {ts!r} -> {next_ts!r}.")
     all_features = payload["features"].float()
     all_returns = payload["action_returns"].float()
@@ -148,17 +178,22 @@ def _build_split(
         all_action_valid = all_action_valid.bool()
         if tuple(all_action_valid.shape) != tuple(all_returns.shape):
             raise ValueError("action_valid_mask shape must match action_returns shape.")
+    _validate_action_return_contract(all_returns, all_action_valid)
     all_session_dates = payload.get("session_dates")
+    start_dt = _optional_utc_timestamp(start_ts)
+    end_dt = _optional_utc_timestamp(end_ts)
     selected = [
         i
-        for i, ts in enumerate(all_timestamps)
-        if (start_ts is None or ts >= start_ts) and (end_ts is None or ts <= end_ts)
+        for i, ts_dt in enumerate(all_timestamp_dt)
+        if (start_dt is None or ts_dt >= start_dt) and (end_dt is None or ts_dt <= end_dt)
     ]
     if len(selected) < lookback + 2:
         raise ValueError(f"Need at least lookback + 2 rows for split {name!r}, got {len(selected)}.")
 
     timestamps = [all_timestamps[i] for i in selected]
     next_timestamps = [all_next_timestamps[i] for i in selected]
+    timestamp_dt = [all_timestamp_dt[i] for i in selected]
+    next_timestamp_dt = [all_next_timestamp_dt[i] for i in selected]
     session_dates = [all_session_dates[i] for i in selected] if all_session_dates is not None else None
     raw_features = all_features[selected]
     action_returns = all_returns[selected]
@@ -171,14 +206,17 @@ def _build_split(
     features = ((raw_features - feature_mean) / feature_std).clamp_(-8.0, 8.0)
     valid: list[int] = []
     require_same_session = bool(payload.get("require_same_session_lookback", False))
+    reward_after_dt = _optional_utc_timestamp(reward_after_ts)
+    reward_start_dt = _optional_utc_timestamp(reward_start_ts)
+    reward_end_dt = _optional_utc_timestamp(reward_end_ts)
     for index in range(lookback - 1, len(timestamps) - 1):
-        reward_ts = timestamps[index]
-        next_reward_ts = next_timestamps[index]
-        if reward_after_ts is not None and reward_ts <= reward_after_ts:
+        reward_dt = timestamp_dt[index]
+        next_reward_dt = next_timestamp_dt[index]
+        if reward_after_dt is not None and reward_dt <= reward_after_dt:
             continue
-        if reward_start_ts is not None and reward_ts < reward_start_ts:
+        if reward_start_dt is not None and reward_dt < reward_start_dt:
             continue
-        if reward_end_ts is not None and next_reward_ts > reward_end_ts:
+        if reward_end_dt is not None and next_reward_dt > reward_end_dt:
             continue
         if require_same_session and session_dates is not None:
             window_dates = session_dates[index - lookback + 1 : index + 1]
@@ -662,7 +700,7 @@ class HourlyEvaluationResult:
     total_traded_notional: float
     max_drawdown: float
     hourly_sharpe: float | None
-    rollout_records: list[dict[str, float | str | int]]
+    rollout_records: list[dict[str, Any]]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -739,7 +777,7 @@ def evaluate_hourly_policy(
     switches = 0
     order_legs = 0.0
     traded_notional_total = 0.0
-    records: list[dict[str, float | str | int]] = []
+    records: list[dict[str, Any]] = []
     previous_index: int | None = None
     previous_date: str | None = None
     episode_steps = 0
@@ -796,7 +834,7 @@ def evaluate_hourly_policy(
             episode_length=int(episode_length or max(int(data.valid_start_indices.numel()), 1)),
         )
         constraint_features = torch.cat([base_constraint_features, exposure_features], dim=1)
-        action_mask = build_action_mask(
+        constraint_mask = build_action_mask(
             current_action=previous_tensor,
             bars_held=torch.tensor([bars_held], dtype=torch.long, device=device),
             cooldown_remaining=torch.tensor([cooldown_remaining], dtype=torch.long, device=device),
@@ -815,9 +853,9 @@ def evaluate_hourly_policy(
         )
         availability_mask = data.valid_actions(index_tensor)
         availability_mask[:, int(constraints.cash_index)] = True
-        action_mask = action_mask & availability_mask
+        pre_exposure_mask = constraint_mask & availability_mask
         action_mask = apply_exposure_masks(
-            action_mask,
+            pre_exposure_mask,
             current_action=previous_tensor,
             action_leverage=action_leverage,
             action_weights=action_weights,
@@ -882,13 +920,63 @@ def evaluate_hourly_policy(
         order_legs += legs
         traded_notional_total += traded_notional
         if capture_rollout:
+            q_row = q_values[0].detach().cpu()
+            final_mask = action_mask[0].detach().cpu()
+            constraint_row = constraint_mask[0].detach().cpu()
+            availability_row = availability_mask[0].detach().cpu()
+            pre_exposure_row = pre_exposure_mask[0].detach().cpu()
+            candidate_actions = torch.arange(len(data.action_names), dtype=torch.long, device=device)
+            previous_candidates = torch.full_like(candidate_actions, previous_action)
+            candidate_notional = trade_notional(
+                previous_candidates,
+                candidate_actions,
+                action_weights,
+                cash_index=constraints.cash_index,
+            )
+            candidate_is_switch = candidate_actions.ne(previous_action)
+            candidate_cost_bps = candidate_notional * (
+                float(constraints.one_way_cost_bps)
+                + candidate_is_switch.float() * float(constraints.extra_switch_penalty_bps)
+            )
+            candidate_costs = candidate_cost_bps.detach().cpu()
+            q_values_by_action: dict[str, float] = {}
+            candidates: dict[str, dict[str, Any]] = {}
+            mask_reasons: dict[str, str] = {}
+            for action_id, action_name in enumerate(data.action_names):
+                valid_candidate = bool(final_mask[action_id].item())
+                if valid_candidate:
+                    reason = None
+                elif not bool(availability_row[action_id].item()):
+                    reason = "not_tradable_at_timestamp"
+                elif not bool(constraint_row[action_id].item()):
+                    reason = "trading_constraint"
+                elif bool(pre_exposure_row[action_id].item()):
+                    reason = "exposure_constraint"
+                else:
+                    reason = "masked"
+                q_value = round(float(q_row[action_id].item()), 8)
+                q_values_by_action[action_name] = q_value
+                candidates[action_name] = {
+                    "valid": valid_candidate,
+                    "q_value": q_value,
+                    "expected_cost_bps": round(float(candidate_costs[action_id].item()), 8),
+                    "risk_bucket": action_meta[action_id].asset_class,
+                    "reason": reason,
+                }
+                if reason is not None:
+                    mask_reasons[action_name] = reason
             records.append(
                 {
+                    "decision_id": f"{data.name}:{data.timestamps[index]}",
                     "timestamp": data.timestamps[index],
+                    "decision_ts": data.timestamps[index],
                     "next_timestamp": data.next_timestamps[index],
+                    "model_id": f"{data.bar_interval}_causal_transformer_v{RISK_AWARE_POLICY_MODEL_VERSION}",
                     "action": action,
                     "asset": data.action_names[action],
+                    "selected_action": data.action_names[action],
                     "previous_action": previous_action,
+                    "previous_asset": data.action_names[previous_action],
                     "segment_reset": int(segment_reset),
                     "market_order_legs": legs,
                     "traded_notional": round(traded_notional, 8),
@@ -902,6 +990,18 @@ def evaluate_hourly_policy(
                     "net_return": round(net_return, 8),
                     "hourly_return": round(net_return, 8),
                     "equity": round(equity, 8),
+                    "action_mask_reasons": mask_reasons,
+                    "q_values": q_values_by_action,
+                    "risk_checks": {
+                        "has_valid_action": bool(final_mask.any().item()),
+                        "selected_action_valid": bool(final_mask[action].item()),
+                        "selected_action_available": bool(availability_row[action].item()),
+                    },
+                    "expected_cost_bps": round(cost_bps, 8),
+                    "data_quality_score": 1.0,
+                    "readiness_score": 1.0 if bool(final_mask[action].item()) else 0.0,
+                    "readiness_config_hash": stable_action_risk_config_hash(exposure_constraints),
+                    "candidates": candidates,
                 }
             )
         if is_switch:

@@ -498,6 +498,10 @@ def validate_reportable_summary(summary: dict[str, Any]) -> list[str]:
         if not _has_path(summary, path):
             errors.append(f"missing {path}")
 
+    dataset_manifest = summary.get("dataset_manifest")
+    if isinstance(dataset_manifest, dict) and dataset_manifest.get("manifest_available") is False:
+        errors.append("dataset_manifest_file_missing")
+
     reportability = summary.get("reportability")
     if isinstance(reportability, dict):
         for reason in reportability.get("reasons", []):

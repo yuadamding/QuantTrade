@@ -17,6 +17,8 @@ SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from rl_quant.research_protocol import hash_string_sequence, stable_json_hash, utc_now_iso  # noqa: E402
+
 
 def parse_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
@@ -134,6 +136,12 @@ def build_exposure_constraints_from_args(args: argparse.Namespace):
 
 def unique_cost_stresses(values: list[float]) -> list[float]:
     return sorted({float(value) for value in values})
+
+
+def read_json_if_exists(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
 
 
 def metric_sharpe(values: list[float], *, periods_per_year: float) -> float | None:
@@ -263,6 +271,213 @@ def _valid_action_indices(split, index: int, *, cash_index: int) -> list[int]:
     return valid
 
 
+def _split_timestamps(split) -> list[str]:
+    return list(getattr(split, "timestamps", getattr(split, "decision_timestamps", [])))
+
+
+def _split_row_date(split, index: int) -> str:
+    session_dates = getattr(split, "session_dates", None)
+    if session_dates is not None:
+        return str(session_dates[index])
+    timestamps = _split_timestamps(split)
+    return timestamps[index][:10] if timestamps else ""
+
+
+def _new_baseline_state(*, initial_action: int, constraints, group_count: int) -> dict[str, object]:
+    import torch
+
+    return {
+        "previous_action": int(initial_action),
+        "previous_index": None,
+        "previous_date": None,
+        "bars_held": int(getattr(constraints, "min_hold_bars", 1)) if constraints is not None else 1,
+        "cooldown_remaining": 0,
+        "switches_today": 0,
+        "switches_episode": 0,
+        "order_legs_today": 0.0,
+        "order_legs_episode": 0.0,
+        "steps_today": 0,
+        "leveraged_bars_today": 0,
+        "consecutive_leveraged_bars": 0,
+        "episode_steps": 0,
+        "group_counts_today": torch.zeros((1, max(int(group_count), 1)), dtype=torch.long),
+    }
+
+
+def _reset_baseline_daily_state(state: dict[str, object]) -> None:
+    state["switches_today"] = 0
+    state["order_legs_today"] = 0.0
+    state["steps_today"] = 0
+    state["leveraged_bars_today"] = 0
+    state["consecutive_leveraged_bars"] = 0
+    state["group_counts_today"].zero_()
+
+
+def _prepare_baseline_state_for_row(
+    state: dict[str, object],
+    split,
+    row_index: int,
+    *,
+    initial_action: int,
+    constraints,
+    episode_length: int | None,
+) -> None:
+    current_date = _split_row_date(split, row_index)
+    previous_index = state["previous_index"]
+    segment_reset = previous_index is None or row_index != int(previous_index) + 1
+    if segment_reset:
+        state["previous_action"] = int(initial_action)
+        state["bars_held"] = int(getattr(constraints, "min_hold_bars", 1)) if constraints is not None else 1
+        state["cooldown_remaining"] = 0
+        state["switches_episode"] = 0
+        state["order_legs_episode"] = 0.0
+        state["episode_steps"] = 0
+        _reset_baseline_daily_state(state)
+    elif state["previous_date"] is not None and current_date != state["previous_date"]:
+        _reset_baseline_daily_state(state)
+    if episode_length is not None and int(state["episode_steps"]) >= int(episode_length):
+        state["switches_episode"] = 0
+        state["order_legs_episode"] = 0.0
+        state["episode_steps"] = 0
+
+
+def _baseline_mask_context(
+    split,
+    *,
+    action_weights,
+    constraints,
+    exposure_constraints,
+    action_meta,
+    cash_index: int,
+) -> dict[str, object] | None:
+    if constraints is None and exposure_constraints is None:
+        return None
+    import torch
+
+    from rl_quant.action_risk import (
+        action_is_inverse_tensor,
+        action_is_leveraged_tensor,
+        action_leverage_tensor,
+        build_action_metadata,
+        group_ids_for_actions,
+    )
+
+    action_meta = action_meta or build_action_metadata(split.action_names)
+    action_weights = action_weights.detach().cpu()
+    action_group_ids, action_groups = group_ids_for_actions(action_meta, device=torch.device("cpu"))
+    return {
+        "constraints": constraints,
+        "exposure_constraints": exposure_constraints,
+        "cash_index": int(cash_index),
+        "action_weights": action_weights,
+        "action_leverage": action_leverage_tensor(action_meta, device=torch.device("cpu")),
+        "action_is_leveraged": action_is_leveraged_tensor(action_meta, device=torch.device("cpu")),
+        "action_is_inverse": action_is_inverse_tensor(action_meta, device=torch.device("cpu")),
+        "action_group_ids": action_group_ids,
+        "group_count": len(action_groups),
+    }
+
+
+def _full_valid_action_indices(
+    split,
+    row_index: int,
+    *,
+    state: dict[str, object],
+    context: dict[str, object] | None,
+    cash_index: int,
+    episode_length: int | None,
+) -> list[int]:
+    if context is None:
+        return _valid_action_indices(split, row_index, cash_index=cash_index)
+
+    import torch
+
+    from rl_quant.action_risk import apply_exposure_masks
+    from rl_quant.trading_constraints import TradingConstraintConfig, build_action_mask
+
+    constraints = context["constraints"] or TradingConstraintConfig(cash_index=cash_index)
+    previous = torch.tensor([int(state["previous_action"])], dtype=torch.long)
+    mask = build_action_mask(
+        current_action=previous,
+        bars_held=torch.tensor([int(state["bars_held"])], dtype=torch.long),
+        cooldown_remaining=torch.tensor([int(state["cooldown_remaining"])], dtype=torch.long),
+        switches_today=torch.tensor([int(state["switches_today"])], dtype=torch.long),
+        min_hold_bars=constraints.min_hold_bars,
+        action_count=len(split.action_names),
+        max_switches_per_day=constraints.max_switches_per_day,
+        switches_episode=torch.tensor([int(state["switches_episode"])], dtype=torch.long),
+        max_switches_per_episode=constraints.max_switches_per_episode,
+        order_legs_today=torch.tensor([float(state["order_legs_today"])], dtype=torch.float32),
+        max_order_legs_per_day=constraints.max_order_legs_per_day,
+        order_legs_episode=torch.tensor([float(state["order_legs_episode"])], dtype=torch.float32),
+        max_order_legs_per_episode=constraints.max_order_legs_per_episode,
+        cash_index=cash_index,
+        count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+    )
+    availability = torch.ones((1, len(split.action_names)), dtype=torch.bool)
+    if getattr(split, "action_valid_mask", None) is not None:
+        availability = split.action_valid_mask[row_index].detach().cpu().bool().unsqueeze(0)
+    availability[:, cash_index] = True
+    mask = mask & availability
+    exposure_constraints = context["exposure_constraints"]
+    if exposure_constraints is not None:
+        mask = apply_exposure_masks(
+            mask,
+            current_action=previous,
+            action_leverage=context["action_leverage"],
+            action_weights=context["action_weights"],
+            action_is_leveraged=context["action_is_leveraged"],
+            action_is_inverse=context["action_is_inverse"],
+            action_group_ids=context["action_group_ids"],
+            group_counts_today=state["group_counts_today"],
+            steps_today=torch.tensor([int(state["steps_today"])], dtype=torch.long),
+            leveraged_bars_today=torch.tensor([int(state["leveraged_bars_today"])], dtype=torch.long),
+            consecutive_leveraged_bars=torch.tensor([int(state["consecutive_leveraged_bars"])], dtype=torch.long),
+            constraints=exposure_constraints,
+            cash_index=cash_index,
+        )
+    if not bool(mask.any().item()):
+        mask[:, cash_index] = True
+    return [action for action, valid in enumerate(mask[0].tolist()) if bool(valid)]
+
+
+def _advance_baseline_state(
+    state: dict[str, object],
+    split,
+    row_index: int,
+    *,
+    action: int,
+    legs: float,
+    constraints,
+    context: dict[str, object] | None,
+) -> None:
+    previous_action = int(state["previous_action"])
+    is_switch = int(action) != previous_action
+    if is_switch:
+        state["bars_held"] = 1
+        state["cooldown_remaining"] = int(getattr(constraints, "cooldown_bars", 0)) if constraints is not None else 0
+        state["switches_today"] = int(state["switches_today"]) + 1
+        state["switches_episode"] = int(state["switches_episode"]) + 1
+    else:
+        state["bars_held"] = int(state["bars_held"]) + 1
+        state["cooldown_remaining"] = max(int(state["cooldown_remaining"]) - 1, 0)
+    state["order_legs_today"] = float(state["order_legs_today"]) + float(legs)
+    state["order_legs_episode"] = float(state["order_legs_episode"]) + float(legs)
+    if context is not None:
+        group_id = int(context["action_group_ids"][int(action)].item())
+        state["group_counts_today"][0, group_id] += 1
+        selected_leveraged = bool(context["action_is_leveraged"][int(action)].item())
+        state["leveraged_bars_today"] = int(state["leveraged_bars_today"]) + int(selected_leveraged)
+        state["consecutive_leveraged_bars"] = (
+            int(state["consecutive_leveraged_bars"]) + 1 if selected_leveraged else 0
+        )
+    state["steps_today"] = int(state["steps_today"]) + 1
+    state["previous_action"] = int(action)
+    state["previous_index"] = int(row_index)
+    state["previous_date"] = _split_row_date(split, row_index)
+    state["episode_steps"] = int(state["episode_steps"]) + 1
+
+
 def _evaluate_action_sequence(
     split,
     actions: list[int],
@@ -273,6 +488,10 @@ def _evaluate_action_sequence(
     switch_cost_bps: float,
     extra_switch_penalty_bps: float,
     count_etf_to_etf_as_two_legs: bool = True,
+    constraints=None,
+    exposure_constraints=None,
+    action_meta=None,
+    episode_length: int | None = None,
 ) -> dict[str, float | int | None]:
     valid_indices = split.valid_start_indices.detach().cpu().tolist()
     if len(actions) != len(valid_indices):
@@ -284,15 +503,40 @@ def _evaluate_action_sequence(
     switches = 0
     order_legs = 0.0
     total_traded_notional = 0.0
-    previous_action = int(initial_action)
-    previous_index: int | None = None
+    context = _baseline_mask_context(
+        split,
+        action_weights=action_weights,
+        constraints=constraints,
+        exposure_constraints=exposure_constraints,
+        action_meta=action_meta,
+        cash_index=cash_index,
+    )
+    state = _new_baseline_state(
+        initial_action=initial_action,
+        constraints=constraints,
+        group_count=int(context["group_count"]) if context is not None else 1,
+    )
     for sequence_index, row_index in enumerate(valid_indices):
-        if previous_index is None or row_index != previous_index + 1:
-            previous_action = int(initial_action)
-        valid_actions = _valid_action_indices(split, row_index, cash_index=cash_index)
+        _prepare_baseline_state_for_row(
+            state,
+            split,
+            row_index,
+            initial_action=initial_action,
+            constraints=constraints,
+            episode_length=episode_length,
+        )
+        previous_action = int(state["previous_action"])
+        valid_actions = _full_valid_action_indices(
+            split,
+            row_index,
+            state=state,
+            context=context,
+            cash_index=cash_index,
+            episode_length=episode_length,
+        )
         action = int(actions[sequence_index])
         if action not in valid_actions:
-            action = int(cash_index)
+            action = int(cash_index) if cash_index in valid_actions else int(valid_actions[0])
         raw_return = float(split.action_returns[row_index, action].item())
         position_weight = weights[action]
         gross_return = position_weight * raw_return
@@ -313,8 +557,20 @@ def _evaluate_action_sequence(
             count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
         )
         total_traded_notional += traded_notional
-        previous_action = action
-        previous_index = row_index
+        _advance_baseline_state(
+            state,
+            split,
+            row_index,
+            action=action,
+            legs=_trade_legs_scalar(
+                previous_action,
+                action,
+                cash_index=cash_index,
+                count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+            ),
+            constraints=constraints,
+            context=context,
+        )
     return {
         "total_return": equity - 1.0,
         "max_drawdown": metric_max_drawdown(equity_curve),
@@ -361,6 +617,10 @@ def random_same_action_distribution_baseline(
     switch_cost_bps: float,
     extra_switch_penalty_bps: float,
     count_etf_to_etf_as_two_legs: bool = True,
+    constraints=None,
+    exposure_constraints=None,
+    action_meta=None,
+    episode_length: int | None = None,
 ) -> dict[str, float | int | None]:
     valid_indices = split.valid_start_indices.detach().cpu().tolist()
     counts = Counter(int(record["action"]) for record in rollout_records if "action" in record)
@@ -382,6 +642,10 @@ def random_same_action_distribution_baseline(
                 switch_cost_bps=switch_cost_bps,
                 extra_switch_penalty_bps=extra_switch_penalty_bps,
                 count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+                constraints=constraints,
+                exposure_constraints=exposure_constraints,
+                action_meta=action_meta,
+                episode_length=episode_length,
             )
         )
     out = _aggregate_random_path_metrics(paths)
@@ -401,6 +665,10 @@ def random_same_turnover_baseline(
     switch_cost_bps: float,
     extra_switch_penalty_bps: float,
     count_etf_to_etf_as_two_legs: bool = True,
+    constraints=None,
+    exposure_constraints=None,
+    action_meta=None,
+    episode_length: int | None = None,
 ) -> dict[str, float | int | None]:
     valid_indices = split.valid_start_indices.detach().cpu().tolist()
     switch_flags = [
@@ -412,22 +680,62 @@ def random_same_turnover_baseline(
     switch_flags = switch_flags[: len(valid_indices)]
     rng = random.Random(seed)
     paths = []
+    context = _baseline_mask_context(
+        split,
+        action_weights=action_weights,
+        constraints=constraints,
+        exposure_constraints=exposure_constraints,
+        action_meta=action_meta,
+        cash_index=cash_index,
+    )
     for _ in range(max(int(n_paths), 1)):
         sampled: list[int] = []
-        previous_action = int(initial_action)
-        previous_index: int | None = None
+        state = _new_baseline_state(
+            initial_action=initial_action,
+            constraints=constraints,
+            group_count=int(context["group_count"]) if context is not None else 1,
+        )
         for sequence_index, row_index in enumerate(valid_indices):
-            if previous_index is None or row_index != previous_index + 1:
-                previous_action = int(initial_action)
-            valid_actions = _valid_action_indices(split, row_index, cash_index=cash_index)
+            _prepare_baseline_state_for_row(
+                state,
+                split,
+                row_index,
+                initial_action=initial_action,
+                constraints=constraints,
+                episode_length=episode_length,
+            )
+            previous_action = int(state["previous_action"])
+            valid_actions = _full_valid_action_indices(
+                split,
+                row_index,
+                state=state,
+                context=context,
+                cash_index=cash_index,
+                episode_length=episode_length,
+            )
             if switch_flags[sequence_index]:
                 choices = [action for action in valid_actions if action != previous_action]
                 action = rng.choice(choices or [cash_index])
             else:
                 action = previous_action if previous_action in valid_actions else cash_index
+            if action not in valid_actions:
+                action = cash_index if cash_index in valid_actions else int(valid_actions[0])
             sampled.append(action)
-            previous_action = action
-            previous_index = row_index
+            legs = _trade_legs_scalar(
+                previous_action,
+                action,
+                cash_index=cash_index,
+                count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+            )
+            _advance_baseline_state(
+                state,
+                split,
+                row_index,
+                action=action,
+                legs=legs,
+                constraints=constraints,
+                context=context,
+            )
         paths.append(
             _evaluate_action_sequence(
                 split,
@@ -438,6 +746,10 @@ def random_same_turnover_baseline(
                 switch_cost_bps=switch_cost_bps,
                 extra_switch_penalty_bps=extra_switch_penalty_bps,
                 count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+                constraints=constraints,
+                exposure_constraints=exposure_constraints,
+                action_meta=action_meta,
+                episode_length=episode_length,
             )
         )
     out = _aggregate_random_path_metrics(paths)
@@ -453,16 +765,241 @@ def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
     with path.open("w", newline="") as sink:
         writer = csv.DictWriter(sink, fieldnames=list(records[0]))
         writer.writeheader()
-        writer.writerows(records)
+        for record in records:
+            writer.writerow(
+                {
+                    key: json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else value
+                    for key, value in record.items()
+                }
+            )
 
 
-def write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
+def write_decision_logs(path: Path, records: list[dict[str, object]]) -> None:
     if not records:
         return
+    from rl_quant.decision_framework import DecisionLog
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as sink:
         for record in records:
-            sink.write(json.dumps(record, sort_keys=True) + "\n")
+            log = DecisionLog(
+                decision_id=str(record["decision_id"]),
+                decision_ts=str(record.get("decision_ts", record["timestamp"])),
+                model_id=str(record["model_id"]),
+                selected_action=str(record["selected_action"]),
+                previous_action=str(record["previous_asset"]),
+                action_mask_reasons=dict(record.get("action_mask_reasons", {})),
+                q_values={str(key): float(value) for key, value in dict(record.get("q_values", {})).items()},
+                risk_checks={str(key): bool(value) for key, value in dict(record.get("risk_checks", {})).items()},
+                expected_cost_bps=float(record["expected_cost_bps"]),
+                data_quality_score=float(record.get("data_quality_score", 1.0)),
+                readiness_score=float(record.get("readiness_score", 1.0)),
+                readiness_config_hash=str(record["readiness_config_hash"]),
+                candidates=dict(record.get("candidates", {})),
+            )
+            log.validate()
+            sink.write(json.dumps(log.to_dict(), sort_keys=True) + "\n")
+
+
+def _baseline_metric(payload: object, *, split_name: str = "test") -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    if split_name in payload and isinstance(payload[split_name], dict):
+        return payload[split_name]
+    if "total_return" in payload:
+        return payload
+    return None
+
+
+def _tensor_hash(tensor) -> str:
+    values = [round(float(value), 10) for value in tensor.detach().cpu().flatten().tolist()]
+    return stable_json_hash(values)
+
+
+def _split_quality(split) -> dict[str, object]:
+    import torch
+
+    action_mask = getattr(split, "action_valid_mask", None)
+    returns = split.action_returns.detach().cpu()
+    if action_mask is None:
+        valid_return_count = int(returns.numel())
+        invalid_return_count = 0
+        valid_returns_finite = bool(torch.isfinite(returns).all().item())
+        invalid_returns_nan = True
+    else:
+        mask = action_mask.detach().cpu().bool()
+        valid_returns = returns[mask]
+        invalid_returns = returns[~mask]
+        valid_return_count = int(valid_returns.numel())
+        invalid_return_count = int(invalid_returns.numel())
+        valid_returns_finite = bool(torch.isfinite(valid_returns).all().item()) if valid_returns.numel() else True
+        invalid_returns_nan = bool(torch.isnan(invalid_returns).all().item()) if invalid_returns.numel() else True
+    return {
+        "rows": len(_split_timestamps(split)),
+        "valid_decision_rows": int(split.valid_start_indices.numel()),
+        "feature_count": len(split.feature_names),
+        "action_count": len(split.action_names),
+        "features_finite": bool(torch.isfinite(split.features.detach().cpu()).all().item()),
+        "valid_return_count": valid_return_count,
+        "invalid_return_count": invalid_return_count,
+        "valid_returns_finite": valid_returns_finite,
+        "invalid_returns_nan": invalid_returns_nan,
+        "has_action_valid_mask": action_mask is not None,
+    }
+
+
+def build_reportability_artifacts(
+    *,
+    args: argparse.Namespace,
+    run_name: str,
+    train_split,
+    val_split,
+    test_split,
+    action_metadata: list[dict[str, object]],
+    action_metadata_hash: str,
+    action_risk_config_hash: str,
+    constraints: object,
+    exposure_constraints: object,
+    baselines: dict[str, object],
+    fixed_cost_stress: dict[str, object],
+    adaptive_cost_stress: dict[str, object],
+    test_metrics: dict[str, object],
+    artifacts: dict[str, object],
+    model_version: int,
+    constraint_feature_names: list[str],
+) -> dict[str, object]:
+    created_at = utc_now_iso()
+    dataset_manifest_path = args.dataset.parent / "dataset_manifest.json"
+    dataset_manifest = read_json_if_exists(dataset_manifest_path) or {
+        "dataset": str(args.dataset),
+        "manifest_path": str(dataset_manifest_path),
+        "manifest_available": False,
+    }
+    dataset_manifest_hash = stable_json_hash(dataset_manifest)
+    feature_manifest = {
+        "feature_set_id": f"hourly_features_{stable_json_hash(train_split.feature_names)[:12]}",
+        "created_at_utc": created_at,
+        "input_dataset": str(args.dataset),
+        "input_dataset_manifest_hash": dataset_manifest_hash,
+        "feature_names": train_split.feature_names,
+        "feature_count": len(train_split.feature_names),
+        "normalizer": {
+            "fit_split": "train",
+            "mean_hash": _tensor_hash(train_split.feature_mean),
+            "std_hash": _tensor_hash(train_split.feature_std),
+        },
+        "constraint_feature_names": constraint_feature_names,
+        "code_version": model_version,
+    }
+    data_quality_report = {
+        "report_id": f"{run_name}_data_quality",
+        "created_at_utc": created_at,
+        "dataset": str(args.dataset),
+        "splits": {
+            "train": _split_quality(train_split),
+            "val": _split_quality(val_split),
+            "test": _split_quality(test_split),
+        },
+        "quality_score": 1.0
+        if all(
+            bool(_split_quality(split)["features_finite"])
+            and bool(_split_quality(split)["valid_returns_finite"])
+            and bool(_split_quality(split)["invalid_returns_nan"])
+            for split in (train_split, val_split, test_split)
+        )
+        else 0.0,
+    }
+    action_mask = getattr(test_split, "action_valid_mask", None)
+    action_eligibility = []
+    for action_id, action_name in enumerate(test_split.action_names):
+        valid_bar_count = (
+            len(test_split.timestamps)
+            if action_mask is None
+            else int(action_mask[:, action_id].detach().cpu().bool().sum().item())
+        )
+        tradable = action_name == "CASH" or valid_bar_count > 0
+        metadata = action_metadata[action_id]
+        action_eligibility.append(
+            {
+                "symbol_id": action_name,
+                "tradable": tradable,
+                "reason_if_excluded": None if tradable else "no_valid_test_bars",
+                "valid_bar_count": valid_bar_count,
+                "asset_class": metadata["asset_class"],
+                "risk_bucket": metadata["group"],
+                "leverage_factor": metadata["leverage"],
+                "inverse": metadata["inverse"],
+            }
+        )
+    baseline_results = []
+    for name, payload in sorted(baselines.items()):
+        metric = _baseline_metric(payload)
+        if metric is None:
+            continue
+        baseline_results.append(
+            {
+                "name": name,
+                "total_return": metric.get("total_return"),
+                "annualized_sharpe": metric.get("annualized_sharpe"),
+                "max_drawdown": metric.get("max_drawdown"),
+                "total_switches": metric.get("total_switches"),
+            }
+        )
+    cost_stress_results = [
+        {"name": name, "kind": "fixed_rollout", **dict(metric)}
+        for name, metric in sorted(fixed_cost_stress.items())
+        if isinstance(metric, dict)
+    ] + [
+        {"name": name, "kind": "adaptive_policy", **dict(metric)}
+        for name, metric in sorted(adaptive_cost_stress.items())
+        if isinstance(metric, dict)
+    ]
+    model_manifest = {
+        "model_id": run_name,
+        "created_at_utc": created_at,
+        "model_version": model_version,
+        "algorithm": "DoubleDQN",
+        "encoder": "CausalTransformer",
+        "training_dataset": str(args.dataset),
+        "training_dataset_manifest_hash": dataset_manifest_hash,
+        "validation_protocol": {
+            "train_start": args.train_start,
+            "train_end": args.train_end,
+            "val_end": args.val_end,
+            "test_start": args.test_start,
+            "test_end": args.test_end,
+            "purge_rule": "chronological_no_overlap",
+        },
+        "hyperparameters_hash": stable_json_hash(vars(args)),
+        "selected_by": "best_validation_total_return_then_switch_count",
+        "feature_names_hash": hash_string_sequence(train_split.feature_names),
+        "action_names_hash": hash_string_sequence(train_split.action_names),
+        "action_metadata_hash": action_metadata_hash,
+        "action_risk_config_hash": action_risk_config_hash,
+        "constraints": asdict(constraints),
+        "exposure_constraints": asdict(exposure_constraints),
+        "training_artifacts": artifacts,
+        "test_metrics": test_metrics,
+        "baseline_results": baseline_results,
+        "cost_stress_results": cost_stress_results,
+        "frequency_stress_results": [
+            {
+                "name": f"base_{train_split.bar_interval}",
+                "kind": "frequency",
+                "bar_interval": train_split.bar_interval,
+                "total_return": test_metrics.get("total_return"),
+                "max_drawdown": test_metrics.get("max_drawdown"),
+                "annualized_sharpe": test_metrics.get("annualized_sharpe"),
+            }
+        ],
+    }
+    return {
+        "dataset_manifest": dataset_manifest,
+        "feature_manifest": feature_manifest,
+        "model_manifest": model_manifest,
+        "data_quality_report": data_quality_report,
+        "action_eligibility": action_eligibility,
+    }
 
 
 def main() -> int:
@@ -700,6 +1237,10 @@ def main() -> int:
             switch_cost_bps=args.switch_cost_bps,
             extra_switch_penalty_bps=args.extra_switch_penalty_bps,
             count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+            constraints=constraints,
+            exposure_constraints=exposure_constraints,
+            action_meta=action_meta,
+            episode_length=args.episode_length,
         )
     }
     baselines["RandomSameActionDistribution"] = {
@@ -714,6 +1255,10 @@ def main() -> int:
             switch_cost_bps=args.switch_cost_bps,
             extra_switch_penalty_bps=args.extra_switch_penalty_bps,
             count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+            constraints=constraints,
+            exposure_constraints=exposure_constraints,
+            action_meta=action_meta,
+            episode_length=args.episode_length,
         )
     }
     concentration = action_concentration(test_result.rollout_records, action_meta=action_meta)
@@ -755,7 +1300,35 @@ def main() -> int:
         run_dir / "model.pt",
     )
     write_rollout(run_dir / "test_rollout.csv", test_result.rollout_records)
-    write_jsonl(run_dir / "decision_logs.jsonl", test_result.rollout_records)
+    write_decision_logs(run_dir / "decision_logs.jsonl", test_result.rollout_records)
+    report_artifacts = build_reportability_artifacts(
+        args=args,
+        run_name=run_name,
+        train_split=train_split,
+        val_split=val_split,
+        test_split=test_split,
+        action_metadata=action_metadata,
+        action_metadata_hash=action_metadata_hash,
+        action_risk_config_hash=action_risk_config_hash,
+        constraints=constraints,
+        exposure_constraints=exposure_constraints,
+        baselines=baselines,
+        fixed_cost_stress=fixed_cost_stress,
+        adaptive_cost_stress=adaptive_cost_stress,
+        test_metrics=test_result.to_dict(),
+        artifacts=artifacts,
+        model_version=RISK_AWARE_POLICY_MODEL_VERSION,
+        constraint_feature_names=HOURLY_CONSTRAINT_FEATURE_NAMES,
+    )
+    artifact_files = {
+        "feature_manifest": run_dir / "feature_manifest.json",
+        "model_manifest": run_dir / "model_manifest.json",
+        "data_quality_report": run_dir / "data_quality_report.json",
+        "action_eligibility": run_dir / "action_eligibility.json",
+    }
+    for artifact_name, artifact_path in artifact_files.items():
+        with artifact_path.open("w") as sink:
+            json.dump(report_artifacts[artifact_name], sink, indent=2)
     summary = {
         "device": str(device),
         "torch_version": torch.__version__,
@@ -770,6 +1343,8 @@ def main() -> int:
         "action_metadata": action_metadata,
         "action_metadata_hash": action_metadata_hash,
         "action_risk_config_hash": action_risk_config_hash,
+        **report_artifacts,
+        "artifact_files": {name: str(path) for name, path in artifact_files.items()},
         "training": artifacts,
         "train_metrics": train_result.to_dict(),
         "val_metrics": val_result.to_dict(),

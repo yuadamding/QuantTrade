@@ -22,7 +22,7 @@ Use the `ml1` conda environment:
 
 ```bash
 cd /path/to/QuantTrade
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,data]"
 conda run -n ml1 python scripts/check_torch_cuda.py --device auto --matrix-size 1024 --repeats 1 --amp
 ```
 
@@ -33,6 +33,9 @@ conda run -n ml1 python scripts/check_torch_cuda.py --device auto --matrix-size 
 - `strategy_data.py`, `strategy_dqn.py`: daily strategy-allocation dataset loading and DQN allocator.
 - `hourly_transformer.py`: causal-transformer DQN allocator for hourly or minute market context.
 - `minute_to_hour_transformer.py`: hierarchical minute-to-hour causal transformer for hourly allocation decisions using causal minute context.
+- `data_sources/polygon_second_aggs.py`: Polygon 1-second aggregate manifest loader, canonical `timestamp_ms` handling, latency utilities, and audit/reportability checks.
+- `features/stock_second_context.py`: sparse-aware stock-second context compression and gold decision-dataset schema.
+- `second_context_transformer.py`: action-conditioned transformer for compact second-derived market-context datasets.
 - `research_protocol.py`: dataset/model manifests, fit-window validation, benchmark registry, stress evidence, and experiment registry helpers.
 - `bar_transformer.py`: interval-neutral aliases for the transformer allocator.
 - `quote_utils.py`: raw quote parsing, NBBO construction, session utilities, and bucket formatting.
@@ -71,6 +74,16 @@ Minute-to-hour causal-context allocator:
 - Model: minute encoder learns intrahour path context; hour encoder learns multi-hour regime context.
 - Constraints: action masks, minimum hold, daily/episode switch caps, daily/episode order-leg caps, cooldown, leg-aware Q-value hysteresis, and ETF-to-ETF two-leg transaction costs.
 
+Second-context decision allocator:
+
+- Raw data: Polygon top-stock 1-second aggregate bars are treated as an immutable bronze layer.
+- State: sparse second bars are compressed into cross-sectional market/liquidity/breadth context blocks.
+- Decision frequency: 5m, 15m, 30m, or 60m; the default target is 15m/30m rather than second-by-second trading.
+- Actions: `CASH` plus tradable action instruments with their own bar data, validity masks, and per-action costs.
+- Reward: action close-to-close return from the decision execution point to the next decision, net of action-specific cost.
+- Causality: a second bar timestamp is treated as the start of its aggregate interval; default `bar_latency_ms=1000` means a decision at `T` can use bars only through `T - 1s`.
+- Model: action-conditioned transformer scores each action from market context, action features, portfolio state, and constraint state.
+
 Correctness contract:
 
 - Trading rewards are simple returns because environments compound equity with `equity *= 1 + return`.
@@ -78,6 +91,7 @@ Correctness contract:
 - Bar datasets must store both `timestamps` and `next_timestamps`; split builders reject rewards realized after a split end.
 - Bar action rewards are computed from the current decision close to the next decision close, so filtered intermediate bars do not distort returns.
 - Minute-to-hour datasets must satisfy `max(context_minute_ts) <= decision_ts < next_ts`.
+- Second-context datasets must satisfy `context_available_ts <= decision_ts`; invalid action returns must be `NaN` where `action_valid_mask` is false.
 - Evaluation walks `valid_start_indices` exactly and resets previous-action state when valid windows are not contiguous.
 - Strategy and bar loaders validate feature/action names and order across train, validation, and test splits.
 - Numeric strategy inputs are parsed strictly; missing action returns should be fixed upstream, not coerced to zero.
@@ -96,13 +110,30 @@ Bar transformer dataset:
 - `state_features.csv`: human-readable copy of bar state features.
 - `action_returns.csv`: human-readable copy of bar action returns.
 
-Minute-to-hour dataset:
+Subhour-to-hour dataset:
 
 - `hour_from_minute_dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `minute_features`, `minute_mask`, `hour_features`, `action_returns`, feature names, and action names.
-- Default grid: hourly decisions/rewards (`60` minutes) built from `1m` source bars.
-- `minute_features`: tensor shaped `[decisions, hours_lookback, minutes_per_hour, minute_feature_count]`.
-- `minute_mask`: boolean tensor where `True` marks causal valid minute bars.
-- `action_returns`: close-to-close ETF returns from each hourly decision timestamp to the next hourly decision timestamp.
+- Default grid: hourly decisions/rewards (`60` minutes) built from causal subhour source bars.
+- `source_bar_interval`: `1m` for minute context or `1s` for Polygon second-bar context.
+- `minute_features`: backward-compatible tensor name shaped `[decisions, hours_lookback, context_bars_per_hour, feature_count]`.
+- `minute_mask`: boolean tensor where `True` marks causal valid source bars. Sparse second bars remain masked rather than forward-filled.
+- `action_returns`: close-to-close returns from each hourly decision timestamp to the next hourly decision timestamp; second data can use fresh as-of closes when no trade exists at the exact boundary.
+
+Polygon second-bar bronze layer:
+
+- Raw files live under `data/polygon/second_aggs/<dataset>/SYMBOL/YYYY/MM/YYYY-MM-DD.parquet`.
+- `manifest.csv` is the source of truth for symbol-day status and file paths; scripts do not recursively infer completed files from the directory alone.
+- `dataset_manifest.json` should include source/audit fields such as `source`, `source_access`, `provider`, `asset_class`, `bar_type`, `adjusted`, `download_status`, and `universe_asof`.
+- `timestamp_ms` is the canonical machine timestamp. String fields such as `timestamp_utc` and `timestamp_exchange` are display/filtering support.
+- Missing second rows mean no eligible trade in that second. The feature layer keeps activity masks instead of blind forward fills.
+
+Second-context gold dataset:
+
+- `dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `market_context`, `market_context_mask`, `market_context_available_timestamps_ms`, `action_features`, `action_returns`, `action_valid_mask`, `action_cost_bps`, `portfolio_state`, `constraint_state`, feature names, action names, `dataset_manifest`, and `data_quality_report`.
+- `market_context`: `[decisions, lookback_blocks, market_feature_count]`, where each block is compressed from sparse 1-second stock bars.
+- `action_returns`: finite only when the matching `action_valid_mask` is true; invalid entries are stored as `NaN`.
+- `action_cost_bps`: per-action cost estimates; `CASH` must be valid with zero return and zero cost.
+- Datasets built from incomplete downloads are marked non-reportable through `source_download_complete=false` and reportability errors.
 
 Research protocol artifacts:
 
@@ -223,9 +254,64 @@ conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
   --warm-start-model data/rl_hour_from_minute_runs/previous_period/model.pt
 ```
 
+Build hourly decisions from Polygon 1-second aggregate bars. The decision grid
+remains hourly, while each hour token consumes up to 3,600 causal second bars.
+Sparse seconds are represented by `minute_mask`; the model compresses the
+second-level stream to `--max-subhour-tokens` before intrahour attention.
+
+```bash
+conda run -n ml1 python scripts/build_hourly_from_second_context_dataset.py
+```
+
+Train the second-to-hour transformer:
+
+```bash
+conda run -n ml1 python scripts/train_hourly_from_second_context_rl.py \
+  --device auto --amp --target-vram-gb 9.5
+```
+
 The warm-start checkpoint is loaded only after its minute feature names, hour
 feature names, action names, and constraint feature schema match the current
 dataset and code.
+
+Audit newly downloaded Polygon second bars:
+
+```bash
+conda run -n ml1 python scripts/audit_polygon_second_aggs.py \
+  --root /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15 \
+  --manifest /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/manifest.csv \
+  --dataset-manifest /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/dataset_manifest.json \
+  --source-access "AWS S3"
+```
+
+Build compact silver features from stock second bars:
+
+```bash
+conda run -n ml1 python scripts/build_stock_second_silver_features.py \
+  --start 2026-06-12T00:00:00+00:00 \
+  --end-exclusive 2026-06-13T00:00:00+00:00 \
+  --block-seconds 300
+```
+
+Build a gold second-context decision dataset. Stock second bars provide market
+context; action returns should come from the action-bar root for tradable ETF or
+stock actions.
+
+```bash
+conda run -n ml1 python scripts/build_second_context_decision_dataset.py \
+  --decision-interval 15m \
+  --context-seconds 3600 \
+  --block-seconds 300 \
+  --bar-latency-ms 1000 \
+  --actions CASH,QQQ,SPY
+```
+
+Train and evaluate the action-conditioned second-context model:
+
+```bash
+conda run -n ml1 python scripts/train_second_context_rl.py --device auto --amp
+conda run -n ml1 python scripts/evaluate_second_context_dataset.py
+```
 
 Validate research manifests:
 

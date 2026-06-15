@@ -87,11 +87,12 @@ class DatasetManifest:
             raise ResearchProtocolError("action_names must start with CASH.")
         if parse_iso_timestamp(self.first_timestamp) > parse_iso_timestamp(self.last_timestamp):
             raise ResearchProtocolError("first_timestamp must be <= last_timestamp.")
-        if self.universe_selection_date is not None:
-            selection_ts = parse_iso_timestamp(self.universe_selection_date)
-            first_ts = parse_iso_timestamp(self.first_timestamp)
-            if selection_ts > first_ts:
-                raise ResearchProtocolError("universe_selection_date must be before or at first_timestamp.")
+        if self.universe_selection_date is None:
+            raise ResearchProtocolError("universe_selection_date is required for point-in-time universe validation.")
+        selection_ts = parse_iso_timestamp(self.universe_selection_date)
+        first_ts = parse_iso_timestamp(self.first_timestamp)
+        if selection_ts > first_ts:
+            raise ResearchProtocolError("universe_selection_date must be before or at first_timestamp.")
         for window in self.feature_fit_windows:
             window.validate_prior_only()
 

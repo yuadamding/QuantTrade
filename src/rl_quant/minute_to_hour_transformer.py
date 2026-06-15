@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from os import PathLike
 from typing import Any
 
@@ -19,7 +20,7 @@ from rl_quant.core import (
     fractional_max_drawdown,
     make_grad_scaler,
 )
-from rl_quant.hourly_transformer import CudaVramReservation
+from rl_quant.hourly_transformer import CudaVramReservation, _validate_action_return_contract
 from rl_quant.trading_constraints import (
     CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,
@@ -34,6 +35,9 @@ from rl_quant.trading_constraints import (
 
 DEFAULT_HOUR_DECISION_GRID_MINUTES = 60
 DEFAULT_MINUTE_SOURCE_INTERVAL = "1m"
+DEFAULT_SECOND_SOURCE_INTERVAL = "1s"
+DEFAULT_MAX_SUBHOUR_TOKENS = 512
+DEFAULT_SECOND_BAR_LATENCY_MS = 1000
 
 
 class TensorDictReplayBuffer:
@@ -111,6 +115,12 @@ class HourFromMinuteDataSplit:
     decision_grid_minutes: int = DEFAULT_HOUR_DECISION_GRID_MINUTES
     periods_per_year: float = 252.0 * 6.0
     action_valid_mask: torch.Tensor | None = None
+    source_bar_interval: str = DEFAULT_MINUTE_SOURCE_INTERVAL
+    context_bars_per_hour: int | None = None
+
+    @property
+    def effective_context_bars_per_hour(self) -> int:
+        return int(self.context_bars_per_hour or self.minutes_per_hour)
 
     def to(self, device: torch.device | str) -> "HourFromMinuteDataSplit":
         return replace(
@@ -157,11 +167,40 @@ def _parse_utc_timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def source_interval_seconds(interval: str) -> int:
+    text = interval.strip().lower()
+    if text.endswith("s"):
+        value = int(text[:-1])
+    elif text.endswith("m"):
+        value = int(text[:-1]) * 60
+    else:
+        raise ValueError(f"Unsupported source_bar_interval {interval!r}; expected values like 1s, 5s, or 1m.")
+    if value <= 0:
+        raise ValueError("source_bar_interval must be positive.")
+    return value
+
+
+def expected_context_bars_per_hour(source_bar_interval: str) -> int:
+    seconds = source_interval_seconds(source_bar_interval)
+    hour_seconds = DEFAULT_HOUR_DECISION_GRID_MINUTES * 60
+    if hour_seconds % seconds != 0:
+        raise ValueError("source_bar_interval must divide one hourly decision window exactly.")
+    return hour_seconds // seconds
+
+
 def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
     grid = payload["minute_timestamp_grid"]
     mask = payload["minute_mask"].bool()
+    source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
+    default_latency_ms = DEFAULT_SECOND_BAR_LATENCY_MS if source_interval == DEFAULT_SECOND_SOURCE_INTERVAL else 0
+    bar_latency_ms = int(payload.get("bar_latency_ms", default_latency_ms))
+    if bar_latency_ms < 0:
+        raise ValueError("bar_latency_ms must be non-negative.")
+    if source_interval == DEFAULT_SECOND_SOURCE_INTERVAL and bar_latency_ms < DEFAULT_SECOND_BAR_LATENCY_MS:
+        raise ValueError("One-second aggregate context requires bar_latency_ms >= 1000.")
+    latency_delta = timedelta(milliseconds=bar_latency_ms)
     if len(grid) != len(decisions):
         raise ValueError("minute_timestamp_grid length must match decision_timestamps length.")
     if mask.shape[0] != len(decisions):
@@ -182,23 +221,26 @@ def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
                 if not minute_ts:
                     continue
                 minute_dt = _parse_utc_timestamp(str(minute_ts))
-                if bool(mask[row_id, hour_id, minute_id]) and minute_dt > decision_dt:
+                if bool(mask[row_id, hour_id, minute_id]) and minute_dt + latency_delta > decision_dt:
                     raise ValueError(
-                        "Minute context leakage at "
-                        f"row={row_id}, hour={hour_id}, minute={minute_id}: {minute_ts} > {decision_ts}."
+                        "Subhour context leakage at "
+                        f"row={row_id}, hour={hour_id}, minute={minute_id}: "
+                        f"{minute_ts} available after {decision_ts}."
                     )
 
 
 def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
     explicit_stride = payload.get("decision_stride_minutes", payload.get("decision_grid_minutes"))
     if explicit_stride is not None and int(explicit_stride) != DEFAULT_HOUR_DECISION_GRID_MINUTES:
-        raise ValueError("Minute-to-hour datasets must use an hourly decision grid with 60-minute rewards.")
-    explicit_minutes_per_hour = payload.get("minutes_per_hour")
-    if explicit_minutes_per_hour is not None and int(explicit_minutes_per_hour) != DEFAULT_HOUR_DECISION_GRID_MINUTES:
-        raise ValueError("Minute-to-hour datasets must encode each hour from 60 one-minute bars.")
-    source_interval = payload.get("source_bar_interval")
-    if source_interval is not None and source_interval != DEFAULT_MINUTE_SOURCE_INTERVAL:
-        raise ValueError("Minute-to-hour datasets must use 1m source bars.")
+        raise ValueError("Subhour-to-hour datasets must use an hourly decision grid with 60-minute rewards.")
+    source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
+    expected_bars = expected_context_bars_per_hour(source_interval)
+    explicit_context_bars = payload.get("context_bars_per_hour", payload.get("minutes_per_hour"))
+    if explicit_context_bars is not None and int(explicit_context_bars) != expected_bars:
+        raise ValueError(
+            "Subhour-to-hour datasets must encode exactly one hour of source bars per hour token; "
+            f"{source_interval} expects {expected_bars} bars."
+        )
 
     for row_id, (decision_ts, next_ts) in enumerate(zip(payload["decision_timestamps"], payload["next_timestamps"])):
         delta_minutes = (
@@ -260,10 +302,12 @@ def _build_split(
     if not decisions:
         raise ValueError("Minute-to-hour dataset has no decision_timestamps.")
     _assert_increasing(decisions, name="decision_timestamps")
+    decision_dt = [_parse_utc_timestamp(ts) for ts in decisions]
     if len(next_timestamps) != len(decisions):
         raise ValueError("next_timestamps length must match decision_timestamps length.")
-    for decision_ts, next_ts in zip(decisions, next_timestamps):
-        if _parse_utc_timestamp(next_ts) <= _parse_utc_timestamp(decision_ts):
+    next_dt = [_parse_utc_timestamp(ts) for ts in next_timestamps]
+    for decision_ts, current_dt, next_ts, following_dt in zip(decisions, decision_dt, next_timestamps, next_dt):
+        if following_dt <= current_dt:
             raise ValueError(f"next_timestamps must be after decisions; got {decision_ts!r} -> {next_ts!r}.")
 
     all_minute_features = payload["minute_features"].float()
@@ -275,36 +319,44 @@ def _build_split(
         all_action_valid = all_action_valid.bool()
         if tuple(all_action_valid.shape) != tuple(all_returns.shape):
             raise ValueError("action_valid_mask shape must match action_returns shape.")
+    _validate_action_return_contract(all_returns, all_action_valid)
     row_count = len(decisions)
     if all_minute_features.shape[0] != row_count or all_minute_mask.shape[0] != row_count:
         raise ValueError("minute feature/mask row counts must match decision_timestamps length.")
     if all_hour_features.shape[0] != row_count or all_returns.shape[0] != row_count:
         raise ValueError("hour_features and action_returns rows must match decision_timestamps length.")
 
+    start_dt = None if start_ts is None else _parse_utc_timestamp(start_ts)
+    end_dt = None if end_ts is None else _parse_utc_timestamp(end_ts)
     selected = [
         i
-        for i, ts in enumerate(decisions)
-        if (start_ts is None or ts >= start_ts) and (end_ts is None or ts <= end_ts)
+        for i, ts_dt in enumerate(decision_dt)
+        if (start_dt is None or ts_dt >= start_dt) and (end_dt is None or ts_dt <= end_dt)
     ]
     if not selected:
         raise ValueError(f"No rows selected for split {name!r}.")
 
     decision_subset = [decisions[i] for i in selected]
     next_subset = [next_timestamps[i] for i in selected]
+    decision_subset_dt = [decision_dt[i] for i in selected]
+    next_subset_dt = [next_dt[i] for i in selected]
     raw_minute = all_minute_features[selected]
     raw_mask = all_minute_mask[selected]
     raw_hour = all_hour_features[selected]
     returns = all_returns[selected]
     action_valid_mask = all_action_valid[selected] if all_action_valid is not None else None
 
+    reward_after_dt = None if reward_after_ts is None else _parse_utc_timestamp(reward_after_ts)
+    reward_start_dt = None if reward_start_ts is None else _parse_utc_timestamp(reward_start_ts)
+    reward_end_dt = None if reward_end_ts is None else _parse_utc_timestamp(reward_end_ts)
     valid: list[int] = []
-    for index, decision_ts in enumerate(decision_subset):
-        next_ts = next_subset[index]
-        if reward_after_ts is not None and decision_ts <= reward_after_ts:
+    for index, current_dt in enumerate(decision_subset_dt):
+        following_dt = next_subset_dt[index]
+        if reward_after_dt is not None and current_dt <= reward_after_dt:
             continue
-        if reward_start_ts is not None and decision_ts < reward_start_ts:
+        if reward_start_dt is not None and current_dt < reward_start_dt:
             continue
-        if reward_end_ts is not None and next_ts > reward_end_ts:
+        if reward_end_dt is not None and following_dt > reward_end_dt:
             continue
         valid.append(index)
     if not valid:
@@ -346,6 +398,8 @@ def _build_split(
         minutes_per_hour=int(payload.get("minutes_per_hour", raw_minute.shape[2])),
         decision_grid_minutes=int(payload.get("decision_grid_minutes", payload.get("decision_stride_minutes", DEFAULT_HOUR_DECISION_GRID_MINUTES))),
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.0)),
+        source_bar_interval=str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL)),
+        context_bars_per_hour=int(payload.get("context_bars_per_hour", payload.get("minutes_per_hour", raw_minute.shape[2]))),
     )
 
 
@@ -407,6 +461,10 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError(f"Action names/order differ between {reference.name!r} and {split.name!r}.")
         if split.decision_grid_minutes != reference.decision_grid_minutes:
             raise ValueError(f"Decision grid minutes differ between {reference.name!r} and {split.name!r}.")
+        if split.source_bar_interval != reference.source_bar_interval:
+            raise ValueError(f"Source bar interval differs between {reference.name!r} and {split.name!r}.")
+        if split.effective_context_bars_per_hour != reference.effective_context_bars_per_hour:
+            raise ValueError(f"Context bars per hour differ between {reference.name!r} and {split.name!r}.")
         if (split.action_valid_mask is None) != (reference.action_valid_mask is None):
             raise ValueError("Splits must agree on whether action_valid_mask is present.")
         if split.action_valid_mask is not None and split.action_valid_mask.shape[1] != reference.action_returns.shape[1]:
@@ -434,12 +492,16 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         dropout: float = 0.05,
         action_embedding_dim: int = 32,
         constraint_feature_dim: int = CONSTRAINT_FEATURE_DIM,
+        max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
+        if max_subhour_tokens is not None and int(max_subhour_tokens) <= 0:
+            raise ValueError("max_subhour_tokens must be positive when provided.")
         self.hours_lookback = int(hours_lookback)
         self.minutes_per_hour = int(minutes_per_hour)
+        self.max_subhour_tokens = None if max_subhour_tokens is None else int(max_subhour_tokens)
         self.action_count = int(action_count)
         self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.minute_proj = nn.Sequential(nn.Linear(minute_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
@@ -489,6 +551,38 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             self._mask_cache[key] = mask
         return mask
 
+    def _compress_subhour_tokens(
+        self,
+        tokens: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        length = tokens.shape[1]
+        if self.max_subhour_tokens is None or length <= self.max_subhour_tokens:
+            return tokens, valid_mask
+        chunk_size = int(math.ceil(length / float(self.max_subhour_tokens)))
+        chunk_count = int(math.ceil(length / float(chunk_size)))
+        padded_length = chunk_count * chunk_size
+        if padded_length != length:
+            pad_tokens = torch.zeros(
+                (tokens.shape[0], padded_length - length, tokens.shape[2]),
+                dtype=tokens.dtype,
+                device=tokens.device,
+            )
+            pad_mask = torch.zeros(
+                (valid_mask.shape[0], padded_length - length),
+                dtype=valid_mask.dtype,
+                device=valid_mask.device,
+            )
+            tokens = torch.cat([tokens, pad_tokens], dim=1)
+            valid_mask = torch.cat([valid_mask, pad_mask], dim=1)
+        grouped_tokens = tokens.reshape(tokens.shape[0], chunk_count, chunk_size, tokens.shape[2])
+        grouped_mask = valid_mask.reshape(valid_mask.shape[0], chunk_count, chunk_size)
+        weights = grouped_mask.to(tokens.dtype).unsqueeze(-1)
+        counts = weights.sum(dim=2).clamp_min(1.0)
+        compressed = (grouped_tokens * weights).sum(dim=2) / counts
+        compressed_mask = grouped_mask.any(dim=2)
+        return compressed, compressed_mask
+
     def forward(
         self,
         minute_features: torch.Tensor,
@@ -504,6 +598,8 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         x = x + self.minute_pos[:minutes][None, None, :, :]
         x = x.reshape(batch * hours, minutes, -1)
         flat_mask = minute_mask.reshape(batch * hours, minutes).bool()
+        x, flat_mask = self._compress_subhour_tokens(x, flat_mask)
+        minutes = x.shape[1]
         safe_padding_mask = ~flat_mask
         empty_rows = ~flat_mask.any(dim=1)
         if bool(empty_rows.any().item()):
@@ -551,6 +647,7 @@ class MinuteToHourTrainingConfig:
     target_vram_gb: float | None = None
     vram_safety_gb: float = 0.12
     warm_start_model: str | bytes | PathLike[str] | None = None
+    max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS
 
 
 class VectorizedMinuteToHourEnv:
@@ -977,6 +1074,7 @@ def train_minute_to_hour_dqn(
         feedforward_dim=config.feedforward_dim,
         dropout=config.dropout,
         action_embedding_dim=config.action_embedding_dim,
+        max_subhour_tokens=config.max_subhour_tokens,
     ).to(device)
     warm_start_info: dict[str, object] | None = None
     if config.warm_start_model is not None:
@@ -1151,6 +1249,9 @@ def train_minute_to_hour_dqn(
         "uses_constraint_features": True,
         "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
         "warm_start": warm_start_info or {"loaded": False},
+        "source_bar_interval": train_data.source_bar_interval,
+        "context_bars_per_hour": train_data.effective_context_bars_per_hour,
+        "max_subhour_tokens": config.max_subhour_tokens,
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

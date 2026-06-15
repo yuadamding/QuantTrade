@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import json
 import math
 import sys
 import tempfile
@@ -33,6 +34,22 @@ from rl_quant.decision_framework import (  # noqa: E402
     filter_point_in_time_rows,
     readiness_band,
     validate_reportable_summary,
+)
+from rl_quant.data_sources.polygon_second_aggs import (  # noqa: E402
+    PolygonSecondAggConfig,
+    available_timestamp_ms,
+    load_manifest,
+    validate_manifest,
+)
+from rl_quant.features.stock_second_context import (  # noqa: E402
+    StockSecondContextConfig,
+    build_second_context_payload,
+    validate_second_context_payload,
+)
+from rl_quant.second_context_transformer import (  # noqa: E402
+    SecondContextTransformerQNetwork,
+    build_second_context_splits,
+    masked_contextual_q_loss,
 )
 from rl_quant.action_risk import (  # noqa: E402
     ExposureConstraintConfig,
@@ -350,6 +367,298 @@ class MinuteToHourTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hourly decision grid"):
             builder.validate_hourly_grid_args(args)
 
+    def test_second_to_hour_builder_switches_to_second_defaults(self) -> None:
+        builder = load_script("build_hourly_from_minute_context_dataset")
+
+        args = builder.parse_args(["--source-bar-interval", "1s"])
+
+        self.assertEqual(args.minutes_per_hour, 3600)
+        self.assertEqual(args.max_action_staleness_seconds, 300)
+        self.assertEqual(args.bar_latency_ms, 1000)
+        self.assertTrue(args.dense_hourly_grid)
+        self.assertTrue(args.allow_missing_action_context)
+        self.assertIn("rl_hour_from_second", str(args.output_dir))
+
+    def test_second_to_hour_payload_accepts_one_second_context(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["validate_hour_level_decision_grid"])
+
+        module.validate_hour_level_decision_grid(
+            {
+                "decision_timestamps": ["2026-06-12T14:30:00+00:00"],
+                "next_timestamps": ["2026-06-12T15:30:00+00:00"],
+                "source_bar_interval": "1s",
+                "context_bars_per_hour": 3600,
+                "decision_grid_minutes": 60,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "expects 3600 bars"):
+            module.validate_hour_level_decision_grid(
+                {
+                    "decision_timestamps": ["2026-06-12T14:30:00+00:00"],
+                    "next_timestamps": ["2026-06-12T15:30:00+00:00"],
+                    "source_bar_interval": "1s",
+                    "context_bars_per_hour": 60,
+                    "decision_grid_minutes": 60,
+                }
+            )
+
+    def test_second_to_hour_timestamp_grid_rejects_decision_second_leakage(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["validate_minute_timestamp_grid"])
+
+        payload = {
+            "decision_timestamps": ["2026-06-12T15:00:00+00:00"],
+            "next_timestamps": ["2026-06-12T16:00:00+00:00"],
+            "minute_timestamp_grid": [[["2026-06-12T15:00:00+00:00"]]],
+            "minute_mask": torch.tensor([[[True]]], dtype=torch.bool),
+            "source_bar_interval": "1s",
+            "bar_latency_ms": 1000,
+        }
+
+        with self.assertRaisesRegex(ValueError, "Subhour context leakage"):
+            module.validate_minute_timestamp_grid(payload)
+
+        payload["minute_timestamp_grid"] = [[["2026-06-12T14:59:59+00:00"]]]
+        module.validate_minute_timestamp_grid(payload)
+
+    def test_second_level_model_compresses_long_intrahour_context(self) -> None:
+        model = MinuteToHourCausalTransformerQNetwork(
+            minute_feature_dim=2,
+            hour_feature_dim=1,
+            action_count=2,
+            hours_lookback=1,
+            minutes_per_hour=3600,
+            d_model=16,
+            n_heads=4,
+            minute_layers=1,
+            hour_layers=1,
+            feedforward_dim=32,
+            action_embedding_dim=4,
+            max_subhour_tokens=32,
+        )
+
+        q_values = model(
+            torch.zeros((2, 1, 3600, 2), dtype=torch.float32),
+            torch.ones((2, 1, 3600), dtype=torch.bool),
+            torch.zeros((2, 1, 1), dtype=torch.float32),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(q_values.shape), (2, 2))
+
+    def test_polygon_second_manifest_marks_incomplete_download_non_reportable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.csv"
+            dataset_manifest_path = root / "dataset_manifest.json"
+            manifest_path.write_text(
+                "symbol,date,status,rows,output_path,output_size,sha256,elapsed_seconds,error\n"
+                "AAA,2026-06-12,downloaded,10,/tmp/missing.parquet,100,,1,\n"
+                "BBB,2026-06-12,empty,0,,0,,1,\n"
+            )
+            dataset_manifest_path.write_text(
+                json.dumps(
+                    {
+                        "source": "Polygon REST aggregate range endpoint",
+                        "start": "2026-06-12",
+                        "end_exclusive": "2026-06-13",
+                        "symbols": 2,
+                        "market_weekdays": 2,
+                        "remaining_symbol_days": 2,
+                        "timespan": "second",
+                    }
+                )
+            )
+
+            rows = load_manifest(manifest_path)
+            report = validate_manifest(
+                rows,
+                PolygonSecondAggConfig(
+                    root=root,
+                    manifest_csv=manifest_path,
+                    dataset_manifest_json=dataset_manifest_path,
+                ),
+            )
+
+        self.assertFalse(report.reportable)
+        self.assertIn("source_download_incomplete", report.reportability_errors)
+        self.assertIn("manifest_references_missing_files", report.reportability_errors)
+        self.assertEqual(report.source_access, "REST")
+
+    def test_second_bar_available_timestamp_requires_latency(self) -> None:
+        self.assertEqual(available_timestamp_ms(1_000, bar_latency_ms=1_000), 2_000)
+
+        with self.assertRaisesRegex(ValueError, "at least 1000"):
+            available_timestamp_ms(1_000, bar_latency_ms=500)
+
+    def _second_context_frame(self, symbol: str, timestamps: list[str], closes: list[float]):
+        try:
+            import pandas as pd
+        except ModuleNotFoundError:
+            self.skipTest("pandas is required for in-memory second-context frame tests")
+
+        rows = []
+        for timestamp, close in zip(timestamps, closes):
+            ms = int(pd.Timestamp(timestamp).timestamp() * 1000)
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "timestamp_ms": ms,
+                    "timestamp_utc": timestamp,
+                    "timestamp_exchange": pd.Timestamp(timestamp).tz_convert("America/New_York").isoformat(),
+                    "open": close,
+                    "high": close * 1.001,
+                    "low": close * 0.999,
+                    "close": close,
+                    "volume": 100.0,
+                    "vwap": close,
+                    "transactions": 3,
+                    "adjusted": True,
+                    "timespan": "second",
+                    "multiplier": 1,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def _small_second_context_payload(self) -> dict[str, object]:
+        decision = "2026-06-12T14:35:00+00:00"
+        stock_times = ["2026-06-12T14:34:00+00:00", "2026-06-12T14:34:59+00:00"]
+        action_times = [
+            "2026-06-12T14:34:59+00:00",
+            "2026-06-12T14:39:59+00:00",
+        ]
+        config = StockSecondContextConfig(
+            decision_interval="5m",
+            context_seconds=60,
+            block_seconds=60,
+            min_active_symbols=1,
+            max_action_staleness_seconds=5,
+        )
+        try:
+            import pandas as pd
+        except ModuleNotFoundError:
+            self.skipTest("pandas is required for in-memory second-context payload tests")
+        return build_second_context_payload(
+            stock_frames_by_symbol={
+                "AAA": self._second_context_frame("AAA", stock_times, [100.0, 101.0]),
+                "BBB": self._second_context_frame("BBB", stock_times, [50.0, 49.5]),
+            },
+            action_frames_by_symbol={
+                "QQQ": self._second_context_frame("QQQ", action_times, [100.0, 101.0]),
+            },
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[int(pd.Timestamp(decision).timestamp() * 1000)],
+            config=config,
+            dataset_manifest={"source_download_complete": False},
+            data_quality_report={"source_download_complete": False, "reportability_errors": ["source_download_incomplete"]},
+        )
+
+    def test_second_context_payload_uses_latency_and_masks_sparse_blocks(self) -> None:
+        payload = self._small_second_context_payload()
+
+        self.assertEqual(tuple(payload["market_context"].shape[:2]), (1, 1))
+        self.assertTrue(bool(payload["market_context_mask"][0, 0].item()))
+        self.assertLessEqual(
+            int(payload["market_context_available_timestamps_ms"][0, 0].item()),
+            int(payload["decision_timestamps_ms"][0].item()),
+        )
+        self.assertAlmostEqual(float(payload["action_returns"][0, 1].item()), 0.01, places=6)
+        self.assertFalse(payload["dataset_manifest"]["reportable"])
+
+    def test_second_context_payload_rejects_unavailable_context(self) -> None:
+        payload = self._small_second_context_payload()
+        payload["market_context_available_timestamps_ms"] = payload["market_context_available_timestamps_ms"].clone()
+        payload["market_context_available_timestamps_ms"][0, 0] = payload["decision_timestamps_ms"][0] + 1
+
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            validate_second_context_payload(payload)
+
+    def test_second_context_transformer_scores_variable_action_features(self) -> None:
+        payload = self._small_second_context_payload()
+        model = SecondContextTransformerQNetwork(
+            market_feature_dim=payload["market_context"].shape[-1],
+            action_feature_dim=payload["action_features"].shape[-1],
+            portfolio_state_dim=payload["portfolio_state"].shape[-1],
+            constraint_state_dim=payload["constraint_state"].shape[-1],
+            d_model=16,
+            n_heads=4,
+            temporal_layers=1,
+            feedforward_dim=32,
+            max_lookback_blocks=payload["market_context"].shape[1],
+        )
+
+        q_values = model(
+            payload["market_context"],
+            payload["market_context_mask"],
+            payload["action_features"],
+            payload["portfolio_state"],
+            payload["constraint_state"],
+        )
+
+        self.assertEqual(tuple(q_values.shape), (1, 2))
+
+    def test_second_context_loss_ignores_nan_invalid_returns(self) -> None:
+        loss = masked_contextual_q_loss(
+            torch.tensor([[1.0, 2.0]]),
+            torch.tensor([[0.0, float("nan")]]),
+            torch.tensor([[True, False]]),
+            action_cost_bps=torch.zeros((1, 2)),
+        )
+
+        self.assertTrue(bool(torch.isfinite(loss).item()))
+
+    def test_second_context_splits_do_not_overlap_at_boundaries(self) -> None:
+        decisions = [f"2026-06-12T14:{minute:02d}:00+00:00" for minute in range(30, 60, 5)]
+        next_timestamps = [*decisions[1:], "2026-06-12T15:00:00+00:00"]
+        payload = {
+            "schema_version": "stock_second_context_decision_v2",
+            "decision_timestamps": decisions,
+            "next_timestamps": next_timestamps,
+            "decision_timestamps_ms": torch.tensor([1_000 * index for index in range(len(decisions))], dtype=torch.long),
+            "next_timestamps_ms": torch.tensor([1_000 * (index + 1) for index in range(len(decisions))], dtype=torch.long),
+            "market_context": torch.zeros((len(decisions), 1, 2), dtype=torch.float32),
+            "market_context_mask": torch.ones((len(decisions), 1), dtype=torch.bool),
+            "market_context_available_timestamps_ms": torch.tensor(
+                [[1_000 * index - 1] for index in range(len(decisions))],
+                dtype=torch.long,
+            ),
+            "action_features": torch.zeros((len(decisions), 2, 1), dtype=torch.float32),
+            "action_returns": torch.zeros((len(decisions), 2), dtype=torch.float32),
+            "action_valid_mask": torch.ones((len(decisions), 2), dtype=torch.bool),
+            "action_cost_bps": torch.zeros((len(decisions), 2), dtype=torch.float32),
+            "portfolio_state": torch.zeros((len(decisions), 1), dtype=torch.float32),
+            "constraint_state": torch.zeros((len(decisions), 1), dtype=torch.float32),
+            "feature_names": {
+                "market_context": ["x", "y"],
+                "action_features": ["a"],
+                "portfolio_state": ["p"],
+                "constraint_state": ["c"],
+            },
+            "action_names": ["CASH", "QQQ"],
+            "dataset_manifest": {
+                "decision_interval": "5m",
+                "source_download_complete": True,
+                "reportable": True,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            torch.save(payload, path)
+
+            train, val, test = build_second_context_splits(
+                dataset_path=path,
+                train_end="2026-06-12T14:35:00+00:00",
+                val_end="2026-06-12T14:45:00+00:00",
+                test_start="2026-06-12T14:45:00+00:00",
+            )
+
+        self.assertEqual(train.decision_timestamps, decisions[:2])
+        self.assertEqual(val.decision_timestamps, ["2026-06-12T14:40:00+00:00"])
+        self.assertEqual(test.decision_timestamps, decisions[3:])
+        self.assertTrue(set(train.decision_timestamps).isdisjoint(val.decision_timestamps))
+        self.assertTrue(set(val.decision_timestamps).isdisjoint(test.decision_timestamps))
+
     def test_min_hold_action_mask_allows_only_current_action(self) -> None:
         mask = build_action_mask(
             current_action=torch.tensor([3]),
@@ -649,7 +958,7 @@ class MinuteToHourTests(unittest.TestCase):
                 path,
             )
 
-            with self.assertRaisesRegex(ValueError, "Minute context leakage"):
+            with self.assertRaisesRegex(ValueError, "context leakage"):
                 module._load_payload(path)
 
     def test_minute_to_hour_payload_rejects_non_hourly_reward_grid(self) -> None:
@@ -763,6 +1072,30 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(result.allocation_switches, 0)
         self.assertEqual([row["asset"] for row in result.rollout_records], ["CASH"])
 
+    def test_minute_to_hour_split_rejects_finite_returns_for_invalid_actions(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
+        payload = {
+            "decision_timestamps": [
+                "2026-01-02T14:30:00+00:00",
+                "2026-01-02T15:30:00+00:00",
+            ],
+            "next_timestamps": [
+                "2026-01-02T15:30:00+00:00",
+                "2026-01-02T16:30:00+00:00",
+            ],
+            "minute_feature_names": ["m"],
+            "hour_feature_names": ["h"],
+            "action_names": ["CASH", "QQQ"],
+            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
+            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
+            "action_returns": torch.zeros((2, 2), dtype=torch.float32),
+            "action_valid_mask": torch.tensor([[True, False], [True, True]]),
+        }
+
+        with self.assertRaisesRegex(ValueError, "Invalid action_returns"):
+            module._build_split(name="train", payload=payload)
+
 
 class HourlySplitTests(unittest.TestCase):
     def test_next_timestamps_are_required(self) -> None:
@@ -824,6 +1157,46 @@ class HourlySplitTests(unittest.TestCase):
         self.assertNotIn(1, split.valid_start_indices.tolist())
         for index in split.valid_start_indices.tolist():
             self.assertLessEqual(split.next_timestamps[index], "2026-01-02T14:35:00+00:00")
+
+    def test_direct_hourly_split_orders_mixed_timezones_by_utc_instant(self) -> None:
+        hourly = __import__("rl_quant.hourly_transformer", fromlist=["_build_split"])
+        payload = {
+            "timestamps": [
+                "2026-01-02T14:30:00+00:00",
+                "2026-01-02T09:45:00-05:00",
+                "2026-01-02T15:00:00+00:00",
+                "2026-01-02T10:15:00-05:00",
+            ],
+            "next_timestamps": [
+                "2026-01-02T09:45:00-05:00",
+                "2026-01-02T15:00:00+00:00",
+                "2026-01-02T10:15:00-05:00",
+                "2026-01-02T15:30:00+00:00",
+            ],
+            "feature_names": ["x"],
+            "action_names": ["CASH", "QQQ"],
+            "features": torch.zeros((4, 1), dtype=torch.float32),
+            "action_returns": torch.zeros((4, 2), dtype=torch.float32),
+        }
+
+        split = hourly._build_split(name="train", payload=payload, lookback=1)
+
+        self.assertEqual(split.timestamps[1], "2026-01-02T09:45:00-05:00")
+
+    def test_direct_hourly_split_rejects_finite_returns_for_invalid_actions(self) -> None:
+        hourly = __import__("rl_quant.hourly_transformer", fromlist=["_build_split"])
+        payload = {
+            "timestamps": [f"2026-01-02T14:{minute:02d}:00+00:00" for minute in range(30, 34)],
+            "next_timestamps": [f"2026-01-02T14:{minute:02d}:00+00:00" for minute in range(31, 35)],
+            "feature_names": ["x"],
+            "action_names": ["CASH", "QQQ"],
+            "features": torch.zeros((4, 1), dtype=torch.float32),
+            "action_returns": torch.zeros((4, 2), dtype=torch.float32),
+            "action_valid_mask": torch.tensor([[True, False], [True, True], [True, True], [True, True]]),
+        }
+
+        with self.assertRaisesRegex(ValueError, "Invalid action_returns"):
+            hourly._build_split(name="train", payload=payload, lookback=1)
 
 
 class ActionRiskTests(unittest.TestCase):
@@ -1374,6 +1747,132 @@ class EvaluationTests(unittest.TestCase):
         self.assertIn("total_return", same_turnover)
         self.assertIn("total_return", same_distribution)
 
+    def test_random_baseline_applies_full_exposure_mask(self) -> None:
+        module = load_script("train_hourly_causal_transformer_rl")
+        split = self._direct_bar_split()
+        split = replace(
+            split,
+            action_names=["CASH", "QQQ", "SOXS"],
+            action_returns=torch.tensor(
+                [
+                    [0.0, 0.0, 0.50],
+                    [0.0, 0.0, 0.50],
+                    [0.0, 0.0, 0.50],
+                    [0.0, 0.0, 0.50],
+                    [0.0, 0.0, 0.50],
+                    [0.0, 0.0, 0.50],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        metadata = build_action_metadata(split.action_names)
+        weights = action_weight_tensor(metadata, device="cpu", max_effective_leverage=1.0)
+        rollout = [{"action": 2, "previous_action": 0} for _ in split.valid_start_indices.tolist()]
+
+        baseline = module.random_same_action_distribution_baseline(
+            split,
+            rollout,
+            seed=9,
+            n_paths=4,
+            initial_action=0,
+            cash_index=0,
+            action_weights=weights,
+            switch_cost_bps=0.0,
+            extra_switch_penalty_bps=0.0,
+            constraints=BarTradingConstraintConfig(one_way_cost_bps=0.0),
+            exposure_constraints=ExposureConstraintConfig(
+                allow_inverse_actions=False,
+                max_leveraged_bars_per_day=None,
+                max_consecutive_leveraged_bars=None,
+                max_same_group_share_per_day=None,
+            ),
+            action_meta=metadata,
+            episode_length=4,
+        )
+
+        self.assertEqual(baseline["total_return"], 0.0)
+
+    def test_direct_hourly_eval_captures_valid_decision_log_payload(self) -> None:
+        class FixedPolicy(nn.Module):
+            def forward(
+                self,
+                state_windows: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                return torch.tensor([[0.0, 1.0, -1.0]], device=state_windows.device).repeat(
+                    state_windows.shape[0],
+                    1,
+                )
+
+        module = load_script("train_hourly_causal_transformer_rl")
+        result = evaluate_hourly_policy(
+            self._direct_bar_split(),
+            FixedPolicy(),
+            device=torch.device("cpu"),
+            initial_action=0,
+            constraints=BarTradingConstraintConfig(one_way_cost_bps=0.0),
+            capture_rollout=True,
+        )
+        first = result.rollout_records[0]
+
+        self.assertIn("q_values", first)
+        self.assertIn("candidates", first)
+        self.assertIn("risk_checks", first)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "decision_logs.jsonl"
+            module.write_decision_logs(path, [first])
+            payload = json.loads(path.read_text().splitlines()[0])
+
+        self.assertEqual(payload["selected_action"], first["selected_action"])
+        self.assertIn(first["selected_action"], payload["q_values"])
+
+    def test_reportability_artifacts_cover_required_summary_sections(self) -> None:
+        module = load_script("train_hourly_causal_transformer_rl")
+        split = self._direct_bar_split()
+        metadata = [item.to_dict() for item in build_action_metadata(split.action_names)]
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_path = Path(directory) / "dataset.pt"
+            (dataset_path.parent / "dataset_manifest.json").write_text('{"dataset_id": "demo"}\n')
+            args = module.parse_args(["--dataset", str(dataset_path), "--run-name", "unit"])
+            constraints = BarTradingConstraintConfig(one_way_cost_bps=0.0)
+            exposure = ExposureConstraintConfig(max_same_group_share_per_day=None)
+            artifacts = module.build_reportability_artifacts(
+                args=args,
+                run_name="unit",
+                train_split=split,
+                val_split=split,
+                test_split=split,
+                action_metadata=metadata,
+                action_metadata_hash="actions",
+                action_risk_config_hash="risk",
+                constraints=constraints,
+                exposure_constraints=exposure,
+                baselines={
+                    "CASH": {"test": {"total_return": 0.0}},
+                    "RandomSameTurnover": {"test": {"total_return": 0.0}},
+                },
+                fixed_cost_stress={},
+                adaptive_cost_stress={},
+                test_metrics={"total_return": 0.0, "max_drawdown": 0.0, "annualized_sharpe": None},
+                artifacts={},
+                model_version=3,
+                constraint_feature_names=[],
+            )
+        summary = {
+            **artifacts,
+            "test_metrics": {"total_return": 0.0},
+            "baselines": {
+                "CASH": {"test": {"total_return": 0.0}},
+                "RandomSameTurnover": {"test": {"total_return": 0.0}},
+            },
+            "cost_stress": {"fixed_rollout": {}, "adaptive": {}},
+            "action_concentration": {"max_risky_group_share": 0.0, "leveraged_action_share": 0.0},
+            "return_diagnostics": {},
+        }
+
+        self.assertEqual(validate_reportable_summary(summary), [])
+
     def test_evaluation_uses_valid_indices_and_resets_at_gaps(self) -> None:
         class FixedPolicy(nn.Module):
             def forward(
@@ -1811,6 +2310,30 @@ class DecisionFrameworkTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_validate_reportable_summary_flags_missing_dataset_manifest_file(self) -> None:
+        errors = validate_reportable_summary(
+            {
+                "dataset_manifest": {"manifest_available": False},
+                "feature_manifest": {},
+                "model_manifest": {},
+                "data_quality_report": {},
+                "action_eligibility": [],
+                "test_metrics": {"total_return": 0.0},
+                "baselines": {
+                    "CASH": {"test": {"total_return": 0.0}},
+                    "RandomSameTurnover": {"test": {"total_return": 0.0}},
+                },
+                "cost_stress": {"fixed_rollout": {}, "adaptive": {}},
+                "action_concentration": {
+                    "max_risky_group_share": 0.0,
+                    "leveraged_action_share": 0.0,
+                },
+                "return_diagnostics": {},
+            }
+        )
+
+        self.assertEqual(errors, ["dataset_manifest_file_missing"])
+
 
 class RepositoryHygieneTests(unittest.TestCase):
     def test_no_current_tree_secret_literals(self) -> None:
@@ -1870,6 +2393,24 @@ class ResearchProtocolTests(unittest.TestCase):
         bad.universe_selection_date = "2026-01-03T00:00:00+00:00"
         with self.assertRaises(ResearchProtocolError):
             bad.validate()
+
+        missing = DatasetManifest.from_dict(manifest.to_dict())
+        missing.universe_selection_date = None
+        with self.assertRaisesRegex(ResearchProtocolError, "universe_selection_date is required"):
+            missing.validate()
+
+    def test_universe_selection_date_resolver_uses_latest_universe_file_date(self) -> None:
+        module = load_script("build_hourly_transformer_dataset")
+        args = module.parse_args(
+            [
+                "--stock-universe",
+                "/tmp/top_us_volume_stocks_2026-06-14.csv",
+                "--etf-universe",
+                "/tmp/top_us_volume_etfs_2026-06-13.csv",
+            ]
+        )
+
+        self.assertEqual(module.resolve_universe_selection_date(args), "2026-06-14T00:00:00+00:00")
 
     def test_model_manifest_requires_baselines_and_stress_tests(self) -> None:
         protocol = EvaluationProtocol(

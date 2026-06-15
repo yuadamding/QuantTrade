@@ -65,6 +65,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--feedforward-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--action-embedding-dim", type=int, default=32)
+    parser.add_argument(
+        "--max-subhour-tokens",
+        type=int,
+        default=512,
+        help="Compress each hour of source bars to at most this many intrahour transformer tokens.",
+    )
     parser.add_argument("--one-way-cost-bps", type=float, default=1.0)
     parser.add_argument("--extra-switch-penalty-bps", type=float, default=1.0)
     parser.add_argument("--q-switch-margin-bps", type=float, default=3.0)
@@ -165,6 +171,7 @@ def main() -> int:
     print(
         f"Minute tensor: {tuple(train_split.minute_features.shape[1:])} | "
         f"Hour tensor: {tuple(train_split.hour_features.shape[1:])} | "
+        f"Source interval: {train_split.source_bar_interval} | "
         f"Actions: {len(train_split.action_names)}"
     )
 
@@ -205,6 +212,7 @@ def main() -> int:
         target_vram_gb=args.target_vram_gb,
         vram_safety_gb=args.vram_safety_gb,
         warm_start_model=args.warm_start_model,
+        max_subhour_tokens=args.max_subhour_tokens,
     )
     model, artifacts = train_minute_to_hour_dqn(train_split, val_split, device=device, config=config)
     train_result = evaluate_minute_to_hour_policy(
@@ -253,6 +261,9 @@ def main() -> int:
             "minute_feature_names": train_split.minute_feature_names,
             "hour_feature_names": train_split.hour_feature_names,
             "action_names": train_split.action_names,
+            "source_bar_interval": train_split.source_bar_interval,
+            "context_bars_per_hour": train_split.effective_context_bars_per_hour,
+            "max_subhour_tokens": args.max_subhour_tokens,
             "constraints": asdict(constraints),
             "config": serializable_args,
             "warm_start": artifacts.get("warm_start"),
@@ -269,6 +280,9 @@ def main() -> int:
         "minute_feature_names": train_split.minute_feature_names,
         "hour_feature_names": train_split.hour_feature_names,
         "action_names": train_split.action_names,
+        "source_bar_interval": train_split.source_bar_interval,
+        "context_bars_per_hour": train_split.effective_context_bars_per_hour,
+        "max_subhour_tokens": args.max_subhour_tokens,
         "training": artifacts,
         "train_metrics": train_result.to_dict(),
         "val_metrics": val_result.to_dict(),
