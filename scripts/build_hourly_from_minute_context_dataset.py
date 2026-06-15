@@ -717,11 +717,15 @@ def main() -> int:
         {
             "decision_timestamps": decision_timestamps,
             "next_timestamps": next_timestamps,
+            "subhour_timestamp_grid": minute_timestamp_grid,
             "minute_timestamp_grid": minute_timestamp_grid,
+            "subhour_feature_names": minute_feature_names,
             "minute_feature_names": minute_feature_names,
             "hour_feature_names": hour_feature_names,
             "action_names": action_names,
+            "subhour_features": minute_features,
             "minute_features": minute_features,
+            "subhour_mask": minute_mask,
             "minute_mask": minute_mask,
             "hour_features": hour_features,
             "action_returns": action_returns,
@@ -787,6 +791,7 @@ def main() -> int:
     }
     metadata = {
         "rows": len(decision_timestamps),
+        "subhour_shape": list(minute_features.shape),
         "minute_shape": list(minute_features.shape),
         "hour_shape": list(hour_features.shape),
         "action_count": len(action_names),

@@ -1,179 +1,785 @@
-# rl_quant
+# QuantTrade
 
-Compact reinforcement-learning trading framework for the research in this
-workspace. The package code lives in `src/rl_quant`; executable workflows live
-in `scripts`. Scripts are designed to be run from the repository root. Use
-repo-relative `data/` and `derived/` paths unless explicit paths are passed.
+QuantTrade is a compact research framework for reinforcement-learning and
+action-scoring trading experiments. It focuses on point-in-time datasets,
+causal market context, explicit action masks, cost-aware evaluation, and
+reportability manifests.
 
-This is research backtesting code under simplified data and execution
-assumptions. It is not live-trading-ready; broker credentials and live order
-placement must stay outside this repository and require explicit opt-in guards.
+This repository is not a live-trading system. It contains backtesting,
+dataset-building, model-training, and research-audit code. Broker credentials,
+live order routing, and production execution must remain outside this
+repository unless a separate live-trading layer is added with explicit opt-in
+guards.
 
-QuantTrade is organized around a point-in-time research protocol. A valid
-experiment must declare the data manifest, feature fit windows, decision
-schedule, action universe, trading constraints, cost/execution model,
-validation protocol, baselines, and hyperparameter search space. A result is
-not reportable unless features are available at or before decision time, reward
-realization stays inside the split, schemas match exactly, trading constraints
-are applied during training and evaluation, costs are leg-aware, cost/frequency
-stress evidence is present, and registered baselines are included.
+## Table Of Contents
 
-Use the `ml1` conda environment:
+- [Project Purpose](#project-purpose)
+- [Current Research Direction](#current-research-direction)
+- [Safety And Reportability](#safety-and-reportability)
+- [Environment](#environment)
+- [Repository Layout](#repository-layout)
+- [Architecture](#architecture)
+- [Data Roots And Storage](#data-roots-and-storage)
+- [Data Layers](#data-layers)
+- [Supported Research Workflows](#supported-research-workflows)
+- [Data Formats](#data-formats)
+- [Model Families](#model-families)
+- [Training And Evaluation Artifacts](#training-and-evaluation-artifacts)
+- [Common Commands](#common-commands)
+- [Script Inventory](#script-inventory)
+- [Correctness Contract](#correctness-contract)
+- [Testing And Quality Checks](#testing-and-quality-checks)
+- [Troubleshooting](#troubleshooting)
+- [Glossary](#glossary)
 
-```bash
-cd /path/to/QuantTrade
-python -m pip install -e ".[dev,data]"
-conda run -n ml1 python scripts/check_torch_cuda.py --device auto --matrix-size 1024 --repeats 1 --amp
+## Project Purpose
+
+QuantTrade is designed to answer research questions like:
+
+- Can a model allocate among strategies, ETFs, or stocks without using future
+  data?
+- Can high-frequency data be compressed into small decision rows that fit GPU
+  training?
+- Can a trading policy be evaluated with realistic masks, latency, costs,
+  terminal position handling, and baseline comparisons?
+- Can datasets and model runs be audited after the fact from manifests?
+
+The framework deliberately separates:
+
+```text
+raw market data
+-> source-specific bronze files
+-> sparse-aware silver features
+-> compact gold decision tensors
+-> model training
+-> sequential evaluation and reportability checks
 ```
 
-## Package Layout
+The most important design principle is point-in-time causality. A feature,
+constraint, cost estimate, or action feature can be a model input only if it is
+available at or before the decision timestamp.
 
-- `core.py`: shared torch runtime, CUDA/AMP helpers, replay buffer, metrics, and temporal Q-network blocks.
-- `intraday_data.py`, `intraday_dqn.py`: QQQ NBBO feature loading and intraday DQN trading.
-- `strategy_data.py`, `strategy_dqn.py`: daily strategy-allocation dataset loading and DQN allocator.
-- `hourly_transformer.py`: causal-transformer DQN allocator for hourly or minute market context.
-- `minute_to_hour_transformer.py`: hierarchical minute-to-hour causal transformer for hourly allocation decisions using causal minute context.
-- `data_sources/polygon_second_aggs.py`: Polygon 1-second aggregate manifest loader, canonical `timestamp_ms` handling, latency utilities, and audit/reportability checks.
-- `features/stock_second_context.py`: sparse-aware stock-second context compression and gold decision-dataset schema.
-- `second_context_transformer.py`: action-conditioned transformer for compact second-derived market-context datasets.
-- `research_protocol.py`: dataset/model manifests, fit-window validation, benchmark registry, stress evidence, and experiment registry helpers.
-- `bar_transformer.py`: interval-neutral aliases for the transformer allocator.
-- `quote_utils.py`: raw quote parsing, NBBO construction, session utilities, and bucket formatting.
+## Current Research Direction
 
-## Policies
+The preferred direction is no longer direct one-minute action switching. The
+current framework prioritizes:
 
-Intraday DQN:
+- Hour-level decision grids for stability.
+- Minute-level or second-level source data for context.
+- Causal subhour encoders that learn intrahour dynamics.
+- Compact second-context decision tensors for large top-volume universes.
+- Action-conditioned models that score each action from market context,
+  action metadata, costs, portfolio state, and constraints.
 
-- State: rolling windows of QQQ NBBO bucket features.
-- Actions: discrete `short`, `flat`, `long` exposure.
-- Reward: realized mid-price PnL over a configurable step horizon after optional latency and costs.
-- Frequency: raw quote data converted to fixed buckets; default is 1-second buckets.
+The second-context path is currently a contextual action scorer plus sequential
+diagnostics. It is useful for ranking actions under a fixed decision dataset,
+but it should not be overstated as a complete end-to-end sequential RL policy
+until prior-action state, order constraints, and risk budgets are trained
+directly in the environment.
 
-Daily strategy allocator:
+## Safety And Reportability
 
-- State: daily market/strategy features, optionally augmented with ecological attention context.
-- Actions: complete strategy curves such as `BH_QQQ`, cross-sectional momentum, dual momentum, and filtered variants.
-- Reward: next daily close-to-close return of the selected strategy minus optional strategy-switch cost.
-- Frequency: daily close-to-close rows, focused on 2026.
+This is research code. A result is not reportable unless all of the following
+are true:
 
-Bar causal-transformer allocator:
+- Every model input is available no later than the decision timestamp.
+- Rewards are realized fully inside the split being evaluated.
+- Train, validation, and test schemas match exactly.
+- Feature and normalizer fit windows end before validation/test usage.
+- Trading constraints are applied during both training and evaluation.
+- Costs are leg-aware and action-specific when possible.
+- Terminal positions are either liquidated with cost or reported as open.
+- Registered baselines and cost/frequency stress tests are included.
+- Source data completeness and known limitations are declared in manifests.
+- Invalid action returns are stored as `NaN`, never silently as zero.
 
-- State: rolling bar windows containing top-stock cross-section features, time features, and ETF context.
-- Actions: `CASH` plus selected liquid ETF actions.
-- Reward: next aligned simple bar return for the selected ETF action, net of leg-aware order costs.
-- Model: masked transformer encoder with previous-action embedding; attention is causal across the lookback window.
-- Frequency: Yahoo Finance `1h` or `1m` exchange-session bars.
-- Constraints: optional action masks, minimum hold, cooldown, daily/episode switch caps, daily/episode order-leg caps, leg-aware Q-value hysteresis, and ETF-to-ETF two-leg transaction costs.
+This repository should not contain secrets. `.env.example` documents optional
+environment variable names only:
 
-Minute-to-hour causal-context allocator:
+```text
+RAPIDAPI_KEY
+RAPIDAPI_HOST
+BROKER_TRADING_PASSWORD
+```
 
-- Decision frequency: hourly boundaries only.
-- State: `H` historical hour tokens, each encoded from up to `M` causal minute bars ending no later than the decision timestamp.
-- Actions: `CASH` plus selected liquid ETF actions.
-- Reward: selected ETF simple return from the decision close to the next hourly decision close.
-- Model: minute encoder learns intrahour path context; hour encoder learns multi-hour regime context.
-- Constraints: action masks, minimum hold, daily/episode switch caps, daily/episode order-leg caps, cooldown, leg-aware Q-value hysteresis, and ETF-to-ETF two-leg transaction costs.
+Do not commit actual API keys, S3 credentials, broker credentials, large raw
+datasets, generated model checkpoints, or generated run directories.
 
-Second-context decision allocator:
+## Environment
 
-- Raw data: Polygon top-stock 1-second aggregate bars are treated as an immutable bronze layer.
-- State: sparse second bars are compressed into cross-sectional market/liquidity/breadth context blocks.
-- Decision frequency: 5m, 15m, 30m, or 60m; the default target is 15m/30m rather than second-by-second trading.
-- Actions: `CASH` plus tradable action instruments with their own bar data, validity masks, and per-action costs.
-- Reward: action close-to-close return from the post-decision execution point to the post-reward execution point, net of action-specific cost.
-- Causality: a second bar timestamp is treated as the start of its aggregate interval; default `bar_latency_ms=1000` means a decision at `T` can use context bars only through `T - 1s`, and default `execution_latency_ms=1000` means non-cash action fills must occur at or after `T + 1s`.
-- Model: action-conditioned transformer scores each action from market context, action features, portfolio state, and constraint state.
+Use the `ml1` conda environment used by this workspace:
 
-Correctness contract:
+```bash
+cd /home/yding1995/quant/QuantTrade
+conda run -n ml1 python -m pip install -e ".[dev,data]"
+```
 
-- Trading rewards are simple returns because environments compound equity with `equity *= 1 + return`.
-- Log returns may appear as state features only, for example `bar_log_return`.
-- Bar datasets must store both `timestamps` and `next_timestamps`; split builders reject rewards realized after a split end.
-- Bar action rewards are computed from the current decision close to the next decision close, so filtered intermediate bars do not distort returns.
-- Minute-to-hour datasets must satisfy `max(context_minute_ts) <= decision_ts < next_ts`.
-- Second-context datasets must satisfy `context_available_ts <= decision_ts`; invalid action returns must be `NaN` where `action_valid_mask` is false.
-- Evaluation walks `valid_start_indices` exactly and resets previous-action state when valid windows are not contiguous.
-- Strategy and bar loaders validate feature/action names and order across train, validation, and test splits.
-- Numeric strategy inputs are parsed strictly; missing action returns should be fixed upstream, not coerced to zero.
+Core dependencies are intentionally small:
+
+- Python `>=3.11`
+- `torch>=2.8,<3`
+- `numpy>=2.2,<3`
+- Optional data stack: `pandas`, `pyarrow`
+- Development tools: `pytest`, `ruff`, `mypy`
+
+Check CUDA and AMP availability:
+
+```bash
+conda run -n ml1 python scripts/check_torch_cuda.py \
+  --device auto \
+  --matrix-size 2048 \
+  --repeats 2 \
+  --amp
+```
+
+Most training scripts accept:
+
+```text
+--device auto
+--amp
+--target-vram-gb 9.5
+```
+
+`--device auto` uses CUDA when available. `--amp` enables mixed precision only
+when the chosen device is CUDA.
+
+## Repository Layout
+
+```text
+QuantTrade/
+  README.md
+  pyproject.toml
+  .env.example
+  docs/
+    decision_tensor_protocol.md
+  src/rl_quant/
+    core.py
+    action_risk.py
+    bar_transformer.py
+    decision_framework.py
+    hourly_transformer.py
+    intraday_data.py
+    intraday_dqn.py
+    minute_to_hour_transformer.py
+    quote_utils.py
+    research_protocol.py
+    second_context_transformer.py
+    strategy_data.py
+    strategy_dqn.py
+    trading_constraints.py
+    data_sources/
+      polygon_second_aggs.py
+    features/
+      stock_second_context.py
+  scripts/
+    *.py
+  tests/
+    test_correctness.py
+```
+
+Important modules:
+
+| Module | Purpose |
+| --- | --- |
+| `core.py` | Torch runtime setup, CUDA/AMP helpers, replay buffers, metrics, and shared Q-network blocks. |
+| `research_protocol.py` | Dataset/model manifests, stable hashes, fit-window validation, benchmark registry, and stress evidence helpers. |
+| `decision_framework.py` | Point-in-time feature availability, readiness scoring, action eligibility, and decision dataset checks. |
+| `trading_constraints.py` | Action masks, min-hold, cooldown, switch caps, order-leg caps, and leg-aware hysteresis. |
+| `action_risk.py` | Action metadata, leverage/inverse flags, risk buckets, and stable action metadata hashes. |
+| `hourly_transformer.py` | Direct bar-level causal transformer DQN allocator. |
+| `minute_to_hour_transformer.py` | Hierarchical subhour-to-hour transformer for hourly allocation decisions from minute or second context. |
+| `second_context_transformer.py` | Action-conditioned transformer scorer for compact second-context decision tensors. |
+| `features/stock_second_context.py` | Sparse-aware 1-second stock context compression and gold decision tensor validation. |
+| `data_sources/polygon_second_aggs.py` | Polygon second aggregate manifest loading, timestamp handling, and audit utilities. |
+| `intraday_data.py`, `intraday_dqn.py` | QQQ quote/NBBO feature loading and intraday DQN training. |
+| `strategy_data.py`, `strategy_dqn.py` | Daily strategy-allocation dataset loading and DQN allocation. |
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[External market data] --> B[Bronze raw files]
+    B --> C[Silver features and audits]
+    C --> D[Gold decision datasets]
+    D --> E[Dataset validators]
+    E --> F[RL trainers and action scorers]
+    F --> G[Sequential evaluation]
+    G --> H[Run manifests and summaries]
+
+    B --> B1[Yahoo daily/hourly/minute bars]
+    B --> B2[Polygon 1-second aggregates]
+    B --> B3[QQQ raw quotes]
+
+    D --> D1[Daily strategy allocator]
+    D --> D2[Direct bar transformer]
+    D --> D3[Subhour-to-hour transformer]
+    D --> D4[Second-context decision tensor]
+```
+
+Data should move forward through the layers. Training code should not parse raw
+vendor files directly when a validated dataset builder exists.
+
+## Data Roots And Storage
+
+Scripts are designed to run from the repository root.
+
+Most legacy scripts use `PROJECT_ROOT`:
+
+```text
+PROJECT_ROOT = checkout root
+derived/      = generated universes, downloaded Yahoo data, backtests, and runs
+data/         = local data when the checkout is standalone
+```
+
+The newer high-frequency scripts use a shared data root:
+
+```text
+if checkout is /home/yding1995/quant/QuantTrade and /home/yding1995/quant/data exists:
+    DATA_ROOT = /home/yding1995/quant/data
+else:
+    DATA_ROOT = QuantTrade/data
+```
+
+Expected local high-frequency paths in this workspace:
+
+```text
+/home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15
+/home/yding1995/quant/data/rl_decision_datasets
+/home/yding1995/quant/data/rl_hour_from_minute
+/home/yding1995/quant/data/rl_hour_from_second
+/home/yding1995/quant/data/second_context_runs
+```
+
+Large generated assets should stay under `data/` or `derived/`, not inside
+`src/`, `scripts/`, or `tests/`.
+
+## Data Layers
+
+### Bronze
+
+Bronze files are raw or minimally normalized source files.
+
+Examples:
+
+- Yahoo daily/hourly/minute OHLCV CSV files.
+- Polygon 1-second aggregate Parquet files.
+- Raw QQQ quote files used to build NBBO buckets.
+
+Polygon second aggregate layout:
+
+```text
+data/polygon/second_aggs/<dataset>/
+  manifest.csv
+  dataset_manifest.json
+  SYMBOL/YYYY/MM/YYYY-MM-DD.parquet
+```
+
+`manifest.csv` is the source of truth for symbol-day status. Do not infer
+completion only from recursive files on disk.
+
+### Silver
+
+Silver features are source-specific cleaned or compressed tables.
+
+Examples:
+
+- Sparse-aware stock second context CSV from `build_stock_second_silver_features.py`.
+- Market ecology daily context from `learn_market_ecological_attention.py`.
+- NBBO bucket features from `extract_nbbo_features.py`.
+
+### Gold
+
+Gold datasets are model-ready decision datasets.
+
+Examples:
+
+- `state_features.csv` plus `action_returns.csv` for daily strategy allocation.
+- `hourly_transformer_dataset.pt` or `minute_transformer_dataset.pt` for direct bar transformers.
+- `hour_from_minute_dataset.pt` or `hour_from_second_dataset.pt` for hourly decisions from subhour context.
+- `dataset.pt` plus manifests for second-context decision tensors.
+
+`.pt` files are trusted local training caches. For large long-term datasets,
+the archival target should be Zarr/Arrow/Parquet arrays plus JSON manifests, as
+defined in [the decision tensor protocol](docs/decision_tensor_protocol.md).
+
+## Supported Research Workflows
+
+### 1. Daily Strategy Allocation
+
+Purpose:
+
+- Test and allocate among complete daily strategy return curves.
+- Use daily market/strategy features and optional market ecology context.
+
+Typical actions:
+
+- `BH_QQQ`: buy-and-hold QQQ benchmark/fallback action.
+- Cross-sectional momentum variants.
+- Dual momentum variants.
+- Filtered momentum variants.
+
+Frequency:
+
+- Daily close-to-close rows.
+- Current scripts focus on 2026 research.
+
+Primary scripts:
+
+```text
+massive_2026_momentum_test.py
+rank_2026_strategy_stability.py
+build_2026_rl_strategy_dataset.py
+learn_market_ecological_attention.py
+merge_market_ecology_with_rl_states.py
+train_strategy_allocator.py
+```
+
+### 2. Direct Bar Transformer
+
+Purpose:
+
+- Train a causal-transformer DQN over rolling `1h` or `1m` bar windows.
+- Score ETF or stock actions with explicit masks and risk constraints.
+
+Frequency:
+
+- Yahoo `1h` or `1m` exchange-session bars.
+
+Primary scripts:
+
+```text
+fetch_top_volume_universes.py
+download_hourly_ohlcv.py
+download_intraday_ohlcv.py
+build_hourly_transformer_dataset.py
+build_minute_transformer_dataset.py
+train_hourly_causal_transformer_rl.py
+train_minute_causal_transformer_rl.py
+```
+
+### 3. Subhour-To-Hour Transformer
+
+Purpose:
+
+- Keep the decision and reward grid hourly.
+- Let a subhour encoder learn minute-level or second-level intrahour dynamics.
+- Let an hour encoder learn multi-hour regime context.
+
+Canonical source-context keys:
+
+```text
+subhour_features
+subhour_mask
+subhour_timestamp_grid
+subhour_feature_names
+```
+
+Legacy aliases are still written and loaded:
+
+```text
+minute_features
+minute_mask
+minute_timestamp_grid
+minute_feature_names
+```
+
+Primary scripts:
+
+```text
+build_hourly_from_minute_context_dataset.py
+build_hourly_from_second_context_dataset.py
+train_hourly_from_minute_context_rl.py
+train_hourly_from_second_context_rl.py
+```
+
+### 4. Second-Context Decision Tensor
+
+Purpose:
+
+- Compress top-stock sparse 1-second bars into compact market-context tokens.
+- Build one gold decision row per decision timestamp.
+- Score actions with action-specific features, masks, costs, target weights,
+  quality scores, and execution timestamps.
+
+Frequency:
+
+- Source bars: Polygon `1s` aggregates.
+- Decision grid: `5m`, `15m`, `30m`, or `60m`.
+- Default examples use `15m`.
+
+Primary scripts:
+
+```text
+audit_polygon_second_aggs.py
+build_stock_second_silver_features.py
+build_second_context_decision_dataset.py
+train_second_context_action_scorer.py
+evaluate_second_context_dataset.py
+```
+
+### 5. Intraday QQQ NBBO DQN
+
+Purpose:
+
+- Train a discrete short/flat/long intraday DQN on QQQ NBBO bucket features.
+
+Frequency:
+
+- Raw quotes converted to fixed buckets.
+- Default bucket size is one second.
+
+Primary scripts:
+
+```text
+extract_nbbo_features.py
+train_dqn_agent.py
+```
 
 ## Data Formats
 
-Daily allocator dataset:
+For the full compact decision tensor standard, read:
 
-- `state_features.csv`: `Date` plus numeric state features available through that date.
-- `action_returns.csv`: `Date` plus one numeric return column per strategy action.
-- `action_manifest.csv`: action index, strategy name, benchmark flag, backtest fields, and variation-risk fields.
+[docs/decision_tensor_protocol.md](docs/decision_tensor_protocol.md)
 
-Bar transformer dataset:
+The root README gives the operational summary below.
 
-- `hourly_transformer_dataset.pt` or `minute_transformer_dataset.pt`: trusted local torch payload with `timestamps`, `next_timestamps`, `feature_names`, `action_names`, `features`, `action_returns`, `bar_interval`, and `periods_per_year`.
-- `state_features.csv`: human-readable copy of bar state features.
-- `action_returns.csv`: human-readable copy of bar action returns.
+### Daily Allocator Dataset
 
-Subhour-to-hour dataset:
+Files:
 
-- `hour_from_minute_dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `minute_features`, `minute_mask`, `hour_features`, `action_returns`, feature names, and action names.
-- Default grid: hourly decisions/rewards (`60` minutes) built from causal subhour source bars.
-- `source_bar_interval`: `1m` for minute context or `1s` for Polygon second-bar context.
-- `minute_features`: backward-compatible tensor name shaped `[decisions, hours_lookback, context_bars_per_hour, feature_count]`.
-- `minute_mask`: boolean tensor where `True` marks causal valid source bars. Sparse second bars remain masked rather than forward-filled.
-- `action_returns`: close-to-close returns from each hourly decision timestamp to the next hourly decision timestamp; second data can use fresh as-of closes when no trade exists at the exact boundary.
-
-Polygon second-bar bronze layer:
-
-- Raw files live under `data/polygon/second_aggs/<dataset>/SYMBOL/YYYY/MM/YYYY-MM-DD.parquet`.
-- `manifest.csv` is the source of truth for symbol-day status and file paths; scripts do not recursively infer completed files from the directory alone.
-- `dataset_manifest.json` should include source/audit fields such as `source`, `source_access`, `provider`, `asset_class`, `bar_type`, `adjusted`, `download_status`, and `universe_asof`.
-- `timestamp_ms` is the canonical machine timestamp. String fields such as `timestamp_utc` and `timestamp_exchange` are display/filtering support.
-- Missing second rows mean no eligible trade in that second. The feature layer keeps activity masks instead of blind forward fills.
-
-Second-context gold dataset:
-
-- `dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `market_context`, `market_context_mask`, `market_context_available_timestamps_ms`, `action_features`, `action_returns`, `action_valid_mask`, `action_cost_bps`, `entry_execution_timestamps_ms`, `exit_execution_timestamps_ms`, `portfolio_state`, `constraint_state`, feature names, action names, `dataset_manifest`, and `data_quality_report`.
-- `market_context`: `[decisions, lookback_blocks, market_feature_count]`, where each block is compressed from sparse 1-second stock bars.
-- `action_returns`: finite only when the matching `action_valid_mask` is true; invalid entries are stored as `NaN`.
-- `action_cost_bps`: per-action cost estimates; `CASH` must be valid with zero return and zero cost.
-- Datasets built from incomplete downloads are marked non-reportable through `source_download_complete=false` and reportability errors.
-
-Research protocol artifacts:
-
-- `dataset_manifest.json`: source/vendor, symbols, schema hashes, timestamp hashes, universe timing, known limitations, and feature fit-window metadata.
-- Model manifests: algorithm, encoder, training dataset, validation protocol, search-space hash, selected metric, baselines, and cost/frequency stress results.
-- `FitWindow`: every learned feature or normalizer should prove `fit_end < feature_asof`.
-
-Intraday NBBO dataset:
-
-- Raw quote files are expected under `QQQ_2025` unless `--raw-dir` is passed.
-- Extracted bucket files live under `derived/nbbo_features` and contain OHLC mid, spread, depth, imbalance, microprice, and quote-quality fields.
-
-## Main Commands
-
-Check CUDA:
-
-```bash
-conda run -n ml1 python scripts/check_torch_cuda.py --device auto --matrix-size 2048 --repeats 2 --amp
+```text
+state_features.csv
+action_returns.csv
+action_manifest.csv
+dataset_manifest.json
 ```
 
-Build daily market ecology and merge it into RL state:
+Rules:
 
-```bash
-conda run -n ml1 python scripts/learn_market_ecological_attention.py
-conda run -n ml1 python scripts/merge_market_ecology_with_rl_states.py
+- `state_features.csv` has `Date` plus numeric features available through that date.
+- `action_returns.csv` has `Date` plus one numeric return column per strategy action.
+- `action_manifest.csv` maps action index to strategy name, benchmark flag,
+  backtest fields, and variation/risk fields.
+- Missing action returns should be fixed upstream, not coerced to zero.
+
+### Direct Bar Transformer Dataset
+
+Typical files:
+
+```text
+hourly_transformer_dataset.pt
+minute_transformer_dataset.pt
+state_features.csv
+action_returns.csv
+metadata.json
+dataset_manifest.json
 ```
 
-Build the daily strategy RL dataset:
+Required payload fields:
+
+```text
+timestamps
+next_timestamps
+feature_names
+action_names
+features
+action_returns
+bar_interval
+periods_per_year
+```
+
+Rules:
+
+- `timestamps` are decision timestamps.
+- `next_timestamps` are reward horizon end timestamps.
+- Split builders reject rewards whose `next_timestamp` is after split end.
+- Valid action returns must be finite.
+- Invalid action returns must be `NaN` when an `action_valid_mask` is present.
+
+### Subhour-To-Hour Dataset
+
+Typical files:
+
+```text
+hour_from_minute_dataset.pt
+hour_from_second_dataset.pt
+metadata.json
+dataset_manifest.json
+README.md
+```
+
+Required payload fields:
+
+```text
+decision_timestamps
+next_timestamps
+subhour_timestamp_grid
+subhour_feature_names
+hour_feature_names
+action_names
+subhour_features
+subhour_mask
+hour_features
+action_returns
+hours_lookback
+context_bars_per_hour
+source_bar_interval
+decision_grid_minutes
+periods_per_year
+```
+
+Shape:
+
+```text
+subhour_features: [decisions, hours_lookback, context_bars_per_hour, feature_count]
+subhour_mask:     [decisions, hours_lookback, context_bars_per_hour]
+hour_features:    [decisions, hours_lookback, hour_feature_count]
+action_returns:   [decisions, actions]
+```
+
+Rules:
+
+- Default decision grid is fixed at one hour.
+- Source data can be `1m` or `1s`.
+- For `1s` data, `bar_latency_ms >= 1000`.
+- Masked sparse source bars stay masked rather than forward-filled.
+- Context timestamps must be available no later than the decision timestamp.
+
+### Polygon Second-Bar Bronze Dataset
+
+Typical files:
+
+```text
+manifest.csv
+dataset_manifest.json
+SYMBOL/YYYY/MM/YYYY-MM-DD.parquet
+```
+
+Expected semantics:
+
+- `timestamp_ms` is the canonical machine timestamp.
+- `timestamp_utc` and `timestamp_exchange` are display/filtering helpers.
+- A missing second row means no eligible trade in that second.
+- Missing rows are not zero returns.
+- Download status and source access must be represented in manifests.
+
+### Second-Context Gold Dataset
+
+Typical files:
+
+```text
+dataset.pt
+dataset_manifest.json
+data_quality_report.json
+feature_manifest.json
+action_metadata.json
+split_manifest.json
+schema.json
+metadata.json
+```
+
+Core payload fields:
+
+```text
+decision_timestamps
+next_timestamps
+decision_timestamps_ms
+next_timestamps_ms
+market_context
+market_context_mask
+market_context_available_timestamps_ms
+action_features
+action_features_available_timestamps_ms
+action_returns
+action_valid_mask
+action_mask_reason_code
+action_cost_bps
+action_cost_available_timestamps_ms
+action_target_weights
+action_quality_score
+entry_execution_timestamps_ms
+exit_execution_timestamps_ms
+execution_model
+portfolio_state
+portfolio_state_available_timestamps_ms
+constraint_state
+constraint_state_available_timestamps_ms
+decision_quality_score
+force_cash_mask
+valid_start_indices
+segment_ids
+session_ids
+feature_names
+feature_names_by_tensor
+action_names
+action_metadata
+split_manifest
+dataset_manifest
+data_quality_report
+tensor_availability
+model_input_keys
+label_keys
+forbidden_model_input_keys
+payload_hash
+```
+
+Rules:
+
+- `protocol_version` is `decision_tensor_v1`.
+- `decision_tensor_protocol_version` is `1.0.0`.
+- Current schema is `stock_second_context_decision_v3`.
+- `dataset_schema_version` is `second_context_gold_v1`.
+- `CASH` is action index `0`.
+- `CASH` return, cost, and target weight are zero.
+- Invalid action returns are `NaN`.
+- Action feature and cost availability timestamps must be at or before the
+  decision timestamp, or `-1` when unavailable.
+- `model_input_keys` must not overlap `forbidden_model_input_keys`.
+
+## Model Families
+
+| Family | File | State | Actions | Training Style | Best Use |
+| --- | --- | --- | --- | --- | --- |
+| Intraday QQQ DQN | `intraday_dqn.py` | NBBO bucket windows | short, flat, long | DQN | Quote-level QQQ experiments. |
+| Daily strategy DQN | `strategy_dqn.py` | Daily features | strategy curves | DQN | 2026 daily strategy allocation. |
+| Direct bar transformer | `hourly_transformer.py` | Rolling bar context | `CASH` plus ETF/stock actions | DQN | Hourly/minute bars with constraints. |
+| Subhour-to-hour transformer | `minute_to_hour_transformer.py` | Minute/second bars inside hour tokens | `CASH` plus ETF/stock actions | DQN | Preferred stable high-frequency RL path. |
+| Second-context scorer | `second_context_transformer.py` | Compact second-derived context plus action features | action-conditioned instruments | Supervised/action scorer with sequential diagnostics | Large-universe second-context experiments. |
+
+## Training And Evaluation Artifacts
+
+Training run directories normally include some or all of:
+
+```text
+model.pt
+summary.json
+model_manifest.json
+dataset_manifest.json
+feature_manifest.json
+data_quality_report.json
+split_manifest.json
+reportability.json
+decision_logs.jsonl
+```
+
+Important artifact meanings:
+
+- `model.pt`: trusted local checkpoint cache.
+- `summary.json`: high-level train/validation/test metrics and stress results.
+- `model_manifest.json`: model kind, hyperparameters, selected checkpoint,
+  feature/action schema, validation protocol, and baselines.
+- `dataset_manifest.json`: source, universe, timestamps, schema hashes, known
+  limitations, and reportability fields.
+- `feature_manifest.json`: feature names, feature groups, feature fit windows,
+  normalization details when available.
+- `split_manifest.json`: train/validation/test row counts and reward-end caps.
+- `reportability.json`: whether the run is reportable and why not.
+- `decision_logs.jsonl`: row-level selected actions, Q-values, masks, costs,
+  equity, and execution metadata for sequential evaluation.
+
+## Common Commands
+
+### Quality Checks
+
+```bash
+conda run -n ml1 ruff check .
+conda run -n ml1 python -m compileall -q src scripts tests
+conda run -n ml1 pytest -q
+```
+
+### CUDA Check
+
+```bash
+conda run -n ml1 python scripts/check_torch_cuda.py \
+  --device auto \
+  --matrix-size 2048 \
+  --repeats 2 \
+  --amp
+```
+
+### Universe Bootstrap
+
+Fetch top US market-cap universe:
+
+```bash
+conda run -n ml1 python scripts/fetch_top_us_market_cap_universe.py \
+  --limit 1000
+```
+
+Fetch top-volume stock and ETF universes:
+
+```bash
+conda run -n ml1 python scripts/fetch_top_volume_universes.py \
+  --stock-limit 1000 \
+  --etf-limit 500
+```
+
+### Yahoo Daily/Hourly/Minute Data
+
+Daily:
+
+```bash
+conda run -n ml1 python scripts/download_daily_ohlcv.py --help
+```
+
+Hourly:
+
+```bash
+conda run -n ml1 python scripts/download_hourly_ohlcv.py --help
+```
+
+Minute:
+
+```bash
+conda run -n ml1 python scripts/download_intraday_ohlcv.py --help
+```
+
+Yahoo Finance limits true `1m` data to a short recent window. Use explicit
+dates and manifests when rebuilding minute bars.
+
+### Daily Strategy Research
+
+Run massive 2026 momentum tests:
+
+```bash
+conda run -n ml1 python scripts/massive_2026_momentum_test.py
+```
+
+Rank strategies by variance and stable performance:
+
+```bash
+conda run -n ml1 python scripts/rank_2026_strategy_stability.py
+```
+
+Build the daily RL allocator dataset:
 
 ```bash
 conda run -n ml1 python scripts/build_2026_rl_strategy_dataset.py
 ```
 
+Learn market ecological attention context:
+
+```bash
+conda run -n ml1 python scripts/learn_market_ecological_attention.py
+```
+
+Merge market ecology into RL states:
+
+```bash
+conda run -n ml1 python scripts/merge_market_ecology_with_rl_states.py
+```
+
 Train the daily strategy allocator:
 
 ```bash
-conda run -n ml1 python scripts/train_strategy_allocator.py --device auto --amp
+conda run -n ml1 python scripts/train_strategy_allocator.py \
+  --device auto \
+  --amp
 ```
 
-Build the hourly transformer dataset:
+### Direct Hourly Bar Transformer
+
+Build an hourly transformer dataset:
 
 ```bash
 conda run -n ml1 python scripts/build_hourly_transformer_dataset.py \
@@ -185,79 +791,78 @@ Train the hourly causal-transformer DQN:
 ```bash
 conda run -n ml1 python scripts/train_hourly_causal_transformer_rl.py \
   --dataset derived/rl_hourly/top_volume_2026/hourly_transformer_dataset.pt \
-  --device auto --amp --target-vram-gb 9.5
+  --device auto \
+  --amp \
+  --target-vram-gb 9.5
 ```
 
-The direct bar trainer is risk-aware by default: leveraged actions are
-risk-scaled, same-group exposure is prospectively capped at 50% after the
-minimum observation window, and leveraged exposure is capped at 30 bars per day
-and 15 consecutive bars unless overridden. Its summary includes canonical
-`cost_stress`, `RandomSameTurnover`, `RandomSameActionDistribution`,
-risk-scaled baseline labels, action metadata hashes, and action-risk config
-hashes.
+The direct bar trainer is risk-aware by default. It supports:
 
-Build the latest minute-level transformer dataset:
+- Leveraged and inverse action controls.
+- Risk-scaled target action weights.
+- Same-group exposure caps.
+- Minimum hold and cooldown.
+- Daily and episode switch caps.
+- Daily and episode order-leg caps.
+- Leg-aware switch costs.
+- Cost stress baselines.
+
+### Direct Minute Bar Transformer
+
+Build the default recent minute dataset:
 
 ```bash
 conda run -n ml1 python scripts/build_minute_transformer_dataset.py
 ```
 
-The minute wrapper drops overnight reward gaps and requires same-session
-lookback windows, so valid `1m` transformer states do not silently span an
-exchange close. It uses the top 16 ETF actions by default for trainability; pass
-`--action-count 500` to build a full top-500 ETF action dataset from the same
-downloaded files.
-
-In the local nested workspace used for the current experiments, defaults resolve
-to `/home/yding1995/quant/data`. In a standalone root checkout, those defaults
-resolve under the checkout's `data/` directory.
-
 Train the minute-level causal-transformer DQN:
 
 ```bash
 conda run -n ml1 python scripts/train_minute_causal_transformer_rl.py \
-  --device auto --amp --target-vram-gb 9.5
+  --device auto \
+  --amp \
+  --target-vram-gb 9.5
 ```
 
-The minute-level wrapper applies conservative direct-minute turnover defaults:
-15-bar minimum hold, 5-bar cooldown, 4 switches per day, 8 switches per
-episode, 8 order legs per day, 2 bps one-way leg cost, 1 bps extra switch
-penalty, and 5 bps Q-value switch margin. Its `summary.json` includes
-0/1/2/5/10 bps test cost stress under the same action-mask constraints.
+Direct minute training is supported, but it is not the preferred default for
+stable research because it can overfit and switch too frequently.
 
-Preferred RL path for minute data: build hourly decisions from minute-level context.
-This preserves minute microstructure/path information while making decisions on
-hourly boundaries, which is a more stable target than direct one-minute trading.
-The default decision/reward grid is fixed at one hour while all context bars
-remain `1m` source data.
+### Preferred Minute-To-Hour Path
+
+Build hourly decisions from minute context:
 
 ```bash
 conda run -n ml1 python scripts/build_hourly_from_minute_context_dataset.py
 ```
 
-Train the hierarchical minute-to-hour causal transformer. The minute encoder
-learns intrahour dynamics from causal 1-minute bars; the hour encoder learns
-multi-hour regime dynamics for the RL action decision.
+Train the hierarchical minute-to-hour transformer:
 
 ```bash
 conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
-  --device auto --amp --target-vram-gb 9.5 \
-  --max-switches-per-episode 3 --max-order-legs-per-episode 6
+  --device auto \
+  --amp \
+  --target-vram-gb 9.5 \
+  --max-switches-per-episode 3 \
+  --max-order-legs-per-episode 6
 ```
 
-For rolling 2026 training, fine-tune each new period from the last period's
-minute-to-hour model instead of relearning the context transformer from scratch:
+Warm-start rolling periods from a prior checkpoint:
 
 ```bash
 conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
-  --device auto --amp --target-vram-gb 9.5 \
+  --device auto \
+  --amp \
+  --target-vram-gb 9.5 \
   --warm-start-model data/rl_hour_from_minute_runs/previous_period/model.pt
 ```
 
-Build hourly decisions from Polygon 1-second aggregate bars. The decision grid
-remains hourly, while each hour token consumes up to 3,600 causal second bars.
-Sparse seconds are represented by `minute_mask`; the model compresses the
-second-level stream to `--max-subhour-tokens` before intrahour attention.
+Warm-start loading is allowed only when minute/subhour feature names, hour
+feature names, action names, and constraint feature schema match the current
+dataset and code.
+
+### Second-To-Hour Path
+
+Build hourly decisions from Polygon 1-second aggregate context:
 
 ```bash
 conda run -n ml1 python scripts/build_hourly_from_second_context_dataset.py
@@ -267,14 +872,18 @@ Train the second-to-hour transformer:
 
 ```bash
 conda run -n ml1 python scripts/train_hourly_from_second_context_rl.py \
-  --device auto --amp --target-vram-gb 9.5
+  --device auto \
+  --amp \
+  --target-vram-gb 9.5
 ```
 
-The warm-start checkpoint is loaded only after its minute feature names, hour
-feature names, action names, and constraint feature schema match the current
-dataset and code.
+This path keeps hourly decisions while allowing each hour token to consume up
+to 3,600 causal one-second source bars. Long second-level streams are compressed
+to `--max-subhour-tokens` before intrahour attention.
 
-Audit newly downloaded Polygon second bars:
+### Polygon Second-Context Gold Dataset
+
+Audit downloaded Polygon second bars:
 
 ```bash
 conda run -n ml1 python scripts/audit_polygon_second_aggs.py \
@@ -284,7 +893,7 @@ conda run -n ml1 python scripts/audit_polygon_second_aggs.py \
   --source-access REST
 ```
 
-Build compact silver features from stock second bars:
+Build compact silver features:
 
 ```bash
 conda run -n ml1 python scripts/build_stock_second_silver_features.py \
@@ -294,9 +903,7 @@ conda run -n ml1 python scripts/build_stock_second_silver_features.py \
   --smoke
 ```
 
-Build a gold second-context decision dataset. Stock second bars provide market
-context; action returns should come from the action-bar root for tradable ETF or
-stock actions.
+Build a gold second-context decision dataset:
 
 ```bash
 conda run -n ml1 python scripts/build_second_context_decision_dataset.py \
@@ -304,24 +911,31 @@ conda run -n ml1 python scripts/build_second_context_decision_dataset.py \
   --context-seconds 3600 \
   --block-seconds 300 \
   --bar-latency-ms 1000 \
+  --execution-latency-ms 1000 \
   --actions CASH,QQQ,SPY \
   --smoke
 ```
 
-Train and evaluate the action-conditioned second-context action scorer. This is
-a contextual action scorer baseline, not a full sequential RL trading policy;
-use the sequential switch-cost metrics for trading-policy diagnostics.
+Train the action-conditioned second-context scorer:
 
 ```bash
-conda run -n ml1 python scripts/train_second_context_action_scorer.py --device auto --amp
+conda run -n ml1 python scripts/train_second_context_action_scorer.py \
+  --device auto \
+  --amp
+```
+
+Evaluate a second-context dataset:
+
+```bash
 conda run -n ml1 python scripts/evaluate_second_context_dataset.py
 ```
 
-Validate research manifests:
+### QQQ Intraday NBBO
+
+Extract quote/NBBO features when raw quote data is available:
 
 ```bash
-conda run -n ml1 python scripts/validate_research_protocol.py \
-  --dataset-manifest data/rl_hour_from_minute/top_volume_1m_recent/dataset_manifest.json
+conda run -n ml1 python scripts/extract_nbbo_features.py --help
 ```
 
 Train the QQQ intraday DQN:
@@ -331,31 +945,233 @@ conda run -n ml1 python scripts/train_dqn_agent.py \
   --train-dates 2025-01-02,2025-01-03 \
   --val-dates 2025-01-06 \
   --test-dates 2025-01-07 \
-  --auto-extract --device auto --amp
+  --auto-extract \
+  --device auto \
+  --amp
 ```
 
-## Data Bootstrap
+### Manifest Validation
 
-Universe and OHLCV helpers are included so the RL data can be rebuilt:
+Validate dataset and model manifests:
 
 ```bash
-conda run -n ml1 python scripts/fetch_top_us_market_cap_universe.py
-conda run -n ml1 python scripts/fetch_top_volume_universes.py
-conda run -n ml1 python scripts/download_daily_ohlcv.py --help
-conda run -n ml1 python scripts/download_hourly_ohlcv.py --help
-conda run -n ml1 python scripts/download_intraday_ohlcv.py --help
+conda run -n ml1 python scripts/validate_research_protocol.py \
+  --dataset-manifest data/rl_hour_from_minute/top_volume_1m_recent/dataset_manifest.json
 ```
 
-Yahoo Finance currently limits true `1m` data to a short recent window. Use the
-intraday downloader with explicit dates and manifests when rebuilding minute
-bars.
+Multiple manifests can be passed by repeating `--dataset-manifest` or
+`--model-manifest`.
 
-## Review Notes
+## Script Inventory
 
-- Scripts use `PACKAGE_ROOT` for imports and script-to-script calls.
-- Scripts use `PROJECT_ROOT` for data paths; a root checkout resolves it to the
-  checkout directory.
-- New RL work should import from `rl_quant`.
-- The market-ecology feature workflow is research-only unless it is run in a
-  prior-only rolling or expanding walk-forward mode. Do not fit ecological
-  context parameters on the full test period for backtest claims.
+| Script | Role |
+| --- | --- |
+| `scripts/check_torch_cuda.py` | Verify Torch, CUDA, AMP, and matrix-multiply runtime. |
+| `scripts/fetch_top_us_market_cap_universe.py` | Fetch a current top US equity universe by market cap. |
+| `scripts/fetch_top_volume_universes.py` | Fetch top-volume US stocks and ETFs. |
+| `scripts/download_daily_ohlcv.py` | Download daily OHLCV data. |
+| `scripts/download_hourly_ohlcv.py` | Download Yahoo hourly OHLCV data. |
+| `scripts/download_intraday_ohlcv.py` | Download Yahoo intraday/minute OHLCV data. |
+| `scripts/massive_2026_momentum_test.py` | Test many daily momentum variants on 2026 data. |
+| `scripts/rank_2026_strategy_stability.py` | Rank strategies by variance and stable performance. |
+| `scripts/analyze_2026_strategy_variation.py` | Analyze 2026 strategy performance variation. |
+| `scripts/build_2026_rl_strategy_dataset.py` | Build daily strategy allocator datasets. |
+| `scripts/learn_market_ecological_attention.py` | Learn CREDO-style causal ecological market context. |
+| `scripts/merge_market_ecology_with_rl_states.py` | Merge market ecology features into daily RL states. |
+| `scripts/train_strategy_allocator.py` | Train the daily strategy DQN allocator. |
+| `scripts/build_hourly_transformer_dataset.py` | Build direct hourly/minute bar transformer datasets. |
+| `scripts/build_minute_transformer_dataset.py` | Wrapper for recent direct minute transformer dataset defaults. |
+| `scripts/train_hourly_causal_transformer_rl.py` | Train direct bar causal-transformer DQN. |
+| `scripts/train_minute_causal_transformer_rl.py` | Wrapper for direct minute causal-transformer DQN defaults. |
+| `scripts/build_hourly_from_minute_context_dataset.py` | Build hourly decisions from causal minute or subhour context. |
+| `scripts/build_hourly_from_second_context_dataset.py` | Wrapper for hourly decisions from Polygon one-second context. |
+| `scripts/train_hourly_from_minute_context_rl.py` | Train hierarchical subhour-to-hour DQN. |
+| `scripts/train_hourly_from_second_context_rl.py` | Wrapper for second-to-hour training defaults. |
+| `scripts/audit_polygon_second_aggs.py` | Audit Polygon second aggregate manifests and reportability. |
+| `scripts/build_stock_second_silver_features.py` | Build sparse-aware silver features from stock second bars. |
+| `scripts/build_second_context_decision_dataset.py` | Build gold decision tensors from second context. |
+| `scripts/train_second_context_action_scorer.py` | Train action-conditioned second-context scorer and diagnostics. |
+| `scripts/train_second_context_rl.py` | Compatibility wrapper for the second-context scorer trainer. |
+| `scripts/evaluate_second_context_dataset.py` | Evaluate a second-context dataset and diagnostic oracle. |
+| `scripts/extract_nbbo_features.py` | Extract QQQ NBBO bucket features from raw quotes. |
+| `scripts/train_dqn_agent.py` | Train the QQQ intraday DQN. |
+| `scripts/validate_research_protocol.py` | Validate dataset/model manifests against protocol rules. |
+
+## Correctness Contract
+
+This section is the short checklist. The stricter tensor-level rules live in
+[docs/decision_tensor_protocol.md](docs/decision_tensor_protocol.md).
+
+General:
+
+- Trading rewards are simple returns because environments compound equity with
+  `equity *= 1 + return`.
+- Log returns may appear as model state features only.
+- Timestamps must be timezone-aware.
+- Timestamps used for machine comparison should be integer milliseconds, not
+  floats.
+- Data split rules must be explicit and auditable.
+
+Data and splits:
+
+- Bar datasets must store both `timestamps` and `next_timestamps`.
+- Decision datasets must store both `decision_timestamps` and `next_timestamps`.
+- Split builders reject rewards realized after split end.
+- Feature schemas and action schemas must match across train/validation/test.
+- Universe selection date must not be after the first dataset timestamp.
+- Learned features and normalizers must prove their fit window ends before
+  validation/test usage.
+
+Actions:
+
+- `CASH` is the fallback action.
+- In second-context gold datasets, `CASH` is action index `0`.
+- `CASH` return, cost, and target weight are zero.
+- Action masks are authoritative.
+- Invalid action returns must be `NaN`.
+- Valid action returns must be finite.
+
+Causality:
+
+- Market context availability must be at or before decision timestamp.
+- Action feature availability must be at or before decision timestamp.
+- Action cost availability must be at or before decision timestamp.
+- Action returns are labels and forbidden as model inputs.
+- A Polygon second aggregate timestamp is treated as the start of its aggregate
+  interval.
+- Default `bar_latency_ms=1000` means a decision at `T` can use one-second bars
+  only through `T - 1s`.
+- Default `execution_latency_ms=1000` means non-cash action fills occur at or
+  after `T + 1s`.
+
+Evaluation:
+
+- Evaluation walks `valid_start_indices`.
+- Sequential evaluators reset previous action when a valid row is not
+  contiguous or when `segment_ids` change.
+- Costs are charged on switches using leg-aware notional when available.
+- Final non-cash positions must be reported as open or liquidated with cost.
+- Baselines should include cash, buy-and-hold where applicable, random
+  action-distribution baselines, and same-turnover baselines.
+
+## Testing And Quality Checks
+
+Run these before committing or pushing:
+
+```bash
+conda run -n ml1 ruff check .
+conda run -n ml1 python -m compileall -q src scripts tests
+conda run -n ml1 pytest -q
+```
+
+Current tests are concentrated in:
+
+```text
+tests/test_correctness.py
+```
+
+The tests cover:
+
+- Dataset split boundaries.
+- Future-feature leakage rejection.
+- Invalid action return handling.
+- CASH action contracts.
+- Cost and switch accounting.
+- Terminal liquidation.
+- Segment/session reset behavior.
+- Second-context protocol fields and sidecars.
+- Subhour canonical aliases and legacy `minute_*` compatibility.
+- Warm-start schema validation.
+- Manifest/reportability helpers.
+
+## Troubleshooting
+
+### `ModuleNotFoundError: rl_quant`
+
+Run commands from the repository root and install the package:
+
+```bash
+conda run -n ml1 python -m pip install -e ".[dev,data]"
+```
+
+### CUDA is not used
+
+Check CUDA first:
+
+```bash
+conda run -n ml1 python scripts/check_torch_cuda.py --device auto --amp
+```
+
+Then pass `--device auto --amp` to training scripts. If CUDA is unavailable,
+scripts should fall back to CPU.
+
+### A dataset is marked non-reportable
+
+Open:
+
+```text
+dataset_manifest.json
+data_quality_report.json
+reportability.json
+```
+
+Common causes:
+
+- Source download is incomplete.
+- Data quality report is missing.
+- Feature fit windows are not prior-only.
+- Split reward horizons cross validation/test boundaries.
+- Required baselines or stress tests are missing.
+- Final non-cash position is left open without being reported.
+
+### Invalid action returns fail validation
+
+Invalid action returns must be `NaN` wherever `action_valid_mask` is false.
+Zero is reserved for a real zero return, not for missing or invalid data.
+
+### Second-level context looks sparse
+
+That is expected. Missing second rows mean no eligible trade in that second.
+The framework preserves sparse masks instead of blind forward fills.
+
+### Warm-start checkpoint is rejected
+
+Warm starts require matching:
+
+- Source/subhour feature names.
+- Hour feature names.
+- Action names.
+- Constraint feature schema.
+- Model architecture dimensions.
+
+This prevents accidentally fine-tuning on incompatible tensors.
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| Action | A selectable strategy, ETF, stock, or `CASH` allocation. |
+| `BH_QQQ` | Buy-and-hold QQQ benchmark strategy used in daily strategy allocation. |
+| Bronze | Raw or minimally normalized source data. |
+| Silver | Cleaned, audited, or compressed source-specific feature data. |
+| Gold | Model-ready decision dataset. |
+| Decision timestamp | Time at which the policy chooses an action. |
+| `next_timestamp` | Reward horizon end timestamp. |
+| `valid_start_indices` | Rows eligible for sequential evaluation. |
+| `segment_ids` | Session/segment identifiers used to reset sequential state. |
+| `action_valid_mask` | Boolean mask indicating which actions may be selected. |
+| `action_returns` | Realized labels for each action. These are not model inputs. |
+| `action_cost_bps` | Estimated execution cost in basis points. |
+| `action_target_weights` | Target portfolio weight per action, used for leverage/risk scaling. |
+| `force_cash_mask` | Row-level gate that forces cash when quality or constraints require it. |
+| Reportable | A run whose data, splits, costs, constraints, baselines, and manifests satisfy the research protocol. |
+
+## Development Notes
+
+- Prefer adding shared logic under `src/rl_quant`.
+- Keep executable workflows under `scripts`.
+- Keep generated data and model runs under `data/` or `derived/`.
+- Keep docs linked from this README or under `docs/`.
+- Use structured parsers and manifests rather than ad hoc filename inference.
+- Do not weaken causality checks to make a dataset train.
+- If a dataset fails validation, fix the upstream data or manifest.

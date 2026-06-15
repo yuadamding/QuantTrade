@@ -61,8 +61,12 @@ ACTION_FEATURE_NAMES = [
     "is_cash",
     "is_etf",
     "is_stock",
+    "is_inverse",
+    "is_leveraged",
+    "leverage_factor",
+    "target_weight",
     "valid_price_flag",
-    "execution_delay_seconds",
+    "feature_staleness_seconds",
     "log_last_dollar_volume",
     "estimated_cost_bps",
 ]
@@ -81,6 +85,7 @@ class StockSecondContextConfig:
     min_active_symbols: int = 250
     max_action_staleness_seconds: int = 300
     execution_latency_ms: int = DEFAULT_BAR_LATENCY_MS
+    execution_model: str = "optimistic_close_plus_estimated_cost_bps"
     default_action_cost_bps: float = 1.0
     max_action_cost_bps: float = 25.0
     rth_only: bool = True
@@ -143,11 +148,16 @@ def regular_session_decision_grid_ms(
     start: str,
     end_exclusive: str,
     decision_interval: str,
+    execution_latency_ms: int = 0,
+    allow_post_close_exit: bool = False,
     exchange_tz: ZoneInfo = EASTERN,
 ) -> list[int]:
     interval_seconds = parse_duration_seconds(decision_interval)
+    if execution_latency_ms < 0:
+        raise ValueError("execution_latency_ms must be non-negative.")
     start_dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(exchange_tz)
     end_dt = datetime.fromisoformat(end_exclusive.replace("Z", "+00:00")).astimezone(exchange_tz)
+    execution_latency = timedelta(milliseconds=execution_latency_ms)
     decisions: list[int] = []
     current_date = start_dt.date()
     while current_date <= end_dt.date():
@@ -156,6 +166,9 @@ def regular_session_decision_grid_ms(
             session_end = datetime.combine(current_date, RTH_END, tzinfo=exchange_tz)
             decision = session_start + timedelta(seconds=interval_seconds)
             while decision + timedelta(seconds=interval_seconds) <= session_end:
+                reward_exit = decision + timedelta(seconds=interval_seconds) + execution_latency
+                if not allow_post_close_exit and reward_exit > session_end:
+                    break
                 decision_utc = decision.astimezone(timezone.utc)
                 if start_dt.astimezone(timezone.utc) <= decision_utc < end_dt.astimezone(timezone.utc):
                     decisions.append(int(decision_utc.timestamp() * 1000))
@@ -388,6 +401,25 @@ def _close_at_or_after(
     return close, timestamps[pos], dollar_volumes[pos]
 
 
+def _close_at_or_before(
+    lookup: tuple[list[int], list[float], list[float]],
+    timestamp_ms: int,
+    *,
+    max_staleness_seconds: int,
+) -> tuple[float, int, float] | None:
+    timestamps, closes, dollar_volumes = lookup
+    pos = bisect.bisect_right(timestamps, int(timestamp_ms)) - 1
+    if pos < 0:
+        return None
+    age_ms = int(timestamp_ms) - int(timestamps[pos])
+    if age_ms < 0 or age_ms > max_staleness_seconds * 1000:
+        return None
+    close = closes[pos]
+    if not math.isfinite(close) or close <= 0:
+        return None
+    return close, timestamps[pos], dollar_volumes[pos]
+
+
 ETF_SYMBOLS = {
     "ARKK",
     "DIA",
@@ -418,11 +450,82 @@ ETF_SYMBOLS = {
     "XLU",
 }
 
+LEVERAGE_BY_SYMBOL = {
+    "SOXL": 3.0,
+    "SOXS": -3.0,
+    "TQQQ": 3.0,
+    "SQQQ": -3.0,
+    "UPRO": 3.0,
+    "SPXU": -3.0,
+    "QLD": 2.0,
+    "QID": -2.0,
+    "SSO": 2.0,
+    "SDS": -2.0,
+    "TBT": -2.0,
+}
+
 
 def _action_type_flags(symbol: str) -> tuple[float, float]:
     if symbol.upper() in ETF_SYMBOLS:
         return 1.0, 0.0
     return 0.0, 1.0
+
+
+def _action_metadata(symbol: str) -> dict[str, float]:
+    upper = symbol.upper()
+    is_cash = float(upper == "CASH")
+    is_etf, is_stock = (0.0, 0.0) if is_cash else _action_type_flags(upper)
+    leverage = 0.0 if is_cash else LEVERAGE_BY_SYMBOL.get(upper, 1.0)
+    abs_leverage = abs(leverage)
+    target_weight = 0.0 if is_cash else min(1.0, 1.0 / max(abs_leverage, 1.0))
+    return {
+        "is_cash": is_cash,
+        "is_etf": is_etf,
+        "is_stock": is_stock,
+        "is_inverse": float(leverage < 0.0),
+        "is_leveraged": float(abs_leverage > 1.0),
+        "leverage_factor": leverage,
+        "target_weight": target_weight,
+    }
+
+
+def _action_metadata_manifest(action_names: list[str]) -> dict[str, Any]:
+    actions: list[dict[str, Any]] = []
+    for action_index, action_name in enumerate(action_names):
+        metadata = _action_metadata(action_name)
+        if metadata["is_cash"]:
+            asset_type = "cash"
+            group = "cash"
+            underlying = None
+            risk_bucket = "cash"
+        elif metadata["is_etf"]:
+            asset_type = "etf"
+            group = "leveraged" if metadata["is_leveraged"] else "core_etf"
+            underlying = action_name.upper()
+            risk_bucket = "leveraged" if metadata["is_leveraged"] else "core_equity"
+        else:
+            asset_type = "stock"
+            group = "single_stock"
+            underlying = action_name.upper()
+            risk_bucket = "single_stock"
+        actions.append(
+            {
+                "action_index": action_index,
+                "action_name": action_name,
+                "symbol_id": "CASH" if metadata["is_cash"] else action_name.upper(),
+                "asset_type": asset_type,
+                "group": group,
+                "underlying": underlying,
+                "leverage_factor": metadata["leverage_factor"],
+                "inverse": bool(metadata["is_inverse"]),
+                "max_weight": metadata["target_weight"],
+                "risk_bucket": risk_bucket,
+            }
+        )
+    return {
+        "actions": actions,
+        "action_metadata_hash": stable_json_hash(actions),
+    }
 
 
 def _estimate_cost_bps(dollar_volume: float, config: StockSecondContextConfig) -> float:
@@ -436,6 +539,11 @@ def _estimate_cost_bps(dollar_volume: float, config: StockSecondContextConfig) -
 def _minutes_to_close_scaled(decision_ms: int) -> float:
     _is_pre, _is_regular, _is_post, _since_open, seconds_to_close = _session_flags(decision_ms)
     return max(0.0, min(seconds_to_close / (6.5 * 3600.0), 1.0))
+
+
+def _session_id(timestamp_ms: int) -> str:
+    local = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).astimezone(EASTERN)
+    return local.date().isoformat()
 
 
 def build_second_context_payload(
@@ -469,7 +577,13 @@ def build_second_context_payload(
     action_returns: list[list[float]] = []
     action_valid_mask: list[list[bool]] = []
     action_cost_bps: list[list[float]] = []
+    action_target_weights: list[list[float]] = []
+    action_features_available_timestamps_ms: list[list[int]] = []
+    action_cost_available_timestamps_ms: list[list[int]] = []
+    action_mask_reason_code: list[list[int]] = []
+    action_quality_score: list[list[float]] = []
     execution_latency_ms = config.execution_latency_ms
+    input_latency_ms = config.bar_latency_ms + config.ingestion_latency_ms
     entry_execution_timestamps_ms: list[list[int]] = []
     exit_execution_timestamps_ms: list[list[int]] = []
     action_count_denom = max(len(action_names) - 1, 1)
@@ -478,21 +592,52 @@ def build_second_context_payload(
         decision_returns: list[float] = []
         decision_valid: list[bool] = []
         decision_costs: list[float] = []
+        decision_weights: list[float] = []
+        decision_action_available: list[int] = []
+        decision_cost_available: list[int] = []
+        decision_reason_codes: list[int] = []
+        decision_action_quality: list[float] = []
         decision_entry_ts: list[int] = []
         decision_exit_ts: list[int] = []
         valid_context_fraction = float(context_mask.float().mean().item())
         for action_index, action in enumerate(action_names):
             symbol = action.upper()
             action_index_scaled = action_index / action_count_denom
+            metadata = _action_metadata(symbol)
             if symbol == "CASH":
-                decision_action_features.append([action_index_scaled, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+                decision_action_features.append(
+                    [
+                        action_index_scaled,
+                        metadata["is_cash"],
+                        metadata["is_etf"],
+                        metadata["is_stock"],
+                        metadata["is_inverse"],
+                        metadata["is_leveraged"],
+                        metadata["leverage_factor"],
+                        metadata["target_weight"],
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ]
+                )
                 decision_returns.append(0.0)
                 decision_valid.append(True)
                 decision_costs.append(0.0)
+                decision_weights.append(0.0)
+                decision_action_available.append(int(decision_ms))
+                decision_cost_available.append(int(decision_ms))
+                decision_reason_codes.append(0)
+                decision_action_quality.append(1.0)
                 decision_entry_ts.append(int(decision_ms))
                 decision_exit_ts.append(int(next_ms))
                 continue
             lookup = action_lookups.get(symbol)
+            feature_point = None if lookup is None else _close_at_or_before(
+                lookup,
+                decision_ms - input_latency_ms,
+                max_staleness_seconds=config.max_action_staleness_seconds,
+            )
             current = None if lookup is None else _close_at_or_after(
                 lookup,
                 decision_ms + execution_latency_ms,
@@ -504,31 +649,50 @@ def build_second_context_payload(
                 max_staleness_seconds=config.max_action_staleness_seconds,
             )
             valid = current is not None and future is not None and valid_context_fraction > 0.0
-            if current is None:
-                execution_delay = float(config.max_action_staleness_seconds + 1)
+            if feature_point is None:
+                feature_staleness = float(config.max_action_staleness_seconds + 1)
                 last_dv = 0.0
                 cost = config.max_action_cost_bps
-                entry_ts = -1
+                feature_available_ts = -1
             else:
-                _close, entry_ts, last_dv = current
-                execution_delay = max(0.0, (entry_ts - (decision_ms + execution_latency_ms)) / 1000.0)
+                _feature_close, feature_ts, last_dv = feature_point
+                feature_staleness = max(0.0, (decision_ms - input_latency_ms - feature_ts) / 1000.0)
                 cost = _estimate_cost_bps(last_dv, config)
+                feature_available_ts = available_timestamp_ms(
+                    feature_ts,
+                    bar_latency_ms=config.bar_latency_ms,
+                    ingestion_latency_ms=config.ingestion_latency_ms,
+                )
+                if feature_available_ts > decision_ms:
+                    raise ValueError("Action features are not available by the decision timestamp.")
+            entry_ts = -1 if current is None else int(current[1])
             exit_ts = -1 if future is None else int(future[1])
-            is_etf, is_stock = _action_type_flags(symbol)
+            reason_code = 0 if valid else 1
             decision_action_features.append(
                 [
                     action_index_scaled,
                     0.0,
-                    is_etf,
-                    is_stock,
-                    float(valid),
-                    execution_delay,
+                    metadata["is_etf"],
+                    metadata["is_stock"],
+                    metadata["is_inverse"],
+                    metadata["is_leveraged"],
+                    metadata["leverage_factor"],
+                    metadata["target_weight"],
+                    float(feature_point is not None),
+                    feature_staleness,
                     math.log1p(max(last_dv, 0.0)),
                     cost,
                 ]
             )
             decision_costs.append(cost)
             decision_valid.append(bool(valid))
+            decision_weights.append(float(metadata["target_weight"]))
+            decision_action_available.append(int(feature_available_ts))
+            decision_cost_available.append(int(feature_available_ts))
+            decision_reason_codes.append(reason_code)
+            decision_action_quality.append(
+                min(valid_context_fraction, 1.0 if feature_point is not None else 0.0)
+            )
             decision_entry_ts.append(int(entry_ts))
             decision_exit_ts.append(int(exit_ts))
             if valid and current is not None and future is not None:
@@ -539,12 +703,19 @@ def build_second_context_payload(
         action_returns.append(decision_returns)
         action_valid_mask.append(decision_valid)
         action_cost_bps.append(decision_costs)
+        action_target_weights.append(decision_weights)
+        action_features_available_timestamps_ms.append(decision_action_available)
+        action_cost_available_timestamps_ms.append(decision_cost_available)
+        action_mask_reason_code.append(decision_reason_codes)
+        action_quality_score.append(decision_action_quality)
         entry_execution_timestamps_ms.append(decision_entry_ts)
         exit_execution_timestamps_ms.append(decision_exit_ts)
 
     action_valid = torch.tensor(action_valid_mask, dtype=torch.bool)
     quality_by_row = market_mask.float().mean(dim=1).clamp(0.0, 1.0)
     valid_action_fraction = action_valid.float().mean(dim=1).clamp(0.0, 1.0)
+    decision_quality_score = (quality_by_row * valid_action_fraction).clamp(0.0, 1.0)
+    force_cash_mask = decision_quality_score <= 0.0
     portfolio_state = torch.zeros((len(decision_timestamps_ms), len(PORTFOLIO_STATE_FEATURE_NAMES)), dtype=torch.float32)
     portfolio_state[:, 0] = 1.0
     constraint_state = torch.stack(
@@ -555,6 +726,98 @@ def build_second_context_payload(
         ],
         dim=1,
     )
+    session_ids = [_session_id(value) for value in decision_timestamps_ms]
+    segment_ids: list[int] = []
+    segment = -1
+    previous_session = None
+    for session in session_ids:
+        if session != previous_session:
+            segment += 1
+            previous_session = session
+        segment_ids.append(segment)
+    valid_start_indices = [index for index, valid in enumerate(action_valid.any(dim=1).tolist()) if valid]
+    action_metadata = _action_metadata_manifest(list(action_names))
+    feature_names = {
+        "market_context": list(MARKET_CONTEXT_FEATURE_NAMES),
+        "action_features": list(ACTION_FEATURE_NAMES),
+        "portfolio_state": list(PORTFOLIO_STATE_FEATURE_NAMES),
+        "constraint_state": list(CONSTRAINT_STATE_FEATURE_NAMES),
+    }
+    schema_registry = {
+        "decision_tensor_protocol_version": "1.0.0",
+        "dataset_schema_version": "second_context_gold_v1",
+        "feature_schema_hash": stable_json_hash(feature_names),
+        "action_schema_hash": stable_json_hash(list(action_names)),
+        "action_metadata_hash": action_metadata["action_metadata_hash"],
+        "constraint_schema_hash": stable_json_hash(CONSTRAINT_STATE_FEATURE_NAMES),
+        "portfolio_state_schema_hash": stable_json_hash(PORTFOLIO_STATE_FEATURE_NAMES),
+        "execution_schema_hash": stable_json_hash(
+            {
+                "execution_model": config.execution_model,
+                "entry_price_source": "first_action_close_at_or_after_decision_plus_execution_latency",
+                "exit_price_source": "first_action_close_at_or_after_reward_end_plus_execution_latency",
+                "execution_latency_ms": config.execution_latency_ms,
+            }
+        ),
+    }
+    tensor_availability = {
+        "market_context": "market_context_available_timestamps_ms <= decision_timestamps_ms",
+        "action_features": "action_features_available_timestamps_ms <= decision_timestamps_ms",
+        "action_cost_bps": "action_cost_available_timestamps_ms <= decision_timestamps_ms",
+        "portfolio_state": "known before the decision from prior fills",
+        "constraint_state": "known before the decision from current masks and session state",
+        "action_returns": "label realized after decision; forbidden as model input",
+    }
+    model_input_keys = [
+        "market_context",
+        "market_context_mask",
+        "action_features",
+        "action_valid_mask",
+        "action_cost_bps",
+        "action_target_weights",
+        "portfolio_state",
+        "constraint_state",
+        "decision_quality_score",
+        "force_cash_mask",
+    ]
+    label_keys = [
+        "action_returns",
+        "next_timestamps",
+        "entry_execution_timestamps_ms",
+        "exit_execution_timestamps_ms",
+    ]
+    forbidden_model_input_keys = ["action_returns", "next_timestamps", "exit_execution_timestamps_ms"]
+    execution_model = {
+        "name": config.execution_model,
+        "entry_rule": "first action close at or after decision_ts + execution_latency_ms",
+        "exit_rule": "first action close at or after next_ts + execution_latency_ms",
+        "cost_rule": "action_cost_bps estimated from trailing liquidity and charged on switches",
+        "liquidate_at_end": False,
+        "allow_extended_hours_exit": bool(config.include_extended_hours),
+    }
+    payload_hash = stable_json_hash(
+        {
+            "decision_timestamps": [timestamp_ms_to_iso(value) for value in decision_timestamps_ms],
+            "action_names": list(action_names),
+            "config": config.to_dict(),
+            "feature_schema_hash": schema_registry["feature_schema_hash"],
+            "action_schema_hash": schema_registry["action_schema_hash"],
+        }
+    )
+    decision_timestamp_strings = [timestamp_ms_to_iso(value) for value in decision_timestamps_ms]
+    next_timestamp_strings = [timestamp_ms_to_iso(value) for value in next_timestamps_ms]
+    split_manifest = {
+        "schema_version": "split_manifest_v1",
+        "rule": "unsplit gold payload; train/validation/test runs must declare decision_ts in split and next_ts <= split_end",
+        "embargo": None,
+        "unsplit": {
+            "start": decision_timestamp_strings[0] if decision_timestamp_strings else None,
+            "end": decision_timestamp_strings[-1] if decision_timestamp_strings else None,
+            "rows": len(decision_timestamp_strings),
+            "valid_rows": len(valid_start_indices),
+            "reward_end_max": max(next_timestamp_strings) if next_timestamp_strings else None,
+        },
+    }
     base_manifest = dict(dataset_manifest or {})
     report = dict(data_quality_report or {})
     source_download_complete = bool(
@@ -569,7 +832,9 @@ def build_second_context_payload(
         reportability_errors.append("min_active_symbols_too_low_for_reportable_dataset")
     manifest = {
         **base_manifest,
-        "schema_version": "stock_second_context_decision_v2",
+        "schema_version": "stock_second_context_decision_v3",
+        "protocol_version": "decision_tensor_v1",
+        **schema_registry,
         "feature_set_id": config.feature_set_id,
         "created_at_utc": utc_now_iso(),
         "source_bar_interval": config.source_bar_interval,
@@ -580,6 +845,14 @@ def build_second_context_payload(
         "bar_latency_ms": config.bar_latency_ms,
         "ingestion_latency_ms": config.ingestion_latency_ms,
         "execution_latency_ms": config.execution_latency_ms,
+        "execution_model": config.execution_model,
+        "execution_model_detail": execution_model,
+        "tensor_availability": tensor_availability,
+        "model_input_keys": model_input_keys,
+        "label_keys": label_keys,
+        "forbidden_model_input_keys": forbidden_model_input_keys,
+        "payload_hash": payload_hash,
+        "split_manifest_hash": stable_json_hash(split_manifest),
         "source_download_complete": source_download_complete,
         "reportable": source_download_complete and not reportability_errors,
         "reportability_errors": list(dict.fromkeys(reportability_errors)),
@@ -591,9 +864,11 @@ def build_second_context_payload(
         ],
     }
     payload = {
-        "schema_version": "stock_second_context_decision_v2",
-        "decision_timestamps": [timestamp_ms_to_iso(value) for value in decision_timestamps_ms],
-        "next_timestamps": [timestamp_ms_to_iso(value) for value in next_timestamps_ms],
+        "schema_version": "stock_second_context_decision_v3",
+        "protocol_version": "decision_tensor_v1",
+        **schema_registry,
+        "decision_timestamps": decision_timestamp_strings,
+        "next_timestamps": next_timestamp_strings,
         "decision_timestamps_ms": torch.tensor(decision_timestamps_ms, dtype=torch.long),
         "next_timestamps_ms": torch.tensor(next_timestamps_ms, dtype=torch.long),
         "market_context": market_context,
@@ -602,30 +877,40 @@ def build_second_context_payload(
         "action_features": torch.tensor(action_features, dtype=torch.float32),
         "action_returns": torch.tensor(action_returns, dtype=torch.float32),
         "action_valid_mask": action_valid,
+        "action_mask_reason_code": torch.tensor(action_mask_reason_code, dtype=torch.int32),
         "action_cost_bps": torch.tensor(action_cost_bps, dtype=torch.float32),
+        "action_target_weights": torch.tensor(action_target_weights, dtype=torch.float32),
+        "action_features_available_timestamps_ms": torch.tensor(action_features_available_timestamps_ms, dtype=torch.long),
+        "action_cost_available_timestamps_ms": torch.tensor(action_cost_available_timestamps_ms, dtype=torch.long),
+        "action_quality_score": torch.tensor(action_quality_score, dtype=torch.float32),
         "entry_execution_timestamps_ms": torch.tensor(entry_execution_timestamps_ms, dtype=torch.long),
         "exit_execution_timestamps_ms": torch.tensor(exit_execution_timestamps_ms, dtype=torch.long),
         "entry_price_source": "first_action_close_at_or_after_decision_plus_execution_latency",
         "exit_price_source": "first_action_close_at_or_after_reward_end_plus_execution_latency",
+        "execution_model": config.execution_model,
         "portfolio_state": portfolio_state,
+        "portfolio_state_available_timestamps_ms": torch.tensor(decision_timestamps_ms, dtype=torch.long),
         "constraint_state": constraint_state,
-        "feature_names": {
-            "market_context": list(MARKET_CONTEXT_FEATURE_NAMES),
-            "action_features": list(ACTION_FEATURE_NAMES),
-            "portfolio_state": list(PORTFOLIO_STATE_FEATURE_NAMES),
-            "constraint_state": list(CONSTRAINT_STATE_FEATURE_NAMES),
-        },
+        "constraint_state_available_timestamps_ms": torch.tensor(decision_timestamps_ms, dtype=torch.long),
+        "decision_quality_score": decision_quality_score,
+        "force_cash_mask": force_cash_mask,
+        "valid_start_indices": torch.tensor(valid_start_indices, dtype=torch.long),
+        "segment_ids": torch.tensor(segment_ids, dtype=torch.long),
+        "session_ids": session_ids,
+        "feature_names": feature_names,
+        "feature_names_by_tensor": feature_names,
         "action_names": list(action_names),
+        "action_metadata": action_metadata,
+        "split_manifest": split_manifest,
         "dataset_manifest": manifest,
         "data_quality_report": report,
+        "tensor_availability": tensor_availability,
+        "model_input_keys": model_input_keys,
+        "label_keys": label_keys,
+        "forbidden_model_input_keys": forbidden_model_input_keys,
+        "execution_model_detail": execution_model,
         "config": config.to_dict(),
-        "payload_hash": stable_json_hash(
-            {
-                "decision_timestamps": [timestamp_ms_to_iso(value) for value in decision_timestamps_ms],
-                "action_names": list(action_names),
-                "config": config.to_dict(),
-            }
-        ),
+        "payload_hash": payload_hash,
     }
     validate_second_context_payload(payload)
     return payload
@@ -671,6 +956,7 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
     action_returns = payload["action_returns"].float()
     action_valid = payload["action_valid_mask"].bool()
     action_costs = payload["action_cost_bps"].float()
+    action_target_weights = payload.get("action_target_weights")
     entry_execution = payload["entry_execution_timestamps_ms"].long()
     exit_execution = payload["exit_execution_timestamps_ms"].long()
     rows = len(decisions)
@@ -685,10 +971,54 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError("market context contains blocks that are unavailable at the decision timestamp.")
     if action_features.ndim != 3 or action_features.shape[0] != rows:
         raise ValueError("action_features must have shape [rows, actions, features].")
+    action_names = list(payload["action_names"])
+    if len(action_names) != action_features.shape[1]:
+        raise ValueError("action_names length must match the action dimension.")
+    feature_names = payload["feature_names"]
+    if not isinstance(feature_names, Mapping):
+        raise ValueError("feature_names must be a dictionary.")
+    expected_feature_widths = {
+        "market_context": market.shape[-1],
+        "action_features": action_features.shape[-1],
+        "portfolio_state": payload["portfolio_state"].shape[-1],
+        "constraint_state": payload["constraint_state"].shape[-1],
+    }
+    for group, width in expected_feature_widths.items():
+        names = list(feature_names.get(group, []))
+        if len(names) != int(width):
+            raise ValueError(f"feature_names[{group!r}] length must match tensor width.")
     if tuple(action_returns.shape) != tuple(action_valid.shape):
         raise ValueError("action_valid_mask shape must match action_returns.")
     if tuple(action_costs.shape) != tuple(action_returns.shape):
         raise ValueError("action_cost_bps shape must match action_returns.")
+    if action_target_weights is not None and tuple(action_target_weights.float().shape) != tuple(action_returns.shape):
+        raise ValueError("action_target_weights shape must match action_returns.")
+    action_feature_available = payload.get("action_features_available_timestamps_ms")
+    if action_feature_available is not None:
+        action_feature_available = action_feature_available.long()
+        if tuple(action_feature_available.shape) != tuple(action_returns.shape):
+            raise ValueError("action_features_available_timestamps_ms shape must match action_returns.")
+        known = action_feature_available >= 0
+        if bool((action_feature_available[known] > decision_ms_tensor.expand_as(action_valid)[known]).any().item()):
+            raise ValueError("action features contain values unavailable at the decision timestamp.")
+    action_cost_available = payload.get("action_cost_available_timestamps_ms")
+    if action_cost_available is not None:
+        action_cost_available = action_cost_available.long()
+        if tuple(action_cost_available.shape) != tuple(action_returns.shape):
+            raise ValueError("action_cost_available_timestamps_ms shape must match action_returns.")
+        known = action_cost_available >= 0
+        if bool((action_cost_available[known] > decision_ms_tensor.expand_as(action_valid)[known]).any().item()):
+            raise ValueError("action costs contain values unavailable at the decision timestamp.")
+    action_mask_reason_code = payload.get("action_mask_reason_code")
+    if action_mask_reason_code is not None and tuple(action_mask_reason_code.shape) != tuple(action_returns.shape):
+        raise ValueError("action_mask_reason_code shape must match action_returns.")
+    action_quality_score = payload.get("action_quality_score")
+    if action_quality_score is not None:
+        action_quality_score = action_quality_score.float()
+        if tuple(action_quality_score.shape) != tuple(action_returns.shape):
+            raise ValueError("action_quality_score shape must match action_returns.")
+        if bool(((action_quality_score < 0) | (action_quality_score > 1)).any().item()):
+            raise ValueError("action_quality_score must be in [0, 1].")
     if tuple(entry_execution.shape) != tuple(action_returns.shape):
         raise ValueError("entry_execution_timestamps_ms shape must match action_returns.")
     if tuple(exit_execution.shape) != tuple(action_returns.shape):
@@ -697,6 +1027,12 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError("action_features first two dimensions must match action_returns.")
     if bool((action_costs < 0).any().item()):
         raise ValueError("action_cost_bps must be non-negative.")
+    if action_target_weights is not None:
+        weights = action_target_weights.float()
+        if bool((weights < 0).any().item()):
+            raise ValueError("action_target_weights must be non-negative.")
+        if abs(float(weights[:, 0].abs().max().item())) > 1e-12:
+            raise ValueError("CASH action target weight must be zero.")
     if not bool(action_valid[:, 0].all().item()):
         raise ValueError("CASH action must be valid for every row.")
     if not bool(torch.isfinite(action_returns[action_valid]).all().item()):
@@ -708,6 +1044,38 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError("Invalid action_returns must be NaN.")
     if abs(float(action_costs[:, 0].abs().max().item())) > 1e-12:
         raise ValueError("CASH action cost must be zero.")
+    decision_quality_score = payload.get("decision_quality_score")
+    if decision_quality_score is not None:
+        decision_quality_score = decision_quality_score.float()
+        if tuple(decision_quality_score.shape) != (rows,):
+            raise ValueError("decision_quality_score must have shape [rows].")
+        if bool(((decision_quality_score < 0) | (decision_quality_score > 1)).any().item()):
+            raise ValueError("decision_quality_score must be in [0, 1].")
+    force_cash_mask = payload.get("force_cash_mask")
+    if force_cash_mask is not None and tuple(force_cash_mask.bool().shape) != (rows,):
+        raise ValueError("force_cash_mask must have shape [rows].")
+    valid_start_indices = payload.get("valid_start_indices")
+    if valid_start_indices is not None:
+        valid_start_indices = valid_start_indices.long()
+        if valid_start_indices.ndim != 1:
+            raise ValueError("valid_start_indices must be a 1D tensor.")
+        if valid_start_indices.numel() and bool(((valid_start_indices < 0) | (valid_start_indices >= rows)).any().item()):
+            raise ValueError("valid_start_indices contains out-of-range rows.")
+    segment_ids = payload.get("segment_ids")
+    if segment_ids is not None and tuple(segment_ids.long().shape) != (rows,):
+        raise ValueError("segment_ids must have shape [rows].")
+    session_ids = payload.get("session_ids")
+    if session_ids is not None and len(list(session_ids)) != rows:
+        raise ValueError("session_ids length must match rows.")
+    for key in ("portfolio_state_available_timestamps_ms", "constraint_state_available_timestamps_ms"):
+        values = payload.get(key)
+        if values is None:
+            continue
+        values = values.long()
+        if tuple(values.shape) != (rows,):
+            raise ValueError(f"{key} must have shape [rows].")
+        if bool((values > torch.tensor(decision_ms, dtype=torch.long)).any().item()):
+            raise ValueError(f"{key} contains values unavailable at the decision timestamp.")
     non_cash_valid = action_valid.clone()
     non_cash_valid[:, 0] = False
     decision_ms_tensor = torch.tensor(decision_ms, dtype=torch.long).unsqueeze(1).expand_as(action_valid)
@@ -726,13 +1094,22 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
                 raise ValueError("Valid non-CASH entry executions must respect execution latency.")
             if bool((exit_execution[non_cash_valid] < exit_min[non_cash_valid]).any().item()):
                 raise ValueError("Valid non-CASH exit executions must respect execution latency.")
-    if any(not name for name in payload["action_names"]):
+    if any(not name for name in action_names):
         raise ValueError("action_names must be non-empty strings.")
-    if str(payload["action_names"][0]).upper() != "CASH":
+    if str(action_names[0]).upper() != "CASH":
         raise ValueError("action_names must start with CASH.")
     manifest = payload["dataset_manifest"]
     if not isinstance(manifest, Mapping):
         raise ValueError("dataset_manifest must be a dictionary.")
+    model_input_keys = set(payload.get("model_input_keys", manifest.get("model_input_keys", [])))
+    forbidden_input_keys = set(payload.get("forbidden_model_input_keys", manifest.get("forbidden_model_input_keys", [])))
+    if model_input_keys & forbidden_input_keys:
+        raise ValueError("model_input_keys overlap forbidden_model_input_keys.")
+    action_metadata = payload.get("action_metadata")
+    if action_metadata is not None:
+        actions = list(action_metadata.get("actions", [])) if isinstance(action_metadata, Mapping) else []
+        if len(actions) != len(action_names):
+            raise ValueError("action_metadata actions length must match action_names.")
     if manifest.get("source_download_complete") is False and manifest.get("reportable") is True:
         raise ValueError("Incomplete source downloads cannot produce reportable datasets.")
 
@@ -740,16 +1117,53 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
 def save_second_context_payload(payload: Mapping[str, Any], path: Path) -> None:
     validate_second_context_payload(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(dict(payload), path)
-    manifest = payload.get("dataset_manifest", {})
+    saved_payload = dict(payload)
+    manifest = dict(payload.get("dataset_manifest", {}))
     report = payload.get("data_quality_report", {})
+    split_manifest = payload.get("split_manifest")
+    if split_manifest is not None:
+        manifest["split_manifest_hash"] = stable_json_hash(split_manifest)
+    saved_payload["dataset_manifest"] = manifest
+    torch.save(saved_payload, path)
     (path.parent / "dataset_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n")
     (path.parent / "data_quality_report.json").write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
+    if split_manifest is not None:
+        (path.parent / "split_manifest.json").write_text(
+            json.dumps(split_manifest, indent=2, sort_keys=True, default=str) + "\n"
+        )
+    (path.parent / "action_metadata.json").write_text(
+        json.dumps(payload.get("action_metadata", {}), indent=2, sort_keys=True, default=str) + "\n"
+    )
+    (path.parent / "schema.json").write_text(
+        json.dumps(
+            {
+                "schema_version": payload.get("schema_version"),
+                "protocol_version": payload.get("protocol_version"),
+                "decision_tensor_protocol_version": payload.get("decision_tensor_protocol_version"),
+                "dataset_schema_version": payload.get("dataset_schema_version"),
+                "feature_schema_hash": payload.get("feature_schema_hash"),
+                "action_schema_hash": payload.get("action_schema_hash"),
+                "constraint_schema_hash": payload.get("constraint_schema_hash"),
+                "portfolio_state_schema_hash": payload.get("portfolio_state_schema_hash"),
+                "execution_schema_hash": payload.get("execution_schema_hash"),
+                "split_manifest_hash": manifest.get("split_manifest_hash"),
+                "model_input_keys": payload.get("model_input_keys", []),
+                "label_keys": payload.get("label_keys", []),
+                "forbidden_model_input_keys": payload.get("forbidden_model_input_keys", []),
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + "\n"
+    )
     (path.parent / "feature_manifest.json").write_text(
         json.dumps(
             {
                 "feature_set_id": manifest.get("feature_set_id", "stock_second_context_v001"),
                 "feature_names": payload.get("feature_names", {}),
+                "feature_schema_hash": payload.get("feature_schema_hash"),
+                "input_dataset_manifest_hash": stable_json_hash(manifest),
                 "created_at_utc": utc_now_iso(),
                 "schema_version": payload.get("schema_version"),
             },

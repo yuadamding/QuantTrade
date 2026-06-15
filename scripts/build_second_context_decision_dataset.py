@@ -56,6 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bar-latency-ms", type=int, default=1000)
     parser.add_argument("--ingestion-latency-ms", type=int, default=0)
     parser.add_argument("--execution-latency-ms", type=int, default=1000)
+    parser.add_argument("--allow-post-close-exit", action="store_true")
     parser.add_argument("--min-active-symbols", type=int)
     parser.add_argument("--smoke", action="store_true", help="Use small smoke-test defaults such as min_active_symbols=10.")
     parser.add_argument("--symbol-limit", type=int, default=500)
@@ -162,6 +163,8 @@ def main() -> int:
         start=args.start,
         end_exclusive=args.end_exclusive,
         decision_interval=args.decision_interval,
+        execution_latency_ms=args.execution_latency_ms,
+        allow_post_close_exit=args.allow_post_close_exit,
     )
     config = StockSecondContextConfig(
         decision_interval=args.decision_interval,

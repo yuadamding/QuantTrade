@@ -188,7 +188,38 @@ def expected_context_bars_per_hour(source_bar_interval: str) -> int:
     return hour_seconds // seconds
 
 
+def _assert_alias_compatible(payload: dict[str, Any], *, canonical: str, legacy: str) -> None:
+    left = payload[canonical]
+    right = payload[legacy]
+    if torch.is_tensor(left) and torch.is_tensor(right):
+        if tuple(left.shape) != tuple(right.shape) or left.dtype != right.dtype:
+            raise ValueError(f"{canonical} and {legacy} aliases must have matching shape and dtype.")
+        return
+    if left != right:
+        raise ValueError(f"{canonical} and {legacy} aliases must contain the same values.")
+
+
+def _canonicalize_subhour_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(payload)
+    for canonical, legacy in (
+        ("subhour_timestamp_grid", "minute_timestamp_grid"),
+        ("subhour_feature_names", "minute_feature_names"),
+        ("subhour_features", "minute_features"),
+        ("subhour_mask", "minute_mask"),
+    ):
+        has_canonical = canonical in resolved
+        has_legacy = legacy in resolved
+        if has_canonical and has_legacy:
+            _assert_alias_compatible(resolved, canonical=canonical, legacy=legacy)
+        elif has_canonical:
+            resolved[legacy] = resolved[canonical]
+        elif has_legacy:
+            resolved[canonical] = resolved[legacy]
+    return resolved
+
+
 def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
+    payload = _canonicalize_subhour_payload(payload)
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
     grid = payload["minute_timestamp_grid"]
@@ -254,7 +285,7 @@ def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
 
 
 def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
-    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload = _canonicalize_subhour_payload(torch.load(path, map_location="cpu", weights_only=True))
     required = {
         "decision_timestamps",
         "next_timestamps",
@@ -470,7 +501,7 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
         if split.action_valid_mask is not None and split.action_valid_mask.shape[1] != reference.action_returns.shape[1]:
             raise ValueError(f"Action-valid mask dimensions differ for split {split.name!r}.")
         if split.minute_features.shape[1:] != reference.minute_features.shape[1:]:
-            raise ValueError(f"Minute tensor shape differs between {reference.name!r} and {split.name!r}.")
+            raise ValueError(f"Subhour tensor shape differs between {reference.name!r} and {split.name!r}.")
         if split.hour_features.shape[1:] != reference.hour_features.shape[1:]:
             raise ValueError(f"Hour tensor shape differs between {reference.name!r} and {split.name!r}.")
 

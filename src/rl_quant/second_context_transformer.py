@@ -27,12 +27,16 @@ class SecondContextDataSplit:
     action_returns: torch.Tensor
     action_valid_mask: torch.Tensor
     action_cost_bps: torch.Tensor
+    action_target_weights: torch.Tensor
     entry_execution_timestamps_ms: torch.Tensor
     exit_execution_timestamps_ms: torch.Tensor
     entry_price_source: str
     exit_price_source: str
+    execution_model: str
     portfolio_state: torch.Tensor
     constraint_state: torch.Tensor
+    segment_ids: torch.Tensor
+    session_ids: list[str]
     valid_start_indices: torch.Tensor
     valid_index_mask: torch.Tensor
     market_mean: torch.Tensor
@@ -51,10 +55,12 @@ class SecondContextDataSplit:
             action_returns=self.action_returns.to(device),
             action_valid_mask=self.action_valid_mask.to(device),
             action_cost_bps=self.action_cost_bps.to(device),
+            action_target_weights=self.action_target_weights.to(device),
             entry_execution_timestamps_ms=self.entry_execution_timestamps_ms.to(device),
             exit_execution_timestamps_ms=self.exit_execution_timestamps_ms.to(device),
             portfolio_state=self.portfolio_state.to(device),
             constraint_state=self.constraint_state.to(device),
+            segment_ids=self.segment_ids.to(device),
             valid_start_indices=self.valid_start_indices.to(device),
             valid_index_mask=self.valid_index_mask.to(device),
             market_mean=self.market_mean.to(device),
@@ -146,10 +152,24 @@ def _build_split(
     action_valid_mask = payload["action_valid_mask"].bool()[selected]
     _validate_action_return_contract(action_returns, action_valid_mask)
     action_cost_bps = payload["action_cost_bps"].float()[selected]
+    if "action_target_weights" in payload:
+        action_target_weights = payload["action_target_weights"].float()[selected]
+    else:
+        action_target_weights = torch.ones_like(action_returns)
+        action_target_weights[:, 0] = 0.0
     entry_execution_timestamps_ms = payload["entry_execution_timestamps_ms"].long()[selected]
     exit_execution_timestamps_ms = payload["exit_execution_timestamps_ms"].long()[selected]
     portfolio_state = payload["portfolio_state"].float()[selected]
     constraint_state = payload["constraint_state"].float()[selected]
+    if "segment_ids" in payload:
+        segment_ids = payload["segment_ids"].long()[selected]
+    else:
+        segment_ids = torch.zeros(len(selected), dtype=torch.long)
+    if "session_ids" in payload:
+        payload_session_ids = list(payload["session_ids"])
+        session_ids = [payload_session_ids[i] for i in selected]
+    else:
+        session_ids = ["" for _ in selected]
 
     if market_mean is None or market_std is None:
         market_mean, market_std = _masked_mean_std(raw_market, market_mask)
@@ -183,12 +203,16 @@ def _build_split(
         action_returns=action_returns,
         action_valid_mask=action_valid_mask,
         action_cost_bps=action_cost_bps,
+        action_target_weights=action_target_weights,
         entry_execution_timestamps_ms=entry_execution_timestamps_ms,
         exit_execution_timestamps_ms=exit_execution_timestamps_ms,
         entry_price_source=str(payload.get("entry_price_source", "")),
         exit_price_source=str(payload.get("exit_price_source", "")),
+        execution_model=str(payload.get("execution_model", payload.get("dataset_manifest", {}).get("execution_model", ""))),
         portfolio_state=portfolio_state,
         constraint_state=constraint_state,
+        segment_ids=segment_ids,
+        session_ids=session_ids,
         valid_start_indices=valid_start_indices,
         valid_index_mask=valid_index_mask,
         market_mean=market_mean,
@@ -388,6 +412,14 @@ def _trade_legs(previous_action: int, action: int) -> float:
     return 1.0 if previous_action == 0 or action == 0 else 2.0
 
 
+def _trade_notional(previous_action: int, action: int, weights: torch.Tensor) -> float:
+    if action == previous_action:
+        return 0.0
+    previous_weight = float(weights[previous_action].item()) if 0 <= previous_action < weights.numel() else 0.0
+    action_weight = float(weights[action].item()) if 0 <= action < weights.numel() else 0.0
+    return previous_weight + action_weight
+
+
 def _evaluate_action_path(
     split: SecondContextDataSplit,
     actions: torch.Tensor,
@@ -395,6 +427,7 @@ def _evaluate_action_path(
     q_values: torch.Tensor | None = None,
     cost_bps_override: float | None = None,
     initial_action: int = 0,
+    liquidate_at_end: bool = False,
     return_decision_logs: bool = False,
 ) -> dict[str, Any]:
     previous_action = int(initial_action)
@@ -405,7 +438,16 @@ def _evaluate_action_path(
     switches = 0
     cash_actions = 0
     equity = 1.0
+    previous_segment_id: int | None = None
+    segment_resets = 0
     for row in range(actions.numel()):
+        segment_id = int(split.segment_ids[row].item()) if row < split.segment_ids.numel() else 0
+        if previous_segment_id is None:
+            previous_segment_id = segment_id
+        elif segment_id != previous_segment_id:
+            previous_action = int(initial_action)
+            previous_segment_id = segment_id
+            segment_resets += 1
         requested_action = int(actions[row].item())
         action = requested_action
         if action < 0 or action >= len(split.action_names) or not bool(split.action_valid_mask[row, action].item()):
@@ -414,8 +456,11 @@ def _evaluate_action_path(
         if not torch.isfinite(split.action_returns[row, action]).item():
             action = 0
             gross = 0.0
+        row_weights = split.action_target_weights[row].detach().cpu()
+        action_weight = float(row_weights[action].item())
+        gross *= action_weight
         legs = _trade_legs(previous_action, action)
-        traded_notional = legs
+        traded_notional = _trade_notional(previous_action, action, row_weights)
         if legs > 0:
             previous_cost_bps = (
                 float(split.action_cost_bps[row, previous_action].item())
@@ -428,14 +473,16 @@ def _evaluate_action_path(
                 cost = traded_notional * cost_bps / 10_000.0
             elif previous_action == 0:
                 cost_bps = selected_cost_bps
-                cost = selected_cost_bps / 10_000.0
+                cost = action_weight * selected_cost_bps / 10_000.0
             elif action == 0:
+                previous_weight = float(row_weights[previous_action].item())
                 cost_bps = previous_cost_bps
-                cost = previous_cost_bps / 10_000.0
+                cost = previous_weight * previous_cost_bps / 10_000.0
             else:
-                total_leg_cost_bps = previous_cost_bps + selected_cost_bps
-                cost_bps = total_leg_cost_bps / traded_notional
-                cost = total_leg_cost_bps / 10_000.0
+                previous_weight = float(row_weights[previous_action].item())
+                total_cost_bps_notional = previous_weight * previous_cost_bps + action_weight * selected_cost_bps
+                cost_bps = total_cost_bps_notional / traded_notional if traded_notional > 0 else 0.0
+                cost = total_cost_bps_notional / 10_000.0
             switches += 1
         else:
             cost_bps = 0.0
@@ -467,9 +514,10 @@ def _evaluate_action_path(
                     "exit_execution_ts": _timestamp_ms_to_iso(int(split.exit_execution_timestamps_ms[row, action].item())),
                     "entry_price_source": split.entry_price_source,
                     "exit_price_source": split.exit_price_source,
+                    "execution_model": split.execution_model,
                     "previous_action": split.action_names[previous_action],
                     "selected_action": split.action_names[action],
-                    "target_weight": 0.0 if action == 0 else 1.0,
+                    "target_weight": action_weight,
                     "order_legs": legs,
                     "traded_notional": traded_notional,
                     "q_values": q_map,
@@ -491,6 +539,23 @@ def _evaluate_action_path(
                 }
             )
         previous_action = action
+    final_action = previous_action
+    terminal_liquidation_cost = 0.0
+    terminal_liquidation_cost_bps = 0.0
+    terminal_liquidation_order_legs = 0.0
+    if liquidate_at_end and final_action != 0 and net_returns:
+        last_row = min(actions.numel() - 1, split.action_cost_bps.shape[0] - 1)
+        last_weights = split.action_target_weights[last_row].detach().cpu()
+        final_weight = float(last_weights[final_action].item())
+        terminal_liquidation_cost_bps = (
+            float(cost_bps_override)
+            if cost_bps_override is not None
+            else float(split.action_cost_bps[last_row, final_action].item())
+        )
+        terminal_liquidation_cost = final_weight * terminal_liquidation_cost_bps / 10_000.0
+        terminal_liquidation_order_legs = 1.0 if final_weight > 0 else 0.0
+        equity *= 1.0 - terminal_liquidation_cost
+        net_returns.append(-terminal_liquidation_cost)
     returns = torch.tensor(net_returns, dtype=torch.float32)
     metrics = _summarize_returns(returns, periods_per_year=split.periods_per_year)
     active_returns = torch.tensor(active_net_returns, dtype=torch.float32)
@@ -501,6 +566,14 @@ def _evaluate_action_path(
             "cash_action_share": cash_actions / len(net_returns) if net_returns else 1.0,
             "switches": switches,
             "switch_rate": switches / len(net_returns) if net_returns else 0.0,
+            "final_action": split.action_names[final_action] if 0 <= final_action < len(split.action_names) else None,
+            "final_position_open": bool(final_action != 0 and not liquidate_at_end),
+            "liquidate_at_end": bool(liquidate_at_end),
+            "terminal_liquidation_cost": terminal_liquidation_cost,
+            "terminal_liquidation_cost_bps": terminal_liquidation_cost_bps,
+            "terminal_liquidation_order_legs": terminal_liquidation_order_legs,
+            "segment_resets": segment_resets,
+            "warnings": ["final_position_open"] if final_action != 0 and not liquidate_at_end else [],
             "active_window_diagnostics": {
                 "active_bars": int(active_returns.numel()),
                 "cash_bars": int(len(net_returns) - active_returns.numel()),
@@ -561,7 +634,9 @@ def evaluate_second_context_trading_policy(
     initial_action: int = 0,
     min_hold_bars: int = 1,
     cooldown_bars: int = 0,
+    liquidate_at_end: bool = False,
     return_decision_logs: bool = False,
+    return_selected_actions: bool = False,
 ) -> dict[str, float | int | None]:
     data = split.to(device)
     model.eval()
@@ -576,7 +651,16 @@ def evaluate_second_context_trading_policy(
     bars_held = 0
     cooldown_remaining = 0
     selected_actions: list[int] = []
+    previous_segment_id: int | None = None
     for row in range(q_values.shape[0]):
+        segment_id = int(data.segment_ids[row].item()) if row < data.segment_ids.numel() else 0
+        if previous_segment_id is None:
+            previous_segment_id = segment_id
+        elif segment_id != previous_segment_id:
+            previous_action = int(initial_action)
+            bars_held = 0
+            cooldown_remaining = 0
+            previous_segment_id = segment_id
         valid = data.action_valid_mask[row].clone()
         if not bool(valid.any().item()):
             continue
@@ -605,9 +689,12 @@ def evaluate_second_context_trading_policy(
         torch.tensor(selected_actions, dtype=torch.long),
         q_values=q_values[: len(selected_actions)],
         initial_action=initial_action,
+        liquidate_at_end=liquidate_at_end,
         return_decision_logs=return_decision_logs,
     )
     metrics.update({"diagnostic_only": False, "cost_model": "sequential_switch_only_cost"})
+    if return_selected_actions:
+        metrics["selected_actions"] = selected_actions
     return metrics
 
 
@@ -617,9 +704,16 @@ def fixed_rollout_cost_stress(
     *,
     cost_bps_values: tuple[float, ...] = (0.0, 1.0, 2.0, 5.0, 10.0, 20.0),
     initial_action: int = 0,
+    liquidate_at_end: bool = False,
 ) -> dict[str, dict[str, Any]]:
     return {
-        f"{cost:g}_bps": _evaluate_action_path(split, actions.long(), cost_bps_override=cost, initial_action=initial_action)
+        f"{cost:g}_bps": _evaluate_action_path(
+            split,
+            actions.long(),
+            cost_bps_override=cost,
+            initial_action=initial_action,
+            liquidate_at_end=liquidate_at_end,
+        )
         for cost in cost_bps_values
     }
 
@@ -669,6 +763,40 @@ def evaluate_second_context_baselines(
                     current = int(candidates[torch.randint(candidates.numel(), (1,), generator=generator)].item())
             turnover_actions[index] = current
     baselines["RandomSameTurnover"] = _evaluate_action_path(split, turnover_actions)
+    if reference_actions is not None and reference_actions.numel() == row_count:
+        switch_positions = [
+            index
+            for index in range(1, row_count)
+            if int(reference_actions[index].item()) != int(reference_actions[index - 1].item())
+        ]
+        same_timing = torch.zeros(row_count, dtype=torch.long)
+        if row_count:
+            current = int(torch.multinomial(distribution, 1, replacement=True, generator=generator).item())
+            same_timing[0] = current
+            for index in range(1, row_count):
+                if index in switch_positions:
+                    valid = split.action_valid_mask[index].clone()
+                    if 0 <= current < valid.numel():
+                        valid[current] = False
+                    candidates = torch.nonzero(valid, as_tuple=False).flatten()
+                    if candidates.numel():
+                        current = int(candidates[torch.randint(candidates.numel(), (1,), generator=generator)].item())
+                same_timing[index] = current
+        baselines["RandomSameTurnoverSameTiming"] = _evaluate_action_path(split, same_timing)
+
+        same_segments = torch.zeros(row_count, dtype=torch.long)
+        if row_count:
+            segment_starts = [0, *switch_positions]
+            segment_ends = [*switch_positions, row_count]
+            for start, end in zip(segment_starts, segment_ends):
+                valid = split.action_valid_mask[start:end].all(dim=0)
+                candidates = torch.nonzero(valid, as_tuple=False).flatten()
+                if candidates.numel():
+                    chosen = int(candidates[torch.randint(candidates.numel(), (1,), generator=generator)].item())
+                else:
+                    chosen = 0
+                same_segments[start:end] = chosen
+        baselines["RandomSameSegments"] = _evaluate_action_path(split, same_segments)
     return baselines
 
 

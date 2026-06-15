@@ -169,7 +169,7 @@ def main() -> int:
         f"{len(val_split.decision_timestamps)}/{len(test_split.decision_timestamps)}"
     )
     print(
-        f"Minute tensor: {tuple(train_split.minute_features.shape[1:])} | "
+        f"Subhour tensor: {tuple(train_split.minute_features.shape[1:])} | "
         f"Hour tensor: {tuple(train_split.hour_features.shape[1:])} | "
         f"Source interval: {train_split.source_bar_interval} | "
         f"Actions: {len(train_split.action_names)}"
