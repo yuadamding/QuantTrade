@@ -72,6 +72,9 @@ def read_universe_symbols(path: Path) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.source_latency_seconds < 0:
+        # Reject rather than silently clamp a negative latency to zero (which would be optimistic).
+        raise SystemExit("--source-latency-seconds must be non-negative.")
     symbols = read_universe_symbols(args.universe)
     if args.max_symbols > 0:
         symbols = symbols[: args.max_symbols]

@@ -857,12 +857,19 @@ def _masked_mean_std(features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.
     # torch.where before summing. Multiplying by a 0/1 mask is NOT safe because NaN * 0 == NaN,
     # so a single NaN in a masked-out position would poison the whole channel's mean/std.
     valid = mask.unsqueeze(-1).bool() & torch.isfinite(features)
-    count = valid.to(features.dtype).sum(dim=(0, 1, 2)).clamp_min(1.0)
+    raw_count = valid.to(features.dtype).sum(dim=(0, 1, 2))
+    count = raw_count.clamp_min(1.0)
     clean = torch.where(valid, features, torch.zeros_like(features))
     mean = clean.sum(dim=(0, 1, 2)) / count
     centered = torch.where(valid, features - mean, torch.zeros_like(features))
     variance = (centered * centered).sum(dim=(0, 1, 2)) / count
-    return mean, variance.sqrt().clamp_min(1e-6)
+    std = variance.sqrt().clamp_min(1e-6)
+    # A channel with fewer than two valid observations cannot estimate a stable mean/std; leave it
+    # unnormalized (mean 0, std 1) so a single value (or none) is not amplified by a near-zero std.
+    insufficient = raw_count < 2.0
+    mean = torch.where(insufficient, torch.zeros_like(mean), mean)
+    std = torch.where(insufficient, torch.ones_like(std), std)
+    return mean, std
 
 
 def _action_feature_mean_std(

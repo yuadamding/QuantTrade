@@ -6443,12 +6443,22 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         from rl_quant.minute_to_hour_transformer import _masked_mean_std
 
         # A NaN in a MASKED-OUT position must not poison the channel statistics (NaN * 0 == NaN).
+        # Two valid observations (3.0, 5.0) -> mean 4.0, NaN at the masked position ignored.
+        features = torch.tensor([[[[3.0], [5.0], [float("nan")]]]])
+        mask = torch.tensor([[[True, True, False]]])
+        mean, std = _masked_mean_std(features, mask)
+        self.assertTrue(torch.isfinite(mean).all() and torch.isfinite(std).all())
+        self.assertAlmostEqual(float(mean.item()), 4.0, places=6)
+
+    def test_masked_mean_std_leaves_sparse_channel_unnormalized(self) -> None:
+        from rl_quant.minute_to_hour_transformer import _masked_mean_std
+
+        # Fewer than two valid observations -> mean 0, std 1 (no amplification by a near-zero std).
         features = torch.tensor([[[[3.0], [float("nan")]]]])
         mask = torch.tensor([[[True, False]]])
         mean, std = _masked_mean_std(features, mask)
-        self.assertTrue(torch.isfinite(mean).all())
-        self.assertTrue(torch.isfinite(std).all())
-        self.assertAlmostEqual(float(mean.item()), 3.0, places=6)
+        self.assertEqual(float(mean.item()), 0.0)
+        self.assertEqual(float(std.item()), 1.0)
 
     def test_news_article_source_latency_is_applied(self) -> None:
         from rl_quant.features.news_llm import _raw_article_row
@@ -6484,6 +6494,35 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 generation_diagnostics=diagnostics,
             )
         self.assertEqual(manifest["generation_diagnostics"], diagnostics)
+
+    def test_news_article_table_rejects_negative_source_latency(self) -> None:
+        module = load_script("build_news_article_table")
+        with self.assertRaises(SystemExit):
+            module.main(["--source-latency-seconds", "-1"])
+
+    def test_partition_latest_available_and_non_latest_selection(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label in ("2026-01-01", "2026-01-02", "2026-01-03"):
+                part = root / label
+                part.mkdir(parents=True)
+                (part / "hour_from_second_dataset.pt").write_bytes(b"")
+            base = SimpleNamespace(
+                partitions_root=root,
+                dataset_file_name="hour_from_second_dataset.pt",
+                start_partition=None,
+                end_partition=None,
+                max_partitions=0,
+                partition_selection="latest",
+            )
+            self.assertEqual(module.latest_available_partition_label(base), "2026-01-03")
+            # Selecting the earliest partition makes the final selected partition NOT the latest
+            # available -- the condition the strict latest-period guard rejects.
+            earliest = SimpleNamespace(**{**vars(base), "max_partitions": 1, "partition_selection": "earliest"})
+            selected = module.partition_paths(earliest)
+            self.assertEqual(selected[-1].parent.name, "2026-01-01")
+            self.assertNotEqual(selected[-1].parent.name, module.latest_available_partition_label(earliest))
 
 
 if __name__ == "__main__":

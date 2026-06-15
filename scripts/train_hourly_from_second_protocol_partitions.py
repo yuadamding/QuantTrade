@@ -5,6 +5,7 @@ import argparse
 import csv
 import gc
 import json
+import re
 import sys
 from dataclasses import asdict
 from datetime import datetime
@@ -162,6 +163,12 @@ def partition_selection_reportability_errors(args: argparse.Namespace) -> list[s
     if int(args.max_partitions) > 0 and args.partition_selection != "latest":
         return ["non_latest_partition_selection"]
     return []
+
+
+def latest_available_partition_label(args: argparse.Namespace) -> str | None:
+    """Newest partition present on disk, ignoring --start/--end/--max selection filters."""
+    paths = sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))
+    return paths[-1].parent.name if paths else None
 
 
 def split_policy_with_partition_selection(split_policy: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
@@ -392,6 +399,34 @@ def main(argv: list[str] | None = None) -> int:
 
     paths = partition_paths(args)
     partition_selection_errors = partition_selection_reportability_errors(args)
+    # The headline (official) test is the LATEST selected partition; earlier partitions are
+    # walk-forward diagnostics, not the latest-period KPI. Under strict reportability the final
+    # selected partition must be the latest available one, so --end-partition / earliest selection
+    # cannot silently make an OLD period the reported test.
+    latest_available_label = latest_available_partition_label(args)
+    official_test_label = paths[-1].parent.name
+    final_test_is_latest_available = official_test_label == latest_available_label
+    if args.reportability_policy == "strict":
+        # The "latest" guarantee relies on partition directory names sorting chronologically. Verify
+        # the labels are ISO-date-prefixed (zero-padded, lexicographic == chronological); otherwise a
+        # non-sortable label (e.g. partition_9 vs partition_10) could make a non-latest period the
+        # official test while passing the equality check below.
+        iso_date_prefix = re.compile(r"^\d{4}-\d{2}-\d{2}")
+        all_labels = [p.parent.name for p in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))]
+        non_sortable_labels = [label for label in all_labels if not iso_date_prefix.match(label)]
+        if non_sortable_labels:
+            raise SystemExit(
+                "strict latest-period evaluation requires ISO-date-prefixed partition labels so "
+                "directory-name order matches chronological order; got non-sortable labels: "
+                f"{non_sortable_labels[:5]}"
+            )
+    if args.reportability_policy == "strict" and not final_test_is_latest_available:
+        raise SystemExit(
+            f"strict latest-period evaluation requires the final selected partition "
+            f"({official_test_label}) to be the latest available partition ({latest_available_label}). "
+            "Adjust --end-partition/--partition-selection/--max-partitions, or use "
+            "--reportability-policy diagnostic for an explicitly non-latest diagnostic run."
+        )
     run_dir = args.output_dir / args.run_name
     partition_dir = run_dir / "partitions"
     partition_dir.mkdir(parents=True, exist_ok=True)
@@ -588,6 +623,9 @@ def main(argv: list[str] | None = None) -> int:
                 "partition": label,
                 "ordinal": ordinal,
                 "status": "ok",
+                # Only the latest selected partition's test is the official latest-period KPI;
+                # earlier partitions are walk-forward diagnostics.
+                "is_official_latest_test": bool(label == official_test_label),
                 "checkpoint": str(checkpoint_path),
                 "train_total_return": train_result.total_return,
                 "val_total_return": val_result.total_return,
@@ -648,6 +686,9 @@ def main(argv: list[str] | None = None) -> int:
                 "partition_selection": args.partition_selection,
                 "partition_selection_reportability_errors": partition_selection_errors,
                 "selection_reportable": not partition_selection_errors,
+                "evaluation_design": "per_partition_walkforward_latest_holdout",
+                "official_test_partition": official_test_label,
+                "final_test_is_latest_available": bool(final_test_is_latest_available),
                 "completed_count": sum(1 for item in records if item["status"] == "ok"),
                 "failed_count": sum(1 for item in records if item["status"] != "ok"),
                 "latest_checkpoint": str(previous_checkpoint) if previous_checkpoint is not None else None,
