@@ -704,12 +704,15 @@ Important artifact meanings:
 - `decision_logs.jsonl`: row-level selected actions, Q-values, masks, costs,
   equity, and execution metadata for sequential evaluation.
 - `selected_action_paths.pt`: replayable selected action indices plus source
-  row indices for train/validation/test.
+  row indices for train/validation/test. Schema v2 stores
+  `raw_policy_actions`, `constraint_adjusted_actions`, `requested_actions`,
+  `executed_actions`, `selection_reasons`, and rows for each split. Legacy
+  `train_actions`/`val_actions`/`test_actions` are executed actions.
 - `action_confidence_*.npz`: all-action confidence tensors with shape
   `[rows, actions, confidence_fields]`.
 - `selected_action_confidence_*.jsonl`: selected/executed action confidence,
-  raw policy action, second-best action, margins, and OOD score for train,
-  validation, and test selected rows.
+  requested action, raw policy action, second-best action, margins, and OOD
+  score for train, validation, and test selected rows.
 - `action_confidence_manifest.json`: confidence method, calibration split,
   hurdle, interval alpha, confidence semantics, OOD status, reportability,
   field names, calibration metrics, and warnings.
@@ -753,6 +756,11 @@ The fixed field names `q_lcb_05` and `q_ucb_95` are legacy names. Always read
 upper quantiles when `--confidence-interval-alpha` is not `0.05`. Confidence is
 marked non-reportable when the calibration split is reused for checkpoint
 selection or when test data is used for calibration.
+
+Sequential second-context evaluation uses
+`same_action_weight_policy = freeze_executed_weight_until_action_change`.
+If the same action id is held across rows, the previously executed exposure is
+carried forward until the action changes or the position is liquidated.
 
 ## Common Commands
 
@@ -1207,6 +1215,9 @@ reportability.json
 Common causes:
 
 - Source download is incomplete.
+- A diagnostic/backfill converter run used a universe as-of after the dataset
+  start, missing action-source files, chunk limits, dry-run mode, or
+  `--allow-missing-action-context`.
 - Data quality report is missing.
 - Feature fit windows are not prior-only.
 - Split reward horizons cross validation/test boundaries.
@@ -1219,6 +1230,11 @@ For second-context datasets, `action_valid_mask` is the decision-time selector
 mask. Supervised labels must be finite only where both `action_valid_mask` and
 `label_valid_mask` are true. Missing labels must be `NaN`; zero is reserved for
 a real zero return, not for missing or invalid data.
+
+For hourly-from-subhour datasets, new payloads use the same split:
+`decision_action_valid_mask`/`action_valid_mask` are decision-time selector
+masks, while `label_valid_mask`/`action_label_valid_mask` mark realized reward
+availability and are forbidden as model inputs.
 
 ### Second-level context looks sparse
 

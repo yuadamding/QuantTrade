@@ -487,6 +487,25 @@ under `label_valid_mask`. Such runs must set
 `evaluation_reportable == false` and include
 `selectable_actions_with_missing_reward_labels` in the evaluation errors.
 
+Sequential action-path artifacts must keep policy intent separate from economic
+execution:
+
+```text
+raw_policy_actions              # unconstrained argmax over decision-valid actions
+constraint_adjusted_actions     # after min-hold/cooldown constraints
+requested_actions               # action requested from the evaluator
+executed_actions                # action actually scored after missing-label fallback
+selection_reasons
+selected_rows
+```
+
+For backward compatibility, `selected_actions` means `executed_actions`.
+Selected-action confidence JSONL must include both requested and executed
+actions. The current same-action exposure policy is
+`freeze_executed_weight_until_action_change`: when an action id is held across
+rows, the previously executed exposure is carried until the action changes or
+the position is liquidated.
+
 ## Split Contract
 
 Splits are defined in metadata, not inferred from file position:

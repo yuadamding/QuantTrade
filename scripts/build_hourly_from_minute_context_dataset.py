@@ -624,6 +624,7 @@ def main() -> int:
     hour_feature_rows: list[list[list[float]]] = []
     action_return_rows: list[list[float]] = []
     action_valid_rows: list[list[bool]] = []
+    action_label_valid_rows: list[list[bool]] = []
     feature_dim = len(minute_feature_names)
     decision_source_times = (
         build_dense_hourly_decision_grid(exchange_times, start=args.start, end_exclusive=args.end_exclusive)
@@ -688,7 +689,8 @@ def main() -> int:
         if valid_count / float(args.hours_lookback * args.minutes_per_hour) < args.min_context_valid_fraction:
             continue
         action_returns = [0.0]
-        action_valid = [True]
+        decision_action_valid = [True]
+        label_valid = [True]
         for symbol in etf_symbols:
             current_close = close_at_or_before(
                 action_price_lookup[symbol],
@@ -700,13 +702,16 @@ def main() -> int:
                 next_context_ts,
                 max_staleness_seconds=args.max_action_staleness_seconds,
             )
-            if current_close is None or future_close is None:
+            action_decision_valid = current_close is not None
+            action_label_valid = current_close is not None and future_close is not None
+            if not action_label_valid:
                 action_returns.append(math.nan)
-                action_valid.append(False)
+                label_valid.append(False)
             else:
                 action_returns.append(clipped_simple_return(current_close, future_close))
-                action_valid.append(True)
-        if sum(action_valid) <= 1:
+                label_valid.append(True)
+            decision_action_valid.append(action_decision_valid)
+        if sum(label_valid) <= 1:
             continue
         decision_timestamps.append(decision_ts)
         next_timestamps.append(next_ts)
@@ -715,7 +720,8 @@ def main() -> int:
         minute_mask_rows.append(mask_tensor)
         hour_feature_rows.append(hour_rows)
         action_return_rows.append(action_returns)
-        action_valid_rows.append(action_valid)
+        action_valid_rows.append(decision_action_valid)
+        action_label_valid_rows.append(label_valid)
 
     if args.min_decision_rows <= 0:
         raise ValueError("--min-decision-rows must be positive.")
@@ -730,6 +736,24 @@ def main() -> int:
     hour_features = torch.tensor(hour_feature_rows, dtype=torch.float32)
     action_returns = torch.tensor(action_return_rows, dtype=torch.float32)
     action_valid_mask = torch.tensor(action_valid_rows, dtype=torch.bool)
+    label_valid_mask = torch.tensor(action_label_valid_rows, dtype=torch.bool)
+    action_mask_semantics = {
+        "decision_action_valid_mask": "Known before the decision; actions with an observed decision-time price.",
+        "action_valid_mask": "Legacy alias for decision_action_valid_mask.",
+        "label_valid_mask": "Known only after reward realization; false when the future reward price is missing.",
+        "action_label_valid_mask": "Legacy alias for label_valid_mask.",
+    }
+    model_input_keys = [
+        "minute_features",
+        "minute_mask",
+        "hour_features",
+        "decision_action_valid_mask",
+        "action_valid_mask",
+    ]
+    forbidden_model_input_keys = [
+        "label_valid_mask",
+        "action_label_valid_mask",
+    ]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = args.output_dir / args.dataset_file_name
     periods_per_year = infer_periods_per_year(decision_timestamps)
@@ -750,7 +774,13 @@ def main() -> int:
             "minute_mask": minute_mask,
             "hour_features": hour_features,
             "action_returns": action_returns,
+            "decision_action_valid_mask": action_valid_mask,
             "action_valid_mask": action_valid_mask,
+            "label_valid_mask": label_valid_mask,
+            "action_label_valid_mask": label_valid_mask,
+            "action_mask_semantics": action_mask_semantics,
+            "model_input_keys": model_input_keys,
+            "forbidden_model_input_keys": forbidden_model_input_keys,
             "hours_lookback": args.hours_lookback,
             "minutes_per_hour": args.minutes_per_hour,
             "context_bars_per_hour": args.minutes_per_hour,
@@ -777,7 +807,13 @@ def main() -> int:
                 "dense_hourly_grid": dense_hourly_grid,
                 "allow_missing_action_context": allow_missing_action_context,
                 "min_decision_rows": int(args.min_decision_rows),
-                "action_return_missing_semantics": "Missing action labels are NaN and marked false in action_valid_mask.",
+                "action_mask_semantics": action_mask_semantics,
+                "model_input_keys": model_input_keys,
+                "forbidden_model_input_keys": forbidden_model_input_keys,
+                "action_return_missing_semantics": (
+                    "Missing action labels are NaN and marked false in label_valid_mask; "
+                    "action_valid_mask is the decision-time selector."
+                ),
                 "start": args.start,
                 "end_exclusive": args.end_exclusive,
                 "universe_selection_date": universe_selection_date,
@@ -809,6 +845,9 @@ def main() -> int:
         "decision_stride_minutes": args.decision_stride_minutes,
         "periods_per_year_formula": "252 * median_decisions_per_utc_day",
         "median_decisions_per_day": median_decisions_per_day,
+        "action_mask_semantics": action_mask_semantics,
+        "model_input_keys": model_input_keys,
+        "forbidden_model_input_keys": forbidden_model_input_keys,
         "start": args.start,
         "end_exclusive": args.end_exclusive,
         "universe_selection_date": universe_selection_date,
@@ -819,7 +858,8 @@ def main() -> int:
         "minute_shape": list(minute_features.shape),
         "hour_shape": list(hour_features.shape),
         "action_count": len(action_names),
-        "valid_action_label_fraction": float(action_valid_mask.float().mean().item()),
+        "decision_action_valid_fraction": float(action_valid_mask.float().mean().item()),
+        "valid_action_label_fraction": float(label_valid_mask.float().mean().item()),
         "action_names": action_names,
         "first_decision_timestamp": decision_timestamps[0],
         "last_decision_timestamp": decision_timestamps[-1],
@@ -891,7 +931,8 @@ to the next hourly decision timestamp, using as-of prices when configured.
 - Context tensor: {list(minute_features.shape)}
 - Hour tensor: {list(hour_features.shape)}
 - Actions: {", ".join(action_names)}
-- Action label mask: `action_valid_mask`; missing action labels are stored as NaN.
+- Decision action mask: `decision_action_valid_mask` / `action_valid_mask`.
+- Action label mask: `label_valid_mask` / `action_label_valid_mask`; missing action labels are stored as NaN.
 - Source bar interval: {source_bar_interval}
 - Bar latency: {int(args.bar_latency_ms)} ms
 - Context bars per hour: {args.minutes_per_hour}

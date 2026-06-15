@@ -116,6 +116,7 @@ class HourFromMinuteDataSplit:
     decision_grid_minutes: int = DEFAULT_HOUR_DECISION_GRID_MINUTES
     periods_per_year: float = 252.0 * 6.0
     action_valid_mask: torch.Tensor | None = None
+    label_valid_mask: torch.Tensor | None = None
     source_bar_interval: str = DEFAULT_MINUTE_SOURCE_INTERVAL
     context_bars_per_hour: int | None = None
 
@@ -131,6 +132,7 @@ class HourFromMinuteDataSplit:
             hour_features=self.hour_features.to(device),
             action_returns=self.action_returns.to(device),
             action_valid_mask=self.action_valid_mask.to(device) if self.action_valid_mask is not None else None,
+            label_valid_mask=self.label_valid_mask.to(device) if self.label_valid_mask is not None else None,
             valid_start_indices=self.valid_start_indices.to(device),
             valid_index_mask=self.valid_index_mask.to(device),
             minute_feature_mean=self.minute_feature_mean.to(device),
@@ -150,6 +152,11 @@ class HourFromMinuteDataSplit:
                 device=indices.device,
             )
         return self.action_valid_mask[indices]
+
+    def label_valid_actions(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.label_valid_mask is not None:
+            return self.label_valid_mask[indices]
+        return torch.isfinite(self.action_returns[indices])
 
 
 def _assert_increasing(values: list[str], *, name: str) -> None:
@@ -352,12 +359,22 @@ def _build_split(
     all_minute_mask = payload["minute_mask"].bool()
     all_hour_features = payload["hour_features"].float()
     all_returns = payload["action_returns"].float()
-    all_action_valid = payload.get("action_valid_mask")
+    raw_action_valid = payload.get("action_valid_mask")
+    raw_decision_valid = payload.get("decision_action_valid_mask", raw_action_valid)
+    raw_label_valid = payload.get("label_valid_mask", payload.get("action_label_valid_mask", raw_action_valid))
+    all_action_valid = raw_decision_valid
     if all_action_valid is not None:
         all_action_valid = all_action_valid.bool()
         if tuple(all_action_valid.shape) != tuple(all_returns.shape):
             raise ValueError("action_valid_mask shape must match action_returns shape.")
-    _validate_action_return_contract(all_returns, all_action_valid)
+    all_label_valid = raw_label_valid
+    if all_label_valid is not None:
+        all_label_valid = all_label_valid.bool()
+        if tuple(all_label_valid.shape) != tuple(all_returns.shape):
+            raise ValueError("label_valid_mask shape must match action_returns shape.")
+        if all_action_valid is not None and bool((all_label_valid & ~all_action_valid).any().item()):
+            raise ValueError("label_valid_mask must be a subset of decision action validity.")
+    _validate_action_return_contract(all_returns, all_label_valid if raw_label_valid is not None else all_action_valid)
     row_count = len(decisions)
     if all_minute_features.shape[0] != row_count or all_minute_mask.shape[0] != row_count:
         raise ValueError("minute feature/mask row counts must match decision_timestamps length.")
@@ -383,6 +400,7 @@ def _build_split(
     raw_hour = all_hour_features[selected]
     returns = all_returns[selected]
     action_valid_mask = all_action_valid[selected] if all_action_valid is not None else None
+    label_valid_mask = all_label_valid[selected] if all_label_valid is not None else None
 
     reward_after_dt = None if reward_after_ts is None else _parse_utc_timestamp(reward_after_ts)
     reward_start_dt = None if reward_start_ts is None else _parse_utc_timestamp(reward_start_ts)
@@ -426,6 +444,7 @@ def _build_split(
         hour_features=hour,
         action_returns=returns,
         action_valid_mask=action_valid_mask,
+        label_valid_mask=label_valid_mask,
         valid_start_indices=valid_start_indices,
         valid_index_mask=valid_index_mask,
         minute_feature_mean=minute_feature_mean,
@@ -507,6 +526,10 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError("Splits must agree on whether action_valid_mask is present.")
         if split.action_valid_mask is not None and split.action_valid_mask.shape[1] != reference.action_returns.shape[1]:
             raise ValueError(f"Action-valid mask dimensions differ for split {split.name!r}.")
+        if (split.label_valid_mask is None) != (reference.label_valid_mask is None):
+            raise ValueError("Splits must agree on whether label_valid_mask is present.")
+        if split.label_valid_mask is not None and split.label_valid_mask.shape[1] != reference.action_returns.shape[1]:
+            raise ValueError(f"Label-valid mask dimensions differ for split {split.name!r}.")
         if split.minute_features.shape[1:] != reference.minute_features.shape[1:]:
             raise ValueError(f"Subhour tensor shape differs between {reference.name!r} and {split.name!r}.")
         if split.hour_features.shape[1:] != reference.hour_features.shape[1:]:
@@ -785,6 +808,10 @@ class VectorizedMinuteToHourEnv:
         selected_valid = action_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
         fallback_actions = torch.argmax(action_mask.long(), dim=1)
         actions = torch.where(selected_valid, actions, fallback_actions)
+        label_mask = self.data.label_valid_actions(current_indices)
+        selected_label_valid = label_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
+        cash_actions = torch.full_like(actions, int(self.config.constraints.cash_index))
+        actions = torch.where(selected_label_valid, actions, cash_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
         legs = trade_legs(
             previous_actions,
@@ -973,6 +1000,10 @@ def evaluate_minute_to_hour_policy(
             )[0].item()
         )
         action_tensor = torch.tensor([action], dtype=torch.long, device=device)
+        label_mask = data.label_valid_actions(torch.tensor([index], dtype=torch.long, device=device))
+        if not bool(label_mask[0, action].item()) or not bool(torch.isfinite(data.action_returns[index, action]).item()):
+            action = int(constraints.cash_index)
+            action_tensor = torch.tensor([action], dtype=torch.long, device=device)
         legs = float(
             trade_legs(
                 prev_tensor,

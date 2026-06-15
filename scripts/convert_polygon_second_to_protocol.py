@@ -33,6 +33,15 @@ REQUIRED_GOLD_PROTOCOL_KEYS = {
     "entry_fill_observed_mask",
     "reward_exit_observed_mask",
 }
+REQUIRED_HOURLY_PROTOCOL_KEYS = {
+    "decision_action_valid_mask",
+    "action_valid_mask",
+    "label_valid_mask",
+    "action_label_valid_mask",
+    "action_mask_semantics",
+    "model_input_keys",
+    "forbidden_model_input_keys",
+}
 
 
 def default_data_root() -> Path:
@@ -99,8 +108,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-missing-action-context",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Permit dense hourly rows with missing action context. This is marked non-reportable in the conversion manifest.",
+    )
+    parser.add_argument(
+        "--allow-non-reportable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Permit diagnostic/backfill conversions whose preflight checks are non-reportable.",
     )
     parser.add_argument("--max-gold-chunks", type=int, default=0, help="0 means all chunks.")
     parser.add_argument("--max-hourly-chunks", type=int, default=0, help="0 means all chunks.")
@@ -184,6 +199,7 @@ def conversion_config_payload(
         "build_gold",
         "build_hourly",
         "allow_missing_action_context",
+        "allow_non_reportable",
     ]
     payload = {key: str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key) for key in keys}
     payload["universe_asof"] = universe_asof
@@ -237,10 +253,13 @@ def resolve_actions(args: argparse.Namespace) -> list[str]:
     if args.actions:
         symbols = [symbol.strip().upper() for symbol in args.actions.split(",") if symbol.strip()]
     else:
-        symbols = [symbol for symbol in read_universe_symbols(args.universe) if symbol_has_files(args.source_root, symbol)]
-        symbols = symbols[: args.action_count]
+        symbols = read_universe_symbols(args.universe)[: args.action_count]
     symbols = [symbol for symbol in dict.fromkeys(symbols) if symbol and symbol != "CASH"]
     return ["CASH", *symbols]
+
+
+def missing_action_source_symbols(source_root: Path, actions: list[str]) -> list[str]:
+    return [symbol for symbol in actions if symbol != "CASH" and not symbol_has_files(source_root, symbol)]
 
 
 def manifest_summary(rows: list[dict[str, str]], dataset_manifest: dict[str, Any]) -> dict[str, Any]:
@@ -359,6 +378,8 @@ def normalize_source_manifest(
     universe_asof: str,
     conversion_config: dict[str, Any],
     preflight_reportability_errors: list[str],
+    missing_action_symbols: list[str],
+    allow_non_reportable: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     rows = load_manifest(source_manifest)
     original = read_json(dataset_manifest_path)
@@ -391,6 +412,8 @@ def normalize_source_manifest(
             "universe_file_hash": file_sha256(universe_path),
             "universe_asof": universe_asof,
             "conversion_config_hash": stable_json_hash(conversion_config),
+            "missing_action_source_symbols": missing_action_symbols,
+            "allow_non_reportable": bool(allow_non_reportable),
             **git_metadata,
             "conversion_manifest_summary": summary,
             "conversion_reportable": not reportability_errors,
@@ -445,6 +468,55 @@ def existing_gold_dataset_is_current(path: Path) -> bool:
         if not torch.equal(payload["action_valid_mask"].bool(), payload["decision_action_valid_mask"].bool()):
             return False
         if bool((payload["label_valid_mask"].bool() & ~payload["decision_action_valid_mask"].bool()).any().item()):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def existing_hourly_dataset_is_current(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        import torch
+
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if not REQUIRED_HOURLY_PROTOCOL_KEYS.issubset(payload):
+            return False
+        returns = payload["action_returns"].float()
+        action_valid = payload["action_valid_mask"].bool()
+        decision_valid = payload["decision_action_valid_mask"].bool()
+        label_valid = payload["label_valid_mask"].bool()
+        action_label_valid = payload["action_label_valid_mask"].bool()
+        if tuple(action_valid.shape) != tuple(returns.shape):
+            return False
+        if tuple(decision_valid.shape) != tuple(returns.shape):
+            return False
+        if tuple(label_valid.shape) != tuple(returns.shape):
+            return False
+        if tuple(action_label_valid.shape) != tuple(returns.shape):
+            return False
+        if not torch.equal(action_valid, decision_valid):
+            return False
+        if not torch.equal(action_label_valid, label_valid):
+            return False
+        if bool((label_valid & ~decision_valid).any().item()):
+            return False
+        if returns.shape[1] > 0:
+            if not bool(action_valid[:, 0].all().item() and label_valid[:, 0].all().item()):
+                return False
+            if not bool(torch.allclose(returns[:, 0], torch.zeros_like(returns[:, 0]), equal_nan=False)):
+                return False
+        if bool((label_valid & ~torch.isfinite(returns)).any().item()):
+            return False
+        non_cash_invalid = ~label_valid.clone()
+        if non_cash_invalid.shape[1] > 0:
+            non_cash_invalid[:, 0] = False
+        if bool((non_cash_invalid & torch.isfinite(returns)).any().item()):
+            return False
+        if "label_valid_mask" in set(payload.get("model_input_keys", [])):
+            return False
+        if "label_valid_mask" not in set(payload.get("forbidden_model_input_keys", [])):
             return False
     except Exception:
         return False
@@ -615,6 +687,7 @@ def conversion_reportability_errors(
     source_summary: dict[str, Any],
     status_counts: Counter[str],
     universe_asof_after_start: bool,
+    missing_action_symbols: list[str],
 ) -> list[str]:
     errors: list[str] = []
     if universe_asof_after_start:
@@ -629,6 +702,8 @@ def conversion_reportability_errors(
         errors.append("dry_run")
     if args.build_hourly and args.allow_missing_action_context:
         errors.append("missing_action_context_allowed")
+    if missing_action_symbols:
+        errors.append("missing_action_source_symbols")
     return list(dict.fromkeys(errors))
 
 
@@ -687,8 +762,10 @@ def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, da
             label = f"{start_day.isoformat()}_to_{end_day.isoformat()}"
             output_dir = args.output_root / "hour_from_second_1s" / "partitions" / label
             output = output_dir / "hour_from_second_dataset.pt"
-            if args.skip_existing and output.exists():
-                records.append({"kind": "hour_from_second", "chunk": label, "status": "skipped_existing", "output": str(output)})
+            if args.skip_existing and existing_hourly_dataset_is_current(output):
+                records.append(
+                    {"kind": "hour_from_second", "chunk": label, "status": "skipped_existing_current", "output": str(output)}
+                )
                 continue
             command = build_hourly_command(args=args, start_day=start_day, end_day=end_day, output_dir=output_dir)
             tasks.append({"kind": "hour_from_second", "chunk": label, "output": str(output), "command": command})
@@ -715,12 +792,22 @@ def main(argv: list[str] | None = None) -> int:
     if not dates:
         raise ValueError("No completed source dates found for the requested range.")
     actions = resolve_actions(args)
+    missing_action_symbols = missing_action_source_symbols(args.source_root, actions)
     config_payload = conversion_config_payload(args, actions=actions, universe_asof=universe_asof)
     preflight_errors: list[str] = []
     if universe_asof_after_start:
         preflight_errors.append("universe_asof_after_dataset_start")
     if args.build_hourly and args.allow_missing_action_context:
         preflight_errors.append("missing_action_context_allowed")
+    if missing_action_symbols:
+        preflight_errors.append("missing_action_source_symbols")
+    preflight_errors = list(dict.fromkeys(preflight_errors))
+    if preflight_errors and not args.allow_non_reportable:
+        raise ValueError(
+            "Non-reportable conversion preflight failed: "
+            f"{', '.join(preflight_errors)}. "
+            "Pass --allow-non-reportable for diagnostic/backfill conversion outputs."
+        )
     protocol_dataset_manifest = args.output_root / "source" / "dataset_manifest.protocol.json"
     source_payload, source_summary = normalize_source_manifest(
         source_manifest=args.source_manifest,
@@ -731,6 +818,8 @@ def main(argv: list[str] | None = None) -> int:
         universe_asof=universe_asof,
         conversion_config=config_payload,
         preflight_reportability_errors=preflight_errors,
+        missing_action_symbols=missing_action_symbols,
+        allow_non_reportable=bool(args.allow_non_reportable),
     )
     records = convert_chunks(args, protocol_dataset_manifest, dates, actions)
     status_counts = Counter(str(record.get("status", "")) for record in records)
@@ -739,6 +828,7 @@ def main(argv: list[str] | None = None) -> int:
         source_summary=source_summary,
         status_counts=status_counts,
         universe_asof_after_start=universe_asof_after_start,
+        missing_action_symbols=missing_action_symbols,
     )
     reportable = not reportability_errors
     conversion_manifest = {
@@ -759,6 +849,7 @@ def main(argv: list[str] | None = None) -> int:
         "universe_file_hash": file_sha256(args.universe),
         "universe_asof": universe_asof,
         "universe_asof_after_start": universe_asof_after_start,
+        "missing_action_source_symbols": missing_action_symbols,
         "output_root": str(args.output_root),
         "start": args.start,
         "end_exclusive": args.end_exclusive,
@@ -768,6 +859,7 @@ def main(argv: list[str] | None = None) -> int:
         **current_git_metadata(),
         "continue_on_error": bool(args.continue_on_error),
         "strict": bool(args.strict),
+        "allow_non_reportable": bool(args.allow_non_reportable),
         "allow_missing_action_context": bool(args.allow_missing_action_context),
         "status_counts": dict(status_counts),
         "records": records,

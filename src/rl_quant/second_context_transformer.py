@@ -749,6 +749,7 @@ def _evaluate_action_path(
                     "entry_price_source": split.entry_price_source,
                     "exit_price_source": split.exit_price_source,
                     "execution_model": split.execution_model,
+                    "same_action_weight_policy": "freeze_executed_weight_until_action_change",
                     "previous_action": split.action_names[previous_action],
                     "selected_action": split.action_names[action],
                     "requested_action": (
@@ -829,6 +830,9 @@ def _evaluate_action_path(
             "terminal_liquidation_cost": terminal_liquidation_cost,
             "terminal_liquidation_cost_bps": terminal_liquidation_cost_bps,
             "terminal_liquidation_order_legs": terminal_liquidation_order_legs,
+            "same_action_weight_policy": "freeze_executed_weight_until_action_change",
+            "selected_action_semantics": "executed_actions_after_missing_label_fallback",
+            "requested_action_semantics": "policy_actions_after_min_hold_and_cooldown_constraints",
             "segment_resets": segment_resets,
             "gap_resets": gap_resets,
             "path_state_resets": segment_resets + gap_resets,
@@ -949,7 +953,11 @@ def evaluate_second_context_trading_policy(
     previous_action = int(initial_action)
     bars_held = int(max(min_hold_bars, 1))
     cooldown_remaining = 0
-    selected_actions: list[int] = []
+    raw_policy_actions: list[int] = []
+    requested_actions: list[int] = []
+    executed_actions: list[int] = []
+    constraint_adjusted_actions: list[int] = []
+    selection_reasons: list[str] = []
     selected_rows: list[int] = []
     previous_row: int | None = None
     for row in split.valid_start_indices.detach().cpu().tolist():
@@ -958,13 +966,16 @@ def evaluate_second_context_trading_policy(
             previous_action = int(initial_action)
             bars_held = int(max(min_hold_bars, 1))
             cooldown_remaining = 0
-        valid = split.action_valid_mask[row].clone()
-        if not bool(valid.any().item()):
+        decision_valid = split.action_valid_mask[row].clone()
+        if not bool(decision_valid.any().item()):
             previous_action = int(initial_action)
             bars_held = int(max(min_hold_bars, 1))
             cooldown_remaining = 0
             previous_row = None
             continue
+        raw_masked_q = q_values[row].masked_fill(~decision_valid, -1e9)
+        raw_policy_action = int(raw_masked_q.argmax().item())
+        valid = decision_valid.clone()
         if min_hold_bars > 1 and bars_held < min_hold_bars and previous_action < valid.numel():
             hold_only = torch.zeros_like(valid)
             hold_only[previous_action] = valid[previous_action]
@@ -986,6 +997,15 @@ def evaluate_second_context_trading_policy(
             or not bool(torch.isfinite(split.action_returns[row, requested_action]).item())
         ):
             executed_action = 0
+        if executed_action != requested_action:
+            if requested_action != raw_policy_action:
+                selection_reason = "constraint_adjusted_then_fallback_due_to_missing_label"
+            else:
+                selection_reason = "fallback_due_to_missing_label"
+        elif requested_action != raw_policy_action:
+            selection_reason = "constraint_adjusted"
+        else:
+            selection_reason = "selected_by_policy"
         if executed_action != previous_action:
             bars_held = 0
             cooldown_remaining = int(cooldown_bars)
@@ -993,13 +1013,17 @@ def evaluate_second_context_trading_policy(
             bars_held += 1
             cooldown_remaining = max(0, cooldown_remaining - 1)
         previous_action = executed_action
-        selected_actions.append(requested_action)
+        raw_policy_actions.append(raw_policy_action)
+        requested_actions.append(requested_action)
+        executed_actions.append(executed_action)
+        constraint_adjusted_actions.append(requested_action)
+        selection_reasons.append(selection_reason)
         selected_rows.append(int(row))
         previous_row = int(row)
     selected_rows_tensor = torch.tensor(selected_rows, dtype=torch.long)
     metrics = _evaluate_action_path(
         split,
-        torch.tensor(selected_actions, dtype=torch.long),
+        torch.tensor(requested_actions, dtype=torch.long),
         row_indices=selected_rows_tensor,
         q_values=q_values[selected_rows_tensor] if selected_rows else q_values[:0],
         initial_action=initial_action,
@@ -1008,7 +1032,12 @@ def evaluate_second_context_trading_policy(
     )
     metrics.update({"diagnostic_only": False, "cost_model": "sequential_switch_only_cost"})
     if return_selected_actions:
-        metrics["selected_actions"] = selected_actions
+        metrics["selected_actions"] = executed_actions
+        metrics["executed_actions"] = executed_actions
+        metrics["requested_actions"] = requested_actions
+        metrics["raw_policy_actions"] = raw_policy_actions
+        metrics["constraint_adjusted_actions"] = constraint_adjusted_actions
+        metrics["selection_reasons"] = selection_reasons
         metrics["selected_rows"] = selected_rows
     return metrics
 

@@ -1275,12 +1275,18 @@ class MinuteToHourTests(unittest.TestCase):
             PickMissingLabelModel(),
             device=torch.device("cpu"),
             return_decision_logs=True,
+            return_selected_actions=True,
         )
 
         self.assertFalse(metrics["evaluation_reportable"])
         self.assertEqual(metrics["selected_action_missing_label_count"], 1)
         self.assertEqual(metrics["policy_unscorable_rows"], 1)
         self.assertEqual(metrics["fallback_due_to_missing_label_count"], 1)
+        self.assertEqual(metrics["raw_policy_actions"], [1])
+        self.assertEqual(metrics["requested_actions"], [1])
+        self.assertEqual(metrics["executed_actions"], [0])
+        self.assertEqual(metrics["selected_actions"], [0])
+        self.assertEqual(metrics["selection_reasons"], ["fallback_due_to_missing_label"])
         self.assertEqual(metrics["decision_logs"][0]["requested_action"], "QQQ")
         self.assertEqual(metrics["decision_logs"][0]["selected_action"], "CASH")
         self.assertTrue(metrics["decision_logs"][0]["fallback_due_to_missing_label"])
@@ -1702,7 +1708,9 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(metrics["total_return"]), 1.01 * 1.02 - 1.0, places=6)
         self.assertEqual(metrics["switches"], 1)
+        self.assertEqual(metrics["same_action_weight_policy"], "freeze_executed_weight_until_action_change")
         second_log = metrics["decision_logs"][1]
+        self.assertEqual(second_log["same_action_weight_policy"], "freeze_executed_weight_until_action_change")
         self.assertAlmostEqual(second_log["target_weight"], 0.5)
         self.assertAlmostEqual(second_log["previous_executed_weight"], 1.0)
         self.assertAlmostEqual(second_log["executed_weight"], 1.0)
@@ -1871,6 +1879,40 @@ class MinuteToHourTests(unittest.TestCase):
             self.assertFalse(module.existing_gold_dataset_is_current(old_path))
             self.assertTrue(module.existing_gold_dataset_is_current(current_path))
 
+    def test_second_context_conversion_skip_requires_current_hourly_schema(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+        current_payload = {
+            "action_returns": torch.tensor([[0.0, float("nan")], [0.0, 0.01]], dtype=torch.float32),
+            "decision_action_valid_mask": torch.tensor([[True, True], [True, True]]),
+            "action_valid_mask": torch.tensor([[True, True], [True, True]]),
+            "label_valid_mask": torch.tensor([[True, False], [True, True]]),
+            "action_label_valid_mask": torch.tensor([[True, False], [True, True]]),
+            "action_mask_semantics": {
+                "decision_action_valid_mask": "known before decision",
+                "label_valid_mask": "known after reward realization",
+            },
+            "model_input_keys": ["minute_features", "action_valid_mask", "decision_action_valid_mask"],
+            "forbidden_model_input_keys": ["label_valid_mask", "action_label_valid_mask"],
+        }
+        old_payload = {
+            "action_returns": torch.tensor([[0.0, float("nan")], [0.0, 0.01]], dtype=torch.float32),
+            "action_valid_mask": torch.tensor([[True, False], [True, True]]),
+        }
+        leaky_payload = dict(current_payload)
+        leaky_payload["model_input_keys"] = ["minute_features", "label_valid_mask"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            old_path = Path(directory) / "old.pt"
+            current_path = Path(directory) / "current.pt"
+            leaky_path = Path(directory) / "leaky.pt"
+            torch.save(old_payload, old_path)
+            torch.save(current_payload, current_path)
+            torch.save(leaky_payload, leaky_path)
+
+            self.assertFalse(module.existing_hourly_dataset_is_current(old_path))
+            self.assertTrue(module.existing_hourly_dataset_is_current(current_path))
+            self.assertFalse(module.existing_hourly_dataset_is_current(leaky_path))
+
     def test_second_context_converter_reportability_flags_future_universe(self) -> None:
         module = load_script("convert_polygon_second_to_protocol")
         args = module.parse_args(
@@ -1886,11 +1928,41 @@ class MinuteToHourTests(unittest.TestCase):
             source_summary={"pending_symbol_days": 0},
             status_counts=module.Counter({"ok": 1}),
             universe_asof_after_start=module.parse_date(module.infer_universe_asof(args.universe)) > module.parse_date(args.start),
+            missing_action_symbols=[],
         )
 
         self.assertFalse(args.continue_on_error)
+        self.assertFalse(args.allow_missing_action_context)
+        self.assertFalse(args.allow_non_reportable)
         self.assertIn("universe_asof_after_dataset_start", errors)
-        self.assertIn("missing_action_context_allowed", errors)
+        self.assertNotIn("missing_action_context_allowed", errors)
+
+    def test_second_context_converter_keeps_intended_actions_separate_from_source_coverage(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            universe = root / "universe_2025-01-01.txt"
+            universe.write_text("AAA\nBBB\n")
+            source_root = root / "source"
+            (source_root / "AAA" / "2025" / "01").mkdir(parents=True)
+            (source_root / "AAA" / "2025" / "01" / "2025-01-02.parquet").write_bytes(b"placeholder")
+            args = module.parse_args(
+                [
+                    "--source-root",
+                    str(source_root),
+                    "--universe",
+                    str(universe),
+                    "--action-count",
+                    "2",
+                ]
+            )
+
+            actions = module.resolve_actions(args)
+            missing = module.missing_action_source_symbols(args.source_root, actions)
+
+        self.assertEqual(actions, ["CASH", "AAA", "BBB"])
+        self.assertEqual(missing, ["BBB"])
 
     def test_min_hold_action_mask_allows_only_current_action(self) -> None:
         mask = build_action_mask(
@@ -2328,6 +2400,57 @@ class MinuteToHourTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Invalid action_returns"):
             module._build_split(name="train", payload=payload)
+
+    def test_minute_to_hour_protocol_splits_decision_and_label_masks(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
+
+        class PickActionPolicy(nn.Module):
+            def forward(
+                self,
+                minute_features: torch.Tensor,
+                minute_mask: torch.Tensor,
+                hour_features: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor,
+            ) -> torch.Tensor:
+                del minute_mask, hour_features, previous_actions, constraint_features
+                return torch.tensor([[0.0, 10.0]], dtype=torch.float32).repeat(minute_features.shape[0], 1)
+
+        payload = {
+            "decision_timestamps": [
+                "2026-01-02T14:30:00+00:00",
+                "2026-01-02T15:30:00+00:00",
+            ],
+            "next_timestamps": [
+                "2026-01-02T15:30:00+00:00",
+                "2026-01-02T16:30:00+00:00",
+            ],
+            "minute_feature_names": ["m"],
+            "hour_feature_names": ["h"],
+            "action_names": ["CASH", "QQQ"],
+            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
+            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
+            "action_returns": torch.tensor([[0.0, float("nan")], [0.0, 0.01]], dtype=torch.float32),
+            "decision_action_valid_mask": torch.tensor([[True, True], [True, True]]),
+            "action_valid_mask": torch.tensor([[True, True], [True, True]]),
+            "label_valid_mask": torch.tensor([[True, False], [True, True]]),
+        }
+
+        split = module._build_split(name="train", payload=payload)
+        self.assertTrue(bool(split.valid_actions(torch.tensor([0]))[0, 1].item()))
+        self.assertFalse(bool(split.label_valid_actions(torch.tensor([0]))[0, 1].item()))
+
+        result = evaluate_minute_to_hour_policy(
+            split,
+            PickActionPolicy(),
+            device=torch.device("cpu"),
+            initial_action=0,
+            constraints=TradingConstraintConfig(one_way_cost_bps=0.0),
+            capture_rollout=True,
+        )
+
+        self.assertEqual([row["asset"] for row in result.rollout_records], ["CASH", "QQQ"])
 
 
 class HourlySplitTests(unittest.TestCase):

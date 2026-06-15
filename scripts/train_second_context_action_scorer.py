@@ -325,17 +325,53 @@ def main() -> int:
         split,
         confidence,
         selected_rows: torch.Tensor,
-        selected_actions: torch.Tensor,
+        executed_actions: torch.Tensor,
+        requested_actions: torch.Tensor | None = None,
+        raw_policy_actions: torch.Tensor | None = None,
+        constraint_adjusted_actions: torch.Tensor | None = None,
+        selection_reasons: list[str] | None = None,
     ) -> None:
+        def action_name(action: int) -> str:
+            return split.action_names[action] if 0 <= action < len(split.action_names) else str(action)
+
+        def maybe_action_float(matrix: torch.Tensor, row: int, action: int) -> float | None:
+            if action < 0 or action >= matrix.shape[1]:
+                return None
+            return maybe_float(matrix[row, action])
+
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as sink:
-            for row_value, action_value in zip(selected_rows.tolist(), selected_actions.tolist()):
+            for position, (row_value, action_value) in enumerate(zip(selected_rows.tolist(), executed_actions.tolist())):
                 row = int(row_value)
                 executed_action = int(action_value)
                 valid = confidence.valid_actions[row]
                 q_row = confidence.q_mean[row].clone()
                 q_row = q_row.masked_fill(~valid, -float("inf"))
-                raw_policy_action = int(q_row.argmax().item()) if bool(valid.any().item()) else 0
+                inferred_raw_policy_action = int(q_row.argmax().item()) if bool(valid.any().item()) else 0
+                raw_policy_action = (
+                    int(raw_policy_actions[position].item())
+                    if raw_policy_actions is not None and position < raw_policy_actions.numel()
+                    else inferred_raw_policy_action
+                )
+                requested_action = (
+                    int(requested_actions[position].item())
+                    if requested_actions is not None and position < requested_actions.numel()
+                    else executed_action
+                )
+                constraint_adjusted_action = (
+                    int(constraint_adjusted_actions[position].item())
+                    if constraint_adjusted_actions is not None and position < constraint_adjusted_actions.numel()
+                    else requested_action
+                )
+                selection_reason = (
+                    str(selection_reasons[position])
+                    if selection_reasons is not None and position < len(selection_reasons)
+                    else (
+                        "selected_by_policy"
+                        if raw_policy_action == requested_action == executed_action
+                        else "constraint_or_evaluator_adjusted"
+                    )
+                )
                 second_q = q_row.clone()
                 if 0 <= executed_action < second_q.numel():
                     second_q[executed_action] = -float("inf")
@@ -354,11 +390,11 @@ def main() -> int:
                 record = {
                     "decision_timestamp": split.decision_timestamps[row],
                     "row_index": row,
-                    "raw_policy_action": split.action_names[raw_policy_action],
-                    "executed_action": split.action_names[executed_action],
-                    "selection_reason": (
-                        "selected_by_policy" if raw_policy_action == executed_action else "constraint_or_evaluator_adjusted"
-                    ),
+                    "raw_policy_action": action_name(raw_policy_action),
+                    "constraint_adjusted_action": action_name(constraint_adjusted_action),
+                    "requested_action": action_name(requested_action),
+                    "executed_action": action_name(executed_action),
+                    "selection_reason": selection_reason,
                     "selected_q_mean": maybe_float(confidence.q_mean[row, executed_action]),
                     "selected_q_std": maybe_float(confidence.q_std_total[row, executed_action]),
                     "selected_q_lcb_05": maybe_float(confidence.q_lcb[row, executed_action]),
@@ -373,18 +409,23 @@ def main() -> int:
                     "selected_advantage_mean": maybe_float(confidence.advantage_mean[row, executed_action]),
                     "selected_advantage_lcb": maybe_float(confidence.advantage_lcb[row, executed_action]),
                     "selected_confidence": maybe_float(selected_confidence),
+                    "requested_q_mean": maybe_action_float(confidence.q_mean, row, requested_action),
+                    "requested_q_std": maybe_action_float(confidence.q_std_total, row, requested_action),
+                    "requested_profit_confidence": maybe_action_float(confidence.profit_confidence, row, requested_action),
+                    "requested_selection_confidence": maybe_action_float(confidence.selection_confidence, row, requested_action),
+                    "requested_confidence": maybe_action_float(confidence.confidence, row, requested_action),
                     "cash_q_mean": maybe_float(confidence.q_mean[row, 0]),
                     "cash_p_best": maybe_float(confidence.p_best[row, 0]),
                     "cash_p_best_member_vote": maybe_float(confidence.p_best_member_vote[row, 0]),
                     "cash_p_best_draw": maybe_float(confidence.p_best_draw[row, 0]),
                     "cash_p_positive": maybe_float(confidence.p_positive[row, 0]),
-                    "second_best_action": split.action_names[second_best_action],
+                    "second_best_action": action_name(second_best_action),
                     "second_best_q_mean": maybe_float(confidence.q_mean[row, second_best_action]),
                     "q_margin_vs_second_best": maybe_float(q_margin),
                     "confidence_margin_vs_second_best": confidence_margin if math.isfinite(confidence_margin) else None,
                     "ood_score": maybe_float(confidence.ood_score[row]),
                     "valid_action_count": int(valid.sum().item()),
-                    "forced_action_flag": raw_policy_action != executed_action,
+                    "forced_action_flag": raw_policy_action != requested_action or requested_action != executed_action,
                 }
                 sink.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -571,23 +612,70 @@ def main() -> int:
     run_dir = args.output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     decision_logs = list(test_policy_metrics.pop("decision_logs", []))
-    train_selected_actions = torch.tensor(list(train_policy_metrics.pop("selected_actions", [])), dtype=torch.long)
-    val_selected_actions = torch.tensor(list(val_policy_metrics.pop("selected_actions", [])), dtype=torch.long)
-    test_selected_actions = torch.tensor(list(test_policy_metrics.pop("selected_actions", [])), dtype=torch.long)
-    train_selected_rows = torch.tensor(list(train_policy_metrics.pop("selected_rows", [])), dtype=torch.long)
-    val_selected_rows = torch.tensor(list(val_policy_metrics.pop("selected_rows", [])), dtype=torch.long)
-    test_selected_rows = torch.tensor(list(test_policy_metrics.pop("selected_rows", [])), dtype=torch.long)
+
+    def pop_policy_path(metrics: dict[str, object]) -> dict[str, object]:
+        legacy_selected = list(metrics.pop("selected_actions", []))
+        executed = list(metrics.pop("executed_actions", legacy_selected))
+        requested = list(metrics.pop("requested_actions", legacy_selected))
+        raw_policy = list(metrics.pop("raw_policy_actions", requested))
+        constraint_adjusted = list(metrics.pop("constraint_adjusted_actions", requested))
+        reasons = [str(reason) for reason in list(metrics.pop("selection_reasons", []))]
+        if len(reasons) != len(executed):
+            reasons = [
+                "selected_by_policy" if raw == req == exe else "constraint_or_evaluator_adjusted"
+                for raw, req, exe in zip(raw_policy, requested, executed)
+            ]
+        return {
+            "executed_actions": torch.tensor(executed, dtype=torch.long),
+            "requested_actions": torch.tensor(requested, dtype=torch.long),
+            "raw_policy_actions": torch.tensor(raw_policy, dtype=torch.long),
+            "constraint_adjusted_actions": torch.tensor(constraint_adjusted, dtype=torch.long),
+            "selection_reasons": reasons,
+            "rows": torch.tensor(list(metrics.pop("selected_rows", [])), dtype=torch.long),
+        }
+
+    train_path = pop_policy_path(train_policy_metrics)
+    val_path = pop_policy_path(val_policy_metrics)
+    test_path = pop_policy_path(test_policy_metrics)
+    train_selected_actions = train_path["executed_actions"]
+    val_selected_actions = val_path["executed_actions"]
+    test_selected_actions = test_path["executed_actions"]
+    train_requested_actions = train_path["requested_actions"]
+    val_requested_actions = val_path["requested_actions"]
+    test_requested_actions = test_path["requested_actions"]
+    train_selected_rows = train_path["rows"]
+    val_selected_rows = val_path["rows"]
+    test_selected_rows = test_path["rows"]
     if decision_logs:
         with (run_dir / "decision_logs.jsonl").open("w") as sink:
             for row in decision_logs:
                 sink.write(json.dumps(row, sort_keys=True, default=str) + "\n")
     torch.save(
         {
+            "action_path_schema_version": "selected_action_paths_v2",
+            "selected_actions_semantics": "executed_actions_after_missing_label_fallback",
+            "requested_actions_semantics": "policy_actions_after_min_hold_and_cooldown_constraints",
+            "same_action_weight_policy": "freeze_executed_weight_until_action_change",
             "train_actions": train_selected_actions,
+            "train_executed_actions": train_selected_actions,
+            "train_requested_actions": train_requested_actions,
+            "train_raw_policy_actions": train_path["raw_policy_actions"],
+            "train_constraint_adjusted_actions": train_path["constraint_adjusted_actions"],
+            "train_selection_reasons": train_path["selection_reasons"],
             "train_rows": train_selected_rows,
             "val_actions": val_selected_actions,
+            "val_executed_actions": val_selected_actions,
+            "val_requested_actions": val_requested_actions,
+            "val_raw_policy_actions": val_path["raw_policy_actions"],
+            "val_constraint_adjusted_actions": val_path["constraint_adjusted_actions"],
+            "val_selection_reasons": val_path["selection_reasons"],
             "val_rows": val_selected_rows,
             "test_actions": test_selected_actions,
+            "test_executed_actions": test_selected_actions,
+            "test_requested_actions": test_requested_actions,
+            "test_raw_policy_actions": test_path["raw_policy_actions"],
+            "test_constraint_adjusted_actions": test_path["constraint_adjusted_actions"],
+            "test_selection_reasons": test_path["selection_reasons"],
             "test_rows": test_selected_rows,
         },
         run_dir / "selected_action_paths.pt",
@@ -690,11 +778,13 @@ def main() -> int:
             )
             confidence_artifacts[f"action_confidence_{split_name}_npz"] = str(path)
         selected_by_split = {
-            "train": (train, train_selected_rows, train_selected_actions),
-            "val": (val, val_selected_rows, val_selected_actions),
-            "test": (test, test_selected_rows, test_selected_actions),
+            "train": (train, train_path),
+            "val": (val, val_path),
+            "test": (test, test_path),
         }
-        for split_name, (split_obj, selected_rows, selected_actions) in selected_by_split.items():
+        for split_name, (split_obj, selected_path) in selected_by_split.items():
+            selected_rows = selected_path["rows"]
+            selected_actions = selected_path["executed_actions"]
             selected_confidence_path = run_dir / f"selected_action_confidence_{split_name}.jsonl"
             if selected_actions.numel():
                 write_selected_action_confidence(
@@ -702,7 +792,11 @@ def main() -> int:
                     split=split_obj,
                     confidence=confidence_by_split[split_name],
                     selected_rows=selected_rows,
-                    selected_actions=selected_actions,
+                    executed_actions=selected_actions,
+                    requested_actions=selected_path["requested_actions"],
+                    raw_policy_actions=selected_path["raw_policy_actions"],
+                    constraint_adjusted_actions=selected_path["constraint_adjusted_actions"],
+                    selection_reasons=selected_path["selection_reasons"],
                 )
                 confidence_artifacts[f"selected_action_confidence_{split_name}_jsonl"] = str(selected_confidence_path)
         confidence_summary = {
@@ -724,17 +818,17 @@ def main() -> int:
         "train": second_context_missing_label_report(
             train,
             row_indices=train_selected_rows,
-            selected_actions=train_selected_actions,
+            selected_actions=train_requested_actions,
         ),
         "val": second_context_missing_label_report(
             val,
             row_indices=val_selected_rows,
-            selected_actions=val_selected_actions,
+            selected_actions=val_requested_actions,
         ),
         "test": second_context_missing_label_report(
             test,
             row_indices=test_selected_rows,
-            selected_actions=test_selected_actions,
+            selected_actions=test_requested_actions,
         ),
     }
     split_manifest = split_manifest_for(train, val, test)
