@@ -128,29 +128,58 @@ def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
         writer.writerows(records)
 
 
+def split_window(split) -> dict[str, str | int]:
+    valid = [int(item) for item in split.valid_start_indices.detach().cpu().tolist()]
+    first_valid = valid[0]
+    last_valid = valid[-1]
+    return {
+        "selected_rows": len(split.decision_timestamps),
+        "valid_starts": len(valid),
+        "first_valid_decision": split.decision_timestamps[first_valid],
+        "first_valid_reward_end": split.next_timestamps[first_valid],
+        "last_valid_decision": split.decision_timestamps[last_valid],
+        "last_valid_reward_end": split.next_timestamps[last_valid],
+    }
+
+
+def iso_timestamp_ms(value: str) -> int:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return int(parsed.timestamp() * 1000)
+
+
 def build_rolling_partition_splits(dataset_path: Path):
     from rl_quant.minute_to_hour_transformer import _build_split, _load_payload
 
     payload = _load_payload(dataset_path)
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
-    if len(decisions) < 3:
-        raise ValueError(f"Partition {dataset_path} has too few decision rows for rolling training.")
-    train_reward_end = decisions[-1]
-    holdout_start = decisions[-1]
-    holdout_reward_end = next_timestamps[-1]
+    if len(decisions) < 4:
+        raise ValueError(
+            f"Partition {dataset_path} has too few decision rows for independent train/validation/test splits."
+        )
+    train_end = decisions[-3]
+    train_reward_end = next_timestamps[-3]
+    validation_start = decisions[-2]
+    validation_reward_end = next_timestamps[-2]
+    test_start = decisions[-1]
+    test_reward_end = next_timestamps[-1]
+    if iso_timestamp_ms(train_reward_end) > iso_timestamp_ms(validation_start):
+        raise ValueError("Training reward window overlaps the validation decision window.")
+    if iso_timestamp_ms(validation_reward_end) > iso_timestamp_ms(test_start):
+        raise ValueError("Validation reward window overlaps the test decision window.")
     train = _build_split(
         name="train",
         payload=payload,
-        end_ts=train_reward_end,
+        end_ts=train_end,
         reward_end_ts=train_reward_end,
     )
     val = _build_split(
         name="val",
         payload=payload,
-        end_ts=holdout_reward_end,
-        reward_start_ts=holdout_start,
-        reward_end_ts=holdout_reward_end,
+        start_ts=validation_start,
+        end_ts=validation_start,
+        reward_start_ts=validation_start,
+        reward_end_ts=validation_reward_end,
         minute_feature_mean=train.minute_feature_mean,
         minute_feature_std=train.minute_feature_std,
         hour_feature_mean=train.hour_feature_mean,
@@ -159,9 +188,10 @@ def build_rolling_partition_splits(dataset_path: Path):
     test = _build_split(
         name="test",
         payload=payload,
-        end_ts=holdout_reward_end,
-        reward_start_ts=holdout_start,
-        reward_end_ts=holdout_reward_end,
+        start_ts=test_start,
+        end_ts=test_start,
+        reward_start_ts=test_start,
+        reward_end_ts=test_reward_end,
         minute_feature_mean=train.minute_feature_mean,
         minute_feature_std=train.minute_feature_std,
         hour_feature_mean=train.hour_feature_mean,
@@ -321,6 +351,9 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint_path,
             )
             write_rollout(current_dir / "test_rollout.csv", test_result.rollout_records)
+            train_window = split_window(train_split)
+            val_window = split_window(val_split)
+            test_window = split_window(test_split)
             summary = {
                 "partition": label,
                 "ordinal": ordinal,
@@ -333,6 +366,14 @@ def main(argv: list[str] | None = None) -> int:
                     "train_valid_starts": int(train_split.valid_start_indices.numel()),
                     "val_valid_starts": int(val_split.valid_start_indices.numel()),
                     "test_valid_starts": int(test_split.valid_start_indices.numel()),
+                },
+                "split_windows": {
+                    "train": train_window,
+                    "val": val_window,
+                    "test": test_window,
+                    "validation_and_test_are_distinct": (
+                        val_window["first_valid_decision"] != test_window["first_valid_decision"]
+                    ),
                 },
                 "training": artifacts,
                 "train_metrics": train_result.to_dict(),

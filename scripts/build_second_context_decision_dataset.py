@@ -17,9 +17,11 @@ if str(SRC) not in sys.path:
 from rl_quant.data_sources.polygon_second_aggs import (  # noqa: E402
     PolygonSecondAggConfig,
     build_source_manifest,
+    iso_to_timestamp_ms,
     iter_symbol_day_files,
     load_manifest,
     load_symbol_day,
+    timestamp_ms_to_iso,
     validate_manifest,
 )
 from rl_quant.features.stock_second_context import (  # noqa: E402
@@ -32,6 +34,8 @@ from rl_quant.features.stock_covariates import (  # noqa: E402
     append_action_covariates_to_payload,
     build_action_covariate_tensor,
     load_silver_rows_by_symbol,
+    read_covariate_coverage_manifest,
+    validate_action_covariate_feature_schema,
 )
 
 
@@ -69,6 +73,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--symbol-limit", type=int, default=500)
     parser.add_argument("--max-files", type=int, default=0, help="Limit stock source files for smoke builds. 0 means no limit.")
     parser.add_argument("--actions", default="CASH,QQQ,SPY", help="Comma-separated action symbols; CASH is added if absent.")
+    parser.add_argument("--strict-action-sources", action="store_true", help="Fail if any requested non-CASH action has no bar files.")
     parser.add_argument("--max-action-staleness-seconds", type=int, default=300)
     parser.add_argument("--include-extended-hours", action="store_true")
     parser.add_argument("--source-access", choices=["auto", "REST", "AWS S3"], default="auto")
@@ -79,6 +84,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--covariate-join-mode", choices=["latest_before_decision"], default="latest_before_decision")
     parser.add_argument("--covariate-max-age-days", type=int, default=0, help="Reserved for stricter future filters; 0 means no age cutoff.")
     parser.add_argument("--covariate-strict-coverage", action="store_true")
+    parser.add_argument("--universe-selection-timestamp", help="Point-in-time timestamp when the stock/action universe was selected.")
+    parser.add_argument("--universe-method", default="unspecified")
+    parser.add_argument("--universe-source", type=Path, help="Universe source file used for this dataset.")
+    parser.add_argument("--universe-source-hash")
+    parser.add_argument(
+        "--allow-fixed-survivor-universe-diagnostic",
+        action="store_true",
+        help="Keep building when the universe is not point-in-time, but mark the dataset non-reportable.",
+    )
     return parser.parse_args(argv)
 
 
@@ -181,6 +195,8 @@ def main() -> int:
     missing_actions = [symbol for symbol in action_symbols if symbol != "CASH" and symbol not in action_frames]
     if missing_actions:
         print(f"Skipping actions without bar files: {', '.join(missing_actions)}")
+        if args.strict_action_sources:
+            raise ValueError(f"Missing requested action bar files for: {', '.join(missing_actions)}")
     action_names = ["CASH", *[symbol for symbol in action_symbols if symbol != "CASH" and symbol in action_frames]]
     if len(action_names) < 2:
         raise ValueError("At least one non-CASH action with second bars is required.")
@@ -192,6 +208,44 @@ def main() -> int:
         execution_latency_ms=args.execution_latency_ms,
         allow_post_close_exit=args.allow_post_close_exit,
     )
+    manifest_errors = list(source_manifest.get("reportability_errors", []))
+    if missing_actions:
+        manifest_errors.append("missing_intended_action_source_symbols")
+    universe_source_hash = args.universe_source_hash
+    if universe_source_hash is None and args.universe_source is not None:
+        universe_source_hash = file_sha256(args.universe_source)
+    universe_selection_timestamp = args.universe_selection_timestamp
+    if not universe_selection_timestamp:
+        manifest_errors.append("universe_selection_timestamp_missing")
+    else:
+        first_decision_ms = min(decision_ms) if decision_ms else None
+        if first_decision_ms is not None and first_decision_ms < iso_to_timestamp_ms(universe_selection_timestamp):
+            manifest_errors.append("future_universe_selection_timestamp")
+            if not args.allow_fixed_survivor_universe_diagnostic:
+                print(
+                    "Universe selection timestamp is after the first decision; "
+                    "dataset will be marked non-reportable.",
+                    file=sys.stderr,
+                )
+    source_manifest.update(
+        {
+            "intended_action_symbols": action_symbols,
+            "realized_action_symbols": action_names,
+            "missing_intended_action_source_symbols": missing_actions,
+            "action_schema_changed_due_to_missing_sources": bool(missing_actions),
+            "universe_selection_timestamp": universe_selection_timestamp,
+            "universe_method": args.universe_method,
+            "universe_source": str(args.universe_source) if args.universe_source else None,
+            "universe_source_hash": universe_source_hash,
+            "first_decision_timestamp": timestamp_ms_to_iso(min(decision_ms)) if decision_ms else None,
+            "retrospective_fixed_survivor_universe_diagnostic": bool(
+                "future_universe_selection_timestamp" in manifest_errors
+                or "universe_selection_timestamp_missing" in manifest_errors
+            ),
+            "reportability_errors": list(dict.fromkeys(manifest_errors)),
+        }
+    )
+    source_manifest["reportable"] = bool(source_manifest.get("source_download_complete", True)) and not source_manifest["reportability_errors"]
     config = StockSecondContextConfig(
         decision_interval=args.decision_interval,
         context_seconds=args.context_seconds,
@@ -227,10 +281,14 @@ def main() -> int:
         schema_path = args.covariate_feature_schema or args.covariates_root / "feature_schema.json"
         source_manifest_hash = file_sha256(manifest_path)
         schema_hash = file_sha256(schema_path)
+        coverage_by_symbol = read_covariate_coverage_manifest(manifest_path)
+        if schema_path.exists():
+            validate_action_covariate_feature_schema(schema_path)
         covariates = build_action_covariate_tensor(
             silver_rows_by_symbol=silver_rows,
             action_names=action_names,
             decision_timestamps_ms=payload["decision_timestamps_ms"],
+            source_coverage_by_symbol=coverage_by_symbol,
             source_manifest_hash=source_manifest_hash,
             max_age_days=args.covariate_max_age_days,
         )

@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
         coverage_by_symbol[symbol] = coverage
         if index % 50 == 0:
             print(f"built silver covariates for {index}/{len(symbols)} symbols", flush=True)
+    if args.strict and strict_errors:
+        preview = "; ".join(strict_errors[:10])
+        raise SystemExit(f"Strict covariate build failed before writing outputs: {preview}")
     report = write_silver_outputs(
         rows_by_symbol=rows_by_symbol,
         output_root=args.output_root,
@@ -86,9 +89,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"Silver covariate symbols: {report['symbols']} | rows: {report['total_silver_rows']}")
     print(f"Silver output -> {args.output_root}")
-    if args.strict and strict_errors:
-        preview = "; ".join(strict_errors[:10])
-        raise SystemExit(f"Strict covariate build failed: {preview}")
     return 0
 
 

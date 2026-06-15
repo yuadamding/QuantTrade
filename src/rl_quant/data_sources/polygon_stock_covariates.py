@@ -163,7 +163,7 @@ def source_record_id(source_dataset: str, payload: Mapping[str, Any], *, line_nu
     )
     if explicit is not None:
         return str(explicit)
-    return f"{source_dataset}:{line_number}"
+    return f"{source_dataset}:line-{line_number}"
 
 
 def normalize_raw_covariate_record(
@@ -176,12 +176,14 @@ def normalize_raw_covariate_record(
     event_ms, available_ms = infer_covariate_timestamps_ms(source_dataset, payload)
     record_payload = dict(payload)
     record_hash = stable_json_hash(record_payload)
+    natural_id = source_record_id(source_dataset, record_payload, line_number=line_number)
+    composite_id = f"{source_dataset}:{canonical_symbol(symbol)}:{natural_id}:{record_hash[:16]}"
     return RawCovariateRecord(
         symbol=canonical_symbol(symbol),
         source_dataset=source_dataset,
         event_timestamp_ms=int(event_ms),
         available_timestamp_ms=int(available_ms),
-        source_record_id=source_record_id(source_dataset, record_payload, line_number=line_number),
+        source_record_id=composite_id,
         source_record_hash=record_hash,
         payload=record_payload,
     )

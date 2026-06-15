@@ -840,6 +840,7 @@ def build_second_context_payload(
         "allow_post_close_exit": bool(config.allow_post_close_exit),
         "allow_extended_hours_exit": bool(config.include_extended_hours),
     }
+    base_manifest = dict(dataset_manifest or {})
     payload_hash = stable_json_hash(
         {
             "decision_timestamps": [timestamp_ms_to_iso(value) for value in decision_timestamps_ms],
@@ -847,6 +848,14 @@ def build_second_context_payload(
             "config": config.to_dict(),
             "feature_schema_hash": schema_registry["feature_schema_hash"],
             "action_schema_hash": schema_registry["action_schema_hash"],
+            "universe_selection_timestamp": base_manifest.get(
+                "universe_selection_timestamp",
+                base_manifest.get("universe_selection_date"),
+            ),
+            "universe_source_hash": base_manifest.get("universe_source_hash"),
+            "source_manifest_hash": base_manifest.get("source_manifest_hash", base_manifest.get("manifest_hash")),
+            "intended_action_symbols": list(base_manifest.get("intended_action_symbols", action_names)),
+            "realized_action_symbols": list(base_manifest.get("realized_action_symbols", action_names)),
         }
     )
     decision_timestamp_strings = [timestamp_ms_to_iso(value) for value in decision_timestamps_ms]
@@ -863,12 +872,14 @@ def build_second_context_payload(
             "reward_end_max": max(next_timestamp_strings) if next_timestamp_strings else None,
         },
     }
-    base_manifest = dict(dataset_manifest or {})
     report = dict(data_quality_report or {})
     source_download_complete = bool(
         base_manifest.get("source_download_complete", report.get("source_download_complete", False))
     )
-    reportability_errors = list(report.get("reportability_errors", []))
+    reportability_errors = [
+        *list(base_manifest.get("reportability_errors", [])),
+        *list(report.get("reportability_errors", [])),
+    ]
     if not source_download_complete:
         reportability_errors.append("source_download_incomplete")
     if not report:
@@ -877,6 +888,16 @@ def build_second_context_payload(
         reportability_errors.append("min_active_symbols_too_low_for_reportable_dataset")
     if config.allow_post_close_exit:
         reportability_errors.append("post_close_reward_exit_allowed")
+    universe_selection_timestamp = base_manifest.get(
+        "universe_selection_timestamp",
+        base_manifest.get("universe_selection_date"),
+    )
+    if not universe_selection_timestamp:
+        reportability_errors.append("universe_selection_timestamp_missing")
+    else:
+        selection_ms = iso_to_timestamp_ms(str(universe_selection_timestamp))
+        if decision_timestamps_ms and min(decision_timestamps_ms) < selection_ms:
+            reportability_errors.append("future_universe_selection_timestamp")
     reportability_scope = (
         "extended_reward_exit_allowed" if config.allow_post_close_exit else "regular_session_reward_exits_only"
     )
@@ -888,6 +909,21 @@ def build_second_context_payload(
         "feature_set_id": config.feature_set_id,
         "created_at_utc": utc_now_iso(),
         "source_bar_interval": config.source_bar_interval,
+        "first_decision_timestamp": decision_timestamp_strings[0] if decision_timestamp_strings else None,
+        "last_decision_timestamp": decision_timestamp_strings[-1] if decision_timestamp_strings else None,
+        "universe_selection_timestamp": universe_selection_timestamp,
+        "universe_method": base_manifest.get("universe_method"),
+        "universe_source_hash": base_manifest.get("universe_source_hash"),
+        "retrospective_fixed_survivor_universe_diagnostic": bool(
+            "future_universe_selection_timestamp" in reportability_errors
+            or "universe_selection_timestamp_missing" in reportability_errors
+        ),
+        "intended_action_symbols": list(base_manifest.get("intended_action_symbols", action_names)),
+        "realized_action_symbols": list(base_manifest.get("realized_action_symbols", action_names)),
+        "missing_intended_action_source_symbols": list(base_manifest.get("missing_intended_action_source_symbols", [])),
+        "action_schema_changed_due_to_missing_sources": bool(
+            base_manifest.get("action_schema_changed_due_to_missing_sources", False)
+        ),
         "action_mask_semantics": {
             "decision_action_valid_mask": "ex-ante tradability/data-readiness mask used for model action selection",
             "action_valid_mask": "legacy alias for decision_action_valid_mask",
@@ -1268,6 +1304,13 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
             raise ValueError("action_metadata actions length must match action_names.")
     if manifest.get("source_download_complete") is False and manifest.get("reportable") is True:
         raise ValueError("Incomplete source downloads cannot produce reportable datasets.")
+    reportability_errors = set(manifest.get("reportability_errors", []))
+    if manifest.get("reportable") is True and (
+        "future_universe_selection_timestamp" in reportability_errors
+        or "universe_selection_timestamp_missing" in reportability_errors
+        or "missing_intended_action_source_symbols" in reportability_errors
+    ):
+        raise ValueError("Universe/action-source reportability errors cannot produce reportable datasets.")
 
 
 def save_second_context_payload(payload: Mapping[str, Any], path: Path) -> None:
