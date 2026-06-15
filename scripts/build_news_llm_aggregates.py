@@ -69,6 +69,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="latest",
         help="When --max-partitions is set, choose latest partitions by default; earliest is diagnostic only.",
     )
+    parser.add_argument(
+        "--reportability-policy",
+        choices=["diagnostic", "strict"],
+        default="diagnostic",
+        help="strict fails (nonzero exit) if any sidecar is non-reportable; diagnostic writes them and continues.",
+    )
     return parser.parse_args(argv)
 
 
@@ -332,6 +338,10 @@ def build_sidecar(
             "action_feature_names": sidecar["action_feature_names"],
             "action_news_llm_schema_hash": sidecar["action_news_llm_schema_hash"],
             "news_llm_feature_manifest_hash": news_llm_manifest_hash,
+            # Source coverage (missing vs known-zero news) derives from the article manifest, so
+            # bind it directly into the sidecar identity rather than relying on indirect coverage
+            # via tensor content hashes.
+            "news_article_manifest_hash": sidecar.get("news_article_manifest_hash"),
             "base_dataset_sha256": sidecar["base_dataset_sha256"],
             "base_dataset_payload_hash": sidecar["base_dataset_payload_hash"],
             "base_dataset_feature_schema_hash": sidecar["base_dataset_feature_schema_hash"],
@@ -372,20 +382,28 @@ def main(argv: list[str] | None = None) -> int:
     news_llm_manifest = read_manifest(news_manifest_path)
     news_llm_manifest_hash = file_sha256(news_manifest_path)
     article_manifest_path = args.article_root / "manifest.json"
-    article_manifest = read_manifest(article_manifest_path)
     feature_manifest_reportability_errors = list(news_llm_manifest.get("reportability_errors", []))
+    # Read the article manifest only after confirming it exists, so the missing-manifest branch is
+    # unambiguous regardless of read_manifest's missing-path behavior.
     if article_manifest_path.exists():
+        article_manifest = read_manifest(article_manifest_path)
         article_manifest_hash = file_sha256(article_manifest_path)
         # Source coverage comes ONLY from the article manifest. Do not fall back to the LLM-row
         # universe, which would conflate "explicit source coverage exists" with "we merely have
         # LLM rows for this symbol" and confuse missing-source vs known-zero-news downstream.
         source_symbols = list(article_manifest.get("symbols_with_source_news", []))
     else:
+        article_manifest = {}
         article_manifest_hash = None
         source_symbols = []
         feature_manifest_reportability_errors.append("news_article_manifest_missing")
     action_names = load_action_names(paths)
-    rows_by_symbol = load_news_llm_rows_by_symbol(args.news_llm_root, action_names)
+    # Read diagnostically: the news-LLM feature manifest's reportability errors are already merged
+    # into feature_manifest_reportability_errors and propagate into each sidecar, so a non-reportable
+    # feature table yields non-reportable sidecars rather than aborting the build here.
+    rows_by_symbol = load_news_llm_rows_by_symbol(
+        args.news_llm_root, action_names, allow_nonreportable=True
+    )
     records: list[dict[str, Any]] = []
     print(f"Building news LLM action sidecars for {len(paths)} partitions with workers={args.workers}", flush=True)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -437,6 +455,9 @@ def main(argv: list[str] | None = None) -> int:
     summary_path = args.partitions_root.parent / "action_news_llm_integration_manifest.json"
     atomic_write_text(summary_path, json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")
     print(f"News LLM integration summary -> {summary_path}")
+    if args.reportability_policy == "strict" and reportability_errors:
+        preview = "; ".join(str(error) for error in reportability_errors[:20])
+        raise SystemExit(f"non-reportable news LLM sidecar build under strict policy: {preview}")
     return 0
 
 

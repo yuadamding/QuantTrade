@@ -155,6 +155,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--vendor-latency-seconds", type=int, default=300)
     parser.add_argument("--processing-latency-seconds", type=int, default=60)
+    parser.add_argument(
+        "--generation-diagnostics-json",
+        type=Path,
+        default=None,
+        help="Path to the generator's *.generation_diagnostics.json. Defaults to one next to --precomputed-jsonl.",
+    )
+    parser.add_argument(
+        "--max-parse-error-fraction",
+        type=float,
+        default=1.0,
+        help="Strict mode: fail if the generator's parse_error_fraction exceeds this (default 1.0 = permissive).",
+    )
+    parser.add_argument(
+        "--max-invalid-llm-row-fraction",
+        type=float,
+        default=1.0,
+        help="Strict mode: fail if the generator's invalid_llm_row_fraction exceeds this (default 1.0 = permissive).",
+    )
     parser.add_argument("--strict", action="store_true")
     return parser.parse_args(argv)
 
@@ -462,6 +480,35 @@ def main(argv: list[str] | None = None) -> int:
         errors=errors,
         analyst_model_policy=analyst_model_policy,
     )
+    if args.precomputed_jsonl:
+        # Flow the generator's quality signal into reportability: a feature table whose per-row
+        # fields are all schema-valid can still be untrustworthy if the generator had many parse
+        # failures or invalid rows. Merge the diagnostics sidecar and fail strict mode over threshold.
+        diagnostics_path = args.generation_diagnostics_json or args.precomputed_jsonl.with_suffix(
+            args.precomputed_jsonl.suffix + ".generation_diagnostics.json"
+        )
+        if diagnostics_path.exists():
+            generation_diagnostics = json.loads(diagnostics_path.read_text())
+            manifest["generation_diagnostics"] = generation_diagnostics
+            parse_fraction = float(generation_diagnostics.get("parse_error_fraction", 0.0) or 0.0)
+            invalid_fraction = float(generation_diagnostics.get("invalid_llm_row_fraction", 0.0) or 0.0)
+            diagnostics_errors: list[str] = []
+            if parse_fraction > args.max_parse_error_fraction:
+                diagnostics_errors.append(
+                    f"generation_parse_error_fraction_{parse_fraction:.6f}_exceeds_{args.max_parse_error_fraction}"
+                )
+            if invalid_fraction > args.max_invalid_llm_row_fraction:
+                diagnostics_errors.append(
+                    f"generation_invalid_llm_row_fraction_{invalid_fraction:.6f}_exceeds_{args.max_invalid_llm_row_fraction}"
+                )
+            if diagnostics_errors:
+                manifest["reportability_errors"] = list(
+                    dict.fromkeys(list(manifest["reportability_errors"]) + diagnostics_errors)
+                )
+                manifest["reportable"] = not manifest["reportability_errors"]
+            (args.output_root / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n"
+            )
     if local_model_manifest is not None:
         model_manifest_path = args.output_root / "local_model_manifest.json"
         model_manifest_path.write_text(json.dumps(local_model_manifest, indent=2, sort_keys=True) + "\n")

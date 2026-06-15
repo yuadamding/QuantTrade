@@ -263,6 +263,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.min_context_valid_fraction = min(float(args.min_context_valid_fraction), 0.01)
     elif args.allow_missing_action_context is None:
         args.allow_missing_action_context = False
+    if args.execution_latency_ms < 0:
+        raise ValueError("--execution-latency-ms must be non-negative.")
+    if args.source_bar_interval == SECOND_SOURCE_BAR_INTERVAL and args.execution_latency_ms < DEFAULT_SECOND_BAR_LATENCY_MS:
+        # Guard the invariant even when a user passes an explicit sub-1000ms value (not just the
+        # zero default): Polygon one-second aggregate fills must be at least one bar after the decision.
+        raise ValueError(
+            f"Polygon one-second source bars require --execution-latency-ms >= {DEFAULT_SECOND_BAR_LATENCY_MS}; "
+            f"got {args.execution_latency_ms}."
+        )
     return args
 
 

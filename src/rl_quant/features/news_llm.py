@@ -33,7 +33,10 @@ DEFAULT_NEWS_LLM_PRIMARY_MODEL_ID = "Qwen/Qwen3-1.7B"
 DEFAULT_NEWS_LLM_SECONDARY_MODEL_ID = "google/gemma-4-26B-A4B-it"
 DEFAULT_NEWS_LLM_FALLBACK_MODEL_ID = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
 DEFAULT_NEWS_LLM_SERVING_ENGINE = "local_transformers"
-DEFAULT_NEWS_LLM_STRUCTURED_OUTPUT = "json_schema"
+# The current local extractor produces prompted JSON that is extracted, range-clamped, and
+# strictly validated post-hoc -- NOT constrained-decoding JSON-schema output. The default must
+# describe that honestly so manifests do not over-claim structured decoding.
+DEFAULT_NEWS_LLM_STRUCTURED_OUTPUT = "prompted_json_posthoc_extract_clamp_validate"
 DETERMINISTIC_NEWS_LLM_PROMPT_HASH = stable_json_hash(
     {
         "schema": NEWS_LLM_EXTRACT_SCHEMA_VERSION,
@@ -628,6 +631,7 @@ _NEWS_LLM_UNIT_INTERVAL_FIELDS = (
     "confidence",
 )
 _NEWS_LLM_BINARY_FIELDS = ("is_primary_ticker", "is_broad_market_or_sector", "llm_valid", *NEWS_LLM_EVENT_FLAGS)
+NEWS_LLM_TIME_HORIZONS = ("intraday", "days_to_weeks", "months_to_years", "unknown")
 _NEWS_LLM_NONEMPTY_STRING_FIELDS = (
     "article_id",
     "ticker",
@@ -687,6 +691,8 @@ def validate_news_llm_rows(rows: list[Mapping[str, Any]]) -> list[str]:
             value = _as_float_or_none(row.get(field))
             if value is None or value not in (0.0, 1.0):
                 errors.append(f"row {index}: {field} must be 0 or 1")
+        if row.get("time_horizon") not in NEWS_LLM_TIME_HORIZONS:
+            errors.append(f"row {index}: time_horizon must be one of {NEWS_LLM_TIME_HORIZONS}")
         published = int(_finite(row.get("published_timestamp_ms"), default=-1.0))
         source_available = int(_finite(row.get("source_available_timestamp_ms"), default=-1.0))
         feature_available = int(_finite(row.get("llm_feature_available_timestamp_ms"), default=-1.0))
@@ -732,7 +738,13 @@ def write_news_llm_feature_outputs(
     distinct_prompt_hashes = sorted({str(r.get("llm_prompt_hash")) for r in rows if str(r.get("llm_prompt_hash") or "").strip()})
     distinct_model_ids = sorted({str(r.get("llm_model_id")) for r in rows if str(r.get("llm_model_id") or "").strip()})
     distinct_providers = sorted({str(r.get("extractor_provider")) for r in rows if str(r.get("extractor_provider") or "").strip()})
-    mixed_provenance = len(distinct_prompt_hashes) > 1 or len(distinct_model_ids) > 1 or len(distinct_providers) > 1
+    distinct_temperatures = sorted({round(_finite(r.get("extractor_temperature"), default=0.0), 6) for r in rows})
+    mixed_provenance = (
+        len(distinct_prompt_hashes) > 1
+        or len(distinct_model_ids) > 1
+        or len(distinct_providers) > 1
+        or len(distinct_temperatures) > 1
+    )
     provenance_errors = ["mixed_provenance_in_feature_table"] if mixed_provenance else []
     all_errors = list(errors or []) + validation_errors + provenance_errors
     reportable = not all_errors
@@ -755,6 +767,7 @@ def write_news_llm_feature_outputs(
         "llm_feature_group": NEWS_LLM_PROTOCOL_VERSION,
         "created_at_utc": utc_now_iso(),
         "feature_table_path": str(feature_path),
+        "feature_table_file_name": feature_path.name,
         "article_manifest_hash": stable_json_hash(article_manifest or {}),
         "article_table_hash": None if article_manifest is None else article_manifest.get("article_table_hash"),
         "row_count": len(rows),
@@ -810,6 +823,7 @@ def write_news_llm_feature_outputs(
             ]
         ),
         "feature_table_file_sha256": _file_sha256(feature_path),
+        "distinct_extractor_temperatures": distinct_temperatures,
         "distinct_llm_prompt_hashes": distinct_prompt_hashes,
         "distinct_llm_model_ids": distinct_model_ids,
         "distinct_extractor_providers": distinct_providers,
@@ -825,14 +839,28 @@ def read_news_llm_rows(root_or_path: Path, *, allow_nonreportable: bool = False)
     import pandas as pd
 
     if root_or_path.is_dir():
-        # The manifest is the source of truth for which feature table is current. Fail closed on a
-        # non-reportable table (return nothing) so a stale canonical Parquet from an earlier valid
-        # build is never silently consumed when the latest build was quarantined.
+        # The manifest is the source of truth for which feature table is current. Fail CLOSED by
+        # default on a non-reportable manifest: raise rather than return [] so a caller cannot
+        # confuse "non-reportable feature table" with "known zero LLM rows". Pass
+        # allow_nonreportable=True for explicit diagnostic reads.
         manifest = read_manifest(root_or_path)
         if manifest.get("reportability_errors") and not allow_nonreportable:
-            return []
-        feature_table_path = manifest.get("feature_table_path")
-        path = Path(feature_table_path) if feature_table_path else root_or_path / "news_article_ticker_llm.parquet"
+            raise ValueError(
+                "Refusing to read non-reportable news LLM feature table: "
+                + "; ".join(str(error) for error in list(manifest["reportability_errors"])[:20])
+            )
+        # Resolve the table path portably: prefer the file NAME inside this artifact dir, then a
+        # relative path resolved against the dir, then an absolute path, so the manifest reads
+        # correctly from any working directory.
+        file_name = manifest.get("feature_table_file_name")
+        raw_path = manifest.get("feature_table_path")
+        if file_name:
+            path = root_or_path / str(file_name)
+        elif raw_path:
+            candidate = Path(str(raw_path))
+            path = candidate if candidate.is_absolute() else root_or_path / candidate.name
+        else:
+            path = root_or_path / "news_article_ticker_llm.parquet"
     else:
         path = root_or_path
     if not path.exists():
@@ -840,10 +868,12 @@ def read_news_llm_rows(root_or_path: Path, *, allow_nonreportable: bool = False)
     return pd.read_parquet(path).to_dict("records")
 
 
-def load_news_llm_rows_by_symbol(root_or_path: Path, symbols: list[str]) -> dict[str, list[dict[str, Any]]]:
+def load_news_llm_rows_by_symbol(
+    root_or_path: Path, symbols: list[str], *, allow_nonreportable: bool = False
+) -> dict[str, list[dict[str, Any]]]:
     selected = {canonical_symbol(symbol) for symbol in symbols if canonical_symbol(symbol) != "CASH"}
     rows_by_symbol = {symbol: [] for symbol in selected}
-    for row in read_news_llm_rows(root_or_path):
+    for row in read_news_llm_rows(root_or_path, allow_nonreportable=allow_nonreportable):
         ticker = canonical_symbol(str(row.get("ticker", "")))
         if ticker in selected:
             rows_by_symbol.setdefault(ticker, []).append(row)

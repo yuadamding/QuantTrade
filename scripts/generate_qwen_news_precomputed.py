@@ -55,15 +55,26 @@ DEFAULT_LOCAL_MODEL = Path("../LLM/Qwen3-1.7B")
 PROMPT_VERSION = "qwen_news_llm_article_ticker_prompt_v1"
 
 
-def prompt_hash_for(temperature: float, *, no_retrieval: bool = True) -> str:
-    # The prompt hash binds the ACTUAL generation temperature so a sampled (nondeterministic)
-    # run cannot share a hash with the deterministic temperature=0 extractor.
+def prompt_hash_for(
+    temperature: float,
+    *,
+    top_p: float = 1.0,
+    max_new_tokens: int = 384,
+    no_retrieval: bool = True,
+) -> str:
+    # Bind ALL generation-affecting parameters (not just temperature) so the hash changes when
+    # sampling, nucleus, or length settings change -- a sampled or differently-configured run
+    # cannot share an identity with the deterministic temperature=0 extractor.
     return stable_json_hash(
         {
             "prompt_version": PROMPT_VERSION,
             "schema": NEWS_LLM_EXTRACT_SCHEMA_VERSION,
             "extractor": "local_qwen3_1_7b",
             "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": bool(temperature != 0.0),
+            "structured_output": "prompted_json_posthoc_extract_clamp_validate",
             "no_retrieval": bool(no_retrieval),
         }
     )
@@ -464,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
             "would make a modern pretrained model appear available before any backtest."
         )
     model_available_timestamp_ms = parse_timestamp_ms(model_available_utc)
-    prompt_hash = prompt_hash_for(args.temperature)
+    prompt_hash = prompt_hash_for(args.temperature, top_p=args.top_p, max_new_tokens=args.max_new_tokens)
     tickers = load_action_tickers(args)
     articles = read_news_article_rows(args.article_root)
     pairs = selected_article_ticker_pairs(articles, tickers)

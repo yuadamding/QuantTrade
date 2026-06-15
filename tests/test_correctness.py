@@ -1960,7 +1960,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(manifest["secondary_model_id"], "google/gemma-4-26B-A4B-it")
         self.assertEqual(manifest["fallback_model_id"], "mistralai/Mistral-Small-3.2-24B-Instruct-2506")
         self.assertEqual(manifest["serving_engine"], "local_transformers")
-        self.assertEqual(manifest["structured_output"], "json_schema")
+        self.assertEqual(manifest["structured_output"], "prompted_json_posthoc_extract_clamp_validate")
         self.assertEqual(manifest["temperature"], 0.0)
         self.assertEqual(manifest["top_p"], 1.0)
         self.assertTrue(manifest["no_external_retrieval"])
@@ -2046,7 +2046,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(policy["secondary_model_id"], "google/gemma-4-26B-A4B-it")
         self.assertEqual(policy["fallback_model_id"], "mistralai/Mistral-Small-3.2-24B-Instruct-2506")
         self.assertEqual(policy["serving_engine"], "local_transformers")
-        self.assertEqual(policy["structured_output"], "json_schema")
+        self.assertEqual(policy["structured_output"], "prompted_json_posthoc_extract_clamp_validate")
         self.assertEqual(policy["temperature"], 0.0)
         self.assertEqual(policy["top_p"], 1.0)
         self.assertFalse(policy["retrospective_historical_policy"]["reportable_for_2023_to_2026_backtest"])
@@ -6390,7 +6390,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 **common,
             )
             self.assertFalse((root / "news_article_ticker_llm.parquet").exists())
-            self.assertEqual(read_news_llm_rows(root), [])
+            # Fail closed by default on a non-reportable manifest (don't confuse it with zero news).
+            with self.assertRaises(ValueError):
+                read_news_llm_rows(root)
             self.assertEqual(len(read_news_llm_rows(root, allow_nonreportable=True)), 2)
 
     def test_news_llm_aggregate_mean_masked_when_no_news_but_count_valid(self) -> None:
@@ -6420,6 +6422,22 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # 0.0 cannot be confused with neutral sentiment.
         self.assertTrue(mask[count_idx])
         self.assertFalse(mask[sentiment_idx])
+
+    def test_news_llm_validation_rejects_invalid_time_horizon(self) -> None:
+        from rl_quant.features.news_llm import validate_news_llm_rows
+
+        errors = validate_news_llm_rows([self._valid_news_llm_row(time_horizon="next_decade")])
+        self.assertTrue(any("time_horizon" in error for error in errors))
+        self.assertEqual(validate_news_llm_rows([self._valid_news_llm_row(time_horizon="days_to_weeks")]), [])
+
+    def test_second_bar_execution_latency_default_and_explicit_floor(self) -> None:
+        module = load_script("build_hourly_from_minute_context_dataset")
+        # Second source data auto-sets execution latency to one bar when left at the 0 default.
+        auto = module.parse_args(["--source-bar-interval", "1s"])
+        self.assertEqual(auto.execution_latency_ms, module.DEFAULT_SECOND_BAR_LATENCY_MS)
+        # An explicit sub-one-bar execution latency for second data is rejected, not silently used.
+        with self.assertRaises(ValueError):
+            module.parse_args(["--source-bar-interval", "1s", "--execution-latency-ms", "500"])
 
 
 if __name__ == "__main__":
