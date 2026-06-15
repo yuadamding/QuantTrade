@@ -164,14 +164,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-parse-error-fraction",
         type=float,
-        default=1.0,
-        help="Strict mode: fail if the generator's parse_error_fraction exceeds this (default 1.0 = permissive).",
+        default=None,
+        help="Max tolerated generator parse_error_fraction. Defaults to 0.0 under --strict, 1.0 otherwise.",
     )
     parser.add_argument(
         "--max-invalid-llm-row-fraction",
         type=float,
-        default=1.0,
-        help="Strict mode: fail if the generator's invalid_llm_row_fraction exceeds this (default 1.0 = permissive).",
+        default=None,
+        help="Max tolerated generator invalid_llm_row_fraction. Defaults to 0.0 under --strict, 1.0 otherwise.",
+    )
+    parser.add_argument(
+        "--allow-missing-generation-diagnostics",
+        action="store_true",
+        help="Permit a precomputed import under --strict without a generation diagnostics sidecar.",
     )
     parser.add_argument("--strict", action="store_true")
     return parser.parse_args(argv)
@@ -469,6 +474,39 @@ def main(argv: list[str] | None = None) -> int:
     if args.strict and errors:
         preview = "; ".join(errors[:10])
         raise SystemExit(f"news_llm_v1 feature build failed: {preview}")
+    # Load and threshold generation diagnostics BEFORE writing so diagnostics-derived
+    # non-reportability drives canonical-vs-quarantine artifact selection inside the writer
+    # (otherwise a canonical Parquet could be written and only later marked non-reportable).
+    generation_diagnostics: dict[str, object] | None = None
+    diagnostics_errors: list[str] = []
+    if args.precomputed_jsonl:
+        diagnostics_path = args.generation_diagnostics_json or args.precomputed_jsonl.with_suffix(
+            args.precomputed_jsonl.suffix + ".generation_diagnostics.json"
+        )
+        # Strict mode tolerates ZERO parse failures / invalid rows unless explicitly overridden;
+        # diagnostic mode stays permissive (1.0).
+        max_parse = (
+            (0.0 if args.strict else 1.0) if args.max_parse_error_fraction is None else args.max_parse_error_fraction
+        )
+        max_invalid = (
+            (0.0 if args.strict else 1.0)
+            if args.max_invalid_llm_row_fraction is None
+            else args.max_invalid_llm_row_fraction
+        )
+        if diagnostics_path.exists():
+            generation_diagnostics = json.loads(diagnostics_path.read_text())
+            parse_fraction = float(generation_diagnostics.get("parse_error_fraction", 0.0) or 0.0)
+            invalid_fraction = float(generation_diagnostics.get("invalid_llm_row_fraction", 0.0) or 0.0)
+            if parse_fraction > max_parse:
+                diagnostics_errors.append(f"generation_parse_error_fraction_{parse_fraction:.6f}_exceeds_{max_parse}")
+            if invalid_fraction > max_invalid:
+                diagnostics_errors.append(
+                    f"generation_invalid_llm_row_fraction_{invalid_fraction:.6f}_exceeds_{max_invalid}"
+                )
+        elif args.strict and not args.allow_missing_generation_diagnostics:
+            # A pretrained-LLM import under strict mode must carry generation diagnostics so parse/
+            # repair quality is auditable; missing diagnostics is itself a reportability failure.
+            diagnostics_errors.append("generation_diagnostics_missing_under_strict")
     manifest = write_news_llm_feature_outputs(
         rows=rows,
         output_root=args.output_root,
@@ -477,38 +515,10 @@ def main(argv: list[str] | None = None) -> int:
         model_available_timestamp_ms=model_available_ms,
         model_training_cutoff_utc=training_cutoff,
         provider=provider,
-        errors=errors,
+        errors=list(errors) + diagnostics_errors,
         analyst_model_policy=analyst_model_policy,
+        generation_diagnostics=generation_diagnostics,
     )
-    if args.precomputed_jsonl:
-        # Flow the generator's quality signal into reportability: a feature table whose per-row
-        # fields are all schema-valid can still be untrustworthy if the generator had many parse
-        # failures or invalid rows. Merge the diagnostics sidecar and fail strict mode over threshold.
-        diagnostics_path = args.generation_diagnostics_json or args.precomputed_jsonl.with_suffix(
-            args.precomputed_jsonl.suffix + ".generation_diagnostics.json"
-        )
-        if diagnostics_path.exists():
-            generation_diagnostics = json.loads(diagnostics_path.read_text())
-            manifest["generation_diagnostics"] = generation_diagnostics
-            parse_fraction = float(generation_diagnostics.get("parse_error_fraction", 0.0) or 0.0)
-            invalid_fraction = float(generation_diagnostics.get("invalid_llm_row_fraction", 0.0) or 0.0)
-            diagnostics_errors: list[str] = []
-            if parse_fraction > args.max_parse_error_fraction:
-                diagnostics_errors.append(
-                    f"generation_parse_error_fraction_{parse_fraction:.6f}_exceeds_{args.max_parse_error_fraction}"
-                )
-            if invalid_fraction > args.max_invalid_llm_row_fraction:
-                diagnostics_errors.append(
-                    f"generation_invalid_llm_row_fraction_{invalid_fraction:.6f}_exceeds_{args.max_invalid_llm_row_fraction}"
-                )
-            if diagnostics_errors:
-                manifest["reportability_errors"] = list(
-                    dict.fromkeys(list(manifest["reportability_errors"]) + diagnostics_errors)
-                )
-                manifest["reportable"] = not manifest["reportability_errors"]
-            (args.output_root / "manifest.json").write_text(
-                json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n"
-            )
     if local_model_manifest is not None:
         model_manifest_path = args.output_root / "local_model_manifest.json"
         model_manifest_path.write_text(json.dumps(local_model_manifest, indent=2, sort_keys=True) + "\n")

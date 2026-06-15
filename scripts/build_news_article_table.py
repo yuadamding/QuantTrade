@@ -40,6 +40,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--universe", type=Path, default=DEFAULT_UNIVERSE)
     parser.add_argument("--max-symbols", type=int, default=0, help="0 means all symbols in the universe file.")
     parser.add_argument("--strict", action="store_true", help="Fail if any selected symbol lacks usable news input.")
+    parser.add_argument(
+        "--source-latency-seconds",
+        type=int,
+        default=0,
+        help=(
+            "Conservative source-availability latency added to publish time (source_available = "
+            "published + latency). Default 0 (publish time). Set a positive value for reportable "
+            "point-in-time use when publish time is not the pipeline-availability time."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -71,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         raw_root=args.raw_covariates_root,
         symbols=symbols,
         strict=args.strict,
+        source_latency_seconds=args.source_latency_seconds,
     )
     source_symbols = discover_news_source_symbols(raw_root=args.raw_covariates_root, symbols=symbols)
     manifest = write_news_article_outputs(
@@ -80,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         symbols=symbols,
         source_symbols=source_symbols,
         errors=errors,
+        source_latency_seconds=args.source_latency_seconds,
     )
     print(f"News articles: {manifest['article_count']} | source symbols: {len(manifest['symbols_with_source_news'])}")
     print(f"News article output -> {args.output_root}")

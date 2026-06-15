@@ -69,8 +69,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--insufficient-split-policy",
         choices=["smoke_fallback", "fail"],
-        default="smoke_fallback",
-        help="For short partitions, either fall back to explicit non-reportable row splits or fail.",
+        default="fail",
+        help=(
+            "For short partitions, either fail (default, research-safe) or fall back to explicit "
+            "non-reportable row splits. Use --smoke (or set smoke_fallback) for diagnostic runs."
+        ),
+    )
+    parser.add_argument(
+        "--reportability-policy",
+        choices=["strict", "diagnostic"],
+        default="strict",
+        help="strict fails a partition whose splits/evaluation are non-reportable; diagnostic records and continues.",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Diagnostic convenience: enable smoke_fallback splits and diagnostic reportability policy.",
     )
     parser.add_argument(
         "--action-covariate-sidecar",
@@ -340,6 +354,11 @@ def build_rolling_partition_splits(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.smoke:
+        # --smoke is an explicit diagnostic switch: permit short-partition fallback splits and
+        # record (rather than fail on) non-reportable partitions.
+        args.insufficient_split_policy = "smoke_fallback"
+        args.reportability_policy = "diagnostic"
     try:
         import torch
 
@@ -556,6 +575,15 @@ def main(argv: list[str] | None = None) -> int:
                 split_policy=run_split_policy,
                 args=args,
             )
+            split_reportable = bool(run_split_policy.get("reportable", True))
+            if args.reportability_policy == "strict" and not (evaluation_reportable and split_reportable):
+                # Fail-fast under strict: do not warm-start the next partition from, or report, a
+                # non-reportable result. (--smoke / --reportability-policy diagnostic records instead.)
+                strict_errors = list(reportability_errors) + list(run_split_policy.get("reportability_errors", []))
+                raise RuntimeError(
+                    f"partition {label} is non-reportable under strict reportability policy: "
+                    + "; ".join(str(error) for error in strict_errors[:20])
+                )
             record = {
                 "partition": label,
                 "ordinal": ordinal,

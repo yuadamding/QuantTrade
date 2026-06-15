@@ -195,7 +195,7 @@ Each `stock_news_llm_v1` feature manifest records:
   "fallback_model_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
   "fallback_model_role": "structured_output_fallback",
   "serving_engine": "local_transformers",
-  "structured_output": "json_schema",
+  "structured_output": "prompted_json_posthoc_extract_clamp_validate",
   "temperature": 0.0,
   "top_p": 1.0,
   "no_external_retrieval": true,

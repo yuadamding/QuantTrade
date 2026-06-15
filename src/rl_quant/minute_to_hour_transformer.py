@@ -853,10 +853,15 @@ def _load_payload(
 
 
 def _masked_mean_std(features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    valid = mask.unsqueeze(-1).to(features.dtype)
-    count = valid.sum(dim=(0, 1, 2)).clamp_min(1.0)
-    mean = (features * valid).sum(dim=(0, 1, 2)) / count
-    variance = (((features - mean) * valid) ** 2).sum(dim=(0, 1, 2)) / count
+    # Finite-safe: include finiteness in the valid set and zero out invalid positions with
+    # torch.where before summing. Multiplying by a 0/1 mask is NOT safe because NaN * 0 == NaN,
+    # so a single NaN in a masked-out position would poison the whole channel's mean/std.
+    valid = mask.unsqueeze(-1).bool() & torch.isfinite(features)
+    count = valid.to(features.dtype).sum(dim=(0, 1, 2)).clamp_min(1.0)
+    clean = torch.where(valid, features, torch.zeros_like(features))
+    mean = clean.sum(dim=(0, 1, 2)) / count
+    centered = torch.where(valid, features - mean, torch.zeros_like(features))
+    variance = (centered * centered).sum(dim=(0, 1, 2)) / count
     return mean, variance.sqrt().clamp_min(1e-6)
 
 

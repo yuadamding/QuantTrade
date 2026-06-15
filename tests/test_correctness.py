@@ -6439,6 +6439,52 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.parse_args(["--source-bar-interval", "1s", "--execution-latency-ms", "500"])
 
+    def test_masked_mean_std_ignores_nan_in_masked_positions(self) -> None:
+        from rl_quant.minute_to_hour_transformer import _masked_mean_std
+
+        # A NaN in a MASKED-OUT position must not poison the channel statistics (NaN * 0 == NaN).
+        features = torch.tensor([[[[3.0], [float("nan")]]]])
+        mask = torch.tensor([[[True, False]]])
+        mean, std = _masked_mean_std(features, mask)
+        self.assertTrue(torch.isfinite(mean).all())
+        self.assertTrue(torch.isfinite(std).all())
+        self.assertAlmostEqual(float(mean.item()), 3.0, places=6)
+
+    def test_news_article_source_latency_is_applied(self) -> None:
+        from rl_quant.features.news_llm import _raw_article_row
+
+        payload = {"article_id": "a1", "published_utc": "2026-01-05T15:00:00+00:00", "title": "QQQ update"}
+        row = _raw_article_row("QQQ", payload, 0, source_latency_seconds=300)
+        self.assertEqual(
+            int(row["source_available_timestamp_ms"]), int(row["published_timestamp_ms"]) + 300 * 1000
+        )
+        baseline = _raw_article_row("QQQ", payload, 0)
+        self.assertEqual(int(baseline["source_available_timestamp_ms"]), int(baseline["published_timestamp_ms"]))
+
+    def test_partition_trainer_defaults_to_fail_and_strict(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        args = module.parse_args([])
+        self.assertEqual(args.insufficient_split_policy, "fail")
+        self.assertEqual(args.reportability_policy, "strict")
+        self.assertFalse(args.smoke)
+
+    def test_news_llm_writer_records_generation_diagnostics(self) -> None:
+        if importlib.util.find_spec("pandas") is None or importlib.util.find_spec("pyarrow") is None:
+            self.skipTest("pandas/pyarrow required for feature-table write test")
+        diagnostics = {"parse_error_fraction": 0.0, "invalid_llm_row_fraction": 0.0, "rows_written_this_run": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = write_news_llm_feature_outputs(
+                rows=[self._valid_news_llm_row()],
+                output_root=Path(directory),
+                article_manifest=None,
+                model_id="m",
+                model_available_timestamp_ms=0,
+                model_training_cutoff_utc="unknown",
+                provider="local_transformers",
+                generation_diagnostics=diagnostics,
+            )
+        self.assertEqual(manifest["generation_diagnostics"], diagnostics)
+
 
 if __name__ == "__main__":
     unittest.main()

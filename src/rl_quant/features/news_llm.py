@@ -270,9 +270,15 @@ def _url_hash(payload: Mapping[str, Any], key: str) -> str:
     return "" if not value else stable_json_hash(str(value))
 
 
-def _raw_article_row(symbol: str, payload: Mapping[str, Any], line_number: int) -> dict[str, Any]:
+def _raw_article_row(
+    symbol: str, payload: Mapping[str, Any], line_number: int, *, source_latency_seconds: int = 0
+) -> dict[str, Any]:
     published = payload.get("published_utc", payload.get("published_at", payload.get("created_at")))
     published_ms = parse_timestamp_ms(published)
+    # Source availability defaults to publish time, but publish time is not necessarily pipeline
+    # availability. A non-zero --source-latency-seconds yields a more conservative point-in-time
+    # availability (published + latency); the policy/latency is recorded in the article manifest.
+    source_available_ms = int(published_ms) + max(0, int(source_latency_seconds)) * 1000
     tickers = _news_tickers(payload)
     primary = canonical_symbol(str(payload.get("primary_ticker", tickers[0] if tickers else symbol)))
     record_hash = stable_json_hash(dict(payload))
@@ -280,7 +286,7 @@ def _raw_article_row(symbol: str, payload: Mapping[str, Any], line_number: int) 
         "article_id": _news_article_id(payload),
         "published_utc": timestamp_ms_to_utc_iso(published_ms),
         "published_timestamp_ms": int(published_ms),
-        "source_available_timestamp_ms": int(published_ms),
+        "source_available_timestamp_ms": int(source_available_ms),
         "publisher_name": _publisher_name(payload),
         "title": str(payload.get("title", "") or ""),
         "description": str(payload.get("description", "") or payload.get("summary", "") or ""),
@@ -335,6 +341,7 @@ def build_news_article_rows(
     raw_root: Path,
     symbols: list[str],
     strict: bool = False,
+    source_latency_seconds: int = 0,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     articles: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
@@ -346,7 +353,7 @@ def build_news_article_rows(
             continue
         for line_number, payload in iter_jsonl_payloads(path):
             try:
-                row = _raw_article_row(normalized, payload, line_number)
+                row = _raw_article_row(normalized, payload, line_number, source_latency_seconds=source_latency_seconds)
             except Exception as exc:  # noqa: BLE001 - keep batch build moving unless strict.
                 errors.append(f"{normalized}:{line_number}: {exc}")
                 continue
@@ -378,6 +385,7 @@ def write_news_article_outputs(
     symbols: list[str],
     source_symbols: list[str] | None = None,
     errors: list[str],
+    source_latency_seconds: int = 0,
 ) -> dict[str, Any]:
     import pandas as pd
 
@@ -400,6 +408,10 @@ def write_news_article_outputs(
         "schema_version": NEWS_LLM_ARTICLE_SCHEMA_VERSION,
         "created_at_utc": utc_now_iso(),
         "raw_root": str(raw_root),
+        "source_availability_policy": (
+            "published_plus_source_latency_seconds" if source_latency_seconds else "published_timestamp"
+        ),
+        "source_latency_seconds": int(source_latency_seconds),
         "selected_symbol_count": len(symbols),
         "selected_symbols": list(symbols),
         "symbols_with_source_news": symbols_with_source,
@@ -724,6 +736,7 @@ def write_news_llm_feature_outputs(
     provider: str,
     errors: list[str] | None = None,
     analyst_model_policy: Mapping[str, Any] | None = None,
+    generation_diagnostics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     import pandas as pd
 
@@ -828,6 +841,7 @@ def write_news_llm_feature_outputs(
         "distinct_llm_model_ids": distinct_model_ids,
         "distinct_extractor_providers": distinct_providers,
         "mixed_provenance": bool(mixed_provenance),
+        "generation_diagnostics": dict(generation_diagnostics) if generation_diagnostics is not None else None,
         "reportability_errors": list(dict.fromkeys(all_errors)),
     }
     manifest["reportable"] = not manifest["reportability_errors"]
