@@ -137,9 +137,10 @@ N  = decision rows
 L  = 12 context blocks
 Fm = 48 or fewer market features
 A  = tradable actions, including CASH
-Fa = 24 or fewer action features
+Fa = base action features, optionally widened by action covariates
 Fp = 6 or fewer portfolio features
-Fc = 8 or fewer constraint features
+Fr = 8 or fewer constraint/risk features
+Fcov = optional action covariate features
 ```
 
 Recommended default:
@@ -214,6 +215,13 @@ row remains in the dataset, the action return is `NaN`, and
 reportability may use `label_valid_mask`; model selection and row construction
 may not use it as future knowledge.
 
+Reportable non-dense/hourly builders must follow the same rule. A non-dense
+builder may not require a future grid timestamp before building a decision row;
+future reward absence must be represented by `label_valid_mask=False` and `NaN`
+returns. Legacy direct-hourly datasets that require every selected action to
+have a future label before retaining a row must set `dataset_reportable=False`
+with `rows_filtered_by_future_label_availability`.
+
 Payloads that only contain the legacy `action_valid_mask` without explicit
 `decision_action_valid_mask` and `label_valid_mask` semantics may be loaded for
 diagnostics, but they are not reportable. Such loaders should attach
@@ -257,6 +265,41 @@ Rules for extensions:
 - Existing required keys must not change shape or meaning within a protocol
   version.
 - A model may ignore unknown groups and still train on the core tensors.
+
+### Action Covariate Extension
+
+Phase 1 stock-specific covariates are action-level optional tensors:
+
+```text
+action_covariates: [N, A, Fc]
+action_covariate_mask: [N, A, Fc]
+action_covariate_available_timestamps_ms: [N, A, Fc]
+action_covariate_age_seconds: [N, A, Fc]
+action_covariate_feature_names: [Fc]
+action_covariate_schema_hash
+action_covariate_source_manifest_hash
+```
+
+When these covariates are appended to `action_features` for current
+second-context model compatibility, the payload must also write:
+
+```text
+action_features_augmented_with_covariates: true
+action_feature_groups:
+  base_action_features: [0, base_Fa)
+  stock_covariates_v1: [base_Fa, base_Fa + Fc)
+action_feature_available_timestamps_ms: [N, A, base_Fa + Fc]
+```
+
+`action_features_available_timestamps_ms[N, A]` remains as a compatibility
+row-level timestamp and should be the maximum known availability timestamp among
+finite model-facing action features. Validators must prefer
+`action_feature_available_timestamps_ms` when present and fail if any known
+feature timestamp exceeds its decision timestamp.
+
+Covariate missingness must not alter `decision_action_valid_mask`. Tradability
+and execution readiness stay in `decision_action_valid_mask`; covariate
+coverage stays in `action_covariate_mask` and missing-flag features.
 
 ## Model Inputs And Labels
 
@@ -660,6 +703,8 @@ feature names match tensor widths
 action names match action dimension
 manifest hashes are present
 source download/reportability flags are explicit
+cache identity matches the requested source manifest, universe, conversion
+config, converter identity, and action schema when reusing an existing artifact
 ```
 
 ## Current Implementation And Next Migrations

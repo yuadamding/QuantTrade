@@ -152,6 +152,7 @@ QuantTrade/
   .env.example
   docs/
     decision_tensor_protocol.md
+    stock_covariate_integration.md
   src/rl_quant/
     core.py
     action_risk.py
@@ -442,6 +443,11 @@ train_dqn_agent.py
 For the full compact decision tensor standard, read:
 
 [docs/decision_tensor_protocol.md](docs/decision_tensor_protocol.md)
+
+For the newly downloaded Polygon stock-specific covariates and the integration
+gap before they become model inputs, read:
+
+[docs/stock_covariate_integration.md](docs/stock_covariate_integration.md)
 
 The root README gives the operational summary below.
 

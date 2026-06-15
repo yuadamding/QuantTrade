@@ -935,7 +935,7 @@ class VectorizedMinuteToHourEnv:
         self.order_legs_episode = self.order_legs_episode + legs
         self.steps = self.steps + 1
 
-        in_bounds = next_indices + 1 < self.data.action_returns.shape[0]
+        in_bounds = next_indices < self.data.action_returns.shape[0]
         next_valid = torch.zeros_like(in_bounds)
         if bool(in_bounds.any().item()):
             next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]

@@ -613,19 +613,31 @@ def main() -> int:
 
     stock_map = bar_source_map(args.stock_minute_dir, interval=source_bar_interval)
     etf_map = bar_source_map(args.etf_minute_dir, interval=source_bar_interval)
-    ranked_stocks = [symbol for symbol in read_ranked_symbols(args.stock_universe) if symbol in stock_map]
+    intended_stocks = read_ranked_symbols(args.stock_universe)
+    intended_stock_slice = intended_stocks[: args.stock_limit]
+    missing_intended_stock_source_symbols = [symbol for symbol in intended_stock_slice if symbol not in stock_map]
+    ranked_stocks = [symbol for symbol in intended_stocks if symbol in stock_map]
     selected_stocks = ranked_stocks[: args.stock_limit]
     if not selected_stocks:
         raise ValueError("No stock source-bar files matched the selected universe.")
 
     if args.actions:
-        etf_symbols = [symbol.strip().upper() for symbol in args.actions.split(",") if symbol.strip()]
+        intended_action_symbols = [symbol.strip().upper() for symbol in args.actions.split(",") if symbol.strip()]
     else:
-        etf_symbols = [symbol for symbol in read_ranked_symbols(args.etf_universe) if symbol in etf_map][: args.action_count]
+        intended_action_symbols = read_ranked_symbols(args.etf_universe)[: args.action_count]
+    missing_intended_action_source_symbols = [symbol for symbol in intended_action_symbols if symbol not in etf_map]
+    etf_symbols = [symbol for symbol in intended_action_symbols if symbol in etf_map]
     etf_symbols = list(dict.fromkeys(symbol for symbol in etf_symbols if symbol in etf_map))
     if not etf_symbols:
         raise ValueError("No action source-bar files matched the selected universe.")
     action_names = ["CASH", *etf_symbols]
+    dataset_reportability_errors: list[str] = []
+    if missing_intended_stock_source_symbols or missing_intended_action_source_symbols:
+        dataset_reportability_errors.append("missing_intended_universe_source_symbols")
+    if allow_missing_action_context:
+        dataset_reportability_errors.append("missing_action_context_allowed")
+    dataset_reportability_errors = list(dict.fromkeys(dataset_reportability_errors))
+    dataset_reportable = not dataset_reportability_errors
 
     print(f"Loading {len(selected_stocks)} stock {source_bar_interval} files for causal context...")
     stock_by_time = {}
@@ -666,7 +678,6 @@ def main() -> int:
         if len(stock_by_time.get(timestamp, [])) >= min_active
         and (timestamp in exchange_times or dense_hourly_grid or timestamp in exact_action_common_times)
     ]
-    common_set = set(common_times)
     if len(common_times) < args.minutes_per_hour:
         raise ValueError("Too few aligned source rows after stock and action filtering.")
     action_price_lookup = {symbol: make_action_lookup(rows) for symbol, rows in etf_features.items()}
@@ -803,8 +814,6 @@ def main() -> int:
         next_ts = epoch_ms_to_utc_iso(next_ms)
         decision_context_ms = decision_ms - int(args.bar_latency_ms)
         next_context_ms = next_ms - int(args.bar_latency_ms)
-        if not dense_hourly_grid and next_ts not in common_set:
-            continue
         decision_date = exchange_timestamp[:10]
         minute_tensor: list[list[list[float]]] = []
         mask_tensor: list[list[bool]] = []
@@ -933,6 +942,10 @@ def main() -> int:
             "action_mask_semantics": action_mask_semantics,
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
+            "dataset_reportable": dataset_reportable,
+            "dataset_reportability_errors": dataset_reportability_errors,
+            "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+            "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
             "hours_lookback": args.hours_lookback,
             "minutes_per_hour": args.minutes_per_hour,
             "context_bars_per_hour": args.minutes_per_hour,
@@ -951,7 +964,11 @@ def main() -> int:
                 "stock_universe": str(args.stock_universe),
                 "etf_universe": str(args.etf_universe),
                 "stock_limit": len(selected_stocks),
+                "intended_stock_symbols": intended_stock_slice,
+                "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
                 "action_symbols": etf_symbols,
+                "intended_action_symbols": intended_action_symbols,
+                "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
                 "min_active_stock_fraction": args.min_active_stock_fraction,
                 "min_context_valid_fraction": args.min_context_valid_fraction,
                 "max_action_staleness_seconds": args.max_action_staleness_seconds,
@@ -962,6 +979,8 @@ def main() -> int:
                 "action_mask_semantics": action_mask_semantics,
                 "model_input_keys": model_input_keys,
                 "forbidden_model_input_keys": forbidden_model_input_keys,
+                "dataset_reportable": dataset_reportable,
+                "dataset_reportability_errors": dataset_reportability_errors,
                 "action_return_missing_semantics": (
                     "Missing action labels are NaN and marked false in label_valid_mask; "
                     "action_valid_mask is the decision-time selector."
@@ -980,7 +999,11 @@ def main() -> int:
         "stock_universe": str(args.stock_universe),
         "etf_universe": str(args.etf_universe),
         "stock_limit": len(selected_stocks),
+        "intended_stock_symbols": intended_stock_slice,
+        "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
         "action_symbols": etf_symbols,
+        "intended_action_symbols": intended_action_symbols,
+        "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "min_active_stock_fraction": args.min_active_stock_fraction,
         "min_context_valid_fraction": args.min_context_valid_fraction,
         "max_action_staleness_seconds": args.max_action_staleness_seconds,
@@ -1000,6 +1023,8 @@ def main() -> int:
         "action_mask_semantics": action_mask_semantics,
         "model_input_keys": model_input_keys,
         "forbidden_model_input_keys": forbidden_model_input_keys,
+        "dataset_reportable": dataset_reportable,
+        "dataset_reportability_errors": dataset_reportability_errors,
         "start": args.start,
         "end_exclusive": args.end_exclusive,
         "universe_selection_date": universe_selection_date,
@@ -1026,6 +1051,10 @@ def main() -> int:
         "periods_per_year": periods_per_year,
         "periods_per_year_formula": "252 * median_decisions_per_utc_day",
         "median_decisions_per_day": median_decisions_per_day,
+        "dataset_reportable": dataset_reportable,
+        "dataset_reportability_errors": dataset_reportability_errors,
+        "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+        "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "dataset": str(dataset_path),
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -1049,18 +1078,34 @@ def main() -> int:
             f"Source {source_bar_interval} bars may be sparse; missing context bars are masked.",
             "Universe selection date is validated to be no later than the first dataset timestamp.",
             "US regular-session timing uses simplified 9:30-16:00 assumptions.",
+            "Rows are retained from decision-time action availability; missing reward labels remain NaN.",
         ],
     )
     try:
-        manifest.write_json(args.output_dir / "dataset_manifest.json")
+        manifest.validate()
+        manifest_payload = manifest.to_dict()
+        manifest_payload.update(
+            {
+                "reportable": dataset_reportable,
+                "reportability_errors": dataset_reportability_errors,
+                "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+                "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
+            }
+        )
+        (args.output_dir / "dataset_manifest.json").write_text(
+            json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n"
+        )
     except ResearchProtocolError as exc:
         if "universe_selection_date must be before or at first_timestamp" not in str(exc):
             raise
         manifest_payload = manifest.to_dict()
+        future_errors = list(dict.fromkeys([*dataset_reportability_errors, "future_universe_selection_date"]))
         manifest_payload.update(
             {
                 "reportable": False,
-                "reportability_errors": ["future_universe_selection_date"],
+                "reportability_errors": future_errors,
+                "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+                "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
                 "actual_universe_selection_date": universe_selection_date,
                 "universe_selection_date_note": (
                     "The supplied universe file date is after the first row; conversion is retained for "
@@ -1085,6 +1130,8 @@ to the next hourly decision timestamp, using as-of prices when configured.
 - Actions: {", ".join(action_names)}
 - Decision action mask: `decision_action_valid_mask` / `action_valid_mask`.
 - Action label mask: `label_valid_mask` / `action_label_valid_mask`; missing action labels are stored as NaN.
+- Dataset reportable: {dataset_reportable}
+- Reportability errors: {", ".join(dataset_reportability_errors) if dataset_reportability_errors else "none"}
 - Source bar interval: {source_bar_interval}
 - Bar latency: {int(args.bar_latency_ms)} ms
 - Context bars per hour: {args.minutes_per_hour}

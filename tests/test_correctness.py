@@ -50,6 +50,16 @@ from rl_quant.data_sources.polygon_second_aggs import (  # noqa: E402
     timestamp_ms_to_iso,
     validate_manifest,
 )
+from rl_quant.data_sources.polygon_stock_covariates import (  # noqa: E402
+    normalize_raw_covariate_record,
+    regular_session_open_ms_after_date,
+)
+from rl_quant.features.stock_covariates import (  # noqa: E402
+    ACTION_COVARIATE_FEATURE_NAMES,
+    append_action_covariates_to_payload,
+    build_action_covariate_tensor,
+    build_symbol_silver_rows,
+)
 from rl_quant.features.stock_second_context import (  # noqa: E402
     StockSecondContextConfig,
     build_second_context_payload,
@@ -175,6 +185,37 @@ class DailyParserTests(unittest.TestCase):
 
 
 class BarDatasetTests(unittest.TestCase):
+    @staticmethod
+    def _write_bar_csv(path: Path, rows: list[tuple[str, str]]) -> None:
+        with path.open("w", newline="") as sink:
+            writer = csv.DictWriter(
+                sink,
+                fieldnames=[
+                    "DatetimeUTC",
+                    "DatetimeExchange",
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                    "Adj Close",
+                    "Volume",
+                ],
+            )
+            writer.writeheader()
+            for timestamp, close in rows:
+                writer.writerow(
+                    {
+                        "DatetimeUTC": timestamp,
+                        "DatetimeExchange": timestamp,
+                        "Open": close,
+                        "High": close,
+                        "Low": close,
+                        "Close": close,
+                        "Adj Close": close,
+                        "Volume": "10",
+                    }
+                )
+
     def test_bar_loader_keeps_simple_and_log_returns_distinct(self) -> None:
         module = load_script("build_hourly_transformer_dataset")
         with tempfile.TemporaryDirectory() as directory:
@@ -276,6 +317,71 @@ class BarDatasetTests(unittest.TestCase):
         next_decision = rows["2026-01-02T14:32:00+00:00"]
         self.assertAlmostEqual(next_decision.bar_return, 0.10)
         self.assertAlmostEqual(module.clipped_simple_return(current.close, next_decision.close), 0.21)
+
+    def test_direct_hourly_builder_marks_legacy_protocol_non_reportable(self) -> None:
+        module = load_script("build_hourly_transformer_dataset")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stock_dir = root / "stocks"
+            etf_dir = root / "etfs"
+            output_dir = root / "out"
+            stock_dir.mkdir()
+            etf_dir.mkdir()
+            rows = [
+                (f"2026-01-02T14:{30 + offset:02d}:00+00:00", str(100 + offset))
+                for offset in range(11)
+            ]
+            self._write_bar_csv(stock_dir / "AAA_1m.csv", rows)
+            self._write_bar_csv(etf_dir / "QQQ_1m.csv", rows)
+            stock_universe = root / "stocks.csv"
+            etf_universe = root / "etfs.csv"
+            stock_universe.write_text("symbol\nAAA\n")
+            etf_universe.write_text("symbol\nQQQ\n")
+            old_argv = sys.argv
+            sys.argv = [
+                "build_hourly_transformer_dataset.py",
+                "--stock-bar-dir",
+                str(stock_dir),
+                "--etf-bar-dir",
+                str(etf_dir),
+                "--stock-universe",
+                str(stock_universe),
+                "--etf-universe",
+                str(etf_universe),
+                "--output-dir",
+                str(output_dir),
+                "--dataset-file-name",
+                "dataset.pt",
+                "--bar-interval",
+                "1m",
+                "--start",
+                "2026-01-02T00:00:00+00:00",
+                "--end-exclusive",
+                "2026-01-03T00:00:00+00:00",
+                "--stock-limit",
+                "1",
+                "--action-count",
+                "1",
+                "--min-active-stock-fraction",
+                "1.0",
+                "--universe-selection-date",
+                "2026-01-01T00:00:00+00:00",
+            ]
+            try:
+                module.main()
+            finally:
+                sys.argv = old_argv
+
+            payload = torch.load(output_dir / "dataset.pt", map_location="cpu", weights_only=True)
+            manifest = json.loads((output_dir / "dataset_manifest.json").read_text())
+
+        self.assertFalse(payload["dataset_reportable"])
+        self.assertIn("legacy_hourly_all_labels_required_protocol", payload["dataset_reportability_errors"])
+        self.assertIn("rows_filtered_by_future_label_availability", payload["dataset_reportability_errors"])
+        self.assertTrue(torch.equal(payload["decision_action_valid_mask"], payload["action_valid_mask"]))
+        self.assertTrue(torch.equal(payload["label_valid_mask"], payload["action_label_valid_mask"]))
+        self.assertFalse(manifest["reportable"])
+        self.assertIn("legacy_hourly_all_labels_required_protocol", manifest["reportability_errors"])
 
 
 class MinuteToHourTests(unittest.TestCase):
@@ -535,6 +641,97 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertFalse(bool(payload["label_valid_mask"][0, 1].item()))
         self.assertTrue(torch.isnan(payload["action_returns"][0, 1]))
 
+    def test_hourly_builder_non_dense_keeps_row_when_future_grid_point_missing(self) -> None:
+        try:
+            import pandas as pd
+        except ModuleNotFoundError:
+            self.skipTest("pandas/pyarrow are required for Parquet builder regression")
+        builder = load_script("build_hourly_from_minute_context_dataset")
+
+        def write_bar_parquet(path: Path, symbol: str, *, rows: int) -> None:
+            start_utc = builder.parse_utc_datetime("2026-01-02T14:31:00+00:00")
+            records: list[dict[str, object]] = []
+            for offset in range(rows):
+                utc_dt = start_utc + builder.timedelta(minutes=offset)
+                exchange_dt = utc_dt.astimezone(builder.timezone(builder.timedelta(hours=-5)))
+                price = 100.0 + offset * 0.01 + (0.5 if symbol == "QQQ" else 0.0)
+                records.append(
+                    {
+                        "timestamp_ms": builder.timestamp_to_epoch_ms(utc_dt),
+                        "timestamp_utc": utc_dt.isoformat(),
+                        "timestamp_exchange": exchange_dt.isoformat(),
+                        "open": price,
+                        "high": price + 0.1,
+                        "low": price - 0.1,
+                        "close": price,
+                        "volume": 1000,
+                    }
+                )
+            pd.DataFrame.from_records(records).to_parquet(path, index=False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stock_dir = root / "stocks"
+            action_dir = root / "actions"
+            output_dir = root / "out"
+            stock_dir.mkdir()
+            action_dir.mkdir()
+            write_bar_parquet(stock_dir / "AAA.parquet", "AAA", rows=60)
+            write_bar_parquet(action_dir / "QQQ.parquet", "QQQ", rows=60)
+            stock_universe = root / "stocks.csv"
+            action_universe = root / "actions.csv"
+            stock_universe.write_text("symbol\nAAA\n")
+            action_universe.write_text("symbol\nQQQ\n")
+            old_argv = sys.argv
+            sys.argv = [
+                "build_hourly_from_minute_context_dataset.py",
+                "--stock-bar-dir",
+                str(stock_dir),
+                "--action-bar-dir",
+                str(action_dir),
+                "--stock-universe",
+                str(stock_universe),
+                "--action-universe",
+                str(action_universe),
+                "--output-dir",
+                str(output_dir),
+                "--dataset-file-name",
+                "dataset.pt",
+                "--start",
+                "2026-01-02T00:00:00+00:00",
+                "--end-exclusive",
+                "2026-01-03T00:00:00+00:00",
+                "--stock-limit",
+                "1",
+                "--action-count",
+                "1",
+                "--hours-lookback",
+                "1",
+                "--context-bars-per-hour",
+                "60",
+                "--min-active-stock-fraction",
+                "1.0",
+                "--min-context-valid-fraction",
+                "1.0",
+                "--min-decision-rows",
+                "1",
+                "--allow-missing-action-context",
+                "--universe-selection-date",
+                "2026-01-01T00:00:00+00:00",
+            ]
+            try:
+                builder.main()
+            finally:
+                sys.argv = old_argv
+
+            payload = torch.load(output_dir / "dataset.pt", map_location="cpu", weights_only=True)
+
+        self.assertEqual(payload["decision_timestamps"], ["2026-01-02T15:30:00+00:00"])
+        self.assertEqual(payload["next_timestamps"], ["2026-01-02T16:30:00+00:00"])
+        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 1].item()))
+        self.assertFalse(bool(payload["label_valid_mask"][0, 1].item()))
+        self.assertTrue(torch.isnan(payload["action_returns"][0, 1]))
+
     def test_hourly_builder_dense_grid_does_not_depend_on_first_action_symbol(self) -> None:
         try:
             import pandas as pd
@@ -789,6 +986,42 @@ class MinuteToHourTests(unittest.TestCase):
         )
 
         self.assertEqual(tuple(q_values.shape), (2, 2))
+
+    def test_vectorized_minute_to_hour_env_allows_last_valid_next_state(self) -> None:
+        split = HourFromMinuteDataSplit(
+            name="train",
+            decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-02T15:30:00+00:00"],
+            next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-02T16:30:00+00:00"],
+            minute_feature_names=["m"],
+            hour_feature_names=["h"],
+            action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((2, 1, 1), dtype=torch.float32),
+            action_returns=torch.zeros((2, 2), dtype=torch.float32),
+            action_valid_mask=torch.ones((2, 2), dtype=torch.bool),
+            label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1], dtype=torch.long),
+            valid_index_mask=torch.tensor([True, True], dtype=torch.bool),
+            minute_feature_mean=torch.zeros(1),
+            minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1),
+            hour_feature_std=torch.ones(1),
+            hours_lookback=1,
+            minutes_per_hour=1,
+        )
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["VectorizedMinuteToHourEnv"])
+        env = module.VectorizedMinuteToHourEnv(
+            split,
+            module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0),
+            torch.device("cpu"),
+        )
+        env.indices[:] = 0
+
+        result = env.step(torch.tensor([0], dtype=torch.long))
+
+        self.assertEqual(int(result["next_indices"][0].item()), 1)
+        self.assertFalse(bool(result["dones"][0].item()))
 
     def test_polygon_second_manifest_marks_incomplete_download_non_reportable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1099,6 +1332,254 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertIn("decision_action_valid_mask", payload["model_input_keys"])
         self.assertNotIn("label_valid_mask", payload["model_input_keys"])
         self.assertIn("label_valid_mask", payload["forbidden_model_input_keys"])
+
+    def test_stock_covariate_financial_date_only_is_next_session_available(self) -> None:
+        record = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="financials",
+            payload={
+                "filing_date": "2026-01-05",
+                "end_date": "2025-12-31",
+                "fiscal_year": "2025",
+                "fiscal_period": "Q4",
+                "financials": {
+                    "income_statement": {
+                        "revenues": {"value": 100.0},
+                        "net_income_loss": {"value": 10.0},
+                    },
+                    "balance_sheet": {
+                        "assets": {"value": 200.0},
+                        "liabilities": {"value": 50.0},
+                        "cash_and_cash_equivalents": {"value": 20.0},
+                    },
+                    "cash_flow_statement": {
+                        "net_cash_flow_from_operating_activities": {"value": 15.0},
+                    },
+                },
+            },
+        )
+        rows = build_symbol_silver_rows([record])
+        before = iso_to_timestamp_ms("2026-01-05T20:00:00+00:00")
+        after = iso_to_timestamp_ms("2026-01-06T15:00:00+00:00")
+        expected_available = regular_session_open_ms_after_date("2026-01-05")
+
+        bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": rows},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[before, after],
+            source_manifest_hash="manifest-hash",
+        )
+        missing_idx = ACTION_COVARIATE_FEATURE_NAMES.index("financial_missing_flag")
+        margin_idx = ACTION_COVARIATE_FEATURE_NAMES.index("net_income_margin")
+
+        self.assertEqual(record.available_timestamp_ms, expected_available)
+        self.assertEqual(float(bundle["action_covariates"][0, 1, missing_idx].item()), 1.0)
+        self.assertFalse(bool(bundle["action_covariate_mask"][0, 1, margin_idx].item()))
+        self.assertEqual(float(bundle["action_covariates"][1, 1, missing_idx].item()), 0.0)
+        self.assertTrue(bool(bundle["action_covariate_mask"][1, 1, margin_idx].item()))
+        self.assertAlmostEqual(float(bundle["action_covariates"][1, 1, margin_idx].item()), 0.1, places=6)
+
+    def test_stock_covariate_news_after_decision_is_not_counted(self) -> None:
+        record = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="news",
+            payload={
+                "id": "n1",
+                "published_utc": "2026-01-05T15:00:01Z",
+                "publisher": {"name": "Wire"},
+                "tickers": ["QQQ"],
+            },
+        )
+        rows = build_symbol_silver_rows([record])
+        before = iso_to_timestamp_ms("2026-01-05T15:00:00+00:00")
+        after = iso_to_timestamp_ms("2026-01-05T15:01:00+00:00")
+        bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": rows},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[before, after],
+            source_coverage_by_symbol={"QQQ": {"news": True}},
+            source_manifest_hash="manifest-hash",
+        )
+        news_1h_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_count_1h")
+
+        self.assertEqual(float(bundle["action_covariates"][0, 1, news_1h_idx].item()), 0.0)
+        self.assertEqual(float(bundle["action_covariates"][1, 1, news_1h_idx].item()), 1.0)
+
+    def test_stock_covariate_max_age_masks_stale_overview(self) -> None:
+        overview = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="overview_snapshots",
+            payload={
+                "asof_date": "2026-01-01",
+                "ticker": "QQQ",
+                "type": "CS",
+                "market_cap": 100.0,
+                "share_class_shares_outstanding": 10.0,
+                "list_date": "2020-01-01",
+                "record_available": True,
+            },
+        )
+        rows = build_symbol_silver_rows([overview])
+        decision = iso_to_timestamp_ms("2026-01-20T15:00:00+00:00")
+        bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": rows},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[decision],
+            source_manifest_hash="manifest-hash",
+            max_age_days=3,
+        )
+        market_cap_idx = ACTION_COVARIATE_FEATURE_NAMES.index("log_market_cap")
+        missing_idx = ACTION_COVARIATE_FEATURE_NAMES.index("overview_missing_flag")
+
+        self.assertFalse(bool(bundle["action_covariate_mask"][0, 1, market_cap_idx].item()))
+        self.assertEqual(float(bundle["action_covariates"][0, 1, missing_idx].item()), 1.0)
+
+    def test_stock_covariate_future_dividend_and_split_are_not_trailing_inputs(self) -> None:
+        dividend = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="dividends",
+            payload={
+                "id": "d1",
+                "cash_amount": 1.0,
+                "declaration_date": "2026-01-02",
+                "ex_dividend_date": "2026-01-20",
+            },
+        )
+        split = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="splits",
+            payload={
+                "id": "s1",
+                "execution_date": "2026-01-20",
+                "split_from": 1,
+                "split_to": 2,
+            },
+        )
+        rows = build_symbol_silver_rows([dividend, split])
+        decision = iso_to_timestamp_ms("2026-01-06T15:00:00+00:00")
+        bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": rows},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[decision],
+            source_coverage_by_symbol={"QQQ": {"dividends": True, "splits": True}},
+            source_manifest_hash="manifest-hash",
+        )
+        div_count_idx = ACTION_COVARIATE_FEATURE_NAMES.index("trailing_12m_dividend_count")
+        split_count_idx = ACTION_COVARIATE_FEATURE_NAMES.index("split_events_last_365d")
+
+        self.assertEqual(float(bundle["action_covariates"][0, 1, div_count_idx].item()), 0.0)
+        self.assertEqual(float(bundle["action_covariates"][0, 1, split_count_idx].item()), 0.0)
+        self.assertTrue(bool(bundle["action_covariate_mask"][0, 1, div_count_idx].item()))
+        self.assertTrue(bool(bundle["action_covariate_mask"][0, 1, split_count_idx].item()))
+
+    def test_stock_covariate_missing_news_source_differs_from_zero_news(self) -> None:
+        decision = iso_to_timestamp_ms("2026-01-05T15:00:00+00:00")
+        complete_bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": []},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[decision],
+            source_coverage_by_symbol={"QQQ": {"news": True}},
+            source_manifest_hash="manifest-hash",
+        )
+        missing_bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": []},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[decision],
+            source_coverage_by_symbol={"QQQ": {"news": False}},
+            source_manifest_hash="manifest-hash",
+        )
+        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_count_1d")
+        news_missing_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_missing_flag")
+
+        self.assertTrue(bool(complete_bundle["action_covariate_mask"][0, 1, news_1d_idx].item()))
+        self.assertEqual(float(complete_bundle["action_covariates"][0, 1, news_missing_idx].item()), 0.0)
+        self.assertFalse(bool(missing_bundle["action_covariate_mask"][0, 1, news_1d_idx].item()))
+        self.assertEqual(float(missing_bundle["action_covariates"][0, 1, news_missing_idx].item()), 1.0)
+
+    def test_stock_covariate_source_coverage_applies_to_empty_symbol_rows(self) -> None:
+        decision = iso_to_timestamp_ms("2026-01-05T15:00:00+00:00")
+        bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[decision],
+            source_coverage_by_symbol={"QQQ": {"news": True}},
+            source_manifest_hash="manifest-hash",
+        )
+        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_count_1d")
+        news_missing_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_missing_flag")
+
+        self.assertTrue(bool(bundle["action_covariate_mask"][0, 1, news_1d_idx].item()))
+        self.assertEqual(float(bundle["action_covariates"][0, 1, news_missing_idx].item()), 0.0)
+
+    def test_second_context_payload_accepts_appended_action_covariates_without_mask_bias(self) -> None:
+        payload = self._small_second_context_payload()
+        original_width = int(payload["action_features"].shape[-1])
+        original_valid = payload["decision_action_valid_mask"].clone()
+        overview = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="overview_snapshots",
+            payload={
+                "asof_date": "2026-06-11",
+                "ticker": "QQQ",
+                "type": "CS",
+                "locale": "us",
+                "market_cap": 100_000_000.0,
+                "share_class_shares_outstanding": 1_000_000.0,
+                "list_date": "1999-03-10",
+                "record_available": True,
+            },
+        )
+        rows = build_symbol_silver_rows([overview])
+        bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": rows},
+            action_names=payload["action_names"],
+            decision_timestamps_ms=payload["decision_timestamps_ms"],
+            source_manifest_hash="manifest-hash",
+        )
+        bundle["action_covariate_feature_schema_file_hash"] = "schema-file-hash"
+        augmented = append_action_covariates_to_payload(payload, bundle)
+
+        validate_second_context_payload(augmented)
+        self.assertEqual(int(augmented["action_features"].shape[-1]), original_width + len(ACTION_COVARIATE_FEATURE_NAMES))
+        self.assertTrue(torch.equal(augmented["decision_action_valid_mask"], original_valid))
+        self.assertTrue(augmented["action_features_augmented_with_covariates"])
+        self.assertIn("stock_covariates_v1", augmented["action_feature_groups"])
+        self.assertEqual(
+            augmented["dataset_manifest"]["action_covariate_feature_schema_file_hash"],
+            "schema-file-hash",
+        )
+        self.assertEqual(tuple(augmented["action_feature_available_timestamps_ms"].shape), tuple(augmented["action_features"].shape))
+
+    def test_second_context_payload_rejects_future_action_covariate_availability(self) -> None:
+        payload = self._small_second_context_payload()
+        decision_ms = int(payload["decision_timestamps_ms"][0].item())
+        covariates = {
+            "action_covariates": torch.zeros((1, 2, 1), dtype=torch.float32),
+            "action_covariate_mask": torch.tensor([[[False], [True]]]),
+            "action_covariate_available_timestamps_ms": torch.tensor([[[-1], [decision_ms + 1]]]),
+            "action_covariate_feature_names": ["log_market_cap"],
+            "action_covariate_schema_hash": stable_json_hash(["log_market_cap"]),
+        }
+        payload.update(covariates)
+
+        with self.assertRaisesRegex(ValueError, "action covariates"):
+            validate_second_context_payload(payload)
+
+    def test_second_context_payload_rejects_forbidden_future_covariate_feature_as_input(self) -> None:
+        payload = self._small_second_context_payload()
+        decision_ms = int(payload["decision_timestamps_ms"][0].item())
+        covariates = {
+            "action_covariates": torch.zeros((1, 2, 1), dtype=torch.float32),
+            "action_covariate_mask": torch.ones((1, 2, 1), dtype=torch.bool),
+            "action_covariate_available_timestamps_ms": torch.full((1, 2, 1), decision_ms, dtype=torch.long),
+            "action_covariate_feature_names": ["future_dividend_ex_date_unannounced"],
+            "action_covariate_schema_hash": stable_json_hash(["future_dividend_ex_date_unannounced"]),
+            "action_features_augmented_with_covariates": True,
+        }
+        payload.update(covariates)
+
+        with self.assertRaisesRegex(ValueError, "Forbidden future-only covariate"):
+            validate_second_context_payload(payload)
 
     def test_second_context_grid_excludes_postclose_exit_by_default(self) -> None:
         decisions = regular_session_decision_grid_ms(
@@ -2157,6 +2638,42 @@ class MinuteToHourTests(unittest.TestCase):
             self.assertFalse(module.existing_gold_dataset_is_current(old_path))
             self.assertTrue(module.existing_gold_dataset_is_current(current_path))
 
+    def test_second_context_conversion_skip_rejects_cache_identity_mismatch(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+        payload = self._small_second_context_payload()
+        manifest = dict(payload["dataset_manifest"])
+        manifest.update(
+            {
+                "source_manifest_hash": "source-a",
+                "universe_file_hash": "universe-a",
+                "conversion_config_hash": "config-a",
+                "converter_identity_hash": "converter-a",
+                "action_schema_hash": stable_json_hash(payload["action_names"]),
+            }
+        )
+        payload["dataset_manifest"] = manifest
+        expected = {
+            "source_manifest_hash": "source-a",
+            "universe_file_hash": "universe-a",
+            "conversion_config_hash": "config-a",
+            "converter_identity_hash": "converter-a",
+            "action_schema_hash": stable_json_hash(payload["action_names"]),
+        }
+        mismatched = dict(expected)
+        mismatched["universe_file_hash"] = "universe-b"
+
+        with tempfile.TemporaryDirectory() as directory:
+            current_path = Path(directory) / "current" / "dataset.pt"
+            current_path.parent.mkdir(parents=True)
+            torch.save(payload, current_path)
+
+            self.assertTrue(module.existing_gold_dataset_is_current(current_path, expected))
+            self.assertFalse(module.existing_gold_dataset_is_current(current_path, mismatched))
+            self.assertEqual(
+                module.validate_cache_identity(manifest, mismatched),
+                ["cache_identity_mismatch:universe_file_hash"],
+            )
+
     def test_second_context_conversion_skip_requires_current_hourly_schema(self) -> None:
         module = load_script("convert_polygon_second_to_protocol")
         current_payload = {
@@ -2190,6 +2707,45 @@ class MinuteToHourTests(unittest.TestCase):
             self.assertFalse(module.existing_hourly_dataset_is_current(old_path))
             self.assertTrue(module.existing_hourly_dataset_is_current(current_path))
             self.assertFalse(module.existing_hourly_dataset_is_current(leaky_path))
+
+    def test_second_context_conversion_stamps_hourly_cache_identity(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+        payload = {
+            "action_returns": torch.tensor([[0.0, float("nan")], [0.0, 0.01]], dtype=torch.float32),
+            "decision_action_valid_mask": torch.tensor([[True, True], [True, True]]),
+            "action_valid_mask": torch.tensor([[True, True], [True, True]]),
+            "label_valid_mask": torch.tensor([[True, False], [True, True]]),
+            "action_label_valid_mask": torch.tensor([[True, False], [True, True]]),
+            "action_mask_semantics": {
+                "decision_action_valid_mask": "known before decision",
+                "label_valid_mask": "known after reward realization",
+            },
+            "model_input_keys": ["minute_features", "action_valid_mask", "decision_action_valid_mask"],
+            "forbidden_model_input_keys": ["label_valid_mask", "action_label_valid_mask"],
+            "dataset_reportable": True,
+            "dataset_reportability_errors": [],
+        }
+        expected = {
+            "source_manifest_hash": "source-a",
+            "universe_file_hash": "universe-a",
+            "conversion_config_hash": "config-a",
+            "converter_identity_hash": "converter-a",
+            "action_schema_hash": "actions-a",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hourly" / "dataset.pt"
+            path.parent.mkdir(parents=True)
+            torch.save(payload, path)
+
+            self.assertFalse(module.existing_hourly_dataset_is_current(path, expected))
+            self.assertEqual(module.stamp_cache_identity(path, expected), [])
+            self.assertTrue(module.existing_hourly_dataset_is_current(path, expected))
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+            self.assertEqual(saved["dataset_manifest"]["source_manifest_hash"], "source-a")
+            self.assertEqual(saved["dataset_manifest"]["reportable"], True)
+            sidecar = json.loads((path.parent / "dataset_manifest.json").read_text())
+            self.assertEqual(sidecar["converter_identity_hash"], "converter-a")
 
     def test_second_context_converter_reportability_flags_future_universe(self) -> None:
         module = load_script("convert_polygon_second_to_protocol")
@@ -2241,6 +2797,52 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual(actions, ["CASH", "AAA", "BBB"])
         self.assertEqual(missing, ["BBB"])
+
+    def test_second_context_converter_passes_action_covariate_flags_to_gold_builder(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            covariates_root = root / "covariates"
+            covariates_root.mkdir()
+            manifest = covariates_root / "manifest.csv"
+            schema = covariates_root / "feature_schema.json"
+            manifest.write_text("symbol,path,rows\nAAA,/tmp/AAA.parquet,1\n")
+            schema.write_text('{"schema_version": "stock_covariates_silver_v1"}\n')
+            expected_manifest_hash = module.file_sha256(manifest)
+            expected_schema_hash = module.file_sha256(schema)
+            args = module.parse_args(
+                [
+                    "--include-action-covariates",
+                    "--covariates-root",
+                    str(covariates_root),
+                    "--covariate-feature-schema",
+                    str(schema),
+                    "--covariate-max-age-days",
+                    "30",
+                    "--covariate-strict-coverage",
+                ]
+            )
+
+            command = module.build_gold_command(
+                args=args,
+                source_manifest=Path("/tmp/source/manifest.csv"),
+                protocol_dataset_manifest=Path("/tmp/protocol.json"),
+                actions=["CASH", "AAA"],
+                start_day=module.parse_date("2026-01-02"),
+                end_day=module.parse_date("2026-01-03"),
+                output=Path("/tmp/out/dataset.pt"),
+            )
+            config = module.conversion_config_payload(args, actions=["CASH", "AAA"], universe_asof="2026-01-01")
+
+        self.assertIn("--include-action-covariates", command)
+        self.assertIn("--covariates-root", command)
+        self.assertIn("--covariate-feature-schema", command)
+        self.assertIn("--covariate-strict-coverage", command)
+        self.assertEqual(command[command.index("--covariate-max-age-days") + 1], "30")
+        self.assertTrue(config["include_action_covariates"])
+        self.assertEqual(config["covariate_max_age_days"], 30)
+        self.assertEqual(config["covariate_silver_manifest_hash"], expected_manifest_hash)
+        self.assertEqual(config["covariate_feature_schema_file_hash"], expected_schema_hash)
 
     def test_min_hold_action_mask_allows_only_current_action(self) -> None:
         mask = build_action_mask(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -27,6 +28,11 @@ from rl_quant.features.stock_second_context import (  # noqa: E402
     regular_session_decision_grid_ms,
     save_second_context_payload,
 )
+from rl_quant.features.stock_covariates import (  # noqa: E402
+    append_action_covariates_to_payload,
+    build_action_covariate_tensor,
+    load_silver_rows_by_symbol,
+)
 
 
 def default_data_root() -> Path:
@@ -38,6 +44,7 @@ def default_data_root() -> Path:
 
 DATA_ROOT = default_data_root()
 DEFAULT_SECOND_ROOT = DATA_ROOT / "polygon" / "second_aggs" / "top500_common_stocks_2025_to_2026-06-15"
+DEFAULT_COVARIATE_SILVER_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "silver" / "top500_2023_to_present"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -65,6 +72,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-action-staleness-seconds", type=int, default=300)
     parser.add_argument("--include-extended-hours", action="store_true")
     parser.add_argument("--source-access", choices=["auto", "REST", "AWS S3"], default="auto")
+    parser.add_argument("--covariates-root", type=Path, default=DEFAULT_COVARIATE_SILVER_ROOT)
+    parser.add_argument("--covariate-feature-schema", type=Path)
+    parser.add_argument("--include-action-covariates", action="store_true")
+    parser.add_argument("--include-market-covariates", action="store_true")
+    parser.add_argument("--covariate-join-mode", choices=["latest_before_decision"], default="latest_before_decision")
+    parser.add_argument("--covariate-max-age-days", type=int, default=0, help="Reserved for stricter future filters; 0 means no age cutoff.")
+    parser.add_argument("--covariate-strict-coverage", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -97,8 +111,20 @@ def load_frames(paths: list[Path], *, include_extended_hours: bool) -> object:
     return pd.concat(frames, ignore_index=True).sort_values("timestamp_ms").reset_index(drop=True)
 
 
+def file_sha256(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main() -> int:
     args = parse_args()
+    if args.include_market_covariates:
+        raise ValueError("Market-level covariates are not implemented yet; use --include-action-covariates for v1.")
     min_active_symbols = args.min_active_symbols if args.min_active_symbols is not None else (10 if args.smoke else 250)
     rows = load_manifest(args.stock_second_manifest)
     source_access = None if args.source_access == "auto" else args.source_access
@@ -188,6 +214,47 @@ def main() -> int:
         dataset_manifest=source_manifest,
         data_quality_report=data_quality,
     )
+    if args.include_action_covariates:
+        silver_rows = load_silver_rows_by_symbol(args.covariates_root, action_names)
+        missing_covariate_actions = [
+            symbol
+            for symbol in action_names
+            if symbol != "CASH" and not silver_rows.get(symbol)
+        ]
+        if missing_covariate_actions and args.covariate_strict_coverage:
+            raise ValueError(f"Missing action covariate silver rows for: {', '.join(missing_covariate_actions)}")
+        manifest_path = args.covariates_root / "manifest.csv"
+        schema_path = args.covariate_feature_schema or args.covariates_root / "feature_schema.json"
+        source_manifest_hash = file_sha256(manifest_path)
+        schema_hash = file_sha256(schema_path)
+        covariates = build_action_covariate_tensor(
+            silver_rows_by_symbol=silver_rows,
+            action_names=action_names,
+            decision_timestamps_ms=payload["decision_timestamps_ms"],
+            source_manifest_hash=source_manifest_hash,
+            max_age_days=args.covariate_max_age_days,
+        )
+        if schema_hash is None:
+            covariates["action_covariate_reportability_errors"] = list(
+                dict.fromkeys(
+                    [
+                        *covariates.get("action_covariate_reportability_errors", []),
+                        "action_covariate_feature_schema_file_missing",
+                    ]
+                )
+            )
+        if missing_covariate_actions:
+            covariates["action_covariate_reportability_errors"] = list(
+                dict.fromkeys(
+                    [
+                        *covariates.get("action_covariate_reportability_errors", []),
+                        "action_covariate_silver_missing_for_selected_actions",
+                    ]
+                )
+            )
+            covariates["missing_action_covariate_symbols"] = missing_covariate_actions
+        covariates["action_covariate_feature_schema_file_hash"] = schema_hash
+        payload = append_action_covariates_to_payload(payload, covariates, append_to_action_features=True)
     save_second_context_payload(payload, args.output)
     metadata = {
         "rows": len(payload["decision_timestamps"]),

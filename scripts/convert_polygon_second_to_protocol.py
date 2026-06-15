@@ -56,6 +56,7 @@ DEFAULT_SOURCE_ROOT = DATA_ROOT / "polygon" / "second_aggs" / "top500_common_sto
 DEFAULT_UNIVERSE = DATA_ROOT / "polygon" / "universes" / "top_500_s3_volume_common_stocks_2026-06-12_tickers.txt"
 DEFAULT_OUTPUT_ROOT = DATA_ROOT / "protocol" / "polygon_second_top500_2025_to_2026-06-15"
 DEFAULT_DOWNLOAD_LOG = DATA_ROOT / "polygon" / "second_aggs" / "logs" / "top500_second_aggs_download.log"
+DEFAULT_COVARIATE_SILVER_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "silver" / "top500_2023_to_present"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -123,6 +124,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--download-log", type=Path, default=DEFAULT_DOWNLOAD_LOG)
     parser.add_argument("--download-process-pattern", default="polygon_download_second_aggs_by_day.py")
     parser.add_argument("--poll-seconds", type=int, default=60)
+    parser.add_argument("--covariates-root", type=Path, default=DEFAULT_COVARIATE_SILVER_ROOT)
+    parser.add_argument("--covariate-feature-schema", type=Path)
+    parser.add_argument("--include-action-covariates", action="store_true")
+    parser.add_argument("--include-market-covariates", action="store_true")
+    parser.add_argument("--covariate-join-mode", choices=["latest_before_decision"], default="latest_before_decision")
+    parser.add_argument("--covariate-max-age-days", type=int, default=0)
+    parser.add_argument("--covariate-strict-coverage", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -164,6 +172,7 @@ def current_git_metadata() -> dict[str, Any]:
     return {
         "converter_git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
         "converter_git_dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
+        "converter_identity_hash": file_sha256(Path(__file__)),
     }
 
 
@@ -200,8 +209,19 @@ def conversion_config_payload(
         "build_hourly",
         "allow_missing_action_context",
         "allow_non_reportable",
+        "covariates_root",
+        "covariate_feature_schema",
+        "include_action_covariates",
+        "include_market_covariates",
+        "covariate_join_mode",
+        "covariate_max_age_days",
+        "covariate_strict_coverage",
     ]
     payload = {key: str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key) for key in keys}
+    if payload.get("include_action_covariates"):
+        schema_path = args.covariate_feature_schema or args.covariates_root / "feature_schema.json"
+        payload["covariate_silver_manifest_hash"] = file_sha256(args.covariates_root / "manifest.csv")
+        payload["covariate_feature_schema_file_hash"] = file_sha256(schema_path)
     payload["universe_asof"] = universe_asof
     payload["actions"] = actions
     return payload
@@ -450,7 +470,17 @@ def safe_log_label(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.=-]+", "_", value)
 
 
-def existing_gold_dataset_is_current(path: Path) -> bool:
+def validate_cache_identity(existing_manifest: dict[str, Any], expected_identity: dict[str, Any] | None) -> list[str]:
+    if not expected_identity:
+        return []
+    errors: list[str] = []
+    for key, expected_value in expected_identity.items():
+        if existing_manifest.get(key) != expected_value:
+            errors.append(f"cache_identity_mismatch:{key}")
+    return errors
+
+
+def existing_gold_dataset_is_current(path: Path, expected_identity: dict[str, Any] | None = None) -> bool:
     if not path.exists():
         return False
     try:
@@ -463,6 +493,8 @@ def existing_gold_dataset_is_current(path: Path) -> bool:
             return False
         validate_second_context_payload(payload)
         manifest = payload.get("dataset_manifest", {})
+        if validate_cache_identity(dict(manifest), expected_identity):
+            return False
         if "action_mask_semantics" not in manifest:
             return False
         if not torch.equal(payload["action_valid_mask"].bool(), payload["decision_action_valid_mask"].bool()):
@@ -474,7 +506,7 @@ def existing_gold_dataset_is_current(path: Path) -> bool:
     return True
 
 
-def existing_hourly_dataset_is_current(path: Path) -> bool:
+def existing_hourly_dataset_is_current(path: Path, expected_identity: dict[str, Any] | None = None) -> bool:
     if not path.exists():
         return False
     try:
@@ -518,9 +550,63 @@ def existing_hourly_dataset_is_current(path: Path) -> bool:
             return False
         if "label_valid_mask" not in set(payload.get("forbidden_model_input_keys", [])):
             return False
+        manifest = payload.get("dataset_manifest", payload.get("source", payload))
+        if validate_cache_identity(dict(manifest), expected_identity):
+            return False
     except Exception:
         return False
     return True
+
+
+def stamp_cache_identity(output: Path, expected_identity: dict[str, Any] | None) -> list[str]:
+    if not expected_identity:
+        return []
+    if not output.exists():
+        return ["cache_identity_stamp_failed:output_missing"]
+    try:
+        import torch
+
+        payload = torch.load(output, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict):
+            return ["cache_identity_stamp_failed:payload_not_dict"]
+
+        raw_manifest = payload.get("dataset_manifest")
+        raw_source = payload.get("source")
+        if isinstance(raw_manifest, dict):
+            manifest = dict(raw_manifest)
+        elif isinstance(raw_source, dict):
+            manifest = dict(raw_source)
+        else:
+            manifest = {}
+        if "reportable" not in manifest and "dataset_reportable" in payload:
+            manifest["reportable"] = bool(payload["dataset_reportable"])
+        if "reportability_errors" not in manifest and "dataset_reportability_errors" in payload:
+            manifest["reportability_errors"] = list(payload["dataset_reportability_errors"])
+        manifest.update(expected_identity)
+        payload["dataset_manifest"] = manifest
+
+        if isinstance(raw_source, dict):
+            source = dict(raw_source)
+            source.update(expected_identity)
+            payload["source"] = source
+        for key, value in expected_identity.items():
+            payload.setdefault(key, value)
+
+        torch.save(payload, output)
+        sidecar = output.parent / "dataset_manifest.json"
+        sidecar_payload: dict[str, Any] = {}
+        if sidecar.exists():
+            try:
+                loaded = json.loads(sidecar.read_text())
+                if isinstance(loaded, dict):
+                    sidecar_payload = loaded
+            except json.JSONDecodeError:
+                sidecar_payload = {}
+        sidecar_payload.update(manifest)
+        sidecar.write_text(json.dumps(sidecar_payload, indent=2, sort_keys=True, default=str) + "\n")
+    except Exception as exc:
+        return [f"cache_identity_stamp_failed:{type(exc).__name__}"]
+    return []
 
 
 def build_gold_command(
@@ -533,7 +619,7 @@ def build_gold_command(
     end_day: date,
     output: Path,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(SCRIPT_DIR / "build_second_context_decision_dataset.py"),
         "--stock-second-root",
@@ -571,6 +657,25 @@ def build_gold_command(
         "--source-access",
         args.source_access,
     ]
+    if args.include_action_covariates:
+        command.extend(
+            [
+                "--include-action-covariates",
+                "--covariates-root",
+                str(args.covariates_root),
+                "--covariate-join-mode",
+                args.covariate_join_mode,
+                "--covariate-max-age-days",
+                str(args.covariate_max_age_days),
+            ]
+        )
+        if args.covariate_feature_schema:
+            command.extend(["--covariate-feature-schema", str(args.covariate_feature_schema)])
+        if args.covariate_strict_coverage:
+            command.append("--covariate-strict-coverage")
+    if args.include_market_covariates:
+        command.append("--include-market-covariates")
+    return command
 
 
 def build_hourly_command(
@@ -631,6 +736,7 @@ def run_conversion_tasks(
     args: argparse.Namespace,
     kind: str,
     tasks: list[dict[str, Any]],
+    expected_cache_identity: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if not tasks:
         return []
@@ -647,12 +753,19 @@ def run_conversion_tasks(
             log_path=log_path,
             dry_run=args.dry_run,
         )
+        stamp_errors: list[str] = []
+        if status == "ok" and not args.dry_run:
+            stamp_errors = stamp_cache_identity(Path(task["output"]), expected_cache_identity)
+            if stamp_errors:
+                status = "failed"
+                return_code = return_code or 1
         return {
             **task,
             "status": status,
             "return_code": return_code,
             "elapsed_seconds": round(elapsed, 3),
             "log_path": str(log_path),
+            "cache_identity_errors": stamp_errors,
         }
 
     records: list[dict[str, Any]] = []
@@ -704,6 +817,13 @@ def conversion_reportability_errors(
         errors.append("missing_action_context_allowed")
     if missing_action_symbols:
         errors.append("missing_action_source_symbols")
+    if args.include_action_covariates and not args.covariates_root.exists():
+        errors.append("action_covariate_silver_root_missing")
+    if args.include_action_covariates and not (args.covariates_root / "manifest.csv").exists():
+        errors.append("action_covariate_silver_manifest_missing")
+    covariate_schema = args.covariate_feature_schema or args.covariates_root / "feature_schema.json"
+    if args.include_action_covariates and not covariate_schema.exists():
+        errors.append("action_covariate_feature_schema_file_missing")
     return list(dict.fromkeys(errors))
 
 
@@ -726,7 +846,14 @@ def conversion_status(
     return "complete"
 
 
-def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, dates: list[date], actions: list[str]) -> list[dict[str, Any]]:
+def convert_chunks(
+    args: argparse.Namespace,
+    protocol_dataset_manifest: Path,
+    dates: list[date],
+    actions: list[str],
+    *,
+    expected_cache_identity: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     source_manifest = args.source_manifest or args.source_root / "manifest.csv"
     records: list[dict[str, Any]] = []
     if args.build_gold:
@@ -737,7 +864,7 @@ def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, da
         for start_day, end_day in chunks:
             label = f"{start_day.isoformat()}_to_{end_day.isoformat()}"
             output = args.output_root / f"second_context_gold_{args.decision_interval}" / "partitions" / label / "dataset.pt"
-            if args.skip_existing and existing_gold_dataset_is_current(output):
+            if args.skip_existing and existing_gold_dataset_is_current(output, expected_cache_identity):
                 records.append(
                     {"kind": "second_context_gold", "chunk": label, "status": "skipped_existing_current", "output": str(output)}
                 )
@@ -752,7 +879,14 @@ def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, da
                 output=output,
             )
             tasks.append({"kind": "second_context_gold", "chunk": label, "output": str(output), "command": command})
-        records.extend(run_conversion_tasks(args=args, kind="second_context_gold", tasks=tasks))
+        records.extend(
+            run_conversion_tasks(
+                args=args,
+                kind="second_context_gold",
+                tasks=tasks,
+                expected_cache_identity=expected_cache_identity,
+            )
+        )
     if args.build_hourly:
         chunks = chunk_dates(dates, args.hourly_chunk_trading_days)
         if args.max_hourly_chunks > 0:
@@ -762,19 +896,28 @@ def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, da
             label = f"{start_day.isoformat()}_to_{end_day.isoformat()}"
             output_dir = args.output_root / "hour_from_second_1s" / "partitions" / label
             output = output_dir / "hour_from_second_dataset.pt"
-            if args.skip_existing and existing_hourly_dataset_is_current(output):
+            if args.skip_existing and existing_hourly_dataset_is_current(output, expected_cache_identity):
                 records.append(
                     {"kind": "hour_from_second", "chunk": label, "status": "skipped_existing_current", "output": str(output)}
                 )
                 continue
             command = build_hourly_command(args=args, start_day=start_day, end_day=end_day, output_dir=output_dir)
             tasks.append({"kind": "hour_from_second", "chunk": label, "output": str(output), "command": command})
-        records.extend(run_conversion_tasks(args=args, kind="hour_from_second", tasks=tasks))
+        records.extend(
+            run_conversion_tasks(
+                args=args,
+                kind="hour_from_second",
+                tasks=tasks,
+                expected_cache_identity=expected_cache_identity,
+            )
+        )
     return records
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.include_market_covariates:
+        raise ValueError("Market-level covariates are not implemented yet; use --include-action-covariates for v1.")
     if args.workers <= 0:
         raise ValueError("--workers must be positive.")
     if args.hourly_min_decision_rows <= 0:
@@ -801,6 +944,13 @@ def main(argv: list[str] | None = None) -> int:
         preflight_errors.append("missing_action_context_allowed")
     if missing_action_symbols:
         preflight_errors.append("missing_action_source_symbols")
+    if args.include_action_covariates and not args.covariates_root.exists():
+        preflight_errors.append("action_covariate_silver_root_missing")
+    if args.include_action_covariates and not (args.covariates_root / "manifest.csv").exists():
+        preflight_errors.append("action_covariate_silver_manifest_missing")
+    covariate_schema = args.covariate_feature_schema or args.covariates_root / "feature_schema.json"
+    if args.include_action_covariates and not covariate_schema.exists():
+        preflight_errors.append("action_covariate_feature_schema_file_missing")
     preflight_errors = list(dict.fromkeys(preflight_errors))
     if preflight_errors and not args.allow_non_reportable:
         raise ValueError(
@@ -821,7 +971,23 @@ def main(argv: list[str] | None = None) -> int:
         missing_action_symbols=missing_action_symbols,
         allow_non_reportable=bool(args.allow_non_reportable),
     )
-    records = convert_chunks(args, protocol_dataset_manifest, dates, actions)
+    expected_cache_identity = {
+        key: source_payload.get(key)
+        for key in (
+            "source_manifest_hash",
+            "universe_file_hash",
+            "conversion_config_hash",
+            "converter_identity_hash",
+        )
+    }
+    expected_cache_identity["action_schema_hash"] = stable_json_hash(actions)
+    records = convert_chunks(
+        args,
+        protocol_dataset_manifest,
+        dates,
+        actions,
+        expected_cache_identity=expected_cache_identity,
+    )
     status_counts = Counter(str(record.get("status", "")) for record in records)
     reportability_errors = conversion_reportability_errors(
         args=args,

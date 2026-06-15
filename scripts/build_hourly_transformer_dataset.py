@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
 
 from rl_quant.research_protocol import (  # noqa: E402
     DatasetManifest,
+    ResearchProtocolError,
     hash_string_sequence,
     stable_json_hash,
     utc_now_iso,
@@ -80,7 +81,10 @@ def read_ranked_symbols(path: Path, *, symbol_column: str = "yahoo_symbol") -> l
     lines = [line.strip() for line in path.read_text().splitlines()]
     non_comment_lines = [line for line in lines if line and not line.startswith("#")]
     if non_comment_lines and all("," not in line for line in non_comment_lines):
-        return [line.upper() for line in dict.fromkeys(non_comment_lines)]
+        values = [line.upper() for line in non_comment_lines]
+        if values and values[0] in {symbol_column.upper(), "SYMBOL", "TICKER"}:
+            values = values[1:]
+        return list(dict.fromkeys(values))
     with path.open(newline="") as source:
         reader = csv.DictReader(source)
         fieldnames = reader.fieldnames or []
@@ -344,19 +348,32 @@ def main() -> int:
     periods_per_year = periods_per_year_for_interval(bar_interval)
     stock_map = bar_file_map(args.stock_bar_dir, interval=bar_interval)
     etf_map = bar_file_map(args.etf_bar_dir, interval=bar_interval)
-    ranked_stocks = [symbol for symbol in read_ranked_symbols(args.stock_universe) if symbol in stock_map]
+    intended_stocks = read_ranked_symbols(args.stock_universe)
+    intended_stock_slice = intended_stocks[: args.stock_limit]
+    missing_intended_stock_source_symbols = [symbol for symbol in intended_stock_slice if symbol not in stock_map]
+    ranked_stocks = [symbol for symbol in intended_stocks if symbol in stock_map]
     selected_stocks = ranked_stocks[: args.stock_limit]
     if not selected_stocks:
         raise ValueError("No stock files matched the selected universe.")
 
     if args.actions:
-        etf_symbols = [symbol.strip().upper() for symbol in args.actions.split(",") if symbol.strip()]
+        intended_action_symbols = [symbol.strip().upper() for symbol in args.actions.split(",") if symbol.strip()]
     else:
-        etf_symbols = [symbol for symbol in read_ranked_symbols(args.etf_universe) if symbol in etf_map][: args.action_count]
+        intended_action_symbols = read_ranked_symbols(args.etf_universe)[: args.action_count]
+    missing_intended_action_source_symbols = [symbol for symbol in intended_action_symbols if symbol not in etf_map]
+    etf_symbols = [symbol for symbol in intended_action_symbols if symbol in etf_map]
     etf_symbols = list(dict.fromkeys(symbol for symbol in etf_symbols if symbol in etf_map))
     if not etf_symbols:
         raise ValueError("No ETF action files matched the selected universe.")
     action_names = ["CASH", *etf_symbols]
+    dataset_reportability_errors = [
+        "legacy_hourly_all_labels_required_protocol",
+        "rows_filtered_by_future_label_availability",
+    ]
+    if missing_intended_stock_source_symbols or missing_intended_action_source_symbols:
+        dataset_reportability_errors.append("missing_intended_universe_source_symbols")
+    dataset_reportability_errors = list(dict.fromkeys(dataset_reportability_errors))
+    dataset_reportable = False
 
     print(f"Loading {len(selected_stocks)} stock files for causal market context...")
     stock_by_time: dict[str, list[BarFeature]] = {}
@@ -423,6 +440,7 @@ def main() -> int:
     session_dates: list[str] = []
     feature_rows: list[list[float]] = []
     action_return_rows: list[list[float]] = []
+    future_label_filtered_rows = 0
     for pos, ts in enumerate(common_times[:-1]):
         next_ts = common_times[pos + 1]
         if args.drop_session_gaps and exchange_times[ts][:10] != exchange_times.get(next_ts, "")[:10]:
@@ -448,6 +466,7 @@ def main() -> int:
             )
             action_returns.append(clipped_simple_return(current.close, next_bar.close))
         if missing:
+            future_label_filtered_rows += 1
             continue
         timestamps.append(ts)
         next_timestamps.append(next_ts)
@@ -460,6 +479,17 @@ def main() -> int:
 
     features = torch.tensor(feature_rows, dtype=torch.float32)
     action_returns = torch.tensor(action_return_rows, dtype=torch.float32)
+    action_valid_mask = torch.ones_like(action_returns, dtype=torch.bool)
+    label_valid_mask = torch.ones_like(action_returns, dtype=torch.bool)
+    action_mask_semantics = {
+        "action_valid_mask": "Legacy alias; all retained rows/actions passed the legacy all-labels-required filter.",
+        "decision_action_valid_mask": "Legacy alias of action_valid_mask for compatibility only.",
+        "label_valid_mask": (
+            "All true for retained rows; rows with missing labels were filtered before payload creation."
+        ),
+    }
+    model_input_keys = ["features", "action_valid_mask", "decision_action_valid_mask"]
+    forbidden_model_input_keys = ["label_valid_mask", "action_label_valid_mask"]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_file_name = args.dataset_file_name or f"{interval_label(bar_interval)}_transformer_dataset.pt"
     dataset_path = args.output_dir / dataset_file_name
@@ -471,6 +501,18 @@ def main() -> int:
             "action_names": action_names,
             "features": features,
             "action_returns": action_returns,
+            "decision_action_valid_mask": action_valid_mask,
+            "action_valid_mask": action_valid_mask,
+            "label_valid_mask": label_valid_mask,
+            "action_label_valid_mask": label_valid_mask,
+            "action_mask_semantics": action_mask_semantics,
+            "model_input_keys": model_input_keys,
+            "forbidden_model_input_keys": forbidden_model_input_keys,
+            "dataset_reportable": dataset_reportable,
+            "dataset_reportability_errors": dataset_reportability_errors,
+            "future_label_filtered_rows": future_label_filtered_rows,
+            "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+            "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
             "bar_interval": bar_interval,
             "periods_per_year": periods_per_year,
             "session_dates": session_dates,
@@ -481,7 +523,11 @@ def main() -> int:
                 "stock_universe": str(args.stock_universe),
                 "etf_universe": str(args.etf_universe),
                 "stock_limit": len(selected_stocks),
+                "intended_stock_symbols": intended_stock_slice,
+                "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
                 "action_symbols": etf_symbols,
+                "intended_action_symbols": intended_action_symbols,
+                "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
                 "bar_interval": bar_interval,
                 "drop_session_gaps": args.drop_session_gaps,
                 "require_same_session_lookback": args.require_same_session_lookback,
@@ -489,6 +535,12 @@ def main() -> int:
                 "start": args.start,
                 "end_exclusive": args.end_exclusive,
                 "universe_selection_date": universe_selection_date,
+                "action_mask_semantics": action_mask_semantics,
+                "model_input_keys": model_input_keys,
+                "forbidden_model_input_keys": forbidden_model_input_keys,
+                "dataset_reportable": dataset_reportable,
+                "dataset_reportability_errors": dataset_reportability_errors,
+                "future_label_filtered_rows": future_label_filtered_rows,
             },
         },
         dataset_path,
@@ -501,7 +553,11 @@ def main() -> int:
         "stock_universe": str(args.stock_universe),
         "etf_universe": str(args.etf_universe),
         "stock_limit": len(selected_stocks),
+        "intended_stock_symbols": intended_stock_slice,
+        "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
         "action_symbols": etf_symbols,
+        "intended_action_symbols": intended_action_symbols,
+        "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "bar_interval": bar_interval,
         "drop_session_gaps": args.drop_session_gaps,
         "require_same_session_lookback": args.require_same_session_lookback,
@@ -509,6 +565,12 @@ def main() -> int:
         "start": args.start,
         "end_exclusive": args.end_exclusive,
         "universe_selection_date": universe_selection_date,
+        "action_mask_semantics": action_mask_semantics,
+        "model_input_keys": model_input_keys,
+        "forbidden_model_input_keys": forbidden_model_input_keys,
+        "dataset_reportable": dataset_reportable,
+        "dataset_reportability_errors": dataset_reportability_errors,
+        "future_label_filtered_rows": future_label_filtered_rows,
     }
     metadata = {
         "rows": len(timestamps),
@@ -526,6 +588,11 @@ def main() -> int:
         "first_next_timestamp": next_timestamps[0] if next_timestamps else None,
         "last_next_timestamp": next_timestamps[-1] if next_timestamps else None,
         "dataset": str(dataset_path),
+        "dataset_reportable": dataset_reportable,
+        "dataset_reportability_errors": dataset_reportability_errors,
+        "future_label_filtered_rows": future_label_filtered_rows,
+        "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+        "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "state_features_csv": str(args.output_dir / "state_features.csv"),
         "action_returns_csv": str(args.output_dir / "action_returns.csv"),
     }
@@ -550,9 +617,39 @@ def main() -> int:
             "Yahoo intraday history is short and may contain missing bars.",
             "Universe selection date is validated to be no later than the first dataset timestamp.",
             "US regular-session timing uses simplified 9:30-16:00 assumptions.",
+            "Legacy direct bar builder requires all selected action labels before retaining a row.",
         ],
     )
-    manifest.write_json(args.output_dir / "dataset_manifest.json")
+    try:
+        manifest.validate()
+        manifest_payload = manifest.to_dict()
+        manifest_payload.update(
+            {
+                "reportable": dataset_reportable,
+                "reportability_errors": dataset_reportability_errors,
+                "future_label_filtered_rows": future_label_filtered_rows,
+                "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+                "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
+            }
+        )
+    except ResearchProtocolError as exc:
+        if "universe_selection_date must be before or at first_timestamp" not in str(exc):
+            raise
+        manifest_payload = manifest.to_dict()
+        manifest_payload.update(
+            {
+                "reportable": False,
+                "reportability_errors": list(
+                    dict.fromkeys([*dataset_reportability_errors, "future_universe_selection_date"])
+                ),
+                "future_label_filtered_rows": future_label_filtered_rows,
+                "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
+                "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
+            }
+        )
+    (args.output_dir / "dataset_manifest.json").write_text(
+        json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n"
+    )
     (args.output_dir / "README.md").write_text(
         f"""# {interval_label(bar_interval).title()} Causal Transformer RL Dataset
 
@@ -571,6 +668,8 @@ upper-triangular attention mask across the lookback window.
 - Window: {args.start} to {args.end_exclusive} exclusive
 - Drop session gaps: {args.drop_session_gaps}
 - Require same-session lookback: {args.require_same_session_lookback}
+- Dataset reportable: {dataset_reportable}
+- Reportability errors: {", ".join(dataset_reportability_errors)}
 """
     )
     print(f"Rows: {len(timestamps)} | Features: {len(feature_names)} | Actions: {len(action_names)}")

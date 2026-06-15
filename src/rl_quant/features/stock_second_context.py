@@ -1097,6 +1097,50 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         known = action_feature_available >= 0
         if bool((action_feature_available[known] > decision_ms_tensor.expand_as(action_valid)[known]).any().item()):
             raise ValueError("action features contain values unavailable at the decision timestamp.")
+    action_feature_available_by_feature = payload.get("action_feature_available_timestamps_ms")
+    if action_feature_available_by_feature is not None:
+        action_feature_available_by_feature = action_feature_available_by_feature.long()
+        if tuple(action_feature_available_by_feature.shape) != tuple(action_features.shape):
+            raise ValueError("action_feature_available_timestamps_ms shape must match action_features.")
+        decision_feature_ms = torch.tensor(decision_ms, dtype=torch.long).view(rows, 1, 1).expand_as(action_feature_available_by_feature)
+        known = action_feature_available_by_feature >= 0
+        if bool((action_feature_available_by_feature[known] > decision_feature_ms[known]).any().item()):
+            raise ValueError("action feature tensor contains per-feature values unavailable at the decision timestamp.")
+    action_covariates = payload.get("action_covariates")
+    action_covariate_feature_names: list[str] = []
+    if action_covariates is not None:
+        required_covariate_keys = {
+            "action_covariate_mask",
+            "action_covariate_available_timestamps_ms",
+            "action_covariate_feature_names",
+            "action_covariate_schema_hash",
+        }
+        missing_covariate_keys = required_covariate_keys - set(payload)
+        if missing_covariate_keys:
+            raise ValueError(f"action_covariates missing required keys: {sorted(missing_covariate_keys)}")
+        action_covariates = action_covariates.float()
+        action_covariate_mask = payload["action_covariate_mask"].bool()
+        action_covariate_available = payload["action_covariate_available_timestamps_ms"].long()
+        action_covariate_feature_names = list(payload["action_covariate_feature_names"])
+        if action_covariates.ndim != 3 or tuple(action_covariates.shape[:2]) != tuple(action_returns.shape):
+            raise ValueError("action_covariates must have shape [rows, actions, features].")
+        if tuple(action_covariate_mask.shape) != tuple(action_covariates.shape):
+            raise ValueError("action_covariate_mask shape must match action_covariates.")
+        if tuple(action_covariate_available.shape) != tuple(action_covariates.shape):
+            raise ValueError("action_covariate_available_timestamps_ms shape must match action_covariates.")
+        if len(action_covariate_feature_names) != int(action_covariates.shape[-1]):
+            raise ValueError("action_covariate_feature_names length must match action_covariates width.")
+        if payload.get("action_covariate_schema_hash") != stable_json_hash(action_covariate_feature_names):
+            raise ValueError("action_covariate_schema_hash does not match action_covariate_feature_names.")
+        decision_covariate_ms = torch.tensor(decision_ms, dtype=torch.long).view(rows, 1, 1).expand_as(action_covariate_available)
+        known_covariates = action_covariate_mask & (action_covariate_available >= 0)
+        if bool((action_covariate_available[known_covariates] > decision_covariate_ms[known_covariates]).any().item()):
+            raise ValueError("action covariates contain values unavailable at the decision timestamp.")
+        if action_covariates[known_covariates].numel() and not bool(torch.isfinite(action_covariates[known_covariates]).all().item()):
+            raise ValueError("Known action_covariates must be finite.")
+        action_covariate_age = payload.get("action_covariate_age_seconds")
+        if action_covariate_age is not None and tuple(action_covariate_age.shape) != tuple(action_covariates.shape):
+            raise ValueError("action_covariate_age_seconds shape must match action_covariates.")
     action_cost_available = payload.get("action_cost_available_timestamps_ms")
     if action_cost_available is not None:
         action_cost_available = action_cost_available.long()
@@ -1210,6 +1254,13 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
     forbidden_input_keys = set(payload.get("forbidden_model_input_keys", manifest.get("forbidden_model_input_keys", [])))
     if model_input_keys & forbidden_input_keys:
         raise ValueError("model_input_keys overlap forbidden_model_input_keys.")
+    covariates_are_model_facing = bool(payload.get("action_features_augmented_with_covariates")) or "action_covariates" in model_input_keys
+    forbidden_covariate_features = {
+        "future_dividend_ex_date_unannounced",
+        "future_split_effective_date_unannounced",
+    }
+    if covariates_are_model_facing and forbidden_covariate_features.intersection(action_covariate_feature_names):
+        raise ValueError("Forbidden future-only covariate feature appears in model-facing inputs.")
     action_metadata = payload.get("action_metadata")
     if action_metadata is not None:
         actions = list(action_metadata.get("actions", [])) if isinstance(action_metadata, Mapping) else []
