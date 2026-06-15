@@ -35,6 +35,7 @@ from build_hourly_transformer_dataset import (  # noqa: E402
 )
 from rl_quant.research_protocol import (  # noqa: E402
     DatasetManifest,
+    ResearchProtocolError,
     hash_string_sequence,
     stable_json_hash,
     utc_now_iso,
@@ -209,8 +210,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--allow-missing-action-context",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Fill missing per-action context features with zeros instead of dropping that source timestamp.",
+    )
+    parser.add_argument(
+        "--min-decision-rows",
+        type=int,
+        default=10,
+        help="Minimum rows required to write a partition. Use 1 for small partitioned backfills.",
     )
     args = parser.parse_args(argv)
     if args.source_bar_interval == SECOND_SOURCE_BAR_INTERVAL:
@@ -233,8 +241,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.bar_latency_ms == 0:
             args.bar_latency_ms = DEFAULT_SECOND_BAR_LATENCY_MS
         args.dense_hourly_grid = True
-        args.allow_missing_action_context = True
+        if args.allow_missing_action_context is None:
+            args.allow_missing_action_context = True
         args.min_context_valid_fraction = min(float(args.min_context_valid_fraction), 0.01)
+    elif args.allow_missing_action_context is None:
+        args.allow_missing_action_context = False
     return args
 
 
@@ -474,7 +485,7 @@ def main() -> int:
     universe_selection_date = resolve_universe_selection_date(args)
     sparse_source = source_bar_seconds < 60
     dense_hourly_grid = bool(args.dense_hourly_grid or sparse_source)
-    allow_missing_action_context = bool(args.allow_missing_action_context or sparse_source)
+    allow_missing_action_context = bool(args.allow_missing_action_context)
 
     stock_map = bar_source_map(args.stock_minute_dir, interval=source_bar_interval)
     etf_map = bar_source_map(args.etf_minute_dir, interval=source_bar_interval)
@@ -612,6 +623,7 @@ def main() -> int:
     minute_mask_rows: list[list[list[bool]]] = []
     hour_feature_rows: list[list[list[float]]] = []
     action_return_rows: list[list[float]] = []
+    action_valid_rows: list[list[bool]] = []
     feature_dim = len(minute_feature_names)
     decision_source_times = (
         build_dense_hourly_decision_grid(exchange_times, start=args.start, end_exclusive=args.end_exclusive)
@@ -676,7 +688,7 @@ def main() -> int:
         if valid_count / float(args.hours_lookback * args.minutes_per_hour) < args.min_context_valid_fraction:
             continue
         action_returns = [0.0]
-        missing_action = False
+        action_valid = [True]
         for symbol in etf_symbols:
             current_close = close_at_or_before(
                 action_price_lookup[symbol],
@@ -689,10 +701,12 @@ def main() -> int:
                 max_staleness_seconds=args.max_action_staleness_seconds,
             )
             if current_close is None or future_close is None:
-                missing_action = True
-                break
-            action_returns.append(clipped_simple_return(current_close, future_close))
-        if missing_action:
+                action_returns.append(math.nan)
+                action_valid.append(False)
+            else:
+                action_returns.append(clipped_simple_return(current_close, future_close))
+                action_valid.append(True)
+        if sum(action_valid) <= 1:
             continue
         decision_timestamps.append(decision_ts)
         next_timestamps.append(next_ts)
@@ -701,14 +715,21 @@ def main() -> int:
         minute_mask_rows.append(mask_tensor)
         hour_feature_rows.append(hour_rows)
         action_return_rows.append(action_returns)
+        action_valid_rows.append(action_valid)
 
-    if len(decision_timestamps) < 10:
-        raise ValueError("Too few hourly decision rows after context/reward filtering.")
+    if args.min_decision_rows <= 0:
+        raise ValueError("--min-decision-rows must be positive.")
+    if len(decision_timestamps) < args.min_decision_rows:
+        raise ValueError(
+            f"Too few hourly decision rows after context/reward filtering: "
+            f"{len(decision_timestamps)} < {args.min_decision_rows}."
+        )
 
     minute_features = torch.tensor(minute_feature_rows, dtype=torch.float32)
     minute_mask = torch.tensor(minute_mask_rows, dtype=torch.bool)
     hour_features = torch.tensor(hour_feature_rows, dtype=torch.float32)
     action_returns = torch.tensor(action_return_rows, dtype=torch.float32)
+    action_valid_mask = torch.tensor(action_valid_rows, dtype=torch.bool)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = args.output_dir / args.dataset_file_name
     periods_per_year = infer_periods_per_year(decision_timestamps)
@@ -729,6 +750,7 @@ def main() -> int:
             "minute_mask": minute_mask,
             "hour_features": hour_features,
             "action_returns": action_returns,
+            "action_valid_mask": action_valid_mask,
             "hours_lookback": args.hours_lookback,
             "minutes_per_hour": args.minutes_per_hour,
             "context_bars_per_hour": args.minutes_per_hour,
@@ -754,6 +776,8 @@ def main() -> int:
                 "bar_latency_ms": int(args.bar_latency_ms),
                 "dense_hourly_grid": dense_hourly_grid,
                 "allow_missing_action_context": allow_missing_action_context,
+                "min_decision_rows": int(args.min_decision_rows),
+                "action_return_missing_semantics": "Missing action labels are NaN and marked false in action_valid_mask.",
                 "start": args.start,
                 "end_exclusive": args.end_exclusive,
                 "universe_selection_date": universe_selection_date,
@@ -795,6 +819,7 @@ def main() -> int:
         "minute_shape": list(minute_features.shape),
         "hour_shape": list(hour_features.shape),
         "action_count": len(action_names),
+        "valid_action_label_fraction": float(action_valid_mask.float().mean().item()),
         "action_names": action_names,
         "first_decision_timestamp": decision_timestamps[0],
         "last_decision_timestamp": decision_timestamps[-1],
@@ -834,7 +859,26 @@ def main() -> int:
             "US regular-session timing uses simplified 9:30-16:00 assumptions.",
         ],
     )
-    manifest.write_json(args.output_dir / "dataset_manifest.json")
+    try:
+        manifest.write_json(args.output_dir / "dataset_manifest.json")
+    except ResearchProtocolError as exc:
+        if "universe_selection_date must be before or at first_timestamp" not in str(exc):
+            raise
+        manifest_payload = manifest.to_dict()
+        manifest_payload.update(
+            {
+                "reportable": False,
+                "reportability_errors": ["future_universe_selection_date"],
+                "actual_universe_selection_date": universe_selection_date,
+                "universe_selection_date_note": (
+                    "The supplied universe file date is after the first row; conversion is retained for "
+                    "engineering/backfill use but this manifest is non-reportable for point-in-time research."
+                ),
+            }
+        )
+        (args.output_dir / "dataset_manifest.json").write_text(
+            json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n"
+        )
     (args.output_dir / "README.md").write_text(
         f"""# Hourly Decisions From Subhour Context Dataset
 
@@ -847,6 +891,7 @@ to the next hourly decision timestamp, using as-of prices when configured.
 - Context tensor: {list(minute_features.shape)}
 - Hour tensor: {list(hour_features.shape)}
 - Actions: {", ".join(action_names)}
+- Action label mask: `action_valid_mask`; missing action labels are stored as NaN.
 - Source bar interval: {source_bar_interval}
 - Bar latency: {int(args.bar_latency_ms)} ms
 - Context bars per hour: {args.minutes_per_hour}

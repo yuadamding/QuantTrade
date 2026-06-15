@@ -260,6 +260,7 @@ def main() -> int:
         evaluate_second_context_trading_policy,
         fixed_rollout_cost_stress,
         predict_second_context_q_values,
+        second_context_missing_label_report,
     )
 
     args = parse_args()
@@ -719,6 +720,23 @@ def main() -> int:
     payload = torch.load(args.dataset, map_location="cpu", weights_only=True)
     dataset_manifest = dict(payload.get("dataset_manifest", {}))
     data_quality_report = dict(payload.get("data_quality_report", {}))
+    split_missing_label_reportability = {
+        "train": second_context_missing_label_report(
+            train,
+            row_indices=train_selected_rows,
+            selected_actions=train_selected_actions,
+        ),
+        "val": second_context_missing_label_report(
+            val,
+            row_indices=val_selected_rows,
+            selected_actions=val_selected_actions,
+        ),
+        "test": second_context_missing_label_report(
+            test,
+            row_indices=test_selected_rows,
+            selected_actions=test_selected_actions,
+        ),
+    }
     split_manifest = split_manifest_for(train, val, test)
     feature_manifest = {
         "feature_names": payload.get("feature_names", {}),
@@ -742,15 +760,69 @@ def main() -> int:
         "feature_names": train.feature_names,
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
     }
-    reportability_reasons: list[str] = []
-    if test_policy_metrics.get("final_position_open"):
-        reportability_reasons.append("test_final_position_open")
-    if "RandomSameTurnoverSameTiming" not in test_baselines:
-        reportability_reasons.append("missing_random_same_turnover_same_timing_baseline")
+    def _as_list(value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        if isinstance(value, tuple):
+            return [str(item) for item in value]
+        return [str(value)]
+
+    conversion_errors: list[str] = []
+    conversion_errors.extend(_as_list(dataset_manifest.get("conversion_reportability_errors")))
+    conversion_errors.extend(_as_list(data_quality_report.get("conversion_reportability_errors")))
+    if dataset_manifest.get("conversion_reportable") is False:
+        conversion_errors.append("conversion_manifest_non_reportable")
+    conversion_reportable = not conversion_errors
+
+    dataset_errors: list[str] = []
+    dataset_errors.extend(_as_list(dataset_manifest.get("reportability_errors")))
+    dataset_errors.extend(_as_list(data_quality_report.get("reportability_errors")))
     if not dataset_manifest.get("reportable", False):
-        reportability_reasons.append("dataset_non_reportable")
+        dataset_errors.append("dataset_non_reportable")
+    dataset_reportable = not dataset_errors
+
+    evaluation_errors: list[str] = []
+    if test_policy_metrics.get("final_position_open"):
+        evaluation_errors.append("test_final_position_open")
+    if "RandomSameTurnoverSameTiming" not in test_baselines:
+        evaluation_errors.append("missing_random_same_turnover_same_timing_baseline")
+    test_missing_label_report = split_missing_label_reportability["test"]
+    if not bool(test_missing_label_report.get("evaluation_reportable", True)):
+        evaluation_errors.extend(_as_list(test_missing_label_report.get("reportability_errors")))
+    evaluation_reportable = not evaluation_errors
+
+    confidence_errors: list[str] = []
+    confidence_reportable: bool | None = None
+    if args.save_action_confidence:
+        confidence_reportable = bool(confidence_summary.get("confidence_reportable", False))
+        if not confidence_reportable:
+            confidence_errors.extend(_as_list(confidence_summary.get("confidence_reportability_errors")))
+            if not confidence_errors:
+                confidence_errors.append("confidence_non_reportable")
+    reportability_errors = {
+        "conversion": list(dict.fromkeys(conversion_errors)),
+        "dataset": list(dict.fromkeys(dataset_errors)),
+        "evaluation": list(dict.fromkeys(evaluation_errors)),
+        "confidence": list(dict.fromkeys(confidence_errors)),
+    }
+    reportability_reasons = [
+        *reportability_errors["conversion"],
+        *reportability_errors["dataset"],
+        *reportability_errors["evaluation"],
+        *reportability_errors["confidence"],
+    ]
     reportability = {
-        "reportable": not reportability_reasons,
+        "reportable": conversion_reportable
+        and dataset_reportable
+        and evaluation_reportable
+        and confidence_reportable is not False,
+        "conversion_reportable": conversion_reportable,
+        "dataset_reportable": dataset_reportable,
+        "evaluation_reportable": evaluation_reportable,
+        "confidence_reportable": confidence_reportable,
+        "reportability_errors": reportability_errors,
         "reasons": reportability_reasons,
         "model_kind": "contextual_action_scorer",
     }
@@ -789,8 +861,10 @@ def main() -> int:
             },
             "baselines": {"train": baselines, "val": val_baselines, "test": test_baselines},
             "fixed_rollout_cost_stress": cost_stress,
+            "missing_label_reportability": split_missing_label_reportability,
             "action_confidence": confidence_summary,
         },
+        "reportability": reportability,
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

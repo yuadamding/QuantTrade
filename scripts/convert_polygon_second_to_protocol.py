@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -55,6 +57,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-manifest", type=Path)
     parser.add_argument("--dataset-manifest", type=Path)
     parser.add_argument("--universe", type=Path, default=DEFAULT_UNIVERSE)
+    parser.add_argument(
+        "--universe-asof",
+        help="Point-in-time universe as-of date. If omitted, inferred from the universe filename when possible.",
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--start", default="2025-01-01")
     parser.add_argument("--end-exclusive", default="2026-06-15")
@@ -73,10 +79,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-context-valid-fraction", type=float, default=0.005)
     parser.add_argument("--hourly-chunk-trading-days", type=int, default=3)
     parser.add_argument("--gold-chunk-trading-days", type=int, default=1)
+    parser.add_argument(
+        "--hourly-min-decision-rows",
+        type=int,
+        default=1,
+        help="Minimum hourly decision rows per partition before the hourly builder fails.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of chunk conversion subprocesses to run concurrently.",
+    )
     parser.add_argument("--build-gold", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--build-hourly", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--continue-on-error", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--continue-on-error", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--strict", action="store_true", help="Exit nonzero for non-reportable or partial conversion outputs.")
+    parser.add_argument(
+        "--allow-missing-action-context",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Permit dense hourly rows with missing action context. This is marked non-reportable in the conversion manifest.",
+    )
     parser.add_argument("--max-gold-chunks", type=int, default=0, help="0 means all chunks.")
     parser.add_argument("--max-hourly-chunks", type=int, default=0, help="0 means all chunks.")
     parser.add_argument("--wait-for-download", action="store_true")
@@ -89,6 +114,81 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def parse_date(value: str) -> date:
     return datetime.fromisoformat(value[:10]).date()
+
+
+def file_sha256(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def infer_universe_asof(path: Path) -> str | None:
+    matches = re.findall(r"20\d{2}-\d{2}-\d{2}", path.name)
+    return matches[-1] if matches else None
+
+
+def current_git_metadata() -> dict[str, Any]:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=PACKAGE_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    status = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=PACKAGE_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return {
+        "converter_git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
+        "converter_git_dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
+    }
+
+
+def conversion_config_payload(
+    args: argparse.Namespace,
+    *,
+    actions: list[str],
+    universe_asof: str,
+) -> dict[str, Any]:
+    keys = [
+        "source_root",
+        "source_manifest",
+        "dataset_manifest",
+        "universe",
+        "output_root",
+        "start",
+        "end_exclusive",
+        "source_access",
+        "stock_limit",
+        "action_count",
+        "decision_interval",
+        "context_seconds",
+        "block_seconds",
+        "bar_latency_ms",
+        "execution_latency_ms",
+        "max_action_staleness_seconds",
+        "min_active_symbols",
+        "min_active_stock_fraction",
+        "min_context_valid_fraction",
+        "hourly_chunk_trading_days",
+        "gold_chunk_trading_days",
+        "hourly_min_decision_rows",
+        "build_gold",
+        "build_hourly",
+        "allow_missing_action_context",
+    ]
+    payload = {key: str(getattr(args, key)) if isinstance(getattr(args, key), Path) else getattr(args, key) for key in keys}
+    payload["universe_asof"] = universe_asof
+    payload["actions"] = actions
+    return payload
 
 
 def iso_start(day: date) -> str:
@@ -255,10 +355,19 @@ def normalize_source_manifest(
     dataset_manifest_path: Path,
     output_path: Path,
     source_access: str,
+    universe_path: Path,
+    universe_asof: str,
+    conversion_config: dict[str, Any],
+    preflight_reportability_errors: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     rows = load_manifest(source_manifest)
     original = read_json(dataset_manifest_path)
     summary = manifest_summary(rows, original)
+    reportability_errors = list(preflight_reportability_errors)
+    if summary["pending_symbol_days"] > 0:
+        reportability_errors.append("source_download_incomplete")
+    reportability_errors = list(dict.fromkeys(reportability_errors))
+    git_metadata = current_git_metadata()
     payload = dict(original)
     payload.update(
         {
@@ -276,7 +385,17 @@ def normalize_source_manifest(
             "remaining_symbol_days": summary["pending_symbol_days"],
             "download_completed_at_utc": utc_now_iso() if summary["pending_symbol_days"] == 0 else None,
             "manifest": str(source_manifest),
+            "source_manifest_hash": file_sha256(source_manifest),
+            "raw_dataset_manifest_hash": file_sha256(dataset_manifest_path),
+            "universe_file": str(universe_path),
+            "universe_file_hash": file_sha256(universe_path),
+            "universe_asof": universe_asof,
+            "conversion_config_hash": stable_json_hash(conversion_config),
+            **git_metadata,
             "conversion_manifest_summary": summary,
+            "conversion_reportable": not reportability_errors,
+            "conversion_reportability_errors": reportability_errors,
+            "reportable": bool(original.get("reportable", True)) and not reportability_errors,
         }
     )
     write_json(output_path, payload)
@@ -302,6 +421,10 @@ def run_command(
         result = subprocess.run(command, cwd=cwd, stdout=sink, stderr=subprocess.STDOUT, text=True, check=False)
     elapsed = time.time() - started
     return ("ok" if result.returncode == 0 else "failed"), result.returncode, elapsed
+
+
+def safe_log_label(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.=-]+", "_", value)
 
 
 def existing_gold_dataset_is_current(path: Path) -> bool:
@@ -385,7 +508,7 @@ def build_hourly_command(
     end_day: date,
     output_dir: Path,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(SCRIPT_DIR / "build_hourly_from_minute_context_dataset.py"),
         "--source-bar-interval",
@@ -420,19 +543,122 @@ def build_hourly_command(
         str(args.max_action_staleness_seconds),
         "--bar-latency-ms",
         str(args.bar_latency_ms),
+        "--min-decision-rows",
+        str(args.hourly_min_decision_rows),
         "--dense-hourly-grid",
-        "--allow-missing-action-context",
     ]
+    if args.allow_missing_action_context:
+        command.append("--allow-missing-action-context")
+    else:
+        command.append("--no-allow-missing-action-context")
+    return command
+
+
+def run_conversion_tasks(
+    *,
+    args: argparse.Namespace,
+    kind: str,
+    tasks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not tasks:
+        return []
+    workers = max(int(args.workers), 1)
+    total = len(tasks)
+    log_root = args.output_root / "logs" / "protocol_conversion_commands" / kind
+
+    def run_one(task: dict[str, Any]) -> dict[str, Any]:
+        label = str(task["chunk"])
+        log_path = log_root / f"{safe_log_label(label)}.log"
+        status, return_code, elapsed = run_command(
+            list(task["command"]),
+            cwd=PACKAGE_ROOT,
+            log_path=log_path,
+            dry_run=args.dry_run,
+        )
+        return {
+            **task,
+            "status": status,
+            "return_code": return_code,
+            "elapsed_seconds": round(elapsed, 3),
+            "log_path": str(log_path),
+        }
+
+    records: list[dict[str, Any]] = []
+    print(f"Starting {kind} conversion tasks: {total} chunks with workers={workers}", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_task = {executor.submit(run_one, task): task for task in tasks}
+        for completed, future in enumerate(as_completed(future_to_task), start=1):
+            task = future_to_task[future]
+            try:
+                record = future.result()
+            except Exception as exc:
+                record = {
+                    **task,
+                    "status": "failed",
+                    "return_code": None,
+                    "elapsed_seconds": None,
+                    "error": repr(exc),
+                }
+            records.append(record)
+            print(
+                f"[{kind} {completed}/{total}] {record['status']} {record['chunk']} "
+                f"elapsed={record.get('elapsed_seconds')}",
+                flush=True,
+            )
+    records.sort(key=lambda record: str(record.get("chunk", "")))
+    return records
+
+
+def conversion_reportability_errors(
+    *,
+    args: argparse.Namespace,
+    source_summary: dict[str, Any],
+    status_counts: Counter[str],
+    universe_asof_after_start: bool,
+) -> list[str]:
+    errors: list[str] = []
+    if universe_asof_after_start:
+        errors.append("universe_asof_after_dataset_start")
+    if int(source_summary.get("pending_symbol_days", 0) or 0) > 0:
+        errors.append("source_download_incomplete")
+    if status_counts.get("failed", 0) > 0 or status_counts.get("error", 0) > 0:
+        errors.append("chunk_conversion_failed")
+    if args.max_gold_chunks > 0 or args.max_hourly_chunks > 0:
+        errors.append("conversion_chunk_limit_applied")
+    if args.dry_run:
+        errors.append("dry_run")
+    if args.build_hourly and args.allow_missing_action_context:
+        errors.append("missing_action_context_allowed")
+    return list(dict.fromkeys(errors))
+
+
+def conversion_status(
+    *,
+    args: argparse.Namespace,
+    source_summary: dict[str, Any],
+    status_counts: Counter[str],
+) -> str:
+    if args.dry_run:
+        return "dry_run"
+    if (
+        status_counts.get("failed", 0) > 0
+        or status_counts.get("error", 0) > 0
+        or int(source_summary.get("pending_symbol_days", 0) or 0) > 0
+        or args.max_gold_chunks > 0
+        or args.max_hourly_chunks > 0
+    ):
+        return "partial"
+    return "complete"
 
 
 def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, dates: list[date], actions: list[str]) -> list[dict[str, Any]]:
     source_manifest = args.source_manifest or args.source_root / "manifest.csv"
-    log_path = args.output_root / "logs" / "protocol_conversion_commands.log"
     records: list[dict[str, Any]] = []
     if args.build_gold:
         chunks = chunk_dates(dates, args.gold_chunk_trading_days)
         if args.max_gold_chunks > 0:
             chunks = chunks[: args.max_gold_chunks]
+        tasks: list[dict[str, Any]] = []
         for start_day, end_day in chunks:
             label = f"{start_day.isoformat()}_to_{end_day.isoformat()}"
             output = args.output_root / f"second_context_gold_{args.decision_interval}" / "partitions" / label / "dataset.pt"
@@ -450,23 +676,13 @@ def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, da
                 end_day=end_day,
                 output=output,
             )
-            status, return_code, elapsed = run_command(command, cwd=PACKAGE_ROOT, log_path=log_path, dry_run=args.dry_run)
-            record = {
-                "kind": "second_context_gold",
-                "chunk": label,
-                "status": status,
-                "return_code": return_code,
-                "elapsed_seconds": round(elapsed, 3),
-                "output": str(output),
-                "command": command,
-            }
-            records.append(record)
-            if status == "failed" and not args.continue_on_error:
-                raise RuntimeError(f"Gold conversion failed for {label}; see {log_path}")
+            tasks.append({"kind": "second_context_gold", "chunk": label, "output": str(output), "command": command})
+        records.extend(run_conversion_tasks(args=args, kind="second_context_gold", tasks=tasks))
     if args.build_hourly:
         chunks = chunk_dates(dates, args.hourly_chunk_trading_days)
         if args.max_hourly_chunks > 0:
             chunks = chunks[: args.max_hourly_chunks]
+        tasks = []
         for start_day, end_day in chunks:
             label = f"{start_day.isoformat()}_to_{end_day.isoformat()}"
             output_dir = args.output_root / "hour_from_second_1s" / "partitions" / label
@@ -475,26 +691,23 @@ def convert_chunks(args: argparse.Namespace, protocol_dataset_manifest: Path, da
                 records.append({"kind": "hour_from_second", "chunk": label, "status": "skipped_existing", "output": str(output)})
                 continue
             command = build_hourly_command(args=args, start_day=start_day, end_day=end_day, output_dir=output_dir)
-            status, return_code, elapsed = run_command(command, cwd=PACKAGE_ROOT, log_path=log_path, dry_run=args.dry_run)
-            record = {
-                "kind": "hour_from_second",
-                "chunk": label,
-                "status": status,
-                "return_code": return_code,
-                "elapsed_seconds": round(elapsed, 3),
-                "output": str(output),
-                "command": command,
-            }
-            records.append(record)
-            if status == "failed" and not args.continue_on_error:
-                raise RuntimeError(f"Hourly conversion failed for {label}; see {log_path}")
+            tasks.append({"kind": "hour_from_second", "chunk": label, "output": str(output), "command": command})
+        records.extend(run_conversion_tasks(args=args, kind="hour_from_second", tasks=tasks))
     return records
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive.")
+    if args.hourly_min_decision_rows <= 0:
+        raise ValueError("--hourly-min-decision-rows must be positive.")
     args.source_manifest = args.source_manifest or args.source_root / "manifest.csv"
     args.dataset_manifest = args.dataset_manifest or args.source_root / "dataset_manifest.json"
+    universe_asof = args.universe_asof or infer_universe_asof(args.universe)
+    if not universe_asof:
+        raise ValueError("--universe-asof is required when it cannot be inferred from --universe filename.")
+    universe_asof_after_start = parse_date(universe_asof) > parse_date(args.start)
     if args.wait_for_download:
         wait_for_download(args)
     rows = load_manifest(args.source_manifest)
@@ -502,33 +715,78 @@ def main(argv: list[str] | None = None) -> int:
     if not dates:
         raise ValueError("No completed source dates found for the requested range.")
     actions = resolve_actions(args)
+    config_payload = conversion_config_payload(args, actions=actions, universe_asof=universe_asof)
+    preflight_errors: list[str] = []
+    if universe_asof_after_start:
+        preflight_errors.append("universe_asof_after_dataset_start")
+    if args.build_hourly and args.allow_missing_action_context:
+        preflight_errors.append("missing_action_context_allowed")
     protocol_dataset_manifest = args.output_root / "source" / "dataset_manifest.protocol.json"
     source_payload, source_summary = normalize_source_manifest(
         source_manifest=args.source_manifest,
         dataset_manifest_path=args.dataset_manifest,
         output_path=protocol_dataset_manifest,
         source_access=args.source_access,
+        universe_path=args.universe,
+        universe_asof=universe_asof,
+        conversion_config=config_payload,
+        preflight_reportability_errors=preflight_errors,
     )
     records = convert_chunks(args, protocol_dataset_manifest, dates, actions)
     status_counts = Counter(str(record.get("status", "")) for record in records)
+    reportability_errors = conversion_reportability_errors(
+        args=args,
+        source_summary=source_summary,
+        status_counts=status_counts,
+        universe_asof_after_start=universe_asof_after_start,
+    )
+    reportable = not reportability_errors
     conversion_manifest = {
         "schema_version": "polygon_second_protocol_conversion_v1",
         "created_at_utc": utc_now_iso(),
+        "conversion_status": conversion_status(args=args, source_summary=source_summary, status_counts=status_counts),
+        "conversion_reportable": reportable,
+        "dataset_reportable": reportable,
+        "reportability_errors": {"conversion": reportability_errors, "dataset": []},
         "source_root": str(args.source_root),
         "source_manifest": str(args.source_manifest),
+        "source_manifest_hash": file_sha256(args.source_manifest),
         "protocol_dataset_manifest": str(protocol_dataset_manifest),
         "source_summary": source_summary,
         "source_payload_hash": stable_json_hash(source_payload),
+        "raw_dataset_manifest_hash": file_sha256(args.dataset_manifest),
+        "universe": str(args.universe),
+        "universe_file_hash": file_sha256(args.universe),
+        "universe_asof": universe_asof,
+        "universe_asof_after_start": universe_asof_after_start,
         "output_root": str(args.output_root),
         "start": args.start,
         "end_exclusive": args.end_exclusive,
         "action_names": actions,
+        "conversion_config": config_payload,
+        "conversion_config_hash": stable_json_hash(config_payload),
+        **current_git_metadata(),
+        "continue_on_error": bool(args.continue_on_error),
+        "strict": bool(args.strict),
+        "allow_missing_action_context": bool(args.allow_missing_action_context),
         "status_counts": dict(status_counts),
         "records": records,
     }
     write_json(args.output_root / "conversion_manifest.json", conversion_manifest)
-    print(json.dumps({key: conversion_manifest[key] for key in ("output_root", "status_counts")}, indent=2, sort_keys=True))
-    return 0 if status_counts.get("failed", 0) == 0 or args.continue_on_error else 1
+    print(
+        json.dumps(
+            {
+                key: conversion_manifest[key]
+                for key in ("output_root", "conversion_status", "conversion_reportable", "status_counts")
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    failed = status_counts.get("failed", 0) > 0 or status_counts.get("error", 0) > 0
+    if args.strict and reportability_errors:
+        return 1
+    return 0 if not failed or args.continue_on_error else 1
 
 
 if __name__ == "__main__":

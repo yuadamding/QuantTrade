@@ -472,6 +472,21 @@ source_download_complete == true
 reportability_errors == []
 ```
 
+Reportability is tracked as separate gates instead of one opaque flag:
+
+```text
+conversion_reportable
+dataset_reportable
+evaluation_reportable
+confidence_reportable
+```
+
+Reportable evaluation is fail-closed when any evaluated non-CASH action is
+selectable under `decision_action_valid_mask` but lacks a realized reward label
+under `label_valid_mask`. Such runs must set
+`evaluation_reportable == false` and include
+`selectable_actions_with_missing_reward_labels` in the evaluation errors.
+
 ## Split Contract
 
 Splits are defined in metadata, not inferred from file position:

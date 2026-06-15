@@ -697,7 +697,10 @@ Important artifact meanings:
 - `feature_manifest.json`: feature names, feature groups, feature fit windows,
   normalization details when available.
 - `split_manifest.json`: train/validation/test row counts and reward-end caps.
-- `reportability.json`: whether the run is reportable and why not.
+- `reportability.json`: whether the run is reportable and why not. For
+  second-context runs this includes separate `conversion_reportable`,
+  `dataset_reportable`, `evaluation_reportable`, and
+  `confidence_reportable` gates plus grouped `reportability_errors`.
 - `decision_logs.jsonl`: row-level selected actions, Q-values, masks, costs,
   equity, and execution metadata for sequential evaluation.
 - `selected_action_paths.pt`: replayable selected action indices plus source

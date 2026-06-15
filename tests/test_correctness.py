@@ -66,6 +66,7 @@ from rl_quant.second_context_transformer import (  # noqa: E402
     evaluate_second_context_trading_policy,
     fixed_rollout_cost_stress,
     masked_contextual_q_loss,
+    second_context_missing_label_report,
 )
 from rl_quant.action_risk import (  # noqa: E402
     ExposureConstraintConfig,
@@ -626,6 +627,7 @@ class MinuteToHourTests(unittest.TestCase):
         action_names: list[str] | None = None,
         returns: list[list[float]] | torch.Tensor,
         valid_mask: list[list[bool]] | torch.Tensor | None = None,
+        label_valid_mask: list[list[bool]] | torch.Tensor | None = None,
         costs: list[list[float]] | torch.Tensor | None = None,
         weights: list[list[float]] | torch.Tensor | None = None,
         decisions: list[str] | None = None,
@@ -641,6 +643,7 @@ class MinuteToHourTests(unittest.TestCase):
             action_valid_mask = torch.isfinite(action_returns)
         else:
             action_valid_mask = torch.as_tensor(valid_mask, dtype=torch.bool)
+        label_valid_tensor = None if label_valid_mask is None else torch.as_tensor(label_valid_mask, dtype=torch.bool)
         if costs is None:
             action_cost_bps = torch.zeros((rows, action_count), dtype=torch.float32)
         else:
@@ -704,6 +707,7 @@ class MinuteToHourTests(unittest.TestCase):
             action_feature_mean=torch.zeros(1, dtype=torch.float32),
             action_feature_std=torch.ones(1, dtype=torch.float32),
             periods_per_year=252.0,
+            label_valid_mask=label_valid_tensor,
         )
 
     def test_second_context_payload_uses_latency_and_masks_sparse_blocks(self) -> None:
@@ -731,6 +735,24 @@ class MinuteToHourTests(unittest.TestCase):
         args = module.parse_args([])
 
         self.assertEqual(args.execution_latency_ms, 1000)
+
+    def test_hour_from_second_builder_respects_missing_context_and_min_rows_flags(self) -> None:
+        module = load_script("build_hourly_from_minute_context_dataset")
+
+        default_args = module.parse_args(["--source-bar-interval", "1s"])
+        strict_args = module.parse_args(
+            [
+                "--source-bar-interval",
+                "1s",
+                "--no-allow-missing-action-context",
+                "--min-decision-rows",
+                "1",
+            ]
+        )
+
+        self.assertTrue(default_args.allow_missing_action_context)
+        self.assertFalse(strict_args.allow_missing_action_context)
+        self.assertEqual(strict_args.min_decision_rows, 1)
 
     def test_second_context_action_features_include_action_identity(self) -> None:
         payload = self._small_second_context_payload()
@@ -1221,6 +1243,66 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(metrics["diagnostic_rows"], "valid_start_indices")
         self.assertEqual(metrics["evaluated_rows"], 1)
         self.assertAlmostEqual(float(metrics["total_return"]), 0.01, places=6)
+
+    def test_second_context_missing_label_report_fails_closed_for_selectable_actions(self) -> None:
+        split = self._second_context_split(
+            returns=[[0.0, 0.02], [0.0, 0.01]],
+            valid_mask=[[True, True], [True, True]],
+            label_valid_mask=[[True, False], [True, True]],
+        )
+
+        report = second_context_missing_label_report(split)
+
+        self.assertFalse(report["evaluation_reportable"])
+        self.assertEqual(report["selectable_missing_label_count"], 1)
+        self.assertEqual(report["rows_with_any_selectable_missing_label"], 1)
+        self.assertEqual(report["reportability_errors"], ["selectable_actions_with_missing_reward_labels"])
+
+    def test_second_context_policy_marks_selected_missing_label_unscorable(self) -> None:
+        class PickMissingLabelModel(nn.Module):
+            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
+                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
+                return torch.tensor([[0.0, 2.0]], dtype=torch.float32)
+
+        split = self._second_context_split(
+            returns=[[0.0, 0.02]],
+            valid_mask=[[True, True]],
+            label_valid_mask=[[True, False]],
+        )
+
+        metrics = evaluate_second_context_trading_policy(
+            split,
+            PickMissingLabelModel(),
+            device=torch.device("cpu"),
+            return_decision_logs=True,
+        )
+
+        self.assertFalse(metrics["evaluation_reportable"])
+        self.assertEqual(metrics["selected_action_missing_label_count"], 1)
+        self.assertEqual(metrics["policy_unscorable_rows"], 1)
+        self.assertEqual(metrics["fallback_due_to_missing_label_count"], 1)
+        self.assertEqual(metrics["decision_logs"][0]["requested_action"], "QQQ")
+        self.assertEqual(metrics["decision_logs"][0]["selected_action"], "CASH")
+        self.assertTrue(metrics["decision_logs"][0]["fallback_due_to_missing_label"])
+
+    def test_second_context_rowwise_scorer_does_not_score_label_invalid_finite_values(self) -> None:
+        class PickMissingLabelModel(nn.Module):
+            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
+                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
+                return torch.tensor([[0.0, 2.0]], dtype=torch.float32)
+
+        split = self._second_context_split(
+            returns=[[0.0, 0.25]],
+            valid_mask=[[True, True]],
+            label_valid_mask=[[True, False]],
+        )
+
+        metrics = evaluate_second_context_action_scorer(split, PickMissingLabelModel(), device=torch.device("cpu"))
+
+        self.assertFalse(metrics["evaluation_reportable"])
+        self.assertEqual(metrics["selected_action_missing_label_count"], 1)
+        self.assertEqual(metrics["rows"], 0)
+        self.assertEqual(metrics["total_return"], 0.0)
 
     def test_second_context_sparse_market_mask_uses_last_true_context_token(self) -> None:
         class IdentityEncoder(nn.Module):
@@ -1788,6 +1870,27 @@ class MinuteToHourTests(unittest.TestCase):
 
             self.assertFalse(module.existing_gold_dataset_is_current(old_path))
             self.assertTrue(module.existing_gold_dataset_is_current(current_path))
+
+    def test_second_context_converter_reportability_flags_future_universe(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+        args = module.parse_args(
+            [
+                "--start",
+                "2025-01-01",
+                "--universe",
+                "/tmp/top_500_s3_volume_common_stocks_2026-06-12_tickers.txt",
+            ]
+        )
+        errors = module.conversion_reportability_errors(
+            args=args,
+            source_summary={"pending_symbol_days": 0},
+            status_counts=module.Counter({"ok": 1}),
+            universe_asof_after_start=module.parse_date(module.infer_universe_asof(args.universe)) > module.parse_date(args.start),
+        )
+
+        self.assertFalse(args.continue_on_error)
+        self.assertIn("universe_asof_after_dataset_start", errors)
+        self.assertIn("missing_action_context_allowed", errors)
 
     def test_min_hold_action_mask_allows_only_current_action(self) -> None:
         mask = build_action_mask(

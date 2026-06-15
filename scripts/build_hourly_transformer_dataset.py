@@ -77,6 +77,10 @@ def resolve_universe_selection_date(args: argparse.Namespace) -> str | None:
 
 
 def read_ranked_symbols(path: Path, *, symbol_column: str = "yahoo_symbol") -> list[str]:
+    lines = [line.strip() for line in path.read_text().splitlines()]
+    non_comment_lines = [line for line in lines if line and not line.startswith("#")]
+    if non_comment_lines and all("," not in line for line in non_comment_lines):
+        return [line.upper() for line in dict.fromkeys(non_comment_lines)]
     with path.open(newline="") as source:
         reader = csv.DictReader(source)
         fieldnames = reader.fieldnames or []

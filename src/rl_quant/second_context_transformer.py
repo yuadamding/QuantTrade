@@ -518,6 +518,81 @@ def _normalise_path_rows(
     return rows
 
 
+def second_context_missing_label_report(
+    split: SecondContextDataSplit,
+    *,
+    row_indices: torch.Tensor | None = None,
+    selected_actions: torch.Tensor | None = None,
+    cash_action_id: int = 0,
+) -> dict[str, Any]:
+    if row_indices is None:
+        rows = split.valid_start_indices.detach().cpu().long().flatten()
+    elif selected_actions is not None:
+        rows = _normalise_path_rows(split, selected_actions.detach().cpu().long().flatten(), row_indices)
+    else:
+        rows = row_indices.detach().cpu().long().flatten()
+        if rows.numel() and bool(((rows < 0) | (rows >= len(split.decision_timestamps))).any().item()):
+            raise ValueError("row_indices contains out-of-range rows.")
+    if rows.numel() == 0:
+        return {
+            "evaluated_rows": 0,
+            "selectable_action_count": 0,
+            "non_cash_selectable_action_count": 0,
+            "selectable_missing_label_count": 0,
+            "selectable_missing_label_fraction": 0.0,
+            "non_cash_selectable_missing_label_fraction": 0.0,
+            "rows_with_any_selectable_missing_label": 0,
+            "selected_action_missing_label_count": 0 if selected_actions is not None else None,
+            "policy_unscorable_rows": 0,
+            "evaluation_reportable": True,
+            "reportability_errors": [],
+        }
+    decision_valid = split.action_valid_mask[rows].detach().cpu().bool()
+    if split.label_valid_mask is None:
+        label_valid = decision_valid.clone()
+    else:
+        label_valid = split.label_valid_mask[rows].detach().cpu().bool()
+    finite_returns = torch.isfinite(split.action_returns[rows].detach().cpu())
+    label_evaluable = label_valid & finite_returns
+    selectable_missing = decision_valid & ~label_evaluable
+    if 0 <= cash_action_id < selectable_missing.shape[1]:
+        selectable_missing[:, cash_action_id] = False
+    selectable_count = int(decision_valid.sum().item())
+    if decision_valid.shape[1] > 1:
+        non_cash_selectable_count = int(decision_valid[:, 1:].sum().item())
+    else:
+        non_cash_selectable_count = 0
+    missing_count = int(selectable_missing.sum().item())
+    rows_with_missing = int(selectable_missing.any(dim=1).sum().item())
+    selected_missing_count: int | None = None
+    if selected_actions is not None:
+        actions = selected_actions.detach().cpu().long().flatten()
+        if actions.numel() != rows.numel():
+            raise ValueError("selected_actions length must match row_indices length.")
+        selected_missing_count = 0
+        for position, action_value in enumerate(actions.tolist()):
+            action = int(action_value)
+            if action == cash_action_id or action < 0 or action >= decision_valid.shape[1]:
+                continue
+            if bool(decision_valid[position, action].item()) and not bool(label_evaluable[position, action].item()):
+                selected_missing_count += 1
+    policy_unscorable_rows = selected_missing_count if selected_missing_count is not None else rows_with_missing
+    errors = ["selectable_actions_with_missing_reward_labels"] if missing_count > 0 else []
+    return {
+        "evaluated_rows": int(rows.numel()),
+        "selectable_action_count": selectable_count,
+        "non_cash_selectable_action_count": non_cash_selectable_count,
+        "selectable_missing_label_count": missing_count,
+        "selectable_missing_label_fraction": missing_count / float(max(selectable_count, 1)),
+        "non_cash_selectable_missing_label_fraction": missing_count / float(max(non_cash_selectable_count, 1)),
+        "rows_with_any_selectable_missing_label": rows_with_missing,
+        "selected_action_missing_label_count": selected_missing_count,
+        "policy_unscorable_rows": int(policy_unscorable_rows or 0),
+        "evaluation_reportable": missing_count == 0,
+        "reportability_errors": errors,
+    }
+
+
 def _evaluate_action_path(
     split: SecondContextDataSplit,
     actions: torch.Tensor,
@@ -548,6 +623,7 @@ def _evaluate_action_path(
     gap_resets = 0
     invalid_action_attempts = 0
     fallback_to_cash_count = 0
+    fallback_due_to_missing_label_count = 0
     rows_with_no_valid_action = 0
     for position, row in enumerate(rows.tolist()):
         reset_reason = _path_reset_reason(split, previous_row, row)
@@ -561,6 +637,20 @@ def _evaluate_action_path(
         requested_action = int(actions[position].item())
         action = requested_action
         row_valid = split.action_valid_mask[row].bool()
+        row_label_valid = (
+            split.label_valid_mask[row].bool()
+            if split.label_valid_mask is not None
+            else torch.isfinite(split.action_returns[row])
+        )
+        requested_missing_label = (
+            0 < requested_action < len(split.action_names)
+            and bool(row_valid[requested_action].item())
+            and (
+                not bool(row_label_valid[requested_action].item())
+                or not bool(torch.isfinite(split.action_returns[row, requested_action]).item())
+            )
+        )
+        fallback_due_to_missing_label = False
         if not bool(row_valid.any().item()):
             rows_with_no_valid_action += 1
             invalid_action_attempts += 1
@@ -571,9 +661,18 @@ def _evaluate_action_path(
             fallback_to_cash_count += 1
             action = 0
         gross_raw = float(split.action_returns[row, action].item())
-        if not torch.isfinite(split.action_returns[row, action]).item():
+        action_missing_label = (
+            action != 0
+            and (
+                not bool(row_label_valid[action].item())
+                or not bool(torch.isfinite(split.action_returns[row, action]).item())
+            )
+        )
+        if action_missing_label or not torch.isfinite(split.action_returns[row, action]).item():
             invalid_action_attempts += int(action == requested_action)
             fallback_to_cash_count += 1
+            fallback_due_to_missing_label = bool(action_missing_label)
+            fallback_due_to_missing_label_count += int(fallback_due_to_missing_label)
             action = 0
             gross_raw = 0.0
         row_weights = split.action_target_weights[row].detach().cpu()
@@ -658,6 +757,8 @@ def _evaluate_action_path(
                         else str(requested_action)
                     ),
                     "path_reset_reason": reset_reason,
+                    "selected_action_missing_label": requested_missing_label,
+                    "fallback_due_to_missing_label": fallback_due_to_missing_label,
                     "target_weight": target_weight,
                     "previous_executed_weight": previous_weight_before,
                     "executed_weight": executed_weight,
@@ -715,6 +816,7 @@ def _evaluate_action_path(
     active_returns = torch.tensor(active_net_returns, dtype=torch.float32)
     active_gross = torch.tensor(active_gross_returns, dtype=torch.float32)
     active_metrics = _summarize_returns(active_returns, periods_per_year=split.periods_per_year)
+    metrics.update(second_context_missing_label_report(split, row_indices=rows, selected_actions=actions))
     metrics.update(
         {
             "cash_action_share": cash_actions / len(net_returns) if net_returns else 1.0,
@@ -732,6 +834,7 @@ def _evaluate_action_path(
             "path_state_resets": segment_resets + gap_resets,
             "invalid_action_attempts": invalid_action_attempts,
             "fallback_to_cash_count": fallback_to_cash_count,
+            "fallback_due_to_missing_label_count": fallback_due_to_missing_label_count,
             "rows_with_no_valid_action": rows_with_no_valid_action,
             "evaluated_rows": int(actions.numel()),
             "warnings": (
@@ -778,6 +881,7 @@ def evaluate_second_context_action_scorer(
     )
     if rows.numel() == 0:
         metrics = _summarize_returns(torch.empty(0, dtype=torch.float32), periods_per_year=split.periods_per_year)
+        metrics.update(second_context_missing_label_report(split, row_indices=rows))
         metrics.update(
             {
                 "cash_action_share": 1.0,
@@ -796,9 +900,14 @@ def evaluate_second_context_action_scorer(
     weights = split.action_target_weights[rows, actions]
     costs = split.action_cost_bps[rows, actions] / 10_000.0 * weights.abs()
     net_returns = (rewards * weights - costs).detach().cpu()
+    if split.label_valid_mask is not None:
+        selected_label_valid = split.label_valid_mask[rows, actions].detach().cpu().bool()
+        cash_selected = actions.detach().cpu() == 0
+        net_returns = net_returns.masked_fill(~(selected_label_valid | cash_selected), float("nan"))
     finite = torch.isfinite(net_returns)
     net_returns = net_returns[finite]
     metrics = _summarize_returns(net_returns, periods_per_year=split.periods_per_year)
+    metrics.update(second_context_missing_label_report(split, row_indices=rows, selected_actions=actions))
     cash_share = float((actions.detach().cpu() == 0).float().mean().item()) if actions.numel() else 1.0
     metrics.update(
         {
@@ -867,7 +976,15 @@ def evaluate_second_context_trading_policy(
         masked_q = q_values[row].masked_fill(~valid, -1e9)
         requested_action = int(masked_q.argmax().item())
         executed_action = requested_action
-        if not torch.isfinite(split.action_returns[row, requested_action]).item():
+        row_label_valid = (
+            split.label_valid_mask[row].bool()
+            if split.label_valid_mask is not None
+            else torch.isfinite(split.action_returns[row])
+        )
+        if requested_action != 0 and (
+            not bool(row_label_valid[requested_action].item())
+            or not bool(torch.isfinite(split.action_returns[row, requested_action]).item())
+        ):
             executed_action = 0
         if executed_action != previous_action:
             bars_held = 0
