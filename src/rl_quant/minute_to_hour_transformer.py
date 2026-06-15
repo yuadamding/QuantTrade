@@ -2203,8 +2203,14 @@ def train_minute_to_hour_dqn(
                         action_features=next_action_features,
                     )
                     next_q = next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-                    target_q = batch["rewards"] + config.learning.gamma * (1.0 - batch["dones"]) * next_q
-                loss = F.smooth_l1_loss(chosen_q, target_q)
+                    # fp32 TD target/loss under AMP: with reward_scale=10_000 the bootstrapped
+                    # targets reach magnitudes where fp16 precision is comparable to per-step
+                    # rewards, so compute the target and smooth_l1 loss in float32.
+                    target_q = (
+                        batch["rewards"].float()
+                        + config.learning.gamma * (1.0 - batch["dones"].float()) * next_q.float()
+                    )
+                loss = F.smooth_l1_loss(chosen_q.float(), target_q)
             optimizer.zero_grad(set_to_none=True)
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -2232,6 +2238,9 @@ def train_minute_to_hour_dqn(
                 episode_length=config.env.episode_length,
                 reward_scale=config.env.reward_scale,
             )
+            # Restore train() mode: the evaluator puts the shared q_network in eval(), which would
+            # otherwise leave dropout disabled for all subsequent gradient steps.
+            q_network.train()
             eval_trace.append(
                 {
                     "step": step,

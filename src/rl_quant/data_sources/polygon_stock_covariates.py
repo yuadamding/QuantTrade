@@ -111,8 +111,13 @@ def infer_covariate_timestamps_ms(source_dataset: str, payload: Mapping[str, Any
         asof = _first_present(payload, ("asof_date", "date", "request_date"))
         if asof is None:
             raise ValueError("overview snapshot is missing asof_date")
-        timestamp_ms = regular_session_open_ms_on_or_after(str(asof))
-        return timestamp_ms, timestamp_ms
+        # market_cap = shares_outstanding * a recent close price, so an asof=D snapshot typically
+        # embeds D's (or D-1's) closing price. Marking it available at D's OWN session open would
+        # leak that day's later/close into any intraday decision on D. Make it available at the
+        # NEXT session open (consistent with financials) while keeping the event date at asof.
+        event_ms = regular_session_open_ms_on_or_after(str(asof))
+        available_ms = regular_session_open_ms_after_date(str(asof))
+        return event_ms, available_ms
 
     if source_dataset == "financials":
         event_date = _first_present(payload, ("end_date", "fiscal_period_end", "period_of_report_date"))

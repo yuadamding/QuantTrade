@@ -32,7 +32,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-ms", type=int)
     parser.add_argument("--lookback", type=int, default=60)
     parser.add_argument("--step-horizon", type=int, default=5)
-    parser.add_argument("--latency-steps", type=int, default=0)
+    parser.add_argument(
+        "--latency-steps",
+        type=int,
+        default=1,
+        help=(
+            "Bars of execution latency between the decision bar and the fill bar. Default 1 "
+            "enforces at least one full bar of latency so fills do not occur at the decision "
+            "bar's own (already-observed) close; 0 is look-ahead for sub-minute (second) bars "
+            "and violates the execution_latency_ms>=1000 invariant for 1-second data."
+        ),
+    )
     parser.add_argument("--action-threshold", type=float, default=0.0)
     parser.add_argument("--threshold-grid", default="0,0.25,0.5,1,2,3,5")
     parser.add_argument("--train-dates", required=True)

@@ -113,8 +113,13 @@ def _load_raw_split(name: str, paths: Sequence[Path], lookback: int) -> dict[str
                 ask = float(row["best_ask"])
                 bucket_start_ns = int(row["bucket_start_ns"]) if row.get("bucket_start_ns") else parse_time_to_ns(row["time"])
                 bucket_seconds = float(row.get("bucket_seconds", 1.0))
-                close_spread = float(row["close_spread"])
-                avg_spread = float(row["avg_spread"])
+                # Clamp spreads to >= 0: a crossed/locked NBBO (best_bid >= best_ask) yields a
+                # negative raw spread, which would otherwise turn the transaction cost
+                # (half_spread, charged on turnover) into a negative cost -- i.e. the policy
+                # would be PAID to trade on crossed markets. The crossed_quotes/crossed_ratio
+                # feature below still surfaces the crossed-book frequency to the model.
+                close_spread = max(float(row["close_spread"]), 0.0)
+                avg_spread = max(float(row["avg_spread"]), 0.0)
                 close_imbalance = float(row["close_imbalance"]) - 0.5
                 avg_imbalance = float(row["avg_imbalance"]) - 0.5
                 close_microprice = float(row["close_microprice"])

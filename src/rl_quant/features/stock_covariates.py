@@ -487,7 +487,12 @@ def _add_dividends(
     builder.add(days_since, available, valid=latest is not None)
     builder.add(float(len(recent)), builder.decision_ms, valid=source_available)
     builder.add(sum(_finite(row.get("dividend_cash_amount")) for row in recent), builder.decision_ms, valid=source_available)
-    builder.add(age, available, valid=latest is not None or known_zero)
+    # Keep days_since_last_dividend and dividend_age_seconds CONSISTENT: both are masked-invalid
+    # when no event exists in the window. The known-zero state is already signaled by the count
+    # feature and the missing flag below, so neither co-derived "since last event" feature should
+    # report a misleading 0 for "no dividend".
+    _ = known_zero  # retained for readability; no longer used to flip age validity
+    builder.add(age, available, valid=latest is not None)
     builder.add_known_now(float(not source_available))
     return source_available, age
 
@@ -508,7 +513,9 @@ def _add_splits(
         age = 0.0
     builder.add(days_since, available, valid=latest is not None)
     builder.add(float(len(recent)), builder.decision_ms, valid=source_available)
-    builder.add(age, available, valid=latest is not None or source_available)
+    # Consistency: split_age_seconds is masked-invalid when no split event exists, matching
+    # days_since_last_split (the count feature + missing flag carry the known-zero signal).
+    builder.add(age, available, valid=latest is not None)
     builder.add_known_now(float(not source_available))
     return source_available, age
 

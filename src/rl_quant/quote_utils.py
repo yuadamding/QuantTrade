@@ -141,6 +141,11 @@ class NbboBuilder:
 
         # These quote files contain many one-sided updates. Preserve the
         # untouched side unless the row clears both sides explicitly.
+        # KNOWN LIMITATION: there is no per-side staleness expiry, so a venue that stops
+        # quoting one side keeps contributing an arbitrarily old price to the NBBO, which can
+        # manufacture locked/crossed books. A crossed book (best_bid >= best_ask) is FLAGGED
+        # (crossed/locked below) but NOT repaired here; cost consumers must clamp the spread to
+        # >= 0 (see intraday_data.load_split) so a crossed book cannot become a negative cost.
         if bid <= 0.0 and ask <= 0.0 and bid_size_lots <= 0 and ask_size_lots <= 0:
             current = VenueQuote()
         else:

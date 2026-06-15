@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Iterable
@@ -27,10 +29,10 @@ NEWS_LLM_ACTION_SIDECAR_SCHEMA_VERSION = "hour_from_second_action_news_llm_v1"
 NEWS_LLM_FLAT_APPEND_MODE = "flat_append_with_news_llm_v1"
 DETERMINISTIC_NEWS_LLM_MODEL_ID = "deterministic_news_llm_v1_baseline"
 NEWS_LLM_ANALYST_MODEL_POLICY_SCHEMA_VERSION = "llm_analyst_model_stack_v1"
-DEFAULT_NEWS_LLM_PRIMARY_MODEL_ID = "Qwen/Qwen3.6-27B"
+DEFAULT_NEWS_LLM_PRIMARY_MODEL_ID = "Qwen/Qwen3-1.7B"
 DEFAULT_NEWS_LLM_SECONDARY_MODEL_ID = "google/gemma-4-26B-A4B-it"
 DEFAULT_NEWS_LLM_FALLBACK_MODEL_ID = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
-DEFAULT_NEWS_LLM_SERVING_ENGINE = "vllm"
+DEFAULT_NEWS_LLM_SERVING_ENGINE = "local_transformers"
 DEFAULT_NEWS_LLM_STRUCTURED_OUTPUT = "json_schema"
 DETERMINISTIC_NEWS_LLM_PROMPT_HASH = stable_json_hash(
     {
@@ -217,6 +219,14 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y"}
     return bool(value)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _publisher_name(payload: Mapping[str, Any]) -> str:
@@ -606,9 +616,46 @@ def build_deterministic_news_llm_rows(
     )
 
 
+_NEWS_LLM_UNIT_INTERVAL_FIELDS = (
+    "ticker_relevance",
+    "company_specificity",
+    "positive_score",
+    "negative_score",
+    "neutral_score",
+    "uncertainty_score",
+    "materiality_score",
+    "novelty_score",
+    "confidence",
+)
+_NEWS_LLM_BINARY_FIELDS = ("is_primary_ticker", "is_broad_market_or_sector", "llm_valid", *NEWS_LLM_EVENT_FLAGS)
+_NEWS_LLM_NONEMPTY_STRING_FIELDS = (
+    "article_id",
+    "ticker",
+    "llm_model_id",
+    "llm_prompt_hash",
+    "extractor_provider",
+)
+
+
+def _as_float_or_none(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
 def validate_news_llm_rows(rows: list[Mapping[str, Any]]) -> list[str]:
+    """Strict validation for a reportable, model-facing LLM feature table.
+
+    Beyond schema/identity, this enforces finiteness and declared score ranges, point-in-time
+    timestamp ordering (published <= source <= feature, model <= feature), nonempty provenance
+    strings, and duplicate-key rejection. These guards matter most on the imported/precomputed
+    path, where rows are produced outside this module.
+    """
     errors: list[str] = []
     required = set(NEWS_LLM_ARTICLE_TICKER_FIELDS)
+    seen_keys: set[tuple[str, str, str]] = set()
     for index, row in enumerate(rows):
         missing = required - set(row)
         if missing:
@@ -622,10 +669,37 @@ def validate_news_llm_rows(rows: list[Mapping[str, Any]]) -> list[str]:
             errors.append(f"row {index}: extractor_temperature must be 0")
         if not _truthy(row.get("extractor_no_retrieval")):
             errors.append(f"row {index}: extractor_no_retrieval must be true")
-        feature_available = int(_finite(row.get("llm_feature_available_timestamp_ms"), default=-1.0))
+        for field in _NEWS_LLM_NONEMPTY_STRING_FIELDS:
+            if not str(row.get(field) or "").strip():
+                errors.append(f"row {index}: {field} must be a nonempty string")
+        sentiment = _as_float_or_none(row.get("sentiment_score"))
+        if sentiment is None or not math.isfinite(sentiment) or not (-1.0 <= sentiment <= 1.0):
+            errors.append(f"row {index}: sentiment_score must be finite in [-1, 1]")
+        for field in _NEWS_LLM_UNIT_INTERVAL_FIELDS:
+            value = _as_float_or_none(row.get(field))
+            if value is None or not math.isfinite(value) or not (0.0 <= value <= 1.0):
+                errors.append(f"row {index}: {field} must be finite in [0, 1]")
+        for field in _NEWS_LLM_BINARY_FIELDS:
+            value = _as_float_or_none(row.get(field))
+            if value is None or value not in (0.0, 1.0):
+                errors.append(f"row {index}: {field} must be 0 or 1")
+        published = int(_finite(row.get("published_timestamp_ms"), default=-1.0))
         source_available = int(_finite(row.get("source_available_timestamp_ms"), default=-1.0))
-        if feature_available < source_available:
-            errors.append(f"row {index}: llm feature availability precedes source availability")
+        feature_available = int(_finite(row.get("llm_feature_available_timestamp_ms"), default=-1.0))
+        model_available = int(_finite(row.get("model_available_timestamp_ms"), default=0.0))
+        if published < 0 or source_available < 0 or feature_available < 0:
+            errors.append(f"row {index}: published/source/feature timestamps must be non-negative ms integers")
+        if published > source_available:
+            errors.append(f"row {index}: published_timestamp_ms must be <= source_available_timestamp_ms")
+        if source_available > feature_available:
+            errors.append(f"row {index}: source availability must be <= llm feature availability")
+        if model_available > feature_available:
+            errors.append(f"row {index}: model availability must be <= llm feature availability")
+        key = (str(row.get("article_id")), str(row.get("ticker")), str(row.get("llm_schema_hash")))
+        if key in seen_keys:
+            errors.append(f"row {index}: duplicate (article_id, ticker, llm_schema_hash) {key}")
+        else:
+            seen_keys.add(key)
     return errors
 
 
@@ -644,11 +718,27 @@ def write_news_llm_feature_outputs(
     import pandas as pd
 
     output_root.mkdir(parents=True, exist_ok=True)
-    feature_path = output_root / "news_article_ticker_llm.parquet"
-    frame = pd.DataFrame.from_records(rows, columns=NEWS_LLM_ARTICLE_TICKER_FIELDS)
-    frame.to_parquet(feature_path, index=False)
+    # Validate BEFORE writing, and only ever materialize a validated table at the canonical path.
+    # An invalid table is quarantined under a clearly non-canonical filename so a downstream
+    # consumer cannot mistake it for a usable, reportable feature table.
     validation_errors = validate_news_llm_rows([dict(row) for row in rows])
-    all_errors = list(errors or []) + validation_errors
+    # Provenance must be derived from the rows, not hard-coded, so imported/precomputed tables are
+    # described honestly. Mixed provenance (more than one prompt hash / model id / provider) is a
+    # reportability failure unless explicitly reconciled upstream.
+    distinct_prompt_hashes = sorted({str(r.get("llm_prompt_hash")) for r in rows if str(r.get("llm_prompt_hash") or "").strip()})
+    distinct_model_ids = sorted({str(r.get("llm_model_id")) for r in rows if str(r.get("llm_model_id") or "").strip()})
+    distinct_providers = sorted({str(r.get("extractor_provider")) for r in rows if str(r.get("extractor_provider") or "").strip()})
+    mixed_provenance = len(distinct_prompt_hashes) > 1 or len(distinct_model_ids) > 1 or len(distinct_providers) > 1
+    provenance_errors = ["mixed_provenance_in_feature_table"] if mixed_provenance else []
+    all_errors = list(errors or []) + validation_errors + provenance_errors
+    reportable = not all_errors
+    canonical_path = output_root / "news_article_ticker_llm.parquet"
+    feature_path = canonical_path if reportable else output_root / "news_article_ticker_llm.nonreportable.parquet"
+    frame = pd.DataFrame.from_records(rows, columns=NEWS_LLM_ARTICLE_TICKER_FIELDS)
+    tmp_path = feature_path.with_name(f".{feature_path.name}.tmp.{os.getpid()}")
+    frame.to_parquet(tmp_path, index=False)
+    tmp_path.replace(feature_path)
+    resolved_prompt_hash = distinct_prompt_hashes[0] if len(distinct_prompt_hashes) == 1 else DETERMINISTIC_NEWS_LLM_PROMPT_HASH
     symbols = sorted(set(canonical_symbol(str(row.get("ticker", ""))) for row in rows if row.get("ticker")))
     model_policy = dict(analyst_model_policy or default_news_llm_analyst_model_policy())
     manifest = {
@@ -663,7 +753,7 @@ def write_news_llm_feature_outputs(
         "symbol_count": len(symbols),
         "symbols_with_news_llm": symbols,
         "llm_model_id": model_id,
-        "llm_prompt_hash": DETERMINISTIC_NEWS_LLM_PROMPT_HASH,
+        "llm_prompt_hash": resolved_prompt_hash,
         "llm_schema_hash": NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH,
         "llm_schema_version": NEWS_LLM_EXTRACT_SCHEMA_VERSION,
         "extractor_provider": provider,
@@ -685,6 +775,8 @@ def write_news_llm_feature_outputs(
         "no_external_retrieval": model_policy.get("no_external_retrieval"),
         "cached_outputs_only": model_policy.get("cached_outputs_only"),
         "llm_analyst_model_policy": model_policy,
+        # Identity-only hash kept for backward compatibility. The CONTENT hash below covers every
+        # feature field so a change to any score/provenance value invalidates reportability.
         "feature_table_hash": stable_json_hash(
             [
                 {
@@ -696,6 +788,24 @@ def write_news_llm_feature_outputs(
                 for row in rows
             ]
         ),
+        "feature_table_content_hash": stable_json_hash(
+            [
+                {field: row.get(field) for field in NEWS_LLM_ARTICLE_TICKER_FIELDS}
+                for row in sorted(
+                    rows,
+                    key=lambda r: (
+                        str(r.get("ticker")),
+                        str(r.get("article_id")),
+                        int(_finite(r.get("llm_feature_available_timestamp_ms"), default=0.0)),
+                    ),
+                )
+            ]
+        ),
+        "feature_table_file_sha256": _file_sha256(feature_path),
+        "distinct_llm_prompt_hashes": distinct_prompt_hashes,
+        "distinct_llm_model_ids": distinct_model_ids,
+        "distinct_extractor_providers": distinct_providers,
+        "mixed_provenance": bool(mixed_provenance),
         "reportability_errors": list(dict.fromkeys(all_errors)),
     }
     manifest["reportable"] = not manifest["reportability_errors"]

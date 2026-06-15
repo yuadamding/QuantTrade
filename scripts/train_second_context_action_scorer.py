@@ -738,10 +738,14 @@ def main() -> int:
             "val": predict_q_values(val),
             "test": predict_q_values(test),
         }
+        # Fit the residual calibrator over the SAME mask family used at predict time
+        # (decision-valid actions). fit() already filters non-finite (label-missing) returns, so
+        # using action_valid_mask here keeps the fitted residual-sigma action set identical to the
+        # set the calibrator is applied to, rather than the smaller supervised (decision&label) set.
         calibrator = ActionConfidenceCalibrator(confidence_config).fit(
             q_by_split["val"],
             val.action_returns,
-            val.supervised_action_valid_mask,
+            val.action_valid_mask,
             action_target_weights=val.action_target_weights,
             action_cost_bps=val.action_cost_bps,
         )
@@ -761,8 +765,16 @@ def main() -> int:
             json.dumps(action_confidence_manifest, indent=2, sort_keys=True) + "\n"
         )
         confidence_artifacts["action_confidence_manifest_json"] = str(run_dir / "action_confidence_manifest.json")
+        # When confidence is non-reportable (e.g. the calibration split was reused for checkpoint
+        # selection), write the per-row artifacts under non_reportable/ so a downstream consumer
+        # cannot silently ingest selection-contaminated confidence as if it were validated.
+        confidence_reportable = bool(action_confidence_manifest.get("confidence_reportable", False))
+        confidence_dir = run_dir if confidence_reportable else (run_dir / "non_reportable")
+        confidence_dir.mkdir(parents=True, exist_ok=True)
+        confidence_artifacts["confidence_reportable"] = confidence_reportable
+        confidence_artifacts["confidence_artifact_dir"] = str(confidence_dir)
         for split_name, split_obj in (("train", train), ("val", val), ("test", test)):
-            path = run_dir / f"action_confidence_{split_name}.npz"
+            path = confidence_dir / f"action_confidence_{split_name}.npz"
             save_action_confidence_npz(
                 path,
                 confidence_by_split[split_name],
@@ -785,7 +797,7 @@ def main() -> int:
         for split_name, (split_obj, selected_path) in selected_by_split.items():
             selected_rows = selected_path["rows"]
             selected_actions = selected_path["executed_actions"]
-            selected_confidence_path = run_dir / f"selected_action_confidence_{split_name}.jsonl"
+            selected_confidence_path = confidence_dir / f"selected_action_confidence_{split_name}.jsonl"
             if selected_actions.numel():
                 write_selected_action_confidence(
                     path=selected_confidence_path,

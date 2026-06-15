@@ -156,12 +156,25 @@ def regular_session_decision_grid_ms(
     interval_seconds = parse_duration_seconds(decision_interval)
     if execution_latency_ms < 0:
         raise ValueError("execution_latency_ms must be non-negative.")
-    start_dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(exchange_tz)
-    end_dt = datetime.fromisoformat(end_exclusive.replace("Z", "+00:00")).astimezone(exchange_tz)
+    def _aware_utc(value: str) -> datetime:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # A naive ISO string (e.g. a date-only "2024-03-15") must be treated as UTC, not the
+        # host's system timezone, or .astimezone() would shift the grid by the local offset and
+        # make decision-grid generation environment-dependent.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    start_dt = _aware_utc(start).astimezone(exchange_tz)
+    end_dt = _aware_utc(end_exclusive).astimezone(exchange_tz)
     execution_latency = timedelta(milliseconds=execution_latency_ms)
     decisions: list[int] = []
     current_date = start_dt.date()
     while current_date <= end_dt.date():
+        # KNOWN LIMITATION: only weekends are excluded -- there is no market-holiday/early-close
+        # calendar, so holiday weekdays still emit a full decision grid. Those rows come back
+        # all-invalid (no second data) and are masked, so there is no leakage, but they inflate
+        # row/segment counts and quality denominators. A trading calendar should gate sessions.
         if current_date.weekday() < 5:
             session_start = datetime.combine(current_date, RTH_START, tzinfo=exchange_tz)
             session_end = datetime.combine(current_date, RTH_END, tzinfo=exchange_tz)
@@ -209,6 +222,9 @@ def _std(values: list[float]) -> float:
 def _weighted_mean(values: list[float], weights: list[float]) -> float:
     total = sum(weights)
     if total <= 0:
+        # KNOWN LIMITATION: when every weight (e.g. dollar volume) is zero, the dollar-volume-
+        # weighted feature silently degrades to a plain equal-weight mean with no distinguishing
+        # flag. Blocks with non-trivial volume are unaffected; price-only blocks fall back here.
         return sum(values) / max(len(values), 1)
     return sum(value * weight for value, weight in zip(values, weights)) / total
 
@@ -233,9 +249,13 @@ def _symbol_block_summary(frame: Any) -> dict[str, float] | None:
     transactions = float(frame["transactions"].fillna(0.0).clip(lower=0.0).sum()) if "transactions" in frame.columns else 0.0
     close = frame["close"].replace(0, float("nan"))
     ranges = ((frame["high"] - frame["low"]) / close * 10_000.0).replace([float("inf"), -float("inf")], float("nan"))
+    clipped_return = max(min(last_close / first_close - 1.0, 1.0), -1.0)
     return {
-        "return": max(min(last_close / first_close - 1.0, 1.0), -1.0),
-        "abs_return": abs(last_close / first_close - 1.0),
+        "return": clipped_return,
+        # Derive abs_return from the CLIPPED return so a single bad-tick outlier cannot dominate
+        # the dollar-volume-weighted abs-return / large-move features while the signed return is
+        # bounded to [-1, 1].
+        "abs_return": abs(clipped_return),
         "volume": max(volume, 0.0),
         "dollar_volume": max(dollar_volume, 0.0),
         "transactions": max(transactions, 0.0),
@@ -266,6 +286,10 @@ def _block_market_features(
     if not summaries:
         is_pre, is_regular, is_post, since_open, to_close = _session_flags(block_end_ms)
         empty = [0.0] * len(MARKET_CONTEXT_FEATURE_NAMES)
+        # A block with no active symbols means every symbol is missing: missing_symbol_fraction
+        # (index 20) must be 1.0, mirroring the populated path's (1.0 - active_fraction). Leaving
+        # it 0.0 would report "all symbols present" -- the exact inverse of the truth.
+        empty[20] = 1.0
         empty[22] = 0.0
         empty[23] = is_pre
         empty[24] = is_regular
@@ -606,7 +630,8 @@ def build_second_context_payload(
         decision_action_quality: list[float] = []
         decision_entry_ts: list[int] = []
         decision_exit_ts: list[int] = []
-        valid_context_fraction = float(context_mask.float().mean().item())
+        # Per-action validity no longer depends on aggregate market-context coverage (see F3 fix);
+        # market-context quality is reported separately via quality_by_row / decision_quality_score.
         for action_index, action in enumerate(action_names):
             symbol = action.upper()
             action_index_scaled = action_index / action_count_denom
@@ -658,7 +683,12 @@ def build_second_context_payload(
                 next_ms + execution_latency_ms,
                 max_staleness_seconds=config.max_action_staleness_seconds,
             )
-            decision_known = feature_point is not None and valid_context_fraction > 0.0
+            # Per-action ex-ante validity depends ONLY on this action's own point-in-time feature
+            # availability, NOT on global market-context coverage. A sparse market-context row
+            # still forces cash at the ROW level via force_cash_mask (decision_quality_score
+            # multiplies by quality_by_row), so a genuinely tradable action is no longer marked
+            # invalid merely because the aggregate market context happened to be sparse.
+            decision_known = feature_point is not None
             entry_observed = current is not None
             exit_observed = future is not None
             label_valid = decision_known and entry_observed and exit_observed
@@ -682,10 +712,8 @@ def build_second_context_payload(
             exit_ts = -1 if future is None else int(future[1])
             if decision_known:
                 reason_code = 0
-            elif feature_point is None:
-                reason_code = 2
             else:
-                reason_code = 1
+                reason_code = 2
             decision_action_features.append(
                 [
                     action_index_scaled,
@@ -711,9 +739,9 @@ def build_second_context_payload(
             decision_action_available.append(int(feature_available_ts))
             decision_cost_available.append(int(feature_available_ts))
             decision_reason_codes.append(reason_code)
-            decision_action_quality.append(
-                min(valid_context_fraction, 1.0 if feature_point is not None else 0.0)
-            )
+            # Per-action quality reflects this action's own data readiness; market-context
+            # coverage is reported separately in constraint_state and decision_quality_score.
+            decision_action_quality.append(1.0 if feature_point is not None else 0.0)
             decision_entry_ts.append(int(entry_ts))
             decision_exit_ts.append(int(exit_ts))
             if label_valid and current is not None and future is not None:

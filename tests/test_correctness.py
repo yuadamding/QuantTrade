@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch import nn
@@ -475,15 +476,22 @@ class MinuteToHourTests(unittest.TestCase):
         torch.save(payload, path)
 
     def test_hourly_context_uses_only_past_minutes(self) -> None:
-        decision_timestamp = "2026-06-10T15:30:00+00:00"
-        next_timestamp = "2026-06-10T16:30:00+00:00"
-        minute_timestamps = [
-            ["2026-06-10T14:31:00+00:00", "2026-06-10T14:32:00+00:00"],
-            ["2026-06-10T15:29:00+00:00", "2026-06-10T15:30:00+00:00"],
+        # Exercise the real causal price lookups: the validity/feature price is the last close
+        # AT OR BEFORE the decision (never a future bar), and the simulated fill is the first close
+        # AT OR AFTER decision + execution latency (a price not observable at decision time).
+        module = load_script("build_hourly_from_minute_context_dataset")
+        timestamps = [
+            "2026-06-10T15:28:00+00:00",
+            "2026-06-10T15:29:00+00:00",
+            "2026-06-10T15:31:00+00:00",
         ]
-
-        self.assertLess(decision_timestamp, next_timestamp)
-        self.assertLessEqual(max(timestamp for hour in minute_timestamps for timestamp in hour), decision_timestamp)
+        closes = [100.0, 101.0, 102.0]
+        lookup = (timestamps, closes)
+        decision_ms = module.timestamp_to_epoch_ms("2026-06-10T15:30:00+00:00")
+        feature_close = module.close_at_or_before(lookup, decision_ms, max_staleness_seconds=120)
+        self.assertEqual(feature_close, 101.0)
+        fill_close = module.close_at_or_after(lookup, decision_ms + 1_000, max_staleness_seconds=120)
+        self.assertEqual(fill_close, 102.0)
 
     def test_next_hour_reward_uses_decision_close_to_next_hour_close(self) -> None:
         module = load_script("build_hourly_transformer_dataset")
@@ -1913,9 +1921,11 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual([row["ticker"] for row in rows], ["QQQ"])
 
-    def test_news_llm_feature_manifest_records_recommended_model_stack(self) -> None:
+    def test_news_llm_feature_manifest_records_current_local_model_stack(self) -> None:
         if importlib.util.find_spec("pandas") is None:
             self.skipTest("pandas is required for Parquet news LLM feature output tests")
+        if importlib.util.find_spec("pyarrow") is None:
+            self.skipTest("pyarrow is required for Parquet news LLM feature output tests")
         article = {
             "article_id": "article-1",
             "published_utc": "2026-01-05T15:00:00+00:00",
@@ -1928,7 +1938,7 @@ class MinuteToHourTests(unittest.TestCase):
         }
         rows = build_deterministic_news_llm_rows(
             [article],
-            model_id="Qwen/Qwen3.6-27B",
+            model_id="Qwen/Qwen3-1.7B",
             model_available_timestamp_ms=iso_to_timestamp_ms("2026-06-15T00:00:00+00:00"),
             model_training_cutoff_utc="unknown_for_downloaded_pretrained_model",
             vendor_latency_seconds=0,
@@ -1939,17 +1949,17 @@ class MinuteToHourTests(unittest.TestCase):
                 rows=rows,
                 output_root=Path(directory),
                 article_manifest={"article_table_hash": "article-hash"},
-                model_id="Qwen/Qwen3.6-27B",
+                model_id="Qwen/Qwen3-1.7B",
                 model_available_timestamp_ms=iso_to_timestamp_ms("2026-06-15T00:00:00+00:00"),
                 model_training_cutoff_utc="unknown_for_downloaded_pretrained_model",
-                provider="vllm",
+                provider="local_transformers",
             )
 
         self.assertEqual(manifest["llm_feature_group"], "stock_news_llm_v1")
-        self.assertEqual(manifest["primary_model_id"], "Qwen/Qwen3.6-27B")
+        self.assertEqual(manifest["primary_model_id"], "Qwen/Qwen3-1.7B")
         self.assertEqual(manifest["secondary_model_id"], "google/gemma-4-26B-A4B-it")
         self.assertEqual(manifest["fallback_model_id"], "mistralai/Mistral-Small-3.2-24B-Instruct-2506")
-        self.assertEqual(manifest["serving_engine"], "vllm")
+        self.assertEqual(manifest["serving_engine"], "local_transformers")
         self.assertEqual(manifest["structured_output"], "json_schema")
         self.assertEqual(manifest["temperature"], 0.0)
         self.assertEqual(manifest["top_p"], 1.0)
@@ -2021,33 +2031,34 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(rows[0]["llm_schema_version"], NEWS_LLM_EXTRACT_SCHEMA_VERSION)
         self.assertEqual(rows[0]["llm_schema_hash"], NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH)
 
-    def test_news_llm_feature_script_exposes_qwen36_policy_and_local_presets(self) -> None:
+    def test_news_llm_feature_script_exposes_qwen17_default_and_local_presets(self) -> None:
         module = load_script("build_news_llm_features")
 
         args = module.parse_args([])
         default_manifest_path = module.local_model_manifest_path(args)
         policy = module.analyst_model_policy_from_args(args)
-        smoke_args = module.parse_args(["--local-model-preset", "qwen3_1_7b"])
-        smoke_manifest_path = module.local_model_manifest_path(smoke_args)
 
-        self.assertEqual(args.local_model_preset, "qwen3_6_27b")
+        self.assertEqual(args.local_model_preset, "qwen3_1_7b")
         self.assertFalse(default_manifest_path.is_absolute())
         self.assertEqual(default_manifest_path.name, "download_manifest.json")
-        self.assertEqual(default_manifest_path.parent.name, "Qwen3.6-27B")
-        self.assertEqual(policy["primary_model_id"], "Qwen/Qwen3.6-27B")
+        self.assertEqual(default_manifest_path.parent.name, "Qwen3-1.7B")
+        self.assertEqual(policy["primary_model_id"], "Qwen/Qwen3-1.7B")
         self.assertEqual(policy["secondary_model_id"], "google/gemma-4-26B-A4B-it")
         self.assertEqual(policy["fallback_model_id"], "mistralai/Mistral-Small-3.2-24B-Instruct-2506")
-        self.assertEqual(policy["serving_engine"], "vllm")
+        self.assertEqual(policy["serving_engine"], "local_transformers")
         self.assertEqual(policy["structured_output"], "json_schema")
         self.assertEqual(policy["temperature"], 0.0)
         self.assertEqual(policy["top_p"], 1.0)
         self.assertFalse(policy["retrospective_historical_policy"]["reportable_for_2023_to_2026_backtest"])
         self.assertIn("qwen3_6_27b", module.LOCAL_MODEL_PRESETS)
+        self.assertIn("qwen3_6_27b_fp8", module.LOCAL_MODEL_PRESETS)
         self.assertIn("qwen3_1_7b", module.LOCAL_MODEL_PRESETS)
         self.assertIn("gemma4_26b_a4b_it", module.LOCAL_MODEL_PRESETS)
         self.assertNotIn("qwen2_5_7b", module.LOCAL_MODEL_PRESETS)
-        self.assertEqual(smoke_manifest_path.name, "download_manifest.json")
-        self.assertEqual(smoke_manifest_path.parent.name, "Qwen3-1.7B")
+        fp8_args = module.parse_args(["--local-model-preset", "qwen3_6_27b_fp8"])
+        fp8_manifest_path = module.local_model_manifest_path(fp8_args)
+        self.assertEqual(fp8_manifest_path.parent.name, "Qwen3.6-27B-FP8")
+        self.assertEqual(module.LOCAL_MODEL_PRESET_REPOS["qwen3_6_27b_fp8"]["repo_id"], "Qwen/Qwen3.6-27B-FP8")
         self.assertEqual(
             module.workspace_relative_path(module.PROJECT_ROOT.parent / "LLM" / "Qwen3.6-27B" / "download_manifest.json"),
             "../LLM/Qwen3.6-27B/download_manifest.json",
@@ -2057,21 +2068,75 @@ class MinuteToHourTests(unittest.TestCase):
         )
         self.assertEqual(sanitized["local_path"], "../LLM/Qwen3-1.7B")
 
-    def test_news_llm_precomputed_defaults_to_qwen36_policy_model(self) -> None:
+    def test_news_llm_missing_local_preset_auto_downloads_manifest(self) -> None:
+        module = load_script("build_news_llm_features")
+        module.LOCAL_MODEL_PRESETS["unit_fake"] = Path("data/unit_fake_llm/download_manifest.json")
+        module.LOCAL_MODEL_PRESET_REPOS["unit_fake"] = {
+            "repo_id": "unit/fake-model",
+            "model_type": "unit",
+            "parameter_class": "tiny",
+            "intended_quanttrade_role": "unit test",
+        }
+        args = module.parse_args(
+            [
+                "--precomputed-jsonl",
+                "data/examples/frozen_qwen_news_outputs.jsonl",
+                "--local-model-preset",
+                "unit_fake",
+                "--local-model-revision",
+                "abc123",
+            ]
+        )
+        manifest_path = module.local_model_manifest_path(args)
+        expected = module.resolve_project_relative_path(manifest_path)
+
+        with mock.patch.object(module, "download_local_model_preset", return_value=expected) as download:
+            resolved = module.ensure_local_model_manifest(args, manifest_path)
+
+        self.assertEqual(resolved, expected)
+        download.assert_called_once_with(args, manifest_path)
+
+    def test_news_llm_download_manifest_is_relative_and_audited(self) -> None:
+        module = load_script("build_news_llm_features")
+        with tempfile.TemporaryDirectory() as directory:
+            local_dir = Path(directory) / "UnitModel"
+            local_dir.mkdir()
+            (local_dir / "model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {"total_size": "123"}, "weight_map": {"a": "b.safetensors"}})
+            )
+            manifest = module.local_model_download_manifest(
+                preset="qwen3_1_7b",
+                repo_id="Qwen/Qwen3-1.7B",
+                revision="abc123",
+                local_dir=local_dir,
+            )
+
+        self.assertEqual(manifest["repo_id"], "Qwen/Qwen3-1.7B")
+        self.assertEqual(manifest["revision"], "abc123")
+        self.assertFalse(Path(str(manifest["local_path"])).is_absolute())
+        self.assertEqual(manifest["model_index_metadata"]["weight_map_entries"], 1)
+        self.assertEqual(manifest["model_index_metadata"]["total_size_bytes"], 123)
+        self.assertIn("*.safetensors", manifest["downloaded_file_policy"]["included"])
+        self.assertIn("*.bin", manifest["downloaded_file_policy"]["excluded"])
+
+    def test_news_llm_precomputed_defaults_to_qwen17_policy_model_without_manifest(self) -> None:
         module = load_script("build_news_llm_features")
 
         args = module.parse_args(
             [
                 "--precomputed-jsonl",
                 "data/examples/frozen_qwen_news_outputs.jsonl",
+                "--local-model-manifest",
+                "data/unit_missing_llm/download_manifest.json",
+                "--no-auto-download-local-model",
                 "--model-available-timestamp-utc",
                 "2026-06-15T00:00:00+00:00",
             ]
         )
         model_id, _available_ms, _training_cutoff, provider, local_manifest = module.resolve_model_metadata(args)
 
-        self.assertEqual(model_id, "Qwen/Qwen3.6-27B")
-        self.assertEqual(provider, "vllm")
+        self.assertEqual(model_id, "Qwen/Qwen3-1.7B")
+        self.assertEqual(provider, "local_transformers")
         self.assertIsNone(local_manifest)
 
     def test_news_llm_aggregates_are_point_in_time(self) -> None:
@@ -3696,7 +3761,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(config["covariate_silver_manifest_hash"], expected_manifest_hash)
         self.assertEqual(config["covariate_feature_schema_file_hash"], expected_schema_hash)
 
-    def test_min_hold_action_mask_allows_only_current_action(self) -> None:
+    def test_min_hold_action_mask_allows_current_action_and_cash(self) -> None:
         mask = build_action_mask(
             current_action=torch.tensor([3]),
             bars_held=torch.tensor([0]),
@@ -3707,8 +3772,26 @@ class MinuteToHourTests(unittest.TestCase):
             action_count=10,
         )
 
-        self.assertEqual(int(mask.sum().item()), 1)
+        # During min-hold only the held action (3) plus the zero-risk CASH (0) fallback
+        # may be selected: de-risking to cash is never blocked by hold/cooldown/caps.
+        self.assertEqual(int(mask.sum().item()), 2)
         self.assertTrue(bool(mask[0, 3].item()))
+        self.assertTrue(bool(mask[0, 0].item()))
+
+    def test_cooldown_action_mask_keeps_cash_derisk_available(self) -> None:
+        mask = build_action_mask(
+            current_action=torch.tensor([2]),
+            bars_held=torch.tensor([10]),
+            cooldown_remaining=torch.tensor([3]),
+            switches_today=torch.tensor([0]),
+            min_hold_bars=1,
+            action_count=6,
+        )
+
+        # In cooldown only the held action and CASH (de-risk) are selectable.
+        self.assertEqual(int(mask.sum().item()), 2)
+        self.assertTrue(bool(mask[0, 2].item()))
+        self.assertTrue(bool(mask[0, 0].item()))
 
     def test_daily_switch_cap_masks_new_positions(self) -> None:
         mask = build_action_mask(
@@ -3721,6 +3804,8 @@ class MinuteToHourTests(unittest.TestCase):
             action_count=10,
         )
 
+        # Turnover budget (daily switch cap) exhausted: a switch to cash also consumes
+        # turnover, so the cap legitimately restricts to holding the current action only.
         self.assertEqual(int(mask.sum().item()), 1)
         self.assertTrue(bool(mask[0, 4].item()))
 
@@ -3737,6 +3822,8 @@ class MinuteToHourTests(unittest.TestCase):
             max_switches_per_episode=3,
         )
 
+        # Episode turnover budget exhausted: restrict to the current action (cash switch
+        # also consumes turnover and is not exempt from the budget).
         self.assertEqual(int(mask.sum().item()), 1)
         self.assertTrue(bool(mask[0, 2].item()))
 
@@ -3764,26 +3851,29 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(float(trade_legs(torch.tensor([0]), torch.tensor([5]))[0].item()), 1.0)
 
     def test_constraint_feature_scaling_uses_episode_cap(self) -> None:
-        constraints = TradingConstraintConfig(max_switches_per_day=4, max_switches_per_episode=3)
-        train_like = make_constraint_features(
+        # With an episode switch cap, the episode-switch feature (index 3) scales by the CAP:
+        # switches_episode=3 / cap=3 -> 1.0.
+        capped = make_constraint_features(
             bars_held=torch.tensor([1]),
             cooldown_remaining=torch.tensor([0]),
             switches_today=torch.tensor([1]),
             switches_episode=torch.tensor([3]),
-            constraints=constraints,
+            constraints=TradingConstraintConfig(max_switches_per_day=4, max_switches_per_episode=3),
             episode_length=32,
         )
-        eval_like = make_constraint_features(
+        self.assertAlmostEqual(float(capped[0, 3].item()), 1.0)
+        # With NO episode cap it must fall back to episode_length scaling (3/32), a different and
+        # much smaller value -- proving the cap (not episode_length) drives the scaling when set.
+        uncapped = make_constraint_features(
             bars_held=torch.tensor([1]),
             cooldown_remaining=torch.tensor([0]),
             switches_today=torch.tensor([1]),
             switches_episode=torch.tensor([3]),
-            constraints=constraints,
+            constraints=TradingConstraintConfig(max_switches_per_day=4, max_switches_per_episode=None),
             episode_length=32,
         )
-
-        self.assertTrue(bool(torch.allclose(train_like, eval_like)))
-        self.assertAlmostEqual(float(train_like[0, 3].item()), 1.0)
+        self.assertAlmostEqual(float(uncapped[0, 3].item()), 3.0 / 32.0)
+        self.assertFalse(bool(torch.allclose(capped, uncapped)))
 
     def test_constraint_feature_zero_cap_does_not_fallback_to_episode_length(self) -> None:
         constraints = TradingConstraintConfig(max_switches_per_day=0, max_order_legs_per_day=0.0)
@@ -4859,7 +4949,7 @@ class EvaluationTests(unittest.TestCase):
             bar_interval="1m",
         )
 
-    def test_direct_bar_env_min_hold_masks_to_current_action(self) -> None:
+    def test_direct_bar_env_min_hold_allows_current_action_and_cash(self) -> None:
         data = self._direct_bar_split()
         env = VectorizedHourlyAllocationEnv(
             data,
@@ -4877,7 +4967,8 @@ class EvaluationTests(unittest.TestCase):
 
         mask = env.action_mask()
 
-        self.assertEqual(mask.tolist(), [[False, True, False]])
+        # Min-hold pins the held action (1) but the zero-risk CASH (0) de-risk stays available.
+        self.assertEqual(mask.tolist(), [[True, True, False]])
 
     def test_direct_bar_env_order_leg_cap_blocks_two_leg_rotation(self) -> None:
         data = self._direct_bar_split()
@@ -5941,12 +6032,323 @@ class ResearchProtocolTests(unittest.TestCase):
         )
         manifest.validate_reportable()
 
+    def _reportable_manifest(self) -> ModelManifest:
+        protocol = EvaluationProtocol(
+            name="holdout",
+            train_start=None,
+            train_end="2026-01-31T00:00:00+00:00",
+            val_end="2026-02-28T00:00:00+00:00",
+            test_start="2026-03-01T00:00:00+00:00",
+            test_end="2026-03-31T00:00:00+00:00",
+            benchmark_names=["CASH"],
+        )
+        return ModelManifest(
+            model_id="demo_model",
+            created_at_utc="2026-06-14T00:00:00+00:00",
+            algorithm="DQN",
+            encoder="MinuteToHourTransformer",
+            training_dataset_id="demo",
+            validation_protocol=protocol,
+            hyperparameter_search_space_hash="abc",
+            hyperparameter_trials=1,
+            selected_by="validation_net_return",
+            feature_names_hash="features",
+            action_names_hash="actions",
+            baseline_results=[BaselineResult("CASH", 0.0, None, 0.0)],
+            cost_stress_results=[StressTestResult("2x_cost", "cost", "multiplier", 2.0, 0.0, None, 0.0)],
+            frequency_stress_results=[
+                StressTestResult("min_hold_2", "frequency", "min_hold_bars", 2.0, 0.0, None, 0.0)
+            ],
+        )
+
+    def test_model_manifest_rejects_test_split_selection(self) -> None:
+        manifest = self._reportable_manifest()
+        manifest.validate_reportable()
+        manifest.selected_by = "test_total_return"
+        with self.assertRaisesRegex(ResearchProtocolError, "selected_by must reference validation"):
+            manifest.validate_reportable()
+
+    def test_model_manifest_rejects_unproduced_benchmark(self) -> None:
+        manifest = self._reportable_manifest()
+        manifest.validation_protocol = EvaluationProtocol(
+            name="holdout",
+            train_start=None,
+            train_end="2026-01-31T00:00:00+00:00",
+            val_end="2026-02-28T00:00:00+00:00",
+            test_start="2026-03-01T00:00:00+00:00",
+            test_end="2026-03-31T00:00:00+00:00",
+            benchmark_names=["CASH", "RandomSameTurnover"],
+        )
+        with self.assertRaisesRegex(ResearchProtocolError, "missing from baseline_results"):
+            manifest.validate_reportable()
+
     def test_default_benchmark_registry_matches_action_universe(self) -> None:
         benchmarks = default_benchmark_registry(["CASH", "QQQ", "SPY"])
 
         self.assertIn("CASH", benchmarks)
         self.assertIn("BuyAndHold_QQQ", benchmarks)
-        self.assertIn("RandomWithSameTurnover", benchmarks)
+        self.assertIn("RandomSameTurnover", benchmarks)
+
+
+class CoreAndFixRegressionTests(unittest.TestCase):
+    """Tests added to close prior coverage gaps and pin the correctness fixes."""
+
+    def test_replay_buffer_wraparound_and_over_capacity(self) -> None:
+        from rl_quant.core import TensorReplayBuffer
+
+        buf = TensorReplayBuffer(capacity=4, device=torch.device("cpu"), fields={"x": torch.long})
+        buf.add(x=torch.tensor([0, 1, 2]))
+        self.assertEqual(buf.size, 3)
+        buf.add(x=torch.tensor([3, 4]))  # wraps past capacity: keeps the 4 most recent
+        self.assertEqual(buf.size, 4)
+        self.assertEqual(sorted(buf.storage["x"].tolist()), [1, 2, 3, 4])
+
+        big = TensorReplayBuffer(capacity=3, device=torch.device("cpu"), fields={"x": torch.long})
+        big.add(x=torch.tensor([10, 11, 12, 13, 14]))  # single add larger than capacity
+        self.assertEqual(big.size, 3)
+        self.assertEqual(sorted(big.storage["x"].tolist()), [12, 13, 14])
+
+    def test_annualized_sharpe_and_drawdowns(self) -> None:
+        from rl_quant.core import absolute_max_drawdown, annualized_sharpe, fractional_max_drawdown
+
+        self.assertIsNone(annualized_sharpe([1.0]))
+        self.assertIsNone(annualized_sharpe([0.01, 0.01]))  # zero sigma -> None
+        self.assertIsNotNone(annualized_sharpe([0.01, -0.01, 0.02, -0.02]))
+        self.assertAlmostEqual(fractional_max_drawdown([100.0, 50.0, 75.0]), -0.5, places=6)
+        self.assertAlmostEqual(absolute_max_drawdown([100.0, 50.0, 75.0]), 50.0, places=6)
+
+    def test_nbbo_builder_midpoint_spread_and_crossed_flag(self) -> None:
+        from rl_quant.quote_utils import NbboBuilder
+
+        builder = NbboBuilder()
+        snap = builder.update(exchange="A", bid=100.0, bid_size_lots=2, ask=100.2, ask_size_lots=3, timestamp_ns=1)
+        self.assertIsNotNone(snap)
+        self.assertAlmostEqual(snap.mid, 100.1, places=6)
+        self.assertAlmostEqual(snap.spread, 0.2, places=6)
+        self.assertFalse(snap.crossed)
+        self.assertFalse(snap.locked)
+        # A second venue bidding above the best ask crosses the book; it must be FLAGGED.
+        crossed = builder.update(exchange="B", bid=100.5, bid_size_lots=1, ask=100.6, ask_size_lots=1, timestamp_ns=2)
+        self.assertTrue(crossed.crossed)
+        self.assertLess(crossed.spread, 0.0)
+
+    def test_causal_mask_disallows_future_positions(self) -> None:
+        from rl_quant.hourly_transformer import CausalTransformerQNetwork
+
+        net = CausalTransformerQNetwork(feature_dim=3, lookback=4, action_count=3)
+        mask = net._causal_mask(4, torch.device("cpu"))
+        for i in range(4):
+            for j in range(4):
+                if j <= i:
+                    self.assertEqual(float(mask[i, j].item()), 0.0)  # self + past allowed
+                else:
+                    self.assertLess(float(mask[i, j].item()), -1e30)  # future disallowed
+
+    def test_calibrator_recovers_known_residual_std_and_flags_in_sample(self) -> None:
+        rows = 100
+        amplitude = 0.05
+        series = torch.tensor([amplitude if i % 2 == 0 else -amplitude for i in range(rows)])
+        returns = torch.stack([series, series], dim=1)
+        q_values = torch.zeros((rows, 2))
+        valid = torch.ones((rows, 2), dtype=torch.bool)
+        config = ActionConfidenceConfig(q_value_scale=1.0, min_calibration_rows=1, ood_penalty=False)
+        calibrator = ActionConfidenceCalibrator(config).fit(q_values, returns, valid)
+        self.assertAlmostEqual(calibrator.metrics["global_residual_std"], amplitude, places=6)
+        self.assertTrue(calibrator.metrics["in_sample_optimistic"])
+
+    def test_p_beats_cash_is_nan_for_cash_self_comparison(self) -> None:
+        rows = 40
+        amplitude = 0.05
+        series = torch.tensor([amplitude if i % 2 == 0 else -amplitude for i in range(rows)])
+        returns = torch.stack([torch.zeros(rows), series], dim=1)
+        q_values = torch.zeros((rows, 2))
+        valid = torch.ones((rows, 2), dtype=torch.bool)
+        config = ActionConfidenceConfig(q_value_scale=1.0, min_calibration_rows=1, ood_penalty=False)
+        calibrator = ActionConfidenceCalibrator(config).fit(q_values, returns, valid)
+        out = calibrator.predict(q_values, valid)
+        self.assertTrue(torch.isnan(out.p_beats_cash[:, 0]).all())  # CASH vs CASH undefined
+        self.assertTrue(torch.isfinite(out.p_beats_cash[:, 1]).all())
+
+    def test_empty_market_block_marks_all_symbols_missing(self) -> None:
+        from rl_quant.features.stock_second_context import (
+            MARKET_CONTEXT_FEATURE_NAMES,
+            _block_market_features,
+        )
+
+        features, valid = _block_market_features(
+            {}, block_start_ms=0, block_end_ms=1_000, total_symbols=10, min_active_symbols=5
+        )
+        self.assertFalse(valid)
+        missing_index = MARKET_CONTEXT_FEATURE_NAMES.index("missing_symbol_fraction")
+        self.assertEqual(features[missing_index], 1.0)
+
+    def test_precomputed_news_requires_model_availability_for_real_model(self) -> None:
+        module = load_script("build_news_llm_features")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rows.jsonl"
+            path.write_text(json.dumps({"ticker": "QQQ", "model_available_timestamp_ms": 0}) + "\n")
+            _, errors = module.read_precomputed_rows(path, require_model_availability=True)
+        self.assertTrue(any("model_available_timestamp_ms must be > 0" in error for error in errors))
+
+    def test_model_manifest_adapter_accepts_trainer_schema(self) -> None:
+        module = load_script("validate_research_protocol")
+        trainer_manifest = {
+            "model_id": "demo",
+            "created_at_utc": "2026-06-14T00:00:00+00:00",
+            "algorithm": "DoubleDQN",
+            "encoder": "CausalTransformer",
+            "training_dataset": "/data/demo.pt",
+            "hyperparameters_hash": "abc",
+            "selected_by": "best_validation_total_return",
+            "feature_names_hash": "fh",
+            "action_names_hash": "ah",
+            "validation_protocol": {
+                "train_end": "2026-01-31T00:00:00+00:00",
+                "val_end": "2026-02-28T00:00:00+00:00",
+                "test_start": "2026-03-01T00:00:00+00:00",
+                "test_end": "2026-03-31T00:00:00+00:00",
+                "purge_rule": "chronological_no_overlap",
+            },
+            "baseline_results": [
+                {"name": "CASH", "total_return": 0.0, "annualized_sharpe": None, "max_drawdown": 0.0, "total_switches": 0}
+            ],
+            "cost_stress_results": [{"name": "2x", "kind": "fixed_rollout", "cost_bps": 2.0, "total_return": 0.0}],
+            "frequency_stress_results": [{"name": "min_hold_2", "kind": "frequency", "total_return": 0.0}],
+            "action_metadata_hash": "should_be_dropped",
+            "constraints": {"min_hold_bars": 1},
+        }
+        manifest = module.load_model_manifest(trainer_manifest)
+        manifest.validate_reportable()
+        self.assertEqual(manifest.model_id, "demo")
+        self.assertIn("CASH", manifest.validation_protocol.benchmark_names)
+
+    def test_ecology_helpers_softmax_and_drawdown_semantics(self) -> None:
+        module = load_script("learn_market_ecological_attention")
+        uniform = module.softmax([0.0, 0.0, 0.0])
+        self.assertAlmostEqual(sum(uniform), 1.0, places=6)
+        self.assertTrue(all(abs(weight - 1.0 / 3.0) < 1e-6 for weight in uniform))
+        skewed = module.softmax([10.0, 0.0])
+        self.assertGreater(skewed[0], skewed[1])
+        # trailing_returns over a small series equals the hand-computed pct changes.
+        series = {"2026-01-01": (100.0, 0.0), "2026-01-02": (110.0, 0.0), "2026-01-03": (104.5, 0.0)}
+        dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+        rets = module.trailing_returns(series, dates, 2, 3)
+        self.assertAlmostEqual(rets[-1], 104.5 / 110.0 - 1.0, places=6)
+        # trailing_drawdown is the CURRENT drawdown from the window peak (NOT max drawdown):
+        # peak is 110, current is 104.5 -> 104.5/110 - 1, even though an intermediate max-DD differs.
+        drawdown = module.trailing_drawdown(series, dates, 2, 3)
+        self.assertAlmostEqual(drawdown, 104.5 / 110.0 - 1.0, places=6)
+
+    @staticmethod
+    def _valid_news_llm_row(**overrides):
+        from rl_quant.features.news_llm import NEWS_LLM_ARTICLE_TICKER_FIELDS
+
+        ts = 1_700_000_000_000
+        row = {field: 0.0 for field in NEWS_LLM_ARTICLE_TICKER_FIELDS}
+        row.update(
+            {
+                "article_id": "a1",
+                "ticker": "QQQ",
+                "published_utc": "2026-01-05T15:00:00+00:00",
+                "published_timestamp_ms": ts,
+                "source_available_timestamp_ms": ts,
+                "llm_feature_available_timestamp_ms": ts,
+                "model_available_timestamp_ms": 0,
+                "ticker_relevance": 1.0,
+                "is_primary_ticker": 1.0,
+                "company_specificity": 1.0,
+                "is_broad_market_or_sector": 0.0,
+                "sentiment_score": 0.5,
+                "positive_score": 0.5,
+                "negative_score": 0.0,
+                "neutral_score": 0.5,
+                "uncertainty_score": 0.0,
+                "materiality_score": 0.5,
+                "novelty_score": 1.0,
+                "time_horizon": "intraday",
+                "confidence": 0.8,
+                "llm_valid": True,
+                "llm_model_id": "m",
+                "llm_prompt_hash": "p",
+                "llm_schema_version": NEWS_LLM_EXTRACT_SCHEMA_VERSION,
+                "llm_schema_hash": NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH,
+                "extractor_provider": "local_transformers",
+                "extractor_temperature": 0.0,
+                "extractor_no_retrieval": True,
+                "model_training_cutoff_utc": "unknown",
+                "article_weight": 1.0,
+                "ticker_count": 1.0,
+            }
+        )
+        row.update(overrides)
+        return row
+
+    def test_news_llm_validation_rejects_bad_rows(self) -> None:
+        from rl_quant.features.news_llm import validate_news_llm_rows
+
+        self.assertEqual(validate_news_llm_rows([self._valid_news_llm_row()]), [])
+        self.assertTrue(
+            any("sentiment_score" in e for e in validate_news_llm_rows([self._valid_news_llm_row(sentiment_score=2.0)]))
+        )
+        self.assertTrue(
+            any("confidence" in e for e in validate_news_llm_rows([self._valid_news_llm_row(confidence=float("nan"))]))
+        )
+        self.assertTrue(
+            any(
+                "source availability" in e
+                for e in validate_news_llm_rows([self._valid_news_llm_row(source_available_timestamp_ms=2_000_000_000_000)])
+            )
+        )
+        self.assertTrue(
+            any(
+                "duplicate" in e
+                for e in validate_news_llm_rows([self._valid_news_llm_row(), self._valid_news_llm_row()])
+            )
+        )
+
+    def test_news_llm_content_hash_changes_with_feature_value(self) -> None:
+        if importlib.util.find_spec("pandas") is None or importlib.util.find_spec("pyarrow") is None:
+            self.skipTest("pandas/pyarrow required for feature-table hashing test")
+        common = dict(
+            article_manifest=None,
+            model_id="m",
+            model_available_timestamp_ms=0,
+            model_training_cutoff_utc="unknown",
+            provider="local_transformers",
+        )
+        with tempfile.TemporaryDirectory() as dir_a, tempfile.TemporaryDirectory() as dir_b:
+            manifest_a = write_news_llm_feature_outputs(rows=[self._valid_news_llm_row()], output_root=Path(dir_a), **common)
+            manifest_b = write_news_llm_feature_outputs(
+                rows=[self._valid_news_llm_row(sentiment_score=-0.5)], output_root=Path(dir_b), **common
+            )
+        self.assertTrue(manifest_a["reportable"])
+        # The content hash MUST change when a feature value changes ...
+        self.assertNotEqual(manifest_a["feature_table_content_hash"], manifest_b["feature_table_content_hash"])
+        # ... while the legacy identity-only hash does not (the exact gap the content hash closes).
+        self.assertEqual(manifest_a["feature_table_hash"], manifest_b["feature_table_hash"])
+
+    def test_news_llm_mixed_provenance_is_nonreportable_and_quarantined(self) -> None:
+        if importlib.util.find_spec("pandas") is None or importlib.util.find_spec("pyarrow") is None:
+            self.skipTest("pandas/pyarrow required for feature-table write test")
+        rows = [
+            self._valid_news_llm_row(article_id="a1", llm_prompt_hash="p1"),
+            self._valid_news_llm_row(article_id="a2", llm_prompt_hash="p2"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = write_news_llm_feature_outputs(
+                rows=rows,
+                output_root=Path(directory),
+                article_manifest=None,
+                model_id="m",
+                model_available_timestamp_ms=0,
+                model_training_cutoff_utc="unknown",
+                provider="local_transformers",
+            )
+            self.assertFalse(manifest["reportable"])
+            self.assertTrue(manifest["mixed_provenance"])
+            # The canonical (reportable) path must NOT be materialized; the table is quarantined.
+            self.assertFalse((Path(directory) / "news_article_ticker_llm.parquet").exists())
+            self.assertTrue((Path(directory) / "news_article_ticker_llm.nonreportable.parquet").exists())
 
 
 if __name__ == "__main__":

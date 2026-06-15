@@ -221,6 +221,7 @@ def equal_weight_metrics(split, *, cash_index: int, action_weights=None) -> dict
     if not action_indices:
         action_indices = [cash_index]
     weights = None if action_weights is None else action_weights.detach().to(device=split.action_returns.device)
+    valid_mask = getattr(split, "action_valid_mask", None)
     equity = 1.0
     equity_curve = [equity]
     returns: list[float] = []
@@ -228,7 +229,17 @@ def equal_weight_metrics(split, *, cash_index: int, action_weights=None) -> dict
         action_returns = split.action_returns[index, action_indices]
         if weights is not None:
             action_returns = action_returns * weights[action_indices]
-        simple_return = float(action_returns.mean().item())
+        # Average only over FINITE and (when available) decision-valid actions. A valid_start row
+        # does not guarantee every action is valid that bar; invalid action returns are NaN by
+        # contract, and an unmasked mean would make equity NaN from that bar onward and silently
+        # NaN the whole EqualWeight baseline. With no valid non-cash action, hold cash (0 return).
+        finite = action_returns.isfinite()
+        if valid_mask is not None:
+            finite = finite & valid_mask[index, action_indices].to(device=finite.device)
+        if bool(finite.any().item()):
+            simple_return = float(action_returns[finite].mean().item())
+        else:
+            simple_return = 0.0
         equity *= 1.0 + simple_return
         equity_curve.append(equity)
         returns.append(simple_return)
@@ -970,7 +981,30 @@ def build_reportability_artifacts(
             "test_end": args.test_end,
             "purge_rule": "chronological_no_overlap",
         },
-        "hyperparameters_hash": stable_json_hash(vars(args)),
+        # Hash the TRAINING search space only. Excluding evaluation-window, reportability-threshold,
+        # and infrastructure args means two runs that share a training configuration but evaluate on
+        # different test windows / cost-stress grids get the SAME hyperparameters_hash, instead of
+        # silently tying model identity to evaluation-only choices.
+        "hyperparameters_hash": stable_json_hash(
+            {
+                key: value
+                for key, value in vars(args).items()
+                if key
+                not in {
+                    "dataset",
+                    "output_dir",
+                    "val_end",
+                    "test_start",
+                    "test_end",
+                    "cost_stress_bps",
+                    "reportable_max_group_share",
+                    "reportable_max_leveraged_share",
+                    "device",
+                    "amp",
+                    "target_vram_gb",
+                }
+            }
+        ),
         "selected_by": "best_validation_total_return_then_switch_count",
         "feature_names_hash": hash_string_sequence(train_split.feature_names),
         "action_names_hash": hash_string_sequence(train_split.action_names),

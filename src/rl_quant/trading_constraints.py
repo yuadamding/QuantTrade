@@ -143,6 +143,14 @@ def build_action_mask(
     if bool(constrained.any().item()):
         mask[constrained, :] = False
         mask[constrained, current_action[constrained].long()] = True
+        # De-risking to CASH must never be blocked by a position-level hold (min-hold or
+        # cooldown): flattening a freshly-entered, possibly leveraged position to the
+        # zero-notional fallback can only reduce risk. Turnover budgets (switch/order-leg
+        # caps) are intentionally NOT exempted -- a switch to cash still consumes the
+        # turnover budget, so an exhausted budget may legitimately restrict to holding.
+        hold_constrained = must_hold | in_cooldown
+        if bool(hold_constrained.any().item()):
+            mask[hold_constrained, int(cash_index)] = True
     return mask
 
 

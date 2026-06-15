@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -46,11 +47,63 @@ DEFAULT_ARTICLE_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "news_articl
 DEFAULT_OUTPUT_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "news_llm_v1" / "top500_2023_to_present"
 LOCAL_MODEL_PRESETS = {
     "qwen3_6_27b": Path("../LLM/Qwen3.6-27B/download_manifest.json"),
+    "qwen3_6_27b_fp8": Path("../LLM/Qwen3.6-27B-FP8/download_manifest.json"),
     "qwen3_1_7b": Path("../LLM/Qwen3-1.7B/download_manifest.json"),
     "gemma4_26b_a4b_it": Path("../LLM/gemma-4-26B-A4B-it/download_manifest.json"),
     "mistral_small_3_2_24b": Path("../LLM/Mistral-Small-3.2-24B-Instruct-2506/download_manifest.json"),
 }
-DEFAULT_LOCAL_MODEL_PRESET = "qwen3_6_27b"
+LOCAL_MODEL_PRESET_REPOS = {
+    "qwen3_6_27b": {
+        "repo_id": "Qwen/Qwen3.6-27B",
+        "model_type": "qwen3.6",
+        "parameter_class": "27B",
+        "intended_quanttrade_role": "primary offline analyst extractor for news/fundamental covariates; not direct trading decisions",
+    },
+    "qwen3_6_27b_fp8": {
+        "repo_id": "Qwen/Qwen3.6-27B-FP8",
+        "model_type": "qwen3.6",
+        "parameter_class": "27B-FP8",
+        "intended_quanttrade_role": "primary offline analyst extractor for news/fundamental covariates under an 80GB VRAM budget; not direct trading decisions",
+    },
+    "qwen3_1_7b": {
+        "repo_id": "Qwen/Qwen3-1.7B",
+        "model_type": "qwen3",
+        "parameter_class": "1.7B",
+        "intended_quanttrade_role": "smoke-test and small offline structured LLM feature extraction; not direct trading decisions",
+    },
+    "gemma4_26b_a4b_it": {
+        "repo_id": "google/gemma-4-26B-A4B-it",
+        "model_type": "gemma4",
+        "parameter_class": "26B-A4B",
+        "intended_quanttrade_role": "validator or fallback offline analyst extractor; not direct trading decisions",
+    },
+    "mistral_small_3_2_24b": {
+        "repo_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+        "model_type": "mistral-small-3.2",
+        "parameter_class": "24B",
+        "intended_quanttrade_role": "structured-output fallback offline analyst extractor; not direct trading decisions",
+    },
+}
+DEFAULT_LOCAL_MODEL_PRESET = "qwen3_1_7b"
+LOCAL_MODEL_ALLOW_PATTERNS = [
+    "*.safetensors",
+    "*.json",
+    "*.model",
+    "*.txt",
+    "*.md",
+    "*.py",
+    "tokenizer*",
+    "vocab*",
+    "merges.txt",
+]
+LOCAL_MODEL_IGNORE_PATTERNS = [
+    "*.bin",
+    "*.h5",
+    "*.msgpack",
+    "*.onnx",
+    "*.tflite",
+    "*.gguf",
+]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -85,6 +138,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the preset manifest used to pin local pretrained LLM metadata.",
     )
     parser.add_argument(
+        "--local-model-revision",
+        help="Optional Hugging Face revision used when auto-downloading a missing local model preset.",
+    )
+    parser.add_argument(
+        "--no-auto-download-local-model",
+        dest="auto_download_local_model",
+        action="store_false",
+        help="Do not download a missing local model preset; require an existing manifest or explicit model availability.",
+    )
+    parser.set_defaults(auto_download_local_model=True)
+    parser.add_argument(
         "--include-external-article-tickers",
         action="store_true",
         help="Keep article-ticker rows outside the article table source universe. Default restricts to the selected universe.",
@@ -95,13 +159,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _coerce_ms(value: object) -> int:
+    if value in (None, ""):
+        return 0
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    return parse_timestamp_ms(str(value))
+
+
 def read_precomputed_rows(
     path: Path,
     *,
     allowed_tickers: set[str] | None = None,
+    model_available_ms: int = 0,
+    vendor_latency_seconds: int = 0,
+    processing_latency_seconds: int = 0,
+    require_model_availability: bool = False,
 ) -> tuple[list[dict[str, object]], list[str]]:
     rows: list[dict[str, object]] = []
     errors: list[str] = []
+    latency_ms = (int(vendor_latency_seconds) + int(processing_latency_seconds)) * 1000
     with path.open() as source:
         for line_number, line in enumerate(source, start=1):
             text = line.strip()
@@ -124,6 +203,24 @@ def read_precomputed_rows(
                 row["llm_schema_version"] = NEWS_LLM_EXTRACT_SCHEMA_VERSION
             if row.get("llm_schema_hash") in (None, ""):
                 row["llm_schema_hash"] = NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH
+            # Reconcile model availability: a real-model import must declare a model-available
+            # timestamp so the point-in-time reportability gate (build_action_news_llm_tensor) is
+            # not a no-op. Take the max of the row value and the resolved manifest/CLI value.
+            effective_model_available = max(_coerce_ms(row.get("model_available_timestamp_ms")), int(model_available_ms))
+            row["model_available_timestamp_ms"] = effective_model_available
+            if require_model_availability and effective_model_available <= 0:
+                errors.append(
+                    f"line {line_number}: model_available_timestamp_ms must be > 0 for a real-model "
+                    "precomputed import (pass --model-available-timestamp-utc or a manifest)."
+                )
+            # Enforce the feature-availability floor: news cannot be model-available before the
+            # later of source availability and model availability, plus vendor+processing latency.
+            availability_floor = (
+                max(_coerce_ms(row.get("source_available_timestamp_ms")), effective_model_available) + latency_ms
+            )
+            row["llm_feature_available_timestamp_ms"] = max(
+                _coerce_ms(row.get("llm_feature_available_timestamp_ms")), availability_floor
+            )
             rows.append(row)
     errors.extend(validate_news_llm_rows(rows))
     return rows, errors
@@ -137,6 +234,10 @@ def resolve_project_relative_path(path: Path) -> Path:
     if path.is_absolute():
         return path
     return (PROJECT_ROOT / path).resolve()
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def workspace_relative_path(path: Path) -> str:
@@ -161,6 +262,119 @@ def sanitize_local_model_manifest(manifest: dict[str, object]) -> dict[str, obje
     return sanitized
 
 
+def model_index_metadata(local_dir: Path) -> dict[str, int] | None:
+    index_path = local_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        return None
+    try:
+        index = json.loads(index_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    weight_map = index.get("weight_map", {})
+    metadata = index.get("metadata", {})
+    if not isinstance(weight_map, dict) or not isinstance(metadata, dict):
+        return None
+    total_size = metadata.get("total_size")
+    return {
+        "weight_map_entries": len(weight_map),
+        "total_size_bytes": int(total_size) if isinstance(total_size, int | float | str) and str(total_size).isdigit() else 0,
+    }
+
+
+def local_model_download_manifest(
+    *,
+    preset: str,
+    repo_id: str,
+    revision: str,
+    local_dir: Path,
+) -> dict[str, object]:
+    preset_metadata = LOCAL_MODEL_PRESET_REPOS[preset]
+    manifest = {
+        "downloaded_at_utc": utc_now_iso(),
+        "local_path": workspace_relative_path(local_dir),
+        "repo_id": repo_id,
+        "revision": revision,
+        "model_type": preset_metadata["model_type"],
+        "parameter_class": preset_metadata["parameter_class"],
+        "intended_quanttrade_role": preset_metadata["intended_quanttrade_role"],
+        "downloaded_file_policy": {
+            "included": list(LOCAL_MODEL_ALLOW_PATTERNS),
+            "excluded": list(LOCAL_MODEL_IGNORE_PATTERNS),
+        },
+        "model_index_metadata": model_index_metadata(local_dir),
+        "reportability_note": (
+            "For historical backtests, runs using this model for decisions before the model "
+            "availability/training cutoff should be marked non-reportable unless a separate "
+            "point-in-time model policy is documented."
+        ),
+    }
+    return manifest
+
+
+def download_local_model_preset(args: argparse.Namespace, manifest_path: Path) -> Path:
+    if args.local_model_manifest is not None:
+        raise SystemExit(
+            f"Local model manifest override does not exist: {args.local_model_manifest}. "
+            "Auto-download is only supported for named --local-model-preset values."
+        )
+    try:
+        from huggingface_hub import HfApi, snapshot_download
+    except ImportError as exc:
+        raise SystemExit(
+            "Auto-downloading local LLM presets requires huggingface_hub. "
+            "Install the LLM extra with: python -m pip install -e \".[llm]\""
+        ) from exc
+
+    preset_metadata = LOCAL_MODEL_PRESET_REPOS[args.local_model_preset]
+    repo_id = str(preset_metadata["repo_id"])
+    local_manifest_path = resolve_project_relative_path(manifest_path)
+    local_dir = local_manifest_path.parent
+    local_dir.mkdir(parents=True, exist_ok=True)
+    requested_revision = args.local_model_revision
+    print(f"Local LLM manifest missing; downloading {repo_id} to {workspace_relative_path(local_dir)}", flush=True)
+    try:
+        # Resolve the commit sha ONCE up front and pin the download to it, so the recorded
+        # revision in the manifest corresponds exactly to the downloaded snapshot (avoids a
+        # TOCTOU window where `main` advances between download and sha lookup).
+        resolved_revision = HfApi().model_info(repo_id=repo_id, revision=requested_revision).sha
+        snapshot_download(
+            repo_id=repo_id,
+            revision=resolved_revision or requested_revision,
+            local_dir=local_dir,
+            allow_patterns=LOCAL_MODEL_ALLOW_PATTERNS,
+            ignore_patterns=LOCAL_MODEL_IGNORE_PATTERNS,
+        )
+    except Exception as exc:
+        raise SystemExit(f"Failed to download local model preset {args.local_model_preset} ({repo_id}): {exc}") from exc
+    # Verify weights actually landed: with safetensors-only allow patterns, a repo that ships only
+    # PyTorch .bin would download config/tokenizer but NO weights and still "succeed". Refuse to
+    # write a success manifest that asserts a usable model when no weight shard is present.
+    weight_files = list(local_dir.glob("*.safetensors")) + list(local_dir.glob("model.safetensors.index.json"))
+    if not weight_files:
+        raise SystemExit(
+            f"Downloaded {repo_id} but found no *.safetensors weights in {workspace_relative_path(local_dir)}; "
+            "refusing to write a model manifest with no usable weights (adjust allow/ignore patterns "
+            "for this repo's weight format)."
+        )
+    manifest = local_model_download_manifest(
+        preset=args.local_model_preset,
+        repo_id=repo_id,
+        revision=resolved_revision or requested_revision or "unknown",
+        local_dir=local_dir,
+    )
+    local_manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return local_manifest_path
+
+
+def ensure_local_model_manifest(args: argparse.Namespace, manifest_path: Path) -> Path:
+    readable_manifest_path = resolve_project_relative_path(manifest_path)
+    if readable_manifest_path.exists():
+        return readable_manifest_path
+    if args.auto_download_local_model:
+        return download_local_model_preset(args, manifest_path)
+    return readable_manifest_path
+
+
 def analyst_model_policy_from_args(args: argparse.Namespace) -> dict[str, object]:
     return default_news_llm_analyst_model_policy(
         primary_model_id=args.primary_model_id,
@@ -175,7 +389,7 @@ def analyst_model_policy_from_args(args: argparse.Namespace) -> dict[str, object
 
 def resolve_model_metadata(args: argparse.Namespace) -> tuple[str, int, str, str, dict[str, object] | None]:
     manifest_path = local_model_manifest_path(args)
-    readable_manifest_path = resolve_project_relative_path(manifest_path)
+    readable_manifest_path = ensure_local_model_manifest(args, manifest_path) if args.precomputed_jsonl else resolve_project_relative_path(manifest_path)
     if args.precomputed_jsonl and readable_manifest_path.exists():
         manifest = sanitize_local_model_manifest(json.loads(readable_manifest_path.read_text()))
         model_id = args.model_id
@@ -213,7 +427,14 @@ def main(argv: list[str] | None = None) -> int:
     allowed_tickers = None if args.include_external_article_tickers or not source_symbols else source_symbols
     model_id, model_available_ms, training_cutoff, provider, local_model_manifest = resolve_model_metadata(args)
     if args.precomputed_jsonl:
-        rows, errors = read_precomputed_rows(args.precomputed_jsonl, allowed_tickers=allowed_tickers)
+        rows, errors = read_precomputed_rows(
+            args.precomputed_jsonl,
+            allowed_tickers=allowed_tickers,
+            model_available_ms=model_available_ms,
+            vendor_latency_seconds=args.vendor_latency_seconds,
+            processing_latency_seconds=args.processing_latency_seconds,
+            require_model_availability=provider != "deterministic_baseline",
+        )
     else:
         articles = read_news_article_rows(args.article_root)
         rows = build_deterministic_news_llm_rows(

@@ -582,6 +582,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-start", default="2025-09-01")
     parser.add_argument("--start-date", default="2026-01-01")
     parser.add_argument("--end-date")
+    parser.add_argument(
+        "--fit-end-date",
+        default=None,
+        help=(
+            "Prior-only fit cutoff (YYYY-MM-DD). When set, kmeans centroids and causal betas are "
+            "learned ONLY from stock-days whose next-day label is on or before this date, then the "
+            "frozen mediators are applied forward to all output dates. Set fit-end-date < the "
+            "downstream validation start so val/test ecology features do not embed future labels. "
+            "When unset, centroids/betas are fit over the FULL output window (leaks future labels "
+            "into any within-window val/test split) and the run is marked fit-window-non-reportable."
+        ),
+    )
     parser.add_argument("--n-mediators", type=int, default=8)
     parser.add_argument("--kmeans-iterations", type=int, default=20)
     parser.add_argument("--max-training-rows", type=int, default=60000)
@@ -615,14 +627,26 @@ def main() -> int:
     )
     if not by_date:
         raise ValueError("No stock-day rows were built. Check date range and input directory.")
+    # Prior-only fit window: restrict the centroid/beta FITTING data to stock-days whose next-day
+    # label is on or before --fit-end-date (date < fit_end, since a day-t row carries the t+1
+    # label), then apply the frozen mediators forward to ALL output dates. Without a cutoff the
+    # fit spans the full window and a within-window val/test split would leak future labels.
+    if args.fit_end_date is not None:
+        fit_by_date = {d: rows for d, rows in by_date.items() if d < args.fit_end_date}
+        if not fit_by_date:
+            raise ValueError("No stock-day rows strictly before --fit-end-date for the ecology fit window.")
+        fit_vectors = [row.features for rows in fit_by_date.values() for row in rows]
+    else:
+        fit_by_date = by_date
+        fit_vectors = vectors
     centroids = learn_kmeans(
-        vectors,
+        fit_vectors,
         k=args.n_mediators,
         iterations=args.kmeans_iterations,
         max_rows=args.max_training_rows,
     )
     alphas, betas, support = learn_causal_betas(
-        by_date,
+        fit_by_date,
         centroids,
         assignment_temperature=args.assignment_temperature,
     )
@@ -641,6 +665,20 @@ def main() -> int:
         "calendar_rows": len(output_dates),
         "claim_boundary": "research context learner; causal-lag predictive coefficients, not structural causal proof",
         "mass_mode": args.mass_mode,
+        "fit_end_date": args.fit_end_date,
+        "fit_window_rows": sum(len(rows) for rows in fit_by_date.values()),
+        "fit_is_prior_only": args.fit_end_date is not None,
+        # When the fit spans the full output window, the predictive mediator features
+        # (pred_rel_ret_m*, q_m*) embed coefficients estimated from labels at every output date,
+        # so any consumer that splits train/val/test within this window leaks future labels.
+        "fit_window_reportable": args.fit_end_date is not None,
+        "fit_window_reportability_note": (
+            "centroids/betas fit prior-only through fit_end_date; safe to merge into RL states whose "
+            "validation starts at or after fit_end_date"
+            if args.fit_end_date is not None
+            else "centroids/betas fit over the FULL output window; predictive features leak future "
+            "labels into any within-window val/test split -- rerun with --fit-end-date < validation start"
+        ),
     }
     build_outputs(
         output_dir=args.output_dir,

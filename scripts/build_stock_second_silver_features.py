@@ -76,16 +76,34 @@ def main() -> int:
     ]
     if args.max_files > 0:
         files = files[: args.max_files]
+    import pandas as pd
+
+    # Group day files by SYMBOL (layout SYMBOL/YYYY/MM/DATE.parquet) and select the first
+    # --symbol-limit SYMBOLS, then concatenate ALL of each symbol's days in the window. The prior
+    # code applied --symbol-limit to day FILES and overwrote frames_by_symbol per symbol, so a
+    # multi-day window silently kept only the last day per symbol and truncated symbols once the
+    # file count hit the limit -- producing an incorrect market-context cross-section.
+    files_by_symbol: dict[str, list[Path]] = {}
+    for path in files:
+        files_by_symbol.setdefault(path.parents[2].name.upper(), []).append(path)
+    selected_symbols = (
+        list(files_by_symbol)[: args.symbol_limit] if args.symbol_limit > 0 else list(files_by_symbol)
+    )
     frames_by_symbol = {}
-    for path in files[: args.symbol_limit]:
-        frame = load_symbol_day(
-            path,
-            rth_only=not args.include_extended_hours,
-            include_extended_hours=args.include_extended_hours,
-        )
-        if len(frame):
-            symbol = str(frame["symbol"].iloc[0]).upper() if "symbol" in frame.columns else path.parents[2].name.upper()
-            frames_by_symbol[symbol] = frame
+    for symbol in selected_symbols:
+        symbol_frames = []
+        for path in sorted(files_by_symbol[symbol], key=lambda item: item.stem):
+            frame = load_symbol_day(
+                path,
+                rth_only=not args.include_extended_hours,
+                include_extended_hours=args.include_extended_hours,
+            )
+            if len(frame):
+                symbol_frames.append(frame)
+        if symbol_frames:
+            frames_by_symbol[symbol] = pd.concat(symbol_frames, ignore_index=True).sort_values(
+                "timestamp_ms"
+            ).reset_index(drop=True)
     if not frames_by_symbol:
         raise ValueError("No stock second-bar frames loaded for the requested window.")
     feature_config = StockSecondContextConfig(

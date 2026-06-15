@@ -167,7 +167,15 @@ def load_symbol_features(path: Path, *, start: str, end_exclusive: str) -> dict[
 
     out: dict[str, BarFeature] = {}
     previous_close: float | None = None
-    for ts, _exchange_ts, open_value, high, low, close, volume in raw_rows:
+    previous_date: str | None = None
+    for ts, exchange_ts, open_value, high, low, close, volume in raw_rows:
+        session_date = str(exchange_ts)[:10]
+        if session_date != previous_date:
+            # Reset across session/date boundaries: the first bar of a new session must not
+            # compute bar_return / bar_log_return against the prior session's last close, which
+            # would mislabel an overnight/weekend gap as an intra-session bar return.
+            previous_close = None
+            previous_date = session_date
         if previous_close is None or previous_close <= 0:
             bar_return = 0.0
             bar_log_return = 0.0

@@ -130,6 +130,13 @@ For offline LLM feature extraction with the downloaded local model:
 conda run -n ml1 python -m pip install -e ".[llm]"
 ```
 
+When `scripts/build_news_llm_features.py` imports precomputed LLM outputs and
+the selected `--local-model-preset` manifest is missing, it auto-downloads that
+preset into `../LLM/<model>/` and writes `download_manifest.json`. Use
+`--no-auto-download-local-model` to require a pre-existing manifest. The RL
+training scripts themselves do not download or call LLMs; they only consume
+frozen feature tables and sidecars.
+
 Current downloaded local LLM checkpoint, used for smoke tests and small offline
 feature-extraction experiments:
 
@@ -138,14 +145,17 @@ feature-extraction experiments:
 Qwen/Qwen3-1.7B@70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
 ```
 
-Recommended analyst extractor stack for frozen production feature builds:
+Current local analyst extractor stack for frozen feature builds:
 
 ```text
-Primary:   Qwen/Qwen3.6-27B
+Primary:   Qwen/Qwen3-1.7B
 Validator: google/gemma-4-26B-A4B-it
 Fallback:  mistralai/Mistral-Small-3.2-24B-Instruct-2506
-Serving:   vLLM with JSON-schema structured outputs
+Serving:   local_transformers with JSON-schema structured outputs
 ```
+
+`Qwen/Qwen3.6-27B` remains an explicit larger-model preset, but it is not the
+default local path on the 10 GiB GPU used for this project stage.
 
 The 2026 LLM stack is diagnostic for retrospective 2023-2026 backtests unless
 the extractor model was available before the first decision timestamp. Training
@@ -1138,6 +1148,7 @@ Multiple manifests can be passed by repeating `--dataset-manifest` or
 | `scripts/build_stock_second_silver_features.py` | Build sparse-aware silver features from stock second bars. |
 | `scripts/build_second_context_decision_dataset.py` | Build gold decision tensors from second context. |
 | `scripts/build_news_article_table.py` | Deduplicate Polygon news JSONL into article rows. |
+| `scripts/generate_qwen_news_precomputed.py` | Generate local Qwen3-1.7B article-ticker JSONL for news LLM features. |
 | `scripts/build_news_llm_features.py` | Build or import audited article-ticker `news_llm_v1` rows. |
 | `scripts/build_news_llm_aggregates.py` | Build optional action news LLM sidecars for hour-from-second partitions. |
 | `scripts/train_second_context_action_scorer.py` | Train action-conditioned second-context scorer and diagnostics. |

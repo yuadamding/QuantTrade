@@ -582,6 +582,13 @@ def stamp_cache_identity(output: Path, expected_identity: dict[str, Any] | None)
             manifest["reportable"] = bool(payload["dataset_reportable"])
         if "reportability_errors" not in manifest and "dataset_reportability_errors" in payload:
             manifest["reportability_errors"] = list(payload["dataset_reportability_errors"])
+        # Preserve the dataset's own self-derived action_schema_hash before stamping the run/cache
+        # identity. The cache-identity action_schema_hash is a proxy (gold action list); the
+        # partition's true action set is recorded separately for audit. Action-set drift driven by
+        # the universe is still caught by universe_file_hash / conversion_config_hash.
+        self_action_hash = manifest.get("action_schema_hash")
+        if self_action_hash and self_action_hash != expected_identity.get("action_schema_hash"):
+            manifest["dataset_action_schema_hash"] = self_action_hash
         manifest.update(expected_identity)
         payload["dataset_manifest"] = manifest
 
@@ -720,6 +727,8 @@ def build_hourly_command(
         str(args.max_action_staleness_seconds),
         "--bar-latency-ms",
         str(args.bar_latency_ms),
+        "--execution-latency-ms",
+        str(args.execution_latency_ms),
         "--min-decision-rows",
         str(args.hourly_min_decision_rows),
         "--dense-hourly-grid",

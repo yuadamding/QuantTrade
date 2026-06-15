@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
+
+_WARNED_UNKNOWN_ACTION_SYMBOLS: set[str] = set()
 
 RISK_AWARE_POLICY_MODEL_VERSION = 3
 
@@ -226,8 +229,39 @@ def _default_max_weight(leverage: float) -> float:
     return min(1.0, 1.0 / max(float(leverage), 1.0))
 
 
-def infer_action_meta(name: str) -> ActionMeta:
+def is_known_action_symbol(name: str) -> bool:
+    """True when an explicit risk-metadata entry exists for the symbol."""
+    return name.upper() in KNOWN_ACTION_META
+
+
+def unknown_action_metadata_symbols(action_names: list[str]) -> list[str]:
+    """Action names with no explicit risk metadata (leverage/inverse are inferred, not known).
+
+    Callers building reportable or leverage/inverse-constrained runs should gate on this:
+    an unknown leveraged/inverse instrument would otherwise be treated as 1x long and slip
+    past the exposure caps.
+    """
+    return [name for name in action_names if name.upper() not in KNOWN_ACTION_META]
+
+
+def infer_action_meta(name: str, *, strict: bool = False) -> ActionMeta:
     symbol = name.upper()
+    known = symbol in KNOWN_ACTION_META
+    if not known:
+        if strict:
+            raise ValueError(
+                f"Unknown action symbol {name!r} has no entry in KNOWN_ACTION_META; refusing to "
+                "infer leverage/inverse for a risk-constrained run. Add explicit metadata or call "
+                "with strict=False to accept the 1x-long, non-inverse fallback."
+            )
+        if symbol not in _WARNED_UNKNOWN_ACTION_SYMBOLS:
+            _WARNED_UNKNOWN_ACTION_SYMBOLS.add(symbol)
+            warnings.warn(
+                f"No risk metadata for action {name!r}; assuming 1x long, non-inverse. A leveraged "
+                "or inverse instrument without metadata would bypass the leverage/inverse exposure "
+                "caps. Add it to KNOWN_ACTION_META or gate with unknown_action_metadata_symbols().",
+                stacklevel=2,
+            )
     values = KNOWN_ACTION_META.get(
         symbol,
         {"asset_class": "etf", "group": symbol.lower(), "underlying": symbol, "leverage": 1.0, "inverse": False},
@@ -246,8 +280,8 @@ def infer_action_meta(name: str) -> ActionMeta:
     )
 
 
-def build_action_metadata(action_names: list[str]) -> list[ActionMeta]:
-    return [infer_action_meta(name) for name in action_names]
+def build_action_metadata(action_names: list[str], *, strict: bool = False) -> list[ActionMeta]:
+    return [infer_action_meta(name, strict=strict) for name in action_names]
 
 
 def action_metadata_to_dicts(action_meta: list[ActionMeta]) -> list[dict[str, Any]]:
@@ -406,6 +440,10 @@ def apply_exposure_masks(
     if constraints.max_same_group_share_per_day is not None:
         min_obs = max(int(constraints.min_group_share_observations), 1)
         next_steps = (steps_today.float() + 1.0).clamp_min(1.0)
+        # Warmup blind spot: the same-group-share cap is intentionally disabled for the first
+        # `min_group_share_observations` bars of each day to avoid noisy ratios on tiny samples.
+        # Full-period over-concentration is still caught by action_concentration/reportability_flags,
+        # which operate on the whole rollout rather than per-step.
         enough_history = next_steps >= float(min_obs)
         candidate_groups = action_group_ids[candidates]
         candidate_group_counts = torch.gather(group_counts_today, 1, candidate_groups)
@@ -415,6 +453,11 @@ def apply_exposure_masks(
         )
         out = out & ~group_exhausted
 
+    # Exposure caps (leverage/inverse/group) must never *remove* CASH (it carries zero
+    # leverage and zero notional), so restore it to its pre-exposure value. We inherit
+    # rather than force-True so that an upstream turnover budget (switch/order-leg cap)
+    # that legitimately dropped CASH is respected; position-level holds keep CASH via
+    # build_action_mask, and data-quality gates force CASH upstream.
     out[:, cash_column] = mask[:, cash_column]
     empty_rows = ~out.any(dim=1)
     if bool(empty_rows.any().item()):

@@ -127,7 +127,12 @@ class VectorizedStrategyAllocationEnv:
         next_valid = torch.zeros_like(in_bounds)
         if bool(in_bounds.any().item()):
             next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
-        dones = (~next_valid) | (self.steps >= int(self.config.episode_length))
+        # Separate the genuine terminal (no more valid data) from the artificial episode-length
+        # truncation. The TD target bootstraps THROUGH truncations (the strategy curve continues),
+        # zeroing the bootstrap only at true terminals; `resets` drives the env episode reset.
+        terminal = ~next_valid
+        truncated = self.steps >= int(self.config.episode_length)
+        resets = terminal | truncated
 
         return {
             "indices": current_indices,
@@ -136,7 +141,8 @@ class VectorizedStrategyAllocationEnv:
             "rewards": rewards,
             "next_indices": next_indices,
             "next_previous_actions": self.previous_actions,
-            "dones": dones,
+            "dones": terminal,
+            "resets": resets,
         }
 
 
@@ -303,7 +309,8 @@ def train_strategy_dqn_agent(
         transition = env.step(actions)
         replay.add(**transition)
         reward_trace.append(float(transition["rewards"].mean().item()))
-        env.reset(transition["dones"])
+        # Reset on terminal OR truncation; the TD target uses `dones` (true terminal only).
+        env.reset(transition["resets"])
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
             batch = replay.sample(config.learning.batch_size)
@@ -324,8 +331,13 @@ def train_strategy_dqn_agent(
                         1,
                         next_actions.unsqueeze(1),
                     ).squeeze(1)
-                    target_q = batch["rewards"] + config.learning.gamma * (1.0 - batch["dones"]) * next_q
-                loss = F.smooth_l1_loss(chosen_q, target_q)
+                    # fp32 TD target/loss: under AMP chosen_q/next_q are fp16, and with
+                    # reward_scale applied the targets can exceed fp16 precision; compute in float32.
+                    target_q = (
+                        batch["rewards"].float()
+                        + config.learning.gamma * (1.0 - batch["dones"].float()) * next_q.float()
+                    )
+                loss = F.smooth_l1_loss(chosen_q.float(), target_q)
 
             optimizer.zero_grad(set_to_none=True)
             if amp_enabled:

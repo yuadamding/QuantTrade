@@ -147,6 +147,7 @@ def validate_existing_sidecar(
     dataset_path: Path,
     payload: dict[str, Any],
     news_llm_manifest_hash: str,
+    article_manifest_hash: str | None = None,
 ) -> None:
     if not isinstance(sidecar, dict):
         raise ValueError("news LLM sidecar payload is not a dictionary")
@@ -158,6 +159,12 @@ def validate_existing_sidecar(
         raise ValueError("integration_schema_version mismatch")
     if sidecar.get("news_llm_feature_manifest_hash") != news_llm_manifest_hash:
         raise ValueError("news_llm_feature_manifest_hash mismatch")
+    # The source-coverage masks (missing vs known-zero news) depend on the article manifest /
+    # source symbol set, which is derived from --article-root independently of --news-llm-root.
+    # A changed article manifest must force a rebuild so a stale sidecar is not reused with the
+    # wrong source-coverage masks.
+    if sidecar.get("news_article_manifest_hash") != article_manifest_hash:
+        raise ValueError("news_article_manifest_hash mismatch")
     if list(sidecar.get("action_names", [])) != list(payload.get("action_names", [])):
         raise ValueError("action_names mismatch")
     if list(sidecar.get("decision_timestamps", [])) != list(payload.get("decision_timestamps", [])):
@@ -210,11 +217,14 @@ def sidecar_action_features(bundle: dict[str, Any], decision_ms: list[int]) -> d
     mask_available = decision_tensor.expand_as(available)
     action_features = torch.cat([features, mask.float()], dim=-1)
     action_feature_available = torch.cat([available, mask_available], dim=-1)
-    known = action_feature_available >= 0
+    # Row-level freshness is the max availability over the VALUE channels only. The mask channels
+    # are pinned to decision_ms, so including them would make every row look perfectly fresh-at-T
+    # regardless of how stale the underlying news is, defeating any downstream staleness gating.
+    value_known = available >= 0
     row_available = torch.where(
-        known,
-        action_feature_available,
-        torch.full_like(action_feature_available, -1),
+        value_known,
+        available,
+        torch.full_like(available, -1),
     ).amax(dim=-1)
     feature_names = [
         *[f"stock_news_llm_v1.{name}" for name in NEWS_LLM_AGGREGATE_FEATURE_NAMES],
@@ -257,6 +267,7 @@ def build_sidecar(
                 dataset_path=dataset_path,
                 payload=payload,
                 news_llm_manifest_hash=news_llm_manifest_hash,
+                article_manifest_hash=article_manifest_hash,
             )
         except ValueError as exc:
             stale_existing_error = str(exc)
@@ -335,6 +346,7 @@ def build_sidecar(
         dataset_path=dataset_path,
         payload=payload,
         news_llm_manifest_hash=news_llm_manifest_hash,
+        article_manifest_hash=article_manifest_hash,
     )
     atomic_torch_save(sidecar, output)
     return {

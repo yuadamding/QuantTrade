@@ -27,8 +27,7 @@ raw Polygon news JSONL
 No script fetches current article URLs or article bodies. The extractor uses
 only the raw Polygon news payload already downloaded.
 
-The currently downloaded local model is a smoke-test and small experiment
-checkpoint:
+The active local model for the current converted-data integration stage is:
 
 ```text
 ../LLM/Qwen3-1.7B
@@ -37,17 +36,20 @@ revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
 manifest: ../LLM/Qwen3-1.7B/download_manifest.json
 ```
 
-The recommended under-30B production analyst stack is:
+The current local extraction stack is:
 
 ```text
-Primary extractor:   Qwen/Qwen3.6-27B
+Primary extractor:   Qwen/Qwen3-1.7B
 Validator/fallback:  google/gemma-4-26B-A4B-it
 Structured fallback: mistralai/Mistral-Small-3.2-24B-Instruct-2506
-Serving engine:      vLLM
+Serving engine:      local_transformers
 Output mode:         JSON schema
 Temperature:         0.0
 Top-p:               1.0
 ```
+
+`Qwen/Qwen3.6-27B` remains an explicit larger-model preset, but it is not the
+default on the local 10 GiB GPU path.
 
 This stack is for frozen, cached feature extraction only. Any historical run
 using a model before its model availability/training cutoff must be marked
@@ -67,8 +69,10 @@ data/polygon/stock_covariates/news_articles_v1/top500_2023_to_present/
 Feature table:
 
 ```text
+scripts/generate_qwen_news_precomputed.py
 scripts/build_news_llm_features.py
 data/polygon/stock_covariates/news_llm_v1/top500_2023_to_present/
+  precomputed_qwen3_1_7b.jsonl
   news_article_ticker_llm.parquet
   manifest.json
 ```
@@ -123,41 +127,72 @@ When importing rows produced by the downloaded local Qwen model, keep the model
 manifest attached:
 
 ```bash
+conda run -n ml1 python scripts/generate_qwen_news_precomputed.py \
+  --article-root ../data/polygon/stock_covariates/news_articles_v1/top500_2023_to_present \
+  --partitions-root ../data/protocol/polygon_second_top500_2023_to_2026-06-15/hour_from_second_1s/partitions \
+  --output-jsonl ../data/polygon/stock_covariates/news_llm_v1/qwen3_1_7b_top16_2023_to_present/precomputed_qwen3_1_7b.jsonl \
+  --local-model ../LLM/Qwen3-1.7B \
+  --device cuda \
+  --dtype bfloat16 \
+  --batch-size 8
+
 conda run -n ml1 python scripts/build_news_llm_features.py \
   --article-root ../data/polygon/stock_covariates/news_articles_v1/top500_2023_to_present \
-  --precomputed-jsonl data/examples/frozen_qwen_news_outputs.jsonl \
-  --local-model-preset qwen3_6_27b \
-  --provider vllm \
-  --model-available-timestamp-utc 2026-06-15T00:00:00+00:00 \
+  --output-root ../data/polygon/stock_covariates/news_llm_v1/qwen3_1_7b_top16_2023_to_present/features \
+  --precomputed-jsonl ../data/polygon/stock_covariates/news_llm_v1/qwen3_1_7b_top16_2023_to_present/precomputed_qwen3_1_7b.jsonl \
+  --local-model-preset qwen3_1_7b \
+  --provider local_transformers \
   --strict
 ```
 
 Available local manifest presets are:
 
 ```text
+qwen3_1_7b
 qwen3_6_27b
+qwen3_6_27b_fp8
 gemma4_26b_a4b_it
 mistral_small_3_2_24b
-qwen3_1_7b
 ```
 
-The `qwen3_1_7b` preset points to the downloaded smoke-test checkpoint. The
-larger presets are expected relative locations for frozen local manifests after
-those models are downloaded or served. Use `--local-model-manifest` only when
-importing outputs from a different frozen checkpoint.
+The `qwen3_1_7b` preset points to the downloaded local checkpoint and is the
+default for current local runs. The larger presets are expected relative
+locations for frozen local manifests. When
+`--precomputed-jsonl` is used and the selected preset manifest is missing,
+`scripts/build_news_llm_features.py` auto-downloads the preset from Hugging Face
+Hub into `../LLM/<model>/` and writes `download_manifest.json`. Pass
+`--no-auto-download-local-model` to require an existing manifest instead. Use
+`--local-model-manifest` only when importing outputs from a different frozen
+checkpoint.
+
+Auto-download requires:
+
+```bash
+conda run -n ml1 python -m pip install -e ".[llm]"
+```
+
+Optional revision pin:
+
+```bash
+--local-model-revision <huggingface_commit_or_tag>
+```
+
+The RL training scripts do not auto-download or call LLMs. They consume only the
+frozen feature table or `action_news_llm_covariates.pt` sidecar produced before
+training.
 
 Each `stock_news_llm_v1` feature manifest records:
 
 ```json
 {
   "llm_feature_group": "stock_news_llm_v1",
-  "primary_model_id": "Qwen/Qwen3.6-27B",
+  "primary_model_id": "Qwen/Qwen3-1.7B",
   "primary_model_role": "main_extractor",
   "secondary_model_id": "google/gemma-4-26B-A4B-it",
   "secondary_model_role": "validator_or_fallback",
   "fallback_model_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
   "fallback_model_role": "structured_output_fallback",
-  "serving_engine": "vllm",
+  "serving_engine": "local_transformers",
   "structured_output": "json_schema",
   "temperature": 0.0,
   "top_p": 1.0,

@@ -604,27 +604,29 @@ def main(argv: list[str] | None = None) -> int:
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-
-        aggregate = {
-            "run_name": args.run_name,
-            "created_at": datetime.now().isoformat(),
-            "partitions_root": str(args.partitions_root),
-            "output_dir": str(run_dir),
-            "device": str(device),
-            "torch_runtime": runtime,
-            "config": config_payload,
-            "constraints": asdict(constraints),
-            "partition_count": len(paths),
-            "partition_selection": args.partition_selection,
-            "partition_selection_reportability_errors": partition_selection_errors,
-            "selection_reportable": not partition_selection_errors,
-            "completed_count": sum(1 for item in records if item["status"] == "ok"),
-            "failed_count": sum(1 for item in records if item["status"] != "ok"),
-            "latest_checkpoint": str(previous_checkpoint) if previous_checkpoint is not None else None,
-            "records": records,
-        }
-        with manifest_path.open("w") as sink:
-            json.dump(aggregate, sink, indent=2)
+            # Persist the aggregate manifest in `finally` (runs before a re-raised partition
+            # failure propagates), so the failed record and incremented failed_count survive for
+            # post-mortem rather than being lost when the loop aborts.
+            aggregate = {
+                "run_name": args.run_name,
+                "created_at": datetime.now().isoformat(),
+                "partitions_root": str(args.partitions_root),
+                "output_dir": str(run_dir),
+                "device": str(device),
+                "torch_runtime": runtime,
+                "config": config_payload,
+                "constraints": asdict(constraints),
+                "partition_count": len(paths),
+                "partition_selection": args.partition_selection,
+                "partition_selection_reportability_errors": partition_selection_errors,
+                "selection_reportable": not partition_selection_errors,
+                "completed_count": sum(1 for item in records if item["status"] == "ok"),
+                "failed_count": sum(1 for item in records if item["status"] != "ok"),
+                "latest_checkpoint": str(previous_checkpoint) if previous_checkpoint is not None else None,
+                "records": records,
+            }
+            with manifest_path.open("w") as sink:
+                json.dump(aggregate, sink, indent=2)
 
     print(f"Rolling training complete. Summary -> {manifest_path}", flush=True)
     return 0

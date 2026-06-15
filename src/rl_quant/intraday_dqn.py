@@ -192,10 +192,15 @@ class VectorizedMarketEnv:
         current_day = self.data.day_ids[current_indices]
         next_day = self.data.day_ids[next_indices]
         day_ends = self.data.day_ends[current_day]
-        done = (next_day != current_day) | (next_indices + self.step_horizon >= day_ends) | (
-            self.steps + 1 >= self.config.episode_length
-        )
-        reward = reward - done.float() * action_positions.abs().float() * _transaction_cost_per_share(
+        # `terminal` = a genuine end of the tradable MDP (day/segment boundary): the position
+        # must be liquidated and the bootstrap must NOT continue. `truncated` = the artificial
+        # episode-length cutoff: the position economically persists, so we bootstrap THROUGH it
+        # (via the real next state stored in this transition) and charge no liquidation cost.
+        # See Pardo et al., "Time Limits in Reinforcement Learning".
+        terminal = (next_day != current_day) | (next_indices + self.step_horizon >= day_ends)
+        truncated = self.steps + 1 >= self.config.episode_length
+        resets = terminal | truncated
+        reward = reward - terminal.float() * action_positions.abs().float() * _transaction_cost_per_share(
             half_spread_next,
             extra_cost_per_share=self.extra_cost,
             commission_per_share=self.commission,
@@ -212,7 +217,10 @@ class VectorizedMarketEnv:
             "rewards": reward,
             "next_indices": next_indices,
             "next_positions": action_positions,
-            "dones": done,
+            # `dones` carries the BOOTSTRAP terminal (true terminal only) so the TD target
+            # bootstraps through episode truncations; `resets` drives env episode resets.
+            "dones": terminal,
+            "resets": resets,
         }
 
 
@@ -602,7 +610,12 @@ def train_dqn_agent(
     env = VectorizedMarketEnv(train_data, config, device)
 
     eval_trace: list[dict[str, float | int | None | str]] = []
-    best_val_pnl = 0.0
+    # Start at -inf so the best learned policy is always captured, even when every learned
+    # policy underperforms the flat-CASH baseline (0.0 PnL); a 0.0 floor would silently return
+    # the untrained CASH init and report it as "the trained agent". The CASH baseline is tracked
+    # separately below so a net-negative-but-best run is not mistaken for beating cash.
+    cash_baseline_val_pnl = 0.0
+    best_val_pnl = float("-inf")
     best_val_trades = 0
     best_state = deepcopy(q_network.state_dict())
 
@@ -645,7 +658,8 @@ def train_dqn_agent(
         transition = env.step(actions)
         replay.add(**transition)
         train_reward_trace.append(float(transition["rewards"].mean().item()))
-        env.reset(transition["dones"])
+        # Reset on terminal OR truncation; the TD target uses `dones` (true terminal only).
+        env.reset(transition["resets"])
 
         if replay.size >= max(config.warmup_steps, config.batch_size):
             batch = replay.sample(config.batch_size)
@@ -657,13 +671,20 @@ def train_dqn_agent(
                 chosen_q = current_q.gather(1, batch["actions"].unsqueeze(1)).squeeze(1)
 
                 with torch.no_grad():
-                    next_actions = torch.argmax(q_network(next_states, batch["next_positions"]), dim=1)
+                    # Double-DQN action selection via the ONLINE network, but using the SAME
+                    # threshold hysteresis that the behavior and evaluation policies apply, so the
+                    # bootstrap estimates the value of the policy that is actually executed/scored
+                    # (not a plain-greedy policy that is never run).
+                    next_online = q_network(next_states, batch["next_positions"])
+                    next_actions = _apply_action_threshold(
+                        next_online, batch["next_positions"], config.action_threshold
+                    )
                     next_q = target_network(next_states, batch["next_positions"]).gather(
                         1,
                         next_actions.unsqueeze(1),
                     ).squeeze(1)
-                    target_q = batch["rewards"] + config.gamma * (1.0 - batch["dones"]) * next_q
-                loss = F.smooth_l1_loss(chosen_q, target_q)
+                    target_q = batch["rewards"].float() + config.gamma * (1.0 - batch["dones"].float()) * next_q.float()
+                loss = F.smooth_l1_loss(chosen_q.float(), target_q)
 
             optimizer.zero_grad(set_to_none=True)
             if amp_enabled:
@@ -728,6 +749,8 @@ def train_dqn_agent(
     q_network.load_state_dict(best_state)
     return q_network, {
         "best_val_pnl": best_val_pnl,
+        "cash_baseline_val_pnl": cash_baseline_val_pnl,
+        "beats_cash_baseline_val": bool(best_val_pnl > cash_baseline_val_pnl),
         "amp_enabled": amp_enabled,
         "loss_trace": loss_trace,
         "train_reward_trace": train_reward_trace,

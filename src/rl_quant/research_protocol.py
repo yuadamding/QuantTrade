@@ -189,9 +189,23 @@ class ModelManifest:
             raise ResearchProtocolError("hyperparameter_search_space_hash is required.")
         if not self.selected_by:
             raise ResearchProtocolError("selected_by is required.")
+        if "test" in self.selected_by.lower():
+            raise ResearchProtocolError(
+                "selected_by must reference validation, not test; selecting a checkpoint on the test "
+                "split is leakage."
+            )
         self.validation_protocol.validate()
         if not self.baseline_results:
             raise ResearchProtocolError("Reportable models require at least one baseline result.")
+        baseline_names = {result.name for result in self.baseline_results}
+        missing_benchmarks = [
+            name for name in self.validation_protocol.benchmark_names if name not in baseline_names
+        ]
+        if missing_benchmarks:
+            raise ResearchProtocolError(
+                "Declared validation benchmark_names are missing from baseline_results: "
+                f"{missing_benchmarks}. Every declared benchmark must have a produced baseline result."
+            )
         if not self.cost_stress_results:
             raise ResearchProtocolError("Reportable models require at least one cost stress result.")
         if not self.frequency_stress_results:
@@ -218,12 +232,12 @@ DEFAULT_BENCHMARKS = [
     "BuyAndHold_SPY",
     "EqualWeight_ETFs",
     "PreviousActionNoTrade",
-    "RandomWithSameTurnover",
+    "RandomSameTurnover",
 ]
 
 
 def default_benchmark_registry(action_names: list[str]) -> list[str]:
-    out = ["CASH", "PreviousActionNoTrade", "RandomWithSameTurnover"]
+    out = ["CASH", "PreviousActionNoTrade", "RandomSameTurnover"]
     for candidate in ("QQQ", "SPY"):
         if candidate in action_names:
             out.append(f"BuyAndHold_{candidate}")

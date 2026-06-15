@@ -264,6 +264,11 @@ class ActionConfidenceCalibrator:
             "interval_alpha": float(coverage_alpha),
             "interval_coverage": float(covered[valid_residual].float().mean().item()),
             "hurdle_bps": float(self.config.hurdle_bps),
+            # These metrics are computed on the SAME residuals used to fit sigma, so they are
+            # in-sample and optimistic by construction (coverage sits near nominal, ECE/Brier
+            # are best-case). Treat them as fit diagnostics, not out-of-sample calibration.
+            "in_sample_optimistic": True,
+            "interval_coverage_basis": "residual_only_sigma_in_sample",
         }
         self.fitted = True
         return self
@@ -293,8 +298,17 @@ class ActionConfidenceCalibrator:
         p_positive = _normal_prob_greater(q_mean, q_std_total, self.config.hurdle_return)
         cash_mean = q_mean[:, :1]
         cash_std = q_std_total[:, :1]
+        # NOTE: diff_std assumes zero correlation between the action and CASH (no covariance
+        # term), so the difference variance is overstated and p_beats_cash is pulled toward
+        # 0.5 for correlated instruments. p_best_draw similarly assumes diagonal covariance.
+        # These are documented as independence-assuming heuristics in manifest().
         diff_std = torch.sqrt(q_std_total.square() + cash_std.square()).clamp_min(1e-8)
         p_beats_cash = _normal_prob_greater(q_mean - cash_mean, diff_std, self.config.hurdle_return)
+        # CASH-vs-CASH is an undefined self-comparison; expose NaN instead of a confusing
+        # sub-0.5 "cash beats cash" value (CASH is action index 0 by contract).
+        cash_self_mask = torch.zeros_like(p_beats_cash, dtype=torch.bool)
+        cash_self_mask[:, 0] = True
+        p_beats_cash = p_beats_cash.masked_fill(cash_self_mask, float("nan"))
         p_best_member_vote = self._p_best_member_vote(q_members_return, valid)
         if q_members_return.shape[0] == 1:
             self._append_warning_once("p_best_member_vote_is_argmax_indicator_with_single_member")
@@ -471,7 +485,21 @@ class ActionConfidenceCalibrator:
                 "p_best_draw": "Monte Carlo probability the action is best under independent normal predictive draws",
                 "selection_confidence": "p_best_draw after any configured OOD penalty",
                 "confidence": "selection_confidence^beta_best * profit_confidence^beta_positive",
+                "p_beats_cash": "P(action net return - CASH net return > hurdle); NaN for the CASH self-comparison",
             },
+            "independence_assumption": (
+                "p_best_draw and p_beats_cash assume cross-action independence (diagonal residual "
+                "covariance). For correlated instruments (e.g. QQQ/SPY/TQQQ or any action vs CASH) "
+                "the difference variance is overstated and these probabilities are biased toward 0.5; "
+                "treat them as upper-variance heuristics rather than calibrated probabilities until a "
+                "residual covariance is estimated and used for correlated draws."
+            ),
+            "calibration_metrics_basis": (
+                "calibration_metrics in this manifest are IN-SAMPLE (computed on the residuals used to "
+                "fit sigma) and optimistic; fit-time interval_coverage uses residual-only sigma whereas "
+                "predict-time q_lcb/q_ucb use sqrt(epistemic^2 + residual^2), so reported coverage does "
+                "not describe the published bands when ensemble_size > 1."
+            ),
             "p_best_method": "predictive_residual_draws",
             "p_best_member_vote_semantics": "ensemble_argmax_vote_fraction",
             "ood_method": self.ood_method,

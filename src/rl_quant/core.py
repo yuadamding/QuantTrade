@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -110,6 +111,9 @@ class TensorReplayBuffer:
             return
 
         if count >= self.capacity:
+            # A single add() larger than capacity keeps only the most recent `capacity` rows.
+            # Callers adding `num_envs` transitions per step should size capacity >> num_envs so
+            # a step's batch is never silently dropped.
             for name in self.storage:
                 transition[name] = transition[name][-self.capacity :]
             count = self.capacity
@@ -264,6 +268,12 @@ def autocast_context(device: torch.device, requested: bool):
 
 
 def make_grad_scaler(device: torch.device, requested: bool) -> torch.amp.GradScaler:
+    if requested and device.type != "cuda":
+        warnings.warn(
+            f"AMP/mixed precision was requested but the device is {device.type!r}, not CUDA; "
+            "AMP is disabled and this run uses fp32. Pass --device cuda for mixed precision.",
+            stacklevel=2,
+        )
     return torch.amp.GradScaler("cuda", enabled=cuda_amp_enabled(device, requested))
 
 

@@ -6,7 +6,7 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean, pstdev
+from statistics import mean, stdev
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
@@ -244,8 +244,15 @@ def metrics(
     ]
     total = test_values[-1] / test_values[0] - 1.0
     days = len(test_values) - 1
-    cagr = (1.0 + total) ** (252.0 / days) - 1.0 if days > 0 and total > -1.0 else float("nan")
-    sigma = pstdev(returns) if len(returns) >= 2 else 0.0
+    # Only annualize when at least ~1 trading year is present. Extrapolating a partial-year (e.g.
+    # ~115-day YTD) return to a full year via (1+total)**(252/days) inflates CAGR (and Calmar);
+    # for sub-year windows report the realized period return instead.
+    if days >= 252 and total > -1.0:
+        cagr = (1.0 + total) ** (252.0 / days) - 1.0
+    else:
+        cagr = total if total > -1.0 else float("nan")
+    # Sample standard deviation (ddof=1); population std is biased low on short samples.
+    sigma = stdev(returns) if len(returns) >= 2 else 0.0
     sharpe = mean(returns) / sigma * math.sqrt(252.0) if sigma > 0 else float("nan")
     peak = test_values[0]
     max_dd = 0.0
@@ -582,6 +589,13 @@ def main() -> int:
     print(f"Test dates: {dates[test_start_i]} -> {dates[-1]} ({len(dates) - test_start_i} rows)")
     print(f"Tested strategies: {len(specs)} + BH_QQQ")
     print(f"Cost model: {args.cost_bps:.2f} bps per unit turnover")
+    print(
+        f"WARNING: {len(specs)} specs are ranked on the SAME in-sample window with no holdout and "
+        "no multiple-comparisons correction. The top performers are dominated by selection noise "
+        "(best-of-N); treat these rankings as hypothesis generation only. For a reportable claim, "
+        "select on a strictly-earlier window and evaluate on a disjoint one, and apply a deflated-"
+        "Sharpe / SPA / White's-reality-check threshold."
+    )
     print(f"Results -> {args.output}")
     print(f"Top curves -> {args.curves_output}")
     if args.all_curves_output:

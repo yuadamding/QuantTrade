@@ -205,6 +205,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Aggregate bar availability latency. Use 1000 for Polygon one-second bars.",
     )
     parser.add_argument(
+        "--execution-latency-ms",
+        type=int,
+        default=0,
+        help=(
+            "Execution latency between the decision/reward timestamp and the simulated fill. "
+            "Action returns are priced at the first close at-or-after decision_ms+latency (entry) "
+            "and next_ms+latency (exit), so the realized return is never computed from a price "
+            "already observable at decision time. Use 1000 for Polygon one-second source bars."
+        ),
+    )
+    parser.add_argument(
         "--dense-hourly-grid",
         action="store_true",
         help="Generate hourly decision timestamps from exchange sessions instead of requiring exact source rows.",
@@ -404,7 +415,15 @@ def load_parquet_bar_features(paths: list[Path], *, start: str, end_exclusive: s
 
     out: dict[str, object] = {}
     previous_close: float | None = None
+    previous_date: str | None = None
     for ts, exchange_ts, open_value, high, low, close, volume in raw_rows:
+        session_date = str(exchange_ts)[:10]
+        if session_date != previous_date:
+            # Reset across session/date boundaries so the first bar of a session does not compute
+            # bar_return against the prior session's close (overnight/weekend gap mislabel). For
+            # 1-second source bars this otherwise injects an overnight jump into the first RTH bar.
+            previous_close = None
+            previous_date = session_date
         if previous_close is None or previous_close <= 0:
             bar_return = 0.0
             bar_log_return = 0.0
@@ -488,6 +507,27 @@ def close_at_or_before(
         return None
     if max_staleness_seconds > 0:
         age_ms = timestamp_ms - action_lookup.timestamp_ms[pos]
+        if age_ms < 0 or age_ms > max_staleness_seconds * 1_000:
+            return None
+    elif action_lookup.timestamp_ms[pos] != timestamp_ms:
+        return None
+    return action_lookup.closes[pos]
+
+
+def close_at_or_after(
+    lookup: ActionPriceLookup | tuple[list[str], list[float]],
+    timestamp: str | int,
+    *,
+    max_staleness_seconds: int,
+) -> float | None:
+    """First close at or after `timestamp` (used for simulated entry/exit fills)."""
+    action_lookup = coerce_action_lookup(lookup)
+    timestamp_ms = timestamp if isinstance(timestamp, int) else timestamp_to_epoch_ms(timestamp)
+    pos = bisect.bisect_left(action_lookup.timestamp_ms, timestamp_ms)
+    if pos >= len(action_lookup.timestamp_ms):
+        return None
+    if max_staleness_seconds > 0:
+        age_ms = action_lookup.timestamp_ms[pos] - timestamp_ms
         if age_ms < 0 or age_ms > max_staleness_seconds * 1_000:
             return None
     elif action_lookup.timestamp_ms[pos] != timestamp_ms:
@@ -813,7 +853,7 @@ def main() -> int:
         next_ms = decision_ms + decision_stride_ms
         next_ts = epoch_ms_to_utc_iso(next_ms)
         decision_context_ms = decision_ms - int(args.bar_latency_ms)
-        next_context_ms = next_ms - int(args.bar_latency_ms)
+        execution_latency_ms = int(args.execution_latency_ms)
         decision_date = exchange_timestamp[:10]
         minute_tensor: list[list[list[float]]] = []
         mask_tensor: list[list[bool]] = []
@@ -852,24 +892,36 @@ def main() -> int:
         action_returns = [0.0]
         decision_action_valid = [True]
         label_valid = [True]
+        entry_fill_ms = decision_ms + execution_latency_ms
+        exit_fill_ms = next_ms + execution_latency_ms
         for symbol in etf_symbols:
-            current_close = close_at_or_before(
-                action_price_lookup[symbol],
+            lookup = action_price_lookup[symbol]
+            # Decision-time validity uses the last price observable at/before the decision (minus
+            # bar latency). The realized return is priced from simulated FILLS at/after the
+            # decision and reward timestamps plus execution latency, so the label is never computed
+            # from a price that was already observable when the action was selected (no look-ahead).
+            feature_close = close_at_or_before(
+                lookup,
                 decision_context_ms,
                 max_staleness_seconds=args.max_action_staleness_seconds,
             )
-            future_close = close_at_or_before(
-                action_price_lookup[symbol],
-                next_context_ms,
+            entry_fill = close_at_or_after(
+                lookup,
+                entry_fill_ms,
                 max_staleness_seconds=args.max_action_staleness_seconds,
             )
-            action_decision_valid = current_close is not None
-            action_label_valid = current_close is not None and future_close is not None
+            exit_fill = close_at_or_after(
+                lookup,
+                exit_fill_ms,
+                max_staleness_seconds=args.max_action_staleness_seconds,
+            )
+            action_decision_valid = feature_close is not None
+            action_label_valid = entry_fill is not None and exit_fill is not None
             if not action_label_valid:
                 action_returns.append(math.nan)
                 label_valid.append(False)
             else:
-                action_returns.append(clipped_simple_return(current_close, future_close))
+                action_returns.append(clipped_simple_return(entry_fill, exit_fill))
                 label_valid.append(True)
             decision_action_valid.append(action_decision_valid)
         if sum(decision_action_valid) <= 1:
@@ -952,6 +1004,12 @@ def main() -> int:
             "source_bar_interval": source_bar_interval,
             "source_bar_seconds": source_bar_seconds,
             "bar_latency_ms": int(args.bar_latency_ms),
+            "execution_latency_ms": int(args.execution_latency_ms),
+            "action_fill_rule": "first_close_at_or_after_decision_plus_execution_latency",
+            # Truthful self-derived action schema hash for THIS hourly partition's actual action
+            # set. Cache identity in the converter additionally gates on universe_file_hash and
+            # conversion_config_hash, which catch hourly action-set changes driven by the universe.
+            "action_schema_hash": stable_json_hash(list(action_names)),
             "decision_grid": DEFAULT_DECISION_GRID_NAME,
             "decision_grid_minutes": DEFAULT_DECISION_GRID_MINUTES,
             "decision_stride_minutes": args.decision_stride_minutes,

@@ -170,10 +170,11 @@ What now works:
 - `scripts/build_news_article_table.py`, `scripts/build_news_llm_features.py`,
   and `scripts/build_news_llm_aggregates.py` build deduplicated news articles,
   article-ticker extraction rows, and optional hour-from-second action sidecars.
-- The recommended under-30B analyst stack is Qwen/Qwen3.6-27B as primary,
+- The current local analyst stack uses Qwen/Qwen3-1.7B as primary,
   google/gemma-4-26B-A4B-it as validator/fallback, and
   mistralai/Mistral-Small-3.2-24B-Instruct-2506 as structured-output fallback.
-  The downloaded `../LLM/Qwen3-1.7B` checkpoint remains a smoke-test option.
+  `Qwen/Qwen3.6-27B` remains an explicit larger-model preset, not the default
+  local path on the 10 GiB GPU used for this project stage.
   The frozen model manifest must be attached to any imported LLM feature table.
 
 What still does not work:

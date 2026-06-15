@@ -1185,8 +1185,15 @@ def train_hourly_transformer_dqn(
                         1,
                         next_actions.unsqueeze(1),
                     ).squeeze(1)
-                    target_q = batch["rewards"] + config.learning.gamma * (1.0 - batch["dones"]) * next_q
-                loss = F.smooth_l1_loss(chosen_q, target_q)
+                    # Build the TD target in float32: under AMP next_q/chosen_q are fp16, and with
+                    # reward_scale=10_000 the bootstrapped targets reach magnitudes where fp16
+                    # resolution (~0.5 near 1e3) is comparable to per-step rewards. Compute the
+                    # target and smooth_l1 loss in fp32 to avoid injecting quantization noise.
+                    target_q = (
+                        batch["rewards"].float()
+                        + config.learning.gamma * (1.0 - batch["dones"].float()) * next_q.float()
+                    )
+                loss = F.smooth_l1_loss(chosen_q.float(), target_q)
 
             optimizer.zero_grad(set_to_none=True)
             if scaler.is_enabled():
@@ -1217,6 +1224,10 @@ def train_hourly_transformer_dqn(
                 action_meta=action_meta,
                 episode_length=config.env.episode_length,
             )
+            # evaluate_hourly_policy() puts the shared q_network in eval() mode; restore train()
+            # so the rest of training keeps dropout active (otherwise dropout is silently disabled
+            # from the first eval onward).
+            q_network.train()
             avg_loss = sum(loss_trace[-200:]) / max(len(loss_trace[-200:]), 1)
             avg_reward = sum(reward_trace[-200:]) / max(len(reward_trace[-200:]), 1)
             eval_trace.append(

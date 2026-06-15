@@ -6,7 +6,7 @@ import csv
 import json
 import math
 from pathlib import Path
-from statistics import mean, median, pstdev
+from statistics import mean, median, pstdev, stdev
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
@@ -136,9 +136,11 @@ def max_drawdown(equity: list[float]) -> float:
 
 
 def sharpe_ratio(returns: list[float]) -> float:
+    # Sample standard deviation (ddof=1), not population: on short (~115-day) YTD samples the
+    # population sigma is biased low and inflates Sharpe. Risk-free rate is assumed 0.
     if len(returns) < 2:
         return 0.0
-    sigma = pstdev(returns)
+    sigma = stdev(returns)
     if sigma <= 0:
         return 0.0
     return mean(returns) / sigma * math.sqrt(252.0)
@@ -198,6 +200,9 @@ def select_actions(
         selected.append(name)
         seen_return_paths.add(fingerprint)
 
+    # CASH is action index 0 (zero-return, zero-cost de-risk fallback), consistent with the
+    # intraday/second/hour pipelines. BH_QQQ follows as the buy-and-hold benchmark.
+    add("CASH")
     add("BH_QQQ")
     for name in ordered_names:
         add(name)
@@ -530,7 +535,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-actions", type=int, default=256)
     parser.add_argument("--start-date", default="2026-01-01")
     parser.add_argument("--end-date")
-    parser.add_argument("--switch-cost-bps", type=float, default=0.0)
+    parser.add_argument(
+        "--switch-cost-bps",
+        type=float,
+        default=5.0,
+        help=(
+            "Per-switch cost in bps charged on action changes. Default 5.0 (non-zero) so the "
+            "headline baseline policy returns are cost-aware; pass 0.0 only for an explicitly "
+            "frictionless diagnostic."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -553,6 +567,11 @@ def main() -> int:
         raise ValueError("The curves file must contain BH_QQQ as the benchmark/fallback action.")
 
     returns_by_name = {name: daily_returns(values) for name, values in curves.items()}
+    # Inject a synthetic CASH action: a flat equity curve / all-zero return series. This gives the
+    # allocator a zero-return, zero-cost de-risk action at index 0 (CASH-index-0 invariant); the
+    # agent can now move to cash rather than being forced into a fully-invested strategy curve.
+    curves["CASH"] = [10_000.0] * len(dates)
+    returns_by_name["CASH"] = [0.0] * len(dates)
     metrics = read_metrics(args.metrics)
     variation_metrics = read_metrics(args.variation_metrics)
     preferred_order = read_strategy_order(args.selection_ranking)
@@ -604,11 +623,13 @@ def main() -> int:
         manifest_rows,
     )
 
-    fallback_action = selected.index("BH_QQQ")
+    # Fallback is CASH (the zero-risk de-risk action at index 0), not BH_QQQ.
+    fallback_action = selected.index("CASH") if "CASH" in selected else 0
+    benchmark_action = selected.index("BH_QQQ") if "BH_QQQ" in selected else fallback_action
     policy_rows: list[dict[str, object]] = []
     policy_records: dict[str, list[dict[str, object]]] = {}
     policies = {
-        "BH_QQQ": [fallback_action] * len(dates),
+        "BH_QQQ": [benchmark_action] * len(dates),
         "BestFixedHindsight": [
             max(
                 range(len(selected)),
@@ -639,6 +660,9 @@ def main() -> int:
         "Trailing21": "Non-oracle; picks the best action by trailing 21 trading days.",
         "OracleNextDay": "Upper-bound diagnostic only; uses same-day future returns.",
     }
+    # Machine-readable flag so downstream reporting cannot rank these look-ahead upper bounds
+    # against achievable policies on the strength of a human-readable Note alone.
+    diagnostic_upper_bound = {"BestFixedHindsight", "OracleNextDay"}
     for name, sequence in policies.items():
         metrics_row, records = evaluate_sequence(
             dates,
@@ -651,6 +675,7 @@ def main() -> int:
         policy_rows.append(
             {
                 "Policy": name,
+                "IsDiagnosticUpperBound": int(name in diagnostic_upper_bound),
                 "Total Return [%]": f"{metrics_row['Total Return [%]']:.6f}",
                 "Sharpe": f"{metrics_row['Sharpe']:.6f}",
                 "Max DD [%]": f"{metrics_row['Max DD [%]']:.6f}",
@@ -662,7 +687,7 @@ def main() -> int:
 
     write_rows(
         args.output_dir / "baseline_policies.csv",
-        ["Policy", "Total Return [%]", "Sharpe", "Max DD [%]", "Final Equity", "Switches", "Note"],
+        ["Policy", "IsDiagnosticUpperBound", "Total Return [%]", "Sharpe", "Max DD [%]", "Final Equity", "Switches", "Note"],
         policy_rows,
     )
     write_rows(
@@ -687,8 +712,28 @@ def main() -> int:
         "universe_dir": str(args.universe_dir),
         "total_curves": len(ordered_names),
         "selected_actions": len(selected),
+        "cash_action_index": selected.index("CASH") if "CASH" in selected else None,
         "state_features": feature_names,
         "switch_cost_bps": args.switch_cost_bps,
+        # Reportability is gated: the daily research pipeline has known methodology limitations
+        # that must be resolved (not just documented) before any test-split result is treated as
+        # a genuine out-of-sample estimate. These are surfaced here so downstream consumers
+        # fail-closed rather than silently trusting contaminated metrics.
+        "reportable": False,
+        "known_limitations": [
+            "selection_in_sample: actions are selected from full-window 2026 rankings (massive_2026 "
+            "best-of-N + rank/analyze), so a within-2026 train/val/test split is not a true holdout "
+            "(data snooping). Select on a strictly-earlier window for reportable results.",
+            "survivorship_universe: the universe/market-caps are taken as-of mid-2026 and applied "
+            "retroactively across all of 2026; the universe selection date is AFTER the first "
+            "dataset timestamp, violating the point-in-time universe invariant.",
+            "ecology_features_may_leak: if market-ecology features are merged in, their centroids/"
+            "betas are fit over the full output window unless learn_market_ecological_attention.py "
+            "was run with a prior-only --fit-end-date; without it, val/test state features embed "
+            "future labels.",
+            "dense_zero_filled_returns: invalid/illiquid action bars are written as 0.0 (the dataset "
+            "format has no label-valid mask), so a data gap reads as a flat day rather than NaN.",
+        ],
         "outputs": {
             "state_features": str(args.output_dir / "state_features.csv"),
             "action_returns": str(args.output_dir / "action_returns.csv"),

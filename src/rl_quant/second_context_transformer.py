@@ -898,7 +898,7 @@ def evaluate_second_context_action_scorer(
         return metrics
     q_rows = q_values[rows]
     valid_rows = split.action_valid_mask[rows]
-    masked_q = q_rows.masked_fill(~valid_rows, -1e9)
+    masked_q = q_rows.masked_fill(~valid_rows, torch.finfo(q_rows.dtype).min)
     actions = masked_q.argmax(dim=1)
     rewards = split.action_returns[rows, actions]
     weights = split.action_target_weights[rows, actions]
@@ -973,7 +973,7 @@ def evaluate_second_context_trading_policy(
             cooldown_remaining = 0
             previous_row = None
             continue
-        raw_masked_q = q_values[row].masked_fill(~decision_valid, -1e9)
+        raw_masked_q = q_values[row].masked_fill(~decision_valid, torch.finfo(q_values.dtype).min)
         raw_policy_action = int(raw_masked_q.argmax().item())
         valid = decision_valid.clone()
         if min_hold_bars > 1 and bars_held < min_hold_bars and previous_action < valid.numel():
@@ -984,7 +984,7 @@ def evaluate_second_context_trading_policy(
             hold_only = torch.zeros_like(valid)
             hold_only[previous_action] = valid[previous_action]
             valid = hold_only if bool(hold_only.any().item()) else valid
-        masked_q = q_values[row].masked_fill(~valid, -1e9)
+        masked_q = q_values[row].masked_fill(~valid, torch.finfo(q_values.dtype).min)
         requested_action = int(masked_q.argmax().item())
         executed_action = requested_action
         row_label_valid = (
