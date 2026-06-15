@@ -106,6 +106,7 @@ class HourFromMinuteDataSplit:
     hours_lookback: int
     minutes_per_hour: int
     periods_per_year: float = 252.0 * 6.0
+    action_valid_mask: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> "HourFromMinuteDataSplit":
         return replace(
@@ -114,6 +115,7 @@ class HourFromMinuteDataSplit:
             minute_mask=self.minute_mask.to(device),
             hour_features=self.hour_features.to(device),
             action_returns=self.action_returns.to(device),
+            action_valid_mask=self.action_valid_mask.to(device) if self.action_valid_mask is not None else None,
             valid_start_indices=self.valid_start_indices.to(device),
             valid_index_mask=self.valid_index_mask.to(device),
             minute_feature_mean=self.minute_feature_mean.to(device),
@@ -124,6 +126,15 @@ class HourFromMinuteDataSplit:
 
     def state(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.minute_features[indices], self.minute_mask[indices], self.hour_features[indices]
+
+    def valid_actions(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.action_valid_mask is None:
+            return torch.ones(
+                (indices.shape[0], self.action_returns.shape[1]),
+                dtype=torch.bool,
+                device=indices.device,
+            )
+        return self.action_valid_mask[indices]
 
 
 def _assert_increasing(values: list[str], *, name: str) -> None:
@@ -232,6 +243,11 @@ def _build_split(
     all_minute_mask = payload["minute_mask"].bool()
     all_hour_features = payload["hour_features"].float()
     all_returns = payload["action_returns"].float()
+    all_action_valid = payload.get("action_valid_mask")
+    if all_action_valid is not None:
+        all_action_valid = all_action_valid.bool()
+        if tuple(all_action_valid.shape) != tuple(all_returns.shape):
+            raise ValueError("action_valid_mask shape must match action_returns shape.")
     row_count = len(decisions)
     if all_minute_features.shape[0] != row_count or all_minute_mask.shape[0] != row_count:
         raise ValueError("minute feature/mask row counts must match decision_timestamps length.")
@@ -252,6 +268,7 @@ def _build_split(
     raw_mask = all_minute_mask[selected]
     raw_hour = all_hour_features[selected]
     returns = all_returns[selected]
+    action_valid_mask = all_action_valid[selected] if all_action_valid is not None else None
 
     valid: list[int] = []
     for index, decision_ts in enumerate(decision_subset):
@@ -291,6 +308,7 @@ def _build_split(
         minute_mask=raw_mask,
         hour_features=hour,
         action_returns=returns,
+        action_valid_mask=action_valid_mask,
         valid_start_indices=valid_start_indices,
         valid_index_mask=valid_index_mask,
         minute_feature_mean=minute_feature_mean,
@@ -359,6 +377,10 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError(f"Hour feature names/order differ between {reference.name!r} and {split.name!r}.")
         if split.action_names != reference.action_names:
             raise ValueError(f"Action names/order differ between {reference.name!r} and {split.name!r}.")
+        if (split.action_valid_mask is None) != (reference.action_valid_mask is None):
+            raise ValueError("Splits must agree on whether action_valid_mask is present.")
+        if split.action_valid_mask is not None and split.action_valid_mask.shape[1] != reference.action_returns.shape[1]:
+            raise ValueError(f"Action-valid mask dimensions differ for split {split.name!r}.")
         if split.minute_features.shape[1:] != reference.minute_features.shape[1:]:
             raise ValueError(f"Minute tensor shape differs between {reference.name!r} and {split.name!r}.")
         if split.hour_features.shape[1:] != reference.hour_features.shape[1:]:
@@ -556,7 +578,7 @@ class VectorizedMinuteToHourEnv:
         )
 
     def action_mask(self) -> torch.Tensor:
-        return build_action_mask(
+        constraint_mask = build_action_mask(
             current_action=self.previous_actions,
             bars_held=self.bars_held,
             cooldown_remaining=self.cooldown_remaining,
@@ -573,6 +595,13 @@ class VectorizedMinuteToHourEnv:
             cash_index=self.config.constraints.cash_index,
             count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
+        availability_mask = self.data.valid_actions(self.indices)
+        availability_mask[:, int(self.config.constraints.cash_index)] = True
+        mask = constraint_mask & availability_mask
+        empty_rows = ~mask.any(dim=1)
+        if bool(empty_rows.any().item()):
+            mask[empty_rows, int(self.config.constraints.cash_index)] = True
+        return mask
 
     def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         minute, mask, hour = self.data.state(self.indices)
@@ -584,7 +613,9 @@ class VectorizedMinuteToHourEnv:
         constraint_features = self.constraint_features()
         action_mask = self.action_mask()
         actions = actions.long()
-        actions = torch.where(action_mask.gather(1, actions.unsqueeze(1)).squeeze(1), actions, previous_actions)
+        selected_valid = action_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
+        fallback_actions = torch.argmax(action_mask.long(), dim=1)
+        actions = torch.where(selected_valid, actions, fallback_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
         legs = trade_legs(
             previous_actions,
@@ -753,6 +784,11 @@ def evaluate_minute_to_hour_policy(
             cash_index=constraints.cash_index,
             count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
         )
+        availability_mask = data.valid_actions(torch.tensor([index], dtype=torch.long, device=device))
+        availability_mask[:, int(constraints.cash_index)] = True
+        action_mask = action_mask & availability_mask
+        if not bool(action_mask.any().item()):
+            action_mask[:, int(constraints.cash_index)] = True
         q_values = model(minute, mask, hour, prev_tensor, constraints_tensor)
         action = int(
             apply_leg_aware_hysteresis(

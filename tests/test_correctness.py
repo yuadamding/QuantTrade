@@ -21,17 +21,30 @@ from rl_quant.decision_framework import (  # noqa: E402
     ActionEligibility,
     DataQualityReport,
     DecisionFrameworkError,
+    DecisionDataset,
+    FeatureManifest,
     DecisionLog,
     DecisionSnapshot,
+    ReadinessConfig,
     apply_data_quality_gate,
     action_eligibilities_to_mask,
     assert_available_at,
     decision_readiness_score,
     filter_point_in_time_rows,
     readiness_band,
+    validate_reportable_summary,
+)
+from rl_quant.action_risk import (  # noqa: E402
+    ExposureConstraintConfig,
+    action_concentration,
+    action_weight_tensor,
+    build_action_metadata,
+    reportability_flags,
+    trade_notional,
 )
 from rl_quant.hourly_transformer import (  # noqa: E402
     CausalTransformerQNetwork,
+    HOURLY_CONSTRAINT_FEATURE_DIM,
     HourlyDataSplit,
     HourlyEnvConfig,
     VectorizedHourlyAllocationEnv,
@@ -40,10 +53,12 @@ from rl_quant.hourly_transformer import (  # noqa: E402
 )
 from rl_quant.intraday_dqn import _apply_action_threshold  # noqa: E402
 from rl_quant.minute_to_hour_transformer import (  # noqa: E402
+    HourFromMinuteDataSplit,
     MinuteToHourCausalTransformerQNetwork,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
+    evaluate_minute_to_hour_policy,
     make_constraint_features,
     sample_valid_actions,
     trade_legs,
@@ -388,6 +403,18 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual(action.tolist(), [1])
 
+    def test_leg_aware_hysteresis_forces_exit_when_current_action_masked(self) -> None:
+        action = apply_leg_aware_hysteresis(
+            torch.tensor([[0.0, 100.0]]),
+            torch.tensor([1]),
+            torch.tensor([[True, False]]),
+            one_way_cost_bps=0.0,
+            extra_switch_penalty_bps=0.0,
+            q_switch_margin_bps=0.0,
+        )
+
+        self.assertEqual(action.tolist(), [0])
+
     def test_sample_valid_actions_uses_valid_set_only(self) -> None:
         actions = sample_valid_actions(torch.tensor([[False, True, False], [True, False, False]]))
 
@@ -520,6 +547,62 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(constraints.max_switches_per_day, 2)
         self.assertEqual(constraints.q_switch_margin_bps, 3.0)
 
+    def test_minute_to_hour_eval_respects_action_valid_mask(self) -> None:
+        class UnavailableActionPolicy(nn.Module):
+            def forward(
+                self,
+                minute_features: torch.Tensor,
+                minute_mask: torch.Tensor,
+                hour_features: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor,
+            ) -> torch.Tensor:
+                q_values = torch.zeros((minute_features.shape[0], 2), device=minute_features.device)
+                q_values[:, 1] = 100.0
+                return q_values
+
+        data = HourFromMinuteDataSplit(
+            name="test",
+            decision_timestamps=[
+                "2026-01-02T14:30:00+00:00",
+                "2026-01-02T14:31:00+00:00",
+                "2026-01-02T14:32:00+00:00",
+            ],
+            next_timestamps=[
+                "2026-01-02T14:31:00+00:00",
+                "2026-01-02T14:32:00+00:00",
+                "2026-01-02T14:33:00+00:00",
+            ],
+            minute_feature_names=["m"],
+            hour_feature_names=["h"],
+            action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((3, 1, 1, 1), dtype=torch.float32),
+            minute_mask=torch.ones((3, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((3, 1, 1), dtype=torch.float32),
+            action_returns=torch.zeros((3, 2), dtype=torch.float32),
+            valid_start_indices=torch.tensor([1], dtype=torch.long),
+            valid_index_mask=torch.tensor([False, True, False]),
+            minute_feature_mean=torch.zeros(1),
+            minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1),
+            hour_feature_std=torch.ones(1),
+            hours_lookback=1,
+            minutes_per_hour=1,
+            action_valid_mask=torch.tensor([[True, True], [True, False], [True, True]]),
+        )
+
+        result = evaluate_minute_to_hour_policy(
+            data,
+            UnavailableActionPolicy(),
+            device=torch.device("cpu"),
+            initial_action=0,
+            constraints=TradingConstraintConfig(one_way_cost_bps=0.0),
+            capture_rollout=True,
+        )
+
+        self.assertEqual(result.allocation_switches, 0)
+        self.assertEqual([row["asset"] for row in result.rollout_records], ["CASH"])
+
 
 class HourlySplitTests(unittest.TestCase):
     def test_next_timestamps_are_required(self) -> None:
@@ -583,6 +666,72 @@ class HourlySplitTests(unittest.TestCase):
             self.assertLessEqual(split.next_timestamps[index], "2026-01-02T14:35:00+00:00")
 
 
+class ActionRiskTests(unittest.TestCase):
+    def test_action_metadata_scales_leveraged_etf_weight(self) -> None:
+        metadata = build_action_metadata(["CASH", "QQQ", "SOXL", "SOXS"])
+
+        soxl = metadata[2]
+        soxs = metadata[3]
+        self.assertEqual(soxl.group, "semiconductor")
+        self.assertEqual(soxl.leverage, 3.0)
+        self.assertAlmostEqual(soxl.max_weight, 1.0 / 3.0)
+        self.assertTrue(soxs.inverse)
+
+    def test_trade_notional_scales_cost_by_position_weight(self) -> None:
+        metadata = build_action_metadata(["CASH", "SOXL", "QQQ"])
+        weights = action_weight_tensor(metadata, device="cpu", max_effective_leverage=1.0)
+
+        cash_to_soxl = trade_notional(torch.tensor([0]), torch.tensor([1]), weights)
+        soxl_to_qqq = trade_notional(torch.tensor([1]), torch.tensor([2]), weights)
+
+        self.assertAlmostEqual(float(cash_to_soxl[0].item()), 1.0 / 3.0)
+        self.assertAlmostEqual(float(soxl_to_qqq[0].item()), 1.0 + 1.0 / 3.0)
+
+    def test_concentration_and_reportability_flag_leveraged_group_collapse(self) -> None:
+        metadata = build_action_metadata(["CASH", "SOXL", "SOXS"])
+        records = [
+            {"asset": "SOXL", "gross_return": 0.01, "bar_return": 0.01, "equity": 1.01, "timestamp": "t1"},
+            {"asset": "SOXS", "gross_return": -0.01, "bar_return": -0.01, "equity": 1.00, "timestamp": "t2"},
+        ]
+
+        concentration = action_concentration(records, action_meta=metadata)
+        flags = reportability_flags(
+            test_metrics={"total_return": -0.01},
+            baselines={
+                "CASH": {"test": {"total_return": 0.0}},
+                "BuyAndHold_QQQ": {"test": {"total_return": 0.01}},
+            },
+            concentration=concentration,
+            max_group_share=0.75,
+            max_leveraged_share=0.50,
+        )
+
+        self.assertEqual(concentration["max_group"], "semiconductor")
+        self.assertEqual(concentration["max_group_share"], 1.0)
+        self.assertFalse(flags["reportable"])
+        self.assertIn("test_return_below_cash", flags["reasons"])
+        self.assertIn("max_group_share_exceeds_limit", flags["reasons"])
+
+    def test_reportability_ignores_cash_for_risky_group_concentration(self) -> None:
+        metadata = build_action_metadata(["CASH", "QQQ"])
+        concentration = action_concentration(
+            [{"asset": "CASH", "bar_return": 0.0, "equity": 1.0, "timestamp": "t1"}],
+            action_meta=metadata,
+        )
+
+        flags = reportability_flags(
+            test_metrics={"total_return": 0.0},
+            baselines={"CASH": {"test": {"total_return": 0.0}}},
+            concentration=concentration,
+            max_group_share=0.75,
+            max_leveraged_share=0.50,
+        )
+
+        self.assertEqual(concentration["max_group"], "cash")
+        self.assertEqual(concentration["max_risky_group_share"], 0.0)
+        self.assertTrue(flags["reportable"])
+
+
 class EvaluationTests(unittest.TestCase):
     def _direct_bar_split(self) -> HourlyDataSplit:
         valid = torch.tensor([1, 2, 3, 4], dtype=torch.long)
@@ -597,6 +746,30 @@ class EvaluationTests(unittest.TestCase):
             features=torch.zeros((6, 1), dtype=torch.float32),
             action_returns=torch.zeros((6, 3), dtype=torch.float32),
             session_dates=["2026-01-02"] * 6,
+            valid_start_indices=valid,
+            valid_index_mask=valid_mask,
+            feature_mean=torch.zeros(1),
+            feature_std=torch.ones(1),
+            lookback=1,
+            bar_interval="1m",
+        )
+
+    def _leveraged_direct_bar_split(self) -> HourlyDataSplit:
+        valid = torch.tensor([1, 2], dtype=torch.long)
+        valid_mask = torch.zeros(4, dtype=torch.bool)
+        valid_mask[valid] = True
+        returns = torch.zeros((4, 2), dtype=torch.float32)
+        returns[1, 1] = 0.09
+        returns[2, 1] = 0.03
+        return HourlyDataSplit(
+            name="test",
+            timestamps=[f"2026-01-02T14:3{minute}:00+00:00" for minute in range(4)],
+            next_timestamps=[f"2026-01-02T14:3{minute + 1}:00+00:00" for minute in range(4)],
+            feature_names=["x"],
+            action_names=["CASH", "SOXL"],
+            features=torch.zeros((4, 1), dtype=torch.float32),
+            action_returns=returns,
+            session_dates=["2026-01-02"] * 4,
             valid_start_indices=valid,
             valid_index_mask=valid_mask,
             feature_mean=torch.zeros(1),
@@ -645,6 +818,60 @@ class EvaluationTests(unittest.TestCase):
         mask = env.action_mask()
 
         self.assertEqual(mask.tolist(), [[True, True, False]])
+        self.assertEqual(tuple(env.constraint_features().shape), (1, HOURLY_CONSTRAINT_FEATURE_DIM))
+
+    def test_direct_bar_env_exposure_mask_caps_leveraged_bars(self) -> None:
+        data = self._leveraged_direct_bar_split()
+        env = VectorizedHourlyAllocationEnv(
+            data,
+            HourlyEnvConfig(
+                lookback=1,
+                num_envs=1,
+                episode_length=4,
+                initial_action=0,
+                exposure_constraints=ExposureConstraintConfig(
+                    max_leveraged_bars_per_day=1,
+                    max_consecutive_leveraged_bars=None,
+                ),
+            ),
+            torch.device("cpu"),
+        )
+        env.bars_held[:] = 10
+        env.leveraged_bars_today[:] = 1
+
+        mask = env.action_mask()
+
+        self.assertEqual(mask.tolist(), [[True, False]])
+
+    def test_direct_hourly_eval_scales_leveraged_returns(self) -> None:
+        class FixedPolicy(nn.Module):
+            def forward(
+                self,
+                state_windows: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                return torch.tensor([[0.0, 1.0]], device=state_windows.device).repeat(
+                    state_windows.shape[0],
+                    1,
+                )
+
+        result = evaluate_hourly_policy(
+            self._leveraged_direct_bar_split(),
+            FixedPolicy(),
+            device=torch.device("cpu"),
+            initial_action=0,
+            constraints=BarTradingConstraintConfig(one_way_cost_bps=0.0),
+            exposure_constraints=ExposureConstraintConfig(
+                max_leveraged_bars_per_day=None,
+                max_consecutive_leveraged_bars=None,
+            ),
+            capture_rollout=True,
+        )
+
+        self.assertAlmostEqual(result.rollout_records[0]["raw_action_return"], 0.09)
+        self.assertAlmostEqual(result.rollout_records[0]["position_weight"], 1.0 / 3.0)
+        self.assertAlmostEqual(result.rollout_records[0]["gross_return"], 0.03)
 
     def test_direct_hourly_eval_resets_episode_switch_cap_by_episode_length(self) -> None:
         class OppositePolicy(nn.Module):
@@ -717,9 +944,18 @@ class EvaluationTests(unittest.TestCase):
                 "5",
                 "--extra-switch-penalty-bps",
                 "1",
+                "--max-effective-leverage",
+                "0.75",
+                "--max-leveraged-bars-per-day",
+                "10",
+                "--max-consecutive-leveraged-bars",
+                "5",
+                "--max-same-group-share-per-day",
+                "0.5",
             ]
         )
         constraints = module.build_constraints_from_args(args)
+        exposure_constraints = module.build_exposure_constraints_from_args(args)
 
         self.assertEqual(constraints.one_way_cost_bps, 2.0)
         self.assertEqual(constraints.min_hold_bars, 15)
@@ -729,6 +965,10 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(constraints.max_order_legs_per_day, 8.0)
         self.assertEqual(constraints.q_switch_margin_bps, 5.0)
         self.assertEqual(constraints.extra_switch_penalty_bps, 1.0)
+        self.assertEqual(exposure_constraints.max_effective_leverage, 0.75)
+        self.assertEqual(exposure_constraints.max_leveraged_bars_per_day, 10)
+        self.assertEqual(exposure_constraints.max_consecutive_leveraged_bars, 5)
+        self.assertEqual(exposure_constraints.max_same_group_share_per_day, 0.5)
 
     def test_fixed_rollout_cost_stress_replays_same_actions(self) -> None:
         module = load_script("train_hourly_causal_transformer_rl")
@@ -739,6 +979,7 @@ class EvaluationTests(unittest.TestCase):
                     "action": 1,
                     "previous_action": 0,
                     "market_order_legs": 1.0,
+                    "traded_notional": 0.5,
                     "gross_return": 0.01,
                 },
                 {
@@ -755,7 +996,27 @@ class EvaluationTests(unittest.TestCase):
 
         self.assertEqual(result["0bps"]["total_switches"], 1)
         self.assertEqual(result["100bps"]["market_order_legs"], 1.0)
+        self.assertEqual(result["100bps"]["total_traded_notional"], 0.5)
         self.assertLess(result["100bps"]["total_return"], result["0bps"]["total_return"])
+
+    def test_fixed_rollout_cost_stress_preserves_old_rollout_cost_formula(self) -> None:
+        module = load_script("train_hourly_causal_transformer_rl")
+
+        result = module.fixed_rollout_cost_stress(
+            [
+                {
+                    "action": 2,
+                    "previous_action": 1,
+                    "market_order_legs": 2.0,
+                    "gross_return": 0.0,
+                },
+            ],
+            cost_bps_values=[10.0],
+            extra_switch_penalty_bps=5.0,
+            periods_per_year=252.0,
+        )
+
+        self.assertEqual(result["10bps"]["total_reward_bps"], -25.0)
 
     def test_fixed_rollout_cost_stress_requires_gross_return(self) -> None:
         module = load_script("train_hourly_causal_transformer_rl")
@@ -932,6 +1193,35 @@ class SchemaTests(unittest.TestCase):
 
 
 class DecisionFrameworkTests(unittest.TestCase):
+    def _eligibility(
+        self,
+        *,
+        symbol_id: str = "CASH",
+        decision_ts: str = "2026-01-02T14:30:00+00:00",
+        available_ts: str = "2026-01-02T14:29:00+00:00",
+        tradable: bool = True,
+        reason_if_excluded: str | None = None,
+        leverage_factor: float = 0.0,
+        inverse: bool = False,
+        risk_bucket: str = "cash",
+    ) -> ActionEligibility:
+        return ActionEligibility(
+            symbol_id=symbol_id,
+            decision_ts=decision_ts,
+            available_ts=available_ts,
+            source="synthetic",
+            source_payload_hash="abc",
+            calculation_window="20d",
+            tradable=tradable,
+            reason_if_excluded=reason_if_excluded,
+            avg_dollar_volume_20d=0.0 if symbol_id == "CASH" else 1_000_000.0,
+            median_spread_bps_20d=0.0 if symbol_id == "CASH" else 25.0,
+            missing_bar_rate_5d=0.0,
+            leverage_factor=leverage_factor,
+            inverse=inverse,
+            risk_bucket=risk_bucket,
+        )
+
     def test_point_in_time_rows_reject_future_available_timestamp(self) -> None:
         rows = [
             {"available_timestamp": "2026-01-02T14:29:00+00:00", "value": 1},
@@ -950,33 +1240,23 @@ class DecisionFrameworkTests(unittest.TestCase):
 
     def test_action_eligibility_and_quality_gate_force_cash(self) -> None:
         eligibilities = [
-            ActionEligibility(
+            self._eligibility(
                 symbol_id="CASH",
-                decision_ts="2026-01-02T14:30:00+00:00",
                 tradable=True,
                 reason_if_excluded=None,
-                avg_dollar_volume_20d=0.0,
-                median_spread_bps_20d=0.0,
-                missing_bar_rate_5d=0.0,
                 leverage_factor=0.0,
                 inverse=False,
                 risk_bucket="cash",
             ),
-            ActionEligibility(
+            self._eligibility(
                 symbol_id="SOXL",
-                decision_ts="2026-01-02T14:30:00+00:00",
                 tradable=False,
                 reason_if_excluded="spread_too_wide",
-                avg_dollar_volume_20d=1_000_000.0,
-                median_spread_bps_20d=25.0,
-                missing_bar_rate_5d=0.1,
                 leverage_factor=3.0,
                 inverse=False,
                 risk_bucket="leveraged_etf",
             ),
         ]
-        for item in eligibilities:
-            item.validate()
 
         mask, reasons = action_eligibilities_to_mask(eligibilities)
         gated = apply_data_quality_gate(mask, data_quality_score=0.50)
@@ -992,6 +1272,55 @@ class DecisionFrameworkTests(unittest.TestCase):
         self.assertEqual(reasons, {"SOXL": "spread_too_wide"})
         self.assertEqual(gated.tolist(), [True, False])
         self.assertTrue(quality.should_force_cash())
+
+    def test_action_eligibility_rejects_future_available_timestamp(self) -> None:
+        eligibility = self._eligibility(available_ts="2026-01-02T14:31:00+00:00")
+
+        with self.assertRaisesRegex(DecisionFrameworkError, "not point-in-time"):
+            eligibility.validate()
+
+    def test_action_eligibility_rejects_negative_leverage(self) -> None:
+        eligibility = self._eligibility(symbol_id="SOXL", leverage_factor=-1.0, risk_bucket="leveraged_etf")
+
+        with self.assertRaisesRegex(DecisionFrameworkError, "leverage_factor"):
+            eligibility.validate()
+
+    def test_action_eligibilities_to_mask_validates_items_and_cash_index(self) -> None:
+        eligibilities = [
+            self._eligibility(symbol_id="QQQ", leverage_factor=1.0, risk_bucket="broad_tech"),
+            self._eligibility(symbol_id="CASH"),
+        ]
+
+        with self.assertRaisesRegex(DecisionFrameworkError, "cash_index must point to CASH"):
+            action_eligibilities_to_mask(eligibilities, cash_index=0)
+
+    def test_feature_manifest_rejects_fit_window_leaking_into_feature_asof(self) -> None:
+        manifest = FeatureManifest(
+            feature_set_id="features",
+            input_dataset_ids=["dataset"],
+            feature_names=["x"],
+            feature_available_ts_rule="close_plus_1m",
+            fit_start="2026-01-01T00:00:00+00:00",
+            fit_end="2026-01-03T00:00:00+00:00",
+            feature_asof="2026-01-03T00:00:00+00:00",
+            normalizer_hash="norm",
+            code_version="abc",
+        )
+
+        with self.assertRaisesRegex(DecisionFrameworkError, "feature_asof"):
+            manifest.validate()
+
+    def test_readiness_config_hash_validates_weights(self) -> None:
+        config = ReadinessConfig(
+            weights={"data_quality": 0.5, "liquidity": 0.5},
+            thresholds={"normal": 0.9},
+            min_data_quality=0.9,
+            min_liquidity_score=0.8,
+            min_constraint_budget=0.5,
+            version="v1",
+        )
+
+        self.assertEqual(len(config.content_hash()), 64)
 
     def test_readiness_score_and_decision_log_validate(self) -> None:
         score = decision_readiness_score(
@@ -1013,6 +1342,15 @@ class DecisionFrameworkTests(unittest.TestCase):
             action_cost_estimate_bps=torch.tensor([0.0, 3.0]),
             action_risk_features=torch.zeros((2, 3)),
             data_quality_score=0.90,
+            action_names=["CASH", "SOXL"],
+        )
+        readiness_config = ReadinessConfig(
+            weights={"data_quality": 0.5, "liquidity": 0.5},
+            thresholds={"reduced_risk": 0.75},
+            min_data_quality=0.9,
+            min_liquidity_score=0.8,
+            min_constraint_budget=0.5,
+            version="v1",
         )
         log = DecisionLog(
             decision_id="d1",
@@ -1026,11 +1364,90 @@ class DecisionFrameworkTests(unittest.TestCase):
             expected_cost_bps=0.0,
             data_quality_score=0.90,
             readiness_score=score,
+            readiness_config_hash=readiness_config.content_hash(),
+            candidates={
+                "CASH": {
+                    "valid": True,
+                    "q_value": 0.0,
+                    "expected_cost_bps": 0.0,
+                    "risk_bucket": "cash",
+                    "reason": None,
+                },
+                "SOXL": {
+                    "valid": False,
+                    "q_value": -1.0,
+                    "expected_cost_bps": 3.0,
+                    "risk_bucket": "leveraged_etf",
+                    "reason": "spread_too_wide",
+                },
+            },
         )
 
         snapshot.validate()
         log.validate()
         self.assertEqual(readiness_band(score), "reduced_risk")
+
+    def test_decision_snapshot_rejects_nan_and_negative_action_cost(self) -> None:
+        snapshot = DecisionSnapshot(
+            decision_ts="2026-01-02T14:30:00+00:00",
+            instrument_universe_hash="abc",
+            market_state=torch.tensor([float("nan")]),
+            portfolio_state=torch.zeros(1),
+            action_valid_mask=torch.tensor([True, False]),
+            action_cost_estimate_bps=torch.tensor([0.0, -1.0]),
+            action_risk_features=torch.zeros((2, 1)),
+            data_quality_score=0.90,
+            action_names=["CASH", "SOXL"],
+        )
+
+        with self.assertRaisesRegex(DecisionFrameworkError, "market_state"):
+            snapshot.validate()
+
+    def test_decision_dataset_invalid_action_returns_must_be_nan(self) -> None:
+        snapshot = DecisionSnapshot(
+            decision_ts="2026-01-02T14:30:00+00:00",
+            instrument_universe_hash="abc",
+            market_state=torch.zeros(1),
+            portfolio_state=torch.zeros(1),
+            action_valid_mask=torch.tensor([True, False]),
+            action_cost_estimate_bps=torch.tensor([0.0, 1.0]),
+            action_risk_features=torch.zeros((2, 1)),
+            data_quality_score=0.90,
+            action_names=["CASH", "SOXL"],
+        )
+        dataset = DecisionDataset(
+            snapshots=[snapshot],
+            action_returns=torch.tensor([[0.0, 0.0]]),
+            action_valid_mask=torch.tensor([[True, False]]),
+            action_cost_bps=torch.tensor([[0.0, 1.0]]),
+            next_timestamps=["2026-01-02T14:31:00+00:00"],
+            manifests=["manifest"],
+        )
+
+        with self.assertRaisesRegex(DecisionFrameworkError, "Invalid action returns"):
+            dataset.validate()
+
+    def test_validate_reportable_summary_requires_decision_artifacts_and_random_baseline(self) -> None:
+        errors = validate_reportable_summary(
+            {
+                "test_metrics": {"total_return": -0.01},
+                "baselines": {
+                    "CASH": {"test": {"total_return": 0.0}},
+                    "BuyAndHold_QQQ": {"test": {"total_return": 0.01}},
+                },
+                "cost_stress": {"fixed_rollout": {}, "adaptive": {}},
+                "action_concentration": {
+                    "max_risky_group_share": 0.9,
+                    "leveraged_action_share": 0.8,
+                },
+                "return_diagnostics": {},
+            }
+        )
+
+        self.assertIn("missing dataset_manifest", errors)
+        self.assertIn("missing baselines.RandomSameTurnover", errors)
+        self.assertIn("test_return_below_cash", errors)
+        self.assertIn("max_group_share_exceeds_limit", errors)
 
 
 class RepositoryHygieneTests(unittest.TestCase):

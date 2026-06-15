@@ -43,6 +43,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-order-legs-per-episode", type=float)
     parser.add_argument("--q-switch-margin-bps", type=float, default=0.0)
     parser.add_argument("--extra-switch-penalty-bps", type=float, default=0.0)
+    parser.add_argument("--max-effective-leverage", type=float, default=1.0)
+    parser.add_argument("--max-leveraged-bars-per-day", type=int, default=60)
+    parser.add_argument("--max-consecutive-leveraged-bars", type=int, default=30)
+    parser.add_argument("--max-same-group-share-per-day", type=float)
+    parser.add_argument("--min-group-share-observations", type=int, default=20)
+    parser.add_argument("--reportable-max-group-share", type=float, default=0.75)
+    parser.add_argument("--reportable-max-leveraged-share", type=float, default=0.50)
     parser.add_argument(
         "--cost-stress-bps",
         type=float,
@@ -95,6 +102,18 @@ def build_constraints_from_args(args: argparse.Namespace, *, cash_index: int = 0
     )
 
 
+def build_exposure_constraints_from_args(args: argparse.Namespace):
+    from rl_quant.action_risk import ExposureConstraintConfig
+
+    return ExposureConstraintConfig(
+        max_effective_leverage=args.max_effective_leverage,
+        max_leveraged_bars_per_day=args.max_leveraged_bars_per_day,
+        max_same_group_share_per_day=args.max_same_group_share_per_day,
+        max_consecutive_leveraged_bars=args.max_consecutive_leveraged_bars,
+        min_group_share_observations=args.min_group_share_observations,
+    )
+
+
 def unique_cost_stresses(values: list[float]) -> list[float]:
     return sorted({float(value) for value in values})
 
@@ -137,14 +156,20 @@ def fixed_rollout_cost_stress(
             action = int(record["action"])
             previous_action = int(record["previous_action"])
             legs = float(record["market_order_legs"])
+            traded_notional = record.get("traded_notional")
             is_switch = action != previous_action
             if "gross_return" not in record:
                 raise ValueError(
                     "fixed_rollout_cost_stress requires gross_return; "
                     "re-run evaluation with the current rollout schema."
-                )
+            )
             gross_return = float(record["gross_return"])
-            realized_cost_bps = legs * float(cost_bps) + float(is_switch) * float(extra_switch_penalty_bps)
+            if traded_notional is None:
+                realized_cost_bps = legs * float(cost_bps) + float(is_switch) * float(extra_switch_penalty_bps)
+            else:
+                realized_cost_bps = float(traded_notional) * (
+                    float(cost_bps) + float(is_switch) * float(extra_switch_penalty_bps)
+                )
             net_return = gross_return - realized_cost_bps / 10_000.0
             equity *= 1.0 + net_return
             equity_curve.append(equity)
@@ -156,21 +181,28 @@ def fixed_rollout_cost_stress(
             "total_reward_bps": sum(returns) * 10_000.0,
             "total_switches": switches,
             "market_order_legs": order_legs,
+            "total_traded_notional": sum(
+                float(record.get("traded_notional", record["market_order_legs"])) for record in rollout_records
+            ),
             "max_drawdown": metric_max_drawdown(equity_curve),
             "annualized_sharpe": metric_sharpe(returns, periods_per_year=periods_per_year),
         }
     return results
 
 
-def equal_weight_metrics(split, *, cash_index: int) -> dict[str, float | int | None]:
+def equal_weight_metrics(split, *, cash_index: int, action_weights=None) -> dict[str, float | int | None]:
     action_indices = [idx for idx in range(len(split.action_names)) if idx != cash_index]
     if not action_indices:
         action_indices = [cash_index]
+    weights = None if action_weights is None else action_weights.detach().to(device=split.action_returns.device)
     equity = 1.0
     equity_curve = [equity]
     returns: list[float] = []
     for index in split.valid_start_indices.detach().cpu().tolist():
-        simple_return = float(split.action_returns[index, action_indices].mean().item())
+        action_returns = split.action_returns[index, action_indices]
+        if weights is not None:
+            action_returns = action_returns * weights[action_indices]
+        simple_return = float(action_returns.mean().item())
         equity *= 1.0 + simple_return
         equity_curve.append(equity)
         returns.append(simple_return)
@@ -199,8 +231,10 @@ def main() -> int:
         import torch
 
         from rl_quant.hourly_transformer import (
+            HOURLY_CONSTRAINT_FEATURE_NAMES,
             HourlyEnvConfig,
             HourlyTransformerTrainingConfig,
+            RISK_AWARE_POLICY_MODEL_VERSION,
             action_index,
             assert_matching_hourly_schema,
             build_hourly_splits,
@@ -213,9 +247,14 @@ def main() -> int:
             resolve_torch_device,
             torch_runtime_summary,
         )
-        from rl_quant.trading_constraints import (
-            CONSTRAINED_POLICY_MODEL_VERSION,
-            CONSTRAINT_FEATURE_NAMES,
+        from rl_quant.decision_framework import validate_reportable_summary
+        from rl_quant.action_risk import (
+            action_concentration,
+            action_metadata_to_dicts,
+            action_weight_tensor,
+            build_action_metadata,
+            reportability_flags,
+            rollout_return_diagnostics,
         )
     except ModuleNotFoundError as exc:
         if exc.name == "torch":
@@ -243,6 +282,13 @@ def main() -> int:
     initial_action = action_index(train_split.action_names, args.initial_action)
     cash_index = train_split.action_names.index("CASH") if "CASH" in train_split.action_names else initial_action
     constraints = build_constraints_from_args(args, cash_index=cash_index)
+    exposure_constraints = build_exposure_constraints_from_args(args)
+    action_meta = build_action_metadata(train_split.action_names)
+    cpu_action_weights = action_weight_tensor(
+        action_meta,
+        device=torch.device("cpu"),
+        max_effective_leverage=exposure_constraints.max_effective_leverage,
+    )
     runtime = torch_runtime_summary(device)
     print(f"Using device: {device}")
     if device.type == "cuda":
@@ -262,6 +308,7 @@ def main() -> int:
         switch_cost_bps=args.switch_cost_bps,
         initial_action=initial_action,
         constraints=constraints,
+        exposure_constraints=exposure_constraints,
     )
     learning_config = DQNLearningConfig(
         num_envs=args.num_envs,
@@ -305,6 +352,8 @@ def main() -> int:
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
         constraints=constraints,
+        exposure_constraints=exposure_constraints,
+        action_meta=action_meta,
         episode_length=args.episode_length,
     )
     val_result = evaluate_hourly_policy(
@@ -314,6 +363,8 @@ def main() -> int:
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
         constraints=constraints,
+        exposure_constraints=exposure_constraints,
+        action_meta=action_meta,
         episode_length=args.episode_length,
     )
     test_result = evaluate_hourly_policy(
@@ -323,6 +374,8 @@ def main() -> int:
         initial_action=initial_action,
         switch_cost_bps=args.switch_cost_bps,
         constraints=constraints,
+        exposure_constraints=exposure_constraints,
+        action_meta=action_meta,
         episode_length=args.episode_length,
         capture_rollout=True,
     )
@@ -334,6 +387,8 @@ def main() -> int:
             initial_action=initial_action,
             switch_cost_bps=cost_bps,
             constraints=replace(constraints, one_way_cost_bps=cost_bps),
+            exposure_constraints=exposure_constraints,
+            action_meta=action_meta,
             episode_length=args.episode_length,
         ).to_dict()
         for cost_bps in unique_cost_stresses(args.cost_stress_bps)
@@ -367,19 +422,30 @@ def main() -> int:
                 initial_action=initial_action,
                 switch_cost_bps=args.switch_cost_bps,
                 constraints=constraints,
+                exposure_constraints=exposure_constraints,
+                action_meta=action_meta,
                 episode_length=args.episode_length,
             ).to_dict()
             for split in (train_split, val_split, test_split)
         }
 
     baselines: dict[str, object] = {"CASH": fixed_action_baseline(train_split.action_names[cash_index])}
-    for action_name in ("QQQ", "SPY"):
+    for action_name in ("QQQ", "SPY", "SOXL", "SOXS", "TQQQ", "SQQQ"):
         if action_name in train_split.action_names:
             baselines[f"BuyAndHold_{action_name}"] = fixed_action_baseline(action_name)
     baselines["EqualWeight_ETFs"] = {
-        split.name: equal_weight_metrics(split, cash_index=cash_index)
+        split.name: equal_weight_metrics(split, cash_index=cash_index, action_weights=cpu_action_weights)
         for split in (train_split, val_split, test_split)
     }
+    concentration = action_concentration(test_result.rollout_records, action_meta=action_meta)
+    return_diagnostics = rollout_return_diagnostics(test_result.rollout_records)
+    reportability = reportability_flags(
+        test_metrics=test_result.to_dict(),
+        baselines=baselines,
+        concentration=concentration,
+        max_group_share=args.reportable_max_group_share,
+        max_leveraged_share=args.reportable_max_leveraged_share,
+    )
 
     run_name = args.run_name or f"{train_split.bar_interval}_causal_transformer_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir = args.output_dir / run_name
@@ -390,9 +456,9 @@ def main() -> int:
     }
     torch.save(
         {
-            "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
+            "model_version": RISK_AWARE_POLICY_MODEL_VERSION,
             "uses_constraint_features": True,
-            "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
+            "constraint_feature_names": HOURLY_CONSTRAINT_FEATURE_NAMES,
             "model_state_dict": model.state_dict(),
             "feature_mean": train_split.feature_mean.detach().cpu(),
             "feature_std": train_split.feature_std.detach().cpu(),
@@ -402,6 +468,8 @@ def main() -> int:
             "periods_per_year": train_split.periods_per_year,
             "config": serializable_args,
             "constraints": asdict(constraints),
+            "exposure_constraints": asdict(exposure_constraints),
+            "action_metadata": action_metadata_to_dicts(action_meta),
         },
         run_dir / "model.pt",
     )
@@ -412,10 +480,12 @@ def main() -> int:
         "torch_runtime": runtime,
         "config": serializable_args,
         "constraints": asdict(constraints),
+        "exposure_constraints": asdict(exposure_constraints),
         "bar_interval": train_split.bar_interval,
         "periods_per_year": train_split.periods_per_year,
         "feature_names": train_split.feature_names,
         "action_names": train_split.action_names,
+        "action_metadata": action_metadata_to_dicts(action_meta),
         "training": artifacts,
         "train_metrics": train_result.to_dict(),
         "val_metrics": val_result.to_dict(),
@@ -427,9 +497,19 @@ def main() -> int:
         },
         "adaptive_cost_stress": adaptive_cost_stress,
         "fixed_rollout_cost_stress": fixed_cost_stress,
+        "action_concentration": concentration,
+        "return_diagnostics": return_diagnostics,
+        "reportability": reportability,
+    }
+    reportability_errors = validate_reportable_summary(summary)
+    summary["reportability"] = {
+        "reportable": bool(reportability["reportable"]) and not reportability_errors,
+        "reasons": list(dict.fromkeys([*reportability.get("reasons", []), *reportability_errors])),
     }
     with (run_dir / "summary.json").open("w") as sink:
         json.dump(summary, sink, indent=2)
+    with (run_dir / "reportability.json").open("w") as sink:
+        json.dump(summary["reportability"], sink, indent=2)
 
     print(
         f"Train TR: {train_result.total_return:.2%} | "

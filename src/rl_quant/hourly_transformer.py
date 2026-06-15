@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from os import PathLike
 from typing import Any
 
@@ -9,6 +9,22 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from rl_quant.action_risk import (
+    EXPOSURE_FEATURE_DIM,
+    EXPOSURE_FEATURE_NAMES,
+    RISK_AWARE_POLICY_MODEL_VERSION,
+    ActionMeta,
+    ExposureConstraintConfig,
+    action_is_leveraged_tensor,
+    action_leverage_tensor,
+    action_metadata_to_dicts,
+    action_weight_tensor,
+    apply_exposure_masks,
+    build_action_metadata,
+    group_ids_for_actions,
+    make_exposure_features,
+    trade_notional,
+)
 from rl_quant.core import (
     DQNLearningConfig,
     TensorDictReplayBuffer,
@@ -20,7 +36,6 @@ from rl_quant.core import (
     make_grad_scaler,
 )
 from rl_quant.trading_constraints import (
-    CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,
     CONSTRAINT_FEATURE_NAMES,
     TradingConstraintConfig,
@@ -30,6 +45,9 @@ from rl_quant.trading_constraints import (
     sample_valid_actions,
     trade_legs,
 )
+
+HOURLY_CONSTRAINT_FEATURE_NAMES = [*CONSTRAINT_FEATURE_NAMES, *EXPOSURE_FEATURE_NAMES]
+HOURLY_CONSTRAINT_FEATURE_DIM = CONSTRAINT_FEATURE_DIM + EXPOSURE_FEATURE_DIM
 
 
 @dataclass
@@ -360,6 +378,7 @@ class HourlyEnvConfig:
     switch_cost_bps: float = 1.0
     initial_action: int = 0
     constraints: TradingConstraintConfig = field(default_factory=TradingConstraintConfig)
+    exposure_constraints: ExposureConstraintConfig = field(default_factory=ExposureConstraintConfig)
 
     def __post_init__(self) -> None:
         if self.switch_cost_bps != 1.0 and self.constraints.one_way_cost_bps == 1.0:
@@ -403,6 +422,23 @@ class VectorizedHourlyAllocationEnv:
         self.switches_episode = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.order_legs_today = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
         self.order_legs_episode = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
+        self.action_meta = build_action_metadata(self.data.action_names)
+        self.action_weights = action_weight_tensor(
+            self.action_meta,
+            device=device,
+            max_effective_leverage=config.exposure_constraints.max_effective_leverage,
+        )
+        self.action_leverage = action_leverage_tensor(self.action_meta, device=device)
+        self.action_is_leveraged = action_is_leveraged_tensor(self.action_meta, device=device)
+        self.action_group_ids, self.action_groups = group_ids_for_actions(self.action_meta, device=device)
+        self.steps_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.leveraged_bars_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.consecutive_leveraged_bars = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.group_counts_today = torch.zeros(
+            (config.num_envs, len(self.action_groups)),
+            dtype=torch.long,
+            device=device,
+        )
         self.steps = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.reset()
 
@@ -428,6 +464,10 @@ class VectorizedHourlyAllocationEnv:
         self.switches_episode[mask] = 0
         self.order_legs_today[mask] = 0.0
         self.order_legs_episode[mask] = 0.0
+        self.steps_today[mask] = 0
+        self.leveraged_bars_today[mask] = 0
+        self.consecutive_leveraged_bars[mask] = 0
+        self.group_counts_today[mask] = 0
         self.steps[mask] = 0
 
     def _date_labels(self, indices: torch.Tensor) -> list[str]:
@@ -458,13 +498,27 @@ class VectorizedHourlyAllocationEnv:
         availability_mask = self.data.valid_actions(self.indices)
         availability_mask[:, int(self.config.constraints.cash_index)] = True
         mask = constraint_mask & availability_mask
+        mask = apply_exposure_masks(
+            mask,
+            current_action=self.previous_actions,
+            action_leverage=self.action_leverage,
+            action_weights=self.action_weights,
+            action_is_leveraged=self.action_is_leveraged,
+            action_group_ids=self.action_group_ids,
+            group_counts_today=self.group_counts_today,
+            steps_today=self.steps_today,
+            leveraged_bars_today=self.leveraged_bars_today,
+            consecutive_leveraged_bars=self.consecutive_leveraged_bars,
+            constraints=self.config.exposure_constraints,
+            cash_index=self.config.constraints.cash_index,
+        )
         empty_rows = ~mask.any(dim=1)
         if bool(empty_rows.any().item()):
             mask[empty_rows, int(self.config.constraints.cash_index)] = True
         return mask
 
     def constraint_features(self) -> torch.Tensor:
-        return make_constraint_features(
+        base = make_constraint_features(
             bars_held=self.bars_held,
             cooldown_remaining=self.cooldown_remaining,
             switches_today=self.switches_today,
@@ -474,6 +528,20 @@ class VectorizedHourlyAllocationEnv:
             order_legs_today=self.order_legs_today,
             order_legs_episode=self.order_legs_episode,
         )
+        exposure = make_exposure_features(
+            current_action=self.previous_actions,
+            action_leverage=self.action_leverage,
+            action_weights=self.action_weights,
+            action_is_leveraged=self.action_is_leveraged,
+            action_group_ids=self.action_group_ids,
+            group_counts_today=self.group_counts_today,
+            steps_today=self.steps_today,
+            leveraged_bars_today=self.leveraged_bars_today,
+            consecutive_leveraged_bars=self.consecutive_leveraged_bars,
+            constraints=self.config.exposure_constraints,
+            episode_length=self.config.episode_length,
+        )
+        return torch.cat([base, exposure], dim=1)
 
     def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.data.state_windows(self.indices), self.previous_actions, self.constraint_features(), self.action_mask()
@@ -484,18 +552,30 @@ class VectorizedHourlyAllocationEnv:
         constraint_features = self.constraint_features()
         action_mask = self.action_mask()
         actions = actions.long()
-        actions = torch.where(action_mask.gather(1, actions.unsqueeze(1)).squeeze(1), actions, previous_actions)
+        selected_valid = action_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
+        fallback_actions = torch.argmax(action_mask.long(), dim=1)
+        actions = torch.where(selected_valid, actions, fallback_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
+        position_weights = self.action_weights[actions]
+        gross_returns = position_weights * raw_returns
         legs = trade_legs(
             previous_actions,
             actions,
             cash_index=self.config.constraints.cash_index,
             count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
+        traded_notional = trade_notional(
+            previous_actions,
+            actions,
+            self.action_weights,
+            cash_index=self.config.constraints.cash_index,
+        )
         is_switch = actions != previous_actions
-        cost_bps = legs * float(self.config.constraints.one_way_cost_bps)
-        cost_bps = cost_bps + is_switch.float() * float(self.config.constraints.extra_switch_penalty_bps)
-        rewards = raw_returns * float(self.config.reward_scale) - cost_bps * float(self.config.reward_scale) / 10_000.0
+        per_notional_cost_bps = float(self.config.constraints.one_way_cost_bps)
+        per_notional_cost_bps += is_switch.float() * float(self.config.constraints.extra_switch_penalty_bps)
+        cost_bps = traded_notional * per_notional_cost_bps
+        net_returns = gross_returns - cost_bps / 10_000.0
+        rewards = net_returns * float(self.config.reward_scale)
         next_indices = current_indices + 1
 
         self.indices = next_indices
@@ -510,6 +590,20 @@ class VectorizedHourlyAllocationEnv:
         self.switches_episode = self.switches_episode + is_switch.long()
         self.order_legs_today = self.order_legs_today + legs
         self.order_legs_episode = self.order_legs_episode + legs
+        selected_groups = self.action_group_ids[actions]
+        self.group_counts_today.scatter_add_(
+            1,
+            selected_groups.unsqueeze(1),
+            torch.ones((actions.shape[0], 1), dtype=torch.long, device=self.device),
+        )
+        selected_leveraged = self.action_is_leveraged[actions]
+        self.steps_today = self.steps_today + 1
+        self.leveraged_bars_today = self.leveraged_bars_today + selected_leveraged.long()
+        self.consecutive_leveraged_bars = torch.where(
+            selected_leveraged,
+            self.consecutive_leveraged_bars + 1,
+            torch.zeros_like(self.consecutive_leveraged_bars),
+        )
         self.steps = self.steps + 1
         in_bounds = next_indices + 1 < self.data.action_returns.shape[0]
         next_valid = torch.zeros_like(in_bounds)
@@ -525,8 +619,13 @@ class VectorizedHourlyAllocationEnv:
                 device=self.device,
             )
             valid_positions = torch.where(in_bounds)[0]
-            self.switches_today[valid_positions[reset_today]] = 0
-            self.order_legs_today[valid_positions[reset_today]] = 0.0
+            reset_positions = valid_positions[reset_today]
+            self.switches_today[reset_positions] = 0
+            self.order_legs_today[reset_positions] = 0.0
+            self.steps_today[reset_positions] = 0
+            self.leveraged_bars_today[reset_positions] = 0
+            self.consecutive_leveraged_bars[reset_positions] = 0
+            self.group_counts_today[reset_positions] = 0
         next_action_mask = self.action_mask()
         return {
             "indices": current_indices,
@@ -541,6 +640,10 @@ class VectorizedHourlyAllocationEnv:
             "next_action_mask": next_action_mask,
             "dones": dones.float(),
             "legs": legs,
+            "raw_action_returns": raw_returns,
+            "position_weights": position_weights,
+            "gross_returns": gross_returns,
+            "traded_notional": traded_notional,
         }
 
 
@@ -551,6 +654,7 @@ class HourlyEvaluationResult:
     total_reward_bps: float
     total_switches: int
     market_order_legs: float
+    total_traded_notional: float
     max_drawdown: float
     hourly_sharpe: float | None
     rollout_records: list[dict[str, float | str | int]]
@@ -562,11 +666,26 @@ class HourlyEvaluationResult:
             "total_reward_bps": self.total_reward_bps,
             "total_switches": self.total_switches,
             "market_order_legs": self.market_order_legs,
+            "total_traded_notional": self.total_traded_notional,
             "max_drawdown": self.max_drawdown,
             "hourly_sharpe": self.hourly_sharpe,
             "annualized_sharpe": self.hourly_sharpe,
             "rollout_records": self.rollout_records,
         }
+
+
+def _constraint_features_for_model(model: nn.Module, features: torch.Tensor) -> torch.Tensor:
+    expected_dim = getattr(model, "constraint_feature_dim", features.shape[1])
+    if expected_dim == features.shape[1]:
+        return features
+    if expected_dim < features.shape[1]:
+        return features[:, :expected_dim]
+    padding = torch.zeros(
+        (features.shape[0], int(expected_dim) - features.shape[1]),
+        dtype=features.dtype,
+        device=features.device,
+    )
+    return torch.cat([features, padding], dim=1)
 
 
 @torch.no_grad()
@@ -578,11 +697,24 @@ def evaluate_hourly_policy(
     initial_action: int = 0,
     switch_cost_bps: float = 1.0,
     constraints: TradingConstraintConfig | None = None,
+    exposure_constraints: ExposureConstraintConfig | None = None,
+    action_meta: list[ActionMeta] | None = None,
     episode_length: int | None = None,
     capture_rollout: bool = False,
 ) -> HourlyEvaluationResult:
     constraints = constraints or TradingConstraintConfig(one_way_cost_bps=switch_cost_bps)
+    exposure_constraints = exposure_constraints or ExposureConstraintConfig()
     data = data if data.features.device == device else data.to(device)
+    action_meta = action_meta or build_action_metadata(data.action_names)
+    action_weights = action_weight_tensor(
+        action_meta,
+        device=device,
+        max_effective_leverage=exposure_constraints.max_effective_leverage,
+    )
+    action_leverage = action_leverage_tensor(action_meta, device=device)
+    action_is_leveraged = action_is_leveraged_tensor(action_meta, device=device)
+    action_group_ids, action_groups = group_ids_for_actions(action_meta, device=device)
+    group_counts_today = torch.zeros((1, len(action_groups)), dtype=torch.long, device=device)
     model.eval()
     previous_action = int(initial_action)
     bars_held = int(constraints.min_hold_bars)
@@ -591,12 +723,16 @@ def evaluate_hourly_policy(
     switches_episode = 0
     order_legs_today = 0.0
     order_legs_episode = 0.0
+    steps_today = 0
+    leveraged_bars_today = 0
+    consecutive_leveraged_bars = 0
     equity = 1.0
     equity_curve = [equity]
     bar_returns: list[float] = []
     total_reward_bps = 0.0
     switches = 0
     order_legs = 0.0
+    traded_notional_total = 0.0
     records: list[dict[str, float | str | int]] = []
     previous_index: int | None = None
     previous_date: str | None = None
@@ -612,17 +748,25 @@ def evaluate_hourly_policy(
             switches_episode = 0
             order_legs_today = 0.0
             order_legs_episode = 0.0
+            steps_today = 0
+            leveraged_bars_today = 0
+            consecutive_leveraged_bars = 0
+            group_counts_today.zero_()
             episode_steps = 0
         elif previous_date is not None and current_date != previous_date:
             switches_today = 0
             order_legs_today = 0.0
+            steps_today = 0
+            leveraged_bars_today = 0
+            consecutive_leveraged_bars = 0
+            group_counts_today.zero_()
         if episode_length is not None and episode_steps >= int(episode_length):
             switches_episode = 0
             order_legs_episode = 0.0
             episode_steps = 0
         index_tensor = torch.tensor([index], dtype=torch.long, device=device)
         previous_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
-        constraint_features = make_constraint_features(
+        base_constraint_features = make_constraint_features(
             bars_held=torch.tensor([bars_held], dtype=torch.long, device=device),
             cooldown_remaining=torch.tensor([cooldown_remaining], dtype=torch.long, device=device),
             switches_today=torch.tensor([switches_today], dtype=torch.long, device=device),
@@ -632,6 +776,20 @@ def evaluate_hourly_policy(
             order_legs_today=torch.tensor([order_legs_today], dtype=torch.float32, device=device),
             order_legs_episode=torch.tensor([order_legs_episode], dtype=torch.float32, device=device),
         )
+        exposure_features = make_exposure_features(
+            current_action=previous_tensor,
+            action_leverage=action_leverage,
+            action_weights=action_weights,
+            action_is_leveraged=action_is_leveraged,
+            action_group_ids=action_group_ids,
+            group_counts_today=group_counts_today,
+            steps_today=torch.tensor([steps_today], dtype=torch.long, device=device),
+            leveraged_bars_today=torch.tensor([leveraged_bars_today], dtype=torch.long, device=device),
+            consecutive_leveraged_bars=torch.tensor([consecutive_leveraged_bars], dtype=torch.long, device=device),
+            constraints=exposure_constraints,
+            episode_length=int(episode_length or max(int(data.valid_start_indices.numel()), 1)),
+        )
+        constraint_features = torch.cat([base_constraint_features, exposure_features], dim=1)
         action_mask = build_action_mask(
             current_action=previous_tensor,
             bars_held=torch.tensor([bars_held], dtype=torch.long, device=device),
@@ -652,9 +810,24 @@ def evaluate_hourly_policy(
         availability_mask = data.valid_actions(index_tensor)
         availability_mask[:, int(constraints.cash_index)] = True
         action_mask = action_mask & availability_mask
+        action_mask = apply_exposure_masks(
+            action_mask,
+            current_action=previous_tensor,
+            action_leverage=action_leverage,
+            action_weights=action_weights,
+            action_is_leveraged=action_is_leveraged,
+            action_group_ids=action_group_ids,
+            group_counts_today=group_counts_today,
+            steps_today=torch.tensor([steps_today], dtype=torch.long, device=device),
+            leveraged_bars_today=torch.tensor([leveraged_bars_today], dtype=torch.long, device=device),
+            consecutive_leveraged_bars=torch.tensor([consecutive_leveraged_bars], dtype=torch.long, device=device),
+            constraints=exposure_constraints,
+            cash_index=constraints.cash_index,
+        )
         if not bool(action_mask.any().item()):
             action_mask[:, int(constraints.cash_index)] = True
-        q_values = model(data.state_windows(index_tensor), previous_tensor, constraint_features)
+        model_constraint_features = _constraint_features_for_model(model, constraint_features)
+        q_values = model(data.state_windows(index_tensor), previous_tensor, model_constraint_features)
         action = int(
             apply_leg_aware_hysteresis(
                 q_values,
@@ -668,6 +841,8 @@ def evaluate_hourly_policy(
             )[0].item()
         )
         action_tensor = torch.tensor([action], dtype=torch.long, device=device)
+        position_weight = float(action_weights[action].item())
+        effective_leverage = float((action_weights[action] * action_leverage[action]).item())
         legs = float(
             trade_legs(
                 previous_tensor,
@@ -676,10 +851,20 @@ def evaluate_hourly_policy(
                 count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
             )[0].item()
         )
-        gross_return = float(data.action_returns[index, action].item())
+        traded_notional = float(
+            trade_notional(
+                previous_tensor,
+                action_tensor,
+                action_weights,
+                cash_index=constraints.cash_index,
+            )[0].item()
+        )
+        raw_action_return = float(data.action_returns[index, action].item())
+        gross_return = position_weight * raw_action_return
         is_switch = action != previous_action
-        cost_bps = legs * float(constraints.one_way_cost_bps)
-        cost_bps += float(is_switch) * float(constraints.extra_switch_penalty_bps)
+        per_notional_cost_bps = float(constraints.one_way_cost_bps)
+        per_notional_cost_bps += float(is_switch) * float(constraints.extra_switch_penalty_bps)
+        cost_bps = traded_notional * per_notional_cost_bps
         net_return = gross_return - cost_bps / 10_000.0
         equity *= 1.0 + net_return
         equity_curve.append(equity)
@@ -688,6 +873,7 @@ def evaluate_hourly_policy(
         if is_switch:
             switches += 1
         order_legs += legs
+        traded_notional_total += traded_notional
         if capture_rollout:
             records.append(
                 {
@@ -698,10 +884,15 @@ def evaluate_hourly_policy(
                     "previous_action": previous_action,
                     "segment_reset": int(segment_reset),
                     "market_order_legs": legs,
+                    "traded_notional": round(traded_notional, 8),
+                    "position_weight": round(position_weight, 8),
+                    "effective_leverage": round(effective_leverage, 8),
+                    "raw_action_return": round(raw_action_return, 8),
                     "gross_return": round(gross_return, 8),
                     "cost_bps": round(cost_bps, 8),
                     "bar_interval": data.bar_interval,
                     "bar_return": round(net_return, 8),
+                    "net_return": round(net_return, 8),
                     "hourly_return": round(net_return, 8),
                     "equity": round(equity, 8),
                 }
@@ -716,6 +907,12 @@ def evaluate_hourly_policy(
             cooldown_remaining = max(cooldown_remaining - 1, 0)
         order_legs_today += legs
         order_legs_episode += legs
+        selected_group = int(action_group_ids[action].item())
+        group_counts_today[0, selected_group] += 1
+        selected_leveraged = bool(action_is_leveraged[action].item())
+        steps_today += 1
+        leveraged_bars_today += int(selected_leveraged)
+        consecutive_leveraged_bars = consecutive_leveraged_bars + 1 if selected_leveraged else 0
         previous_action = action
         previous_index = index
         previous_date = current_date
@@ -726,6 +923,7 @@ def evaluate_hourly_policy(
         total_reward_bps=total_reward_bps,
         total_switches=switches,
         market_order_legs=order_legs,
+        total_traded_notional=traded_notional_total,
         max_drawdown=fractional_max_drawdown(equity_curve),
         hourly_sharpe=annualized_sharpe(bar_returns, periods_per_year=data.periods_per_year),
         rollout_records=records,
@@ -783,6 +981,7 @@ def train_hourly_transformer_dqn(
     val_data = val_data if val_data.features.device == device else val_data.to(device)
     assert_matching_hourly_schema(train_data, val_data)
     action_count = len(train_data.action_names)
+    action_meta = build_action_metadata(train_data.action_names)
 
     q_network = CausalTransformerQNetwork(
         feature_dim=train_data.features.shape[1],
@@ -794,6 +993,7 @@ def train_hourly_transformer_dqn(
         feedforward_dim=config.feedforward_dim,
         dropout=config.dropout,
         action_embedding_dim=config.action_embedding_dim,
+        constraint_feature_dim=HOURLY_CONSTRAINT_FEATURE_DIM,
     ).to(device)
     target_network = deepcopy(q_network).to(device)
     target_network.eval()
@@ -809,13 +1009,13 @@ def train_hourly_transformer_dqn(
         fields={
             "indices": ((), torch.long),
             "previous_actions": ((), torch.long),
-            "constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
+            "constraint_features": ((HOURLY_CONSTRAINT_FEATURE_DIM,), torch.float32),
             "action_mask": ((action_count,), torch.bool),
             "actions": ((), torch.long),
             "rewards": ((), torch.float32),
             "next_indices": ((), torch.long),
             "next_previous_actions": ((), torch.long),
-            "next_constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
+            "next_constraint_features": ((HOURLY_CONSTRAINT_FEATURE_DIM,), torch.float32),
             "next_action_mask": ((action_count,), torch.bool),
             "dones": ((), torch.float32),
         },
@@ -935,6 +1135,8 @@ def train_hourly_transformer_dqn(
                 initial_action=config.env.initial_action,
                 switch_cost_bps=config.env.switch_cost_bps,
                 constraints=config.env.constraints,
+                exposure_constraints=config.env.exposure_constraints,
+                action_meta=action_meta,
                 episode_length=config.env.episode_length,
             )
             avg_loss = sum(loss_trace[-200:]) / max(len(loss_trace[-200:]), 1)
@@ -974,9 +1176,11 @@ def train_hourly_transformer_dqn(
         "valid_action_count_trace": valid_action_count_trace,
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
-        "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
+        "model_version": RISK_AWARE_POLICY_MODEL_VERSION,
         "uses_constraint_features": True,
-        "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
+        "constraint_feature_names": HOURLY_CONSTRAINT_FEATURE_NAMES,
+        "action_metadata": action_metadata_to_dicts(action_meta),
+        "exposure_constraints": asdict(config.env.exposure_constraints),
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

@@ -1,6 +1,7 @@
 """Compact RL trading research framework."""
 
 __all__ = [
+    "action_risk",
     "bar_transformer",
     "core",
     "decision_framework",

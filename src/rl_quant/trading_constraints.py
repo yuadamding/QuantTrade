@@ -179,7 +179,8 @@ def apply_leg_aware_hysteresis(
     best_action = torch.argmax(adjusted_q, dim=1)
     best_edge = adjusted_q.gather(1, best_action.unsqueeze(1)).squeeze(1)
     should_switch = best_action.ne(current_action.long()) & (best_edge > 0)
-    return torch.where(should_switch, best_action, current_action.long())
+    current_allowed = action_mask.gather(1, current_action.long().unsqueeze(1)).squeeze(1)
+    return torch.where(should_switch | ~current_allowed, best_action, current_action.long())
 
 
 def sample_valid_actions(action_mask: torch.Tensor) -> torch.Tensor:
