@@ -20,7 +20,9 @@ from rl_quant.core import (
     make_grad_scaler,
 )
 from rl_quant.trading_constraints import (
+    CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,
+    CONSTRAINT_FEATURE_NAMES,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
@@ -47,6 +49,7 @@ class HourlyDataSplit:
     lookback: int
     periods_per_year: float = 252.0 * 6.5
     bar_interval: str = "1h"
+    action_valid_mask: torch.Tensor | None = None
 
     def to(self, device: torch.device | str) -> "HourlyDataSplit":
         return replace(
@@ -57,12 +60,22 @@ class HourlyDataSplit:
             valid_index_mask=self.valid_index_mask.to(device),
             feature_mean=self.feature_mean.to(device),
             feature_std=self.feature_std.to(device),
+            action_valid_mask=self.action_valid_mask.to(device) if self.action_valid_mask is not None else None,
         )
 
     def state_windows(self, indices: torch.Tensor) -> torch.Tensor:
         offsets = torch.arange(self.lookback, device=indices.device, dtype=torch.long)
         window_indices = indices.unsqueeze(1) - (self.lookback - 1) + offsets.unsqueeze(0)
         return self.features[window_indices]
+
+    def valid_actions(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.action_valid_mask is None:
+            return torch.ones(
+                (indices.shape[0], self.action_returns.shape[1]),
+                dtype=torch.bool,
+                device=indices.device,
+            )
+        return self.action_valid_mask[indices]
 
 
 def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
@@ -109,6 +122,11 @@ def _build_split(
         raise ValueError("features row count must match timestamps length.")
     if all_returns.shape[0] != len(all_timestamps):
         raise ValueError("action_returns row count must match timestamps length.")
+    all_action_valid = payload.get("action_valid_mask")
+    if all_action_valid is not None:
+        all_action_valid = all_action_valid.bool()
+        if tuple(all_action_valid.shape) != tuple(all_returns.shape):
+            raise ValueError("action_valid_mask shape must match action_returns shape.")
     all_session_dates = payload.get("session_dates")
     selected = [
         i
@@ -123,6 +141,7 @@ def _build_split(
     session_dates = [all_session_dates[i] for i in selected] if all_session_dates is not None else None
     raw_features = all_features[selected]
     action_returns = all_returns[selected]
+    action_valid_mask = all_action_valid[selected] if all_action_valid is not None else None
     if feature_mean is None:
         feature_mean = raw_features.mean(dim=0)
     if feature_std is None:
@@ -167,6 +186,7 @@ def _build_split(
         lookback=lookback,
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.5)),
         bar_interval=str(payload.get("bar_interval", "1h")),
+        action_valid_mask=action_valid_mask,
     )
 
 
@@ -227,6 +247,10 @@ def assert_matching_hourly_schema(*splits: HourlyDataSplit) -> None:
             raise ValueError(f"Feature dimensions differ between {reference.name!r} and {split.name!r}.")
         if split.action_returns.shape[1] != reference.action_returns.shape[1]:
             raise ValueError(f"Action dimensions differ between {reference.name!r} and {split.name!r}.")
+        if (split.action_valid_mask is None) != (reference.action_valid_mask is None):
+            raise ValueError("Splits must agree on whether action_valid_mask is present.")
+        if split.action_valid_mask is not None and split.action_valid_mask.shape[1] != reference.action_returns.shape[1]:
+            raise ValueError(f"Action-valid mask dimensions differ for split {split.name!r}.")
         if split.bar_interval != reference.bar_interval:
             raise ValueError(f"Bar intervals differ between {reference.name!r} and {split.name!r}.")
 
@@ -247,6 +271,7 @@ class CausalTransformerQNetwork(nn.Module):
         dropout: float = 0.05,
         action_embedding_dim: int = 32,
         constraint_feature_dim: int = CONSTRAINT_FEATURE_DIM,
+        require_constraint_features: bool = True,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -254,6 +279,7 @@ class CausalTransformerQNetwork(nn.Module):
         self.lookback = int(lookback)
         self.action_count = int(action_count)
         self.constraint_feature_dim = int(constraint_feature_dim)
+        self.require_constraint_features = bool(require_constraint_features)
         self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.input_proj = nn.Sequential(
             nn.Linear(feature_dim, d_model),
@@ -303,11 +329,18 @@ class CausalTransformerQNetwork(nn.Module):
         if length > self.lookback:
             raise ValueError(f"Window length {length} exceeds configured lookback {self.lookback}.")
         if constraint_features is None:
+            if self.require_constraint_features:
+                raise ValueError("constraint_features are required for constrained policy inference.")
             constraint_features = torch.zeros(
                 state_windows.shape[0],
                 self.constraint_feature_dim,
                 dtype=state_windows.dtype,
                 device=state_windows.device,
+            )
+        if constraint_features.shape[-1] != self.constraint_feature_dim:
+            raise ValueError(
+                f"constraint_features must have last dimension {self.constraint_feature_dim}; "
+                f"got {constraint_features.shape[-1]}."
             )
         x = self.input_proj(state_windows)
         x = x + self.position_embedding[-length:][None, :, :]
@@ -405,7 +438,7 @@ class VectorizedHourlyAllocationEnv:
         return [source[int(index.item())] for index in indices.detach().cpu()]
 
     def action_mask(self) -> torch.Tensor:
-        return build_action_mask(
+        constraint_mask = build_action_mask(
             current_action=self.previous_actions,
             bars_held=self.bars_held,
             cooldown_remaining=self.cooldown_remaining,
@@ -422,6 +455,13 @@ class VectorizedHourlyAllocationEnv:
             cash_index=self.config.constraints.cash_index,
             count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
+        availability_mask = self.data.valid_actions(self.indices)
+        availability_mask[:, int(self.config.constraints.cash_index)] = True
+        mask = constraint_mask & availability_mask
+        empty_rows = ~mask.any(dim=1)
+        if bool(empty_rows.any().item()):
+            mask[empty_rows, int(self.config.constraints.cash_index)] = True
+        return mask
 
     def constraint_features(self) -> torch.Tensor:
         return make_constraint_features(
@@ -609,6 +649,11 @@ def evaluate_hourly_policy(
             cash_index=constraints.cash_index,
             count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
         )
+        availability_mask = data.valid_actions(index_tensor)
+        availability_mask[:, int(constraints.cash_index)] = True
+        action_mask = action_mask & availability_mask
+        if not bool(action_mask.any().item()):
+            action_mask[:, int(constraints.cash_index)] = True
         q_values = model(data.state_windows(index_tensor), previous_tensor, constraint_features)
         action = int(
             apply_leg_aware_hysteresis(
@@ -929,6 +974,9 @@ def train_hourly_transformer_dqn(
         "valid_action_count_trace": valid_action_count_trace,
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
+        "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
+        "uses_constraint_features": True,
+        "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

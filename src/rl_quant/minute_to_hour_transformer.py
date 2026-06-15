@@ -21,7 +21,9 @@ from rl_quant.core import (
 )
 from rl_quant.hourly_transformer import CudaVramReservation
 from rl_quant.trading_constraints import (
+    CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,
+    CONSTRAINT_FEATURE_NAMES,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
@@ -1018,6 +1020,9 @@ def train_minute_to_hour_dqn(
         "valid_action_count_trace": valid_action_count_trace,
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
+        "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
+        "uses_constraint_features": True,
+        "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

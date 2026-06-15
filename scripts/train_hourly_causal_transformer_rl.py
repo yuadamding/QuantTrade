@@ -138,7 +138,12 @@ def fixed_rollout_cost_stress(
             previous_action = int(record["previous_action"])
             legs = float(record["market_order_legs"])
             is_switch = action != previous_action
-            gross_return = float(record["gross_return"] if "gross_return" in record else record["bar_return"])
+            if "gross_return" not in record:
+                raise ValueError(
+                    "fixed_rollout_cost_stress requires gross_return; "
+                    "re-run evaluation with the current rollout schema."
+                )
+            gross_return = float(record["gross_return"])
             realized_cost_bps = legs * float(cost_bps) + float(is_switch) * float(extra_switch_penalty_bps)
             net_return = gross_return - realized_cost_bps / 10_000.0
             equity *= 1.0 + net_return
@@ -207,6 +212,10 @@ def main() -> int:
             configure_torch_runtime,
             resolve_torch_device,
             torch_runtime_summary,
+        )
+        from rl_quant.trading_constraints import (
+            CONSTRAINED_POLICY_MODEL_VERSION,
+            CONSTRAINT_FEATURE_NAMES,
         )
     except ModuleNotFoundError as exc:
         if exc.name == "torch":
@@ -381,6 +390,9 @@ def main() -> int:
     }
     torch.save(
         {
+            "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
+            "uses_constraint_features": True,
+            "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
             "model_state_dict": model.state_dict(),
             "feature_mean": train_split.feature_mean.detach().cpu(),
             "feature_std": train_split.feature_std.detach().cpu(),

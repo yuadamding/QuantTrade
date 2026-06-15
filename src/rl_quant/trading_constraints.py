@@ -21,6 +21,20 @@ class TradingConstraintConfig:
 
 
 CONSTRAINT_FEATURE_DIM = 6
+CONSTRAINED_POLICY_MODEL_VERSION = 2
+CONSTRAINT_FEATURE_NAMES = [
+    "bars_held_over_min_hold",
+    "cooldown_remaining_over_cooldown",
+    "switches_today_over_cap",
+    "switches_episode_over_cap",
+    "order_legs_today_over_cap",
+    "order_legs_episode_over_cap",
+]
+
+
+def _cap_denominator(value: int | float | None, fallback: int | float) -> float:
+    raw = fallback if value is None else value
+    return max(float(raw), 1.0)
 
 
 def trade_legs(
@@ -57,10 +71,10 @@ def make_constraint_features(
         order_legs_today = torch.zeros(batch, dtype=torch.float32, device=bars_held.device)
     if order_legs_episode is None:
         order_legs_episode = torch.zeros(batch, dtype=torch.float32, device=bars_held.device)
-    daily_switch_den = float(constraints.max_switches_per_day or episode_length)
-    episode_switch_den = float(constraints.max_switches_per_episode or episode_length)
-    daily_leg_den = float(constraints.max_order_legs_per_day or max(2 * episode_length, 1))
-    episode_leg_den = float(constraints.max_order_legs_per_episode or max(2 * episode_length, 1))
+    daily_switch_den = _cap_denominator(constraints.max_switches_per_day, episode_length)
+    episode_switch_den = _cap_denominator(constraints.max_switches_per_episode, episode_length)
+    daily_leg_den = _cap_denominator(constraints.max_order_legs_per_day, max(2 * episode_length, 1))
+    episode_leg_den = _cap_denominator(constraints.max_order_legs_per_episode, max(2 * episode_length, 1))
     return torch.stack(
         [
             bars_held.float() / max(float(constraints.min_hold_bars), 1.0),

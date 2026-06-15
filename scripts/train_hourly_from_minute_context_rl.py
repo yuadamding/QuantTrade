@@ -108,6 +108,10 @@ def main() -> int:
             resolve_torch_device,
             torch_runtime_summary,
         )
+        from rl_quant.trading_constraints import (
+            CONSTRAINED_POLICY_MODEL_VERSION,
+            CONSTRAINT_FEATURE_NAMES,
+        )
         from rl_quant.minute_to_hour_transformer import (
             MinuteToHourEnvConfig,
             MinuteToHourTrainingConfig,
@@ -226,6 +230,9 @@ def main() -> int:
     }
     torch.save(
         {
+            "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
+            "uses_constraint_features": True,
+            "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
             "model_state_dict": model.state_dict(),
             "minute_feature_mean": train_split.minute_feature_mean.detach().cpu(),
             "minute_feature_std": train_split.minute_feature_std.detach().cpu(),
