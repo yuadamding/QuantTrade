@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -73,7 +74,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--symbol-limit", type=int, default=500)
     parser.add_argument("--max-files", type=int, default=0, help="Limit stock source files for smoke builds. 0 means no limit.")
     parser.add_argument("--actions", default="CASH,QQQ,SPY", help="Comma-separated action symbols; CASH is added if absent.")
-    parser.add_argument("--strict-action-sources", action="store_true", help="Fail if any requested non-CASH action has no bar files.")
+    parser.add_argument(
+        "--strict-action-sources",
+        dest="strict_action_sources",
+        action="store_true",
+        default=True,
+        help="Fail if any requested non-CASH action has no bar files. This is the default.",
+    )
+    parser.add_argument(
+        "--allow-missing-action-sources-for-diagnostic",
+        dest="strict_action_sources",
+        action="store_false",
+        help="Allow missing requested action bars, drop those actions, and mark the dataset non-reportable.",
+    )
     parser.add_argument("--max-action-staleness-seconds", type=int, default=300)
     parser.add_argument("--include-extended-hours", action="store_true")
     parser.add_argument("--source-access", choices=["auto", "REST", "AWS S3"], default="auto")
@@ -133,6 +146,22 @@ def file_sha256(path: Path) -> str | None:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def universe_reportability_errors(args: argparse.Namespace, *, first_decision_ms: int | None) -> list[str]:
+    errors: list[str] = []
+    timestamp = args.universe_selection_timestamp
+    if not timestamp:
+        errors.append("universe_selection_timestamp_missing")
+    elif first_decision_ms is not None and first_decision_ms < iso_to_timestamp_ms(timestamp):
+        errors.append("future_universe_selection_timestamp")
+    if errors and not args.allow_fixed_survivor_universe_diagnostic:
+        detail = ", ".join(errors)
+        raise ValueError(
+            "Universe selection is not point-in-time reportable "
+            f"({detail}); pass --allow-fixed-survivor-universe-diagnostic only for diagnostic builds."
+        )
+    return errors
 
 
 def main() -> int:
@@ -215,18 +244,8 @@ def main() -> int:
     if universe_source_hash is None and args.universe_source is not None:
         universe_source_hash = file_sha256(args.universe_source)
     universe_selection_timestamp = args.universe_selection_timestamp
-    if not universe_selection_timestamp:
-        manifest_errors.append("universe_selection_timestamp_missing")
-    else:
-        first_decision_ms = min(decision_ms) if decision_ms else None
-        if first_decision_ms is not None and first_decision_ms < iso_to_timestamp_ms(universe_selection_timestamp):
-            manifest_errors.append("future_universe_selection_timestamp")
-            if not args.allow_fixed_survivor_universe_diagnostic:
-                print(
-                    "Universe selection timestamp is after the first decision; "
-                    "dataset will be marked non-reportable.",
-                    file=sys.stderr,
-                )
+    first_decision_ms = min(decision_ms) if decision_ms else None
+    manifest_errors.extend(universe_reportability_errors(args, first_decision_ms=first_decision_ms))
     source_manifest.update(
         {
             "intended_action_symbols": action_symbols,
@@ -314,12 +333,31 @@ def main() -> int:
         covariates["action_covariate_feature_schema_file_hash"] = schema_hash
         payload = append_action_covariates_to_payload(payload, covariates, append_to_action_features=True)
     save_second_context_payload(payload, args.output)
+    manifest = dict(payload.get("dataset_manifest", {}))
     metadata = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "rows": len(payload["decision_timestamps"]),
         "market_context_shape": list(payload["market_context"].shape),
         "actions": action_names,
         "stock_symbols": len(stock_frames),
         "dataset": str(args.output),
+        "payload_hash": payload.get("payload_hash"),
+        "feature_schema_hash": payload.get("feature_schema_hash"),
+        "action_metadata_hash": payload.get("action_metadata_hash"),
+        "dataset_reportable": manifest.get("reportable"),
+        "reportability_errors": list(manifest.get("reportability_errors", [])),
+        "universe_selection_timestamp": manifest.get("universe_selection_timestamp"),
+        "universe_method": manifest.get("universe_method"),
+        "universe_source": manifest.get("universe_source"),
+        "universe_source_hash": manifest.get("universe_source_hash"),
+        "source_manifest_hash": source_manifest.get("source_manifest_hash"),
+        "action_covariate_schema_hash": manifest.get("action_covariate_schema_hash"),
+        "action_covariate_source_manifest_hash": manifest.get("action_covariate_source_manifest_hash"),
+        "action_covariate_feature_schema_file_hash": manifest.get("action_covariate_feature_schema_file_hash"),
+        "tensor_content_hashes": payload.get("tensor_content_hashes", {}),
+        "model_input_keys": list(payload.get("model_input_keys", [])),
+        "covariate_mode": payload.get("covariate_mode"),
+        "covariate_protocol_version": payload.get("covariate_protocol_version"),
     }
     args.output.with_name("metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     print(f"Rows: {metadata['rows']} | Context: {metadata['market_context_shape']} | Actions: {len(action_names)}")

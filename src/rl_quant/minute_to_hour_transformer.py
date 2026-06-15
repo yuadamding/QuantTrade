@@ -5,7 +5,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from os import PathLike
+from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import torch
 import torch.nn.functional as F
@@ -39,6 +41,8 @@ DEFAULT_MINUTE_SOURCE_INTERVAL = "1m"
 DEFAULT_SECOND_SOURCE_INTERVAL = "1s"
 DEFAULT_MAX_SUBHOUR_TOKENS = 512
 DEFAULT_SECOND_BAR_LATENCY_MS = 1000
+DEFAULT_EXCHANGE_CALENDAR_ID = "XNYS_decision_timestamp_sessions_America_New_York_v1"
+_EASTERN = ZoneInfo("America/New_York")
 
 
 class TensorDictReplayBuffer:
@@ -121,6 +125,12 @@ class HourFromMinuteDataSplit:
     context_bars_per_hour: int | None = None
     dataset_reportable: bool = True
     dataset_reportability_errors: list[str] = field(default_factory=list)
+    action_features: torch.Tensor | None = None
+    action_feature_names: list[str] = field(default_factory=list)
+    action_feature_mean: torch.Tensor | None = None
+    action_feature_std: torch.Tensor | None = None
+    action_feature_groups: dict[str, list[int]] = field(default_factory=dict)
+    split_policy: dict[str, object] = field(default_factory=dict)
 
     @property
     def effective_context_bars_per_hour(self) -> int:
@@ -135,16 +145,22 @@ class HourFromMinuteDataSplit:
             action_returns=self.action_returns.to(device),
             action_valid_mask=self.action_valid_mask.to(device) if self.action_valid_mask is not None else None,
             label_valid_mask=self.label_valid_mask.to(device) if self.label_valid_mask is not None else None,
+            action_features=self.action_features.to(device) if self.action_features is not None else None,
             valid_start_indices=self.valid_start_indices.to(device),
             valid_index_mask=self.valid_index_mask.to(device),
             minute_feature_mean=self.minute_feature_mean.to(device),
             minute_feature_std=self.minute_feature_std.to(device),
             hour_feature_mean=self.hour_feature_mean.to(device),
             hour_feature_std=self.hour_feature_std.to(device),
+            action_feature_mean=self.action_feature_mean.to(device) if self.action_feature_mean is not None else None,
+            action_feature_std=self.action_feature_std.to(device) if self.action_feature_std is not None else None,
         )
 
     def state(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.minute_features[indices], self.minute_mask[indices], self.hour_features[indices]
+
+    def action_feature_state(self, indices: torch.Tensor) -> torch.Tensor | None:
+        return None if self.action_features is None else self.action_features[indices]
 
     def valid_actions(self, indices: torch.Tensor) -> torch.Tensor:
         if self.action_valid_mask is None:
@@ -234,6 +250,328 @@ def _canonicalize_subhour_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+def _timestamp_to_epoch_ms(value: str) -> int:
+    parsed = _parse_utc_timestamp(value)
+    return int(parsed.timestamp() * 1000)
+
+
+def _row_decision_timestamps_ms(payload: dict[str, Any]) -> torch.Tensor:
+    if "decision_timestamps_ms" in payload:
+        return torch.as_tensor(payload["decision_timestamps_ms"], dtype=torch.long)
+    return torch.tensor([_timestamp_to_epoch_ms(value) for value in payload["decision_timestamps"]], dtype=torch.long)
+
+
+def _unique_in_order(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _session_ids_from_payload(payload: dict[str, Any]) -> tuple[list[str], str]:
+    decisions = list(payload["decision_timestamps"])
+    for key in ("session_ids", "session_dates"):
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        sessions = [str(value) for value in raw]
+        if len(sessions) != len(decisions):
+            raise ValueError(f"{key} length must match decision_timestamps length.")
+        return sessions, f"payload.{key}"
+    sessions = [_parse_utc_timestamp(value).astimezone(_EASTERN).date().isoformat() for value in decisions]
+    return sessions, "derived_from_decision_timestamps"
+
+
+def _session_ids_for_timestamps(timestamps: list[str]) -> list[str]:
+    return [_parse_utc_timestamp(value).astimezone(_EASTERN).date().isoformat() for value in timestamps]
+
+
+def _split_policy_reportability_errors(split_policy: dict[str, object] | None) -> list[str]:
+    if not split_policy:
+        return []
+    errors = split_policy.get("reportability_errors", [])
+    return [str(error) for error in errors]
+
+
+def _block_bounds(
+    *,
+    block_name: str,
+    block_sessions: list[str],
+    decisions: list[str],
+    next_timestamps: list[str],
+    decision_sessions: list[str],
+    next_sessions: list[str],
+) -> dict[str, object]:
+    block = set(block_sessions)
+    selected = [index for index, session in enumerate(decision_sessions) if session in block]
+    usable = [
+        index
+        for index in selected
+        if next_sessions[index] in block and _parse_utc_timestamp(next_timestamps[index]) > _parse_utc_timestamp(decisions[index])
+    ]
+    if not selected:
+        raise ValueError(f"No decision rows selected for {block_name} split.")
+    if not usable:
+        raise ValueError(f"No reward-complete rows selected for {block_name} split.")
+    return {
+        "sessions": list(block_sessions),
+        "session_count": len(block_sessions),
+        "start": decisions[min(selected)],
+        "end": decisions[max(selected)],
+        "reward_start": decisions[min(usable)],
+        "reward_end": max(next_timestamps[index] for index in usable),
+        "valid_decision_start": decisions[min(usable)],
+        "valid_decision_end": decisions[max(usable)],
+        "valid_reward_end": max(next_timestamps[index] for index in usable),
+        "selected_rows": len(selected),
+        "valid_rows": len(usable),
+    }
+
+
+def infer_latest_holdout_split_policy(
+    payload: dict[str, Any],
+    *,
+    val_sessions: int,
+    test_sessions: int,
+    embargo_sessions: int = 1,
+    min_train_sessions: int = 60,
+) -> dict[str, object]:
+    if val_sessions <= 0 or test_sessions <= 0 or min_train_sessions <= 0:
+        raise ValueError("val_sessions, test_sessions, and min_train_sessions must be positive.")
+    if embargo_sessions < 0:
+        raise ValueError("embargo_sessions must be non-negative.")
+
+    decisions = list(payload["decision_timestamps"])
+    next_timestamps = list(payload["next_timestamps"])
+    decision_sessions, session_source = _session_ids_from_payload(payload)
+    next_sessions = _session_ids_for_timestamps(next_timestamps)
+    complete_indices = [
+        index
+        for index, next_ts in enumerate(next_timestamps)
+        if _parse_utc_timestamp(next_ts) > _parse_utc_timestamp(decisions[index])
+    ]
+    complete_sessions = _unique_in_order([decision_sessions[index] for index in complete_indices])
+    required = min_train_sessions + val_sessions + test_sessions + 2 * embargo_sessions
+    if len(complete_sessions) < required:
+        raise ValueError(
+            "Not enough complete sessions for reportable latest_holdout split: "
+            f"need {required}, got {len(complete_sessions)}."
+        )
+
+    test_block = complete_sessions[-test_sessions:]
+    val_end_idx = len(complete_sessions) - test_sessions - embargo_sessions
+    val_start_idx = val_end_idx - val_sessions
+    train_end_idx = val_start_idx - embargo_sessions
+    train_block = complete_sessions[:train_end_idx]
+    val_block = complete_sessions[val_start_idx:val_end_idx]
+    if len(train_block) < min_train_sessions:
+        raise ValueError("Empty or too-small training split after validation/test/embargo allocation.")
+
+    train = _block_bounds(
+        block_name="train",
+        block_sessions=train_block,
+        decisions=decisions,
+        next_timestamps=next_timestamps,
+        decision_sessions=decision_sessions,
+        next_sessions=next_sessions,
+    )
+    val = _block_bounds(
+        block_name="val",
+        block_sessions=val_block,
+        decisions=decisions,
+        next_timestamps=next_timestamps,
+        decision_sessions=decision_sessions,
+        next_sessions=next_sessions,
+    )
+    test = _block_bounds(
+        block_name="test",
+        block_sessions=test_block,
+        decisions=decisions,
+        next_timestamps=next_timestamps,
+        decision_sessions=decision_sessions,
+        next_sessions=next_sessions,
+    )
+    max_decision = decisions[max(complete_indices)]
+    max_reward = max(next_timestamps[index] for index in complete_indices)
+    test_uses_latest = test["valid_decision_end"] == max_decision and test["valid_reward_end"] == max_reward
+    errors: list[str] = [] if test_uses_latest else ["latest_holdout_test_does_not_use_latest_complete_period"]
+    return {
+        "split_mode": "latest_holdout",
+        "calendar_id": DEFAULT_EXCHANGE_CALENDAR_ID,
+        "session_id_source": session_source,
+        "train_sessions": train["session_count"],
+        "val_sessions": val["session_count"],
+        "test_sessions": test["session_count"],
+        "embargo_sessions": int(embargo_sessions),
+        "min_train_sessions": int(min_train_sessions),
+        "train_start": train["valid_decision_start"],
+        "train_end": train["valid_decision_end"],
+        "train_reward_end": train["valid_reward_end"],
+        "val_start": val["valid_decision_start"],
+        "val_end": val["valid_decision_end"],
+        "val_reward_end": val["valid_reward_end"],
+        "test_start": test["valid_decision_start"],
+        "test_end": test["valid_decision_end"],
+        "test_reward_end": test["valid_reward_end"],
+        "max_dataset_decision_timestamp": max_decision,
+        "max_dataset_reward_end_timestamp": max_reward,
+        "test_uses_latest_complete_period": bool(test_uses_latest),
+        "manual_split_used": False,
+        "reportable": not errors,
+        "reportability_errors": errors,
+        "blocks": {"train": train, "val": val, "test": test},
+    }
+
+
+def infer_latest_rows_smoke_split_policy(
+    payload: dict[str, Any],
+    *,
+    val_rows: int,
+    test_rows: int,
+    min_train_rows: int = 1,
+) -> dict[str, object]:
+    if val_rows <= 0 or test_rows <= 0 or min_train_rows <= 0:
+        raise ValueError("val_rows, test_rows, and min_train_rows must be positive.")
+    decisions = list(payload["decision_timestamps"])
+    next_timestamps = list(payload["next_timestamps"])
+    required = min_train_rows + val_rows + test_rows
+    if len(decisions) < required:
+        raise ValueError(f"Not enough rows for latest_rows_smoke split: need {required}, got {len(decisions)}.")
+    train_end = len(decisions) - val_rows - test_rows
+    val_end = len(decisions) - test_rows
+    train_indices = list(range(0, train_end))
+    val_indices = list(range(train_end, val_end))
+    test_indices = list(range(val_end, len(decisions)))
+
+    def row_block(name: str, indices: list[int]) -> dict[str, object]:
+        return {
+            "sessions": [],
+            "session_count": 0,
+            "start": decisions[indices[0]],
+            "end": decisions[indices[-1]],
+            "reward_start": decisions[indices[0]],
+            "reward_end": next_timestamps[indices[-1]],
+            "valid_decision_start": decisions[indices[0]],
+            "valid_decision_end": decisions[indices[-1]],
+            "valid_reward_end": next_timestamps[indices[-1]],
+            "selected_rows": len(indices),
+            "valid_rows": len(indices),
+        }
+
+    train = row_block("train", train_indices)
+    val = row_block("val", val_indices)
+    test = row_block("test", test_indices)
+    return {
+        "split_mode": "latest_rows_smoke",
+        "calendar_id": DEFAULT_EXCHANGE_CALENDAR_ID,
+        "train_rows": len(train_indices),
+        "val_rows": len(val_indices),
+        "test_rows": len(test_indices),
+        "train_start": train["valid_decision_start"],
+        "train_end": train["valid_decision_end"],
+        "train_reward_end": train["valid_reward_end"],
+        "val_start": val["valid_decision_start"],
+        "val_end": val["valid_decision_end"],
+        "val_reward_end": val["valid_reward_end"],
+        "test_start": test["valid_decision_start"],
+        "test_end": test["valid_decision_end"],
+        "test_reward_end": test["valid_reward_end"],
+        "max_dataset_decision_timestamp": decisions[-1],
+        "max_dataset_reward_end_timestamp": next_timestamps[-1],
+        "test_uses_latest_complete_period": True,
+        "manual_split_used": False,
+        "reportable": False,
+        "reportability_errors": ["smoke_row_based_split"],
+        "blocks": {"train": train, "val": val, "test": test},
+    }
+
+
+def manual_split_policy(
+    payload: dict[str, Any],
+    *,
+    train_end: str,
+    val_end: str,
+    test_start: str,
+    train_start: str | None = None,
+    test_end: str | None = None,
+) -> dict[str, object]:
+    decisions = list(payload["decision_timestamps"])
+    next_timestamps = list(payload["next_timestamps"])
+    max_decision = decisions[-1]
+    max_reward = max(next_timestamps)
+    test_end_text = test_end or max_decision
+    test_uses_latest = (
+        _parse_utc_timestamp(test_start) <= _parse_utc_timestamp(max_decision)
+        and _parse_utc_timestamp(test_end_text) >= _parse_utc_timestamp(max_decision)
+    )
+    errors: list[str] = [] if test_uses_latest else ["manual_split_skips_latest_complete_period"]
+    return {
+        "split_mode": "manual",
+        "calendar_id": DEFAULT_EXCHANGE_CALENDAR_ID,
+        "train_start": train_start,
+        "train_end": train_end,
+        "val_end": val_end,
+        "test_start": test_start,
+        "test_end": test_end,
+        "max_dataset_decision_timestamp": max_decision,
+        "max_dataset_reward_end_timestamp": max_reward,
+        "test_uses_latest_complete_period": bool(test_uses_latest),
+        "manual_split_used": True,
+        "reportable": not errors,
+        "reportability_errors": errors,
+    }
+
+
+def _merge_action_covariate_sidecar(
+    dataset_path: str | bytes | PathLike[str],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    sidecar_path = Path(dataset_path).with_name("action_covariates.pt")
+    if not sidecar_path.exists():
+        return payload
+    sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=True)
+    if not isinstance(sidecar, dict):
+        raise ValueError(f"Action covariate sidecar must contain a dictionary: {sidecar_path}")
+    if list(sidecar.get("action_names", [])) != list(payload.get("action_names", [])):
+        raise ValueError(f"Action covariate sidecar action_names do not match dataset: {sidecar_path}")
+    if list(sidecar.get("decision_timestamps", [])) != list(payload.get("decision_timestamps", [])):
+        raise ValueError(f"Action covariate sidecar decision_timestamps do not match dataset: {sidecar_path}")
+    merged = dict(payload)
+    for key, value in sidecar.items():
+        if key in {"base_dataset_file_name", "base_dataset_sha256"}:
+            continue
+        if key in merged and key not in {"decision_timestamps", "decision_timestamps_ms", "action_names"}:
+            raise ValueError(f"Action covariate sidecar key already exists in dataset payload: {key}")
+        merged[key] = value
+    merged["action_covariate_sidecar_path"] = str(sidecar_path)
+    errors = list(merged.get("dataset_reportability_errors", []))
+    errors.extend(sidecar.get("action_covariate_reportability_errors", []))
+    errors = list(dict.fromkeys(errors))
+    merged["dataset_reportability_errors"] = errors
+    merged["dataset_reportable"] = bool(merged.get("dataset_reportable", merged.get("reportable", True))) and not errors
+    return merged
+
+
+def validate_action_feature_tensors(payload: dict[str, Any]) -> None:
+    if "action_features" not in payload:
+        return
+    action_features = payload["action_features"].float()
+    action_returns = payload["action_returns"].float()
+    if action_features.ndim != 3 or tuple(action_features.shape[:2]) != tuple(action_returns.shape):
+        raise ValueError("action_features must have shape [rows, actions, features].")
+    feature_names = list(payload.get("action_feature_names", payload.get("feature_names", {}).get("action_features", [])))
+    if len(feature_names) != int(action_features.shape[-1]):
+        raise ValueError("action_feature_names length must match action_features width.")
+    available = payload.get("action_feature_available_timestamps_ms")
+    if available is not None:
+        available = torch.as_tensor(available, dtype=torch.long)
+        if tuple(available.shape) != tuple(action_features.shape):
+            raise ValueError("action_feature_available_timestamps_ms shape must match action_features.")
+        decision_ms = _row_decision_timestamps_ms(payload).view(-1, 1, 1).expand_as(available)
+        known = available >= 0
+        if bool((available[known] > decision_ms[known]).any().item()):
+            raise ValueError("action feature availability timestamp exceeds decision timestamp.")
+    if not bool(torch.isfinite(action_features).all().item()):
+        raise ValueError("action_features must be finite.")
+
+
 def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
     payload = _canonicalize_subhour_payload(payload)
     decisions = list(payload["decision_timestamps"])
@@ -302,6 +640,7 @@ def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
 
 def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
     payload = _canonicalize_subhour_payload(torch.load(path, map_location="cpu", weights_only=True))
+    payload = _merge_action_covariate_sidecar(path, payload)
     required = {
         "decision_timestamps",
         "next_timestamps",
@@ -319,6 +658,7 @@ def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
         raise ValueError(f"Minute-to-hour dataset is missing required keys: {sorted(missing)}")
     validate_hour_level_decision_grid(payload)
     validate_minute_timestamp_grid(payload)
+    validate_action_feature_tensors(payload)
     return payload
 
 
@@ -328,6 +668,25 @@ def _masked_mean_std(features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.
     mean = (features * valid).sum(dim=(0, 1, 2)) / count
     variance = (((features - mean) * valid) ** 2).sum(dim=(0, 1, 2)) / count
     return mean, variance.sqrt().clamp_min(1e-6)
+
+
+def _action_feature_mean_std(
+    features: torch.Tensor,
+    feature_names: list[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = features.mean(dim=(0, 1))
+    std = features.std(dim=(0, 1), unbiased=False).clamp_min(1e-6)
+    if feature_names:
+        keep_raw = torch.tensor(
+            [
+                name.startswith("stock_covariates_v1_mask.") or name.endswith("_missing_flag")
+                for name in feature_names
+            ],
+            dtype=torch.bool,
+        )
+        mean = torch.where(keep_raw, torch.zeros_like(mean), mean)
+        std = torch.where(keep_raw, torch.ones_like(std), std)
+    return mean, std
 
 
 def _build_split(
@@ -343,6 +702,9 @@ def _build_split(
     minute_feature_std: torch.Tensor | None = None,
     hour_feature_mean: torch.Tensor | None = None,
     hour_feature_std: torch.Tensor | None = None,
+    action_feature_mean: torch.Tensor | None = None,
+    action_feature_std: torch.Tensor | None = None,
+    split_policy: dict[str, object] | None = None,
 ) -> HourFromMinuteDataSplit:
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
@@ -361,12 +723,19 @@ def _build_split(
     all_minute_mask = payload["minute_mask"].bool()
     all_hour_features = payload["hour_features"].float()
     all_returns = payload["action_returns"].float()
+    all_action_features = payload.get("action_features")
+    action_feature_names = list(payload.get("action_feature_names", []))
+    action_feature_groups = {
+        str(key): [int(bounds[0]), int(bounds[1])]
+        for key, bounds in dict(payload.get("action_feature_groups", {})).items()
+    }
     raw_action_valid = payload.get("action_valid_mask")
     has_explicit_decision_mask = "decision_action_valid_mask" in payload
     has_explicit_label_mask = "label_valid_mask" in payload or "action_label_valid_mask" in payload
     raw_decision_valid = payload.get("decision_action_valid_mask", raw_action_valid)
     raw_label_valid = payload.get("label_valid_mask", payload.get("action_label_valid_mask", raw_action_valid))
     dataset_reportability_errors = list(payload.get("dataset_reportability_errors", []))
+    dataset_reportability_errors.extend(_split_policy_reportability_errors(split_policy))
     if raw_action_valid is not None and (not has_explicit_decision_mask or not has_explicit_label_mask):
         dataset_reportability_errors.append("legacy_action_valid_mask_semantics_ambiguous")
     dataset_reportability_errors = list(dict.fromkeys(dataset_reportability_errors))
@@ -389,6 +758,12 @@ def _build_split(
         raise ValueError("minute feature/mask row counts must match decision_timestamps length.")
     if all_hour_features.shape[0] != row_count or all_returns.shape[0] != row_count:
         raise ValueError("hour_features and action_returns rows must match decision_timestamps length.")
+    if all_action_features is not None:
+        all_action_features = all_action_features.float()
+        if all_action_features.ndim != 3 or tuple(all_action_features.shape[:2]) != tuple(all_returns.shape):
+            raise ValueError("action_features must have shape [rows, actions, features].")
+        if len(action_feature_names) != int(all_action_features.shape[-1]):
+            raise ValueError("action_feature_names length must match action_features width.")
 
     start_dt = None if start_ts is None else _parse_utc_timestamp(start_ts)
     end_dt = None if end_ts is None else _parse_utc_timestamp(end_ts)
@@ -407,6 +782,7 @@ def _build_split(
     raw_minute = all_minute_features[selected]
     raw_mask = all_minute_mask[selected]
     raw_hour = all_hour_features[selected]
+    raw_action_features = all_action_features[selected] if all_action_features is not None else None
     returns = all_returns[selected]
     action_valid_mask = all_action_valid[selected] if all_action_valid is not None else None
     label_valid_mask = all_label_valid[selected] if all_label_valid is not None else None
@@ -433,6 +809,11 @@ def _build_split(
         hour_feature_mean = raw_hour.mean(dim=(0, 1))
     if hour_feature_std is None:
         hour_feature_std = raw_hour.std(dim=(0, 1), unbiased=False).clamp_min(1e-6)
+    action_features = None
+    if raw_action_features is not None:
+        if action_feature_mean is None or action_feature_std is None:
+            action_feature_mean, action_feature_std = _action_feature_mean_std(raw_action_features, action_feature_names)
+        action_features = ((raw_action_features - action_feature_mean) / action_feature_std).clamp_(-8.0, 8.0)
 
     minute = ((raw_minute - minute_feature_mean) / minute_feature_std).clamp_(-8.0, 8.0)
     minute = minute.masked_fill(~raw_mask.unsqueeze(-1), 0.0)
@@ -468,50 +849,187 @@ def _build_split(
         context_bars_per_hour=int(payload.get("context_bars_per_hour", payload.get("minutes_per_hour", raw_minute.shape[2]))),
         dataset_reportable=dataset_reportable,
         dataset_reportability_errors=dataset_reportability_errors,
+        action_features=action_features,
+        action_feature_names=action_feature_names,
+        action_feature_mean=action_feature_mean,
+        action_feature_std=action_feature_std,
+        action_feature_groups=action_feature_groups,
+        split_policy=dict(split_policy or {}),
     )
 
 
 def build_hour_from_minute_splits(
     *,
     dataset_path,
-    train_end: str,
-    val_end: str,
-    test_start: str,
+    split_mode: str = "latest_holdout",
+    train_end: str | None = None,
+    val_end: str | None = None,
+    test_start: str | None = None,
     train_start: str | None = None,
     test_end: str | None = None,
+    val_sessions: int = 10,
+    test_sessions: int = 20,
+    embargo_sessions: int = 1,
+    min_train_sessions: int = 60,
+    val_rows: int = 20,
+    test_rows: int = 20,
+    min_train_rows: int = 1,
 ) -> tuple[HourFromMinuteDataSplit, HourFromMinuteDataSplit, HourFromMinuteDataSplit]:
     payload = _load_payload(dataset_path)
-    train = _build_split(
-        name="train",
-        payload=payload,
-        start_ts=train_start,
-        end_ts=train_end,
-        reward_end_ts=train_end,
-    )
-    val = _build_split(
-        name="val",
-        payload=payload,
-        start_ts=train_start,
-        end_ts=val_end,
-        reward_after_ts=train_end,
-        reward_end_ts=val_end,
-        minute_feature_mean=train.minute_feature_mean,
-        minute_feature_std=train.minute_feature_std,
-        hour_feature_mean=train.hour_feature_mean,
-        hour_feature_std=train.hour_feature_std,
-    )
-    test = _build_split(
-        name="test",
-        payload=payload,
-        start_ts=train_start,
-        end_ts=test_end,
-        reward_start_ts=test_start,
-        reward_end_ts=test_end,
-        minute_feature_mean=train.minute_feature_mean,
-        minute_feature_std=train.minute_feature_std,
-        hour_feature_mean=train.hour_feature_mean,
-        hour_feature_std=train.hour_feature_std,
-    )
+    if split_mode == "latest_holdout":
+        if any(value is not None for value in (train_start, train_end, val_end, test_start, test_end)):
+            raise ValueError("Manual timestamp cutoffs require split_mode='manual'.")
+        split_policy = infer_latest_holdout_split_policy(
+            payload,
+            val_sessions=val_sessions,
+            test_sessions=test_sessions,
+            embargo_sessions=embargo_sessions,
+            min_train_sessions=min_train_sessions,
+        )
+        blocks = split_policy["blocks"]
+        train_block = dict(blocks["train"])
+        val_block = dict(blocks["val"])
+        test_block = dict(blocks["test"])
+        train = _build_split(
+            name="train",
+            payload=payload,
+            start_ts=str(train_block["start"]),
+            end_ts=str(train_block["end"]),
+            reward_end_ts=str(train_block["reward_end"]),
+            split_policy=split_policy,
+        )
+        val = _build_split(
+            name="val",
+            payload=payload,
+            start_ts=str(val_block["start"]),
+            end_ts=str(val_block["end"]),
+            reward_start_ts=str(val_block["reward_start"]),
+            reward_end_ts=str(val_block["reward_end"]),
+            minute_feature_mean=train.minute_feature_mean,
+            minute_feature_std=train.minute_feature_std,
+            hour_feature_mean=train.hour_feature_mean,
+            hour_feature_std=train.hour_feature_std,
+            action_feature_mean=train.action_feature_mean,
+            action_feature_std=train.action_feature_std,
+            split_policy=split_policy,
+        )
+        test = _build_split(
+            name="test",
+            payload=payload,
+            start_ts=str(test_block["start"]),
+            end_ts=str(test_block["end"]),
+            reward_start_ts=str(test_block["reward_start"]),
+            reward_end_ts=str(test_block["reward_end"]),
+            minute_feature_mean=train.minute_feature_mean,
+            minute_feature_std=train.minute_feature_std,
+            hour_feature_mean=train.hour_feature_mean,
+            hour_feature_std=train.hour_feature_std,
+            action_feature_mean=train.action_feature_mean,
+            action_feature_std=train.action_feature_std,
+            split_policy=split_policy,
+        )
+    elif split_mode == "latest_rows_smoke":
+        if any(value is not None for value in (train_start, train_end, val_end, test_start, test_end)):
+            raise ValueError("Manual timestamp cutoffs cannot be combined with latest_rows_smoke.")
+        split_policy = infer_latest_rows_smoke_split_policy(
+            payload,
+            val_rows=val_rows,
+            test_rows=test_rows,
+            min_train_rows=min_train_rows,
+        )
+        blocks = split_policy["blocks"]
+        train_block = dict(blocks["train"])
+        val_block = dict(blocks["val"])
+        test_block = dict(blocks["test"])
+        train = _build_split(
+            name="train",
+            payload=payload,
+            start_ts=str(train_block["start"]),
+            end_ts=str(train_block["end"]),
+            reward_end_ts=str(train_block["reward_end"]),
+            split_policy=split_policy,
+        )
+        val = _build_split(
+            name="val",
+            payload=payload,
+            start_ts=str(val_block["start"]),
+            end_ts=str(val_block["end"]),
+            reward_start_ts=str(val_block["reward_start"]),
+            reward_end_ts=str(val_block["reward_end"]),
+            minute_feature_mean=train.minute_feature_mean,
+            minute_feature_std=train.minute_feature_std,
+            hour_feature_mean=train.hour_feature_mean,
+            hour_feature_std=train.hour_feature_std,
+            action_feature_mean=train.action_feature_mean,
+            action_feature_std=train.action_feature_std,
+            split_policy=split_policy,
+        )
+        test = _build_split(
+            name="test",
+            payload=payload,
+            start_ts=str(test_block["start"]),
+            end_ts=str(test_block["end"]),
+            reward_start_ts=str(test_block["reward_start"]),
+            reward_end_ts=str(test_block["reward_end"]),
+            minute_feature_mean=train.minute_feature_mean,
+            minute_feature_std=train.minute_feature_std,
+            hour_feature_mean=train.hour_feature_mean,
+            hour_feature_std=train.hour_feature_std,
+            action_feature_mean=train.action_feature_mean,
+            action_feature_std=train.action_feature_std,
+            split_policy=split_policy,
+        )
+    elif split_mode == "manual":
+        if train_end is None or val_end is None or test_start is None:
+            raise ValueError("Manual split mode requires train_end, val_end, and test_start.")
+        split_policy = manual_split_policy(
+            payload,
+            train_start=train_start,
+            train_end=train_end,
+            val_end=val_end,
+            test_start=test_start,
+            test_end=test_end,
+        )
+        train = _build_split(
+            name="train",
+            payload=payload,
+            start_ts=train_start,
+            end_ts=train_end,
+            reward_end_ts=train_end,
+            split_policy=split_policy,
+        )
+        val = _build_split(
+            name="val",
+            payload=payload,
+            start_ts=train_start,
+            end_ts=val_end,
+            reward_after_ts=train_end,
+            reward_end_ts=val_end,
+            minute_feature_mean=train.minute_feature_mean,
+            minute_feature_std=train.minute_feature_std,
+            hour_feature_mean=train.hour_feature_mean,
+            hour_feature_std=train.hour_feature_std,
+            action_feature_mean=train.action_feature_mean,
+            action_feature_std=train.action_feature_std,
+            split_policy=split_policy,
+        )
+        test = _build_split(
+            name="test",
+            payload=payload,
+            start_ts=train_start,
+            end_ts=test_end,
+            reward_start_ts=test_start,
+            reward_end_ts=test_end,
+            minute_feature_mean=train.minute_feature_mean,
+            minute_feature_std=train.minute_feature_std,
+            hour_feature_mean=train.hour_feature_mean,
+            hour_feature_std=train.hour_feature_std,
+            action_feature_mean=train.action_feature_mean,
+            action_feature_std=train.action_feature_std,
+            split_policy=split_policy,
+        )
+    else:
+        raise ValueError(f"Unsupported split_mode {split_mode!r}.")
     assert_matching_hour_from_minute_schema(train, val, test)
     return train, val, test
 
@@ -533,6 +1051,10 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError(f"Source bar interval differs between {reference.name!r} and {split.name!r}.")
         if split.effective_context_bars_per_hour != reference.effective_context_bars_per_hour:
             raise ValueError(f"Context bars per hour differ between {reference.name!r} and {split.name!r}.")
+        if (split.action_features is None) != (reference.action_features is None):
+            raise ValueError("Splits must agree on whether action_features are present.")
+        if split.action_feature_names != reference.action_feature_names:
+            raise ValueError(f"Action feature names/order differ between {reference.name!r} and {split.name!r}.")
         if (split.action_valid_mask is None) != (reference.action_valid_mask is None):
             raise ValueError("Splits must agree on whether action_valid_mask is present.")
         if split.action_valid_mask is not None and split.action_valid_mask.shape[1] != reference.action_returns.shape[1]:
@@ -545,6 +1067,8 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError(f"Subhour tensor shape differs between {reference.name!r} and {split.name!r}.")
         if split.hour_features.shape[1:] != reference.hour_features.shape[1:]:
             raise ValueError(f"Hour tensor shape differs between {reference.name!r} and {split.name!r}.")
+        if split.action_features is not None and split.action_features.shape[1:] != reference.action_features.shape[1:]:
+            raise ValueError(f"Action feature tensor shape differs between {reference.name!r} and {split.name!r}.")
 
 
 def minute_to_hour_missing_label_report(
@@ -650,6 +1174,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         action_embedding_dim: int = 32,
         constraint_feature_dim: int = CONSTRAINT_FEATURE_DIM,
         max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS,
+        action_feature_dim: int = 0,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -660,6 +1185,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         self.minutes_per_hour = int(minutes_per_hour)
         self.max_subhour_tokens = None if max_subhour_tokens is None else int(max_subhour_tokens)
         self.action_count = int(action_count)
+        self.action_feature_dim = int(action_feature_dim)
         self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.minute_proj = nn.Sequential(nn.Linear(minute_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
         self.minute_pos = nn.Parameter(torch.zeros(minutes_per_hour, d_model))
@@ -682,6 +1208,24 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         self.previous_action_embedding = nn.Embedding(action_count, action_embedding_dim)
         self.action_context = nn.Linear(action_embedding_dim, d_model)
         self.constraint_context = nn.Linear(constraint_feature_dim, d_model)
+        if self.action_feature_dim > 0:
+            self.action_id_embedding = nn.Embedding(action_count, d_model)
+            self.action_feature_encoder = nn.Sequential(
+                nn.Linear(self.action_feature_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+            )
+            self.action_feature_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, feedforward_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(feedforward_dim, 1),
+            )
+        else:
+            self.action_id_embedding = None
+            self.action_feature_encoder = None
+            self.action_feature_head = None
         hour_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -747,6 +1291,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         hour_features: torch.Tensor,
         previous_actions: torch.Tensor,
         constraint_features: torch.Tensor,
+        action_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, hours, minutes, _ = minute_features.shape
         if hours > self.hours_lookback or minutes > self.minutes_per_hour:
@@ -781,7 +1326,18 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         constraint_ctx = self.constraint_context(constraint_features.float())
         hour_tokens = hour_tokens + action_ctx[:, None, :] + constraint_ctx[:, None, :]
         encoded = self.hour_encoder(hour_tokens, mask=self._causal_mask(hours, x.device))
-        return self.head(encoded[:, -1, :])
+        context = encoded[:, -1, :]
+        if self.action_feature_encoder is None:
+            return self.head(context)
+        if action_features is None:
+            raise ValueError("Model was configured with action_feature_dim > 0 but action_features were not provided.")
+        if action_features.shape[1] != self.action_count or action_features.shape[2] != self.action_feature_dim:
+            raise ValueError("action_features shape does not match configured action count/feature dimension.")
+        action_ids = torch.arange(self.action_count, device=action_features.device)
+        action_tokens = self.action_feature_encoder(action_features.float())
+        action_tokens = action_tokens + self.action_id_embedding(action_ids)[None, :, :]
+        q_tokens = context[:, None, :] + action_tokens
+        return self.action_feature_head(q_tokens).squeeze(-1)
 
 
 @dataclass
@@ -891,9 +1447,27 @@ class VectorizedMinuteToHourEnv:
             mask[empty_rows, int(self.config.constraints.cash_index)] = True
         return mask
 
-    def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def observe(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         minute, mask, hour = self.data.state(self.indices)
-        return minute, mask, hour, self.previous_actions, self.constraint_features(), self.action_mask()
+        return (
+            minute,
+            mask,
+            hour,
+            self.data.action_feature_state(self.indices),
+            self.previous_actions,
+            self.constraint_features(),
+            self.action_mask(),
+        )
 
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
@@ -1061,6 +1635,7 @@ def evaluate_minute_to_hour_policy(
             order_legs_episode = 0.0
             episode_steps = 0
         minute, mask, hour = data.state(torch.tensor([index], dtype=torch.long, device=device))
+        action_features = data.action_feature_state(torch.tensor([index], dtype=torch.long, device=device))
         prev_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
         bars_tensor = torch.tensor([bars_held], dtype=torch.long, device=device)
         cooldown_tensor = torch.tensor([cooldown_remaining], dtype=torch.long, device=device)
@@ -1098,7 +1673,10 @@ def evaluate_minute_to_hour_policy(
         action_mask = action_mask & availability_mask
         if not bool(action_mask.any().item()):
             action_mask[:, int(constraints.cash_index)] = True
-        q_values = model(minute, mask, hour, prev_tensor, constraints_tensor)
+        if action_features is None:
+            q_values = model(minute, mask, hour, prev_tensor, constraints_tensor)
+        else:
+            q_values = model(minute, mask, hour, prev_tensor, constraints_tensor, action_features=action_features)
         action = int(
             apply_leg_aware_hysteresis(
                 q_values,
@@ -1214,6 +1792,7 @@ def _assert_checkpoint_schema(
     minute_feature_names: list[str],
     hour_feature_names: list[str],
     action_names: list[str],
+    action_feature_names: list[str],
 ) -> None:
     expected = {
         "minute_feature_names": minute_feature_names,
@@ -1226,6 +1805,11 @@ def _assert_checkpoint_schema(
             raise ValueError(f"Warm-start checkpoint is missing {key}; refusing unverified fine-tune.")
         if list(actual) != list(expected_values):
             raise ValueError(f"Warm-start checkpoint {key} does not match the current dataset schema.")
+
+    checkpoint_action_features = checkpoint.get("action_feature_names", [])
+    if action_feature_names or checkpoint_action_features:
+        if list(checkpoint_action_features) != list(action_feature_names):
+            raise ValueError("Warm-start checkpoint action_feature_names does not match the current dataset schema.")
 
     constraint_names = checkpoint.get("constraint_feature_names")
     if constraint_names is None:
@@ -1248,6 +1832,7 @@ def load_minute_to_hour_warm_start(
         minute_feature_names=train_data.minute_feature_names,
         hour_feature_names=train_data.hour_feature_names,
         action_names=train_data.action_names,
+        action_feature_names=train_data.action_feature_names,
     )
     try:
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -1287,6 +1872,7 @@ def train_minute_to_hour_dqn(
         dropout=config.dropout,
         action_embedding_dim=config.action_embedding_dim,
         max_subhour_tokens=config.max_subhour_tokens,
+        action_feature_dim=0 if train_data.action_features is None else int(train_data.action_features.shape[-1]),
     ).to(device)
     warm_start_info: dict[str, object] | None = None
     if config.warm_start_model is not None:
@@ -1333,7 +1919,7 @@ def train_minute_to_hour_dqn(
     valid_action_count_trace: list[float] = []
     eval_trace: list[dict[str, float | int | None | str]] = []
     for step in range(1, config.learning.train_steps + 1):
-        minute, mask, hour, previous_actions, constraint_features, action_mask = env.observe()
+        minute, mask, hour, action_features, previous_actions, constraint_features, action_mask = env.observe()
         valid_action_count_trace.append(float(action_mask.sum(dim=1).float().mean().item()))
         epsilon = epsilon_by_step(
             step=step,
@@ -1343,7 +1929,14 @@ def train_minute_to_hour_dqn(
         )
         with torch.no_grad():
             with autocast_context(device, config.learning.use_amp):
-                q_values = q_network(minute, mask, hour, previous_actions, constraint_features)
+                q_values = q_network(
+                    minute,
+                    mask,
+                    hour,
+                    previous_actions,
+                    constraint_features,
+                    action_features=action_features,
+                )
             greedy_actions = apply_leg_aware_hysteresis(
                 q_values,
                 previous_actions,
@@ -1367,8 +1960,17 @@ def train_minute_to_hour_dqn(
             batch = replay.sample(config.learning.batch_size)
             current_minute, current_mask, current_hour = train_data.state(batch["indices"])
             next_minute, next_mask, next_hour = train_data.state(batch["next_indices"])
+            current_action_features = train_data.action_feature_state(batch["indices"])
+            next_action_features = train_data.action_feature_state(batch["next_indices"])
             with autocast_context(device, config.learning.use_amp):
-                q = q_network(current_minute, current_mask, current_hour, batch["previous_actions"], batch["constraint_features"])
+                q = q_network(
+                    current_minute,
+                    current_mask,
+                    current_hour,
+                    batch["previous_actions"],
+                    batch["constraint_features"],
+                    action_features=current_action_features,
+                )
                 chosen_q = q.gather(1, batch["actions"].unsqueeze(1)).squeeze(1)
                 with torch.no_grad():
                     next_online = q_network(
@@ -1377,6 +1979,7 @@ def train_minute_to_hour_dqn(
                         next_hour,
                         batch["next_previous_actions"],
                         batch["next_constraint_features"],
+                        action_features=next_action_features,
                     )
                     next_actions = apply_leg_aware_hysteresis(
                         next_online,
@@ -1395,6 +1998,7 @@ def train_minute_to_hour_dqn(
                         next_hour,
                         batch["next_previous_actions"],
                         batch["next_constraint_features"],
+                        action_features=next_action_features,
                     )
                     next_q = next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
                     target_q = batch["rewards"] + config.learning.gamma * (1.0 - batch["dones"]) * next_q
@@ -1464,6 +2068,10 @@ def train_minute_to_hour_dqn(
         "source_bar_interval": train_data.source_bar_interval,
         "context_bars_per_hour": train_data.effective_context_bars_per_hour,
         "max_subhour_tokens": config.max_subhour_tokens,
+        "split_policy": train_data.split_policy,
+        "action_feature_names": train_data.action_feature_names,
+        "action_feature_dim": 0 if train_data.action_features is None else int(train_data.action_features.shape[-1]),
+        "action_feature_groups": train_data.action_feature_groups,
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

@@ -38,11 +38,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_minute_runs")
     parser.add_argument("--run-name")
     parser.add_argument("--warm-start-model", type=Path, help="Fine-tune from a previous minute-to-hour model.pt checkpoint.")
-    parser.add_argument("--train-start")
-    parser.add_argument("--train-end", default="2026-06-05T23:59:59+00:00")
-    parser.add_argument("--val-end", default="2026-06-10T23:59:59+00:00")
-    parser.add_argument("--test-start", default="2026-06-11T00:00:00+00:00")
-    parser.add_argument("--test-end", default="2026-06-12T23:59:59+00:00")
+    parser.add_argument(
+        "--split-mode",
+        choices=["latest_holdout", "manual", "latest_rows_smoke"],
+        default="latest_holdout",
+        help="Default latest_holdout uses the latest complete sessions as test. Manual cutoffs are diagnostic.",
+    )
+    parser.add_argument("--train-start", help="Manual split only.")
+    parser.add_argument("--train-end", help="Manual split only.")
+    parser.add_argument("--val-end", help="Manual split only.")
+    parser.add_argument("--test-start", help="Manual split only.")
+    parser.add_argument("--test-end", help="Manual split only.")
+    parser.add_argument("--test-sessions", type=int, default=20)
+    parser.add_argument("--val-sessions", type=int, default=10)
+    parser.add_argument("--embargo-sessions", type=int, default=1)
+    parser.add_argument("--min-train-sessions", type=int, default=60)
+    parser.add_argument("--test-rows", type=int, default=20)
+    parser.add_argument("--val-rows", type=int, default=20)
+    parser.add_argument("--min-train-rows", type=int, default=1)
     parser.add_argument("--initial-action", default="CASH")
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--episode-length", type=int, default=32)
@@ -152,11 +165,19 @@ def main() -> int:
 
     train_split, val_split, test_split = build_hour_from_minute_splits(
         dataset_path=args.dataset,
+        split_mode=args.split_mode,
         train_start=args.train_start,
         train_end=args.train_end,
         val_end=args.val_end,
         test_start=args.test_start,
         test_end=args.test_end,
+        test_sessions=args.test_sessions,
+        val_sessions=args.val_sessions,
+        embargo_sessions=args.embargo_sessions,
+        min_train_sessions=args.min_train_sessions,
+        test_rows=args.test_rows,
+        val_rows=args.val_rows,
+        min_train_rows=args.min_train_rows,
     )
     initial_action = action_index(train_split.action_names, args.initial_action)
     runtime = torch_runtime_summary(device)
@@ -258,12 +279,25 @@ def main() -> int:
             "minute_feature_std": train_split.minute_feature_std.detach().cpu(),
             "hour_feature_mean": train_split.hour_feature_mean.detach().cpu(),
             "hour_feature_std": train_split.hour_feature_std.detach().cpu(),
+            "action_feature_mean": (
+                train_split.action_feature_mean.detach().cpu()
+                if train_split.action_feature_mean is not None
+                else None
+            ),
+            "action_feature_std": (
+                train_split.action_feature_std.detach().cpu()
+                if train_split.action_feature_std is not None
+                else None
+            ),
             "minute_feature_names": train_split.minute_feature_names,
             "hour_feature_names": train_split.hour_feature_names,
+            "action_feature_names": train_split.action_feature_names,
+            "action_feature_groups": train_split.action_feature_groups,
             "action_names": train_split.action_names,
             "source_bar_interval": train_split.source_bar_interval,
             "context_bars_per_hour": train_split.effective_context_bars_per_hour,
             "max_subhour_tokens": args.max_subhour_tokens,
+            "split_policy": train_split.split_policy,
             "constraints": asdict(constraints),
             "config": serializable_args,
             "warm_start": artifacts.get("warm_start"),
@@ -283,6 +317,7 @@ def main() -> int:
         "source_bar_interval": train_split.source_bar_interval,
         "context_bars_per_hour": train_split.effective_context_bars_per_hour,
         "max_subhour_tokens": args.max_subhour_tokens,
+        "split_policy": train_split.split_policy,
         "training": artifacts,
         "train_metrics": train_result.to_dict(),
         "val_metrics": val_result.to_dict(),

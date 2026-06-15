@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,12 +56,14 @@ from rl_quant.data_sources.polygon_stock_covariates import (  # noqa: E402
     regular_session_open_ms_after_date,
 )
 from rl_quant.features.stock_covariates import (  # noqa: E402
+    ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES,
     ACTION_COVARIATE_FEATURE_NAMES,
     ACTION_COVARIATE_SCHEMA_HASH,
     append_action_covariates_to_payload,
     build_action_covariate_tensor,
     build_symbol_silver_rows,
     read_covariate_coverage_manifest,
+    tensor_content_hash,
     validate_action_covariate_feature_schema,
 )
 from rl_quant.features.stock_second_context import (  # noqa: E402
@@ -427,6 +430,39 @@ class MinuteToHourTests(unittest.TestCase):
             feedforward_dim=32,
             action_embedding_dim=4,
         )
+
+    @staticmethod
+    def _write_minute_to_hour_dataset(
+        path: Path,
+        *,
+        decisions: list[str],
+        next_timestamps: list[str],
+        session_ids: list[str] | None = None,
+        minute_values: list[float] | None = None,
+    ) -> None:
+        rows = len(decisions)
+        minute_values = minute_values or [0.0] * rows
+        minute_grid = []
+        for decision in decisions:
+            context_dt = datetime.fromisoformat(decision) - timedelta(minutes=1)
+            minute_grid.append([[context_dt.isoformat()]])
+        payload = {
+            "decision_timestamps": decisions,
+            "next_timestamps": next_timestamps,
+            "minute_timestamp_grid": minute_grid,
+            "minute_feature_names": ["m"],
+            "hour_feature_names": ["h"],
+            "action_names": ["CASH", "QQQ"],
+            "minute_features": torch.tensor(minute_values, dtype=torch.float32).view(rows, 1, 1, 1),
+            "minute_mask": torch.ones((rows, 1, 1), dtype=torch.bool),
+            "hour_features": torch.zeros((rows, 1, 1), dtype=torch.float32),
+            "action_returns": torch.zeros((rows, 2), dtype=torch.float32),
+            "decision_action_valid_mask": torch.ones((rows, 2), dtype=torch.bool),
+            "label_valid_mask": torch.ones((rows, 2), dtype=torch.bool),
+        }
+        if session_ids is not None:
+            payload["session_ids"] = session_ids
+        torch.save(payload, path)
 
     def test_hourly_context_uses_only_past_minutes(self) -> None:
         decision_timestamp = "2026-06-10T15:30:00+00:00"
@@ -990,6 +1026,99 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual(tuple(q_values.shape), (2, 2))
 
+    def test_minute_to_hour_action_covariate_sidecar_merges_into_split(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload", "_build_split"])
+        decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
+        next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
+        action_features = torch.tensor(
+            [
+                [[0.0, 0.0, 0.0, 0.0], [1.0, 10.0, 1.0, 1.0]],
+                [[0.0, 0.0, 0.0, 0.0], [3.0, 20.0, 1.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hour_from_second_dataset.pt"
+            torch.save(
+                {
+                    "decision_timestamps": decisions,
+                    "next_timestamps": next_timestamps,
+                    "minute_timestamp_grid": [
+                        [["2026-06-10T15:29:59+00:00"]],
+                        [["2026-06-10T16:29:59+00:00"]],
+                    ],
+                    "minute_feature_names": ["m"],
+                    "hour_feature_names": ["h"],
+                    "action_names": ["CASH", "QQQ"],
+                    "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+                    "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
+                    "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
+                    "action_returns": torch.zeros((2, 2), dtype=torch.float32),
+                    "source_bar_interval": "1s",
+                    "context_bars_per_hour": 3600,
+                    "minutes_per_hour": 3600,
+                    "decision_grid_minutes": 60,
+                    "bar_latency_ms": 1000,
+                },
+                path,
+            )
+            torch.save(
+                {
+                    "decision_timestamps": decisions,
+                    "action_names": ["CASH", "QQQ"],
+                    "action_features": action_features,
+                    "action_feature_names": [
+                        "stock_covariates_v1.log_market_cap",
+                        "stock_covariates_v1.days_since_listed",
+                        "stock_covariates_v1_mask.log_market_cap",
+                        "stock_covariates_v1_mask.days_since_listed",
+                    ],
+                    "action_feature_available_timestamps_ms": torch.full((2, 2, 4), -1, dtype=torch.long),
+                    "action_feature_groups": {
+                        "stock_covariates_v1": [0, 2],
+                        "stock_covariates_v1_mask": [2, 4],
+                    },
+                    "action_covariate_reportability_errors": [],
+                },
+                path.with_name("action_covariates.pt"),
+            )
+
+            payload = module._load_payload(path)
+            split = module._build_split(name="train", payload=payload)
+
+        self.assertEqual(tuple(split.action_features.shape), (2, 2, 4))
+        self.assertEqual(split.action_feature_names[-1], "stock_covariates_v1_mask.days_since_listed")
+        self.assertEqual(split.action_feature_groups["stock_covariates_v1"], [0, 2])
+        self.assertTrue(torch.equal(split.action_features[:, :, 2:], action_features[:, :, 2:]))
+
+    def test_minute_to_hour_model_scores_action_features(self) -> None:
+        model = MinuteToHourCausalTransformerQNetwork(
+            minute_feature_dim=2,
+            hour_feature_dim=1,
+            action_count=3,
+            hours_lookback=1,
+            minutes_per_hour=2,
+            d_model=16,
+            n_heads=4,
+            minute_layers=1,
+            hour_layers=1,
+            feedforward_dim=32,
+            action_embedding_dim=4,
+            action_feature_dim=5,
+        )
+
+        q_values = model(
+            torch.zeros((2, 1, 2, 2), dtype=torch.float32),
+            torch.ones((2, 1, 2), dtype=torch.bool),
+            torch.zeros((2, 1, 1), dtype=torch.float32),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
+            action_features=torch.zeros((2, 3, 5), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(q_values.shape), (2, 3))
+        self.assertTrue(bool(torch.isfinite(q_values).all().item()))
+
     def test_vectorized_minute_to_hour_env_allows_last_valid_next_state(self) -> None:
         split = HourFromMinuteDataSplit(
             name="train",
@@ -1249,6 +1378,31 @@ class MinuteToHourTests(unittest.TestCase):
         args = module.parse_args([])
 
         self.assertEqual(args.execution_latency_ms, 1000)
+        self.assertTrue(args.strict_action_sources)
+
+    def test_second_context_builder_requires_point_in_time_universe_or_diagnostic_flag(self) -> None:
+        module = load_script("build_second_context_decision_dataset")
+        first_decision = iso_to_timestamp_ms("2026-06-12T14:35:00+00:00")
+        missing_args = module.parse_args([])
+        future_args = module.parse_args(["--universe-selection-timestamp", "2026-06-13T00:00:00+00:00"])
+        diagnostic_args = module.parse_args(
+            [
+                "--universe-selection-timestamp",
+                "2026-06-13T00:00:00+00:00",
+                "--allow-fixed-survivor-universe-diagnostic",
+            ]
+        )
+        lenient_action_args = module.parse_args(["--allow-missing-action-sources-for-diagnostic"])
+
+        with self.assertRaisesRegex(ValueError, "Universe selection"):
+            module.universe_reportability_errors(missing_args, first_decision_ms=first_decision)
+        with self.assertRaisesRegex(ValueError, "Universe selection"):
+            module.universe_reportability_errors(future_args, first_decision_ms=first_decision)
+        self.assertEqual(
+            module.universe_reportability_errors(diagnostic_args, first_decision_ms=first_decision),
+            ["future_universe_selection_timestamp"],
+        )
+        self.assertFalse(lenient_action_args.strict_action_sources)
 
     def test_second_context_manifest_marks_future_universe_nonreportable(self) -> None:
         decision = "2026-06-12T14:35:00+00:00"
@@ -1604,6 +1758,12 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertTrue(bool(bundle["action_covariate_mask"][0, 1, news_1d_idx].item()))
         self.assertEqual(float(bundle["action_covariates"][0, 1, news_missing_idx].item()), 0.0)
+        self.assertEqual(bundle["action_source_coverage_names"], ["overview_snapshots", "financials", "dividends", "splits", "news"])
+        self.assertTrue(bool(bundle["action_source_coverage"][0, 1, bundle["action_source_coverage_names"].index("news")].item()))
+        self.assertFalse(bool(bundle["action_source_coverage"][0, 0].any().item()))
+        self.assertEqual(bundle["action_covariate_action_type_feature_names"], ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES)
+        self.assertEqual(bundle["action_covariate_action_type_features"][0, 0].tolist(), [1.0, 0.0])
+        self.assertEqual(bundle["action_covariate_action_type_features"][0, 1].tolist(), [0.0, 1.0])
 
     def test_stock_covariate_coverage_manifest_is_explicit_source_of_availability(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1619,6 +1779,33 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertTrue(coverage["QQQ"]["financials"])
         self.assertFalse(coverage["QQQ"]["splits"])
         self.assertFalse(coverage["QQQ"]["dividends"])
+
+    def test_stock_covariate_coverage_manifest_rejects_unknown_or_overlapping_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            unknown_path = Path(directory) / "unknown.csv"
+            unknown_path.write_text(
+                "symbol,path,rows,datasets_available,datasets_missing\n"
+                "QQQ,/tmp/QQQ.parquet,0,\"news,unknown_dataset\",\"splits\"\n"
+            )
+            overlap_path = Path(directory) / "overlap.csv"
+            overlap_path.write_text(
+                "symbol,path,rows,datasets_available,datasets_missing\n"
+                "QQQ,/tmp/QQQ.parquet,0,\"news,financials\",\"news\"\n"
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unknown covariate coverage datasets"):
+                read_covariate_coverage_manifest(unknown_path)
+            with self.assertRaisesRegex(ValueError, "both available and missing"):
+                read_covariate_coverage_manifest(overlap_path)
+
+    def test_tensor_content_hash_tracks_tensor_values(self) -> None:
+        first = torch.tensor([[1.0, float("nan")], [2.0, 3.0]], dtype=torch.float32)
+        same = torch.tensor([[1.0, float("nan")], [2.0, 3.0]], dtype=torch.float32)
+        changed = first.clone()
+        changed[1, 1] = 4.0
+
+        self.assertEqual(tensor_content_hash(first), tensor_content_hash(same))
+        self.assertNotEqual(tensor_content_hash(first), tensor_content_hash(changed))
 
     def test_stock_covariate_source_coverage_is_not_inferred_from_future_rows(self) -> None:
         record = normalize_raw_covariate_record(
@@ -1709,13 +1896,22 @@ class MinuteToHourTests(unittest.TestCase):
         augmented = append_action_covariates_to_payload(payload, bundle)
 
         validate_second_context_payload(augmented)
-        self.assertEqual(int(augmented["action_features"].shape[-1]), original_width + 2 * len(ACTION_COVARIATE_FEATURE_NAMES))
+        expected_width = original_width + 2 * len(ACTION_COVARIATE_FEATURE_NAMES)
+        expected_width += len(ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES)
+        self.assertEqual(int(augmented["action_features"].shape[-1]), expected_width)
         self.assertTrue(torch.equal(augmented["decision_action_valid_mask"], original_valid))
         self.assertTrue(augmented["action_features_augmented_with_covariates"])
         self.assertIn("stock_covariates_v1", augmented["action_feature_groups"])
         self.assertIn("stock_covariates_v1_mask", augmented["action_feature_groups"])
+        self.assertIn("stock_covariates_v1_type", augmented["action_feature_groups"])
         self.assertTrue(augmented["action_covariate_mask_appended_to_action_features"])
+        self.assertEqual(augmented["dataset_manifest"]["covariate_mode"], "flat_append_baseline")
         self.assertNotEqual(augmented["payload_hash"], payload["payload_hash"])
+        self.assertIn("action_covariates_tensor_hash", augmented["tensor_content_hashes"])
+        self.assertEqual(
+            augmented["dataset_manifest"]["tensor_content_hashes"],
+            augmented["tensor_content_hashes"],
+        )
         self.assertEqual(
             augmented["dataset_manifest"]["action_covariate_feature_schema_file_hash"],
             "schema-file-hash",
@@ -3565,6 +3761,125 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual([row["requested_asset"] for row in result.rollout_records], ["QQQ", "QQQ"])
         self.assertEqual([row["executed_asset"] for row in result.rollout_records], ["CASH", "QQQ"])
 
+    def test_latest_holdout_uses_final_complete_sessions_and_train_normalizer(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        sessions = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]
+        decisions = [
+            f"{session}T{hour}:30:00+00:00"
+            for session in sessions
+            for hour in ("14", "15")
+        ]
+        next_timestamps = [
+            f"{session}T{hour}:30:00+00:00"
+            for session in sessions
+            for hour in ("15", "16")
+        ]
+        session_ids = [session for session in sessions for _ in range(2)]
+        minute_values = [2.0] * 6 + [50.0] * 4
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            self._write_minute_to_hour_dataset(
+                path,
+                decisions=decisions,
+                next_timestamps=next_timestamps,
+                session_ids=session_ids,
+                minute_values=minute_values,
+            )
+
+            train, val, test = module.build_hour_from_minute_splits(
+                dataset_path=path,
+                split_mode="latest_holdout",
+                val_sessions=1,
+                test_sessions=1,
+                embargo_sessions=0,
+                min_train_sessions=2,
+            )
+
+        self.assertEqual(train.split_policy["split_mode"], "latest_holdout")
+        self.assertTrue(train.split_policy["test_uses_latest_complete_period"])
+        self.assertTrue(train.dataset_reportable)
+        self.assertEqual(train.split_policy["test_start"], decisions[-2])
+        self.assertEqual([test.decision_timestamps[i] for i in test.valid_start_indices.tolist()], decisions[-2:])
+        self.assertEqual([val.decision_timestamps[i] for i in val.valid_start_indices.tolist()], decisions[-4:-2])
+        self.assertAlmostEqual(float(train.minute_feature_mean[0].item()), 2.0, places=6)
+        self.assertTrue(torch.equal(val.minute_feature_mean, train.minute_feature_mean))
+        self.assertTrue(torch.equal(test.minute_feature_mean, train.minute_feature_mean))
+
+    def test_reward_horizon_cannot_cross_split_end(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
+        payload = {
+            "decision_timestamps": [
+                "2026-01-02T14:30:00+00:00",
+                "2026-01-02T15:30:00+00:00",
+            ],
+            "next_timestamps": [
+                "2026-01-02T15:30:00+00:00",
+                "2026-01-02T16:30:00+00:00",
+            ],
+            "minute_feature_names": ["m"],
+            "hour_feature_names": ["h"],
+            "action_names": ["CASH", "QQQ"],
+            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
+            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
+            "action_returns": torch.zeros((2, 2), dtype=torch.float32),
+            "decision_action_valid_mask": torch.ones((2, 2), dtype=torch.bool),
+            "label_valid_mask": torch.ones((2, 2), dtype=torch.bool),
+        }
+
+        split = module._build_split(
+            name="train",
+            payload=payload,
+            end_ts="2026-01-02T15:30:00+00:00",
+            reward_end_ts="2026-01-02T15:30:00+00:00",
+        )
+
+        self.assertEqual(split.decision_timestamps, payload["decision_timestamps"])
+        self.assertEqual(split.valid_start_indices.tolist(), [0])
+
+    def test_manual_split_that_skips_latest_period_is_non_reportable(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18", "19")]
+        next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19", "20")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+
+            _train, _val, test = module.build_hour_from_minute_splits(
+                dataset_path=path,
+                split_mode="manual",
+                train_end=decisions[1],
+                val_end=next_timestamps[2],
+                test_start=decisions[3],
+                test_end=next_timestamps[3],
+            )
+
+        self.assertFalse(test.dataset_reportable)
+        self.assertFalse(test.split_policy["test_uses_latest_complete_period"])
+        self.assertIn("manual_split_skips_latest_complete_period", test.dataset_reportability_errors)
+
+    def test_latest_rows_smoke_split_is_non_reportable(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18")]
+        next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+
+            train, val, test = module.build_hour_from_minute_splits(
+                dataset_path=path,
+                split_mode="latest_rows_smoke",
+                val_rows=1,
+                test_rows=1,
+                min_train_rows=2,
+            )
+
+        self.assertEqual(train.split_policy["split_mode"], "latest_rows_smoke")
+        self.assertFalse(test.dataset_reportable)
+        self.assertEqual([val.decision_timestamps[i] for i in val.valid_start_indices.tolist()], [decisions[-2]])
+        self.assertEqual([test.decision_timestamps[i] for i in test.valid_start_indices.tolist()], [decisions[-1]])
+        self.assertIn("smoke_row_based_split", test.dataset_reportability_errors)
+
     def test_hour_from_second_partition_training_uses_distinct_validation_and_test_rows(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         decisions = [
@@ -3614,6 +3929,55 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(val.decision_timestamps, [decisions[-2]])
         self.assertEqual(test.decision_timestamps, [decisions[-1]])
         self.assertNotEqual(module.split_window(val)["first_valid_decision"], module.split_window(test)["first_valid_decision"])
+
+    def test_hour_from_second_max_partitions_defaults_to_latest(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label in ["2025-01-01_to_2025-01-04", "2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"]:
+                part = root / label
+                part.mkdir()
+                (part / "hour_from_second_dataset.pt").write_text("placeholder")
+            args = module.parse_args(
+                [
+                    "--partitions-root",
+                    str(root),
+                    "--max-partitions",
+                    "2",
+                ]
+            )
+
+            selected = [path.parent.name for path in module.partition_paths(args)]
+
+        self.assertEqual(selected, ["2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"])
+        self.assertEqual(module.partition_selection_reportability_errors(args), [])
+
+    def test_hour_from_second_earliest_partition_selection_is_diagnostic(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label in ["2025-01-01_to_2025-01-04", "2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"]:
+                part = root / label
+                part.mkdir()
+                (part / "hour_from_second_dataset.pt").write_text("placeholder")
+            args = module.parse_args(
+                [
+                    "--partitions-root",
+                    str(root),
+                    "--max-partitions",
+                    "1",
+                    "--partition-selection",
+                    "earliest",
+                ]
+            )
+
+            selected = [path.parent.name for path in module.partition_paths(args)]
+            policy = module.split_policy_with_partition_selection({"reportable": True, "reportability_errors": []}, args)
+
+        self.assertEqual(selected, ["2025-01-01_to_2025-01-04"])
+        self.assertFalse(policy["reportable"])
+        self.assertEqual(policy["partition_selection_reportability_errors"], ["non_latest_partition_selection"])
+        self.assertIn("non_latest_partition_selection", policy["reportability_errors"])
 
 
 class HourlySplitTests(unittest.TestCase):

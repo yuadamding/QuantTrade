@@ -47,6 +47,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start-partition", help="First partition label to include, inclusive.")
     parser.add_argument("--end-partition", help="Last partition label to include, inclusive.")
     parser.add_argument("--max-partitions", type=int, default=0, help="0 means all matching partitions.")
+    parser.add_argument(
+        "--partition-selection",
+        choices=["latest", "earliest"],
+        default="latest",
+        help="When --max-partitions is set, choose latest partitions by default; earliest is diagnostic only.",
+    )
     parser.add_argument("--initial-action", default="CASH")
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--episode-length", type=int, default=8)
@@ -96,10 +102,32 @@ def partition_paths(args: argparse.Namespace) -> list[Path]:
     if args.end_partition:
         paths = [path for path in paths if path.parent.name <= args.end_partition]
     if args.max_partitions > 0:
-        paths = paths[: args.max_partitions]
+        if args.partition_selection == "latest":
+            paths = paths[-args.max_partitions :]
+        elif args.partition_selection == "earliest":
+            paths = paths[: args.max_partitions]
+        else:
+            raise ValueError(f"Unsupported partition selection: {args.partition_selection!r}")
     if not paths:
         raise ValueError("No partition datasets matched the requested filters.")
     return paths
+
+
+def partition_selection_reportability_errors(args: argparse.Namespace) -> list[str]:
+    if int(args.max_partitions) > 0 and args.partition_selection != "latest":
+        return ["non_latest_partition_selection"]
+    return []
+
+
+def split_policy_with_partition_selection(split_policy: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
+    selection_errors = partition_selection_reportability_errors(args)
+    errors = [*list(split_policy.get("reportability_errors", [])), *selection_errors]
+    out = dict(split_policy)
+    out["partition_selection"] = args.partition_selection
+    out["partition_selection_reportability_errors"] = selection_errors
+    out["reportability_errors"] = list(dict.fromkeys(errors))
+    out["reportable"] = bool(split_policy.get("reportable", True)) and not out["reportability_errors"]
+    return out
 
 
 def build_constraints_from_args(args: argparse.Namespace):
@@ -148,54 +176,60 @@ def iso_timestamp_ms(value: str) -> int:
 
 
 def build_rolling_partition_splits(dataset_path: Path):
-    from rl_quant.minute_to_hour_transformer import _build_split, _load_payload
+    from rl_quant.minute_to_hour_transformer import (
+        _build_split,
+        _load_payload,
+        infer_latest_rows_smoke_split_policy,
+    )
 
     payload = _load_payload(dataset_path)
     decisions = list(payload["decision_timestamps"])
-    next_timestamps = list(payload["next_timestamps"])
     if len(decisions) < 4:
         raise ValueError(
             f"Partition {dataset_path} has too few decision rows for independent train/validation/test splits."
         )
-    train_end = decisions[-3]
-    train_reward_end = next_timestamps[-3]
-    validation_start = decisions[-2]
-    validation_reward_end = next_timestamps[-2]
-    test_start = decisions[-1]
-    test_reward_end = next_timestamps[-1]
-    if iso_timestamp_ms(train_reward_end) > iso_timestamp_ms(validation_start):
-        raise ValueError("Training reward window overlaps the validation decision window.")
-    if iso_timestamp_ms(validation_reward_end) > iso_timestamp_ms(test_start):
-        raise ValueError("Validation reward window overlaps the test decision window.")
+    split_policy = infer_latest_rows_smoke_split_policy(payload, val_rows=1, test_rows=1, min_train_rows=2)
+    blocks = split_policy["blocks"]
+    train_block = dict(blocks["train"])
+    val_block = dict(blocks["val"])
+    test_block = dict(blocks["test"])
     train = _build_split(
         name="train",
         payload=payload,
-        end_ts=train_end,
-        reward_end_ts=train_reward_end,
+        start_ts=str(train_block["start"]),
+        end_ts=str(train_block["end"]),
+        reward_end_ts=str(train_block["reward_end"]),
+        split_policy=split_policy,
     )
     val = _build_split(
         name="val",
         payload=payload,
-        start_ts=validation_start,
-        end_ts=validation_start,
-        reward_start_ts=validation_start,
-        reward_end_ts=validation_reward_end,
+        start_ts=str(val_block["start"]),
+        end_ts=str(val_block["end"]),
+        reward_start_ts=str(val_block["reward_start"]),
+        reward_end_ts=str(val_block["reward_end"]),
         minute_feature_mean=train.minute_feature_mean,
         minute_feature_std=train.minute_feature_std,
         hour_feature_mean=train.hour_feature_mean,
         hour_feature_std=train.hour_feature_std,
+        action_feature_mean=train.action_feature_mean,
+        action_feature_std=train.action_feature_std,
+        split_policy=split_policy,
     )
     test = _build_split(
         name="test",
         payload=payload,
-        start_ts=test_start,
-        end_ts=test_start,
-        reward_start_ts=test_start,
-        reward_end_ts=test_reward_end,
+        start_ts=str(test_block["start"]),
+        end_ts=str(test_block["end"]),
+        reward_start_ts=str(test_block["reward_start"]),
+        reward_end_ts=str(test_block["reward_end"]),
         minute_feature_mean=train.minute_feature_mean,
         minute_feature_std=train.minute_feature_std,
         hour_feature_mean=train.hour_feature_mean,
         hour_feature_std=train.hour_feature_std,
+        action_feature_mean=train.action_feature_mean,
+        action_feature_std=train.action_feature_std,
+        split_policy=split_policy,
     )
     return train, val, test
 
@@ -234,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
         torch.cuda.manual_seed_all(args.seed)
 
     paths = partition_paths(args)
+    partition_selection_errors = partition_selection_reportability_errors(args)
     run_dir = args.output_dir / args.run_name
     partition_dir = run_dir / "partitions"
     partition_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{ordinal}/{len(paths)}] loading {label}", flush=True)
         try:
             train_split, val_split, test_split = build_rolling_partition_splits(dataset_path)
+            run_split_policy = split_policy_with_partition_selection(train_split.split_policy, args)
             initial_action = action_index(train_split.action_names, args.initial_action)
             env_config = MinuteToHourEnvConfig(
                 num_envs=args.num_envs,
@@ -336,12 +372,25 @@ def main(argv: list[str] | None = None) -> int:
                     "minute_feature_std": train_split.minute_feature_std.detach().cpu(),
                     "hour_feature_mean": train_split.hour_feature_mean.detach().cpu(),
                     "hour_feature_std": train_split.hour_feature_std.detach().cpu(),
+                    "action_feature_mean": (
+                        train_split.action_feature_mean.detach().cpu()
+                        if train_split.action_feature_mean is not None
+                        else None
+                    ),
+                    "action_feature_std": (
+                        train_split.action_feature_std.detach().cpu()
+                        if train_split.action_feature_std is not None
+                        else None
+                    ),
                     "minute_feature_names": train_split.minute_feature_names,
                     "hour_feature_names": train_split.hour_feature_names,
+                    "action_feature_names": train_split.action_feature_names,
+                    "action_feature_groups": train_split.action_feature_groups,
                     "action_names": train_split.action_names,
                     "source_bar_interval": train_split.source_bar_interval,
                     "context_bars_per_hour": train_split.effective_context_bars_per_hour,
                     "max_subhour_tokens": args.max_subhour_tokens,
+                    "split_policy": run_split_policy,
                     "constraints": asdict(constraints),
                     "config": config_payload,
                     "warm_start": artifacts.get("warm_start"),
@@ -375,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
                         val_window["first_valid_decision"] != test_window["first_valid_decision"]
                     ),
                 },
+                "split_policy": run_split_policy,
                 "training": artifacts,
                 "train_metrics": train_result.to_dict(),
                 "val_metrics": val_result.to_dict(),
@@ -393,8 +443,17 @@ def main(argv: list[str] | None = None) -> int:
                 "test_total_return": test_result.total_return,
                 "test_switches": test_result.allocation_switches,
                 "test_order_legs": test_result.market_order_legs,
-                "evaluation_reportable": test_result.evaluation_reportable,
-                "reportability_errors": test_result.reportability_errors,
+                "evaluation_reportable": bool(test_result.evaluation_reportable) and not partition_selection_errors,
+                "reportability_errors": list(dict.fromkeys([*test_result.reportability_errors, *partition_selection_errors])),
+                "split_mode": run_split_policy.get("split_mode"),
+                "split_reportable": run_split_policy.get("reportable"),
+                "split_reportability_errors": run_split_policy.get("reportability_errors", []),
+                "partition_selection": args.partition_selection,
+                "partition_selection_reportability_errors": partition_selection_errors,
+                "action_features_present": train_split.action_features is not None,
+                "action_feature_dim": artifacts.get("action_feature_dim"),
+                "action_feature_names": artifacts.get("action_feature_names", []),
+                "action_feature_groups": artifacts.get("action_feature_groups", {}),
                 "elapsed_seconds": summary["elapsed_seconds"],
                 "cuda_peak_reserved_gb": artifacts.get("cuda_peak_reserved_gb"),
                 "cuda_device_used_end_gb": artifacts.get("cuda_device_used_end_gb"),
@@ -433,6 +492,9 @@ def main(argv: list[str] | None = None) -> int:
             "config": config_payload,
             "constraints": asdict(constraints),
             "partition_count": len(paths),
+            "partition_selection": args.partition_selection,
+            "partition_selection_reportability_errors": partition_selection_errors,
+            "selection_reportable": not partition_selection_errors,
             "completed_count": sum(1 for item in records if item["status"] == "ok"),
             "failed_count": sum(1 for item in records if item["status"] != "ok"),
             "latest_checkpoint": str(previous_checkpoint) if previous_checkpoint is not None else None,

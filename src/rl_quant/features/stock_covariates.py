@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -53,6 +54,32 @@ ACTION_COVARIATE_FEATURE_NAMES = [
 ]
 ACTION_COVARIATE_SCHEMA_HASH = stable_json_hash(ACTION_COVARIATE_FEATURE_NAMES)
 COVARIATE_GROUPS = ("overview_snapshots", "financials", "dividends", "splits", "news")
+ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES = ["is_cash_action", "is_non_cash_action"]
+
+
+def tensor_content_hash(tensor: torch.Tensor) -> str:
+    detached = tensor.detach().cpu().contiguous()
+    if detached.dtype.is_floating_point:
+        detached = detached.clone()
+        detached[torch.isnan(detached)] = float("nan")
+    digest = hashlib.sha256()
+    metadata = json.dumps(
+        {"dtype": str(detached.dtype), "shape": list(detached.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest.update(metadata.encode("utf-8"))
+    digest.update(detached.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def tensor_content_hashes(payload: Mapping[str, Any], keys: list[str]) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for key in keys:
+        value = payload.get(key)
+        if torch.is_tensor(value):
+            hashes[f"{key}_tensor_hash"] = tensor_content_hash(value)
+    return hashes
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -215,6 +242,13 @@ def read_covariate_coverage_manifest(path: Path) -> dict[str, dict[str, bool]]:
                 for item in str(row.get("datasets_missing", "")).split(",")
                 if item.strip()
             }
+            allowed = set(COVARIATE_GROUPS)
+            unknown = sorted((available | missing) - allowed)
+            if unknown:
+                raise ValueError(f"Unknown covariate coverage datasets for {symbol}: {unknown}")
+            overlap = sorted(available & missing)
+            if overlap:
+                raise ValueError(f"Covariate coverage datasets cannot be both available and missing for {symbol}: {overlap}")
             coverage = {group: group in available for group in COVARIATE_GROUPS}
             for group in missing:
                 if group in coverage:
@@ -464,19 +498,25 @@ def build_action_covariate_tensor(
     available_rows: list[list[list[int]]] = []
     age_rows: list[list[list[float]]] = []
     coverage_rows: list[list[float]] = []
+    source_coverage_rows: list[list[list[bool]]] = []
+    action_type_rows: list[list[list[float]]] = []
     for decision_ms in decisions:
         decision_values: list[list[float]] = []
         decision_masks: list[list[bool]] = []
         decision_available: list[list[int]] = []
         decision_ages: list[list[float]] = []
         decision_group_coverage: list[float] = []
+        decision_source_coverage: list[list[bool]] = []
+        decision_action_type: list[list[float]] = []
         for action in action_names:
             symbol = canonical_symbol(action)
             builder = _CovariateRowBuilder(decision_ms)
             if symbol == "CASH":
+                coverage = empty_source_coverage()
                 for _name in ACTION_COVARIATE_FEATURE_NAMES:
                     builder.add(0.0, decision_ms, valid=False)
                 decision_group_coverage.append(0.0)
+                decision_action_type.append([1.0, 0.0])
             else:
                 rows = rows_by_symbol.get(symbol, [])
                 coverage = coverage_by_symbol.get(symbol, empty_source_coverage())
@@ -511,17 +551,21 @@ def build_action_covariate_tensor(
                 builder.add_known_now(coverage_fraction)
                 builder.add_known_now(max_age)
                 decision_group_coverage.append(coverage_fraction)
+                decision_action_type.append([0.0, 1.0])
             if len(builder.values) != len(ACTION_COVARIATE_FEATURE_NAMES):
                 raise ValueError("Internal covariate feature width mismatch.")
             decision_values.append(builder.values)
             decision_masks.append(builder.mask)
             decision_available.append(builder.available)
             decision_ages.append(builder.age_seconds)
+            decision_source_coverage.append([bool(coverage.get(group, False)) for group in COVARIATE_GROUPS])
         value_rows.append(decision_values)
         mask_rows.append(decision_masks)
         available_rows.append(decision_available)
         age_rows.append(decision_ages)
         coverage_rows.append(decision_group_coverage)
+        source_coverage_rows.append(decision_source_coverage)
+        action_type_rows.append(decision_action_type)
     coverage_summary = {
         "mean_action_group_coverage_fraction": float(
             sum(sum(row) for row in coverage_rows) / max(sum(len(row) for row in coverage_rows), 1)
@@ -540,6 +584,10 @@ def build_action_covariate_tensor(
         "action_covariate_mask": torch.tensor(mask_rows, dtype=torch.bool),
         "action_covariate_available_timestamps_ms": torch.tensor(available_rows, dtype=torch.long),
         "action_covariate_age_seconds": torch.tensor(age_rows, dtype=torch.float32),
+        "action_source_coverage": torch.tensor(source_coverage_rows, dtype=torch.bool),
+        "action_source_coverage_names": list(COVARIATE_GROUPS),
+        "action_covariate_action_type_features": torch.tensor(action_type_rows, dtype=torch.float32),
+        "action_covariate_action_type_feature_names": list(ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES),
         "action_covariate_feature_names": list(ACTION_COVARIATE_FEATURE_NAMES),
         "action_covariate_schema_hash": ACTION_COVARIATE_SCHEMA_HASH,
         "action_covariate_source_manifest_hash": source_manifest_hash,
@@ -590,6 +638,21 @@ def append_action_covariates_to_payload(
                 f"stock_covariates_v1_mask.{name}"
                 for name in covariates["action_covariate_feature_names"]
             )
+        action_type_features = covariates.get("action_covariate_action_type_features")
+        action_type_width = 0
+        if action_type_features is not None:
+            action_type_features = action_type_features.float()
+            if tuple(action_type_features.shape[:2]) != tuple(out["action_returns"].shape):
+                raise ValueError("action_covariate_action_type_features first two dimensions must match action_returns.")
+            appended_features.append(action_type_features)
+            action_type_width = int(action_type_features.shape[-1])
+            appended_names.extend(
+                f"stock_covariates_v1_type.{name}"
+                for name in covariates.get(
+                    "action_covariate_action_type_feature_names",
+                    ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES,
+                )
+            )
         appended_feature_tensor = torch.cat(appended_features, dim=-1)
         out["action_features"] = torch.cat([base_features, appended_feature_tensor], dim=-1)
         feature_names["action_features"] = [
@@ -607,6 +670,10 @@ def append_action_covariates_to_payload(
         appended_available = [action_covariate_available]
         if append_mask_features:
             appended_available.append(decision_ms.expand_as(action_covariate_available))
+        if action_type_width:
+            appended_available.append(
+                decision_ms.expand(decision_ms.shape[0], action_covariates.shape[1], action_type_width)
+            )
         per_feature_available = torch.cat([base_available, *appended_available], dim=-1)
         decision_feature_ms = decision_ms.expand_as(per_feature_available)
         known_features = per_feature_available >= 0
@@ -618,6 +685,8 @@ def append_action_covariates_to_payload(
         out["action_features_available_timestamps_ms"] = row_level
         out["action_features_augmented_with_covariates"] = True
         out["action_covariate_mask_appended_to_action_features"] = bool(append_mask_features)
+        out["covariate_mode"] = "flat_append_baseline"
+        out["covariate_protocol_version"] = "stock_covariates_flat_append_v2"
         out["action_feature_groups"] = {
             "base_action_features": [0, base_width],
             "stock_covariates_v1": [base_width, base_width + int(action_covariates.shape[-1])],
@@ -628,12 +697,36 @@ def append_action_covariates_to_payload(
                 mask_start,
                 mask_start + int(action_covariates.shape[-1]),
             ]
+        if action_type_width:
+            type_start = base_width + int(action_covariates.shape[-1])
+            if append_mask_features:
+                type_start += int(action_covariates.shape[-1])
+            out["action_feature_groups"]["stock_covariates_v1_type"] = [
+                type_start,
+                type_start + action_type_width,
+            ]
     else:
         out["action_features_augmented_with_covariates"] = False
         out["action_covariate_mask_appended_to_action_features"] = False
+        out["covariate_mode"] = "audit_only"
+        out["covariate_protocol_version"] = "stock_covariates_audit_v1"
     out["feature_names"] = feature_names
     out["feature_names_by_tensor"] = feature_names
     out["feature_schema_hash"] = stable_json_hash(feature_names)
+    out["tensor_content_hashes"] = tensor_content_hashes(
+        out,
+        [
+            "market_context",
+            "action_returns",
+            "action_features",
+            "action_covariates",
+            "action_covariate_mask",
+            "action_covariate_available_timestamps_ms",
+            "action_source_coverage",
+            "action_covariate_action_type_features",
+        ],
+    )
+    out.update(out["tensor_content_hashes"])
     base_payload_hash = out.get("payload_hash")
     payload_hash = stable_json_hash(
         {
@@ -647,6 +740,8 @@ def append_action_covariates_to_payload(
             "action_covariate_feature_schema_file_hash": covariates.get("action_covariate_feature_schema_file_hash"),
             "action_feature_groups": out.get("action_feature_groups", {}),
             "action_covariate_mask_appended_to_action_features": out.get("action_covariate_mask_appended_to_action_features"),
+            "covariate_mode": out.get("covariate_mode"),
+            "tensor_content_hashes": out["tensor_content_hashes"],
             "dataset_manifest": {
                 key: value
                 for key, value in dict(out.get("dataset_manifest", {})).items()
@@ -672,12 +767,18 @@ def append_action_covariates_to_payload(
             "action_covariate_feature_schema_file_hash": covariates.get("action_covariate_feature_schema_file_hash"),
             "action_features_augmented_with_covariates": bool(append_to_action_features),
             "action_covariate_mask_appended_to_action_features": bool(append_to_action_features and append_mask_features),
+            "covariate_mode": "flat_append_baseline",
+            "covariate_protocol_version": "stock_covariates_flat_append_v2",
             "action_feature_groups": out.get("action_feature_groups", {}),
             "feature_schema_hash": out["feature_schema_hash"],
+            "tensor_content_hashes": out["tensor_content_hashes"],
             "base_payload_hash_before_action_covariates": base_payload_hash,
             "payload_hash": payload_hash,
             "covariate_augmented_payload_hash": payload_hash,
-            "action_covariate_cash_semantics": "CASH covariate values are zero-imputed and mask=false; mask channels are model-facing when appended.",
+            "action_covariate_cash_semantics": (
+                "CASH covariate values are zero-imputed and mask=false; explicit "
+                "stock_covariates_v1_type action-type channels disambiguate CASH from true zero values."
+            ),
             "reportability_errors": list(dict.fromkeys(errors)),
         }
     )
