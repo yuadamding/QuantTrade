@@ -53,6 +53,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="latest",
         help="When --max-partitions is set, choose latest partitions by default; earliest is diagnostic only.",
     )
+    parser.add_argument(
+        "--split-mode",
+        choices=["latest_holdout", "latest_rows_smoke"],
+        default="latest_holdout",
+        help="latest_holdout uses latest complete sessions inside each partition; latest_rows_smoke is diagnostic.",
+    )
+    parser.add_argument("--test-sessions", type=int, default=1)
+    parser.add_argument("--val-sessions", type=int, default=1)
+    parser.add_argument("--embargo-sessions", type=int, default=0)
+    parser.add_argument("--min-train-sessions", type=int, default=1)
+    parser.add_argument("--test-rows", type=int, default=1)
+    parser.add_argument("--val-rows", type=int, default=1)
+    parser.add_argument("--min-train-rows", type=int, default=2)
+    parser.add_argument(
+        "--insufficient-split-policy",
+        choices=["smoke_fallback", "fail"],
+        default="smoke_fallback",
+        help="For short partitions, either fall back to explicit non-reportable row splits or fail.",
+    )
+    parser.add_argument(
+        "--action-covariate-sidecar",
+        choices=["auto", "required", "none"],
+        default="auto",
+        help="Control whether neighboring action_covariates.pt sidecars are loaded.",
+    )
+    parser.add_argument(
+        "--news-llm-sidecar",
+        choices=["auto", "required", "none"],
+        default="none",
+        help="Opt into neighboring action_news_llm_covariates.pt sidecars.",
+    )
     parser.add_argument("--initial-action", default="CASH")
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--episode-length", type=int, default=8)
@@ -130,6 +161,20 @@ def split_policy_with_partition_selection(split_policy: dict[str, object], args:
     return out
 
 
+def combined_evaluation_reportability(
+    *,
+    evaluator_reportable: bool,
+    evaluator_errors: list[str],
+    split_policy: dict[str, object],
+    args: argparse.Namespace,
+) -> tuple[bool, list[str]]:
+    partition_errors = partition_selection_reportability_errors(args)
+    split_errors = [str(error) for error in split_policy.get("reportability_errors", [])]
+    errors = list(dict.fromkeys([*evaluator_errors, *split_errors, *partition_errors]))
+    reportable = bool(evaluator_reportable) and bool(split_policy.get("reportable", True)) and not errors
+    return reportable, errors
+
+
 def build_constraints_from_args(args: argparse.Namespace):
     from rl_quant.minute_to_hour_transformer import TradingConstraintConfig
 
@@ -175,20 +220,79 @@ def iso_timestamp_ms(value: str) -> int:
     return int(parsed.timestamp() * 1000)
 
 
-def build_rolling_partition_splits(dataset_path: Path):
+def build_rolling_partition_splits(
+    dataset_path: Path,
+    *,
+    split_mode: str = "latest_holdout",
+    val_sessions: int = 1,
+    test_sessions: int = 1,
+    embargo_sessions: int = 0,
+    min_train_sessions: int = 1,
+    val_rows: int = 1,
+    test_rows: int = 1,
+    min_train_rows: int = 2,
+    insufficient_split_policy: str = "smoke_fallback",
+    action_covariate_sidecar: str = "auto",
+    news_llm_sidecar: str = "none",
+):
     from rl_quant.minute_to_hour_transformer import (
         _build_split,
         _load_payload,
+        infer_latest_holdout_split_policy,
         infer_latest_rows_smoke_split_policy,
     )
 
-    payload = _load_payload(dataset_path)
+    payload = _load_payload(
+        dataset_path,
+        action_covariate_sidecar=action_covariate_sidecar,
+        news_llm_sidecar=news_llm_sidecar,
+    )
     decisions = list(payload["decision_timestamps"])
     if len(decisions) < 4:
         raise ValueError(
             f"Partition {dataset_path} has too few decision rows for independent train/validation/test splits."
         )
-    split_policy = infer_latest_rows_smoke_split_policy(payload, val_rows=1, test_rows=1, min_train_rows=2)
+    if split_mode == "latest_holdout":
+        try:
+            split_policy = infer_latest_holdout_split_policy(
+                payload,
+                val_sessions=val_sessions,
+                test_sessions=test_sessions,
+                embargo_sessions=embargo_sessions,
+                min_train_sessions=min_train_sessions,
+            )
+        except ValueError as exc:
+            if insufficient_split_policy != "smoke_fallback":
+                raise
+            split_policy = infer_latest_rows_smoke_split_policy(
+                payload,
+                val_rows=val_rows,
+                test_rows=test_rows,
+                min_train_rows=min_train_rows,
+            )
+            fallback_errors = list(split_policy.get("reportability_errors", []))
+            fallback_errors.extend(
+                [
+                    "latest_holdout_insufficient_complete_sessions",
+                    "fallback_to_latest_rows_smoke_split",
+                ]
+            )
+            split_policy = dict(split_policy)
+            split_policy["requested_split_mode"] = "latest_holdout"
+            split_policy["split_mode"] = "latest_rows_smoke_fallback"
+            split_policy["fallback_from_split_mode"] = "latest_holdout"
+            split_policy["fallback_reason"] = str(exc)
+            split_policy["reportable"] = False
+            split_policy["reportability_errors"] = list(dict.fromkeys(fallback_errors))
+    elif split_mode == "latest_rows_smoke":
+        split_policy = infer_latest_rows_smoke_split_policy(
+            payload,
+            val_rows=val_rows,
+            test_rows=test_rows,
+            min_train_rows=min_train_rows,
+        )
+    else:
+        raise ValueError(f"Unsupported split_mode {split_mode!r}.")
     blocks = split_policy["blocks"]
     train_block = dict(blocks["train"])
     val_block = dict(blocks["val"])
@@ -292,7 +396,20 @@ def main(argv: list[str] | None = None) -> int:
         started = datetime.now()
         print(f"[{ordinal}/{len(paths)}] loading {label}", flush=True)
         try:
-            train_split, val_split, test_split = build_rolling_partition_splits(dataset_path)
+            train_split, val_split, test_split = build_rolling_partition_splits(
+                dataset_path,
+                split_mode=args.split_mode,
+                val_sessions=args.val_sessions,
+                test_sessions=args.test_sessions,
+                embargo_sessions=args.embargo_sessions,
+                min_train_sessions=args.min_train_sessions,
+                val_rows=args.val_rows,
+                test_rows=args.test_rows,
+                min_train_rows=args.min_train_rows,
+                insufficient_split_policy=args.insufficient_split_policy,
+                action_covariate_sidecar=args.action_covariate_sidecar,
+                news_llm_sidecar=args.news_llm_sidecar,
+            )
             run_split_policy = split_policy_with_partition_selection(train_split.split_policy, args)
             initial_action = action_index(train_split.action_names, args.initial_action)
             env_config = MinuteToHourEnvConfig(
@@ -433,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
             }
             with (current_dir / "summary.json").open("w") as sink:
                 json.dump(summary, sink, indent=2)
+            evaluation_reportable, reportability_errors = combined_evaluation_reportability(
+                evaluator_reportable=bool(test_result.evaluation_reportable),
+                evaluator_errors=list(test_result.reportability_errors),
+                split_policy=run_split_policy,
+                args=args,
+            )
             record = {
                 "partition": label,
                 "ordinal": ordinal,
@@ -443,8 +566,8 @@ def main(argv: list[str] | None = None) -> int:
                 "test_total_return": test_result.total_return,
                 "test_switches": test_result.allocation_switches,
                 "test_order_legs": test_result.market_order_legs,
-                "evaluation_reportable": bool(test_result.evaluation_reportable) and not partition_selection_errors,
-                "reportability_errors": list(dict.fromkeys([*test_result.reportability_errors, *partition_selection_errors])),
+                "evaluation_reportable": evaluation_reportable,
+                "reportability_errors": reportability_errors,
                 "split_mode": run_split_policy.get("split_mode"),
                 "split_reportable": run_split_policy.get("reportable"),
                 "split_reportability_errors": run_split_policy.get("reportability_errors", []),

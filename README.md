@@ -110,7 +110,7 @@ datasets, generated model checkpoints, or generated run directories.
 Use the `ml1` conda environment used by this workspace:
 
 ```bash
-cd /home/yding1995/quant/QuantTrade
+cd QuantTrade
 conda run -n ml1 python -m pip install -e ".[dev,data]"
 ```
 
@@ -120,7 +120,36 @@ Core dependencies are intentionally small:
 - `torch>=2.8,<3`
 - `numpy>=2.2,<3`
 - Optional data stack: `pandas`, `pyarrow`
+- Optional local LLM inference stack: `transformers`, `accelerate`,
+  `sentencepiece`
 - Development tools: `pytest`, `ruff`, `mypy`
+
+For offline LLM feature extraction with the downloaded local model:
+
+```bash
+conda run -n ml1 python -m pip install -e ".[llm]"
+```
+
+Current downloaded local LLM checkpoint, used for smoke tests and small offline
+feature-extraction experiments:
+
+```text
+../LLM/Qwen3-1.7B
+Qwen/Qwen3-1.7B@70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+```
+
+Recommended analyst extractor stack for frozen production feature builds:
+
+```text
+Primary:   Qwen/Qwen3.6-27B
+Validator: google/gemma-4-26B-A4B-it
+Fallback:  mistralai/Mistral-Small-3.2-24B-Instruct-2506
+Serving:   vLLM with JSON-schema structured outputs
+```
+
+The 2026 LLM stack is diagnostic for retrospective 2023-2026 backtests unless
+the extractor model was available before the first decision timestamp. Training
+never calls an LLM directly; it consumes only frozen feature tables and sidecars.
 
 Check CUDA and AMP availability:
 
@@ -153,6 +182,7 @@ QuantTrade/
   docs/
     decision_tensor_protocol.md
     stock_covariate_integration.md
+    news_llm_covariate_protocol.md
   src/rl_quant/
     core.py
     action_risk.py
@@ -237,20 +267,21 @@ data/         = local data when the checkout is standalone
 The newer high-frequency scripts use a shared data root:
 
 ```text
-if checkout is /home/yding1995/quant/QuantTrade and /home/yding1995/quant/data exists:
-    DATA_ROOT = /home/yding1995/quant/data
+if ../data exists:
+    DATA_ROOT = ../data
 else:
-    DATA_ROOT = QuantTrade/data
+    DATA_ROOT = data
 ```
 
-Expected local high-frequency paths in this workspace:
+Expected local high-frequency paths in this workspace, written relative to the
+repository root:
 
 ```text
-/home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15
-/home/yding1995/quant/data/rl_decision_datasets
-/home/yding1995/quant/data/rl_hour_from_minute
-/home/yding1995/quant/data/rl_hour_from_second
-/home/yding1995/quant/data/second_context_runs
+../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15
+../data/rl_decision_datasets
+../data/rl_hour_from_minute
+../data/rl_hour_from_second
+../data/second_context_runs
 ```
 
 Large generated assets should stay under `data/` or `derived/`, not inside
@@ -448,6 +479,14 @@ For the newly downloaded Polygon stock-specific covariates and the integration
 gap before they become model inputs, read:
 
 [docs/stock_covariate_integration.md](docs/stock_covariate_integration.md)
+
+For the narrow, auditable news LLM covariate layer, read:
+
+[docs/news_llm_covariate_protocol.md](docs/news_llm_covariate_protocol.md)
+
+That layer is an offline feature-extraction path only. QuantTrade training
+does not call an LLM directly, and `stock_fundamental_llm_v1` remains a planned
+separate typed group rather than a current model input.
 
 The root README gives the operational summary below.
 
@@ -983,9 +1022,9 @@ Audit downloaded Polygon second bars:
 
 ```bash
 conda run -n ml1 python scripts/audit_polygon_second_aggs.py \
-  --root /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15 \
-  --manifest /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/manifest.csv \
-  --dataset-manifest /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/dataset_manifest.json \
+  --root ../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15 \
+  --manifest ../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/manifest.csv \
+  --dataset-manifest ../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/dataset_manifest.json \
   --source-access REST
 ```
 
@@ -1098,6 +1137,9 @@ Multiple manifests can be passed by repeating `--dataset-manifest` or
 | `scripts/audit_polygon_second_aggs.py` | Audit Polygon second aggregate manifests and reportability. |
 | `scripts/build_stock_second_silver_features.py` | Build sparse-aware silver features from stock second bars. |
 | `scripts/build_second_context_decision_dataset.py` | Build gold decision tensors from second context. |
+| `scripts/build_news_article_table.py` | Deduplicate Polygon news JSONL into article rows. |
+| `scripts/build_news_llm_features.py` | Build or import audited article-ticker `news_llm_v1` rows. |
+| `scripts/build_news_llm_aggregates.py` | Build optional action news LLM sidecars for hour-from-second partitions. |
 | `scripts/train_second_context_action_scorer.py` | Train action-conditioned second-context scorer and diagnostics. |
 | `scripts/train_second_context_rl.py` | Compatibility wrapper for the second-context scorer trainer. |
 | `scripts/evaluate_second_context_dataset.py` | Evaluate a second-context dataset and diagnostic oracle. |

@@ -56,6 +56,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test-rows", type=int, default=20)
     parser.add_argument("--val-rows", type=int, default=20)
     parser.add_argument("--min-train-rows", type=int, default=1)
+    parser.add_argument(
+        "--action-covariate-sidecar",
+        choices=["auto", "required", "none"],
+        default="auto",
+        help="Control whether neighboring action_covariates.pt sidecars are loaded.",
+    )
+    parser.add_argument(
+        "--news-llm-sidecar",
+        choices=["auto", "required", "none"],
+        default="none",
+        help="Opt into neighboring action_news_llm_covariates.pt sidecars.",
+    )
     parser.add_argument("--initial-action", default="CASH")
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--episode-length", type=int, default=32)
@@ -178,6 +190,8 @@ def main() -> int:
         test_rows=args.test_rows,
         val_rows=args.val_rows,
         min_train_rows=args.min_train_rows,
+        action_covariate_sidecar=args.action_covariate_sidecar,
+        news_llm_sidecar=args.news_llm_sidecar,
     )
     initial_action = action_index(train_split.action_names, args.initial_action)
     runtime = torch_runtime_summary(device)

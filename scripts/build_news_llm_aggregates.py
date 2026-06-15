@@ -19,14 +19,16 @@ SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from rl_quant.features.stock_covariates import (  # noqa: E402
-    COVARIATE_FLAT_PROTOCOL_VERSION,
-    build_action_covariate_tensor,
-    load_silver_rows_by_symbol,
-    read_covariate_coverage_manifest,
-    tensor_content_hashes,
-    validate_action_covariate_feature_schema,
+from rl_quant.features.news_llm import (  # noqa: E402
+    NEWS_LLM_ACTION_SIDECAR_SCHEMA_VERSION,
+    NEWS_LLM_AGGREGATE_FEATURE_NAMES,
+    NEWS_LLM_FLAT_APPEND_MODE,
+    NEWS_LLM_PROTOCOL_VERSION,
+    build_action_news_llm_tensor,
+    load_news_llm_rows_by_symbol,
+    read_manifest,
 )
+from rl_quant.features.stock_covariates import tensor_content_hashes  # noqa: E402
 from rl_quant.research_protocol import stable_json_hash, utc_now_iso  # noqa: E402
 
 
@@ -45,19 +47,19 @@ DEFAULT_PARTITIONS_ROOT = (
     / "hour_from_second_1s"
     / "partitions"
 )
-DEFAULT_COVARIATE_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "silver" / "top500_2023_to_present"
+DEFAULT_NEWS_LLM_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "news_llm_v1" / "top500_2023_to_present"
+DEFAULT_ARTICLE_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "news_articles_v1" / "top500_2023_to_present"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Attach compact action-level stock covariate sidecars to existing hour-from-second partitions."
+        description="Build decision-aligned action news_llm_v1 sidecars for hour-from-second partitions."
     )
     parser.add_argument("--partitions-root", type=Path, default=DEFAULT_PARTITIONS_ROOT)
     parser.add_argument("--dataset-file-name", default="hour_from_second_dataset.pt")
-    parser.add_argument("--covariates-root", type=Path, default=DEFAULT_COVARIATE_ROOT)
-    parser.add_argument("--covariate-feature-schema", type=Path)
-    parser.add_argument("--output-file-name", default="action_covariates.pt")
-    parser.add_argument("--max-age-days", type=int, default=0)
+    parser.add_argument("--news-llm-root", type=Path, default=DEFAULT_NEWS_LLM_ROOT)
+    parser.add_argument("--article-root", type=Path, default=DEFAULT_ARTICLE_ROOT)
+    parser.add_argument("--output-file-name", default="action_news_llm_covariates.pt")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-partitions", type=int, default=0)
@@ -98,12 +100,6 @@ def partition_paths(args: argparse.Namespace) -> list[Path]:
     if not paths:
         raise ValueError(f"No partition datasets found below {args.partitions_root}")
     return paths
-
-
-def partition_selection_reportability_errors(args: argparse.Namespace) -> list[str]:
-    if int(args.max_partitions) > 0 and args.partition_selection != "latest":
-        return ["non_latest_partition_selection"]
-    return []
 
 
 def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
@@ -150,64 +146,52 @@ def validate_existing_sidecar(
     sidecar: dict[str, Any],
     dataset_path: Path,
     payload: dict[str, Any],
-    covariates_root: Path,
-    source_manifest_hash: str,
-    schema_file_hash: str,
+    news_llm_manifest_hash: str,
 ) -> None:
     if not isinstance(sidecar, dict):
-        raise ValueError("sidecar payload is not a dictionary")
+        raise ValueError("news LLM sidecar payload is not a dictionary")
     expected_identity = base_dataset_identity(dataset_path, payload)
     for key, expected in expected_identity.items():
         if sidecar.get(key) != expected:
             raise ValueError(f"{key} mismatch")
+    if sidecar.get("integration_schema_version") != NEWS_LLM_ACTION_SIDECAR_SCHEMA_VERSION:
+        raise ValueError("integration_schema_version mismatch")
+    if sidecar.get("news_llm_feature_manifest_hash") != news_llm_manifest_hash:
+        raise ValueError("news_llm_feature_manifest_hash mismatch")
     if list(sidecar.get("action_names", [])) != list(payload.get("action_names", [])):
         raise ValueError("action_names mismatch")
     if list(sidecar.get("decision_timestamps", [])) != list(payload.get("decision_timestamps", [])):
         raise ValueError("decision_timestamps mismatch")
-    if sidecar.get("action_covariate_source_manifest_hash") != source_manifest_hash:
-        raise ValueError("action_covariate_source_manifest_hash mismatch")
-    if sidecar.get("action_covariate_feature_schema_file_hash") != schema_file_hash:
-        raise ValueError("action_covariate_feature_schema_file_hash mismatch")
-    try:
-        stored_root = Path(str(sidecar.get("covariates_root", ""))).resolve()
-        expected_root = covariates_root.resolve()
-    except OSError as exc:
-        raise ValueError("covariates_root is invalid") from exc
-    if stored_root != expected_root:
-        raise ValueError("covariates_root mismatch")
-    if sidecar.get("covariate_protocol_version") != COVARIATE_FLAT_PROTOCOL_VERSION:
-        raise ValueError("covariate_protocol_version mismatch")
-    action_features = sidecar.get("action_features")
-    feature_names = list(sidecar.get("action_feature_names", []))
-    action_available = sidecar.get("action_feature_available_timestamps_ms")
-    if not torch.is_tensor(action_features) or action_features.ndim != 3:
+    features = sidecar.get("action_features")
+    available = sidecar.get("action_feature_available_timestamps_ms")
+    names = list(sidecar.get("action_feature_names", []))
+    if not torch.is_tensor(features) or features.ndim != 3:
         raise ValueError("action_features missing or invalid")
     expected_rows = len(payload.get("decision_timestamps", []))
     expected_actions = len(payload.get("action_names", []))
-    if tuple(action_features.shape[:2]) != (expected_rows, expected_actions):
+    if tuple(features.shape[:2]) != (expected_rows, expected_actions):
         raise ValueError("action_features row/action shape mismatch")
-    if len(feature_names) != int(action_features.shape[-1]):
+    if len(names) != int(features.shape[-1]):
         raise ValueError("action_feature_names length mismatch")
-    if not torch.is_tensor(action_available) or tuple(action_available.shape) != tuple(action_features.shape):
+    if not torch.is_tensor(available) or tuple(available.shape) != tuple(features.shape):
         raise ValueError("action_feature_available_timestamps_ms shape mismatch")
-    hash_keys = [
-        "action_features",
-        "action_feature_available_timestamps_ms",
-        "action_covariates",
-        "action_covariate_mask",
-        "action_covariate_available_timestamps_ms",
-        "action_source_coverage",
-        "action_covariate_action_type_features",
-    ]
-    expected_hashes = tensor_content_hashes(sidecar, hash_keys)
-    recorded_hashes = sidecar.get("tensor_content_hashes")
-    if not isinstance(recorded_hashes, dict):
-        raise ValueError("tensor_content_hashes missing or invalid")
-    if dict(recorded_hashes) != expected_hashes:
+    decision_ms = torch.tensor([timestamp_ms(value) for value in payload["decision_timestamps"]], dtype=torch.long)
+    decision_tensor = decision_ms.view(-1, 1, 1).expand_as(available)
+    known = available >= 0
+    if bool((available[known] > decision_tensor[known]).any().item()):
+        raise ValueError("news LLM sidecar contains future action feature availability")
+    expected_hashes = tensor_content_hashes(
+        sidecar,
+        [
+            "action_features",
+            "action_feature_available_timestamps_ms",
+            "action_news_llm_features",
+            "action_news_llm_mask",
+            "action_news_llm_available_timestamps_ms",
+        ],
+    )
+    if dict(sidecar.get("tensor_content_hashes", {})) != expected_hashes:
         raise ValueError("tensor_content_hashes mismatch")
-    for key, expected in expected_hashes.items():
-        if sidecar.get(key) != expected:
-            raise ValueError(f"{key} mismatch")
 
 
 def load_action_names(paths: list[Path]) -> list[str]:
@@ -218,16 +202,48 @@ def load_action_names(paths: list[Path]) -> list[str]:
     return action_names
 
 
+def sidecar_action_features(bundle: dict[str, Any], decision_ms: list[int]) -> dict[str, Any]:
+    features = bundle["action_news_llm_features"].float()
+    mask = bundle["action_news_llm_mask"].bool()
+    available = bundle["action_news_llm_available_timestamps_ms"].long()
+    decision_tensor = torch.tensor(decision_ms, dtype=torch.long).view(-1, 1, 1)
+    mask_available = decision_tensor.expand_as(available)
+    action_features = torch.cat([features, mask.float()], dim=-1)
+    action_feature_available = torch.cat([available, mask_available], dim=-1)
+    known = action_feature_available >= 0
+    row_available = torch.where(
+        known,
+        action_feature_available,
+        torch.full_like(action_feature_available, -1),
+    ).amax(dim=-1)
+    feature_names = [
+        *[f"stock_news_llm_v1.{name}" for name in NEWS_LLM_AGGREGATE_FEATURE_NAMES],
+        *[f"stock_news_llm_v1_mask.{name}" for name in NEWS_LLM_AGGREGATE_FEATURE_NAMES],
+    ]
+    width = len(NEWS_LLM_AGGREGATE_FEATURE_NAMES)
+    return {
+        "action_features": action_features,
+        "action_feature_names": feature_names,
+        "action_feature_available_timestamps_ms": action_feature_available,
+        "action_features_available_timestamps_ms": row_available,
+        "action_features_any_available_timestamps_ms": row_available,
+        "action_feature_groups": {
+            "stock_news_llm_v1": [0, width],
+            "stock_news_llm_v1_mask": [width, 2 * width],
+        },
+    }
+
+
 def build_sidecar(
     *,
     dataset_path: Path,
     output_file_name: str,
-    silver_rows_by_symbol: dict[str, list[dict[str, Any]]],
-    coverage_by_symbol: dict[str, dict[str, bool]],
-    source_manifest_hash: str,
-    schema_file_hash: str,
-    covariates_root: Path,
-    max_age_days: int,
+    news_llm_rows_by_symbol: dict[str, list[dict[str, Any]]],
+    source_symbols: list[str],
+    news_llm_manifest: dict[str, Any],
+    news_llm_manifest_hash: str,
+    article_manifest_hash: str | None,
+    feature_manifest_reportability_errors: list[str],
     force: bool,
 ) -> dict[str, Any]:
     output = dataset_path.with_name(output_file_name)
@@ -240,9 +256,7 @@ def build_sidecar(
                 sidecar=sidecar,
                 dataset_path=dataset_path,
                 payload=payload,
-                covariates_root=covariates_root,
-                source_manifest_hash=source_manifest_hash,
-                schema_file_hash=schema_file_hash,
+                news_llm_manifest_hash=news_llm_manifest_hash,
             )
         except ValueError as exc:
             stale_existing_error = str(exc)
@@ -254,112 +268,65 @@ def build_sidecar(
                 "rows": len(payload["decision_timestamps"]),
                 "actions": len(payload["action_names"]),
                 "features": len(sidecar.get("action_feature_names", [])),
-                "reportability_errors": list(sidecar.get("action_covariate_reportability_errors", [])),
+                "reportability_errors": list(sidecar.get("action_news_llm_reportability_errors", [])),
             }
 
     action_names = list(payload["action_names"])
     decisions = list(payload["decision_timestamps"])
     decision_ms = [timestamp_ms(value) for value in decisions]
-    covariates = build_action_covariate_tensor(
-        silver_rows_by_symbol=silver_rows_by_symbol,
+    bundle = build_action_news_llm_tensor(
+        news_llm_rows_by_symbol=news_llm_rows_by_symbol,
         action_names=action_names,
         decision_timestamps_ms=decision_ms,
-        source_coverage_by_symbol=coverage_by_symbol,
-        source_manifest_hash=source_manifest_hash,
-        max_age_days=max_age_days,
+        source_symbols=source_symbols,
+        source_manifest_hash=news_llm_manifest_hash,
     )
-    covariates["action_covariate_feature_schema_file_hash"] = schema_file_hash
-
-    action_covariates = covariates["action_covariates"].float()
-    action_mask = covariates["action_covariate_mask"].bool()
-    action_available = covariates["action_covariate_available_timestamps_ms"].long()
-    action_type_features = covariates["action_covariate_action_type_features"].float()
-    decision_tensor = torch.tensor(decision_ms, dtype=torch.long).view(-1, 1, 1)
-    mask_available = decision_tensor.expand_as(action_available)
-    action_type_available = decision_tensor.expand(
-        decision_tensor.shape[0],
-        action_covariates.shape[1],
-        action_type_features.shape[-1],
-    )
-    action_features = torch.cat([action_covariates, action_mask.float(), action_type_features], dim=-1)
-    action_feature_available = torch.cat([action_available, mask_available, action_type_available], dim=-1)
-    known = action_feature_available >= 0
-    row_available = torch.where(known, action_feature_available, torch.full_like(action_feature_available, -1)).amax(dim=-1)
-    known_covariate_values = action_available >= 0
-    value_row_available = torch.where(
-        known_covariate_values,
-        action_available,
-        torch.full_like(action_available, -1),
-    ).amax(dim=-1)
-    feature_names = [
-        *[f"stock_covariates_v1.{name}" for name in covariates["action_covariate_feature_names"]],
-        *[f"stock_covariates_v1_mask.{name}" for name in covariates["action_covariate_feature_names"]],
-        *[
-            f"stock_covariates_v1_type.{name}"
-            for name in covariates["action_covariate_action_type_feature_names"]
-        ],
-    ]
-    feature_count = int(action_covariates.shape[-1])
-    action_type_count = int(action_type_features.shape[-1])
+    errors = list(bundle["action_news_llm_reportability_errors"])
+    errors.extend(feature_manifest_reportability_errors)
+    bundle["action_news_llm_reportability_errors"] = list(dict.fromkeys(errors))
+    feature_payload = sidecar_action_features(bundle, decision_ms)
     sidecar = {
-        "integration_schema_version": "hour_from_second_action_covariates_v1",
+        "integration_schema_version": NEWS_LLM_ACTION_SIDECAR_SCHEMA_VERSION,
         "created_at_utc": utc_now_iso(),
         **base_dataset_identity(dataset_path, payload),
         "decision_timestamps": decisions,
         "decision_timestamps_ms": decision_ms,
         "action_names": action_names,
-        "action_features": action_features,
-        "action_feature_names": feature_names,
-        "action_feature_available_timestamps_ms": action_feature_available,
-        "action_features_available_timestamps_ms": row_available,
-        "action_features_any_available_timestamps_ms": row_available,
-        "action_covariate_value_latest_available_timestamps_ms": value_row_available,
-        "action_feature_groups": {
-            "stock_covariates_v1": [0, feature_count],
-            "stock_covariates_v1_mask": [feature_count, 2 * feature_count],
-            "stock_covariates_v1_type": [2 * feature_count, 2 * feature_count + action_type_count],
-        },
-        "covariate_mode": "flat_append_baseline",
-        "covariate_protocol_version": COVARIATE_FLAT_PROTOCOL_VERSION,
-        "action_features_augmented_with_covariates": False,
-        "action_features_are_covariate_sidecar_only": True,
-        "action_covariate_mask_appended_to_action_features": True,
-        "action_covariate_cash_semantics": (
-            "CASH covariate values are zero-imputed and mask=false; explicit "
-            "stock_covariates_v1_type action-type channels disambiguate CASH from true zero values."
-        ),
-        "covariates_root": str(covariates_root.resolve()),
-        "action_covariate_feature_schema_file_hash": schema_file_hash,
-        **covariates,
+        "news_llm_covariate_mode": NEWS_LLM_FLAT_APPEND_MODE,
+        "news_llm_protocol_version": NEWS_LLM_PROTOCOL_VERSION,
+        "news_llm_feature_manifest_hash": news_llm_manifest_hash,
+        "news_article_manifest_hash": article_manifest_hash,
+        "news_llm_manifest": news_llm_manifest,
+        "action_features_augmented_with_news_llm": False,
+        "action_features_are_news_llm_sidecar_only": True,
+        **bundle,
+        **feature_payload,
     }
     sidecar["tensor_content_hashes"] = tensor_content_hashes(
         sidecar,
         [
             "action_features",
             "action_feature_available_timestamps_ms",
-            "action_covariates",
-            "action_covariate_mask",
-            "action_covariate_available_timestamps_ms",
-            "action_source_coverage",
-            "action_covariate_action_type_features",
+            "action_news_llm_features",
+            "action_news_llm_mask",
+            "action_news_llm_available_timestamps_ms",
         ],
     )
     sidecar.update(sidecar["tensor_content_hashes"])
-    sidecar["action_covariate_sidecar_hash"] = stable_json_hash(
+    sidecar["action_news_llm_sidecar_hash"] = stable_json_hash(
         {
             "integration_schema_version": sidecar["integration_schema_version"],
             "decision_timestamps": decisions,
             "action_names": action_names,
-            "action_feature_names": feature_names,
-            "action_covariate_schema_hash": sidecar["action_covariate_schema_hash"],
-            "action_covariate_source_manifest_hash": source_manifest_hash,
-            "action_covariate_feature_schema_file_hash": schema_file_hash,
+            "action_feature_names": sidecar["action_feature_names"],
+            "action_news_llm_schema_hash": sidecar["action_news_llm_schema_hash"],
+            "news_llm_feature_manifest_hash": news_llm_manifest_hash,
             "base_dataset_sha256": sidecar["base_dataset_sha256"],
             "base_dataset_payload_hash": sidecar["base_dataset_payload_hash"],
             "base_dataset_feature_schema_hash": sidecar["base_dataset_feature_schema_hash"],
             "base_dataset_action_schema_hash": sidecar["base_dataset_action_schema_hash"],
-            "action_features_are_covariate_sidecar_only": sidecar["action_features_are_covariate_sidecar_only"],
-            "covariate_reportability_errors": sidecar["action_covariate_reportability_errors"],
+            "action_features_are_news_llm_sidecar_only": sidecar["action_features_are_news_llm_sidecar_only"],
+            "reportability_errors": sidecar["action_news_llm_reportability_errors"],
             "tensor_content_hashes": sidecar["tensor_content_hashes"],
         }
     )
@@ -367,9 +334,7 @@ def build_sidecar(
         sidecar=sidecar,
         dataset_path=dataset_path,
         payload=payload,
-        covariates_root=covariates_root,
-        source_manifest_hash=source_manifest_hash,
-        schema_file_hash=schema_file_hash,
+        news_llm_manifest_hash=news_llm_manifest_hash,
     )
     atomic_torch_save(sidecar, output)
     return {
@@ -378,9 +343,9 @@ def build_sidecar(
         "output": str(output),
         "rows": len(decisions),
         "actions": len(action_names),
-        "features": len(feature_names),
+        "features": len(sidecar["action_feature_names"]),
         "stale_existing_error": stale_existing_error,
-        "reportability_errors": list(sidecar["action_covariate_reportability_errors"]),
+        "reportability_errors": list(sidecar["action_news_llm_reportability_errors"]),
     }
 
 
@@ -389,34 +354,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.workers <= 0:
         raise ValueError("--workers must be positive.")
     paths = partition_paths(args)
-    selection_errors = partition_selection_reportability_errors(args)
-    schema_path = args.covariate_feature_schema or args.covariates_root / "feature_schema.json"
-    if not schema_path.exists():
-        raise FileNotFoundError(f"Covariate feature schema does not exist: {schema_path}")
-    validate_action_covariate_feature_schema(schema_path)
-    manifest_path = args.covariates_root / "manifest.csv"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Covariate manifest does not exist: {manifest_path}")
+    news_manifest_path = args.news_llm_root / "manifest.json"
+    if not news_manifest_path.exists():
+        raise FileNotFoundError(f"News LLM manifest does not exist: {news_manifest_path}")
+    news_llm_manifest = read_manifest(news_manifest_path)
+    news_llm_manifest_hash = file_sha256(news_manifest_path)
+    article_manifest_path = args.article_root / "manifest.json"
+    article_manifest = read_manifest(article_manifest_path)
+    article_manifest_hash = file_sha256(article_manifest_path) if article_manifest_path.exists() else None
+    source_symbols = list(
+        article_manifest.get(
+            "symbols_with_source_news",
+            news_llm_manifest.get("symbols_with_news_llm", []),
+        )
+    )
     action_names = load_action_names(paths)
-    silver_rows_by_symbol = load_silver_rows_by_symbol(args.covariates_root, action_names)
-    coverage_by_symbol = read_covariate_coverage_manifest(manifest_path)
-    source_manifest_hash = file_sha256(manifest_path)
-    schema_file_hash = file_sha256(schema_path)
-
+    rows_by_symbol = load_news_llm_rows_by_symbol(args.news_llm_root, action_names)
+    feature_manifest_reportability_errors = list(news_llm_manifest.get("reportability_errors", []))
     records: list[dict[str, Any]] = []
-    print(f"Integrating action covariates for {len(paths)} partitions with workers={args.workers}", flush=True)
+    print(f"Building news LLM action sidecars for {len(paths)} partitions with workers={args.workers}", flush=True)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
             executor.submit(
                 build_sidecar,
                 dataset_path=path,
                 output_file_name=args.output_file_name,
-                silver_rows_by_symbol=silver_rows_by_symbol,
-                coverage_by_symbol=coverage_by_symbol,
-                source_manifest_hash=source_manifest_hash,
-                schema_file_hash=schema_file_hash,
-                covariates_root=args.covariates_root,
-                max_age_days=args.max_age_days,
+                news_llm_rows_by_symbol=rows_by_symbol,
+                source_symbols=source_symbols,
+                news_llm_manifest=news_llm_manifest,
+                news_llm_manifest_hash=news_llm_manifest_hash,
+                article_manifest_hash=article_manifest_hash,
+                feature_manifest_reportability_errors=feature_manifest_reportability_errors,
                 force=args.force,
             )
             for path in paths
@@ -426,36 +394,34 @@ def main(argv: list[str] | None = None) -> int:
             records.append(record)
             print(f"[{index}/{len(paths)}] {record['status']} {record['partition']}", flush=True)
     records.sort(key=lambda item: str(item["partition"]))
-    record_reportability_errors = list(
+    reportability_errors = list(
         dict.fromkeys(
             error
             for item in records
             for error in item.get("reportability_errors", [])
         )
     )
-    reportability_errors = list(dict.fromkeys([*selection_errors, *record_reportability_errors]))
-    non_reportable_partition_count = sum(1 for item in records if item.get("reportability_errors"))
     summary = {
         "created_at_utc": utc_now_iso(),
         "partitions_root": str(args.partitions_root),
         "dataset_file_name": args.dataset_file_name,
-        "covariates_root": str(args.covariates_root),
-        "covariate_manifest_hash": source_manifest_hash,
-        "covariate_feature_schema_file_hash": schema_file_hash,
+        "news_llm_root": str(args.news_llm_root),
+        "article_root": str(args.article_root),
+        "news_llm_manifest_hash": news_llm_manifest_hash,
+        "news_article_manifest_hash": article_manifest_hash,
         "partition_selection": args.partition_selection,
-        "partition_selection_reportability_errors": selection_errors,
         "partition_count": len(paths),
         "written_count": sum(1 for item in records if item["status"] == "written"),
         "rewritten_stale_existing_count": sum(1 for item in records if item["status"] == "rewritten_stale_existing"),
         "skipped_count": sum(1 for item in records if item["status"].startswith("skipped")),
-        "non_reportable_partition_count": non_reportable_partition_count,
+        "non_reportable_partition_count": sum(1 for item in records if item.get("reportability_errors")),
         "reportable": not reportability_errors,
         "reportability_errors": reportability_errors,
         "records": records,
     }
-    summary_path = args.partitions_root.parent / "action_covariate_integration_manifest.json"
+    summary_path = args.partitions_root.parent / "action_news_llm_integration_manifest.json"
     atomic_write_text(summary_path, json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")
-    print(f"Integration summary -> {summary_path}", flush=True)
+    print(f"News LLM integration summary -> {summary_path}")
     return 0
 
 

@@ -25,8 +25,8 @@ Purpose:
 Current raw locations:
 
 ```text
-/home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15
-/home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2023_to_2025-01-01
+../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15
+../data/polygon/second_aggs/top500_common_stocks_2023_to_2025-01-01
 ```
 
 Format:
@@ -47,7 +47,7 @@ Frequency:
 Current protocol conversion target:
 
 ```text
-/home/yding1995/quant/data/protocol/polygon_second_top500_2025_to_2026-06-15
+../data/protocol/polygon_second_top500_2025_to_2026-06-15
 ```
 
 ### Stock-Specific Covariates
@@ -61,13 +61,13 @@ Purpose:
 Current raw location:
 
 ```text
-/home/yding1995/quant/data/polygon/stock_covariates/top500_2023_to_present
+../data/polygon/stock_covariates/top500_2023_to_present
 ```
 
 Current manifest:
 
 ```text
-/home/yding1995/quant/data/polygon/stock_covariates/top500_2023_to_present/manifest.csv
+../data/polygon/stock_covariates/top500_2023_to_present/manifest.csv
 ```
 
 Download range:
@@ -79,7 +79,7 @@ Download range:
 Universe:
 
 ```text
-/home/yding1995/quant/data/polygon/universes/top_500_s3_volume_common_stocks_2026-06-12_tickers.txt
+../data/polygon/universes/top_500_s3_volume_common_stocks_2026-06-12_tickers.txt
 ```
 
 Raw file layout:
@@ -165,11 +165,25 @@ What now works:
 - Phase 1 appends compact covariates to `action_features` for model
   compatibility and also stores the explicit optional covariate tensors for
   audit.
+- `docs/news_llm_covariate_protocol.md` defines the separate
+  `stock_news_llm_v1` layer for audited news-derived features.
+- `scripts/build_news_article_table.py`, `scripts/build_news_llm_features.py`,
+  and `scripts/build_news_llm_aggregates.py` build deduplicated news articles,
+  article-ticker extraction rows, and optional hour-from-second action sidecars.
+- The recommended under-30B analyst stack is Qwen/Qwen3.6-27B as primary,
+  google/gemma-4-26B-A4B-it as validator/fallback, and
+  mistralai/Mistral-Small-3.2-24B-Instruct-2506 as structured-output fallback.
+  The downloaded `../LLM/Qwen3-1.7B` checkpoint remains a smoke-test option.
+  The frozen model manifest must be attached to any imported LLM feature table.
 
 What still does not work:
 
 - Market-level covariates are intentionally not implemented yet.
-- Hour-from-second datasets do not yet consume covariate aggregates.
+- Hour-from-second datasets consume news LLM aggregates only when
+  `--news-llm-sidecar` is explicitly enabled for training.
+- `stock_fundamental_llm_v1` is not implemented yet. Fundamental ratios remain
+  deterministic `stock_covariates_v1` inputs until a separate cached LLM silver
+  layer exists.
 - Existing warm-start checkpoints require exact feature schema matches, so an
   old non-covariate checkpoint cannot strictly warm-start into a covariate
   model without an explicit compatibility path.
@@ -212,7 +226,7 @@ flowchart LR
 Recommended output:
 
 ```text
-/home/yding1995/quant/data/polygon/stock_covariates/silver/top500_2023_to_present/
+../data/polygon/stock_covariates/silver/top500_2023_to_present/
   manifest.csv
   feature_schema.json
   SYMBOL.parquet
@@ -320,13 +334,21 @@ trailing_12m_dividend_count
 trailing_12m_dividend_cash
 days_since_last_split
 split_events_last_365d
-news_count_1d
-news_count_7d
-news_count_30d
+log1p_news_count_1d
+log1p_news_count_7d
+log1p_news_count_30d
+log1p_weighted_news_count_1d
+log1p_weighted_news_count_7d
+multi_ticker_news_fraction_1d
 news_publisher_count_7d
+news_top_publisher_share_7d
 news_missing_flag
 covariate_age_seconds
 ```
+
+News counts are log-scaled after point-in-time article deduplication. Multi-ticker
+articles are also mention-weighted, so a broad article tagged to several symbols
+does not enter every action as a full independent stock-specific event.
 
 Recommended market-level aggregate features:
 

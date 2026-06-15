@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -255,6 +256,14 @@ def _timestamp_to_epoch_ms(value: str) -> int:
     return int(parsed.timestamp() * 1000)
 
 
+def _file_sha256(path: str | bytes | PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _row_decision_timestamps_ms(payload: dict[str, Any]) -> torch.Tensor:
     if "decision_timestamps_ms" in payload:
         return torch.as_tensor(payload["decision_timestamps_ms"], dtype=torch.long)
@@ -345,7 +354,8 @@ def infer_latest_holdout_split_policy(
     complete_indices = [
         index
         for index, next_ts in enumerate(next_timestamps)
-        if _parse_utc_timestamp(next_ts) > _parse_utc_timestamp(decisions[index])
+        if next_sessions[index] == decision_sessions[index]
+        and _parse_utc_timestamp(next_ts) > _parse_utc_timestamp(decisions[index])
     ]
     complete_sessions = _unique_in_order([decision_sessions[index] for index in complete_indices])
     required = min_train_sessions + val_sessions + test_sessions + 2 * embargo_sessions
@@ -388,8 +398,8 @@ def infer_latest_holdout_split_policy(
         decision_sessions=decision_sessions,
         next_sessions=next_sessions,
     )
-    max_decision = decisions[max(complete_indices)]
-    max_reward = max(next_timestamps[index] for index in complete_indices)
+    max_decision = max((decisions[index] for index in complete_indices), key=_parse_utc_timestamp)
+    max_reward = max((next_timestamps[index] for index in complete_indices), key=_parse_utc_timestamp)
     test_uses_latest = test["valid_decision_end"] == max_decision and test["valid_reward_end"] == max_reward
     errors: list[str] = [] if test_uses_latest else ["latest_holdout_test_does_not_use_latest_complete_period"]
     return {
@@ -494,12 +504,12 @@ def manual_split_policy(
 ) -> dict[str, object]:
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
-    max_decision = decisions[-1]
-    max_reward = max(next_timestamps)
-    test_end_text = test_end or max_decision
+    max_decision = max(decisions, key=_parse_utc_timestamp)
+    max_reward = max(next_timestamps, key=_parse_utc_timestamp)
+    test_end_text = test_end or max_reward
     test_uses_latest = (
         _parse_utc_timestamp(test_start) <= _parse_utc_timestamp(max_decision)
-        and _parse_utc_timestamp(test_end_text) >= _parse_utc_timestamp(max_decision)
+        and _parse_utc_timestamp(test_end_text) >= _parse_utc_timestamp(max_reward)
     )
     errors: list[str] = [] if test_uses_latest else ["manual_split_skips_latest_complete_period"]
     return {
@@ -522,20 +532,59 @@ def manual_split_policy(
 def _merge_action_covariate_sidecar(
     dataset_path: str | bytes | PathLike[str],
     payload: dict[str, Any],
+    *,
+    action_covariate_sidecar: str | bytes | PathLike[str] = "auto",
 ) -> dict[str, Any]:
-    sidecar_path = Path(dataset_path).with_name("action_covariates.pt")
+    if str(action_covariate_sidecar) == "none":
+        return payload
+    if str(action_covariate_sidecar) in {"auto", "required"}:
+        sidecar_path = Path(dataset_path).with_name("action_covariates.pt")
+    else:
+        sidecar_path = Path(action_covariate_sidecar)
     if not sidecar_path.exists():
+        if str(action_covariate_sidecar) == "required":
+            raise FileNotFoundError(f"Required action covariate sidecar does not exist: {sidecar_path}")
         return payload
     sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=True)
     if not isinstance(sidecar, dict):
         raise ValueError(f"Action covariate sidecar must contain a dictionary: {sidecar_path}")
+    if sidecar.get("base_dataset_file_name") not in {None, Path(dataset_path).name}:
+        raise ValueError(f"Action covariate sidecar base_dataset_file_name does not match dataset: {sidecar_path}")
+    expected_base_sha = sidecar.get("base_dataset_sha256")
+    if expected_base_sha is None:
+        raise ValueError(f"Action covariate sidecar missing base_dataset_sha256; rebuild sidecar: {sidecar_path}")
+    if str(expected_base_sha) != _file_sha256(dataset_path):
+        raise ValueError(f"Action covariate sidecar base_dataset_sha256 does not match dataset: {sidecar_path}")
+    payload_identity = {
+        "payload_hash": payload.get("payload_hash"),
+        "feature_schema_hash": payload.get("feature_schema_hash"),
+        "action_schema_hash": payload.get("action_schema_hash", payload.get("action_metadata_hash")),
+    }
+    for sidecar_key, payload_key, label in (
+        ("base_dataset_payload_hash", "payload_hash", "payload_hash"),
+        ("base_dataset_feature_schema_hash", "feature_schema_hash", "feature_schema_hash"),
+        ("base_dataset_action_schema_hash", "action_schema_hash", "action_schema_hash"),
+    ):
+        sidecar_value = sidecar.get(sidecar_key)
+        payload_value = payload_identity.get(payload_key)
+        if payload_value is not None:
+            if sidecar_value is None:
+                raise ValueError(f"Action covariate sidecar missing {label}: {sidecar_path}")
+            if str(sidecar_value) != str(payload_value):
+                raise ValueError(f"Action covariate sidecar {label} does not match dataset: {sidecar_path}")
     if list(sidecar.get("action_names", [])) != list(payload.get("action_names", [])):
         raise ValueError(f"Action covariate sidecar action_names do not match dataset: {sidecar_path}")
     if list(sidecar.get("decision_timestamps", [])) != list(payload.get("decision_timestamps", [])):
         raise ValueError(f"Action covariate sidecar decision_timestamps do not match dataset: {sidecar_path}")
     merged = dict(payload)
     for key, value in sidecar.items():
-        if key in {"base_dataset_file_name", "base_dataset_sha256"}:
+        if key in {
+            "base_dataset_file_name",
+            "base_dataset_sha256",
+            "base_dataset_payload_hash",
+            "base_dataset_feature_schema_hash",
+            "base_dataset_action_schema_hash",
+        }:
             continue
         if key in merged and key not in {"decision_timestamps", "decision_timestamps_ms", "action_names"}:
             raise ValueError(f"Action covariate sidecar key already exists in dataset payload: {key}")
@@ -543,6 +592,141 @@ def _merge_action_covariate_sidecar(
     merged["action_covariate_sidecar_path"] = str(sidecar_path)
     errors = list(merged.get("dataset_reportability_errors", []))
     errors.extend(sidecar.get("action_covariate_reportability_errors", []))
+    errors = list(dict.fromkeys(errors))
+    merged["dataset_reportability_errors"] = errors
+    merged["dataset_reportable"] = bool(merged.get("dataset_reportable", merged.get("reportable", True))) and not errors
+    return merged
+
+
+def _merge_news_llm_sidecar(
+    dataset_path: str | bytes | PathLike[str],
+    payload: dict[str, Any],
+    *,
+    news_llm_sidecar: str | bytes | PathLike[str] = "none",
+) -> dict[str, Any]:
+    if str(news_llm_sidecar) == "none":
+        return payload
+    if str(news_llm_sidecar) in {"auto", "required"}:
+        sidecar_path = Path(dataset_path).with_name("action_news_llm_covariates.pt")
+    else:
+        sidecar_path = Path(news_llm_sidecar)
+    if not sidecar_path.exists():
+        if str(news_llm_sidecar) == "required":
+            raise FileNotFoundError(f"Required news LLM sidecar does not exist: {sidecar_path}")
+        return payload
+    sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=True)
+    if not isinstance(sidecar, dict):
+        raise ValueError(f"News LLM sidecar must contain a dictionary: {sidecar_path}")
+    if sidecar.get("base_dataset_file_name") not in {None, Path(dataset_path).name}:
+        raise ValueError(f"News LLM sidecar base_dataset_file_name does not match dataset: {sidecar_path}")
+    expected_base_sha = sidecar.get("base_dataset_sha256")
+    if expected_base_sha is None:
+        raise ValueError(f"News LLM sidecar missing base_dataset_sha256; rebuild sidecar: {sidecar_path}")
+    if str(expected_base_sha) != _file_sha256(dataset_path):
+        raise ValueError(f"News LLM sidecar base_dataset_sha256 does not match dataset: {sidecar_path}")
+    payload_identity = {
+        "payload_hash": payload.get("payload_hash"),
+        "feature_schema_hash": payload.get("feature_schema_hash"),
+        "action_schema_hash": payload.get("action_schema_hash", payload.get("action_metadata_hash")),
+    }
+    for sidecar_key, payload_key, label in (
+        ("base_dataset_payload_hash", "payload_hash", "payload_hash"),
+        ("base_dataset_feature_schema_hash", "feature_schema_hash", "feature_schema_hash"),
+        ("base_dataset_action_schema_hash", "action_schema_hash", "action_schema_hash"),
+    ):
+        sidecar_value = sidecar.get(sidecar_key)
+        payload_value = payload_identity.get(payload_key)
+        if payload_value is not None:
+            if sidecar_value is None:
+                raise ValueError(f"News LLM sidecar missing {label}: {sidecar_path}")
+            if str(sidecar_value) != str(payload_value):
+                raise ValueError(f"News LLM sidecar {label} does not match dataset: {sidecar_path}")
+    if list(sidecar.get("action_names", [])) != list(payload.get("action_names", [])):
+        raise ValueError(f"News LLM sidecar action_names do not match dataset: {sidecar_path}")
+    if list(sidecar.get("decision_timestamps", [])) != list(payload.get("decision_timestamps", [])):
+        raise ValueError(f"News LLM sidecar decision_timestamps do not match dataset: {sidecar_path}")
+    sidecar_features = sidecar.get("action_features")
+    sidecar_available = sidecar.get("action_feature_available_timestamps_ms")
+    sidecar_feature_names = list(sidecar.get("action_feature_names", []))
+    if not torch.is_tensor(sidecar_features) or sidecar_features.ndim != 3:
+        raise ValueError(f"News LLM sidecar action_features missing or invalid: {sidecar_path}")
+    if tuple(sidecar_features.shape[:2]) != tuple(payload["action_returns"].shape):
+        raise ValueError(f"News LLM sidecar action_features shape does not match dataset: {sidecar_path}")
+    if len(sidecar_feature_names) != int(sidecar_features.shape[-1]):
+        raise ValueError(f"News LLM sidecar action_feature_names length mismatch: {sidecar_path}")
+    if not torch.is_tensor(sidecar_available) or tuple(sidecar_available.shape) != tuple(sidecar_features.shape):
+        raise ValueError(f"News LLM sidecar action_feature_available_timestamps_ms shape mismatch: {sidecar_path}")
+    merged = dict(payload)
+    existing_features = merged.get("action_features")
+    existing_width = 0
+    if existing_features is None:
+        merged["action_features"] = sidecar_features.float()
+        merged["action_feature_names"] = sidecar_feature_names
+        merged["action_feature_available_timestamps_ms"] = sidecar_available.long()
+    else:
+        existing_features = existing_features.float()
+        existing_width = int(existing_features.shape[-1])
+        if tuple(existing_features.shape[:2]) != tuple(sidecar_features.shape[:2]):
+            raise ValueError(f"News LLM sidecar action_features shape cannot be appended: {sidecar_path}")
+        existing_names = list(merged.get("action_feature_names", merged.get("feature_names", {}).get("action_features", [])))
+        if len(existing_names) != existing_width:
+            raise ValueError("Existing action_feature_names length does not match action_features width.")
+        existing_available = merged.get("action_feature_available_timestamps_ms")
+        if existing_available is None:
+            raise ValueError("Existing action features require per-feature availability before appending news LLM.")
+        existing_available = existing_available.long()
+        if tuple(existing_available.shape) != tuple(existing_features.shape):
+            raise ValueError("Existing action feature availability shape does not match action_features.")
+        merged["action_features"] = torch.cat([existing_features, sidecar_features.float()], dim=-1)
+        merged["action_feature_names"] = [*existing_names, *sidecar_feature_names]
+        merged["action_feature_available_timestamps_ms"] = torch.cat(
+            [existing_available, sidecar_available.long()],
+            dim=-1,
+        )
+    known = merged["action_feature_available_timestamps_ms"] >= 0
+    row_available = torch.where(
+        known,
+        merged["action_feature_available_timestamps_ms"],
+        torch.full_like(merged["action_feature_available_timestamps_ms"], -1),
+    ).amax(dim=-1)
+    merged["action_features_available_timestamps_ms"] = row_available
+    merged["action_features_any_available_timestamps_ms"] = row_available
+    groups = {
+        str(key): [int(bounds[0]), int(bounds[1])]
+        for key, bounds in dict(merged.get("action_feature_groups", {})).items()
+    }
+    for key, bounds in dict(sidecar.get("action_feature_groups", {})).items():
+        groups[str(key)] = [int(bounds[0]) + existing_width, int(bounds[1]) + existing_width]
+    merged["action_feature_groups"] = groups
+    feature_names = {key: list(value) for key, value in dict(merged.get("feature_names", {})).items()}
+    feature_names["action_features"] = list(merged["action_feature_names"])
+    merged["feature_names"] = feature_names
+    merged["feature_names_by_tensor"] = feature_names
+    for key, value in sidecar.items():
+        if key in {
+            "base_dataset_file_name",
+            "base_dataset_sha256",
+            "base_dataset_payload_hash",
+            "base_dataset_feature_schema_hash",
+            "base_dataset_action_schema_hash",
+            "decision_timestamps",
+            "decision_timestamps_ms",
+            "action_names",
+            "action_features",
+            "action_feature_names",
+            "action_feature_available_timestamps_ms",
+            "action_features_available_timestamps_ms",
+            "action_features_any_available_timestamps_ms",
+            "action_feature_groups",
+        }:
+            continue
+        if key in merged:
+            raise ValueError(f"News LLM sidecar key already exists in dataset payload: {key}")
+        merged[key] = value
+    merged["action_news_llm_sidecar_path"] = str(sidecar_path)
+    merged["action_features_augmented_with_news_llm"] = True
+    errors = list(merged.get("dataset_reportability_errors", []))
+    errors.extend(sidecar.get("action_news_llm_reportability_errors", []))
     errors = list(dict.fromkeys(errors))
     merged["dataset_reportability_errors"] = errors
     merged["dataset_reportable"] = bool(merged.get("dataset_reportable", merged.get("reportable", True))) and not errors
@@ -638,9 +822,15 @@ def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
             )
 
 
-def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
+def _load_payload(
+    path: str | bytes | PathLike[str],
+    *,
+    action_covariate_sidecar: str | bytes | PathLike[str] = "auto",
+    news_llm_sidecar: str | bytes | PathLike[str] = "none",
+) -> dict[str, Any]:
     payload = _canonicalize_subhour_payload(torch.load(path, map_location="cpu", weights_only=True))
-    payload = _merge_action_covariate_sidecar(path, payload)
+    payload = _merge_action_covariate_sidecar(path, payload, action_covariate_sidecar=action_covariate_sidecar)
+    payload = _merge_news_llm_sidecar(path, payload, news_llm_sidecar=news_llm_sidecar)
     required = {
         "decision_timestamps",
         "next_timestamps",
@@ -679,7 +869,13 @@ def _action_feature_mean_std(
     if feature_names:
         keep_raw = torch.tensor(
             [
-                name.startswith("stock_covariates_v1_mask.") or name.endswith("_missing_flag")
+                name.startswith("stock_covariates_v1_mask.")
+                or name.startswith("stock_news_llm_v1_mask.")
+                or name.endswith("_missing_flag")
+                or name.startswith("stock_covariates_v1_type.")
+                or name.endswith(".is_common_stock")
+                or name.endswith(".is_adr_or_foreign")
+                or name.endswith(".is_active_reference_record")
                 for name in feature_names
             ],
             dtype=torch.bool,
@@ -874,8 +1070,14 @@ def build_hour_from_minute_splits(
     val_rows: int = 20,
     test_rows: int = 20,
     min_train_rows: int = 1,
+    action_covariate_sidecar: str | bytes | PathLike[str] = "auto",
+    news_llm_sidecar: str | bytes | PathLike[str] = "none",
 ) -> tuple[HourFromMinuteDataSplit, HourFromMinuteDataSplit, HourFromMinuteDataSplit]:
-    payload = _load_payload(dataset_path)
+    payload = _load_payload(
+        dataset_path,
+        action_covariate_sidecar=action_covariate_sidecar,
+        news_llm_sidecar=news_llm_sidecar,
+    )
     if split_mode == "latest_holdout":
         if any(value is not None for value in (train_start, train_end, val_end, test_start, test_end)):
             raise ValueError("Manual timestamp cutoffs require split_mode='manual'.")

@@ -14,6 +14,7 @@ from rl_quant.research_protocol import stable_json_hash
 
 
 DAY_MS = 86_400_000
+COVARIATE_FLAT_PROTOCOL_VERSION = "stock_covariates_flat_append_v3"
 ACTION_COVARIATE_FEATURE_NAMES = [
     "log_market_cap",
     "log_share_class_shares_outstanding",
@@ -41,12 +42,17 @@ ACTION_COVARIATE_FEATURE_NAMES = [
     "split_events_last_365d",
     "split_age_seconds",
     "split_missing_flag",
-    "news_count_1h",
-    "news_count_1d",
-    "news_count_7d",
-    "news_count_30d",
+    "log1p_news_count_1h",
+    "log1p_news_count_1d",
+    "log1p_news_count_7d",
+    "log1p_news_count_30d",
+    "log1p_weighted_news_count_1d",
+    "log1p_weighted_news_count_7d",
+    "log1p_weighted_news_count_30d",
+    "multi_ticker_news_fraction_1d",
     "news_publisher_count_1d",
     "news_publisher_count_7d",
+    "news_top_publisher_share_7d",
     "news_age_seconds",
     "news_missing_flag",
     "covariate_group_coverage_fraction",
@@ -59,9 +65,6 @@ ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES = ["is_cash_action", "is_non_cash_act
 
 def tensor_content_hash(tensor: torch.Tensor) -> str:
     detached = tensor.detach().cpu().contiguous()
-    if detached.dtype.is_floating_point:
-        detached = detached.clone()
-        detached[torch.isnan(detached)] = float("nan")
     digest = hashlib.sha256()
     metadata = json.dumps(
         {"dtype": str(detached.dtype), "shape": list(detached.shape)},
@@ -69,7 +72,13 @@ def tensor_content_hash(tensor: torch.Tensor) -> str:
         separators=(",", ":"),
     )
     digest.update(metadata.encode("utf-8"))
-    digest.update(detached.numpy().tobytes(order="C"))
+    if detached.dtype.is_floating_point:
+        nan_mask = torch.isnan(detached)
+        clean = torch.where(nan_mask, torch.zeros_like(detached), detached).contiguous()
+        digest.update(clean.numpy().tobytes(order="C"))
+        digest.update(nan_mask.numpy().tobytes(order="C"))
+    else:
+        digest.update(detached.numpy().tobytes(order="C"))
     return digest.hexdigest()
 
 
@@ -121,6 +130,28 @@ def _publisher_id(payload: Mapping[str, Any]) -> str:
         if name:
             return str(name)
     return ""
+
+
+def _news_article_key(payload: Mapping[str, Any], fallback: str) -> str:
+    for key in ("id", "article_url", "amp_url"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    published = str(payload.get("published_utc", payload.get("published_at", payload.get("created_at", ""))))
+    title = str(payload.get("title", ""))
+    publisher = _publisher_id(payload)
+    if title or published or publisher:
+        return stable_json_hash({"title": title, "published": published, "publisher": publisher})
+    return fallback
+
+
+def _news_tickers(payload: Mapping[str, Any]) -> list[str]:
+    raw = payload.get("tickers", [])
+    if isinstance(raw, str):
+        return [canonical_symbol(raw)]
+    if not isinstance(raw, list):
+        return []
+    return list(dict.fromkeys(canonical_symbol(str(item)) for item in raw if str(item).strip()))
 
 
 def _list_date_ms(payload: Mapping[str, Any]) -> int:
@@ -192,6 +223,13 @@ def build_symbol_silver_rows(records: list[RawCovariateRecord]) -> list[dict[str
             row["split_ratio"] = _safe_ratio(split_to, split_from) if split_from else 0.0
         elif record.source_dataset == "news":
             row["news_publisher_id"] = _publisher_id(payload)
+            tickers = _news_tickers(payload)
+            ticker_count = max(len(tickers), 1)
+            primary = canonical_symbol(str(payload.get("primary_ticker", tickers[0] if tickers else "")))
+            row["news_article_id"] = _news_article_key(payload, record.source_record_id)
+            row["news_article_ticker_count"] = float(ticker_count)
+            row["news_mention_weight"] = 1.0 / float(ticker_count)
+            row["news_is_primary_ticker"] = float(primary == record.symbol)
         rows.append(row)
     return rows
 
@@ -301,6 +339,40 @@ def _count_recent(rows: list[Mapping[str, Any]], dataset: str, decision_ms: int,
         for row in _rows_before(rows, dataset, decision_ms)
         if lower <= int(row.get("event_timestamp_ms", -1)) <= decision_ms
     ]
+
+
+def _dedupe_news(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    deduped: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("news_article_id", row.get("source_record_id", "")))
+        existing = deduped.get(key)
+        if existing is None or int(row.get("available_timestamp_ms", -1)) > int(existing.get("available_timestamp_ms", -1)):
+            deduped[key] = row
+    return list(deduped.values())
+
+
+def _weighted_news_count(rows: list[Mapping[str, Any]]) -> float:
+    return sum(max(_finite(row.get("news_mention_weight"), default=1.0), 0.0) for row in rows)
+
+
+def _multi_ticker_fraction(rows: list[Mapping[str, Any]]) -> float:
+    if not rows:
+        return 0.0
+    multi = sum(1 for row in rows if _finite(row.get("news_article_ticker_count"), default=1.0) > 1.0)
+    return float(multi) / float(len(rows))
+
+
+def _top_publisher_share(rows: list[Mapping[str, Any]]) -> float:
+    if not rows:
+        return 0.0
+    counts: dict[str, int] = {}
+    for row in rows:
+        publisher = str(row.get("news_publisher_id", ""))
+        if publisher:
+            counts[publisher] = counts.get(publisher, 0) + 1
+    if not counts:
+        return 0.0
+    return float(max(counts.values())) / float(len(rows))
 
 
 class _CovariateRowBuilder:
@@ -446,19 +518,24 @@ def _add_news(
     rows: list[Mapping[str, Any]],
     source_available: bool,
 ) -> tuple[bool, float]:
-    news_1h = _count_recent(rows, "news", builder.decision_ms, 3_600_000)
-    news_1d = _count_recent(rows, "news", builder.decision_ms, DAY_MS)
-    news_7d = _count_recent(rows, "news", builder.decision_ms, 7 * DAY_MS)
-    news_30d = _count_recent(rows, "news", builder.decision_ms, 30 * DAY_MS)
+    news_1h = _dedupe_news(_count_recent(rows, "news", builder.decision_ms, 3_600_000))
+    news_1d = _dedupe_news(_count_recent(rows, "news", builder.decision_ms, DAY_MS))
+    news_7d = _dedupe_news(_count_recent(rows, "news", builder.decision_ms, 7 * DAY_MS))
+    news_30d = _dedupe_news(_count_recent(rows, "news", builder.decision_ms, 30 * DAY_MS))
     latest = max(_rows_before(rows, "news", builder.decision_ms), key=lambda row: int(row.get("event_timestamp_ms", -1)), default=None)
     available = int(latest.get("available_timestamp_ms", builder.decision_ms)) if latest else builder.decision_ms
     age = max(0.0, (builder.decision_ms - available) / 1000.0) if latest else 0.0
-    builder.add(float(len(news_1h)), builder.decision_ms, valid=source_available)
-    builder.add(float(len(news_1d)), builder.decision_ms, valid=source_available)
-    builder.add(float(len(news_7d)), builder.decision_ms, valid=source_available)
-    builder.add(float(len(news_30d)), builder.decision_ms, valid=source_available)
+    builder.add(math.log1p(float(len(news_1h))), builder.decision_ms, valid=source_available)
+    builder.add(math.log1p(float(len(news_1d))), builder.decision_ms, valid=source_available)
+    builder.add(math.log1p(float(len(news_7d))), builder.decision_ms, valid=source_available)
+    builder.add(math.log1p(float(len(news_30d))), builder.decision_ms, valid=source_available)
+    builder.add(math.log1p(_weighted_news_count(news_1d)), builder.decision_ms, valid=source_available)
+    builder.add(math.log1p(_weighted_news_count(news_7d)), builder.decision_ms, valid=source_available)
+    builder.add(math.log1p(_weighted_news_count(news_30d)), builder.decision_ms, valid=source_available)
+    builder.add(_multi_ticker_fraction(news_1d), builder.decision_ms, valid=source_available)
     builder.add(float(len({str(row.get("news_publisher_id", "")) for row in news_1d if row.get("news_publisher_id")})), builder.decision_ms, valid=source_available)
     builder.add(float(len({str(row.get("news_publisher_id", "")) for row in news_7d if row.get("news_publisher_id")})), builder.decision_ms, valid=source_available)
+    builder.add(_top_publisher_share(news_7d), builder.decision_ms, valid=source_available)
     builder.add(age, available, valid=latest is not None or source_available)
     builder.add_known_now(float(not source_available))
     return source_available, age
@@ -686,7 +763,7 @@ def append_action_covariates_to_payload(
         out["action_features_augmented_with_covariates"] = True
         out["action_covariate_mask_appended_to_action_features"] = bool(append_mask_features)
         out["covariate_mode"] = "flat_append_baseline"
-        out["covariate_protocol_version"] = "stock_covariates_flat_append_v2"
+        out["covariate_protocol_version"] = COVARIATE_FLAT_PROTOCOL_VERSION
         out["action_feature_groups"] = {
             "base_action_features": [0, base_width],
             "stock_covariates_v1": [base_width, base_width + int(action_covariates.shape[-1])],
@@ -768,7 +845,7 @@ def append_action_covariates_to_payload(
             "action_features_augmented_with_covariates": bool(append_to_action_features),
             "action_covariate_mask_appended_to_action_features": bool(append_to_action_features and append_mask_features),
             "covariate_mode": "flat_append_baseline",
-            "covariate_protocol_version": "stock_covariates_flat_append_v2",
+            "covariate_protocol_version": COVARIATE_FLAT_PROTOCOL_VERSION,
             "action_feature_groups": out.get("action_feature_groups", {}),
             "feature_schema_hash": out["feature_schema_hash"],
             "tensor_content_hashes": out["tensor_content_hashes"],
@@ -814,7 +891,7 @@ def write_silver_outputs(
     manifest_path = output_root / "manifest.csv"
     pd.DataFrame.from_records(manifest_rows).to_csv(manifest_path, index=False)
     feature_schema = {
-        "schema_version": "stock_covariates_silver_v1",
+        "schema_version": "stock_covariates_silver_v2",
         "action_covariate_feature_names": ACTION_COVARIATE_FEATURE_NAMES,
         "action_covariate_schema_hash": ACTION_COVARIATE_SCHEMA_HASH,
     }

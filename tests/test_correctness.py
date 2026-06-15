@@ -66,6 +66,16 @@ from rl_quant.features.stock_covariates import (  # noqa: E402
     tensor_content_hash,
     validate_action_covariate_feature_schema,
 )
+from rl_quant.features.news_llm import (  # noqa: E402
+    NEWS_LLM_AGGREGATE_FEATURE_NAMES,
+    NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH,
+    NEWS_LLM_EXTRACT_SCHEMA_VERSION,
+    aggregate_news_llm_features_for_symbol,
+    build_action_news_llm_tensor,
+    build_deterministic_news_llm_rows,
+    build_news_article_rows,
+    write_news_llm_feature_outputs,
+)
 from rl_quant.features.stock_second_context import (  # noqa: E402
     StockSecondContextConfig,
     build_second_context_payload,
@@ -1064,6 +1074,8 @@ class MinuteToHourTests(unittest.TestCase):
             )
             torch.save(
                 {
+                    "base_dataset_file_name": path.name,
+                    "base_dataset_sha256": module._file_sha256(path),
                     "decision_timestamps": decisions,
                     "action_names": ["CASH", "QQQ"],
                     "action_features": action_features,
@@ -1090,6 +1102,121 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(split.action_feature_names[-1], "stock_covariates_v1_mask.days_since_listed")
         self.assertEqual(split.action_feature_groups["stock_covariates_v1"], [0, 2])
         self.assertTrue(torch.equal(split.action_features[:, :, 2:], action_features[:, :, 2:]))
+
+    def test_minute_to_hour_sidecar_mode_required_and_none(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+        decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
+        next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hour_from_second_dataset.pt"
+            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+
+            payload = module._load_payload(path, action_covariate_sidecar="none")
+            self.assertNotIn("action_features", payload)
+            with self.assertRaisesRegex(FileNotFoundError, "Required action covariate sidecar"):
+                module._load_payload(path, action_covariate_sidecar="required")
+
+    def test_minute_to_hour_news_llm_sidecar_is_explicit_opt_in(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+        decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
+        next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hour_from_second_dataset.pt"
+            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+
+            default_payload = module._load_payload(path, action_covariate_sidecar="none")
+            self.assertNotIn("action_features", default_payload)
+            with self.assertRaisesRegex(FileNotFoundError, "Required news LLM sidecar"):
+                module._load_payload(path, action_covariate_sidecar="none", news_llm_sidecar="required")
+
+            available = torch.tensor(
+                [
+                    [[-1, iso_to_timestamp_ms(decisions[0])], [iso_to_timestamp_ms(decisions[0]), iso_to_timestamp_ms(decisions[0])]],
+                    [[-1, iso_to_timestamp_ms(decisions[1])], [iso_to_timestamp_ms(decisions[1]), iso_to_timestamp_ms(decisions[1])]],
+                ],
+                dtype=torch.long,
+            )
+            torch.save(
+                {
+                    "base_dataset_file_name": path.name,
+                    "base_dataset_sha256": module._file_sha256(path),
+                    "decision_timestamps": decisions,
+                    "action_names": ["CASH", "QQQ"],
+                    "action_features": torch.ones((2, 2, 2), dtype=torch.float32),
+                    "action_feature_names": [
+                        "stock_news_llm_v1.log1p_llm_weighted_news_count_1h",
+                        "stock_news_llm_v1_mask.log1p_llm_weighted_news_count_1h",
+                    ],
+                    "action_feature_available_timestamps_ms": available,
+                    "action_feature_groups": {
+                        "stock_news_llm_v1": [0, 1],
+                        "stock_news_llm_v1_mask": [1, 2],
+                    },
+                    "action_news_llm_reportability_errors": [],
+                },
+                path.with_name("action_news_llm_covariates.pt"),
+            )
+
+            payload = module._load_payload(path, action_covariate_sidecar="none", news_llm_sidecar="required")
+
+        self.assertEqual(tuple(payload["action_features"].shape), (2, 2, 2))
+        self.assertEqual(payload["action_feature_names"][0], "stock_news_llm_v1.log1p_llm_weighted_news_count_1h")
+        self.assertTrue(payload["action_features_augmented_with_news_llm"])
+        self.assertEqual(payload["action_feature_groups"]["stock_news_llm_v1"], [0, 1])
+
+    def test_minute_to_hour_sidecar_requires_matching_base_hash(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+        decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
+        next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hour_from_second_dataset.pt"
+            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            torch.save(
+                {
+                    "base_dataset_file_name": path.name,
+                    "base_dataset_sha256": "not-the-current-dataset-hash",
+                    "decision_timestamps": decisions,
+                    "action_names": ["CASH", "QQQ"],
+                    "action_features": torch.zeros((2, 2, 1), dtype=torch.float32),
+                    "action_feature_names": ["stock_covariates_v1.log_market_cap"],
+                    "action_feature_available_timestamps_ms": torch.full((2, 2, 1), -1, dtype=torch.long),
+                    "action_covariate_reportability_errors": [],
+                },
+                path.with_name("action_covariates.pt"),
+            )
+
+            with self.assertRaisesRegex(ValueError, "base_dataset_sha256"):
+                module._load_payload(path, action_covariate_sidecar="required")
+
+    def test_binary_action_features_are_not_zscored(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_action_feature_mean_std"])
+        features = torch.tensor(
+            [
+                [[1.0, 1.0, 0.0, 1.0, 1.0], [2.0, 0.0, 1.0, 0.0, 0.0]],
+                [[3.0, 1.0, 0.0, 1.0, 1.0], [4.0, 0.0, 1.0, 0.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        )
+        mean, std = module._action_feature_mean_std(
+            features,
+            [
+                "stock_covariates_v1.log_market_cap",
+                "stock_covariates_v1_type.is_cash_action",
+                "stock_covariates_v1_type.is_non_cash_action",
+                "stock_covariates_v1.is_common_stock",
+                "stock_news_llm_v1_mask.log1p_llm_weighted_news_count_1h",
+            ],
+        )
+
+        self.assertNotEqual(float(mean[0].item()), 0.0)
+        self.assertEqual(float(mean[1].item()), 0.0)
+        self.assertEqual(float(mean[2].item()), 0.0)
+        self.assertEqual(float(mean[3].item()), 0.0)
+        self.assertEqual(float(mean[4].item()), 0.0)
+        self.assertEqual(float(std[1].item()), 1.0)
+        self.assertEqual(float(std[2].item()), 1.0)
+        self.assertEqual(float(std[3].item()), 1.0)
+        self.assertEqual(float(std[4].item()), 1.0)
 
     def test_minute_to_hour_model_scores_action_features(self) -> None:
         model = MinuteToHourCausalTransformerQNetwork(
@@ -1162,7 +1289,7 @@ class MinuteToHourTests(unittest.TestCase):
             dataset_manifest_path = root / "dataset_manifest.json"
             manifest_path.write_text(
                 "symbol,date,status,rows,output_path,output_size,sha256,elapsed_seconds,error\n"
-                "AAA,2026-06-12,downloaded,10,/tmp/missing.parquet,100,,1,\n"
+                "AAA,2026-06-12,downloaded,10,missing.parquet,100,,1,\n"
                 "BBB,2026-06-12,empty,0,,0,,1,\n"
             )
             dataset_manifest_path.write_text(
@@ -1647,10 +1774,365 @@ class MinuteToHourTests(unittest.TestCase):
             source_coverage_by_symbol={"QQQ": {"news": True}},
             source_manifest_hash="manifest-hash",
         )
-        news_1h_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_count_1h")
+        news_1h_idx = ACTION_COVARIATE_FEATURE_NAMES.index("log1p_news_count_1h")
 
         self.assertEqual(float(bundle["action_covariates"][0, 1, news_1h_idx].item()), 0.0)
-        self.assertEqual(float(bundle["action_covariates"][1, 1, news_1h_idx].item()), 1.0)
+        self.assertAlmostEqual(float(bundle["action_covariates"][1, 1, news_1h_idx].item()), math.log1p(1.0), places=6)
+
+    def test_stock_covariate_news_dedupes_and_weights_multi_ticker_articles(self) -> None:
+        first = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="news",
+            payload={
+                "id": "same-article",
+                "published_utc": "2026-01-05T14:30:00Z",
+                "publisher": {"name": "Wire"},
+                "tickers": ["QQQ", "AAPL", "MSFT", "NVDA"],
+            },
+            line_number=1,
+        )
+        duplicate = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="news",
+            payload={
+                "id": "same-article",
+                "published_utc": "2026-01-05T14:31:00Z",
+                "publisher": {"name": "Wire"},
+                "tickers": ["QQQ", "AAPL", "MSFT", "NVDA"],
+            },
+            line_number=2,
+        )
+        single = normalize_raw_covariate_record(
+            symbol="QQQ",
+            source_dataset="news",
+            payload={
+                "id": "single-article",
+                "published_utc": "2026-01-05T14:45:00Z",
+                "publisher": {"name": "Other"},
+                "tickers": ["QQQ"],
+            },
+            line_number=3,
+        )
+        rows = build_symbol_silver_rows([first, duplicate, single])
+        decision = iso_to_timestamp_ms("2026-01-05T15:00:00+00:00")
+        bundle = build_action_covariate_tensor(
+            silver_rows_by_symbol={"QQQ": rows},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[decision],
+            source_coverage_by_symbol={"QQQ": {"news": True}},
+            source_manifest_hash="manifest-hash",
+        )
+        count_idx = ACTION_COVARIATE_FEATURE_NAMES.index("log1p_news_count_1d")
+        weighted_idx = ACTION_COVARIATE_FEATURE_NAMES.index("log1p_weighted_news_count_1d")
+        multi_idx = ACTION_COVARIATE_FEATURE_NAMES.index("multi_ticker_news_fraction_1d")
+        publisher_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_publisher_count_1d")
+
+        self.assertAlmostEqual(float(bundle["action_covariates"][0, 1, count_idx].item()), math.log1p(2.0), places=6)
+        self.assertAlmostEqual(
+            float(bundle["action_covariates"][0, 1, weighted_idx].item()),
+            math.log1p(1.25),
+            places=6,
+        )
+        self.assertAlmostEqual(float(bundle["action_covariates"][0, 1, multi_idx].item()), 0.5, places=6)
+        self.assertEqual(float(bundle["action_covariates"][0, 1, publisher_idx].item()), 2.0)
+
+    def test_news_llm_article_table_dedupes_articles_across_symbol_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            raw_root = Path(directory)
+            (raw_root / "QQQ").mkdir()
+            (raw_root / "AAPL").mkdir()
+            payload = {
+                "id": "article-1",
+                "published_utc": "2026-01-05T15:00:00Z",
+                "publisher": {"name": "Wire"},
+                "title": "QQQ and AAPL rally after earnings beat",
+                "description": "The companies raised guidance.",
+                "tickers": ["QQQ", "AAPL"],
+            }
+            (raw_root / "QQQ" / "news.jsonl").write_text(json.dumps(payload) + "\n")
+            duplicate = dict(payload)
+            duplicate["description"] = "Duplicate row from another symbol directory."
+            (raw_root / "AAPL" / "news.jsonl").write_text(json.dumps(duplicate) + "\n")
+
+            rows, errors = build_news_article_rows(raw_root=raw_root, symbols=["QQQ", "AAPL"])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0]["tickers_json"]), ["AAPL", "QQQ"])
+        self.assertEqual(json.loads(rows[0]["source_symbols_json"]), ["AAPL", "QQQ"])
+        self.assertEqual(rows[0]["source_record_count"], 2)
+
+    def test_news_llm_deterministic_features_are_article_ticker_and_audited(self) -> None:
+        article = {
+            "article_id": "article-1",
+            "published_utc": "2026-01-05T15:00:00+00:00",
+            "published_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "source_available_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "title": "QQQ beats earnings and raises guidance",
+            "description": "Analysts upgrade the stock after strong profit growth.",
+            "tickers_json": json.dumps(["QQQ", "AAPL"]),
+            "primary_ticker": "QQQ",
+        }
+
+        rows = build_deterministic_news_llm_rows(
+            [article],
+            model_available_timestamp_ms=0,
+            vendor_latency_seconds=0,
+            processing_latency_seconds=0,
+        )
+
+        self.assertEqual([row["ticker"] for row in rows], ["AAPL", "QQQ"])
+        qqq = next(row for row in rows if row["ticker"] == "QQQ")
+        self.assertEqual(qqq["llm_schema_version"], NEWS_LLM_EXTRACT_SCHEMA_VERSION)
+        self.assertEqual(qqq["llm_schema_hash"], NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH)
+        self.assertTrue(qqq["extractor_no_retrieval"])
+        self.assertEqual(float(qqq["extractor_temperature"]), 0.0)
+        self.assertGreater(float(qqq["positive_score"]), float(qqq["negative_score"]))
+        self.assertEqual(float(qqq["event_earnings"]), 1.0)
+        self.assertEqual(float(qqq["event_guidance"]), 1.0)
+        self.assertEqual(float(qqq["event_analyst_rating"]), 1.0)
+        self.assertEqual(float(qqq["is_primary_ticker"]), 1.0)
+
+    def test_news_llm_builder_restricts_to_allowed_universe_when_requested(self) -> None:
+        article = {
+            "article_id": "article-1",
+            "published_utc": "2026-01-05T15:00:00+00:00",
+            "published_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "source_available_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "title": "QQQ and AAPL beat earnings",
+            "description": "Both tickers rallied.",
+            "tickers_json": json.dumps(["QQQ", "AAPL"]),
+            "primary_ticker": "QQQ",
+        }
+
+        rows = build_deterministic_news_llm_rows(
+            [article],
+            model_available_timestamp_ms=0,
+            allowed_tickers={"QQQ"},
+        )
+
+        self.assertEqual([row["ticker"] for row in rows], ["QQQ"])
+
+    def test_news_llm_feature_manifest_records_recommended_model_stack(self) -> None:
+        article = {
+            "article_id": "article-1",
+            "published_utc": "2026-01-05T15:00:00+00:00",
+            "published_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "source_available_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "title": "QQQ beats earnings",
+            "description": "The company reports stronger profits.",
+            "tickers_json": json.dumps(["QQQ"]),
+            "primary_ticker": "QQQ",
+        }
+        rows = build_deterministic_news_llm_rows(
+            [article],
+            model_id="Qwen/Qwen3.6-27B",
+            model_available_timestamp_ms=iso_to_timestamp_ms("2026-06-15T00:00:00+00:00"),
+            model_training_cutoff_utc="unknown_for_downloaded_pretrained_model",
+            vendor_latency_seconds=0,
+            processing_latency_seconds=0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = write_news_llm_feature_outputs(
+                rows=rows,
+                output_root=Path(directory),
+                article_manifest={"article_table_hash": "article-hash"},
+                model_id="Qwen/Qwen3.6-27B",
+                model_available_timestamp_ms=iso_to_timestamp_ms("2026-06-15T00:00:00+00:00"),
+                model_training_cutoff_utc="unknown_for_downloaded_pretrained_model",
+                provider="vllm",
+            )
+
+        self.assertEqual(manifest["llm_feature_group"], "stock_news_llm_v1")
+        self.assertEqual(manifest["primary_model_id"], "Qwen/Qwen3.6-27B")
+        self.assertEqual(manifest["secondary_model_id"], "google/gemma-4-26B-A4B-it")
+        self.assertEqual(manifest["fallback_model_id"], "mistralai/Mistral-Small-3.2-24B-Instruct-2506")
+        self.assertEqual(manifest["serving_engine"], "vllm")
+        self.assertEqual(manifest["structured_output"], "json_schema")
+        self.assertEqual(manifest["temperature"], 0.0)
+        self.assertEqual(manifest["top_p"], 1.0)
+        self.assertTrue(manifest["no_external_retrieval"])
+        self.assertTrue(manifest["cached_outputs_only"])
+        self.assertFalse(
+            manifest["llm_analyst_model_policy"]["retrospective_historical_policy"][
+                "reportable_for_2023_to_2026_backtest"
+            ]
+        )
+
+    def test_news_llm_precomputed_import_fills_schema_defaults_and_filters_universe(self) -> None:
+        module = load_script("build_news_llm_features")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "precomputed.jsonl"
+            base = {
+                "article_id": "article-1",
+                "published_utc": "2026-01-05T15:00:00+00:00",
+                "published_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+                "source_available_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+                "llm_feature_available_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+                "ticker_relevance": 1.0,
+                "is_primary_ticker": 1.0,
+                "company_specificity": 1.0,
+                "is_broad_market_or_sector": 0.0,
+                "sentiment_score": 0.5,
+                "positive_score": 0.5,
+                "negative_score": 0.0,
+                "neutral_score": 0.5,
+                "uncertainty_score": 0.0,
+                "materiality_score": 0.5,
+                "novelty_score": 1.0,
+                "time_horizon": "intraday",
+                "event_earnings": 1.0,
+                "event_guidance": 0.0,
+                "event_product": 0.0,
+                "event_ai_or_technology": 0.0,
+                "event_analyst_rating": 0.0,
+                "event_mna": 0.0,
+                "event_regulatory": 0.0,
+                "event_litigation": 0.0,
+                "event_macro": 0.0,
+                "event_sector": 0.0,
+                "event_management": 0.0,
+                "event_capital_return": 0.0,
+                "confidence": 0.8,
+                "llm_valid": True,
+                "llm_model_id": "local-test-model",
+                "llm_prompt_hash": "prompt-hash",
+                "extractor_provider": "local_transformers",
+                "extractor_temperature": 0.0,
+                "extractor_no_retrieval": True,
+                "model_available_timestamp_ms": 0,
+                "model_training_cutoff_utc": "unknown",
+                "article_weight": 1.0,
+                "ticker_count": 1.0,
+            }
+            external = dict(base)
+            external["ticker"] = "AAPL"
+            included = dict(base)
+            included["ticker"] = "QQQ"
+            path.write_text(json.dumps(external) + "\n" + json.dumps(included) + "\n")
+
+            rows, errors = module.read_precomputed_rows(path, allowed_tickers={"QQQ"})
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ticker"], "QQQ")
+        self.assertEqual(rows[0]["llm_schema_version"], NEWS_LLM_EXTRACT_SCHEMA_VERSION)
+        self.assertEqual(rows[0]["llm_schema_hash"], NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH)
+
+    def test_news_llm_feature_script_exposes_qwen36_policy_and_local_presets(self) -> None:
+        module = load_script("build_news_llm_features")
+
+        args = module.parse_args([])
+        default_manifest_path = module.local_model_manifest_path(args)
+        policy = module.analyst_model_policy_from_args(args)
+        smoke_args = module.parse_args(["--local-model-preset", "qwen3_1_7b"])
+        smoke_manifest_path = module.local_model_manifest_path(smoke_args)
+
+        self.assertEqual(args.local_model_preset, "qwen3_6_27b")
+        self.assertFalse(default_manifest_path.is_absolute())
+        self.assertEqual(default_manifest_path.name, "download_manifest.json")
+        self.assertEqual(default_manifest_path.parent.name, "Qwen3.6-27B")
+        self.assertEqual(policy["primary_model_id"], "Qwen/Qwen3.6-27B")
+        self.assertEqual(policy["secondary_model_id"], "google/gemma-4-26B-A4B-it")
+        self.assertEqual(policy["fallback_model_id"], "mistralai/Mistral-Small-3.2-24B-Instruct-2506")
+        self.assertEqual(policy["serving_engine"], "vllm")
+        self.assertEqual(policy["structured_output"], "json_schema")
+        self.assertEqual(policy["temperature"], 0.0)
+        self.assertEqual(policy["top_p"], 1.0)
+        self.assertFalse(policy["retrospective_historical_policy"]["reportable_for_2023_to_2026_backtest"])
+        self.assertIn("qwen3_6_27b", module.LOCAL_MODEL_PRESETS)
+        self.assertIn("qwen3_1_7b", module.LOCAL_MODEL_PRESETS)
+        self.assertIn("gemma4_26b_a4b_it", module.LOCAL_MODEL_PRESETS)
+        self.assertNotIn("qwen2_5_7b", module.LOCAL_MODEL_PRESETS)
+        self.assertEqual(smoke_manifest_path.name, "download_manifest.json")
+        self.assertEqual(smoke_manifest_path.parent.name, "Qwen3-1.7B")
+        self.assertEqual(
+            module.workspace_relative_path(module.PROJECT_ROOT.parent / "LLM" / "Qwen3.6-27B" / "download_manifest.json"),
+            "../LLM/Qwen3.6-27B/download_manifest.json",
+        )
+        sanitized = module.sanitize_local_model_manifest(
+            {"local_path": str(module.PROJECT_ROOT.parent / "LLM" / "Qwen3-1.7B")}
+        )
+        self.assertEqual(sanitized["local_path"], "../LLM/Qwen3-1.7B")
+
+    def test_news_llm_precomputed_defaults_to_qwen36_policy_model(self) -> None:
+        module = load_script("build_news_llm_features")
+
+        args = module.parse_args(
+            [
+                "--precomputed-jsonl",
+                "data/examples/frozen_qwen_news_outputs.jsonl",
+                "--model-available-timestamp-utc",
+                "2026-06-15T00:00:00+00:00",
+            ]
+        )
+        model_id, _available_ms, _training_cutoff, provider, local_manifest = module.resolve_model_metadata(args)
+
+        self.assertEqual(model_id, "Qwen/Qwen3.6-27B")
+        self.assertEqual(provider, "vllm")
+        self.assertIsNone(local_manifest)
+
+    def test_news_llm_aggregates_are_point_in_time(self) -> None:
+        article = {
+            "article_id": "article-1",
+            "published_utc": "2026-01-05T15:00:00+00:00",
+            "published_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "source_available_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "title": "QQQ faces lawsuit and weak outlook",
+            "description": "The regulatory investigation may hurt profit.",
+            "tickers_json": json.dumps(["QQQ"]),
+            "primary_ticker": "QQQ",
+        }
+        rows = build_deterministic_news_llm_rows(
+            [article],
+            model_available_timestamp_ms=0,
+            vendor_latency_seconds=300,
+            processing_latency_seconds=60,
+        )
+        before = iso_to_timestamp_ms("2026-01-05T15:05:59+00:00")
+        after = iso_to_timestamp_ms("2026-01-05T15:06:00+00:00")
+        count_idx = NEWS_LLM_AGGREGATE_FEATURE_NAMES.index("log1p_llm_weighted_news_count_1h")
+        sentiment_idx = NEWS_LLM_AGGREGATE_FEATURE_NAMES.index("llm_net_sentiment_1d")
+        missing_idx = NEWS_LLM_AGGREGATE_FEATURE_NAMES.index("llm_news_missing_flag")
+
+        before_values, before_mask, _before_available, _before_age = aggregate_news_llm_features_for_symbol(
+            rows=rows,
+            decision_ms=before,
+            source_available=True,
+        )
+        after_values, after_mask, after_available, _after_age = aggregate_news_llm_features_for_symbol(
+            rows=rows,
+            decision_ms=after,
+            source_available=True,
+        )
+
+        self.assertEqual(before_values[count_idx], 0.0)
+        self.assertTrue(before_mask[count_idx])
+        self.assertGreater(after_values[count_idx], 0.0)
+        self.assertLess(after_values[sentiment_idx], 0.0)
+        self.assertEqual(after_values[missing_idx], 0.0)
+        self.assertTrue(after_mask[missing_idx])
+        self.assertLessEqual(after_available[count_idx], after)
+
+    def test_action_news_llm_tensor_distinguishes_cash_missing_and_zero_news(self) -> None:
+        decision = iso_to_timestamp_ms("2026-01-05T16:00:00+00:00")
+        bundle = build_action_news_llm_tensor(
+            news_llm_rows_by_symbol={"QQQ": []},
+            action_names=["CASH", "QQQ", "MSFT"],
+            decision_timestamps_ms=[decision],
+            source_symbols=["QQQ"],
+            source_manifest_hash="news-llm-manifest-hash",
+        )
+        count_idx = NEWS_LLM_AGGREGATE_FEATURE_NAMES.index("log1p_llm_weighted_news_count_1h")
+        missing_idx = NEWS_LLM_AGGREGATE_FEATURE_NAMES.index("llm_news_missing_flag")
+
+        self.assertFalse(bool(bundle["action_news_llm_mask"][0, 0].any().item()))
+        self.assertTrue(bool(bundle["action_news_llm_mask"][0, 1, count_idx].item()))
+        self.assertEqual(float(bundle["action_news_llm_features"][0, 1, count_idx].item()), 0.0)
+        self.assertEqual(float(bundle["action_news_llm_features"][0, 1, missing_idx].item()), 0.0)
+        self.assertFalse(bool(bundle["action_news_llm_mask"][0, 2, count_idx].item()))
+        self.assertEqual(float(bundle["action_news_llm_features"][0, 2, missing_idx].item()), 1.0)
+        self.assertNotIn("news_llm_source_manifest_hash_missing", bundle["action_news_llm_reportability_errors"])
 
     def test_stock_covariate_max_age_masks_stale_overview(self) -> None:
         overview = normalize_raw_covariate_record(
@@ -1736,7 +2218,7 @@ class MinuteToHourTests(unittest.TestCase):
             source_coverage_by_symbol={"QQQ": {"news": False}},
             source_manifest_hash="manifest-hash",
         )
-        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_count_1d")
+        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("log1p_news_count_1d")
         news_missing_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_missing_flag")
 
         self.assertTrue(bool(complete_bundle["action_covariate_mask"][0, 1, news_1d_idx].item()))
@@ -1753,7 +2235,7 @@ class MinuteToHourTests(unittest.TestCase):
             source_coverage_by_symbol={"QQQ": {"news": True}},
             source_manifest_hash="manifest-hash",
         )
-        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_count_1d")
+        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("log1p_news_count_1d")
         news_missing_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_missing_flag")
 
         self.assertTrue(bool(bundle["action_covariate_mask"][0, 1, news_1d_idx].item()))
@@ -1770,7 +2252,7 @@ class MinuteToHourTests(unittest.TestCase):
             path = Path(directory) / "manifest.csv"
             path.write_text(
                 "symbol,path,rows,datasets_available,datasets_missing\n"
-                "QQQ,/tmp/QQQ.parquet,0,\"news,financials\",\"splits\"\n"
+                "QQQ,QQQ.parquet,0,\"news,financials\",\"splits\"\n"
             )
 
             coverage = read_covariate_coverage_manifest(path)
@@ -1785,12 +2267,12 @@ class MinuteToHourTests(unittest.TestCase):
             unknown_path = Path(directory) / "unknown.csv"
             unknown_path.write_text(
                 "symbol,path,rows,datasets_available,datasets_missing\n"
-                "QQQ,/tmp/QQQ.parquet,0,\"news,unknown_dataset\",\"splits\"\n"
+                "QQQ,QQQ.parquet,0,\"news,unknown_dataset\",\"splits\"\n"
             )
             overlap_path = Path(directory) / "overlap.csv"
             overlap_path.write_text(
                 "symbol,path,rows,datasets_available,datasets_missing\n"
-                "QQQ,/tmp/QQQ.parquet,0,\"news,financials\",\"news\"\n"
+                "QQQ,QQQ.parquet,0,\"news,financials\",\"news\"\n"
             )
 
             with self.assertRaisesRegex(ValueError, "Unknown covariate coverage datasets"):
@@ -1826,7 +2308,7 @@ class MinuteToHourTests(unittest.TestCase):
             decision_timestamps_ms=[decision],
             source_manifest_hash="manifest-hash",
         )
-        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_count_1d")
+        news_1d_idx = ACTION_COVARIATE_FEATURE_NAMES.index("log1p_news_count_1d")
         news_missing_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_missing_flag")
 
         self.assertFalse(bool(bundle["action_covariate_mask"][0, 1, news_1d_idx].item()))
@@ -3122,7 +3604,7 @@ class MinuteToHourTests(unittest.TestCase):
                 "--start",
                 "2025-01-01",
                 "--universe",
-                "/tmp/top_500_s3_volume_common_stocks_2026-06-12_tickers.txt",
+                "data/top_500_s3_volume_common_stocks_2026-06-12_tickers.txt",
             ]
         )
         errors = module.conversion_reportability_errors(
@@ -3174,8 +3656,8 @@ class MinuteToHourTests(unittest.TestCase):
             covariates_root.mkdir()
             manifest = covariates_root / "manifest.csv"
             schema = covariates_root / "feature_schema.json"
-            manifest.write_text("symbol,path,rows\nAAA,/tmp/AAA.parquet,1\n")
-            schema.write_text('{"schema_version": "stock_covariates_silver_v1"}\n')
+            manifest.write_text("symbol,path,rows\nAAA,AAA.parquet,1\n")
+            schema.write_text('{"schema_version": "stock_covariates_silver_v2"}\n')
             expected_manifest_hash = module.file_sha256(manifest)
             expected_schema_hash = module.file_sha256(schema)
             args = module.parse_args(
@@ -3193,12 +3675,12 @@ class MinuteToHourTests(unittest.TestCase):
 
             command = module.build_gold_command(
                 args=args,
-                source_manifest=Path("/tmp/source/manifest.csv"),
-                protocol_dataset_manifest=Path("/tmp/protocol.json"),
+                source_manifest=Path("source/manifest.csv"),
+                protocol_dataset_manifest=Path("protocol.json"),
                 actions=["CASH", "AAA"],
                 start_day=module.parse_date("2026-01-02"),
                 end_day=module.parse_date("2026-01-03"),
-                output=Path("/tmp/out/dataset.pt"),
+                output=Path("out/dataset.pt"),
             )
             config = module.conversion_config_payload(args, actions=["CASH", "AAA"], universe_asof="2026-01-01")
 
@@ -3551,7 +4033,7 @@ class MinuteToHourTests(unittest.TestCase):
                 "--max-order-legs-per-episode",
                 "5",
                 "--warm-start-model",
-                "/tmp/model.pt",
+                "models/model.pt",
             ]
         )
         constraints = module.build_constraints_from_args(args)
@@ -3559,7 +4041,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(constraints.max_switches_per_episode, 3)
         self.assertEqual(constraints.max_order_legs_per_day, 4)
         self.assertEqual(constraints.max_order_legs_per_episode, 5)
-        self.assertEqual(args.warm_start_model, Path("/tmp/model.pt"))
+        self.assertEqual(args.warm_start_model, Path("models/model.pt"))
 
     def test_minute_to_hour_default_constraints_remain_conservative(self) -> None:
         module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["default_minute_to_hour_constraints"])
@@ -3858,6 +4340,29 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertFalse(test.split_policy["test_uses_latest_complete_period"])
         self.assertIn("manual_split_skips_latest_complete_period", test.dataset_reportability_errors)
 
+    def test_manual_split_requires_latest_reward_end_not_just_latest_decision(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18", "19")]
+        next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19", "20")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+
+            _train, _val, test = module.build_hour_from_minute_splits(
+                dataset_path=path,
+                split_mode="manual",
+                train_end=decisions[1],
+                val_end=next_timestamps[2],
+                test_start=decisions[3],
+                test_end=decisions[-1],
+            )
+
+        self.assertFalse(test.dataset_reportable)
+        self.assertEqual(test.split_policy["max_dataset_decision_timestamp"], decisions[-1])
+        self.assertEqual(test.split_policy["max_dataset_reward_end_timestamp"], next_timestamps[-1])
+        self.assertFalse(test.split_policy["test_uses_latest_complete_period"])
+        self.assertIn("manual_split_skips_latest_complete_period", test.dataset_reportability_errors)
+
     def test_latest_rows_smoke_split_is_non_reportable(self) -> None:
         module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
         decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18")]
@@ -3920,7 +4425,7 @@ class MinuteToHourTests(unittest.TestCase):
                 path,
             )
 
-            train, val, test = module.build_rolling_partition_splits(path)
+            train, val, test = module.build_rolling_partition_splits(path, split_mode="latest_rows_smoke")
 
         self.assertEqual([train.decision_timestamps[i] for i in train.valid_start_indices.tolist()], decisions[:3])
         self.assertEqual([val.decision_timestamps[i] for i in val.valid_start_indices.tolist()], [decisions[-2]])
@@ -3930,8 +4435,75 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(test.decision_timestamps, [decisions[-1]])
         self.assertNotEqual(module.split_window(val)["first_valid_decision"], module.split_window(test)["first_valid_decision"])
 
+    def test_hour_from_second_partition_training_defaults_to_latest_holdout_sessions(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        sessions = ["2026-01-02", "2026-01-05", "2026-01-06"]
+        decisions = [
+            f"{session}T{hour}:30:00+00:00"
+            for session in sessions
+            for hour in ("14", "15")
+        ]
+        next_timestamps = [
+            f"{session}T{hour}:30:00+00:00"
+            for session in sessions
+            for hour in ("15", "16")
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            self._write_minute_to_hour_dataset(
+                path,
+                decisions=decisions,
+                next_timestamps=next_timestamps,
+                session_ids=[session for session in sessions for _ in range(2)],
+            )
+
+            train, val, test = module.build_rolling_partition_splits(path)
+
+        self.assertEqual(train.split_policy["split_mode"], "latest_holdout")
+        self.assertTrue(test.dataset_reportable)
+        self.assertEqual([train.decision_timestamps[i] for i in train.valid_start_indices.tolist()], decisions[:2])
+        self.assertEqual([val.decision_timestamps[i] for i in val.valid_start_indices.tolist()], decisions[2:4])
+        self.assertEqual([test.decision_timestamps[i] for i in test.valid_start_indices.tolist()], decisions[4:])
+
+    def test_hour_from_second_partition_training_short_chunks_fallback_is_non_reportable(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18")]
+        next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+
+            train, _val, test = module.build_rolling_partition_splits(path)
+
+        self.assertEqual(train.split_policy["split_mode"], "latest_rows_smoke_fallback")
+        self.assertFalse(test.dataset_reportable)
+        self.assertIn("latest_holdout_insufficient_complete_sessions", test.dataset_reportability_errors)
+        self.assertIn("fallback_to_latest_rows_smoke_split", test.dataset_reportability_errors)
+
     def test_hour_from_second_max_partitions_defaults_to_latest(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label in ["2025-01-01_to_2025-01-04", "2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"]:
+                part = root / label
+                part.mkdir()
+                (part / "hour_from_second_dataset.pt").write_text("placeholder")
+            args = module.parse_args(
+                [
+                    "--partitions-root",
+                    str(root),
+                    "--max-partitions",
+                    "2",
+                ]
+            )
+
+            selected = [path.parent.name for path in module.partition_paths(args)]
+
+        self.assertEqual(selected, ["2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"])
+        self.assertEqual(module.partition_selection_reportability_errors(args), [])
+
+    def test_integrate_covariates_max_partitions_defaults_to_latest(self) -> None:
+        module = load_script("integrate_stock_covariates_with_hour_partitions")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for label in ["2025-01-01_to_2025-01-04", "2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"]:
@@ -3973,11 +4545,29 @@ class MinuteToHourTests(unittest.TestCase):
 
             selected = [path.parent.name for path in module.partition_paths(args)]
             policy = module.split_policy_with_partition_selection({"reportable": True, "reportability_errors": []}, args)
+            reportable, errors = module.combined_evaluation_reportability(
+                evaluator_reportable=True,
+                evaluator_errors=[],
+                split_policy={"reportable": False, "reportability_errors": ["smoke_row_based_split"]},
+                args=args,
+            )
+            latest_args = module.parse_args(["--partitions-root", str(root)])
+            evaluator_error_reportable, evaluator_errors = module.combined_evaluation_reportability(
+                evaluator_reportable=True,
+                evaluator_errors=["requested_actions_with_missing_reward_labels"],
+                split_policy={"reportable": True, "reportability_errors": []},
+                args=latest_args,
+            )
 
         self.assertEqual(selected, ["2025-01-01_to_2025-01-04"])
         self.assertFalse(policy["reportable"])
         self.assertEqual(policy["partition_selection_reportability_errors"], ["non_latest_partition_selection"])
         self.assertIn("non_latest_partition_selection", policy["reportability_errors"])
+        self.assertFalse(reportable)
+        self.assertIn("smoke_row_based_split", errors)
+        self.assertIn("non_latest_partition_selection", errors)
+        self.assertFalse(evaluator_error_reportable)
+        self.assertEqual(evaluator_errors, ["requested_actions_with_missing_reward_labels"])
 
 
 class HourlySplitTests(unittest.TestCase):
@@ -5219,6 +5809,27 @@ class DecisionFrameworkTests(unittest.TestCase):
 
 
 class RepositoryHygieneTests(unittest.TestCase):
+    def test_no_local_absolute_path_literals(self) -> None:
+        forbidden = [
+            "/" + part
+            for part in [
+                "home/yding1995",
+                "tmp/",
+                "mnt/",
+                "root/",
+                "Users/",
+                "path/to",
+            ]
+        ]
+        excluded_parts = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__"}
+        excluded_names = {"test_correctness.py"}
+        for path in ROOT.rglob("*"):
+            if not path.is_file() or excluded_parts.intersection(path.parts) or path.name in excluded_names:
+                continue
+            text = path.read_text(errors="ignore")
+            for needle in forbidden:
+                self.assertNotIn(needle, text, f"Local absolute path literal {needle!r} found in {path}")
+
     def test_no_current_tree_secret_literals(self) -> None:
         forbidden = [
             "X-RapidAPI-Key",
@@ -5287,9 +5898,9 @@ class ResearchProtocolTests(unittest.TestCase):
         args = module.parse_args(
             [
                 "--stock-universe",
-                "/tmp/top_us_volume_stocks_2026-06-14.csv",
+                "data/top_us_volume_stocks_2026-06-14.csv",
                 "--etf-universe",
-                "/tmp/top_us_volume_etfs_2026-06-13.csv",
+                "data/top_us_volume_etfs_2026-06-13.csv",
             ]
         )
 
