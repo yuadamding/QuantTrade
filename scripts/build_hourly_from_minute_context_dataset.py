@@ -776,7 +776,6 @@ def main() -> int:
         "context_bars_per_hour": args.minutes_per_hour,
         "source_bar_interval": source_bar_interval,
         "source_bar_seconds": source_bar_seconds,
-        "bar_latency_ms": int(args.bar_latency_ms),
         "decision_grid": DEFAULT_DECISION_GRID_NAME,
         "decision_grid_minutes": DEFAULT_DECISION_GRID_MINUTES,
         "decision_stride_minutes": args.decision_stride_minutes,
