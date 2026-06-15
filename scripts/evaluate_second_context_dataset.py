@@ -52,10 +52,17 @@ def main() -> int:
     payload = torch.load(args.dataset, map_location="cpu", weights_only=True)
     validate_second_context_payload(payload)
     returns = payload["action_returns"].float()
-    valid = payload["action_valid_mask"].bool()
+    decision_valid = payload.get("decision_action_valid_mask", payload["action_valid_mask"]).bool()
+    label_valid = payload.get("label_valid_mask", payload["action_valid_mask"]).bool()
+    evaluable = decision_valid & label_valid
     costs = payload["action_cost_bps"].float() / 10_000.0
-    net = returns - costs
-    best = net.masked_fill(~valid, -1e9).argmax(dim=1)
+    weights = payload.get("action_target_weights")
+    if weights is None:
+        weights = torch.ones_like(returns)
+        weights[:, 0] = 0.0
+    weights = weights.float()
+    net = returns * weights - costs * weights.abs()
+    best = net.masked_fill(~evaluable, -1e9).argmax(dim=1)
     best_returns = net[torch.arange(net.shape[0]), best]
     summary = {
         "rows": len(payload["decision_timestamps"]),
@@ -64,7 +71,9 @@ def main() -> int:
         "diagnostic_only": True,
         "diagnostic_oracle_best_valid_action_future_leakage": summarize_returns(best_returns),
         "forbidden_model_selection_metrics": ["diagnostic_oracle_best_valid_action_future_leakage"],
-        "valid_action_fraction": float(valid.float().mean().item()),
+        "decision_valid_action_fraction": float(decision_valid.float().mean().item()),
+        "label_valid_action_fraction": float(evaluable.float().mean().item()),
+        "valid_action_fraction": float(decision_valid.float().mean().item()),
         "dataset_manifest": payload.get("dataset_manifest", {}),
     }
     output = args.output or args.dataset.with_name("evaluation_summary.json")

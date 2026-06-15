@@ -593,7 +593,11 @@ market_context_available_timestamps_ms
 action_features
 action_features_available_timestamps_ms
 action_returns
+decision_action_valid_mask
 action_valid_mask
+label_valid_mask
+entry_fill_observed_mask
+reward_exit_observed_mask
 action_mask_reason_code
 action_cost_bps
 action_cost_available_timestamps_ms
@@ -633,7 +637,17 @@ Rules:
 - `dataset_schema_version` is `second_context_gold_v1`.
 - `CASH` is action index `0`.
 - `CASH` return, cost, and target weight are zero.
-- Invalid action returns are `NaN`.
+- `decision_action_valid_mask` is the ex-ante mask used for action selection.
+- `action_valid_mask` is a legacy alias of `decision_action_valid_mask`.
+- `label_valid_mask` marks realized return labels that exist after the reward
+  horizon and is forbidden as model input.
+- `entry_fill_observed_mask` and `reward_exit_observed_mask` are historical
+  audit masks for label construction and are forbidden as model inputs.
+- Action returns are finite only where `decision_action_valid_mask` and
+  `label_valid_mask` are both true; otherwise they must be `NaN`, except CASH.
+- `action_target_weights` are signed target exposures. Generated stock-second
+  datasets are long-only today, but evaluators charge costs on absolute
+  executed exposure so future short variants do not create negative costs.
 - Action feature and cost availability timestamps must be at or before the
   decision timestamp, or `-1` when unavailable.
 - `model_input_keys` must not overlap `forbidden_model_input_keys`.
@@ -663,6 +677,8 @@ split_manifest.json
 reportability.json
 decision_logs.jsonl
 selected_action_paths.pt
+selected_action_confidence_train.jsonl
+selected_action_confidence_val.jsonl
 selected_action_confidence_test.jsonl
 action_confidence_train.npz
 action_confidence_val.npz
@@ -688,10 +704,12 @@ Important artifact meanings:
   row indices for train/validation/test.
 - `action_confidence_*.npz`: all-action confidence tensors with shape
   `[rows, actions, confidence_fields]`.
-- `selected_action_confidence_test.jsonl`: selected/executed action confidence,
-  raw policy action, second-best action, margins, and OOD score for test rows.
+- `selected_action_confidence_*.jsonl`: selected/executed action confidence,
+  raw policy action, second-best action, margins, and OOD score for train,
+  validation, and test selected rows.
 - `action_confidence_manifest.json`: confidence method, calibration split,
-  hurdle, interval alpha, field names, calibration metrics, and warnings.
+  hurdle, interval alpha, confidence semantics, OOD status, reportability,
+  field names, calibration metrics, and warnings.
 
 Action-confidence artifacts are separate from raw policy scores. The current
 second-context trainer writes residual-calibrated single-model confidence by
@@ -705,18 +723,33 @@ q_std_total
 q_lcb_05
 q_ucb_95
 p_positive
+profit_confidence
 p_beats_cash
 p_best
+p_best_member_vote
+p_best_draw
+selection_confidence
 advantage_mean
 advantage_lcb
 rank
 confidence
 ```
 
-Invalid actions keep `valid_action = 0`, `p_best = 0`, and `NaN` for scalar
-confidence/probability fields so invalid choices cannot silently improve
-averages. `q_mean` is stored in return units after dividing model scores by the
-training `reward_scale`.
+`p_best` is a backward-compatible alias of `p_best_draw`, the Monte Carlo
+probability that the action is best under the calibrated predictive return
+distribution. `p_best_member_vote` is only an ensemble vote fraction; with a
+single model it is an argmax indicator and the manifest warns accordingly.
+`profit_confidence` is an alias of `p_positive`, while `selection_confidence`
+is `p_best_draw` after any active OOD penalty. Invalid actions keep
+`valid_action = 0`, `p_best = 0`, and `NaN` for scalar confidence/probability
+fields so invalid choices cannot silently improve averages. `q_mean` is stored
+in return units after dividing model scores by the training `reward_scale`.
+
+The fixed field names `q_lcb_05` and `q_ucb_95` are legacy names. Always read
+`action_confidence_manifest.json.interval_quantiles` for the actual lower and
+upper quantiles when `--confidence-interval-alpha` is not `0.05`. Confidence is
+marked non-reportable when the calibration split is reused for checkpoint
+selection or when test data is used for calibration.
 
 ## Common Commands
 
@@ -962,8 +995,20 @@ Train the action-conditioned second-context scorer:
 ```bash
 conda run -n ml1 python scripts/train_second_context_action_scorer.py \
   --device auto \
-  --amp
+  --amp \
+  --epochs 500 \
+  --batch-size 256 \
+  --micro-batch-size 8 \
+  --eval-batch-size 16 \
+  --checkpoint-every-epochs 5 \
+  --target-vram-gb 9.5
 ```
+
+`--batch-size` is the effective optimizer batch. `--micro-batch-size` is the
+actual transformer batch placed on CUDA before gradient accumulation, so long
+runs can use many epochs over the full dataset while keeping peak memory inside
+the 9.5 GiB target. Validation, test scoring, and confidence artifacts use
+`--eval-batch-size` and are also batched.
 
 Evaluate a second-context dataset:
 
@@ -1167,8 +1212,10 @@ Common causes:
 
 ### Invalid action returns fail validation
 
-Invalid action returns must be `NaN` wherever `action_valid_mask` is false.
-Zero is reserved for a real zero return, not for missing or invalid data.
+For second-context datasets, `action_valid_mask` is the decision-time selector
+mask. Supervised labels must be finite only where both `action_valid_mask` and
+`label_valid_mask` are true. Missing labels must be `NaN`; zero is reserved for
+a real zero return, not for missing or invalid data.
 
 ### Second-level context looks sparse
 
@@ -1200,10 +1247,12 @@ This prevents accidentally fine-tuning on incompatible tensors.
 | `next_timestamp` | Reward horizon end timestamp. |
 | `valid_start_indices` | Rows eligible for sequential evaluation. |
 | `segment_ids` | Session/segment identifiers used to reset sequential state. |
-| `action_valid_mask` | Boolean mask indicating which actions may be selected. |
+| `decision_action_valid_mask` | Ex-ante Boolean mask indicating which actions may be selected. |
+| `action_valid_mask` | Legacy alias of `decision_action_valid_mask`. |
+| `label_valid_mask` | Ex-post label availability mask for loss/calibration/evaluation filtering. |
 | `action_returns` | Realized labels for each action. These are not model inputs. |
 | `action_cost_bps` | Estimated execution cost in basis points. |
-| `action_target_weights` | Target portfolio weight per action, used for leverage/risk scaling. |
+| `action_target_weights` | Signed target portfolio exposure per action, used for leverage/risk scaling. |
 | `force_cash_mask` | Row-level gate that forces cash when quality or constraints require it. |
 | Reportable | A run whose data, splits, costs, constraints, baselines, and manifests satisfy the research protocol. |
 

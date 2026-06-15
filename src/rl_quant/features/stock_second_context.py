@@ -576,7 +576,10 @@ def build_second_context_payload(
     }
     action_features: list[list[list[float]]] = []
     action_returns: list[list[float]] = []
-    action_valid_mask: list[list[bool]] = []
+    decision_action_valid_mask: list[list[bool]] = []
+    label_valid_mask: list[list[bool]] = []
+    entry_fill_observed_mask: list[list[bool]] = []
+    reward_exit_observed_mask: list[list[bool]] = []
     action_cost_bps: list[list[float]] = []
     action_target_weights: list[list[float]] = []
     action_features_available_timestamps_ms: list[list[int]] = []
@@ -592,6 +595,9 @@ def build_second_context_payload(
         decision_action_features: list[list[float]] = []
         decision_returns: list[float] = []
         decision_valid: list[bool] = []
+        decision_label_valid: list[bool] = []
+        decision_entry_observed: list[bool] = []
+        decision_exit_observed: list[bool] = []
         decision_costs: list[float] = []
         decision_weights: list[float] = []
         decision_action_available: list[int] = []
@@ -624,6 +630,9 @@ def build_second_context_payload(
                 )
                 decision_returns.append(0.0)
                 decision_valid.append(True)
+                decision_label_valid.append(True)
+                decision_entry_observed.append(True)
+                decision_exit_observed.append(True)
                 decision_costs.append(0.0)
                 decision_weights.append(0.0)
                 decision_action_available.append(int(decision_ms))
@@ -649,7 +658,10 @@ def build_second_context_payload(
                 next_ms + execution_latency_ms,
                 max_staleness_seconds=config.max_action_staleness_seconds,
             )
-            valid = current is not None and future is not None and valid_context_fraction > 0.0
+            decision_known = feature_point is not None and valid_context_fraction > 0.0
+            entry_observed = current is not None
+            exit_observed = future is not None
+            label_valid = decision_known and entry_observed and exit_observed
             if feature_point is None:
                 feature_staleness = float(config.max_action_staleness_seconds + 1)
                 last_dv = 0.0
@@ -668,7 +680,12 @@ def build_second_context_payload(
                     raise ValueError("Action features are not available by the decision timestamp.")
             entry_ts = -1 if current is None else int(current[1])
             exit_ts = -1 if future is None else int(future[1])
-            reason_code = 0 if valid else 1
+            if decision_known:
+                reason_code = 0
+            elif feature_point is None:
+                reason_code = 2
+            else:
+                reason_code = 1
             decision_action_features.append(
                 [
                     action_index_scaled,
@@ -686,7 +703,10 @@ def build_second_context_payload(
                 ]
             )
             decision_costs.append(cost)
-            decision_valid.append(bool(valid))
+            decision_valid.append(bool(decision_known))
+            decision_label_valid.append(bool(label_valid))
+            decision_entry_observed.append(bool(entry_observed))
+            decision_exit_observed.append(bool(exit_observed))
             decision_weights.append(float(metadata["target_weight"]))
             decision_action_available.append(int(feature_available_ts))
             decision_cost_available.append(int(feature_available_ts))
@@ -696,13 +716,16 @@ def build_second_context_payload(
             )
             decision_entry_ts.append(int(entry_ts))
             decision_exit_ts.append(int(exit_ts))
-            if valid and current is not None and future is not None:
+            if label_valid and current is not None and future is not None:
                 decision_returns.append(max(min(future[0] / current[0] - 1.0, 1.0), -1.0))
             else:
                 decision_returns.append(math.nan)
         action_features.append(decision_action_features)
         action_returns.append(decision_returns)
-        action_valid_mask.append(decision_valid)
+        decision_action_valid_mask.append(decision_valid)
+        label_valid_mask.append(decision_label_valid)
+        entry_fill_observed_mask.append(decision_entry_observed)
+        reward_exit_observed_mask.append(decision_exit_observed)
         action_cost_bps.append(decision_costs)
         action_target_weights.append(decision_weights)
         action_features_available_timestamps_ms.append(decision_action_available)
@@ -712,7 +735,10 @@ def build_second_context_payload(
         entry_execution_timestamps_ms.append(decision_entry_ts)
         exit_execution_timestamps_ms.append(decision_exit_ts)
 
-    action_valid = torch.tensor(action_valid_mask, dtype=torch.bool)
+    action_valid = torch.tensor(decision_action_valid_mask, dtype=torch.bool)
+    label_valid = torch.tensor(label_valid_mask, dtype=torch.bool)
+    entry_fill_observed = torch.tensor(entry_fill_observed_mask, dtype=torch.bool)
+    reward_exit_observed = torch.tensor(reward_exit_observed_mask, dtype=torch.bool)
     quality_by_row = market_mask.float().mean(dim=1).clamp(0.0, 1.0)
     valid_action_fraction = action_valid.float().mean(dim=1).clamp(0.0, 1.0)
     decision_quality_score = (quality_by_row * valid_action_fraction).clamp(0.0, 1.0)
@@ -768,12 +794,18 @@ def build_second_context_payload(
         "action_cost_bps": "action_cost_available_timestamps_ms <= decision_timestamps_ms",
         "portfolio_state": "known before the decision from prior fills",
         "constraint_state": "known before the decision from current masks and session state",
+        "decision_action_valid_mask": "known before the decision; actions the policy may select",
+        "action_valid_mask": "legacy alias for decision_action_valid_mask",
+        "label_valid_mask": "known only after reward realization; used for training/evaluation labels, forbidden as model input",
+        "entry_fill_observed_mask": "historical audit flag for whether the entry fill label was observed, forbidden as model input",
+        "reward_exit_observed_mask": "historical audit flag for whether the reward exit label was observed, forbidden as model input",
         "action_returns": "label realized after decision; forbidden as model input",
     }
     model_input_keys = [
         "market_context",
         "market_context_mask",
         "action_features",
+        "decision_action_valid_mask",
         "action_valid_mask",
         "action_cost_bps",
         "action_target_weights",
@@ -784,11 +816,21 @@ def build_second_context_payload(
     ]
     label_keys = [
         "action_returns",
+        "label_valid_mask",
+        "entry_fill_observed_mask",
+        "reward_exit_observed_mask",
         "next_timestamps",
         "entry_execution_timestamps_ms",
         "exit_execution_timestamps_ms",
     ]
-    forbidden_model_input_keys = ["action_returns", "next_timestamps", "exit_execution_timestamps_ms"]
+    forbidden_model_input_keys = [
+        "action_returns",
+        "label_valid_mask",
+        "entry_fill_observed_mask",
+        "reward_exit_observed_mask",
+        "next_timestamps",
+        "exit_execution_timestamps_ms",
+    ]
     execution_model = {
         "name": config.execution_model,
         "entry_rule": "first action close at or after decision_ts + execution_latency_ms",
@@ -846,6 +888,16 @@ def build_second_context_payload(
         "feature_set_id": config.feature_set_id,
         "created_at_utc": utc_now_iso(),
         "source_bar_interval": config.source_bar_interval,
+        "action_mask_semantics": {
+            "decision_action_valid_mask": "ex-ante tradability/data-readiness mask used for model action selection",
+            "action_valid_mask": "legacy alias for decision_action_valid_mask",
+            "label_valid_mask": "ex-post label availability mask used only for supervised loss and realized-return filtering",
+            "entry_fill_observed_mask": "ex-post fill availability flag for realized label construction",
+            "reward_exit_observed_mask": "ex-post reward-exit availability flag for realized label construction",
+        },
+        "return_semantics": "action_returns are raw asset returns from entry_execution_timestamps_ms to exit_execution_timestamps_ms; strategy PnL applies action_target_weights and costs separately.",
+        "target_weight_semantics": "action_target_weights are signed target exposures relative to portfolio equity; generated v3 stock-second actions are long-only except CASH=0.",
+        "cash_action_invariant": "CASH is action index 0, always decision-valid and label-valid, with zero return, zero cost, and zero target weight.",
         "decision_interval": config.decision_interval,
         "context_seconds": config.context_seconds,
         "block_seconds": config.block_seconds,
@@ -886,7 +938,11 @@ def build_second_context_payload(
         "market_context_available_timestamps_ms": available_ms,
         "action_features": torch.tensor(action_features, dtype=torch.float32),
         "action_returns": torch.tensor(action_returns, dtype=torch.float32),
+        "decision_action_valid_mask": action_valid,
         "action_valid_mask": action_valid,
+        "label_valid_mask": label_valid,
+        "entry_fill_observed_mask": entry_fill_observed,
+        "reward_exit_observed_mask": reward_exit_observed,
         "action_mask_reason_code": torch.tensor(action_mask_reason_code, dtype=torch.int32),
         "action_cost_bps": torch.tensor(action_cost_bps, dtype=torch.float32),
         "action_target_weights": torch.tensor(action_target_weights, dtype=torch.float32),
@@ -938,6 +994,7 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         "action_features",
         "action_returns",
         "action_valid_mask",
+        "action_target_weights",
         "action_cost_bps",
         "portfolio_state",
         "constraint_state",
@@ -965,8 +1022,20 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
     action_features = payload["action_features"]
     action_returns = payload["action_returns"].float()
     action_valid = payload["action_valid_mask"].bool()
+    decision_action_valid = payload.get("decision_action_valid_mask")
+    if decision_action_valid is not None:
+        decision_action_valid = decision_action_valid.bool()
+    label_valid = payload.get("label_valid_mask")
+    if label_valid is not None:
+        label_valid = label_valid.bool()
+    entry_fill_observed = payload.get("entry_fill_observed_mask")
+    if entry_fill_observed is not None:
+        entry_fill_observed = entry_fill_observed.bool()
+    reward_exit_observed = payload.get("reward_exit_observed_mask")
+    if reward_exit_observed is not None:
+        reward_exit_observed = reward_exit_observed.bool()
     action_costs = payload["action_cost_bps"].float()
-    action_target_weights = payload.get("action_target_weights")
+    action_target_weights = payload["action_target_weights"].float()
     entry_execution = payload["entry_execution_timestamps_ms"].long()
     exit_execution = payload["exit_execution_timestamps_ms"].long()
     rows = len(decisions)
@@ -999,9 +1068,26 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
             raise ValueError(f"feature_names[{group!r}] length must match tensor width.")
     if tuple(action_returns.shape) != tuple(action_valid.shape):
         raise ValueError("action_valid_mask shape must match action_returns.")
+    if decision_action_valid is not None:
+        if tuple(decision_action_valid.shape) != tuple(action_returns.shape):
+            raise ValueError("decision_action_valid_mask shape must match action_returns.")
+        if not bool(torch.equal(decision_action_valid, action_valid)):
+            raise ValueError("action_valid_mask must be the legacy alias of decision_action_valid_mask.")
+    else:
+        decision_action_valid = action_valid
+    if label_valid is not None and tuple(label_valid.shape) != tuple(action_returns.shape):
+        raise ValueError("label_valid_mask shape must match action_returns.")
+    if label_valid is None:
+        label_valid = action_valid
+    if bool((label_valid & ~action_valid).any().item()):
+        raise ValueError("label_valid_mask must be a subset of decision action validity.")
+    if entry_fill_observed is not None and tuple(entry_fill_observed.shape) != tuple(action_returns.shape):
+        raise ValueError("entry_fill_observed_mask shape must match action_returns.")
+    if reward_exit_observed is not None and tuple(reward_exit_observed.shape) != tuple(action_returns.shape):
+        raise ValueError("reward_exit_observed_mask shape must match action_returns.")
     if tuple(action_costs.shape) != tuple(action_returns.shape):
         raise ValueError("action_cost_bps shape must match action_returns.")
-    if action_target_weights is not None and tuple(action_target_weights.float().shape) != tuple(action_returns.shape):
+    if tuple(action_target_weights.shape) != tuple(action_returns.shape):
         raise ValueError("action_target_weights shape must match action_returns.")
     action_feature_available = payload.get("action_features_available_timestamps_ms")
     if action_feature_available is not None:
@@ -1037,21 +1123,30 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError("action_features first two dimensions must match action_returns.")
     if bool((action_costs < 0).any().item()):
         raise ValueError("action_cost_bps must be non-negative.")
-    if action_target_weights is not None:
-        weights = action_target_weights.float()
-        if bool((weights < 0).any().item()):
-            raise ValueError("action_target_weights must be non-negative.")
-        if abs(float(weights[:, 0].abs().max().item())) > 1e-12:
-            raise ValueError("CASH action target weight must be zero.")
+    if not bool(torch.isfinite(action_target_weights).all().item()):
+        raise ValueError("action_target_weights must be finite.")
+    if abs(float(action_target_weights[:, 0].abs().max().item())) > 1e-12:
+        raise ValueError("CASH action target weight must be zero.")
     if not bool(action_valid[:, 0].all().item()):
         raise ValueError("CASH action must be valid for every row.")
-    if not bool(torch.isfinite(action_returns[action_valid]).all().item()):
-        raise ValueError("Valid action_returns must be finite.")
+    if not bool(label_valid[:, 0].all().item()):
+        raise ValueError("CASH action must be label-valid for every row.")
+    label_ready = action_valid & label_valid
+    if not bool(torch.isfinite(action_returns[label_ready]).all().item()):
+        raise ValueError("Label-valid action_returns must be finite.")
     if bool((action_returns[:, 0].abs() > 1e-12).any().item()):
         raise ValueError("CASH action return must be zero.")
-    invalid_returns = action_returns[~action_valid]
+    invalid_returns = action_returns[~label_ready]
     if invalid_returns.numel() and not bool(torch.isnan(invalid_returns).all().item()):
-        raise ValueError("Invalid action_returns must be NaN.")
+        raise ValueError("Non-label-valid action_returns must be NaN.")
+    if entry_fill_observed is not None:
+        missing_entry_labels = label_ready & ~entry_fill_observed
+        if bool(missing_entry_labels.any().item()):
+            raise ValueError("Label-valid actions must have observed entry fills.")
+    if reward_exit_observed is not None:
+        missing_exit_labels = label_ready & ~reward_exit_observed
+        if bool(missing_exit_labels.any().item()):
+            raise ValueError("Label-valid actions must have observed reward exits.")
     if abs(float(action_costs[:, 0].abs().max().item())) > 1e-12:
         raise ValueError("CASH action cost must be zero.")
     decision_quality_score = payload.get("decision_quality_score")
@@ -1086,7 +1181,7 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
             raise ValueError(f"{key} must have shape [rows].")
         if bool((values > torch.tensor(decision_ms, dtype=torch.long)).any().item()):
             raise ValueError(f"{key} contains values unavailable at the decision timestamp.")
-    non_cash_valid = action_valid.clone()
+    non_cash_valid = label_ready.clone()
     non_cash_valid[:, 0] = False
     decision_ms_tensor = torch.tensor(decision_ms, dtype=torch.long).unsqueeze(1).expand_as(action_valid)
     next_ms_tensor = torch.tensor(next_ms, dtype=torch.long).unsqueeze(1).expand_as(action_valid)

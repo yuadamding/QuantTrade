@@ -30,6 +30,7 @@ from rl_quant.action_risk import (
     trade_notional,
 )
 from rl_quant.core import (
+    CudaVramReservation,
     DQNLearningConfig,
     TensorDictReplayBuffer,
     annualized_sharpe,
@@ -1035,41 +1036,6 @@ def evaluate_hourly_policy(
         hourly_sharpe=annualized_sharpe(bar_returns, periods_per_year=data.periods_per_year),
         rollout_records=records,
     )
-
-
-class CudaVramReservation:
-    def __init__(self, *, target_gb: float | None, safety_gb: float) -> None:
-        self.target_gb = target_gb
-        self.safety_gb = safety_gb
-        self.chunks: list[torch.Tensor] = []
-        self.report: dict[str, float | int | str] = {}
-
-    def maybe_reserve(self, device: torch.device) -> None:
-        if self.target_gb is None or device.type != "cuda" or self.chunks:
-            return
-        torch.cuda.synchronize(device)
-        free, total = torch.cuda.mem_get_info(device)
-        used = total - free
-        target = min(int(self.target_gb * 1024**3), total - int(self.safety_gb * 1024**3))
-        bytes_to_reserve = max(target - used, 0)
-        max_chunk = 1_024**3
-        remaining = bytes_to_reserve
-        while remaining > 0:
-            chunk_bytes = min(remaining, max_chunk)
-            chunk = torch.empty(chunk_bytes, dtype=torch.uint8, device=device)
-            chunk.zero_()
-            self.chunks.append(chunk)
-            remaining -= chunk_bytes
-        torch.cuda.synchronize(device)
-        free_after, total_after = torch.cuda.mem_get_info(device)
-        self.report = {
-            "target_gb": float(self.target_gb),
-            "safety_gb": float(self.safety_gb),
-            "reserved_ballast_gb": round(bytes_to_reserve / 1024**3, 4),
-            "device_used_after_reserve_gb": round((total_after - free_after) / 1024**3, 4),
-            "device_total_gb": round(total_after / 1024**3, 4),
-            "chunks": len(self.chunks),
-        }
 
 
 def _state_dict_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:

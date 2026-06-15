@@ -8,6 +8,7 @@ from statistics import NormalDist
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 
 ACTION_CONFIDENCE_FIELD_NAMES = (
@@ -18,8 +19,12 @@ ACTION_CONFIDENCE_FIELD_NAMES = (
     "q_lcb_05",
     "q_ucb_95",
     "p_positive",
+    "profit_confidence",
     "p_beats_cash",
     "p_best",
+    "p_best_member_vote",
+    "p_best_draw",
+    "selection_confidence",
     "advantage_mean",
     "advantage_lcb",
     "rank",
@@ -38,6 +43,10 @@ class ActionConfidenceConfig:
     confidence_beta_positive: float = 0.5
     ood_lambda: float = 1.0
     q_value_scale: float = 10_000.0
+    p_best_draws: int = 512
+    p_best_draw_batch_rows: int = 512
+    p_best_draw_batch_size: int = 64
+    p_best_draw_seed: int = 17
 
     def validate(self) -> None:
         if self.hurdle_bps < 0:
@@ -52,6 +61,12 @@ class ActionConfidenceConfig:
             raise ValueError("ood_lambda must be non-negative.")
         if self.q_value_scale <= 0:
             raise ValueError("q_value_scale must be positive.")
+        if self.p_best_draws <= 0:
+            raise ValueError("p_best_draws must be positive.")
+        if self.p_best_draw_batch_rows <= 0:
+            raise ValueError("p_best_draw_batch_rows must be positive.")
+        if self.p_best_draw_batch_size <= 0:
+            raise ValueError("p_best_draw_batch_size must be positive.")
 
     @property
     def hurdle_return(self) -> float:
@@ -70,8 +85,12 @@ class ActionConfidenceOutput:
     q_lcb: torch.Tensor
     q_ucb: torch.Tensor
     p_positive: torch.Tensor
+    profit_confidence: torch.Tensor
     p_beats_cash: torch.Tensor
     p_best: torch.Tensor
+    p_best_member_vote: torch.Tensor
+    p_best_draw: torch.Tensor
+    selection_confidence: torch.Tensor
     advantage_mean: torch.Tensor
     advantage_lcb: torch.Tensor
     rank: torch.Tensor
@@ -80,24 +99,37 @@ class ActionConfidenceOutput:
     field_names: tuple[str, ...] = field(default=ACTION_CONFIDENCE_FIELD_NAMES)
 
     def as_tensor(self) -> torch.Tensor:
-        return torch.stack(
-            [
-                self.valid_actions.float(),
-                self.q_mean,
-                self.q_std_epistemic,
-                self.q_std_total,
-                self.q_lcb,
-                self.q_ucb,
-                self.p_positive,
-                self.p_beats_cash,
-                self.p_best,
-                self.advantage_mean,
-                self.advantage_lcb,
-                self.rank,
-                self.confidence,
-            ],
-            dim=-1,
-        )
+        tensors = [
+            self.valid_actions.float(),
+            self.q_mean,
+            self.q_std_epistemic,
+            self.q_std_total,
+            self.q_lcb,
+            self.q_ucb,
+            self.p_positive,
+            self.profit_confidence,
+            self.p_beats_cash,
+            self.p_best,
+            self.p_best_member_vote,
+            self.p_best_draw,
+            self.selection_confidence,
+            self.advantage_mean,
+            self.advantage_lcb,
+            self.rank,
+            self.confidence,
+        ]
+        expected_shape = tuple(self.valid_actions.shape)
+        for index, tensor in enumerate(tensors):
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"Action confidence tensor {self.field_names[index] if index < len(self.field_names) else index!r} "
+                    f"has shape {tuple(tensor.shape)}, expected {expected_shape}."
+                )
+        if len(tensors) != len(self.field_names):
+            raise ValueError("Action confidence field count does not match ACTION_CONFIDENCE_FIELD_NAMES.")
+        if self.ood_score.numel() != expected_shape[0]:
+            raise ValueError("ood_score length must match confidence rows.")
+        return torch.stack(tensors, dim=-1)
 
 
 def _ensure_member_axis(q_values: torch.Tensor) -> torch.Tensor:
@@ -124,7 +156,7 @@ def _realized_net_returns(
     weights = action_target_weights.float() if action_target_weights is not None else torch.ones_like(net)
     net = net * weights
     if action_cost_bps is not None:
-        net = net - action_cost_bps.float() / 10_000.0 * weights
+        net = net - action_cost_bps.float() / 10_000.0 * weights.abs()
     return net
 
 
@@ -167,7 +199,13 @@ class ActionConfidenceCalibrator:
         self.action_residual_std: torch.Tensor | None = None
         self.metrics: dict[str, Any] = {}
         self.warnings: list[str] = []
+        self.ood_method = "none"
+        self.ood_penalty_active = False
         self.fitted = False
+
+    def _append_warning_once(self, warning: str) -> None:
+        if warning not in self.warnings:
+            self.warnings.append(warning)
 
     def fit(
         self,
@@ -257,25 +295,39 @@ class ActionConfidenceCalibrator:
         cash_std = q_std_total[:, :1]
         diff_std = torch.sqrt(q_std_total.square() + cash_std.square()).clamp_min(1e-8)
         p_beats_cash = _normal_prob_greater(q_mean - cash_mean, diff_std, self.config.hurdle_return)
-        p_best = self._p_best(q_members_return, valid)
+        p_best_member_vote = self._p_best_member_vote(q_members_return, valid)
+        if q_members_return.shape[0] == 1:
+            self._append_warning_once("p_best_member_vote_is_argmax_indicator_with_single_member")
+        p_best_draw = self._p_best_draw(q_mean, q_std_total, valid)
+        p_best = p_best_draw
         advantage_mean, advantage_lcb = self._advantages(q_mean, q_lcb, q_ucb, valid)
         rank = self._rank(q_mean, valid)
         if ood_score is None:
             ood = torch.zeros(q_mean.shape[0], dtype=q_mean.dtype, device=q_mean.device)
+            self.ood_method = "none"
+            self.ood_penalty_active = False
+            if self.config.ood_penalty:
+                self._append_warning_once("ood_penalty_configured_but_no_ood_score_supplied")
         else:
             ood = ood_score.to(device=q_mean.device, dtype=q_mean.dtype).flatten()
             if ood.numel() != q_mean.shape[0]:
                 raise ValueError("ood_score length must match q_values rows.")
+            self.ood_method = "external_score"
+            self.ood_penalty_active = bool(self.config.ood_penalty)
         if self.config.ood_penalty:
             ood_penalty = torch.exp(-float(self.config.ood_lambda) * ood).clamp(0.0, 1.0)
         else:
             ood_penalty = torch.ones_like(ood)
-        confidence = (
-            p_best.clamp(0.0, 1.0).pow(float(self.config.confidence_beta_best))
-            * p_positive.clamp(0.0, 1.0).pow(float(self.config.confidence_beta_positive))
-            * ood_penalty[:, None]
-        )
+        profit_confidence = p_positive
+        selection_confidence = p_best_draw.clamp(0.0, 1.0) * ood_penalty[:, None]
+        confidence = selection_confidence.pow(float(self.config.confidence_beta_best)) * profit_confidence.clamp(
+            0.0,
+            1.0,
+        ).pow(float(self.config.confidence_beta_positive))
         p_best = p_best.masked_fill(~valid, 0.0)
+        p_best_member_vote = p_best_member_vote.masked_fill(~valid, 0.0)
+        p_best_draw = p_best_draw.masked_fill(~valid, 0.0)
+        selection_confidence = selection_confidence.masked_fill(~valid, float("nan"))
         return ActionConfidenceOutput(
             valid_actions=valid.detach().cpu(),
             q_mean=_masked_nan(q_mean, valid).detach().cpu(),
@@ -284,8 +336,12 @@ class ActionConfidenceCalibrator:
             q_lcb=_masked_nan(q_lcb, valid).detach().cpu(),
             q_ucb=_masked_nan(q_ucb, valid).detach().cpu(),
             p_positive=_masked_nan(p_positive, valid).detach().cpu(),
+            profit_confidence=_masked_nan(profit_confidence, valid).detach().cpu(),
             p_beats_cash=_masked_nan(p_beats_cash, valid).detach().cpu(),
             p_best=p_best.detach().cpu(),
+            p_best_member_vote=p_best_member_vote.detach().cpu(),
+            p_best_draw=p_best_draw.detach().cpu(),
+            selection_confidence=selection_confidence.detach().cpu(),
             advantage_mean=_masked_nan(advantage_mean, valid).detach().cpu(),
             advantage_lcb=_masked_nan(advantage_lcb, valid).detach().cpu(),
             rank=_masked_nan(rank, valid).detach().cpu(),
@@ -294,7 +350,7 @@ class ActionConfidenceCalibrator:
         )
 
     @staticmethod
-    def _p_best(q_members: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    def _p_best_member_vote(q_members: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         masked = q_members.masked_fill(~valid.unsqueeze(0), -float("inf"))
         winners = masked.argmax(dim=-1)
         p_best = torch.zeros_like(q_members[0])
@@ -305,6 +361,38 @@ class ActionConfidenceCalibrator:
             p_best.scatter_add_(dim=1, index=winner.unsqueeze(1), src=src)
         p_best = p_best / max(float(q_members.shape[0]), 1.0)
         return p_best.masked_fill(~valid_rows[:, None], 0.0).masked_fill(~valid, 0.0)
+
+    def _p_best_draw(self, q_mean: torch.Tensor, q_std_total: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        rows, actions = q_mean.shape
+        p_best = torch.zeros_like(q_mean)
+        generator = torch.Generator(device=q_mean.device)
+        generator.manual_seed(int(self.config.p_best_draw_seed))
+        row_batch = int(self.config.p_best_draw_batch_rows)
+        draw_batch = int(self.config.p_best_draw_batch_size)
+        total_draws = int(self.config.p_best_draws)
+        for row_start in range(0, rows, row_batch):
+            row_end = min(row_start + row_batch, rows)
+            mean_chunk = q_mean[row_start:row_end]
+            std_chunk = q_std_total[row_start:row_end]
+            valid_chunk = valid[row_start:row_end]
+            counts = torch.zeros_like(mean_chunk)
+            draws_done = 0
+            while draws_done < total_draws:
+                current_draws = min(draw_batch, total_draws - draws_done)
+                noise = torch.randn(
+                    (current_draws, row_end - row_start, actions),
+                    device=q_mean.device,
+                    dtype=q_mean.dtype,
+                    generator=generator,
+                )
+                samples = mean_chunk.unsqueeze(0) + noise * std_chunk.unsqueeze(0)
+                samples = samples.masked_fill(~valid_chunk.unsqueeze(0), -float("inf"))
+                winners = samples.argmax(dim=-1)
+                counts = counts + F.one_hot(winners, num_classes=actions).to(dtype=q_mean.dtype).sum(dim=0)
+                draws_done += current_draws
+            row_valid = valid_chunk.any(dim=1)
+            p_best[row_start:row_end] = (counts / float(total_draws)).masked_fill(~row_valid[:, None], 0.0)
+        return p_best.masked_fill(~valid, 0.0)
 
     @staticmethod
     def _advantages(
@@ -343,20 +431,56 @@ class ActionConfidenceCalibrator:
         uses_test_for_calibration: bool = False,
         uses_checkpoint_selection_for_calibration: bool = False,
     ) -> dict[str, Any]:
+        lower_quantile = float(self.config.interval_alpha)
+        upper_quantile = float(1.0 - self.config.interval_alpha)
+        confidence_reportability_errors: list[str] = []
+        if uses_test_for_calibration:
+            confidence_reportability_errors.append("test_split_used_for_confidence_calibration")
+        if uses_checkpoint_selection_for_calibration:
+            confidence_reportability_errors.append("calibration_split_reused_for_checkpoint_selection")
+        warnings = list(dict.fromkeys(self.warnings))
+        if ensemble_size <= 1 and "p_best_member_vote_is_argmax_indicator_with_single_member" not in warnings:
+            warnings.append("p_best_member_vote_is_argmax_indicator_with_single_member")
         return {
-            "schema_version": "action_confidence_v1",
+            "schema_version": "action_confidence_v2",
             "confidence_method": self.config.method,
             "ensemble_size": int(ensemble_size),
             "split": split_name,
             "calibration_split": calibration_split,
             "uses_test_for_calibration": bool(uses_test_for_calibration),
             "uses_checkpoint_selection_for_calibration": bool(uses_checkpoint_selection_for_calibration),
+            "confidence_reportable": not confidence_reportability_errors,
+            "confidence_reportability_errors": confidence_reportability_errors,
             "hurdle_bps": float(self.config.hurdle_bps),
             "interval_alpha": float(self.config.interval_alpha),
+            "interval_quantiles": {
+                "lower_quantile": lower_quantile,
+                "upper_quantile": upper_quantile,
+                "central_interval_coverage_target": upper_quantile - lower_quantile,
+                "interval_assumption": "normal_residual",
+                "legacy_field_names": {
+                    "q_lcb_05": "lower quantile when interval_alpha=0.05",
+                    "q_ucb_95": "upper quantile when interval_alpha=0.05",
+                },
+            },
+            "confidence_semantics": {
+                "p_positive": "normal-residual estimate of P(weighted net return > hurdle)",
+                "profit_confidence": "alias of p_positive",
+                "p_best": "backward-compatible alias of p_best_draw",
+                "p_best_member_vote": "fraction of ensemble members that rank the action first; with one member this is an argmax indicator",
+                "p_best_draw": "Monte Carlo probability the action is best under independent normal predictive draws",
+                "selection_confidence": "p_best_draw after any configured OOD penalty",
+                "confidence": "selection_confidence^beta_best * profit_confidence^beta_positive",
+            },
+            "p_best_method": "predictive_residual_draws",
+            "p_best_member_vote_semantics": "ensemble_argmax_vote_fraction",
+            "ood_method": self.ood_method,
+            "ood_penalty_configured": bool(self.config.ood_penalty),
+            "ood_penalty_active": bool(self.ood_penalty_active),
             "field_names": list(ACTION_CONFIDENCE_FIELD_NAMES),
             "config": self.config.to_dict(),
             "calibration_metrics": dict(self.metrics),
-            "warnings": list(self.warnings),
+            "warnings": warnings,
         }
 
 
@@ -393,8 +517,12 @@ def save_action_confidence_npz(
         "q_lcb_05": confidence.q_lcb.numpy().astype("float32"),
         "q_ucb_95": confidence.q_ucb.numpy().astype("float32"),
         "p_positive": confidence.p_positive.numpy().astype("float32"),
+        "profit_confidence": confidence.profit_confidence.numpy().astype("float32"),
         "p_beats_cash": confidence.p_beats_cash.numpy().astype("float32"),
         "p_best": confidence.p_best.numpy().astype("float32"),
+        "p_best_member_vote": confidence.p_best_member_vote.numpy().astype("float32"),
+        "p_best_draw": confidence.p_best_draw.numpy().astype("float32"),
+        "selection_confidence": confidence.selection_confidence.numpy().astype("float32"),
         "advantage_mean": confidence.advantage_mean.numpy().astype("float32"),
         "advantage_lcb": confidence.advantage_lcb.numpy().astype("float32"),
         "rank": confidence.rank.numpy().astype("float32"),

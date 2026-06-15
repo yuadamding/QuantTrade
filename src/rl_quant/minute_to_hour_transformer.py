@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from rl_quant.core import (
+    CudaVramReservation,
     DQNLearningConfig,
     annualized_sharpe,
     autocast_context,
@@ -20,7 +21,7 @@ from rl_quant.core import (
     fractional_max_drawdown,
     make_grad_scaler,
 )
-from rl_quant.hourly_transformer import CudaVramReservation, _validate_action_return_contract
+from rl_quant.hourly_transformer import _validate_action_return_contract
 from rl_quant.trading_constraints import (
     CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,

@@ -59,12 +59,16 @@ Required tensors:
 | `market_context_available_timestamps_ms` | `[N, L]` | `int64` | When each context token became available. |
 | `action_features` | `[N, A, Fa]` | `float16` or `float32` | Per-action features known at decision time. |
 | `action_features_available_timestamps_ms` | `[N, A]` | `int64` | When each action feature row became available; `-1` means unavailable. |
-| `action_valid_mask` | `[N, A]` | `bool` | True where the action can be selected. |
+| `decision_action_valid_mask` | `[N, A]` | `bool` | Ex-ante mask; true where the action can be selected at the decision timestamp. |
+| `action_valid_mask` | `[N, A]` | `bool` | Legacy alias of `decision_action_valid_mask`. |
+| `label_valid_mask` | `[N, A]` | `bool` | Ex-post mask; true where the realized reward label exists. |
+| `entry_fill_observed_mask` | `[N, A]` | `bool` | Ex-post audit flag for observed entry fill labels. |
+| `reward_exit_observed_mask` | `[N, A]` | `bool` | Ex-post audit flag for observed reward-exit labels. |
 | `action_mask_reason_code` | `[N, A]` | `uint16` or `int32` | Numeric reason code for invalid actions. |
-| `action_returns` | `[N, A]` | `float32` | Realized simple return for valid actions; invalid values must be `NaN`. |
+| `action_returns` | `[N, A]` | `float32` | Realized simple return where both decision and label masks are true; missing labels must be `NaN`. |
 | `action_cost_bps` | `[N, A]` | `float16` or `float32` | Estimated action execution cost in basis points. |
 | `action_cost_available_timestamps_ms` | `[N, A]` | `int64` | When each cost estimate became available; `-1` means unavailable. |
-| `action_target_weights` | `[N, A]` | `float16` or `float32` | Target portfolio weight for each action. |
+| `action_target_weights` | `[N, A]` | `float16` or `float32` | Signed target portfolio exposure for each action. |
 | `action_quality_score` | `[N, A]` | `float16` or `float32` | Per-action data quality in `[0, 1]`. |
 | `entry_execution_timestamps_ms` | `[N, A]` | `int64` | Simulated entry fill timestamp. |
 | `exit_execution_timestamps_ms` | `[N, A]` | `int64` | Simulated exit/reward fill timestamp. |
@@ -173,17 +177,27 @@ execution_latency_ms >= 1000
 
 ```text
 action_names[0] == "CASH"
+decision_action_valid_mask[:, 0] == True
 action_valid_mask[:, 0] == True
+label_valid_mask[:, 0] == True
 action_returns[:, 0] == 0
 action_cost_bps[:, 0] == 0
 action_target_weights[:, 0] == 0
 ```
 
-Invalid actions must satisfy:
+Mask semantics:
 
 ```text
-action_valid_mask[n, a] == False => isNaN(action_returns[n, a])
+action_valid_mask == decision_action_valid_mask
+label_valid_mask[n, a] == True => decision_action_valid_mask[n, a] == True
+decision_action_valid_mask[n, a] and label_valid_mask[n, a] => isfinite(action_returns[n, a])
+not (decision_action_valid_mask[n, a] and label_valid_mask[n, a]) => isNaN(action_returns[n, a]), except CASH
 ```
+
+Models may consume `decision_action_valid_mask`/`action_valid_mask` for action
+selection. Models must not consume `label_valid_mask`,
+`entry_fill_observed_mask`, or `reward_exit_observed_mask`; those are historical
+label-audit fields.
 
 ## Feature Groups
 
@@ -234,6 +248,7 @@ Every dataset manifest must separate inputs from labels:
     "market_context",
     "market_context_mask",
     "action_features",
+    "decision_action_valid_mask",
     "action_valid_mask",
     "action_cost_bps",
     "action_target_weights",
@@ -244,12 +259,18 @@ Every dataset manifest must separate inputs from labels:
   ],
   "label_keys": [
     "action_returns",
+    "label_valid_mask",
+    "entry_fill_observed_mask",
+    "reward_exit_observed_mask",
     "next_timestamps",
     "entry_execution_timestamps_ms",
     "exit_execution_timestamps_ms"
   ],
   "forbidden_model_input_keys": [
     "action_returns",
+    "label_valid_mask",
+    "entry_fill_observed_mask",
+    "reward_exit_observed_mask",
     "next_timestamps",
     "exit_execution_timestamps_ms"
   ]

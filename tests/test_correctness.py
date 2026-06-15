@@ -589,6 +589,7 @@ class MinuteToHourTests(unittest.TestCase):
         decision = "2026-06-12T14:35:00+00:00"
         stock_times = ["2026-06-12T14:34:00+00:00", "2026-06-12T14:34:59+00:00"]
         action_times = [
+            "2026-06-12T14:34:59+00:00",
             "2026-06-12T14:35:01+00:00",
             "2026-06-12T14:40:01+00:00",
         ]
@@ -610,7 +611,7 @@ class MinuteToHourTests(unittest.TestCase):
                 "BBB": self._second_context_frame("BBB", stock_times, [50.0, 49.5]),
             },
             action_frames_by_symbol={
-                "QQQ": self._second_context_frame("QQQ", action_times, [100.0, 101.0]),
+                "QQQ": self._second_context_frame("QQQ", action_times, [99.0, 100.0, 101.0]),
             },
             action_names=["CASH", "QQQ"],
             decision_timestamps_ms=[int(pd.Timestamp(decision).timestamp() * 1000)],
@@ -746,15 +747,58 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(float(payload["action_features"][0, 0, names.index("is_cash")].item()), 1.0)
         self.assertEqual(float(payload["action_features"][0, 1, names.index("is_etf")].item()), 1.0)
         self.assertEqual(float(payload["action_features"][0, 1, names.index("is_stock")].item()), 0.0)
-        self.assertEqual(float(payload["action_features"][0, 1, names.index("valid_price_flag")].item()), 0.0)
+        self.assertEqual(float(payload["action_features"][0, 1, names.index("valid_price_flag")].item()), 1.0)
         self.assertEqual(float(payload["action_target_weights"][0, 0].item()), 0.0)
         self.assertEqual(float(payload["action_target_weights"][0, 1].item()), 1.0)
-        self.assertEqual(int(payload["action_features_available_timestamps_ms"][0, 1].item()), -1)
+        self.assertLessEqual(
+            int(payload["action_features_available_timestamps_ms"][0, 1].item()),
+            int(payload["decision_timestamps_ms"][0].item()),
+        )
         self.assertIn("action_returns", payload["forbidden_model_input_keys"])
         self.assertNotIn("action_returns", payload["model_input_keys"])
         self.assertEqual(payload["decision_tensor_protocol_version"], "1.0.0")
         self.assertIn("feature_schema_hash", payload)
         self.assertIn("action_metadata", payload)
+
+    def test_second_context_payload_splits_decision_and_label_masks(self) -> None:
+        decision = "2026-06-12T14:35:00+00:00"
+        stock_times = ["2026-06-12T14:34:00+00:00", "2026-06-12T14:34:59+00:00"]
+        action_times = [
+            "2026-06-12T14:34:59+00:00",
+            "2026-06-12T14:35:01+00:00",
+        ]
+        config = StockSecondContextConfig(
+            decision_interval="5m",
+            context_seconds=60,
+            block_seconds=60,
+            min_active_symbols=1,
+            max_action_staleness_seconds=5,
+        )
+        try:
+            import pandas as pd
+        except ModuleNotFoundError:
+            self.skipTest("pandas is required for in-memory second-context payload tests")
+        payload = build_second_context_payload(
+            stock_frames_by_symbol={
+                "AAA": self._second_context_frame("AAA", stock_times, [100.0, 101.0]),
+            },
+            action_frames_by_symbol={
+                "QQQ": self._second_context_frame("QQQ", action_times, [99.0, 100.0]),
+            },
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[int(pd.Timestamp(decision).timestamp() * 1000)],
+            config=config,
+            dataset_manifest={"source_download_complete": True},
+            data_quality_report={"source_download_complete": True, "reportability_errors": []},
+        )
+
+        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 1].item()))
+        self.assertTrue(bool(payload["action_valid_mask"][0, 1].item()))
+        self.assertFalse(bool(payload["label_valid_mask"][0, 1].item()))
+        self.assertTrue(torch.isnan(payload["action_returns"][0, 1]))
+        self.assertIn("decision_action_valid_mask", payload["model_input_keys"])
+        self.assertNotIn("label_valid_mask", payload["model_input_keys"])
+        self.assertIn("label_valid_mask", payload["forbidden_model_input_keys"])
 
     def test_second_context_grid_excludes_postclose_exit_by_default(self) -> None:
         decisions = regular_session_decision_grid_ms(
@@ -866,6 +910,70 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertIn("validation", manifest)
         self.assertNotIn("val", manifest)
 
+    def test_second_context_trainer_batch_plan_defaults_eval_to_micro_batch(self) -> None:
+        module = load_script("train_second_context_action_scorer")
+
+        plan = module.resolve_batch_plan(
+            batch_size=10,
+            micro_batch_size=4,
+            eval_batch_size=None,
+            checkpoint_every_epochs=5,
+            log_every_epochs=None,
+        )
+
+        self.assertEqual(plan["batch_size"], 10)
+        self.assertEqual(plan["micro_batch_size"], 4)
+        self.assertEqual(plan["gradient_accumulation_steps"], 3)
+        self.assertEqual(plan["eval_batch_size"], 4)
+        self.assertEqual(plan["checkpoint_every_epochs"], 5)
+
+    def test_second_context_epoch_accumulates_micro_batches_for_small_vram(self) -> None:
+        module = load_script("train_second_context_action_scorer")
+        split = self._second_context_split(
+            returns=[
+                [0.0, 0.001],
+                [0.0, -0.001],
+                [0.0, 0.002],
+                [0.0, -0.002],
+                [0.0, 0.0015],
+            ]
+        )
+        model = SecondContextTransformerQNetwork(
+            market_feature_dim=split.market_context.shape[-1],
+            action_feature_dim=split.action_features.shape[-1],
+            portfolio_state_dim=split.portfolio_state.shape[-1],
+            constraint_state_dim=split.constraint_state.shape[-1],
+            d_model=8,
+            n_heads=2,
+            temporal_layers=1,
+            feedforward_dim=16,
+            dropout=0.0,
+            max_lookback_blocks=split.market_context.shape[1],
+            action_count=len(split.action_names),
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scaler = torch.amp.GradScaler("cuda", enabled=False)
+
+        stats = module.train_second_context_epoch(
+            split,
+            model,
+            optimizer,
+            scaler,
+            device=torch.device("cpu"),
+            batch_size=4,
+            micro_batch_size=2,
+            reward_scale=10_000.0,
+            use_amp=False,
+            grad_clip=1.0,
+            pin_memory=False,
+        )
+
+        self.assertEqual(stats["optimizer_steps"], 2)
+        self.assertEqual(stats["micro_batches"], 3)
+        self.assertEqual(stats["rows_seen"], 5)
+        self.assertEqual(stats["valid_targets_seen"], 10)
+        self.assertTrue(math.isfinite(float(stats["average_loss"])))
+
     def test_second_context_transformer_scores_variable_action_features(self) -> None:
         payload = self._small_second_context_payload()
         model = SecondContextTransformerQNetwork(
@@ -906,6 +1014,7 @@ class MinuteToHourTests(unittest.TestCase):
             interval_alpha=0.05,
             min_calibration_rows=10,
             q_value_scale=10_000.0,
+            p_best_draws=128,
         )
         q_values = torch.tensor(
             [
@@ -933,6 +1042,65 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(float(output.p_best[0, 2].item()), 0.0)
         self.assertAlmostEqual(float(output.p_best[0].sum().item()), 1.0, places=6)
         self.assertIn("calibration_rows_below_minimum", calibrator.warnings[0])
+
+    def test_action_confidence_distinguishes_member_vote_from_draw_probability(self) -> None:
+        config = ActionConfidenceConfig(
+            min_calibration_rows=1,
+            q_value_scale=10_000.0,
+            p_best_draws=512,
+            p_best_draw_seed=3,
+        )
+        q_values = torch.zeros((4, 2), dtype=torch.float32)
+        realized = torch.tensor([[0.0, 0.001], [0.001, 0.0], [0.0, -0.001], [-0.001, 0.0]], dtype=torch.float32)
+        valid = torch.ones((4, 2), dtype=torch.bool)
+
+        calibrator = ActionConfidenceCalibrator(config).fit(q_values, realized, valid)
+        output = calibrator.predict(q_values, valid)
+        manifest = calibrator.manifest(split_name="test", ensemble_size=1, calibration_split="val")
+
+        self.assertEqual(float(output.p_best_member_vote[0, 0].item()), 1.0)
+        self.assertEqual(float(output.p_best_member_vote[0, 1].item()), 0.0)
+        self.assertGreater(float(output.p_best_draw[0, 1].item()), 0.25)
+        self.assertLess(float(output.p_best_draw[0, 1].item()), 0.75)
+        self.assertTrue(torch.allclose(output.p_best, output.p_best_draw))
+        self.assertIn("p_best_member_vote_is_argmax_indicator_with_single_member", manifest["warnings"])
+
+    def test_action_confidence_manifest_marks_reused_calibration_split_diagnostic(self) -> None:
+        calibrator = ActionConfidenceCalibrator(
+            ActionConfidenceConfig(min_calibration_rows=1, interval_alpha=0.10, p_best_draws=64)
+        )
+        q_values = torch.tensor([[0.0, 1.0], [0.0, 2.0]], dtype=torch.float32)
+        realized = torch.tensor([[0.0, 0.001], [0.0, 0.002]], dtype=torch.float32)
+        valid = torch.ones((2, 2), dtype=torch.bool)
+        calibrator.fit(q_values, realized, valid)
+        manifest = calibrator.manifest(
+            split_name="all",
+            ensemble_size=1,
+            calibration_split="val",
+            uses_checkpoint_selection_for_calibration=True,
+        )
+
+        self.assertFalse(manifest["confidence_reportable"])
+        self.assertIn(
+            "calibration_split_reused_for_checkpoint_selection",
+            manifest["confidence_reportability_errors"],
+        )
+        self.assertEqual(manifest["interval_quantiles"]["lower_quantile"], 0.10)
+        self.assertEqual(manifest["interval_quantiles"]["upper_quantile"], 0.90)
+        self.assertAlmostEqual(manifest["interval_quantiles"]["central_interval_coverage_target"], 0.80)
+
+    def test_action_confidence_ood_penalty_reduces_selection_confidence(self) -> None:
+        config = ActionConfidenceConfig(min_calibration_rows=1, q_value_scale=10_000.0, p_best_draws=128, ood_lambda=1.0)
+        q_values = torch.zeros((2, 2), dtype=torch.float32)
+        realized = torch.tensor([[0.0, 0.001], [0.0, 0.001]], dtype=torch.float32)
+        valid = torch.ones((2, 2), dtype=torch.bool)
+        calibrator = ActionConfidenceCalibrator(config).fit(q_values, realized, valid)
+        output = calibrator.predict(q_values, valid, ood_score=torch.tensor([0.0, 2.0]))
+        manifest = calibrator.manifest(split_name="test", ensemble_size=1, calibration_split="val")
+
+        self.assertLess(float(output.selection_confidence[1, 0].item()), float(output.selection_confidence[0, 0].item()))
+        self.assertEqual(manifest["ood_method"], "external_score")
+        self.assertTrue(manifest["ood_penalty_active"])
 
     def test_action_confidence_saves_compressed_npz_and_manifest(self) -> None:
         config = ActionConfidenceConfig(hurdle_bps=1.0, min_calibration_rows=1, q_value_scale=10_000.0)
@@ -964,7 +1132,7 @@ class MinuteToHourTests(unittest.TestCase):
             saved_manifest = json.loads(path.with_suffix(".json").read_text())
 
         self.assertEqual(tuple(loaded["confidence_tensor"].shape), (2, 2, len(ACTION_CONFIDENCE_FIELD_NAMES)))
-        self.assertEqual(saved_manifest["schema_version"], "action_confidence_v1")
+        self.assertEqual(saved_manifest["schema_version"], "action_confidence_v2")
         self.assertTrue(saved_manifest["uses_checkpoint_selection_for_calibration"])
 
     def test_action_confidence_rejects_shape_mismatch(self) -> None:
@@ -1008,6 +1176,18 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertLess(float(loss.item()), 1e-8)
 
+    def test_second_context_loss_charges_signed_weight_costs_on_absolute_exposure(self) -> None:
+        loss = masked_contextual_q_loss(
+            torch.tensor([[0.0, -105.0]], dtype=torch.float32),
+            torch.tensor([[0.0, 0.01]], dtype=torch.float32),
+            torch.tensor([[True, True]]),
+            action_cost_bps=torch.tensor([[0.0, 5.0]], dtype=torch.float32),
+            action_target_weights=torch.tensor([[0.0, -1.0]], dtype=torch.float32),
+            reward_scale=10_000.0,
+        )
+
+        self.assertLess(float(loss.item()), 1e-8)
+
     def test_second_context_rowwise_scorer_uses_target_weights(self) -> None:
         class WeightedModel(nn.Module):
             def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
@@ -1023,6 +1203,24 @@ class MinuteToHourTests(unittest.TestCase):
         metrics = evaluate_second_context_action_scorer(split, WeightedModel(), device=torch.device("cpu"))
 
         self.assertAlmostEqual(float(metrics["total_return"]), 0.0095, places=6)
+
+    def test_second_context_rowwise_scorer_uses_valid_start_indices_by_default(self) -> None:
+        class WeightedModel(nn.Module):
+            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
+                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
+                return torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
+
+        split = self._second_context_split(
+            returns=[[0.0, 0.50], [0.0, 0.01]],
+            valid_mask=[[True, True], [True, True]],
+            valid_start_indices=[1],
+        )
+
+        metrics = evaluate_second_context_action_scorer(split, WeightedModel(), device=torch.device("cpu"))
+
+        self.assertEqual(metrics["diagnostic_rows"], "valid_start_indices")
+        self.assertEqual(metrics["evaluated_rows"], 1)
+        self.assertAlmostEqual(float(metrics["total_return"]), 0.01, places=6)
 
     def test_second_context_sparse_market_mask_uses_last_true_context_token(self) -> None:
         class IdentityEncoder(nn.Module):
@@ -1090,6 +1288,7 @@ class MinuteToHourTests(unittest.TestCase):
             "action_returns": torch.zeros((len(decisions), 2), dtype=torch.float32),
             "action_valid_mask": torch.ones((len(decisions), 2), dtype=torch.bool),
             "action_cost_bps": torch.zeros((len(decisions), 2), dtype=torch.float32),
+            "action_target_weights": torch.tensor([[0.0, 1.0] for _ in decisions], dtype=torch.float32),
             "entry_execution_timestamps_ms": torch.tensor(
                 [[value, value] for value in decision_ms],
                 dtype=torch.long,
@@ -1375,6 +1574,58 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(logs[1]["traded_notional"], 2.0)
         self.assertAlmostEqual(logs[1]["cost_bps"], 15.0)
 
+    def test_second_context_signed_weights_pay_positive_costs(self) -> None:
+        class ShortModel(nn.Module):
+            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
+                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
+                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)
+
+        split = self._second_context_split(
+            returns=[[0.0, 0.0]],
+            costs=[[0.0, 10.0]],
+            weights=[[0.0, -1.0]],
+        )
+
+        metrics = evaluate_second_context_trading_policy(
+            split,
+            ShortModel(),
+            device=torch.device("cpu"),
+            return_decision_logs=True,
+        )
+
+        self.assertAlmostEqual(float(metrics["total_return"]), -0.001, places=6)
+        log = metrics["decision_logs"][0]
+        self.assertEqual(log["target_weight"], -1.0)
+        self.assertEqual(log["executed_weight"], -1.0)
+        self.assertAlmostEqual(log["traded_notional"], 1.0)
+        self.assertAlmostEqual(log["net_return"], -0.001)
+
+    def test_second_context_row_varying_weights_carry_executed_exposure(self) -> None:
+        class HoldModel(nn.Module):
+            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
+                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
+                return torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
+
+        split = self._second_context_split(
+            returns=[[0.0, 0.01], [0.0, 0.02]],
+            weights=[[0.0, 1.0], [0.0, 0.5]],
+        )
+
+        metrics = evaluate_second_context_trading_policy(
+            split,
+            HoldModel(),
+            device=torch.device("cpu"),
+            return_decision_logs=True,
+        )
+
+        self.assertAlmostEqual(float(metrics["total_return"]), 1.01 * 1.02 - 1.0, places=6)
+        self.assertEqual(metrics["switches"], 1)
+        second_log = metrics["decision_logs"][1]
+        self.assertAlmostEqual(second_log["target_weight"], 0.5)
+        self.assertAlmostEqual(second_log["previous_executed_weight"], 1.0)
+        self.assertAlmostEqual(second_log["executed_weight"], 1.0)
+        self.assertAlmostEqual(second_log["gross_return"], 0.02)
+
     def test_second_context_weighted_leveraged_action_scales_return_and_cost(self) -> None:
         class LeveragedModel(nn.Module):
             def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
@@ -1511,6 +1762,32 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertTrue(summary["diagnostic_only"])
         self.assertIn("diagnostic_oracle_best_valid_action_future_leakage", summary)
         self.assertNotIn("oracle_best_valid_action", summary)
+
+    def test_second_context_conversion_skip_requires_current_gold_schema(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+        payload = self._small_second_context_payload()
+        old_payload = dict(payload)
+        for key in (
+            "decision_action_valid_mask",
+            "label_valid_mask",
+            "entry_fill_observed_mask",
+            "reward_exit_observed_mask",
+        ):
+            old_payload.pop(key, None)
+        old_manifest = dict(old_payload.get("dataset_manifest", {}))
+        old_manifest.pop("action_mask_semantics", None)
+        old_payload["dataset_manifest"] = old_manifest
+
+        with tempfile.TemporaryDirectory() as directory:
+            old_path = Path(directory) / "old" / "dataset.pt"
+            current_path = Path(directory) / "current" / "dataset.pt"
+            old_path.parent.mkdir(parents=True)
+            current_path.parent.mkdir(parents=True)
+            torch.save(old_payload, old_path)
+            torch.save(payload, current_path)
+
+            self.assertFalse(module.existing_gold_dataset_is_current(old_path))
+            self.assertTrue(module.existing_gold_dataset_is_current(current_path))
 
     def test_min_hold_action_mask_allows_only_current_action(self) -> None:
         mask = build_action_mask(
