@@ -176,6 +176,7 @@ def main() -> int:
         min_active_symbols=min_active_symbols,
         max_action_staleness_seconds=args.max_action_staleness_seconds,
         include_extended_hours=args.include_extended_hours,
+        allow_post_close_exit=args.allow_post_close_exit,
         rth_only=not args.include_extended_hours,
     )
     payload = build_second_context_payload(

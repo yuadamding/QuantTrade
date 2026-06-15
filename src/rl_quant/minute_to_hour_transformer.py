@@ -194,6 +194,12 @@ def _assert_alias_compatible(payload: dict[str, Any], *, canonical: str, legacy:
     if torch.is_tensor(left) and torch.is_tensor(right):
         if tuple(left.shape) != tuple(right.shape) or left.dtype != right.dtype:
             raise ValueError(f"{canonical} and {legacy} aliases must have matching shape and dtype.")
+        if left.dtype.is_floating_point or right.dtype.is_floating_point:
+            same_values = torch.allclose(left, right, equal_nan=True)
+        else:
+            same_values = torch.equal(left, right)
+        if not bool(same_values):
+            raise ValueError(f"{canonical} and {legacy} aliases must contain the same values.")
         return
     if left != right:
         raise ValueError(f"{canonical} and {legacy} aliases must contain the same values.")
@@ -640,11 +646,14 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             mask=self._causal_mask(minutes, x.device),
             src_key_padding_mask=safe_padding_mask,
         )
-        last_valid = flat_mask.long().sum(dim=1).clamp_min(1) - 1
+        valid_positions = torch.arange(minutes, device=x.device).expand(batch * hours, -1)
+        last_valid = torch.where(flat_mask, valid_positions, torch.full_like(valid_positions, -1)).max(dim=1).values
+        last_valid = last_valid.clamp_min(0)
         hour_context = minute_context[
             torch.arange(batch * hours, device=x.device),
             last_valid,
         ].reshape(batch, hours, -1)
+        hour_context = hour_context.masked_fill(empty_rows.reshape(batch, hours, 1), 0.0)
 
         hour_tokens = self.hour_proj(torch.cat([hour_context, hour_features], dim=-1))
         hour_tokens = hour_tokens + self.hour_pos[:hours][None, :, :]

@@ -90,6 +90,7 @@ class StockSecondContextConfig:
     max_action_cost_bps: float = 25.0
     rth_only: bool = True
     include_extended_hours: bool = False
+    allow_post_close_exit: bool = False
     source_bar_interval: str = "1s"
     feature_set_id: str = "stock_second_context_v001"
     known_limitations: list[str] = field(default_factory=list)
@@ -757,6 +758,7 @@ def build_second_context_payload(
                 "entry_price_source": "first_action_close_at_or_after_decision_plus_execution_latency",
                 "exit_price_source": "first_action_close_at_or_after_reward_end_plus_execution_latency",
                 "execution_latency_ms": config.execution_latency_ms,
+                "allow_post_close_exit": config.allow_post_close_exit,
             }
         ),
     }
@@ -793,6 +795,7 @@ def build_second_context_payload(
         "exit_rule": "first action close at or after next_ts + execution_latency_ms",
         "cost_rule": "action_cost_bps estimated from trailing liquidity and charged on switches",
         "liquidate_at_end": False,
+        "allow_post_close_exit": bool(config.allow_post_close_exit),
         "allow_extended_hours_exit": bool(config.include_extended_hours),
     }
     payload_hash = stable_json_hash(
@@ -830,6 +833,11 @@ def build_second_context_payload(
         reportability_errors.append("data_quality_report_missing")
     if config.min_active_symbols < max(1, len(stock_frames_by_symbol) // 2):
         reportability_errors.append("min_active_symbols_too_low_for_reportable_dataset")
+    if config.allow_post_close_exit:
+        reportability_errors.append("post_close_reward_exit_allowed")
+    reportability_scope = (
+        "extended_reward_exit_allowed" if config.allow_post_close_exit else "regular_session_reward_exits_only"
+    )
     manifest = {
         **base_manifest,
         "schema_version": "stock_second_context_decision_v3",
@@ -845,6 +853,7 @@ def build_second_context_payload(
         "bar_latency_ms": config.bar_latency_ms,
         "ingestion_latency_ms": config.ingestion_latency_ms,
         "execution_latency_ms": config.execution_latency_ms,
+        "allow_post_close_exit": config.allow_post_close_exit,
         "execution_model": config.execution_model,
         "execution_model_detail": execution_model,
         "tensor_availability": tensor_availability,
@@ -855,6 +864,7 @@ def build_second_context_payload(
         "split_manifest_hash": stable_json_hash(split_manifest),
         "source_download_complete": source_download_complete,
         "reportable": source_download_complete and not reportability_errors,
+        "reportability_scope": reportability_scope,
         "reportability_errors": list(dict.fromkeys(reportability_errors)),
         "known_limitations": [
             *config.known_limitations,

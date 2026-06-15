@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--save-action-confidence", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--confidence-hurdle-bps", type=float, default=2.0)
+    parser.add_argument("--confidence-interval-alpha", type=float, default=0.05)
+    parser.add_argument("--confidence-min-calibration-rows", type=int, default=1_000)
+    parser.add_argument("--confidence-beta-best", type=float, default=0.5)
+    parser.add_argument("--confidence-beta-positive", type=float, default=0.5)
+    parser.add_argument("--confidence-ood-lambda", type=float, default=1.0)
     return parser.parse_args(argv)
 
 
@@ -74,7 +82,9 @@ def split_manifest_for(*splits) -> dict[str, object]:
 def main() -> int:
     import torch
 
+    from rl_quant.confidence import ActionConfidenceCalibrator, ActionConfidenceConfig, save_action_confidence_npz
     from rl_quant.core import configure_torch_runtime, resolve_torch_device
+    from rl_quant.research_protocol import stable_json_hash
     from rl_quant.second_context_transformer import (
         SecondContextTransformerQNetwork,
         build_second_context_splits,
@@ -115,10 +125,118 @@ def main() -> int:
     scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp and device.type == "cuda"))
     train_dev = train.to(device)
     rows = train_dev.market_context.shape[0]
+
+    @torch.no_grad()
+    def predict_q_values(split) -> torch.Tensor:
+        data = split.to(device)
+        model.eval()
+        return model(
+            data.market_context,
+            data.market_context_mask,
+            data.action_features,
+            data.portfolio_state,
+            data.constraint_state,
+        ).detach().cpu()
+
+    def maybe_float(value: torch.Tensor) -> float | None:
+        number = float(value.item())
+        return number if math.isfinite(number) else None
+
+    def write_selected_action_confidence(
+        *,
+        path: Path,
+        split,
+        confidence,
+        selected_rows: torch.Tensor,
+        selected_actions: torch.Tensor,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as sink:
+            for row_value, action_value in zip(selected_rows.tolist(), selected_actions.tolist()):
+                row = int(row_value)
+                executed_action = int(action_value)
+                valid = confidence.valid_actions[row]
+                q_row = confidence.q_mean[row].clone()
+                q_row = q_row.masked_fill(~valid, -float("inf"))
+                raw_policy_action = int(q_row.argmax().item()) if bool(valid.any().item()) else 0
+                second_q = q_row.clone()
+                if 0 <= executed_action < second_q.numel():
+                    second_q[executed_action] = -float("inf")
+                second_best_action = int(second_q.argmax().item()) if bool(torch.isfinite(second_q).any().item()) else 0
+                confidence_row = confidence.confidence[row].clone()
+                confidence_row = confidence_row.masked_fill(~valid, -float("inf"))
+                confidence_other = confidence_row.clone()
+                if 0 <= executed_action < confidence_other.numel():
+                    confidence_other[executed_action] = -float("inf")
+                best_other_confidence = (
+                    float(confidence_other.max().item()) if bool(torch.isfinite(confidence_other).any().item()) else float("nan")
+                )
+                selected_confidence = confidence.confidence[row, executed_action]
+                q_margin = confidence.q_mean[row, executed_action] - confidence.q_mean[row, second_best_action]
+                confidence_margin = float(selected_confidence.item()) - best_other_confidence
+                record = {
+                    "decision_timestamp": split.decision_timestamps[row],
+                    "row_index": row,
+                    "raw_policy_action": split.action_names[raw_policy_action],
+                    "executed_action": split.action_names[executed_action],
+                    "selection_reason": (
+                        "selected_by_policy" if raw_policy_action == executed_action else "constraint_or_evaluator_adjusted"
+                    ),
+                    "selected_q_mean": maybe_float(confidence.q_mean[row, executed_action]),
+                    "selected_q_std": maybe_float(confidence.q_std_total[row, executed_action]),
+                    "selected_q_lcb_05": maybe_float(confidence.q_lcb[row, executed_action]),
+                    "selected_q_ucb_95": maybe_float(confidence.q_ucb[row, executed_action]),
+                    "selected_p_positive": maybe_float(confidence.p_positive[row, executed_action]),
+                    "selected_p_beats_cash": maybe_float(confidence.p_beats_cash[row, executed_action]),
+                    "selected_p_best": maybe_float(confidence.p_best[row, executed_action]),
+                    "selected_advantage_mean": maybe_float(confidence.advantage_mean[row, executed_action]),
+                    "selected_advantage_lcb": maybe_float(confidence.advantage_lcb[row, executed_action]),
+                    "selected_confidence": maybe_float(selected_confidence),
+                    "cash_q_mean": maybe_float(confidence.q_mean[row, 0]),
+                    "cash_p_best": maybe_float(confidence.p_best[row, 0]),
+                    "cash_p_positive": maybe_float(confidence.p_positive[row, 0]),
+                    "second_best_action": split.action_names[second_best_action],
+                    "second_best_q_mean": maybe_float(confidence.q_mean[row, second_best_action]),
+                    "q_margin_vs_second_best": maybe_float(q_margin),
+                    "confidence_margin_vs_second_best": confidence_margin if math.isfinite(confidence_margin) else None,
+                    "ood_score": maybe_float(confidence.ood_score[row]),
+                    "valid_action_count": int(valid.sum().item()),
+                    "forced_action_flag": raw_policy_action != executed_action,
+                }
+                sink.write(json.dumps(record, sort_keys=True) + "\n")
+
     best_state: dict[str, object] | None = None
     best_score = float("-inf")
     best_epoch = 0
     best_val_policy: dict[str, object] = {}
+    selection_protocol = {
+        "schema_version": "checkpoint_selection_v1",
+        "model_kind": "contextual_action_scorer",
+        "primary_selection_metric": "validation_sequential_total_return_after_costs",
+        "secondary_terms": [
+            "validation_active_net_return_diagnostic",
+            "minus_0.001_times_validation_switch_rate",
+        ],
+        "formula": "validation_total_return + validation_active_net_return - 0.001 * validation_switch_rate",
+        "tie_breaker": "lower_validation_switch_rate_then_earlier_epoch",
+        "num_trials": int(args.epochs),
+        "search_space_hash": stable_json_hash(
+            {
+                "d_model": args.d_model,
+                "n_heads": args.n_heads,
+                "temporal_layers": args.temporal_layers,
+                "feedforward_dim": args.feedforward_dim,
+                "dropout": args.dropout,
+                "batch_size": args.batch_size,
+                "learning_rate": args.learning_rate,
+                "weight_decay": args.weight_decay,
+                "reward_scale": args.reward_scale,
+                "amp": bool(args.amp),
+                "seed": args.seed,
+            }
+        ),
+    }
+    candidate_validation_scores: list[dict[str, object]] = []
     for epoch in range(args.epochs):
         model.train()
         order = torch.randperm(rows, device=device)
@@ -139,6 +257,7 @@ def main() -> int:
                     train_dev.action_returns[index],
                     train_dev.action_valid_mask[index],
                     action_cost_bps=train_dev.action_cost_bps[index],
+                    action_target_weights=train_dev.action_target_weights[index],
                     reward_scale=args.reward_scale,
                 )
             scaler.scale(loss).backward()
@@ -152,7 +271,20 @@ def main() -> int:
         active_return = float(active.get("active_net_return", 0.0)) if isinstance(active, dict) else 0.0
         switch_penalty = 0.001 * float(val_policy.get("switch_rate", 0.0) or 0.0)
         checkpoint_score = float(val_policy.get("total_return", 0.0) or 0.0) + active_return - switch_penalty
-        if checkpoint_score > best_score:
+        candidate_validation_scores.append(
+            {
+                "epoch": epoch + 1,
+                "validation_total_return": float(val_policy.get("total_return", 0.0) or 0.0),
+                "validation_active_net_return": active_return,
+                "validation_switch_rate": float(val_policy.get("switch_rate", 0.0) or 0.0),
+                "score": checkpoint_score,
+            }
+        )
+        is_better = checkpoint_score > best_score
+        if checkpoint_score == best_score and candidate_validation_scores:
+            best_switch_rate = float(best_val_policy.get("switch_rate", float("inf")) or float("inf"))
+            is_better = float(val_policy.get("switch_rate", 0.0) or 0.0) < best_switch_rate
+        if is_better:
             best_score = checkpoint_score
             best_epoch = epoch + 1
             best_val_policy = copy.deepcopy(val_policy)
@@ -200,10 +332,24 @@ def main() -> int:
     train_selected_actions = torch.tensor(list(train_policy_metrics.pop("selected_actions", [])), dtype=torch.long)
     val_selected_actions = torch.tensor(list(val_policy_metrics.pop("selected_actions", [])), dtype=torch.long)
     test_selected_actions = torch.tensor(list(test_policy_metrics.pop("selected_actions", [])), dtype=torch.long)
+    train_selected_rows = torch.tensor(list(train_policy_metrics.pop("selected_rows", [])), dtype=torch.long)
+    val_selected_rows = torch.tensor(list(val_policy_metrics.pop("selected_rows", [])), dtype=torch.long)
+    test_selected_rows = torch.tensor(list(test_policy_metrics.pop("selected_rows", [])), dtype=torch.long)
     if decision_logs:
         with (run_dir / "decision_logs.jsonl").open("w") as sink:
             for row in decision_logs:
                 sink.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+    torch.save(
+        {
+            "train_actions": train_selected_actions,
+            "train_rows": train_selected_rows,
+            "val_actions": val_selected_actions,
+            "val_rows": val_selected_rows,
+            "test_actions": test_selected_actions,
+            "test_rows": test_selected_rows,
+        },
+        run_dir / "selected_action_paths.pt",
+    )
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -233,7 +379,87 @@ def main() -> int:
         reference_actions=test_selected_actions if test_selected_actions.numel() else None,
         seed=args.seed,
     )
-    cost_stress = fixed_rollout_cost_stress(test, test_selected_actions) if test_selected_actions.numel() else {}
+    cost_stress = (
+        fixed_rollout_cost_stress(test, test_selected_actions, row_indices=test_selected_rows)
+        if test_selected_actions.numel()
+        else {}
+    )
+    confidence_artifacts: dict[str, str] = {}
+    confidence_summary: dict[str, object] = {}
+    action_confidence_manifest: dict[str, object] | None = None
+    if args.save_action_confidence:
+        confidence_config = ActionConfidenceConfig(
+            method="single_model_residual",
+            hurdle_bps=args.confidence_hurdle_bps,
+            interval_alpha=args.confidence_interval_alpha,
+            min_calibration_rows=args.confidence_min_calibration_rows,
+            confidence_beta_best=args.confidence_beta_best,
+            confidence_beta_positive=args.confidence_beta_positive,
+            ood_lambda=args.confidence_ood_lambda,
+            q_value_scale=args.reward_scale,
+        )
+        q_by_split = {
+            "train": predict_q_values(train),
+            "val": predict_q_values(val),
+            "test": predict_q_values(test),
+        }
+        calibrator = ActionConfidenceCalibrator(confidence_config).fit(
+            q_by_split["val"],
+            val.action_returns,
+            val.action_valid_mask,
+            action_target_weights=val.action_target_weights,
+            action_cost_bps=val.action_cost_bps,
+        )
+        confidence_by_split = {
+            "train": calibrator.predict(q_by_split["train"], train.action_valid_mask),
+            "val": calibrator.predict(q_by_split["val"], val.action_valid_mask),
+            "test": calibrator.predict(q_by_split["test"], test.action_valid_mask),
+        }
+        action_confidence_manifest = calibrator.manifest(
+            split_name="all",
+            ensemble_size=1,
+            calibration_split="val",
+            uses_test_for_calibration=False,
+            uses_checkpoint_selection_for_calibration=True,
+        )
+        (run_dir / "action_confidence_manifest.json").write_text(
+            json.dumps(action_confidence_manifest, indent=2, sort_keys=True) + "\n"
+        )
+        confidence_artifacts["action_confidence_manifest_json"] = str(run_dir / "action_confidence_manifest.json")
+        for split_name, split_obj in (("train", train), ("val", val), ("test", test)):
+            path = run_dir / f"action_confidence_{split_name}.npz"
+            save_action_confidence_npz(
+                path,
+                confidence_by_split[split_name],
+                row_indices=torch.arange(len(split_obj.decision_timestamps), dtype=torch.long),
+                decision_timestamps=split_obj.decision_timestamps,
+                action_names=split_obj.action_names,
+                manifest={
+                    **action_confidence_manifest,
+                    "split": split_name,
+                    "rows": len(split_obj.decision_timestamps),
+                    "valid_rows": int(split_obj.valid_start_indices.numel()),
+                },
+            )
+            confidence_artifacts[f"action_confidence_{split_name}_npz"] = str(path)
+        selected_confidence_path = run_dir / "selected_action_confidence_test.jsonl"
+        if test_selected_actions.numel():
+            write_selected_action_confidence(
+                path=selected_confidence_path,
+                split=test,
+                confidence=confidence_by_split["test"],
+                selected_rows=test_selected_rows,
+                selected_actions=test_selected_actions,
+            )
+            confidence_artifacts["selected_action_confidence_test_jsonl"] = str(selected_confidence_path)
+        confidence_summary = {
+            "enabled": True,
+            "method": confidence_config.method,
+            "calibration_split": "val",
+            "uses_checkpoint_selection_for_calibration": True,
+            "metrics": dict(calibrator.metrics),
+            "warnings": list(calibrator.warnings),
+        }
     payload = torch.load(args.dataset, map_location="cpu", weights_only=True)
     dataset_manifest = dict(payload.get("dataset_manifest", {}))
     data_quality_report = dict(payload.get("data_quality_report", {}))
@@ -248,8 +474,11 @@ def main() -> int:
         "model_kind": "contextual_action_scorer",
         "selected_checkpoint_epoch": best_epoch,
         "selected_checkpoint_score": best_score,
-        "selection_metric": "val_sequential_total_plus_active_return_minus_switch_penalty",
+        "selection_metric": selection_protocol["formula"],
+        "selection_protocol": selection_protocol,
+        "candidate_validation_scores": candidate_validation_scores,
         "selected_val_policy_metrics": best_val_policy,
+        "action_confidence": action_confidence_manifest,
         "split_manifest": split_manifest,
         "action_names": train.action_names,
         "feature_names": train.feature_names,
@@ -275,11 +504,15 @@ def main() -> int:
         "checkpoint_selection": {
             "selected_epoch": best_epoch,
             "selected_score": best_score,
-            "metric": "val_sequential_total_plus_active_return_minus_switch_penalty",
+            "metric": selection_protocol["formula"],
+            "protocol": selection_protocol,
+            "candidate_validation_scores": candidate_validation_scores,
         },
         "artifacts": {
             "decision_logs_jsonl": str(run_dir / "decision_logs.jsonl") if decision_logs else None,
+            "selected_action_paths_pt": str(run_dir / "selected_action_paths.pt"),
             "split_manifest_json": str(run_dir / "split_manifest.json"),
+            **confidence_artifacts,
         },
         "metrics": {
             "action_scorer_rowwise": {"train": train_metrics, "val": val_metrics, "test": test_metrics},
@@ -290,6 +523,7 @@ def main() -> int:
             },
             "baselines": {"train": baselines, "val": val_baselines, "test": test_baselines},
             "fixed_rollout_cost_stress": cost_stress,
+            "action_confidence": confidence_summary,
         },
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")

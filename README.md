@@ -155,6 +155,7 @@ QuantTrade/
   src/rl_quant/
     core.py
     action_risk.py
+    confidence.py
     bar_transformer.py
     decision_framework.py
     hourly_transformer.py
@@ -182,6 +183,7 @@ Important modules:
 | Module | Purpose |
 | --- | --- |
 | `core.py` | Torch runtime setup, CUDA/AMP helpers, replay buffers, metrics, and shared Q-network blocks. |
+| `confidence.py` | Action-level confidence tensors, residual calibration, probability-of-profit estimates, and compressed confidence artifacts. |
 | `research_protocol.py` | Dataset/model manifests, stable hashes, fit-window validation, benchmark registry, and stress evidence helpers. |
 | `decision_framework.py` | Point-in-time feature availability, readiness scoring, action eligibility, and decision dataset checks. |
 | `trading_constraints.py` | Action masks, min-hold, cooldown, switch caps, order-leg caps, and leg-aware hysteresis. |
@@ -660,6 +662,12 @@ data_quality_report.json
 split_manifest.json
 reportability.json
 decision_logs.jsonl
+selected_action_paths.pt
+selected_action_confidence_test.jsonl
+action_confidence_train.npz
+action_confidence_val.npz
+action_confidence_test.npz
+action_confidence_manifest.json
 ```
 
 Important artifact meanings:
@@ -676,6 +684,39 @@ Important artifact meanings:
 - `reportability.json`: whether the run is reportable and why not.
 - `decision_logs.jsonl`: row-level selected actions, Q-values, masks, costs,
   equity, and execution metadata for sequential evaluation.
+- `selected_action_paths.pt`: replayable selected action indices plus source
+  row indices for train/validation/test.
+- `action_confidence_*.npz`: all-action confidence tensors with shape
+  `[rows, actions, confidence_fields]`.
+- `selected_action_confidence_test.jsonl`: selected/executed action confidence,
+  raw policy action, second-best action, margins, and OOD score for test rows.
+- `action_confidence_manifest.json`: confidence method, calibration split,
+  hurdle, interval alpha, field names, calibration metrics, and warnings.
+
+Action-confidence artifacts are separate from raw policy scores. The current
+second-context trainer writes residual-calibrated single-model confidence by
+default. The tensor fields are:
+
+```text
+valid_action
+q_mean
+q_std_epistemic
+q_std_total
+q_lcb_05
+q_ucb_95
+p_positive
+p_beats_cash
+p_best
+advantage_mean
+advantage_lcb
+rank
+confidence
+```
+
+Invalid actions keep `valid_action = 0`, `p_best = 0`, and `NaN` for scalar
+confidence/probability fields so invalid choices cannot silently improve
+averages. `q_mean` is stored in return units after dividing model scores by the
+training `reward_scale`.
 
 ## Common Commands
 
