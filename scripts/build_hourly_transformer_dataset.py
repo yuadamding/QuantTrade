@@ -222,6 +222,25 @@ def clipped_simple_return(current_close: float, next_close: float) -> float:
 def aggregate_stock_features(values: list[BarFeature], *, total_symbols: int) -> list[float]:
     if not values:
         return [0.0] * 14
+    if len(values) == 1:
+        item = values[0]
+        concentration = 1.0 if item.dollar_volume > 0.0 else 0.0
+        return [
+            1.0 / max(float(total_symbols), 1.0),
+            item.bar_return,
+            item.bar_return,
+            0.0,
+            1.0 if item.bar_return > 0.0 else 0.0,
+            item.bar_return,
+            item.bar_return,
+            item.intraday_ret,
+            item.range_bps,
+            0.0,
+            item.log_dollar_volume,
+            0.0,
+            concentration,
+            abs(item.bar_return),
+        ]
     returns = [item.bar_return for item in values]
     abs_returns = [abs(item.bar_return) for item in values]
     intraday = [item.intraday_ret for item in values]

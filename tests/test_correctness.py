@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -334,6 +335,34 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertAlmostEqual(module.clipped_simple_return(100.0, 105.0), 0.05)
 
+    def test_aggregate_stock_features_single_stock_fast_path_matches_contract(self) -> None:
+        module = load_script("build_hourly_transformer_dataset")
+        item = module.BarFeature(
+            close=100.0,
+            bar_return=0.02,
+            bar_log_return=0.0198,
+            intraday_ret=0.01,
+            range_bps=25.0,
+            log_volume=8.0,
+            log_dollar_volume=12.0,
+            dollar_volume=10_000.0,
+        )
+
+        values = module.aggregate_stock_features([item], total_symbols=10)
+
+        self.assertEqual(values[0], 0.1)
+        self.assertEqual(values[1], item.bar_return)
+        self.assertEqual(values[2], item.bar_return)
+        self.assertEqual(values[3], 0.0)
+        self.assertEqual(values[5], item.bar_return)
+        self.assertEqual(values[6], item.bar_return)
+        self.assertEqual(values[8], item.range_bps)
+        self.assertEqual(values[9], 0.0)
+        self.assertEqual(values[10], item.log_dollar_volume)
+        self.assertEqual(values[11], 0.0)
+        self.assertEqual(values[12], 1.0)
+        self.assertEqual(values[13], abs(item.bar_return))
+
     def test_minute_to_hour_periods_per_year_uses_actual_schedule(self) -> None:
         module = load_script("build_hourly_from_minute_context_dataset")
 
@@ -348,6 +377,255 @@ class MinuteToHourTests(unittest.TestCase):
         )
 
         self.assertEqual(periods, 630.0)
+
+    def test_minute_to_hour_builder_prunes_daily_parquet_shards_by_time_range(self) -> None:
+        module = load_script("build_hourly_from_minute_context_dataset")
+
+        paths = [
+            Path("AAA/2026/06/2026-06-09.parquet"),
+            Path("AAA/2026/06/2026-06-10.parquet"),
+            Path("AAA/2026/06/2026-06-11.parquet"),
+            Path("AAA/2026/06/2026-06-12.parquet"),
+            Path("AAA.parquet"),
+        ]
+        filtered = module.filter_bar_paths_for_time_range(
+            paths,
+            start_dt=module.parse_utc_datetime("2026-06-10T13:30:00+00:00"),
+            end_dt=module.parse_utc_datetime("2026-06-12T00:00:00+00:00"),
+        )
+
+        self.assertEqual(
+            filtered,
+            [
+                Path("AAA/2026/06/2026-06-10.parquet"),
+                Path("AAA/2026/06/2026-06-11.parquet"),
+                Path("AAA.parquet"),
+            ],
+        )
+
+    def test_minute_to_hour_action_lookup_preserves_staleness_semantics(self) -> None:
+        module = load_script("build_hourly_from_minute_context_dataset")
+
+        lookup = module.make_action_lookup(
+            {
+                "2026-06-10T14:30:00+00:00": SimpleNamespace(close=100.0),
+                "2026-06-10T14:31:00+00:00": SimpleNamespace(close=101.0),
+            }
+        )
+
+        self.assertEqual(
+            module.close_at_or_before(
+                lookup,
+                "2026-06-10T14:30:30+00:00",
+                max_staleness_seconds=60,
+            ),
+            100.0,
+        )
+        self.assertIsNone(
+            module.close_at_or_before(
+                lookup,
+                "2026-06-10T14:30:30+00:00",
+                max_staleness_seconds=0,
+            )
+        )
+        self.assertEqual(
+            module.close_at_or_before(
+                lookup,
+                module.timestamp_to_epoch_ms("2026-06-10T14:31:00+00:00"),
+                max_staleness_seconds=0,
+            ),
+            101.0,
+        )
+        self.assertIsNone(
+            module.close_at_or_before(
+                lookup,
+                "2026-06-10T14:32:01+00:00",
+                max_staleness_seconds=60,
+            )
+        )
+
+    def test_hourly_builder_retains_decision_valid_row_with_missing_future_label(self) -> None:
+        try:
+            import pandas as pd
+        except ModuleNotFoundError:
+            self.skipTest("pandas/pyarrow are required for Parquet builder regression")
+        builder = load_script("build_hourly_from_minute_context_dataset")
+
+        def write_bar_parquet(path: Path, symbol: str, *, rows: int) -> None:
+            start_utc = builder.parse_utc_datetime("2026-01-02T14:31:00+00:00")
+            records: list[dict[str, object]] = []
+            for offset in range(rows):
+                utc_dt = start_utc + builder.timedelta(minutes=offset)
+                exchange_dt = utc_dt.astimezone(builder.timezone(builder.timedelta(hours=-5)))
+                price = 100.0 + offset * 0.01 + (0.5 if symbol == "QQQ" else 0.0)
+                records.append(
+                    {
+                        "timestamp_ms": builder.timestamp_to_epoch_ms(utc_dt),
+                        "timestamp_utc": utc_dt.isoformat(),
+                        "timestamp_exchange": exchange_dt.isoformat(),
+                        "open": price,
+                        "high": price + 0.1,
+                        "low": price - 0.1,
+                        "close": price,
+                        "volume": 1000,
+                    }
+                )
+            pd.DataFrame.from_records(records).to_parquet(path, index=False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stock_dir = root / "stocks"
+            action_dir = root / "actions"
+            output_dir = root / "out"
+            stock_dir.mkdir()
+            action_dir.mkdir()
+            write_bar_parquet(stock_dir / "AAA.parquet", "AAA", rows=120)
+            write_bar_parquet(action_dir / "QQQ.parquet", "QQQ", rows=60)
+            stock_universe = root / "stocks.csv"
+            action_universe = root / "actions.csv"
+            stock_universe.write_text("symbol\nAAA\n")
+            action_universe.write_text("symbol\nQQQ\n")
+            old_argv = sys.argv
+            sys.argv = [
+                "build_hourly_from_minute_context_dataset.py",
+                "--stock-bar-dir",
+                str(stock_dir),
+                "--action-bar-dir",
+                str(action_dir),
+                "--stock-universe",
+                str(stock_universe),
+                "--action-universe",
+                str(action_universe),
+                "--output-dir",
+                str(output_dir),
+                "--dataset-file-name",
+                "dataset.pt",
+                "--start",
+                "2026-01-02T00:00:00+00:00",
+                "--end-exclusive",
+                "2026-01-03T00:00:00+00:00",
+                "--stock-limit",
+                "1",
+                "--action-count",
+                "1",
+                "--hours-lookback",
+                "1",
+                "--context-bars-per-hour",
+                "60",
+                "--min-active-stock-fraction",
+                "1.0",
+                "--min-context-valid-fraction",
+                "1.0",
+                "--min-decision-rows",
+                "1",
+                "--dense-hourly-grid",
+                "--allow-missing-action-context",
+                "--universe-selection-date",
+                "2026-01-01T00:00:00+00:00",
+            ]
+            try:
+                builder.main()
+            finally:
+                sys.argv = old_argv
+
+            payload = torch.load(output_dir / "dataset.pt", map_location="cpu", weights_only=True)
+
+        self.assertEqual(payload["decision_timestamps"], ["2026-01-02T15:30:00+00:00"])
+        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 1].item()))
+        self.assertFalse(bool(payload["label_valid_mask"][0, 1].item()))
+        self.assertTrue(torch.isnan(payload["action_returns"][0, 1]))
+
+    def test_hourly_builder_dense_grid_does_not_depend_on_first_action_symbol(self) -> None:
+        try:
+            import pandas as pd
+        except ModuleNotFoundError:
+            self.skipTest("pandas/pyarrow are required for Parquet builder regression")
+        builder = load_script("build_hourly_from_minute_context_dataset")
+
+        def write_bar_parquet(path: Path, symbol: str, *, start: str, rows: int) -> None:
+            start_utc = builder.parse_utc_datetime(start)
+            records: list[dict[str, object]] = []
+            for offset in range(rows):
+                utc_dt = start_utc + builder.timedelta(minutes=offset)
+                exchange_dt = utc_dt.astimezone(builder.timezone(builder.timedelta(hours=-5)))
+                price = 100.0 + offset * 0.01 + (1.0 if symbol == "QQQ" else 0.0)
+                records.append(
+                    {
+                        "timestamp_ms": builder.timestamp_to_epoch_ms(utc_dt),
+                        "timestamp_utc": utc_dt.isoformat(),
+                        "timestamp_exchange": exchange_dt.isoformat(),
+                        "open": price,
+                        "high": price + 0.1,
+                        "low": price - 0.1,
+                        "close": price,
+                        "volume": 1000,
+                    }
+                )
+            pd.DataFrame.from_records(records).to_parquet(path, index=False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stock_dir = root / "stocks"
+            action_dir = root / "actions"
+            output_dir = root / "out"
+            stock_dir.mkdir()
+            action_dir.mkdir()
+            write_bar_parquet(stock_dir / "AAA.parquet", "AAA", start="2026-01-02T14:31:00+00:00", rows=120)
+            write_bar_parquet(action_dir / "OLD.parquet", "OLD", start="2026-01-05T14:31:00+00:00", rows=120)
+            write_bar_parquet(action_dir / "QQQ.parquet", "QQQ", start="2026-01-02T14:31:00+00:00", rows=120)
+            stock_universe = root / "stocks.csv"
+            action_universe = root / "actions.csv"
+            stock_universe.write_text("symbol\nAAA\n")
+            action_universe.write_text("symbol\nOLD\nQQQ\n")
+            old_argv = sys.argv
+            sys.argv = [
+                "build_hourly_from_minute_context_dataset.py",
+                "--stock-bar-dir",
+                str(stock_dir),
+                "--action-bar-dir",
+                str(action_dir),
+                "--stock-universe",
+                str(stock_universe),
+                "--action-universe",
+                str(action_universe),
+                "--output-dir",
+                str(output_dir),
+                "--dataset-file-name",
+                "dataset.pt",
+                "--start",
+                "2026-01-02T00:00:00+00:00",
+                "--end-exclusive",
+                "2026-01-03T00:00:00+00:00",
+                "--stock-limit",
+                "1",
+                "--action-count",
+                "2",
+                "--hours-lookback",
+                "1",
+                "--context-bars-per-hour",
+                "60",
+                "--min-active-stock-fraction",
+                "1.0",
+                "--min-context-valid-fraction",
+                "1.0",
+                "--min-decision-rows",
+                "1",
+                "--dense-hourly-grid",
+                "--allow-missing-action-context",
+                "--universe-selection-date",
+                "2026-01-01T00:00:00+00:00",
+            ]
+            try:
+                builder.main()
+            finally:
+                sys.argv = old_argv
+
+            payload = torch.load(output_dir / "dataset.pt", map_location="cpu", weights_only=True)
+
+        self.assertIn("2026-01-02T15:30:00+00:00", payload["decision_timestamps"])
+        self.assertEqual(payload["action_names"], ["CASH", "OLD", "QQQ"])
+        self.assertFalse(bool(payload["decision_action_valid_mask"][0, 1].item()))
+        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 2].item()))
 
     def test_minute_to_hour_scripts_default_to_shared_data_root_when_available(self) -> None:
         builder = load_script("build_hourly_from_minute_context_dataset")
@@ -2401,6 +2679,59 @@ class MinuteToHourTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid action_returns"):
             module._build_split(name="train", payload=payload)
 
+    def test_minute_to_hour_legacy_action_valid_mask_is_diagnostic_only(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
+        payload = {
+            "decision_timestamps": [
+                "2026-01-02T14:30:00+00:00",
+                "2026-01-02T15:30:00+00:00",
+            ],
+            "next_timestamps": [
+                "2026-01-02T15:30:00+00:00",
+                "2026-01-02T16:30:00+00:00",
+            ],
+            "minute_feature_names": ["m"],
+            "hour_feature_names": ["h"],
+            "action_names": ["CASH", "QQQ"],
+            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
+            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
+            "action_returns": torch.tensor([[0.0, float("nan")], [0.0, 0.01]], dtype=torch.float32),
+            "action_valid_mask": torch.tensor([[True, False], [True, True]]),
+        }
+
+        split = module._build_split(name="train", payload=payload)
+
+        self.assertFalse(split.dataset_reportable)
+        self.assertEqual(split.dataset_reportability_errors, ["legacy_action_valid_mask_semantics_ambiguous"])
+
+    def test_minute_to_hour_explicit_non_reportable_dataset_remains_diagnostic(self) -> None:
+        module = __import__(
+            "rl_quant.minute_to_hour_transformer",
+            fromlist=["_build_split", "minute_to_hour_missing_label_report"],
+        )
+        payload = {
+            "decision_timestamps": ["2026-01-02T14:30:00+00:00"],
+            "next_timestamps": ["2026-01-02T15:30:00+00:00"],
+            "minute_feature_names": ["m"],
+            "hour_feature_names": ["h"],
+            "action_names": ["CASH", "QQQ"],
+            "minute_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+            "minute_mask": torch.ones((1, 1, 1), dtype=torch.bool),
+            "hour_features": torch.zeros((1, 1, 1), dtype=torch.float32),
+            "action_returns": torch.tensor([[0.0, 0.01]], dtype=torch.float32),
+            "decision_action_valid_mask": torch.tensor([[True, True]]),
+            "label_valid_mask": torch.tensor([[True, True]]),
+            "dataset_reportable": False,
+        }
+
+        split = module._build_split(name="train", payload=payload)
+        report = module.minute_to_hour_missing_label_report(split)
+
+        self.assertFalse(split.dataset_reportable)
+        self.assertFalse(report["evaluation_reportable"])
+        self.assertEqual(report["reportability_errors"], ["dataset_marked_non_reportable"])
+
     def test_minute_to_hour_protocol_splits_decision_and_label_masks(self) -> None:
         module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
 
@@ -2451,6 +2782,14 @@ class MinuteToHourTests(unittest.TestCase):
         )
 
         self.assertEqual([row["asset"] for row in result.rollout_records], ["CASH", "QQQ"])
+        self.assertFalse(result.evaluation_reportable)
+        self.assertEqual(result.selectable_missing_label_count, 1)
+        self.assertEqual(result.requested_action_missing_label_count, 1)
+        self.assertEqual(result.executed_action_missing_label_count, 0)
+        self.assertEqual(result.policy_unscorable_rows, 1)
+        self.assertIn("requested_actions_with_missing_reward_labels", result.reportability_errors)
+        self.assertEqual([row["requested_asset"] for row in result.rollout_records], ["QQQ", "QQQ"])
+        self.assertEqual([row["executed_asset"] for row in result.rollout_records], ["CASH", "QQQ"])
 
 
 class HourlySplitTests(unittest.TestCase):

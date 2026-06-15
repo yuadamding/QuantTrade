@@ -106,6 +106,13 @@ config
 payload_hash
 ```
 
+Cache reuse must validate identity as well as schema. A `skip_existing` cache is
+current only when its source manifest hash, raw source/dataset manifest hash,
+universe hash, conversion config hash, feature/action schema hashes, and
+converter code identity match the expected run. A schema-valid artifact built
+from a different universe, source window, action count, feature config, or
+converter version must be rebuilt or marked non-reportable in strict workflows.
+
 Recommended values:
 
 ```text
@@ -198,6 +205,19 @@ Models may consume `decision_action_valid_mask`/`action_valid_mask` for action
 selection. Models must not consume `label_valid_mask`,
 `entry_fill_observed_mask`, or `reward_exit_observed_mask`; those are historical
 label-audit fields.
+
+Row inclusion must obey the same information set. Builders must not drop
+decision rows solely because a non-CASH action lacks a future reward label. If
+an action was selectable at decision time but the future label is missing, the
+row remains in the dataset, the action return is `NaN`, and
+`label_valid_mask[n, a] == False`. Training loss, diagnostics, and evaluation
+reportability may use `label_valid_mask`; model selection and row construction
+may not use it as future knowledge.
+
+Payloads that only contain the legacy `action_valid_mask` without explicit
+`decision_action_valid_mask` and `label_valid_mask` semantics may be loaded for
+diagnostics, but they are not reportable. Such loaders should attach
+`legacy_action_valid_mask_semantics_ambiguous` to dataset/reportability errors.
 
 ## Feature Groups
 

@@ -119,6 +119,8 @@ class HourFromMinuteDataSplit:
     label_valid_mask: torch.Tensor | None = None
     source_bar_interval: str = DEFAULT_MINUTE_SOURCE_INTERVAL
     context_bars_per_hour: int | None = None
+    dataset_reportable: bool = True
+    dataset_reportability_errors: list[str] = field(default_factory=list)
 
     @property
     def effective_context_bars_per_hour(self) -> int:
@@ -360,8 +362,15 @@ def _build_split(
     all_hour_features = payload["hour_features"].float()
     all_returns = payload["action_returns"].float()
     raw_action_valid = payload.get("action_valid_mask")
+    has_explicit_decision_mask = "decision_action_valid_mask" in payload
+    has_explicit_label_mask = "label_valid_mask" in payload or "action_label_valid_mask" in payload
     raw_decision_valid = payload.get("decision_action_valid_mask", raw_action_valid)
     raw_label_valid = payload.get("label_valid_mask", payload.get("action_label_valid_mask", raw_action_valid))
+    dataset_reportability_errors = list(payload.get("dataset_reportability_errors", []))
+    if raw_action_valid is not None and (not has_explicit_decision_mask or not has_explicit_label_mask):
+        dataset_reportability_errors.append("legacy_action_valid_mask_semantics_ambiguous")
+    dataset_reportability_errors = list(dict.fromkeys(dataset_reportability_errors))
+    dataset_reportable = bool(payload.get("dataset_reportable", payload.get("reportable", True))) and not dataset_reportability_errors
     all_action_valid = raw_decision_valid
     if all_action_valid is not None:
         all_action_valid = all_action_valid.bool()
@@ -457,6 +466,8 @@ def _build_split(
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.0)),
         source_bar_interval=str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL)),
         context_bars_per_hour=int(payload.get("context_bars_per_hour", payload.get("minutes_per_hour", raw_minute.shape[2]))),
+        dataset_reportable=dataset_reportable,
+        dataset_reportability_errors=dataset_reportability_errors,
     )
 
 
@@ -534,6 +545,91 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError(f"Subhour tensor shape differs between {reference.name!r} and {split.name!r}.")
         if split.hour_features.shape[1:] != reference.hour_features.shape[1:]:
             raise ValueError(f"Hour tensor shape differs between {reference.name!r} and {split.name!r}.")
+
+
+def minute_to_hour_missing_label_report(
+    split: HourFromMinuteDataSplit,
+    *,
+    row_indices: torch.Tensor | list[int] | None = None,
+    requested_actions: torch.Tensor | list[int] | None = None,
+    executed_actions: torch.Tensor | list[int] | None = None,
+    cash_index: int = 0,
+) -> dict[str, object]:
+    errors = list(split.dataset_reportability_errors)
+    if not split.dataset_reportable and not errors:
+        errors.append("dataset_marked_non_reportable")
+    if row_indices is None:
+        rows = split.valid_start_indices.detach().cpu().long()
+    else:
+        rows = torch.as_tensor(row_indices, dtype=torch.long).detach().cpu()
+    if rows.numel() == 0:
+        return {
+            "evaluation_reportable": not errors,
+            "reportability_errors": errors,
+            "selectable_missing_label_count": 0,
+            "rows_with_any_selectable_missing_label": 0,
+            "requested_action_missing_label_count": 0 if requested_actions is not None else None,
+            "executed_action_missing_label_count": 0 if executed_actions is not None else None,
+            "policy_unscorable_rows": 0 if requested_actions is not None else None,
+        }
+
+    action_returns = split.action_returns.detach().cpu()
+    selected_returns = action_returns[rows]
+    if split.action_valid_mask is None:
+        decision_valid = torch.ones((rows.numel(), action_returns.shape[1]), dtype=torch.bool)
+    else:
+        decision_valid = split.action_valid_mask.detach().cpu()[rows].bool()
+    if split.label_valid_mask is None:
+        label_valid = torch.isfinite(selected_returns)
+    else:
+        label_valid = split.label_valid_mask.detach().cpu()[rows].bool()
+    finite_returns = torch.isfinite(selected_returns)
+    label_ok = label_valid & finite_returns
+    non_cash = torch.ones(decision_valid.shape[1], dtype=torch.bool)
+    if 0 <= int(cash_index) < non_cash.shape[0]:
+        non_cash[int(cash_index)] = False
+    selectable_missing = decision_valid & non_cash.unsqueeze(0) & ~label_ok
+    selectable_missing_count = int(selectable_missing.sum().item())
+    rows_with_missing = int(selectable_missing.any(dim=1).sum().item())
+
+    requested_missing_count: int | None = None
+    if requested_actions is not None:
+        requested = torch.as_tensor(requested_actions, dtype=torch.long).detach().cpu()
+        requested_missing_count = 0
+        for position, action_value in enumerate(requested.tolist()):
+            if position >= rows.numel() or action_value == int(cash_index):
+                continue
+            if not (0 <= int(action_value) < label_ok.shape[1]):
+                requested_missing_count += 1
+                continue
+            requested_missing_count += int(not bool(label_ok[position, int(action_value)].item()))
+
+    executed_missing_count: int | None = None
+    if executed_actions is not None:
+        executed = torch.as_tensor(executed_actions, dtype=torch.long).detach().cpu()
+        executed_missing_count = 0
+        for position, action_value in enumerate(executed.tolist()):
+            if position >= rows.numel() or action_value == int(cash_index):
+                continue
+            if not (0 <= int(action_value) < label_ok.shape[1]):
+                executed_missing_count += 1
+                continue
+            executed_missing_count += int(not bool(label_ok[position, int(action_value)].item()))
+
+    if selectable_missing_count > 0:
+        errors.append("selectable_actions_with_missing_reward_labels")
+    if requested_missing_count:
+        errors.append("requested_actions_with_missing_reward_labels")
+    errors = list(dict.fromkeys(errors))
+    return {
+        "evaluation_reportable": not errors,
+        "reportability_errors": errors,
+        "selectable_missing_label_count": selectable_missing_count,
+        "rows_with_any_selectable_missing_label": rows_with_missing,
+        "requested_action_missing_label_count": requested_missing_count,
+        "executed_action_missing_label_count": executed_missing_count,
+        "policy_unscorable_rows": requested_missing_count,
+    }
 
 
 class MinuteToHourCausalTransformerQNetwork(nn.Module):
@@ -880,6 +976,13 @@ class MinuteToHourEvaluationResult:
     max_drawdown: float
     annualized_sharpe: float | None
     rollout_records: list[dict[str, float | str | int]]
+    evaluation_reportable: bool = True
+    reportability_errors: list[str] = field(default_factory=list)
+    selectable_missing_label_count: int = 0
+    rows_with_any_selectable_missing_label: int = 0
+    requested_action_missing_label_count: int = 0
+    executed_action_missing_label_count: int = 0
+    policy_unscorable_rows: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -892,6 +995,13 @@ class MinuteToHourEvaluationResult:
             "max_drawdown": self.max_drawdown,
             "annualized_sharpe": self.annualized_sharpe,
             "rollout_records": self.rollout_records,
+            "evaluation_reportable": self.evaluation_reportable,
+            "reportability_errors": self.reportability_errors,
+            "selectable_missing_label_count": self.selectable_missing_label_count,
+            "rows_with_any_selectable_missing_label": self.rows_with_any_selectable_missing_label,
+            "requested_action_missing_label_count": self.requested_action_missing_label_count,
+            "executed_action_missing_label_count": self.executed_action_missing_label_count,
+            "policy_unscorable_rows": self.policy_unscorable_rows,
         }
 
 
@@ -927,6 +1037,9 @@ def evaluate_minute_to_hour_policy(
     allocation_switches = 0
     order_legs = 0.0
     records: list[dict[str, float | str | int]] = []
+    evaluated_rows: list[int] = []
+    requested_actions: list[int] = []
+    executed_actions: list[int] = []
     episode_steps = 0
     for index in data.valid_start_indices.detach().cpu().tolist():
         current_date = data.decision_timestamps[index][:10]
@@ -999,11 +1112,19 @@ def evaluate_minute_to_hour_policy(
                 count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
             )[0].item()
         )
+        requested_action = action
         action_tensor = torch.tensor([action], dtype=torch.long, device=device)
         label_mask = data.label_valid_actions(torch.tensor([index], dtype=torch.long, device=device))
+        requested_label_missing = (
+            action != int(constraints.cash_index)
+            and (not bool(label_mask[0, action].item()) or not bool(torch.isfinite(data.action_returns[index, action]).item()))
+        )
         if not bool(label_mask[0, action].item()) or not bool(torch.isfinite(data.action_returns[index, action]).item()):
             action = int(constraints.cash_index)
             action_tensor = torch.tensor([action], dtype=torch.long, device=device)
+        evaluated_rows.append(int(index))
+        requested_actions.append(int(requested_action))
+        executed_actions.append(int(action))
         legs = float(
             trade_legs(
                 prev_tensor,
@@ -1029,9 +1150,14 @@ def evaluate_minute_to_hour_policy(
                     "decision_timestamp": data.decision_timestamps[index],
                     "next_timestamp": data.next_timestamps[index],
                     "action": action,
+                    "requested_action": requested_action,
+                    "executed_action": action,
                     "asset": data.action_names[action],
+                    "requested_asset": data.action_names[requested_action],
+                    "executed_asset": data.action_names[action],
                     "previous_action": previous_action,
                     "segment_reset": int(segment_reset),
+                    "fallback_due_to_missing_label": int(requested_label_missing),
                     "market_order_legs": legs,
                     "net_return": round(net_return, 8),
                     "equity": round(equity, 8),
@@ -1052,6 +1178,13 @@ def evaluate_minute_to_hour_policy(
         previous_date = current_date
         episode_steps += 1
 
+    report = minute_to_hour_missing_label_report(
+        data,
+        row_indices=evaluated_rows,
+        requested_actions=requested_actions,
+        executed_actions=executed_actions,
+        cash_index=int(constraints.cash_index),
+    )
     return MinuteToHourEvaluationResult(
         split_name=data.name,
         total_return=equity - 1.0,
@@ -1061,6 +1194,13 @@ def evaluate_minute_to_hour_policy(
         max_drawdown=fractional_max_drawdown(equity_curve),
         annualized_sharpe=annualized_sharpe(returns, periods_per_year=data.periods_per_year),
         rollout_records=records,
+        evaluation_reportable=bool(report["evaluation_reportable"]),
+        reportability_errors=list(report["reportability_errors"]),
+        selectable_missing_label_count=int(report["selectable_missing_label_count"]),
+        rows_with_any_selectable_missing_label=int(report["rows_with_any_selectable_missing_label"]),
+        requested_action_missing_label_count=int(report["requested_action_missing_label_count"] or 0),
+        executed_action_missing_label_count=int(report["executed_action_missing_label_count"] or 0),
+        policy_unscorable_rows=int(report["policy_unscorable_rows"] or 0),
     )
 
 

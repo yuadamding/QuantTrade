@@ -5,11 +5,12 @@ import argparse
 import bisect
 from collections import Counter
 import csv
+from dataclasses import dataclass, field
 import json
 import math
 import statistics
 import sys
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -261,7 +262,7 @@ def timestamp_add_milliseconds(value: str, milliseconds: int) -> str:
     return (datetime.fromisoformat(value) + timedelta(milliseconds=milliseconds)).isoformat()
 
 
-def utc_iso_seconds(value: object) -> str:
+def parse_utc_datetime(value: object) -> datetime:
     if isinstance(value, datetime):
         parsed = value
     else:
@@ -271,7 +272,23 @@ def utc_iso_seconds(value: object) -> str:
         parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    return parsed.astimezone(timezone.utc)
+
+
+def utc_iso_seconds(value: object) -> str:
+    return parse_utc_datetime(value).replace(microsecond=0).isoformat()
+
+
+def timestamp_to_epoch_ms(value: str | datetime) -> int:
+    parsed = parse_utc_datetime(value)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = parsed - epoch
+    return ((delta.days * 86_400 + delta.seconds) * 1_000) + (delta.microseconds // 1_000)
+
+
+def epoch_ms_to_utc_iso(value: int) -> str:
+    seconds, milliseconds = divmod(int(value), 1_000)
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=milliseconds * 1_000).isoformat()
 
 
 def session_minutes(exchange_timestamp: str) -> int:
@@ -289,6 +306,27 @@ def parquet_symbol_from_path(root: Path, path: Path) -> str:
     if len(relative.parts) >= 4:
         return relative.parts[0].upper()
     return path.stem.upper()
+
+
+def parquet_path_date(path: Path) -> date | None:
+    try:
+        return datetime.strptime(path.stem, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def filter_bar_paths_for_time_range(paths: list[Path], *, start_dt: datetime, end_dt: datetime) -> list[Path]:
+    filtered: list[Path] = []
+    for path in paths:
+        path_date = parquet_path_date(path)
+        if path_date is None:
+            filtered.append(path)
+            continue
+        path_start = datetime.combine(path_date, time.min, tzinfo=timezone.utc)
+        path_end = path_start + timedelta(days=1)
+        if path_start < end_dt and path_end > start_dt:
+            filtered.append(path)
+    return filtered
 
 
 def bar_source_map(directory: Path, *, interval: str) -> dict[str, Path | list[Path]]:
@@ -312,9 +350,16 @@ def load_parquet_bar_features(paths: list[Path], *, start: str, end_exclusive: s
 
     start_dt = datetime.fromisoformat(start).astimezone(timezone.utc)
     end_dt = datetime.fromisoformat(end_exclusive).astimezone(timezone.utc)
+    paths = filter_bar_paths_for_time_range(paths, start_dt=start_dt, end_dt=end_dt)
     raw_rows: list[tuple[str, str, float, float, float, float, float]] = []
     for path in paths:
-        frame = pd.read_parquet(path)
+        try:
+            frame = pd.read_parquet(
+                path,
+                columns=["timestamp_ms", "timestamp_utc", "timestamp_exchange", "open", "high", "low", "close", "volume"],
+            )
+        except (KeyError, ValueError):
+            frame = pd.read_parquet(path)
         if frame.empty:
             continue
         if "timestamp_ms" in frame.columns:
@@ -324,18 +369,37 @@ def load_parquet_bar_features(paths: list[Path], *, start: str, end_exclusive: s
         keep = (timestamps >= start_dt) & (timestamps < end_dt)
         if not bool(keep.any()):
             continue
-        selected = frame.loc[keep].copy()
-        normalized_timestamps = [value.to_pydatetime() for value in timestamps[keep]]
-        for ts_value, row in zip(normalized_timestamps, selected.to_dict("records")):
-            ts = utc_iso_seconds(ts_value)
-            close = float(row["close"])
-            open_value = float(row["open"])
-            high = float(row["high"])
-            low = float(row["low"])
-            volume = float(row["volume"])
+        selected = frame.loc[keep]
+        if "timestamp_ms" in frame.columns:
+            timestamp_ms_values = selected["timestamp_ms"].to_numpy(dtype="int64", copy=False)
+        else:
+            timestamp_ms_values = [
+                timestamp_to_epoch_ms(value.to_pydatetime()) for value in timestamps[keep]
+            ]
+        exchange_values = selected["timestamp_exchange"].to_numpy(copy=False)
+        open_values = selected["open"].to_numpy(dtype="float64", copy=False)
+        high_values = selected["high"].to_numpy(dtype="float64", copy=False)
+        low_values = selected["low"].to_numpy(dtype="float64", copy=False)
+        close_values = selected["close"].to_numpy(dtype="float64", copy=False)
+        volume_values = selected["volume"].to_numpy(dtype="float64", copy=False)
+        for ts_ms, exchange_ts, open_value, high, low, close, volume in zip(
+            timestamp_ms_values,
+            exchange_values,
+            open_values,
+            high_values,
+            low_values,
+            close_values,
+            volume_values,
+        ):
+            ts = epoch_ms_to_utc_iso((int(ts_ms) // 1_000) * 1_000)
+            close = float(close)
+            open_value = float(open_value)
+            high = float(high)
+            low = float(low)
+            volume = float(volume)
             if close <= 0 or open_value <= 0:
                 continue
-            raw_rows.append((ts, str(row["timestamp_exchange"]), open_value, high, low, close, max(volume, 0.0)))
+            raw_rows.append((ts, str(exchange_ts), open_value, high, low, close, max(volume, 0.0)))
     raw_rows.sort(key=lambda item: item[0])
 
     out: dict[str, object] = {}
@@ -386,43 +450,101 @@ def load_bar_exchange_times(source: Path | list[Path], *, start: str, end_exclus
     return load_exchange_times(paths[0], start=start, end_exclusive=end_exclusive)
 
 
-def make_action_lookup(features: dict[str, object]) -> tuple[list[str], list[float]]:
+@dataclass(frozen=True)
+class ActionPriceLookup:
+    timestamps: list[str]
+    timestamp_ms: list[int]
+    closes: list[float]
+
+
+def make_action_lookup(features: dict[str, object]) -> ActionPriceLookup:
     timestamps = sorted(features)
+    timestamp_ms = [timestamp_to_epoch_ms(timestamp) for timestamp in timestamps]
     closes = [float(features[timestamp].close) for timestamp in timestamps]
-    return timestamps, closes
+    return ActionPriceLookup(timestamps=timestamps, timestamp_ms=timestamp_ms, closes=closes)
+
+
+def coerce_action_lookup(lookup: ActionPriceLookup | tuple[list[str], list[float]]) -> ActionPriceLookup:
+    if isinstance(lookup, ActionPriceLookup):
+        return lookup
+    timestamps, closes = lookup
+    return ActionPriceLookup(
+        timestamps=list(timestamps),
+        timestamp_ms=[timestamp_to_epoch_ms(timestamp) for timestamp in timestamps],
+        closes=list(closes),
+    )
 
 
 def close_at_or_before(
-    lookup: tuple[list[str], list[float]],
-    timestamp: str,
+    lookup: ActionPriceLookup | tuple[list[str], list[float]],
+    timestamp: str | int,
     *,
     max_staleness_seconds: int,
 ) -> float | None:
-    timestamps, closes = lookup
-    pos = bisect.bisect_right(timestamps, timestamp) - 1
+    action_lookup = coerce_action_lookup(lookup)
+    timestamp_ms = timestamp if isinstance(timestamp, int) else timestamp_to_epoch_ms(timestamp)
+    pos = bisect.bisect_right(action_lookup.timestamp_ms, timestamp_ms) - 1
     if pos < 0:
         return None
     if max_staleness_seconds > 0:
-        age = (datetime.fromisoformat(timestamp) - datetime.fromisoformat(timestamps[pos])).total_seconds()
-        if age < 0 or age > max_staleness_seconds:
+        age_ms = timestamp_ms - action_lookup.timestamp_ms[pos]
+        if age_ms < 0 or age_ms > max_staleness_seconds * 1_000:
             return None
-    elif timestamps[pos] != timestamp:
+    elif action_lookup.timestamp_ms[pos] != timestamp_ms:
         return None
-    return closes[pos]
+    return action_lookup.closes[pos]
+
+
+def exchange_timezone_by_date(exchange_times: dict[str, str]) -> dict[str, tzinfo]:
+    date_tz: dict[str, tzinfo] = {}
+    for exchange_timestamp in exchange_times.values():
+        dt = datetime.fromisoformat(exchange_timestamp)
+        if dt.tzinfo is not None:
+            date_tz.setdefault(dt.date().isoformat(), dt.tzinfo)
+    return date_tz
+
+
+@dataclass
+class ExchangeTimestampLookup:
+    exchange_times: dict[str, str]
+    date_tz_by_date: dict[str, tzinfo]
+    cache: dict[str, str | None] = field(default_factory=dict)
+
+    @classmethod
+    def from_exchange_maps(cls, *maps: dict[str, str]) -> "ExchangeTimestampLookup":
+        exchange_times: dict[str, str] = {}
+        for mapping in maps:
+            exchange_times.update(mapping)
+        return cls(exchange_times=exchange_times, date_tz_by_date=exchange_timezone_by_date(exchange_times))
+
+    def get(self, timestamp_utc: str) -> str | None:
+        direct = self.exchange_times.get(timestamp_utc)
+        if direct is not None:
+            return direct
+        if timestamp_utc not in self.cache:
+            self.cache[timestamp_utc] = infer_exchange_timestamp(
+                timestamp_utc,
+                self.exchange_times,
+                date_tz_by_date=self.date_tz_by_date,
+            )
+        return self.cache[timestamp_utc]
+
+    def get_ms(self, timestamp_ms: int) -> str | None:
+        return self.get(epoch_ms_to_utc_iso(timestamp_ms))
 
 
 def build_dense_hourly_decision_grid(exchange_times: dict[str, str], *, start: str, end_exclusive: str) -> list[str]:
     start_dt = datetime.fromisoformat(start).astimezone(timezone.utc)
     end_dt = datetime.fromisoformat(end_exclusive).astimezone(timezone.utc)
-    date_tz: dict[str, timezone] = {}
+    date_tz: dict[str, tzinfo] = {}
     for exchange_timestamp in exchange_times.values():
         dt = datetime.fromisoformat(exchange_timestamp)
         if dt.tzinfo is not None:
             date_tz.setdefault(dt.date().isoformat(), dt.tzinfo)
     decisions: list[str] = []
-    for date_text, tzinfo in sorted(date_tz.items()):
-        session_start = datetime.combine(datetime.fromisoformat(date_text).date(), time(9, 30), tzinfo=tzinfo)
-        session_end = datetime.combine(datetime.fromisoformat(date_text).date(), time(16, 0), tzinfo=tzinfo)
+    for date_text, exchange_tzinfo in sorted(date_tz.items()):
+        session_start = datetime.combine(datetime.fromisoformat(date_text).date(), time(9, 30), tzinfo=exchange_tzinfo)
+        session_end = datetime.combine(datetime.fromisoformat(date_text).date(), time(16, 0), tzinfo=exchange_tzinfo)
         decision = session_start + timedelta(minutes=DEFAULT_DECISION_GRID_MINUTES)
         while decision + timedelta(minutes=DEFAULT_DECISION_GRID_MINUTES) <= session_end:
             utc_decision = decision.astimezone(timezone.utc)
@@ -432,17 +554,19 @@ def build_dense_hourly_decision_grid(exchange_times: dict[str, str], *, start: s
     return decisions
 
 
-def infer_exchange_timestamp(timestamp_utc: str, exchange_times: dict[str, str]) -> str | None:
+def infer_exchange_timestamp(
+    timestamp_utc: str,
+    exchange_times: dict[str, str],
+    *,
+    date_tz_by_date: dict[str, tzinfo] | None = None,
+) -> str | None:
     if timestamp_utc in exchange_times:
         return exchange_times[timestamp_utc]
     timestamp_dt = datetime.fromisoformat(timestamp_utc).astimezone(timezone.utc)
-    date_tz: dict[str, timezone] = {}
-    for exchange_timestamp in exchange_times.values():
-        exchange_dt = datetime.fromisoformat(exchange_timestamp)
-        if exchange_dt.tzinfo is not None:
-            date_tz.setdefault(exchange_dt.date().isoformat(), exchange_dt.tzinfo)
-    for date_text, tzinfo in date_tz.items():
-        local_dt = timestamp_dt.astimezone(tzinfo)
+    if date_tz_by_date is None:
+        date_tz_by_date = exchange_timezone_by_date(exchange_times)
+    for date_text, exchange_tzinfo in date_tz_by_date.items():
+        local_dt = timestamp_dt.astimezone(exchange_tzinfo)
         if local_dt.date().isoformat() == date_text:
             return local_dt.isoformat()
     return None
@@ -526,7 +650,13 @@ def main() -> int:
         )
         etf_features[symbol] = rows
         etf_exchange_times[symbol] = exchange
-    exchange_times = etf_exchange_times[etf_symbols[0]]
+    action_exchange_times: dict[str, str] = {}
+    for exchange in etf_exchange_times.values():
+        for timestamp, exchange_timestamp in exchange.items():
+            action_exchange_times.setdefault(timestamp, exchange_timestamp)
+    exchange_times = dict(stock_exchange_times)
+    for timestamp, exchange_timestamp in action_exchange_times.items():
+        exchange_times.setdefault(timestamp, exchange_timestamp)
     exact_action_common_times = sorted(set.intersection(*(set(rows) for rows in etf_features.values())))
     common_times = sorted(stock_by_time)
     min_active = max(1, int(len(selected_stocks) * args.min_active_stock_fraction))
@@ -540,6 +670,7 @@ def main() -> int:
     if len(common_times) < args.minutes_per_hour:
         raise ValueError("Too few aligned source rows after stock and action filtering.")
     action_price_lookup = {symbol: make_action_lookup(rows) for symbol, rows in etf_features.items()}
+    exchange_lookup = ExchangeTimestampLookup.from_exchange_maps(stock_exchange_times, exchange_times)
 
     stock_feature_names = [
         "stock_active_fraction",
@@ -582,9 +713,21 @@ def main() -> int:
     minute_feature_names = [*stock_feature_names, *path_feature_names, *time_feature_names, *etf_feature_names]
     hour_feature_names = ["hour_valid_fraction", "hour_session_progress_centered"]
 
+    exchange_time_feature_cache: dict[str, tuple[float, ...]] = {}
+
+    def parse_exchange_time_cached(exchange_timestamp: str) -> tuple[float, ...]:
+        cached = exchange_time_feature_cache.get(exchange_timestamp)
+        if cached is None:
+            cached = tuple(parse_exchange_time(exchange_timestamp))
+            exchange_time_feature_cache[exchange_timestamp] = cached
+        return cached
+
     minute_feature_by_time: dict[str, list[float]] = {}
+    minute_exchange_date_by_time: dict[str, str] = {}
     cumulative_by_date: dict[str, float] = {}
-    returns_by_date: dict[str, list[float]] = {}
+    count_by_date: dict[str, int] = {}
+    return_sum_by_date: dict[str, float] = {}
+    return_sumsq_by_date: dict[str, float] = {}
     volume_by_date: dict[str, float] = {}
     for timestamp in common_times:
         stock_features = aggregate_stock_features(stock_by_time[timestamp], total_symbols=len(selected_stocks))
@@ -594,14 +737,17 @@ def main() -> int:
         date_key = exchange_timestamp[:10]
         stock_ret = stock_features[1]
         cumulative_by_date[date_key] = cumulative_by_date.get(date_key, 0.0) + stock_ret
-        returns = returns_by_date.setdefault(date_key, [])
-        returns.append(stock_ret)
+        count = count_by_date.get(date_key, 0) + 1
+        count_by_date[date_key] = count
+        return_sum_by_date[date_key] = return_sum_by_date.get(date_key, 0.0) + stock_ret
+        return_sumsq_by_date[date_key] = return_sumsq_by_date.get(date_key, 0.0) + stock_ret * stock_ret
         volume_by_date[date_key] = volume_by_date.get(date_key, 0.0) + stock_features[10]
-        avg = sum(returns) / len(returns)
-        realized_vol = (sum((value - avg) ** 2 for value in returns) / max(len(returns), 1)) ** 0.5
-        avg_log_dollar_volume_so_far = min(volume_by_date[date_key] / max(len(returns), 1.0), 1e6)
+        avg = return_sum_by_date[date_key] / count
+        variance = max(return_sumsq_by_date[date_key] / count - avg * avg, 0.0)
+        realized_vol = variance**0.5
+        avg_log_dollar_volume_so_far = min(volume_by_date[date_key] / max(float(count), 1.0), 1e6)
         path_features = [cumulative_by_date[date_key], realized_vol, avg_log_dollar_volume_so_far]
-        time_features = list(parse_exchange_time(exchange_timestamp))
+        time_features = list(parse_exchange_time_cached(exchange_timestamp))
         etf_row: list[float] = []
         missing = False
         for symbol in etf_symbols:
@@ -615,6 +761,7 @@ def main() -> int:
             etf_row.extend([current.bar_return, current.intraday_ret, current.range_bps, current.log_dollar_volume])
         if not missing:
             minute_feature_by_time[timestamp] = [*stock_features, *path_features, *time_features, *etf_row]
+            minute_exchange_date_by_time[timestamp] = date_key
 
     decision_timestamps: list[str] = []
     next_timestamps: list[str] = []
@@ -626,26 +773,36 @@ def main() -> int:
     action_valid_rows: list[list[bool]] = []
     action_label_valid_rows: list[list[bool]] = []
     feature_dim = len(minute_feature_names)
+    zero_feature = [0.0] * feature_dim
+    source_bar_ms = source_bar_seconds * 1_000
     decision_source_times = (
         build_dense_hourly_decision_grid(exchange_times, start=args.start, end_exclusive=args.end_exclusive)
         if dense_hourly_grid
         else common_times
     )
     decision_stride_seconds = int(args.decision_stride_minutes) * 60
+    decision_stride_ms = decision_stride_seconds * 1_000
+    minute_feature_by_ms: dict[int, list[float]] = {}
+    minute_timestamp_by_ms: dict[int, str] = {}
+    minute_exchange_date_by_ms: dict[int, str] = {}
+    for timestamp, features in minute_feature_by_time.items():
+        timestamp_ms = timestamp_to_epoch_ms(timestamp)
+        minute_feature_by_ms[timestamp_ms] = features
+        minute_timestamp_by_ms[timestamp_ms] = timestamp
+        if timestamp in minute_exchange_date_by_time:
+            minute_exchange_date_by_ms[timestamp_ms] = minute_exchange_date_by_time[timestamp]
     for decision_ts in decision_source_times:
-        exchange_timestamp = (
-            exchange_times.get(decision_ts)
-            or stock_exchange_times.get(decision_ts)
-            or infer_exchange_timestamp(decision_ts, exchange_times)
-        )
+        exchange_timestamp = exchange_lookup.get(decision_ts)
         if exchange_timestamp is None:
             continue
         elapsed = session_elapsed_seconds(exchange_timestamp)
         if elapsed <= 0 or elapsed % decision_stride_seconds != 0:
             continue
-        next_ts = timestamp_add_seconds(decision_ts, decision_stride_seconds)
-        decision_context_ts = timestamp_add_milliseconds(decision_ts, -int(args.bar_latency_ms))
-        next_context_ts = timestamp_add_milliseconds(next_ts, -int(args.bar_latency_ms))
+        decision_ms = timestamp_to_epoch_ms(decision_ts)
+        next_ms = decision_ms + decision_stride_ms
+        next_ts = epoch_ms_to_utc_iso(next_ms)
+        decision_context_ms = decision_ms - int(args.bar_latency_ms)
+        next_context_ms = next_ms - int(args.bar_latency_ms)
         if not dense_hourly_grid and next_ts not in common_set:
             continue
         decision_date = exchange_timestamp[:10]
@@ -654,35 +811,30 @@ def main() -> int:
         timestamp_tensor: list[list[str]] = []
         hour_rows: list[list[float]] = []
         valid_count = 0
-        decision_dt = datetime.fromisoformat(decision_context_ts)
         for hour_index in range(args.hours_lookback):
             offset_hours = args.hours_lookback - 1 - hour_index
-            hour_end = decision_dt - timedelta(seconds=offset_hours * decision_stride_seconds)
-            hour_start = hour_end - timedelta(seconds=(args.minutes_per_hour - 1) * source_bar_seconds)
+            hour_end_ms = decision_context_ms - (offset_hours * decision_stride_ms)
+            hour_start_ms = hour_end_ms - ((args.minutes_per_hour - 1) * source_bar_ms)
             minute_rows: list[list[float]] = []
             mask_rows: list[bool] = []
             ts_rows: list[str] = []
+            hour_valid_count = 0
             for minute_offset in range(args.minutes_per_hour):
-                minute_ts = (hour_start + timedelta(seconds=minute_offset * source_bar_seconds)).isoformat()
-                minute_exchange_timestamp = stock_exchange_times.get(minute_ts) or exchange_times.get(minute_ts)
+                minute_ms = hour_start_ms + (minute_offset * source_bar_ms)
+                minute_feature = minute_feature_by_ms.get(minute_ms)
                 is_valid = (
-                    minute_ts <= decision_context_ts
-                    and minute_ts in minute_feature_by_time
-                    and minute_exchange_timestamp is not None
-                    and minute_exchange_timestamp[:10] == decision_date
+                    minute_ms <= decision_context_ms
+                    and minute_feature is not None
+                    and minute_exchange_date_by_ms.get(minute_ms) == decision_date
                 )
-                ts_rows.append(minute_ts if is_valid else "")
+                ts_rows.append(minute_timestamp_by_ms[minute_ms] if is_valid else "")
                 mask_rows.append(is_valid)
-                minute_rows.append(minute_feature_by_time[minute_ts] if is_valid else [0.0] * feature_dim)
+                minute_rows.append(minute_feature if is_valid and minute_feature is not None else zero_feature)
                 valid_count += int(is_valid)
-            valid_fraction = sum(mask_rows) / float(args.minutes_per_hour)
-            hour_exchange_timestamp = (
-                exchange_times.get(hour_end.isoformat())
-                or stock_exchange_times.get(hour_end.isoformat())
-                or infer_exchange_timestamp(hour_end.isoformat(), exchange_times)
-                or exchange_timestamp
-            )
-            hour_rows.append([valid_fraction, parse_exchange_time(hour_exchange_timestamp)[0]])
+                hour_valid_count += int(is_valid)
+            valid_fraction = hour_valid_count / float(args.minutes_per_hour)
+            hour_exchange_timestamp = exchange_lookup.get_ms(hour_end_ms) or exchange_timestamp
+            hour_rows.append([valid_fraction, parse_exchange_time_cached(hour_exchange_timestamp)[0]])
             timestamp_tensor.append(ts_rows)
             mask_tensor.append(mask_rows)
             minute_tensor.append(minute_rows)
@@ -694,12 +846,12 @@ def main() -> int:
         for symbol in etf_symbols:
             current_close = close_at_or_before(
                 action_price_lookup[symbol],
-                decision_context_ts,
+                decision_context_ms,
                 max_staleness_seconds=args.max_action_staleness_seconds,
             )
             future_close = close_at_or_before(
                 action_price_lookup[symbol],
-                next_context_ts,
+                next_context_ms,
                 max_staleness_seconds=args.max_action_staleness_seconds,
             )
             action_decision_valid = current_close is not None
@@ -711,7 +863,7 @@ def main() -> int:
                 action_returns.append(clipped_simple_return(current_close, future_close))
                 label_valid.append(True)
             decision_action_valid.append(action_decision_valid)
-        if sum(label_valid) <= 1:
+        if sum(decision_action_valid) <= 1:
             continue
         decision_timestamps.append(decision_ts)
         next_timestamps.append(next_ts)

@@ -645,6 +645,11 @@ Rules:
   audit masks for label construction and are forbidden as model inputs.
 - Action returns are finite only where `decision_action_valid_mask` and
   `label_valid_mask` are both true; otherwise they must be `NaN`, except CASH.
+- Dataset builders must not drop a decision row solely because a selectable
+  non-CASH action lacks a future reward label. Keep the row, store `NaN`, and
+  let `label_valid_mask` drive loss/evaluation/reportability.
+- Legacy payloads with only `action_valid_mask` and no explicit decision-vs-label
+  mask semantics are diagnostic-only and non-reportable.
 - `action_target_weights` are signed target exposures. Generated stock-second
   datasets are long-only today, but evaluators charge costs on absolute
   executed exposure so future short variants do not create negative costs.
@@ -1235,6 +1240,12 @@ For hourly-from-subhour datasets, new payloads use the same split:
 `decision_action_valid_mask`/`action_valid_mask` are decision-time selector
 masks, while `label_valid_mask`/`action_label_valid_mask` mark realized reward
 availability and are forbidden as model inputs.
+
+`skip_existing` caches must be treated as current only when both schema and
+identity match the requested run: source manifest hash, raw source/dataset
+manifest hash, universe hash, conversion config hash, feature/action schema
+hashes, and converter code identity must agree. A schema-valid cache from a
+different universe, source window, action count, or converter version is stale.
 
 ### Second-level context looks sparse
 
