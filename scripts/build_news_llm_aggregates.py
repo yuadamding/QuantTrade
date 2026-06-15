@@ -373,16 +373,19 @@ def main(argv: list[str] | None = None) -> int:
     news_llm_manifest_hash = file_sha256(news_manifest_path)
     article_manifest_path = args.article_root / "manifest.json"
     article_manifest = read_manifest(article_manifest_path)
-    article_manifest_hash = file_sha256(article_manifest_path) if article_manifest_path.exists() else None
-    source_symbols = list(
-        article_manifest.get(
-            "symbols_with_source_news",
-            news_llm_manifest.get("symbols_with_news_llm", []),
-        )
-    )
+    feature_manifest_reportability_errors = list(news_llm_manifest.get("reportability_errors", []))
+    if article_manifest_path.exists():
+        article_manifest_hash = file_sha256(article_manifest_path)
+        # Source coverage comes ONLY from the article manifest. Do not fall back to the LLM-row
+        # universe, which would conflate "explicit source coverage exists" with "we merely have
+        # LLM rows for this symbol" and confuse missing-source vs known-zero-news downstream.
+        source_symbols = list(article_manifest.get("symbols_with_source_news", []))
+    else:
+        article_manifest_hash = None
+        source_symbols = []
+        feature_manifest_reportability_errors.append("news_article_manifest_missing")
     action_names = load_action_names(paths)
     rows_by_symbol = load_news_llm_rows_by_symbol(args.news_llm_root, action_names)
-    feature_manifest_reportability_errors = list(news_llm_manifest.get("reportability_errors", []))
     records: list[dict[str, Any]] = []
     print(f"Building news LLM action sidecars for {len(paths)} partitions with workers={args.workers}", flush=True)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:

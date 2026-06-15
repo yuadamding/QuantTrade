@@ -672,13 +672,17 @@ def validate_news_llm_rows(rows: list[Mapping[str, Any]]) -> list[str]:
         for field in _NEWS_LLM_NONEMPTY_STRING_FIELDS:
             if not str(row.get(field) or "").strip():
                 errors.append(f"row {index}: {field} must be a nonempty string")
-        sentiment = _as_float_or_none(row.get("sentiment_score"))
+        # Continuous scores must be real floats, not booleans coerced to 0.0/1.0 (a bool here
+        # usually signals a schema/extraction error), so reject bool explicitly for these fields.
+        sentiment_raw = row.get("sentiment_score")
+        sentiment = None if isinstance(sentiment_raw, bool) else _as_float_or_none(sentiment_raw)
         if sentiment is None or not math.isfinite(sentiment) or not (-1.0 <= sentiment <= 1.0):
-            errors.append(f"row {index}: sentiment_score must be finite in [-1, 1]")
+            errors.append(f"row {index}: sentiment_score must be a finite float in [-1, 1]")
         for field in _NEWS_LLM_UNIT_INTERVAL_FIELDS:
-            value = _as_float_or_none(row.get(field))
+            raw = row.get(field)
+            value = None if isinstance(raw, bool) else _as_float_or_none(raw)
             if value is None or not math.isfinite(value) or not (0.0 <= value <= 1.0):
-                errors.append(f"row {index}: {field} must be finite in [0, 1]")
+                errors.append(f"row {index}: {field} must be a finite float in [0, 1]")
         for field in _NEWS_LLM_BINARY_FIELDS:
             value = _as_float_or_none(row.get(field))
             if value is None or value not in (0.0, 1.0):
@@ -738,6 +742,10 @@ def write_news_llm_feature_outputs(
     tmp_path = feature_path.with_name(f".{feature_path.name}.tmp.{os.getpid()}")
     frame.to_parquet(tmp_path, index=False)
     tmp_path.replace(feature_path)
+    # On a non-reportable build, remove any stale canonical table from a prior valid build so a
+    # reader keyed on the canonical path cannot consume an out-of-date, now-superseded table.
+    if not reportable and canonical_path.exists():
+        canonical_path.unlink()
     resolved_prompt_hash = distinct_prompt_hashes[0] if len(distinct_prompt_hashes) == 1 else DETERMINISTIC_NEWS_LLM_PROMPT_HASH
     symbols = sorted(set(canonical_symbol(str(row.get("ticker", ""))) for row in rows if row.get("ticker")))
     model_policy = dict(analyst_model_policy or default_news_llm_analyst_model_policy())
@@ -813,10 +821,20 @@ def write_news_llm_feature_outputs(
     return manifest
 
 
-def read_news_llm_rows(root_or_path: Path) -> list[dict[str, Any]]:
+def read_news_llm_rows(root_or_path: Path, *, allow_nonreportable: bool = False) -> list[dict[str, Any]]:
     import pandas as pd
 
-    path = root_or_path / "news_article_ticker_llm.parquet" if root_or_path.is_dir() else root_or_path
+    if root_or_path.is_dir():
+        # The manifest is the source of truth for which feature table is current. Fail closed on a
+        # non-reportable table (return nothing) so a stale canonical Parquet from an earlier valid
+        # build is never silently consumed when the latest build was quarantined.
+        manifest = read_manifest(root_or_path)
+        if manifest.get("reportability_errors") and not allow_nonreportable:
+            return []
+        feature_table_path = manifest.get("feature_table_path")
+        path = Path(feature_table_path) if feature_table_path else root_or_path / "news_article_ticker_llm.parquet"
+    else:
+        path = root_or_path
     if not path.exists():
         return []
     return pd.read_parquet(path).to_dict("records")
@@ -915,6 +933,17 @@ def _novelty_weighted_sentiment(rows: list[Mapping[str, Any]]) -> float:
     )
 
 
+def _last_input_available_ms(rows: list[Mapping[str, Any]]) -> int | None:
+    """Most recent availability among contributing (weighted) rows, or None if there are none."""
+    avails = [
+        int(_finite(row.get("llm_feature_available_timestamp_ms"), default=-1.0))
+        for row in rows
+        if _row_weight(row) > 0.0
+    ]
+    avails = [value for value in avails if value >= 0]
+    return max(avails) if avails else None
+
+
 class _NewsLlmAggregateBuilder:
     def __init__(self, decision_ms: int, source_available: bool) -> None:
         self.decision_ms = int(decision_ms)
@@ -924,17 +953,39 @@ class _NewsLlmAggregateBuilder:
         self.available: list[int] = []
         self.age_seconds: list[float] = []
 
-    def add_decision_value(self, value: float) -> None:
-        if self.source_available:
+    def _append(self, value: float, *, mask: bool, available_ms: int) -> None:
+        if mask:
             self.values.append(float(value))
             self.mask.append(True)
-            self.available.append(self.decision_ms)
-            self.age_seconds.append(0.0)
+            self.available.append(int(available_ms))
+            self.age_seconds.append(max(0.0, (self.decision_ms - int(available_ms)) / 1000.0))
         else:
             self.values.append(0.0)
             self.mask.append(False)
             self.available.append(-1)
             self.age_seconds.append(-1.0)
+
+    def add_decision_value(self, value: float) -> None:
+        self._append(value, mask=self.source_available, available_ms=self.decision_ms)
+
+    def add_count_value(self, value: float, *, window_rows: list[Mapping[str, Any]]) -> None:
+        # Count features are valid (value meaningful, including 0 = "no news") whenever source
+        # coverage exists. Freshness reflects the most recent contributing row when present,
+        # otherwise the decision time (a true zero-count computed now).
+        last = _last_input_available_ms(window_rows)
+        self._append(
+            value,
+            mask=self.source_available,
+            available_ms=last if last is not None else self.decision_ms,
+        )
+
+    def add_mean_value(self, value: float, *, window_rows: list[Mapping[str, Any]]) -> None:
+        # Mean/fraction/sentiment features are only valid when at least one weighted row exists;
+        # otherwise a 0.0 would be indistinguishable from "no news in the window", so mask False.
+        # Freshness reflects the most recent contributing row.
+        last = _last_input_available_ms(window_rows)
+        valid = self.source_available and last is not None
+        self._append(value, mask=valid, available_ms=last if last is not None else -1)
 
     def add_event_age(self, value: float, available_ms: int | None) -> None:
         if self.source_available and available_ms is not None and available_ms >= 0:
@@ -968,13 +1019,13 @@ def aggregate_news_llm_features_for_symbol(
     known = _known_rows(rows, decision_ms)
     builder = _NewsLlmAggregateBuilder(decision_ms, source_available=source_available)
     for window_rows in (rows_1h, rows_1d, rows_7d, rows_30d):
-        builder.add_decision_value(math.log1p(_weighted_sum(window_rows)))
-    builder.add_decision_value(_weighted_mean(rows_1d, "positive_score"))
-    builder.add_decision_value(_weighted_mean(rows_1d, "negative_score"))
-    builder.add_decision_value(_weighted_mean(rows_1d, "sentiment_score"))
-    builder.add_decision_value(_weighted_mean(rows_7d, "sentiment_score"))
-    builder.add_decision_value(_weighted_mean(rows_30d, "sentiment_score"))
-    builder.add_decision_value(
+        builder.add_count_value(math.log1p(_weighted_sum(window_rows)), window_rows=window_rows)
+    builder.add_mean_value(_weighted_mean(rows_1d, "positive_score"), window_rows=rows_1d)
+    builder.add_mean_value(_weighted_mean(rows_1d, "negative_score"), window_rows=rows_1d)
+    builder.add_mean_value(_weighted_mean(rows_1d, "sentiment_score"), window_rows=rows_1d)
+    builder.add_mean_value(_weighted_mean(rows_7d, "sentiment_score"), window_rows=rows_7d)
+    builder.add_mean_value(_weighted_mean(rows_30d, "sentiment_score"), window_rows=rows_30d)
+    builder.add_count_value(
         math.log1p(
             sum(
                 _row_weight(row)
@@ -982,9 +1033,10 @@ def aggregate_news_llm_features_for_symbol(
                 if _finite(row.get("materiality_score"), default=0.0) >= 0.5
                 and _finite(row.get("sentiment_score"), default=0.0) > 0.0
             )
-        )
+        ),
+        window_rows=rows_7d,
     )
-    builder.add_decision_value(
+    builder.add_count_value(
         math.log1p(
             sum(
                 _row_weight(row)
@@ -992,15 +1044,18 @@ def aggregate_news_llm_features_for_symbol(
                 if _finite(row.get("materiality_score"), default=0.0) >= 0.5
                 and _finite(row.get("sentiment_score"), default=0.0) < 0.0
             )
-        )
+        ),
+        window_rows=rows_7d,
     )
-    builder.add_decision_value(_weighted_mean(rows_1d, "company_specificity"))
-    builder.add_decision_value(_weighted_mean(rows_1d, "is_broad_market_or_sector"))
-    builder.add_decision_value(_fraction(rows_7d, lambda row: _finite(row.get("ticker_count"), default=1.0) > 1.0))
-    builder.add_decision_value(math.log1p(_weighted_sum(rows_30d, "event_earnings")))
-    builder.add_decision_value(math.log1p(_weighted_sum(rows_30d, "event_guidance")))
-    builder.add_decision_value(math.log1p(_weighted_sum(rows_7d, "event_analyst_rating")))
-    builder.add_decision_value(
+    builder.add_mean_value(_weighted_mean(rows_1d, "company_specificity"), window_rows=rows_1d)
+    builder.add_mean_value(_weighted_mean(rows_1d, "is_broad_market_or_sector"), window_rows=rows_1d)
+    builder.add_mean_value(
+        _fraction(rows_7d, lambda row: _finite(row.get("ticker_count"), default=1.0) > 1.0), window_rows=rows_7d
+    )
+    builder.add_count_value(math.log1p(_weighted_sum(rows_30d, "event_earnings")), window_rows=rows_30d)
+    builder.add_count_value(math.log1p(_weighted_sum(rows_30d, "event_guidance")), window_rows=rows_30d)
+    builder.add_count_value(math.log1p(_weighted_sum(rows_7d, "event_analyst_rating")), window_rows=rows_7d)
+    builder.add_count_value(
         math.log1p(
             sum(
                 _row_weight(row)
@@ -1008,9 +1063,10 @@ def aggregate_news_llm_features_for_symbol(
                 if _finite(row.get("event_regulatory"), default=0.0) > 0.0
                 and _finite(row.get("sentiment_score"), default=0.0) < 0.0
             )
-        )
+        ),
+        window_rows=rows_30d,
     )
-    builder.add_decision_value(
+    builder.add_count_value(
         math.log1p(
             sum(
                 _row_weight(row)
@@ -1018,9 +1074,10 @@ def aggregate_news_llm_features_for_symbol(
                 if _finite(row.get("event_litigation"), default=0.0) > 0.0
                 and _finite(row.get("sentiment_score"), default=0.0) < 0.0
             )
-        )
+        ),
+        window_rows=rows_30d,
     )
-    builder.add_decision_value(
+    builder.add_count_value(
         math.log1p(
             sum(
                 _row_weight(row)
@@ -1031,13 +1088,18 @@ def aggregate_news_llm_features_for_symbol(
                 )
                 and _finite(row.get("sentiment_score"), default=0.0) > 0.0
             )
-        )
+        ),
+        window_rows=rows_30d,
     )
-    builder.add_decision_value(_novelty_weighted_sentiment(rows_1d))
-    builder.add_decision_value(_novelty_weighted_sentiment(rows_7d))
-    builder.add_decision_value(_weighted_mean(rows_7d, "confidence"))
-    builder.add_decision_value(_fraction(rows_7d, lambda row: _finite(row.get("confidence"), default=0.0) < 0.5))
-    builder.add_decision_value(math.log1p(sum(1 for row in rows_7d if not _truthy(row.get("llm_valid")))))
+    builder.add_mean_value(_novelty_weighted_sentiment(rows_1d), window_rows=rows_1d)
+    builder.add_mean_value(_novelty_weighted_sentiment(rows_7d), window_rows=rows_7d)
+    builder.add_mean_value(_weighted_mean(rows_7d, "confidence"), window_rows=rows_7d)
+    builder.add_mean_value(
+        _fraction(rows_7d, lambda row: _finite(row.get("confidence"), default=0.0) < 0.5), window_rows=rows_7d
+    )
+    builder.add_count_value(
+        math.log1p(sum(1 for row in rows_7d if not _truthy(row.get("llm_valid")))), window_rows=rows_7d
+    )
 
     material_rows = [
         row

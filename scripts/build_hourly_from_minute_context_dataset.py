@@ -252,6 +252,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.max_action_staleness_seconds = 300
         if args.bar_latency_ms == 0:
             args.bar_latency_ms = DEFAULT_SECOND_BAR_LATENCY_MS
+        if args.execution_latency_ms == 0:
+            # Second-bar fills must occur at least one bar after the decision; a 0ms default would
+            # let entries fill at the decision bar's own (already-observed) close, violating the
+            # execution_latency_ms>=1000 invariant for 1s data.
+            args.execution_latency_ms = DEFAULT_SECOND_BAR_LATENCY_MS
         args.dense_hourly_grid = True
         if args.allow_missing_action_context is None:
             args.allow_missing_action_context = True

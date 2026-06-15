@@ -866,22 +866,47 @@ def _action_feature_mean_std(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     mean = features.mean(dim=(0, 1))
     std = features.std(dim=(0, 1), unbiased=False).clamp_min(1e-6)
-    if feature_names:
-        keep_raw = torch.tensor(
-            [
-                name.startswith("stock_covariates_v1_mask.")
-                or name.startswith("stock_news_llm_v1_mask.")
-                or name.endswith("_missing_flag")
-                or name.startswith("stock_covariates_v1_type.")
-                or name.endswith(".is_common_stock")
-                or name.endswith(".is_adr_or_foreign")
-                or name.endswith(".is_active_reference_record")
-                for name in feature_names
-            ],
-            dtype=torch.bool,
+    if not feature_names:
+        return mean, std
+
+    def _is_keep_raw(name: str) -> bool:
+        return (
+            name.startswith("stock_covariates_v1_mask.")
+            or name.startswith("stock_news_llm_v1_mask.")
+            or name.endswith("_missing_flag")
+            or name.startswith("stock_covariates_v1_type.")
+            or name.endswith(".is_common_stock")
+            or name.endswith(".is_adr_or_foreign")
+            or name.endswith(".is_active_reference_record")
         )
-        mean = torch.where(keep_raw, torch.zeros_like(mean), mean)
-        std = torch.where(keep_raw, torch.ones_like(std), std)
+
+    name_to_index = {name: index for index, name in enumerate(feature_names)}
+    # Value channels (news / covariates) carry a sibling mask channel and are zero-filled where
+    # unavailable (and for CASH). Computing mean/std over those zero/masked entries distorts the
+    # normalizer, so for any value channel with a matching mask channel, fit statistics only over
+    # mask-true, finite entries (this also excludes CASH, whose covariate/news masks are False).
+    mask_prefixes = {"stock_news_llm_v1.": "stock_news_llm_v1_mask.", "stock_covariates_v1.": "stock_covariates_v1_mask."}
+    for index, name in enumerate(feature_names):
+        if _is_keep_raw(name):
+            mean[index] = 0.0
+            std[index] = 1.0
+            continue
+        mask_name = None
+        for value_prefix, mask_prefix in mask_prefixes.items():
+            if name.startswith(value_prefix):
+                mask_name = mask_prefix + name[len(value_prefix) :]
+                break
+        mask_index = name_to_index.get(mask_name) if mask_name is not None else None
+        if mask_index is None:
+            continue
+        valid = (features[:, :, mask_index] > 0.5) & torch.isfinite(features[:, :, index])
+        if bool(valid.any().item()):
+            valid_values = features[:, :, index][valid]
+            mean[index] = valid_values.mean()
+            std[index] = valid_values.std(unbiased=False).clamp_min(1e-6)
+        else:
+            mean[index] = 0.0
+            std[index] = 1.0
     return mean, std
 
 

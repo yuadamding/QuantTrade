@@ -53,15 +53,23 @@ DEFAULT_OUTPUT_JSONL = (
 )
 DEFAULT_LOCAL_MODEL = Path("../LLM/Qwen3-1.7B")
 PROMPT_VERSION = "qwen_news_llm_article_ticker_prompt_v1"
-PROMPT_HASH = stable_json_hash(
-    {
-        "prompt_version": PROMPT_VERSION,
-        "schema": NEWS_LLM_EXTRACT_SCHEMA_VERSION,
-        "extractor": "local_qwen3_1_7b",
-        "temperature": 0.0,
-        "no_retrieval": True,
-    }
-)
+
+
+def prompt_hash_for(temperature: float, *, no_retrieval: bool = True) -> str:
+    # The prompt hash binds the ACTUAL generation temperature so a sampled (nondeterministic)
+    # run cannot share a hash with the deterministic temperature=0 extractor.
+    return stable_json_hash(
+        {
+            "prompt_version": PROMPT_VERSION,
+            "schema": NEWS_LLM_EXTRACT_SCHEMA_VERSION,
+            "extractor": "local_qwen3_1_7b",
+            "temperature": float(temperature),
+            "no_retrieval": bool(no_retrieval),
+        }
+    )
+
+
+DETERMINISTIC_PROMPT_HASH = prompt_hash_for(0.0)
 TIME_HORIZONS = {"intraday", "days_to_weeks", "months_to_years", "unknown"}
 
 
@@ -75,7 +83,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-jsonl", type=Path, default=DEFAULT_OUTPUT_JSONL)
     parser.add_argument("--local-model", type=Path, default=DEFAULT_LOCAL_MODEL)
     parser.add_argument("--tickers", help="Comma-separated tickers. Defaults to non-cash actions from --partitions-root.")
-    parser.add_argument("--model-available-timestamp-utc", default="1970-01-01T00:00:01+00:00")
+    parser.add_argument(
+        "--model-available-timestamp-utc",
+        default=None,
+        help=(
+            "When the pretrained extractor became available (UTC ISO). Defaults to the local model "
+            "manifest's downloaded_at_utc; a 1970/epoch default is intentionally NOT used because it "
+            "would make a modern model appear available before any backtest. Required if neither is present."
+        ),
+    )
     parser.add_argument("--model-training-cutoff-utc", default="unknown_for_downloaded_pretrained_model")
     parser.add_argument("--vendor-latency-seconds", type=int, default=300)
     parser.add_argument("--processing-latency-seconds", type=int, default=60)
@@ -313,6 +329,8 @@ def build_output_row(
     vendor_latency_seconds: int,
     processing_latency_seconds: int,
     parse_error: str | None,
+    extractor_temperature: float,
+    prompt_hash: str,
 ) -> dict[str, Any]:
     row = dict(fallback)
     if parsed is not None:
@@ -333,11 +351,14 @@ def build_output_row(
             "source_available_timestamp_ms": source_available,
             "llm_feature_available_timestamp_ms": int(feature_available),
             "llm_model_id": model_id,
-            "llm_prompt_hash": PROMPT_HASH,
+            "llm_prompt_hash": prompt_hash,
             "llm_schema_version": NEWS_LLM_EXTRACT_SCHEMA_VERSION,
             "llm_schema_hash": NEWS_LLM_ARTICLE_TICKER_SCHEMA_HASH,
             "extractor_provider": "local_transformers_qwen3_1_7b",
-            "extractor_temperature": 0.0,
+            # Record the ACTUAL generation temperature. A nonzero (sampled) run is therefore
+            # honestly non-deterministic and downstream validate_news_llm_rows marks it
+            # non-reportable, instead of every row claiming temperature 0.
+            "extractor_temperature": float(extractor_temperature),
             "extractor_no_retrieval": True,
             "model_available_timestamp_ms": int(model_available_timestamp_ms),
             "model_training_cutoff_utc": model_training_cutoff_utc,
@@ -362,7 +383,8 @@ def generate_batch(
     args: argparse.Namespace,
     model_id: str,
     model_available_timestamp_ms: int,
-) -> list[dict[str, Any]]:
+    prompt_hash: str,
+) -> tuple[list[dict[str, Any]], int]:
     fallbacks = [
         deterministic_article_ticker_features(
             article,
@@ -397,6 +419,7 @@ def generate_batch(
     prompt_width = encoded["input_ids"].shape[-1]
     texts = tokenizer.batch_decode(generated[:, prompt_width:], skip_special_tokens=True)
     rows: list[dict[str, Any]] = []
+    parse_errors = 0
     for (article, ticker), fallback, text in zip(pairs, fallbacks, texts, strict=True):
         parsed: dict[str, Any] | None
         parse_error: str | None = None
@@ -405,6 +428,7 @@ def generate_batch(
         except Exception as exc:  # noqa: BLE001 - failed structured output becomes an invalid audited row.
             parsed = None
             parse_error = f"{type(exc).__name__}: {exc}"
+            parse_errors += 1
         rows.append(
             build_output_row(
                 article=article,
@@ -417,9 +441,11 @@ def generate_batch(
                 vendor_latency_seconds=args.vendor_latency_seconds,
                 processing_latency_seconds=args.processing_latency_seconds,
                 parse_error=parse_error,
+                extractor_temperature=args.temperature,
+                prompt_hash=prompt_hash,
             )
         )
-    return rows
+    return rows, parse_errors
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -430,7 +456,15 @@ def main(argv: list[str] | None = None) -> int:
     args.output_jsonl = resolve_project_path(args.output_jsonl)
     model_manifest = load_local_model_manifest(args.local_model)
     model_id = model_id_from_manifest(model_manifest)
-    model_available_timestamp_ms = parse_timestamp_ms(args.model_available_timestamp_utc)
+    model_available_utc = args.model_available_timestamp_utc or str(model_manifest.get("downloaded_at_utc") or "")
+    if not model_available_utc:
+        raise SystemExit(
+            "Model availability is required: pass --model-available-timestamp-utc or provide a local "
+            "download_manifest.json with downloaded_at_utc. Refusing to default to the epoch, which "
+            "would make a modern pretrained model appear available before any backtest."
+        )
+    model_available_timestamp_ms = parse_timestamp_ms(model_available_utc)
+    prompt_hash = prompt_hash_for(args.temperature)
     tickers = load_action_tickers(args)
     articles = read_news_article_rows(args.article_root)
     pairs = selected_article_ticker_pairs(articles, tickers)
@@ -453,7 +487,9 @@ def main(argv: list[str] | None = None) -> int:
                 "total_selected_pairs": len(pairs),
                 "completed_pairs": len(completed),
                 "todo_pairs": len(todo),
-                "prompt_hash": PROMPT_HASH,
+                "prompt_hash": prompt_hash,
+                "extractor_temperature": float(args.temperature),
+                "model_available_utc": model_available_utc,
             },
             indent=2,
             sort_keys=True,
@@ -465,6 +501,8 @@ def main(argv: list[str] | None = None) -> int:
     tokenizer, model, device = load_model(args)
     print(f"Loaded {model_id} on {device}", flush=True)
     written = 0
+    parse_error_total = 0
+    invalid_total = 0
     started = time.monotonic()
     batch_size = max(1, int(args.batch_size))
     next_report = 1
@@ -473,13 +511,14 @@ def main(argv: list[str] | None = None) -> int:
         while index < len(todo):
             batch = todo[index : index + batch_size]
             try:
-                rows = generate_batch(
+                rows, batch_parse_errors = generate_batch(
                     tokenizer=tokenizer,
                     model=model,
                     pairs=batch,
                     args=args,
                     model_id=model_id,
                     model_available_timestamp_ms=model_available_timestamp_ms,
+                    prompt_hash=prompt_hash,
                 )
             except torch.cuda.OutOfMemoryError:
                 if batch_size == 1:
@@ -491,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
             for row in rows:
                 sink.write(json.dumps(row, sort_keys=True, default=str) + "\n")
             written += len(rows)
+            parse_error_total += batch_parse_errors
+            invalid_total += sum(1 for row in rows if not row.get("llm_valid"))
             index += len(rows)
             if written >= next_report or written == len(todo):
                 sink.flush()
@@ -508,6 +549,23 @@ def main(argv: list[str] | None = None) -> int:
                     next_report = 25
                 while next_report <= written:
                     next_report += 25
+    # Generation diagnostics: surface parse failures / invalid rows so a broken extractor run is
+    # not mistaken for clean output. A high parse_error_fraction should gate downstream reportable use.
+    diagnostics = {
+        "output_jsonl": str(args.output_jsonl),
+        "model_id": model_id,
+        "prompt_hash": prompt_hash,
+        "extractor_temperature": float(args.temperature),
+        "model_available_utc": model_available_utc,
+        "rows_written_this_run": written,
+        "parse_error_count": parse_error_total,
+        "parse_error_fraction": (parse_error_total / written) if written else 0.0,
+        "invalid_llm_row_count": invalid_total,
+        "invalid_llm_row_fraction": (invalid_total / written) if written else 0.0,
+    }
+    diagnostics_path = args.output_jsonl.with_suffix(args.output_jsonl.suffix + ".generation_diagnostics.json")
+    diagnostics_path.write_text(json.dumps(diagnostics, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(diagnostics, indent=2, sort_keys=True), flush=True)
     print(f"Done. wrote={written} output={args.output_jsonl}", flush=True)
     return 0
 

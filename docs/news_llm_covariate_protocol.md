@@ -43,8 +43,10 @@ Primary extractor:   Qwen/Qwen3-1.7B
 Validator/fallback:  google/gemma-4-26B-A4B-it
 Structured fallback: mistralai/Mistral-Small-3.2-24B-Instruct-2506
 Serving engine:      local_transformers
-Output mode:         JSON schema
-Temperature:         0.0
+Output mode:         prompted JSON with post-hoc extraction, range clamping, and strict
+                     row validation (not constrained-decoding JSON-schema output)
+Temperature:         0.0 (the recorded extractor_temperature reflects the actual run;
+                     a nonzero/sampled run is marked non-reportable)
 Top-p:               1.0
 ```
 

@@ -476,6 +476,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"News LLM output -> {args.output_root}")
     if manifest["reportability_errors"]:
         print(f"Reportability errors: {manifest['reportability_errors']}")
+        # --strict must fail on writer-discovered reportability errors (row validation, duplicates,
+        # mixed provenance), not just reader errors, so a CI/batch job cannot treat a
+        # non-reportable feature table as a successful build.
+        if args.strict:
+            preview = "; ".join(str(error) for error in manifest["reportability_errors"][:20])
+            raise SystemExit(f"news_llm_v1 feature build failed strict reportability: {preview}")
     return 0
 
 

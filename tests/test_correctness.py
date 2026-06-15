@@ -6350,6 +6350,77 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "news_article_ticker_llm.parquet").exists())
             self.assertTrue((Path(directory) / "news_article_ticker_llm.nonreportable.parquet").exists())
 
+    def test_news_llm_validation_rejects_nonzero_temperature(self) -> None:
+        from rl_quant.features.news_llm import validate_news_llm_rows
+
+        # A sampled (nonzero-temperature) extraction must be non-reportable, so the generator
+        # recording the ACTUAL temperature makes such rows fail validation rather than masquerade
+        # as deterministic.
+        errors = validate_news_llm_rows([self._valid_news_llm_row(extractor_temperature=0.7)])
+        self.assertTrue(any("extractor_temperature" in error for error in errors))
+        # A boolean in a continuous-score field is rejected (not silently coerced to 0/1).
+        bad_bool = validate_news_llm_rows([self._valid_news_llm_row(confidence=True)])
+        self.assertTrue(any("confidence" in error for error in bad_bool))
+
+    def test_news_llm_nonreportable_write_quarantines_and_reader_skips(self) -> None:
+        if importlib.util.find_spec("pandas") is None or importlib.util.find_spec("pyarrow") is None:
+            self.skipTest("pandas/pyarrow required for feature-table write test")
+        from rl_quant.features.news_llm import read_news_llm_rows
+
+        common = dict(
+            article_manifest=None,
+            model_id="m",
+            model_available_timestamp_ms=0,
+            model_training_cutoff_utc="unknown",
+            provider="local_transformers",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # First a valid build -> canonical table exists and is readable.
+            write_news_llm_feature_outputs(rows=[self._valid_news_llm_row()], output_root=root, **common)
+            self.assertTrue((root / "news_article_ticker_llm.parquet").exists())
+            self.assertEqual(len(read_news_llm_rows(root)), 1)
+            # Then a non-reportable (mixed-provenance) build -> canonical removed, reader fails closed.
+            write_news_llm_feature_outputs(
+                rows=[
+                    self._valid_news_llm_row(article_id="a1", llm_prompt_hash="p1"),
+                    self._valid_news_llm_row(article_id="a2", llm_prompt_hash="p2"),
+                ],
+                output_root=root,
+                **common,
+            )
+            self.assertFalse((root / "news_article_ticker_llm.parquet").exists())
+            self.assertEqual(read_news_llm_rows(root), [])
+            self.assertEqual(len(read_news_llm_rows(root, allow_nonreportable=True)), 2)
+
+    def test_news_llm_aggregate_mean_masked_when_no_news_but_count_valid(self) -> None:
+        from rl_quant.features.news_llm import build_deterministic_news_llm_rows
+
+        article = {
+            "article_id": "article-1",
+            "published_utc": "2026-01-05T15:00:00+00:00",
+            "published_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "source_available_timestamp_ms": iso_to_timestamp_ms("2026-01-05T15:00:00+00:00"),
+            "title": "QQQ outlook",
+            "description": "Mixed update.",
+            "tickers_json": json.dumps(["QQQ"]),
+            "primary_ticker": "QQQ",
+        }
+        rows = build_deterministic_news_llm_rows(
+            [article], model_available_timestamp_ms=0, vendor_latency_seconds=300, processing_latency_seconds=60
+        )
+        # A decision BEFORE the row becomes available: the window is empty.
+        before = iso_to_timestamp_ms("2026-01-05T15:05:59+00:00")
+        count_idx = NEWS_LLM_AGGREGATE_FEATURE_NAMES.index("log1p_llm_weighted_news_count_1h")
+        sentiment_idx = NEWS_LLM_AGGREGATE_FEATURE_NAMES.index("llm_net_sentiment_1d")
+        _values, mask, _available, _age = aggregate_news_llm_features_for_symbol(
+            rows=rows, decision_ms=before, source_available=True
+        )
+        # Count feature is valid (0 = "no news"); the mean/sentiment feature is masked invalid so a
+        # 0.0 cannot be confused with neutral sentiment.
+        self.assertTrue(mask[count_idx])
+        self.assertFalse(mask[sentiment_idx])
+
 
 if __name__ == "__main__":
     unittest.main()
