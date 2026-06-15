@@ -1914,6 +1914,8 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual([row["ticker"] for row in rows], ["QQQ"])
 
     def test_news_llm_feature_manifest_records_recommended_model_stack(self) -> None:
+        if importlib.util.find_spec("pandas") is None:
+            self.skipTest("pandas is required for Parquet news LLM feature output tests")
         article = {
             "article_id": "article-1",
             "published_utc": "2026-01-05T15:00:00+00:00",
