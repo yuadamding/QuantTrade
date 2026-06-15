@@ -61,7 +61,9 @@ def main() -> int:
         "rows": len(payload["decision_timestamps"]),
         "actions": payload["action_names"],
         "cash": summarize_returns(net[:, 0]),
-        "oracle_best_valid_action": summarize_returns(best_returns),
+        "diagnostic_only": True,
+        "diagnostic_oracle_best_valid_action_future_leakage": summarize_returns(best_returns),
+        "forbidden_model_selection_metrics": ["diagnostic_oracle_best_valid_action_future_leakage"],
         "valid_action_fraction": float(valid.float().mean().item()),
         "dataset_manifest": payload.get("dataset_manifest", {}),
     }

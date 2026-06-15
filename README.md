@@ -80,8 +80,8 @@ Second-context decision allocator:
 - State: sparse second bars are compressed into cross-sectional market/liquidity/breadth context blocks.
 - Decision frequency: 5m, 15m, 30m, or 60m; the default target is 15m/30m rather than second-by-second trading.
 - Actions: `CASH` plus tradable action instruments with their own bar data, validity masks, and per-action costs.
-- Reward: action close-to-close return from the decision execution point to the next decision, net of action-specific cost.
-- Causality: a second bar timestamp is treated as the start of its aggregate interval; default `bar_latency_ms=1000` means a decision at `T` can use bars only through `T - 1s`.
+- Reward: action close-to-close return from the post-decision execution point to the post-reward execution point, net of action-specific cost.
+- Causality: a second bar timestamp is treated as the start of its aggregate interval; default `bar_latency_ms=1000` means a decision at `T` can use context bars only through `T - 1s`, and default `execution_latency_ms=1000` means non-cash action fills must occur at or after `T + 1s`.
 - Model: action-conditioned transformer scores each action from market context, action features, portfolio state, and constraint state.
 
 Correctness contract:
@@ -129,7 +129,7 @@ Polygon second-bar bronze layer:
 
 Second-context gold dataset:
 
-- `dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `market_context`, `market_context_mask`, `market_context_available_timestamps_ms`, `action_features`, `action_returns`, `action_valid_mask`, `action_cost_bps`, `portfolio_state`, `constraint_state`, feature names, action names, `dataset_manifest`, and `data_quality_report`.
+- `dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `market_context`, `market_context_mask`, `market_context_available_timestamps_ms`, `action_features`, `action_returns`, `action_valid_mask`, `action_cost_bps`, `entry_execution_timestamps_ms`, `exit_execution_timestamps_ms`, `portfolio_state`, `constraint_state`, feature names, action names, `dataset_manifest`, and `data_quality_report`.
 - `market_context`: `[decisions, lookback_blocks, market_feature_count]`, where each block is compressed from sparse 1-second stock bars.
 - `action_returns`: finite only when the matching `action_valid_mask` is true; invalid entries are stored as `NaN`.
 - `action_cost_bps`: per-action cost estimates; `CASH` must be valid with zero return and zero cost.
@@ -281,7 +281,7 @@ conda run -n ml1 python scripts/audit_polygon_second_aggs.py \
   --root /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15 \
   --manifest /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/manifest.csv \
   --dataset-manifest /home/yding1995/quant/data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/dataset_manifest.json \
-  --source-access "AWS S3"
+  --source-access REST
 ```
 
 Build compact silver features from stock second bars:
@@ -290,7 +290,8 @@ Build compact silver features from stock second bars:
 conda run -n ml1 python scripts/build_stock_second_silver_features.py \
   --start 2026-06-12T00:00:00+00:00 \
   --end-exclusive 2026-06-13T00:00:00+00:00 \
-  --block-seconds 300
+  --block-seconds 300 \
+  --smoke
 ```
 
 Build a gold second-context decision dataset. Stock second bars provide market
@@ -303,13 +304,16 @@ conda run -n ml1 python scripts/build_second_context_decision_dataset.py \
   --context-seconds 3600 \
   --block-seconds 300 \
   --bar-latency-ms 1000 \
-  --actions CASH,QQQ,SPY
+  --actions CASH,QQQ,SPY \
+  --smoke
 ```
 
-Train and evaluate the action-conditioned second-context model:
+Train and evaluate the action-conditioned second-context action scorer. This is
+a contextual action scorer baseline, not a full sequential RL trading policy;
+use the sequential switch-cost metrics for trading-policy diagnostics.
 
 ```bash
-conda run -n ml1 python scripts/train_second_context_rl.py --device auto --amp
+conda run -n ml1 python scripts/train_second_context_action_scorer.py --device auto --amp
 conda run -n ml1 python scripts/evaluate_second_context_dataset.py
 ```
 

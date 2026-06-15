@@ -49,7 +49,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start", default="2026-06-12T00:00:00+00:00")
     parser.add_argument("--end-exclusive", default="2026-06-13T00:00:00+00:00")
     parser.add_argument("--block-seconds", type=int, default=300)
-    parser.add_argument("--min-active-symbols", type=int, default=10)
+    parser.add_argument("--min-active-symbols", type=int)
+    parser.add_argument("--smoke", action="store_true", help="Use small smoke-test defaults such as min_active_symbols=10.")
     parser.add_argument("--symbol-limit", type=int, default=500)
     parser.add_argument("--max-files", type=int, default=0, help="Limit source files for smoke builds. 0 means no limit.")
     parser.add_argument("--include-extended-hours", action="store_true")
@@ -58,6 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    min_active_symbols = args.min_active_symbols if args.min_active_symbols is not None else (10 if args.smoke else 250)
     rows = load_manifest(args.stock_second_manifest)
     config = PolygonSecondAggConfig(
         root=args.stock_second_root,
@@ -90,7 +92,7 @@ def main() -> int:
         decision_interval=f"{args.block_seconds}s",
         context_seconds=args.block_seconds,
         block_seconds=args.block_seconds,
-        min_active_symbols=args.min_active_symbols,
+        min_active_symbols=min_active_symbols,
         include_extended_hours=args.include_extended_hours,
         rth_only=not args.include_extended_hours,
     )

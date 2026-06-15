@@ -57,9 +57,12 @@ MARKET_CONTEXT_FEATURE_NAMES = [
 ]
 
 ACTION_FEATURE_NAMES = [
+    "action_index_scaled",
     "is_cash",
+    "is_etf",
+    "is_stock",
     "valid_price_flag",
-    "staleness_seconds",
+    "execution_delay_seconds",
     "log_last_dollar_volume",
     "estimated_cost_bps",
 ]
@@ -77,6 +80,7 @@ class StockSecondContextConfig:
     ingestion_latency_ms: int = 0
     min_active_symbols: int = 250
     max_action_staleness_seconds: int = 300
+    execution_latency_ms: int = DEFAULT_BAR_LATENCY_MS
     default_action_cost_bps: float = 1.0
     max_action_cost_bps: float = 25.0
     rth_only: bool = True
@@ -100,6 +104,8 @@ class StockSecondContextConfig:
             raise ValueError("min_active_symbols must be positive.")
         if self.max_action_staleness_seconds < 0:
             raise ValueError("max_action_staleness_seconds must be non-negative.")
+        if self.execution_latency_ms < 0:
+            raise ValueError("execution_latency_ms must be non-negative.")
         if self.default_action_cost_bps < 0 or self.max_action_cost_bps < self.default_action_cost_bps:
             raise ValueError("action cost bps settings are invalid.")
         if self.rth_only and self.include_extended_hours:
@@ -363,23 +369,60 @@ def _close_lookup(frame: Any) -> tuple[list[int], list[float], list[float]]:
     return timestamps, closes, dollar_volume
 
 
-def _close_at_or_before(
+def _close_at_or_after(
     lookup: tuple[list[int], list[float], list[float]],
     timestamp_ms: int,
     *,
     max_staleness_seconds: int,
 ) -> tuple[float, int, float] | None:
     timestamps, closes, dollar_volumes = lookup
-    pos = bisect.bisect_right(timestamps, int(timestamp_ms)) - 1
-    if pos < 0:
+    pos = bisect.bisect_left(timestamps, int(timestamp_ms))
+    if pos >= len(timestamps):
         return None
-    age_ms = int(timestamp_ms) - int(timestamps[pos])
-    if age_ms < 0 or age_ms > max_staleness_seconds * 1000:
+    delay_ms = int(timestamps[pos]) - int(timestamp_ms)
+    if delay_ms < 0 or delay_ms > max_staleness_seconds * 1000:
         return None
     close = closes[pos]
     if not math.isfinite(close) or close <= 0:
         return None
     return close, timestamps[pos], dollar_volumes[pos]
+
+
+ETF_SYMBOLS = {
+    "ARKK",
+    "DIA",
+    "EEM",
+    "EFA",
+    "GLD",
+    "HYG",
+    "IWM",
+    "IVV",
+    "LQD",
+    "QQQ",
+    "SQQQ",
+    "SLV",
+    "SMH",
+    "SOXL",
+    "SOXS",
+    "SPY",
+    "TBT",
+    "TLT",
+    "TQQQ",
+    "UNG",
+    "USO",
+    "VTI",
+    "XBI",
+    "XLE",
+    "XLF",
+    "XLK",
+    "XLU",
+}
+
+
+def _action_type_flags(symbol: str) -> tuple[float, float]:
+    if symbol.upper() in ETF_SYMBOLS:
+        return 1.0, 0.0
+    return 0.0, 1.0
 
 
 def _estimate_cost_bps(dollar_volume: float, config: StockSecondContextConfig) -> float:
@@ -426,52 +469,68 @@ def build_second_context_payload(
     action_returns: list[list[float]] = []
     action_valid_mask: list[list[bool]] = []
     action_cost_bps: list[list[float]] = []
-    latency_ms = config.bar_latency_ms + config.ingestion_latency_ms
+    execution_latency_ms = config.execution_latency_ms
+    entry_execution_timestamps_ms: list[list[int]] = []
+    exit_execution_timestamps_ms: list[list[int]] = []
+    action_count_denom = max(len(action_names) - 1, 1)
     for decision_ms, next_ms, context_mask in zip(decision_timestamps_ms, next_timestamps_ms, market_mask):
         decision_action_features: list[list[float]] = []
         decision_returns: list[float] = []
         decision_valid: list[bool] = []
         decision_costs: list[float] = []
+        decision_entry_ts: list[int] = []
+        decision_exit_ts: list[int] = []
         valid_context_fraction = float(context_mask.float().mean().item())
-        for action in action_names:
+        for action_index, action in enumerate(action_names):
             symbol = action.upper()
+            action_index_scaled = action_index / action_count_denom
             if symbol == "CASH":
-                decision_action_features.append([1.0, 1.0, 0.0, 0.0, 0.0])
+                decision_action_features.append([action_index_scaled, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
                 decision_returns.append(0.0)
                 decision_valid.append(True)
                 decision_costs.append(0.0)
+                decision_entry_ts.append(int(decision_ms))
+                decision_exit_ts.append(int(next_ms))
                 continue
             lookup = action_lookups.get(symbol)
-            current = None if lookup is None else _close_at_or_before(
+            current = None if lookup is None else _close_at_or_after(
                 lookup,
-                decision_ms - latency_ms,
+                decision_ms + execution_latency_ms,
                 max_staleness_seconds=config.max_action_staleness_seconds,
             )
-            future = None if lookup is None else _close_at_or_before(
+            future = None if lookup is None else _close_at_or_after(
                 lookup,
-                next_ms - latency_ms,
+                next_ms + execution_latency_ms,
                 max_staleness_seconds=config.max_action_staleness_seconds,
             )
             valid = current is not None and future is not None and valid_context_fraction > 0.0
             if current is None:
-                staleness = float(config.max_action_staleness_seconds + 1)
+                execution_delay = float(config.max_action_staleness_seconds + 1)
                 last_dv = 0.0
                 cost = config.max_action_cost_bps
+                entry_ts = -1
             else:
-                _close, close_ts_ms, last_dv = current
-                staleness = max(0.0, (decision_ms - latency_ms - close_ts_ms) / 1000.0)
+                _close, entry_ts, last_dv = current
+                execution_delay = max(0.0, (entry_ts - (decision_ms + execution_latency_ms)) / 1000.0)
                 cost = _estimate_cost_bps(last_dv, config)
+            exit_ts = -1 if future is None else int(future[1])
+            is_etf, is_stock = _action_type_flags(symbol)
             decision_action_features.append(
                 [
+                    action_index_scaled,
                     0.0,
+                    is_etf,
+                    is_stock,
                     float(valid),
-                    staleness,
+                    execution_delay,
                     math.log1p(max(last_dv, 0.0)),
                     cost,
                 ]
             )
             decision_costs.append(cost)
             decision_valid.append(bool(valid))
+            decision_entry_ts.append(int(entry_ts))
+            decision_exit_ts.append(int(exit_ts))
             if valid and current is not None and future is not None:
                 decision_returns.append(max(min(future[0] / current[0] - 1.0, 1.0), -1.0))
             else:
@@ -480,6 +539,8 @@ def build_second_context_payload(
         action_returns.append(decision_returns)
         action_valid_mask.append(decision_valid)
         action_cost_bps.append(decision_costs)
+        entry_execution_timestamps_ms.append(decision_entry_ts)
+        exit_execution_timestamps_ms.append(decision_exit_ts)
 
     action_valid = torch.tensor(action_valid_mask, dtype=torch.bool)
     quality_by_row = market_mask.float().mean(dim=1).clamp(0.0, 1.0)
@@ -504,6 +565,8 @@ def build_second_context_payload(
         reportability_errors.append("source_download_incomplete")
     if not report:
         reportability_errors.append("data_quality_report_missing")
+    if config.min_active_symbols < max(1, len(stock_frames_by_symbol) // 2):
+        reportability_errors.append("min_active_symbols_too_low_for_reportable_dataset")
     manifest = {
         **base_manifest,
         "schema_version": "stock_second_context_decision_v2",
@@ -516,6 +579,7 @@ def build_second_context_payload(
         "lookback_blocks": config.lookback_blocks,
         "bar_latency_ms": config.bar_latency_ms,
         "ingestion_latency_ms": config.ingestion_latency_ms,
+        "execution_latency_ms": config.execution_latency_ms,
         "source_download_complete": source_download_complete,
         "reportable": source_download_complete and not reportability_errors,
         "reportability_errors": list(dict.fromkeys(reportability_errors)),
@@ -523,7 +587,7 @@ def build_second_context_payload(
             *config.known_limitations,
             "Top-stock second bars provide market context; action returns require separate tradable action bars.",
             "Sparse seconds are preserved through masks and active-second features.",
-            "Adjusted aggregate bars are not live-realistic execution prices.",
+            "Action-return labels use first available action bar at or after the decision and reward timestamps.",
         ],
     }
     payload = {
@@ -539,6 +603,10 @@ def build_second_context_payload(
         "action_returns": torch.tensor(action_returns, dtype=torch.float32),
         "action_valid_mask": action_valid,
         "action_cost_bps": torch.tensor(action_cost_bps, dtype=torch.float32),
+        "entry_execution_timestamps_ms": torch.tensor(entry_execution_timestamps_ms, dtype=torch.long),
+        "exit_execution_timestamps_ms": torch.tensor(exit_execution_timestamps_ms, dtype=torch.long),
+        "entry_price_source": "first_action_close_at_or_after_decision_plus_execution_latency",
+        "exit_price_source": "first_action_close_at_or_after_reward_end_plus_execution_latency",
         "portfolio_state": portfolio_state,
         "constraint_state": constraint_state,
         "feature_names": {
@@ -567,6 +635,8 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
     required = {
         "decision_timestamps",
         "next_timestamps",
+        "entry_execution_timestamps_ms",
+        "exit_execution_timestamps_ms",
         "market_context",
         "market_context_mask",
         "market_context_available_timestamps_ms",
@@ -601,6 +671,8 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
     action_returns = payload["action_returns"].float()
     action_valid = payload["action_valid_mask"].bool()
     action_costs = payload["action_cost_bps"].float()
+    entry_execution = payload["entry_execution_timestamps_ms"].long()
+    exit_execution = payload["exit_execution_timestamps_ms"].long()
     rows = len(decisions)
     if market.ndim != 3 or market.shape[0] != rows:
         raise ValueError("market_context must have shape [rows, lookback_blocks, features].")
@@ -617,6 +689,10 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError("action_valid_mask shape must match action_returns.")
     if tuple(action_costs.shape) != tuple(action_returns.shape):
         raise ValueError("action_cost_bps shape must match action_returns.")
+    if tuple(entry_execution.shape) != tuple(action_returns.shape):
+        raise ValueError("entry_execution_timestamps_ms shape must match action_returns.")
+    if tuple(exit_execution.shape) != tuple(action_returns.shape):
+        raise ValueError("exit_execution_timestamps_ms shape must match action_returns.")
     if action_features.shape[:2] != action_returns.shape:
         raise ValueError("action_features first two dimensions must match action_returns.")
     if bool((action_costs < 0).any().item()):
@@ -625,11 +701,31 @@ def validate_second_context_payload(payload: Mapping[str, Any]) -> None:
         raise ValueError("CASH action must be valid for every row.")
     if not bool(torch.isfinite(action_returns[action_valid]).all().item()):
         raise ValueError("Valid action_returns must be finite.")
+    if bool((action_returns[:, 0].abs() > 1e-12).any().item()):
+        raise ValueError("CASH action return must be zero.")
     invalid_returns = action_returns[~action_valid]
     if invalid_returns.numel() and not bool(torch.isnan(invalid_returns).all().item()):
         raise ValueError("Invalid action_returns must be NaN.")
     if abs(float(action_costs[:, 0].abs().max().item())) > 1e-12:
         raise ValueError("CASH action cost must be zero.")
+    non_cash_valid = action_valid.clone()
+    non_cash_valid[:, 0] = False
+    decision_ms_tensor = torch.tensor(decision_ms, dtype=torch.long).unsqueeze(1).expand_as(action_valid)
+    next_ms_tensor = torch.tensor(next_ms, dtype=torch.long).unsqueeze(1).expand_as(action_valid)
+    if bool((entry_execution[non_cash_valid] < decision_ms_tensor[non_cash_valid]).any().item()):
+        raise ValueError("Valid non-CASH entry executions must be at or after the decision timestamp.")
+    if bool((exit_execution[non_cash_valid] < next_ms_tensor[non_cash_valid]).any().item()):
+        raise ValueError("Valid non-CASH exit executions must be at or after the reward end timestamp.")
+    config = payload.get("config", {})
+    if isinstance(config, Mapping):
+        execution_latency_ms = int(config.get("execution_latency_ms", 0) or 0)
+        if execution_latency_ms > 0:
+            entry_min = decision_ms_tensor + execution_latency_ms
+            exit_min = next_ms_tensor + execution_latency_ms
+            if bool((entry_execution[non_cash_valid] < entry_min[non_cash_valid]).any().item()):
+                raise ValueError("Valid non-CASH entry executions must respect execution latency.")
+            if bool((exit_execution[non_cash_valid] < exit_min[non_cash_valid]).any().item()):
+                raise ValueError("Valid non-CASH exit executions must respect execution latency.")
     if any(not name for name in payload["action_names"]):
         raise ValueError("action_names must be non-empty strings.")
     if str(payload["action_names"][0]).upper() != "CASH":

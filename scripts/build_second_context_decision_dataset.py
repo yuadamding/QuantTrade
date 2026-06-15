@@ -55,7 +55,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--block-seconds", type=int, default=300)
     parser.add_argument("--bar-latency-ms", type=int, default=1000)
     parser.add_argument("--ingestion-latency-ms", type=int, default=0)
-    parser.add_argument("--min-active-symbols", type=int, default=10)
+    parser.add_argument("--execution-latency-ms", type=int, default=1000)
+    parser.add_argument("--min-active-symbols", type=int)
+    parser.add_argument("--smoke", action="store_true", help="Use small smoke-test defaults such as min_active_symbols=10.")
     parser.add_argument("--symbol-limit", type=int, default=500)
     parser.add_argument("--max-files", type=int, default=0, help="Limit stock source files for smoke builds. 0 means no limit.")
     parser.add_argument("--actions", default="CASH,QQQ,SPY", help="Comma-separated action symbols; CASH is added if absent.")
@@ -96,6 +98,7 @@ def load_frames(paths: list[Path], *, include_extended_hours: bool) -> object:
 
 def main() -> int:
     args = parse_args()
+    min_active_symbols = args.min_active_symbols if args.min_active_symbols is not None else (10 if args.smoke else 250)
     rows = load_manifest(args.stock_second_manifest)
     source_access = None if args.source_access == "auto" else args.source_access
     source_config = PolygonSecondAggConfig(
@@ -166,7 +169,8 @@ def main() -> int:
         block_seconds=args.block_seconds,
         bar_latency_ms=args.bar_latency_ms,
         ingestion_latency_ms=args.ingestion_latency_ms,
-        min_active_symbols=args.min_active_symbols,
+        execution_latency_ms=args.execution_latency_ms,
+        min_active_symbols=min_active_symbols,
         max_action_staleness_seconds=args.max_action_staleness_seconds,
         include_extended_hours=args.include_extended_hours,
         rth_only=not args.include_extended_hours,
