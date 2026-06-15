@@ -20,9 +20,11 @@ from rl_quant.core import (
     make_grad_scaler,
 )
 from rl_quant.trading_constraints import (
+    CONSTRAINT_FEATURE_DIM,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
+    make_constraint_features,
     sample_valid_actions,
     trade_legs,
 )
@@ -244,12 +246,14 @@ class CausalTransformerQNetwork(nn.Module):
         feedforward_dim: int = 768,
         dropout: float = 0.05,
         action_embedding_dim: int = 32,
+        constraint_feature_dim: int = CONSTRAINT_FEATURE_DIM,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
         self.lookback = int(lookback)
         self.action_count = int(action_count)
+        self.constraint_feature_dim = int(constraint_feature_dim)
         self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.input_proj = nn.Sequential(
             nn.Linear(feature_dim, d_model),
@@ -259,6 +263,7 @@ class CausalTransformerQNetwork(nn.Module):
         self.position_embedding = nn.Parameter(torch.zeros(lookback, d_model))
         self.previous_action_embedding = nn.Embedding(action_count, action_embedding_dim)
         self.previous_action_proj = nn.Linear(action_embedding_dim, d_model)
+        self.constraint_proj = nn.Linear(self.constraint_feature_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -288,14 +293,27 @@ class CausalTransformerQNetwork(nn.Module):
             self._mask_cache[key] = mask
         return mask
 
-    def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        state_windows: torch.Tensor,
+        previous_actions: torch.Tensor,
+        constraint_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         length = state_windows.shape[1]
         if length > self.lookback:
             raise ValueError(f"Window length {length} exceeds configured lookback {self.lookback}.")
+        if constraint_features is None:
+            constraint_features = torch.zeros(
+                state_windows.shape[0],
+                self.constraint_feature_dim,
+                dtype=state_windows.dtype,
+                device=state_windows.device,
+            )
         x = self.input_proj(state_windows)
         x = x + self.position_embedding[-length:][None, :, :]
         action_context = self.previous_action_proj(self.previous_action_embedding(previous_actions.long()))
-        x = x + action_context[:, None, :]
+        constraint_context = self.constraint_proj(constraint_features.float())
+        x = x + action_context[:, None, :] + constraint_context[:, None, :]
         x = self.encoder(x, mask=self._causal_mask(length, x.device))
         return self.head(self.out_norm(x[:, -1, :]))
 
@@ -405,12 +423,25 @@ class VectorizedHourlyAllocationEnv:
             count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
 
-    def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.data.state_windows(self.indices), self.previous_actions, self.action_mask()
+    def constraint_features(self) -> torch.Tensor:
+        return make_constraint_features(
+            bars_held=self.bars_held,
+            cooldown_remaining=self.cooldown_remaining,
+            switches_today=self.switches_today,
+            switches_episode=self.switches_episode,
+            constraints=self.config.constraints,
+            episode_length=self.config.episode_length,
+            order_legs_today=self.order_legs_today,
+            order_legs_episode=self.order_legs_episode,
+        )
+
+    def observe(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.data.state_windows(self.indices), self.previous_actions, self.constraint_features(), self.action_mask()
 
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
         previous_actions = self.previous_actions.clone()
+        constraint_features = self.constraint_features()
         action_mask = self.action_mask()
         actions = actions.long()
         actions = torch.where(action_mask.gather(1, actions.unsqueeze(1)).squeeze(1), actions, previous_actions)
@@ -460,11 +491,13 @@ class VectorizedHourlyAllocationEnv:
         return {
             "indices": current_indices,
             "previous_actions": previous_actions,
+            "constraint_features": constraint_features,
             "action_mask": action_mask,
             "actions": actions,
             "rewards": rewards,
             "next_indices": next_indices,
             "next_previous_actions": self.previous_actions,
+            "next_constraint_features": self.constraint_features(),
             "next_action_mask": next_action_mask,
             "dones": dones.float(),
             "legs": legs,
@@ -549,6 +582,16 @@ def evaluate_hourly_policy(
             episode_steps = 0
         index_tensor = torch.tensor([index], dtype=torch.long, device=device)
         previous_tensor = torch.tensor([previous_action], dtype=torch.long, device=device)
+        constraint_features = make_constraint_features(
+            bars_held=torch.tensor([bars_held], dtype=torch.long, device=device),
+            cooldown_remaining=torch.tensor([cooldown_remaining], dtype=torch.long, device=device),
+            switches_today=torch.tensor([switches_today], dtype=torch.long, device=device),
+            switches_episode=torch.tensor([switches_episode], dtype=torch.long, device=device),
+            constraints=constraints,
+            episode_length=int(episode_length or max(int(data.valid_start_indices.numel()), 1)),
+            order_legs_today=torch.tensor([order_legs_today], dtype=torch.float32, device=device),
+            order_legs_episode=torch.tensor([order_legs_episode], dtype=torch.float32, device=device),
+        )
         action_mask = build_action_mask(
             current_action=previous_tensor,
             bars_held=torch.tensor([bars_held], dtype=torch.long, device=device),
@@ -566,7 +609,7 @@ def evaluate_hourly_policy(
             cash_index=constraints.cash_index,
             count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
         )
-        q_values = model(data.state_windows(index_tensor), previous_tensor)
+        q_values = model(data.state_windows(index_tensor), previous_tensor, constraint_features)
         action = int(
             apply_leg_aware_hysteresis(
                 q_values,
@@ -610,6 +653,8 @@ def evaluate_hourly_policy(
                     "previous_action": previous_action,
                     "segment_reset": int(segment_reset),
                     "market_order_legs": legs,
+                    "gross_return": round(gross_return, 8),
+                    "cost_bps": round(cost_bps, 8),
                     "bar_interval": data.bar_interval,
                     "bar_return": round(net_return, 8),
                     "hourly_return": round(net_return, 8),
@@ -719,11 +764,13 @@ def train_hourly_transformer_dqn(
         fields={
             "indices": ((), torch.long),
             "previous_actions": ((), torch.long),
+            "constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
             "action_mask": ((action_count,), torch.bool),
             "actions": ((), torch.long),
             "rewards": ((), torch.float32),
             "next_indices": ((), torch.long),
             "next_previous_actions": ((), torch.long),
+            "next_constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
             "next_action_mask": ((action_count,), torch.bool),
             "dones": ((), torch.float32),
         },
@@ -746,7 +793,7 @@ def train_hourly_transformer_dqn(
     eval_trace: list[dict[str, float | int | None | str]] = []
 
     for step in range(1, config.learning.train_steps + 1):
-        states, previous_actions, action_mask = env.observe()
+        states, previous_actions, constraint_features, action_mask = env.observe()
         valid_action_count_trace.append(float(action_mask.sum(dim=1).float().mean().item()))
         epsilon = epsilon_by_step(
             step=step,
@@ -756,7 +803,7 @@ def train_hourly_transformer_dqn(
         )
         with torch.no_grad():
             with autocast_context(device, config.learning.use_amp):
-                q_values = q_network(states, previous_actions)
+                q_values = q_network(states, previous_actions, constraint_features)
             greedy_actions = apply_leg_aware_hysteresis(
                 q_values,
                 previous_actions,
@@ -782,15 +829,36 @@ def train_hourly_transformer_dqn(
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(batch["next_indices"])
             with autocast_context(device, config.learning.use_amp):
-                chosen_q = q_network(current_states, batch["previous_actions"]).gather(
+                chosen_q = q_network(
+                    current_states,
+                    batch["previous_actions"],
+                    batch["constraint_features"],
+                ).gather(
                     1,
                     batch["actions"].unsqueeze(1),
                 ).squeeze(1)
                 with torch.no_grad():
-                    next_online = q_network(next_states, batch["next_previous_actions"])
-                    next_online = next_online.masked_fill(~batch["next_action_mask"], torch.finfo(next_online.dtype).min)
-                    next_actions = torch.argmax(next_online, dim=1)
-                    next_q = target_network(next_states, batch["next_previous_actions"]).gather(
+                    next_online = q_network(
+                        next_states,
+                        batch["next_previous_actions"],
+                        batch["next_constraint_features"],
+                    )
+                    next_actions = apply_leg_aware_hysteresis(
+                        next_online,
+                        batch["next_previous_actions"],
+                        batch["next_action_mask"],
+                        one_way_cost_bps=config.env.constraints.one_way_cost_bps,
+                        extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
+                        q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
+                        cash_index=config.env.constraints.cash_index,
+                        reward_scale=config.env.reward_scale,
+                        count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
+                    )
+                    next_q = target_network(
+                        next_states,
+                        batch["next_previous_actions"],
+                        batch["next_constraint_features"],
+                    ).gather(
                         1,
                         next_actions.unsqueeze(1),
                     ).squeeze(1)

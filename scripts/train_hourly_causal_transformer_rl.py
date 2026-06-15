@@ -99,6 +99,85 @@ def unique_cost_stresses(values: list[float]) -> list[float]:
     return sorted({float(value) for value in values})
 
 
+def metric_sharpe(values: list[float], *, periods_per_year: float) -> float | None:
+    if len(values) < 2:
+        return None
+    avg = sum(values) / len(values)
+    variance = sum((value - avg) ** 2 for value in values) / len(values)
+    if variance <= 0:
+        return None
+    return avg / (variance**0.5) * (periods_per_year**0.5)
+
+
+def metric_max_drawdown(equity_curve: list[float]) -> float:
+    peak = equity_curve[0] if equity_curve else 1.0
+    worst = 0.0
+    for value in equity_curve:
+        peak = max(peak, value)
+        if peak > 0:
+            worst = min(worst, value / peak - 1.0)
+    return worst
+
+
+def fixed_rollout_cost_stress(
+    rollout_records: list[dict[str, object]],
+    *,
+    cost_bps_values: list[float],
+    extra_switch_penalty_bps: float,
+    periods_per_year: float,
+) -> dict[str, dict[str, float | int | None]]:
+    results: dict[str, dict[str, float | int | None]] = {}
+    for cost_bps in unique_cost_stresses(cost_bps_values):
+        equity = 1.0
+        equity_curve = [equity]
+        returns: list[float] = []
+        switches = 0
+        order_legs = 0.0
+        for record in rollout_records:
+            action = int(record["action"])
+            previous_action = int(record["previous_action"])
+            legs = float(record["market_order_legs"])
+            is_switch = action != previous_action
+            gross_return = float(record["gross_return"] if "gross_return" in record else record["bar_return"])
+            realized_cost_bps = legs * float(cost_bps) + float(is_switch) * float(extra_switch_penalty_bps)
+            net_return = gross_return - realized_cost_bps / 10_000.0
+            equity *= 1.0 + net_return
+            equity_curve.append(equity)
+            returns.append(net_return)
+            switches += int(is_switch)
+            order_legs += legs
+        results[f"{cost_bps:g}bps"] = {
+            "total_return": equity - 1.0,
+            "total_reward_bps": sum(returns) * 10_000.0,
+            "total_switches": switches,
+            "market_order_legs": order_legs,
+            "max_drawdown": metric_max_drawdown(equity_curve),
+            "annualized_sharpe": metric_sharpe(returns, periods_per_year=periods_per_year),
+        }
+    return results
+
+
+def equal_weight_metrics(split, *, cash_index: int) -> dict[str, float | int | None]:
+    action_indices = [idx for idx in range(len(split.action_names)) if idx != cash_index]
+    if not action_indices:
+        action_indices = [cash_index]
+    equity = 1.0
+    equity_curve = [equity]
+    returns: list[float] = []
+    for index in split.valid_start_indices.detach().cpu().tolist():
+        simple_return = float(split.action_returns[index, action_indices].mean().item())
+        equity *= 1.0 + simple_return
+        equity_curve.append(equity)
+        returns.append(simple_return)
+    return {
+        "total_return": equity - 1.0,
+        "max_drawdown": metric_max_drawdown(equity_curve),
+        "annualized_sharpe": metric_sharpe(returns, periods_per_year=split.periods_per_year),
+        "total_switches": 0,
+        "market_order_legs": 0.0,
+    }
+
+
 def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
     if not records:
         return
@@ -238,7 +317,7 @@ def main() -> int:
         episode_length=args.episode_length,
         capture_rollout=True,
     )
-    cost_stress = {
+    adaptive_cost_stress = {
         f"{cost_bps:g}bps": evaluate_hourly_policy(
             test_split.to(device),
             model,
@@ -249,6 +328,48 @@ def main() -> int:
             episode_length=args.episode_length,
         ).to_dict()
         for cost_bps in unique_cost_stresses(args.cost_stress_bps)
+    }
+    fixed_cost_stress = fixed_rollout_cost_stress(
+        test_result.rollout_records,
+        cost_bps_values=args.cost_stress_bps,
+        extra_switch_penalty_bps=args.extra_switch_penalty_bps,
+        periods_per_year=test_split.periods_per_year,
+    )
+
+    class FixedActionPolicy(torch.nn.Module):
+        def __init__(self, *, action_count: int, action: int) -> None:
+            super().__init__()
+            self.action_count = int(action_count)
+            self.action = int(action)
+
+        def forward(self, state_windows, previous_actions, constraint_features=None):
+            q_values = torch.zeros((state_windows.shape[0], self.action_count), device=state_windows.device)
+            q_values[:, self.action] = 100.0
+            return q_values
+
+    def fixed_action_baseline(action_name: str) -> dict[str, object]:
+        action = action_index(train_split.action_names, action_name)
+        policy = FixedActionPolicy(action_count=len(train_split.action_names), action=action)
+        return {
+            split.name: evaluate_hourly_policy(
+                split,
+                policy,
+                device=torch.device("cpu"),
+                initial_action=initial_action,
+                switch_cost_bps=args.switch_cost_bps,
+                constraints=constraints,
+                episode_length=args.episode_length,
+            ).to_dict()
+            for split in (train_split, val_split, test_split)
+        }
+
+    baselines: dict[str, object] = {"CASH": fixed_action_baseline(train_split.action_names[cash_index])}
+    for action_name in ("QQQ", "SPY"):
+        if action_name in train_split.action_names:
+            baselines[f"BuyAndHold_{action_name}"] = fixed_action_baseline(action_name)
+    baselines["EqualWeight_ETFs"] = {
+        split.name: equal_weight_metrics(split, cash_index=cash_index)
+        for split in (train_split, val_split, test_split)
     }
 
     run_name = args.run_name or f"{train_split.bar_interval}_causal_transformer_{datetime.now():%Y%m%d_%H%M%S}"
@@ -287,7 +408,13 @@ def main() -> int:
         "train_metrics": train_result.to_dict(),
         "val_metrics": val_result.to_dict(),
         "test_metrics": test_result.to_dict(),
-        "cost_stress": cost_stress,
+        "baselines": baselines,
+        "cost_stress": {
+            "adaptive": adaptive_cost_stress,
+            "fixed_rollout": fixed_cost_stress,
+        },
+        "adaptive_cost_stress": adaptive_cost_stress,
+        "fixed_rollout_cost_stress": fixed_cost_stress,
     }
     with (run_dir / "summary.json").open("w") as sink:
         json.dump(summary, sink, indent=2)

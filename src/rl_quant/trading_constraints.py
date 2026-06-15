@@ -20,6 +20,9 @@ class TradingConstraintConfig:
     cash_index: int = 0
 
 
+CONSTRAINT_FEATURE_DIM = 6
+
+
 def trade_legs(
     previous_action: torch.Tensor,
     action: torch.Tensor,
@@ -36,6 +39,39 @@ def trade_legs(
     legs = torch.where(changed & prev_risky, legs + 1.0, legs)
     legs = torch.where(changed & next_risky, legs + 1.0, legs)
     return legs
+
+
+def make_constraint_features(
+    *,
+    bars_held: torch.Tensor,
+    cooldown_remaining: torch.Tensor,
+    switches_today: torch.Tensor,
+    switches_episode: torch.Tensor,
+    constraints: TradingConstraintConfig,
+    episode_length: int,
+    order_legs_today: torch.Tensor | None = None,
+    order_legs_episode: torch.Tensor | None = None,
+) -> torch.Tensor:
+    batch = bars_held.shape[0]
+    if order_legs_today is None:
+        order_legs_today = torch.zeros(batch, dtype=torch.float32, device=bars_held.device)
+    if order_legs_episode is None:
+        order_legs_episode = torch.zeros(batch, dtype=torch.float32, device=bars_held.device)
+    daily_switch_den = float(constraints.max_switches_per_day or episode_length)
+    episode_switch_den = float(constraints.max_switches_per_episode or episode_length)
+    daily_leg_den = float(constraints.max_order_legs_per_day or max(2 * episode_length, 1))
+    episode_leg_den = float(constraints.max_order_legs_per_episode or max(2 * episode_length, 1))
+    return torch.stack(
+        [
+            bars_held.float() / max(float(constraints.min_hold_bars), 1.0),
+            cooldown_remaining.float() / max(float(constraints.cooldown_bars), 1.0),
+            switches_today.float() / max(daily_switch_den, 1.0),
+            switches_episode.float() / max(episode_switch_den, 1.0),
+            order_legs_today.float() / max(daily_leg_den, 1.0),
+            order_legs_episode.float() / max(episode_leg_den, 1.0),
+        ],
+        dim=1,
+    ).clamp(0.0, 8.0)
 
 
 def build_action_mask(

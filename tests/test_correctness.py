@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from rl_quant.hourly_transformer import (  # noqa: E402
+    CausalTransformerQNetwork,
     HourlyDataSplit,
     HourlyEnvConfig,
     VectorizedHourlyAllocationEnv,
@@ -50,7 +51,10 @@ from rl_quant.strategy_data import (  # noqa: E402
     assert_matching_strategy_schema,
 )
 from rl_quant.strategy_dqn import evaluate_strategy_policy  # noqa: E402
-from rl_quant.trading_constraints import TradingConstraintConfig as BarTradingConstraintConfig  # noqa: E402
+from rl_quant.trading_constraints import (  # noqa: E402
+    CONSTRAINT_FEATURE_DIM,
+    TradingConstraintConfig as BarTradingConstraintConfig,
+)
 
 
 def load_script(name: str):
@@ -374,11 +378,31 @@ class MinuteToHourTests(unittest.TestCase):
             torch.tensor([[[True, True, False], [True, True, True]], [[False, False, False], [True, False, False]]]),
             torch.zeros((2, 2, 2), dtype=torch.float32),
             torch.zeros(2, dtype=torch.long),
-            torch.zeros((2, 4), dtype=torch.float32),
+            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
         )
 
         self.assertEqual(tuple(q_values.shape), (2, 4))
         self.assertTrue(bool(torch.isfinite(q_values).all().item()))
+
+    def test_direct_bar_model_accepts_constraint_features(self) -> None:
+        model = CausalTransformerQNetwork(
+            feature_dim=3,
+            lookback=4,
+            action_count=3,
+            d_model=16,
+            n_heads=4,
+            n_layers=1,
+            feedforward_dim=32,
+            action_embedding_dim=4,
+        )
+        q_values = model(
+            torch.zeros((2, 4, 3), dtype=torch.float32),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(q_values.shape), (2, 3))
+        self.assertEqual(model.constraint_feature_dim, CONSTRAINT_FEATURE_DIM)
 
     def test_minute_timestamp_grid_future_context_is_rejected(self) -> None:
         module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
@@ -421,6 +445,14 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(constraints.max_switches_per_episode, 3)
         self.assertEqual(constraints.max_order_legs_per_day, 4)
         self.assertEqual(constraints.max_order_legs_per_episode, 5)
+
+    def test_minute_to_hour_default_constraints_remain_conservative(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["default_minute_to_hour_constraints"])
+
+        constraints = module.default_minute_to_hour_constraints()
+
+        self.assertEqual(constraints.max_switches_per_day, 2)
+        self.assertEqual(constraints.q_switch_margin_bps, 3.0)
 
 
 class HourlySplitTests(unittest.TestCase):
@@ -550,7 +582,12 @@ class EvaluationTests(unittest.TestCase):
 
     def test_direct_hourly_eval_resets_episode_switch_cap_by_episode_length(self) -> None:
         class OppositePolicy(nn.Module):
-            def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
+            def forward(
+                self,
+                state_windows: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor | None = None,
+            ) -> torch.Tensor:
                 q_values = torch.zeros((state_windows.shape[0], 3), device=state_windows.device)
                 q_values[previous_actions == 0, 1] = 1.0
                 q_values[previous_actions == 1, 0] = 1.0
@@ -570,7 +607,12 @@ class EvaluationTests(unittest.TestCase):
 
     def test_direct_hourly_eval_applies_daily_switch_cap(self) -> None:
         class FixedPolicy(nn.Module):
-            def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
+            def forward(
+                self,
+                state_windows: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor | None = None,
+            ) -> torch.Tensor:
                 return torch.tensor([[0.0, 1.0, 0.0]], device=state_windows.device).repeat(
                     state_windows.shape[0],
                     1,
@@ -622,9 +664,41 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(constraints.q_switch_margin_bps, 5.0)
         self.assertEqual(constraints.extra_switch_penalty_bps, 1.0)
 
+    def test_fixed_rollout_cost_stress_replays_same_actions(self) -> None:
+        module = load_script("train_hourly_causal_transformer_rl")
+
+        result = module.fixed_rollout_cost_stress(
+            [
+                {
+                    "action": 1,
+                    "previous_action": 0,
+                    "market_order_legs": 1.0,
+                    "gross_return": 0.01,
+                },
+                {
+                    "action": 1,
+                    "previous_action": 1,
+                    "market_order_legs": 0.0,
+                    "gross_return": 0.01,
+                },
+            ],
+            cost_bps_values=[0.0, 100.0],
+            extra_switch_penalty_bps=0.0,
+            periods_per_year=252.0,
+        )
+
+        self.assertEqual(result["0bps"]["total_switches"], 1)
+        self.assertEqual(result["100bps"]["market_order_legs"], 1.0)
+        self.assertLess(result["100bps"]["total_return"], result["0bps"]["total_return"])
+
     def test_evaluation_uses_valid_indices_and_resets_at_gaps(self) -> None:
         class FixedPolicy(nn.Module):
-            def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
+            def forward(
+                self,
+                state_windows: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor | None = None,
+            ) -> torch.Tensor:
                 return torch.tensor([[0.0, 1.0]], device=state_windows.device).repeat(state_windows.shape[0], 1)
 
         valid = torch.tensor([2, 3, 5], dtype=torch.long)
