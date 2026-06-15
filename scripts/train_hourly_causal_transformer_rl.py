@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import sys
+from collections import Counter
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,17 @@ PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKA
 SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+
+def parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}.")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -44,12 +57,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--q-switch-margin-bps", type=float, default=0.0)
     parser.add_argument("--extra-switch-penalty-bps", type=float, default=0.0)
     parser.add_argument("--max-effective-leverage", type=float, default=1.0)
-    parser.add_argument("--max-leveraged-bars-per-day", type=int, default=60)
-    parser.add_argument("--max-consecutive-leveraged-bars", type=int, default=30)
-    parser.add_argument("--max-same-group-share-per-day", type=float)
+    parser.add_argument("--allow-leveraged-actions", type=parse_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--allow-inverse-actions", type=parse_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--max-leveraged-bars-per-day", type=int, default=30)
+    parser.add_argument("--max-consecutive-leveraged-bars", type=int, default=15)
+    parser.add_argument("--max-same-group-share-per-day", type=float, default=0.50)
     parser.add_argument("--min-group-share-observations", type=int, default=20)
     parser.add_argument("--reportable-max-group-share", type=float, default=0.75)
     parser.add_argument("--reportable-max-leveraged-share", type=float, default=0.50)
+    parser.add_argument("--random-baseline-paths", type=int, default=256)
     parser.add_argument(
         "--cost-stress-bps",
         type=float,
@@ -107,6 +123,8 @@ def build_exposure_constraints_from_args(args: argparse.Namespace):
 
     return ExposureConstraintConfig(
         max_effective_leverage=args.max_effective_leverage,
+        allow_leveraged_actions=args.allow_leveraged_actions,
+        allow_inverse_actions=args.allow_inverse_actions,
         max_leveraged_bars_per_day=args.max_leveraged_bars_per_day,
         max_same_group_share_per_day=args.max_same_group_share_per_day,
         max_consecutive_leveraged_bars=args.max_consecutive_leveraged_bars,
@@ -215,6 +233,219 @@ def equal_weight_metrics(split, *, cash_index: int, action_weights=None) -> dict
     }
 
 
+def _trade_legs_scalar(
+    previous_action: int,
+    action: int,
+    *,
+    cash_index: int,
+    count_etf_to_etf_as_two_legs: bool = True,
+) -> float:
+    if action == previous_action:
+        return 0.0
+    if not count_etf_to_etf_as_two_legs:
+        return 1.0
+    legs = 0.0
+    if previous_action != cash_index:
+        legs += 1.0
+    if action != cash_index:
+        legs += 1.0
+    return legs
+
+
+def _valid_action_indices(split, index: int, *, cash_index: int) -> list[int]:
+    if getattr(split, "action_valid_mask", None) is None:
+        valid = list(range(len(split.action_names)))
+    else:
+        row = split.action_valid_mask[index].detach().cpu().tolist()
+        valid = [action for action, is_valid in enumerate(row) if bool(is_valid)]
+    if cash_index not in valid:
+        valid.append(cash_index)
+    return valid
+
+
+def _evaluate_action_sequence(
+    split,
+    actions: list[int],
+    *,
+    initial_action: int,
+    cash_index: int,
+    action_weights,
+    switch_cost_bps: float,
+    extra_switch_penalty_bps: float,
+    count_etf_to_etf_as_two_legs: bool = True,
+) -> dict[str, float | int | None]:
+    valid_indices = split.valid_start_indices.detach().cpu().tolist()
+    if len(actions) != len(valid_indices):
+        raise ValueError("actions length must match split.valid_start_indices length.")
+    weights = [float(value) for value in action_weights.detach().cpu().tolist()]
+    equity = 1.0
+    equity_curve = [equity]
+    returns: list[float] = []
+    switches = 0
+    order_legs = 0.0
+    total_traded_notional = 0.0
+    previous_action = int(initial_action)
+    previous_index: int | None = None
+    for sequence_index, row_index in enumerate(valid_indices):
+        if previous_index is None or row_index != previous_index + 1:
+            previous_action = int(initial_action)
+        valid_actions = _valid_action_indices(split, row_index, cash_index=cash_index)
+        action = int(actions[sequence_index])
+        if action not in valid_actions:
+            action = int(cash_index)
+        raw_return = float(split.action_returns[row_index, action].item())
+        position_weight = weights[action]
+        gross_return = position_weight * raw_return
+        is_switch = action != previous_action
+        previous_weight = 0.0 if previous_action == cash_index else weights[previous_action]
+        next_weight = 0.0 if action == cash_index else weights[action]
+        traded_notional = previous_weight + next_weight if is_switch else 0.0
+        cost_bps = traded_notional * (float(switch_cost_bps) + float(is_switch) * float(extra_switch_penalty_bps))
+        net_return = gross_return - cost_bps / 10_000.0
+        equity *= 1.0 + net_return
+        equity_curve.append(equity)
+        returns.append(net_return)
+        switches += int(is_switch)
+        order_legs += _trade_legs_scalar(
+            previous_action,
+            action,
+            cash_index=cash_index,
+            count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+        )
+        total_traded_notional += traded_notional
+        previous_action = action
+        previous_index = row_index
+    return {
+        "total_return": equity - 1.0,
+        "max_drawdown": metric_max_drawdown(equity_curve),
+        "annualized_sharpe": metric_sharpe(returns, periods_per_year=split.periods_per_year),
+        "total_switches": switches,
+        "market_order_legs": order_legs,
+        "total_traded_notional": total_traded_notional,
+    }
+
+
+def _aggregate_random_path_metrics(paths: list[dict[str, float | int | None]]) -> dict[str, float | int | None]:
+    if not paths:
+        return {"paths": 0, "total_return": 0.0}
+    result: dict[str, float | int | None] = {"paths": len(paths)}
+    numeric_keys = [
+        "total_return",
+        "max_drawdown",
+        "annualized_sharpe",
+        "total_switches",
+        "market_order_legs",
+        "total_traded_notional",
+    ]
+    for key in numeric_keys:
+        values = [float(path[key]) for path in paths if path.get(key) is not None]
+        if not values:
+            result[key] = None
+            continue
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        result[key] = mean
+        result[f"{key}_std"] = variance**0.5
+    return result
+
+
+def random_same_action_distribution_baseline(
+    split,
+    rollout_records: list[dict[str, object]],
+    *,
+    seed: int,
+    n_paths: int,
+    initial_action: int,
+    cash_index: int,
+    action_weights,
+    switch_cost_bps: float,
+    extra_switch_penalty_bps: float,
+    count_etf_to_etf_as_two_legs: bool = True,
+) -> dict[str, float | int | None]:
+    valid_indices = split.valid_start_indices.detach().cpu().tolist()
+    counts = Counter(int(record["action"]) for record in rollout_records if "action" in record)
+    if not counts:
+        counts = Counter({cash_index: 1})
+    action_ids = sorted(counts)
+    action_counts = [counts[action] for action in action_ids]
+    rng = random.Random(seed)
+    paths = []
+    for _ in range(max(int(n_paths), 1)):
+        sampled = rng.choices(action_ids, weights=action_counts, k=len(valid_indices))
+        paths.append(
+            _evaluate_action_sequence(
+                split,
+                sampled,
+                initial_action=initial_action,
+                cash_index=cash_index,
+                action_weights=action_weights,
+                switch_cost_bps=switch_cost_bps,
+                extra_switch_penalty_bps=extra_switch_penalty_bps,
+                count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+            )
+        )
+    out = _aggregate_random_path_metrics(paths)
+    out["seed"] = seed
+    return out
+
+
+def random_same_turnover_baseline(
+    split,
+    rollout_records: list[dict[str, object]],
+    *,
+    seed: int,
+    n_paths: int,
+    initial_action: int,
+    cash_index: int,
+    action_weights,
+    switch_cost_bps: float,
+    extra_switch_penalty_bps: float,
+    count_etf_to_etf_as_two_legs: bool = True,
+) -> dict[str, float | int | None]:
+    valid_indices = split.valid_start_indices.detach().cpu().tolist()
+    switch_flags = [
+        int(record.get("action", cash_index)) != int(record.get("previous_action", cash_index))
+        for record in rollout_records
+    ]
+    if len(switch_flags) < len(valid_indices):
+        switch_flags.extend([False] * (len(valid_indices) - len(switch_flags)))
+    switch_flags = switch_flags[: len(valid_indices)]
+    rng = random.Random(seed)
+    paths = []
+    for _ in range(max(int(n_paths), 1)):
+        sampled: list[int] = []
+        previous_action = int(initial_action)
+        previous_index: int | None = None
+        for sequence_index, row_index in enumerate(valid_indices):
+            if previous_index is None or row_index != previous_index + 1:
+                previous_action = int(initial_action)
+            valid_actions = _valid_action_indices(split, row_index, cash_index=cash_index)
+            if switch_flags[sequence_index]:
+                choices = [action for action in valid_actions if action != previous_action]
+                action = rng.choice(choices or [cash_index])
+            else:
+                action = previous_action if previous_action in valid_actions else cash_index
+            sampled.append(action)
+            previous_action = action
+            previous_index = row_index
+        paths.append(
+            _evaluate_action_sequence(
+                split,
+                sampled,
+                initial_action=initial_action,
+                cash_index=cash_index,
+                action_weights=action_weights,
+                switch_cost_bps=switch_cost_bps,
+                extra_switch_penalty_bps=extra_switch_penalty_bps,
+                count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+            )
+        )
+    out = _aggregate_random_path_metrics(paths)
+    out["seed"] = seed
+    out["target_switches"] = sum(int(flag) for flag in switch_flags)
+    return out
+
+
 def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
     if not records:
         return
@@ -223,6 +454,15 @@ def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
         writer = csv.DictWriter(sink, fieldnames=list(records[0]))
         writer.writeheader()
         writer.writerows(records)
+
+
+def write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as sink:
+        for record in records:
+            sink.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def main() -> int:
@@ -255,6 +495,8 @@ def main() -> int:
             build_action_metadata,
             reportability_flags,
             rollout_return_diagnostics,
+            stable_action_metadata_hash,
+            stable_action_risk_config_hash,
         )
     except ModuleNotFoundError as exc:
         if exc.name == "torch":
@@ -284,6 +526,9 @@ def main() -> int:
     constraints = build_constraints_from_args(args, cash_index=cash_index)
     exposure_constraints = build_exposure_constraints_from_args(args)
     action_meta = build_action_metadata(train_split.action_names)
+    action_metadata = action_metadata_to_dicts(action_meta)
+    action_metadata_hash = stable_action_metadata_hash(action_meta)
+    action_risk_config_hash = stable_action_risk_config_hash(exposure_constraints)
     cpu_action_weights = action_weight_tensor(
         action_meta,
         device=torch.device("cpu"),
@@ -432,10 +677,44 @@ def main() -> int:
     baselines: dict[str, object] = {"CASH": fixed_action_baseline(train_split.action_names[cash_index])}
     for action_name in ("QQQ", "SPY", "SOXL", "SOXS", "TQQQ", "SQQQ"):
         if action_name in train_split.action_names:
-            baselines[f"BuyAndHold_{action_name}"] = fixed_action_baseline(action_name)
-    baselines["EqualWeight_ETFs"] = {
+            baseline = fixed_action_baseline(action_name)
+            action_id = action_index(train_split.action_names, action_name)
+            suffix = "risk_scaled_constrained" if float(cpu_action_weights[action_id].item()) < 0.999 else "constrained"
+            baselines[f"BuyAndHold_{action_name}_{suffix}"] = baseline
+            baselines[f"BuyAndHold_{action_name}"] = baseline
+    equal_weight_risk_scaled = {
         split.name: equal_weight_metrics(split, cash_index=cash_index, action_weights=cpu_action_weights)
         for split in (train_split, val_split, test_split)
+    }
+    baselines["EqualWeight_ETFs_risk_scaled_frictionless"] = equal_weight_risk_scaled
+    baselines["EqualWeight_ETFs"] = equal_weight_risk_scaled
+    baselines["RandomSameTurnover"] = {
+        "test": random_same_turnover_baseline(
+            test_split,
+            test_result.rollout_records,
+            seed=args.seed + 10_001,
+            n_paths=args.random_baseline_paths,
+            initial_action=initial_action,
+            cash_index=cash_index,
+            action_weights=cpu_action_weights,
+            switch_cost_bps=args.switch_cost_bps,
+            extra_switch_penalty_bps=args.extra_switch_penalty_bps,
+            count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+        )
+    }
+    baselines["RandomSameActionDistribution"] = {
+        "test": random_same_action_distribution_baseline(
+            test_split,
+            test_result.rollout_records,
+            seed=args.seed + 20_001,
+            n_paths=args.random_baseline_paths,
+            initial_action=initial_action,
+            cash_index=cash_index,
+            action_weights=cpu_action_weights,
+            switch_cost_bps=args.switch_cost_bps,
+            extra_switch_penalty_bps=args.extra_switch_penalty_bps,
+            count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+        )
     }
     concentration = action_concentration(test_result.rollout_records, action_meta=action_meta)
     return_diagnostics = rollout_return_diagnostics(test_result.rollout_records)
@@ -469,11 +748,14 @@ def main() -> int:
             "config": serializable_args,
             "constraints": asdict(constraints),
             "exposure_constraints": asdict(exposure_constraints),
-            "action_metadata": action_metadata_to_dicts(action_meta),
+            "action_metadata": action_metadata,
+            "action_metadata_hash": action_metadata_hash,
+            "action_risk_config_hash": action_risk_config_hash,
         },
         run_dir / "model.pt",
     )
     write_rollout(run_dir / "test_rollout.csv", test_result.rollout_records)
+    write_jsonl(run_dir / "decision_logs.jsonl", test_result.rollout_records)
     summary = {
         "device": str(device),
         "torch_version": torch.__version__,
@@ -485,7 +767,9 @@ def main() -> int:
         "periods_per_year": train_split.periods_per_year,
         "feature_names": train_split.feature_names,
         "action_names": train_split.action_names,
-        "action_metadata": action_metadata_to_dicts(action_meta),
+        "action_metadata": action_metadata,
+        "action_metadata_hash": action_metadata_hash,
+        "action_risk_config_hash": action_risk_config_hash,
         "training": artifacts,
         "train_metrics": train_result.to_dict(),
         "val_metrics": val_result.to_dict(),

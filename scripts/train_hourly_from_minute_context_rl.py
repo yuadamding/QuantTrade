@@ -16,6 +16,16 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+def default_data_root() -> Path:
+    shared_data = PROJECT_ROOT.parent / "data"
+    if PROJECT_ROOT.name in {"QuantTrade", "rl_quant"} and shared_data.exists():
+        return shared_data
+    return PROJECT_ROOT / "data"
+
+
+DATA_ROOT = default_data_root()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a hierarchical minute-to-hour causal-transformer DQN allocator.",
@@ -23,10 +33,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         type=Path,
-        default=PROJECT_ROOT / "data" / "rl_hour_from_minute" / "top_volume_1m_recent" / "hour_from_minute_dataset.pt",
+        default=DATA_ROOT / "rl_hour_from_minute" / "top_volume_1m_recent" / "hour_from_minute_dataset.pt",
     )
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "rl_hour_from_minute_runs")
+    parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_minute_runs")
     parser.add_argument("--run-name")
+    parser.add_argument("--warm-start-model", type=Path, help="Fine-tune from a previous minute-to-hour model.pt checkpoint.")
     parser.add_argument("--train-start")
     parser.add_argument("--train-end", default="2026-06-05T23:59:59+00:00")
     parser.add_argument("--val-end", default="2026-06-10T23:59:59+00:00")
@@ -193,6 +204,7 @@ def main() -> int:
         action_embedding_dim=args.action_embedding_dim,
         target_vram_gb=args.target_vram_gb,
         vram_safety_gb=args.vram_safety_gb,
+        warm_start_model=args.warm_start_model,
     )
     model, artifacts = train_minute_to_hour_dqn(train_split, val_split, device=device, config=config)
     train_result = evaluate_minute_to_hour_policy(
@@ -243,6 +255,7 @@ def main() -> int:
             "action_names": train_split.action_names,
             "constraints": asdict(constraints),
             "config": serializable_args,
+            "warm_start": artifacts.get("warm_start"),
         },
         run_dir / "model.pt",
     )
@@ -275,6 +288,9 @@ def main() -> int:
     )
     if artifacts.get("vram_reservation"):
         print(f"VRAM reservation: {artifacts['vram_reservation']}")
+    warm_start = artifacts.get("warm_start")
+    if isinstance(warm_start, dict) and warm_start.get("loaded"):
+        print(f"Warm-started from: {warm_start.get('path')}")
     if "cuda_device_used_end_gb" in artifacts:
         print(
             f"CUDA used end: {artifacts['cuda_device_used_end_gb']} GiB | "

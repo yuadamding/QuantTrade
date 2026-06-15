@@ -37,31 +37,60 @@ from rl_quant.research_protocol import (  # noqa: E402
 )
 
 
-def parse_args() -> argparse.Namespace:
+def default_data_root() -> Path:
+    shared_data = PROJECT_ROOT.parent / "data"
+    if PROJECT_ROOT.name in {"QuantTrade", "rl_quant"} and shared_data.exists():
+        return shared_data
+    return PROJECT_ROOT / "data"
+
+
+def default_derived_root() -> Path:
+    shared_derived = PROJECT_ROOT.parent / "derived"
+    if PROJECT_ROOT.name in {"QuantTrade", "rl_quant"} and shared_derived.exists():
+        return shared_derived
+    return PROJECT_ROOT / "derived"
+
+
+DATA_ROOT = default_data_root()
+DERIVED_ROOT = default_derived_root()
+SOURCE_BAR_INTERVAL = "1m"
+DEFAULT_DECISION_GRID_MINUTES = 60
+DEFAULT_CONTEXT_MINUTES_PER_GRID = 60
+DEFAULT_DECISION_GRID_NAME = "hour"
+
+
+def validate_hourly_grid_args(args: argparse.Namespace) -> None:
+    if args.decision_stride_minutes != DEFAULT_DECISION_GRID_MINUTES:
+        raise ValueError("Minute-source RL datasets use an hourly decision grid; decision-stride-minutes must be 60.")
+    if args.minutes_per_hour != DEFAULT_CONTEXT_MINUTES_PER_GRID:
+        raise ValueError("Minute-source hourly context uses 60 one-minute bars per hour; minutes-per-hour must be 60.")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build an hourly-decision dataset with causal minute-level context windows.",
     )
     parser.add_argument(
         "--stock-minute-dir",
         type=Path,
-        default=PROJECT_ROOT / "data" / "minute_ohlcv" / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15",
+        default=DATA_ROOT / "minute_ohlcv" / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15",
     )
     parser.add_argument(
         "--etf-minute-dir",
         type=Path,
-        default=PROJECT_ROOT / "data" / "minute_ohlcv" / "top_us_volume_etfs_500_2026-06-14_1m_2026-05-25_2026-06-15",
+        default=DATA_ROOT / "minute_ohlcv" / "top_us_volume_etfs_500_2026-06-14_1m_2026-05-25_2026-06-15",
     )
     parser.add_argument(
         "--stock-universe",
         type=Path,
-        default=PROJECT_ROOT / "derived" / "universes" / "top_us_volume_stocks_nasdaq_1000_2026-06-14.csv",
+        default=DERIVED_ROOT / "universes" / "top_us_volume_stocks_nasdaq_1000_2026-06-14.csv",
     )
     parser.add_argument(
         "--etf-universe",
         type=Path,
-        default=PROJECT_ROOT / "derived" / "universes" / "top_us_volume_etfs_500_2026-06-14.csv",
+        default=DERIVED_ROOT / "universes" / "top_us_volume_etfs_500_2026-06-14.csv",
     )
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "rl_hour_from_minute" / "top_volume_1m_recent")
+    parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_minute" / "top_volume_1m_recent")
     parser.add_argument("--dataset-file-name", default="hour_from_minute_dataset.pt")
     parser.add_argument("--start", default="2026-05-25T00:00:00+00:00")
     parser.add_argument("--end-exclusive", default="2026-06-15T00:00:00+00:00")
@@ -74,10 +103,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-active-stock-fraction", type=float, default=0.30)
     parser.add_argument("--hours-lookback", type=int, default=4)
-    parser.add_argument("--minutes-per-hour", type=int, default=60)
-    parser.add_argument("--decision-stride-minutes", type=int, default=60)
+    parser.add_argument(
+        "--minutes-per-hour",
+        type=int,
+        default=DEFAULT_CONTEXT_MINUTES_PER_GRID,
+        help="Number of 1m source bars inside each hour context token; fixed at 60 for the default hourly grid.",
+    )
+    parser.add_argument(
+        "--decision-stride-minutes",
+        "--decision-grid-minutes",
+        dest="decision_stride_minutes",
+        type=int,
+        default=DEFAULT_DECISION_GRID_MINUTES,
+        help="Decision-grid spacing in minutes; fixed at 60 so minute data is consumed on an hourly grid.",
+    )
     parser.add_argument("--min-context-valid-fraction", type=float, default=0.50)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def timestamp_add_minutes(value: str, minutes: int) -> str:
@@ -114,11 +155,12 @@ def main() -> int:
 
     if args.hours_lookback <= 0 or args.minutes_per_hour <= 0 or args.decision_stride_minutes <= 0:
         raise ValueError("hours-lookback, minutes-per-hour, and decision-stride-minutes must be positive.")
-    if interval_minutes("1m") != 1.0:
+    validate_hourly_grid_args(args)
+    if interval_minutes(SOURCE_BAR_INTERVAL) != 1.0:
         raise ValueError("Internal interval check failed.")
 
-    stock_map = bar_file_map(args.stock_minute_dir, interval="1m")
-    etf_map = bar_file_map(args.etf_minute_dir, interval="1m")
+    stock_map = bar_file_map(args.stock_minute_dir, interval=SOURCE_BAR_INTERVAL)
+    etf_map = bar_file_map(args.etf_minute_dir, interval=SOURCE_BAR_INTERVAL)
     ranked_stocks = [symbol for symbol in read_ranked_symbols(args.stock_universe) if symbol in stock_map]
     selected_stocks = ranked_stocks[: args.stock_limit]
     if not selected_stocks:
@@ -321,6 +363,9 @@ def main() -> int:
             "action_returns": action_returns,
             "hours_lookback": args.hours_lookback,
             "minutes_per_hour": args.minutes_per_hour,
+            "source_bar_interval": SOURCE_BAR_INTERVAL,
+            "decision_grid": DEFAULT_DECISION_GRID_NAME,
+            "decision_grid_minutes": DEFAULT_DECISION_GRID_MINUTES,
             "decision_stride_minutes": args.decision_stride_minutes,
             "periods_per_year": periods_per_year,
             "periods_per_year_formula": "252 * median_decisions_per_utc_day",
@@ -352,6 +397,9 @@ def main() -> int:
         "min_context_valid_fraction": args.min_context_valid_fraction,
         "hours_lookback": args.hours_lookback,
         "minutes_per_hour": args.minutes_per_hour,
+        "source_bar_interval": SOURCE_BAR_INTERVAL,
+        "decision_grid": DEFAULT_DECISION_GRID_NAME,
+        "decision_grid_minutes": DEFAULT_DECISION_GRID_MINUTES,
         "decision_stride_minutes": args.decision_stride_minutes,
         "periods_per_year_formula": "252 * median_decisions_per_utc_day",
         "median_decisions_per_day": median_decisions_per_day,
@@ -368,6 +416,9 @@ def main() -> int:
         "last_decision_timestamp": decision_timestamps[-1],
         "first_next_timestamp": next_timestamps[0],
         "last_next_timestamp": next_timestamps[-1],
+        "source_bar_interval": SOURCE_BAR_INTERVAL,
+        "decision_grid": DEFAULT_DECISION_GRID_NAME,
+        "decision_grid_minutes": DEFAULT_DECISION_GRID_MINUTES,
         "periods_per_year": periods_per_year,
         "periods_per_year_formula": "252 * median_decisions_per_utc_day",
         "median_decisions_per_day": median_decisions_per_day,
@@ -380,7 +431,7 @@ def main() -> int:
         source_vendor="Yahoo Finance chart",
         symbols=[*selected_stocks, *etf_symbols],
         universe_selection_date=args.universe_selection_date,
-        bar_interval=f"{args.decision_stride_minutes}m decision / 1m context",
+        bar_interval=f"1h decision / {SOURCE_BAR_INTERVAL} context",
         timezone="UTC timestamps with exchange timestamp features",
         adjustment="Adjusted close when available, otherwise close",
         feature_names=[*minute_feature_names, *[f"hour_{name}" for name in hour_feature_names]],
@@ -409,7 +460,8 @@ next hourly decision timestamp.
 - Minute tensor: {list(minute_features.shape)}
 - Hour tensor: {list(hour_features.shape)}
 - Actions: {", ".join(action_names)}
-- Decision stride minutes: {args.decision_stride_minutes}
+- Source bar interval: {SOURCE_BAR_INTERVAL}
+- Decision grid: {DEFAULT_DECISION_GRID_NAME} ({DEFAULT_DECISION_GRID_MINUTES} minutes)
 - Periods per year: {periods_per_year:.1f}
 - Median decisions per day: {median_decisions_per_day:.1f}
 """

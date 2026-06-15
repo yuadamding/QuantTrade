@@ -99,6 +99,7 @@ Bar transformer dataset:
 Minute-to-hour dataset:
 
 - `hour_from_minute_dataset.pt`: trusted local torch payload with `decision_timestamps`, `next_timestamps`, `minute_features`, `minute_mask`, `hour_features`, `action_returns`, feature names, and action names.
+- Default grid: hourly decisions/rewards (`60` minutes) built from `1m` source bars.
 - `minute_features`: tensor shaped `[decisions, hours_lookback, minutes_per_hour, minute_feature_count]`.
 - `minute_mask`: boolean tensor where `True` marks causal valid minute bars.
 - `action_returns`: close-to-close ETF returns from each hourly decision timestamp to the next hourly decision timestamp.
@@ -156,6 +157,14 @@ conda run -n ml1 python scripts/train_hourly_causal_transformer_rl.py \
   --device auto --amp --target-vram-gb 9.5
 ```
 
+The direct bar trainer is risk-aware by default: leveraged actions are
+risk-scaled, same-group exposure is prospectively capped at 50% after the
+minimum observation window, and leveraged exposure is capped at 30 bars per day
+and 15 consecutive bars unless overridden. Its summary includes canonical
+`cost_stress`, `RandomSameTurnover`, `RandomSameActionDistribution`,
+risk-scaled baseline labels, action metadata hashes, and action-risk config
+hashes.
+
 Build the latest minute-level transformer dataset:
 
 ```bash
@@ -185,19 +194,38 @@ episode, 8 order legs per day, 2 bps one-way leg cost, 1 bps extra switch
 penalty, and 5 bps Q-value switch margin. Its `summary.json` includes
 0/1/2/5/10 bps test cost stress under the same action-mask constraints.
 
-Build hourly decisions from minute-level context:
+Preferred RL path for minute data: build hourly decisions from minute-level context.
+This preserves minute microstructure/path information while making decisions on
+hourly boundaries, which is a more stable target than direct one-minute trading.
+The default decision/reward grid is fixed at one hour while all context bars
+remain `1m` source data.
 
 ```bash
 conda run -n ml1 python scripts/build_hourly_from_minute_context_dataset.py
 ```
 
-Train the hierarchical minute-to-hour causal transformer:
+Train the hierarchical minute-to-hour causal transformer. The minute encoder
+learns intrahour dynamics from causal 1-minute bars; the hour encoder learns
+multi-hour regime dynamics for the RL action decision.
 
 ```bash
 conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
   --device auto --amp --target-vram-gb 9.5 \
   --max-switches-per-episode 3 --max-order-legs-per-episode 6
 ```
+
+For rolling 2026 training, fine-tune each new period from the last period's
+minute-to-hour model instead of relearning the context transformer from scratch:
+
+```bash
+conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
+  --device auto --amp --target-vram-gb 9.5 \
+  --warm-start-model data/rl_hour_from_minute_runs/previous_period/model.pt
+```
+
+The warm-start checkpoint is loaded only after its minute feature names, hour
+feature names, action names, and constraint feature schema match the current
+dataset and code.
 
 Validate research manifests:
 

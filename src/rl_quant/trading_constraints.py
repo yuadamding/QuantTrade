@@ -183,6 +183,43 @@ def apply_leg_aware_hysteresis(
     return torch.where(should_switch | ~current_allowed, best_action, current_action.long())
 
 
+def apply_notional_aware_hysteresis(
+    q_values: torch.Tensor,
+    current_action: torch.Tensor,
+    action_mask: torch.Tensor,
+    *,
+    action_weights: torch.Tensor,
+    one_way_cost_bps: float,
+    extra_switch_penalty_bps: float,
+    q_switch_margin_bps: float,
+    cash_index: int = 0,
+    reward_scale: float = 10_000.0,
+) -> torch.Tensor:
+    batch, action_count = q_values.shape
+    candidates = torch.arange(action_count, dtype=torch.long, device=q_values.device).unsqueeze(0).expand(batch, -1)
+    previous = current_action.long().unsqueeze(1).expand_as(candidates)
+    weights = action_weights.to(device=q_values.device, dtype=q_values.dtype)
+    previous_weights = weights[previous]
+    next_weights = weights[candidates]
+    previous_weights = torch.where(previous == int(cash_index), torch.zeros_like(previous_weights), previous_weights)
+    next_weights = torch.where(candidates == int(cash_index), torch.zeros_like(next_weights), next_weights)
+    is_switch = candidates.ne(previous)
+    traded_notional = torch.where(is_switch, previous_weights + next_weights, torch.zeros_like(next_weights))
+    required_edge = (
+        traded_notional * float(one_way_cost_bps)
+        + is_switch.float() * float(extra_switch_penalty_bps)
+        + is_switch.float() * float(q_switch_margin_bps)
+    ) * float(reward_scale) / 10_000.0
+    current_q = q_values.gather(1, current_action.long().unsqueeze(1))
+    adjusted_q = q_values - current_q - required_edge
+    adjusted_q = adjusted_q.masked_fill(~action_mask, torch.finfo(q_values.dtype).min)
+    best_action = torch.argmax(adjusted_q, dim=1)
+    best_edge = adjusted_q.gather(1, best_action.unsqueeze(1)).squeeze(1)
+    should_switch = best_action.ne(current_action.long()) & (best_edge > 0)
+    current_allowed = action_mask.gather(1, current_action.long().unsqueeze(1)).squeeze(1)
+    return torch.where(should_switch | ~current_allowed, best_action, current_action.long())
+
+
 def sample_valid_actions(action_mask: torch.Tensor) -> torch.Tensor:
     if not bool(action_mask.any(dim=1).all().item()):
         raise ValueError("Each action-mask row must contain at least one valid action.")

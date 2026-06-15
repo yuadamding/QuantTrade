@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -38,9 +40,11 @@ class ActionMeta:
 @dataclass(frozen=True)
 class ExposureConstraintConfig:
     max_effective_leverage: float | None = 1.0
-    max_leveraged_bars_per_day: int | None = 60
-    max_same_group_share_per_day: float | None = None
-    max_consecutive_leveraged_bars: int | None = 30
+    allow_leveraged_actions: bool = True
+    allow_inverse_actions: bool = True
+    max_leveraged_bars_per_day: int | None = 30
+    max_same_group_share_per_day: float | None = 0.50
+    max_consecutive_leveraged_bars: int | None = 15
     min_group_share_observations: int = 20
 
 
@@ -250,6 +254,16 @@ def action_metadata_to_dicts(action_meta: list[ActionMeta]) -> list[dict[str, An
     return [item.to_dict() for item in action_meta]
 
 
+def stable_action_metadata_hash(action_meta: list[ActionMeta]) -> str:
+    payload = json.dumps(action_metadata_to_dicts(action_meta), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def stable_action_risk_config_hash(config: ExposureConstraintConfig) -> str:
+    payload = json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def action_weight_tensor(
     action_meta: list[ActionMeta],
     *,
@@ -359,6 +373,7 @@ def apply_exposure_masks(
     leveraged_bars_today: torch.Tensor,
     consecutive_leveraged_bars: torch.Tensor,
     constraints: ExposureConstraintConfig,
+    action_is_inverse: torch.Tensor | None = None,
     cash_index: int = 0,
 ) -> torch.Tensor:
     out = mask.clone()
@@ -367,11 +382,18 @@ def apply_exposure_masks(
     candidate_leverage = action_leverage[candidates]
     candidate_weights = action_weights[candidates]
     candidate_is_leveraged = action_is_leveraged[candidates]
+    candidate_is_inverse = action_is_inverse[candidates] if action_is_inverse is not None else torch.zeros_like(out)
     cash_column = int(cash_index)
 
     if constraints.max_effective_leverage is not None:
         effective_leverage = candidate_leverage * candidate_weights
         out = out & (effective_leverage <= float(constraints.max_effective_leverage) + 1e-12)
+
+    if not constraints.allow_leveraged_actions:
+        out = out & ~candidate_is_leveraged
+
+    if not constraints.allow_inverse_actions:
+        out = out & ~candidate_is_inverse
 
     if constraints.max_leveraged_bars_per_day is not None:
         exhausted = leveraged_bars_today >= int(constraints.max_leveraged_bars_per_day)
@@ -383,12 +405,13 @@ def apply_exposure_masks(
 
     if constraints.max_same_group_share_per_day is not None:
         min_obs = max(int(constraints.min_group_share_observations), 1)
-        enough_history = steps_today >= min_obs
+        next_steps = (steps_today.float() + 1.0).clamp_min(1.0)
+        enough_history = next_steps >= float(min_obs)
         candidate_groups = action_group_ids[candidates]
         candidate_group_counts = torch.gather(group_counts_today, 1, candidate_groups)
-        candidate_group_share = candidate_group_counts.float() / steps_today.float().clamp_min(1.0).unsqueeze(1)
+        candidate_group_share = (candidate_group_counts.float() + 1.0) / next_steps.unsqueeze(1)
         group_exhausted = enough_history.unsqueeze(1) & (
-            candidate_group_share >= float(constraints.max_same_group_share_per_day)
+            candidate_group_share > float(constraints.max_same_group_share_per_day)
         )
         out = out & ~group_exhausted
 

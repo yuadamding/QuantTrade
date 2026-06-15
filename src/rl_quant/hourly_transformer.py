@@ -15,6 +15,7 @@ from rl_quant.action_risk import (
     RISK_AWARE_POLICY_MODEL_VERSION,
     ActionMeta,
     ExposureConstraintConfig,
+    action_is_inverse_tensor,
     action_is_leveraged_tensor,
     action_leverage_tensor,
     action_metadata_to_dicts,
@@ -23,6 +24,8 @@ from rl_quant.action_risk import (
     build_action_metadata,
     group_ids_for_actions,
     make_exposure_features,
+    stable_action_metadata_hash,
+    stable_action_risk_config_hash,
     trade_notional,
 )
 from rl_quant.core import (
@@ -39,7 +42,7 @@ from rl_quant.trading_constraints import (
     CONSTRAINT_FEATURE_DIM,
     CONSTRAINT_FEATURE_NAMES,
     TradingConstraintConfig,
-    apply_leg_aware_hysteresis,
+    apply_notional_aware_hysteresis,
     build_action_mask,
     make_constraint_features,
     sample_valid_actions,
@@ -430,6 +433,7 @@ class VectorizedHourlyAllocationEnv:
         )
         self.action_leverage = action_leverage_tensor(self.action_meta, device=device)
         self.action_is_leveraged = action_is_leveraged_tensor(self.action_meta, device=device)
+        self.action_is_inverse = action_is_inverse_tensor(self.action_meta, device=device)
         self.action_group_ids, self.action_groups = group_ids_for_actions(self.action_meta, device=device)
         self.steps_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.leveraged_bars_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
@@ -504,6 +508,7 @@ class VectorizedHourlyAllocationEnv:
             action_leverage=self.action_leverage,
             action_weights=self.action_weights,
             action_is_leveraged=self.action_is_leveraged,
+            action_is_inverse=self.action_is_inverse,
             action_group_ids=self.action_group_ids,
             group_counts_today=self.group_counts_today,
             steps_today=self.steps_today,
@@ -713,6 +718,7 @@ def evaluate_hourly_policy(
     )
     action_leverage = action_leverage_tensor(action_meta, device=device)
     action_is_leveraged = action_is_leveraged_tensor(action_meta, device=device)
+    action_is_inverse = action_is_inverse_tensor(action_meta, device=device)
     action_group_ids, action_groups = group_ids_for_actions(action_meta, device=device)
     group_counts_today = torch.zeros((1, len(action_groups)), dtype=torch.long, device=device)
     model.eval()
@@ -816,6 +822,7 @@ def evaluate_hourly_policy(
             action_leverage=action_leverage,
             action_weights=action_weights,
             action_is_leveraged=action_is_leveraged,
+            action_is_inverse=action_is_inverse,
             action_group_ids=action_group_ids,
             group_counts_today=group_counts_today,
             steps_today=torch.tensor([steps_today], dtype=torch.long, device=device),
@@ -829,15 +836,15 @@ def evaluate_hourly_policy(
         model_constraint_features = _constraint_features_for_model(model, constraint_features)
         q_values = model(data.state_windows(index_tensor), previous_tensor, model_constraint_features)
         action = int(
-            apply_leg_aware_hysteresis(
+            apply_notional_aware_hysteresis(
                 q_values,
                 previous_tensor,
                 action_mask,
+                action_weights=action_weights,
                 one_way_cost_bps=constraints.one_way_cost_bps,
                 extra_switch_penalty_bps=constraints.extra_switch_penalty_bps,
                 q_switch_margin_bps=constraints.q_switch_margin_bps,
                 cash_index=constraints.cash_index,
-                count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
             )[0].item()
         )
         action_tensor = torch.tensor([action], dtype=torch.long, device=device)
@@ -982,6 +989,11 @@ def train_hourly_transformer_dqn(
     assert_matching_hourly_schema(train_data, val_data)
     action_count = len(train_data.action_names)
     action_meta = build_action_metadata(train_data.action_names)
+    action_weights = action_weight_tensor(
+        action_meta,
+        device=device,
+        max_effective_leverage=config.env.exposure_constraints.max_effective_leverage,
+    )
 
     q_network = CausalTransformerQNetwork(
         feature_dim=train_data.features.shape[1],
@@ -1049,16 +1061,16 @@ def train_hourly_transformer_dqn(
         with torch.no_grad():
             with autocast_context(device, config.learning.use_amp):
                 q_values = q_network(states, previous_actions, constraint_features)
-            greedy_actions = apply_leg_aware_hysteresis(
+            greedy_actions = apply_notional_aware_hysteresis(
                 q_values,
                 previous_actions,
                 action_mask,
+                action_weights=action_weights,
                 one_way_cost_bps=config.env.constraints.one_way_cost_bps,
                 extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
                 q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
                 cash_index=config.env.constraints.cash_index,
                 reward_scale=config.env.reward_scale,
-                count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
             )
             random_actions = sample_valid_actions(action_mask)
             explore = torch.rand(greedy_actions.shape, device=device) < epsilon
@@ -1088,16 +1100,16 @@ def train_hourly_transformer_dqn(
                         batch["next_previous_actions"],
                         batch["next_constraint_features"],
                     )
-                    next_actions = apply_leg_aware_hysteresis(
+                    next_actions = apply_notional_aware_hysteresis(
                         next_online,
                         batch["next_previous_actions"],
                         batch["next_action_mask"],
+                        action_weights=action_weights,
                         one_way_cost_bps=config.env.constraints.one_way_cost_bps,
                         extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
                         q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
                         cash_index=config.env.constraints.cash_index,
                         reward_scale=config.env.reward_scale,
-                        count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
                     )
                     next_q = target_network(
                         next_states,
@@ -1180,7 +1192,9 @@ def train_hourly_transformer_dqn(
         "uses_constraint_features": True,
         "constraint_feature_names": HOURLY_CONSTRAINT_FEATURE_NAMES,
         "action_metadata": action_metadata_to_dicts(action_meta),
+        "action_metadata_hash": stable_action_metadata_hash(action_meta),
         "exposure_constraints": asdict(config.env.exposure_constraints),
+        "action_risk_config_hash": stable_action_risk_config_hash(config.env.exposure_constraints),
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

@@ -32,6 +32,9 @@ from rl_quant.trading_constraints import (
     trade_legs,
 )
 
+DEFAULT_HOUR_DECISION_GRID_MINUTES = 60
+DEFAULT_MINUTE_SOURCE_INTERVAL = "1m"
+
 
 class TensorDictReplayBuffer:
     def __init__(
@@ -105,6 +108,7 @@ class HourFromMinuteDataSplit:
     hour_feature_std: torch.Tensor
     hours_lookback: int
     minutes_per_hour: int
+    decision_grid_minutes: int = DEFAULT_HOUR_DECISION_GRID_MINUTES
     periods_per_year: float = 252.0 * 6.0
     action_valid_mask: torch.Tensor | None = None
 
@@ -185,6 +189,28 @@ def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
                     )
 
 
+def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
+    explicit_stride = payload.get("decision_stride_minutes", payload.get("decision_grid_minutes"))
+    if explicit_stride is not None and int(explicit_stride) != DEFAULT_HOUR_DECISION_GRID_MINUTES:
+        raise ValueError("Minute-to-hour datasets must use an hourly decision grid with 60-minute rewards.")
+    explicit_minutes_per_hour = payload.get("minutes_per_hour")
+    if explicit_minutes_per_hour is not None and int(explicit_minutes_per_hour) != DEFAULT_HOUR_DECISION_GRID_MINUTES:
+        raise ValueError("Minute-to-hour datasets must encode each hour from 60 one-minute bars.")
+    source_interval = payload.get("source_bar_interval")
+    if source_interval is not None and source_interval != DEFAULT_MINUTE_SOURCE_INTERVAL:
+        raise ValueError("Minute-to-hour datasets must use 1m source bars.")
+
+    for row_id, (decision_ts, next_ts) in enumerate(zip(payload["decision_timestamps"], payload["next_timestamps"])):
+        delta_minutes = (
+            _parse_utc_timestamp(next_ts) - _parse_utc_timestamp(decision_ts)
+        ).total_seconds() / 60.0
+        if abs(delta_minutes - DEFAULT_HOUR_DECISION_GRID_MINUTES) > 1e-9:
+            raise ValueError(
+                "Minute-to-hour datasets must use an hourly decision grid; "
+                f"row {row_id} has {delta_minutes:g} minutes between decision and reward."
+            )
+
+
 def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     required = {
@@ -202,6 +228,7 @@ def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
     missing = required - set(payload)
     if missing:
         raise ValueError(f"Minute-to-hour dataset is missing required keys: {sorted(missing)}")
+    validate_hour_level_decision_grid(payload)
     validate_minute_timestamp_grid(payload)
     return payload
 
@@ -317,6 +344,7 @@ def _build_split(
         hour_feature_std=hour_feature_std,
         hours_lookback=int(payload.get("hours_lookback", raw_minute.shape[1])),
         minutes_per_hour=int(payload.get("minutes_per_hour", raw_minute.shape[2])),
+        decision_grid_minutes=int(payload.get("decision_grid_minutes", payload.get("decision_stride_minutes", DEFAULT_HOUR_DECISION_GRID_MINUTES))),
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.0)),
     )
 
@@ -377,6 +405,8 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError(f"Hour feature names/order differ between {reference.name!r} and {split.name!r}.")
         if split.action_names != reference.action_names:
             raise ValueError(f"Action names/order differ between {reference.name!r} and {split.name!r}.")
+        if split.decision_grid_minutes != reference.decision_grid_minutes:
+            raise ValueError(f"Decision grid minutes differ between {reference.name!r} and {split.name!r}.")
         if (split.action_valid_mask is None) != (reference.action_valid_mask is None):
             raise ValueError("Splits must agree on whether action_valid_mask is present.")
         if split.action_valid_mask is not None and split.action_valid_mask.shape[1] != reference.action_returns.shape[1]:
@@ -520,6 +550,7 @@ class MinuteToHourTrainingConfig:
     action_embedding_dim: int = 32
     target_vram_gb: float | None = None
     vram_safety_gb: float = 0.12
+    warm_start_model: str | bytes | PathLike[str] | None = None
 
 
 class VectorizedMinuteToHourEnv:
@@ -868,6 +899,59 @@ def _state_dict_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
 
 
+def _assert_checkpoint_schema(
+    checkpoint: dict[str, Any],
+    *,
+    minute_feature_names: list[str],
+    hour_feature_names: list[str],
+    action_names: list[str],
+) -> None:
+    expected = {
+        "minute_feature_names": minute_feature_names,
+        "hour_feature_names": hour_feature_names,
+        "action_names": action_names,
+    }
+    for key, expected_values in expected.items():
+        actual = checkpoint.get(key)
+        if actual is None:
+            raise ValueError(f"Warm-start checkpoint is missing {key}; refusing unverified fine-tune.")
+        if list(actual) != list(expected_values):
+            raise ValueError(f"Warm-start checkpoint {key} does not match the current dataset schema.")
+
+    constraint_names = checkpoint.get("constraint_feature_names")
+    if constraint_names is None:
+        raise ValueError("Warm-start checkpoint is missing constraint_feature_names; refusing unverified fine-tune.")
+    if list(constraint_names) != list(CONSTRAINT_FEATURE_NAMES):
+        raise ValueError("Warm-start checkpoint constraint feature schema does not match current code.")
+
+
+def load_minute_to_hour_warm_start(
+    model: nn.Module,
+    *,
+    checkpoint_path: str | bytes | PathLike[str],
+    train_data: HourFromMinuteDataSplit,
+) -> dict[str, object]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise ValueError("Warm-start checkpoint must be a saved minute-to-hour model artifact with model_state_dict.")
+    _assert_checkpoint_schema(
+        checkpoint,
+        minute_feature_names=train_data.minute_feature_names,
+        hour_feature_names=train_data.hour_feature_names,
+        action_names=train_data.action_names,
+    )
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    except RuntimeError as exc:
+        raise ValueError("Warm-start checkpoint architecture does not match current model hyperparameters.") from exc
+    return {
+        "loaded": True,
+        "path": str(checkpoint_path),
+        "model_version": checkpoint.get("model_version"),
+        "uses_constraint_features": checkpoint.get("uses_constraint_features"),
+    }
+
+
 def train_minute_to_hour_dqn(
     train_data: HourFromMinuteDataSplit,
     val_data: HourFromMinuteDataSplit,
@@ -894,6 +978,13 @@ def train_minute_to_hour_dqn(
         dropout=config.dropout,
         action_embedding_dim=config.action_embedding_dim,
     ).to(device)
+    warm_start_info: dict[str, object] | None = None
+    if config.warm_start_model is not None:
+        warm_start_info = load_minute_to_hour_warm_start(
+            q_network,
+            checkpoint_path=config.warm_start_model,
+            train_data=train_data,
+        )
     target_network = deepcopy(q_network).to(device)
     target_network.eval()
     optimizer = torch.optim.AdamW(
@@ -1059,6 +1150,7 @@ def train_minute_to_hour_dqn(
         "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
         "uses_constraint_features": True,
         "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
+        "warm_start": warm_start_info or {"loaded": False},
     }
     if device.type == "cuda":
         torch.cuda.synchronize(device)

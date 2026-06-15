@@ -36,10 +36,17 @@ from rl_quant.decision_framework import (  # noqa: E402
 )
 from rl_quant.action_risk import (  # noqa: E402
     ExposureConstraintConfig,
+    action_is_inverse_tensor,
+    action_is_leveraged_tensor,
+    action_leverage_tensor,
     action_concentration,
     action_weight_tensor,
+    apply_exposure_masks,
     build_action_metadata,
+    group_ids_for_actions,
     reportability_flags,
+    stable_action_metadata_hash,
+    stable_action_risk_config_hash,
     trade_notional,
 )
 from rl_quant.hourly_transformer import (  # noqa: E402
@@ -59,6 +66,7 @@ from rl_quant.minute_to_hour_transformer import (  # noqa: E402
     apply_leg_aware_hysteresis,
     build_action_mask,
     evaluate_minute_to_hour_policy,
+    load_minute_to_hour_warm_start,
     make_constraint_features,
     sample_valid_actions,
     trade_legs,
@@ -83,6 +91,7 @@ from rl_quant.trading_constraints import (  # noqa: E402
     CONSTRAINT_FEATURE_DIM,
     CONSTRAINT_FEATURE_NAMES,
     TradingConstraintConfig as BarTradingConstraintConfig,
+    apply_notional_aware_hysteresis,
 )
 
 
@@ -235,6 +244,46 @@ class BarDatasetTests(unittest.TestCase):
 
 
 class MinuteToHourTests(unittest.TestCase):
+    @staticmethod
+    def _small_minute_to_hour_split(action_names: list[str] | None = None) -> HourFromMinuteDataSplit:
+        action_names = action_names or ["CASH", "QQQ"]
+        return HourFromMinuteDataSplit(
+            name="train",
+            decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-02T15:30:00+00:00"],
+            next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-02T16:30:00+00:00"],
+            minute_feature_names=["m"],
+            hour_feature_names=["h"],
+            action_names=action_names,
+            minute_features=torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((2, 1, 1), dtype=torch.float32),
+            action_returns=torch.zeros((2, len(action_names)), dtype=torch.float32),
+            valid_start_indices=torch.tensor([0], dtype=torch.long),
+            valid_index_mask=torch.tensor([True, False]),
+            minute_feature_mean=torch.zeros(1),
+            minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1),
+            hour_feature_std=torch.ones(1),
+            hours_lookback=1,
+            minutes_per_hour=1,
+        )
+
+    @staticmethod
+    def _small_minute_to_hour_model() -> MinuteToHourCausalTransformerQNetwork:
+        return MinuteToHourCausalTransformerQNetwork(
+            minute_feature_dim=1,
+            hour_feature_dim=1,
+            action_count=2,
+            hours_lookback=1,
+            minutes_per_hour=1,
+            d_model=16,
+            n_heads=4,
+            minute_layers=1,
+            hour_layers=1,
+            feedforward_dim=32,
+            action_embedding_dim=4,
+        )
+
     def test_hourly_context_uses_only_past_minutes(self) -> None:
         decision_timestamp = "2026-06-10T15:30:00+00:00"
         next_timestamp = "2026-06-10T16:30:00+00:00"
@@ -265,6 +314,41 @@ class MinuteToHourTests(unittest.TestCase):
         )
 
         self.assertEqual(periods, 630.0)
+
+    def test_minute_to_hour_scripts_default_to_shared_data_root_when_available(self) -> None:
+        builder = load_script("build_hourly_from_minute_context_dataset")
+        trainer = load_script("train_hourly_from_minute_context_rl")
+        expected_data_root = ROOT.parent / "data" if (ROOT.parent / "data").exists() else ROOT / "data"
+        expected_derived_root = ROOT.parent / "derived" if (ROOT.parent / "derived").exists() else ROOT / "derived"
+
+        build_args = builder.parse_args([])
+        train_args = trainer.parse_args([])
+
+        self.assertEqual(build_args.output_dir, expected_data_root / "rl_hour_from_minute" / "top_volume_1m_recent")
+        self.assertEqual(build_args.decision_stride_minutes, builder.DEFAULT_DECISION_GRID_MINUTES)
+        self.assertEqual(build_args.minutes_per_hour, builder.DEFAULT_CONTEXT_MINUTES_PER_GRID)
+        self.assertEqual(
+            build_args.stock_minute_dir,
+            expected_data_root
+            / "minute_ohlcv"
+            / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15",
+        )
+        self.assertEqual(
+            build_args.stock_universe,
+            expected_derived_root / "universes" / "top_us_volume_stocks_nasdaq_1000_2026-06-14.csv",
+        )
+        self.assertEqual(
+            train_args.dataset,
+            expected_data_root / "rl_hour_from_minute" / "top_volume_1m_recent" / "hour_from_minute_dataset.pt",
+        )
+        self.assertEqual(train_args.output_dir, expected_data_root / "rl_hour_from_minute_runs")
+
+    def test_minute_to_hour_builder_rejects_non_hourly_default_grid(self) -> None:
+        builder = load_script("build_hourly_from_minute_context_dataset")
+        args = builder.parse_args(["--decision-stride-minutes", "30"])
+
+        with self.assertRaisesRegex(ValueError, "hourly decision grid"):
+            builder.validate_hourly_grid_args(args)
 
     def test_min_hold_action_mask_allows_only_current_action(self) -> None:
         mask = build_action_mask(
@@ -445,6 +529,54 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(tuple(q_values.shape), (2, 4))
         self.assertTrue(bool(torch.isfinite(q_values).all().item()))
 
+    def test_minute_to_hour_warm_start_loads_matching_checkpoint(self) -> None:
+        train_data = self._small_minute_to_hour_split()
+        source = self._small_minute_to_hour_model()
+        target = self._small_minute_to_hour_model()
+        for parameter in source.parameters():
+            parameter.data.fill_(0.125)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            torch.save(
+                {
+                    "model_state_dict": source.state_dict(),
+                    "minute_feature_names": train_data.minute_feature_names,
+                    "hour_feature_names": train_data.hour_feature_names,
+                    "action_names": train_data.action_names,
+                    "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
+                    "model_version": "test",
+                    "uses_constraint_features": True,
+                },
+                path,
+            )
+
+            info = load_minute_to_hour_warm_start(target, checkpoint_path=path, train_data=train_data)
+
+        self.assertTrue(info["loaded"])
+        for name, value in target.state_dict().items():
+            self.assertTrue(torch.equal(value, source.state_dict()[name]))
+
+    def test_minute_to_hour_warm_start_rejects_schema_mismatch(self) -> None:
+        train_data = self._small_minute_to_hour_split()
+        source = self._small_minute_to_hour_model()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.pt"
+            torch.save(
+                {
+                    "model_state_dict": source.state_dict(),
+                    "minute_feature_names": train_data.minute_feature_names,
+                    "hour_feature_names": train_data.hour_feature_names,
+                    "action_names": ["CASH", "SPY"],
+                    "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
+                },
+                path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "action_names"):
+                load_minute_to_hour_warm_start(self._small_minute_to_hour_model(), checkpoint_path=path, train_data=train_data)
+
     def test_direct_bar_model_accepts_constraint_features(self) -> None:
         model = CausalTransformerQNetwork(
             feature_dim=3,
@@ -520,6 +652,31 @@ class MinuteToHourTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Minute context leakage"):
                 module._load_payload(path)
 
+    def test_minute_to_hour_payload_rejects_non_hourly_reward_grid(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.pt"
+            torch.save(
+                {
+                    "decision_timestamps": ["2026-06-10T15:30:00+00:00"],
+                    "next_timestamps": ["2026-06-10T16:00:00+00:00"],
+                    "minute_timestamp_grid": [[["2026-06-10T15:30:00+00:00"]]],
+                    "minute_feature_names": ["x"],
+                    "hour_feature_names": ["h"],
+                    "action_names": ["CASH", "QQQ"],
+                    "minute_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+                    "minute_mask": torch.tensor([[[True]]]),
+                    "hour_features": torch.zeros((1, 1, 1), dtype=torch.float32),
+                    "action_returns": torch.zeros((1, 2), dtype=torch.float32),
+                    "decision_stride_minutes": 30,
+                    "source_bar_interval": "1m",
+                },
+                path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "hourly decision grid"):
+                module._load_payload(path)
+
     def test_train_cli_wires_episode_and_leg_caps(self) -> None:
         module = load_script("train_hourly_from_minute_context_rl")
 
@@ -531,6 +688,8 @@ class MinuteToHourTests(unittest.TestCase):
                 "4",
                 "--max-order-legs-per-episode",
                 "5",
+                "--warm-start-model",
+                "/tmp/model.pt",
             ]
         )
         constraints = module.build_constraints_from_args(args)
@@ -538,6 +697,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(constraints.max_switches_per_episode, 3)
         self.assertEqual(constraints.max_order_legs_per_day, 4)
         self.assertEqual(constraints.max_order_legs_per_episode, 5)
+        self.assertEqual(args.warm_start_model, Path("/tmp/model.pt"))
 
     def test_minute_to_hour_default_constraints_remain_conservative(self) -> None:
         module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["default_minute_to_hour_constraints"])
@@ -686,6 +846,79 @@ class ActionRiskTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(cash_to_soxl[0].item()), 1.0 / 3.0)
         self.assertAlmostEqual(float(soxl_to_qqq[0].item()), 1.0 + 1.0 / 3.0)
+
+    def test_notional_aware_hysteresis_uses_action_weight_cost(self) -> None:
+        weights = torch.tensor([1.0, 1.0 / 3.0])
+        action = apply_notional_aware_hysteresis(
+            torch.tensor([[0.0, 4.0]]),
+            torch.tensor([0]),
+            torch.tensor([[True, True]]),
+            action_weights=weights,
+            one_way_cost_bps=10.0,
+            extra_switch_penalty_bps=0.0,
+            q_switch_margin_bps=0.0,
+        )
+
+        self.assertEqual(action.tolist(), [1])
+
+    def test_exposure_masks_can_forbid_leveraged_and_inverse_actions(self) -> None:
+        metadata = build_action_metadata(["CASH", "QQQ", "SOXL", "SOXS"])
+        device = torch.device("cpu")
+        group_ids, _ = group_ids_for_actions(metadata, device=device)
+        mask = apply_exposure_masks(
+            torch.ones((1, 4), dtype=torch.bool),
+            current_action=torch.tensor([0]),
+            action_leverage=action_leverage_tensor(metadata, device=device),
+            action_weights=action_weight_tensor(metadata, device=device, max_effective_leverage=1.0),
+            action_is_leveraged=action_is_leveraged_tensor(metadata, device=device),
+            action_is_inverse=action_is_inverse_tensor(metadata, device=device),
+            action_group_ids=group_ids,
+            group_counts_today=torch.zeros((1, int(group_ids.max().item()) + 1), dtype=torch.long),
+            steps_today=torch.tensor([0]),
+            leveraged_bars_today=torch.tensor([0]),
+            consecutive_leveraged_bars=torch.tensor([0]),
+            constraints=ExposureConstraintConfig(allow_leveraged_actions=False, allow_inverse_actions=False),
+        )
+
+        self.assertEqual(mask.tolist(), [[True, True, False, False]])
+
+    def test_same_group_cap_uses_prospective_share(self) -> None:
+        metadata = build_action_metadata(["CASH", "SOXL", "SOXS", "QQQ"])
+        device = torch.device("cpu")
+        group_ids, groups = group_ids_for_actions(metadata, device=device)
+        semiconductor_id = groups.index("semiconductor")
+        group_counts = torch.zeros((1, len(groups)), dtype=torch.long)
+        group_counts[0, semiconductor_id] = 10
+        mask = apply_exposure_masks(
+            torch.ones((1, 4), dtype=torch.bool),
+            current_action=torch.tensor([0]),
+            action_leverage=action_leverage_tensor(metadata, device=device),
+            action_weights=action_weight_tensor(metadata, device=device, max_effective_leverage=1.0),
+            action_is_leveraged=action_is_leveraged_tensor(metadata, device=device),
+            action_is_inverse=action_is_inverse_tensor(metadata, device=device),
+            action_group_ids=group_ids,
+            group_counts_today=group_counts,
+            steps_today=torch.tensor([19]),
+            leveraged_bars_today=torch.tensor([0]),
+            consecutive_leveraged_bars=torch.tensor([0]),
+            constraints=ExposureConstraintConfig(max_same_group_share_per_day=0.50, min_group_share_observations=20),
+        )
+
+        self.assertTrue(bool(mask[0, 0].item()))
+        self.assertFalse(bool(mask[0, 1].item()))
+        self.assertFalse(bool(mask[0, 2].item()))
+        self.assertTrue(bool(mask[0, 3].item()))
+
+    def test_action_metadata_and_risk_config_hashes_are_stable(self) -> None:
+        metadata = build_action_metadata(["CASH", "QQQ", "SOXL"])
+        config = ExposureConstraintConfig(max_same_group_share_per_day=0.5)
+
+        self.assertEqual(stable_action_metadata_hash(metadata), stable_action_metadata_hash(metadata))
+        self.assertEqual(stable_action_risk_config_hash(config), stable_action_risk_config_hash(config))
+        self.assertNotEqual(
+            stable_action_risk_config_hash(config),
+            stable_action_risk_config_hash(ExposureConstraintConfig(max_same_group_share_per_day=0.25)),
+        )
 
     def test_concentration_and_reportability_flag_leveraged_group_collapse(self) -> None:
         metadata = build_action_metadata(["CASH", "SOXL", "SOXS"])
@@ -873,6 +1106,55 @@ class EvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(result.rollout_records[0]["position_weight"], 1.0 / 3.0)
         self.assertAlmostEqual(result.rollout_records[0]["gross_return"], 0.03)
 
+    def test_direct_hourly_eval_respects_inverse_action_block(self) -> None:
+        class InversePolicy(nn.Module):
+            def forward(
+                self,
+                state_windows: torch.Tensor,
+                previous_actions: torch.Tensor,
+                constraint_features: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                q_values = torch.zeros((state_windows.shape[0], 3), device=state_windows.device)
+                q_values[:, 2] = 100.0
+                return q_values
+
+        valid = torch.tensor([1, 2], dtype=torch.long)
+        valid_mask = torch.zeros(4, dtype=torch.bool)
+        valid_mask[valid] = True
+        data = HourlyDataSplit(
+            name="test",
+            timestamps=[f"2026-01-02T14:3{minute}:00+00:00" for minute in range(4)],
+            next_timestamps=[f"2026-01-02T14:3{minute + 1}:00+00:00" for minute in range(4)],
+            feature_names=["x"],
+            action_names=["CASH", "QQQ", "SOXS"],
+            features=torch.zeros((4, 1), dtype=torch.float32),
+            action_returns=torch.zeros((4, 3), dtype=torch.float32),
+            session_dates=["2026-01-02"] * 4,
+            valid_start_indices=valid,
+            valid_index_mask=valid_mask,
+            feature_mean=torch.zeros(1),
+            feature_std=torch.ones(1),
+            lookback=1,
+            bar_interval="1m",
+        )
+
+        result = evaluate_hourly_policy(
+            data,
+            InversePolicy(),
+            device=torch.device("cpu"),
+            initial_action=0,
+            constraints=BarTradingConstraintConfig(one_way_cost_bps=0.0),
+            exposure_constraints=ExposureConstraintConfig(
+                allow_inverse_actions=False,
+                max_leveraged_bars_per_day=None,
+                max_consecutive_leveraged_bars=None,
+                max_same_group_share_per_day=None,
+            ),
+            capture_rollout=True,
+        )
+
+        self.assertEqual([row["asset"] for row in result.rollout_records], ["CASH", "CASH"])
+
     def test_direct_hourly_eval_resets_episode_switch_cap_by_episode_length(self) -> None:
         class OppositePolicy(nn.Module):
             def forward(
@@ -946,6 +1228,10 @@ class EvaluationTests(unittest.TestCase):
                 "1",
                 "--max-effective-leverage",
                 "0.75",
+                "--allow-leveraged-actions",
+                "false",
+                "--allow-inverse-actions",
+                "false",
                 "--max-leveraged-bars-per-day",
                 "10",
                 "--max-consecutive-leveraged-bars",
@@ -966,8 +1252,20 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(constraints.q_switch_margin_bps, 5.0)
         self.assertEqual(constraints.extra_switch_penalty_bps, 1.0)
         self.assertEqual(exposure_constraints.max_effective_leverage, 0.75)
+        self.assertFalse(exposure_constraints.allow_leveraged_actions)
+        self.assertFalse(exposure_constraints.allow_inverse_actions)
         self.assertEqual(exposure_constraints.max_leveraged_bars_per_day, 10)
         self.assertEqual(exposure_constraints.max_consecutive_leveraged_bars, 5)
+        self.assertEqual(exposure_constraints.max_same_group_share_per_day, 0.5)
+
+    def test_direct_train_cli_defaults_to_conservative_exposure_caps(self) -> None:
+        module = load_script("train_hourly_causal_transformer_rl")
+        exposure_constraints = module.build_exposure_constraints_from_args(module.parse_args([]))
+
+        self.assertTrue(exposure_constraints.allow_leveraged_actions)
+        self.assertTrue(exposure_constraints.allow_inverse_actions)
+        self.assertEqual(exposure_constraints.max_leveraged_bars_per_day, 30)
+        self.assertEqual(exposure_constraints.max_consecutive_leveraged_bars, 15)
         self.assertEqual(exposure_constraints.max_same_group_share_per_day, 0.5)
 
     def test_fixed_rollout_cost_stress_replays_same_actions(self) -> None:
@@ -1035,6 +1333,46 @@ class EvaluationTests(unittest.TestCase):
                 extra_switch_penalty_bps=0.0,
                 periods_per_year=252.0,
             )
+
+    def test_random_baselines_are_generated_from_rollout_shape(self) -> None:
+        module = load_script("train_hourly_causal_transformer_rl")
+        split = self._direct_bar_split()
+        weights = action_weight_tensor(build_action_metadata(split.action_names), device="cpu", max_effective_leverage=1.0)
+        rollout = [
+            {"action": 1, "previous_action": 0},
+            {"action": 1, "previous_action": 1},
+            {"action": 2, "previous_action": 1},
+            {"action": 2, "previous_action": 2},
+        ]
+
+        same_turnover = module.random_same_turnover_baseline(
+            split,
+            rollout,
+            seed=7,
+            n_paths=8,
+            initial_action=0,
+            cash_index=0,
+            action_weights=weights,
+            switch_cost_bps=1.0,
+            extra_switch_penalty_bps=0.0,
+        )
+        same_distribution = module.random_same_action_distribution_baseline(
+            split,
+            rollout,
+            seed=8,
+            n_paths=8,
+            initial_action=0,
+            cash_index=0,
+            action_weights=weights,
+            switch_cost_bps=1.0,
+            extra_switch_penalty_bps=0.0,
+        )
+
+        self.assertEqual(same_turnover["paths"], 8)
+        self.assertEqual(same_turnover["target_switches"], 2)
+        self.assertEqual(same_distribution["paths"], 8)
+        self.assertIn("total_return", same_turnover)
+        self.assertIn("total_return", same_distribution)
 
     def test_evaluation_uses_valid_indices_and_resets_at_gaps(self) -> None:
         class FixedPolicy(nn.Module):
@@ -1448,6 +1786,30 @@ class DecisionFrameworkTests(unittest.TestCase):
         self.assertIn("missing baselines.RandomSameTurnover", errors)
         self.assertIn("test_return_below_cash", errors)
         self.assertIn("max_group_share_exceeds_limit", errors)
+
+    def test_validate_reportable_summary_accepts_canonical_cost_stress_and_random_baseline(self) -> None:
+        errors = validate_reportable_summary(
+            {
+                "dataset_manifest": {},
+                "feature_manifest": {},
+                "model_manifest": {},
+                "data_quality_report": {},
+                "action_eligibility": [],
+                "test_metrics": {"total_return": 0.0},
+                "baselines": {
+                    "CASH": {"test": {"total_return": 0.0}},
+                    "RandomSameTurnover": {"test": {"total_return": 0.0}},
+                },
+                "cost_stress": {"fixed_rollout": {}, "adaptive": {}},
+                "action_concentration": {
+                    "max_risky_group_share": 0.0,
+                    "leveraged_action_share": 0.0,
+                },
+                "return_diagnostics": {},
+            }
+        )
+
+        self.assertEqual(errors, [])
 
 
 class RepositoryHygieneTests(unittest.TestCase):
