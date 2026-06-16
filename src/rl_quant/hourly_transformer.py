@@ -40,6 +40,7 @@ from rl_quant.core import (
     epsilon_by_step,
     fractional_max_drawdown,
     make_grad_scaler,
+    safe_next_row_indices,
 )
 from rl_quant.trading_constraints import (
     CONSTRAINT_FEATURE_DIM,
@@ -1160,7 +1161,7 @@ def train_hourly_transformer_dqn(
             # Clamp next_indices for the state lookup: a true terminal can store an out-of-data next
             # row (its bootstrap is zeroed below); a no-op for non-terminal in-range transitions.
             n_rows = int(train_data.action_returns.shape[0])
-            safe_next_indices = batch["next_indices"].clamp(min=0, max=n_rows - 1)
+            safe_next_indices = safe_next_row_indices(batch["next_indices"], batch["terminated"], n_rows)
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(safe_next_indices)
             with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):

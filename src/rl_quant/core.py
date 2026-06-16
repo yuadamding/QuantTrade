@@ -219,6 +219,37 @@ def epsilon_by_step(*, step: int, train_steps: int, start: float, end: float) ->
     return end + (start - end) * fraction_left
 
 
+def as_binary_bool_mask(mask: torch.Tensor, *, name: str = "mask") -> torch.Tensor:
+    """Coerce a mask to bool, REJECTING non-binary values. Already-bool tensors pass through with no
+    device sync; a numeric tensor must contain only finite {0, 1} (a stray 0.5/NaN/-1 is a bug)."""
+    if mask.dtype == torch.bool:
+        return mask
+    mask_f = mask.float()
+    valid = torch.isfinite(mask_f) & ((mask_f == 0.0) | (mask_f == 1.0))
+    if not bool(valid.all().item()):
+        bad = mask_f[~valid].flatten()[:8].tolist()
+        raise ValueError(f"{name} must be bool or binary 0/1; found values like {bad}.")
+    return mask_f.bool()
+
+
+def safe_next_row_indices(
+    next_indices: torch.Tensor, terminated: torch.Tensor, n_rows: int, *, name: str = "next_indices"
+) -> torch.Tensor:
+    """Clamp next-state row indices to ``[0, n_rows-1]`` for the state lookup, but ONLY for terminal
+    transitions (whose bootstrap is zeroed anyway). A NON-terminal out-of-range index would silently
+    bootstrap from the WRONG row, so it is rejected rather than clamped (clamping would hide the bug)."""
+    if n_rows <= 0:
+        raise ValueError("cannot construct next states for an empty split.")
+    terminated_b = as_binary_bool_mask(terminated, name="terminated")
+    bad = ((next_indices < 0) | (next_indices >= n_rows)) & ~terminated_b
+    if bool(bad.any().item()):
+        examples = next_indices[bad].flatten()[:8].tolist()
+        raise ValueError(
+            f"{name} has out-of-range NON-terminal indices {examples}; valid range is [0, {n_rows - 1}]."
+        )
+    return next_indices.clamp(min=0, max=n_rows - 1)
+
+
 def dqn_td_target(
     rewards: torch.Tensor,
     gamma: float,
@@ -249,8 +280,16 @@ def dqn_td_target(
     # The range check also rejects NaN/inf (any comparison with NaN is False; inf fails the upper bound).
     if not 0.0 <= gamma_f <= 1.0:
         raise ValueError(f"gamma must be finite and in [0, 1]; got {gamma!r}.")
+    terminated_b = as_binary_bool_mask(terminated, name="terminated")
+    next_q_f = next_q.detach().float()
+    # Terminal rows ignore next_q (torch.where below tolerates their NaN/Inf); a NON-terminal row
+    # with non-finite next_q is a real bug that would corrupt the bootstrap, so reject it.
+    bad = (~terminated_b) & ~torch.isfinite(next_q_f)
+    if bool(bad.any().item()):
+        examples = next_q_f[bad].flatten()[:8].tolist()
+        raise ValueError(f"dqn_td_target: non-terminal next_q is not finite: {examples}.")
     rewards_f = rewards.float()
-    bootstrap = torch.where(terminated.bool(), torch.zeros_like(rewards_f), next_q.detach().float())
+    bootstrap = torch.where(terminated_b, torch.zeros_like(rewards_f), next_q_f)
     return rewards_f + gamma_f * bootstrap
 
 

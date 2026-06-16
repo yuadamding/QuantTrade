@@ -7020,6 +7020,33 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 dqn_td_target(rewards, bad_gamma, terminated, next_q)
         self.assertAlmostEqual(float(dqn_td_target(rewards, 0.9, terminated, next_q)[0].item()), 1.0 + 0.9 * 5.0, places=5)
 
+    def test_dqn_td_target_rejects_non_binary_terminated_and_nonfinite_next_q(self) -> None:
+        from rl_quant.core import dqn_td_target
+
+        # Non-binary terminated mask is a corruption, not a 50% terminal.
+        with self.assertRaises(ValueError):
+            dqn_td_target(torch.tensor([1.0]), 0.99, torch.tensor([0.5]), torch.tensor([2.0]))
+        # A NON-terminal row with non-finite next_q is rejected; a TERMINAL row's NaN next_q is fine.
+        with self.assertRaises(ValueError):
+            dqn_td_target(torch.tensor([1.0]), 0.99, torch.tensor([0.0]), torch.tensor([float("nan")]))
+        target = dqn_td_target(torch.tensor([1.0]), 0.99, torch.tensor([1.0]), torch.tensor([float("nan")]))
+        self.assertAlmostEqual(float(target[0].item()), 1.0, places=5)
+
+    def test_safe_next_row_indices_clamps_terminal_but_rejects_nonterminal_oob(self) -> None:
+        from rl_quant.core import as_binary_bool_mask, safe_next_row_indices
+
+        # Terminal out-of-range indices are clamped (their bootstrap is zeroed anyway).
+        out = safe_next_row_indices(torch.tensor([5, -1, 2]), torch.tensor([1.0, 1.0, 0.0]), n_rows=4)
+        self.assertEqual(out.tolist(), [3, 0, 2])
+        # A NON-terminal out-of-range index is a real bug -> rejected, not silently clamped.
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(torch.tensor([4, 1]), torch.tensor([0.0, 0.0]), n_rows=4)
+        # as_binary_bool_mask: bool passthrough; binary float ok; non-binary rejected.
+        self.assertTrue(bool(as_binary_bool_mask(torch.tensor([True, False]))[0].item()))
+        self.assertEqual(as_binary_bool_mask(torch.tensor([1.0, 0.0])).tolist(), [True, False])
+        with self.assertRaises(ValueError):
+            as_binary_bool_mask(torch.tensor([0.5]))
+
     def test_replay_buffers_validate_batch_shapes(self) -> None:
         from rl_quant.core import TensorDictReplayBuffer, TensorReplayBuffer
 

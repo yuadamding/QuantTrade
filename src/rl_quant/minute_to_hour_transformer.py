@@ -25,6 +25,7 @@ from rl_quant.core import (
     epsilon_by_step,
     fractional_max_drawdown,
     make_grad_scaler,
+    safe_next_row_indices,
 )
 from rl_quant.hourly_transformer import _validate_action_return_contract
 from rl_quant.trading_constraints import (
@@ -2247,7 +2248,7 @@ def train_minute_to_hour_dqn(
             # out-of-data next row, whose bootstrapped value is zeroed below via `terminated` anyway.
             # For non-terminal transitions next_indices is always in range, so this is a no-op there.
             n_rows = int(train_data.action_returns.shape[0])
-            safe_next_indices = batch["next_indices"].clamp(min=0, max=n_rows - 1)
+            safe_next_indices = safe_next_row_indices(batch["next_indices"], batch["terminated"], n_rows)
             current_minute, current_mask, current_hour = train_data.state(batch["indices"])
             next_minute, next_mask, next_hour = train_data.state(safe_next_indices)
             current_action_features = train_data.action_feature_state(batch["indices"])

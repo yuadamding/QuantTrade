@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import runpy
+import shlex
 import sys
 
 from rl_quant.paths import scripts_dir
@@ -112,7 +113,8 @@ def _preset_command(args: argparse.Namespace) -> int:
         return 0
     if args.name not in PRESETS:
         raise SystemExit(f"qt: unknown preset {args.name!r}; run `qt preset list`.")
-    print(" ".join(resolve_preset(args.name)))
+    # shlex.join so the printed args stay safe to copy/paste even if a path contains spaces.
+    print(shlex.join(resolve_preset(args.name)))
     return 0
 
 

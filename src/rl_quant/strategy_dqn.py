@@ -18,6 +18,7 @@ from rl_quant.core import (
     epsilon_by_step,
     fractional_max_drawdown,
     make_grad_scaler,
+    safe_next_row_indices,
 )
 from rl_quant.strategy_data import StrategyDataSplit
 from rl_quant.strategy_data import assert_matching_strategy_schema
@@ -318,7 +319,7 @@ def train_strategy_dqn_agent(
             # Clamp next_indices for the window lookup: a true terminal can store an out-of-data next
             # row (its bootstrap is zeroed via `terminated`); no-op for in-range non-terminal rows.
             n_rows = int(train_data.features.shape[0])
-            safe_next_indices = batch["next_indices"].clamp(min=0, max=n_rows - 1)
+            safe_next_indices = safe_next_row_indices(batch["next_indices"], batch["terminated"], n_rows)
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(safe_next_indices)
 
