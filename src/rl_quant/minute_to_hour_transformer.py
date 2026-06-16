@@ -912,13 +912,16 @@ def _action_feature_mean_std(
         if mask_index is None:
             continue
         valid = (features[:, :, mask_index] > 0.5) & torch.isfinite(features[:, :, index])
-        if bool(valid.any().item()):
-            valid_values = features[:, :, index][valid]
-            mean[index] = valid_values.mean()
-            std[index] = valid_values.std(unbiased=False).clamp_min(1e-6)
-        else:
+        valid_values = features[:, :, index][valid]
+        if valid_values.numel() < 2:
+            # Match _masked_mean_std: a value channel with fewer than two valid (mask-true, finite)
+            # observations cannot estimate a stable mean/std. Leave it unnormalized (mean 0, std 1) so
+            # a single value is not amplified ~1e6x by an std clamped to 1e-6 (and none -> identity).
             mean[index] = 0.0
             std[index] = 1.0
+        else:
+            mean[index] = valid_values.mean()
+            std[index] = valid_values.std(unbiased=False).clamp_min(1e-6)
     return mean, std
 
 
@@ -1589,6 +1592,23 @@ class MinuteToHourEnvConfig:
 
 
 @dataclass
+class RecencyWeightConfig:
+    """Recency-focus weighting of TRAINING transitions. ``mode='none'`` -> uniform (default).
+
+    With ``mode='exponential'`` a training row with decision timestamp ``t`` gets weight
+        ``min_weight + (1 - min_weight) * exp(-ln2 * age_days / half_life_days)``
+    where ``age_days`` is measured relative to the VALIDATION start (never the test block), so
+    older training rows are down-weighted toward the recent pre-validation regime but never fully
+    ignored (weight stays >= ``min_weight``). The test split is never passed to the trainer, so
+    recency weighting is structurally incapable of touching it.
+    """
+
+    mode: str = "none"
+    half_life_days: float = 120.0
+    min_weight: float = 0.05
+
+
+@dataclass
 class MinuteToHourTrainingConfig:
     env: MinuteToHourEnvConfig
     learning: DQNLearningConfig
@@ -1603,6 +1623,7 @@ class MinuteToHourTrainingConfig:
     vram_safety_gb: float = 0.12
     warm_start_model: str | bytes | PathLike[str] | None = None
     max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS
+    recency: RecencyWeightConfig = field(default_factory=RecencyWeightConfig)
 
 
 class VectorizedMinuteToHourEnv:
@@ -2085,6 +2106,40 @@ def load_minute_to_hour_warm_start(
     }
 
 
+def compute_recency_weights(
+    decision_timestamps: list[str],
+    validation_start_ms: int,
+    *,
+    mode: str,
+    half_life_days: float,
+    min_weight: float,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Per-row recency weights for training transitions (see :class:`RecencyWeightConfig`).
+
+    Ages are clamped at 0 and measured against ``validation_start_ms`` (the earliest validation
+    decision), so a training row is weighted only by how far it sits BEFORE validation -- the test
+    block is never referenced. Returns a float32 tensor of shape ``(len(decision_timestamps),)``.
+    ``mode='none'`` returns all ones (so a weighted mean is identical to an unweighted mean).
+    """
+    count = len(decision_timestamps)
+    if mode == "none":
+        return torch.ones(count, dtype=torch.float32, device=device)
+    if mode != "exponential":
+        raise ValueError(f"Unsupported recency weighting mode: {mode!r}")
+    if half_life_days <= 0.0:
+        raise ValueError("recency half_life_days must be positive.")
+    if not 0.0 <= min_weight <= 1.0:
+        raise ValueError("recency min_weight must be in [0, 1].")
+    day_ms = 86_400_000.0
+    decay = math.log(2.0) / float(half_life_days)
+    weights = torch.empty(count, dtype=torch.float32, device=device)
+    for index, timestamp in enumerate(decision_timestamps):
+        age_days = max(0.0, (validation_start_ms - _timestamp_to_epoch_ms(timestamp)) / day_ms)
+        weights[index] = min_weight + (1.0 - min_weight) * math.exp(-decay * age_days)
+    return weights
+
+
 def train_minute_to_hour_dqn(
     train_data: HourFromMinuteDataSplit,
     val_data: HourFromMinuteDataSplit,
@@ -2096,6 +2151,24 @@ def train_minute_to_hour_dqn(
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
     assert_matching_hour_from_minute_schema(train_data, val_data)
+    # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
+    # passed to this function, so older training rows can be down-weighted without any risk of
+    # touching the held-out test block. mode='none' yields uniform weights (no behavior change).
+    validation_start_ms = (
+        min(_timestamp_to_epoch_ms(ts) for ts in val_data.decision_timestamps)
+        if val_data.decision_timestamps
+        else None
+    )
+    recency_mode = config.recency.mode if validation_start_ms is not None else "none"
+    train_recency_weights = compute_recency_weights(
+        train_data.decision_timestamps,
+        validation_start_ms or 0,
+        mode=recency_mode,
+        half_life_days=config.recency.half_life_days,
+        min_weight=config.recency.min_weight,
+        device=device,
+    )
+    recency_active = recency_mode != "none"
     action_count = len(train_data.action_names)
     q_network = MinuteToHourCausalTransformerQNetwork(
         minute_feature_dim=train_data.minute_features.shape[-1],
@@ -2247,7 +2320,16 @@ def train_minute_to_hour_dqn(
                         batch["rewards"].float()
                         + config.learning.gamma * (1.0 - batch["dones"].float()) * next_q.float()
                     )
-                loss = F.smooth_l1_loss(chosen_q.float(), target_q)
+                if recency_active:
+                    # Recency-weighted smooth_l1: per-sample loss scaled by each transition's source
+                    # training row weight (looked up via the replay-stored decision-row `indices`).
+                    per_sample_loss = F.smooth_l1_loss(chosen_q.float(), target_q, reduction="none")
+                    sample_weights = train_recency_weights[batch["indices"]]
+                    loss = (per_sample_loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+                else:
+                    # Default (uniform) path: identical fused mean reduction as before recency support,
+                    # so disabling recency is a byte-for-byte no-op on the training objective.
+                    loss = F.smooth_l1_loss(chosen_q.float(), target_q)
             optimizer.zero_grad(set_to_none=True)
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -2300,9 +2382,22 @@ def train_minute_to_hour_dqn(
                 best_state = _state_dict_to_cpu(q_network)
 
     q_network.load_state_dict(best_state)
+    recency_policy: dict[str, object] = {
+        "mode": recency_mode,
+        "half_life_days": config.recency.half_life_days,
+        "min_weight": config.recency.min_weight,
+        "validation_start_ms": validation_start_ms,
+        # The trainer only ever receives train_data + val_data; the test split is never visible here.
+        "test_used_for_recency_selection": False,
+    }
+    if train_recency_weights.numel() > 0:
+        recency_policy["weight_min"] = float(train_recency_weights.min().item())
+        recency_policy["weight_max"] = float(train_recency_weights.max().item())
+        recency_policy["weight_mean"] = float(train_recency_weights.mean().item())
     artifacts: dict[str, object] = {
         "best_val_return": best_val_return,
         "best_val_order_legs": best_val_legs,
+        "recency_policy": recency_policy,
         "amp_enabled": scaler.is_enabled(),
         "loss_trace": loss_trace,
         "train_reward_trace": reward_trace,

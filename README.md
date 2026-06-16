@@ -117,7 +117,7 @@ conda run -n ml1 python -m pip install -e ".[dev,data]"
 Core dependencies are intentionally small:
 
 - Python `>=3.11`
-- `torch>=2.8,<3`
+- `torch>=2.6,<3`
 - `numpy>=2.2,<3`
 - Optional data stack: `pandas`, `pyarrow`
 - Optional local LLM inference stack: `transformers`, `accelerate`,

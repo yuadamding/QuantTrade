@@ -9,7 +9,11 @@ description = "Compact reinforcement-learning trading framework for intraday, da
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.2,<3",
-    "torch>=2.8,<3",
+    # Floor is 2.6 so the package metadata stays consistent with the default
+    # CUDA 12.4 environment provisioned by scripts/setup_quanttrade_miniforge_env.sh
+    # (torch==2.6.0+cu124, pinned there for vLLM compatibility). The code only
+    # uses stable torch APIs (<=2.3 era), and 2.8/2.11 CUDA profiles remain valid.
+    "torch>=2.6,<3",
 ]
 
 [project.optional-dependencies]

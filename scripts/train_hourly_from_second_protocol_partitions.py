@@ -83,6 +83,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="strict fails a partition whose splits/evaluation are non-reportable; diagnostic records and continues.",
     )
     parser.add_argument(
+        "--allow-truncated-training-history",
+        action="store_true",
+        help=(
+            "Permit a strict latest-period run whose earliest selected partition is not the earliest "
+            "available one (i.e. prior history is excluded). Off by default: the stated protocol is "
+            "latest periods for test, ALL earlier periods for train/validation."
+        ),
+    )
+    parser.add_argument(
+        "--recency-weighting",
+        choices=["none", "exponential"],
+        default="none",
+        help=(
+            "Down-weight older TRAINING rows toward the recent pre-validation regime. Default none "
+            "(uniform). Weights are anchored to the validation start; the held-out test block is "
+            "never weighted or referenced by training."
+        ),
+    )
+    parser.add_argument(
+        "--recency-half-life-days",
+        type=float,
+        default=120.0,
+        help="Half-life (calendar days) for exponential recency weighting; smaller = stronger recency focus.",
+    )
+    parser.add_argument(
+        "--recency-min-weight",
+        type=float,
+        default=0.05,
+        help="Lower bound on the recency weight so old regimes are down-weighted but never fully ignored.",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Diagnostic convenience: enable smoke_fallback splits and diagnostic reportability policy.",
@@ -169,6 +200,104 @@ def latest_available_partition_label(args: argparse.Namespace) -> str | None:
     """Newest partition present on disk, ignoring --start/--end/--max selection filters."""
     paths = sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))
     return paths[-1].parent.name if paths else None
+
+
+def strict_latest_partition_violations(
+    *,
+    selected_labels: list[str],
+    all_available_labels: list[str],
+    allow_truncated_training_history: bool,
+) -> list[str]:
+    """Strict latest-period reporting violations; empty list means the selection is admissible.
+
+    Enforces the stated protocol -- latest periods for test, ALL earlier periods for train/validation:
+      1. Every available partition label must be a real, ISO-date-prefixed calendar date so that
+         directory-name order equals chronological order (rejects ``partition_9`` and ``2026-99-99``).
+      2. The final selected partition must be the latest available one (no OLD period reported as the
+         headline latest-period test).
+      3. No earlier available partition may be silently excluded from the train/validation history,
+         unless ``allow_truncated_training_history`` explicitly permits it.
+    """
+    violations: list[str] = []
+    iso_date_prefix = re.compile(r"^\d{4}-\d{2}-\d{2}")
+    invalid_labels: list[str] = []
+    for label in all_available_labels:
+        if not iso_date_prefix.match(label):
+            invalid_labels.append(label)
+            continue
+        try:
+            # Reject regex-matching but impossible calendar dates (e.g. 2026-99-99); a prefix match
+            # is not enough to guarantee sortable, real dates.
+            datetime.strptime(label[:10], "%Y-%m-%d")
+        except ValueError:
+            invalid_labels.append(label)
+    if invalid_labels:
+        # Latest/earliest comparisons are meaningless when labels are not sortable real dates.
+        violations.append(
+            "partition labels must be ISO-date-prefixed real calendar dates so directory order matches "
+            f"chronological order; got invalid labels: {invalid_labels[:5]}"
+        )
+        return violations
+    latest_available = all_available_labels[-1] if all_available_labels else None
+    if selected_labels and latest_available is not None and selected_labels[-1] != latest_available:
+        violations.append(
+            f"final selected partition ({selected_labels[-1]}) is not the latest available partition "
+            f"({latest_available})"
+        )
+    if (
+        not allow_truncated_training_history
+        and selected_labels
+        and all_available_labels
+        and selected_labels[0] != all_available_labels[0]
+    ):
+        violations.append(
+            f"earliest selected partition ({selected_labels[0]}) is not the earliest available partition "
+            f"({all_available_labels[0]}); prior train/validation history is silently excluded "
+            "(pass --allow-truncated-training-history to override)"
+        )
+    return violations
+
+
+def build_training_time_policy(args: argparse.Namespace, final_test_is_latest_available: bool) -> dict[str, object]:
+    """Declared recency / latest-period training-time policy recorded for reproducibility.
+
+    The critical attestation is ``test_used_for_recency_selection: False``: recency weighting is
+    anchored to the validation start and the test block is never passed to the trainer, so it cannot
+    influence training or model selection. Recency hyperparameters here are fixed CLI arguments; a
+    future validation-based recency-profile sweep would set ``recency_hyperparameters_selected_on``
+    to ``validation``.
+    """
+    return {
+        "evaluation_design": "per_partition_walkforward_latest_holdout",
+        "test_is_latest_period": bool(final_test_is_latest_available),
+        "recency_weighting": args.recency_weighting,
+        "recency_half_life_days": float(args.recency_half_life_days),
+        "recency_min_weight": float(args.recency_min_weight),
+        "checkpoint_selection": "best_validation_return_then_fewer_order_legs",
+        "cash_hurdle_bps": float(args.q_switch_margin_bps),
+        "cash_hurdle_selected_on": "fixed_cli_argument",
+        "recency_hyperparameters_selected_on": "fixed_cli_argument",
+        "test_used_for_recency_selection": False,
+    }
+
+
+def official_test_block(records: list[dict[str, object]], final_test_is_latest_available: bool) -> dict[str, object] | None:
+    """First-class official latest-period test result so consumers need not scan partition records."""
+    official = next((item for item in records if item.get("is_official_latest_test")), None)
+    if official is None:
+        return None
+    return {
+        "partition": official.get("partition"),
+        "ordinal": official.get("ordinal"),
+        "is_latest_available": bool(final_test_is_latest_available),
+        "status": official.get("status"),
+        "reportable": bool(official.get("evaluation_reportable", False)),
+        "reportability_errors": list(official.get("reportability_errors", [])),
+        "test_total_return": official.get("test_total_return"),
+        "test_switches": official.get("test_switches"),
+        "test_order_legs": official.get("test_order_legs"),
+        "val_total_return": official.get("val_total_return"),
+    }
 
 
 def split_policy_with_partition_selection(split_policy: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
@@ -378,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         from rl_quant.minute_to_hour_transformer import (
             MinuteToHourEnvConfig,
             MinuteToHourTrainingConfig,
+            RecencyWeightConfig,
             action_index,
             evaluate_minute_to_hour_policy,
             train_minute_to_hour_dqn,
@@ -403,30 +533,32 @@ def main(argv: list[str] | None = None) -> int:
     # walk-forward diagnostics, not the latest-period KPI. Under strict reportability the final
     # selected partition must be the latest available one, so --end-partition / earliest selection
     # cannot silently make an OLD period the reported test.
-    latest_available_label = latest_available_partition_label(args)
-    official_test_label = paths[-1].parent.name
+    all_available_labels = [p.parent.name for p in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))]
+    selected_labels = [p.parent.name for p in paths]
+    latest_available_label = all_available_labels[-1] if all_available_labels else None
+    official_test_label = selected_labels[-1]
     final_test_is_latest_available = official_test_label == latest_available_label
+    # How many earlier available partitions were excluded from the selected train/validation history.
+    excluded_prior_partition_count = (
+        all_available_labels.index(selected_labels[0]) if selected_labels[0] in all_available_labels else 0
+    )
+    training_history_truncated = excluded_prior_partition_count > 0
+    all_prior_partitions_included = not training_history_truncated
     if args.reportability_policy == "strict":
-        # The "latest" guarantee relies on partition directory names sorting chronologically. Verify
-        # the labels are ISO-date-prefixed (zero-padded, lexicographic == chronological); otherwise a
-        # non-sortable label (e.g. partition_9 vs partition_10) could make a non-latest period the
-        # official test while passing the equality check below.
-        iso_date_prefix = re.compile(r"^\d{4}-\d{2}-\d{2}")
-        all_labels = [p.parent.name for p in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))]
-        non_sortable_labels = [label for label in all_labels if not iso_date_prefix.match(label)]
-        if non_sortable_labels:
-            raise SystemExit(
-                "strict latest-period evaluation requires ISO-date-prefixed partition labels so "
-                "directory-name order matches chronological order; got non-sortable labels: "
-                f"{non_sortable_labels[:5]}"
-            )
-    if args.reportability_policy == "strict" and not final_test_is_latest_available:
-        raise SystemExit(
-            f"strict latest-period evaluation requires the final selected partition "
-            f"({official_test_label}) to be the latest available partition ({latest_available_label}). "
-            "Adjust --end-partition/--partition-selection/--max-partitions, or use "
-            "--reportability-policy diagnostic for an explicitly non-latest diagnostic run."
+        violations = strict_latest_partition_violations(
+            selected_labels=selected_labels,
+            all_available_labels=all_available_labels,
+            allow_truncated_training_history=args.allow_truncated_training_history,
         )
+        if violations:
+            raise SystemExit(
+                "strict latest-period evaluation refused the partition selection:\n  - "
+                + "\n  - ".join(violations)
+                + "\nAdjust --start-partition/--end-partition/--partition-selection/--max-partitions, "
+                "pass --allow-truncated-training-history where appropriate, or use "
+                "--reportability-policy diagnostic for an explicitly non-latest/non-exhaustive run."
+            )
+    training_time_policy = build_training_time_policy(args, final_test_is_latest_available)
     run_dir = args.output_dir / args.run_name
     partition_dir = run_dir / "partitions"
     partition_dir.mkdir(parents=True, exist_ok=True)
@@ -503,6 +635,11 @@ def main(argv: list[str] | None = None) -> int:
                 vram_safety_gb=args.vram_safety_gb,
                 warm_start_model=previous_checkpoint,
                 max_subhour_tokens=args.max_subhour_tokens,
+                recency=RecencyWeightConfig(
+                    mode=args.recency_weighting,
+                    half_life_days=args.recency_half_life_days,
+                    min_weight=args.recency_min_weight,
+                ),
             )
             model, artifacts = train_minute_to_hour_dqn(train_split, val_split, device=device, config=train_config)
             train_result = evaluate_minute_to_hour_policy(
@@ -596,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 },
                 "split_policy": run_split_policy,
+                "training_time_policy": training_time_policy,
                 "training": artifacts,
                 "train_metrics": train_result.to_dict(),
                 "val_metrics": val_result.to_dict(),
@@ -687,8 +825,20 @@ def main(argv: list[str] | None = None) -> int:
                 "partition_selection_reportability_errors": partition_selection_errors,
                 "selection_reportable": not partition_selection_errors,
                 "evaluation_design": "per_partition_walkforward_latest_holdout",
+                "training_time_policy": training_time_policy,
                 "official_test_partition": official_test_label,
                 "final_test_is_latest_available": bool(final_test_is_latest_available),
+                "all_prior_partitions_included": bool(all_prior_partitions_included),
+                "training_history_truncated": bool(training_history_truncated),
+                "excluded_prior_partition_count": int(excluded_prior_partition_count),
+                "allow_truncated_training_history": bool(args.allow_truncated_training_history),
+                # First-class official result so dashboards/papers do not have to scan `records`
+                # for is_official_latest_test (None until the official/latest partition completes).
+                "official_test": official_test_block(records, final_test_is_latest_available),
+                "official_partition_count": sum(1 for item in records if item.get("is_official_latest_test")),
+                "diagnostic_partition_count": sum(
+                    1 for item in records if item["status"] == "ok" and not item.get("is_official_latest_test")
+                ),
                 "completed_count": sum(1 for item in records if item["status"] == "ok"),
                 "failed_count": sum(1 for item in records if item["status"] != "ok"),
                 "latest_checkpoint": str(previous_checkpoint) if previous_checkpoint is not None else None,

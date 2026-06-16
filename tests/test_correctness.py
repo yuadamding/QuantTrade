@@ -6524,6 +6524,245 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertEqual(selected[-1].parent.name, "2026-01-01")
             self.assertNotEqual(selected[-1].parent.name, module.latest_available_partition_label(earliest))
 
+    def test_action_feature_normalizer_one_valid_value_gets_mean_zero_std_one(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_action_feature_mean_std"])
+        # Channel "one" has a single mask-true value (5.0; the other entry is masked out); channel "two"
+        # has two mask-true values (2.0, 6.0). (B=2, S=1, F=4) with interleaved value/mask channels.
+        features = torch.tensor(
+            [
+                [[5.0, 1.0, 2.0, 1.0]],
+                [[99.0, 0.0, 6.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        )
+        names = [
+            "stock_covariates_v1.one",
+            "stock_covariates_v1_mask.one",
+            "stock_covariates_v1.two",
+            "stock_covariates_v1_mask.two",
+        ]
+        mean, std = module._action_feature_mean_std(features, names)
+        # Single valid observation -> unnormalized (mean 0, std 1), not amplified by a 1e-6 std.
+        self.assertEqual(float(mean[0].item()), 0.0)
+        self.assertEqual(float(std[0].item()), 1.0)
+        # Two valid observations -> real statistics (mean 4.0, population std 2.0).
+        self.assertAlmostEqual(float(mean[2].item()), 4.0, places=5)
+        self.assertAlmostEqual(float(std[2].item()), 2.0, places=5)
+
+    def test_strict_latest_partition_violations_detects_calendar_latest_and_truncation(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        fn = module.strict_latest_partition_violations
+        labels = ["2026-01-01", "2026-01-02", "2026-01-03"]
+        # Full selection ending at the latest available partition is admissible.
+        self.assertEqual(fn(selected_labels=labels, all_available_labels=labels, allow_truncated_training_history=False), [])
+        # Regex-matching but impossible calendar date is rejected.
+        calendar = fn(
+            selected_labels=["2026-99-99"],
+            all_available_labels=["2026-01-01", "2026-99-99"],
+            allow_truncated_training_history=True,
+        )
+        self.assertTrue(any("invalid labels" in violation for violation in calendar))
+        # Final selected partition is not the latest available -> violation.
+        not_latest = fn(selected_labels=["2026-01-01"], all_available_labels=labels, allow_truncated_training_history=True)
+        self.assertTrue(any("not the latest available" in violation for violation in not_latest))
+        # Earliest selected partition is not the earliest available -> truncated history violation...
+        truncated = fn(
+            selected_labels=["2026-01-02", "2026-01-03"],
+            all_available_labels=labels,
+            allow_truncated_training_history=False,
+        )
+        self.assertTrue(any("silently excluded" in violation for violation in truncated))
+        # ...unless explicitly allowed (and the final partition is still the latest available).
+        self.assertEqual(
+            fn(selected_labels=["2026-01-02", "2026-01-03"], all_available_labels=labels, allow_truncated_training_history=True),
+            [],
+        )
+
+    def test_official_test_block_summarizes_latest_partition(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        records = [
+            {"partition": "2026-01-01", "ordinal": 1, "status": "ok", "is_official_latest_test": False, "test_total_return": 0.01},
+            {
+                "partition": "2026-01-02",
+                "ordinal": 2,
+                "status": "ok",
+                "is_official_latest_test": True,
+                "evaluation_reportable": True,
+                "reportability_errors": [],
+                "test_total_return": 0.05,
+                "test_switches": 3,
+                "test_order_legs": 4,
+                "val_total_return": 0.02,
+            },
+        ]
+        block = module.official_test_block(records, final_test_is_latest_available=True)
+        self.assertEqual(block["partition"], "2026-01-02")
+        self.assertTrue(block["is_latest_available"])
+        self.assertTrue(block["reportable"])
+        self.assertEqual(block["test_total_return"], 0.05)
+        self.assertEqual(block["test_switches"], 3)
+        # No official partition yet (e.g. before the latest partition completes) -> None.
+        self.assertIsNone(module.official_test_block([records[0]], True))
+
+    def test_recency_weights_decrease_with_age_and_keep_min_weight(self) -> None:
+        from rl_quant.minute_to_hour_transformer import _timestamp_to_epoch_ms, compute_recency_weights
+
+        val_start_ms = _timestamp_to_epoch_ms("2026-06-01T13:30:00+00:00")
+        timestamps = [
+            "2026-01-01T14:30:00+00:00",  # ~151 days before validation
+            "2026-04-01T14:30:00+00:00",  # ~61 days before validation
+            "2026-05-31T14:30:00+00:00",  # ~1 day before validation
+        ]
+        weights = compute_recency_weights(
+            timestamps, val_start_ms, mode="exponential", half_life_days=60.0, min_weight=0.05
+        )
+        # Older rows get strictly smaller weights, never below min_weight, never above 1.0.
+        self.assertLess(float(weights[0]), float(weights[1]))
+        self.assertLess(float(weights[1]), float(weights[2]))
+        self.assertGreaterEqual(float(weights[0]), 0.05)
+        self.assertLessEqual(float(weights[2]), 1.0)
+        self.assertGreater(float(weights[2]), 0.95)  # ~1 day old -> near full weight
+
+    def test_recency_weights_anchor_validation_start_not_test_end(self) -> None:
+        from rl_quant.minute_to_hour_transformer import _timestamp_to_epoch_ms, compute_recency_weights
+
+        val_start = "2026-06-01T13:30:00+00:00"
+        val_start_ms = _timestamp_to_epoch_ms(val_start)
+        # A row exactly at the validation start has age 0 -> weight 1.0 (anchored to validation, not test).
+        anchor = compute_recency_weights([val_start], val_start_ms, mode="exponential", half_life_days=60.0, min_weight=0.05)
+        self.assertAlmostEqual(float(anchor[0]), 1.0, places=6)
+        # A row AFTER the validation start (a test-era timestamp) clamps to age 0 -> weight 1.0; the
+        # function never produces >1 (negative-age amplification) and only consumes the rows it is given.
+        later = compute_recency_weights(
+            ["2026-07-01T13:30:00+00:00"], val_start_ms, mode="exponential", half_life_days=60.0, min_weight=0.05
+        )
+        self.assertAlmostEqual(float(later[0]), 1.0, places=6)
+
+    def test_recency_weights_mode_none_is_uniform_and_weighted_mean_equals_mean(self) -> None:
+        from rl_quant.minute_to_hour_transformer import compute_recency_weights
+
+        weights = compute_recency_weights(
+            ["2026-01-01T14:30:00+00:00", "2026-05-31T14:30:00+00:00"],
+            0,
+            mode="none",
+            half_life_days=60.0,
+            min_weight=0.05,
+        )
+        self.assertTrue(torch.equal(weights, torch.ones(2)))
+        # No-regression guarantee: a uniform-weighted mean equals an unweighted mean exactly.
+        per_sample = torch.tensor([0.2, 0.4, 0.9, 1.3])
+        ones = torch.ones(4)
+        weighted = (per_sample * ones).sum() / ones.sum().clamp_min(1e-8)
+        self.assertAlmostEqual(float(weighted), float(per_sample.mean()), places=6)
+
+    def test_partition_trainer_recency_flags_and_training_time_policy(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        defaults = module.parse_args([])
+        self.assertEqual(defaults.recency_weighting, "none")
+        self.assertEqual(defaults.recency_half_life_days, 120.0)
+        self.assertEqual(defaults.recency_min_weight, 0.05)
+        policy = module.build_training_time_policy(defaults, final_test_is_latest_available=True)
+        self.assertEqual(policy["recency_weighting"], "none")
+        self.assertTrue(policy["test_is_latest_period"])
+        self.assertFalse(policy["test_used_for_recency_selection"])
+        self.assertEqual(policy["checkpoint_selection"], "best_validation_return_then_fewer_order_legs")
+        explicit = module.parse_args(
+            ["--recency-weighting", "exponential", "--recency-half-life-days", "60", "--recency-min-weight", "0.1"]
+        )
+        explicit_policy = module.build_training_time_policy(explicit, final_test_is_latest_available=False)
+        self.assertEqual(explicit_policy["recency_weighting"], "exponential")
+        self.assertEqual(explicit_policy["recency_half_life_days"], 60.0)
+        self.assertEqual(explicit_policy["recency_min_weight"], 0.1)
+        self.assertFalse(explicit_policy["test_is_latest_period"])
+
+    def test_recency_weighting_trains_and_is_uniform_when_disabled(self) -> None:
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit,
+            MinuteToHourEnvConfig,
+            MinuteToHourTrainingConfig,
+            RecencyWeightConfig,
+            train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+            n = len(dates)
+            return HourFromMinuteDataSplit(
+                name=name,
+                decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
+                next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
+                minute_feature_names=["m"],
+                hour_feature_names=["h"],
+                action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((n, 1, 1, 1)),
+                minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((n, 1, 1)),
+                action_returns=torch.zeros((n, 2)),
+                action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                # Last row has no successor -> valid_index_mask False so the env resets at the boundary.
+                valid_start_indices=torch.arange(n - 1, dtype=torch.long),
+                valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+                minute_feature_mean=torch.zeros(1),
+                minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1),
+                hour_feature_std=torch.ones(1),
+                hours_lookback=1,
+                minutes_per_hour=1,
+            )
+
+        train = make_split(
+            "train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"]
+        )
+        val = make_split("val", ["2026-06-01", "2026-06-02"])
+        learning = DQNLearningConfig(
+            num_envs=2,
+            episode_length=3,
+            replay_capacity=64,
+            batch_size=4,
+            train_steps=8,
+            warmup_steps=2,
+            gamma=0.99,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            target_update_interval=3,
+            epsilon_start=0.2,
+            epsilon_end=0.0,
+            eval_interval=4,
+            grad_clip=1.0,
+            use_amp=False,
+        )
+        env = MinuteToHourEnvConfig(num_envs=2, episode_length=3)
+
+        def run(mode: str) -> dict:
+            config = MinuteToHourTrainingConfig(
+                env=env,
+                learning=learning,
+                d_model=16,
+                n_heads=2,
+                minute_layers=1,
+                hour_layers=1,
+                feedforward_dim=16,
+                action_embedding_dim=4,
+                recency=RecencyWeightConfig(mode=mode, half_life_days=60.0, min_weight=0.05),
+            )
+            torch.manual_seed(0)
+            _, artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+            return artifacts["recency_policy"]
+
+        # Disabled (default): every training row keeps weight 1.0 -> weighted loss == plain mean.
+        uniform = run("none")
+        self.assertEqual(uniform["weight_min"], 1.0)
+        self.assertEqual(uniform["weight_max"], 1.0)
+        # Exponential: older training rows are down-weighted; weights stay within [min_weight, 1];
+        # and the trainer never references the test split for recency.
+        weighted = run("exponential")
+        self.assertEqual(weighted["mode"], "exponential")
+        self.assertFalse(weighted["test_used_for_recency_selection"])
+        self.assertLess(weighted["weight_min"], weighted["weight_max"])
+        self.assertGreaterEqual(weighted["weight_min"], 0.05)
+        self.assertLessEqual(weighted["weight_max"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
