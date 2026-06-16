@@ -107,8 +107,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cooldown-bars", type=int, default=0)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>")
     parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision")
-    parser.add_argument("--target-vram-gb", type=float, help="Reserve CUDA VRAM after warmup toward this total used amount.")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP autocast precision when --amp is set: fp16 (default) or bf16 (no GradScaler).",
+    )
+    parser.add_argument(
+        "--target-vram-gb",
+        type=float,
+        help="OPT-IN CUDA ballast: reserve VRAM after warmup toward this total used amount. This "
+        "INCREASES memory (not a cap); use --min-free-vram-gb to guard headroom for large models.",
+    )
     parser.add_argument("--vram-safety-gb", type=float, default=0.12)
+    parser.add_argument(
+        "--min-free-vram-gb",
+        type=float,
+        default=0.0,
+        help="Fail fast before training if free CUDA memory is below this many GiB (0 disables).",
+    )
     parser.add_argument("--seed", type=int, default=17)
     return parser.parse_args(argv)
 
@@ -147,6 +164,7 @@ def main() -> int:
         from rl_quant.core import (
             DQNLearningConfig,
             configure_torch_runtime,
+            require_min_free_vram,
             resolve_torch_device,
             torch_runtime_summary,
         )
@@ -171,6 +189,7 @@ def main() -> int:
 
     device = resolve_torch_device(args.device)
     configure_torch_runtime(device)
+    require_min_free_vram(device, args.min_free_vram_gb)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -233,6 +252,7 @@ def main() -> int:
         eval_interval=args.eval_interval,
         grad_clip=args.grad_clip,
         use_amp=args.amp,
+        amp_dtype=args.amp_dtype,
     )
     config = MinuteToHourTrainingConfig(
         env=env_config,

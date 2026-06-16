@@ -16,6 +16,10 @@ dependencies = [
     "torch>=2.6,<3",
 ]
 
+[project.scripts]
+qt = "rl_quant.cli:main"
+quanttrade = "rl_quant.cli:main"
+
 [project.optional-dependencies]
 data = [
     "pandas>=2.2,<3",

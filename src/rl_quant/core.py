@@ -83,10 +83,11 @@ class TemporalQNetwork(nn.Module):
 
 def _validate_replay_batch(
     storage: dict[str, torch.Tensor], transition: dict[str, torch.Tensor]
-) -> None:
+) -> int:
     """Validate declared replay fields share one leading batch dim and match the stored trailing
-    shape, so a mis-shaped transition fails loudly instead of silently corrupting learning curves.
-    Extra transition keys (e.g. legs/resets) are ignored, matching add()'s field-driven write."""
+    shape, and RETURN that canonical batch size. The returned count is derived only from declared
+    fields, so an extra transition key (e.g. legs/resets) appearing first cannot define the write
+    size. Extra keys are otherwise ignored, matching add()'s field-driven write."""
     counts: set[int] = set()
     for name, target in storage.items():
         value = transition[name]
@@ -100,6 +101,7 @@ def _validate_replay_batch(
         counts.add(int(value.shape[0]))
     if len(counts) > 1:
         raise ValueError(f"mismatched replay batch sizes across fields: {sorted(counts)}")
+    return next(iter(counts)) if counts else 0
 
 
 class TensorReplayBuffer:
@@ -127,9 +129,9 @@ class TensorReplayBuffer:
         missing = set(self.storage) - set(transition)
         if missing:
             raise ValueError(f"Missing replay fields: {sorted(missing)}")
-        _validate_replay_batch(self.storage, transition)
-        first_value = next(iter(transition.values()))
-        count = int(first_value.shape[0])
+        # Canonical batch size comes from declared fields only -- never from an arbitrary (possibly
+        # extra) first transition value, which could have a different leading dim.
+        count = _validate_replay_batch(self.storage, transition)
         if count == 0:
             return
 
@@ -184,9 +186,9 @@ class TensorDictReplayBuffer:
         missing = set(self.storage) - set(transition)
         if missing:
             raise ValueError(f"Missing replay fields: {sorted(missing)}")
-        _validate_replay_batch(self.storage, transition)
-        first_value = next(iter(transition.values()))
-        count = int(first_value.shape[0])
+        # Canonical batch size comes from declared fields only -- never from an arbitrary (possibly
+        # extra) first transition value, which could have a different leading dim.
+        count = _validate_replay_batch(self.storage, transition)
         if count == 0:
             return
         if count >= self.capacity:
@@ -319,24 +321,35 @@ def cuda_amp_enabled(device: torch.device, requested: bool) -> bool:
     return bool(requested and device.type == "cuda")
 
 
-_AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+_AMP_DTYPES = {
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def resolve_amp_dtype(name: str) -> torch.dtype:
-    """Map an AMP precision name to a torch dtype. fp32 is not an AMP dtype (disable AMP instead)."""
+    """Map an AMP precision name to a torch dtype (whitespace/case-insensitive). fp32 is not an AMP
+    dtype (disable AMP instead)."""
+    normalized = str(name).strip().lower()
     try:
-        return _AMP_DTYPES[name]
+        return _AMP_DTYPES[normalized]
     except KeyError as exc:
-        raise ValueError(f"Unsupported amp dtype {name!r}; choose one of {sorted(_AMP_DTYPES)}.") from exc
+        raise ValueError(f"Unsupported amp dtype {name!r}; choose fp16 or bf16.") from exc
 
 
 def autocast_context(device: torch.device, requested: bool, amp_dtype: str = "fp16"):
-    enabled = cuda_amp_enabled(device, requested)
-    if not enabled:
+    # Resolve eagerly so a typo'd amp_dtype is rejected even when AMP is disabled (e.g. a CPU dry run),
+    # rather than silently ignored until a CUDA run.
+    dtype = resolve_amp_dtype(amp_dtype)
+    if not cuda_amp_enabled(device, requested):
         return nullcontext()
-    # bf16 has a wider exponent range than fp16 and is preferred on Ampere/Hopper-class GPUs; the
-    # default stays fp16 so existing runs are unchanged unless a caller opts into bf16.
-    return torch.amp.autocast(device_type="cuda", dtype=resolve_amp_dtype(amp_dtype))
+    # bf16 has a wider exponent range than fp16 and is preferred on Ampere/Hopper-class GPUs; fail
+    # clearly rather than silently if the device cannot do bf16.
+    if dtype is torch.bfloat16 and hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("CUDA bf16 AMP requested, but this device does not support bf16.")
+    return torch.amp.autocast(device_type="cuda", dtype=dtype)
 
 
 def make_grad_scaler(device: torch.device, requested: bool, amp_dtype: str = "fp16") -> torch.amp.GradScaler:
@@ -354,24 +367,44 @@ def make_grad_scaler(device: torch.device, requested: bool, amp_dtype: str = "fp
     return torch.amp.GradScaler("cuda", enabled=enabled)
 
 
-def cuda_memory_report(device: torch.device) -> dict[str, float]:
+def cuda_memory_report(device: torch.device, *, round_digits: int | None = None) -> dict[str, float]:
     """Point-in-time CUDA memory snapshot (allocated/reserved/peak/free/total GiB).
 
     A true accounting of what training actually occupies, unlike the VRAM-ballast reservation
     (which *increases* usage toward a target). Returns zeros for non-CUDA devices so callers can
-    log/guard unconditionally."""
+    log/guard unconditionally. Values are RAW by default (use them for threshold guards); pass
+    ``round_digits`` only for human-readable logs/manifests."""
     if device.type != "cuda":
-        return {"allocated_gb": 0.0, "reserved_gb": 0.0, "peak_allocated_gb": 0.0, "peak_reserved_gb": 0.0, "free_gb": 0.0, "total_gb": 0.0}
-    torch.cuda.synchronize(device)
-    free, total = torch.cuda.mem_get_info(device)
-    return {
-        "allocated_gb": round(torch.cuda.memory_allocated(device) / 1024**3, 4),
-        "reserved_gb": round(torch.cuda.memory_reserved(device) / 1024**3, 4),
-        "peak_allocated_gb": round(torch.cuda.max_memory_allocated(device) / 1024**3, 4),
-        "peak_reserved_gb": round(torch.cuda.max_memory_reserved(device) / 1024**3, 4),
-        "free_gb": round(free / 1024**3, 4),
-        "total_gb": round(total / 1024**3, 4),
-    }
+        report = {"allocated_gb": 0.0, "reserved_gb": 0.0, "peak_allocated_gb": 0.0, "peak_reserved_gb": 0.0, "free_gb": 0.0, "total_gb": 0.0}
+    else:
+        torch.cuda.synchronize(device)
+        free, total = torch.cuda.mem_get_info(device)
+        report = {
+            "allocated_gb": torch.cuda.memory_allocated(device) / 1024**3,
+            "reserved_gb": torch.cuda.memory_reserved(device) / 1024**3,
+            "peak_allocated_gb": torch.cuda.max_memory_allocated(device) / 1024**3,
+            "peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 1024**3,
+            "free_gb": free / 1024**3,
+            "total_gb": total / 1024**3,
+        }
+    if round_digits is not None:
+        return {key: round(value, round_digits) for key, value in report.items()}
+    return report
+
+
+def require_min_free_vram(device: torch.device, min_free_gb: float, *, phase: str = "training") -> None:
+    """Fail fast when free CUDA memory is below ``min_free_gb`` GiB (no-op off CUDA or when <= 0).
+
+    Uses raw (unrounded) free memory for the comparison. A preflight guard against OOM, distinct
+    from the VRAM-ballast reservation, which intentionally consumes memory."""
+    if device.type != "cuda" or min_free_gb <= 0:
+        return
+    free_gb = cuda_memory_report(device)["free_gb"]
+    if free_gb < min_free_gb:
+        raise SystemExit(
+            f"insufficient free CUDA memory before {phase}: {free_gb:.2f} GiB free < "
+            f"--min-free-vram-gb {min_free_gb:.2f} GiB. Free memory or lower the requirement."
+        )
 
 
 class CudaVramReservation:

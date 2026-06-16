@@ -161,15 +161,8 @@ The 2026 LLM stack is diagnostic for retrospective 2023-2026 backtests unless
 the extractor model was available before the first decision timestamp. Training
 never calls an LLM directly; it consumes only frozen feature tables and sidecars.
 
-Check CUDA and AMP availability:
-
-```bash
-conda run -n ml1 python scripts/check_torch_cuda.py \
-  --device auto \
-  --matrix-size 2048 \
-  --repeats 2 \
-  --amp
-```
+Verify CUDA/AMP with `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.is_bf16_supported())"`.
+(The standalone `check_torch_cuda.py` diagnostic was moved to `../archive/quanttrade_scripts/`.)
 
 Most training scripts accept:
 
@@ -192,6 +185,28 @@ reserves byte tensors after warmup to *raise* used VRAM toward the target (it do
 not shard, offload, or limit memory). Leave it unset for large-model training
 unless you deliberately want to reserve extra VRAM; use `--min-free-vram-gb` to
 guard headroom instead.
+
+## Unified CLI (`qt`)
+
+Installing the package (`pip install -e .`) registers a `qt` (alias `quanttrade`)
+command that dispatches to the workflow entry points, with named presets for the
+common configurations:
+
+```bash
+qt --help
+qt preset list
+qt train subhour --source 1s            # 1-second context preset
+qt train direct-bar --interval 1m       # minute direct-bar preset
+qt build subhour --source 1s
+qt train second-context
+qt validate protocol --dataset-manifest ...
+```
+
+`--preset NAME` (see `qt preset list`) expands to the underlying workflow's
+arguments; any extra arguments are forwarded verbatim and override preset
+defaults. The thin `scripts/train_hourly_from_second_context_rl.py`-style
+wrappers now just call `qt`. (Full per-script `--help` is still available by
+running the canonical `scripts/*.py` entry points directly.)
 
 ## Repository Layout
 
@@ -339,7 +354,6 @@ Silver features are source-specific cleaned or compressed tables.
 Examples:
 
 - Sparse-aware stock second context CSV from `build_stock_second_silver_features.py`.
-- Market ecology daily context from `learn_market_ecological_attention.py`.
 - NBBO bucket features from `extract_nbbo_features.py`.
 
 ### Gold
@@ -378,16 +392,15 @@ Frequency:
 - Daily close-to-close rows.
 - Current scripts focus on 2026 research.
 
-Primary scripts:
+Primary script:
 
 ```text
-massive_2026_momentum_test.py
-rank_2026_strategy_stability.py
-build_2026_rl_strategy_dataset.py
-learn_market_ecological_attention.py
-merge_market_ecology_with_rl_states.py
-train_strategy_allocator.py
+train_strategy_allocator.py    # qt train strategy
 ```
+
+The one-off 2026 momentum/stability/variation experiments, the market-ecology
+research scripts, and the strategy-dataset builder were moved out of the repo to
+`../archive/quanttrade_scripts/` to keep it compact.
 
 ### 2. Direct Bar Transformer
 
@@ -465,7 +478,6 @@ Frequency:
 Primary scripts:
 
 ```text
-audit_polygon_second_aggs.py
 build_stock_second_silver_features.py
 build_second_context_decision_dataset.py
 train_second_context_action_scorer.py
@@ -845,13 +857,8 @@ conda run -n ml1 pytest -q
 
 ### CUDA Check
 
-```bash
-conda run -n ml1 python scripts/check_torch_cuda.py \
-  --device auto \
-  --matrix-size 2048 \
-  --repeats 2 \
-  --amp
-```
+Verify availability directly: `python -c "import torch; print(torch.cuda.is_available())"`.
+(`check_torch_cuda.py` was archived to `../archive/quanttrade_scripts/`.)
 
 ### Universe Bootstrap
 
@@ -895,37 +902,11 @@ dates and manifests when rebuilding minute bars.
 
 ### Daily Strategy Research
 
-Run massive 2026 momentum tests:
+The 2026 momentum/stability/variation experiments, the daily RL allocator
+dataset builder, and the market-ecology context scripts were moved out of the
+repo to `../archive/quanttrade_scripts/`. Restore them from there if needed.
 
-```bash
-conda run -n ml1 python scripts/massive_2026_momentum_test.py
-```
-
-Rank strategies by variance and stable performance:
-
-```bash
-conda run -n ml1 python scripts/rank_2026_strategy_stability.py
-```
-
-Build the daily RL allocator dataset:
-
-```bash
-conda run -n ml1 python scripts/build_2026_rl_strategy_dataset.py
-```
-
-Learn market ecological attention context:
-
-```bash
-conda run -n ml1 python scripts/learn_market_ecological_attention.py
-```
-
-Merge market ecology into RL states:
-
-```bash
-conda run -n ml1 python scripts/merge_market_ecology_with_rl_states.py
-```
-
-Train the daily strategy allocator:
+Train the daily strategy allocator (`qt train strategy`):
 
 ```bash
 conda run -n ml1 python scripts/train_strategy_allocator.py \
@@ -949,7 +930,7 @@ conda run -n ml1 python scripts/train_hourly_causal_transformer_rl.py \
   --dataset derived/rl_hourly/top_volume_2026/hourly_transformer_dataset.pt \
   --device auto \
   --amp \
-  --target-vram-gb 9.5
+  --min-free-vram-gb 2
 ```
 
 The direct bar trainer is risk-aware by default. It supports:
@@ -977,7 +958,7 @@ Train the minute-level causal-transformer DQN:
 conda run -n ml1 python scripts/train_minute_causal_transformer_rl.py \
   --device auto \
   --amp \
-  --target-vram-gb 9.5
+  --min-free-vram-gb 2
 ```
 
 Direct minute training is supported, but it is not the preferred default for
@@ -997,7 +978,7 @@ Train the hierarchical minute-to-hour transformer:
 conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
   --device auto \
   --amp \
-  --target-vram-gb 9.5 \
+  --min-free-vram-gb 2 \
   --max-switches-per-episode 3 \
   --max-order-legs-per-episode 6
 ```
@@ -1008,7 +989,7 @@ Warm-start rolling periods from a prior checkpoint:
 conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
   --device auto \
   --amp \
-  --target-vram-gb 9.5 \
+  --min-free-vram-gb 2 \
   --warm-start-model data/rl_hour_from_minute_runs/previous_period/model.pt
 ```
 
@@ -1030,7 +1011,7 @@ Train the second-to-hour transformer:
 conda run -n ml1 python scripts/train_hourly_from_second_context_rl.py \
   --device auto \
   --amp \
-  --target-vram-gb 9.5
+  --min-free-vram-gb 2
 ```
 
 This path keeps hourly decisions while allowing each hour token to consume up
@@ -1038,16 +1019,6 @@ to 3,600 causal one-second source bars. Long second-level streams are compressed
 to `--max-subhour-tokens` before intrahour attention.
 
 ### Polygon Second-Context Gold Dataset
-
-Audit downloaded Polygon second bars:
-
-```bash
-conda run -n ml1 python scripts/audit_polygon_second_aggs.py \
-  --root ../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15 \
-  --manifest ../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/manifest.csv \
-  --dataset-manifest ../data/polygon/second_aggs/top500_common_stocks_2025_to_2026-06-15/dataset_manifest.json \
-  --source-access REST
-```
 
 Build compact silver features:
 
@@ -1083,14 +1054,17 @@ conda run -n ml1 python scripts/train_second_context_action_scorer.py \
   --micro-batch-size 8 \
   --eval-batch-size 16 \
   --checkpoint-every-epochs 5 \
-  --target-vram-gb 9.5
+  --amp-dtype bf16 \
+  --min-free-vram-gb 2
 ```
 
 `--batch-size` is the effective optimizer batch. `--micro-batch-size` is the
-actual transformer batch placed on CUDA before gradient accumulation, so long
-runs can use many epochs over the full dataset while keeping peak memory inside
-the 9.5 GiB target. Validation, test scoring, and confidence artifacts use
-`--eval-batch-size` and are also batched.
+actual transformer batch placed on CUDA before gradient accumulation, so the
+peak training memory is driven by the micro-batch (not the optimizer batch),
+letting long runs use many epochs over the full dataset. `--min-free-vram-gb`
+aborts early if free VRAM is too low; `--target-vram-gb` is **not** a cap (it
+reserves ballast that raises usage — do not use it to bound memory). Validation,
+test scoring, and confidence artifacts use `--eval-batch-size` and are also batched.
 
 Evaluate a second-context dataset:
 
@@ -1134,18 +1108,11 @@ Multiple manifests can be passed by repeating `--dataset-manifest` or
 
 | Script | Role |
 | --- | --- |
-| `scripts/check_torch_cuda.py` | Verify Torch, CUDA, AMP, and matrix-multiply runtime. |
 | `scripts/fetch_top_us_market_cap_universe.py` | Fetch a current top US equity universe by market cap. |
 | `scripts/fetch_top_volume_universes.py` | Fetch top-volume US stocks and ETFs. |
 | `scripts/download_daily_ohlcv.py` | Download daily OHLCV data. |
 | `scripts/download_hourly_ohlcv.py` | Download Yahoo hourly OHLCV data. |
 | `scripts/download_intraday_ohlcv.py` | Download Yahoo intraday/minute OHLCV data. |
-| `scripts/massive_2026_momentum_test.py` | Test many daily momentum variants on 2026 data. |
-| `scripts/rank_2026_strategy_stability.py` | Rank strategies by variance and stable performance. |
-| `scripts/analyze_2026_strategy_variation.py` | Analyze 2026 strategy performance variation. |
-| `scripts/build_2026_rl_strategy_dataset.py` | Build daily strategy allocator datasets. |
-| `scripts/learn_market_ecological_attention.py` | Learn CREDO-style causal ecological market context. |
-| `scripts/merge_market_ecology_with_rl_states.py` | Merge market ecology features into daily RL states. |
 | `scripts/train_strategy_allocator.py` | Train the daily strategy DQN allocator. |
 | `scripts/build_hourly_transformer_dataset.py` | Build direct hourly/minute bar transformer datasets. |
 | `scripts/build_minute_transformer_dataset.py` | Wrapper for recent direct minute transformer dataset defaults. |
@@ -1155,7 +1122,6 @@ Multiple manifests can be passed by repeating `--dataset-manifest` or
 | `scripts/build_hourly_from_second_context_dataset.py` | Wrapper for hourly decisions from Polygon one-second context. |
 | `scripts/train_hourly_from_minute_context_rl.py` | Train hierarchical subhour-to-hour DQN. |
 | `scripts/train_hourly_from_second_context_rl.py` | Wrapper for second-to-hour training defaults. |
-| `scripts/audit_polygon_second_aggs.py` | Audit Polygon second aggregate manifests and reportability. |
 | `scripts/build_stock_second_silver_features.py` | Build sparse-aware silver features from stock second bars. |
 | `scripts/build_second_context_decision_dataset.py` | Build gold decision tensors from second context. |
 | `scripts/build_news_article_table.py` | Deduplicate Polygon news JSONL into article rows. |
@@ -1268,12 +1234,7 @@ conda run -n ml1 python -m pip install -e ".[dev,data]"
 
 ### CUDA is not used
 
-Check CUDA first:
-
-```bash
-conda run -n ml1 python scripts/check_torch_cuda.py --device auto --amp
-```
-
+Check CUDA first: `python -c "import torch; print(torch.cuda.is_available())"`.
 Then pass `--device auto --amp` to training scripts. If CUDA is unavailable,
 scripts should fall back to CPU.
 

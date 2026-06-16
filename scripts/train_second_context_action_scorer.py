@@ -273,8 +273,8 @@ def main() -> int:
     from rl_quant.core import (
         CudaVramReservation,
         configure_torch_runtime,
-        cuda_memory_report,
         make_grad_scaler,
+        require_min_free_vram,
         resolve_torch_device,
     )
     from rl_quant.research_protocol import stable_json_hash
@@ -301,13 +301,7 @@ def main() -> int:
     )
     device = resolve_torch_device(args.device)
     configure_torch_runtime(device)
-    if args.min_free_vram_gb > 0 and device.type == "cuda":
-        free_gb = cuda_memory_report(device)["free_gb"]
-        if free_gb < args.min_free_vram_gb:
-            raise SystemExit(
-                f"insufficient free CUDA memory: {free_gb:.2f} GiB free < --min-free-vram-gb "
-                f"{args.min_free_vram_gb:.2f} GiB. Free memory or lower the requirement."
-            )
+    require_min_free_vram(device, args.min_free_vram_gb)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)

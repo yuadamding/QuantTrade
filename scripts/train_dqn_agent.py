@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         default="fp16",
         help="AMP autocast precision when --amp is set: fp16 (default) or bf16 (no GradScaler).",
     )
+    parser.add_argument(
+        "--min-free-vram-gb",
+        type=float,
+        default=0.0,
+        help="Fail fast before training if free CUDA memory is below this many GiB (0 disables).",
+    )
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 
@@ -154,6 +160,7 @@ def main() -> int:
 
         from rl_quant.core import (
             configure_torch_runtime,
+            require_min_free_vram,
             resolve_torch_device,
             torch_runtime_summary,
         )
@@ -183,6 +190,7 @@ def main() -> int:
         raise SystemExit("--latency-steps cannot exceed --step-horizon in this simulator.")
     device = resolve_torch_device(args.device)
     configure_torch_runtime(device)
+    require_min_free_vram(device, args.min_free_vram_gb)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)

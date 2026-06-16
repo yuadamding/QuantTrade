@@ -2,7 +2,6 @@
 
 __all__ = [
     "action_risk",
-    "bar_transformer",
     "core",
     "decision_framework",
     "hourly_transformer",

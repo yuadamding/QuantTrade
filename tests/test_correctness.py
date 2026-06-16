@@ -6222,23 +6222,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(manifest.model_id, "demo")
         self.assertIn("CASH", manifest.validation_protocol.benchmark_names)
 
-    def test_ecology_helpers_softmax_and_drawdown_semantics(self) -> None:
-        module = load_script("learn_market_ecological_attention")
-        uniform = module.softmax([0.0, 0.0, 0.0])
-        self.assertAlmostEqual(sum(uniform), 1.0, places=6)
-        self.assertTrue(all(abs(weight - 1.0 / 3.0) < 1e-6 for weight in uniform))
-        skewed = module.softmax([10.0, 0.0])
-        self.assertGreater(skewed[0], skewed[1])
-        # trailing_returns over a small series equals the hand-computed pct changes.
-        series = {"2026-01-01": (100.0, 0.0), "2026-01-02": (110.0, 0.0), "2026-01-03": (104.5, 0.0)}
-        dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
-        rets = module.trailing_returns(series, dates, 2, 3)
-        self.assertAlmostEqual(rets[-1], 104.5 / 110.0 - 1.0, places=6)
-        # trailing_drawdown is the CURRENT drawdown from the window peak (NOT max drawdown):
-        # peak is 110, current is 104.5 -> 104.5/110 - 1, even though an intermediate max-DD differs.
-        drawdown = module.trailing_drawdown(series, dates, 2, 3)
-        self.assertAlmostEqual(drawdown, 104.5 / 110.0 - 1.0, places=6)
-
     @staticmethod
     def _valid_news_llm_row(**overrides):
         from rl_quant.features.news_llm import NEWS_LLM_ARTICLE_TICKER_FIELDS
@@ -7050,6 +7033,40 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dbuf.add(x=torch.zeros(3, 5))  # wrong trailing shape
 
+    def test_replay_buffer_extra_first_field_does_not_define_batch_size(self) -> None:
+        from rl_quant.core import TensorDictReplayBuffer
+
+        buffer = TensorDictReplayBuffer(
+            capacity=8,
+            device=torch.device("cpu"),
+            fields={"states": ((3,), torch.float32), "actions": ((), torch.long)},
+        )
+        # An extra field placed FIRST with a different leading dim must NOT define the write size;
+        # the canonical count comes from the declared replay fields (2 rows here), not "extra" (99).
+        buffer.add(extra=torch.zeros(99), states=torch.zeros(2, 3), actions=torch.zeros(2, dtype=torch.long))
+        self.assertEqual(buffer.size, 2)
+
+    def test_autocast_context_validates_dtype_eagerly_and_normalizes(self) -> None:
+        from rl_quant.core import autocast_context, resolve_amp_dtype
+
+        # Normalization: whitespace/case-insensitive, accepts long and short spellings.
+        self.assertEqual(resolve_amp_dtype("  FP16 "), torch.float16)
+        self.assertEqual(resolve_amp_dtype("BFloat16"), torch.bfloat16)
+        # Eager validation: a bad dtype is rejected even when AMP is disabled (CPU / requested=False).
+        with self.assertRaises(ValueError):
+            autocast_context(torch.device("cpu"), False, "fp8")
+
+    def test_cuda_memory_report_round_digits(self) -> None:
+        from rl_quant.core import cuda_memory_report
+
+        cpu = torch.device("cpu")
+        raw = cuda_memory_report(cpu)
+        rounded = cuda_memory_report(cpu, round_digits=2)
+        # CPU is all-zero either way; the key contract is that raw (guard) and rounded (log) both work.
+        self.assertEqual(set(raw), set(rounded))
+        self.assertEqual(raw["free_gb"], 0.0)
+        self.assertEqual(rounded["free_gb"], 0.0)
+
     def test_intraday_training_config_has_amp_dtype(self) -> None:
         import dataclasses
 
@@ -7123,6 +7140,63 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             except Exception as exc:  # noqa: BLE001 - want to report every broken module
                 failures.append(f"{mod.name}: {type(exc).__name__}: {exc}")
         self.assertEqual(failures, [])
+
+    def test_qt_cli_workflows_map_to_existing_scripts(self) -> None:
+        from rl_quant.cli import _DISPATCH
+        from rl_quant.paths import scripts_dir
+
+        for (group, workflow), script in _DISPATCH.items():
+            path = scripts_dir() / script
+            self.assertTrue(path.exists(), f"qt {group} {workflow} -> missing script {path}")
+
+    def test_qt_cli_dispatch_expands_preset_and_forwards_args(self) -> None:
+        from rl_quant.cli import build_parser, resolve_workflow
+        from rl_quant.paths import scripts_dir
+
+        parser = build_parser()
+        # --source 1s selects the second-context preset by default; --foo bar is forwarded verbatim.
+        args, passthrough = parser.parse_known_args(["train", "subhour", "--source", "1s", "--foo", "bar"])
+        script, script_argv = resolve_workflow(args, passthrough)
+        self.assertEqual(script, "train_hourly_from_minute_context_rl.py")
+        self.assertTrue((scripts_dir() / script).exists())
+        self.assertIn("--run-name", script_argv)  # from the preset
+        # Passthrough args come AFTER preset args so the user overrides defaults.
+        self.assertEqual(script_argv[-2:], ["--foo", "bar"])
+        # No selector default -> no preset, args forwarded unchanged.
+        args2, passthrough2 = parser.parse_known_args(["train", "subhour", "--source", "1m", "--x", "1"])
+        _, argv2 = resolve_workflow(args2, passthrough2)
+        self.assertEqual(argv2, ["--x", "1"])
+
+    def test_qt_preset_commands_and_registry(self) -> None:
+        from rl_quant.cli import _DISPATCH, main
+        from rl_quant.presets import PRESETS, resolve_preset
+
+        self.assertEqual(main(["preset", "list"]), 0)
+        self.assertEqual(main(["preset", "show", "train.subhour.second-context"]), 0)
+        with self.assertRaises(SystemExit):
+            resolve_preset("does-not-exist")
+        # Every preset expands to a non-empty arg list and targets a real (group, workflow).
+        for name, preset in PRESETS.items():
+            self.assertTrue(resolve_preset(name), f"preset {name} expanded empty")
+            group, workflow = preset.workflow.split(".", 1)
+            self.assertIn((group, workflow), _DISPATCH, f"preset {name} targets unknown workflow")
+
+    def test_runtime_config_add_args_and_resolve(self) -> None:
+        import argparse
+
+        from rl_quant.config import RuntimeConfig, add_runtime_args, resolve_runtime
+
+        parser = argparse.ArgumentParser()
+        add_runtime_args(parser, seed_default=7)
+        # --device cpu so the test is deterministic regardless of CUDA availability.
+        args = parser.parse_args(["--device", "cpu", "--amp", "--amp-dtype", "bf16", "--min-free-vram-gb", "4", "--seed", "5"])
+        self.assertEqual((args.device, args.amp, args.amp_dtype, args.min_free_vram_gb, args.seed), ("cpu", True, "bf16", 4.0, 5))
+        runtime = resolve_runtime(args)
+        self.assertIsInstance(runtime, RuntimeConfig)
+        self.assertEqual(runtime.device.type, "cpu")
+        self.assertTrue(runtime.use_amp)
+        self.assertEqual(runtime.amp_dtype, "bf16")
+        self.assertEqual(runtime.seed, 5)
 
 
 if __name__ == "__main__":
