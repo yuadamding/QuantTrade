@@ -6,6 +6,7 @@ import csv
 import gc
 import json
 import sys
+import time
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -151,6 +152,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resume-state-file", default="training_state.pt")
     parser.add_argument("--checkpoint-every-steps", type=int, default=250)
+    parser.add_argument("--payload-progress-every", type=int, default=5)
     parser.add_argument("--recency-weighting", choices=["none", "exponential"], default="none")
     parser.add_argument("--recency-half-life-days", type=float, default=120.0)
     parser.add_argument("--recency-min-weight", type=float, default=0.05)
@@ -237,44 +239,84 @@ def _same_schema(left: Any, right: Any) -> bool:
     return left == right
 
 
-def concatenate_payloads(paths: list[Path], *, action_covariate_sidecar: str, news_llm_sidecar: str) -> dict[str, Any]:
+def concatenate_payloads(
+    paths: list[Path],
+    *,
+    action_covariate_sidecar: str,
+    news_llm_sidecar: str,
+    progress_every: int = 5,
+) -> dict[str, Any]:
     from rl_quant.minute_to_hour_transformer import _load_payload
 
-    payloads = [
-        _load_payload(path, action_covariate_sidecar=action_covariate_sidecar, news_llm_sidecar=news_llm_sidecar)
-        for path in paths
-    ]
-    first = payloads[0]
+    started = time.monotonic()
+    progress_every = max(1, int(progress_every))
+    first: dict[str, Any] | None = None
     out: dict[str, Any] = {}
+    row_lists: dict[str, list[Any]] = {key: [] for key in ROW_LIST_KEYS}
+    row_tensors: dict[str, list[torch.Tensor]] = {key: [] for key in ROW_TENSOR_KEYS}
+    errors: list[str] = []
+    dataset_reportable = True
+    loaded_count = 0
+    row_count = 0
+
+    print(f"Loading {len(paths)} partition payloads with sidecars...", flush=True)
+    for index, path in enumerate(paths, start=1):
+        payload = _load_payload(path, action_covariate_sidecar=action_covariate_sidecar, news_llm_sidecar=news_llm_sidecar)
+        if first is None:
+            first = payload
+            for key in SCHEMA_KEYS:
+                if key in first:
+                    out[key] = first[key]
+        else:
+            for key in SCHEMA_KEYS:
+                if key in out and key in payload and not _same_schema(out[key], payload[key]):
+                    raise ValueError(f"Schema key {key!r} differs across partitions.")
+        rows_this = len(payload["decision_timestamps"])
+        row_count += rows_this
+        loaded_count += 1
+        for key in ROW_LIST_KEYS:
+            if first is not None and key in first:
+                row_lists[key].extend(list(payload.get(key, [])))
+        for key in ROW_TENSOR_KEYS:
+            if key in payload:
+                row_tensors[key].append(payload[key])
+        errors.extend(str(item) for item in payload.get("dataset_reportability_errors", []))
+        dataset_reportable = dataset_reportable and bool(payload.get("dataset_reportable", payload.get("reportable", True)))
+        if index == 1 or index == len(paths) or index % progress_every == 0:
+            elapsed = max(time.monotonic() - started, 1e-9)
+            print(
+                "payload_load_progress "
+                f"{index}/{len(paths)} rows={row_count} elapsed_s={elapsed:.1f} "
+                f"rows_per_s={row_count / elapsed:.2f} last={path.parent.name}",
+                flush=True,
+            )
+
+    if first is None:
+        raise ValueError("No payloads loaded.")
     for key in SCHEMA_KEYS:
-        if key not in first:
-            continue
-        for payload in payloads[1:]:
-            if key in payload and not _same_schema(first[key], payload[key]):
-                raise ValueError(f"Schema key {key!r} differs across partitions.")
-        out[key] = first[key]
+        if key in first:
+            out[key] = first[key]
     for key in ROW_LIST_KEYS:
         if key in first:
-            rows: list[Any] = []
-            for payload in payloads:
-                rows.extend(list(payload.get(key, [])))
-            out[key] = rows
-    row_count = len(out["decision_timestamps"])
+            out[key] = row_lists[key]
+    print(f"Concatenating tensor fields for {row_count} rows...", flush=True)
     for key in ROW_TENSOR_KEYS:
-        tensors = [payload[key] for payload in payloads if key in payload]
+        tensors = row_tensors[key]
         if tensors:
-            if len(tensors) != len(payloads):
+            if len(tensors) != loaded_count:
                 raise ValueError(f"Row tensor key {key!r} is missing from some partitions.")
+            print(f"  cat {key}: {len(tensors)} chunks", flush=True)
             out[key] = torch.cat(tensors, dim=0)
-    errors: list[str] = []
-    for payload in payloads:
-        errors.extend(str(item) for item in payload.get("dataset_reportability_errors", []))
     out["dataset_reportability_errors"] = list(dict.fromkeys(errors))
-    out["dataset_reportable"] = all(bool(payload.get("dataset_reportable", payload.get("reportable", True))) for payload in payloads) and not errors
+    out["dataset_reportable"] = dataset_reportable and not errors
     out["composite_partition_count"] = len(paths)
     out["composite_partition_start"] = paths[0].parent.name
     out["composite_partition_end"] = paths[-1].parent.name
     out["composite_row_count"] = row_count
+    print(
+        f"Composite payload ready: partitions={loaded_count} rows={row_count} elapsed_s={time.monotonic() - started:.1f}",
+        flush=True,
+    )
     return out
 
 
@@ -448,7 +490,9 @@ def main(argv: list[str] | None = None) -> int:
         paths,
         action_covariate_sidecar=args.action_covariate_sidecar,
         news_llm_sidecar=args.news_llm_sidecar,
+        progress_every=args.payload_progress_every,
     )
+    print("Building calendar train/val/test splits...", flush=True)
     train_split, val_split, test_split = build_calendar_splits(payload, boundaries)
     constraints = build_constraints_from_args(args)
     initial_action = action_index(train_split.action_names, args.initial_action)
