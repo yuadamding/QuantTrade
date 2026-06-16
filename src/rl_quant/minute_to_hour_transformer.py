@@ -1773,7 +1773,13 @@ class VectorizedMinuteToHourEnv:
         next_valid = torch.zeros_like(in_bounds)
         if bool(in_bounds.any().item()):
             next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
-        dones = (~next_valid) | (self.steps >= int(self.config.episode_length))
+        # Distinguish a TRUE terminal (no valid next row -> nothing to bootstrap from) from a mere
+        # episode-length TRUNCATION (a rollout boundary whose next row is a real continuation). DQN
+        # must bootstrap through truncations; only `terminated` may zero the TD bootstrap. Both still
+        # end the episode (`dones`) and trigger an env reset.
+        terminated = ~next_valid
+        truncated = self.steps >= int(self.config.episode_length)
+        dones = terminated | truncated
         if bool(in_bounds.any().item()):
             old_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in current_indices[in_bounds].detach().cpu()]
             new_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in next_indices[in_bounds].detach().cpu()]
@@ -1796,6 +1802,7 @@ class VectorizedMinuteToHourEnv:
             "next_constraint_features": next_constraint_features,
             "next_action_mask": next_action_mask,
             "dones": dones.float(),
+            "terminated": terminated.float(),
             "legs": legs,
         }
 
@@ -2129,8 +2136,10 @@ def compute_recency_weights(
         raise ValueError(f"Unsupported recency weighting mode: {mode!r}")
     if half_life_days <= 0.0:
         raise ValueError("recency half_life_days must be positive.")
-    if not 0.0 <= min_weight <= 1.0:
-        raise ValueError("recency min_weight must be in [0, 1].")
+    if not 0.0 < min_weight <= 1.0:
+        # A zero floor lets a batch of only-old rows collapse to ~0 weight (unstable loss scale after
+        # the clamp_min denominator), and contradicts "older regimes are never fully ignored".
+        raise ValueError("recency min_weight must be in (0, 1].")
     day_ms = 86_400_000.0
     decay = math.log(2.0) / float(half_life_days)
     weights = torch.empty(count, dtype=torch.float32, device=device)
@@ -2160,6 +2169,16 @@ def train_minute_to_hour_dqn(
         else None
     )
     recency_mode = config.recency.mode if validation_start_ms is not None else "none"
+    if recency_mode != "none" and validation_start_ms is not None and train_data.decision_timestamps:
+        # Recency weighting is precisely where the train/validation boundary should be re-asserted:
+        # a training row at/after validation start would silently get weight 1.0 (age clamped to 0)
+        # and mask an upstream split bug. Fail loudly instead.
+        train_max_ms = max(_timestamp_to_epoch_ms(ts) for ts in train_data.decision_timestamps)
+        if train_max_ms >= validation_start_ms:
+            raise ValueError(
+                "train split overlaps validation start; refusing recency-weighted training "
+                f"(train_max_ms={train_max_ms} >= validation_start_ms={validation_start_ms})."
+            )
     train_recency_weights = compute_recency_weights(
         train_data.decision_timestamps,
         validation_start_ms or 0,
@@ -2216,6 +2235,7 @@ def train_minute_to_hour_dqn(
             "next_constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
             "next_action_mask": ((action_count,), torch.bool),
             "dones": ((), torch.float32),
+            "terminated": ((), torch.float32),
         },
     )
     env = VectorizedMinuteToHourEnv(train_data, config.env, device)
@@ -2270,10 +2290,15 @@ def train_minute_to_hour_dqn(
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
             batch = replay.sample(config.learning.batch_size)
+            # Clamp next_indices for the state lookup: a TRUE terminal transition can store an
+            # out-of-data next row, whose bootstrapped value is zeroed below via `terminated` anyway.
+            # For non-terminal transitions next_indices is always in range, so this is a no-op there.
+            n_rows = int(train_data.action_returns.shape[0])
+            safe_next_indices = batch["next_indices"].clamp(max=n_rows - 1)
             current_minute, current_mask, current_hour = train_data.state(batch["indices"])
-            next_minute, next_mask, next_hour = train_data.state(batch["next_indices"])
+            next_minute, next_mask, next_hour = train_data.state(safe_next_indices)
             current_action_features = train_data.action_feature_state(batch["indices"])
-            next_action_features = train_data.action_feature_state(batch["next_indices"])
+            next_action_features = train_data.action_feature_state(safe_next_indices)
             with autocast_context(device, config.learning.use_amp):
                 q = q_network(
                     current_minute,
@@ -2316,9 +2341,12 @@ def train_minute_to_hour_dqn(
                     # fp32 TD target/loss under AMP: with reward_scale=10_000 the bootstrapped
                     # targets reach magnitudes where fp16 precision is comparable to per-step
                     # rewards, so compute the target and smooth_l1 loss in float32.
+                    # Bootstrap through episode-length TRUNCATIONS (next row is a real continuation);
+                    # zero the bootstrap only on TRUE terminals (no valid next row). Using `dones`
+                    # here would wrongly treat every rollout-boundary truncation as terminal.
                     target_q = (
                         batch["rewards"].float()
-                        + config.learning.gamma * (1.0 - batch["dones"].float()) * next_q.float()
+                        + config.learning.gamma * (1.0 - batch["terminated"].float()) * next_q.float()
                     )
                 if recency_active:
                     # Recency-weighted smooth_l1: per-sample loss scaled by each transition's source

@@ -6763,6 +6763,133 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(weighted["weight_min"], 0.05)
         self.assertLessEqual(weighted["weight_max"], 1.0)
 
+    def test_episode_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
+        module = __import__(
+            "rl_quant.minute_to_hour_transformer",
+            fromlist=["VectorizedMinuteToHourEnv", "MinuteToHourEnvConfig", "HourFromMinuteDataSplit"],
+        )
+        n = 4
+        split = module.HourFromMinuteDataSplit(
+            name="train",
+            decision_timestamps=[f"2026-01-0{i + 1}T14:30:00+00:00" for i in range(n)],
+            next_timestamps=[f"2026-01-0{i + 1}T15:30:00+00:00" for i in range(n)],
+            minute_feature_names=["m"],
+            hour_feature_names=["h"],
+            action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((n, 1, 1, 1)),
+            minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((n, 1, 1)),
+            action_returns=torch.zeros((n, 2)),
+            action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            valid_start_indices=torch.arange(n - 1, dtype=torch.long),
+            valid_index_mask=torch.tensor([True, True, True, False]),
+            minute_feature_mean=torch.zeros(1),
+            minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1),
+            hour_feature_std=torch.ones(1),
+            hours_lookback=1,
+            minutes_per_hour=1,
+        )
+        env = module.VectorizedMinuteToHourEnv(
+            split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=2, initial_action=0), torch.device("cpu")
+        )
+        cash = torch.zeros(1, dtype=torch.long)
+        # Reach the episode-length boundary with a valid next row -> truncation (done) but NOT terminal.
+        env.reset(torch.ones(1, dtype=torch.bool))
+        env.indices[:] = 0
+        env.steps[:] = 0
+        first = env.step(cash)  # steps 0->1, next row 1 is valid
+        self.assertEqual(float(first["dones"][0].item()), 0.0)
+        self.assertEqual(float(first["terminated"][0].item()), 0.0)
+        second = env.step(cash)  # steps 1->2 == episode_length -> truncation
+        self.assertEqual(float(second["dones"][0].item()), 1.0)
+        self.assertEqual(float(second["terminated"][0].item()), 0.0)  # bootstrap must still happen
+        # Stepping into a row whose successor is invalid -> a true data-boundary terminal.
+        env.reset(torch.ones(1, dtype=torch.bool))
+        env.indices[:] = 2
+        env.steps[:] = 0
+        boundary = env.step(cash)  # next row 3 has valid_index_mask False
+        self.assertEqual(float(boundary["terminated"][0].item()), 1.0)
+        self.assertEqual(float(boundary["dones"][0].item()), 1.0)
+
+    def test_recency_weighting_rejects_zero_min_weight(self) -> None:
+        from rl_quant.minute_to_hour_transformer import compute_recency_weights
+
+        with self.assertRaises(ValueError):
+            compute_recency_weights(
+                ["2026-01-01T14:30:00+00:00"], 1, mode="exponential", half_life_days=60.0, min_weight=0.0
+            )
+
+    def test_recency_weighting_rejects_train_overlapping_validation(self) -> None:
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit,
+            MinuteToHourEnvConfig,
+            MinuteToHourTrainingConfig,
+            RecencyWeightConfig,
+            train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+            n = len(dates)
+            return HourFromMinuteDataSplit(
+                name=name,
+                decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
+                next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
+                minute_feature_names=["m"],
+                hour_feature_names=["h"],
+                action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((n, 1, 1, 1)),
+                minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((n, 1, 1)),
+                action_returns=torch.zeros((n, 2)),
+                action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                valid_start_indices=torch.arange(n - 1, dtype=torch.long),
+                valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+                minute_feature_mean=torch.zeros(1),
+                minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1),
+                hour_feature_std=torch.ones(1),
+                hours_lookback=1,
+                minutes_per_hour=1,
+            )
+
+        # train_max (2026-06-15) is AFTER validation start (2026-06-01) -> recency must refuse.
+        train = make_split("train", ["2026-05-01", "2026-06-15"])
+        val = make_split("val", ["2026-06-01", "2026-06-02"])
+        learning = DQNLearningConfig(
+            num_envs=1,
+            episode_length=2,
+            replay_capacity=8,
+            batch_size=2,
+            train_steps=2,
+            warmup_steps=1,
+            gamma=0.99,
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            target_update_interval=2,
+            epsilon_start=0.1,
+            epsilon_end=0.0,
+            eval_interval=2,
+            grad_clip=1.0,
+            use_amp=False,
+        )
+        config = MinuteToHourTrainingConfig(
+            env=MinuteToHourEnvConfig(num_envs=1, episode_length=2),
+            learning=learning,
+            d_model=16,
+            n_heads=2,
+            minute_layers=1,
+            hour_layers=1,
+            feedforward_dim=16,
+            action_embedding_dim=4,
+            recency=RecencyWeightConfig(mode="exponential", half_life_days=60.0, min_weight=0.05),
+        )
+        with self.assertRaises(ValueError):
+            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -244,17 +244,18 @@ def strict_latest_partition_violations(
             f"final selected partition ({selected_labels[-1]}) is not the latest available partition "
             f"({latest_available})"
         )
-    if (
-        not allow_truncated_training_history
-        and selected_labels
-        and all_available_labels
-        and selected_labels[0] != all_available_labels[0]
-    ):
-        violations.append(
-            f"earliest selected partition ({selected_labels[0]}) is not the earliest available partition "
-            f"({all_available_labels[0]}); prior train/validation history is silently excluded "
-            "(pass --allow-truncated-training-history to override)"
-        )
+    if not allow_truncated_training_history and all_available_labels:
+        # Exact-coverage invariant: every available partition before the test must be present, not
+        # merely the first/last endpoints -- this also rejects a skipped middle partition (a future
+        # selection bug) that an endpoints-only check would miss.
+        selected_set = set(selected_labels)
+        excluded = [label for label in all_available_labels if label not in selected_set]
+        if excluded:
+            violations.append(
+                f"selected partitions do not cover all available history; {len(excluded)} earlier/middle "
+                f"partition(s) are silently excluded from train/validation: {excluded[:5]} "
+                "(pass --allow-truncated-training-history to override)"
+            )
     return violations
 
 
@@ -294,9 +295,14 @@ def official_test_block(records: list[dict[str, object]], final_test_is_latest_a
         "reportable": bool(official.get("evaluation_reportable", False)),
         "reportability_errors": list(official.get("reportability_errors", [])),
         "test_total_return": official.get("test_total_return"),
+        "test_total_reward_bps": official.get("test_total_reward_bps"),
+        "test_max_drawdown": official.get("test_max_drawdown"),
+        "test_annualized_sharpe": official.get("test_annualized_sharpe"),
         "test_switches": official.get("test_switches"),
         "test_order_legs": official.get("test_order_legs"),
         "val_total_return": official.get("val_total_return"),
+        "checkpoint_selected_on": "validation",
+        "test_used_for_selection": False,
     }
 
 
@@ -768,6 +774,9 @@ def main(argv: list[str] | None = None) -> int:
                 "train_total_return": train_result.total_return,
                 "val_total_return": val_result.total_return,
                 "test_total_return": test_result.total_return,
+                "test_total_reward_bps": test_result.total_reward_bps,
+                "test_max_drawdown": test_result.max_drawdown,
+                "test_annualized_sharpe": test_result.annualized_sharpe,
                 "test_switches": test_result.allocation_switches,
                 "test_order_legs": test_result.market_order_legs,
                 "evaluation_reportable": evaluation_reportable,
