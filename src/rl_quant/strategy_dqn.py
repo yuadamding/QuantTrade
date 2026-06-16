@@ -14,6 +14,7 @@ from rl_quant.core import (
     annualized_sharpe,
     autocast_context,
     configure_torch_runtime,
+    dqn_td_target,
     epsilon_by_step,
     fractional_max_drawdown,
     make_grad_scaler,
@@ -141,7 +142,7 @@ class VectorizedStrategyAllocationEnv:
             "rewards": rewards,
             "next_indices": next_indices,
             "next_previous_actions": self.previous_actions,
-            "dones": terminal,
+            "terminated": terminal,
             "resets": resets,
         }
 
@@ -278,7 +279,7 @@ def train_strategy_dqn_agent(
             "rewards": torch.float32,
             "next_indices": torch.long,
             "next_previous_actions": torch.long,
-            "dones": torch.float32,
+            "terminated": torch.float32,
         },
     )
     env = VectorizedStrategyAllocationEnv(train_data, config.env, device)
@@ -309,7 +310,7 @@ def train_strategy_dqn_agent(
         transition = env.step(actions)
         replay.add(**transition)
         reward_trace.append(float(transition["rewards"].mean().item()))
-        # Reset on terminal OR truncation; the TD target uses `dones` (true terminal only).
+        # Reset on terminal OR truncation; the TD target bootstraps on `terminated` (true terminal only).
         env.reset(transition["resets"])
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
@@ -331,12 +332,9 @@ def train_strategy_dqn_agent(
                         1,
                         next_actions.unsqueeze(1),
                     ).squeeze(1)
-                    # fp32 TD target/loss: under AMP chosen_q/next_q are fp16, and with
-                    # reward_scale applied the targets can exceed fp16 precision; compute in float32.
-                    target_q = (
-                        batch["rewards"].float()
-                        + config.learning.gamma * (1.0 - batch["dones"].float()) * next_q.float()
-                    )
+                    # Shared truncation-aware fp32 target (core.dqn_td_target): bootstrap through
+                    # truncations, zero only on true terminals, NaN-safe for terminal next_q.
+                    target_q = dqn_td_target(batch["rewards"], config.learning.gamma, batch["terminated"], next_q)
                 loss = F.smooth_l1_loss(chosen_q.float(), target_q)
 
             optimizer.zero_grad(set_to_none=True)

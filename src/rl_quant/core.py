@@ -27,6 +27,7 @@ class DQNLearningConfig:
     eval_interval: int
     grad_clip: float
     use_amp: bool = False
+    amp_dtype: str = "fp16"  # AMP autocast precision when use_amp: "fp16" (default) or "bf16".
 
 
 class TemporalQNetwork(nn.Module):
@@ -203,10 +204,25 @@ def dqn_td_target(
 
     Only ``terminated`` (a true terminal with no valid next row) zeros the bootstrap; a mere
     rollout-length truncation keeps bootstrapping because its next row is a real continuation.
-    Passing the episode-end `dones` mask here instead would wrongly treat every truncation as
-    terminal and bias values toward short horizons. Computed in float32 (AMP-safe: with large
-    reward_scale, fp16 target resolution is comparable to per-step rewards)."""
-    return rewards.float() + gamma * (1.0 - terminated.float()) * next_q.float()
+    Passing the episode-end reset mask here instead would wrongly treat every truncation as
+    terminal and bias values toward short horizons.
+
+    Uses ``torch.where`` rather than ``(1 - terminated) * next_q`` so a terminal row's ``next_q`` of
+    NaN/Inf (e.g. from an empty next action mask or a clamped out-of-data dummy state) cannot
+    propagate into the target -- the unselected branch never contaminates terminal positions.
+    ``next_q`` is detached (a TD target must not backpropagate) and the target is computed in
+    float32 (AMP-safe: with large reward_scale, fp16 target resolution is comparable to per-step
+    rewards). Requires rewards/terminated/next_q to share one shape to avoid silent broadcasting
+    (e.g. (B, 1) vs (B,) collapsing to (B, B))."""
+    if rewards.shape != next_q.shape or rewards.shape != terminated.shape:
+        raise ValueError(
+            "dqn_td_target expects rewards, terminated, and next_q to share one shape; got "
+            f"rewards={tuple(rewards.shape)}, terminated={tuple(terminated.shape)}, "
+            f"next_q={tuple(next_q.shape)}."
+        )
+    rewards_f = rewards.float()
+    bootstrap = torch.where(terminated.bool(), torch.zeros_like(rewards_f), next_q.detach().float())
+    return rewards_f + float(gamma) * bootstrap
 
 
 def annualized_sharpe(values: list[float], periods_per_year: float = 252.0) -> float | None:
@@ -276,21 +292,59 @@ def cuda_amp_enabled(device: torch.device, requested: bool) -> bool:
     return bool(requested and device.type == "cuda")
 
 
-def autocast_context(device: torch.device, requested: bool):
+_AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+def resolve_amp_dtype(name: str) -> torch.dtype:
+    """Map an AMP precision name to a torch dtype. fp32 is not an AMP dtype (disable AMP instead)."""
+    try:
+        return _AMP_DTYPES[name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported amp dtype {name!r}; choose one of {sorted(_AMP_DTYPES)}.") from exc
+
+
+def autocast_context(device: torch.device, requested: bool, amp_dtype: str = "fp16"):
     enabled = cuda_amp_enabled(device, requested)
     if not enabled:
         return nullcontext()
-    return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+    # bf16 has a wider exponent range than fp16 and is preferred on Ampere/Hopper-class GPUs; the
+    # default stays fp16 so existing runs are unchanged unless a caller opts into bf16.
+    return torch.amp.autocast(device_type="cuda", dtype=resolve_amp_dtype(amp_dtype))
 
 
-def make_grad_scaler(device: torch.device, requested: bool) -> torch.amp.GradScaler:
+def make_grad_scaler(device: torch.device, requested: bool, amp_dtype: str = "fp16") -> torch.amp.GradScaler:
     if requested and device.type != "cuda":
         warnings.warn(
             f"AMP/mixed precision was requested but the device is {device.type!r}, not CUDA; "
             "AMP is disabled and this run uses fp32. Pass --device cuda for mixed precision.",
             stacklevel=2,
         )
-    return torch.amp.GradScaler("cuda", enabled=cuda_amp_enabled(device, requested))
+    # Loss scaling is an fp16-only concern; bf16 has fp32-like range and needs no GradScaler, so the
+    # scaler is enabled only for cuda + requested + fp16. Resolve eagerly so an invalid amp_dtype is
+    # rejected even when AMP is disabled (rather than silently passing on CPU).
+    dtype = resolve_amp_dtype(amp_dtype)
+    enabled = cuda_amp_enabled(device, requested) and dtype == torch.float16
+    return torch.amp.GradScaler("cuda", enabled=enabled)
+
+
+def cuda_memory_report(device: torch.device) -> dict[str, float]:
+    """Point-in-time CUDA memory snapshot (allocated/reserved/peak/free/total GiB).
+
+    A true accounting of what training actually occupies, unlike the VRAM-ballast reservation
+    (which *increases* usage toward a target). Returns zeros for non-CUDA devices so callers can
+    log/guard unconditionally."""
+    if device.type != "cuda":
+        return {"allocated_gb": 0.0, "reserved_gb": 0.0, "peak_allocated_gb": 0.0, "peak_reserved_gb": 0.0, "free_gb": 0.0, "total_gb": 0.0}
+    torch.cuda.synchronize(device)
+    free, total = torch.cuda.mem_get_info(device)
+    return {
+        "allocated_gb": round(torch.cuda.memory_allocated(device) / 1024**3, 4),
+        "reserved_gb": round(torch.cuda.memory_reserved(device) / 1024**3, 4),
+        "peak_allocated_gb": round(torch.cuda.max_memory_allocated(device) / 1024**3, 4),
+        "peak_reserved_gb": round(torch.cuda.max_memory_reserved(device) / 1024**3, 4),
+        "free_gb": round(free / 1024**3, 4),
+        "total_gb": round(total / 1024**3, 4),
+    }
 
 
 class CudaVramReservation:

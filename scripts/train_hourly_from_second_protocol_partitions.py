@@ -7,6 +7,7 @@ import gc
 import json
 import re
 import sys
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -164,8 +165,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cooldown-bars", type=int, default=0)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>")
     parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--target-vram-gb", type=float)
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP autocast precision when --amp is set. bf16 has a wider exponent range and is "
+        "preferred on Ampere/Hopper GPUs; fp16 (default) preserves prior behavior.",
+    )
+    parser.add_argument(
+        "--target-vram-gb",
+        type=float,
+        help="OPT-IN VRAM ballast: reserve byte tensors to raise used VRAM toward this target after "
+        "warmup. This INCREASES memory (it does not cap/shard/offload) -- leave unset for large "
+        "models; use --min-free-vram-gb to guard headroom instead.",
+    )
     parser.add_argument("--vram-safety-gb", type=float, default=0.50)
+    parser.add_argument(
+        "--min-free-vram-gb",
+        type=float,
+        default=0.0,
+        help="Fail fast before training if free CUDA memory is below this many GiB (0 disables).",
+    )
     parser.add_argument("--seed", type=int, default=17)
     return parser.parse_args(argv)
 
@@ -240,31 +260,31 @@ def strict_latest_partition_violations(
         return violations
     # Collect ALL independent violations rather than returning on the first, so a single run surfaces
     # every reason the selection is inadmissible (avoids fix-one / re-run / discover-next churn).
-    has_duplicates = len(selected_labels) != len(set(selected_labels))
-    if has_duplicates:
-        seen: set[str] = set()
-        duplicates = [label for label in selected_labels if label in seen or seen.add(label)]
-        violations.append(f"selected partitions contain duplicate labels: {sorted(set(duplicates))[:5]}")
+    duplicates = sorted(label for label, count in Counter(selected_labels).items() if count > 1)
+    if duplicates:
+        violations.append(f"selected partitions contain duplicate labels: {duplicates[:5]}")
     latest_available = all_available_labels[-1] if all_available_labels else None
     if selected_labels and latest_available is not None and selected_labels[-1] != latest_available:
         violations.append(
             f"final selected partition ({selected_labels[-1]}) is not the latest available partition "
             f"({latest_available})"
         )
-    # Set-based exact coverage is only meaningful when labels are unique; with duplicates the
-    # duplicate violation above already flags the selection bug, and the set comparison is unreliable.
-    if not allow_truncated_training_history and all_available_labels and not has_duplicates:
-        # Exact-coverage invariant: every available partition before the test must be present, not
-        # merely the first/last endpoints -- this also rejects a skipped middle partition (a future
-        # selection bug) that an endpoints-only check would miss.
+    if not allow_truncated_training_history and all_available_labels:
+        # Exact-coverage invariant via set membership (well-defined even with duplicates): every
+        # available partition before the test must be present (rejects a skipped earliest OR middle
+        # partition), and report any unknown selected label separately rather than masking it.
+        available_set = set(all_available_labels)
         selected_set = set(selected_labels)
-        excluded = [label for label in all_available_labels if label not in selected_set]
-        if excluded:
+        missing = [label for label in all_available_labels if label not in selected_set]
+        extra = sorted({label for label in selected_labels if label not in available_set})
+        if missing:
             violations.append(
-                f"selected partitions do not cover all available history; {len(excluded)} earlier/middle "
-                f"partition(s) are silently excluded from train/validation: {excluded[:5]} "
+                f"selected partitions do not cover all available history; {len(missing)} earlier/middle "
+                f"partition(s) are silently excluded from train/validation: {missing[:5]} "
                 "(pass --allow-truncated-training-history to override)"
             )
+        if extra:
+            violations.append(f"selected partitions contain unknown labels not present on disk: {extra[:5]}")
     return violations
 
 
@@ -516,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         from rl_quant.core import (
             DQNLearningConfig,
             configure_torch_runtime,
+            cuda_memory_report,
             resolve_torch_device,
             torch_runtime_summary,
         )
@@ -538,6 +559,13 @@ def main(argv: list[str] | None = None) -> int:
 
     device = resolve_torch_device(args.device)
     configure_torch_runtime(device)
+    if args.min_free_vram_gb > 0 and device.type == "cuda":
+        free_gb = cuda_memory_report(device)["free_gb"]
+        if free_gb < args.min_free_vram_gb:
+            raise SystemExit(
+                f"insufficient free CUDA memory: {free_gb:.2f} GiB free < --min-free-vram-gb "
+                f"{args.min_free_vram_gb:.2f} GiB. Free memory or lower the requirement."
+            )
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -635,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
                 eval_interval=args.eval_interval,
                 grad_clip=args.grad_clip,
                 use_amp=args.amp,
+                amp_dtype=args.amp_dtype,
             )
             train_config = MinuteToHourTrainingConfig(
                 env=env_config,

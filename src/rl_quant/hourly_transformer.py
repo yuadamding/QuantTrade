@@ -655,11 +655,12 @@ class VectorizedHourlyAllocationEnv:
         if bool(in_bounds.any().item()):
             next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
         # Separate a TRUE terminal (no valid next row) from an episode-length TRUNCATION (a rollout
-        # boundary whose next row is a real continuation). Both end the episode (`dones`) and reset
-        # the env, but only `terminated` may zero the TD bootstrap (see core.dqn_td_target).
+        # boundary whose next row is a real continuation). `resets` ends the episode (terminal OR
+        # truncation) and drives env reset; only `terminated` may zero the TD bootstrap (see
+        # core.dqn_td_target). Naming matches strategy_dqn/intraday_dqn: terminated vs resets.
         terminated = ~next_valid
         truncated = self.steps >= int(self.config.episode_length)
-        dones = terminated | truncated
+        resets = terminated | truncated
         if bool(in_bounds.any().item()):
             old_dates = self._date_labels(current_indices[in_bounds])
             new_dates = self._date_labels(next_indices[in_bounds])
@@ -688,7 +689,7 @@ class VectorizedHourlyAllocationEnv:
             "next_previous_actions": self.previous_actions,
             "next_constraint_features": self.constraint_features(),
             "next_action_mask": next_action_mask,
-            "dones": dones.float(),
+            "resets": resets.float(),
             "terminated": terminated.float(),
             "legs": legs,
             "raw_action_returns": raw_returns,
@@ -1087,7 +1088,7 @@ def train_hourly_transformer_dqn(
         lr=config.learning.learning_rate,
         weight_decay=config.learning.weight_decay,
     )
-    scaler = make_grad_scaler(device, config.learning.use_amp)
+    scaler = make_grad_scaler(device, config.learning.use_amp, config.learning.amp_dtype)
     replay = TensorDictReplayBuffer(
         capacity=config.learning.replay_capacity,
         device=device,
@@ -1102,7 +1103,6 @@ def train_hourly_transformer_dqn(
             "next_previous_actions": ((), torch.long),
             "next_constraint_features": ((HOURLY_CONSTRAINT_FEATURE_DIM,), torch.float32),
             "next_action_mask": ((action_count,), torch.bool),
-            "dones": ((), torch.float32),
             "terminated": ((), torch.float32),
         },
     )
@@ -1133,7 +1133,7 @@ def train_hourly_transformer_dqn(
             end=config.learning.epsilon_end,
         )
         with torch.no_grad():
-            with autocast_context(device, config.learning.use_amp):
+            with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):
                 q_values = q_network(states, previous_actions, constraint_features)
             greedy_actions = apply_notional_aware_hysteresis(
                 q_values,
@@ -1153,7 +1153,7 @@ def train_hourly_transformer_dqn(
         transition = env.step(actions)
         replay.add(**transition)
         reward_trace.append(float(transition["rewards"].mean().item()))
-        env.reset(transition["dones"].bool())
+        env.reset(transition["resets"].bool())
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
             batch = replay.sample(config.learning.batch_size)
@@ -1163,7 +1163,7 @@ def train_hourly_transformer_dqn(
             safe_next_indices = batch["next_indices"].clamp(min=0, max=n_rows - 1)
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(safe_next_indices)
-            with autocast_context(device, config.learning.use_amp):
+            with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):
                 chosen_q = q_network(
                     current_states,
                     batch["previous_actions"],
@@ -1198,8 +1198,8 @@ def train_hourly_transformer_dqn(
                         next_actions.unsqueeze(1),
                     ).squeeze(1)
                     # Bootstrap through episode-length truncations; zero only on true terminals.
-                    # Shared float32 target with the minute-to-hour trainer (AMP-safe). Using `dones`
-                    # here would wrongly treat truncation as terminal.
+                    # Shared float32 target with the minute-to-hour trainer (AMP-safe). Using the
+                    # reset mask here would wrongly treat truncation as terminal.
                     target_q = dqn_td_target(batch["rewards"], config.learning.gamma, batch["terminated"], next_q)
                 loss = F.smooth_l1_loss(chosen_q.float(), target_q)
 

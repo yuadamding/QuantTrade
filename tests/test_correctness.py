@@ -1288,7 +1288,7 @@ class MinuteToHourTests(unittest.TestCase):
         result = env.step(torch.tensor([0], dtype=torch.long))
 
         self.assertEqual(int(result["next_indices"][0].item()), 1)
-        self.assertFalse(bool(result["dones"][0].item()))
+        self.assertFalse(bool(result["resets"][0].item()))
 
     def test_polygon_second_manifest_marks_incomplete_download_non_reportable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6800,10 +6800,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         env.indices[:] = 0
         env.steps[:] = 0
         first = env.step(cash)  # steps 0->1, next row 1 is valid
-        self.assertEqual(float(first["dones"][0].item()), 0.0)
+        self.assertEqual(float(first["resets"][0].item()), 0.0)
         self.assertEqual(float(first["terminated"][0].item()), 0.0)
         second = env.step(cash)  # steps 1->2 == episode_length -> truncation
-        self.assertEqual(float(second["dones"][0].item()), 1.0)
+        self.assertEqual(float(second["resets"][0].item()), 1.0)
         self.assertEqual(float(second["terminated"][0].item()), 0.0)  # bootstrap must still happen
         # Stepping into a row whose successor is invalid -> a true data-boundary terminal.
         env.reset(torch.ones(1, dtype=torch.bool))
@@ -6811,7 +6811,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         env.steps[:] = 0
         boundary = env.step(cash)  # next row 3 has valid_index_mask False
         self.assertEqual(float(boundary["terminated"][0].item()), 1.0)
-        self.assertEqual(float(boundary["dones"][0].item()), 1.0)
+        self.assertEqual(float(boundary["resets"][0].item()), 1.0)
 
     def test_recency_weighting_rejects_zero_min_weight(self) -> None:
         from rl_quant.minute_to_hour_transformer import compute_recency_weights
@@ -6901,6 +6901,24 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(target[0].item()), 2.0 + 0.9 * 10.0, places=5)
         self.assertAlmostEqual(float(target[1].item()), 2.0, places=5)
 
+    def test_dqn_td_target_is_nan_safe_and_shape_checked(self) -> None:
+        from rl_quant.core import dqn_td_target
+
+        # A terminal row's NaN/Inf next_q must NOT propagate (torch.where selects 0 for terminals).
+        rewards = torch.tensor([1.0, 1.0, 2.0])
+        next_q = torch.tensor([float("nan"), float("inf"), 10.0])
+        terminated = torch.tensor([1.0, 1.0, 0.0])
+        target = dqn_td_target(rewards, 0.9, terminated, next_q)
+        self.assertTrue(bool(torch.isfinite(target).all().item()))
+        self.assertAlmostEqual(float(target[0].item()), 1.0, places=5)
+        self.assertAlmostEqual(float(target[1].item()), 1.0, places=5)
+        self.assertAlmostEqual(float(target[2].item()), 2.0 + 0.9 * 10.0, places=5)
+        # A boolean terminated mask works identically.
+        self.assertTrue(bool(torch.isfinite(dqn_td_target(rewards, 0.9, terminated.bool(), next_q)).all().item()))
+        # Shape mismatch must raise (guards the silent (B, 1) vs (B,) broadcast bug).
+        with self.assertRaises(ValueError):
+            dqn_td_target(torch.zeros(3, 1), 0.9, torch.zeros(3), torch.zeros(3))
+
     def test_hourly_env_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
         module = __import__(
             "rl_quant.hourly_transformer",
@@ -6931,17 +6949,17 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         env.indices[:] = 0
         env.steps[:] = 0
         first = env.step(cash)
-        self.assertEqual(float(first["dones"][0].item()), 0.0)
+        self.assertEqual(float(first["resets"][0].item()), 0.0)
         self.assertEqual(float(first["terminated"][0].item()), 0.0)
         second = env.step(cash)  # steps 1->2 == episode_length -> truncation, not terminal
-        self.assertEqual(float(second["dones"][0].item()), 1.0)
+        self.assertEqual(float(second["resets"][0].item()), 1.0)
         self.assertEqual(float(second["terminated"][0].item()), 0.0)
         env.reset(torch.ones(1, dtype=torch.bool))
         env.indices[:] = 4
         env.steps[:] = 0
         boundary = env.step(cash)  # next row 5 has no valid successor -> true terminal
         self.assertEqual(float(boundary["terminated"][0].item()), 1.0)
-        self.assertEqual(float(boundary["dones"][0].item()), 1.0)
+        self.assertEqual(float(boundary["resets"][0].item()), 1.0)
 
     def test_strict_latest_partition_rejects_duplicate_selected_labels(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
@@ -6960,6 +6978,55 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         )
         self.assertTrue(any("duplicate" in violation for violation in combined))
         self.assertTrue(any("not the latest available" in violation for violation in combined))
+        # Duplicates must NOT suppress the missing-partition report: both surface in one run.
+        dup_and_missing = module.strict_latest_partition_violations(
+            selected_labels=["2026-01-01", "2026-01-03", "2026-01-03"],
+            all_available_labels=["2026-01-01", "2026-01-02", "2026-01-03"],
+            allow_truncated_training_history=False,
+        )
+        self.assertTrue(any("duplicate" in violation for violation in dup_and_missing))
+        self.assertTrue(any("silently excluded" in violation for violation in dup_and_missing))
+
+    def test_amp_precision_helpers_and_cuda_memory_report(self) -> None:
+        from contextlib import nullcontext
+
+        from rl_quant.core import (
+            DQNLearningConfig,
+            autocast_context,
+            cuda_memory_report,
+            make_grad_scaler,
+            resolve_amp_dtype,
+        )
+
+        # Precision name -> dtype mapping, with eager rejection of unknown names.
+        self.assertEqual(resolve_amp_dtype("fp16"), torch.float16)
+        self.assertEqual(resolve_amp_dtype("bf16"), torch.bfloat16)
+        with self.assertRaises(ValueError):
+            resolve_amp_dtype("fp8")
+        cpu = torch.device("cpu")
+        # On CPU, AMP is always disabled regardless of dtype -> a no-op nullcontext (no behavior change).
+        self.assertIsInstance(autocast_context(cpu, True, "bf16"), type(nullcontext()))
+        with autocast_context(cpu, True, "bf16"):
+            pass
+        # GradScaler is disabled off-CUDA; an invalid amp_dtype is rejected eagerly even when disabled.
+        self.assertFalse(make_grad_scaler(cpu, True, "bf16").is_enabled())
+        with self.assertRaises(ValueError):
+            make_grad_scaler(cpu, False, "fp8")
+        # cuda_memory_report is CPU-safe (zeros) so callers can log/guard unconditionally.
+        report = cuda_memory_report(cpu)
+        self.assertEqual(
+            set(report), {"allocated_gb", "reserved_gb", "peak_allocated_gb", "peak_reserved_gb", "free_gb", "total_gb"}
+        )
+        self.assertEqual(report["total_gb"], 0.0)
+        # Default precision is fp16 (backward compatible) and bf16 is accepted.
+        self.assertEqual(
+            DQNLearningConfig(
+                num_envs=1, episode_length=1, replay_capacity=1, batch_size=1, train_steps=1, warmup_steps=0,
+                gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=1, epsilon_start=0.0,
+                epsilon_end=0.0, eval_interval=1, grad_clip=1.0,
+            ).amp_dtype,
+            "fp16",
+        )
 
     def test_all_public_rl_quant_modules_import(self) -> None:
         import importlib

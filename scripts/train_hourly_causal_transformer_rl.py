@@ -97,6 +97,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action-embedding-dim", type=int, default=32)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>")
     parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP autocast precision when --amp is set. bf16 (wider exponent range) is preferred on "
+        "Ampere/Hopper GPUs; fp16 (default) preserves prior behavior.",
+    )
     parser.add_argument("--target-vram-gb", type=float, help="Reserve CUDA VRAM after warmup toward this total used amount.")
     parser.add_argument("--vram-safety-gb", type=float, default=0.12)
     parser.add_argument("--seed", type=int, default=11)
@@ -1142,6 +1149,7 @@ def main() -> int:
         eval_interval=args.eval_interval,
         grad_clip=args.grad_clip,
         use_amp=args.amp,
+        amp_dtype=args.amp_dtype,
     )
     config = HourlyTransformerTrainingConfig(
         env=env_config,

@@ -1776,11 +1776,11 @@ class VectorizedMinuteToHourEnv:
             next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
         # Distinguish a TRUE terminal (no valid next row -> nothing to bootstrap from) from a mere
         # episode-length TRUNCATION (a rollout boundary whose next row is a real continuation). DQN
-        # must bootstrap through truncations; only `terminated` may zero the TD bootstrap. Both still
-        # end the episode (`dones`) and trigger an env reset.
+        # must bootstrap through truncations; only `terminated` may zero the TD bootstrap. `resets`
+        # ends the episode (terminal OR truncation) and drives env reset (matches strategy/intraday).
         terminated = ~next_valid
         truncated = self.steps >= int(self.config.episode_length)
-        dones = terminated | truncated
+        resets = terminated | truncated
         if bool(in_bounds.any().item()):
             old_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in current_indices[in_bounds].detach().cpu()]
             new_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in next_indices[in_bounds].detach().cpu()]
@@ -1802,7 +1802,7 @@ class VectorizedMinuteToHourEnv:
             "next_previous_actions": self.previous_actions,
             "next_constraint_features": next_constraint_features,
             "next_action_mask": next_action_mask,
-            "dones": dones.float(),
+            "resets": resets.float(),
             "terminated": terminated.float(),
             "legs": legs,
         }
@@ -2220,7 +2220,7 @@ def train_minute_to_hour_dqn(
         lr=config.learning.learning_rate,
         weight_decay=config.learning.weight_decay,
     )
-    scaler = make_grad_scaler(device, config.learning.use_amp)
+    scaler = make_grad_scaler(device, config.learning.use_amp, config.learning.amp_dtype)
     replay = TensorDictReplayBuffer(
         capacity=config.learning.replay_capacity,
         device=device,
@@ -2235,7 +2235,6 @@ def train_minute_to_hour_dqn(
             "next_previous_actions": ((), torch.long),
             "next_constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
             "next_action_mask": ((action_count,), torch.bool),
-            "dones": ((), torch.float32),
             "terminated": ((), torch.float32),
         },
     )
@@ -2261,7 +2260,7 @@ def train_minute_to_hour_dqn(
             end=config.learning.epsilon_end,
         )
         with torch.no_grad():
-            with autocast_context(device, config.learning.use_amp):
+            with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):
                 q_values = q_network(
                     minute,
                     mask,
@@ -2287,7 +2286,7 @@ def train_minute_to_hour_dqn(
         transition = env.step(actions)
         replay.add(**{key: value for key, value in transition.items() if key in replay.storage})
         reward_trace.append(float(transition["rewards"].mean().item()))
-        env.reset(transition["dones"].bool())
+        env.reset(transition["resets"].bool())
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
             batch = replay.sample(config.learning.batch_size)
@@ -2300,7 +2299,7 @@ def train_minute_to_hour_dqn(
             next_minute, next_mask, next_hour = train_data.state(safe_next_indices)
             current_action_features = train_data.action_feature_state(batch["indices"])
             next_action_features = train_data.action_feature_state(safe_next_indices)
-            with autocast_context(device, config.learning.use_amp):
+            with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):
                 q = q_network(
                     current_minute,
                     current_mask,
