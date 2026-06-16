@@ -1636,7 +1636,7 @@ class VectorizedMinuteToHourEnv:
             order_legs_episode=self.order_legs_episode,
         )
 
-    def action_mask(self) -> torch.Tensor:
+    def action_mask(self, row_indices: torch.Tensor | None = None) -> torch.Tensor:
         constraint_mask = build_action_mask(
             current_action=self.previous_actions,
             bars_held=self.bars_held,
@@ -1654,7 +1654,19 @@ class VectorizedMinuteToHourEnv:
             cash_index=self.config.constraints.cash_index,
             count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
-        availability_mask = self.data.valid_actions(self.indices)
+        if row_indices is None:
+            row_indices = self.indices
+        if row_indices.shape != self.previous_actions.shape:
+            raise ValueError(
+                "row_indices must have the same shape as the vectorized environment state; "
+                f"got {tuple(row_indices.shape)} and {tuple(self.previous_actions.shape)}."
+            )
+        row_count = int(self.data.action_returns.shape[0])
+        in_bounds = (row_indices >= 0) & (row_indices < row_count)
+        safe_indices = row_indices.clamp(0, max(row_count - 1, 0))
+        availability_mask = self.data.valid_actions(safe_indices)
+        if bool((~in_bounds).any().item()):
+            availability_mask[~in_bounds] = False
         availability_mask[:, int(self.config.constraints.cash_index)] = True
         mask = constraint_mask & availability_mask
         empty_rows = ~mask.any(dim=1)
@@ -1744,7 +1756,7 @@ class VectorizedMinuteToHourEnv:
             self.order_legs_today[valid_positions[reset_today]] = 0.0
 
         next_constraint_features = self.constraint_features()
-        next_action_mask = self.action_mask()
+        next_action_mask = self.action_mask(next_indices)
         return {
             "indices": current_indices,
             "previous_actions": previous_actions,

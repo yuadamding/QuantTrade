@@ -6796,6 +6796,45 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(float(boundary["terminated"][0].item()), 1.0)
         self.assertEqual(float(boundary["resets"][0].item()), 1.0)
 
+    def test_episode_terminal_out_of_range_next_action_mask_is_safe_dummy(self) -> None:
+        module = __import__(
+            "rl_quant.minute_to_hour_transformer",
+            fromlist=["VectorizedMinuteToHourEnv", "MinuteToHourEnvConfig", "HourFromMinuteDataSplit"],
+        )
+        n = 3
+        split = module.HourFromMinuteDataSplit(
+            name="train",
+            decision_timestamps=[f"2026-01-0{i + 1}T14:30:00+00:00" for i in range(n)],
+            next_timestamps=[f"2026-01-0{i + 1}T15:30:00+00:00" for i in range(n)],
+            minute_feature_names=["m"],
+            hour_feature_names=["h"],
+            action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((n, 1, 1, 1)),
+            minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((n, 1, 1)),
+            action_returns=torch.zeros((n, 2)),
+            action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            valid_start_indices=torch.arange(n, dtype=torch.long),
+            valid_index_mask=torch.ones(n, dtype=torch.bool),
+            minute_feature_mean=torch.zeros(1),
+            minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1),
+            hour_feature_std=torch.ones(1),
+            hours_lookback=1,
+            minutes_per_hour=1,
+        )
+        env = module.VectorizedMinuteToHourEnv(
+            split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0), torch.device("cpu")
+        )
+        cash = torch.zeros(1, dtype=torch.long)
+        env.indices[:] = n - 1
+        transition = env.step(cash)
+        self.assertEqual(int(transition["next_indices"][0].item()), n)
+        self.assertEqual(float(transition["terminated"][0].item()), 1.0)
+        self.assertEqual(float(transition["resets"][0].item()), 1.0)
+        self.assertEqual(transition["next_action_mask"].tolist(), [[True, False]])
+
     def test_recency_weighting_rejects_zero_min_weight(self) -> None:
         from rl_quant.minute_to_hour_transformer import compute_recency_weights
 
