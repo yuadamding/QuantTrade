@@ -6746,6 +6746,91 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(weighted["weight_min"], 0.05)
         self.assertLessEqual(weighted["weight_max"], 1.0)
 
+    def test_minute_to_hour_training_state_resumes_from_checkpoint(self) -> None:
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit,
+            MinuteToHourEnvConfig,
+            MinuteToHourTrainingConfig,
+            train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+            n = len(dates)
+            return HourFromMinuteDataSplit(
+                name=name,
+                decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
+                next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
+                minute_feature_names=["m"],
+                hour_feature_names=["h"],
+                action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((n, 1, 1, 1)),
+                minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((n, 1, 1)),
+                action_returns=torch.zeros((n, 2)),
+                action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                valid_start_indices=torch.arange(n - 1, dtype=torch.long),
+                valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+                minute_feature_mean=torch.zeros(1),
+                minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1),
+                hour_feature_std=torch.ones(1),
+                hours_lookback=1,
+                minutes_per_hour=1,
+            )
+
+        train = make_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
+        val = make_split("val", ["2026-02-01", "2026-02-02"])
+        env = MinuteToHourEnvConfig(num_envs=2, episode_length=2)
+
+        def config(train_steps: int, state_path: Path, *, resume: bool) -> MinuteToHourTrainingConfig:
+            return MinuteToHourTrainingConfig(
+                env=env,
+                learning=DQNLearningConfig(
+                    num_envs=2,
+                    episode_length=2,
+                    replay_capacity=16,
+                    batch_size=2,
+                    train_steps=train_steps,
+                    warmup_steps=1,
+                    gamma=0.99,
+                    learning_rate=1e-3,
+                    weight_decay=0.0,
+                    target_update_interval=2,
+                    epsilon_start=0.1,
+                    epsilon_end=0.0,
+                    eval_interval=2,
+                    grad_clip=1.0,
+                    use_amp=False,
+                ),
+                d_model=16,
+                n_heads=2,
+                minute_layers=1,
+                hour_layers=1,
+                feedforward_dim=16,
+                action_embedding_dim=4,
+                resume_training_state=state_path if resume else None,
+                checkpoint_training_state=state_path,
+                checkpoint_every_steps=1,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "training_state.pt"
+            torch.manual_seed(123)
+            _, first = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config(3, state_path, resume=False))
+            self.assertFalse(first["resume"]["loaded"])
+            self.assertTrue(state_path.exists())
+            saved = torch.load(state_path, map_location="cpu", weights_only=False)
+            self.assertEqual(saved["step"], 3)
+
+            _, resumed = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config(5, state_path, resume=True))
+            self.assertTrue(resumed["resume"]["loaded"])
+            self.assertEqual(resumed["resume"]["resumed_from_step"], 3)
+            self.assertEqual(resumed["resume"]["start_step"], 4)
+            saved_again = torch.load(state_path, map_location="cpu", weights_only=False)
+            self.assertEqual(saved_again["step"], 5)
+
     def test_episode_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
         module = __import__(
             "rl_quant.minute_to_hour_transformer",
@@ -6834,6 +6919,48 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(float(transition["terminated"][0].item()), 1.0)
         self.assertEqual(float(transition["resets"][0].item()), 1.0)
         self.assertEqual(transition["next_action_mask"].tolist(), [[True, False]])
+
+    def test_calendar_holdout_trainer_filters_partitions_before_boundaries(self) -> None:
+        script_path = ROOT / "scripts" / "train_hourly_from_second_calendar_holdout.py"
+        spec = importlib.util.spec_from_file_location("calendar_holdout_trainer", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for label in [
+                "2026-01-01_to_2026-01-04",
+                "2026-02-01_to_2026-02-04",
+                "2026-06-10_to_2026-06-13",
+            ]:
+                partition_dir = root / label
+                partition_dir.mkdir(parents=True)
+                (partition_dir / "hour_from_second_dataset.pt").touch()
+            args = module.parse_args(
+                [
+                    "--partitions-root",
+                    str(root),
+                    "--max-partitions",
+                    "2",
+                    "--partition-selection",
+                    "latest",
+                    "--test-months",
+                    "2",
+                    "--val-months",
+                    "1",
+                ]
+            )
+            paths = module.partition_paths(args)
+            self.assertEqual(
+                [path.parent.name for path in paths],
+                ["2026-02-01_to_2026-02-04", "2026-06-10_to_2026-06-13"],
+            )
+            boundaries = module.calendar_boundaries(args, paths)
+            self.assertEqual(boundaries["train_end_ts"], "2026-03-13T00:00:00+00:00")
+            self.assertEqual(boundaries["val_end_ts"], "2026-04-13T00:00:00+00:00")
+            self.assertEqual(boundaries["test_start_ts"], "2026-04-13T00:00:00+00:00")
+            self.assertEqual(boundaries["test_end_ts"], "2026-06-13T00:00:00+00:00")
 
     def test_recency_weighting_rejects_zero_min_weight(self) -> None:
         from rl_quant.minute_to_hour_transformer import compute_recency_weights

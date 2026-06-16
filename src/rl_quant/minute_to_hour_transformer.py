@@ -1577,6 +1577,9 @@ class MinuteToHourTrainingConfig:
     target_vram_gb: float | None = None
     vram_safety_gb: float = 0.12
     warm_start_model: str | bytes | PathLike[str] | None = None
+    resume_training_state: str | bytes | PathLike[str] | None = None
+    checkpoint_training_state: str | bytes | PathLike[str] | None = None
+    checkpoint_every_steps: int = 0
     max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS
     recency: RecencyWeightConfig = field(default_factory=RecencyWeightConfig)
 
@@ -2020,6 +2023,140 @@ def _state_dict_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
 
 
+def _tensor_dict_to_cpu(values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in values.items()}
+
+
+def _optimizer_state_to_cpu(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    def move(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: move(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [move(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move(item) for item in value)
+        return value
+
+    return move(optimizer.state_dict())
+
+
+def _replay_state_to_cpu(replay: TensorDictReplayBuffer) -> dict[str, object]:
+    return {
+        "capacity": int(replay.capacity),
+        "size": int(replay.size),
+        "cursor": int(replay.cursor),
+        "storage": _tensor_dict_to_cpu(replay.storage),
+    }
+
+
+def _load_replay_state(replay: TensorDictReplayBuffer, state: dict[str, object], device: torch.device) -> None:
+    if int(state.get("capacity", -1)) != int(replay.capacity):
+        raise ValueError("Resume checkpoint replay capacity does not match the current training config.")
+    storage = state.get("storage")
+    if not isinstance(storage, dict):
+        raise ValueError("Resume checkpoint is missing replay storage.")
+    if set(storage) != set(replay.storage):
+        raise ValueError("Resume checkpoint replay fields do not match the current training config.")
+    for key, target in replay.storage.items():
+        value = storage[key]
+        if not torch.is_tensor(value) or tuple(value.shape) != tuple(target.shape):
+            raise ValueError(f"Resume checkpoint replay field {key!r} has an incompatible shape.")
+        target.copy_(value.to(device=device, dtype=target.dtype))
+    replay.size = int(state.get("size", 0))
+    replay.cursor = int(state.get("cursor", 0))
+
+
+def _env_state_to_cpu(env: VectorizedMinuteToHourEnv) -> dict[str, torch.Tensor]:
+    return {
+        "indices": env.indices.detach().cpu().clone(),
+        "previous_actions": env.previous_actions.detach().cpu().clone(),
+        "bars_held": env.bars_held.detach().cpu().clone(),
+        "cooldown_remaining": env.cooldown_remaining.detach().cpu().clone(),
+        "switches_today": env.switches_today.detach().cpu().clone(),
+        "switches_episode": env.switches_episode.detach().cpu().clone(),
+        "order_legs_today": env.order_legs_today.detach().cpu().clone(),
+        "order_legs_episode": env.order_legs_episode.detach().cpu().clone(),
+        "steps": env.steps.detach().cpu().clone(),
+    }
+
+
+def _load_env_state(env: VectorizedMinuteToHourEnv, state: dict[str, torch.Tensor], device: torch.device) -> None:
+    for key in _env_state_to_cpu(env):
+        value = state.get(key)
+        target = getattr(env, key)
+        if not torch.is_tensor(value) or tuple(value.shape) != tuple(target.shape):
+            raise ValueError(f"Resume checkpoint env field {key!r} has an incompatible shape.")
+        target.copy_(value.to(device=device, dtype=target.dtype))
+
+
+def _capture_rng_state(device: torch.device) -> dict[str, object]:
+    state: dict[str, object] = {"torch_rng_state": torch.get_rng_state()}
+    if device.type == "cuda" and torch.cuda.is_available():
+        state["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, object], device: torch.device) -> None:
+    torch_rng_state = state.get("torch_rng_state")
+    if torch.is_tensor(torch_rng_state):
+        torch.set_rng_state(torch_rng_state.cpu())
+    cuda_state = state.get("cuda_rng_state_all")
+    if device.type == "cuda" and isinstance(cuda_state, list) and cuda_state:
+        torch.cuda.set_rng_state_all([item.cpu() if torch.is_tensor(item) else item for item in cuda_state])
+
+
+def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def _save_minute_to_hour_training_state(
+    path: Path,
+    *,
+    step: int,
+    q_network: nn.Module,
+    target_network: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    replay: TensorDictReplayBuffer,
+    env: VectorizedMinuteToHourEnv,
+    best_val_return: float,
+    best_val_legs: float,
+    best_state: dict[str, torch.Tensor],
+    loss_trace: list[float],
+    reward_trace: list[float],
+    valid_action_count_trace: list[float],
+    eval_trace: list[dict[str, float | int | None | str]],
+    device: torch.device,
+) -> None:
+    _atomic_torch_save(
+        {
+            "checkpoint_kind": "minute_to_hour_dqn_training_state",
+            "checkpoint_version": 1,
+            "step": int(step),
+            "q_network_state_dict": _state_dict_to_cpu(q_network),
+            "target_network_state_dict": _state_dict_to_cpu(target_network),
+            "optimizer_state_dict": _optimizer_state_to_cpu(optimizer),
+            "scaler_state_dict": scaler.state_dict(),
+            "replay": _replay_state_to_cpu(replay),
+            "env": _env_state_to_cpu(env),
+            "best_val_return": float(best_val_return),
+            "best_val_legs": float(best_val_legs),
+            "best_state": _tensor_dict_to_cpu(best_state),
+            "loss_trace": list(loss_trace),
+            "train_reward_trace": list(reward_trace),
+            "valid_action_count_trace": list(valid_action_count_trace),
+            "eval_trace": list(eval_trace),
+            "rng_state": _capture_rng_state(device),
+        },
+        path,
+    )
+
+
 def _assert_checkpoint_schema(
     checkpoint: dict[str, Any],
     *,
@@ -2216,7 +2353,54 @@ def train_minute_to_hour_dqn(
     reward_trace: list[float] = []
     valid_action_count_trace: list[float] = []
     eval_trace: list[dict[str, float | int | None | str]] = []
-    for step in range(1, config.learning.train_steps + 1):
+    resume_info: dict[str, object] = {"loaded": False}
+    start_step = 1
+    resume_path = Path(config.resume_training_state) if config.resume_training_state is not None else None
+    if resume_path is not None and resume_path.exists():
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        if not isinstance(checkpoint, dict) or checkpoint.get("checkpoint_kind") != "minute_to_hour_dqn_training_state":
+            raise ValueError("Resume checkpoint is not a minute-to-hour DQN training state.")
+        q_network.load_state_dict(checkpoint["q_network_state_dict"], strict=True)
+        target_network.load_state_dict(checkpoint["target_network_state_dict"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if isinstance(scaler_state, dict):
+            scaler.load_state_dict(scaler_state)
+        replay_state = checkpoint.get("replay")
+        env_state = checkpoint.get("env")
+        if not isinstance(replay_state, dict) or not isinstance(env_state, dict):
+            raise ValueError("Resume checkpoint is missing replay or environment state.")
+        _load_replay_state(replay, replay_state, device)
+        _load_env_state(env, env_state, device)
+        best_val_return = float(checkpoint.get("best_val_return", best_val_return))
+        best_val_legs = float(checkpoint.get("best_val_legs", best_val_legs))
+        raw_best_state = checkpoint.get("best_state")
+        if not isinstance(raw_best_state, dict):
+            raise ValueError("Resume checkpoint is missing best_state.")
+        best_state = {
+            key: value.detach().cpu().clone()
+            for key, value in raw_best_state.items()
+            if torch.is_tensor(value)
+        }
+        loss_trace = [float(item) for item in checkpoint.get("loss_trace", [])]
+        reward_trace = [float(item) for item in checkpoint.get("train_reward_trace", [])]
+        valid_action_count_trace = [float(item) for item in checkpoint.get("valid_action_count_trace", [])]
+        eval_trace = list(checkpoint.get("eval_trace", []))
+        rng_state = checkpoint.get("rng_state")
+        if isinstance(rng_state, dict):
+            _restore_rng_state(rng_state, device)
+        resumed_step = int(checkpoint.get("step", 0))
+        start_step = min(resumed_step + 1, config.learning.train_steps + 1)
+        resume_info = {
+            "loaded": True,
+            "path": str(resume_path),
+            "resumed_from_step": resumed_step,
+            "start_step": start_step,
+        }
+
+    checkpoint_path = Path(config.checkpoint_training_state) if config.checkpoint_training_state is not None else None
+    checkpoint_every_steps = max(0, int(config.checkpoint_every_steps))
+    for step in range(start_step, config.learning.train_steps + 1):
         minute, mask, hour, action_features, previous_actions, constraint_features, action_mask = env.observe()
         valid_action_count_trace.append(float(action_mask.sum(dim=1).float().mean().item()))
         epsilon = epsilon_by_step(
@@ -2381,6 +2565,27 @@ def train_minute_to_hour_dqn(
                 best_val_return = val_result.total_return
                 best_val_legs = val_result.market_order_legs
                 best_state = _state_dict_to_cpu(q_network)
+        if checkpoint_path is not None and checkpoint_every_steps > 0 and (
+            step % checkpoint_every_steps == 0 or step == config.learning.train_steps
+        ):
+            _save_minute_to_hour_training_state(
+                checkpoint_path,
+                step=step,
+                q_network=q_network,
+                target_network=target_network,
+                optimizer=optimizer,
+                scaler=scaler,
+                replay=replay,
+                env=env,
+                best_val_return=best_val_return,
+                best_val_legs=best_val_legs,
+                best_state=best_state,
+                loss_trace=loss_trace,
+                reward_trace=reward_trace,
+                valid_action_count_trace=valid_action_count_trace,
+                eval_trace=eval_trace,
+                device=device,
+            )
 
     q_network.load_state_dict(best_state)
     recency_policy: dict[str, object] = {
@@ -2409,6 +2614,10 @@ def train_minute_to_hour_dqn(
         "uses_constraint_features": True,
         "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
         "warm_start": warm_start_info or {"loaded": False},
+        "resume": resume_info,
+        "last_completed_step": int(config.learning.train_steps if start_step <= config.learning.train_steps else start_step - 1),
+        "checkpoint_training_state": str(checkpoint_path) if checkpoint_path is not None else None,
+        "checkpoint_every_steps": checkpoint_every_steps,
         "source_bar_interval": train_data.source_bar_interval,
         "context_bars_per_hour": train_data.effective_context_bars_per_hour,
         "max_subhour_tokens": config.max_subhour_tokens,
