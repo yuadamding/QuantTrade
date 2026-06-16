@@ -7028,6 +7028,88 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             "fp16",
         )
 
+    def test_dqn_td_target_rejects_invalid_gamma(self) -> None:
+        from rl_quant.core import dqn_td_target
+
+        rewards, terminated, next_q = torch.tensor([1.0]), torch.tensor([0.0]), torch.tensor([5.0])
+        for bad_gamma in (1.5, -0.1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                dqn_td_target(rewards, bad_gamma, terminated, next_q)
+        self.assertAlmostEqual(float(dqn_td_target(rewards, 0.9, terminated, next_q)[0].item()), 1.0 + 0.9 * 5.0, places=5)
+
+    def test_replay_buffers_validate_batch_shapes(self) -> None:
+        from rl_quant.core import TensorDictReplayBuffer, TensorReplayBuffer
+
+        cpu = torch.device("cpu")
+        buf = TensorReplayBuffer(capacity=8, device=cpu, fields={"a": torch.float32, "b": torch.long})
+        buf.add(a=torch.zeros(3), b=torch.zeros(3, dtype=torch.long), extra=torch.zeros(3))  # extra ignored
+        with self.assertRaises(ValueError):
+            buf.add(a=torch.zeros(3), b=torch.zeros(2, dtype=torch.long))  # mismatched leading batch dim
+        dbuf = TensorDictReplayBuffer(capacity=8, device=cpu, fields={"x": ((4,), torch.float32)})
+        dbuf.add(x=torch.zeros(3, 4))
+        with self.assertRaises(ValueError):
+            dbuf.add(x=torch.zeros(3, 5))  # wrong trailing shape
+
+    def test_intraday_training_config_has_amp_dtype(self) -> None:
+        import dataclasses
+
+        module = __import__("rl_quant.intraday_dqn", fromlist=["TrainingConfig"])
+        fields = {f.name: f for f in dataclasses.fields(module.TrainingConfig)}
+        self.assertIn("amp_dtype", fields)
+        self.assertEqual(fields["amp_dtype"].default, "fp16")
+
+    def test_amp_dtype_reaches_minute_to_hour_autocast(self) -> None:
+        import unittest.mock as mock
+
+        import rl_quant.minute_to_hour_transformer as m2h
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit,
+            MinuteToHourEnvConfig,
+            MinuteToHourTrainingConfig,
+            train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+            n = len(dates)
+            return HourFromMinuteDataSplit(
+                name=name,
+                decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
+                next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((n, 1, 1)), action_returns=torch.zeros((n, 2)),
+                action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            )
+
+        train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
+        val = make_split("val", ["2026-06-01", "2026-06-02"])
+        learning = DQNLearningConfig(
+            num_envs=2, episode_length=3, replay_capacity=64, batch_size=4, train_steps=6, warmup_steps=2,
+            gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=3, epsilon_start=0.2,
+            epsilon_end=0.0, eval_interval=4, grad_clip=1.0, amp_dtype="bf16",
+        )
+        config = MinuteToHourTrainingConfig(
+            env=MinuteToHourEnvConfig(num_envs=2, episode_length=3), learning=learning,
+            d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+        )
+        seen: list[str] = []
+        real = m2h.autocast_context
+
+        def recorder(device, requested, amp_dtype="fp16"):
+            seen.append(amp_dtype)
+            return real(device, requested, amp_dtype)
+
+        torch.manual_seed(0)
+        with mock.patch.object(m2h, "autocast_context", recorder):
+            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+        # The trainer must thread config.learning.amp_dtype into autocast_context (not a hardcoded fp16).
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"bf16"})
+
     def test_all_public_rl_quant_modules_import(self) -> None:
         import importlib
         import pkgutil

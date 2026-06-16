@@ -81,6 +81,27 @@ class TemporalQNetwork(nn.Module):
         return self.head(torch.cat([x, previous_action_features], dim=1))
 
 
+def _validate_replay_batch(
+    storage: dict[str, torch.Tensor], transition: dict[str, torch.Tensor]
+) -> None:
+    """Validate declared replay fields share one leading batch dim and match the stored trailing
+    shape, so a mis-shaped transition fails loudly instead of silently corrupting learning curves.
+    Extra transition keys (e.g. legs/resets) are ignored, matching add()'s field-driven write."""
+    counts: set[int] = set()
+    for name, target in storage.items():
+        value = transition[name]
+        if value.ndim == 0:
+            raise ValueError(f"replay field {name!r} needs a leading batch dimension")
+        if tuple(value.shape[1:]) != tuple(target.shape[1:]):
+            raise ValueError(
+                f"replay field {name!r} trailing shape {tuple(value.shape[1:])} != "
+                f"expected {tuple(target.shape[1:])}"
+            )
+        counts.add(int(value.shape[0]))
+    if len(counts) > 1:
+        raise ValueError(f"mismatched replay batch sizes across fields: {sorted(counts)}")
+
+
 class TensorReplayBuffer:
     """Circular replay buffer for tensor transitions with fixed field names."""
 
@@ -106,6 +127,7 @@ class TensorReplayBuffer:
         missing = set(self.storage) - set(transition)
         if missing:
             raise ValueError(f"Missing replay fields: {sorted(missing)}")
+        _validate_replay_batch(self.storage, transition)
         first_value = next(iter(transition.values()))
         count = int(first_value.shape[0])
         if count == 0:
@@ -162,6 +184,7 @@ class TensorDictReplayBuffer:
         missing = set(self.storage) - set(transition)
         if missing:
             raise ValueError(f"Missing replay fields: {sorted(missing)}")
+        _validate_replay_batch(self.storage, transition)
         first_value = next(iter(transition.values()))
         count = int(first_value.shape[0])
         if count == 0:
@@ -220,9 +243,13 @@ def dqn_td_target(
             f"rewards={tuple(rewards.shape)}, terminated={tuple(terminated.shape)}, "
             f"next_q={tuple(next_q.shape)}."
         )
+    gamma_f = float(gamma)
+    # The range check also rejects NaN/inf (any comparison with NaN is False; inf fails the upper bound).
+    if not 0.0 <= gamma_f <= 1.0:
+        raise ValueError(f"gamma must be finite and in [0, 1]; got {gamma!r}.")
     rewards_f = rewards.float()
     bootstrap = torch.where(terminated.bool(), torch.zeros_like(rewards_f), next_q.detach().float())
-    return rewards_f + float(gamma) * bootstrap
+    return rewards_f + gamma_f * bootstrap
 
 
 def annualized_sharpe(values: list[float], periods_per_year: float = 252.0) -> float | None:

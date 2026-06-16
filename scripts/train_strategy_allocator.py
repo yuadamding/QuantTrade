@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-embedding-dim", type=int, default=16)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>")
     parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision during training")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP autocast precision when --amp is set: fp16 (default) or bf16 (no GradScaler).",
+    )
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 
@@ -148,6 +154,7 @@ def main() -> int:
         eval_interval=args.eval_interval,
         grad_clip=args.grad_clip,
         use_amp=args.amp,
+        amp_dtype=args.amp_dtype,
     )
     config = StrategyTrainingConfig(
         env=env_config,

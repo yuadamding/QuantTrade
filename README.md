@@ -176,11 +176,22 @@ Most training scripts accept:
 ```text
 --device auto
 --amp
---target-vram-gb 9.5
+--amp-dtype fp16|bf16
+--min-free-vram-gb 8
+--target-vram-gb 9.5   # legacy ballast; see warning below
 ```
 
 `--device auto` uses CUDA when available. `--amp` enables mixed precision only
-when the chosen device is CUDA.
+when the chosen device is CUDA. `--amp-dtype` selects the autocast dtype: `fp16`
+(default) or `bf16` (wider exponent range, preferred on Ampere/Hopper; GradScaler
+is disabled for `bf16`). `--min-free-vram-gb` fails fast before training when free
+CUDA memory is below the given margin.
+
+`--target-vram-gb` is **legacy CUDA ballast reservation, not a memory cap**: it
+reserves byte tensors after warmup to *raise* used VRAM toward the target (it does
+not shard, offload, or limit memory). Leave it unset for large-model training
+unless you deliberately want to reserve extra VRAM; use `--min-free-vram-gb` to
+guard headroom instead.
 
 ## Repository Layout
 

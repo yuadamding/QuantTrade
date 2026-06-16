@@ -49,6 +49,7 @@ class TrainingConfig:
     pretrain_epochs: int
     pretrain_batch_size: int
     use_amp: bool = False
+    amp_dtype: str = "fp16"  # AMP autocast precision when use_amp: "fp16" (default) or "bf16".
 
 
 class ConvQNetwork(nn.Module):
@@ -343,7 +344,7 @@ def _pretrain_q_network(
             batch_positions = positions[batch_ids]
             batch_targets = targets[batch_ids]
 
-            with autocast_context(device, config.use_amp):
+            with autocast_context(device, config.use_amp, config.amp_dtype):
                 predicted_q = q_network(train_data.state_windows(batch_indices), batch_positions)
                 loss = F.smooth_l1_loss(predicted_q, batch_targets)
             optimizer.zero_grad(set_to_none=True)
@@ -605,7 +606,7 @@ def train_dqn_agent(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    scaler = make_grad_scaler(device, config.use_amp)
+    scaler = make_grad_scaler(device, config.use_amp, config.amp_dtype)
     amp_enabled = scaler.is_enabled()
     replay = ReplayBuffer(config.replay_capacity, device)
     env = VectorizedMarketEnv(train_data, config, device)
@@ -649,7 +650,7 @@ def train_dqn_agent(
         )
 
         with torch.no_grad():
-            with autocast_context(device, config.use_amp):
+            with autocast_context(device, config.use_amp, config.amp_dtype):
                 q_values = q_network(states, positions)
             greedy_actions = _apply_action_threshold(q_values, positions, config.action_threshold)
             random_actions = torch.randint(0, 3, greedy_actions.shape, device=device)
@@ -667,7 +668,7 @@ def train_dqn_agent(
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(batch["next_indices"])
 
-            with autocast_context(device, config.use_amp):
+            with autocast_context(device, config.use_amp, config.amp_dtype):
                 current_q = q_network(current_states, batch["positions"])
                 chosen_q = current_q.gather(1, batch["actions"].unsqueeze(1)).squeeze(1)
 

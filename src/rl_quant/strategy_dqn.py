@@ -267,7 +267,7 @@ def train_strategy_dqn_agent(
         lr=config.learning.learning_rate,
         weight_decay=config.learning.weight_decay,
     )
-    scaler = make_grad_scaler(device, config.learning.use_amp)
+    scaler = make_grad_scaler(device, config.learning.use_amp, config.learning.amp_dtype)
     amp_enabled = scaler.is_enabled()
     replay = TensorReplayBuffer(
         capacity=config.learning.replay_capacity,
@@ -300,7 +300,7 @@ def train_strategy_dqn_agent(
             end=config.learning.epsilon_end,
         )
         with torch.no_grad():
-            with autocast_context(device, config.learning.use_amp):
+            with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):
                 q_values = q_network(states, previous_actions)
             greedy_actions = torch.argmax(q_values, dim=1)
             random_actions = torch.randint(0, action_count, greedy_actions.shape, device=device)
@@ -318,7 +318,7 @@ def train_strategy_dqn_agent(
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(batch["next_indices"])
 
-            with autocast_context(device, config.learning.use_amp):
+            with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):
                 chosen_q = q_network(current_states, batch["previous_actions"]).gather(
                     1,
                     batch["actions"].unsqueeze(1),

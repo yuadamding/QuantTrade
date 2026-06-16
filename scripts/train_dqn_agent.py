@@ -72,6 +72,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrain-batch-size", type=int, default=2048)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>")
     parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision during training")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP autocast precision when --amp is set: fp16 (default) or bf16 (no GradScaler).",
+    )
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 
@@ -235,6 +241,7 @@ def main() -> int:
         pretrain_epochs=args.pretrain_epochs,
         pretrain_batch_size=args.pretrain_batch_size,
         use_amp=args.amp,
+        amp_dtype=args.amp_dtype,
     )
 
     train_split = train_split.to(device)

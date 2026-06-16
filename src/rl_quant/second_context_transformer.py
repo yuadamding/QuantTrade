@@ -402,6 +402,7 @@ def predict_second_context_q_values(
     device: torch.device,
     batch_size: int | None = None,
     use_amp: bool = False,
+    amp_dtype: str = "fp16",
     pin_memory: bool = True,
 ) -> torch.Tensor:
     rows = split.market_context.shape[0]
@@ -420,7 +421,7 @@ def predict_second_context_q_values(
         action_features = _slice_to_device(split.action_features, indices, device, pin_memory=pin_memory)
         portfolio_state = _slice_to_device(split.portfolio_state, indices, device, pin_memory=pin_memory)
         constraint_state = _slice_to_device(split.constraint_state, indices, device, pin_memory=pin_memory)
-        with autocast_context(device, use_amp):
+        with autocast_context(device, use_amp, amp_dtype):
             q_values = model(market_context, market_mask, action_features, portfolio_state, constraint_state)
         outputs.append(q_values.detach().float().cpu())
     return torch.cat(outputs, dim=0)
@@ -867,6 +868,7 @@ def evaluate_second_context_action_scorer(
     reward_scale: float = 10_000.0,
     batch_size: int | None = None,
     use_amp: bool = False,
+    amp_dtype: str = "fp16",
     pin_memory: bool = True,
     evaluate_all_rows: bool = False,
 ) -> dict[str, float | int | None]:
@@ -876,6 +878,7 @@ def evaluate_second_context_action_scorer(
         device=device,
         batch_size=batch_size,
         use_amp=use_amp,
+        amp_dtype=amp_dtype,
         pin_memory=pin_memory,
     )
     rows = (
@@ -940,6 +943,7 @@ def evaluate_second_context_trading_policy(
     return_selected_actions: bool = False,
     batch_size: int | None = None,
     use_amp: bool = False,
+    amp_dtype: str = "fp16",
     pin_memory: bool = True,
 ) -> dict[str, float | int | None]:
     q_values = predict_second_context_q_values(
@@ -948,6 +952,7 @@ def evaluate_second_context_trading_policy(
         device=device,
         batch_size=batch_size,
         use_amp=use_amp,
+        amp_dtype=amp_dtype,
         pin_memory=pin_memory,
     )
     previous_action = int(initial_action)

@@ -67,8 +67,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reward-scale", type=float, default=10_000.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--target-vram-gb", type=float, help="Reserve CUDA ballast after warmup toward this total used VRAM.")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help="AMP autocast precision when --amp is set. bf16 (wider exponent range, no GradScaler) "
+        "is preferred on Ampere/Hopper GPUs; fp16 (default) preserves prior behavior.",
+    )
+    parser.add_argument(
+        "--target-vram-gb",
+        type=float,
+        help="OPT-IN CUDA ballast: reserve byte tensors after warmup toward this total used VRAM. "
+        "This INCREASES memory (it does not cap/shard/offload) -- leave unset for large models; use "
+        "--min-free-vram-gb to guard headroom instead.",
+    )
     parser.add_argument("--vram-safety-gb", type=float, default=0.12)
+    parser.add_argument(
+        "--min-free-vram-gb",
+        type=float,
+        default=0.0,
+        help="Fail fast before training if free CUDA memory is below this many GiB (0 disables).",
+    )
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--empty-cache-every-epochs", type=int, default=0)
     parser.add_argument("--seed", type=int, default=17)
@@ -158,6 +177,7 @@ def train_second_context_epoch(
     reward_scale: float,
     use_amp: bool,
     grad_clip: float,
+    amp_dtype: str = "fp16",
     pin_memory: bool = True,
     vram_reservation=None,
 ) -> dict[str, float | int]:
@@ -209,7 +229,7 @@ def train_second_context_epoch(
                 device,
                 pin_memory=pin_memory,
             )
-            with autocast_context(device, use_amp):
+            with autocast_context(device, use_amp, amp_dtype):
                 q_values = model(market_context, market_mask, action_features, portfolio_state, constraint_state)
                 loss = masked_contextual_q_loss(
                     q_values,
@@ -250,7 +270,13 @@ def main() -> int:
     import torch
 
     from rl_quant.confidence import ActionConfidenceCalibrator, ActionConfidenceConfig, save_action_confidence_npz
-    from rl_quant.core import CudaVramReservation, configure_torch_runtime, make_grad_scaler, resolve_torch_device
+    from rl_quant.core import (
+        CudaVramReservation,
+        configure_torch_runtime,
+        cuda_memory_report,
+        make_grad_scaler,
+        resolve_torch_device,
+    )
     from rl_quant.research_protocol import stable_json_hash
     from rl_quant.second_context_transformer import (
         SecondContextTransformerQNetwork,
@@ -275,6 +301,13 @@ def main() -> int:
     )
     device = resolve_torch_device(args.device)
     configure_torch_runtime(device)
+    if args.min_free_vram_gb > 0 and device.type == "cuda":
+        free_gb = cuda_memory_report(device)["free_gb"]
+        if free_gb < args.min_free_vram_gb:
+            raise SystemExit(
+                f"insufficient free CUDA memory: {free_gb:.2f} GiB free < --min-free-vram-gb "
+                f"{args.min_free_vram_gb:.2f} GiB. Free memory or lower the requirement."
+            )
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -299,7 +332,7 @@ def main() -> int:
         action_count=len(train.action_names),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scaler = make_grad_scaler(device, args.amp)
+    scaler = make_grad_scaler(device, args.amp, args.amp_dtype)
     reservation = CudaVramReservation(target_gb=args.target_vram_gb, safety_gb=args.vram_safety_gb)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -312,6 +345,7 @@ def main() -> int:
             device=device,
             batch_size=batch_plan["eval_batch_size"],
             use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
             pin_memory=args.pin_memory,
         )
 
@@ -480,6 +514,7 @@ def main() -> int:
             micro_batch_size=batch_plan["micro_batch_size"],
             reward_scale=args.reward_scale,
             use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
             grad_clip=args.grad_clip,
             pin_memory=args.pin_memory,
             vram_reservation=reservation,
@@ -502,6 +537,7 @@ def main() -> int:
                 reward_scale=args.reward_scale,
                 batch_size=batch_plan["eval_batch_size"],
                 use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
                 pin_memory=args.pin_memory,
             )
             active = val_policy.get("active_window_diagnostics", {})
@@ -537,6 +573,7 @@ def main() -> int:
                 reward_scale=args.reward_scale,
                 batch_size=batch_plan["eval_batch_size"],
                 use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
                 pin_memory=args.pin_memory,
             )
             print(
@@ -557,6 +594,7 @@ def main() -> int:
         reward_scale=args.reward_scale,
         batch_size=batch_plan["eval_batch_size"],
         use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
         pin_memory=args.pin_memory,
     )
     val_metrics = evaluate_second_context_action_scorer(
@@ -566,6 +604,7 @@ def main() -> int:
         reward_scale=args.reward_scale,
         batch_size=batch_plan["eval_batch_size"],
         use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
         pin_memory=args.pin_memory,
     )
     test_metrics = evaluate_second_context_action_scorer(
@@ -575,6 +614,7 @@ def main() -> int:
         reward_scale=args.reward_scale,
         batch_size=batch_plan["eval_batch_size"],
         use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
         pin_memory=args.pin_memory,
     )
     train_policy_metrics = evaluate_second_context_trading_policy(
@@ -585,6 +625,7 @@ def main() -> int:
         return_selected_actions=True,
         batch_size=batch_plan["eval_batch_size"],
         use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
         pin_memory=args.pin_memory,
     )
     val_policy_metrics = evaluate_second_context_trading_policy(
@@ -595,6 +636,7 @@ def main() -> int:
         return_selected_actions=True,
         batch_size=batch_plan["eval_batch_size"],
         use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
         pin_memory=args.pin_memory,
     )
     test_policy_metrics = evaluate_second_context_trading_policy(
@@ -606,6 +648,7 @@ def main() -> int:
         return_selected_actions=True,
         batch_size=batch_plan["eval_batch_size"],
         use_amp=args.amp,
+            amp_dtype=args.amp_dtype,
         pin_memory=args.pin_memory,
     )
     run_name = args.run_name or f"second_context_action_scorer_{datetime.now():%Y%m%d_%H%M%S}"
