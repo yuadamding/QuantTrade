@@ -6901,6 +6901,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # Shape mismatch must raise (guards the silent (B, 1) vs (B,) broadcast bug).
         with self.assertRaises(ValueError):
             dqn_td_target(torch.zeros(3, 1), 0.9, torch.zeros(3), torch.zeros(3))
+        # Device equality is validated so a CPU/GPU mix fails legibly here, not deep inside torch.where.
+        if torch.cuda.is_available():
+            with self.assertRaises(ValueError):
+                dqn_td_target(rewards, 0.9, terminated, next_q.cuda())
 
     def test_hourly_env_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
         module = __import__(
@@ -7041,6 +7045,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # A NON-terminal out-of-range index is a real bug -> rejected, not silently clamped.
         with self.assertRaises(ValueError):
             safe_next_row_indices(torch.tensor([4, 1]), torch.tensor([0.0, 0.0]), n_rows=4)
+        # Shape mismatch must be rejected up front (else the &-mask broadcasts to the wrong rows).
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(torch.tensor([[1], [2]]), torch.tensor([0.0, 0.0]), n_rows=4)
+        # A float "index" tensor is rejected -- indices must be torch.long.
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(torch.tensor([1.0, 2.0]), torch.tensor([0.0, 0.0]), n_rows=4)
         # as_binary_bool_mask: bool passthrough; binary float ok; non-binary rejected.
         self.assertTrue(bool(as_binary_bool_mask(torch.tensor([True, False]))[0].item()))
         self.assertEqual(as_binary_bool_mask(torch.tensor([1.0, 0.0])).tolist(), [True, False])

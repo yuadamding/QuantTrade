@@ -237,9 +237,25 @@ def safe_next_row_indices(
 ) -> torch.Tensor:
     """Clamp next-state row indices to ``[0, n_rows-1]`` for the state lookup, but ONLY for terminal
     transitions (whose bootstrap is zeroed anyway). A NON-terminal out-of-range index would silently
-    bootstrap from the WRONG row, so it is rejected rather than clamped (clamping would hide the bug)."""
+    bootstrap from the WRONG row, so it is rejected rather than clamped (clamping would hide the bug).
+
+    ``next_indices`` must be an integer (``torch.long``) tensor that shares one shape AND device with
+    ``terminated``: a shape mismatch would let the ``&`` below broadcast (e.g. (B, 1) vs (B,) -> (B, B))
+    and validate the wrong rows, and a cross-device pair would raise a far less legible error deeper in."""
     if n_rows <= 0:
         raise ValueError("cannot construct next states for an empty split.")
+    if next_indices.shape != terminated.shape:
+        raise ValueError(
+            f"{name} and terminated must share one shape; got {tuple(next_indices.shape)} "
+            f"and {tuple(terminated.shape)}."
+        )
+    if next_indices.device != terminated.device:
+        raise ValueError(
+            f"{name} and terminated must be on the same device; got {next_indices.device} "
+            f"and {terminated.device}."
+        )
+    if next_indices.dtype != torch.long:
+        raise ValueError(f"{name} must be a torch.long index tensor; got {next_indices.dtype}.")
     terminated_b = as_binary_bool_mask(terminated, name="terminated")
     bad = ((next_indices < 0) | (next_indices >= n_rows)) & ~terminated_b
     if bool(bad.any().item()):
@@ -275,6 +291,11 @@ def dqn_td_target(
             "dqn_td_target expects rewards, terminated, and next_q to share one shape; got "
             f"rewards={tuple(rewards.shape)}, terminated={tuple(terminated.shape)}, "
             f"next_q={tuple(next_q.shape)}."
+        )
+    if rewards.device != next_q.device or rewards.device != terminated.device:
+        raise ValueError(
+            "dqn_td_target expects rewards, terminated, and next_q on the same device; got "
+            f"rewards={rewards.device}, terminated={terminated.device}, next_q={next_q.device}."
         )
     gamma_f = float(gamma)
     # The range check also rejects NaN/inf (any comparison with NaN is False; inf fails the upper bound).
