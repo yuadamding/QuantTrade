@@ -7181,6 +7181,30 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             group, workflow = preset.workflow.split(".", 1)
             self.assertIn((group, workflow), _DISPATCH, f"preset {name} targets unknown workflow")
 
+    def test_qt_rejects_preset_for_wrong_workflow(self) -> None:
+        from rl_quant.cli import build_parser, resolve_workflow
+
+        parser = build_parser()
+        # A direct-bar preset must NOT be accepted for a second-context command (would forward the
+        # wrong CLI flags to the script).
+        args, passthrough = parser.parse_known_args(
+            ["train", "second-context", "--preset", "train.direct-bar.minute"]
+        )
+        with self.assertRaises(SystemExit):
+            resolve_workflow(args, passthrough)
+        # The matching preset is accepted.
+        args2, pt2 = parser.parse_known_args(["train", "direct-bar", "--preset", "train.direct-bar.minute"])
+        script, argv = resolve_workflow(args2, pt2)
+        self.assertEqual(script, "train_hourly_causal_transformer_rl.py")
+        self.assertTrue(argv)
+
+    def test_minute_to_hour_uses_core_replay_buffer(self) -> None:
+        # The local duplicate was removed; the trainer must use core's validated buffer.
+        import rl_quant.core as core
+        import rl_quant.minute_to_hour_transformer as m2h
+
+        self.assertIs(m2h.TensorDictReplayBuffer, core.TensorDictReplayBuffer)
+
     def test_runtime_config_add_args_and_resolve(self) -> None:
         import argparse
 

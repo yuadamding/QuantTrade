@@ -17,6 +17,7 @@ from torch import nn
 from rl_quant.core import (
     CudaVramReservation,
     DQNLearningConfig,
+    TensorDictReplayBuffer,
     annualized_sharpe,
     autocast_context,
     configure_torch_runtime,
@@ -45,54 +46,6 @@ DEFAULT_MAX_SUBHOUR_TOKENS = 512
 DEFAULT_SECOND_BAR_LATENCY_MS = 1000
 DEFAULT_EXCHANGE_CALENDAR_ID = "XNYS_decision_timestamp_sessions_America_New_York_v1"
 _EASTERN = ZoneInfo("America/New_York")
-
-
-class TensorDictReplayBuffer:
-    def __init__(
-        self,
-        *,
-        capacity: int,
-        device: torch.device,
-        fields: dict[str, tuple[tuple[int, ...], torch.dtype]],
-    ) -> None:
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
-        self.capacity = int(capacity)
-        self.device = device
-        self.storage = {
-            name: torch.zeros((capacity, *shape), dtype=dtype, device=device)
-            for name, (shape, dtype) in fields.items()
-        }
-        self.size = 0
-        self.cursor = 0
-
-    def add(self, **transition: torch.Tensor) -> None:
-        missing = set(self.storage) - set(transition)
-        if missing:
-            raise ValueError(f"Missing replay fields: {sorted(missing)}")
-        first_value = next(iter(transition.values()))
-        count = int(first_value.shape[0])
-        if count == 0:
-            return
-        if count >= self.capacity:
-            for name in self.storage:
-                transition[name] = transition[name][-self.capacity :]
-            count = self.capacity
-        first = min(count, self.capacity - self.cursor)
-        second = count - first
-        for name, target in self.storage.items():
-            values = transition[name].to(device=self.device, dtype=target.dtype)
-            target[self.cursor : self.cursor + first] = values[:first]
-            if second:
-                target[:second] = values[first:]
-        self.cursor = (self.cursor + count) % self.capacity
-        self.size = min(self.capacity, self.size + count)
-
-    def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
-        if self.size <= 0:
-            raise ValueError("Cannot sample from an empty replay buffer")
-        batch_ids = torch.randint(0, self.size, (batch_size,), device=self.device)
-        return {name: values[batch_ids] for name, values in self.storage.items()}
 
 
 def default_minute_to_hour_constraints() -> TradingConstraintConfig:

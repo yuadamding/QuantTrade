@@ -221,9 +221,12 @@ QuantTrade/
     news_llm_covariate_protocol.md
   src/rl_quant/
     core.py
+    cli.py
+    config.py
+    paths.py
+    presets.py
     action_risk.py
     confidence.py
-    bar_transformer.py
     decision_framework.py
     hourly_transformer.py
     intraday_data.py

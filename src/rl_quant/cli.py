@@ -73,7 +73,19 @@ def resolve_workflow(args: argparse.Namespace, passthrough: list[str]) -> tuple[
     script = _DISPATCH[(args.group, args.workflow)]
     selector = getattr(args, "interval", None) or getattr(args, "source", None)
     preset_name = args.preset or _DEFAULT_PRESETS.get((args.group, args.workflow, selector or ""))
-    preset_args = resolve_preset(preset_name) if preset_name else []
+    preset_args: list[str] = []
+    if preset_name:
+        if preset_name not in PRESETS:
+            raise SystemExit(f"qt: unknown preset {preset_name!r}; run `qt preset list`.")
+        expected = f"{args.group}.{args.workflow}"
+        if PRESETS[preset_name].workflow != expected:
+            # Refuse to feed a preset's args to a different workflow (e.g. a direct-bar preset to a
+            # second-context command), which would forward the wrong CLI flags to the script.
+            raise SystemExit(
+                f"qt: preset {preset_name!r} targets workflow {PRESETS[preset_name].workflow!r}, "
+                f"not {expected!r}; run `qt preset list` to see each preset's workflow."
+            )
+        preset_args = resolve_preset(preset_name)
     return script, [*preset_args, *passthrough]
 
 
