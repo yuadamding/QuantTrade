@@ -7154,6 +7154,47 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIn("amp_dtype", fields)
         self.assertEqual(fields["amp_dtype"].default, "fp16")
 
+    def test_intraday_valid_index_mask_matches_valid_start_range(self) -> None:
+        import csv as _csv
+        import tempfile
+        from pathlib import Path as _Path
+
+        from rl_quant.intraday_data import _finalize_split, _load_raw_split
+
+        cols = [
+            "time", "bucket_start_ns", "bucket_seconds", "close_mid", "best_bid", "best_ask",
+            "close_spread", "avg_spread", "close_imbalance", "avg_imbalance", "close_microprice",
+            "high_mid", "low_mid", "quote_updates", "bid_depth_lots", "ask_depth_lots",
+            "locked_quotes", "crossed_quotes",
+        ]
+        row = {
+            "time": "09:30:00", "bucket_start_ns": "0", "bucket_seconds": "1", "close_mid": "100.0",
+            "best_bid": "99.9", "best_ask": "100.1", "close_spread": "0.2", "avg_spread": "0.2",
+            "close_imbalance": "0.5", "avg_imbalance": "0.5", "close_microprice": "100.0",
+            "high_mid": "100.2", "low_mid": "99.8", "quote_updates": "10", "bid_depth_lots": "5",
+            "ask_depth_lots": "5", "locked_quotes": "0", "crossed_quotes": "0",
+        }
+        with tempfile.TemporaryDirectory() as d:
+            path = _Path(d) / "2026-01-02_nbbo_1s.csv"
+            with path.open("w", newline="") as fh:
+                writer = _csv.DictWriter(fh, fieldnames=cols)
+                writer.writeheader()
+                for _ in range(6):
+                    writer.writerow(row)
+            raw = _load_raw_split("train", [path], lookback=2)
+        mask = raw["valid_index_mask"]
+        # 6 rows, lookback=2 -> valid range [1, 4]; row 0 (< lookback-1) and row 5 (= day_end-1, no
+        # in-day finite next) are excluded. The mask must be the FULL valid range, == valid_start_indices.
+        self.assertEqual(mask.dtype, torch.bool)
+        self.assertEqual(int(mask.shape[0]), 6)
+        self.assertEqual(mask.nonzero().flatten().tolist(), [1, 2, 3, 4])
+        self.assertEqual(mask.nonzero().flatten().tolist(), raw["valid_start_indices"].tolist())
+        self.assertFalse(bool(mask[0].item()))
+        self.assertFalse(bool(mask[5].item()))
+        # The new required field survives finalize() and a device move (.to keeps it co-located).
+        split = _finalize_split(raw, feature_mean=torch.zeros(14), feature_std=torch.ones(14))
+        self.assertEqual(split.to(torch.device("cpu")).valid_index_mask.tolist(), mask.tolist())
+
     def test_amp_dtype_reaches_minute_to_hour_autocast(self) -> None:
         import unittest.mock as mock
 

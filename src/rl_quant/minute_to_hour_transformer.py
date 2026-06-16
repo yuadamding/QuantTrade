@@ -2250,11 +2250,15 @@ def train_minute_to_hour_dqn(
             n_rows = int(train_data.action_returns.shape[0])
             # min_index = 0: state() is plain row indexing (each row carries its own self-contained
             # window), so there is no rolling-window floor to respect and no tail-wrap to avoid.
+            # valid_index_mask is the same tensor the env uses to DEFINE terminated (terminated =
+            # ~valid_index_mask[next]), so every non-terminal next is mask-True by construction --
+            # passing it rejects nothing legitimate and turns a mask/terminated mismatch into a loud error.
             safe_next_indices = safe_next_row_indices(
                 batch["next_indices"],
                 batch["terminated"],
                 min_index=0,
                 max_index=n_rows - 1,
+                valid_index_mask=train_data.valid_index_mask,
             )
             current_minute, current_mask, current_hour = train_data.state(batch["indices"])
             next_minute, next_mask, next_hour = train_data.state(safe_next_indices)

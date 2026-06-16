@@ -49,6 +49,11 @@ class MarketDataSplit:
     day_starts: torch.Tensor
     day_ends: torch.Tensor
     valid_start_indices: torch.Tensor
+    # True at every row that is a well-formed decision/bootstrap target: the contiguous per-day range
+    # [day_start + lookback - 1, day_end - 2]. This is the FULL valid range (every row in valid_start_indices),
+    # NOT the start-eligible reset pool -- a mid-episode continuation row (current + step_horizon) is a
+    # legitimate non-terminal next without being a reset-eligible start, so it must remain mask-True.
+    valid_index_mask: torch.Tensor
     feature_mean: torch.Tensor
     feature_std: torch.Tensor
     lookback: int
@@ -65,6 +70,7 @@ class MarketDataSplit:
             day_starts=self.day_starts.to(device),
             day_ends=self.day_ends.to(device),
             valid_start_indices=self.valid_start_indices.to(device),
+            valid_index_mask=self.valid_index_mask.to(device),
             feature_mean=self.feature_mean.to(device),
             feature_std=self.feature_std.to(device),
         )
@@ -178,6 +184,13 @@ def _load_raw_split(name: str, paths: Sequence[Path], lookback: int) -> dict[str
             valid_indices.extend(range(valid_start, valid_end))
         base_index = day_end
 
+    n_rows = len(feature_rows)
+    valid_start_indices = torch.tensor(valid_indices, dtype=torch.long)
+    # Bool membership view of valid_start_indices, used to reject in-range-but-invalid non-terminal
+    # bootstrap rows in safe_next_row_indices. Length == n_rows so it indexes 1:1 with feature rows.
+    valid_index_mask = torch.zeros(n_rows, dtype=torch.bool)
+    valid_index_mask[valid_start_indices] = True
+
     return {
         "name": name,
         "dates": dates,
@@ -191,7 +204,8 @@ def _load_raw_split(name: str, paths: Sequence[Path], lookback: int) -> dict[str
         "day_ids": torch.tensor(day_ids, dtype=torch.long),
         "day_starts": torch.tensor(day_starts, dtype=torch.long),
         "day_ends": torch.tensor(day_ends, dtype=torch.long),
-        "valid_start_indices": torch.tensor(valid_indices, dtype=torch.long),
+        "valid_start_indices": valid_start_indices,
+        "valid_index_mask": valid_index_mask,
         "lookback": lookback,
     }
 
@@ -220,6 +234,7 @@ def _finalize_split(
         day_starts=raw["day_starts"],
         day_ends=raw["day_ends"],
         valid_start_indices=raw["valid_start_indices"],
+        valid_index_mask=raw["valid_index_mask"],
         feature_mean=feature_mean,
         feature_std=feature_std,
         lookback=int(raw["lookback"]),
