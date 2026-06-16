@@ -6890,6 +6890,91 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
 
+    def test_dqn_td_target_bootstraps_through_truncation_only_zeros_terminal(self) -> None:
+        from rl_quant.core import dqn_td_target
+
+        rewards = torch.tensor([2.0, 2.0])
+        next_q = torch.tensor([10.0, 10.0])
+        # First transition is a truncation (terminated=0 -> bootstrap); second is a true terminal.
+        terminated = torch.tensor([0.0, 1.0])
+        target = dqn_td_target(rewards, 0.9, terminated, next_q)
+        self.assertAlmostEqual(float(target[0].item()), 2.0 + 0.9 * 10.0, places=5)
+        self.assertAlmostEqual(float(target[1].item()), 2.0, places=5)
+
+    def test_hourly_env_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
+        module = __import__(
+            "rl_quant.hourly_transformer",
+            fromlist=["VectorizedHourlyAllocationEnv", "HourlyEnvConfig", "HourlyDataSplit"],
+        )
+        n = 6
+        split = module.HourlyDataSplit(
+            name="train",
+            timestamps=[f"2026-01-02T14:3{m}:00+00:00" for m in range(n)],
+            next_timestamps=[f"2026-01-02T14:3{m + 1}:00+00:00" for m in range(n)],
+            feature_names=["x"],
+            action_names=["CASH", "QQQ"],
+            features=torch.zeros((n, 1), dtype=torch.float32),
+            action_returns=torch.zeros((n, 2), dtype=torch.float32),
+            session_dates=["2026-01-02"] * n,
+            valid_start_indices=torch.tensor([0, 1, 2, 3, 4], dtype=torch.long),
+            valid_index_mask=torch.tensor([True, True, True, True, True, False]),
+            feature_mean=torch.zeros(1),
+            feature_std=torch.ones(1),
+            lookback=1,
+            bar_interval="1m",
+        )
+        env = module.VectorizedHourlyAllocationEnv(
+            split, module.HourlyEnvConfig(lookback=1, num_envs=1, episode_length=2, initial_action=0), torch.device("cpu")
+        )
+        cash = torch.zeros(1, dtype=torch.long)
+        env.reset(torch.ones(1, dtype=torch.bool))
+        env.indices[:] = 0
+        env.steps[:] = 0
+        first = env.step(cash)
+        self.assertEqual(float(first["dones"][0].item()), 0.0)
+        self.assertEqual(float(first["terminated"][0].item()), 0.0)
+        second = env.step(cash)  # steps 1->2 == episode_length -> truncation, not terminal
+        self.assertEqual(float(second["dones"][0].item()), 1.0)
+        self.assertEqual(float(second["terminated"][0].item()), 0.0)
+        env.reset(torch.ones(1, dtype=torch.bool))
+        env.indices[:] = 4
+        env.steps[:] = 0
+        boundary = env.step(cash)  # next row 5 has no valid successor -> true terminal
+        self.assertEqual(float(boundary["terminated"][0].item()), 1.0)
+        self.assertEqual(float(boundary["dones"][0].item()), 1.0)
+
+    def test_strict_latest_partition_rejects_duplicate_selected_labels(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        violations = module.strict_latest_partition_violations(
+            selected_labels=["2026-01-03", "2026-01-03"],
+            all_available_labels=["2026-01-01", "2026-01-02", "2026-01-03"],
+            allow_truncated_training_history=True,
+        )
+        self.assertTrue(any("duplicate" in violation for violation in violations))
+        # Duplicates AND a non-latest final partition must both be reported in a single run
+        # (no early-return masking, so the user fixes everything at once).
+        combined = module.strict_latest_partition_violations(
+            selected_labels=["2026-01-01", "2026-01-05", "2026-01-05"],
+            all_available_labels=["2026-01-01", "2026-01-05", "2026-01-10"],
+            allow_truncated_training_history=True,
+        )
+        self.assertTrue(any("duplicate" in violation for violation in combined))
+        self.assertTrue(any("not the latest available" in violation for violation in combined))
+
+    def test_all_public_rl_quant_modules_import(self) -> None:
+        import importlib
+        import pkgutil
+
+        import rl_quant
+
+        failures = []
+        for mod in pkgutil.iter_modules(rl_quant.__path__, "rl_quant."):
+            try:
+                importlib.import_module(mod.name)
+            except Exception as exc:  # noqa: BLE001 - want to report every broken module
+                failures.append(f"{mod.name}: {type(exc).__name__}: {exc}")
+        self.assertEqual(failures, [])
+
 
 if __name__ == "__main__":
     unittest.main()

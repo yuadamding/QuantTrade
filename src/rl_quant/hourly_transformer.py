@@ -36,6 +36,7 @@ from rl_quant.core import (
     annualized_sharpe,
     autocast_context,
     configure_torch_runtime,
+    dqn_td_target,
     epsilon_by_step,
     fractional_max_drawdown,
     make_grad_scaler,
@@ -653,7 +654,12 @@ class VectorizedHourlyAllocationEnv:
         next_valid = torch.zeros_like(in_bounds)
         if bool(in_bounds.any().item()):
             next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
-        dones = (~next_valid) | (self.steps >= int(self.config.episode_length))
+        # Separate a TRUE terminal (no valid next row) from an episode-length TRUNCATION (a rollout
+        # boundary whose next row is a real continuation). Both end the episode (`dones`) and reset
+        # the env, but only `terminated` may zero the TD bootstrap (see core.dqn_td_target).
+        terminated = ~next_valid
+        truncated = self.steps >= int(self.config.episode_length)
+        dones = terminated | truncated
         if bool(in_bounds.any().item()):
             old_dates = self._date_labels(current_indices[in_bounds])
             new_dates = self._date_labels(next_indices[in_bounds])
@@ -683,6 +689,7 @@ class VectorizedHourlyAllocationEnv:
             "next_constraint_features": self.constraint_features(),
             "next_action_mask": next_action_mask,
             "dones": dones.float(),
+            "terminated": terminated.float(),
             "legs": legs,
             "raw_action_returns": raw_returns,
             "position_weights": position_weights,
@@ -1096,6 +1103,7 @@ def train_hourly_transformer_dqn(
             "next_constraint_features": ((HOURLY_CONSTRAINT_FEATURE_DIM,), torch.float32),
             "next_action_mask": ((action_count,), torch.bool),
             "dones": ((), torch.float32),
+            "terminated": ((), torch.float32),
         },
     )
     env = VectorizedHourlyAllocationEnv(train_data, config.env, device)
@@ -1149,8 +1157,12 @@ def train_hourly_transformer_dqn(
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
             batch = replay.sample(config.learning.batch_size)
+            # Clamp next_indices for the state lookup: a true terminal can store an out-of-data next
+            # row (its bootstrap is zeroed below); a no-op for non-terminal in-range transitions.
+            n_rows = int(train_data.action_returns.shape[0])
+            safe_next_indices = batch["next_indices"].clamp(min=0, max=n_rows - 1)
             current_states = train_data.state_windows(batch["indices"])
-            next_states = train_data.state_windows(batch["next_indices"])
+            next_states = train_data.state_windows(safe_next_indices)
             with autocast_context(device, config.learning.use_amp):
                 chosen_q = q_network(
                     current_states,
@@ -1185,14 +1197,10 @@ def train_hourly_transformer_dqn(
                         1,
                         next_actions.unsqueeze(1),
                     ).squeeze(1)
-                    # Build the TD target in float32: under AMP next_q/chosen_q are fp16, and with
-                    # reward_scale=10_000 the bootstrapped targets reach magnitudes where fp16
-                    # resolution (~0.5 near 1e3) is comparable to per-step rewards. Compute the
-                    # target and smooth_l1 loss in fp32 to avoid injecting quantization noise.
-                    target_q = (
-                        batch["rewards"].float()
-                        + config.learning.gamma * (1.0 - batch["dones"].float()) * next_q.float()
-                    )
+                    # Bootstrap through episode-length truncations; zero only on true terminals.
+                    # Shared float32 target with the minute-to-hour trainer (AMP-safe). Using `dones`
+                    # here would wrongly treat truncation as terminal.
+                    target_q = dqn_td_target(batch["rewards"], config.learning.gamma, batch["terminated"], next_q)
                 loss = F.smooth_l1_loss(chosen_q.float(), target_q)
 
             optimizer.zero_grad(set_to_none=True)

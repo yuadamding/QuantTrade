@@ -193,6 +193,22 @@ def epsilon_by_step(*, step: int, train_steps: int, start: float, end: float) ->
     return end + (start - end) * fraction_left
 
 
+def dqn_td_target(
+    rewards: torch.Tensor,
+    gamma: float,
+    terminated: torch.Tensor,
+    next_q: torch.Tensor,
+) -> torch.Tensor:
+    """Double-DQN Bellman target that bootstraps through episode-length TRUNCATIONS.
+
+    Only ``terminated`` (a true terminal with no valid next row) zeros the bootstrap; a mere
+    rollout-length truncation keeps bootstrapping because its next row is a real continuation.
+    Passing the episode-end `dones` mask here instead would wrongly treat every truncation as
+    terminal and bias values toward short horizons. Computed in float32 (AMP-safe: with large
+    reward_scale, fp16 target resolution is comparable to per-step rewards)."""
+    return rewards.float() + gamma * (1.0 - terminated.float()) * next_q.float()
+
+
 def annualized_sharpe(values: list[float], periods_per_year: float = 252.0) -> float | None:
     if len(values) < 2:
         return None

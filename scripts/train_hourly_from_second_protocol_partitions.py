@@ -238,13 +238,22 @@ def strict_latest_partition_violations(
             f"chronological order; got invalid labels: {invalid_labels[:5]}"
         )
         return violations
+    # Collect ALL independent violations rather than returning on the first, so a single run surfaces
+    # every reason the selection is inadmissible (avoids fix-one / re-run / discover-next churn).
+    has_duplicates = len(selected_labels) != len(set(selected_labels))
+    if has_duplicates:
+        seen: set[str] = set()
+        duplicates = [label for label in selected_labels if label in seen or seen.add(label)]
+        violations.append(f"selected partitions contain duplicate labels: {sorted(set(duplicates))[:5]}")
     latest_available = all_available_labels[-1] if all_available_labels else None
     if selected_labels and latest_available is not None and selected_labels[-1] != latest_available:
         violations.append(
             f"final selected partition ({selected_labels[-1]}) is not the latest available partition "
             f"({latest_available})"
         )
-    if not allow_truncated_training_history and all_available_labels:
+    # Set-based exact coverage is only meaningful when labels are unique; with duplicates the
+    # duplicate violation above already flags the selection bug, and the set comparison is unreliable.
+    if not allow_truncated_training_history and all_available_labels and not has_duplicates:
         # Exact-coverage invariant: every available partition before the test must be present, not
         # merely the first/last endpoints -- this also rejects a skipped middle partition (a future
         # selection bug) that an endpoints-only check would miss.

@@ -20,6 +20,7 @@ from rl_quant.core import (
     annualized_sharpe,
     autocast_context,
     configure_torch_runtime,
+    dqn_td_target,
     epsilon_by_step,
     fractional_max_drawdown,
     make_grad_scaler,
@@ -2294,7 +2295,7 @@ def train_minute_to_hour_dqn(
             # out-of-data next row, whose bootstrapped value is zeroed below via `terminated` anyway.
             # For non-terminal transitions next_indices is always in range, so this is a no-op there.
             n_rows = int(train_data.action_returns.shape[0])
-            safe_next_indices = batch["next_indices"].clamp(max=n_rows - 1)
+            safe_next_indices = batch["next_indices"].clamp(min=0, max=n_rows - 1)
             current_minute, current_mask, current_hour = train_data.state(batch["indices"])
             next_minute, next_mask, next_hour = train_data.state(safe_next_indices)
             current_action_features = train_data.action_feature_state(batch["indices"])
@@ -2341,13 +2342,9 @@ def train_minute_to_hour_dqn(
                     # fp32 TD target/loss under AMP: with reward_scale=10_000 the bootstrapped
                     # targets reach magnitudes where fp16 precision is comparable to per-step
                     # rewards, so compute the target and smooth_l1 loss in float32.
-                    # Bootstrap through episode-length TRUNCATIONS (next row is a real continuation);
-                    # zero the bootstrap only on TRUE terminals (no valid next row). Using `dones`
-                    # here would wrongly treat every rollout-boundary truncation as terminal.
-                    target_q = (
-                        batch["rewards"].float()
-                        + config.learning.gamma * (1.0 - batch["terminated"].float()) * next_q.float()
-                    )
+                    # Bootstrap through episode-length TRUNCATIONS; zero the bootstrap only on TRUE
+                    # terminals. Shared with the hourly trainer via core.dqn_td_target.
+                    target_q = dqn_td_target(batch["rewards"], config.learning.gamma, batch["terminated"], next_q)
                 if recency_active:
                     # Recency-weighted smooth_l1: per-sample loss scaled by each transition's source
                     # training row weight (looked up via the replay-stored decision-row `indices`).
