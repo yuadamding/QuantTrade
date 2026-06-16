@@ -2248,7 +2248,14 @@ def train_minute_to_hour_dqn(
             # out-of-data next row, whose bootstrapped value is zeroed below via `terminated` anyway.
             # For non-terminal transitions next_indices is always in range, so this is a no-op there.
             n_rows = int(train_data.action_returns.shape[0])
-            safe_next_indices = safe_next_row_indices(batch["next_indices"], batch["terminated"], n_rows)
+            # min_index = 0: state() is plain row indexing (each row carries its own self-contained
+            # window), so there is no rolling-window floor to respect and no tail-wrap to avoid.
+            safe_next_indices = safe_next_row_indices(
+                batch["next_indices"],
+                batch["terminated"],
+                min_index=0,
+                max_index=n_rows - 1,
+            )
             current_minute, current_mask, current_hour = train_data.state(batch["indices"])
             next_minute, next_mask, next_hour = train_data.state(safe_next_indices)
             current_action_features = train_data.action_feature_state(batch["indices"])

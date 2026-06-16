@@ -319,7 +319,15 @@ def train_strategy_dqn_agent(
             # Clamp next_indices for the window lookup: a true terminal can store an out-of-data next
             # row (its bootstrap is zeroed via `terminated`); no-op for in-range non-terminal rows.
             n_rows = int(train_data.features.shape[0])
-            safe_next_indices = safe_next_row_indices(batch["next_indices"], batch["terminated"], n_rows)
+            # min_index = lookback-1 so a clamped terminal dummy never builds a tail-wrapped window;
+            # valid_index_mask rejects any in-range-but-invalid non-terminal next row defensively.
+            safe_next_indices = safe_next_row_indices(
+                batch["next_indices"],
+                batch["terminated"],
+                min_index=train_data.lookback - 1,
+                max_index=n_rows - 1,
+                valid_index_mask=train_data.valid_index_mask,
+            )
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(safe_next_indices)
 

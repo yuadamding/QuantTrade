@@ -6905,6 +6905,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         if torch.cuda.is_available():
             with self.assertRaises(ValueError):
                 dqn_td_target(rewards, 0.9, terminated, next_q.cuda())
+        # A non-finite CHOSEN reward is rejected -- unlike a terminal next_q it is never discarded, so a
+        # NaN/Inf reward (an unmasked invalid action return) would silently poison the target. Rejected
+        # on BOTH non-terminal and terminal rows, since the reward term is always added.
+        with self.assertRaises(ValueError):
+            dqn_td_target(torch.tensor([1.0, float("nan")]), 0.9, torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0]))
+        with self.assertRaises(ValueError):
+            dqn_td_target(torch.tensor([float("inf"), 1.0]), 0.9, torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0]))
 
     def test_hourly_env_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
         module = __import__(
@@ -7039,18 +7046,53 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_safe_next_row_indices_clamps_terminal_but_rejects_nonterminal_oob(self) -> None:
         from rl_quant.core import as_binary_bool_mask, safe_next_row_indices
 
-        # Terminal out-of-range indices are clamped (their bootstrap is zeroed anyway).
-        out = safe_next_row_indices(torch.tensor([5, -1, 2]), torch.tensor([1.0, 1.0, 0.0]), n_rows=4)
-        self.assertEqual(out.tolist(), [3, 0, 2])
-        # A NON-terminal out-of-range index is a real bug -> rejected, not silently clamped.
+        # Terminal out-of-range indices clamp into [min_index, max_index]; crucially they clamp to
+        # MIN_INDEX (here 2), not 0, so a clamped terminal dummy never builds a tail-wrapped window.
+        out = safe_next_row_indices(
+            torch.tensor([7, 0, 3]), torch.tensor([1.0, 1.0, 0.0]), min_index=2, max_index=5
+        )
+        self.assertEqual(out.tolist(), [5, 2, 3])  # 7->5 (max); 0->2 (min, terminal); 3 in range
+        # A NON-terminal index below min_index (would wrap the lookback window) is rejected.
         with self.assertRaises(ValueError):
-            safe_next_row_indices(torch.tensor([4, 1]), torch.tensor([0.0, 0.0]), n_rows=4)
+            safe_next_row_indices(torch.tensor([1, 3]), torch.tensor([0.0, 0.0]), min_index=2, max_index=5)
+        # A NON-terminal index above max_index is rejected too.
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(torch.tensor([6, 3]), torch.tensor([0.0, 0.0]), min_index=2, max_index=5)
+        # valid_index_mask rejects an in-range-but-INVALID non-terminal row (row 4 is invalid here)...
+        mask = torch.tensor([True, True, True, True, False, True])
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(
+                torch.tensor([4, 3]), torch.tensor([0.0, 0.0]), min_index=2, max_index=5, valid_index_mask=mask
+            )
+        # ...but in-range VALID non-terminal rows pass through unchanged.
+        ok = safe_next_row_indices(
+            torch.tensor([3, 5]), torch.tensor([0.0, 0.0]), min_index=2, max_index=5, valid_index_mask=mask
+        )
+        self.assertEqual(ok.tolist(), [3, 5])
+        # A TERMINAL row may sit on an invalid/out-of-range index without tripping the mask check.
+        term_ok = safe_next_row_indices(
+            torch.tensor([4, 99]), torch.tensor([1.0, 1.0]), min_index=2, max_index=5, valid_index_mask=mask
+        )
+        self.assertEqual(term_ok.tolist(), [4, 5])
+        # Bad min/max ordering, a non-bool mask, and a too-short mask are all rejected.
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(torch.tensor([3]), torch.tensor([0.0]), min_index=5, max_index=2)
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(
+                torch.tensor([3]), torch.tensor([0.0]), min_index=0, max_index=5,
+                valid_index_mask=torch.ones(6, dtype=torch.long),
+            )
+        with self.assertRaises(ValueError):
+            safe_next_row_indices(
+                torch.tensor([3]), torch.tensor([0.0]), min_index=0, max_index=5,
+                valid_index_mask=torch.ones(3, dtype=torch.bool),
+            )
         # Shape mismatch must be rejected up front (else the &-mask broadcasts to the wrong rows).
         with self.assertRaises(ValueError):
-            safe_next_row_indices(torch.tensor([[1], [2]]), torch.tensor([0.0, 0.0]), n_rows=4)
+            safe_next_row_indices(torch.tensor([[1], [2]]), torch.tensor([0.0, 0.0]), min_index=0, max_index=4)
         # A float "index" tensor is rejected -- indices must be torch.long.
         with self.assertRaises(ValueError):
-            safe_next_row_indices(torch.tensor([1.0, 2.0]), torch.tensor([0.0, 0.0]), n_rows=4)
+            safe_next_row_indices(torch.tensor([1.0, 2.0]), torch.tensor([0.0, 0.0]), min_index=0, max_index=4)
         # as_binary_bool_mask: bool passthrough; binary float ok; non-binary rejected.
         self.assertTrue(bool(as_binary_bool_mask(torch.tensor([True, False]))[0].item()))
         self.assertEqual(as_binary_bool_mask(torch.tensor([1.0, 0.0])).tolist(), [True, False])

@@ -1161,7 +1161,15 @@ def train_hourly_transformer_dqn(
             # Clamp next_indices for the state lookup: a true terminal can store an out-of-data next
             # row (its bootstrap is zeroed below); a no-op for non-terminal in-range transitions.
             n_rows = int(train_data.action_returns.shape[0])
-            safe_next_indices = safe_next_row_indices(batch["next_indices"], batch["terminated"], n_rows)
+            # min_index = lookback-1 so a clamped terminal dummy never builds a tail-wrapped window;
+            # valid_index_mask rejects any in-range-but-invalid non-terminal next row defensively.
+            safe_next_indices = safe_next_row_indices(
+                batch["next_indices"],
+                batch["terminated"],
+                min_index=train_data.lookback - 1,
+                max_index=n_rows - 1,
+                valid_index_mask=train_data.valid_index_mask,
+            )
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(safe_next_indices)
             with autocast_context(device, config.learning.use_amp, config.learning.amp_dtype):

@@ -233,17 +233,30 @@ def as_binary_bool_mask(mask: torch.Tensor, *, name: str = "mask") -> torch.Tens
 
 
 def safe_next_row_indices(
-    next_indices: torch.Tensor, terminated: torch.Tensor, n_rows: int, *, name: str = "next_indices"
+    next_indices: torch.Tensor,
+    terminated: torch.Tensor,
+    *,
+    min_index: int,
+    max_index: int,
+    valid_index_mask: torch.Tensor | None = None,
+    name: str = "next_indices",
 ) -> torch.Tensor:
-    """Clamp next-state row indices to ``[0, n_rows-1]`` for the state lookup, but ONLY for terminal
-    transitions (whose bootstrap is zeroed anyway). A NON-terminal out-of-range index would silently
-    bootstrap from the WRONG row, so it is rejected rather than clamped (clamping would hide the bug).
+    """Clamp next-state row indices into ``[min_index, max_index]`` for the state lookup, but ONLY for
+    terminal transitions (whose bootstrap is zeroed downstream anyway). A NON-terminal index outside
+    that range -- or, when ``valid_index_mask`` is given, one whose row is not a valid decision row --
+    would silently bootstrap from the WRONG (or a tail-wrapped) window, so it is rejected rather than
+    clamped (clamping would hide the bug).
+
+    ``min_index`` is the lowest row whose state lookup is well-formed: for a rolling-window split it is
+    ``lookback - 1`` so the window start ``index - (lookback - 1)`` is >= 0 and never wraps from the
+    tail via negative indexing; for a plain row-indexed split it is 0. Terminal dummies clamp to
+    ``min_index`` (NOT 0) precisely so a windowed lookup of the discarded dummy never wraps.
 
     ``next_indices`` must be an integer (``torch.long``) tensor that shares one shape AND device with
     ``terminated``: a shape mismatch would let the ``&`` below broadcast (e.g. (B, 1) vs (B,) -> (B, B))
     and validate the wrong rows, and a cross-device pair would raise a far less legible error deeper in."""
-    if n_rows <= 0:
-        raise ValueError("cannot construct next states for an empty split.")
+    if min_index < 0 or max_index < min_index:
+        raise ValueError(f"need 0 <= min_index <= max_index; got min_index={min_index}, max_index={max_index}.")
     if next_indices.shape != terminated.shape:
         raise ValueError(
             f"{name} and terminated must share one shape; got {tuple(next_indices.shape)} "
@@ -257,13 +270,29 @@ def safe_next_row_indices(
     if next_indices.dtype != torch.long:
         raise ValueError(f"{name} must be a torch.long index tensor; got {next_indices.dtype}.")
     terminated_b = as_binary_bool_mask(terminated, name="terminated")
-    bad = ((next_indices < 0) | (next_indices >= n_rows)) & ~terminated_b
+    bad = ((next_indices < min_index) | (next_indices > max_index)) & ~terminated_b
+    clamped = next_indices.clamp(min=min_index, max=max_index)
+    if valid_index_mask is not None:
+        if valid_index_mask.device != next_indices.device:
+            raise ValueError(f"valid_index_mask must be on {next_indices.device}; got {valid_index_mask.device}.")
+        if valid_index_mask.dtype != torch.bool:
+            raise ValueError(f"valid_index_mask must be torch.bool; got {valid_index_mask.dtype}.")
+        if valid_index_mask.ndim != 1 or valid_index_mask.shape[0] <= max_index:
+            raise ValueError(
+                f"valid_index_mask must be 1-D with length > max_index ({max_index}); "
+                f"got shape {tuple(valid_index_mask.shape)}."
+            )
+        # Index the mask with the CLAMPED rows so an out-of-range (terminal) index cannot index OOB;
+        # terminal rows are excluded from `bad` via ~terminated_b, so their mask value is irrelevant.
+        bad = bad | ((~valid_index_mask[clamped]) & ~terminated_b)
     if bool(bad.any().item()):
         examples = next_indices[bad].flatten()[:8].tolist()
+        suffix = "" if valid_index_mask is None else " AND valid_index_mask=True"
         raise ValueError(
-            f"{name} has out-of-range NON-terminal indices {examples}; valid range is [0, {n_rows - 1}]."
+            f"{name} has invalid NON-terminal indices {examples}; valid rows are "
+            f"[{min_index}, {max_index}]{suffix}."
         )
-    return next_indices.clamp(min=0, max=n_rows - 1)
+    return clamped
 
 
 def dqn_td_target(
@@ -310,6 +339,13 @@ def dqn_td_target(
         examples = next_q_f[bad].flatten()[:8].tolist()
         raise ValueError(f"dqn_td_target: non-terminal next_q is not finite: {examples}.")
     rewards_f = rewards.float()
+    # The CHOSEN-action reward must be finite on EVERY row (terminal included): a NaN/Inf reward means
+    # an invalid/NaN action return (the protocol's marker for an unavailable non-CASH action) reached
+    # the reward instead of being masked out, and -- unlike a terminal next_q -- it is never discarded,
+    # so it would silently poison the target. Reject it here, the single chokepoint all trainers share.
+    if not bool(torch.isfinite(rewards_f).all().item()):
+        bad_r = rewards_f[~torch.isfinite(rewards_f)].flatten()[:8].tolist()
+        raise ValueError(f"dqn_td_target: rewards must be finite; got non-finite values like {bad_r}.")
     bootstrap = torch.where(terminated_b, torch.zeros_like(rewards_f), next_q_f)
     return rewards_f + gamma_f * bootstrap
 

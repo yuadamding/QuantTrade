@@ -669,7 +669,15 @@ def train_dqn_agent(
             # Clamp next_indices for the window lookup: a true terminal can store an out-of-data next
             # row (its bootstrap is zeroed via `terminated`); no-op for in-range non-terminal rows.
             n_rows = int(train_data.features.shape[0])
-            safe_next_indices = safe_next_row_indices(batch["next_indices"], batch["terminated"], n_rows)
+            # min_index = lookback-1 so a clamped terminal dummy never builds a tail-wrapped window.
+            # No valid_index_mask: IntradayData exposes only valid_start_indices, and the range check
+            # suffices because non-terminal next rows are provably >= (lookback-1)+step_horizon.
+            safe_next_indices = safe_next_row_indices(
+                batch["next_indices"],
+                batch["terminated"],
+                min_index=train_data.lookback - 1,
+                max_index=n_rows - 1,
+            )
             current_states = train_data.state_windows(batch["indices"])
             next_states = train_data.state_windows(safe_next_indices)
 
