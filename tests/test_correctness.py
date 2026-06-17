@@ -7312,6 +7312,72 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         ) * scale
         self.assertTrue(torch.allclose(grid, want_grid, atol=1e-3))
 
+    def test_leg_level_action_transition(self) -> None:
+        from rl_quant.execution import (
+            ExecutionConfig,
+            FillLevel,
+            FillStatus,
+            Holdings,
+            LegSide,
+            SymbolQuote,
+            simulate_action_transition,
+        )
+
+        proxy = ExecutionConfig(fill_level=FillLevel.DELAYED_CLOSE, spread_multiplier=1.0)
+        quote_cfg = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE)
+
+        def q(sym, *, ret=0.0, lat=0.0, hs=0.0, bid=None, ask=None, mid=100.0):
+            return SymbolQuote(symbol=sym, mid=mid, interval_return=ret, latency_return=lat,
+                               half_spread=hs, best_bid=bid, best_ask=ask)
+
+        cash = Holdings(())
+        qqq = Holdings.single_slot("QQQ", 1.0)
+        sqqq = Holdings.single_slot("SQQQ", 1.0)
+
+        # cash -> QQQ: one BUY leg; RETURN-based gross = weight*interval_return; proxy cost = half_spread/mid bps.
+        out = simulate_action_transition(cash, qqq, {"QQQ": q("QQQ", ret=0.02, hs=0.05, mid=100.0)}, proxy)
+        self.assertEqual([(leg.symbol, leg.side) for leg in out.legs], [("QQQ", LegSide.BUY)])
+        self.assertAlmostEqual(out.gross_mark_pnl, 0.02)
+        self.assertAlmostEqual(out.legs[0].spread_bps, 5.0)  # 0.05 / 100 * 1e4
+        self.assertAlmostEqual(out.realized_execution_cost, 1.0 * 5.0 / 1e4)
+        self.assertAlmostEqual(out.net_pnl, 0.02 - 0.0005)
+        self.assertIsNone(out.legs[0].fill_price)  # proxy fill -> no executable price
+        self.assertFalse(out.real_executable_fill_model)
+        # QQQ -> cash: one SELL leg.
+        self.assertEqual(
+            [(leg.symbol, leg.side) for leg in
+             simulate_action_transition(qqq, cash, {"QQQ": q("QQQ", hs=0.05)}, proxy).legs],
+            [("QQQ", LegSide.SELL)],
+        )
+        # QQQ -> SPY switch: two legs (sell QQQ + buy SPY), each on its own book.
+        spy = Holdings.single_slot("SPY", 1.0)
+        switch = simulate_action_transition(qqq, spy, {"QQQ": q("QQQ", hs=0.05), "SPY": q("SPY", ret=0.01, hs=0.05)}, proxy)
+        self.assertEqual({(leg.symbol, leg.side) for leg in switch.legs}, {("QQQ", LegSide.SELL), ("SPY", LegSide.BUY)})
+        # Buying inverse SQQQ fills at SQQQ's OWN ask (NOT "inverse -> sell"); no leverage multiplier on gross.
+        inv = simulate_action_transition(cash, sqqq, {"SQQQ": q("SQQQ", ret=0.03, mid=20.0, bid=19.98, ask=20.02)}, quote_cfg)
+        self.assertEqual(inv.legs[0].side, LegSide.BUY)
+        self.assertAlmostEqual(inv.legs[0].fill_price, 20.02)  # SQQQ ask, not QQQ / not a sell
+        self.assertAlmostEqual(inv.gross_mark_pnl, 0.03)  # weight * its own return, no leverage mult
+        self.assertTrue(inv.real_executable_fill_model)
+        self.assertEqual(
+            simulate_action_transition(sqqq, cash, {"SQQQ": q("SQQQ", mid=20.0, bid=19.98, ask=20.02)}, quote_cfg).legs[0].fill_price,
+            19.98,  # closing the long sells at the bid
+        )
+        # Missing quote at quote-side -> MISSING_QUOTE leg + non-(real-executable) + warning; proxy tolerates it.
+        miss = simulate_action_transition(cash, qqq, {"QQQ": q("QQQ", ret=0.02)}, quote_cfg)
+        self.assertEqual(miss.legs[0].fill_status, FillStatus.MISSING_QUOTE)
+        self.assertFalse(miss.real_executable_fill_model)
+        self.assertIn("missing_quote:QQQ", miss.warnings)
+        self.assertEqual(
+            simulate_action_transition(cash, qqq, {"QQQ": q("QQQ", ret=0.02)}, proxy).legs[0].fill_status,
+            FillStatus.FILLED,
+        )
+        # Hold (same action) -> no legs, no cost; held weight earns latency + interval return.
+        hold = simulate_action_transition(qqq, qqq, {"QQQ": q("QQQ", ret=0.02, lat=0.01, hs=0.05)}, proxy)
+        self.assertEqual(len(hold.legs), 0)
+        self.assertEqual(hold.realized_execution_cost, 0.0)
+        self.assertAlmostEqual(hold.gross_mark_pnl, 0.02 + 0.01)
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
