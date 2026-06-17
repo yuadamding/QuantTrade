@@ -32,7 +32,10 @@ from rl_quant.trading_constraints import (
     CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,
     CONSTRAINT_FEATURE_NAMES,
+    POSITION_AWARE_POLICY_MODEL_VERSION,
     TRANSITION_FEATURE_DIM,
+    TRANSITION_FEATURE_NAMES,
+    TRANSITION_FEATURE_SCHEMA_VERSION,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
@@ -1525,6 +1528,18 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             self._mask_cache[key] = mask
         return mask
 
+    def _transition_rows(self, previous_actions: torch.Tensor) -> torch.Tensor:
+        # Gather the [B, A, F] per-candidate transition features for the held positions. Validate the
+        # ids up front so an out-of-range previous_action raises a clear error instead of silently
+        # wrapping (negative index) or tripping a cryptic CUDA assert deep in the gather.
+        ids = previous_actions.long()
+        if bool(((ids < 0) | (ids >= self.action_count)).any().item()):
+            raise ValueError(
+                f"previous_actions must be valid action ids in [0, {self.action_count}); "
+                "got an out-of-range id (CASH=0 is the expected reset state)."
+            )
+        return self.transition_table[ids]
+
     def _compress_subhour_tokens(
         self,
         tokens: torch.Tensor,
@@ -1604,8 +1619,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             out = self.head(context)
             if self.transition_bias is not None:
                 # Per-candidate transition bias gathered by the held position id (zero at init).
-                transition = self.transition_table[previous_actions.long()]  # [B, A, F]
-                out = out + self.transition_bias(transition).squeeze(-1)
+                out = out + self.transition_bias(self._transition_rows(previous_actions)).squeeze(-1)
             return out
         if action_features is None:
             raise ValueError("Model was configured with action_feature_dim > 0 but action_features were not provided.")
@@ -1617,8 +1631,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         if self.transition_encoder is not None:
             # Add a per-candidate token encoding the cost/risk of moving from the held position
             # (previous_actions) to each candidate. Gathered from the static table; zero at init.
-            transition = self.transition_table[previous_actions.long()]  # [B, A, F]
-            action_tokens = action_tokens + self.transition_encoder(transition)
+            action_tokens = action_tokens + self.transition_encoder(self._transition_rows(previous_actions))
         q_tokens = context[:, None, :] + action_tokens
         return self.action_feature_head(q_tokens).squeeze(-1)
 
@@ -2260,6 +2273,7 @@ def _assert_checkpoint_schema(
     hour_feature_names: list[str],
     action_names: list[str],
     action_feature_names: list[str],
+    transition_feature_dim: int = 0,
 ) -> None:
     expected = {
         "minute_feature_names": minute_feature_names,
@@ -2284,6 +2298,19 @@ def _assert_checkpoint_schema(
     if list(constraint_names) != list(CONSTRAINT_FEATURE_NAMES):
         raise ValueError("Warm-start checkpoint constraint feature schema does not match current code.")
 
+    # Transition (position-aware) schema must match the model being warm-started into, in BOTH
+    # directions: a v3 transition checkpoint cannot load a v2 (transition-off) model and vice versa,
+    # and a schema-version/name drift is rejected with a clear message rather than a cryptic strict-load
+    # state_dict error.
+    expected_transition = list(TRANSITION_FEATURE_NAMES) if transition_feature_dim > 0 else []
+    checkpoint_transition = list(checkpoint.get("transition_feature_names", []))
+    if checkpoint_transition != expected_transition:
+        raise ValueError(
+            "Warm-start checkpoint transition feature schema does not match the current model "
+            f"(use_transition_features mismatch or schema drift): checkpoint={checkpoint_transition}, "
+            f"expected={expected_transition}."
+        )
+
 
 def load_minute_to_hour_warm_start(
     model: nn.Module,
@@ -2300,6 +2327,7 @@ def load_minute_to_hour_warm_start(
         hour_feature_names=train_data.hour_feature_names,
         action_names=train_data.action_names,
         action_feature_names=train_data.action_feature_names,
+        transition_feature_dim=int(getattr(model, "transition_feature_dim", 0)),
     )
     try:
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -2310,6 +2338,7 @@ def load_minute_to_hour_warm_start(
         "path": str(checkpoint_path),
         "model_version": checkpoint.get("model_version"),
         "uses_constraint_features": checkpoint.get("uses_constraint_features"),
+        "uses_transition_features": checkpoint.get("uses_transition_features"),
     }
 
 
@@ -2729,9 +2758,13 @@ def train_minute_to_hour_dqn(
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
         "cash_idle_penalty_bps": float(config.env.cash_idle_penalty_bps),
-        "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
+        "model_version": POSITION_AWARE_POLICY_MODEL_VERSION if config.use_transition_features else CONSTRAINED_POLICY_MODEL_VERSION,
         "uses_constraint_features": True,
         "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
+        "uses_transition_features": bool(config.use_transition_features),
+        "transition_feature_names": list(TRANSITION_FEATURE_NAMES) if config.use_transition_features else [],
+        "transition_feature_dim": TRANSITION_FEATURE_DIM if config.use_transition_features else 0,
+        "transition_feature_schema_version": TRANSITION_FEATURE_SCHEMA_VERSION if config.use_transition_features else 0,
         "warm_start": warm_start_info or {"loaded": False},
         "resume": resume_info,
         "last_completed_step": int(config.learning.train_steps if start_step <= config.learning.train_steps else start_step - 1),

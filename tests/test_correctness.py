@@ -6994,6 +6994,82 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_td_next_q_max_depends_on_next_previous_action(self) -> None:
+        # The TD target uses max_a Q(s', a) evaluated with next_previous_actions (the post-action held
+        # position). This is a direct regression guard that a refactor passing the wrong previous action
+        # to the target network would be caught: same next-market, different next position -> different max-Q.
+        from rl_quant.minute_to_hour_transformer import MinuteToHourCausalTransformerQNetwork
+        from rl_quant.trading_constraints import TRANSITION_FEATURE_DIM
+
+        action_count, d_model, batch = 3, 16, 2
+        torch.manual_seed(3)
+        table = torch.randn(action_count, action_count, TRANSITION_FEATURE_DIM)
+        net = MinuteToHourCausalTransformerQNetwork(
+            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
+            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+            action_feature_dim=2, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table,
+        )
+        net.eval()
+        with torch.no_grad():  # perturb so the (zero-init) transition path is active
+            net.transition_encoder[0].weight.copy_(
+                torch.arange(d_model * TRANSITION_FEATURE_DIM).float().reshape(d_model, TRANSITION_FEATURE_DIM) * 0.01
+            )
+            net.transition_encoder[0].bias.copy_(torch.arange(d_model).float() * 0.01)
+        inputs = dict(
+            minute_features=torch.zeros(batch, 1, 1, 1), minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
+            hour_features=torch.zeros(batch, 1, 1), constraint_features=torch.zeros(batch, 6),
+            action_features=torch.zeros(batch, action_count, 2),
+        )
+        with torch.no_grad():
+            max_from_cash = net(previous_actions=torch.zeros(batch, dtype=torch.long), **inputs).max(dim=1).values
+            max_from_qqq = net(previous_actions=torch.ones(batch, dtype=torch.long), **inputs).max(dim=1).values
+        self.assertFalse(torch.allclose(max_from_cash, max_from_qqq))
+        # The table gather guards out-of-range ids (both bounds) with a clear error rather than a silent
+        # negative-index wrap to the last row.
+        with self.assertRaises(ValueError):
+            net._transition_rows(torch.tensor([-1], dtype=torch.long))
+        with self.assertRaises(ValueError):
+            net._transition_rows(torch.tensor([action_count], dtype=torch.long))
+
+    def test_transition_table_cost_matches_env_reward_convention(self) -> None:
+        from rl_quant.trading_constraints import TRANSITION_FEATURE_NAMES, build_transition_feature_table, trade_legs
+
+        one_way, extra = 1.5, 0.5
+        table = build_transition_feature_table(
+            action_count=3, cash_index=0, one_way_cost_bps=one_way, extra_switch_penalty_bps=extra,
+            count_etf_to_etf_as_two_legs=True, action_leverage=torch.tensor([0.0, 1.0, 1.0]),
+            action_group_ids=torch.tensor([0, 1, 1]), device="cpu",
+        )
+        col = TRANSITION_FEATURE_NAMES.index("est_cost_bps_over_100")
+        for prev in range(3):
+            for cand in range(3):
+                legs = trade_legs(
+                    torch.tensor(prev), torch.tensor(cand), cash_index=0, count_etf_to_etf_as_two_legs=True
+                ).item()
+                # Must equal the env reward's cost deduction convention: legs*one_way + switch*extra.
+                expected_bps = legs * one_way + (1.0 if prev != cand else 0.0) * extra
+                self.assertAlmostEqual(table[prev, cand, col].item() * 100.0, expected_bps, places=5)
+
+    def test_warm_start_schema_rejects_transition_mismatch(self) -> None:
+        from rl_quant.minute_to_hour_transformer import _assert_checkpoint_schema
+        from rl_quant.trading_constraints import CONSTRAINT_FEATURE_NAMES, TRANSITION_FEATURE_NAMES
+
+        common = dict(
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"], action_feature_names=[]
+        )
+        base = {
+            "minute_feature_names": ["m"], "hour_feature_names": ["h"], "action_names": ["CASH", "QQQ"],
+            "action_feature_names": [], "constraint_feature_names": list(CONSTRAINT_FEATURE_NAMES),
+        }
+        names = list(TRANSITION_FEATURE_NAMES)
+        # off->off and on->on match; on->off and off->on are rejected with a clear schema error.
+        _assert_checkpoint_schema({**base, "transition_feature_names": []}, **common, transition_feature_dim=0)
+        _assert_checkpoint_schema({**base, "transition_feature_names": names}, **common, transition_feature_dim=len(names))
+        with self.assertRaises(ValueError):
+            _assert_checkpoint_schema({**base, "transition_feature_names": names}, **common, transition_feature_dim=0)
+        with self.assertRaises(ValueError):
+            _assert_checkpoint_schema({**base, "transition_feature_names": []}, **common, transition_feature_dim=len(names))
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [

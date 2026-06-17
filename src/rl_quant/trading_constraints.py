@@ -22,6 +22,10 @@ class TradingConstraintConfig:
 
 CONSTRAINT_FEATURE_DIM = 6
 CONSTRAINED_POLICY_MODEL_VERSION = 2
+# Position-aware policy: scores each candidate with the (held position -> candidate) transition.
+# A distinct model contract so a transition-aware checkpoint cannot be confused with a v2 one.
+POSITION_AWARE_POLICY_MODEL_VERSION = 3
+TRANSITION_FEATURE_SCHEMA_VERSION = 1
 CONSTRAINT_FEATURE_NAMES = [
     "bars_held_over_min_hold",
     "cooldown_remaining_over_cooldown",
