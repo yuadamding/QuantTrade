@@ -86,6 +86,10 @@ class VectorizedMinuteToHourEnv:
     def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
         if not (0 <= config.initial_action < len(data.action_names)):
             raise ValueError("initial_action is outside the action space.")
+        # cash_index is special everywhere (cash-idle penalty, zero shadow exposure, label fallback); an
+        # out-of-range index would silently mis-charge the idle penalty / zero the wrong action's exposure.
+        if not (0 <= int(config.constraints.cash_index) < len(data.action_names)):
+            raise ValueError("constraints.cash_index is outside the action space.")
         self.data = data if data.minute_features.device == device else data.to(device)
         self.config = config
         self.device = device
@@ -342,7 +346,7 @@ class VectorizedMinuteToHourEnv:
             "next_position_dynamic": next_position_dynamic,
         }
         # PR-3 shadow side-channel: replay stores only its declared fields, so these extra keys never reach
-        # training -- they are for logging / the shadow A/B only. cost_delta vs the legacy TRADE cost (cost_bps).
+        # training -- they are for logging / the shadow A/B only.
         if self.execution_env_reward_shadow:
             out["execution_env_reward_shadow"] = execution_env_reward_shadow
             out["execution_cost_bps_shadow"] = execution_cost_bps_shadow

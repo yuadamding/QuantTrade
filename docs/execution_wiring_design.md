@@ -16,13 +16,16 @@ return-based: `HourFromMinuteDataSplit` carries `action_returns` + `action_names
 tensor and no NBBO on disk; `action_target_weights` exists only on the unrelated `SecondContextDataSplit`).
 So the work below is explicitly a **cost-model** experiment, NOT a real-executable claim.
 
-## 1. Current state (post-reorg)
+## 1. Current state
 
-The protocol-first layers exist; `envs/` is the authoritative owner of state/transition/reward, and
-`execution.py` is the foundational engine — still **unwired** (no env/trainer computes reward through it, so
-nothing it does has moved a reported number).
+The protocol-first layers exist; `envs/` is the authoritative owner of state/transition/reward. **PR-3 has
+shipped:** `execution.py`'s weight-bps cost model is wired into `envs/minute_to_hour` in SHADOW mode (default
+off) — it computes the execution reward/cost alongside the legacy reward and logs them; training still uses
+the legacy reward, so nothing it does has moved a reported number. The engine is not yet the reward authority
+of any trainer (that is PR-4).
 
 Already landed on `main` (all default-preserving, gate-green):
+- PR-3 shadow-mode execution reward (this doc's §3) — `execution_env_reward_shadow`, default off.
 - The engine: fail-closed valuation/fills, `valuation_complete`/`execution_complete`/`impact_applied`,
   `SwitchFillPolicy.{INDEPENDENT_LEGS (default), ATOMIC_SWITCH}`, and the return-based **bps** cost model
   `WeightExecutionCostConfig(fee_bps, impact_kind, linear_impact_bps_per_weight)`.
@@ -53,41 +56,47 @@ one explicit flag; (3) manifest records the flag value + `result_moving_flag: tr
 **test block untouched** (recency-focus protocol); (5) A/B reports Δ return/turnover/exposure/cash-share/
 cost-drag/drawdown (+ PSR/DSR); (6) explicit reportability label + reasons; (7) one-flag rollback.
 
-## 3. PR-3 — shadow-mode execution reward in the minute_to_hour env (THE NEXT STEP)
+## 3. PR-3 — shadow-mode execution reward in the minute_to_hour env (SHIPPED)
 
-**Goal:** wire `execution.py` into the `envs/minute_to_hour` env for the first time, but only to compute the
-execution-engine reward/cost **alongside** the legacy reward and **log** them — training still uses the legacy
-reward. Default byte-identical; this is the safe first contact between the engine and a trainer.
+`execution.py`'s weight-bps cost model is wired into `envs/minute_to_hour` behind
+`MinuteToHourEnvConfig.execution_env_reward_shadow` (default off). When on, the env computes the
+execution-engine reward/cost ALONGSIDE the legacy reward and logs them; training still uses the legacy
+`rewards`, so the run is byte-identical to shadow-off (regression-tested at the env-step and train-trace level).
 
-**Pricing (decision made): weight-bps cost model — sourced from action metadata, NOT a dataset field.**
-`HourFromMinuteDataSplit` has **no** `action_target_weights`; the env is single-slot/leg-based. So the
-per-action weight VECTOR is derived from action metadata (`features/action_risk.action_weight_tensor`/
-`action_leverage_tensor` on `build_action_metadata(data.action_names)`) — note these are **static per-symbol
-caps** (a function of leverage), not time-varying targets, and PR-3 must state that limitation. The shadow
-cost is `execution.py`'s `WeightExecutionCostConfig` (`fee_bps + linear_impact_bps_per_weight`) applied to the
-transition **prior-held-weight vector → executed-weight vector** (indexed by `previous_actions`/`actions`,
-not a dataset tensor). The env must therefore track a `execution_shadow_holdings` weight vector (set on reset,
-updated to the executed weight each step, saved/restored on resume when the flag is on — mirror the dynamic
-env-state checkpoint fix). This is a **cost-model A/B**: leg-aware bps cost vs the env's current
-`legs * one_way_cost_bps + is_switch * extra_switch_penalty_bps`. Explicitly **not** real-executable (no
-quote-side fills, no latency P&L) — strict reportability still requires NBBO data that isn't on disk.
+**Pricing: static single-slot weight-bps, sourced from action metadata (NOT a dataset field).**
+`HourFromMinuteDataSplit` has no `action_target_weights`; the env is single-slot/leg-based. The per-action
+weight is the STATIC `action_weight_tensor(build_action_metadata(action_names))` (cash zeroed), so
+`previous_action` alone determines the prior held weight — **no `execution_shadow_holdings` state is needed**
+(it would be required only if weights became time-varying per row). The shadow cost prices the transition's
+two legs (sell prior weight + buy executed weight) via the vectorized `weight_transition_cost_bps`, pinned to
+the dataclass engine by an equivalence test. Cost-model A/B (turnover-weighted vs leg-count); explicitly
+**not** real-executable (no NBBO / quote-side fills / latency P&L).
 
-**Contract (env `step`, behind `execution_env_reward_shadow: bool = False`, default off):**
-- Legacy path unchanged: `rewards` (the tensor used for training) is computed exactly as today; the trained
-  model and every reported number are identical with the flag off OR on (shadow is a pure side-channel).
-- When on, additionally compute (no RNG draws, no reordering, no mutation of the legacy reward):
-  - `execution_cost_bps_shadow = 1e4 * outcome.realized_execution_cost` — the engine returns
-    `realized_execution_cost` in **return units** (`traded · total_cost_bps / 1e4`), so convert to bps with ×1e4;
-  - `execution_env_reward_shadow = raw_returns * reward_scale - (execution_cost_bps_shadow + cash_idle_penalty_bps) * reward_scale / 1e4`
-    — it **must carry the same `cash_idle_penalty_bps` term as the legacy reward** so `reward_delta` isolates the
-    trade-cost-model change, not the cash-idle policy (the legacy reward subtracts `cost_bps + cash_idle_penalty_bps`);
-  - `reward_delta = execution_env_reward_shadow - rewards`; `cost_delta = execution_cost_bps_shadow - legacy_trade_cost_bps`;
-  - `impact_applied_shadow` — the **transition-actual** flag from the outcome (now fixed: a positive impact was
-    charged on a filled leg), not the config-level capability;
-  - `execution_transition_issues` (the engine's fail-closed flags, if any).
-- Emit these into the step dict (replay filters unknown keys → harmless), surface per-run aggregates
-  (mean/quantiles of `reward_delta`, `cost_delta`) and stamp `execution_env_reward_shadow: true` in the
-  run manifest.
+**Open semantics question (resolve before PR-4):** the shadow weight is `action_metadata.max_weight`
+(= 1/leverage for a leveraged ETF). This is correct only if `action_returns` are METADATA-WEIGHTED portfolio
+returns. If they are FULL-CAPITAL single-slot returns (100% capital in the asset, leverage intrinsic), the
+turnover weight should be 1.0 for every non-cash action and the current model UNDERCHARGES leveraged turnover.
+The minute_to_hour builder takes `action_returns` from the upstream payload (applies no leverage), so this must
+be confirmed against the gold builder before training on the execution reward. The artifact records
+`execution_shadow_weight_source` so the assumption is auditable; for a non-leveraged universe (all max_weight
+== 1) there is no discrepancy.
+
+**Contract (env `step`, default off, byte-identical):**
+- Legacy `rewards` (used for training) is computed first and never mutated.
+- When on, the env additionally computes (no RNG, no reordering) via the SHARED `transition_trade_cost_bps`
+  breakdown (`leg_cost_bps`, `switch_penalty_bps`, `cash_idle_bps`):
+  - `execution_cost_bps_shadow` = `weight_transition_cost_bps` of the transition's legs (bps = 1e4 × the
+    engine's return-unit `realized_execution_cost`);
+  - `execution_env_reward_shadow = raw * reward_scale - (execution_cost_bps_shadow + switch_penalty_bps + cash_idle_bps) * reward_scale / 1e4`
+    — it swaps ONLY the leg/execution cost and KEEPS the behavioural switch-penalty regularizer + cash-idle,
+    so `reward_delta` isolates the cost-MODEL change (PR-4 would not silently drop the regularizer);
+  - `reward_delta_shadow = execution_env_reward_shadow - rewards`;
+    `cost_delta_shadow = execution_cost_bps_shadow - leg_cost_bps` (vs the LEG cost only — switch penalty +
+    cash-idle are held constant across both rewards);
+  - emitted into the step dict (replay stores only its declared fields → never reaches training).
+- The train loop aggregates the per-step deltas and stamps the artifact: `execution_env_reward_shadow`,
+  `execution_shadow_cost_model="static_single_slot_weight_bps"`, `execution_shadow_real_executable=False`,
+  and the mean reward/cost deltas (reward units + scale-normalised bps).
 
 **Why it's bounded.** Training reads only `rewards` (legacy); the shadow quantities are computed from existing
 env state + the engine and only logged. Verification: (i) a regression test that `loss_trace`/`reward_trace`/

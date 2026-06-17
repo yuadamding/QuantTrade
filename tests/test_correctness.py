@@ -8189,6 +8189,20 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(float(held.switch_penalty_bps[0]), 0.0)
         self.assertEqual(float(held.cash_idle_bps[0]), 0.0)
 
+        exit_ = bd(1, 0, cash_idle=50.0)  # asset 1 -> CASH: a switch (sell leg + penalty) AND cash idle charged
+        self.assertGreater(float(exit_.leg_cost_bps[0]), 0.0)
+        self.assertEqual(float(exit_.switch_penalty_bps[0]), 5.0)
+        self.assertEqual(float(exit_.cash_idle_bps[0]), 50.0)
+
+        # ETF<->ETF (1 -> 2, both non-cash) leg count honours count_etf_to_etf_as_two_legs.
+        two = dataclasses.replace(cons, count_etf_to_etf_as_two_legs=True)
+        one = dataclasses.replace(cons, count_etf_to_etf_as_two_legs=False)
+        legs_two = float(transition_trade_cost_bps(
+            torch.tensor([1]), torch.tensor([2]), constraints=two, cash_idle_penalty_bps=0.0).legs[0])
+        legs_one = float(transition_trade_cost_bps(
+            torch.tensor([1]), torch.tensor([2]), constraints=one, cash_idle_penalty_bps=0.0).legs[0])
+        self.assertGreater(legs_two, legs_one)  # counting both legs of an ETF<->ETF switch costs more
+
         # The env reward uses exactly (trade_cost_bps + cash_idle_bps) from the SAME primitive.
         split = HourFromMinuteDataSplit(
             name="t", decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(3)],
