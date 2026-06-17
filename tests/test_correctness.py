@@ -9199,7 +9199,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(failures, [])
 
     def test_qt_cli_workflows_map_to_existing_scripts(self) -> None:
-        from rl_quant.cli import _DISPATCH
+        from rl_quant.workflows.cli import _DISPATCH
         from rl_quant.paths import scripts_dir
 
         for (group, workflow), script in _DISPATCH.items():
@@ -9225,7 +9225,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(argv2, ["--x", "1"])
 
     def test_qt_preset_commands_and_registry(self) -> None:
-        from rl_quant.cli import _DISPATCH, main
+        from rl_quant.workflows.cli import _DISPATCH, main
         from rl_quant.presets import PRESETS, resolve_preset
 
         self.assertEqual(main(["preset", "list"]), 0)
