@@ -7097,6 +7097,60 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_qnetwork_dynamic_features_zero_init_and_condition_q(self) -> None:
+        # PR-D D3a: the network can consume a per-env dynamic position-state vector. Zero-init -> a freshly
+        # built dynamic-aware net scores IDENTICALLY (so flag-on-but-untrained == off, byte-identical); after
+        # perturbing the encoder the Q depends on the dynamic state; dynamic_feature_dim=0 adds no params.
+        from rl_quant.minute_to_hour_transformer import MinuteToHourCausalTransformerQNetwork
+        from rl_quant.trading_constraints import DYNAMIC_TRANSITION_FEATURE_DIM
+
+        action_count, d_model, batch = 3, 16, 2
+        D = DYNAMIC_TRANSITION_FEATURE_DIM
+        ctor = dict(
+            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
+            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+        )
+        inputs = dict(
+            minute_features=torch.zeros(batch, 1, 1, 1),
+            minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
+            hour_features=torch.zeros(batch, 1, 1),
+            constraint_features=torch.zeros(batch, 6),
+            previous_actions=torch.zeros(batch, dtype=torch.long),
+        )
+        af = torch.zeros(batch, action_count, 2)
+        dyn = torch.randn(batch, D)
+
+        # dynamic_feature_dim=0 -> no dynamic params at all.
+        torch.manual_seed(1)
+        off = MinuteToHourCausalTransformerQNetwork(action_feature_dim=2, **ctor)
+        self.assertIsNone(off.dynamic_encoder)
+        self.assertIsNone(off.dynamic_bias)
+        self.assertFalse(any("dynamic" in k for k in off.state_dict()))
+
+        # Zero-init: passing dynamic_state changes nothing at init (action-feature head + fallback head).
+        for afd, action_features in ((2, af), (0, None)):
+            torch.manual_seed(3)
+            net = MinuteToHourCausalTransformerQNetwork(action_feature_dim=afd, dynamic_feature_dim=D, **ctor)
+            net.eval()
+            with torch.no_grad():
+                base = net(action_features=action_features, dynamic_state=None, **inputs)
+                withdyn = net(action_features=action_features, dynamic_state=dyn, **inputs)
+            self.assertTrue(torch.allclose(base, withdyn), f"zero-init must be a no-op (afd={afd})")
+
+        # After perturbing the dynamic encoder, the Q depends on the dynamic state (and differs across states).
+        torch.manual_seed(3)
+        net = MinuteToHourCausalTransformerQNetwork(action_feature_dim=2, dynamic_feature_dim=D, **ctor)
+        with torch.no_grad():
+            net.dynamic_encoder[0].weight.copy_(torch.arange(d_model * D).float().reshape(d_model, D) * 0.01)
+            net.dynamic_encoder[0].bias.copy_(torch.arange(d_model).float() * 0.01)
+        net.eval()
+        with torch.no_grad():
+            q_none = net(action_features=af, dynamic_state=None, **inputs)
+            q_a = net(action_features=af, dynamic_state=torch.zeros(batch, D) + 0.5, **inputs)
+            q_b = net(action_features=af, dynamic_state=torch.zeros(batch, D) - 0.5, **inputs)
+        self.assertFalse(torch.allclose(q_a, q_none))  # dynamic state now moves Q
+        self.assertFalse(torch.allclose(q_a, q_b))  # and different states give different Q
+
     def test_td_next_q_max_depends_on_next_previous_action(self) -> None:
         # The TD target uses max_a Q(s', a) evaluated with next_previous_actions (the post-action held
         # position). This is a direct regression guard that a refactor passing the wrong previous action

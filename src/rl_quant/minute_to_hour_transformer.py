@@ -1421,6 +1421,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         action_feature_dim: int = 0,
         transition_feature_dim: int = 0,
         transition_table: torch.Tensor | None = None,
+        dynamic_feature_dim: int = 0,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -1433,6 +1434,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         self.action_count = int(action_count)
         self.action_feature_dim = int(action_feature_dim)
         self.transition_feature_dim = int(transition_feature_dim)
+        self.dynamic_feature_dim = int(dynamic_feature_dim)
         self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.minute_proj = nn.Sequential(nn.Linear(minute_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
         self.minute_pos = nn.Parameter(torch.zeros(minutes_per_hour, d_model))
@@ -1502,6 +1504,29 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             self.transition_table = None
             self.transition_encoder = None
             self.transition_bias = None
+        # Dynamic position-state features (opt-in, PR-D). A per-env [B, dynamic_feature_dim] vector of the
+        # HELD position's realized-P&L excursion is passed into forward() and injected per-candidate
+        # (broadcast across candidates, since it is position-level not candidate-level). Encoders are
+        # ZERO-INITIALISED so a freshly-built dynamic-aware model scores identically until trained; and
+        # dynamic_feature_dim=0 registers no params at all -> existing checkpoints load strict.
+        if self.dynamic_feature_dim > 0:
+            if self.action_feature_dim > 0:
+                self.dynamic_encoder = nn.Sequential(
+                    nn.Linear(self.dynamic_feature_dim, d_model),
+                    nn.LayerNorm(d_model),
+                    nn.GELU(),
+                )
+                nn.init.zeros_(self.dynamic_encoder[0].weight)
+                nn.init.zeros_(self.dynamic_encoder[0].bias)
+                self.dynamic_bias = None
+            else:
+                self.dynamic_encoder = None
+                self.dynamic_bias = nn.Linear(self.dynamic_feature_dim, 1)
+                nn.init.zeros_(self.dynamic_bias.weight)
+                nn.init.zeros_(self.dynamic_bias.bias)
+        else:
+            self.dynamic_encoder = None
+            self.dynamic_bias = None
         hour_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -1580,6 +1605,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         previous_actions: torch.Tensor,
         constraint_features: torch.Tensor,
         action_features: torch.Tensor | None = None,
+        dynamic_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, hours, minutes, _ = minute_features.shape
         if hours > self.hours_lookback or minutes > self.minutes_per_hour:
@@ -1620,6 +1646,9 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             if self.transition_bias is not None:
                 # Per-candidate transition bias gathered by the held position id (zero at init).
                 out = out + self.transition_bias(self._transition_rows(previous_actions)).squeeze(-1)
+            if self.dynamic_bias is not None and dynamic_state is not None:
+                # Per-env dynamic position-state bias, broadcast across candidates ([B,1]->[B,A]; zero at init).
+                out = out + self.dynamic_bias(dynamic_state.float())
             return out
         if action_features is None:
             raise ValueError("Model was configured with action_feature_dim > 0 but action_features were not provided.")
@@ -1632,6 +1661,10 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             # Add a per-candidate token encoding the cost/risk of moving from the held position
             # (previous_actions) to each candidate. Gathered from the static table; zero at init.
             action_tokens = action_tokens + self.transition_encoder(self._transition_rows(previous_actions))
+        if self.dynamic_encoder is not None and dynamic_state is not None:
+            # Add the held position's dynamic state (P&L excursion) as a per-env token, broadcast across
+            # candidates ([B,d_model]->[B,1,d_model]); zero at init so an untrained dynamic model is identical.
+            action_tokens = action_tokens + self.dynamic_encoder(dynamic_state.float())[:, None, :]
         q_tokens = context[:, None, :] + action_tokens
         return self.action_feature_head(q_tokens).squeeze(-1)
 
