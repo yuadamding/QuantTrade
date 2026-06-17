@@ -7805,6 +7805,56 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                                     gross_mark_pnl=0.0, realized_execution_cost=0.0, net_pnl=0.0,
                                     next_state=Holdings(()), real_executable_fill_model=True, execution_complete=False)
 
+    def test_decision_log_reportability_gate(self) -> None:
+        # PR-C: additive, LABEL-ONLY reportability validator (moves no P&L; nobody calls it yet besides this).
+        from rl_quant.reportability import (
+            REQUIRED_DECISION_LOG_FIELDS,
+            evaluate_decision_log_reportability,
+        )
+
+        def base_row(**overrides):
+            row = {k: 0 for k in REQUIRED_DECISION_LOG_FIELDS}  # all required fields present (non-None)
+            row["order_legs"] = 1.0
+            row["traded_notional"] = 1.0
+            row.update(overrides)
+            return row
+
+        # Empty logs are not reportable.
+        v = evaluate_decision_log_reportability([], require_real_executable=False)
+        self.assertFalse(v.reportable)
+        self.assertIn("no_decision_rows", v.missing_reportability_reasons)
+
+        # A missing required field fails the base gate.
+        v = evaluate_decision_log_reportability([base_row(net_return=None)], require_real_executable=False)
+        self.assertFalse(v.reportable)
+        self.assertTrue(any("missing_net_return" in r for r in v.missing_reportability_reasons))
+
+        # Close-only row (required fields present, but no real-execution evidence): base-reportable when not
+        # required, but NOT real-executable, and the strict gaps are surfaced regardless.
+        close_only = base_row(entry_price=None, exit_price=None)
+        v = evaluate_decision_log_reportability([close_only], require_real_executable=False)
+        self.assertTrue(v.reportable)
+        self.assertFalse(v.real_executable_trade_reportable)
+        for tag in ("not_crossable_quote_fill_model", "valuation_incomplete", "execution_incomplete",
+                    "impact_not_applied", "missing_entry_price"):
+            self.assertTrue(any(tag in r for r in v.missing_reportability_reasons), tag)
+        # Requiring real-executability on the same close-only row fails the overall gate.
+        self.assertFalse(evaluate_decision_log_reportability([close_only], require_real_executable=True).reportable)
+
+        # A fully real-executable row passes the strict claim even when required, with no missing reasons.
+        real_row = base_row(
+            real_executable_fill_model=True, valuation_complete=True, execution_complete=True,
+            impact_applied=True, entry_price=100.1, requires_exit_price=True, exit_price=99.9,
+        )
+        v = evaluate_decision_log_reportability([real_row], require_real_executable=True)
+        self.assertTrue(v.reportable)
+        self.assertTrue(v.real_executable_trade_reportable)
+        self.assertEqual(v.missing_reportability_reasons, ())
+        # Drop the exit price on a row that requires it -> strict claim fails.
+        v = evaluate_decision_log_reportability([{**real_row, "exit_price": None}], require_real_executable=True)
+        self.assertFalse(v.real_executable_trade_reportable)
+        self.assertTrue(any("missing_exit_price" in r for r in v.missing_reportability_reasons))
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
