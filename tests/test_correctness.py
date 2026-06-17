@@ -1353,6 +1353,52 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertNotIn("unrealized_pnl", result)
         self.assertNotIn("entry_index", result)
 
+    def test_minute_to_hour_dynamic_env_state_checkpoint(self) -> None:
+        # Reorg review P0: the dynamic env bookkeeping (entry_index/unrealized_pnl/mae/mfe) must be
+        # checkpointed and restored when use_dynamic_transition_features is on -- else a resumed dynamic run
+        # silently resets it mid-episode while replay still holds dynamic-aware samples. Verify the round-trip
+        # restores the fields, and that a legacy checkpoint missing them fails closed for a dynamic resume
+        # (and is tolerated when the flag is off).
+        from rl_quant.training.minute_to_hour import _env_state_to_cpu, _load_env_state
+
+        split = HourFromMinuteDataSplit(
+            name="train",
+            decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
+            next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((4, 1, 1, 1), dtype=torch.float32),
+            minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((4, 1, 1), dtype=torch.float32),
+            action_returns=torch.tensor([[0.0, 0.10], [0.0, -0.20], [0.0, 0.30], [0.0, 0.0]], dtype=torch.float32),
+            action_valid_mask=torch.ones((4, 2), dtype=torch.bool),
+            label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            valid_index_mask=torch.tensor([True, True, True, True], dtype=torch.bool),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["VectorizedMinuteToHourEnv"])
+        cfg = module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0)
+        env = module.VectorizedMinuteToHourEnv(split, cfg, torch.device("cpu"))
+        env.indices[:] = 0
+        env.entry_index[:] = 0
+        for requested in (1, 1):  # hold QQQ two steps -> non-zero unrealized_pnl / MAE / MFE
+            env.step(torch.tensor([requested], dtype=torch.long))
+        self.assertNotEqual(float(env.unrealized_pnl[0].item()), 0.0)
+
+        saved = _env_state_to_cpu(env)
+        for key in ("entry_index", "unrealized_pnl", "mae", "mfe"):
+            self.assertIn(key, saved)
+        fresh = module.VectorizedMinuteToHourEnv(split, cfg, torch.device("cpu"))
+        _load_env_state(fresh, saved, torch.device("cpu"), require_dynamic=True)
+        for key in ("entry_index", "unrealized_pnl", "mae", "mfe"):
+            self.assertTrue(torch.equal(getattr(fresh, key), getattr(env, key)), key)
+
+        legacy = {k: v for k, v in saved.items() if k not in ("entry_index", "unrealized_pnl", "mae", "mfe")}
+        _load_env_state(fresh, legacy, torch.device("cpu"), require_dynamic=False)  # tolerated when flag off
+        with self.assertRaises(ValueError):  # fail closed for a dynamic resume
+            _load_env_state(fresh, legacy, torch.device("cpu"), require_dynamic=True)
+
     def test_polygon_second_manifest_marks_incomplete_download_non_reportable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -7133,7 +7179,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             net = MinuteToHourCausalTransformerQNetwork(action_feature_dim=afd, dynamic_feature_dim=D, **ctor)
             net.eval()
             with torch.no_grad():
-                base = net(action_features=action_features, dynamic_state=None, **inputs)
+                base = net(action_features=action_features, dynamic_state=torch.zeros(batch, D), **inputs)
                 withdyn = net(action_features=action_features, dynamic_state=dyn, **inputs)
             self.assertTrue(torch.allclose(base, withdyn), f"zero-init must be a no-op (afd={afd})")
 
@@ -7145,11 +7191,55 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             net.dynamic_encoder[0].bias.copy_(torch.arange(d_model).float() * 0.01)
         net.eval()
         with torch.no_grad():
-            q_none = net(action_features=af, dynamic_state=None, **inputs)
+            q_zero = net(action_features=af, dynamic_state=torch.zeros(batch, D), **inputs)
             q_a = net(action_features=af, dynamic_state=torch.zeros(batch, D) + 0.5, **inputs)
             q_b = net(action_features=af, dynamic_state=torch.zeros(batch, D) - 0.5, **inputs)
-        self.assertFalse(torch.allclose(q_a, q_none))  # dynamic state now moves Q
+        self.assertFalse(torch.allclose(q_a, q_zero))  # dynamic state now moves Q vs the zero ablation
         self.assertFalse(torch.allclose(q_a, q_b))  # and different states give different Q
+        # A dynamic-built model must fail closed when dynamic_state is omitted -- no silent non-dynamic scoring.
+        with self.assertRaises(ValueError):
+            net(action_features=af, dynamic_state=None, **inputs)
+
+    def test_transition_features_clean_perturbation(self) -> None:
+        # Reorg review: enabling transition_feature_dim>0 must be a CLEAN perturbation -- the shared backbone
+        # (hour_encoder + head) is bit-identical to the transition_feature_dim=0 model under the same seed,
+        # because the zero-init transition module is built under saved/restored RNG. So a transition A/B
+        # isolates the feature, not a different random initialisation. Covers the action-feature + fallback heads.
+        from rl_quant.minute_to_hour_transformer import MinuteToHourCausalTransformerQNetwork
+        from rl_quant.trading_constraints import TRANSITION_FEATURE_DIM
+
+        action_count, d_model, batch = 3, 16, 2
+        f_dim = TRANSITION_FEATURE_DIM
+        ctor = dict(
+            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
+            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+        )
+        inputs = dict(
+            minute_features=torch.zeros(batch, 1, 1, 1),
+            minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
+            hour_features=torch.zeros(batch, 1, 1),
+            constraint_features=torch.zeros(batch, 6),
+            previous_actions=torch.zeros(batch, dtype=torch.long),
+        )
+        zero_table = torch.zeros(action_count, action_count, f_dim)
+        for afd, action_features in ((2, torch.zeros(batch, action_count, 2)), (0, None)):
+            torch.manual_seed(7)
+            off = MinuteToHourCausalTransformerQNetwork(action_feature_dim=afd, **ctor)
+            torch.manual_seed(7)
+            on = MinuteToHourCausalTransformerQNetwork(
+                action_feature_dim=afd, transition_feature_dim=f_dim, transition_table=zero_table, **ctor
+            )
+            for sub in ("hour_encoder", "head"):  # backbone modules built AFTER the transition block
+                for (name, p_off), (_, p_on) in zip(
+                    getattr(off, sub).named_parameters(), getattr(on, sub).named_parameters()
+                ):
+                    self.assertTrue(torch.equal(p_off, p_on), f"{sub}.{name} differs (afd={afd}) -> RNG perturbed")
+            off.eval()
+            on.eval()
+            with torch.no_grad():
+                q_off = off(action_features=action_features, **inputs)
+                q_on = on(action_features=action_features, **inputs)
+            self.assertTrue(torch.equal(q_off, q_on), f"zero-table transition must be a no-op at init (afd={afd})")
 
     def test_td_next_q_max_depends_on_next_previous_action(self) -> None:
         # The TD target uses max_a Q(s', a) evaluated with next_previous_actions (the post-action held

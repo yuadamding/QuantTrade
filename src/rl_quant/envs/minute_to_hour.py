@@ -7,6 +7,7 @@ import torch
 
 from rl_quant.trading_constraints import (
     TradingConstraintConfig,
+    advance_position_excursion,
     build_action_mask,
     build_dynamic_transition_features,
     make_constraint_features,
@@ -217,12 +218,10 @@ class VectorizedMinuteToHourEnv:
         # position starts fresh this step (entry row = the current decision row). Held across a day boundary is
         # still held, so unlike the daily switch/leg counters below, this state is NOT reset on a new day.
         held = ~is_switch
-        cum = torch.where(held, (1.0 + self.unrealized_pnl) * (1.0 + raw_returns) - 1.0, raw_returns)
-        zeros = torch.zeros_like(cum)
         self.entry_index = torch.where(is_switch, current_indices, self.entry_index)
-        self.mae = torch.where(held, torch.minimum(self.mae, cum), torch.minimum(zeros, cum))
-        self.mfe = torch.where(held, torch.maximum(self.mfe, cum), torch.maximum(zeros, cum))
-        self.unrealized_pnl = cum
+        self.unrealized_pnl, self.mae, self.mfe = advance_position_excursion(
+            self.unrealized_pnl, self.mae, self.mfe, raw_returns, held=held
+        )
         next_position_dynamic = self.dynamic_state()  # PR-D: post-action dynamic state (enters the next bar)
 
         in_bounds = next_indices < self.data.action_returns.shape[0]

@@ -116,6 +116,28 @@ def build_dynamic_transition_features(
     return torch.stack([upnl, adverse, favorable, drawdown, runup], dim=1)
 
 
+def advance_position_excursion(
+    unrealized_pnl: torch.Tensor,
+    mae: torch.Tensor,
+    mfe: torch.Tensor,
+    raw_return: torch.Tensor,
+    *,
+    held: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Advance the held position's (unrealized P&L, MAE, MFE) by one step's raw (gross) return.
+
+    On a HOLD (``held``) compound this step's return into the position-since-entry and extend the max
+    adverse / favorable excursion; on a SWITCH the new position starts fresh this step. Tensor-shaped, so it
+    serves both the vectorized env step and a scalar evaluation rollout (1-element tensors). This is the
+    SINGLE source of truth for the excursion recurrence, so the env and the evaluator cannot drift; the env
+    additionally tracks ``entry_index`` (not needed to build the dynamic features)."""
+    cum = torch.where(held, (1.0 + unrealized_pnl) * (1.0 + raw_return) - 1.0, raw_return)
+    zeros = torch.zeros_like(cum)
+    mae = torch.where(held, torch.minimum(mae, cum), torch.minimum(zeros, cum))
+    mfe = torch.where(held, torch.maximum(mfe, cum), torch.maximum(zeros, cum))
+    return cum, mae, mfe
+
+
 def build_transition_feature_table(
     *,
     action_count: int,

@@ -38,8 +38,10 @@ from rl_quant.trading_constraints import (
     DYNAMIC_TRANSITION_FEATURE_DIM,
     DYNAMIC_TRANSITION_FEATURE_NAMES,
     DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION,
+    advance_position_excursion,
     apply_leg_aware_hysteresis,
     build_action_mask,
+    build_dynamic_transition_features,
     build_transition_feature_table,
     make_constraint_features,
     sample_valid_actions,
@@ -163,6 +165,15 @@ def evaluate_minute_to_hour_policy(
     constraint_episode_length = int(episode_length or max(int(data.valid_start_indices.numel()), 1))
     data = data if data.minute_features.device == device else data.to(device)
     model.eval()
+    # PR-D: evaluate a dynamic-aware model with its dynamic features. The held-position excursion is tracked
+    # continuously and reset only on a data-segment break (a walk-forward backtest has no artificial episode
+    # truncations), built each step via the SAME recurrence the env uses (advance_position_excursion) so the
+    # eval dynamic features cannot drift from training's. dyn_dim == 0 => the model is non-dynamic and the
+    # forward guard requires dynamic_state to stay None (unchanged default behaviour).
+    dyn_dim = int(getattr(model, "dynamic_feature_dim", 0))
+    unrealized_pnl = 0.0
+    position_mae = 0.0
+    position_mfe = 0.0
     previous_action = int(initial_action)
     bars_held = int(constraints.min_hold_bars)
     cooldown_remaining = 0
@@ -195,6 +206,9 @@ def evaluate_minute_to_hour_policy(
             order_legs_today = 0.0
             order_legs_episode = 0.0
             episode_steps = 0
+            unrealized_pnl = 0.0
+            position_mae = 0.0
+            position_mfe = 0.0
         elif previous_date is not None and current_date != previous_date:
             switches_today = 0
             order_legs_today = 0.0
@@ -241,10 +255,18 @@ def evaluate_minute_to_hour_policy(
         action_mask = action_mask & availability_mask
         if not bool(action_mask.any().item()):
             action_mask[:, int(constraints.cash_index)] = True
-        if action_features is None:
-            q_values = model(minute, mask, hour, prev_tensor, constraints_tensor)
-        else:
-            q_values = model(minute, mask, hour, prev_tensor, constraints_tensor, action_features=action_features)
+        # Pass action_features / dynamic_state only when present so a minimal forward(5-arg) policy (e.g. a
+        # test mock or a non-dynamic model) is still called exactly as before -- unchanged default behaviour.
+        forward_kwargs: dict[str, torch.Tensor] = {}
+        if action_features is not None:
+            forward_kwargs["action_features"] = action_features
+        if dyn_dim > 0:
+            forward_kwargs["dynamic_state"] = build_dynamic_transition_features(
+                unrealized_pnl=torch.tensor([unrealized_pnl], device=device),
+                mae=torch.tensor([position_mae], device=device),
+                mfe=torch.tensor([position_mfe], device=device),
+            )
+        q_values = model(minute, mask, hour, prev_tensor, constraints_tensor, **forward_kwargs)
         action = int(
             apply_leg_aware_hysteresis(
                 q_values,
@@ -309,6 +331,19 @@ def evaluate_minute_to_hour_policy(
                     "equity": round(equity, 8),
                 }
             )
+        if dyn_dim > 0:
+            # Advance the held-position excursion by this step's GROSS return (raw_returns in the env), via
+            # the shared recurrence; reset-on-switch is encoded by held = not is_switch.
+            next_upnl, next_mae, next_mfe = advance_position_excursion(
+                torch.tensor([unrealized_pnl], device=device),
+                torch.tensor([position_mae], device=device),
+                torch.tensor([position_mfe], device=device),
+                torch.tensor([gross_return], device=device),
+                held=torch.tensor([not is_switch], device=device),
+            )
+            unrealized_pnl = float(next_upnl.item())
+            position_mae = float(next_mae.item())
+            position_mfe = float(next_mfe.item())
         if is_switch:
             bars_held = 1
             cooldown_remaining = int(constraints.cooldown_bars)
@@ -451,22 +486,48 @@ def _load_replay_state(replay: TensorDictReplayBuffer, state: dict[str, object],
     replay.cursor = int(state.get("cursor", 0))
 
 
+_LEGACY_ENV_STATE_KEYS = (
+    "indices", "previous_actions", "bars_held", "cooldown_remaining",
+    "switches_today", "switches_episode", "order_legs_today", "order_legs_episode", "steps",
+)
+# PR-D dynamic position-state bookkeeping. The env tracks these every step regardless of the flag, but they
+# are only CONSUMED (fed to the model / replay) when use_dynamic_transition_features is on -- so they are
+# required in a resume checkpoint only for a dynamic run. We always save them (cheap, correct); we require
+# them on load only when the dynamic flag is on.
+_DYNAMIC_ENV_STATE_KEYS = ("entry_index", "unrealized_pnl", "mae", "mfe")
+
+
 def _env_state_to_cpu(env: VectorizedMinuteToHourEnv) -> dict[str, torch.Tensor]:
     return {
-        "indices": env.indices.detach().cpu().clone(),
-        "previous_actions": env.previous_actions.detach().cpu().clone(),
-        "bars_held": env.bars_held.detach().cpu().clone(),
-        "cooldown_remaining": env.cooldown_remaining.detach().cpu().clone(),
-        "switches_today": env.switches_today.detach().cpu().clone(),
-        "switches_episode": env.switches_episode.detach().cpu().clone(),
-        "order_legs_today": env.order_legs_today.detach().cpu().clone(),
-        "order_legs_episode": env.order_legs_episode.detach().cpu().clone(),
-        "steps": env.steps.detach().cpu().clone(),
+        key: getattr(env, key).detach().cpu().clone()
+        for key in (*_LEGACY_ENV_STATE_KEYS, *_DYNAMIC_ENV_STATE_KEYS)
     }
 
 
-def _load_env_state(env: VectorizedMinuteToHourEnv, state: dict[str, torch.Tensor], device: torch.device) -> None:
-    for key in _env_state_to_cpu(env):
+def _load_env_state(
+    env: VectorizedMinuteToHourEnv,
+    state: dict[str, torch.Tensor],
+    device: torch.device,
+    *,
+    require_dynamic: bool = False,
+) -> None:
+    keys = list(_LEGACY_ENV_STATE_KEYS)
+    if require_dynamic:
+        missing = [k for k in _DYNAMIC_ENV_STATE_KEYS if k not in state]
+        if missing:
+            raise ValueError(
+                "Resume checkpoint is missing dynamic env state required by "
+                f"use_dynamic_transition_features=True: {missing}. Resuming a dynamic run without restored "
+                "position state would corrupt the in-flight episodes' dynamic features (entry/MAE/MFE/"
+                "unrealized P&L) while replay still holds dynamic-aware samples -- re-train or migrate the "
+                "checkpoint instead of silently resetting them."
+            )
+        keys += list(_DYNAMIC_ENV_STATE_KEYS)
+    else:
+        # Restore dynamic bookkeeping if a checkpoint carries it (harmless when the flag is off -- the fields
+        # are tracked but unconsumed), while staying tolerant of older checkpoints that predate the fields.
+        keys += [k for k in _DYNAMIC_ENV_STATE_KEYS if k in state]
+    for key in keys:
         value = state.get(key)
         target = getattr(env, key)
         if not torch.is_tensor(value) or tuple(value.shape) != tuple(target.shape):
@@ -814,7 +875,7 @@ def train_minute_to_hour_dqn(
         if not isinstance(replay_state, dict) or not isinstance(env_state, dict):
             raise ValueError("Resume checkpoint is missing replay or environment state.")
         _load_replay_state(replay, replay_state, device)
-        _load_env_state(env, env_state, device)
+        _load_env_state(env, env_state, device, require_dynamic=config.use_dynamic_transition_features)
         best_val_return = float(checkpoint.get("best_val_return", best_val_return))
         best_val_legs = float(checkpoint.get("best_val_legs", best_val_legs))
         raw_best_state = checkpoint.get("best_state")

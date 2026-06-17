@@ -103,6 +103,13 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             if transition_table is None:
                 raise ValueError("transition_feature_dim > 0 requires a transition_table [A, A, F].")
             self.register_buffer("transition_table", transition_table.float())
+            # Build the (zero-init) transition submodule WITHOUT perturbing the construction RNG of the rest
+            # of the network (hour_encoder/head are built below). Like the dynamic block, its random init is
+            # immediately overwritten by zeros_, so saving/restoring the RNG makes the shared backbone's init
+            # identical whether transition_feature_dim is 0 or > 0 -> a freshly built transition-aware model is
+            # a CLEAN perturbation of the non-transition one (same backbone init + zero-init head => identical
+            # until trained), so a transition A/B isolates the feature, not a different random initialization.
+            _rng_state = torch.get_rng_state()
             if self.action_feature_dim > 0:
                 self.transition_encoder = nn.Sequential(
                     nn.Linear(self.transition_feature_dim, d_model),
@@ -119,6 +126,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
                 self.transition_bias = nn.Linear(self.transition_feature_dim, 1)
                 nn.init.zeros_(self.transition_bias.weight)
                 nn.init.zeros_(self.transition_bias.bias)
+            torch.set_rng_state(_rng_state)
         else:
             self.transition_table = None
             self.transition_encoder = None
@@ -237,6 +245,22 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         batch, hours, minutes, _ = minute_features.shape
         if hours > self.hours_lookback or minutes > self.minutes_per_hour:
             raise ValueError("Input context exceeds configured hours_lookback or minutes_per_hour.")
+        # A model built with dynamic_feature_dim > 0 MUST be given dynamic_state -- silently omitting it would
+        # let a "dynamic-aware" run (so labelled in its manifest) score like the non-dynamic model. Fail
+        # closed. For a zero ablation, pass an explicit zero tensor and record that in the run manifest. Shape
+        # is checked here (cheap, no device sync); finiteness is left to the env/dataset boundary to avoid a
+        # per-step GPU sync on the training hot path.
+        if self.dynamic_feature_dim > 0:
+            if dynamic_state is None:
+                raise ValueError(
+                    "dynamic_state is required because the model was built with dynamic_feature_dim > 0 "
+                    "(pass an explicit zero tensor for a zero-ablation and record it in the manifest)."
+                )
+            if tuple(dynamic_state.shape) != (batch, self.dynamic_feature_dim):
+                raise ValueError(
+                    f"dynamic_state shape {tuple(dynamic_state.shape)} does not match "
+                    f"(batch={batch}, dynamic_feature_dim={self.dynamic_feature_dim})."
+                )
         x = self.minute_proj(minute_features)
         x = x + self.minute_pos[:minutes][None, None, :, :]
         x = x.reshape(batch * hours, minutes, -1)
