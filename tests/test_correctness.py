@@ -8056,6 +8056,58 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertFalse(v.real_executable_trade_reportable)
         self.assertIn("strict:exit_price", v.missing_reportability_reasons)
 
+    def test_statistical_credibility_psr_dsr(self) -> None:
+        # Statistical-credibility axis (separate from mechanical reportability): PSR / expected-max-Sharpe /
+        # DSR. Pure formulas (Bailey & Lopez de Prado); change no backtest number. Reference values are
+        # hand-computed to pin the formula against transcription errors.
+        from rl_quant.statistical_credibility import (
+            deflated_sharpe_ratio,
+            expected_maximum_sharpe,
+            probabilistic_sharpe_ratio,
+        )
+
+        # PSR(observed==benchmark) == 0.5 (z=0); monotone in observed_sharpe; -> 1 as observed >> benchmark.
+        self.assertAlmostEqual(probabilistic_sharpe_ratio(0.3, benchmark_sharpe=0.3, n_observations=50), 0.5, places=9)
+        self.assertLess(
+            probabilistic_sharpe_ratio(0.05, benchmark_sharpe=0.0, n_observations=100),
+            probabilistic_sharpe_ratio(0.15, benchmark_sharpe=0.0, n_observations=100),
+        )
+        # Hand-computed: z = 0.1*sqrt(99)/sqrt(1.005) ~= 0.99251 -> Phi ~= 0.8395.
+        self.assertAlmostEqual(
+            probabilistic_sharpe_ratio(0.1, benchmark_sharpe=0.0, n_observations=100), 0.8395, places=3
+        )
+        # More observations of the same edge -> more confident.
+        self.assertLess(
+            probabilistic_sharpe_ratio(0.1, benchmark_sharpe=0.0, n_observations=50),
+            probabilistic_sharpe_ratio(0.1, benchmark_sharpe=0.0, n_observations=500),
+        )
+
+        # Expected max Sharpe under the null: 0 for one trial, strictly increasing in the number of trials,
+        # and scaling linearly with the cross-trial Sharpe std.
+        self.assertEqual(expected_maximum_sharpe(1), 0.0)
+        self.assertLess(expected_maximum_sharpe(10), expected_maximum_sharpe(1000))
+        self.assertGreater(expected_maximum_sharpe(100), 0.0)
+        self.assertAlmostEqual(
+            expected_maximum_sharpe(100, trials_sharpe_std=2.0), 2.0 * expected_maximum_sharpe(100), places=9
+        )
+
+        # DSR with a single trial reduces to PSR vs 0; deflation LOWERS it as the trial count rises.
+        self.assertAlmostEqual(
+            deflated_sharpe_ratio(0.2, n_trials=1, n_observations=200),
+            probabilistic_sharpe_ratio(0.2, benchmark_sharpe=0.0, n_observations=200),
+            places=9,
+        )
+        self.assertGreater(
+            deflated_sharpe_ratio(0.2, n_trials=2, n_observations=200, trials_sharpe_std=0.1),
+            deflated_sharpe_ratio(0.2, n_trials=500, n_observations=200, trials_sharpe_std=0.1),
+        )
+        # Validation: bad n_observations / n_trials fail closed.
+        for bad in ({"observed_sharpe": 0.1, "benchmark_sharpe": 0.0, "n_observations": 1},):
+            with self.assertRaises(ValueError):
+                probabilistic_sharpe_ratio(**bad)
+        with self.assertRaises(ValueError):
+            expected_maximum_sharpe(0)
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
