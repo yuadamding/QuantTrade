@@ -8108,6 +8108,70 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             expected_maximum_sharpe(0)
 
+    def test_protocol_model_input_label_split_validator(self) -> None:
+        # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
+        # label/future field must NEVER be a model input. Pure/additive (changes no data or training).
+        from rl_quant.protocol import (
+            assert_no_model_input_leakage,
+            validate_decision_tensor_payload,
+            validate_model_input_label_split,
+        )
+
+        # The canonical second-context split (mirrors features/stock_second_context.py:832-861) must validate.
+        model_input_keys = [
+            "market_context", "market_context_mask", "action_features", "decision_action_valid_mask",
+            "action_valid_mask", "action_cost_bps", "action_target_weights", "portfolio_state",
+            "constraint_state", "decision_quality_score", "force_cash_mask",
+        ]
+        label_keys = [
+            "action_returns", "label_valid_mask", "entry_fill_observed_mask", "reward_exit_observed_mask",
+            "next_timestamps", "entry_execution_timestamps_ms", "exit_execution_timestamps_ms",
+        ]
+        forbidden = [
+            "action_returns", "label_valid_mask", "entry_fill_observed_mask", "reward_exit_observed_mask",
+            "next_timestamps", "exit_execution_timestamps_ms",
+        ]
+        ok, issues = validate_model_input_label_split(
+            model_input_keys=model_input_keys, label_keys=label_keys, forbidden_model_input_keys=forbidden
+        )
+        self.assertTrue(ok, issues)
+        self.assertEqual(issues, ())
+
+        # A leaked label/future field as a model input is rejected (the hard anti-leakage rule).
+        leaked_ok, leaked_issues = validate_model_input_label_split(
+            model_input_keys=[*model_input_keys, "action_returns"], label_keys=label_keys, forbidden_model_input_keys=forbidden
+        )
+        self.assertFalse(leaked_ok)
+        self.assertTrue(any("leak" in i for i in leaked_issues))
+        with self.assertRaises(ValueError):
+            assert_no_model_input_leakage(
+                model_input_keys=[*model_input_keys, "action_returns"], label_keys=label_keys, forbidden_model_input_keys=forbidden
+            )
+        # assert_* does not raise on the clean canonical split.
+        assert_no_model_input_leakage(
+            model_input_keys=model_input_keys, label_keys=label_keys, forbidden_model_input_keys=forbidden
+        )
+
+        # Other contract violations: a forbidden key not declared as a label, and an empty model-input list.
+        self.assertFalse(validate_model_input_label_split(
+            model_input_keys=model_input_keys, label_keys=label_keys,
+            forbidden_model_input_keys=[*forbidden, "some_future_flag"],
+        )[0])
+        self.assertFalse(validate_model_input_label_split(
+            model_input_keys=[], label_keys=label_keys, forbidden_model_input_keys=forbidden
+        )[0])
+
+        # Payload entry pulls the lists from the payload, falling back to the manifest (like the builder guard).
+        ok_payload, _ = validate_decision_tensor_payload(
+            {"model_input_keys": model_input_keys, "label_keys": label_keys, "forbidden_model_input_keys": forbidden}
+        )
+        self.assertTrue(ok_payload)
+        ok_manifest, _ = validate_decision_tensor_payload(
+            {"model_input_keys": model_input_keys},  # missing the rest in payload...
+            {"label_keys": label_keys, "forbidden_model_input_keys": forbidden},  # ...supplied by manifest
+        )
+        self.assertTrue(ok_manifest)
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
