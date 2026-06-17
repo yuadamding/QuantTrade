@@ -7070,6 +7070,176 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _assert_checkpoint_schema({**base, "transition_feature_names": []}, **common, transition_feature_dim=len(names))
 
+    def test_execution_simulator_transition_cases(self) -> None:
+        from rl_quant.execution import (
+            ExecutionConfig,
+            FillLevel,
+            MarketSnapshot,
+            PositionState,
+            TerminalPolicy,
+            fill_index,
+            simulate_transition,
+        )
+
+        cfg = ExecutionConfig(  # trade_scale = 2*100 = 200; delayed_close (mid proxy)
+            trade_lot_size=2, commission_per_share=0.01, extra_cost_per_share=0.02, terminal_policy=TerminalPolicy.CARRY
+        )
+        now = MarketSnapshot(mid=100.0, half_spread=0.05)
+        fill = MarketSnapshot(mid=101.0, half_spread=0.05)
+        nxt = MarketSnapshot(mid=103.0, half_spread=0.05)
+
+        def run(old, new, *, terminal=False, config=cfg, n=now, f=fill, x=nxt):
+            return simulate_transition(PositionState(position=old), new, n, f, x, is_terminal=terminal, config=config)
+
+        # fill_index: min(now+latency, next), capped at next; latency<=0 collapses to current bar.
+        self.assertEqual(fill_index(10, step_horizon=5, latency_steps=2), 12)
+        self.assertEqual(fill_index(10, step_horizon=5, latency_steps=0), 10)
+        self.assertEqual(fill_index(10, step_horizon=5, latency_steps=99), 15)
+
+        per_share = 0.05 + 0.02 + 0.01  # half_spread + extra + commission
+        # cash->cash: everything zero.
+        z = run(0.0, 0.0)
+        self.assertEqual((z.gross_return, z.entry_cost, z.exit_cost, z.net_return, z.order_legs), (0.0, 0.0, 0.0, 0.0, 0.0))
+        # cash->asset (+1): no old leg, 1-unit entry cost, new earns fill->next.
+        ca = run(0.0, 1.0)
+        self.assertAlmostEqual(ca.old_latency_return, 0.0)
+        self.assertAlmostEqual(ca.new_interval_return, 1.0 * (103.0 - 101.0) * 200.0)
+        self.assertAlmostEqual(ca.entry_cost, 1.0 * per_share * 200.0)
+        self.assertEqual(ca.order_legs, 1.0)
+        # asset->same (+1->+1): NO re-entry cost, one continuous leg now->next.
+        hold = run(1.0, 1.0)
+        self.assertEqual(hold.entry_cost, 0.0)
+        self.assertEqual(hold.order_legs, 0.0)
+        self.assertAlmostEqual(hold.net_return, 1.0 * (103.0 - 100.0) * 200.0)
+        # asset->cash (+1->0): old STILL earns the now->fill latency leg; 1-unit exit turnover cost.
+        ac = run(1.0, 0.0)
+        self.assertAlmostEqual(ac.old_latency_return, 1.0 * (101.0 - 100.0) * 200.0)
+        self.assertEqual(ac.new_interval_return, 0.0)
+        self.assertAlmostEqual(ac.entry_cost, 1.0 * per_share * 200.0)
+        # A->B full reversal (-1 -> +1): turnover is 2 units.
+        ab = run(-1.0, 1.0)
+        self.assertEqual(ab.order_legs, 2.0)
+        self.assertAlmostEqual(ab.entry_cost, 2.0 * per_share * 200.0)
+        # Terminal liquidation charges |new| * cost at the NEXT bar; CARRY charges none.
+        term = run(0.0, 1.0, terminal=True, config=ExecutionConfig(trade_lot_size=2, terminal_policy=TerminalPolicy.LIQUIDATE_AT_NEXT))
+        self.assertAlmostEqual(term.exit_cost, 1.0 * 0.05 * 200.0)
+        self.assertEqual(run(0.0, 1.0, terminal=True).exit_cost, 0.0)  # cfg is CARRY
+        # delayed_close is honestly NOT a real executable fill; no fill prices.
+        self.assertFalse(cfg.real_executable_fill_model)
+        self.assertIsNone(ca.entry_fill_price)
+        # quote_side: buy fills at ask, sell at bid, and IS a real executable fill model.
+        qcfg = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE, trade_lot_size=1)
+        q_now = MarketSnapshot(mid=100.0, best_bid=99.9, best_ask=100.1)
+        q = simulate_transition(PositionState(position=0.0), 1.0, q_now, q_now, q_now, is_terminal=False, config=qcfg)
+        self.assertTrue(qcfg.real_executable_fill_model)
+        self.assertAlmostEqual(q.entry_fill_price, 100.1)  # buy at ask
+        sell = simulate_transition(PositionState(position=1.0), 0.0, q_now, q_now, q_now, is_terminal=False, config=qcfg)
+        self.assertAlmostEqual(sell.entry_fill_price, 99.9)  # closing the long sells at bid
+
+    def test_execution_simulator_reproduces_intraday_reward(self) -> None:
+        # Equivalence gate: delayed_close net_return must equal the intraday inline arithmetic exactly,
+        # so the later intraday wiring is result-preserving.
+        from rl_quant.execution import ExecutionConfig, MarketSnapshot, PositionState, TerminalPolicy, simulate_transition
+
+        trade_lot_size, commission, extra = 3, 0.01, 0.005
+        scale = trade_lot_size * 100.0
+        cfg = ExecutionConfig(
+            trade_lot_size=trade_lot_size, commission_per_share=commission, extra_cost_per_share=extra,
+            terminal_policy=TerminalPolicy.LIQUIDATE_AT_NEXT,
+        )
+        mids = [100.0, 100.5, 99.5]
+        spreads = [0.03, 0.04]
+        for old in (-1.0, 0.0, 1.0):
+            for new in (-1.0, 0.0, 1.0):
+                for mid_now in mids:
+                    for mid_fill in mids:
+                        for mid_next in mids:
+                            for hs_fill in spreads:
+                                for hs_next in spreads:
+                                    for terminal in (False, True):
+                                        turnover = abs(new - old)
+                                        expected = (
+                                            old * (mid_fill - mid_now)
+                                            + new * (mid_next - mid_fill)
+                                            - turnover * (hs_fill + extra + commission)
+                                        ) * scale
+                                        if terminal and new != 0.0:
+                                            expected -= abs(new) * (hs_next + extra + commission) * scale
+                                        out = simulate_transition(
+                                            PositionState(position=old),
+                                            new,
+                                            MarketSnapshot(mid=mid_now, half_spread=0.0),
+                                            MarketSnapshot(mid=mid_fill, half_spread=hs_fill),
+                                            MarketSnapshot(mid=mid_next, half_spread=hs_next),
+                                            is_terminal=terminal,
+                                            config=cfg,
+                                        )
+                                        self.assertAlmostEqual(out.net_return, expected, places=6)
+
+    def test_transition_pnl_matches_inline_and_simulate(self) -> None:
+        # transition_pnl is the single source of truth wired into the intraday env/eval/pretraining
+        # sites. Prove it reproduces the inline arithmetic in scalar, vectorized, and 3x3-broadcast forms
+        # (so the wiring is result-preserving), and equals simulate_transition for delayed_close.
+        from rl_quant.execution import (
+            ExecutionConfig,
+            MarketSnapshot,
+            PositionState,
+            simulate_transition,
+            transition_pnl,
+        )
+
+        scale, comm, extra = 200.0, 0.01, 0.005
+
+        def inline(old, new, mn, mf, mx, hf, hn, term):
+            r = (old * (mf - mn) + new * (mx - mf) - abs(new - old) * (hf + extra + comm)) * scale
+            return r - (1.0 if term else 0.0) * abs(new) * (hn + extra + comm) * scale
+
+        # Scalar: transition_pnl == inline, and == simulate_transition.net_return (delayed_close).
+        cfg = ExecutionConfig(trade_lot_size=2, commission_per_share=comm, extra_cost_per_share=extra)
+        for old in (-1.0, 0.0, 1.0):
+            for new in (-1.0, 0.0, 1.0):
+                for term in (False, True):
+                    tp = transition_pnl(old, new, 100.0, 101.0, 99.0, 0.03, 0.04, term,
+                                        trade_scale=scale, commission_per_share=comm, extra_cost_per_share=extra)
+                    self.assertAlmostEqual(tp, inline(old, new, 100.0, 101.0, 99.0, 0.03, 0.04, term), places=6)
+                    sim = simulate_transition(
+                        PositionState(position=old), new,
+                        MarketSnapshot(mid=100.0), MarketSnapshot(mid=101.0, half_spread=0.03),
+                        MarketSnapshot(mid=99.0, half_spread=0.04), is_terminal=term, config=cfg,
+                    )
+                    self.assertAlmostEqual(sim.net_return, tp, places=6)
+
+        # Vectorized (env path): long positions, float price/spread tensors, bool terminal -> elementwise match.
+        old = torch.tensor([-1, 0, 1, 1], dtype=torch.long)
+        new = torch.tensor([1, 1, 0, 1], dtype=torch.long)
+        mn = torch.tensor([100.0, 100.0, 100.0, 100.0])
+        mf = torch.tensor([100.5, 99.5, 101.0, 100.2])
+        mx = torch.tensor([101.0, 99.0, 102.0, 100.4])
+        hf = torch.tensor([0.03, 0.04, 0.03, 0.05])
+        hn = torch.tensor([0.04, 0.05, 0.04, 0.06])
+        term = torch.tensor([False, True, True, False])
+        got = transition_pnl(old, new, mn, mf, mx, hf, hn, term, trade_scale=scale, commission_per_share=comm, extra_cost_per_share=extra)
+        want = (old.float() * (mf - mn) + new.float() * (mx - mf) - (new - old).abs().float() * (hf + extra + comm)) * scale
+        want = want - term.float() * new.abs().float() * (hn + extra + comm) * scale
+        # atol is loose: folding the env's two-statement reward into one expression re-associates
+        # float32 adds (~1e-5 noise on values ~100); any real operand error would be O(1)+.
+        self.assertTrue(torch.allclose(got, want, atol=1e-3))
+
+        # 3x3 broadcast (pretraining path): current [1,3,1], candidate [1,1,3], market [N,1,1] -> [N,3,3].
+        positions = torch.tensor([-1.0, 0.0, 1.0])
+        cur = positions.view(1, 3, 1)
+        cand = positions.view(1, 1, 3)
+        mn3, mf3, mx3 = mn.view(-1, 1, 1), mf.view(-1, 1, 1), mx.view(-1, 1, 1)
+        hf3, hn3, term3 = hf.view(-1, 1, 1), hn.view(-1, 1, 1), term.view(-1, 1, 1)
+        grid = transition_pnl(cur, cand, mn3, mf3, mx3, hf3, hn3, term3, trade_scale=scale, commission_per_share=comm, extra_cost_per_share=extra)
+        self.assertEqual(tuple(grid.shape), (4, 3, 3))
+        want_grid = (
+            cur * (mf3 - mn3) + cand * (mx3 - mf3)
+            - (cand - cur).abs() * (hf3 + extra + comm)
+            - term3.float() * cand.abs() * (hn3 + extra + comm)
+        ) * scale
+        self.assertTrue(torch.allclose(grid, want_grid, atol=1e-3))
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [

@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from rl_quant.execution import transition_pnl
 from rl_quant.intraday_data import MarketDataSplit
 from rl_quant.core import (
     TemporalQNetwork,
@@ -96,15 +97,6 @@ def _fill_indices(indices: torch.Tensor, *, step_horizon: int, latency_steps: in
     return torch.minimum(indices + latency_steps, next_indices)
 
 
-def _transaction_cost_per_share(
-    half_spread: torch.Tensor,
-    *,
-    extra_cost_per_share: float,
-    commission_per_share: float,
-) -> torch.Tensor:
-    return half_spread + extra_cost_per_share + commission_per_share
-
-
 class ReplayBuffer(TensorReplayBuffer):
     def __init__(self, capacity: int, device: torch.device) -> None:
         super().__init__(
@@ -180,18 +172,6 @@ class VectorizedMarketEnv:
         half_spread_fill = self.data.half_spread[fill_indices]
         half_spread_next = self.data.half_spread[next_indices]
 
-        turnover_units = (action_positions - current_positions).abs().float()
-        reward = (
-            current_positions.float() * (mid_fill - mid_now)
-            + action_positions.float() * (mid_next - mid_fill)
-            - turnover_units
-            * _transaction_cost_per_share(
-                half_spread_fill,
-                extra_cost_per_share=self.extra_cost,
-                commission_per_share=self.commission,
-            )
-        ) * self.trade_scale
-
         current_day = self.data.day_ids[current_indices]
         next_day = self.data.day_ids[next_indices]
         day_ends = self.data.day_ends[current_day]
@@ -203,11 +183,20 @@ class VectorizedMarketEnv:
         terminal = (next_day != current_day) | (next_indices + self.step_horizon >= day_ends)
         truncated = self.steps + 1 >= self.config.episode_length
         resets = terminal | truncated
-        reward = reward - terminal.float() * action_positions.abs().float() * _transaction_cost_per_share(
+        # Shared old/new-position latency P&L + turnover/terminal-liquidation cost (see execution.py).
+        reward = transition_pnl(
+            current_positions,
+            action_positions,
+            mid_now,
+            mid_fill,
+            mid_next,
+            half_spread_fill,
             half_spread_next,
-            extra_cost_per_share=self.extra_cost,
+            terminal,
+            trade_scale=self.trade_scale,
             commission_per_share=self.commission,
-        ) * self.trade_scale
+            extra_cost_per_share=self.extra_cost,
+        )
 
         self.indices = next_indices
         self.positions = action_positions
@@ -277,29 +266,30 @@ def _build_pretraining_targets(
     next_indices = indices + step_horizon
     fill_indices = _fill_indices(indices, step_horizon=step_horizon, latency_steps=latency_steps)
 
-    hold_before_fill = (data.close_mid[fill_indices] - data.close_mid[indices]).view(-1, 1, 1)
-    hold_after_fill = (data.close_mid[next_indices] - data.close_mid[fill_indices]).view(-1, 1, 1)
-    enter_cost = _transaction_cost_per_share(
-        data.half_spread[fill_indices],
-        extra_cost_per_share=extra_cost_per_share,
-        commission_per_share=commission_per_share,
-    ).view(-1, 1, 1)
-    exit_cost = _transaction_cost_per_share(
-        data.half_spread[next_indices],
-        extra_cost_per_share=extra_cost_per_share,
-        commission_per_share=commission_per_share,
-    ).view(-1, 1, 1)
+    mid_now = data.close_mid[indices].view(-1, 1, 1)
+    mid_fill = data.close_mid[fill_indices].view(-1, 1, 1)
+    mid_next = data.close_mid[next_indices].view(-1, 1, 1)
+    half_spread_fill = data.half_spread[fill_indices].view(-1, 1, 1)
+    half_spread_next = data.half_spread[next_indices].view(-1, 1, 1)
     terminal_mask = (next_indices + step_horizon >= day_end_for_candidate[valid_mask]).view(-1, 1, 1)
     trade_scale = float(trade_lot_size * 100)
 
     action_positions = ACTION_TO_POSITION.to(device=device, dtype=torch.float32).view(1, 1, 3)
     current_positions = ACTION_TO_POSITION.to(device=device, dtype=torch.float32).view(1, 3, 1)
-    target_q = (
-        current_positions * hold_before_fill
-        + action_positions * hold_after_fill
-        - (action_positions - current_positions).abs() * enter_cost
-        - terminal_mask * action_positions.abs() * exit_cost
-    ) * trade_scale
+    # Same shared transition reward as the env step, broadcast over the [current, candidate] grid.
+    target_q = transition_pnl(
+        current_positions,
+        action_positions,
+        mid_now,
+        mid_fill,
+        mid_next,
+        half_spread_fill,
+        half_spread_next,
+        terminal_mask,
+        trade_scale=trade_scale,
+        commission_per_share=commission_per_share,
+        extra_cost_per_share=extra_cost_per_share,
+    )
 
     expanded_indices = indices.unsqueeze(1).expand(-1, 3).reshape(-1)
     expanded_positions = ACTION_TO_POSITION.to(device=device).view(1, 3).expand(indices.shape[0], -1).reshape(-1)
@@ -509,18 +499,21 @@ def evaluate_policy(
             half_spread_fill = float(data.half_spread[fill_index].item())
             half_spread_next = float(data.half_spread[next_index].item())
             turnover_units = abs(new_position - old_position)
-            entry_cost = half_spread_fill + extra_cost_per_share + commission_per_share
-            reward = (
-                old_position * (mid_fill - mid_now)
-                + new_position * (mid_next - mid_fill)
-                - turnover_units * entry_cost
-            ) * trade_scale
-
             next_is_terminal = next_index + step_horizon >= day_end
-            if next_is_terminal and new_position != 0:
-                reward -= abs(new_position) * (
-                    half_spread_next + extra_cost_per_share + commission_per_share
-                ) * trade_scale
+            # Same shared transition reward as the env step / pretraining targets (see execution.py).
+            reward = transition_pnl(
+                old_position,
+                new_position,
+                mid_now,
+                mid_fill,
+                mid_next,
+                half_spread_fill,
+                half_spread_next,
+                next_is_terminal,
+                trade_scale=trade_scale,
+                commission_per_share=commission_per_share,
+                extra_cost_per_share=extra_cost_per_share,
+            )
 
             day_steps += 1
             day_pnl += reward
