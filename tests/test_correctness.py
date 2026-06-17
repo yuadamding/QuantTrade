@@ -9201,6 +9201,55 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 for forbidden in ("resets", "dones", "truncated"):
                     self.assertNotIn(forbidden, args, f"{name}: dqn_td_target must not bootstrap on {forbidden}")
 
+    def test_architecture_layer_import_boundaries(self) -> None:
+        # Lock the protocol-first layering so it can't erode (Sculley et al., "Hidden Technical Debt in ML
+        # Systems": boundary erosion / undeclared consumers). The foundational/low layers must not import
+        # higher ones. These rules hold as of the reorg; this guards against regression. TYPE_CHECKING-only
+        # imports are excluded (they are not runtime dependencies -- e.g. the envs<->training annotation
+        # cycle-break), so a layer importing a higher one purely for typing is allowed.
+        import ast
+
+        forbidden_by_layer = {
+            "protocol": ("data_sources", "features", "datasets", "envs", "models", "training", "evaluation", "reportability", "workflows"),
+            "data_sources": ("features", "datasets", "envs", "models", "training", "evaluation", "reportability", "workflows"),
+            "features": ("datasets", "envs", "models", "training", "evaluation", "reportability", "workflows"),
+            "datasets": ("envs", "models", "training", "evaluation", "reportability", "workflows"),
+            "models": ("datasets", "envs", "training", "evaluation", "reportability", "workflows"),
+        }
+
+        def runtime_imports(tree: ast.AST) -> list[str]:
+            mods: list[str] = []
+
+            def visit(node: ast.AST) -> None:
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, ast.If):
+                        test = child.test
+                        is_type_checking = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+                            isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+                        )
+                        if is_type_checking:
+                            for n in child.orelse:  # the else branch IS runtime
+                                visit(n)
+                            continue
+                    if isinstance(child, ast.ImportFrom) and child.module:
+                        mods.append(child.module)
+                    elif isinstance(child, ast.Import):
+                        mods.extend(alias.name for alias in child.names)
+                    visit(child)
+
+            visit(tree)
+            return mods
+
+        src = ROOT / "src" / "rl_quant"
+        violations: list[str] = []
+        for layer, forbidden in forbidden_by_layer.items():
+            for path in sorted((src / layer).rglob("*.py")):
+                for module in runtime_imports(ast.parse(path.read_text())):
+                    for higher in forbidden:
+                        if module == f"rl_quant.{higher}" or module.startswith(f"rl_quant.{higher}."):
+                            violations.append(f"{layer}/{path.name} -> {module} (forbidden: {layer} must not import {higher})")
+        self.assertEqual(violations, [], "layer import-boundary violations:\n" + "\n".join(violations))
+
     def test_news_article_rows_reject_negative_source_latency(self) -> None:
         # A negative source latency implies availability BEFORE publish (look-ahead). The library must
         # fail closed at every entry point, not silently clamp to 0 (optimistic) as it once did.
