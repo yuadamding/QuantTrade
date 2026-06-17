@@ -120,7 +120,7 @@ from rl_quant.hourly_transformer import (  # noqa: E402
     assert_matching_hourly_schema,
     evaluate_hourly_policy,
 )
-from rl_quant.intraday_dqn import _apply_action_threshold  # noqa: E402
+from rl_quant.training.intraday import _apply_action_threshold  # noqa: E402
 from rl_quant.minute_to_hour_transformer import (  # noqa: E402
     HourFromMinuteDataSplit,
     MinuteToHourCausalTransformerQNetwork,
@@ -9101,7 +9101,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import re
 
         src = ROOT / "src" / "rl_quant"
-        trainers = ["training/strategy.py", "intraday_dqn.py", "hourly_transformer.py", "minute_to_hour_transformer.py"]
+        trainers = ["training/strategy.py", "training/intraday.py", "hourly_transformer.py", "minute_to_hour_transformer.py"]
         call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
         for name in trainers:
             calls = call_re.findall((src / name).read_text())
