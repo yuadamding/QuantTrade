@@ -4591,9 +4591,21 @@ class MinuteToHourTests(unittest.TestCase):
             )
 
             selected = [path.parent.name for path in module.partition_paths(args)]
+            errors = module.partition_selection_reportability_errors(args)
+            allow_truncated = module.parse_args(
+                [
+                    "--partitions-root",
+                    str(root),
+                    "--max-partitions",
+                    "2",
+                    "--allow-truncated-training-history",
+                ]
+            )
+            allow_truncated_errors = module.partition_selection_reportability_errors(allow_truncated)
 
         self.assertEqual(selected, ["2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"])
-        self.assertEqual(module.partition_selection_reportability_errors(args), [])
+        self.assertTrue(any("silently excluded" in error for error in errors))
+        self.assertEqual(allow_truncated_errors, [])
 
     def test_integrate_covariates_max_partitions_defaults_to_latest(self) -> None:
         module = load_script("integrate_stock_covariates_with_hour_partitions")
@@ -4613,9 +4625,21 @@ class MinuteToHourTests(unittest.TestCase):
             )
 
             selected = [path.parent.name for path in module.partition_paths(args)]
+            errors = module.partition_selection_reportability_errors(args)
+            allow_truncated = module.parse_args(
+                [
+                    "--partitions-root",
+                    str(root),
+                    "--max-partitions",
+                    "2",
+                    "--allow-truncated-training-history",
+                ]
+            )
+            allow_truncated_errors = module.partition_selection_reportability_errors(allow_truncated)
 
         self.assertEqual(selected, ["2026-01-01_to_2026-01-04", "2026-06-01_to_2026-06-04"])
-        self.assertEqual(module.partition_selection_reportability_errors(args), [])
+        self.assertTrue(any("silently excluded" in error for error in errors))
+        self.assertEqual(allow_truncated_errors, [])
 
     def test_hour_from_second_earliest_partition_selection_is_diagnostic(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
@@ -4654,11 +4678,13 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual(selected, ["2025-01-01_to_2025-01-04"])
         self.assertFalse(policy["reportable"])
-        self.assertEqual(policy["partition_selection_reportability_errors"], ["non_latest_partition_selection"])
-        self.assertIn("non_latest_partition_selection", policy["reportability_errors"])
+        self.assertTrue(
+            any("not the latest available" in error for error in policy["partition_selection_reportability_errors"])
+        )
+        self.assertTrue(any("not the latest available" in error for error in policy["reportability_errors"]))
         self.assertFalse(reportable)
         self.assertIn("smoke_row_based_split", errors)
-        self.assertIn("non_latest_partition_selection", errors)
+        self.assertTrue(any("not the latest available" in error for error in errors))
         self.assertFalse(evaluator_error_reportable)
         self.assertEqual(evaluator_errors, ["requested_actions_with_missing_reward_labels"])
 

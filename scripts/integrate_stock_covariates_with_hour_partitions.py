@@ -27,6 +27,7 @@ from rl_quant.features.stock_covariates import (  # noqa: E402
     tensor_content_hashes,
     validate_action_covariate_feature_schema,
 )
+from rl_quant.partition_protocol import strict_latest_partition_violations  # noqa: E402
 from rl_quant.research_protocol import stable_json_hash, utc_now_iso  # noqa: E402
 
 
@@ -67,6 +68,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="latest",
         help="When --max-partitions is set, choose latest partitions by default; earliest is diagnostic only.",
     )
+    parser.add_argument(
+        "--allow-truncated-training-history",
+        action="store_true",
+        help=(
+            "Permit a manifest whose selected partitions omit earlier available history. Off by "
+            "default: restricted integration outputs are marked non-reportable."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -100,10 +109,23 @@ def partition_paths(args: argparse.Namespace) -> list[Path]:
     return paths
 
 
-def partition_selection_reportability_errors(args: argparse.Namespace) -> list[str]:
-    if int(args.max_partitions) > 0 and args.partition_selection != "latest":
-        return ["non_latest_partition_selection"]
-    return []
+def partition_selection_reportability_errors(
+    args: argparse.Namespace,
+    *,
+    selected_labels: list[str] | None = None,
+    all_available_labels: list[str] | None = None,
+) -> list[str]:
+    if all_available_labels is None:
+        all_available_labels = [
+            path.parent.name for path in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))
+        ]
+    if selected_labels is None:
+        selected_labels = [path.parent.name for path in partition_paths(args)]
+    return strict_latest_partition_violations(
+        selected_labels=selected_labels,
+        all_available_labels=all_available_labels,
+        allow_truncated_training_history=bool(args.allow_truncated_training_history),
+    )
 
 
 def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
@@ -389,7 +411,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.workers <= 0:
         raise ValueError("--workers must be positive.")
     paths = partition_paths(args)
-    selection_errors = partition_selection_reportability_errors(args)
+    all_available_labels = [
+        path.parent.name for path in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))
+    ]
+    selected_labels = [path.parent.name for path in paths]
+    selection_errors = partition_selection_reportability_errors(
+        args,
+        selected_labels=selected_labels,
+        all_available_labels=all_available_labels,
+    )
     schema_path = args.covariate_feature_schema or args.covariates_root / "feature_schema.json"
     if not schema_path.exists():
         raise FileNotFoundError(f"Covariate feature schema does not exist: {schema_path}")
@@ -443,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         "covariate_manifest_hash": source_manifest_hash,
         "covariate_feature_schema_file_hash": schema_file_hash,
         "partition_selection": args.partition_selection,
+        "allow_truncated_training_history": bool(args.allow_truncated_training_history),
         "partition_selection_reportability_errors": selection_errors,
         "partition_count": len(paths),
         "written_count": sum(1 for item in records if item["status"] == "written"),

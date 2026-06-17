@@ -221,10 +221,23 @@ def partition_paths(args: argparse.Namespace) -> list[Path]:
     return paths
 
 
-def partition_selection_reportability_errors(args: argparse.Namespace) -> list[str]:
-    if int(args.max_partitions) > 0 and args.partition_selection != "latest":
-        return ["non_latest_partition_selection"]
-    return []
+def partition_selection_reportability_errors(
+    args: argparse.Namespace,
+    *,
+    selected_labels: list[str] | None = None,
+    all_available_labels: list[str] | None = None,
+) -> list[str]:
+    if all_available_labels is None:
+        all_available_labels = [
+            path.parent.name for path in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))
+        ]
+    if selected_labels is None:
+        selected_labels = [path.parent.name for path in partition_paths(args)]
+    return strict_latest_partition_violations(
+        selected_labels=selected_labels,
+        all_available_labels=all_available_labels,
+        allow_truncated_training_history=bool(getattr(args, "allow_truncated_training_history", False)),
+    )
 
 
 def latest_available_partition_label(args: argparse.Namespace) -> str | None:
@@ -280,8 +293,14 @@ def official_test_block(records: list[dict[str, object]], final_test_is_latest_a
     }
 
 
-def split_policy_with_partition_selection(split_policy: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
-    selection_errors = partition_selection_reportability_errors(args)
+def split_policy_with_partition_selection(
+    split_policy: dict[str, object],
+    args: argparse.Namespace,
+    *,
+    selection_errors: list[str] | None = None,
+) -> dict[str, object]:
+    if selection_errors is None:
+        selection_errors = partition_selection_reportability_errors(args)
     errors = [*list(split_policy.get("reportability_errors", [])), *selection_errors]
     out = dict(split_policy)
     out["partition_selection"] = args.partition_selection
@@ -297,8 +316,13 @@ def combined_evaluation_reportability(
     evaluator_errors: list[str],
     split_policy: dict[str, object],
     args: argparse.Namespace,
+    selection_errors: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
-    partition_errors = partition_selection_reportability_errors(args)
+    partition_errors = (
+        partition_selection_reportability_errors(args)
+        if selection_errors is None
+        else list(selection_errors)
+    )
     split_errors = [str(error) for error in split_policy.get("reportability_errors", [])]
     errors = list(dict.fromkeys([*evaluator_errors, *split_errors, *partition_errors]))
     reportable = bool(evaluator_reportable) and bool(split_policy.get("reportable", True)) and not errors
@@ -510,13 +534,17 @@ def main(argv: list[str] | None = None) -> int:
         torch.cuda.manual_seed_all(args.seed)
 
     paths = partition_paths(args)
-    partition_selection_errors = partition_selection_reportability_errors(args)
+    all_available_labels = [p.parent.name for p in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))]
+    selected_labels = [p.parent.name for p in paths]
+    partition_selection_errors = partition_selection_reportability_errors(
+        args,
+        selected_labels=selected_labels,
+        all_available_labels=all_available_labels,
+    )
     # The headline (official) test is the LATEST selected partition; earlier partitions are
     # walk-forward diagnostics, not the latest-period KPI. Under strict reportability the final
     # selected partition must be the latest available one, so --end-partition / earliest selection
     # cannot silently make an OLD period the reported test.
-    all_available_labels = [p.parent.name for p in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))]
-    selected_labels = [p.parent.name for p in paths]
     latest_available_label = _chronological_latest_label(all_available_labels)
     official_test_label = selected_labels[-1]
     final_test_is_latest_available = official_test_label == latest_available_label
@@ -527,15 +555,10 @@ def main(argv: list[str] | None = None) -> int:
     training_history_truncated = excluded_prior_partition_count > 0
     all_prior_partitions_included = not training_history_truncated
     if args.reportability_policy == "strict":
-        violations = strict_latest_partition_violations(
-            selected_labels=selected_labels,
-            all_available_labels=all_available_labels,
-            allow_truncated_training_history=args.allow_truncated_training_history,
-        )
-        if violations:
+        if partition_selection_errors:
             raise SystemExit(
                 "strict latest-period evaluation refused the partition selection:\n  - "
-                + "\n  - ".join(violations)
+                + "\n  - ".join(partition_selection_errors)
                 + "\nAdjust --start-partition/--end-partition/--partition-selection/--max-partitions, "
                 "pass --allow-truncated-training-history where appropriate, or use "
                 "--reportability-policy diagnostic for an explicitly non-latest/non-exhaustive run."
@@ -578,7 +601,11 @@ def main(argv: list[str] | None = None) -> int:
                 action_covariate_sidecar=args.action_covariate_sidecar,
                 news_llm_sidecar=args.news_llm_sidecar,
             )
-            run_split_policy = split_policy_with_partition_selection(train_split.split_policy, args)
+            run_split_policy = split_policy_with_partition_selection(
+                train_split.split_policy,
+                args,
+                selection_errors=partition_selection_errors,
+            )
             initial_action = action_index(train_split.action_names, args.initial_action)
             env_config = MinuteToHourEnvConfig(
                 num_envs=args.num_envs,
@@ -731,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
                 evaluator_errors=list(test_result.reportability_errors),
                 split_policy=run_split_policy,
                 args=args,
+                selection_errors=partition_selection_errors,
             )
             split_reportable = bool(run_split_policy.get("reportable", True))
             if args.reportability_policy == "strict" and not (evaluation_reportable and split_reportable):
