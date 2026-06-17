@@ -8150,6 +8150,69 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(free.total_reward_bps, 0.0)  # zero returns, no trade, no penalty -> zero
         self.assertLess(penalised.total_reward_bps, free.total_reward_bps)  # cash-idle penalty now charged in eval
 
+    def test_transition_cost_breakdown_table_and_env_reward_consistency(self) -> None:
+        # Locks the shared transition-cost semantics (review #2/#3): the breakdown separates leg/execution cost
+        # from the behavioural switch-penalty regularizer and the cash-idle penalty, and the env reward uses
+        # exactly trade_cost_bps (= leg + switch) + cash_idle. Since env + eval call the SAME primitive, this
+        # also pins their agreement.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import (
+            MinuteToHourEnvConfig, VectorizedMinuteToHourEnv, transition_trade_cost_bps,
+        )
+
+        cons = dataclasses.replace(
+            default_minute_to_hour_constraints(), one_way_cost_bps=10.0, extra_switch_penalty_bps=5.0, cash_index=0
+        )
+
+        def bd(prev: int, act: int, cash_idle: float = 0.0):
+            return transition_trade_cost_bps(
+                torch.tensor([prev]), torch.tensor([act]), constraints=cons, cash_idle_penalty_bps=cash_idle
+            )
+
+        cash_hold = bd(0, 0, cash_idle=50.0)  # CASH -> CASH: no trade; only cash-idle charged
+        self.assertEqual(float(cash_hold.legs[0]), 0.0)
+        self.assertEqual(float(cash_hold.leg_cost_bps[0]), 0.0)
+        self.assertEqual(float(cash_hold.switch_penalty_bps[0]), 0.0)
+        self.assertEqual(float(cash_hold.cash_idle_bps[0]), 50.0)
+
+        enter = bd(0, 1, cash_idle=50.0)  # CASH -> asset 1: a switch; leg cost > 0; switch penalty once; no idle
+        self.assertGreater(float(enter.leg_cost_bps[0]), 0.0)
+        self.assertEqual(float(enter.switch_penalty_bps[0]), 5.0)
+        self.assertEqual(float(enter.cash_idle_bps[0]), 0.0)
+        self.assertAlmostEqual(
+            float(enter.trade_cost_bps[0]), float(enter.leg_cost_bps[0]) + float(enter.switch_penalty_bps[0]), places=6
+        )
+
+        held = bd(1, 1, cash_idle=50.0)  # hold asset 1: no switch, no idle
+        self.assertEqual(float(held.switch_penalty_bps[0]), 0.0)
+        self.assertEqual(float(held.cash_idle_bps[0]), 0.0)
+
+        # The env reward uses exactly (trade_cost_bps + cash_idle_bps) from the SAME primitive.
+        split = HourFromMinuteDataSplit(
+            name="t", decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(3)],
+            next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(3)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((3, 1, 1, 1)), minute_mask=torch.ones((3, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((3, 1, 1)), action_returns=torch.tensor([[0.0, 0.10], [0.0, 0.0], [0.0, 0.0]]),
+            action_valid_mask=torch.ones((3, 2), dtype=torch.bool), label_valid_mask=torch.ones((3, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1, 2]), valid_index_mask=torch.tensor([True, True, True]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        env = VectorizedMinuteToHourEnv(
+            split, MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0,
+                                         cash_idle_penalty_bps=50.0, constraints=cons), torch.device("cpu")
+        )
+        env.indices[:] = 0
+        env.entry_index[:] = 0
+        out = env.step(torch.tensor([1], dtype=torch.long))  # CASH -> QQQ, raw return 0.10
+        b = bd(0, 1, cash_idle=50.0)  # cash_idle_bps is 0 here (QQQ is not cash) -- idle only charged on cash
+        self.assertEqual(float(b.cash_idle_bps[0]), 0.0)
+        expected = 0.10 * 10_000.0 - (float(b.trade_cost_bps[0]) + float(b.cash_idle_bps[0])) * 10_000.0 / 10_000.0
+        self.assertAlmostEqual(float(out["rewards"][0]), expected, places=4)
+
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
         # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.
@@ -8366,6 +8429,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # the actual config dataclass (drift guard) so the registry can't silently disagree with the code.
         import dataclasses
 
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig
         from rl_quant.protocol.flags import FLAG_REGISTRY, FlagSpec, result_moving_flags
         from rl_quant.training.minute_to_hour import MinuteToHourTrainingConfig
 
@@ -8392,6 +8456,24 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 config_defaults[name], FLAG_REGISTRY[name].default,
                 f"{name}: registry default disagrees with MinuteToHourTrainingConfig",
             )
+        # execution_env_reward_shadow is a real MinuteToHourEnvConfig field now (PR-3); its registry default
+        # must match the config default.
+        env_defaults = {f.name: f.default for f in dataclasses.fields(MinuteToHourEnvConfig)}
+        self.assertEqual(
+            env_defaults["execution_env_reward_shadow"], FLAG_REGISTRY["execution_env_reward_shadow"].default
+        )
+        # Drift guard: every boolean gating field on the env/training configs must be registered (or explicitly
+        # allowlisted as non-governance), so a new result/label-moving flag cannot be wired without a registry
+        # entry + its A/B metadata.
+        non_governance_bools: set[str] = set()  # add genuinely-cosmetic bools here if ever needed
+        config_bools = {
+            f.name
+            for cfg in (MinuteToHourEnvConfig, MinuteToHourTrainingConfig)
+            for f in dataclasses.fields(cfg)
+            if f.type in (bool, "bool")
+        }
+        unregistered = config_bools - set(FLAG_REGISTRY) - non_governance_bools
+        self.assertEqual(unregistered, set(), f"unregistered governance flag(s): {unregistered}")
 
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")

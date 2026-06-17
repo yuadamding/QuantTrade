@@ -300,14 +300,14 @@ def evaluate_minute_to_hour_policy(
         # Shared with the env (transition_trade_cost_bps) so the eval ledger cannot drift from the training
         # reward, and it now applies the env's cash_idle_penalty_bps (omitted before -> a latent drift for
         # nonzero-penalty runs). For the default penalty (0) this is byte-identical to the prior inline cost.
-        legs_t, trade_cost_bps_t, cash_idle_bps_t = transition_trade_cost_bps(
+        cost = transition_trade_cost_bps(
             prev_tensor, action_tensor, constraints=constraints, cash_idle_penalty_bps=cash_idle_penalty_bps
         )
-        legs = float(legs_t[0].item())
+        legs = float(cost.legs[0].item())
         is_switch = action != previous_action
-        cost_bps = float(trade_cost_bps_t[0].item())
+        cost_bps = float(cost.trade_cost_bps[0].item())  # leg cost + switch penalty (the legacy combined cost)
         gross_return = float(data.action_returns[index, action].item())
-        net_return = gross_return - (cost_bps + float(cash_idle_bps_t[0].item())) / 10_000.0
+        net_return = gross_return - (cost_bps + float(cost.cash_idle_bps[0].item())) / 10_000.0
         equity *= 1.0 + net_return
         equity_curve.append(equity)
         returns.append(net_return)
@@ -1129,10 +1129,21 @@ def train_minute_to_hour_dqn(
         "vram_reservation": reservation.report,
         "cash_idle_penalty_bps": float(config.env.cash_idle_penalty_bps),
         # PR-3: shadow execution-reward diagnostics (None when the flag is off). Label-changing only -- the
-        # trained model + every other metric are byte-identical to a shadow-off run.
+        # trained model + every other metric are byte-identical to a shadow-off run. Honesty labels: this is a
+        # STATIC single-slot weight-bps COST-MODEL shadow, NOT real-executable (no NBBO / quote-side fills /
+        # latency P&L on this dataset).
         "execution_env_reward_shadow": bool(config.env.execution_env_reward_shadow),
+        "execution_shadow_cost_model": (
+            "static_single_slot_weight_bps" if config.env.execution_env_reward_shadow else None
+        ),
+        "execution_shadow_real_executable": False,
+        # reward delta in REWARD units (scale-dependent) AND scale-normalised bps (comparable across runs).
         "execution_shadow_reward_delta_mean": (
             sum(shadow_reward_deltas) / len(shadow_reward_deltas) if shadow_reward_deltas else None
+        ),
+        "execution_shadow_reward_delta_bps_mean": (
+            (sum(shadow_reward_deltas) / len(shadow_reward_deltas)) / float(config.env.reward_scale) * 10_000.0
+            if shadow_reward_deltas else None
         ),
         "execution_shadow_cost_delta_bps_mean": (
             sum(shadow_cost_deltas) / len(shadow_cost_deltas) if shadow_cost_deltas else None

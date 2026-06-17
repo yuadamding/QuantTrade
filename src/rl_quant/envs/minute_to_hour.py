@@ -36,19 +36,37 @@ class MinuteToHourEnvConfig:
     constraints: TradingConstraintConfig = field(default_factory=default_minute_to_hour_constraints)
 
 
+@dataclass(frozen=True)
+class TransitionCostBreakdown:
+    """bps breakdown of a minute->hour transition's reward cost, SHARED by the env reward and the evaluation
+    rollout so they cannot drift. The three components are deliberately distinct:
+    - ``leg_cost_bps`` = ``legs * one_way_cost_bps`` -- the EXECUTION / turnover cost (what an execution-cost
+      A/B should compare against);
+    - ``switch_penalty_bps`` = ``is_switch * extra_switch_penalty_bps`` -- a BEHAVIOURAL anti-churn regularizer,
+      NOT a market execution cost (so a cost-model swap must not silently drop it);
+    - ``cash_idle_bps`` -- the idle-cash penalty when the executed action is cash.
+    The legacy reward cost is ``trade_cost_bps + cash_idle_bps`` and the net return is
+    ``raw_return - (trade_cost_bps + cash_idle_bps)/1e4`` (env reward = ``reward_scale * net_return``)."""
+
+    legs: torch.Tensor
+    leg_cost_bps: torch.Tensor
+    switch_penalty_bps: torch.Tensor
+    cash_idle_bps: torch.Tensor
+
+    @property
+    def trade_cost_bps(self) -> torch.Tensor:
+        return self.leg_cost_bps + self.switch_penalty_bps
+
+
 def transition_trade_cost_bps(
     previous_actions: torch.Tensor,
     actions: torch.Tensor,
     *,
     constraints: TradingConstraintConfig,
     cash_idle_penalty_bps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The minute->hour transition cost, SHARED by the env's reward and the evaluation rollout so the two can
-    never drift (the architecture rule: only env/execution defines reward). Returns
-    ``(legs, trade_cost_bps, cash_idle_bps)`` where ``trade_cost_bps = legs*one_way_cost_bps +
-    switch*extra_switch_penalty_bps`` and ``cash_idle_bps`` is charged when the executed action is cash. The
-    net return is ``raw_return - (trade_cost_bps + cash_idle_bps)/1e4`` and the env reward is
-    ``reward_scale * net_return``. Tensor-shaped, so it serves the vectorized env and a 1-element eval step."""
+) -> TransitionCostBreakdown:
+    """Compute the shared minute->hour transition cost breakdown (see TransitionCostBreakdown). Tensor-shaped,
+    so it serves both the vectorized env and a 1-element evaluation step."""
     legs = trade_legs(
         previous_actions,
         actions,
@@ -56,9 +74,12 @@ def transition_trade_cost_bps(
         count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
     )
     is_switch = (actions != previous_actions).float()
-    trade_cost_bps = legs * float(constraints.one_way_cost_bps) + is_switch * float(constraints.extra_switch_penalty_bps)
-    cash_idle_bps = (actions == int(constraints.cash_index)).float() * float(cash_idle_penalty_bps)
-    return legs, trade_cost_bps, cash_idle_bps
+    return TransitionCostBreakdown(
+        legs=legs,
+        leg_cost_bps=legs * float(constraints.one_way_cost_bps),
+        switch_penalty_bps=is_switch * float(constraints.extra_switch_penalty_bps),
+        cash_idle_bps=(actions == int(constraints.cash_index)).float() * float(cash_idle_penalty_bps),
+    )
 
 
 class VectorizedMinuteToHourEnv:
@@ -224,12 +245,15 @@ class VectorizedMinuteToHourEnv:
         actions = torch.where(selected_label_valid, actions, cash_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
         is_switch = actions != previous_actions
-        legs, cost_bps, cash_idle_penalty_bps = transition_trade_cost_bps(
+        cost = transition_trade_cost_bps(
             previous_actions,
             actions,
             constraints=self.config.constraints,
             cash_idle_penalty_bps=self.config.cash_idle_penalty_bps,
         )
+        legs = cost.legs
+        cost_bps = cost.trade_cost_bps  # leg cost + switch penalty (the legacy combined trade cost)
+        cash_idle_penalty_bps = cost.cash_idle_bps
         rewards = raw_returns * float(self.config.reward_scale) - (
             cost_bps + cash_idle_penalty_bps
         ) * float(self.config.reward_scale) / 10_000.0
@@ -247,8 +271,11 @@ class VectorizedMinuteToHourEnv:
             execution_cost_bps_shadow = weight_transition_cost_bps(
                 sell_weight, buy_weight, weight_cost=self._shadow_weight_cost
             )
+            # Swap ONLY the execution/leg cost (cost.leg_cost_bps -> execution_cost_bps_shadow); KEEP the
+            # behavioural switch-penalty regularizer + the cash-idle penalty, so reward_delta / cost_delta
+            # isolate the cost-MODEL change and PR-4 would not silently drop the anti-churn regularizer.
             execution_env_reward_shadow = raw_returns * float(self.config.reward_scale) - (
-                execution_cost_bps_shadow + cash_idle_penalty_bps
+                execution_cost_bps_shadow + cost.switch_penalty_bps + cash_idle_penalty_bps
             ) * float(self.config.reward_scale) / 10_000.0
 
         next_indices = current_indices + 1
@@ -320,5 +347,7 @@ class VectorizedMinuteToHourEnv:
             out["execution_env_reward_shadow"] = execution_env_reward_shadow
             out["execution_cost_bps_shadow"] = execution_cost_bps_shadow
             out["reward_delta_shadow"] = execution_env_reward_shadow - rewards
-            out["cost_delta_shadow"] = execution_cost_bps_shadow - cost_bps
+            # vs the legacy LEG/execution cost (excludes the switch-penalty regularizer, which both rewards
+            # keep) -> a pure execution-cost-model delta.
+            out["cost_delta_shadow"] = execution_cost_bps_shadow - cost.leg_cost_bps
         return out

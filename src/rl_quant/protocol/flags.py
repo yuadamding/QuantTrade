@@ -70,9 +70,10 @@ FLAG_REGISTRY: dict[str, FlagSpec] = {
         ),
         delete_criterion="remove the flag after two stable cycles at the new default",
     ),
-    # Declared AHEAD of the PR-3/PR-4 execution-engine wiring (see docs/execution_wiring_design.md) so the
-    # governance contract exists before the code does. These are not yet config fields; the drift guard in the
-    # gate test only cross-checks the two flags above against MinuteToHourTrainingConfig.
+    # Execution-engine reward flags (see docs/execution_wiring_design.md). execution_env_reward_shadow is now a
+    # real MinuteToHourEnvConfig field (PR-3 shipped); use_execution_env_reward is declared ahead of the PR-4
+    # training-reward flip and is not yet a config field. The gate test cross-checks each registered flag's
+    # default against its config field where that field exists.
     "execution_env_reward_shadow": FlagSpec(
         name="execution_env_reward_shadow",
         default=False,
