@@ -1705,6 +1705,14 @@ class VectorizedMinuteToHourEnv:
         self.order_legs_today = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
         self.order_legs_episode = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
         self.steps = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        # PR-D / D0 dynamic position bookkeeping: maintained as internal env state but NOT yet consumed by
+        # the reward, the model forward, the replay buffer, or the step() dict -- so training is byte-identical
+        # (see pr_d_dynamic_state_design.md). This is a RETURN-based env (no prices/target weights), so we track
+        # the entry row, the compounded return since entry, and the max adverse/favorable excursion since entry.
+        self.entry_index = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.unrealized_pnl = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
+        self.mae = torch.zeros(config.num_envs, dtype=torch.float32, device=device)  # max adverse excursion (<= 0)
+        self.mfe = torch.zeros(config.num_envs, dtype=torch.float32, device=device)  # max favorable excursion (>= 0)
         self.reset()
 
     def _build_start_index_pool(self) -> torch.Tensor:
@@ -1730,6 +1738,11 @@ class VectorizedMinuteToHourEnv:
         self.order_legs_today[mask] = 0.0
         self.order_legs_episode[mask] = 0.0
         self.steps[mask] = 0
+        # D0 dynamic bookkeeping resets with the episode (entry starts at the freshly-drawn start row).
+        self.entry_index[mask] = self.indices[mask]
+        self.unrealized_pnl[mask] = 0.0
+        self.mae[mask] = 0.0
+        self.mfe[mask] = 0.0
 
     def constraint_features(self) -> torch.Tensor:
         return make_constraint_features(
@@ -1847,6 +1860,17 @@ class VectorizedMinuteToHourEnv:
         self.order_legs_today = self.order_legs_today + legs
         self.order_legs_episode = self.order_legs_episode + legs
         self.steps = self.steps + 1
+        # D0 dynamic bookkeeping (computed from existing state only; not fed to reward/model/replay): on a HOLD
+        # compound this step's return into the position held since entry and extend MAE/MFE; on a SWITCH the new
+        # position starts fresh this step (entry row = the current decision row). Held across a day boundary is
+        # still held, so unlike the daily switch/leg counters below, this state is NOT reset on a new day.
+        held = ~is_switch
+        cum = torch.where(held, (1.0 + self.unrealized_pnl) * (1.0 + raw_returns) - 1.0, raw_returns)
+        zeros = torch.zeros_like(cum)
+        self.entry_index = torch.where(is_switch, current_indices, self.entry_index)
+        self.mae = torch.where(held, torch.minimum(self.mae, cum), torch.minimum(zeros, cum))
+        self.mfe = torch.where(held, torch.maximum(self.mfe, cum), torch.maximum(zeros, cum))
+        self.unrealized_pnl = cum
 
         in_bounds = next_indices < self.data.action_returns.shape[0]
         next_valid = torch.zeros_like(in_bounds)

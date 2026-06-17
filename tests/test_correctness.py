@@ -1290,6 +1290,69 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(int(result["next_indices"][0].item()), 1)
         self.assertFalse(bool(result["resets"][0].item()))
 
+    def test_minute_to_hour_env_d0_dynamic_bookkeeping(self) -> None:
+        # PR-D / D0: env tracks entry_index / unrealized_pnl / mae / mfe as PURE bookkeeping (not consumed by
+        # reward/model/replay -> training is byte-identical; that part is covered by the existing trainer tests
+        # staying green). Here we verify the compounding/reset semantics directly, robust to constraint
+        # redirection by reading the ACTUALLY-executed action from the step result.
+        split = HourFromMinuteDataSplit(
+            name="train",
+            decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
+            next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
+            minute_feature_names=["m"],
+            hour_feature_names=["h"],
+            action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((4, 1, 1, 1), dtype=torch.float32),
+            minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((4, 1, 1), dtype=torch.float32),
+            action_returns=torch.tensor([[0.0, 0.10], [0.0, -0.20], [0.0, 0.30], [0.0, 0.0]], dtype=torch.float32),
+            action_valid_mask=torch.ones((4, 2), dtype=torch.bool),
+            label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            valid_index_mask=torch.tensor([True, True, True, True], dtype=torch.bool),
+            minute_feature_mean=torch.zeros(1),
+            minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1),
+            hour_feature_std=torch.ones(1),
+            hours_lookback=1,
+            minutes_per_hour=1,
+        )
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["VectorizedMinuteToHourEnv"])
+        env = module.VectorizedMinuteToHourEnv(
+            split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0), torch.device("cpu")
+        )
+        env.indices[:] = 0
+        env.entry_index[:] = 0  # align bookkeeping with the manually-set start row
+
+        for requested in (1, 1, 0):
+            idx_before = int(env.indices[0].item())
+            prev_action = int(env.previous_actions[0].item())
+            u_before = float(env.unrealized_pnl[0].item())
+            mae_before = float(env.mae[0].item())
+            mfe_before = float(env.mfe[0].item())
+
+            result = env.step(torch.tensor([requested], dtype=torch.long))
+
+            executed = int(result["actions"][0].item())
+            raw = float(split.action_returns[idx_before, executed].item())
+            switched = executed != prev_action
+            cum_expected = raw if switched else (1.0 + u_before) * (1.0 + raw) - 1.0
+            self.assertAlmostEqual(float(env.unrealized_pnl[0].item()), cum_expected, places=6)
+            if switched:
+                self.assertEqual(int(env.entry_index[0].item()), idx_before)
+                self.assertAlmostEqual(float(env.mae[0].item()), min(0.0, cum_expected), places=6)
+                self.assertAlmostEqual(float(env.mfe[0].item()), max(0.0, cum_expected), places=6)
+            else:
+                self.assertAlmostEqual(float(env.mae[0].item()), min(mae_before, cum_expected), places=6)
+                self.assertAlmostEqual(float(env.mfe[0].item()), max(mfe_before, cum_expected), places=6)
+            # Path invariant: the latest cum sits within [MAE, MFE].
+            self.assertLessEqual(float(env.mae[0].item()), float(env.unrealized_pnl[0].item()) + 1e-6)
+            self.assertGreaterEqual(float(env.mfe[0].item()), float(env.unrealized_pnl[0].item()) - 1e-6)
+
+        # The bookkeeping is NOT exported in the step dict (D2's job), so training/replay is untouched.
+        self.assertNotIn("unrealized_pnl", result)
+        self.assertNotIn("entry_index", result)
+
     def test_polygon_second_manifest_marks_incomplete_download_non_reportable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
