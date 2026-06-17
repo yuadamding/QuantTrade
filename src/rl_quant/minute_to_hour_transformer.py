@@ -27,7 +27,7 @@ from rl_quant.core import (
     make_grad_scaler,
     safe_next_row_indices,
 )
-from rl_quant.hourly_transformer import _validate_action_return_contract
+from rl_quant.datasets.hourly import _validate_action_return_contract
 from rl_quant.trading_constraints import (
     CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,

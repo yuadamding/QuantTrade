@@ -4808,7 +4808,7 @@ class HourlySplitTests(unittest.TestCase):
 
     def test_split_excludes_rewards_realized_after_split_end(self) -> None:
         module = load_script("build_hourly_transformer_dataset")
-        hourly = __import__("rl_quant.hourly_transformer", fromlist=["_build_split"])
+        hourly = __import__("rl_quant.datasets.hourly", fromlist=["_build_split"])
         timestamps = [f"2026-01-02T14:{minute:02d}:00+00:00" for minute in range(30, 36)]
         next_timestamps = [
             "2026-01-02T14:31:00+00:00",
@@ -4842,7 +4842,7 @@ class HourlySplitTests(unittest.TestCase):
             self.assertLessEqual(split.next_timestamps[index], "2026-01-02T14:35:00+00:00")
 
     def test_direct_hourly_split_orders_mixed_timezones_by_utc_instant(self) -> None:
-        hourly = __import__("rl_quant.hourly_transformer", fromlist=["_build_split"])
+        hourly = __import__("rl_quant.datasets.hourly", fromlist=["_build_split"])
         payload = {
             "timestamps": [
                 "2026-01-02T14:30:00+00:00",
@@ -4867,7 +4867,7 @@ class HourlySplitTests(unittest.TestCase):
         self.assertEqual(split.timestamps[1], "2026-01-02T09:45:00-05:00")
 
     def test_direct_hourly_split_rejects_finite_returns_for_invalid_actions(self) -> None:
-        hourly = __import__("rl_quant.hourly_transformer", fromlist=["_build_split"])
+        hourly = __import__("rl_quant.datasets.hourly", fromlist=["_build_split"])
         payload = {
             "timestamps": [f"2026-01-02T14:{minute:02d}:00+00:00" for minute in range(30, 34)],
             "next_timestamps": [f"2026-01-02T14:{minute:02d}:00+00:00" for minute in range(31, 35)],
@@ -9101,7 +9101,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import re
 
         src = ROOT / "src" / "rl_quant"
-        trainers = ["training/strategy.py", "training/intraday.py", "hourly_transformer.py", "minute_to_hour_transformer.py"]
+        trainers = ["training/strategy.py", "training/intraday.py", "training/hourly.py", "minute_to_hour_transformer.py"]
         call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
         for name in trainers:
             calls = call_re.findall((src / name).read_text())

@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from rl_quant.models.second_context import SecondContextTransformerQNetwork
 from rl_quant.core import autocast_context
 from rl_quant.features.stock_second_context import validate_second_context_payload
-from rl_quant.hourly_transformer import _validate_action_return_contract
+from rl_quant.datasets.hourly import _validate_action_return_contract
 from rl_quant.reportability import evaluate_decision_log_reportability
 
 
