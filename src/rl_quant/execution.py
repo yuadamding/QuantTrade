@@ -105,6 +105,12 @@ def _require_int_allow_negative(name: str, value: object) -> int:
         raise ValueError(f"{name} must be integer-like; got {value!r}.") from exc
 
 
+# Public aliases so other modules (e.g. the intraday env) can enforce the SAME integer-like bar/lot
+# validation as ExecutionConfig instead of int()-truncating a fractional config value.
+require_positive_int = _require_positive_int
+require_nonnegative_int = _require_nonnegative_int
+
+
 class FillLevel(str, Enum):
     DELAYED_CLOSE = "delayed_close"  # mid move + symmetric half-spread cost proxy (today's intraday)
     MID_PLUS_SPREAD = "mid_plus_spread"  # fill = mid +/- half_spread * spread_multiplier
@@ -295,14 +301,17 @@ class TransitionOutcome:
 def fill_index(now_index: int, *, step_horizon: int, latency_steps: int) -> int:
     """Bar at which a decision fills: ``min(now + latency, next)``, capped at the next decision bar.
 
-    ``latency_steps <= 0`` collapses the fill to the current bar (decision and fill coincide). Mirrors the
-    vectorized ``fill_indices`` exactly, so a fill can never be pushed past the holding horizon."""
+    ``latency_steps <= 0`` collapses the fill to the current bar (decision and fill coincide). For valid
+    (non-negative) bar indices this mirrors the vectorized ``fill_indices`` element-wise, so a fill can never
+    be pushed past the holding horizon. ``now_index`` must be a non-negative integer bar index -- a negative
+    value would silently index from the end of the array (PyTorch negative-indexing footgun) downstream."""
+    now = _require_nonnegative_int("now_index", now_index)
     horizon = _require_positive_int("step_horizon", step_horizon)
     latency = _require_int_allow_negative("latency_steps", latency_steps)
-    next_index = now_index + horizon
+    next_index = now + horizon
     if latency <= 0:
-        return now_index
-    return min(now_index + latency, next_index)
+        return now
+    return min(now + latency, next_index)
 
 
 # Only wide signed integer dtypes are safe as bar indices: uint8/int8/int16 (and unsigned generally)
@@ -601,6 +610,13 @@ class ActionTransitionOutcome:
     net_pnl: float
     next_state: Holdings
     real_executable_fill_model: bool
+    # Decomposed reportability status so a downstream evaluator never has to read intent out of the P&L
+    # numbers (which are still produced for diagnostics even when the transition is non-reportable):
+    #   valuation_complete  -- every held/executed non-zero position had a quote to value it
+    #   execution_complete  -- every requested trade leg (and terminal liquidation leg) actually filled
+    # real_executable_fill_model is the AND of crossable-quote fills + valuation_complete + execution_complete.
+    valuation_complete: bool = True
+    execution_complete: bool = True
     warnings: tuple[str, ...] = ()
 
 
@@ -660,6 +676,8 @@ def simulate_action_transition(
     realized_cost = 0.0
     warnings: list[str] = []
     real = config.real_executable_fill_model
+    valuation_complete = True  # could every held/executed non-zero position be valued?
+    execution_complete = True  # did every requested trade / terminal liquidation leg fill?
 
     def warn(message: str) -> None:
         # Dedup so the same symbol flagged on multiple legs (latency / interval / trade) warns once.
@@ -678,6 +696,7 @@ def simulate_action_transition(
         elif abs(prev_w) > eps:
             warn(f"missing_quote:{symbol}")
             real = False
+            valuation_complete = False
 
     # executed[symbol] = weight ACTUALLY held after fills (== target only where the leg fills).
     executed: dict[str, float] = {}
@@ -697,6 +716,7 @@ def simulate_action_transition(
         if quote is None:
             warn(f"missing_quote:{symbol}")
             real = False
+            execution_complete = False
             executed[symbol] = prev_w  # blocked: no quote -> trade did not fill, keep prior weight
             continue
         leg, cost = _make_leg(symbol, prev_w, tgt_w, quote, config)
@@ -704,6 +724,7 @@ def simulate_action_transition(
         if leg.fill_status != FillStatus.FILLED:
             warn(f"missing_quote:{symbol}")
             real = False
+            execution_complete = False
             executed[symbol] = prev_w  # blocked: unfilled leg keeps prior weight (no teleport, no cost)
         else:
             realized_cost += cost
@@ -721,6 +742,7 @@ def simulate_action_transition(
         else:
             warn(f"missing_quote:{symbol}")
             real = False
+            valuation_complete = False
 
     next_state = Holdings(tuple((s, w) for s, w in executed.items() if abs(w) > eps))
     if is_terminal and config.terminal_policy == TerminalPolicy.LIQUIDATE_AT_NEXT:
@@ -732,6 +754,7 @@ def simulate_action_transition(
             if quote is None:
                 warn(f"terminal_missing_quote:{symbol}")
                 real = False
+                execution_complete = False
                 remaining.append((symbol, weight))  # cannot liquidate without a quote -> still held
                 continue
             leg, cost = _make_leg(symbol, weight, 0.0, quote, config)
@@ -739,6 +762,7 @@ def simulate_action_transition(
             if leg.fill_status != FillStatus.FILLED:
                 warn(f"terminal_missing_quote:{symbol}")
                 real = False
+                execution_complete = False
                 remaining.append((symbol, weight))
             else:
                 realized_cost += cost
@@ -754,5 +778,7 @@ def simulate_action_transition(
         net_pnl=gross - realized_cost,
         next_state=next_state,
         real_executable_fill_model=real,
+        valuation_complete=valuation_complete,
+        execution_complete=execution_complete,
         warnings=tuple(warnings),
     )

@@ -9,7 +9,11 @@ from torch import nn
 
 from rl_quant.execution import fill_index as compute_fill_index
 from rl_quant.execution import fill_indices as compute_fill_indices
-from rl_quant.execution import transition_pnl
+from rl_quant.execution import (
+    require_nonnegative_int,
+    require_positive_int,
+    transition_pnl,
+)
 from rl_quant.intraday_data import MarketDataSplit
 from rl_quant.core import (
     TemporalQNetwork,
@@ -118,8 +122,10 @@ class VectorizedMarketEnv:
         self.trade_scale = float(config.trade_lot_size * 100)
         self.extra_cost = float(config.extra_cost_per_share)
         self.commission = float(config.commission_per_share)
-        self.step_horizon = int(config.step_horizon)
-        self.latency_steps = int(config.latency_steps)
+        # Validate integer-like instead of int()-truncating: a fractional step_horizon/latency_steps (e.g.
+        # from a non-CLI caller) must fail closed, not silently truncate the holding/latency horizon.
+        self.step_horizon = require_positive_int("step_horizon", config.step_horizon)
+        self.latency_steps = require_nonnegative_int("latency_steps", config.latency_steps)
         self.start_indices = self._build_start_index_pool()
 
         self.indices = torch.zeros(config.num_envs, dtype=torch.long, device=device)

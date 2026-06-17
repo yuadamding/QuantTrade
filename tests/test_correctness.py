@@ -7491,6 +7491,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(miss.next_state, cash)  # blocked: no fill -> keep prior (cash) holdings
         self.assertAlmostEqual(miss.gross_mark_pnl, 0.0)  # earns nothing on the unfilled target
         self.assertEqual(miss.realized_execution_cost, 0.0)
+        self.assertFalse(miss.execution_complete)  # the requested buy did not fill
+        self.assertTrue(miss.valuation_complete)  # nothing non-zero was left unvalued (ended in cash)
         self.assertEqual(
             simulate_action_transition(cash, qqq, {"QQQ": q("QQQ", ret=0.02)}, proxy).legs[0].fill_status,
             FillStatus.FILLED,
@@ -7537,6 +7539,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         term_block = simulate_action_transition(qqq, qqq, {}, quote_cfg, is_terminal=True)
         self.assertEqual(term_block.next_state, qqq)  # could not liquidate -> still held
         self.assertFalse(term_block.real_executable_fill_model)
+        self.assertFalse(term_block.execution_complete)  # liquidation leg could not fill
         self.assertIn("terminal_missing_quote:QQQ", term_block.warnings)
         # With a real quote, terminal liquidation flattens to cash and books the exit leg + its cost.
         term_ok = simulate_action_transition(
@@ -7552,11 +7555,29 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIn("missing_quote:QQQ", held_no_quote.warnings)
         self.assertEqual(held_no_quote.next_state, qqq)  # still held (unvalued, not flattened)
         self.assertEqual(held_no_quote.gross_mark_pnl, 0.0)  # cannot value it -> 0, but flagged non-real
+        # Decomposed status: could not VALUE the held position, but nothing FAILED to execute (no trade).
+        self.assertFalse(held_no_quote.valuation_complete)
+        self.assertTrue(held_no_quote.execution_complete)
         # A held position WITH a quote is valued normally and stays real-executable.
         held_ok = simulate_action_transition(qqq, qqq, {"QQQ": q("QQQ", ret=0.02, lat=0.01, bid=99.9, ask=100.1)}, quote_cfg)
         self.assertTrue(held_ok.real_executable_fill_model)
         self.assertEqual(held_ok.warnings, ())
         self.assertAlmostEqual(held_ok.gross_mark_pnl, 0.03)
+        self.assertTrue(held_ok.valuation_complete)
+        self.assertTrue(held_ok.execution_complete)
+
+        # Public integer-like validators are exported so the env (and other callers) enforce the same
+        # bar/lot rules as ExecutionConfig instead of int()-truncating a fractional config value.
+        from rl_quant.execution import require_nonnegative_int, require_positive_int
+
+        self.assertEqual(require_positive_int("h", 3), 3)
+        self.assertEqual(require_nonnegative_int("l", 0), 0)
+        for bad in (1.9, True, -1, "x"):
+            with self.assertRaises(ValueError):
+                require_positive_int("h", bad)
+        for bad in (0.5, True, -1):
+            with self.assertRaises(ValueError):
+                require_nonnegative_int("l", bad)
 
         # Holdings fails closed: duplicate symbol, non-finite weight, explicit CASH; ~0 weights are dropped.
         for bad in ((("QQQ", 0.5), ("QQQ", 0.7)), (("QQQ", float("nan")),), (("CASH", 1.0),)):
@@ -7580,6 +7601,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 fill_indices(_torch.arange(4, dtype=bad_dtype), step_horizon=5, latency_steps=1)
         for ok_dtype in (_torch.int32, _torch.int64):
             self.assertEqual(fill_indices(_torch.arange(4, dtype=ok_dtype), step_horizon=5, latency_steps=1).dtype, ok_dtype)
+        # Scalar fill_index also validates now_index: reject fractional/bool and (critically) NEGATIVE bar
+        # indices, which would otherwise index from the end of the array (PyTorch negative-indexing footgun).
+        for bad_now in (1.5, True, -1):
+            with self.assertRaises(ValueError):
+                fill_index(bad_now, step_horizon=5, latency_steps=1)
+        self.assertEqual(fill_index(0, step_horizon=5, latency_steps=1), 1)  # zero is a valid first bar
         self.assertEqual(
             fill_indices(_torch.arange(6), step_horizon=5, latency_steps=2).tolist(),
             [fill_index(i, step_horizon=5, latency_steps=2) for i in range(6)],
