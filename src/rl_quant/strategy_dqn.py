@@ -7,9 +7,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from rl_quant.models.strategy import StrategyQNetwork
 from rl_quant.core import (
     DQNLearningConfig,
-    TemporalQNetwork,
     TensorReplayBuffer,
     annualized_sharpe,
     autocast_context,
@@ -32,30 +32,6 @@ class StrategyEnvConfig:
     reward_scale: float = 10_000.0
     switch_cost_bps: float = 0.0
     initial_action: int = 0
-
-
-class StrategyQNetwork(nn.Module):
-    def __init__(
-        self,
-        *,
-        feature_dim: int,
-        lookback: int,
-        action_count: int,
-        hidden_size: int = 128,
-        action_embedding_dim: int = 16,
-    ) -> None:
-        super().__init__()
-        self.network = TemporalQNetwork(
-            feature_dim=feature_dim,
-            lookback=lookback,
-            action_count=action_count,
-            previous_action_count=action_count,
-            hidden_size=hidden_size,
-            previous_action_embedding_dim=action_embedding_dim,
-        )
-
-    def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
-        return self.network(state_windows, previous_actions)
 
 
 @dataclass

@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from rl_quant.models.intraday import ConvQNetwork
 from rl_quant.execution import fill_index as compute_fill_index
 from rl_quant.execution import fill_indices as compute_fill_indices
 from rl_quant.execution import (
@@ -16,7 +17,6 @@ from rl_quant.execution import (
 )
 from rl_quant.intraday_data import MarketDataSplit
 from rl_quant.core import (
-    TemporalQNetwork,
     TensorReplayBuffer,
     absolute_max_drawdown,
     annualized_sharpe,
@@ -58,22 +58,6 @@ class TrainingConfig:
     pretrain_batch_size: int
     use_amp: bool = False
     amp_dtype: str = "fp16"  # AMP autocast precision when use_amp: "fp16" (default) or "bf16".
-
-
-class ConvQNetwork(nn.Module):
-    def __init__(self, feature_dim: int, lookback: int, hidden_size: int = 128) -> None:
-        super().__init__()
-        self.network = TemporalQNetwork(
-            feature_dim=feature_dim,
-            lookback=lookback,
-            action_count=3,
-            previous_action_count=3,
-            hidden_size=hidden_size,
-            previous_action_embedding_dim=8,
-        )
-
-    def forward(self, state_windows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return self.network(state_windows, positions + 1)
 
 
 def initialize_flat_policy(model: ConvQNetwork) -> None:
