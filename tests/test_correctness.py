@@ -8262,6 +8262,35 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         )
         self.assertTrue(ok_manifest)
 
+    def test_flag_registry_governance(self) -> None:
+        # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
+        # every result-moving flag carries A/B metrics + flip/delete criteria, and the recorded defaults match
+        # the actual config dataclass (drift guard) so the registry can't silently disagree with the code.
+        import dataclasses
+
+        from rl_quant.protocol.flags import FLAG_REGISTRY, FlagSpec, result_moving_flags
+        from rl_quant.training.minute_to_hour import MinuteToHourTrainingConfig
+
+        for name, spec in FLAG_REGISTRY.items():
+            self.assertIsInstance(spec, FlagSpec)
+            self.assertEqual(spec.name, name)
+            self.assertFalse(spec.default, f"{name}: opt-in flags must default to False (default-preserving)")
+            if spec.is_result_moving:
+                self.assertTrue(spec.required_ab, f"{name}: a result-moving flag must declare A/B metrics")
+                self.assertTrue(spec.flip_criterion, f"{name}: missing flip_criterion")
+                self.assertTrue(spec.delete_criterion, f"{name}: missing delete_criterion")
+
+        # The dynamic + transition flags are registered as result-moving and match the config defaults.
+        self.assertEqual(
+            set(result_moving_flags()), {"use_dynamic_transition_features", "use_transition_features"}
+        )
+        config_defaults = {f.name: f.default for f in dataclasses.fields(MinuteToHourTrainingConfig)}
+        for name in ("use_dynamic_transition_features", "use_transition_features"):
+            self.assertEqual(
+                config_defaults[name], FLAG_REGISTRY[name].default,
+                f"{name}: registry default disagrees with MinuteToHourTrainingConfig",
+            )
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [

@@ -859,6 +859,16 @@ def build_second_context_payload(
         "next_timestamps",
         "exit_execution_timestamps_ms",
     ]
+    # Validate the REAL builder split against the protocol contract at BUILD time (not only a test fixture):
+    # a model input must never be a label / forbidden (realized-outcome) key. No-op for the canonical split;
+    # fails closed if an edit ever introduces leakage. (features -> protocol is a valid downward import.)
+    from rl_quant.protocol import assert_no_model_input_leakage
+
+    assert_no_model_input_leakage(
+        model_input_keys=model_input_keys,
+        label_keys=label_keys,
+        forbidden_model_input_keys=forbidden_model_input_keys,
+    )
     execution_model = {
         "name": config.execution_model,
         "entry_rule": "first action close at or after decision_ts + execution_latency_ms",
