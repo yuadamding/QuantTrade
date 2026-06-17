@@ -37,8 +37,13 @@ from rl_quant.trading_constraints import (
     TRANSITION_FEATURE_NAMES,
     TRANSITION_FEATURE_SCHEMA_VERSION,
     TradingConstraintConfig,
+    DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION,
+    DYNAMIC_TRANSITION_FEATURE_DIM,
+    DYNAMIC_TRANSITION_FEATURE_NAMES,
+    DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION,
     apply_leg_aware_hysteresis,
     build_action_mask,
+    build_dynamic_transition_features,
     build_transition_feature_table,
     make_constraint_features,
     sample_valid_actions,
@@ -1510,6 +1515,13 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         # ZERO-INITIALISED so a freshly-built dynamic-aware model scores identically until trained; and
         # dynamic_feature_dim=0 registers no params at all -> existing checkpoints load strict.
         if self.dynamic_feature_dim > 0:
+            # Build the (zero-init) dynamic submodule WITHOUT perturbing the construction RNG of the rest of
+            # the network (hour_encoder/head are built below). Its random init is immediately overwritten by
+            # zeros_, so saving/restoring the RNG makes the shared backbone's init identical whether the flag
+            # is off or on -> a freshly built dynamic-aware model is a CLEAN perturbation of the non-dynamic
+            # one (same backbone init + zero-init dynamic head => identical until trained), so the D4 A/B
+            # isolates the feature rather than a different random initialization.
+            _rng_state = torch.get_rng_state()
             if self.action_feature_dim > 0:
                 self.dynamic_encoder = nn.Sequential(
                     nn.Linear(self.dynamic_feature_dim, d_model),
@@ -1524,6 +1536,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
                 self.dynamic_bias = nn.Linear(self.dynamic_feature_dim, 1)
                 nn.init.zeros_(self.dynamic_bias.weight)
                 nn.init.zeros_(self.dynamic_bias.bias)
+            torch.set_rng_state(_rng_state)
         else:
             self.dynamic_encoder = None
             self.dynamic_bias = None
@@ -1719,6 +1732,12 @@ class MinuteToHourTrainingConfig:
     # checkpoints load unchanged). When True, the Q-network scores each candidate with the cost/risk of
     # moving from the held position to it (see build_transition_feature_table).
     use_transition_features: bool = False
+    # Opt-in PR-D dynamic position-state features (default off -> byte-identical, existing checkpoints load
+    # strict). When True, the Q-network also scores each candidate with the HELD position's realized-P&L
+    # excursion (unrealized_pnl / MAE / MFE / drawdown / runup), threaded from the env through replay. This
+    # MOVES training numbers when on, so it ships behind this flag and flips to default only after a
+    # latest-period A/B (no default flip here).
+    use_dynamic_transition_features: bool = False
 
 
 class VectorizedMinuteToHourEnv:
@@ -1849,9 +1868,20 @@ class VectorizedMinuteToHourEnv:
             self.action_mask(),
         )
 
+    def dynamic_state(self) -> torch.Tensor:
+        """Per-env [B, DYNAMIC_TRANSITION_FEATURE_DIM] dynamic position-state features (PR-D) of the position
+        held entering the current decision. Fed to the Q-network only when use_dynamic_transition_features."""
+        return build_dynamic_transition_features(
+            unrealized_pnl=self.unrealized_pnl, mae=self.mae, mfe=self.mfe
+        )
+
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
         previous_actions = self.previous_actions.clone()
+        # PR-D: snapshot the dynamic state of the position held ENTERING this decision (before the update
+        # below). Always computed and returned (the replay add() filters unknown keys, so it is harmless when
+        # use_dynamic_transition_features is off); consumed only when the flag is on.
+        position_dynamic = self.dynamic_state()
         constraint_features = self.constraint_features()
         action_mask = self.action_mask()
         actions = actions.long()
@@ -1904,6 +1934,7 @@ class VectorizedMinuteToHourEnv:
         self.mae = torch.where(held, torch.minimum(self.mae, cum), torch.minimum(zeros, cum))
         self.mfe = torch.where(held, torch.maximum(self.mfe, cum), torch.maximum(zeros, cum))
         self.unrealized_pnl = cum
+        next_position_dynamic = self.dynamic_state()  # PR-D: post-action dynamic state (enters the next bar)
 
         in_bounds = next_indices < self.data.action_returns.shape[0]
         next_valid = torch.zeros_like(in_bounds)
@@ -1940,6 +1971,8 @@ class VectorizedMinuteToHourEnv:
             "resets": resets.float(),
             "terminated": terminated.float(),
             "legs": legs,
+            "position_dynamic": position_dynamic,
+            "next_position_dynamic": next_position_dynamic,
         }
 
 
@@ -2331,6 +2364,7 @@ def _assert_checkpoint_schema(
     action_names: list[str],
     action_feature_names: list[str],
     transition_feature_dim: int = 0,
+    dynamic_feature_dim: int = 0,
 ) -> None:
     expected = {
         "minute_feature_names": minute_feature_names,
@@ -2368,6 +2402,17 @@ def _assert_checkpoint_schema(
             f"expected={expected_transition}."
         )
 
+    # Same bidirectional guard for the PR-D dynamic position-state schema: a dynamic-aware checkpoint
+    # (wider input) cannot warm-start a non-dynamic model and vice versa.
+    expected_dynamic = list(DYNAMIC_TRANSITION_FEATURE_NAMES) if dynamic_feature_dim > 0 else []
+    checkpoint_dynamic = list(checkpoint.get("dynamic_transition_feature_names", []))
+    if checkpoint_dynamic != expected_dynamic:
+        raise ValueError(
+            "Warm-start checkpoint dynamic transition feature schema does not match the current model "
+            f"(use_dynamic_transition_features mismatch or schema drift): checkpoint={checkpoint_dynamic}, "
+            f"expected={expected_dynamic}."
+        )
+
 
 def load_minute_to_hour_warm_start(
     model: nn.Module,
@@ -2385,6 +2430,7 @@ def load_minute_to_hour_warm_start(
         action_names=train_data.action_names,
         action_feature_names=train_data.action_feature_names,
         transition_feature_dim=int(getattr(model, "transition_feature_dim", 0)),
+        dynamic_feature_dim=int(getattr(model, "dynamic_feature_dim", 0)),
     )
     try:
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -2495,6 +2541,7 @@ def train_minute_to_hour_dqn(
             device=device,
         )
         transition_feature_dim = TRANSITION_FEATURE_DIM
+    dynamic_feature_dim = DYNAMIC_TRANSITION_FEATURE_DIM if config.use_dynamic_transition_features else 0
     q_network = MinuteToHourCausalTransformerQNetwork(
         minute_feature_dim=train_data.minute_features.shape[-1],
         hour_feature_dim=train_data.hour_features.shape[-1],
@@ -2512,6 +2559,7 @@ def train_minute_to_hour_dqn(
         action_feature_dim=0 if train_data.action_features is None else int(train_data.action_features.shape[-1]),
         transition_feature_dim=transition_feature_dim,
         transition_table=transition_table,
+        dynamic_feature_dim=dynamic_feature_dim,
     ).to(device)
     warm_start_info: dict[str, object] | None = None
     if config.warm_start_model is not None:
@@ -2528,22 +2576,29 @@ def train_minute_to_hour_dqn(
         weight_decay=config.learning.weight_decay,
     )
     scaler = make_grad_scaler(device, config.learning.use_amp, config.learning.amp_dtype)
+    replay_fields = {
+        "indices": ((), torch.long),
+        "previous_actions": ((), torch.long),
+        "constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
+        "action_mask": ((action_count,), torch.bool),
+        "actions": ((), torch.long),
+        "rewards": ((), torch.float32),
+        "next_indices": ((), torch.long),
+        "next_previous_actions": ((), torch.long),
+        "next_constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
+        "next_action_mask": ((action_count,), torch.bool),
+        "terminated": ((), torch.float32),
+    }
+    if config.use_dynamic_transition_features:
+        # Only declared when the flag is on -> storage has exactly the 11 legacy keys otherwise, so the
+        # buffer (and a flag-off resume) is byte-identical. The step dict always carries these keys; the
+        # add() call below filters to declared fields, so they are silently dropped when the flag is off.
+        replay_fields["position_dynamic"] = ((DYNAMIC_TRANSITION_FEATURE_DIM,), torch.float32)
+        replay_fields["next_position_dynamic"] = ((DYNAMIC_TRANSITION_FEATURE_DIM,), torch.float32)
     replay = TensorDictReplayBuffer(
         capacity=config.learning.replay_capacity,
         device=device,
-        fields={
-            "indices": ((), torch.long),
-            "previous_actions": ((), torch.long),
-            "constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
-            "action_mask": ((action_count,), torch.bool),
-            "actions": ((), torch.long),
-            "rewards": ((), torch.float32),
-            "next_indices": ((), torch.long),
-            "next_previous_actions": ((), torch.long),
-            "next_constraint_features": ((CONSTRAINT_FEATURE_DIM,), torch.float32),
-            "next_action_mask": ((action_count,), torch.bool),
-            "terminated": ((), torch.float32),
-        },
+        fields=replay_fields,
     )
     env = VectorizedMinuteToHourEnv(train_data, config.env, device)
     reservation = CudaVramReservation(target_gb=config.target_vram_gb, safety_gb=config.vram_safety_gb)
@@ -2622,6 +2677,7 @@ def train_minute_to_hour_dqn(
                     previous_actions,
                     constraint_features,
                     action_features=action_features,
+                    dynamic_state=env.dynamic_state() if config.use_dynamic_transition_features else None,
                 )
             greedy_actions = apply_leg_aware_hysteresis(
                 q_values,
@@ -2672,6 +2728,7 @@ def train_minute_to_hour_dqn(
                     batch["previous_actions"],
                     batch["constraint_features"],
                     action_features=current_action_features,
+                    dynamic_state=batch.get("position_dynamic"),
                 )
                 chosen_q = q.gather(1, batch["actions"].unsqueeze(1)).squeeze(1)
                 with torch.no_grad():
@@ -2682,6 +2739,7 @@ def train_minute_to_hour_dqn(
                         batch["next_previous_actions"],
                         batch["next_constraint_features"],
                         action_features=next_action_features,
+                        dynamic_state=batch.get("next_position_dynamic"),
                     )
                     next_actions = apply_leg_aware_hysteresis(
                         next_online,
@@ -2701,6 +2759,7 @@ def train_minute_to_hour_dqn(
                         batch["next_previous_actions"],
                         batch["next_constraint_features"],
                         action_features=next_action_features,
+                        dynamic_state=batch.get("next_position_dynamic"),
                     )
                     next_q = next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
                     # fp32 TD target/loss under AMP: with reward_scale=10_000 the bootstrapped
@@ -2815,13 +2874,29 @@ def train_minute_to_hour_dqn(
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
         "cash_idle_penalty_bps": float(config.env.cash_idle_penalty_bps),
-        "model_version": POSITION_AWARE_POLICY_MODEL_VERSION if config.use_transition_features else CONSTRAINED_POLICY_MODEL_VERSION,
+        "model_version": (
+            DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION
+            if config.use_dynamic_transition_features
+            else POSITION_AWARE_POLICY_MODEL_VERSION
+            if config.use_transition_features
+            else CONSTRAINED_POLICY_MODEL_VERSION
+        ),
         "uses_constraint_features": True,
         "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
         "uses_transition_features": bool(config.use_transition_features),
         "transition_feature_names": list(TRANSITION_FEATURE_NAMES) if config.use_transition_features else [],
         "transition_feature_dim": TRANSITION_FEATURE_DIM if config.use_transition_features else 0,
         "transition_feature_schema_version": TRANSITION_FEATURE_SCHEMA_VERSION if config.use_transition_features else 0,
+        "uses_dynamic_transition_features": bool(config.use_dynamic_transition_features),
+        "dynamic_transition_feature_names": (
+            list(DYNAMIC_TRANSITION_FEATURE_NAMES) if config.use_dynamic_transition_features else []
+        ),
+        "dynamic_transition_feature_dim": (
+            DYNAMIC_TRANSITION_FEATURE_DIM if config.use_dynamic_transition_features else 0
+        ),
+        "dynamic_transition_feature_schema_version": (
+            DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION if config.use_dynamic_transition_features else 0
+        ),
         "warm_start": warm_start_info or {"loaded": False},
         "resume": resume_info,
         "last_completed_step": int(config.learning.train_steps if start_step <= config.learning.train_steps else start_step - 1),

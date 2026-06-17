@@ -8241,6 +8241,85 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(weighted["weight_min"], 0.05)
         self.assertLessEqual(weighted["weight_max"], 1.0)
 
+    def test_dynamic_transition_features_train_end_to_end_and_artifacts(self) -> None:
+        # PR-D D2/D3b: with use_dynamic_transition_features=True the env->replay->forward(dynamic_state)
+        # wiring trains end-to-end (shapes line up through rollout, current-Q, and the TD next-state forwards)
+        # and the artifact records the dynamic schema. Default off keeps the artifact byte-identical (no
+        # dynamic keys / legacy model_version) -- the existing trainer tests cover the off path numerically.
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit,
+            MinuteToHourEnvConfig,
+            MinuteToHourTrainingConfig,
+            train_minute_to_hour_dqn,
+        )
+        from rl_quant.trading_constraints import (
+            DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION,
+            DYNAMIC_TRANSITION_FEATURE_DIM,
+            DYNAMIC_TRANSITION_FEATURE_NAMES,
+            DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION,
+        )
+
+        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+            n = len(dates)
+            returns = torch.zeros((n, 2))
+            returns[:, 1] = 0.01  # non-trivial QQQ return so the dynamic P&L-excursion state is non-degenerate
+            return HourFromMinuteDataSplit(
+                name=name,
+                decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
+                next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((n, 1, 1)), action_returns=returns,
+                action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                valid_start_indices=torch.arange(n - 1, dtype=torch.long),
+                valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1),
+                hours_lookback=1, minutes_per_hour=1,
+            )
+
+        train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
+        val = make_split("val", ["2026-06-01", "2026-06-02"])
+        learning = DQNLearningConfig(
+            num_envs=2, episode_length=3, replay_capacity=64, batch_size=4, train_steps=8, warmup_steps=2,
+            gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=3, epsilon_start=0.2,
+            epsilon_end=0.0, eval_interval=4, grad_clip=1.0, use_amp=False,
+        )
+
+        def run(dynamic: bool) -> dict:
+            config = MinuteToHourTrainingConfig(
+                env=MinuteToHourEnvConfig(num_envs=2, episode_length=3), learning=learning,
+                d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+                use_dynamic_transition_features=dynamic,
+            )
+            torch.manual_seed(0)
+            _, artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+            return artifacts
+
+        # Flag ON: trains end-to-end (no shape error through the dynamic-threaded forwards) + stamps schema.
+        on = run(True)
+        self.assertTrue(on["uses_dynamic_transition_features"])
+        self.assertEqual(on["model_version"], DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION)
+        self.assertEqual(on["dynamic_transition_feature_names"], list(DYNAMIC_TRANSITION_FEATURE_NAMES))
+        self.assertEqual(on["dynamic_transition_feature_dim"], DYNAMIC_TRANSITION_FEATURE_DIM)
+        self.assertEqual(on["dynamic_transition_feature_schema_version"], DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION)
+        # Flag OFF (default): the dynamic schema is absent and the model_version is the legacy contract.
+        off = run(False)
+        self.assertFalse(off["uses_dynamic_transition_features"])
+        self.assertEqual(off["dynamic_transition_feature_names"], [])
+        self.assertEqual(off["dynamic_transition_feature_dim"], 0)
+        self.assertNotEqual(off["model_version"], DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION)
+
+        # Clean A/B perturbation: building the zero-init dynamic submodule restores the construction RNG, so
+        # flag-on shares flag-off's backbone init -> the FIRST optimizer step is identical (the dynamic head
+        # contributes 0 until trained), then the traces DIVERGE once the dynamic encoder receives gradient
+        # (the feature actually engages). This is the property a D4 A/B relies on to isolate the feature.
+        self.assertTrue(len(on["loss_trace"]) > 1 and len(off["loss_trace"]) == len(on["loss_trace"]))
+        self.assertAlmostEqual(on["loss_trace"][0], off["loss_trace"][0], places=6)
+        self.assertNotEqual(on["loss_trace"], off["loss_trace"])
+
     def test_minute_to_hour_training_state_resumes_from_checkpoint(self) -> None:
         from rl_quant.core import DQNLearningConfig
         from rl_quant.minute_to_hour_transformer import (
