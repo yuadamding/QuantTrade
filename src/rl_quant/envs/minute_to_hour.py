@@ -67,6 +67,18 @@ def transition_trade_cost_bps(
 ) -> TransitionCostBreakdown:
     """Compute the shared minute->hour transition cost breakdown (see TransitionCostBreakdown). Tensor-shaped,
     so it serves both the vectorized env and a 1-element evaluation step."""
+    # Central reward/cost accounting: reject impossible inputs (cheap metadata/scalar checks -- no device sync).
+    if previous_actions.shape != actions.shape:
+        raise ValueError("previous_actions and actions must have the same shape.")
+    if previous_actions.device != actions.device:
+        raise ValueError("previous_actions and actions must be on the same device.")
+    if previous_actions.dtype not in (torch.int16, torch.int32, torch.int64) or actions.dtype not in (
+        torch.int16, torch.int32, torch.int64
+    ):
+        raise ValueError("previous_actions and actions must be integer action-index tensors.")
+    cash_idle = float(cash_idle_penalty_bps)
+    if not (cash_idle >= 0.0) or cash_idle == float("inf"):
+        raise ValueError("cash_idle_penalty_bps must be finite and non-negative.")
     legs = trade_legs(
         previous_actions,
         actions,
@@ -87,9 +99,16 @@ class VectorizedMinuteToHourEnv:
         if not (0 <= config.initial_action < len(data.action_names)):
             raise ValueError("initial_action is outside the action space.")
         # cash_index is special everywhere (cash-idle penalty, zero shadow exposure, label fallback); an
-        # out-of-range index would silently mis-charge the idle penalty / zero the wrong action's exposure.
-        if not (0 <= int(config.constraints.cash_index) < len(data.action_names)):
+        # out-of-range OR non-cash index would silently mis-charge the idle penalty / zero the wrong action's
+        # exposure / force-restore the wrong action. Validate range AND that it actually points to a cash action.
+        cash_index = int(config.constraints.cash_index)
+        if not (0 <= cash_index < len(data.action_names)):
             raise ValueError("constraints.cash_index is outside the action space.")
+        if build_action_metadata(list(data.action_names))[cash_index].asset_class != "cash":
+            raise ValueError(
+                f"constraints.cash_index={cash_index} points to {data.action_names[cash_index]!r}, which is "
+                "not a cash action (action-metadata asset_class != 'cash')."
+            )
         self.data = data if data.minute_features.device == device else data.to(device)
         self.config = config
         self.device = device

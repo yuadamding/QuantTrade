@@ -1147,6 +1147,9 @@ def train_minute_to_hour_dqn(
         "execution_shadow_weight_source": (
             "action_metadata.max_weight" if config.env.execution_env_reward_shadow else None
         ),
+        # The shadow currently uses a FEE-ONLY weight cost (fee_bps = one_way_cost_bps, no market impact);
+        # surfaced so it is not silently assumed to include impact before a cost/impact stress grid.
+        "execution_shadow_impact_kind": ("none" if config.env.execution_env_reward_shadow else None),
         # reward delta in REWARD units (scale-dependent) AND scale-normalised bps (comparable across runs).
         "execution_shadow_reward_delta_mean": (
             sum(shadow_reward_deltas) / len(shadow_reward_deltas) if shadow_reward_deltas else None

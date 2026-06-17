@@ -1,7 +1,8 @@
-# Wiring the execution engine into reward — design (DESIGN-ONLY, no number-moving code)
+# Wiring the execution engine into reward — shipped PR-3 contract + PR-4 plan (no number-moving code)
 
 Companion to the 2026-06-17 target memo and [architecture_migration_plan.md](architecture_migration_plan.md).
-This is the reviewable contract for the **next** step (PR-3, shadow mode); no code in this doc moves a number.
+This records the **shipped** PR-3 shadow-mode contract (§3) and the remaining PR-4 promotion plan (§4); the
+document itself is non-executable and moves no numbers.
 
 ## 0. Target & the honesty line
 
@@ -114,14 +115,14 @@ This MOVES results, so it merges only through the §2.1 gate: default off + byte
 (test block untouched) reporting the Δ metrics + PSR/DSR; explicit reportability label; one-flag rollback.
 Never bundled with PR-3.
 
-**Prerequisite (known latent drift):** `evaluate_minute_to_hour_policy` currently RECOMPUTES the reward/cost
-ledger inline (`legs`/`cost_bps`/`net_return`/equity) outside the env, and omits the env's
-`cash_idle_penalty_bps` (it isn't even passed to the evaluator). With the default `cash_idle_penalty_bps == 0`
-the two agree today, but they diverge for any nonzero-penalty run, and PR-4 would make this worse (eval must
-score the *execution* reward the env trains on). Before PR-4, route eval scoring through the env (or a single
-shared pure transition/reward primitive called by both `env.step` and the evaluator) so "only env/execution
-computes reward" actually holds. This is the eval-through-env refactor — bounded but multi-call-site (8+
-`evaluate_minute_to_hour_policy` call sites), tracked here, not rushed.
+**Prerequisite (partly done; remaining drift):** the cash-idle drift is FIXED — `evaluate_minute_to_hour_policy`
+now takes a `cash_idle_penalty_bps` argument and computes its ledger through the SHARED
+`transition_trade_cost_bps` (leg/switch/cash-idle accounting matches the env). What remains is that the eval
+still recomputes the REST of the rollout ledger (`net_return`/equity/action-selection/dynamic recurrence)
+outside the env. Before PR-4, route eval scoring fully through the env (or one shared reward primitive used by
+both `env.step` and the evaluator) so "only env/execution computes reward" holds end-to-end, not just for cost.
+Also resolve the weight-semantics question (§3) and confirm action-selection/hysteresis + transition features
+use the same cost basis as the execution reward (today they are leg-count, a behavioural prior).
 
 ## 5. Deferred / blocked (honesty line)
 

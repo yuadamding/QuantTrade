@@ -8178,7 +8178,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(float(cash_hold.cash_idle_bps[0]), 50.0)
 
         enter = bd(0, 1, cash_idle=50.0)  # CASH -> asset 1: a switch; leg cost > 0; switch penalty once; no idle
-        self.assertGreater(float(enter.leg_cost_bps[0]), 0.0)
+        self.assertEqual(float(enter.legs[0]), 1.0)  # entering from cash = one buy leg
+        self.assertEqual(float(enter.leg_cost_bps[0]), 10.0)  # legs * one_way_cost_bps
         self.assertEqual(float(enter.switch_penalty_bps[0]), 5.0)
         self.assertEqual(float(enter.cash_idle_bps[0]), 0.0)
         self.assertAlmostEqual(
@@ -8190,7 +8191,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(float(held.cash_idle_bps[0]), 0.0)
 
         exit_ = bd(1, 0, cash_idle=50.0)  # asset 1 -> CASH: a switch (sell leg + penalty) AND cash idle charged
-        self.assertGreater(float(exit_.leg_cost_bps[0]), 0.0)
+        self.assertEqual(float(exit_.legs[0]), 1.0)
+        self.assertEqual(float(exit_.leg_cost_bps[0]), 10.0)
         self.assertEqual(float(exit_.switch_penalty_bps[0]), 5.0)
         self.assertEqual(float(exit_.cash_idle_bps[0]), 50.0)
 
@@ -8201,7 +8203,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             torch.tensor([1]), torch.tensor([2]), constraints=two, cash_idle_penalty_bps=0.0).legs[0])
         legs_one = float(transition_trade_cost_bps(
             torch.tensor([1]), torch.tensor([2]), constraints=one, cash_idle_penalty_bps=0.0).legs[0])
-        self.assertGreater(legs_two, legs_one)  # counting both legs of an ETF<->ETF switch costs more
+        self.assertEqual(legs_two, 2.0)  # sell ETF1 + buy ETF2 counted as two legs
+        self.assertEqual(legs_one, 1.0)  # counted as a single switch leg
 
         # The env reward uses exactly (trade_cost_bps + cash_idle_bps) from the SAME primitive.
         split = HourFromMinuteDataSplit(
@@ -8226,6 +8229,43 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(float(b.cash_idle_bps[0]), 0.0)
         expected = 0.10 * 10_000.0 - (float(b.trade_cost_bps[0]) + float(b.cash_idle_bps[0])) * 10_000.0 / 10_000.0
         self.assertAlmostEqual(float(out["rewards"][0]), expected, places=4)
+
+    def test_minute_to_hour_env_rejects_non_cash_cash_index(self) -> None:
+        # Review #2: cash_index must point to a CASH action, not merely be in range -- otherwise the wrong
+        # action gets the cash-idle penalty / zero shadow exposure / label fallback. Out-of-range and
+        # in-range-but-not-cash both fail closed; the correct cash index constructs fine.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.minute_to_hour_transformer import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+
+        def split() -> HourFromMinuteDataSplit:
+            return HourFromMinuteDataSplit(
+                name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
+                next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
+                action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
+                valid_start_indices=torch.tensor([0, 1]), valid_index_mask=torch.tensor([True, True]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            )
+
+        base = default_minute_to_hour_constraints()
+        device = torch.device("cpu")
+        # cash_index=0 -> "CASH": constructs fine.
+        VectorizedMinuteToHourEnv(split(), MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+        # cash_index=1 -> "QQQ" (in range but not cash): fail closed.
+        with self.assertRaises(ValueError):
+            VectorizedMinuteToHourEnv(
+                split(), MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=1,
+                                               constraints=dataclasses.replace(base, cash_index=1)), device)
+        # cash_index out of range: fail closed.
+        with self.assertRaises(ValueError):
+            VectorizedMinuteToHourEnv(
+                split(), MinuteToHourEnvConfig(num_envs=1, episode_length=5,
+                                               constraints=dataclasses.replace(base, cash_index=5)), device)
 
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)

@@ -15,6 +15,8 @@ import torch
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
+QUANT_ROOT = PACKAGE_ROOT.parent
+QUANT_ROOT_TEXT = QUANT_ROOT.resolve().as_posix()
 SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -85,6 +87,23 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def relativize_local_path(path: Path) -> str:
+    text = path.resolve().as_posix()
+    if text == QUANT_ROOT_TEXT:
+        return "."
+    prefix = f"{QUANT_ROOT_TEXT}/"
+    if text.startswith(prefix):
+        return text[len(prefix) :]
+    return text
+
+
+def resolve_recorded_path(value: object) -> Path:
+    path = Path(str(value))
+    if path.is_absolute():
+        return path.resolve()
+    return (QUANT_ROOT / path).resolve()
 
 
 def timestamp_ms(value: str) -> int:
@@ -191,7 +210,7 @@ def validate_existing_sidecar(
     if sidecar.get("action_covariate_feature_schema_file_hash") != schema_file_hash:
         raise ValueError("action_covariate_feature_schema_file_hash mismatch")
     try:
-        stored_root = Path(str(sidecar.get("covariates_root", ""))).resolve()
+        stored_root = resolve_recorded_path(sidecar.get("covariates_root", ""))
         expected_root = covariates_root.resolve()
     except OSError as exc:
         raise ValueError("covariates_root is invalid") from exc
@@ -272,7 +291,7 @@ def build_sidecar(
             return {
                 "partition": dataset_path.parent.name,
                 "status": "skipped_existing_validated",
-                "output": str(output),
+                "output": relativize_local_path(output),
                 "rows": len(payload["decision_timestamps"]),
                 "actions": len(payload["action_names"]),
                 "features": len(sidecar.get("action_feature_names", [])),
@@ -350,7 +369,7 @@ def build_sidecar(
             "CASH covariate values are zero-imputed and mask=false; explicit "
             "stock_covariates_v1_type action-type channels disambiguate CASH from true zero values."
         ),
-        "covariates_root": str(covariates_root.resolve()),
+        "covariates_root": relativize_local_path(covariates_root),
         "action_covariate_feature_schema_file_hash": schema_file_hash,
         **covariates,
     }
@@ -397,7 +416,7 @@ def build_sidecar(
     return {
         "partition": dataset_path.parent.name,
         "status": "written" if stale_existing_error is None else "rewritten_stale_existing",
-        "output": str(output),
+        "output": relativize_local_path(output),
         "rows": len(decisions),
         "actions": len(action_names),
         "features": len(feature_names),
@@ -467,9 +486,9 @@ def main(argv: list[str] | None = None) -> int:
     non_reportable_partition_count = sum(1 for item in records if item.get("reportability_errors"))
     summary = {
         "created_at_utc": utc_now_iso(),
-        "partitions_root": str(args.partitions_root),
+        "partitions_root": relativize_local_path(args.partitions_root),
         "dataset_file_name": args.dataset_file_name,
-        "covariates_root": str(args.covariates_root),
+        "covariates_root": relativize_local_path(args.covariates_root),
         "covariate_manifest_hash": source_manifest_hash,
         "covariate_feature_schema_file_hash": schema_file_hash,
         "partition_selection": args.partition_selection,
@@ -486,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     summary_path = args.partitions_root.parent / "action_covariate_integration_manifest.json"
     atomic_write_text(summary_path, json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")
-    print(f"Integration summary -> {summary_path}", flush=True)
+    print(f"Integration summary -> {relativize_local_path(summary_path)}", flush=True)
     return 0
 
 
