@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from rl_quant.execution import fill_index as compute_fill_index
 from rl_quant.execution import transition_pnl
 from rl_quant.intraday_data import MarketDataSplit
 from rl_quant.core import (
@@ -493,7 +494,7 @@ def evaluate_policy(
 
             mid_now = float(data.close_mid[index].item())
             next_index = index + step_horizon
-            fill_index = min(index + latency_steps, next_index)
+            fill_index = compute_fill_index(index, step_horizon=step_horizon, latency_steps=latency_steps)
             mid_fill = float(data.close_mid[fill_index].item())
             mid_next = float(data.close_mid[next_index].item())
             half_spread_fill = float(data.half_spread[fill_index].item())

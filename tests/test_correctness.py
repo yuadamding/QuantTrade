@@ -7095,6 +7095,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=2), 12)
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=0), 10)
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=99), 15)
+        # The shared scalar fill_index agrees with the intraday vectorized _fill_indices (eval and the
+        # env/pretraining sites now share this one definition); lock it against drift.
+        from rl_quant.intraday_dqn import _fill_indices
+
+        for horizon in (1, 5):
+            for latency in (0, 1, 3, 99):
+                idx = torch.arange(20)
+                vec = _fill_indices(idx, step_horizon=horizon, latency_steps=latency)
+                want = [fill_index(int(i), step_horizon=horizon, latency_steps=latency) for i in idx.tolist()]
+                self.assertEqual(vec.tolist(), want)
 
         per_share = 0.05 + 0.02 + 0.01  # half_spread + extra + commission
         # cash->cash: everything zero.
