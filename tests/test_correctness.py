@@ -7095,16 +7095,27 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=2), 12)
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=0), 10)
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=99), 15)
-        # The shared scalar fill_index agrees with the intraday vectorized _fill_indices (eval and the
-        # env/pretraining sites now share this one definition); lock it against drift.
-        from rl_quant.intraday_dqn import _fill_indices
+        # The vectorized fill_indices now lives in execution.py (single source of truth) and the intraday
+        # env/pretraining sites import it; it must equal scalar fill_index applied element-wise. Lock it
+        # against drift across negative/zero/positive latency, and confirm device/dtype are preserved.
+        from rl_quant.execution import fill_indices as exec_fill_indices
 
         for horizon in (1, 5):
-            for latency in (0, 1, 3, 99):
+            for latency in (-3, 0, 1, 3, 99):
                 idx = torch.arange(20)
-                vec = _fill_indices(idx, step_horizon=horizon, latency_steps=latency)
+                vec = exec_fill_indices(idx, step_horizon=horizon, latency_steps=latency)
                 want = [fill_index(int(i), step_horizon=horizon, latency_steps=latency) for i in idx.tolist()]
                 self.assertEqual(vec.tolist(), want)
+                self.assertEqual(vec.dtype, idx.dtype)
+                self.assertEqual(vec.device, idx.device)
+        # Vectorized helper carries the same step_horizon>0 guard as the scalar version.
+        with self.assertRaises(ValueError):
+            exec_fill_indices(torch.arange(4), step_horizon=0, latency_steps=1)
+        # Also assert the intraday env/pretraining sites import THIS helper (no private duplicate remains).
+        import rl_quant.intraday_dqn as _idqn
+
+        self.assertFalse(hasattr(_idqn, "_fill_indices"))
+        self.assertIs(_idqn.compute_fill_indices, exec_fill_indices)
 
         per_share = 0.05 + 0.02 + 0.01  # half_spread + extra + commission
         # cash->cash: everything zero.
@@ -7207,6 +7218,112 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=-3), 10)
         with self.assertRaises(ValueError):
             fill_index(10, step_horizon=0, latency_steps=1)
+
+    def test_execution_validation_hardening_followup(self) -> None:
+        # Follow-up validation hardening (review of 0732733): type-safe bar/lot counts, impact_model
+        # coercion, quote_side_plus_impact must carry real impact, positive/in-quote prices, and
+        # PositionState invariants. None of these change a valid run; they only fail closed on bad input.
+        from rl_quant.execution import (
+            ExecutionConfig,
+            FillLevel,
+            ImpactModel,
+            MarketSnapshot,
+            PositionState,
+            SymbolQuote,
+            simulate_transition,
+        )
+
+        # (a) Integer-like bars/lot: reject bool and fractional floats; ACCEPT integer-valued floats and
+        # coerce-store as int (so trade_scale et al. never see a fractional lot).
+        for kwargs in (
+            {"latency_steps": True}, {"step_horizon": True}, {"trade_lot_size": True},
+            {"latency_steps": 0.9}, {"step_horizon": 1.5}, {"trade_lot_size": 1.5},
+            {"step_horizon": float("nan")}, {"trade_lot_size": float("inf")},
+        ):
+            with self.assertRaises(ValueError):
+                ExecutionConfig(**kwargs)
+        coerced = ExecutionConfig(trade_lot_size=2.0, step_horizon=3.0, latency_steps=1.0)
+        self.assertEqual((coerced.trade_lot_size, coerced.step_horizon, coerced.latency_steps), (2, 3, 1))
+        for value in (coerced.trade_lot_size, coerced.step_horizon, coerced.latency_steps):
+            self.assertIsInstance(value, int)
+        self.assertEqual(coerced.trade_scale, 200.0)
+
+        # (b) impact_model: a mapping is coerced to ImpactModel; a bare string (or other type) is rejected
+        # at construction instead of crashing later on a missing .kind.
+        mapped = ExecutionConfig(
+            fill_level=FillLevel.QUOTE_SIDE_PLUS_IMPACT, impact_model={"kind": "linear", "coef_per_unit": 0.01}
+        )
+        self.assertIsInstance(mapped.impact_model, ImpactModel)
+        self.assertEqual(mapped.impact_model.kind, "linear")
+        for bad_impact in ("linear", 3, ["linear"]):
+            with self.assertRaises(ValueError):
+                ExecutionConfig(impact_model=bad_impact)
+
+        # (c) quote_side_plus_impact must apply a positive linear impact, else it is indistinguishable
+        # from quote_side yet claims to model impact.
+        for bad in (ImpactModel(kind="none"), ImpactModel(kind="linear", coef_per_unit=0.0)):
+            with self.assertRaises(ValueError):
+                ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE_PLUS_IMPACT, impact_model=bad)
+
+        # Granular fill-model properties (the report layer composes reportability from these + logs).
+        proxy = ExecutionConfig(fill_level=FillLevel.DELAYED_CLOSE)
+        self.assertEqual(
+            (proxy.proxy_fill_model, proxy.uses_crossable_quote_fills, proxy.applies_implemented_impact, proxy.real_executable_fill_model),
+            (True, False, False, False),
+        )
+        qside = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE)
+        self.assertEqual(
+            (qside.proxy_fill_model, qside.uses_crossable_quote_fills, qside.applies_implemented_impact, qside.real_executable_fill_model),
+            (False, True, False, True),
+        )
+        self.assertEqual(
+            (mapped.proxy_fill_model, mapped.uses_crossable_quote_fills, mapped.applies_implemented_impact, mapped.real_executable_fill_model),
+            (False, True, True, True),
+        )
+
+        # MarketSnapshot: mid must be positive and inside [best_bid, best_ask] when both are present.
+        for bad in (
+            {"mid": 0.0}, {"mid": -1.0},
+            {"mid": 200.0, "best_bid": 99.9, "best_ask": 100.1},  # above the ask
+            {"mid": 50.0, "best_bid": 99.9, "best_ask": 100.1},  # below the bid
+        ):
+            with self.assertRaises(ValueError):
+                MarketSnapshot(**bad)
+        MarketSnapshot(mid=100.0, best_bid=99.9, best_ask=100.1)  # valid, no raise
+
+        # SymbolQuote enforces the SAME mid-inside-quote invariant so _market() can't silently degrade a
+        # malformed-but-present quote to MISSING_QUOTE; a valid quote round-trips through _market().
+        with self.assertRaises(ValueError):
+            SymbolQuote(symbol="X", mid=200.0, best_bid=99.9, best_ask=100.1)
+        ok_quote = SymbolQuote(symbol="X", mid=100.0, best_bid=99.9, best_ask=100.1)
+        snap = ok_quote._market()
+        self.assertEqual((snap.mid, snap.best_bid, snap.best_ask), (100.0, 99.9, 100.1))
+
+        # PositionState invariants: finite position, non-negative integer bars_held, positive entry_price,
+        # and a flat (0) book carries no entry_price. Integer-valued bars_held floats coerce to int.
+        for kwargs in (
+            {"position": float("nan")},
+            {"position": 1.0, "bars_held": -1},
+            {"position": 1.0, "bars_held": 1.5},
+            {"position": 1.0, "bars_held": True},
+            {"position": 1.0, "entry_price": -5.0},
+            {"position": 0.0, "entry_price": 100.0},  # flat must not carry an entry price
+        ):
+            with self.assertRaises(ValueError):
+                PositionState(**kwargs)
+        held = PositionState(position=1.0, bars_held=2.0, entry_price=100.0)
+        self.assertEqual(held.bars_held, 2)
+        self.assertIsInstance(held.bars_held, int)
+        self.assertIsNone(PositionState(position=0.0).entry_price)
+
+        # A quote-side transition to flat records the close-out price on the OUTCOME (entry_fill_price)
+        # but leaves the flat next_state with entry_price=None (no stale exit price on a flat book).
+        qcfg = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE)
+        q_now = MarketSnapshot(mid=100.0, best_bid=99.9, best_ask=100.1)
+        to_flat = simulate_transition(PositionState(position=1.0), 0.0, q_now, q_now, q_now, is_terminal=False, config=qcfg)
+        self.assertAlmostEqual(to_flat.entry_fill_price, 99.9)  # sold the long at the bid
+        self.assertEqual(to_flat.next_state.position, 0.0)
+        self.assertIsNone(to_flat.next_state.entry_price)
 
     def test_execution_simulator_reproduces_intraday_reward(self) -> None:
         # Equivalence gate: delayed_close net_return must equal the intraday inline arithmetic exactly,

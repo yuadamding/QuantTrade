@@ -9,8 +9,10 @@ Encodes the real-life cost of moving from a HELD position to a candidate at deci
     (all dollar terms scaled by trade_scale = trade_lot_size * 100)
 
 This is the per-step decomposition currently inlined three times in ``intraday_dqn`` (env step, eval
-loop, pretraining-target builder). The module is a pure, dependency-light extraction so those sites --
-and, later, the weight-aware second-context / minute-to-hour paths -- can share ONE reward engine.
+loop, pretraining-target builder). The reward engine and the scalar helpers stay torch-free arithmetic
+(``transition_pnl`` runs on tensors OR python scalars) so those sites -- and, later, the weight-aware
+second-context / minute-to-hour paths -- can share ONE reward engine. The single tensor-only helper is
+``fill_indices`` (the vectorized counterpart of scalar ``fill_index``), which is why ``torch`` is imported.
 
 Honesty contract: ``delayed_close`` is a MID-price proxy with a symmetric half-spread cost, NOT a
 crossable fill, so ``real_executable_fill_model`` is False and fill prices are ``None``. Only the
@@ -23,8 +25,11 @@ This module changes no trainer's reward on its own; it is wired in (result-prese
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+
+import torch
 
 
 def _require_finite_nonnegative(name: str, value: float) -> None:
@@ -33,6 +38,39 @@ def _require_finite_nonnegative(name: str, value: float) -> None:
     coerced = float(value)
     if not math.isfinite(coerced) or coerced < 0.0:
         raise ValueError(f"{name} must be finite and non-negative; got {value!r}.")
+
+
+def _require_nonnegative_int(name: str, value: object) -> int:
+    # Bars/lots must be integer-like: reject bool, and reject a float that is non-finite or has a
+    # fractional part instead of silently truncating it (int(1.9) == 1 would rescale every dollar P&L).
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, not bool; got {value!r}.")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name} must be integer-like; got {value!r}.")
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be integer-like; got {value!r}.") from exc
+    if coerced < 0:
+        raise ValueError(f"{name} must be non-negative; got {value!r}.")
+    return coerced
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    coerced = _require_nonnegative_int(name, value)
+    if coerced <= 0:
+        raise ValueError(f"{name} must be positive; got {value!r}.")
+    return coerced
+
+
+def _require_positive_price(name: str, value: float) -> float:
+    # Equity/ETF prices must be strictly positive: a non-positive mid/quote/entry would produce
+    # meaningless P&L and costs. (A bare ``value <= 0`` would pass NaN, so check finiteness too.)
+    coerced = float(value)
+    if not math.isfinite(coerced) or coerced <= 0.0:
+        raise ValueError(f"{name} must be finite and positive; got {value!r}.")
+    return coerced
 
 
 class FillLevel(str, Enum):
@@ -64,6 +102,20 @@ class ImpactModel:
         _require_finite_nonnegative("impact_model.coef_per_unit", self.coef_per_unit)
 
 
+def _coerce_impact_model(value: object) -> ImpactModel:
+    # @dataclass does NOT enforce field types at runtime, so coerce a mapping and accept an ImpactModel,
+    # but reject anything else (e.g. a bare "linear" string) at construction -- otherwise the bad value
+    # sits silently until ``_impact_per_share`` reads ``.kind`` and crashes with an opaque AttributeError.
+    if isinstance(value, ImpactModel):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return ImpactModel(**value)
+        except TypeError as exc:
+            raise ValueError(f"invalid impact_model mapping: {value!r}") from exc
+    raise ValueError(f"impact_model must be an ImpactModel or mapping; got {type(value).__name__}.")
+
+
 @dataclass(frozen=True)
 class ExecutionConfig:
     fill_level: FillLevel = FillLevel.DELAYED_CLOSE
@@ -83,25 +135,58 @@ class ExecutionConfig:
         # falling through to quote-side logic and crashing later on a missing .value).
         object.__setattr__(self, "fill_level", FillLevel(self.fill_level))
         object.__setattr__(self, "terminal_policy", TerminalPolicy(self.terminal_policy))
-        if int(self.latency_steps) < 0:
-            raise ValueError(f"latency_steps must be >= 0 (0 = no latency); got {self.latency_steps}.")
-        if int(self.step_horizon) <= 0:
-            raise ValueError(f"step_horizon must be positive; got {self.step_horizon}.")
-        if int(self.trade_lot_size) <= 0:
-            raise ValueError(f"trade_lot_size must be positive; got {self.trade_lot_size}.")
+        # Coerce-and-store the bar/lot counts so a fractional value can't slip through int() truncation
+        # (int(1.9) == 1) and silently rescale every dollar P&L through trade_scale.
+        object.__setattr__(self, "latency_steps", _require_nonnegative_int("latency_steps", self.latency_steps))
+        object.__setattr__(self, "step_horizon", _require_positive_int("step_horizon", self.step_horizon))
+        object.__setattr__(self, "trade_lot_size", _require_positive_int("trade_lot_size", self.trade_lot_size))
         _require_finite_nonnegative("commission_per_share", self.commission_per_share)
         _require_finite_nonnegative("extra_cost_per_share", self.extra_cost_per_share)
         _require_finite_nonnegative("spread_multiplier", self.spread_multiplier)
-        # impact_model validated in ImpactModel.__post_init__.
+        object.__setattr__(self, "impact_model", _coerce_impact_model(self.impact_model))
+        # quote_side_plus_impact must carry a REAL (positive linear) impact: otherwise it is numerically
+        # identical to plain quote_side yet would still advertise that it models impact. Fail closed and
+        # tell the caller to use quote_side for a zero-impact crossable fill.
+        if self.fill_level == FillLevel.QUOTE_SIDE_PLUS_IMPACT and not (
+            self.impact_model.kind == "linear" and self.impact_model.coef_per_unit > 0.0
+        ):
+            raise ValueError(
+                "quote_side_plus_impact requires impact_model.kind='linear' with coef_per_unit > 0; "
+                "use quote_side for a zero-impact crossable fill."
+            )
 
     @property
     def trade_scale(self) -> float:
         return float(self.trade_lot_size) * 100.0
 
     @property
-    def real_executable_fill_model(self) -> bool:
-        # delayed_close / mid_plus_spread are proxies, NOT crossable fills -> honestly not real.
+    def uses_crossable_quote_fills(self) -> bool:
+        # quote_side / quote_side_plus_impact buy at ask and sell at bid -> a real, crossable fill model.
         return self.fill_level in (FillLevel.QUOTE_SIDE, FillLevel.QUOTE_SIDE_PLUS_IMPACT)
+
+    @property
+    def applies_implemented_impact(self) -> bool:
+        # True only when a positive linear impact is actually applied. __post_init__ guarantees this for
+        # quote_side_plus_impact, but it is expressed independently so the report layer can check the
+        # impact axis on its own (a separate dimension from "are fills crossable").
+        return (
+            self.fill_level == FillLevel.QUOTE_SIDE_PLUS_IMPACT
+            and self.impact_model.kind == "linear"
+            and self.impact_model.coef_per_unit > 0.0
+        )
+
+    @property
+    def proxy_fill_model(self) -> bool:
+        # delayed_close / mid_plus_spread are mid-based proxies, NOT crossable fills.
+        return self.fill_level in (FillLevel.DELAYED_CLOSE, FillLevel.MID_PLUS_SPREAD)
+
+    @property
+    def real_executable_fill_model(self) -> bool:
+        # The FILL MODEL is real iff fills are crossable quote-side fills. NOTE: a fully reportable "real
+        # executable trade" is STRICTER -- it also needs latency P&L, applied impact, AND real fill-price
+        # logs -- and must be judged at the report layer from this flag AND the decision logs, never from
+        # config alone. This property is only the fill-model half of that judgement.
+        return self.uses_crossable_quote_fills
 
 
 @dataclass(frozen=True)
@@ -109,6 +194,17 @@ class PositionState:
     position: float  # signed units; intraday {-1, 0, 1}; weight-aware paths may use a weight
     bars_held: int = 0
     entry_price: float | None = None
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.position)):
+            raise ValueError(f"position must be finite; got {self.position!r}.")
+        object.__setattr__(self, "bars_held", _require_nonnegative_int("bars_held", self.bars_held))
+        if self.entry_price is not None:
+            _require_positive_price("entry_price", self.entry_price)
+        # A flat book holds no open position, so it carries no entry price -- the same invariant the
+        # terminal-liquidation fix enforces, applied generally so no path can leave stale entry state.
+        if self.position == 0.0 and self.entry_price is not None:
+            raise ValueError("a flat position (0) must not carry an entry_price.")
 
 
 @dataclass(frozen=True)
@@ -119,16 +215,24 @@ class MarketSnapshot:
     best_ask: float | None = None
 
     def __post_init__(self) -> None:
-        if not math.isfinite(float(self.mid)):
-            raise ValueError(f"mid must be finite; got {self.mid!r}.")
+        # A non-positive mid would produce meaningless P&L and costs (and crossing distances).
+        _require_positive_price("mid", self.mid)
         # A negative half_spread would turn the cost into a NEGATIVE cost (paying the agent to trade).
         _require_finite_nonnegative("half_spread", self.half_spread)
         for name in ("best_bid", "best_ask"):
             value = getattr(self, name)
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite when provided; got {value!r}.")
-        if self.best_bid is not None and self.best_ask is not None and self.best_bid > self.best_ask:
-            raise ValueError(f"best_bid ({self.best_bid}) must be <= best_ask ({self.best_ask}).")
+        if self.best_bid is not None and self.best_ask is not None:
+            if self.best_bid > self.best_ask:
+                raise ValueError(f"best_bid ({self.best_bid}) must be <= best_ask ({self.best_ask}).")
+            # The mid must sit inside the quoted market: a mid outside [bid, ask] makes the quote-side
+            # crossing distance |fill - mid| nonsensical (negative or absurdly large).
+            if not (self.best_bid <= self.mid <= self.best_ask):
+                raise ValueError(
+                    f"mid ({self.mid}) must lie within [best_bid, best_ask] "
+                    f"([{self.best_bid}, {self.best_ask}]) when both quotes are provided."
+                )
 
 
 @dataclass(frozen=True)
@@ -151,14 +255,30 @@ class TransitionOutcome:
 def fill_index(now_index: int, *, step_horizon: int, latency_steps: int) -> int:
     """Bar at which a decision fills: ``min(now + latency, next)``, capped at the next decision bar.
 
-    ``latency_steps <= 0`` collapses the fill to the current bar (decision and fill coincide). Mirrors
-    intraday ``_fill_indices`` exactly, so a fill can never be pushed past the holding horizon."""
+    ``latency_steps <= 0`` collapses the fill to the current bar (decision and fill coincide). Mirrors the
+    vectorized ``fill_indices`` exactly, so a fill can never be pushed past the holding horizon."""
     if int(step_horizon) <= 0:
         raise ValueError(f"step_horizon must be positive; got {step_horizon}.")
     next_index = now_index + int(step_horizon)
     if int(latency_steps) <= 0:
         return now_index
     return min(now_index + int(latency_steps), next_index)
+
+
+def fill_indices(now_indices: torch.Tensor, *, step_horizon: int, latency_steps: int) -> torch.Tensor:
+    """Vectorized counterpart of scalar :func:`fill_index`: the per-element fill bar for a batch of
+    decision bars, ``min(now + latency, now + step_horizon)`` with ``latency <= 0`` collapsing to ``now``.
+
+    The single source of truth for vectorized fill timing (intraday env step + pretraining targets). It is
+    byte-for-byte equal to ``fill_index`` applied element-wise (``torch.minimum`` is the per-element min),
+    preserves the input tensor's device and dtype, and -- unlike the old inline helper -- carries the same
+    ``step_horizon > 0`` guard as the scalar version."""
+    if int(step_horizon) <= 0:
+        raise ValueError(f"step_horizon must be positive; got {step_horizon}.")
+    if int(latency_steps) <= 0:
+        return now_indices
+    next_indices = now_indices + int(step_horizon)
+    return torch.minimum(now_indices + int(latency_steps), next_indices)
 
 
 def transition_pnl(
@@ -275,10 +395,17 @@ def simulate_transition(
         next_state = PositionState(position=0.0, bars_held=0, entry_price=None)
     else:
         held = new == old
+        # A transition that ends FLAT carries no entry price -- the close-out price is recorded on the
+        # outcome (entry_fill_price), not on the next state. (For quote-side fills entry_fill_price is a
+        # real bid/ask, so without this a flat next_state would carry a stale exit price.)
+        if new == 0.0:
+            next_entry_price: float | None = None
+        else:
+            next_entry_price = state.entry_price if held else entry_fill_price
         next_state = PositionState(
             position=new,
             bars_held=state.bars_held + 1 if held else 0,
-            entry_price=state.entry_price if held else entry_fill_price,
+            entry_price=next_entry_price,
         )
     return TransitionOutcome(
         old_latency_return=old_latency_return,
@@ -349,8 +476,17 @@ class SymbolQuote:
             value = getattr(self, name)
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{self.symbol}.{name} must be finite when provided; got {value!r}.")
-        if self.best_bid is not None and self.best_ask is not None and self.best_bid > self.best_ask:
-            raise ValueError(f"{self.symbol}: best_bid ({self.best_bid}) must be <= best_ask ({self.best_ask}).")
+        if self.best_bid is not None and self.best_ask is not None:
+            if self.best_bid > self.best_ask:
+                raise ValueError(f"{self.symbol}: best_bid ({self.best_bid}) must be <= best_ask ({self.best_ask}).")
+            # Enforce the SAME mid-inside-quote invariant as MarketSnapshot so _market() can never forward
+            # an out-of-quote mid: otherwise _make_leg would catch the MarketSnapshot ValueError and
+            # silently downgrade a (malformed-but-present) quote to a MISSING_QUOTE fill.
+            if not (self.best_bid <= self.mid <= self.best_ask):
+                raise ValueError(
+                    f"{self.symbol}: mid ({self.mid}) must lie within [best_bid, best_ask] "
+                    f"([{self.best_bid}, {self.best_ask}])."
+                )
 
     def _market(self) -> MarketSnapshot:
         return MarketSnapshot(mid=self.mid, half_spread=self.half_spread, best_bid=self.best_bid, best_ask=self.best_ask)

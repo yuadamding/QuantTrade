@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from rl_quant.execution import fill_index as compute_fill_index
+from rl_quant.execution import fill_indices as compute_fill_indices
 from rl_quant.execution import transition_pnl
 from rl_quant.intraday_data import MarketDataSplit
 from rl_quant.core import (
@@ -91,13 +92,6 @@ def _apply_action_threshold(q_values: torch.Tensor, current_positions: torch.Ten
     return torch.where(should_switch, greedy_actions, current_actions)
 
 
-def _fill_indices(indices: torch.Tensor, *, step_horizon: int, latency_steps: int) -> torch.Tensor:
-    next_indices = indices + step_horizon
-    if latency_steps <= 0:
-        return indices
-    return torch.minimum(indices + latency_steps, next_indices)
-
-
 class ReplayBuffer(TensorReplayBuffer):
     def __init__(self, capacity: int, device: torch.device) -> None:
         super().__init__(
@@ -161,7 +155,7 @@ class VectorizedMarketEnv:
         current_indices = self.indices.clone()
         current_positions = self.positions.clone()
         next_indices = current_indices + self.step_horizon
-        fill_indices = _fill_indices(
+        fill_indices = compute_fill_indices(
             current_indices,
             step_horizon=self.step_horizon,
             latency_steps=self.latency_steps,
@@ -265,7 +259,7 @@ def _build_pretraining_targets(
     valid_mask = candidate_indices + step_horizon < day_end_for_candidate
     indices = candidate_indices[valid_mask]
     next_indices = indices + step_horizon
-    fill_indices = _fill_indices(indices, step_horizon=step_horizon, latency_steps=latency_steps)
+    fill_indices = compute_fill_indices(indices, step_horizon=step_horizon, latency_steps=latency_steps)
 
     mid_now = data.close_mid[indices].view(-1, 1, 1)
     mid_fill = data.close_mid[fill_indices].view(-1, 1, 1)
