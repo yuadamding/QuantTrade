@@ -71,6 +71,50 @@ TRANSITION_FEATURE_NAMES = [
 ]
 TRANSITION_FEATURE_DIM = len(TRANSITION_FEATURE_NAMES)
 
+# PR-D dynamic position state (opt-in, behind use_dynamic_transition_features; D1 lands the builder/constants
+# only -- nothing consumes them until D3). These columns carry the HELD position's realized-P&L EXCURSION,
+# the signal the static [A,A,F] table and the constraint_features counters do NOT contain, so a
+# position-aware Q can weigh hold-vs-exit by how the open position has actually performed. This env is
+# RETURN-based (no prices / target weights), so the design's price-relative and executed-weight columns are
+# intentionally absent; the holding/cooldown/switch/leg counters are already in constraint_features and are
+# deliberately NOT duplicated here.
+DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION = 2
+# A distinct model contract so a dynamic-transition-aware checkpoint (wider input) cannot be confused with a
+# v3 static-transition one at load.
+DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION = 4
+DYNAMIC_TRANSITION_FEATURE_NAMES = [
+    "unrealized_pnl",  # compounded return since entry
+    "max_adverse_excursion",  # most-negative cumulative return since entry (<= 0)
+    "max_favorable_excursion",  # most-positive cumulative return since entry (>= 0)
+    "drawdown_from_peak",  # max_favorable_excursion - unrealized_pnl (>= 0)
+    "runup_from_trough",  # unrealized_pnl - max_adverse_excursion (>= 0)
+]
+DYNAMIC_TRANSITION_FEATURE_DIM = len(DYNAMIC_TRANSITION_FEATURE_NAMES)
+
+
+def build_dynamic_transition_features(
+    *,
+    unrealized_pnl: torch.Tensor,
+    mae: torch.Tensor,
+    mfe: torch.Tensor,
+    clamp: float = 1.0,
+) -> torch.Tensor:
+    """Per-env ``[B, DYNAMIC_TRANSITION_FEATURE_DIM]`` dynamic position-state features (PR-D D1).
+
+    Built ONLY from the env's RETURN-based held-position bookkeeping (no prices/weights): the compounded
+    return since entry (``unrealized_pnl``), its max adverse / favorable excursion, and the derived
+    drawdown-from-peak and run-up-from-trough. Returns are clamped to +/-``clamp`` (derived spreads to
+    ``2*clamp``) so a runaway compounded value can't dominate the encoder -- mirroring
+    ``make_constraint_features`` normalize+clamp discipline. The block is per-env (independent of the
+    candidate action); the forward broadcasts it across candidates. Pure/deterministic; no model state."""
+    band = float(clamp)
+    upnl = unrealized_pnl.float().clamp(-band, band)
+    adverse = mae.float().clamp(-band, band)
+    favorable = mfe.float().clamp(-band, band)
+    drawdown = (favorable - upnl).clamp(0.0, 2.0 * band)
+    runup = (upnl - adverse).clamp(0.0, 2.0 * band)
+    return torch.stack([upnl, adverse, favorable, drawdown, runup], dim=1)
+
 
 def build_transition_feature_table(
     *,

@@ -6990,6 +6990,36 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(table[1, 2, col["est_cost_bps_over_100"]].item(), 5.0 / 100.0, places=6)
         self.assertEqual(table[1, 2, col["same_group"]].item(), 1.0)
 
+    def test_build_dynamic_transition_features(self) -> None:
+        # PR-D D1: additive per-env dynamic position-state features (P&L excursion). Static path untouched
+        # -> training byte-identical (covered by the unchanged trainer tests). Nothing consumes this until D3.
+        from rl_quant.trading_constraints import (
+            DYNAMIC_TRANSITION_FEATURE_DIM,
+            DYNAMIC_TRANSITION_FEATURE_NAMES,
+            build_dynamic_transition_features,
+        )
+
+        self.assertEqual(DYNAMIC_TRANSITION_FEATURE_DIM, len(DYNAMIC_TRANSITION_FEATURE_NAMES))
+        self.assertEqual(DYNAMIC_TRANSITION_FEATURE_NAMES[0], "unrealized_pnl")
+
+        upnl = torch.tensor([0.10, -0.20, 2.0])
+        mae = torch.tensor([-0.05, -0.30, -0.10])
+        mfe = torch.tensor([0.20, 0.00, 0.50])
+        out = build_dynamic_transition_features(unrealized_pnl=upnl, mae=mae, mfe=mfe, clamp=1.0)
+        self.assertEqual(tuple(out.shape), (3, DYNAMIC_TRANSITION_FEATURE_DIM))
+        col = {name: i for i, name in enumerate(DYNAMIC_TRANSITION_FEATURE_NAMES)}
+        # row 0: drawdown_from_peak = mfe - upnl = 0.10; runup_from_trough = upnl - mae = 0.15.
+        self.assertAlmostEqual(out[0, col["drawdown_from_peak"]].item(), 0.10, places=6)
+        self.assertAlmostEqual(out[0, col["runup_from_trough"]].item(), 0.15, places=6)
+        # row 2: upnl 2.0 clamps to 1.0; drawdown = mfe(0.5) - upnl(1.0) = -0.5 -> clamped to >= 0.
+        self.assertAlmostEqual(out[2, col["unrealized_pnl"]].item(), 1.0, places=6)
+        self.assertAlmostEqual(out[2, col["drawdown_from_peak"]].item(), 0.0, places=6)
+        self.assertAlmostEqual(out[2, col["runup_from_trough"]].item(), 1.0 - (-0.10), places=6)
+        # Derived spreads are always non-negative; deterministic.
+        self.assertTrue(bool((out[:, col["drawdown_from_peak"]] >= 0).all().item()))
+        self.assertTrue(bool((out[:, col["runup_from_trough"]] >= 0).all().item()))
+        self.assertTrue(torch.equal(out, build_dynamic_transition_features(unrealized_pnl=upnl, mae=mae, mfe=mfe, clamp=1.0)))
+
     def test_qnetwork_transition_features_condition_q_on_held_position(self) -> None:
         from rl_quant.minute_to_hour_transformer import MinuteToHourCausalTransformerQNetwork
         from rl_quant.trading_constraints import TRANSITION_FEATURE_DIM
