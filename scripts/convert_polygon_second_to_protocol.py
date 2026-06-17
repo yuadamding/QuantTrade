@@ -118,6 +118,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Permit diagnostic/backfill conversions whose preflight checks are non-reportable.",
     )
+    parser.add_argument(
+        "--allow-fixed-survivor-universe-diagnostic",
+        action="store_true",
+        help=(
+            "Forward the explicit fixed-survivor universe diagnostic override to gold second-context "
+            "builders. Outputs are marked non-reportable when the universe is not point-in-time."
+        ),
+    )
     parser.add_argument("--max-gold-chunks", type=int, default=0, help="0 means all chunks.")
     parser.add_argument("--max-hourly-chunks", type=int, default=0, help="0 means all chunks.")
     parser.add_argument("--wait-for-download", action="store_true")
@@ -209,6 +217,7 @@ def conversion_config_payload(
         "build_hourly",
         "allow_missing_action_context",
         "allow_non_reportable",
+        "allow_fixed_survivor_universe_diagnostic",
         "covariates_root",
         "covariate_feature_schema",
         "include_action_covariates",
@@ -682,6 +691,8 @@ def build_gold_command(
             command.append("--covariate-strict-coverage")
     if args.include_market_covariates:
         command.append("--include-market-covariates")
+    if args.allow_fixed_survivor_universe_diagnostic:
+        command.append("--allow-fixed-survivor-universe-diagnostic")
     return command
 
 

@@ -3761,6 +3761,24 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(config["covariate_silver_manifest_hash"], expected_manifest_hash)
         self.assertEqual(config["covariate_feature_schema_file_hash"], expected_schema_hash)
 
+    def test_second_context_converter_passes_fixed_survivor_universe_diagnostic_flag(self) -> None:
+        module = load_script("convert_polygon_second_to_protocol")
+        args = module.parse_args(["--allow-fixed-survivor-universe-diagnostic"])
+
+        command = module.build_gold_command(
+            args=args,
+            source_manifest=Path("source/manifest.csv"),
+            protocol_dataset_manifest=Path("protocol.json"),
+            actions=["CASH", "AAA"],
+            start_day=module.parse_date("2026-01-02"),
+            end_day=module.parse_date("2026-01-03"),
+            output=Path("out/dataset.pt"),
+        )
+        config = module.conversion_config_payload(args, actions=["CASH", "AAA"], universe_asof="2026-01-01")
+
+        self.assertIn("--allow-fixed-survivor-universe-diagnostic", command)
+        self.assertTrue(config["allow_fixed_survivor_universe_diagnostic"])
+
     def test_min_hold_action_mask_allows_current_action_and_cash(self) -> None:
         mask = build_action_mask(
             current_action=torch.tensor([3]),
