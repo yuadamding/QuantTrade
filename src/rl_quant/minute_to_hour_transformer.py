@@ -87,6 +87,11 @@ class HourFromMinuteDataSplit:
     action_feature_std: torch.Tensor | None = None
     action_feature_groups: dict[str, list[int]] = field(default_factory=dict)
     split_policy: dict[str, object] = field(default_factory=dict)
+    # Audit of the missing-selectable-label row filter (see _build_split): how many time-eligible rows
+    # were dropped, and whether the drop removed the split's LATEST reward row(s) -- which, for the test
+    # split, shrinks it below the full latest period and is gated as non-reportable.
+    excluded_missing_label_rows: int = 0
+    filter_removed_latest_reward_rows: bool = False
 
     @property
     def effective_context_bars_per_hour(self) -> int:
@@ -999,6 +1004,7 @@ def _build_split(
     reward_start_dt = None if reward_start_ts is None else _parse_utc_timestamp(reward_start_ts)
     reward_end_dt = None if reward_end_ts is None else _parse_utc_timestamp(reward_end_ts)
     valid: list[int] = []
+    time_eligible: list[int] = []
     for index, current_dt in enumerate(decision_subset_dt):
         following_dt = next_subset_dt[index]
         if reward_after_dt is not None and current_dt <= reward_after_dt:
@@ -1007,11 +1013,26 @@ def _build_split(
             continue
         if reward_end_dt is not None and following_dt > reward_end_dt:
             continue
+        # Time-eligible row (its reward window lies inside the split). Tracked separately from `valid`
+        # so the missing-selectable-label filter below cannot SILENTLY shrink the split's latest reward
+        # coverage without it being recorded and (for the test split) gated.
+        time_eligible.append(index)
         if bool(rows_with_selectable_missing_labels[index].item()):
             continue
         valid.append(index)
     if not valid:
         raise ValueError(f"No valid reward indices remain for split {name!r}.")
+    # Audit the filter: indices are chronological, so the LAST time-eligible row carries the latest
+    # reward. If the filter dropped it, the split no longer covers the latest complete period -- it is a
+    # "filtered fully-scorable universe", not the full latest period. For the TEST split that breaks the
+    # latest-period reportability contract, so fail closed (train/val record the count but are not gated).
+    excluded_missing_label_rows = len(time_eligible) - len(valid)
+    filter_removed_latest_reward_rows = bool(time_eligible) and valid[-1] != time_eligible[-1]
+    if name == "test" and filter_removed_latest_reward_rows:
+        dataset_reportability_errors = list(
+            dict.fromkeys([*dataset_reportability_errors, "test_filter_removed_latest_reward_rows"])
+        )
+        dataset_reportable = False
 
     if minute_feature_mean is None or minute_feature_std is None:
         minute_feature_mean, minute_feature_std = _masked_mean_std(raw_minute, raw_mask)
@@ -1065,6 +1086,8 @@ def _build_split(
         action_feature_std=action_feature_std,
         action_feature_groups=action_feature_groups,
         split_policy=dict(split_policy or {}),
+        excluded_missing_label_rows=excluded_missing_label_rows,
+        filter_removed_latest_reward_rows=filter_removed_latest_reward_rows,
     )
 
 

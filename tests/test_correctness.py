@@ -6645,8 +6645,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIsNone(latest([]))
 
     def test_label_span_is_fully_anchored_and_rejects_malformed(self) -> None:
-        module = load_script("train_hourly_from_second_protocol_partitions")
-        span = module._label_span
+        from rl_quant.partition_protocol import label_span as span
         # Bare date == one-day half-open window [date, date + 1 day) (never empty).
         start, end = span("2026-01-01")
         self.assertEqual((end - start).days, 1)
@@ -6659,6 +6658,188 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # Empty, inverted, and impossible-date ranges are malformed.
         for bad in ("2026-01-01_to_2026-01-01", "2026-02-01_to_2026-01-01", "2026-99-99", "2026-01-01_to_2026-99-99"):
             self.assertIsNone(span(bad), bad)
+
+    def test_strict_latest_validates_selected_labels_in_all_modes(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        fn = module.strict_latest_partition_violations
+        available = ["2026-01-01_to_2026-02-01", "2026-02-01_to_2026-03-01"]
+        # An UNKNOWN selected label (well-formed but not on disk) is reported even when truncated
+        # history is allowed -- it is never admissible, independent of the coverage override.
+        unknown = fn(
+            selected_labels=["2026-01-01_to_2026-02-01", "2026-06-01_to_2026-07-01"],
+            all_available_labels=available,
+            allow_truncated_training_history=True,
+        )
+        self.assertTrue(any("unknown labels" in v for v in unknown))
+        # An INVALID selected label is validated too (the parser scans selected, not just available).
+        invalid_selected = fn(
+            selected_labels=["2026-13-99_to_2026-99-01"],
+            all_available_labels=available,
+            allow_truncated_training_history=True,
+        )
+        self.assertTrue(any("invalid labels" in v for v in invalid_selected))
+        # The overlap diagnostic names BOTH the overlapping window and the container it overlaps.
+        overlap = fn(
+            selected_labels=["2026-01-01_to_2026-03-31", "2026-03-15_to_2026-03-20"],
+            all_available_labels=["2026-01-01_to_2026-03-31", "2026-03-15_to_2026-03-20"],
+            allow_truncated_training_history=True,
+        )
+        joined = " ".join(overlap)
+        self.assertIn("2026-03-15_to_2026-03-20", joined)
+        self.assertIn("2026-01-01_to_2026-03-31", joined)
+
+    def test_partition_protocol_shared_by_both_trainers(self) -> None:
+        # Both training scripts must use the SAME latest-period gate implementation, so a fix in one
+        # path cannot leave the other behind (the calendar-holdout drift this shared module closes).
+        from rl_quant import partition_protocol
+
+        protocol = load_script("train_hourly_from_second_protocol_partitions")
+        self.assertIs(
+            protocol.strict_latest_partition_violations, partition_protocol.strict_latest_partition_violations
+        )
+        script_path = ROOT / "scripts" / "train_hourly_from_second_calendar_holdout.py"
+        spec = importlib.util.spec_from_file_location("calendar_holdout_shared_check", script_path)
+        calendar = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(calendar)
+        self.assertIs(
+            calendar.strict_latest_partition_violations, partition_protocol.strict_latest_partition_violations
+        )
+        self.assertIs(calendar.label_span, partition_protocol.label_span)
+
+    def test_calendar_holdout_selection_reportability(self) -> None:
+        script_path = ROOT / "scripts" / "train_hourly_from_second_calendar_holdout.py"
+        spec = importlib.util.spec_from_file_location("calendar_holdout_reportability", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for label in ("2026-01-01_to_2026-02-01", "2026-02-01_to_2026-03-01", "2026-03-01_to_2026-04-01"):
+                (root / label).mkdir(parents=True)
+                (root / label / "hour_from_second_dataset.pt").touch()
+            # Clean run over ALL partitions, ending at the latest available -> reportable, not manual.
+            args = module.parse_args(["--partitions-root", str(root), "--test-months", "1", "--val-months", "1"])
+            errors, manual = module.calendar_selection_reportability(args, module.partition_paths(args))
+            self.assertEqual(errors, [])
+            self.assertFalse(manual)
+            # Restricting to a non-latest suffix (--end-partition before the latest available) -> manual
+            # AND non-reportable, with the latest-availability violation named ("latest among selected"
+            # is NOT enough when newer complete partitions exist).
+            args2 = module.parse_args(
+                [
+                    "--partitions-root", str(root),
+                    "--end-partition", "2026-02-01_to_2026-03-01",
+                    "--test-months", "1", "--val-months", "1",
+                ]
+            )
+            errors2, manual2 = module.calendar_selection_reportability(args2, module.partition_paths(args2))
+            self.assertTrue(manual2)
+            self.assertTrue(any("not the latest available" in e for e in errors2), errors2)
+
+    def test_derive_reportable_partition_split_latest_suffix(self) -> None:
+        from rl_quant.partition_protocol import derive_reportable_partition_split, partition_windows_from_labels
+
+        labels = [f"2026-{m:02d}-01_to_2026-{m + 1:02d}-01" for m in range(1, 7)]  # 6 consecutive months
+        windows = partition_windows_from_labels(labels)
+        # val=2, test=1 -> test=[P5], val=[P3,P4], train=[P0,P1,P2].
+        split = derive_reportable_partition_split(windows, val_count=2, test_count=1)
+        self.assertEqual([w.label for w in split.test], [labels[5]])
+        self.assertEqual([w.label for w in split.val], [labels[3], labels[4]])
+        self.assertEqual([w.label for w in split.train], labels[:3])
+        # val=2, test=3 -> test=last 3, val=preceding 2, train=first 1.
+        split2 = derive_reportable_partition_split(windows, val_count=2, test_count=3)
+        self.assertEqual([w.label for w in split2.test], labels[3:])
+        self.assertEqual([w.label for w in split2.val], [labels[1], labels[2]])
+        self.assertEqual([w.label for w in split2.train], [labels[0]])
+        # Latest is by window END, independent of input order.
+        shuffled = partition_windows_from_labels([labels[2], labels[5], labels[0], labels[4], labels[1], labels[3]])
+        latest_test = derive_reportable_partition_split(shuffled, val_count=1, test_count=1).test
+        self.assertEqual([w.label for w in latest_test], [labels[5]])
+
+    def test_derive_reportable_partition_split_guards(self) -> None:
+        from datetime import datetime as _datetime
+
+        from rl_quant.partition_protocol import (
+            PartitionWindow,
+            derive_reportable_partition_split,
+            partition_windows_from_labels,
+        )
+
+        labels = [f"2026-{m:02d}-01_to_2026-{m + 1:02d}-01" for m in range(1, 5)]  # 4 months
+        windows = partition_windows_from_labels(labels)
+        with self.assertRaises(ValueError):  # need >= val+test+1 = 5, have 4
+            derive_reportable_partition_split(windows, val_count=2, test_count=2)
+        with self.assertRaises(ValueError):  # non-positive counts
+            derive_reportable_partition_split(windows, val_count=0, test_count=1)
+        with self.assertRaises(ValueError):  # truncation must be explicitly allowed
+            derive_reportable_partition_split(windows, val_count=1, test_count=1, train_window_count=1)
+        truncated = derive_reportable_partition_split(
+            windows, val_count=1, test_count=1, train_window_count=1, allow_truncated_training_history=True
+        )
+        self.assertEqual([w.label for w in truncated.train], [labels[1]])  # most RECENT train block kept
+        # Overlapping windows are not a valid walk-forward.
+        overlapping = [
+            PartitionWindow("a", _datetime(2026, 1, 1), _datetime(2026, 3, 1)),
+            PartitionWindow("b", _datetime(2026, 2, 1), _datetime(2026, 4, 1)),
+            PartitionWindow("c", _datetime(2026, 4, 1), _datetime(2026, 5, 1)),
+        ]
+        with self.assertRaises(ValueError):
+            derive_reportable_partition_split(overlapping, val_count=1, test_count=1)
+        # Incomplete windows are dropped, so test is the latest COMPLETE window.
+        incomplete = [*windows[:3], PartitionWindow(windows[3].label, windows[3].start, windows[3].end_exclusive, complete=False)]
+        self.assertEqual(
+            [w.label for w in derive_reportable_partition_split(incomplete, val_count=1, test_count=1).test],
+            [labels[2]],
+        )
+        # Malformed labels are rejected at parse time, not silently dropped.
+        with self.assertRaises(ValueError):
+            partition_windows_from_labels(["2026-01-01_to_garbage"])
+
+    def test_build_split_records_and_gates_latest_reward_row_filtering(self) -> None:
+        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
+
+        def _payload(invalid_row: int) -> dict:
+            returns = torch.tensor([[0.0, 0.01], [0.0, 0.02], [0.0, 0.03]], dtype=torch.float32)
+            label_valid = torch.ones((3, 2), dtype=torch.bool)
+            label_valid[invalid_row, 1] = False
+            returns[invalid_row, 1] = float("nan")  # contract: a label-invalid return must be NaN
+            return {
+                "decision_timestamps": [f"2026-06-10T1{5 + i}:30:00+00:00" for i in range(3)],
+                "next_timestamps": [f"2026-06-10T1{6 + i}:30:00+00:00" for i in range(3)],
+                "minute_timestamp_grid": [[[f"2026-06-10T1{5 + i}:29:59+00:00"]] for i in range(3)],
+                "minute_feature_names": ["m"],
+                "hour_feature_names": ["h"],
+                "action_names": ["CASH", "QQQ"],
+                "minute_features": torch.zeros((3, 1, 1, 1), dtype=torch.float32),
+                "minute_mask": torch.ones((3, 1, 1), dtype=torch.bool),
+                "hour_features": torch.zeros((3, 1, 1), dtype=torch.float32),
+                "action_returns": returns,
+                "action_valid_mask": torch.ones((3, 2), dtype=torch.bool),
+                "label_valid_mask": label_valid,
+                "source_bar_interval": "1s",
+                "context_bars_per_hour": 3600,
+                "minutes_per_hour": 3600,
+                "decision_grid_minutes": 60,
+                "bar_latency_ms": 1000,
+            }
+
+        # The LATEST row (index 2) has a selectable non-cash missing label -> the filter drops it, so the
+        # TEST split loses its latest reward row. Recorded AND gated non-reportable (not silently shrunk).
+        test_split = module._build_split(name="test", payload=_payload(2))
+        self.assertEqual(test_split.excluded_missing_label_rows, 1)
+        self.assertTrue(test_split.filter_removed_latest_reward_rows)
+        self.assertFalse(test_split.dataset_reportable)
+        self.assertIn("test_filter_removed_latest_reward_rows", test_split.dataset_reportability_errors)
+        self.assertEqual(test_split.valid_start_indices.tolist(), [0, 1])
+        # Same data as a TRAIN split: the drop is recorded but NOT gated by this rule (train may
+        # legitimately end before the latest reward row).
+        train_split = module._build_split(name="train", payload=_payload(2))
+        self.assertTrue(train_split.filter_removed_latest_reward_rows)
+        self.assertNotIn("test_filter_removed_latest_reward_rows", train_split.dataset_reportability_errors)
+        # Dropping a NON-latest row (index 0) does not trip the latest-reward gate.
+        mid_split = module._build_split(name="test", payload=_payload(0))
+        self.assertEqual(mid_split.excluded_missing_label_rows, 1)
+        self.assertFalse(mid_split.filter_removed_latest_reward_rows)
+        self.assertNotIn("test_filter_removed_latest_reward_rows", mid_split.dataset_reportability_errors)
 
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")

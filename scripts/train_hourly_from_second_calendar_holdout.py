@@ -20,6 +20,14 @@ SRC = PACKAGE_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+# Shared latest-period partition protocol -- the SAME gate the protocol-partition trainer uses, so the
+# two paths cannot drift. (stdlib-only module, safe to import at module scope once SRC is on sys.path.)
+from rl_quant.partition_protocol import (  # noqa: E402
+    chronological_latest_label,
+    label_span,
+    strict_latest_partition_violations,
+)
+
 
 def default_data_root() -> Path:
     shared_data = PROJECT_ROOT.parent / "data"
@@ -167,10 +175,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def parse_partition_end(label: str) -> date:
-    try:
-        return datetime.strptime(label.split("_to_", 1)[1][:10], "%Y-%m-%d").date()
-    except (IndexError, ValueError) as exc:
-        raise ValueError(f"Partition label must be YYYY-MM-DD_to_YYYY-MM-DD, got {label!r}") from exc
+    # Use the shared, fully-anchored parser so a malformed/suffixed label (e.g. ..._to_..._garbage) is
+    # rejected rather than silently truncated to its first 10 chars. The span end is exclusive.
+    span = label_span(label)
+    if span is None:
+        raise ValueError(f"Partition label must be YYYY-MM-DD or YYYY-MM-DD_to_YYYY-MM-DD, got {label!r}")
+    return span[1].date()
+
+
+def calendar_selection_reportability(args: argparse.Namespace, selected_paths: list[Path]) -> tuple[list[str], bool]:
+    """Strict latest-period reportability for the calendar-holdout partition selection.
+
+    Mirrors the protocol-partition gate: the selected partitions must be valid, non-overlapping, and end
+    at the latest AVAILABLE partition (not merely the latest among the selected paths). Any manual
+    override -- a date boundary (``--end-date`` / ``--test-start-date`` / ``--val-start-date``) or a
+    partition restriction (``--start/--end-partition`` / ``--max-partitions`` / ``earliest``) -- marks the
+    split as manual and non-reportable: an OFFICIAL latest-period claim must be the auto-derived split
+    over all available partitions. Returns ``(reportability_errors, manual_split_used)``."""
+    all_available = [p.parent.name for p in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))]
+    selected = [p.parent.name for p in selected_paths]
+    # allow_truncated_training_history=True: a calendar holdout may legitimately train on a recent window,
+    # so missing EARLIER history is not itself an error -- but the test must still be the latest available.
+    errors = strict_latest_partition_violations(
+        selected_labels=selected,
+        all_available_labels=all_available,
+        allow_truncated_training_history=True,
+    )
+    manual_split_used = bool(
+        args.test_start_date
+        or args.val_start_date
+        or args.end_date
+        or args.start_partition
+        or args.end_partition
+        or int(args.max_partitions) > 0
+        or args.partition_selection != "latest"
+    )
+    if manual_split_used:
+        errors = [*errors, "manual_or_restricted_calendar_split_used"]
+    # --end-date is a calendar boundary the partition-label gate cannot see; if it excludes the latest
+    # available data, the test is not the latest complete period.
+    if args.end_date and all_available:
+        latest_label = chronological_latest_label(all_available)
+        latest = label_span(latest_label) if latest_label else None
+        if latest is not None and datetime.strptime(args.end_date, "%Y-%m-%d") < latest[1]:
+            errors.append("end_date_excludes_latest_available_data")
+    return list(dict.fromkeys(errors)), manual_split_used
 
 
 def subtract_months(value: date, months: int) -> date:
@@ -326,9 +375,18 @@ def concatenate_payloads(
     return out
 
 
-def build_calendar_splits(payload: dict[str, Any], boundaries: dict[str, str | int]):
+def build_calendar_splits(
+    payload: dict[str, Any],
+    boundaries: dict[str, str | int],
+    *,
+    selection_errors: list[str] | None = None,
+    manual_split_used: bool = False,
+):
     from rl_quant.minute_to_hour_transformer import _build_split
 
+    # Reportability comes from the actual partition selection, not an unconditional True: a restricted
+    # or manually-bounded run cannot claim the latest complete period (see calendar_selection_reportability).
+    selection_errors = list(selection_errors or [])
     split_policy = {
         "split_mode": "calendar_holdout",
         "evaluation_design": "calendar_holdout_latest_months",
@@ -339,10 +397,19 @@ def build_calendar_splits(payload: dict[str, Any], boundaries: dict[str, str | i
         "val_end": boundaries["val_end_ts"],
         "test_start": boundaries["test_start_ts"],
         "test_end": boundaries["test_end_ts"],
-        "test_uses_latest_complete_period": True,
-        "manual_split_used": False,
-        "reportable": True,
-        "reportability_errors": [],
+        "test_uses_latest_complete_period": not selection_errors,
+        "manual_split_used": bool(manual_split_used),
+        "reportable": not selection_errors,
+        "reportability_errors": selection_errors,
+        # Machine-explicit attestation of the reportable split protocol: test = latest complete
+        # period(s); validation = the immediately preceding block; train = strictly earlier; the test
+        # block never drives model/recency selection. The first is gated on the partition selection
+        # (selection_errors); the rest are asserted from the calendar walk-forward boundaries.
+        "test_is_latest_available_suffix": not selection_errors,
+        "validation_immediately_precedes_test": boundaries["val_end_ts"] == boundaries["test_start_ts"],
+        "train_ends_before_validation": boundaries["train_end_ts"] <= boundaries["val_start_ts"],
+        "test_used_for_model_selection": False,
+        "test_used_for_recency_selection": False,
         "blocks": {
             "train": {"start": None, "end": boundaries["train_end_ts"], "reward_end": boundaries["train_end_ts"]},
             "val": {
@@ -499,7 +566,16 @@ def main(argv: list[str] | None = None) -> int:
         progress_every=args.payload_progress_every,
     )
     print("Building calendar train/val/test splits...", flush=True)
-    train_split, val_split, test_split = build_calendar_splits(payload, boundaries)
+    selection_errors, manual_split_used = calendar_selection_reportability(args, paths)
+    if selection_errors:
+        print(
+            "calendar-holdout partition selection is NOT latest-period reportable:\n  - "
+            + "\n  - ".join(selection_errors),
+            flush=True,
+        )
+    train_split, val_split, test_split = build_calendar_splits(
+        payload, boundaries, selection_errors=selection_errors, manual_split_used=manual_split_used
+    )
     constraints = build_constraints_from_args(args)
     initial_action = action_index(train_split.action_names, args.initial_action)
     runtime = torch_runtime_summary(device)
