@@ -8267,6 +8267,87 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 split(), MinuteToHourEnvConfig(num_envs=1, episode_length=5,
                                                constraints=dataclasses.replace(base, cash_index=5)), device)
 
+    def test_minute_to_hour_cash_index_validator_and_action_dtype_guards(self) -> None:
+        # Review #6 (afdf0a6): the SHARED cash-index validator fails closed identically in the env AND the
+        # evaluator (the eval previously could silently price the cash-idle penalty / cash fallback against the
+        # wrong action); it rejects wrong TYPES (bool/float/str would int-coerce silently); the default env
+        # build inspects ONLY the cash symbol (no spurious warnings for unknown non-cash tickers -- the
+        # afdf0a6 regression); the shared transition-cost helper rejects non-finite/negative cost scalars; and
+        # env.step rejects non-integer action tensors (.long() would silently truncate a float).
+        import dataclasses
+        import warnings
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import (
+            MinuteToHourEnvConfig,
+            VectorizedMinuteToHourEnv,
+            transition_trade_cost_bps,
+            validate_cash_index_for_actions,
+        )
+        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+
+        device = torch.device("cpu")
+
+        def split(action_names):
+            n = len(action_names)
+            return HourFromMinuteDataSplit(
+                name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
+                next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
+                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, n)),
+                action_valid_mask=torch.ones((2, n), dtype=torch.bool), label_valid_mask=torch.ones((2, n), dtype=torch.bool),
+                valid_start_indices=torch.tensor([0, 1]), valid_index_mask=torch.tensor([True, True]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            )
+
+        base = default_minute_to_hour_constraints()
+
+        # (1) The validator: a valid int 0 -> "CASH" returns 0; wrong types and bad indices fail closed
+        # (bool/float/str must NOT silently int-coerce; out-of-range and in-range-but-not-cash both raise).
+        self.assertEqual(validate_cash_index_for_actions(["CASH", "QQQ"], 0), 0)
+        for bad in (True, 1.0, "0", None):
+            with self.assertRaises(ValueError):
+                validate_cash_index_for_actions(["CASH", "QQQ"], bad)
+        with self.assertRaises(ValueError):
+            validate_cash_index_for_actions(["CASH", "QQQ"], 5)
+        with self.assertRaises(ValueError):
+            validate_cash_index_for_actions(["CASH", "QQQ"], 1)
+
+        # (2) Default (shadow-off) env build with an UNKNOWN non-cash ticker emits NO warning: only the cash
+        # symbol is inspected, not every action (all-action metadata build is gated behind the shadow flag).
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            VectorizedMinuteToHourEnv(
+                split(["CASH", "UNSEEN_TICKER_ZZ"]),
+                MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+        self.assertEqual(list(caught), [])
+
+        # (3) The evaluator fails closed on a non-cash cash_index too (the env-vs-eval consistency this fixes).
+        with self.assertRaises(ValueError):
+            evaluate_minute_to_hour_policy(
+                split(["CASH", "QQQ"]), _ConstantActionModel(2, 0), device=device,
+                constraints=dataclasses.replace(base, cash_index=1))
+
+        # (4) The shared transition-cost helper rejects non-finite / negative cost scalars (a NaN/negative
+        # one_way_cost or extra_switch would otherwise produce a garbage but silent cost ledger).
+        prev = torch.tensor([0], dtype=torch.long)
+        act = torch.tensor([1], dtype=torch.long)
+        with self.assertRaises(ValueError):
+            transition_trade_cost_bps(prev, act, constraints=dataclasses.replace(base, one_way_cost_bps=-1.0),
+                                      cash_idle_penalty_bps=0.0)
+        with self.assertRaises(ValueError):
+            transition_trade_cost_bps(prev, act, constraints=dataclasses.replace(base, extra_switch_penalty_bps=float("inf")),
+                                      cash_idle_penalty_bps=0.0)
+
+        # (5) env.step fails closed on a non-integer action tensor (float would truncate to the wrong index).
+        env = VectorizedMinuteToHourEnv(
+            split(["CASH", "QQQ"]), MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+        env.reset()
+        with self.assertRaises(ValueError):
+            env.step(torch.tensor([0.0]))
+
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
         # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.
@@ -9595,6 +9676,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # side-channel, never trained on) yet MUST surface the shadow deltas in the artifact. Train a tiny run
         # twice (shadow off vs on, same seed) -> identical loss/reward traces; only the on-run carries the deltas.
         from rl_quant.core import DQNLearningConfig
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
         from rl_quant.minute_to_hour_transformer import (
             HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
         )
@@ -9637,6 +9719,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIsNone(off["execution_shadow_reward_delta_mean"])
         self.assertTrue(on["execution_env_reward_shadow"])
         self.assertIsNotNone(on["execution_shadow_reward_delta_mean"])  # surfaced when on
+        # #8: real_executable is None when no shadow ran (distinguishes "no shadow" from "shadow, not real-exec")
+        # and explicitly False (never True) when on; the priced FEE is surfaced (and None when off).
+        self.assertIsNone(off["execution_shadow_real_executable"])
+        self.assertIsNone(off["execution_shadow_fee_bps"])
+        self.assertIs(on["execution_shadow_real_executable"], False)
+        self.assertEqual(on["execution_shadow_fee_bps"], float(default_minute_to_hour_constraints().one_way_cost_bps))
 
     def test_all_public_rl_quant_modules_import(self) -> None:
         import importlib

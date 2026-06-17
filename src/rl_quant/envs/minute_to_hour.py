@@ -1,6 +1,7 @@
 """Envs layer: the hour-allocation environment over sub-hour context -- state/transition/reward authority (extracted from rl_quant.minute_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -19,7 +20,7 @@ from rl_quant.datasets.hour_from_subhour import (
     default_minute_to_hour_constraints,
 )
 from rl_quant.execution import WeightExecutionCostConfig, weight_transition_cost_bps
-from rl_quant.features.action_risk import action_weight_tensor, build_action_metadata
+from rl_quant.features.action_risk import action_weight_tensor, build_action_metadata, infer_action_meta
 
 
 @dataclass
@@ -79,6 +80,12 @@ def transition_trade_cost_bps(
     cash_idle = float(cash_idle_penalty_bps)
     if not (cash_idle >= 0.0) or cash_idle == float("inf"):
         raise ValueError("cash_idle_penalty_bps must be finite and non-negative.")
+    one_way = float(constraints.one_way_cost_bps)
+    if not (one_way >= 0.0) or one_way == float("inf"):
+        raise ValueError("constraints.one_way_cost_bps must be finite and non-negative.")
+    extra_switch = float(constraints.extra_switch_penalty_bps)
+    if not (extra_switch >= 0.0) or extra_switch == float("inf"):
+        raise ValueError("constraints.extra_switch_penalty_bps must be finite and non-negative.")
     legs = trade_legs(
         previous_actions,
         actions,
@@ -88,27 +95,39 @@ def transition_trade_cost_bps(
     is_switch = (actions != previous_actions).float()
     return TransitionCostBreakdown(
         legs=legs,
-        leg_cost_bps=legs * float(constraints.one_way_cost_bps),
-        switch_penalty_bps=is_switch * float(constraints.extra_switch_penalty_bps),
-        cash_idle_bps=(actions == int(constraints.cash_index)).float() * float(cash_idle_penalty_bps),
+        leg_cost_bps=legs * one_way,
+        switch_penalty_bps=is_switch * extra_switch,
+        cash_idle_bps=(actions == int(constraints.cash_index)).float() * cash_idle,
     )
+
+
+def validate_cash_index_for_actions(action_names: Sequence[str], cash_index: object) -> int:
+    """Validate that ``cash_index`` is a real cash action for ``action_names`` and return it as an int.
+
+    Shared by the env and the evaluator so both fail closed identically: ``cash_index`` is special everywhere
+    (cash-idle penalty, zero shadow exposure, label/force-restore fallback), so an out-of-range, wrong-type, or
+    non-cash index would silently mis-charge the idle penalty / zero the wrong action's exposure / restore the
+    wrong action. We reject ``bool``/``float``/``str`` (``int(True)``/``int(2.9)`` would otherwise coerce
+    silently) and inspect ONLY the cash symbol via ``infer_action_meta(strict=True)`` — building metadata for
+    every action would emit spurious warnings for unknown non-cash symbols (e.g. a new ETF ticker)."""
+    if isinstance(cash_index, bool) or not isinstance(cash_index, int):
+        raise ValueError(f"constraints.cash_index must be an int, got {cash_index!r}.")
+    if not (0 <= cash_index < len(action_names)):
+        raise ValueError("constraints.cash_index is outside the action space.")
+    symbol = str(action_names[cash_index])
+    if infer_action_meta(symbol, strict=True).asset_class != "cash":
+        raise ValueError(
+            f"constraints.cash_index={cash_index} points to {symbol!r}, which is "
+            "not a cash action (action-metadata asset_class != 'cash')."
+        )
+    return cash_index
 
 
 class VectorizedMinuteToHourEnv:
     def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
         if not (0 <= config.initial_action < len(data.action_names)):
             raise ValueError("initial_action is outside the action space.")
-        # cash_index is special everywhere (cash-idle penalty, zero shadow exposure, label fallback); an
-        # out-of-range OR non-cash index would silently mis-charge the idle penalty / zero the wrong action's
-        # exposure / force-restore the wrong action. Validate range AND that it actually points to a cash action.
-        cash_index = int(config.constraints.cash_index)
-        if not (0 <= cash_index < len(data.action_names)):
-            raise ValueError("constraints.cash_index is outside the action space.")
-        if build_action_metadata(list(data.action_names))[cash_index].asset_class != "cash":
-            raise ValueError(
-                f"constraints.cash_index={cash_index} points to {data.action_names[cash_index]!r}, which is "
-                "not a cash action (action-metadata asset_class != 'cash')."
-            )
+        validate_cash_index_for_actions(data.action_names, config.constraints.cash_index)
         self.data = data if data.minute_features.device == device else data.to(device)
         self.config = config
         self.device = device
@@ -258,6 +277,10 @@ class VectorizedMinuteToHourEnv:
         position_dynamic = self.dynamic_state()
         constraint_features = self.constraint_features()
         action_mask = self.action_mask()
+        # Fail closed on non-integer action tensors: ``.long()`` would silently truncate a float (2.9 -> 2) or
+        # coerce a bool, picking the wrong action index instead of surfacing the caller's bug.
+        if actions.dtype not in (torch.int16, torch.int32, torch.int64):
+            raise ValueError(f"actions must be an integer action-index tensor, got dtype {actions.dtype}.")
         actions = actions.long()
         selected_valid = action_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
         fallback_actions = torch.argmax(action_mask.long(), dim=1)

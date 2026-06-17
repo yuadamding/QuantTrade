@@ -62,6 +62,7 @@ from rl_quant.envs.minute_to_hour import (
     MinuteToHourEnvConfig,
     VectorizedMinuteToHourEnv,
     transition_trade_cost_bps,
+    validate_cash_index_for_actions,
 )
 
 
@@ -166,6 +167,9 @@ def evaluate_minute_to_hour_policy(
     capture_rollout: bool = False,
 ) -> MinuteToHourEvaluationResult:
     constraints = constraints or default_minute_to_hour_constraints()
+    # Same fail-closed cash-index check the env runs at construction, so the evaluator cannot silently price the
+    # cash-idle penalty / cash fallback against the wrong (or non-cash) action when scored outside the env.
+    validate_cash_index_for_actions(data.action_names, constraints.cash_index)
     constraint_episode_length = int(episode_length or max(int(data.valid_start_indices.numel()), 1))
     data = data if data.minute_features.device == device else data.to(device)
     model.eval()
@@ -421,7 +425,9 @@ def evaluate_minute_to_hour_baselines(
     baseline is not expressible here; the references are always-cash and per-action buy-and-hold. This is an
     EVALUATION-ONLY helper: it changes no training/reward path."""
     constraints = constraints or default_minute_to_hour_constraints()
-    cash_index = int(constraints.cash_index)
+    # Fail closed (and normalise to int) before deriving initial_action / the cash skip below; each
+    # evaluate_minute_to_hour_policy call re-validates, but the baseline wiring reads cash_index first.
+    cash_index = validate_cash_index_for_actions(data.action_names, constraints.cash_index)
     action_count = len(data.action_names)
     common = dict(
         device=device, constraints=constraints, episode_length=episode_length,
@@ -1136,7 +1142,10 @@ def train_minute_to_hour_dqn(
         "execution_shadow_cost_model": (
             "static_single_slot_weight_bps" if config.env.execution_env_reward_shadow else None
         ),
-        "execution_shadow_real_executable": False,
+        # None when off (the field is meaningless without a shadow); False (never True) when on -- this is a
+        # cost-model shadow, NOT real-executable. None-vs-False lets a consumer distinguish "no shadow ran" from
+        # "shadow ran and is explicitly not real-executable".
+        "execution_shadow_real_executable": (False if config.env.execution_env_reward_shadow else None),
         # Schema version (the cost_delta basis CHANGED in v2: it is now vs the legacy LEG cost, switch penalty
         # held constant) + the auditable weight-source assumption (see docs/execution_wiring_design.md §3).
         "execution_shadow_schema_version": 2 if config.env.execution_env_reward_shadow else None,
@@ -1148,8 +1157,12 @@ def train_minute_to_hour_dqn(
             "action_metadata.max_weight" if config.env.execution_env_reward_shadow else None
         ),
         # The shadow currently uses a FEE-ONLY weight cost (fee_bps = one_way_cost_bps, no market impact);
-        # surfaced so it is not silently assumed to include impact before a cost/impact stress grid.
+        # surfaced (kind AND the actual bps) so it is not silently assumed to include impact before a
+        # cost/impact stress grid, and so the priced fee is auditable against the constraint config.
         "execution_shadow_impact_kind": ("none" if config.env.execution_env_reward_shadow else None),
+        "execution_shadow_fee_bps": (
+            float(config.env.constraints.one_way_cost_bps) if config.env.execution_env_reward_shadow else None
+        ),
         # reward delta in REWARD units (scale-dependent) AND scale-normalised bps (comparable across runs).
         "execution_shadow_reward_delta_mean": (
             sum(shadow_reward_deltas) / len(shadow_reward_deltas) if shadow_reward_deltas else None
