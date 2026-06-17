@@ -657,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_action=initial_action,
             constraints=constraints,
             episode_length=args.episode_length,
+            cash_idle_penalty_bps=args.cash_idle_penalty_bps,
         )
         val_result = evaluate_minute_to_hour_policy(
             val_split.to(device),
@@ -665,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_action=initial_action,
             constraints=constraints,
             episode_length=args.episode_length,
+            cash_idle_penalty_bps=args.cash_idle_penalty_bps,
         )
         test_result = evaluate_minute_to_hour_policy(
             test_split.to(device),
@@ -673,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_action=initial_action,
             constraints=constraints,
             episode_length=args.episode_length,
+            cash_idle_penalty_bps=args.cash_idle_penalty_bps,
             capture_rollout=True,
         )
         checkpoint_path = run_dir / "model.pt"

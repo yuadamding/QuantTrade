@@ -45,7 +45,6 @@ from rl_quant.trading_constraints import (
     build_transition_feature_table,
     make_constraint_features,
     sample_valid_actions,
-    trade_legs,
 )
 
 from rl_quant.models.minute_to_hour import (  # re-export: model moved to the models layer
@@ -59,7 +58,11 @@ from rl_quant.datasets.hour_from_subhour import (
     default_minute_to_hour_constraints,
     minute_to_hour_missing_label_report,
 )
-from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+from rl_quant.envs.minute_to_hour import (
+    MinuteToHourEnvConfig,
+    VectorizedMinuteToHourEnv,
+    transition_trade_cost_bps,
+)
 
 
 @dataclass
@@ -159,6 +162,7 @@ def evaluate_minute_to_hour_policy(
     constraints: TradingConstraintConfig | None = None,
     episode_length: int | None = None,
     reward_scale: float = 10_000.0,
+    cash_idle_penalty_bps: float = 0.0,
     capture_rollout: bool = False,
 ) -> MinuteToHourEvaluationResult:
     constraints = constraints or default_minute_to_hour_constraints()
@@ -293,19 +297,17 @@ def evaluate_minute_to_hour_policy(
         evaluated_rows.append(int(index))
         requested_actions.append(int(requested_action))
         executed_actions.append(int(action))
-        legs = float(
-            trade_legs(
-                prev_tensor,
-                action_tensor,
-                cash_index=constraints.cash_index,
-                count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
-            )[0].item()
+        # Shared with the env (transition_trade_cost_bps) so the eval ledger cannot drift from the training
+        # reward, and it now applies the env's cash_idle_penalty_bps (omitted before -> a latent drift for
+        # nonzero-penalty runs). For the default penalty (0) this is byte-identical to the prior inline cost.
+        legs_t, trade_cost_bps_t, cash_idle_bps_t = transition_trade_cost_bps(
+            prev_tensor, action_tensor, constraints=constraints, cash_idle_penalty_bps=cash_idle_penalty_bps
         )
+        legs = float(legs_t[0].item())
         is_switch = action != previous_action
-        cost_bps = legs * float(constraints.one_way_cost_bps)
-        cost_bps += float(is_switch) * float(constraints.extra_switch_penalty_bps)
+        cost_bps = float(trade_cost_bps_t[0].item())
         gross_return = float(data.action_returns[index, action].item())
-        net_return = gross_return - cost_bps / 10_000.0
+        net_return = gross_return - (cost_bps + float(cash_idle_bps_t[0].item())) / 10_000.0
         equity *= 1.0 + net_return
         equity_curve.append(equity)
         returns.append(net_return)
@@ -409,6 +411,7 @@ def evaluate_minute_to_hour_baselines(
     constraints: TradingConstraintConfig | None = None,
     episode_length: int | None = None,
     reward_scale: float = 10_000.0,
+    cash_idle_penalty_bps: float = 0.0,
     include_buy_and_hold: bool = True,
 ) -> dict[str, MinuteToHourEvaluationResult]:
     """Deterministic reference policies run through the SAME eval path as a trained model (identical cost /
@@ -422,7 +425,7 @@ def evaluate_minute_to_hour_baselines(
     action_count = len(data.action_names)
     common = dict(
         device=device, constraints=constraints, episode_length=episode_length,
-        reward_scale=reward_scale, initial_action=cash_index,
+        reward_scale=reward_scale, cash_idle_penalty_bps=cash_idle_penalty_bps, initial_action=cash_index,
     )
     results: dict[str, MinuteToHourEvaluationResult] = {
         "always_cash": evaluate_minute_to_hour_policy(data, _ConstantActionModel(action_count, cash_index), **common),
@@ -1054,6 +1057,7 @@ def train_minute_to_hour_dqn(
                 constraints=config.env.constraints,
                 episode_length=config.env.episode_length,
                 reward_scale=config.env.reward_scale,
+                cash_idle_penalty_bps=config.env.cash_idle_penalty_bps,
             )
             # Restore train() mode: the evaluator puts the shared q_network in eval(), which would
             # otherwise leave dropout disabled for all subsequent gradient steps.

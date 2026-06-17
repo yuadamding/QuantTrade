@@ -8123,6 +8123,33 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         hold = run(True, 0)  # CASH -> CASH: no trade -> zero shadow execution cost
         self.assertEqual(float(hold["execution_cost_bps_shadow"][0]), 0.0)
 
+    def test_minute_to_hour_eval_applies_cash_idle_penalty(self) -> None:
+        # Review #5 fix (eval-through-shared-primitive): evaluate_minute_to_hour_policy now applies the env's
+        # cash_idle_penalty_bps via the SHARED transition_trade_cost_bps -- it omitted it before (a latent
+        # drift vs the training reward). An always-cash policy's reward drops when the penalty is nonzero;
+        # with penalty 0 it is byte-identical to the prior behaviour (no cost on zero-return cash holds).
+        from rl_quant.minute_to_hour_transformer import HourFromMinuteDataSplit
+        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+
+        split = HourFromMinuteDataSplit(
+            name="eval",
+            decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
+            next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((4, 1, 1, 1)), minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((4, 1, 1)), action_returns=torch.zeros((4, 2)),
+            action_valid_mask=torch.ones((4, 2), dtype=torch.bool), label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1, 2, 3]), valid_index_mask=torch.tensor([True, True, True, True]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        always_cash = _ConstantActionModel(2, 0)  # holds CASH every row
+        device = torch.device("cpu")
+        free = evaluate_minute_to_hour_policy(split, always_cash, device=device, cash_idle_penalty_bps=0.0)
+        penalised = evaluate_minute_to_hour_policy(split, always_cash, device=device, cash_idle_penalty_bps=100.0)
+        self.assertEqual(free.total_reward_bps, 0.0)  # zero returns, no trade, no penalty -> zero
+        self.assertLess(penalised.total_reward_bps, free.total_reward_bps)  # cash-idle penalty now charged in eval
+
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
         # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.

@@ -36,6 +36,31 @@ class MinuteToHourEnvConfig:
     constraints: TradingConstraintConfig = field(default_factory=default_minute_to_hour_constraints)
 
 
+def transition_trade_cost_bps(
+    previous_actions: torch.Tensor,
+    actions: torch.Tensor,
+    *,
+    constraints: TradingConstraintConfig,
+    cash_idle_penalty_bps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The minute->hour transition cost, SHARED by the env's reward and the evaluation rollout so the two can
+    never drift (the architecture rule: only env/execution defines reward). Returns
+    ``(legs, trade_cost_bps, cash_idle_bps)`` where ``trade_cost_bps = legs*one_way_cost_bps +
+    switch*extra_switch_penalty_bps`` and ``cash_idle_bps`` is charged when the executed action is cash. The
+    net return is ``raw_return - (trade_cost_bps + cash_idle_bps)/1e4`` and the env reward is
+    ``reward_scale * net_return``. Tensor-shaped, so it serves the vectorized env and a 1-element eval step."""
+    legs = trade_legs(
+        previous_actions,
+        actions,
+        cash_index=constraints.cash_index,
+        count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
+    )
+    is_switch = (actions != previous_actions).float()
+    trade_cost_bps = legs * float(constraints.one_way_cost_bps) + is_switch * float(constraints.extra_switch_penalty_bps)
+    cash_idle_bps = (actions == int(constraints.cash_index)).float() * float(cash_idle_penalty_bps)
+    return legs, trade_cost_bps, cash_idle_bps
+
+
 class VectorizedMinuteToHourEnv:
     def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
         if not (0 <= config.initial_action < len(data.action_names)):
@@ -198,17 +223,12 @@ class VectorizedMinuteToHourEnv:
         cash_actions = torch.full_like(actions, int(self.config.constraints.cash_index))
         actions = torch.where(selected_label_valid, actions, cash_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
-        legs = trade_legs(
+        is_switch = actions != previous_actions
+        legs, cost_bps, cash_idle_penalty_bps = transition_trade_cost_bps(
             previous_actions,
             actions,
-            cash_index=self.config.constraints.cash_index,
-            count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
-        )
-        is_switch = actions != previous_actions
-        cost_bps = legs * float(self.config.constraints.one_way_cost_bps)
-        cost_bps = cost_bps + is_switch.float() * float(self.config.constraints.extra_switch_penalty_bps)
-        cash_idle_penalty_bps = (
-            (actions == int(self.config.constraints.cash_index)).float() * float(self.config.cash_idle_penalty_bps)
+            constraints=self.config.constraints,
+            cash_idle_penalty_bps=self.config.cash_idle_penalty_bps,
         )
         rewards = raw_returns * float(self.config.reward_scale) - (
             cost_bps + cash_idle_penalty_bps
