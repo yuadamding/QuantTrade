@@ -7466,10 +7466,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
              simulate_action_transition(qqq, cash, {"QQQ": q("QQQ", hs=0.05)}, proxy).legs],
             [("QQQ", LegSide.SELL)],
         )
-        # QQQ -> SPY switch: two legs (sell QQQ + buy SPY), each on its own book.
+        # QQQ -> SPY switch: two legs (sell QQQ + buy SPY), each on its own book, EXITS BEFORE ENTRIES.
         spy = Holdings.single_slot("SPY", 1.0)
         switch = simulate_action_transition(qqq, spy, {"QQQ": q("QQQ", hs=0.05), "SPY": q("SPY", ret=0.01, hs=0.05)}, proxy)
-        self.assertEqual({(leg.symbol, leg.side) for leg in switch.legs}, {("QQQ", LegSide.SELL), ("SPY", LegSide.BUY)})
+        self.assertEqual([(leg.symbol, leg.side) for leg in switch.legs], [("QQQ", LegSide.SELL), ("SPY", LegSide.BUY)])
+        self.assertEqual(switch.next_state, spy)  # both legs filled -> executed == target
         # Buying inverse SQQQ fills at SQQQ's OWN ask (NOT "inverse -> sell"); no leverage multiplier on gross.
         inv = simulate_action_transition(cash, sqqq, {"SQQQ": q("SQQQ", ret=0.03, mid=20.0, bid=19.98, ask=20.02)}, quote_cfg)
         self.assertEqual(inv.legs[0].side, LegSide.BUY)
@@ -7481,19 +7482,107 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             19.98,  # closing the long sells at the bid
         )
         # Missing quote at quote-side -> MISSING_QUOTE leg + non-(real-executable) + warning; proxy tolerates it.
+        # Fail-closed: the unfilled trade does NOT teleport the book to the target -- it stays flat and earns
+        # nothing on the would-be position (no interval P&L on an unfilled target).
         miss = simulate_action_transition(cash, qqq, {"QQQ": q("QQQ", ret=0.02)}, quote_cfg)
         self.assertEqual(miss.legs[0].fill_status, FillStatus.MISSING_QUOTE)
         self.assertFalse(miss.real_executable_fill_model)
         self.assertIn("missing_quote:QQQ", miss.warnings)
+        self.assertEqual(miss.next_state, cash)  # blocked: no fill -> keep prior (cash) holdings
+        self.assertAlmostEqual(miss.gross_mark_pnl, 0.0)  # earns nothing on the unfilled target
+        self.assertEqual(miss.realized_execution_cost, 0.0)
         self.assertEqual(
             simulate_action_transition(cash, qqq, {"QQQ": q("QQQ", ret=0.02)}, proxy).legs[0].fill_status,
             FillStatus.FILLED,
         )
+        # Missing quote entirely (symbol absent from the market map) also blocks the trade, keeping cash.
+        absent = simulate_action_transition(cash, qqq, {}, quote_cfg)
+        self.assertEqual(absent.next_state, cash)
+        self.assertEqual(len(absent.legs), 0)
+        self.assertFalse(absent.real_executable_fill_model)
+        self.assertIn("missing_quote:QQQ", absent.warnings)
         # Hold (same action) -> no legs, no cost; held weight earns latency + interval return.
         hold = simulate_action_transition(qqq, qqq, {"QQQ": q("QQQ", ret=0.02, lat=0.01, hs=0.05)}, proxy)
         self.assertEqual(len(hold.legs), 0)
         self.assertEqual(hold.realized_execution_cost, 0.0)
         self.assertAlmostEqual(hold.gross_mark_pnl, 0.02 + 0.01)
+
+    def test_leg_level_failclosed_and_helper_strictness(self) -> None:
+        # Follow-up hardening (review of 0b3dd15): leg-level fail-closed semantics (no free terminal
+        # liquidation, Holdings validation) + public fill-timing helpers reject fractional inputs +
+        # numeric fields coerce-and-store. The leg layer is still unwired, so none of this changes a reward.
+        import torch as _torch
+
+        from rl_quant.execution import (
+            ExecutionConfig,
+            FillLevel,
+            Holdings,
+            MarketSnapshot,
+            PositionState,
+            SymbolQuote,
+            fill_index,
+            fill_indices,
+            simulate_action_transition,
+        )
+
+        def q(sym, *, ret=0.0, lat=0.0, hs=0.0, bid=None, ask=None, mid=100.0):
+            return SymbolQuote(symbol=sym, mid=mid, interval_return=ret, latency_return=lat,
+                               half_spread=hs, best_bid=bid, best_ask=ask)
+
+        quote_cfg = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE, terminal_policy="liquidate_at_next")
+        qqq = Holdings.single_slot("QQQ", 1.0)
+
+        # Terminal liquidation with a MISSING quote must NOT flatten the book for free: the holding stays
+        # and the outcome is flagged with a terminal_missing_quote warning.
+        term_block = simulate_action_transition(qqq, qqq, {}, quote_cfg, is_terminal=True)
+        self.assertEqual(term_block.next_state, qqq)  # could not liquidate -> still held
+        self.assertFalse(term_block.real_executable_fill_model)
+        self.assertIn("terminal_missing_quote:QQQ", term_block.warnings)
+        # With a real quote, terminal liquidation flattens to cash and books the exit leg + its cost.
+        term_ok = simulate_action_transition(
+            qqq, qqq, {"QQQ": q("QQQ", mid=100.0, bid=99.9, ask=100.1)}, quote_cfg, is_terminal=True
+        )
+        self.assertEqual(term_ok.next_state, Holdings(()))
+        self.assertGreater(term_ok.realized_execution_cost, 0.0)
+
+        # Holdings fails closed: duplicate symbol, non-finite weight, explicit CASH; ~0 weights are dropped.
+        for bad in ((("QQQ", 0.5), ("QQQ", 0.7)), (("QQQ", float("nan")),), (("CASH", 1.0),)):
+            with self.assertRaises(ValueError):
+                Holdings(bad)
+        self.assertEqual(Holdings((("QQQ", 1.0), ("SPY", 0.0))).symbols(), ("QQQ",))  # ~0 dropped
+
+        # Public fill-timing helpers reject fractional/bool bar+latency (not just ExecutionConfig), and the
+        # vectorized helper requires an integer index tensor. Valid integer calls still agree element-wise.
+        for kwargs in ({"step_horizon": 1.5, "latency_steps": 1}, {"step_horizon": 5, "latency_steps": 0.5},
+                       {"step_horizon": True, "latency_steps": 1}):
+            with self.assertRaises(ValueError):
+                fill_index(10, **kwargs)
+            with self.assertRaises(ValueError):
+                fill_indices(_torch.arange(4), **kwargs)
+        with self.assertRaises(ValueError):
+            fill_indices(_torch.arange(4, dtype=_torch.float32), step_horizon=5, latency_steps=1)
+        self.assertEqual(
+            fill_indices(_torch.arange(6), step_horizon=5, latency_steps=2).tolist(),
+            [fill_index(i, step_horizon=5, latency_steps=2) for i in range(6)],
+        )
+
+        # Numeric fields coerce-and-store (a value that only validated but stayed a string would later break
+        # arithmetic); bool is rejected everywhere numeric; best_bid/best_ask must be positive.
+        cfg = ExecutionConfig(commission_per_share="0.01", extra_cost_per_share="0.02")
+        self.assertIsInstance(cfg.commission_per_share, float)
+        self.assertAlmostEqual(cfg.commission_per_share, 0.01)
+        self.assertEqual(MarketSnapshot(mid="100.0").mid, 100.0)
+        self.assertEqual(PositionState(position="1.0", entry_price="100.0").position, 1.0)
+        for bad in ({"commission_per_share": True}, {"spread_multiplier": True}):
+            with self.assertRaises(ValueError):
+                ExecutionConfig(**bad)
+        for bad in (
+            {"mid": 50.0, "best_bid": -1.0, "best_ask": 100.0},
+            {"mid": 50.0, "best_bid": 0.0, "best_ask": 100.0},
+            {"mid": True},
+        ):
+            with self.assertRaises(ValueError):
+                MarketSnapshot(**bad)
 
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")

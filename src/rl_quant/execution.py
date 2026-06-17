@@ -32,12 +32,40 @@ from enum import Enum
 import torch
 
 
-def _require_finite_nonnegative(name: str, value: float) -> None:
-    # NOTE: a bare ``value < 0`` does NOT reject NaN (every NaN comparison is False), so an explicit
-    # finiteness check is required to keep NaN/Inf out of cost/reward accounting.
-    coerced = float(value)
+def _coerce_float(name: str, value: object) -> float:
+    # Numeric fields must end up as real floats: reject bool (True would silently become 1.0) and any
+    # non-numeric type, and RETURN the coerced float so the caller can store it -- a value that only
+    # *validated* but stayed a string would later break arithmetic (e.g. "0.01" + 0.05).
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric, not bool; got {value!r}.")
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be numeric; got {value!r}.") from exc
+
+
+def _coerce_finite(name: str, value: object) -> float:
+    coerced = _coerce_float(name, value)
+    if not math.isfinite(coerced):
+        raise ValueError(f"{name} must be finite; got {value!r}.")
+    return coerced
+
+
+def _coerce_finite_nonnegative(name: str, value: object) -> float:
+    # NOTE: a bare ``value < 0`` does NOT reject NaN (every NaN comparison is False), so check finiteness.
+    coerced = _coerce_float(name, value)
     if not math.isfinite(coerced) or coerced < 0.0:
         raise ValueError(f"{name} must be finite and non-negative; got {value!r}.")
+    return coerced
+
+
+def _coerce_positive_price(name: str, value: object) -> float:
+    # Equity/ETF prices must be strictly positive: a non-positive mid/quote/entry would produce
+    # meaningless P&L and costs. (A bare ``value <= 0`` would pass NaN, so check finiteness too.)
+    coerced = _coerce_float(name, value)
+    if not math.isfinite(coerced) or coerced <= 0.0:
+        raise ValueError(f"{name} must be finite and positive; got {value!r}.")
+    return coerced
 
 
 def _require_nonnegative_int(name: str, value: object) -> int:
@@ -64,13 +92,17 @@ def _require_positive_int(name: str, value: object) -> int:
     return coerced
 
 
-def _require_positive_price(name: str, value: float) -> float:
-    # Equity/ETF prices must be strictly positive: a non-positive mid/quote/entry would produce
-    # meaningless P&L and costs. (A bare ``value <= 0`` would pass NaN, so check finiteness too.)
-    coerced = float(value)
-    if not math.isfinite(coerced) or coerced <= 0.0:
-        raise ValueError(f"{name} must be finite and positive; got {value!r}.")
-    return coerced
+def _require_int_allow_negative(name: str, value: object) -> int:
+    # Like _require_nonnegative_int but permits negatives (latency_steps <= 0 collapses to "now").
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, not bool; got {value!r}.")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name} must be integer-like; got {value!r}.")
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be integer-like; got {value!r}.") from exc
 
 
 class FillLevel(str, Enum):
@@ -99,7 +131,9 @@ class ImpactModel:
                 f"impact_model.kind must be 'none' or 'linear' (sqrt/almgren_chriss not yet implemented); "
                 f"got {self.kind!r}."
             )
-        _require_finite_nonnegative("impact_model.coef_per_unit", self.coef_per_unit)
+        object.__setattr__(
+            self, "coef_per_unit", _coerce_finite_nonnegative("impact_model.coef_per_unit", self.coef_per_unit)
+        )
 
 
 def _coerce_impact_model(value: object) -> ImpactModel:
@@ -140,9 +174,15 @@ class ExecutionConfig:
         object.__setattr__(self, "latency_steps", _require_nonnegative_int("latency_steps", self.latency_steps))
         object.__setattr__(self, "step_horizon", _require_positive_int("step_horizon", self.step_horizon))
         object.__setattr__(self, "trade_lot_size", _require_positive_int("trade_lot_size", self.trade_lot_size))
-        _require_finite_nonnegative("commission_per_share", self.commission_per_share)
-        _require_finite_nonnegative("extra_cost_per_share", self.extra_cost_per_share)
-        _require_finite_nonnegative("spread_multiplier", self.spread_multiplier)
+        object.__setattr__(
+            self, "commission_per_share", _coerce_finite_nonnegative("commission_per_share", self.commission_per_share)
+        )
+        object.__setattr__(
+            self, "extra_cost_per_share", _coerce_finite_nonnegative("extra_cost_per_share", self.extra_cost_per_share)
+        )
+        object.__setattr__(
+            self, "spread_multiplier", _coerce_finite_nonnegative("spread_multiplier", self.spread_multiplier)
+        )
         object.__setattr__(self, "impact_model", _coerce_impact_model(self.impact_model))
         # quote_side_plus_impact must carry a REAL (positive linear) impact: otherwise it is numerically
         # identical to plain quote_side yet would still advertise that it models impact. Fail closed and
@@ -196,11 +236,10 @@ class PositionState:
     entry_price: float | None = None
 
     def __post_init__(self) -> None:
-        if not math.isfinite(float(self.position)):
-            raise ValueError(f"position must be finite; got {self.position!r}.")
+        object.__setattr__(self, "position", _coerce_finite("position", self.position))
         object.__setattr__(self, "bars_held", _require_nonnegative_int("bars_held", self.bars_held))
         if self.entry_price is not None:
-            _require_positive_price("entry_price", self.entry_price)
+            object.__setattr__(self, "entry_price", _coerce_positive_price("entry_price", self.entry_price))
         # A flat book holds no open position, so it carries no entry price -- the same invariant the
         # terminal-liquidation fix enforces, applied generally so no path can leave stale entry state.
         if self.position == 0.0 and self.entry_price is not None:
@@ -216,13 +255,14 @@ class MarketSnapshot:
 
     def __post_init__(self) -> None:
         # A non-positive mid would produce meaningless P&L and costs (and crossing distances).
-        _require_positive_price("mid", self.mid)
+        object.__setattr__(self, "mid", _coerce_positive_price("mid", self.mid))
         # A negative half_spread would turn the cost into a NEGATIVE cost (paying the agent to trade).
-        _require_finite_nonnegative("half_spread", self.half_spread)
+        object.__setattr__(self, "half_spread", _coerce_finite_nonnegative("half_spread", self.half_spread))
+        # Quotes, when present, must be positive prices (a negative/zero bid or ask is not a real quote).
         for name in ("best_bid", "best_ask"):
             value = getattr(self, name)
-            if value is not None and not math.isfinite(float(value)):
-                raise ValueError(f"{name} must be finite when provided; got {value!r}.")
+            if value is not None:
+                object.__setattr__(self, name, _coerce_positive_price(name, value))
         if self.best_bid is not None and self.best_ask is not None:
             if self.best_bid > self.best_ask:
                 raise ValueError(f"best_bid ({self.best_bid}) must be <= best_ask ({self.best_ask}).")
@@ -257,12 +297,15 @@ def fill_index(now_index: int, *, step_horizon: int, latency_steps: int) -> int:
 
     ``latency_steps <= 0`` collapses the fill to the current bar (decision and fill coincide). Mirrors the
     vectorized ``fill_indices`` exactly, so a fill can never be pushed past the holding horizon."""
-    if int(step_horizon) <= 0:
-        raise ValueError(f"step_horizon must be positive; got {step_horizon}.")
-    next_index = now_index + int(step_horizon)
-    if int(latency_steps) <= 0:
+    horizon = _require_positive_int("step_horizon", step_horizon)
+    latency = _require_int_allow_negative("latency_steps", latency_steps)
+    next_index = now_index + horizon
+    if latency <= 0:
         return now_index
-    return min(now_index + int(latency_steps), next_index)
+    return min(now_index + latency, next_index)
+
+
+_INTEGER_TENSOR_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
 
 
 def fill_indices(now_indices: torch.Tensor, *, step_horizon: int, latency_steps: int) -> torch.Tensor:
@@ -271,14 +314,16 @@ def fill_indices(now_indices: torch.Tensor, *, step_horizon: int, latency_steps:
 
     The single source of truth for vectorized fill timing (intraday env step + pretraining targets). It is
     byte-for-byte equal to ``fill_index`` applied element-wise (``torch.minimum`` is the per-element min),
-    preserves the input tensor's device and dtype, and -- unlike the old inline helper -- carries the same
-    ``step_horizon > 0`` guard as the scalar version."""
-    if int(step_horizon) <= 0:
-        raise ValueError(f"step_horizon must be positive; got {step_horizon}.")
-    if int(latency_steps) <= 0:
+    preserves the input tensor's device and dtype, validates the same integer-like bar/latency arguments as
+    the scalar version (no silent fractional truncation), and requires an integer index tensor."""
+    horizon = _require_positive_int("step_horizon", step_horizon)
+    latency = _require_int_allow_negative("latency_steps", latency_steps)
+    if now_indices.dtype not in _INTEGER_TENSOR_DTYPES:
+        raise ValueError(f"now_indices must be an integer tensor; got dtype {now_indices.dtype}.")
+    if latency <= 0:
         return now_indices
-    next_indices = now_indices + int(step_horizon)
-    return torch.minimum(now_indices + int(latency_steps), next_indices)
+    next_indices = now_indices + horizon
+    return torch.minimum(now_indices + latency, next_indices)
 
 
 def transition_pnl(
@@ -466,16 +511,14 @@ class SymbolQuote:
     best_ask: float | None = None
 
     def __post_init__(self) -> None:
-        if not math.isfinite(float(self.mid)) or self.mid <= 0.0:
-            raise ValueError(f"{self.symbol}: mid must be finite and positive; got {self.mid!r}.")
-        _require_finite_nonnegative(f"{self.symbol}.half_spread", self.half_spread)
+        object.__setattr__(self, "mid", _coerce_positive_price(f"{self.symbol}.mid", self.mid))
+        object.__setattr__(self, "half_spread", _coerce_finite_nonnegative(f"{self.symbol}.half_spread", self.half_spread))
         for name in ("interval_return", "latency_return"):
-            if not math.isfinite(float(getattr(self, name))):
-                raise ValueError(f"{self.symbol}.{name} must be finite; got {getattr(self, name)!r}.")
+            object.__setattr__(self, name, _coerce_finite(f"{self.symbol}.{name}", getattr(self, name)))
         for name in ("best_bid", "best_ask"):
             value = getattr(self, name)
-            if value is not None and not math.isfinite(float(value)):
-                raise ValueError(f"{self.symbol}.{name} must be finite when provided; got {value!r}.")
+            if value is not None:
+                object.__setattr__(self, name, _coerce_positive_price(f"{self.symbol}.{name}", value))
         if self.best_bid is not None and self.best_ask is not None:
             if self.best_bid > self.best_ask:
                 raise ValueError(f"{self.symbol}: best_bid ({self.best_bid}) must be <= best_ask ({self.best_ask}).")
@@ -499,6 +542,24 @@ class Holdings:
     for a future multi-instrument path without a schema change."""
 
     weights: tuple[tuple[str, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        # Normalize and fail closed: reject duplicate symbols (ambiguous weight_of), non-finite weights,
+        # and an explicit "CASH" holding (cash is the implicit unallocated remainder). Drop ~0 weights so
+        # equality and symbol enumeration are canonical.
+        seen: set[str] = set()
+        clean: list[tuple[str, float]] = []
+        for symbol, weight in self.weights:
+            symbol = str(symbol)
+            if symbol.upper() == "CASH":
+                raise ValueError("CASH must be implicit (the unallocated remainder), not a holding.")
+            if symbol in seen:
+                raise ValueError(f"duplicate holding symbol: {symbol}.")
+            seen.add(symbol)
+            w = _coerce_finite(f"holding[{symbol}]", weight)
+            if abs(w) > 1e-12:
+                clean.append((symbol, w))
+        object.__setattr__(self, "weights", tuple(clean))
 
     @classmethod
     def single_slot(cls, symbol: str | None, weight: float) -> "Holdings":
@@ -571,48 +632,94 @@ def simulate_action_transition(
     is_terminal: bool = False,
 ) -> ActionTransitionOutcome:
     """Return-based, per-symbol leg-level transition P&L (see the module note above). Each prior holding
-    earns its latency leg (now->fill) and each target holding earns its interval leg (fill->next); every
-    symbol whose weight changes emits a BUY/SELL leg filled on ITS OWN book, costed by the per-leg spread
-    in bps of that symbol's mid. A missing quote at a quote-side level flags the leg MISSING_QUOTE and
-    marks the whole outcome non-(real-executable). No trainer calls this yet -- it changes no reward."""
+    earns its latency leg (now->fill); every symbol whose weight changes emits a BUY/SELL leg filled on ITS
+    OWN book, costed by the per-leg spread in bps of that symbol's mid; and the EXECUTED (post-fill) holding
+    earns its interval leg (fill->next).
+
+    Fail-closed semantics (a trade that cannot fill does NOT move the book): a symbol with no quote, or a
+    quote-side leg with no bid/ask (MISSING_QUOTE), keeps its PRIOR weight -- the transition does not silently
+    teleport to the target -- and the outcome is flagged non-(real-executable) with a warning. Terminal
+    liquidation likewise only flattens symbols whose exit leg fills; a missing terminal quote keeps the
+    holding and flags the outcome. Legs are ordered exits-before-entries for stable, economic logs.
+
+    Each leg fills on its OWN book INDEPENDENTLY, so a partially-fillable switch is NOT weight-conserving:
+    if only one leg of an A->B switch can fill, the book is left over-allocated (bought B, could not sell A)
+    or stranded in cash (sold A, could not buy B). That is the honest consequence of independent fills and is
+    always flagged (real_executable_fill_model=False + a missing_quote warning); whoever later wires this into
+    a trainer must decide whether to layer an atomic-switch or cash-plug rebalancing policy on top.
+    No trainer calls this yet -- it changes no reward."""
+    eps = 1e-12
     symbols = sorted(set(prev_holdings.symbols()) | set(target_holdings.symbols()))
-    old_latency = 0.0
-    new_interval = 0.0
     legs: list[ExecutionLeg] = []
     realized_cost = 0.0
     warnings: list[str] = []
     real = config.real_executable_fill_model
 
+    # The old (prior) position earns its now->fill latency leg on every held symbol that has a quote.
+    old_latency = 0.0
     for symbol in symbols:
         quote = market_by_symbol.get(symbol)
+        if quote is not None:
+            old_latency += prev_holdings.weight_of(symbol) * quote.latency_return
+
+    # executed[symbol] = weight ACTUALLY held after fills (== target only where the leg fills).
+    executed: dict[str, float] = {}
+    changes: list[tuple[str, float, float]] = []
+    for symbol in symbols:
         prev_w = prev_holdings.weight_of(symbol)
         tgt_w = target_holdings.weight_of(symbol)
+        if abs(tgt_w - prev_w) > eps:
+            changes.append((symbol, prev_w, tgt_w))
+        else:
+            executed[symbol] = tgt_w  # no trade required (== prev)
+    # Exits (weight shrinking toward 0 / flipping) before entries; alphabetical within each for determinism.
+    sells = sorted(c for c in changes if c[2] < c[1])
+    buys = sorted(c for c in changes if c[2] > c[1])
+    for symbol, prev_w, tgt_w in sells + buys:
+        quote = market_by_symbol.get(symbol)
         if quote is None:
-            if abs(tgt_w - prev_w) > 1e-12:
-                warnings.append(f"missing_quote:{symbol}")
-                real = False
+            warnings.append(f"missing_quote:{symbol}")
+            real = False
+            executed[symbol] = prev_w  # blocked: no quote -> trade did not fill, keep prior weight
             continue
-        old_latency += prev_w * quote.latency_return
-        new_interval += tgt_w * quote.interval_return
-        if abs(tgt_w - prev_w) > 1e-12:
-            leg, cost = _make_leg(symbol, prev_w, tgt_w, quote, config)
-            legs.append(leg)
+        leg, cost = _make_leg(symbol, prev_w, tgt_w, quote, config)
+        legs.append(leg)
+        if leg.fill_status != FillStatus.FILLED:
+            warnings.append(f"missing_quote:{symbol}")
+            real = False
+            executed[symbol] = prev_w  # blocked: unfilled leg keeps prior weight (no teleport, no cost)
+        else:
             realized_cost += cost
-            if leg.fill_status == FillStatus.MISSING_QUOTE:
-                real = False
-                warnings.append(f"missing_quote:{symbol}")
+            executed[symbol] = tgt_w
 
-    next_state = target_holdings
+    # The executed position earns its fill->next interval leg.
+    new_interval = 0.0
+    for symbol, weight in executed.items():
+        quote = market_by_symbol.get(symbol)
+        if quote is not None and abs(weight) > eps:
+            new_interval += weight * quote.interval_return
+
+    next_state = Holdings(tuple((s, w) for s, w in executed.items() if abs(w) > eps))
     if is_terminal and config.terminal_policy == TerminalPolicy.LIQUIDATE_AT_NEXT:
-        # Liquidate every target holding to flat (one extra exit leg per symbol).
-        for symbol in target_holdings.symbols():
-            tgt_w = target_holdings.weight_of(symbol)
+        remaining: list[tuple[str, float]] = []
+        for symbol, weight in executed.items():
+            if abs(weight) <= eps:
+                continue
             quote = market_by_symbol.get(symbol)
-            if abs(tgt_w) > 1e-12 and quote is not None:
-                leg, cost = _make_leg(symbol, tgt_w, 0.0, quote, config)
-                legs.append(leg)
+            if quote is None:
+                warnings.append(f"terminal_missing_quote:{symbol}")
+                real = False
+                remaining.append((symbol, weight))  # cannot liquidate without a quote -> still held
+                continue
+            leg, cost = _make_leg(symbol, weight, 0.0, quote, config)
+            legs.append(leg)
+            if leg.fill_status != FillStatus.FILLED:
+                warnings.append(f"terminal_missing_quote:{symbol}")
+                real = False
+                remaining.append((symbol, weight))
+            else:
                 realized_cost += cost
-        next_state = Holdings(())
+        next_state = Holdings(tuple(remaining))
 
     gross = old_latency + new_interval
     return ActionTransitionOutcome(
