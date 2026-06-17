@@ -9101,7 +9101,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import re
 
         src = ROOT / "src" / "rl_quant"
-        trainers = ["training/strategy.py", "training/intraday.py", "training/hourly.py", "minute_to_hour_transformer.py"]
+        trainers = ["training/strategy.py", "training/intraday.py", "training/hourly.py", "training/minute_to_hour.py"]
         call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
         for name in trainers:
             calls = call_re.findall((src / name).read_text())
@@ -9135,7 +9135,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_amp_dtype_reaches_minute_to_hour_autocast(self) -> None:
         import unittest.mock as mock
 
-        import rl_quant.minute_to_hour_transformer as m2h
+        import rl_quant.training.minute_to_hour as m2h  # the train loop looks up autocast_context here
         from rl_quant.core import DQNLearningConfig
         from rl_quant.minute_to_hour_transformer import (
             HourFromMinuteDataSplit,
