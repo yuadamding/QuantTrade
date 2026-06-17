@@ -272,14 +272,23 @@ class ExecutionConfig:
 
     @property
     def applies_implemented_impact(self) -> bool:
-        # True only when a positive linear impact is actually applied. __post_init__ guarantees this for
-        # quote_side_plus_impact, but it is expressed independently so the report layer can check the
-        # impact axis on its own (a separate dimension from "are fills crossable").
+        # SCALAR (signed-position, per-share dollar) impact axis: True only when the scalar impact_model
+        # applies a positive linear impact. __post_init__ guarantees this for quote_side_plus_impact. This
+        # is the impact axis for the transition_pnl / simulate_transition path -- NOT the leg-level path.
         return (
             self.fill_level == FillLevel.QUOTE_SIDE_PLUS_IMPACT
             and self.impact_model.kind == "linear"
             and self.impact_model.coef_per_unit > 0.0
         )
+
+    @property
+    def applies_weight_impact(self) -> bool:
+        # LEG-LEVEL (return/weight) impact axis: True only when weight_cost charges a positive linear impact.
+        # The leg path (_make_leg) prices impact from weight_cost, NOT from impact_model -- so a
+        # quote_side_plus_impact config (which has a positive SCALAR impact_model) still applies ZERO impact
+        # on the leg path unless weight_cost is set. The report layer must check THIS for leg-level runs so a
+        # transition is never labelled impact-priced when the leg engine charged no impact.
+        return self.weight_cost.impact_kind != "none" and self.weight_cost.linear_impact_bps_per_weight > 0.0
 
     @property
     def proxy_fill_model(self) -> bool:
@@ -662,6 +671,20 @@ class ExecutionLeg:
     impact_bps: float = 0.0  # size-dependent impact from weight_cost (0 unless filled)
     total_cost_bps: float = 0.0  # spread_bps + fee_bps + impact_bps (the charged bps for this leg)
 
+    def __post_init__(self) -> None:
+        for name in ("traded_weight", "spread_bps", "fee_bps", "impact_bps"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"ExecutionLeg.{name} must be finite and non-negative; got {value!r}.")
+        if not math.isclose(
+            self.total_cost_bps, self.spread_bps + self.fee_bps + self.impact_bps, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            raise ValueError("ExecutionLeg.total_cost_bps must equal spread_bps + fee_bps + impact_bps.")
+        # An unfilled leg never carries a fill price. NOTE: a FILLED leg may still have fill_price=None at a
+        # PROXY level (delayed_close / mid_plus_spread), so the implication only runs one way.
+        if self.fill_status != FillStatus.FILLED and self.fill_price is not None:
+            raise ValueError("an unfilled leg must not carry a fill_price.")
+
 
 @dataclass(frozen=True)
 class ActionTransitionOutcome:
@@ -677,10 +700,21 @@ class ActionTransitionOutcome:
     # numbers (which are still produced for diagnostics even when the transition is non-reportable):
     #   valuation_complete  -- every held/executed non-zero position had a quote to value it
     #   execution_complete  -- every requested trade leg (and terminal liquidation leg) actually filled
+    #   impact_applied      -- the leg engine charged a positive (weight_cost) impact on this transition
     # real_executable_fill_model is the AND of crossable-quote fills + valuation_complete + execution_complete.
+    # impact_applied is a SEPARATE axis (impact is not required for a crossable fill to be "real").
     valuation_complete: bool = True
     execution_complete: bool = True
+    impact_applied: bool = False
     warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not math.isclose(
+            self.net_pnl, self.gross_mark_pnl - self.realized_execution_cost, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            raise ValueError("ActionTransitionOutcome.net_pnl must equal gross_mark_pnl - realized_execution_cost.")
+        if self.real_executable_fill_model and not (self.valuation_complete and self.execution_complete):
+            raise ValueError("real_executable_fill_model implies valuation_complete and execution_complete.")
 
 
 def _make_leg(symbol: str, prev_w: float, tgt_w: float, quote: SymbolQuote, config: ExecutionConfig) -> tuple[ExecutionLeg, float]:
@@ -879,5 +913,6 @@ def simulate_action_transition(
         real_executable_fill_model=real,
         valuation_complete=valuation_complete,
         execution_complete=execution_complete,
+        impact_applied=config.applies_weight_impact,
         warnings=tuple(warnings),
     )

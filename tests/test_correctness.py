@@ -7758,6 +7758,53 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ExecutionConfig(weight_cost="bad")
 
+        # impact axes are separate: SCALAR impact (impact_model, quote_side_plus_impact) is NOT the LEG
+        # impact (weight_cost). A quote_side_plus_impact config with default weight_cost charges ZERO leg
+        # impact, so the leg outcome's impact_applied must be False (closes the "claims impact, charges none"
+        # hazard). The leg path's impact_applied tracks weight_cost, independent of fill_level.
+        qspi = ExecutionConfig(
+            fill_level=FillLevel.QUOTE_SIDE_PLUS_IMPACT,
+            impact_model={"kind": "linear", "coef_per_unit": 0.01},  # scalar impact present...
+        )
+        self.assertTrue(qspi.applies_implemented_impact)  # ...scalar axis on
+        self.assertFalse(qspi.applies_weight_impact)  # ...but leg axis off (weight_cost default zero)
+        self.assertFalse(ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE).applies_weight_impact)
+        with_leg_impact = ExecutionConfig(
+            fill_level=FillLevel.QUOTE_SIDE,
+            weight_cost=WeightExecutionCostConfig(impact_kind="linear_bps", linear_impact_bps_per_weight=3.0),
+        )
+        self.assertTrue(with_leg_impact.applies_weight_impact)
+        out_no_impact = simulate_action_transition(
+            cash, qqq_full, {"QQQ": q(bid=99.9, ask=100.1)}, qspi
+        )
+        self.assertFalse(out_no_impact.impact_applied)  # crossable + valued + executed, but NO leg impact
+        self.assertTrue(out_no_impact.real_executable_fill_model)  # impact is a separate axis from realness
+        out_impact = simulate_action_transition(
+            cash, qqq_full, {"QQQ": q(bid=99.9, ask=100.1)}, with_leg_impact
+        )
+        self.assertTrue(out_impact.impact_applied)
+
+        # Leg + outcome invariants are enforced at construction.
+        from rl_quant.execution import ActionTransitionOutcome, ExecutionLeg, FillStatus, Holdings, LegSide
+
+        with self.assertRaises(ValueError):  # total_cost_bps must equal spread+fee+impact
+            ExecutionLeg(symbol="X", side=LegSide.BUY, traded_weight=1.0, mark_before=0.0, mid_at_fill=100.0,
+                         fill_price=None, spread_bps=5.0, fill_status=FillStatus.FILLED, total_cost_bps=4.0)
+        with self.assertRaises(ValueError):  # an unfilled leg must not carry a fill_price
+            ExecutionLeg(symbol="X", side=LegSide.BUY, traded_weight=1.0, mark_before=0.0, mid_at_fill=100.0,
+                         fill_price=100.1, spread_bps=0.0, fill_status=FillStatus.MISSING_QUOTE)
+        # A FILLED proxy leg with fill_price=None is VALID (the reviewer's filled=>price invariant is wrong).
+        ExecutionLeg(symbol="X", side=LegSide.BUY, traded_weight=1.0, mark_before=0.0, mid_at_fill=100.0,
+                     fill_price=None, spread_bps=5.0, fill_status=FillStatus.FILLED, total_cost_bps=5.0)
+        with self.assertRaises(ValueError):  # net_pnl must equal gross - cost
+            ActionTransitionOutcome(legs=(), old_position_latency_pnl=0.0, new_position_interval_pnl=0.0,
+                                    gross_mark_pnl=1.0, realized_execution_cost=0.1, net_pnl=0.5,
+                                    next_state=Holdings(()), real_executable_fill_model=False)
+        with self.assertRaises(ValueError):  # real implies valuation_complete and execution_complete
+            ActionTransitionOutcome(legs=(), old_position_latency_pnl=0.0, new_position_interval_pnl=0.0,
+                                    gross_mark_pnl=0.0, realized_execution_cost=0.0, net_pnl=0.0,
+                                    next_state=Holdings(()), real_executable_fill_model=True, execution_complete=False)
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
