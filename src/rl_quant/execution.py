@@ -123,6 +123,14 @@ class TerminalPolicy(str, Enum):
     CARRY = "carry"  # no liquidation (episode-length truncation / bootstrap-through)
 
 
+class SwitchFillPolicy(str, Enum):
+    # How a multi-leg switch behaves when only SOME of its legs can fill (leg-level path only).
+    INDEPENDENT_LEGS = "independent_legs"  # each leg fills on its own book; partial fills allowed (default,
+    #                                        not weight-conserving -- can over-allocate or strand in cash)
+    ATOMIC_SWITCH = "atomic_switch"  # all-or-nothing: if ANY required leg cannot fill, execute NONE of them
+    #                                  (keep prior holdings). Recommended for reportable allocator evaluation.
+
+
 @dataclass(frozen=True)
 class ImpactModel:
     kind: str = "none"  # "none" | "linear"
@@ -167,6 +175,9 @@ class ExecutionConfig:
     spread_multiplier: float = 1.0  # scales the half-spread proxy / mid_plus_spread crossing depth
     impact_model: ImpactModel = field(default_factory=ImpactModel)
     terminal_policy: TerminalPolicy = TerminalPolicy.LIQUIDATE_AT_NEXT
+    # Default preserves the current leg-level behavior (independent per-leg fills); a future trainer
+    # wiring should set ATOMIC_SWITCH for reportable allocator evaluation. Only affects the leg-level path.
+    switch_fill_policy: SwitchFillPolicy = SwitchFillPolicy.INDEPENDENT_LEGS
 
     def __post_init__(self) -> None:
         # Fail closed on invalid execution parameters: a research run must never silently claim a
@@ -175,6 +186,7 @@ class ExecutionConfig:
         # falling through to quote-side logic and crashing later on a missing .value).
         object.__setattr__(self, "fill_level", FillLevel(self.fill_level))
         object.__setattr__(self, "terminal_policy", TerminalPolicy(self.terminal_policy))
+        object.__setattr__(self, "switch_fill_policy", SwitchFillPolicy(self.switch_fill_policy))
         # Coerce-and-store the bar/lot counts so a fractional value can't slip through int() truncation
         # (int(1.9) == 1) and silently rescale every dollar P&L through trade_scale.
         object.__setattr__(self, "latency_steps", _require_nonnegative_int("latency_steps", self.latency_steps))
@@ -644,6 +656,17 @@ def _make_leg(symbol: str, prev_w: float, tgt_w: float, quote: SymbolQuote, conf
     return leg, cost
 
 
+def _leg_fillable(prev_w: float, tgt_w: float, quote: SymbolQuote | None, config: ExecutionConfig) -> bool:
+    """Whether a single change leg would FILL under the config's fill model, WITHOUT committing it. Mirrors
+    _make_leg's fill logic: quote-side needs the crossed side present (ask for a buy, bid for a sell); proxy
+    levels fill on the mid alone. Used by the ATOMIC_SWITCH pre-pass."""
+    if quote is None:
+        return False
+    if not config.uses_crossable_quote_fills:
+        return True
+    return (quote.best_ask if tgt_w > prev_w else quote.best_bid) is not None
+
+
 def simulate_action_transition(
     prev_holdings: Holdings,
     target_holdings: Holdings,
@@ -664,12 +687,14 @@ def simulate_action_transition(
     silently earning a 0 return. Terminal liquidation likewise only flattens symbols whose exit leg fills; a
     missing terminal quote keeps the holding and flags the outcome. Legs are ordered exits-before-entries.
 
-    Each leg fills on its OWN book INDEPENDENTLY, so a partially-fillable switch is NOT weight-conserving:
-    if only one leg of an A->B switch can fill, the book is left over-allocated (bought B, could not sell A)
-    or stranded in cash (sold A, could not buy B). That is the honest consequence of independent fills and is
-    always flagged (real_executable_fill_model=False + a missing_quote warning); whoever later wires this into
-    a trainer must decide whether to layer an atomic-switch or cash-plug rebalancing policy on top.
-    No trainer calls this yet -- it changes no reward."""
+    config.switch_fill_policy controls partial-switch behavior. INDEPENDENT_LEGS (default) fills each leg on
+    its OWN book independently, so a partially-fillable switch is NOT weight-conserving: if only one leg of an
+    A->B switch fills, the book is left over-allocated (bought B, could not sell A) or stranded in cash (sold
+    A, could not buy B) -- the honest consequence of independent fills, always flagged
+    (real_executable_fill_model=False + a missing_quote warning). ATOMIC_SWITCH is all-or-nothing: if ANY
+    required leg cannot fill, NONE execute and the prior holdings are kept (an 'atomic_switch_blocked' warning
+    is added) -- the recommended policy for reportable allocator evaluation. (Terminal liquidation is governed
+    separately and stays per-symbol fail-closed.) No trainer calls this yet -- it changes no reward."""
     eps = 1e-12
     symbols = sorted(set(prev_holdings.symbols()) | set(target_holdings.symbols()))
     legs: list[ExecutionLeg] = []
@@ -711,7 +736,21 @@ def simulate_action_transition(
     # Exits (weight shrinking toward 0 / flipping) before entries; alphabetical within each for determinism.
     sells = sorted(c for c in changes if c[2] < c[1])
     buys = sorted(c for c in changes if c[2] > c[1])
-    for symbol, prev_w, tgt_w in sells + buys:
+    ordered = sells + buys
+    if config.switch_fill_policy == SwitchFillPolicy.ATOMIC_SWITCH and ordered:
+        # All-or-nothing: if ANY required leg cannot fill, execute NONE of them and keep prior holdings
+        # (a partial switch would over-allocate or strand cash). The transition is non-reportable.
+        unfillable = [c for c in ordered if not _leg_fillable(c[1], c[2], market_by_symbol.get(c[0]), config)]
+        if unfillable:
+            for symbol, _prev_w, _tgt_w in unfillable:
+                warn(f"missing_quote:{symbol}")
+            warn("atomic_switch_blocked")
+            real = False
+            execution_complete = False
+            for symbol, prev_w, _tgt_w in ordered:
+                executed[symbol] = prev_w  # blocked transition: every leg keeps its prior weight
+            ordered = []
+    for symbol, prev_w, tgt_w in ordered:
         quote = market_by_symbol.get(symbol)
         if quote is None:
             warn(f"missing_quote:{symbol}")

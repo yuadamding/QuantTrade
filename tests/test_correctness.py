@@ -7630,6 +7630,67 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 MarketSnapshot(**bad)
 
+    def test_switch_fill_policy_atomic_vs_independent(self) -> None:
+        # PR4: opt-in ATOMIC_SWITCH all-or-nothing partial-switch policy on the (still-unwired) leg layer.
+        # Default stays INDEPENDENT_LEGS so no existing behavior/reward changes.
+        from rl_quant.execution import (
+            ExecutionConfig,
+            FillLevel,
+            Holdings,
+            LegSide,
+            SwitchFillPolicy,
+            SymbolQuote,
+            simulate_action_transition,
+        )
+
+        def q(sym, *, ret=0.0, lat=0.0, mid=100.0, bid=None, ask=None):
+            return SymbolQuote(symbol=sym, mid=mid, interval_return=ret, latency_return=lat, best_bid=bid, best_ask=ask)
+
+        a = Holdings.single_slot("A", 1.0)
+        b = Holdings.single_slot("B", 1.0)
+
+        # Default is INDEPENDENT_LEGS; string coerces to the enum; an unknown value fails closed.
+        self.assertIs(ExecutionConfig().switch_fill_policy, SwitchFillPolicy.INDEPENDENT_LEGS)
+        self.assertIs(
+            ExecutionConfig(switch_fill_policy="atomic_switch").switch_fill_policy, SwitchFillPolicy.ATOMIC_SWITCH
+        )
+        with self.assertRaises(ValueError):
+            ExecutionConfig(switch_fill_policy="atomic")
+
+        indep = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE, switch_fill_policy=SwitchFillPolicy.INDEPENDENT_LEGS)
+        atomic = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE, switch_fill_policy=SwitchFillPolicy.ATOMIC_SWITCH)
+
+        # A -> B where B has no bid/ask (B buy cannot fill at quote_side) but A's sell can fill.
+        partial = {
+            "A": q("A", ret=0.02, lat=0.01, mid=100.0, bid=99.9, ask=100.1),
+            "B": q("B", ret=0.05, mid=50.0),  # missing quotes -> unfillable buy
+        }
+        # INDEPENDENT: A sells (fills), B buy blocked -> stranded in cash (the non-conserving partial fill).
+        out_indep = simulate_action_transition(a, b, partial, indep)
+        self.assertEqual(out_indep.next_state, Holdings(()))
+        self.assertFalse(out_indep.real_executable_fill_model)
+        # ATOMIC: B buy unfillable -> NOTHING executes, keep A; A still earns its latency+interval return.
+        out_atomic = simulate_action_transition(a, b, partial, atomic)
+        self.assertEqual(out_atomic.next_state, a)
+        self.assertFalse(out_atomic.real_executable_fill_model)
+        self.assertFalse(out_atomic.execution_complete)
+        self.assertEqual(len(out_atomic.legs), 0)
+        self.assertEqual(out_atomic.realized_execution_cost, 0.0)
+        self.assertIn("missing_quote:B", out_atomic.warnings)
+        self.assertIn("atomic_switch_blocked", out_atomic.warnings)
+        self.assertAlmostEqual(out_atomic.gross_mark_pnl, 1.0 * 0.01 + 1.0 * 0.02)  # held A: latency + interval
+
+        # When ALL legs fill, ATOMIC == INDEPENDENT: both reach target B with the normal sell+buy legs.
+        full = {
+            "A": q("A", ret=0.02, mid=100.0, bid=99.9, ask=100.1),
+            "B": q("B", ret=0.05, mid=50.0, bid=49.95, ask=50.05),
+        }
+        done = simulate_action_transition(a, b, full, atomic)
+        self.assertEqual(done.next_state, b)
+        self.assertTrue(done.real_executable_fill_model)
+        self.assertTrue(done.execution_complete)
+        self.assertEqual({(leg.symbol, leg.side) for leg in done.legs}, {("A", LegSide.SELL), ("B", LegSide.BUY)})
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
