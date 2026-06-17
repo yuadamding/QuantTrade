@@ -6,20 +6,27 @@ trading requires crossable quote-side fills, latency P&L, **applied impact**, AN
 anything short of that is causal-research / backtest only.
 
 Two tiers (aligned to docs/decision_tensor_protocol.md, the "decision_logs.jsonl" required-fields list):
-- BASE / mechanical reportability: every protocol field present AND semantically valid (finite numerics,
-  non-negative costs/turnover, positive equity, ordered timestamps when numeric). This is what a CAUSAL
-  close-based backtest can satisfy.
+- BASE / mechanical reportability: every protocol field present AND semantically valid -- finite numerics,
+  non-negative costs/turnover, positive equity, the SELECTED action allowed by the (ex-ante) action mask, and
+  point-in-time-causal, ordered timestamps: context_available_until <= decision_ts <= entry_execution_ts <=
+  reward_end_ts <= exit_execution_ts (parsed from numeric epochs, ISO-8601 strings, or datetimes). This is
+  what a CAUSAL close-based backtest can satisfy.
 - STRICT / real-executable: base PLUS crossable-fill flags (real_executable_fill_model, valuation_complete,
-  execution_complete, impact_applied) and real fill prices (entry_price on traded rows, exit_price when
-  required). The close-only path legitimately has no fill prices, so entry/exit_price are STRICT-tier, not
-  base -- a causal backtest is base-reportable but not real-executable.
+  execution_complete, impact_applied) and real fill prices that are FINITE POSITIVE numbers (entry_price on
+  traded rows, exit_price when required). The close-only path has no fills, so entry/exit_price are
+  STRICT-tier -- a causal backtest is base-reportable but not real-executable.
 
-Pure functions, no model/trainer dependency; changes no return/cost/equity number. Intended consumers: the
+Pure functions, no model/trainer dependency; changes no return/cost/equity number. Consumers: the
 second_context / hourly decision-log emitters (stamp the verdict into the run manifest) and the future
-leg-engine wiring (design PR-B2). Deletion criterion: fold into the report layer once that layer owns
-reportability end-to-end. KNOWN LIMITATIONS (deferred): net_return==gross-cost consistency is not asserted
-(the cost convention is path-specific); requires_exit_price is honored as logged rather than derived from
-position/terminal state; statistical reportability (overfitting/multiple-testing) is out of scope here.
+leg-engine wiring (design PR-B2).
+
+KNOWN LIMITATIONS (deferred; mostly need NEW decision-log fields, not validator logic): the policy-intent
+chain (raw_policy/requested/constraint-adjusted action) is not required because the protocol doc requires
+only selected_action; requires_exit_price is honored as logged rather than derived from position/terminal
+state; row-level impact decomposition (impact_cost_bps) is not required (the leg engine already carries
+ExecutionLeg.impact_bps); net_return==gross-cost / equity recurrence is not asserted (the cost convention is
+path-specific); and STATISTICAL credibility (overfitting / multiple-testing: PBO / deflated-Sharpe /
+reality-check) is a SEPARATE axis this mechanical gate intentionally does not cover.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 # BASE tier: protocol-required fields a causal backtest must log (docs/decision_tensor_protocol.md). The
 # real fill prices (entry_price/exit_price) are intentionally STRICT-tier, not base.
@@ -63,20 +71,22 @@ _REAL_EXECUTABLE_FLAGS: tuple[str, ...] = (
 )
 _FINITE_NUMERIC_FIELDS = ("target_weight", "order_legs", "traded_notional", "gross_return", "cost_bps", "net_return", "equity_after")
 _NONNEGATIVE_FIELDS = ("order_legs", "traded_notional", "cost_bps")
-_TIMESTAMP_ORDER_FIELDS = ("decision_ts", "entry_execution_ts", "reward_end_ts", "exit_execution_ts")
+# Point-in-time-causal chain: must be non-decreasing left to right.
+_TIMESTAMP_CHAIN = ("context_available_until", "decision_ts", "entry_execution_ts", "reward_end_ts", "exit_execution_ts")
 
 
 @dataclass(frozen=True)
 class ReportabilityIssue:
     row_index: int | None
     field: str | None
-    category: str  # "missing" | "malformed" | "negative" | "nonpositive_equity" | "ordering" | "strict"
+    category: str  # "missing" | "malformed" | "negative" | "nonpositive_equity" | "ordering" | "mask" | "strict"
     message: str
 
 
 @dataclass(frozen=True)
 class ReportabilityVerdict:
     reportable: bool  # overall gate: base valid (+ strict when require_real_executable)
+    base_reportable: bool  # mechanical/base reportability, independent of the require flag
     real_executable_trade_reportable: bool  # strict claim, always computed
     issues: tuple[ReportabilityIssue, ...]  # structured per-row/field issues (no string parsing needed)
     missing_reportability_reasons: tuple[str, ...]  # distinct "category:field" tokens, for manifests/labels
@@ -87,6 +97,27 @@ def _is_finite_number(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     return math.isfinite(float(value))
+
+
+def _is_positive_finite_number(value: object) -> bool:
+    return _is_finite_number(value) and float(value) > 0.0
+
+
+def _parse_timestamp(value: object) -> float | None:
+    """Best-effort timestamp -> comparable epoch seconds. Never raises; returns None if unrecognized.
+    Accepts finite numeric epochs, ISO-8601 strings (datetime.fromisoformat), and datetime objects."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 def _is_traded_row(row: Mapping) -> bool:
@@ -107,18 +138,23 @@ def evaluate_decision_log_reportability(
 ) -> ReportabilityVerdict:
     """Judge decision-log rows for (base) mechanical reportability and (strict) real-executable reportability.
 
-    Validates presence AND semantics: required fields non-None, finite numerics (no NaN/inf/bool/str),
-    non-negative costs/turnover, positive equity, and -- when timestamps are numeric -- non-decreasing
-    decision/entry/reward-end/exit ordering. All checks are defensive (they never raise on a malformed field;
-    they record a structured issue). ``reportable`` is base validity (+ strict when required);
+    Validates presence AND semantics: required fields non-None; finite numerics (no NaN/inf/bool/str);
+    non-negative costs/turnover; positive equity; the selected action allowed by the ex-ante action mask;
+    parseable, point-in-time-causal, non-decreasing timestamps; and (strict tier) finite-positive fill prices.
+    All checks are defensive -- they never raise on a malformed field/row; they record a structured issue.
+    ``base_reportable`` is mechanical validity; ``reportable`` adds the strict tier when required;
     ``real_executable_trade_reportable`` is always the strict claim."""
     base_issues: list[ReportabilityIssue] = []
     strict_issues: list[ReportabilityIssue] = []
 
     if not rows:
-        base_issues.append(ReportabilityIssue(None, None, "missing", "no decision rows"))
+        base_issues.append(ReportabilityIssue(None, "decision_rows", "missing", "no decision rows"))
 
     for i, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            base_issues.append(ReportabilityIssue(i, None, "malformed", f"row {i}: not a mapping ({type(row).__name__})"))
+            continue
+
         for field in REQUIRED_DECISION_LOG_FIELDS:
             if row.get(field) is None:
                 base_issues.append(ReportabilityIssue(i, field, "missing", f"row {i}: missing {field}"))
@@ -133,27 +169,52 @@ def evaluate_decision_log_reportability(
         equity = row.get("equity_after")
         if _is_finite_number(equity) and float(equity) <= 0.0:
             base_issues.append(ReportabilityIssue(i, "equity_after", "nonpositive_equity", f"row {i}: equity_after must be > 0 ({equity!r})"))
-        # Timestamp ordering only when ALL four are numeric (ISO-string logs skip this defensively, never fail).
-        stamps = [row.get(field) for field in _TIMESTAMP_ORDER_FIELDS]
-        if all(_is_finite_number(s) for s in stamps) and not (stamps[0] <= stamps[1] <= stamps[2] <= stamps[3]):
-            base_issues.append(ReportabilityIssue(i, None, "ordering", f"row {i}: timestamps not non-decreasing {stamps}"))
+
+        # Point-in-time causality: parse the timestamp chain (numeric / ISO / datetime) and require it
+        # non-decreasing. A present-but-unparseable timestamp is malformed; ordering runs once all parse.
+        parsed: dict[str, float] = {}
+        for field in _TIMESTAMP_CHAIN:
+            value = row.get(field)
+            if value is None:
+                continue  # already a 'missing' issue
+            stamp = _parse_timestamp(value)
+            if stamp is None:
+                base_issues.append(ReportabilityIssue(i, field, "malformed", f"row {i}: {field} is not a parseable timestamp ({value!r})"))
+            else:
+                parsed[field] = stamp
+        if len(parsed) == len(_TIMESTAMP_CHAIN):
+            seq = [parsed[field] for field in _TIMESTAMP_CHAIN]
+            if any(seq[k] > seq[k + 1] for k in range(len(seq) - 1)):
+                base_issues.append(ReportabilityIssue(i, "execution_timestamps", "ordering", f"row {i}: timestamps not non-decreasing {seq}"))
+
+        # The selected action must be allowed by the (ex-ante) action mask, when the mask is a name->bool map.
+        action_mask = row.get("action_mask")
+        selected = row.get("selected_action")
+        if isinstance(action_mask, Mapping) and selected is not None:
+            try:
+                allowed = action_mask.get(selected)
+            except TypeError:
+                allowed = None  # unhashable selected_action
+            if allowed is not True:
+                base_issues.append(ReportabilityIssue(i, "action_mask", "mask", f"row {i}: selected_action {selected!r} not allowed by action_mask"))
 
         # STRICT real-executable tier.
         for field in _REAL_EXECUTABLE_FLAGS:
             if row.get(field) is not True:
                 strict_issues.append(ReportabilityIssue(i, field, "strict", f"row {i}: {field} is not True"))
-        if _is_traded_row(row) and row.get("entry_price") is None:
-            strict_issues.append(ReportabilityIssue(i, "entry_price", "strict", f"row {i}: traded row missing entry_price"))
-        if row.get("requires_exit_price") and row.get("exit_price") is None:
-            strict_issues.append(ReportabilityIssue(i, "exit_price", "strict", f"row {i}: missing required exit_price"))
+        if _is_traded_row(row) and not _is_positive_finite_number(row.get("entry_price")):
+            strict_issues.append(ReportabilityIssue(i, "entry_price", "strict", f"row {i}: traded row needs a finite positive entry_price ({row.get('entry_price')!r})"))
+        if row.get("requires_exit_price") and not _is_positive_finite_number(row.get("exit_price")):
+            strict_issues.append(ReportabilityIssue(i, "exit_price", "strict", f"row {i}: needs a finite positive exit_price ({row.get('exit_price')!r})"))
 
-    base_ok = not base_issues
-    real_ok = base_ok and not strict_issues
-    reportable = base_ok and (real_ok if require_real_executable else True)
+    base_reportable = not base_issues
+    real_ok = base_reportable and not strict_issues
+    reportable = base_reportable and (real_ok if require_real_executable else True)
     all_issues = (*base_issues, *strict_issues)
     reasons = tuple(sorted({f"{issue.category}:{issue.field}" for issue in all_issues}))
     return ReportabilityVerdict(
         reportable=reportable,
+        base_reportable=base_reportable,
         real_executable_trade_reportable=real_ok,
         issues=all_issues,
         missing_reportability_reasons=reasons,

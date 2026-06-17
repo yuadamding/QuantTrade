@@ -3272,8 +3272,14 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(metrics["switches"], 2)
         self.assertAlmostEqual(float(metrics["total_return"]), 0.0, places=6)
         # Reportability label (no P&L movement): the close-based path must NOT claim real executable trading.
-        self.assertEqual(metrics["sequential_evaluation_type"], "close_based_research_backtest")
+        # (This synthetic split uses placeholder execution timestamps that are not point-in-time causal, so
+        # it is honestly mechanically non-reportable; a real run with causal timestamps is close_based.)
         self.assertFalse(metrics["real_executable_trade_reportable"])
+        self.assertIn(
+            metrics["sequential_evaluation_type"],
+            ("close_based_research_backtest", "non_reportable_research_diagnostic"),
+        )
+        self.assertIsInstance(metrics["mechanically_reportable"], bool)
         self.assertTrue(len(metrics["missing_reportability_reasons"]) > 0)
 
     def test_second_context_min_hold_does_not_force_initial_cash(self) -> None:
@@ -7882,12 +7888,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
         def base_row(**overrides):
             # A complete, semantically-valid BASE row: every protocol field present + valid; numeric
-            # timestamps in non-decreasing order; positive equity. (entry/exit_price are STRICT-tier.)
+            # timestamps in non-decreasing causal order; positive equity; selected action allowed by the
+            # mask. (entry/exit_price are STRICT-tier.)
             row = dict.fromkeys(REQUIRED_DECISION_LOG_FIELDS, 0)
             row.update(
-                decision_ts=0, context_available_until=0, entry_execution_ts=1, reward_end_ts=2, exit_execution_ts=3,
-                target_weight=1.0, order_legs=1.0, traded_notional=1.0,
-                q_values={}, action_mask={}, mask_reasons={}, data_quality_score=1.0, readiness_score=1.0,
+                context_available_until=0, decision_ts=1, entry_execution_ts=2, reward_end_ts=3, exit_execution_ts=4,
+                previous_action="CASH", selected_action="QQQ", target_weight=1.0, order_legs=1.0, traded_notional=1.0,
+                q_values={"QQQ": 0.1}, q_edge_vs_cash=0.1, q_edge_vs_current=0.1,
+                action_mask={"CASH": True, "QQQ": True}, mask_reasons={}, data_quality_score=1.0, readiness_score=1.0,
                 gross_return=0.01, cost_bps=1.0, net_return=0.009, equity_after=1.0,
             )
             row.update(overrides)
@@ -7896,40 +7904,59 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         def cats(v):
             return {issue.category for issue in v.issues}
 
-        # Empty logs are not reportable.
+        # Empty logs are not reportable, with a stable token (not ":None").
         v = evaluate_decision_log_reportability([], require_real_executable=False)
         self.assertFalse(v.reportable)
-        self.assertIn("missing:None", v.missing_reportability_reasons)
+        self.assertIn("missing:decision_rows", v.missing_reportability_reasons)
+        # A non-mapping row fails gracefully (no raise).
+        self.assertFalse(evaluate_decision_log_reportability(["bad", None, []], require_real_executable=False).reportable)
 
         # A missing required field fails the base gate.
         v = evaluate_decision_log_reportability([base_row(net_return=None)], require_real_executable=False)
         self.assertFalse(v.reportable)
         self.assertIn("missing:net_return", v.missing_reportability_reasons)
 
-        # Semantic validity (not just presence): NaN cost, negative legs, non-positive equity, out-of-order ts.
+        # Semantic validity (not just presence): NaN cost, negative legs, non-positive equity.
         self.assertIn("malformed", cats(evaluate_decision_log_reportability([base_row(cost_bps=float("nan"))], require_real_executable=False)))
         self.assertIn("negative", cats(evaluate_decision_log_reportability([base_row(order_legs=-1.0)], require_real_executable=False)))
         self.assertIn("nonpositive_equity", cats(evaluate_decision_log_reportability([base_row(equity_after=0.0)], require_real_executable=False)))
-        self.assertIn("ordering", cats(evaluate_decision_log_reportability([base_row(exit_execution_ts=0)], require_real_executable=False)))
         # Malformed turnover is a HARD failure (not silently treated as not-traded).
         self.assertFalse(evaluate_decision_log_reportability([base_row(order_legs=float("nan"))], require_real_executable=False).reportable)
-        # ISO-string timestamps (as second_context emits) skip the numeric ordering check rather than false-fail.
-        self.assertTrue(evaluate_decision_log_reportability(
-            [base_row(decision_ts="2026-01-02T14:30:00+00:00", entry_execution_ts="2026-01-02T14:30:05+00:00",
-                      reward_end_ts="2026-01-02T15:30:00+00:00", exit_execution_ts="2026-01-02T15:30:05+00:00")],
-            require_real_executable=False,
-        ).reportable)
+        # The selected action must be allowed by the ex-ante action mask.
+        self.assertIn("mask", cats(evaluate_decision_log_reportability([base_row(action_mask={"CASH": True, "QQQ": False})], require_real_executable=False)))
+
+        # Point-in-time-causal timestamp ordering, now PARSED (numeric, ISO-8601, datetime) and enforced --
+        # not skipped. context_available_until must precede decision_ts.
+        self.assertIn("ordering", cats(evaluate_decision_log_reportability([base_row(exit_execution_ts=0)], require_real_executable=False)))
+        self.assertIn("ordering", cats(evaluate_decision_log_reportability([base_row(context_available_until=2, decision_ts=1)], require_real_executable=False)))
+        iso = dict(context_available_until="2026-01-02T14:29:59+00:00", decision_ts="2026-01-02T14:30:00+00:00",
+                   entry_execution_ts="2026-01-02T14:30:05+00:00", reward_end_ts="2026-01-02T15:30:00+00:00",
+                   exit_execution_ts="2026-01-02T15:30:05+00:00")
+        self.assertTrue(evaluate_decision_log_reportability([base_row(**iso)], require_real_executable=False).reportable)  # ordered ISO passes
+        self.assertIn("ordering", cats(evaluate_decision_log_reportability(  # ISO out of order fails
+            [base_row(**{**iso, "exit_execution_ts": "2020-01-01T00:00:00+00:00"})], require_real_executable=False)))
 
         # Close-only row: base-reportable, but NOT real-executable; strict gaps surfaced regardless.
         close_only = base_row(entry_price=None, exit_price=None)
         v = evaluate_decision_log_reportability([close_only], require_real_executable=False)
         self.assertTrue(v.reportable)
+        self.assertTrue(v.base_reportable)
         self.assertFalse(v.real_executable_trade_reportable)
         for tag in ("strict:real_executable_fill_model", "strict:valuation_complete", "strict:execution_complete",
                     "strict:impact_applied", "strict:entry_price"):
             self.assertIn(tag, v.missing_reportability_reasons)
         # Requiring real-executability on the close-only row fails the overall gate.
         self.assertFalse(evaluate_decision_log_reportability([close_only], require_real_executable=True).reportable)
+
+        # Strict fill prices must be FINITE POSITIVE, not merely present (None/NaN/0/negative/str all fail).
+        for bad_price in (None, float("nan"), float("inf"), 0.0, -1.0, "100.1"):
+            sv = evaluate_decision_log_reportability(
+                [base_row(real_executable_fill_model=True, valuation_complete=True, execution_complete=True,
+                          impact_applied=True, entry_price=bad_price)],
+                require_real_executable=True,
+            )
+            self.assertFalse(sv.real_executable_trade_reportable, bad_price)
+            self.assertIn("strict:entry_price", sv.missing_reportability_reasons)
 
         # A fully real-executable row passes the strict claim even when required, with no issues.
         real_row = base_row(

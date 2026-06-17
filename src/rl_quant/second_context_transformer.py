@@ -1044,13 +1044,25 @@ def evaluate_second_context_trading_policy(
     decision_logs = metrics.get("decision_logs")
     if decision_logs is not None:
         verdict = evaluate_decision_log_reportability(decision_logs, require_real_executable=True)
+        base_reportable = verdict.base_reportable
         real_reportable = verdict.real_executable_trade_reportable
         reasons: tuple[str, ...] = verdict.missing_reportability_reasons  # already distinct "category:field" tokens
     else:
+        base_reportable = False
         real_reportable = False
         reasons = ("missing:decision_logs",)
-    metrics["sequential_evaluation_type"] = "real_executable" if real_reportable else "close_based_research_backtest"
+    # Expose BOTH tiers: mechanical (causal/complete/coherent) vs strict real-executable. A causal close-only
+    # backtest is mechanically reportable but not real-executable; a log that fails even the base tier (e.g.
+    # non-causal timestamps) is a non-reportable diagnostic.
+    metrics["mechanically_reportable"] = bool(base_reportable)
     metrics["real_executable_trade_reportable"] = bool(real_reportable)
+    metrics["sequential_evaluation_type"] = (
+        "real_executable"
+        if real_reportable
+        else "close_based_research_backtest"
+        if base_reportable
+        else "non_reportable_research_diagnostic"
+    )
     metrics["missing_reportability_reasons"] = reasons
     if return_selected_actions:
         metrics["selected_actions"] = executed_actions
