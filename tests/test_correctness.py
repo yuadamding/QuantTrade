@@ -9101,7 +9101,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import re
 
         src = ROOT / "src" / "rl_quant"
-        trainers = ["strategy_dqn.py", "intraday_dqn.py", "hourly_transformer.py", "minute_to_hour_transformer.py"]
+        trainers = ["training/strategy.py", "intraday_dqn.py", "hourly_transformer.py", "minute_to_hour_transformer.py"]
         call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
         for name in trainers:
             calls = call_re.findall((src / name).read_text())
