@@ -978,6 +978,23 @@ def _build_split(
     action_valid_mask = all_action_valid[selected] if all_action_valid is not None else None
     label_valid_mask = all_label_valid[selected] if all_label_valid is not None else None
 
+    if action_valid_mask is None:
+        scorable_decision_valid = torch.ones_like(returns, dtype=torch.bool)
+    else:
+        scorable_decision_valid = action_valid_mask.bool()
+    if label_valid_mask is None:
+        scorable_label_ok = torch.isfinite(returns)
+    else:
+        scorable_label_ok = label_valid_mask.bool() & torch.isfinite(returns)
+    non_cash_actions = torch.ones(returns.shape[1], dtype=torch.bool, device=returns.device)
+    action_names = list(payload["action_names"])
+    cash_index = action_names.index("CASH") if "CASH" in action_names else 0
+    if 0 <= cash_index < int(non_cash_actions.numel()):
+        non_cash_actions[cash_index] = False
+    rows_with_selectable_missing_labels = (
+        scorable_decision_valid & non_cash_actions.unsqueeze(0) & ~scorable_label_ok
+    ).any(dim=1)
+
     reward_after_dt = None if reward_after_ts is None else _parse_utc_timestamp(reward_after_ts)
     reward_start_dt = None if reward_start_ts is None else _parse_utc_timestamp(reward_start_ts)
     reward_end_dt = None if reward_end_ts is None else _parse_utc_timestamp(reward_end_ts)
@@ -989,6 +1006,8 @@ def _build_split(
         if reward_start_dt is not None and current_dt < reward_start_dt:
             continue
         if reward_end_dt is not None and following_dt > reward_end_dt:
+            continue
+        if bool(rows_with_selectable_missing_labels[index].item()):
             continue
         valid.append(index)
     if not valid:

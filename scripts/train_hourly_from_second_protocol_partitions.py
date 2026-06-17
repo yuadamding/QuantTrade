@@ -222,26 +222,43 @@ def partition_selection_reportability_errors(args: argparse.Namespace) -> list[s
     return []
 
 
-def _chronological_latest_label(labels: list[str]) -> str | None:
-    """Latest label by PARSED calendar date, independent of input/lexicographic order.
+_LABEL_RANGE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:_to_(\d{4}-\d{2}-\d{2}))?")
 
-    Directory-name (lexicographic) order only equals chronological order when labels are clean
-    ISO-date prefixes; an unsortable suffix like ``2026-06-15_v10`` sorts BEFORE ``2026-06-15_v2``,
-    so trusting ``sorted(...)[-1]`` can pick the wrong "latest". Labels that are not ISO-date-prefixed
-    real dates are ignored; if none parse we fall back to the last given label. Same-date ties resolve
-    to the last given label (callers needing an unambiguous latest reject same-date labels first --
-    ``strict_latest_partition_violations`` does)."""
-    dated: list[tuple[datetime, int, str]] = []
+
+def _label_span(label: str) -> tuple[datetime, datetime] | None:
+    """Parse a partition label into a half-open ``[start, end)`` calendar span.
+
+    The real label format is ``<start>_to_<end>`` with ``end`` exclusive (the builder sets
+    ``end = last_trading_day + 1``); a bare ``<date>`` label is treated as a single-day point
+    ``[start, start)``. Returns ``None`` when the start (or a present ``_to_`` end) is not a real
+    calendar date, or when ``end < start`` -- i.e. the label is not a sortable, well-formed window."""
+    match = _LABEL_RANGE.match(label)
+    if not match:
+        return None
+    try:
+        start = datetime.strptime(match.group(1), "%Y-%m-%d")
+        end = datetime.strptime(match.group(2), "%Y-%m-%d") if match.group(2) else start
+    except ValueError:
+        return None
+    return (start, end) if end >= start else None
+
+
+def _chronological_latest_label(labels: list[str]) -> str | None:
+    """Latest label by its WINDOW-END date (most recent data), independent of input/lexicographic order.
+
+    Labels are ``<start>_to_<end>`` ranges (or bare dates). Ranking by the start prefix alone would
+    crown a window whose data ENDS earlier than an overlapping sibling (a wide backfill vs a short
+    tail), so rank by parsed end, then start, then position. Directory (lexicographic) order is also
+    unreliable for unsortable suffixes (``2026-06-15_v10`` sorts before ``_v2``). Unparseable labels
+    are ignored; if none parse we fall back to the last given label."""
+    ranked: list[tuple[datetime, datetime, int, str]] = []
     for index, label in enumerate(labels):
-        if not re.match(r"^\d{4}-\d{2}-\d{2}", label):
-            continue
-        try:
-            dated.append((datetime.strptime(label[:10], "%Y-%m-%d"), index, label))
-        except ValueError:
-            continue
-    if not dated:
+        span = _label_span(label)
+        if span is not None:
+            ranked.append((span[1], span[0], index, label))
+    if not ranked:
         return labels[-1] if labels else None
-    return max(dated, key=lambda item: (item[0], item[1]))[2]
+    return max(ranked, key=lambda item: (item[0], item[1], item[2]))[3]
 
 
 def latest_available_partition_label(args: argparse.Namespace) -> str | None:
@@ -259,47 +276,61 @@ def strict_latest_partition_violations(
     """Strict latest-period reporting violations; empty list means the selection is admissible.
 
     Enforces the stated protocol -- latest periods for test, ALL earlier periods for train/validation:
-      1. Every available partition label must be a real, ISO-date-prefixed calendar date so that
-         directory-name order equals chronological order (rejects ``partition_9`` and ``2026-99-99``).
-      2. The final selected partition must be the latest available one (no OLD period reported as the
-         headline latest-period test).
-      3. No earlier available partition may be silently excluded from the train/validation history,
+      1. Every available partition label must be a real ISO calendar window -- a ``<date>`` or
+         ``<start>_to_<end>`` (end >= start) -- so spans are sortable (rejects ``partition_9``,
+         ``2026-99-99``, ``2026-01-01_to_garbage``); same-start-date distinct labels are ambiguous.
+      2. Available windows must be a strictly non-overlapping walk-forward (rejects a window contained
+         in or overlapping another, which would make the latest period ambiguous and leak train/test).
+      3. The final selected partition must be the latest available one, ranked by WINDOW END (most
+         recent data) -- so no OLD period is reported as the headline latest-period test.
+      4. No earlier available partition may be silently excluded from the train/validation history,
          unless ``allow_truncated_training_history`` explicitly permits it.
     """
     violations: list[str] = []
-    iso_date_prefix = re.compile(r"^\d{4}-\d{2}-\d{2}")
-    invalid_labels: list[str] = []
-    for label in all_available_labels:
-        if not iso_date_prefix.match(label):
-            invalid_labels.append(label)
-            continue
-        try:
-            # Reject regex-matching but impossible calendar dates (e.g. 2026-99-99); a prefix match
-            # is not enough to guarantee sortable, real dates.
-            datetime.strptime(label[:10], "%Y-%m-%d")
-        except ValueError:
-            invalid_labels.append(label)
+    # A label must be a real ISO start date, optionally `_to_<real ISO end date>` with end >= start
+    # (rejects partition_9, 2026-99-99, and 2026-01-01_to_garbage) so windows are sortable real spans.
+    invalid_labels = [label for label in all_available_labels if _label_span(label) is None]
     if invalid_labels:
-        # Latest/earliest comparisons are meaningless when labels are not sortable real dates.
         violations.append(
-            "partition labels must be ISO-date-prefixed real calendar dates so directory order matches "
-            f"chronological order; got invalid labels: {invalid_labels[:5]}"
+            "partition labels must be ISO-date-prefixed real calendar dates (optionally "
+            "<start>_to_<end> with a real end >= start) so directory order matches chronological "
+            f"order; got invalid labels: {invalid_labels[:5]}"
         )
         return violations
-    # Chronological order must be UNAMBIGUOUS from the label. The validated date prefix only carries
-    # day granularity, so two distinct labels sharing a date (e.g. 2026-06-15_v2 vs 2026-06-15_v10)
+    distinct_labels = list(dict.fromkeys(all_available_labels))
+    # Chronological order must be UNAMBIGUOUS from the label. The start prefix carries only day
+    # granularity, so two distinct labels sharing a START date (e.g. 2026-06-15_v2 vs 2026-06-15_v10)
     # cannot be ordered from the label, and lexicographic tie-breaking is unreliable (_v10 < _v2).
     # Fail closed: with an ambiguous order, "which partition is the latest-period test" is undefined.
-    by_date: dict[str, list[str]] = {}
-    for label in dict.fromkeys(all_available_labels):  # distinct labels only
-        by_date.setdefault(label[:10], []).append(label)
-    ambiguous_dates = sorted(date for date, group in by_date.items() if len(group) > 1)
-    if ambiguous_dates:
+    by_start: dict[str, list[str]] = {}
+    for label in distinct_labels:
+        by_start.setdefault(label[:10], []).append(label)
+    ambiguous_starts = sorted(start for start, group in by_start.items() if len(group) > 1)
+    if ambiguous_starts:
         violations.append(
             "partition labels are not chronologically unambiguous; multiple distinct labels share a "
-            f"calendar date, so the latest-period test cannot be determined from the label: "
-            f"{[label for date in ambiguous_dates[:3] for label in by_date[date]][:6]} "
+            f"start date, so the latest-period test cannot be determined from the label: "
+            f"{[label for start in ambiguous_starts[:3] for label in by_start[start]][:6]} "
             "(use date-only labels or a zero-padded, lexicographically sortable suffix)"
+        )
+        return violations
+    # Windows must be a strictly NON-overlapping walk-forward. Labels are half-open [start, end) ranges;
+    # an overlapping/contained window (e.g. a short window inside a wide backfill, as can happen when
+    # separate --skip-existing builds leave mixed chunkings in one partitions dir) makes "the latest
+    # period" ambiguous by date order alone -- a contained window can have a LATER start but an EARLIER
+    # end than its container -- and risks train/test data leakage. Fail closed. (Adjacent consecutive
+    # windows share at most a boundary, end_i <= start_{i+1}, so they are not flagged.)
+    spans = sorted(((_label_span(label), label) for label in distinct_labels), key=lambda item: item[0])
+    running_max_end: datetime | None = None
+    overlapping: list[str] = []
+    for (start, end), label in spans:
+        if running_max_end is not None and start < running_max_end:
+            overlapping.append(label)
+        running_max_end = end if running_max_end is None else max(running_max_end, end)
+    if overlapping:
+        violations.append(
+            "partition windows overlap (a proper walk-forward must be strictly non-overlapping); "
+            f"overlapping/contained windows: {overlapping[:5]}"
         )
         return violations
     # Collect ALL independent violations rather than returning on the first, so a single run surfaces
@@ -320,7 +351,7 @@ def strict_latest_partition_violations(
         # partition), and report any unknown selected label separately rather than masking it.
         available_set = set(all_available_labels)
         selected_set = set(selected_labels)
-        missing = [label for label in all_available_labels if label not in selected_set]
+        missing = [label for label in dict.fromkeys(all_available_labels) if label not in selected_set]
         extra = sorted({label for label in selected_labels if label not in available_set})
         if missing:
             violations.append(

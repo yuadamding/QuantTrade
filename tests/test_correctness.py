@@ -4315,6 +4315,7 @@ class MinuteToHourTests(unittest.TestCase):
         split = module._build_split(name="train", payload=payload)
         self.assertTrue(bool(split.valid_actions(torch.tensor([0]))[0, 1].item()))
         self.assertFalse(bool(split.label_valid_actions(torch.tensor([0]))[0, 1].item()))
+        self.assertEqual(split.valid_start_indices.tolist(), [1])
 
         result = evaluate_minute_to_hour_policy(
             split,
@@ -4325,15 +4326,15 @@ class MinuteToHourTests(unittest.TestCase):
             capture_rollout=True,
         )
 
-        self.assertEqual([row["asset"] for row in result.rollout_records], ["CASH", "QQQ"])
-        self.assertFalse(result.evaluation_reportable)
-        self.assertEqual(result.selectable_missing_label_count, 1)
-        self.assertEqual(result.requested_action_missing_label_count, 1)
+        self.assertEqual([row["asset"] for row in result.rollout_records], ["QQQ"])
+        self.assertTrue(result.evaluation_reportable)
+        self.assertEqual(result.selectable_missing_label_count, 0)
+        self.assertEqual(result.requested_action_missing_label_count, 0)
         self.assertEqual(result.executed_action_missing_label_count, 0)
-        self.assertEqual(result.policy_unscorable_rows, 1)
-        self.assertIn("requested_actions_with_missing_reward_labels", result.reportability_errors)
-        self.assertEqual([row["requested_asset"] for row in result.rollout_records], ["QQQ", "QQQ"])
-        self.assertEqual([row["executed_asset"] for row in result.rollout_records], ["CASH", "QQQ"])
+        self.assertEqual(result.policy_unscorable_rows, 0)
+        self.assertEqual(result.reportability_errors, [])
+        self.assertEqual([row["requested_asset"] for row in result.rollout_records], ["QQQ"])
+        self.assertEqual([row["executed_asset"] for row in result.rollout_records], ["QQQ"])
 
     def test_latest_holdout_uses_final_complete_sessions_and_train_normalizer(self) -> None:
         module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
@@ -6603,6 +6604,21 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 allow_truncated_training_history=True,
             )
             self.assertTrue(any("not chronologically unambiguous" in v for v in violations), ambiguous_available)
+        # Distinct-start OVERLAPPING windows (a short window contained in a wide backfill) are rejected:
+        # ranking by start would crown the contained 2026-03-15_to_2026-03-20 as latest even though the
+        # container holds newer data (through Mar 31), and the windows leak train/test. Fail closed.
+        overlapping = fn(
+            selected_labels=["2026-01-01_to_2026-03-31", "2026-03-15_to_2026-03-20"],
+            all_available_labels=["2026-01-01_to_2026-03-31", "2026-03-15_to_2026-03-20"],
+            allow_truncated_training_history=True,
+        )
+        self.assertTrue(any("overlap" in v for v in overlapping))
+        # Adjacent consecutive windows that merely SHARE a boundary (end_i == start_{i+1}) are NOT
+        # overlapping and remain admissible.
+        adjacent = ["2026-01-02_to_2026-01-07", "2026-01-07_to_2026-01-11", "2026-01-11_to_2026-01-16"]
+        self.assertEqual(
+            fn(selected_labels=adjacent, all_available_labels=adjacent, allow_truncated_training_history=False), []
+        )
 
     def test_chronological_latest_label_ignores_lexicographic_suffix_order(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
