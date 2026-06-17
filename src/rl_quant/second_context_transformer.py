@@ -1045,10 +1045,10 @@ def evaluate_second_context_trading_policy(
     if decision_logs is not None:
         verdict = evaluate_decision_log_reportability(decision_logs, require_real_executable=True)
         real_reportable = verdict.real_executable_trade_reportable
-        reasons: tuple[str, ...] = tuple(sorted({r.split(":", 1)[-1] for r in verdict.missing_reportability_reasons}))
+        reasons: tuple[str, ...] = verdict.missing_reportability_reasons  # already distinct "category:field" tokens
     else:
         real_reportable = False
-        reasons = ("decision_logs_not_emitted",)
+        reasons = ("missing:decision_logs",)
     metrics["sequential_evaluation_type"] = "real_executable" if real_reportable else "close_based_research_backtest"
     metrics["real_executable_trade_reportable"] = bool(real_reportable)
     metrics["missing_reportability_reasons"] = reasons

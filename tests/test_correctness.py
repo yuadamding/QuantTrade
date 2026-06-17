@@ -7873,42 +7873,65 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                                     next_state=Holdings(()), real_executable_fill_model=True, execution_complete=False)
 
     def test_decision_log_reportability_gate(self) -> None:
-        # PR-C: additive, LABEL-ONLY reportability validator (moves no P&L; nobody calls it yet besides this).
+        # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
+        # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.
         from rl_quant.reportability import (
             REQUIRED_DECISION_LOG_FIELDS,
             evaluate_decision_log_reportability,
         )
 
         def base_row(**overrides):
-            row = {k: 0 for k in REQUIRED_DECISION_LOG_FIELDS}  # all required fields present (non-None)
-            row["order_legs"] = 1.0
-            row["traded_notional"] = 1.0
+            # A complete, semantically-valid BASE row: every protocol field present + valid; numeric
+            # timestamps in non-decreasing order; positive equity. (entry/exit_price are STRICT-tier.)
+            row = dict.fromkeys(REQUIRED_DECISION_LOG_FIELDS, 0)
+            row.update(
+                decision_ts=0, context_available_until=0, entry_execution_ts=1, reward_end_ts=2, exit_execution_ts=3,
+                target_weight=1.0, order_legs=1.0, traded_notional=1.0,
+                q_values={}, action_mask={}, mask_reasons={}, data_quality_score=1.0, readiness_score=1.0,
+                gross_return=0.01, cost_bps=1.0, net_return=0.009, equity_after=1.0,
+            )
             row.update(overrides)
             return row
+
+        def cats(v):
+            return {issue.category for issue in v.issues}
 
         # Empty logs are not reportable.
         v = evaluate_decision_log_reportability([], require_real_executable=False)
         self.assertFalse(v.reportable)
-        self.assertIn("no_decision_rows", v.missing_reportability_reasons)
+        self.assertIn("missing:None", v.missing_reportability_reasons)
 
         # A missing required field fails the base gate.
         v = evaluate_decision_log_reportability([base_row(net_return=None)], require_real_executable=False)
         self.assertFalse(v.reportable)
-        self.assertTrue(any("missing_net_return" in r for r in v.missing_reportability_reasons))
+        self.assertIn("missing:net_return", v.missing_reportability_reasons)
 
-        # Close-only row (required fields present, but no real-execution evidence): base-reportable when not
-        # required, but NOT real-executable, and the strict gaps are surfaced regardless.
+        # Semantic validity (not just presence): NaN cost, negative legs, non-positive equity, out-of-order ts.
+        self.assertIn("malformed", cats(evaluate_decision_log_reportability([base_row(cost_bps=float("nan"))], require_real_executable=False)))
+        self.assertIn("negative", cats(evaluate_decision_log_reportability([base_row(order_legs=-1.0)], require_real_executable=False)))
+        self.assertIn("nonpositive_equity", cats(evaluate_decision_log_reportability([base_row(equity_after=0.0)], require_real_executable=False)))
+        self.assertIn("ordering", cats(evaluate_decision_log_reportability([base_row(exit_execution_ts=0)], require_real_executable=False)))
+        # Malformed turnover is a HARD failure (not silently treated as not-traded).
+        self.assertFalse(evaluate_decision_log_reportability([base_row(order_legs=float("nan"))], require_real_executable=False).reportable)
+        # ISO-string timestamps (as second_context emits) skip the numeric ordering check rather than false-fail.
+        self.assertTrue(evaluate_decision_log_reportability(
+            [base_row(decision_ts="2026-01-02T14:30:00+00:00", entry_execution_ts="2026-01-02T14:30:05+00:00",
+                      reward_end_ts="2026-01-02T15:30:00+00:00", exit_execution_ts="2026-01-02T15:30:05+00:00")],
+            require_real_executable=False,
+        ).reportable)
+
+        # Close-only row: base-reportable, but NOT real-executable; strict gaps surfaced regardless.
         close_only = base_row(entry_price=None, exit_price=None)
         v = evaluate_decision_log_reportability([close_only], require_real_executable=False)
         self.assertTrue(v.reportable)
         self.assertFalse(v.real_executable_trade_reportable)
-        for tag in ("not_crossable_quote_fill_model", "valuation_incomplete", "execution_incomplete",
-                    "impact_not_applied", "missing_entry_price"):
-            self.assertTrue(any(tag in r for r in v.missing_reportability_reasons), tag)
-        # Requiring real-executability on the same close-only row fails the overall gate.
+        for tag in ("strict:real_executable_fill_model", "strict:valuation_complete", "strict:execution_complete",
+                    "strict:impact_applied", "strict:entry_price"):
+            self.assertIn(tag, v.missing_reportability_reasons)
+        # Requiring real-executability on the close-only row fails the overall gate.
         self.assertFalse(evaluate_decision_log_reportability([close_only], require_real_executable=True).reportable)
 
-        # A fully real-executable row passes the strict claim even when required, with no missing reasons.
+        # A fully real-executable row passes the strict claim even when required, with no issues.
         real_row = base_row(
             real_executable_fill_model=True, valuation_complete=True, execution_complete=True,
             impact_applied=True, entry_price=100.1, requires_exit_price=True, exit_price=99.9,
@@ -7916,11 +7939,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         v = evaluate_decision_log_reportability([real_row], require_real_executable=True)
         self.assertTrue(v.reportable)
         self.assertTrue(v.real_executable_trade_reportable)
-        self.assertEqual(v.missing_reportability_reasons, ())
+        self.assertEqual(v.issues, ())
         # Drop the exit price on a row that requires it -> strict claim fails.
         v = evaluate_decision_log_reportability([{**real_row, "exit_price": None}], require_real_executable=True)
         self.assertFalse(v.real_executable_trade_reportable)
-        self.assertTrue(any("missing_exit_price" in r for r in v.missing_reportability_reasons))
+        self.assertIn("strict:exit_price", v.missing_reportability_reasons)
 
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
