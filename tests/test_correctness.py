@@ -8372,6 +8372,48 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(on["loss_trace"][0], off["loss_trace"][0], places=6)
         self.assertNotEqual(on["loss_trace"], off["loss_trace"])
 
+    def test_minute_to_hour_baseline_panel(self) -> None:
+        # Baseline panel (eval-only; changes no training/reward): deterministic cash / buy-and-hold references
+        # run through the SAME eval path as a trained model, so a policy (or a PR-D A/B) must beat them under
+        # cost. Single-slot action space -> no equal-weight; always_cash + per-action buy-and-hold.
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit,
+            MinuteToHourEvaluationResult,
+            evaluate_minute_to_hour_baselines,
+        )
+
+        n = 6
+        returns = torch.zeros((n, 2))
+        returns[:, 1] = 0.01  # QQQ earns +1%/bar; CASH earns 0
+        data = HourFromMinuteDataSplit(
+            name="val",
+            decision_timestamps=[f"2026-06-1{2}T1{4 + i}:30:00+00:00" for i in range(n)],
+            next_timestamps=[f"2026-06-1{2}T1{5 + i}:30:00+00:00" for i in range(n)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((n, 1, 1)), action_returns=returns,
+            action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            valid_start_indices=torch.arange(n - 1, dtype=torch.long),
+            valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1),
+            hours_lookback=1, minutes_per_hour=1,
+        )
+        panel = evaluate_minute_to_hour_baselines(data, device=torch.device("cpu"))
+
+        self.assertIn("always_cash", panel)
+        self.assertIn("buy_and_hold:QQQ", panel)
+        for result in panel.values():
+            self.assertIsInstance(result, MinuteToHourEvaluationResult)
+            self.assertTrue(math.isfinite(result.total_return))
+        # Cash does nothing (no trades, no cost) -> ~0 return and 0 switches.
+        self.assertAlmostEqual(panel["always_cash"].total_return, 0.0, places=6)
+        self.assertEqual(panel["always_cash"].allocation_switches, 0)
+        # Buy-and-hold QQQ enters once (one switch) and rides the +1%/bar series -> strictly beats cash.
+        self.assertEqual(panel["buy_and_hold:QQQ"].allocation_switches, 1)
+        self.assertGreater(panel["buy_and_hold:QQQ"].total_return, panel["always_cash"].total_return)
+
     def test_minute_to_hour_training_state_resumes_from_checkpoint(self) -> None:
         from rl_quant.core import DQNLearningConfig
         from rl_quant.minute_to_hour_transformer import (

@@ -2218,6 +2218,58 @@ def evaluate_minute_to_hour_policy(
     )
 
 
+class _ConstantActionModel(nn.Module):
+    """A deterministic baseline 'policy': emits a Q-vector that, after the eval's cost-aware hysteresis,
+    enters and holds a single target action. Used only by evaluate_minute_to_hour_baselines -- the Q value
+    is large so it dominates the switch-cost margin (the target is entered when valid and then held)."""
+
+    def __init__(self, action_count: int, target_action: int) -> None:
+        super().__init__()
+        self.action_count = int(action_count)
+        self.target_action = int(target_action)
+
+    def forward(self, minute, mask, hour, previous_actions, constraint_features, action_features=None, dynamic_state=None):
+        del minute, mask, hour, constraint_features, action_features, dynamic_state
+        q = torch.zeros(previous_actions.shape[0], self.action_count, device=previous_actions.device)
+        q[:, self.target_action] = 1.0e6
+        return q
+
+
+def evaluate_minute_to_hour_baselines(
+    data: HourFromMinuteDataSplit,
+    *,
+    device: torch.device,
+    constraints: TradingConstraintConfig | None = None,
+    episode_length: int | None = None,
+    reward_scale: float = 10_000.0,
+    include_buy_and_hold: bool = True,
+) -> dict[str, MinuteToHourEvaluationResult]:
+    """Deterministic reference policies run through the SAME eval path as a trained model (identical cost /
+    constraint / reportability / drawdown / Sharpe accounting), so a policy -- or a PR-D flag-on-vs-off A/B
+    -- can be benchmarked against cash and buy-and-hold. A model that does not beat these under cost should
+    not be promoted (per the review). NOTE: the action space is single-slot/discrete, so an equal-weight
+    baseline is not expressible here; the references are always-cash and per-action buy-and-hold. This is an
+    EVALUATION-ONLY helper: it changes no training/reward path."""
+    constraints = constraints or default_minute_to_hour_constraints()
+    cash_index = int(constraints.cash_index)
+    action_count = len(data.action_names)
+    common = dict(
+        device=device, constraints=constraints, episode_length=episode_length,
+        reward_scale=reward_scale, initial_action=cash_index,
+    )
+    results: dict[str, MinuteToHourEvaluationResult] = {
+        "always_cash": evaluate_minute_to_hour_policy(data, _ConstantActionModel(action_count, cash_index), **common),
+    }
+    if include_buy_and_hold:
+        for action in range(action_count):
+            if action == cash_index:
+                continue
+            results[f"buy_and_hold:{data.action_names[action]}"] = evaluate_minute_to_hour_policy(
+                data, _ConstantActionModel(action_count, action), **common
+            )
+    return results
+
+
 def _state_dict_to_cpu(module: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
 
