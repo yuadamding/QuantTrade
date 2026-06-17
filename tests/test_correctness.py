@@ -8060,6 +8060,69 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                                     gross_mark_pnl=0.0, realized_execution_cost=0.0, net_pnl=0.0,
                                     next_state=Holdings(()), real_executable_fill_model=True, execution_complete=False)
 
+    def test_weight_transition_cost_bps_matches_engine(self) -> None:
+        # PR-3: the vectorized weight_transition_cost_bps (used by the shadow env) must equal the per-leg
+        # WeightExecutionCostConfig cost the dataclass engine charges, in bps (= 1e4 * realized_execution_cost).
+        from rl_quant.execution import (
+            ExecutionConfig, FillLevel, Holdings, SymbolQuote, WeightExecutionCostConfig,
+            simulate_action_transition, weight_transition_cost_bps,
+        )
+
+        wc = WeightExecutionCostConfig(fee_bps=2.0)
+        cfg = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE, weight_cost=wc)
+
+        def zq(sym: str) -> SymbolQuote:  # zero spread -> total cost is fee only (isolates the fee term)
+            return SymbolQuote(symbol=sym, mid=100.0, best_bid=100.0, best_ask=100.0)
+
+        out_buy = simulate_action_transition(Holdings(()), Holdings((("QQQ", 1.0),)), {"QQQ": zq("QQQ")}, cfg)
+        helper_buy = weight_transition_cost_bps(torch.tensor([0.0]), torch.tensor([1.0]), weight_cost=wc)
+        self.assertAlmostEqual(float(helper_buy[0]), 1e4 * out_buy.realized_execution_cost, places=6)
+
+        out_sw = simulate_action_transition(
+            Holdings((("QQQ", 1.0),)), Holdings((("SPY", 0.5),)), {"QQQ": zq("QQQ"), "SPY": zq("SPY")}, cfg
+        )
+        helper_sw = weight_transition_cost_bps(torch.tensor([1.0]), torch.tensor([0.5]), weight_cost=wc)
+        self.assertAlmostEqual(float(helper_sw[0]), 1e4 * out_sw.realized_execution_cost, places=6)
+        self.assertAlmostEqual(float(helper_sw[0]), 3.0, places=6)  # (1.0 + 0.5) * 2 bps
+
+    def test_minute_to_hour_execution_shadow_reward_side_channel(self) -> None:
+        # PR-3: execution_env_reward_shadow ON computes a weight-bps execution reward/cost ALONGSIDE the legacy
+        # reward (logged in the step dict) but leaves the training `rewards` byte-identical -- replay stores only
+        # declared fields, so the shadow never reaches training. Default OFF emits no shadow keys.
+        split = HourFromMinuteDataSplit(
+            name="train",
+            decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
+            next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((4, 1, 1, 1)), minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((4, 1, 1)),
+            action_returns=torch.tensor([[0.0, 0.10], [0.0, -0.20], [0.0, 0.30], [0.0, 0.0]]),
+            action_valid_mask=torch.ones((4, 2), dtype=torch.bool), label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1, 2, 3]), valid_index_mask=torch.tensor([True, True, True, True]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        module = __import__("rl_quant.minute_to_hour_transformer",
+                            fromlist=["VectorizedMinuteToHourEnv", "MinuteToHourEnvConfig"])
+
+        def run(shadow: bool, action: int) -> dict:
+            env = module.VectorizedMinuteToHourEnv(
+                split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0,
+                                                    execution_env_reward_shadow=shadow), torch.device("cpu"))
+            env.indices[:] = 0
+            env.entry_index[:] = 0
+            return env.step(torch.tensor([action], dtype=torch.long))
+
+        off, on = run(False, 1), run(True, 1)  # switch CASH->QQQ
+        self.assertTrue(torch.equal(off["rewards"], on["rewards"]))  # training reward byte-identical
+        self.assertNotIn("execution_env_reward_shadow", off)
+        for key in ("execution_env_reward_shadow", "execution_cost_bps_shadow", "reward_delta_shadow", "cost_delta_shadow"):
+            self.assertIn(key, on)
+        self.assertTrue(torch.isfinite(on["execution_cost_bps_shadow"]).all())
+        self.assertGreater(float(on["execution_cost_bps_shadow"][0]), 0.0)  # a real switch trades
+        hold = run(True, 0)  # CASH -> CASH: no trade -> zero shadow execution cost
+        self.assertEqual(float(hold["execution_cost_bps_shadow"][0]), 0.0)
+
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
         # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.

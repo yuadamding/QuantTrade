@@ -197,6 +197,29 @@ class WeightExecutionCostConfig:
         return 0.0
 
 
+def weight_transition_cost_bps(
+    sell_weight: torch.Tensor,
+    buy_weight: torch.Tensor,
+    *,
+    weight_cost: WeightExecutionCostConfig,
+) -> torch.Tensor:
+    """Vectorized weight-bps execution cost (in BPS) of a single-slot transition's two legs -- a SELL of the
+    prior position's weight + a BUY of the new position's weight. Matches ``simulate_action_transition``'s
+    per-leg ``WeightExecutionCostConfig`` charge: each leg costs ``traded * (fee_bps + impact_bps(traded))``
+    with linear ``impact_bps(traded) = linear_impact_bps_per_weight * |traded|`` (so impact COST ~ size^2).
+    Inputs are the EFFECTIVE traded weights per leg (cash already zeroed; 0 on a hold). The result is in bps,
+    i.e. ``1e4 * `` the engine's return-unit ``realized_execution_cost``. Use this in a VECTORIZED env step --
+    the dataclass ``simulate_action_transition`` is too heavy per step; an equivalence test pins them together."""
+    coef = float(weight_cost.linear_impact_bps_per_weight) if weight_cost.impact_kind == "linear_bps" else 0.0
+    fee = float(weight_cost.fee_bps)
+
+    def _leg(traded: torch.Tensor) -> torch.Tensor:
+        traded = traded.abs()
+        return traded * (fee + coef * traded)
+
+    return _leg(sell_weight) + _leg(buy_weight)
+
+
 def _coerce_weight_cost(value: object) -> WeightExecutionCostConfig:
     if isinstance(value, WeightExecutionCostConfig):
         return value

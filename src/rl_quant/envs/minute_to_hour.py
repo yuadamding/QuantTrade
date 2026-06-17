@@ -18,6 +18,8 @@ from rl_quant.datasets.hour_from_subhour import (
     HourFromMinuteDataSplit,
     default_minute_to_hour_constraints,
 )
+from rl_quant.execution import WeightExecutionCostConfig, weight_transition_cost_bps
+from rl_quant.features.action_risk import action_weight_tensor, build_action_metadata
 
 
 @dataclass
@@ -27,6 +29,10 @@ class MinuteToHourEnvConfig:
     reward_scale: float = 10_000.0
     initial_action: int = 0
     cash_idle_penalty_bps: float = 0.0
+    # PR-3 shadow mode (default off, byte-identical): when on, the env ALSO computes the leg-engine weight-bps
+    # execution reward/cost per transition and logs it + deltas in the step dict; training still uses the
+    # legacy `rewards`. A cost-model A/B (turnover-weighted vs leg-count), NOT real-executable (no NBBO).
+    execution_env_reward_shadow: bool = False
     constraints: TradingConstraintConfig = field(default_factory=default_minute_to_hour_constraints)
 
 
@@ -55,6 +61,15 @@ class VectorizedMinuteToHourEnv:
         self.unrealized_pnl = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
         self.mae = torch.zeros(config.num_envs, dtype=torch.float32, device=device)  # max adverse excursion (<= 0)
         self.mfe = torch.zeros(config.num_envs, dtype=torch.float32, device=device)  # max favorable excursion (>= 0)
+        # PR-3 shadow mode: per-action STATIC weights from action metadata (cash zeroed in step), so the prior
+        # held weight is determined by previous_action -- no separate shadow-holdings state needed. The shadow
+        # fee rate is the env's one_way_cost_bps, so the A/B isolates the costing METHOD, not the rate.
+        self.execution_env_reward_shadow = bool(config.execution_env_reward_shadow)
+        if self.execution_env_reward_shadow:
+            self._shadow_action_weights = action_weight_tensor(
+                build_action_metadata(list(self.data.action_names)), device=device
+            )
+            self._shadow_weight_cost = WeightExecutionCostConfig(fee_bps=float(config.constraints.one_way_cost_bps))
         self.reset()
 
     def _build_start_index_pool(self) -> torch.Tensor:
@@ -198,6 +213,23 @@ class VectorizedMinuteToHourEnv:
         rewards = raw_returns * float(self.config.reward_scale) - (
             cost_bps + cash_idle_penalty_bps
         ) * float(self.config.reward_scale) / 10_000.0
+        # PR-3 shadow (computed from the SAME state, only logged -- `rewards` above, used for training, is
+        # untouched, so this is byte-identical to shadow-off). Weight-bps cost of the transition's two legs
+        # (sell prior weight + buy new weight; cash = no exposure; only a real switch trades), carrying the same
+        # cash-idle term as the legacy reward so reward_delta isolates the trade-cost-MODEL change.
+        if self.execution_env_reward_shadow:
+            cash_idx = int(self.config.constraints.cash_index)
+            w_prev = self._shadow_action_weights[previous_actions]
+            w_next = self._shadow_action_weights[actions]
+            zeros = torch.zeros_like(w_prev)
+            sell_weight = torch.where(is_switch & (previous_actions != cash_idx), w_prev, zeros)
+            buy_weight = torch.where(is_switch & (actions != cash_idx), w_next, zeros)
+            execution_cost_bps_shadow = weight_transition_cost_bps(
+                sell_weight, buy_weight, weight_cost=self._shadow_weight_cost
+            )
+            execution_env_reward_shadow = raw_returns * float(self.config.reward_scale) - (
+                execution_cost_bps_shadow + cash_idle_penalty_bps
+            ) * float(self.config.reward_scale) / 10_000.0
 
         next_indices = current_indices + 1
         self.indices = next_indices
@@ -245,7 +277,7 @@ class VectorizedMinuteToHourEnv:
 
         next_constraint_features = self.constraint_features()
         next_action_mask = self.action_mask(next_indices)
-        return {
+        out: dict[str, torch.Tensor] = {
             "indices": current_indices,
             "previous_actions": previous_actions,
             "constraint_features": constraint_features,
@@ -262,3 +294,11 @@ class VectorizedMinuteToHourEnv:
             "position_dynamic": position_dynamic,
             "next_position_dynamic": next_position_dynamic,
         }
+        # PR-3 shadow side-channel: replay stores only its declared fields, so these extra keys never reach
+        # training -- they are for logging / the shadow A/B only. cost_delta vs the legacy TRADE cost (cost_bps).
+        if self.execution_env_reward_shadow:
+            out["execution_env_reward_shadow"] = execution_env_reward_shadow
+            out["execution_cost_bps_shadow"] = execution_cost_bps_shadow
+            out["reward_delta_shadow"] = execution_env_reward_shadow - rewards
+            out["cost_delta_shadow"] = execution_cost_bps_shadow - cost_bps
+        return out
