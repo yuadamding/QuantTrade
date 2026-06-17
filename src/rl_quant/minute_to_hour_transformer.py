@@ -32,9 +32,11 @@ from rl_quant.trading_constraints import (
     CONSTRAINED_POLICY_MODEL_VERSION,
     CONSTRAINT_FEATURE_DIM,
     CONSTRAINT_FEATURE_NAMES,
+    TRANSITION_FEATURE_DIM,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
+    build_transition_feature_table,
     make_constraint_features,
     sample_valid_actions,
     trade_legs,
@@ -1414,6 +1416,8 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         constraint_feature_dim: int = CONSTRAINT_FEATURE_DIM,
         max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS,
         action_feature_dim: int = 0,
+        transition_feature_dim: int = 0,
+        transition_table: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
@@ -1425,6 +1429,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         self.max_subhour_tokens = None if max_subhour_tokens is None else int(max_subhour_tokens)
         self.action_count = int(action_count)
         self.action_feature_dim = int(action_feature_dim)
+        self.transition_feature_dim = int(transition_feature_dim)
         self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.minute_proj = nn.Sequential(nn.Linear(minute_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
         self.minute_pos = nn.Parameter(torch.zeros(minutes_per_hour, d_model))
@@ -1465,6 +1470,35 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             self.action_id_embedding = None
             self.action_feature_encoder = None
             self.action_feature_head = None
+        # Position-aware transition features (opt-in). When enabled, a static [A, A, F] table of
+        # (previous_action, candidate_action) features is gathered by previous_action id inside forward
+        # and fed per-candidate into the Q head. The encoders are ZERO-INITIALISED so a freshly-built
+        # transition-aware model scores identically to the pre-feature model until trained (and a model
+        # built with transition_feature_dim=0 has no new params at all -> existing checkpoints load strict).
+        if self.transition_feature_dim > 0:
+            if transition_table is None:
+                raise ValueError("transition_feature_dim > 0 requires a transition_table [A, A, F].")
+            self.register_buffer("transition_table", transition_table.float())
+            if self.action_feature_dim > 0:
+                self.transition_encoder = nn.Sequential(
+                    nn.Linear(self.transition_feature_dim, d_model),
+                    nn.LayerNorm(d_model),
+                    nn.GELU(),
+                )
+                nn.init.zeros_(self.transition_encoder[0].weight)
+                nn.init.zeros_(self.transition_encoder[0].bias)
+                self.transition_bias = None
+            else:
+                # Fallback head emits Q[B, A] from one Linear over context, with no per-candidate tokens
+                # to add to; inject transition awareness as an additive per-candidate [B, A] bias instead.
+                self.transition_encoder = None
+                self.transition_bias = nn.Linear(self.transition_feature_dim, 1)
+                nn.init.zeros_(self.transition_bias.weight)
+                nn.init.zeros_(self.transition_bias.bias)
+        else:
+            self.transition_table = None
+            self.transition_encoder = None
+            self.transition_bias = None
         hour_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -1567,7 +1601,12 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         encoded = self.hour_encoder(hour_tokens, mask=self._causal_mask(hours, x.device))
         context = encoded[:, -1, :]
         if self.action_feature_encoder is None:
-            return self.head(context)
+            out = self.head(context)
+            if self.transition_bias is not None:
+                # Per-candidate transition bias gathered by the held position id (zero at init).
+                transition = self.transition_table[previous_actions.long()]  # [B, A, F]
+                out = out + self.transition_bias(transition).squeeze(-1)
+            return out
         if action_features is None:
             raise ValueError("Model was configured with action_feature_dim > 0 but action_features were not provided.")
         if action_features.shape[1] != self.action_count or action_features.shape[2] != self.action_feature_dim:
@@ -1575,6 +1614,11 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         action_ids = torch.arange(self.action_count, device=action_features.device)
         action_tokens = self.action_feature_encoder(action_features.float())
         action_tokens = action_tokens + self.action_id_embedding(action_ids)[None, :, :]
+        if self.transition_encoder is not None:
+            # Add a per-candidate token encoding the cost/risk of moving from the held position
+            # (previous_actions) to each candidate. Gathered from the static table; zero at init.
+            transition = self.transition_table[previous_actions.long()]  # [B, A, F]
+            action_tokens = action_tokens + self.transition_encoder(transition)
         q_tokens = context[:, None, :] + action_tokens
         return self.action_feature_head(q_tokens).squeeze(-1)
 
@@ -1625,6 +1669,10 @@ class MinuteToHourTrainingConfig:
     checkpoint_every_steps: int = 0
     max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS
     recency: RecencyWeightConfig = field(default_factory=RecencyWeightConfig)
+    # Opt-in position-aware transition features (default off -> no new model params, existing
+    # checkpoints load unchanged). When True, the Q-network scores each candidate with the cost/risk of
+    # moving from the held position to it (see build_transition_feature_table).
+    use_transition_features: bool = False
 
 
 class VectorizedMinuteToHourEnv:
@@ -2341,6 +2389,26 @@ def train_minute_to_hour_dqn(
     )
     recency_active = recency_mode != "none"
     action_count = len(train_data.action_names)
+    transition_feature_dim = 0
+    transition_table = None
+    if config.use_transition_features:
+        from rl_quant.action_risk import action_leverage_tensor, build_action_metadata, group_ids_for_actions
+
+        action_meta = build_action_metadata(train_data.action_names)
+        action_group_ids, _ = group_ids_for_actions(action_meta, device=device)
+        cons = config.env.constraints
+        # Use the env's cash_index / leg convention so the table's legs/cost columns match realized cost.
+        transition_table = build_transition_feature_table(
+            action_count=action_count,
+            cash_index=int(cons.cash_index),
+            one_way_cost_bps=cons.one_way_cost_bps,
+            extra_switch_penalty_bps=cons.extra_switch_penalty_bps,
+            count_etf_to_etf_as_two_legs=cons.count_etf_to_etf_as_two_legs,
+            action_leverage=action_leverage_tensor(action_meta, device=device),
+            action_group_ids=action_group_ids,
+            device=device,
+        )
+        transition_feature_dim = TRANSITION_FEATURE_DIM
     q_network = MinuteToHourCausalTransformerQNetwork(
         minute_feature_dim=train_data.minute_features.shape[-1],
         hour_feature_dim=train_data.hour_features.shape[-1],
@@ -2356,6 +2424,8 @@ def train_minute_to_hour_dqn(
         action_embedding_dim=config.action_embedding_dim,
         max_subhour_tokens=config.max_subhour_tokens,
         action_feature_dim=0 if train_data.action_features is None else int(train_data.action_features.shape[-1]),
+        transition_feature_dim=transition_feature_dim,
+        transition_table=transition_table,
     ).to(device)
     warm_start_info: dict[str, object] | None = None
     if config.warm_start_model is not None:

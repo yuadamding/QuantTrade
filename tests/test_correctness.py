@@ -6885,6 +6885,115 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertFalse(mid_split.filter_removed_latest_reward_rows)
         self.assertNotIn("test_filter_removed_latest_reward_rows", mid_split.dataset_reportability_errors)
 
+    def test_transition_feature_table_encodes_hold_switch_exit(self) -> None:
+        from rl_quant.trading_constraints import TRANSITION_FEATURE_NAMES, build_transition_feature_table
+
+        # 0=CASH, 1=QQQ (lev 1, group 1), 2=SQQQ (lev 1, group 1).
+        table = build_transition_feature_table(
+            action_count=3,
+            cash_index=0,
+            one_way_cost_bps=2.0,
+            extra_switch_penalty_bps=1.0,
+            count_etf_to_etf_as_two_legs=True,
+            action_leverage=torch.tensor([0.0, 1.0, 1.0]),
+            action_group_ids=torch.tensor([0, 1, 1]),
+            device="cpu",
+        )
+        self.assertEqual(tuple(table.shape), (3, 3, len(TRANSITION_FEATURE_NAMES)))
+        col = {name: i for i, name in enumerate(TRANSITION_FEATURE_NAMES)}
+        # hold (cash->cash): 0 legs, is_hold=1, is_switch=0.
+        self.assertEqual(table[0, 0, col["legs"]].item(), 0.0)
+        self.assertEqual(table[0, 0, col["is_hold"]].item(), 1.0)
+        self.assertEqual(table[0, 0, col["is_switch"]].item(), 0.0)
+        # cash->etf: 1 leg, cost = 1*2 + 1 switch penalty = 3 bps; prev_is_cash=1, cand_is_cash=0.
+        self.assertEqual(table[0, 1, col["legs"]].item(), 1.0)
+        self.assertAlmostEqual(table[0, 1, col["est_cost_bps_over_100"]].item(), 3.0 / 100.0, places=6)
+        self.assertEqual(table[0, 1, col["prev_is_cash"]].item(), 1.0)
+        self.assertEqual(table[0, 1, col["cand_is_cash"]].item(), 0.0)
+        self.assertAlmostEqual(table[0, 1, col["leverage_delta"]].item(), 1.0, places=6)
+        self.assertEqual(table[0, 1, col["same_group"]].item(), 0.0)  # cash group != QQQ group
+        # etf->etf switch (QQQ->SQQQ): 2 legs, cost = 2*2 + 1 = 5 bps, same group.
+        self.assertEqual(table[1, 2, col["legs"]].item(), 2.0)
+        self.assertAlmostEqual(table[1, 2, col["est_cost_bps_over_100"]].item(), 5.0 / 100.0, places=6)
+        self.assertEqual(table[1, 2, col["same_group"]].item(), 1.0)
+
+    def test_qnetwork_transition_features_condition_q_on_held_position(self) -> None:
+        from rl_quant.minute_to_hour_transformer import MinuteToHourCausalTransformerQNetwork
+        from rl_quant.trading_constraints import TRANSITION_FEATURE_DIM
+
+        action_count, d_model, batch = 3, 16, 2
+        ctor = dict(
+            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
+            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+        )
+        inputs = dict(
+            minute_features=torch.zeros(batch, 1, 1, 1),
+            minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
+            hour_features=torch.zeros(batch, 1, 1),
+            constraint_features=torch.zeros(batch, 6),
+        )
+        prev0 = torch.zeros(batch, dtype=torch.long)
+        prev1 = torch.ones(batch, dtype=torch.long)
+
+        def _contribution(net, *, prev, action_features):
+            net.eval()
+            with torch.no_grad():
+                full = net(previous_actions=prev, action_features=action_features, **inputs)
+                net.transition_encoder, net.transition_bias = None, None  # isolate the transition path
+                base = net(previous_actions=prev, action_features=action_features, **inputs)
+            return full - base
+
+        table = torch.randn(action_count, action_count, TRANSITION_FEATURE_DIM)
+        af = torch.zeros(batch, action_count, 2)
+        # Action-conditioned branch: zero-init -> the transition path contributes nothing at init.
+        torch.manual_seed(1)
+        net = MinuteToHourCausalTransformerQNetwork(
+            action_feature_dim=2, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
+        )
+        self.assertTrue(
+            torch.allclose(_contribution(net, prev=prev0, action_features=af), torch.zeros(batch, action_count))
+        )
+
+        def _perturbed(seed):
+            torch.manual_seed(seed)
+            model = MinuteToHourCausalTransformerQNetwork(
+                action_feature_dim=2, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
+            )
+            with torch.no_grad():  # varied (not constant) weights so LayerNorm preserves the signal
+                model.transition_encoder[0].weight.copy_(torch.arange(d_model * TRANSITION_FEATURE_DIM).float().reshape(d_model, TRANSITION_FEATURE_DIM) * 0.01)
+                model.transition_encoder[0].bias.copy_(torch.arange(d_model).float() * 0.01)
+            return model
+
+        contrib0 = _contribution(_perturbed(1), prev=prev0, action_features=af)
+        contrib1 = _contribution(_perturbed(1), prev=prev1, action_features=af)
+        self.assertFalse(torch.allclose(contrib0, torch.zeros_like(contrib0)))  # now contributes
+        self.assertFalse(torch.allclose(contrib0, contrib1))  # contribution depends on held position
+        # Fallback head (no action_features): forward returns [B, A] and is held-position aware via the bias.
+        torch.manual_seed(2)
+        fb = MinuteToHourCausalTransformerQNetwork(
+            action_feature_dim=0, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
+        )
+        with torch.no_grad():
+            out = fb(previous_actions=prev0, action_features=None, **inputs)
+        self.assertEqual(tuple(out.shape), (batch, action_count))
+
+        def _perturbed_fallback(seed):
+            torch.manual_seed(seed)
+            model = MinuteToHourCausalTransformerQNetwork(
+                action_feature_dim=0, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
+            )
+            with torch.no_grad():
+                model.transition_bias.weight.copy_(torch.arange(TRANSITION_FEATURE_DIM).float().reshape(1, -1) * 0.1)
+                model.transition_bias.bias.fill_(0.0)
+            return model
+
+        self.assertFalse(
+            torch.allclose(
+                _contribution(_perturbed_fallback(2), prev=prev0, action_features=None),
+                _contribution(_perturbed_fallback(2), prev=prev1, action_features=None),
+            )
+        )
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [

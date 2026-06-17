@@ -55,6 +55,61 @@ def trade_legs(
     return legs
 
 
+TRANSITION_FEATURE_NAMES = [
+    "is_hold",
+    "is_switch",
+    "prev_is_cash",
+    "cand_is_cash",
+    "legs",
+    "est_cost_bps_over_100",
+    "leverage_delta",
+    "same_group",
+]
+TRANSITION_FEATURE_DIM = len(TRANSITION_FEATURE_NAMES)
+
+
+def build_transition_feature_table(
+    *,
+    action_count: int,
+    cash_index: int,
+    one_way_cost_bps: float,
+    extra_switch_penalty_bps: float = 0.0,
+    count_etf_to_etf_as_two_legs: bool = True,
+    action_leverage: torch.Tensor,
+    action_group_ids: torch.Tensor,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Static ``[A, A, TRANSITION_FEATURE_DIM]`` table of (previous_action, candidate_action) features.
+
+    Dim 0 indexes the HELD/previous action, dim 1 the CANDIDATE action. Every feature is a deterministic
+    function of ``(prev, cand)`` and static action metadata -- the legs/cost columns mirror the env reward
+    exactly (``legs * one_way_cost_bps + switch * extra_switch_penalty_bps``) -- so there is no market,
+    reward, or future-label leakage and the table can be gathered by ``previous_action`` id inside the
+    Q-network: ``table[previous_actions]`` gives the ``[B, A, F]`` per-candidate transition tensor."""
+    device = action_leverage.device if device is None else device
+    leverage = action_leverage.to(device=device, dtype=torch.float32)
+    groups = action_group_ids.to(device=device)
+    arange = torch.arange(action_count, device=device)
+    prev = arange[:, None].expand(action_count, action_count)
+    cand = arange[None, :].expand(action_count, action_count)
+    is_switch = cand != prev
+    legs = trade_legs(prev, cand, cash_index=cash_index, count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs)
+    est_cost_bps = legs * float(one_way_cost_bps) + is_switch.float() * float(extra_switch_penalty_bps)
+    return torch.stack(
+        [
+            (~is_switch).float(),
+            is_switch.float(),
+            (prev == int(cash_index)).float(),
+            (cand == int(cash_index)).float(),
+            legs,
+            est_cost_bps / 100.0,
+            leverage[cand] - leverage[prev],
+            (groups[cand] == groups[prev]).float(),
+        ],
+        dim=-1,
+    )
+
+
 def make_constraint_features(
     *,
     bars_held: torch.Tensor,
