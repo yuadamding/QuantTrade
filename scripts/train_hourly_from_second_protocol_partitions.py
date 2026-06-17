@@ -155,6 +155,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action-embedding-dim", type=int, default=32)
     parser.add_argument("--max-subhour-tokens", type=int, default=256)
     parser.add_argument("--one-way-cost-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--cash-idle-penalty-bps",
+        type=float,
+        default=0.0,
+        help="Training-only reward penalty for choosing CASH; evaluation P&L remains unpenalized.",
+    )
     parser.add_argument("--extra-switch-penalty-bps", type=float, default=1.0)
     parser.add_argument("--q-switch-margin-bps", type=float, default=3.0)
     parser.add_argument("--max-switches-per-day", type=int, default=2)
@@ -216,10 +222,32 @@ def partition_selection_reportability_errors(args: argparse.Namespace) -> list[s
     return []
 
 
+def _chronological_latest_label(labels: list[str]) -> str | None:
+    """Latest label by PARSED calendar date, independent of input/lexicographic order.
+
+    Directory-name (lexicographic) order only equals chronological order when labels are clean
+    ISO-date prefixes; an unsortable suffix like ``2026-06-15_v10`` sorts BEFORE ``2026-06-15_v2``,
+    so trusting ``sorted(...)[-1]`` can pick the wrong "latest". Labels that are not ISO-date-prefixed
+    real dates are ignored; if none parse we fall back to the last given label. Same-date ties resolve
+    to the last given label (callers needing an unambiguous latest reject same-date labels first --
+    ``strict_latest_partition_violations`` does)."""
+    dated: list[tuple[datetime, int, str]] = []
+    for index, label in enumerate(labels):
+        if not re.match(r"^\d{4}-\d{2}-\d{2}", label):
+            continue
+        try:
+            dated.append((datetime.strptime(label[:10], "%Y-%m-%d"), index, label))
+        except ValueError:
+            continue
+    if not dated:
+        return labels[-1] if labels else None
+    return max(dated, key=lambda item: (item[0], item[1]))[2]
+
+
 def latest_available_partition_label(args: argparse.Namespace) -> str | None:
     """Newest partition present on disk, ignoring --start/--end/--max selection filters."""
-    paths = sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))
-    return paths[-1].parent.name if paths else None
+    labels = [path.parent.name for path in args.partitions_root.glob(f"*/{args.dataset_file_name}")]
+    return _chronological_latest_label(labels)
 
 
 def strict_latest_partition_violations(
@@ -258,12 +286,29 @@ def strict_latest_partition_violations(
             f"chronological order; got invalid labels: {invalid_labels[:5]}"
         )
         return violations
+    # Chronological order must be UNAMBIGUOUS from the label. The validated date prefix only carries
+    # day granularity, so two distinct labels sharing a date (e.g. 2026-06-15_v2 vs 2026-06-15_v10)
+    # cannot be ordered from the label, and lexicographic tie-breaking is unreliable (_v10 < _v2).
+    # Fail closed: with an ambiguous order, "which partition is the latest-period test" is undefined.
+    by_date: dict[str, list[str]] = {}
+    for label in dict.fromkeys(all_available_labels):  # distinct labels only
+        by_date.setdefault(label[:10], []).append(label)
+    ambiguous_dates = sorted(date for date, group in by_date.items() if len(group) > 1)
+    if ambiguous_dates:
+        violations.append(
+            "partition labels are not chronologically unambiguous; multiple distinct labels share a "
+            f"calendar date, so the latest-period test cannot be determined from the label: "
+            f"{[label for date in ambiguous_dates[:3] for label in by_date[date]][:6]} "
+            "(use date-only labels or a zero-padded, lexicographically sortable suffix)"
+        )
+        return violations
     # Collect ALL independent violations rather than returning on the first, so a single run surfaces
     # every reason the selection is inadmissible (avoids fix-one / re-run / discover-next churn).
     duplicates = sorted(label for label, count in Counter(selected_labels).items() if count > 1)
     if duplicates:
         violations.append(f"selected partitions contain duplicate labels: {duplicates[:5]}")
-    latest_available = all_available_labels[-1] if all_available_labels else None
+    # Latest available by PARSED date, not the caller's positional ordering (see _chronological_latest_label).
+    latest_available = _chronological_latest_label(all_available_labels)
     if selected_labels and latest_available is not None and selected_labels[-1] != latest_available:
         violations.append(
             f"final selected partition ({selected_labels[-1]}) is not the latest available partition "
@@ -572,7 +617,7 @@ def main(argv: list[str] | None = None) -> int:
     # cannot silently make an OLD period the reported test.
     all_available_labels = [p.parent.name for p in sorted(args.partitions_root.glob(f"*/{args.dataset_file_name}"))]
     selected_labels = [p.parent.name for p in paths]
-    latest_available_label = all_available_labels[-1] if all_available_labels else None
+    latest_available_label = _chronological_latest_label(all_available_labels)
     official_test_label = selected_labels[-1]
     final_test_is_latest_available = official_test_label == latest_available_label
     # How many earlier available partitions were excluded from the selected train/validation history.
@@ -639,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
                 num_envs=args.num_envs,
                 episode_length=args.episode_length,
                 initial_action=initial_action,
+                cash_idle_penalty_bps=args.cash_idle_penalty_bps,
                 constraints=constraints,
             )
             learning_config = DQNLearningConfig(

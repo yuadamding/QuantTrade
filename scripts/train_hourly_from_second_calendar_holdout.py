@@ -94,8 +94,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset-file-name", default="hour_from_second_dataset.pt")
     parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_second_calendar_holdout_runs")
     parser.add_argument("--run-name", default=f"calendar_holdout_1s_{datetime.now():%Y%m%d_%H%M%S}")
-    parser.add_argument("--test-months", type=int, default=2)
-    parser.add_argument("--val-months", type=int, default=1)
+    parser.add_argument("--test-months", type=int, default=3)
+    parser.add_argument("--val-months", type=int, default=3)
     parser.add_argument("--test-start-date", help="Optional YYYY-MM-DD override for the first held-out test date.")
     parser.add_argument("--val-start-date", help="Optional YYYY-MM-DD override for the first validation date.")
     parser.add_argument("--end-date", help="Optional YYYY-MM-DD exclusive end date; defaults to latest partition end.")
@@ -135,6 +135,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--action-embedding-dim", type=int, default=32)
     parser.add_argument("--max-subhour-tokens", type=int, default=256)
     parser.add_argument("--one-way-cost-bps", type=float, default=1.0)
+    parser.add_argument(
+        "--cash-idle-penalty-bps",
+        type=float,
+        default=0.0,
+        help="Training-only reward penalty for choosing CASH; evaluation P&L remains unpenalized.",
+    )
     parser.add_argument("--extra-switch-penalty-bps", type=float, default=1.0)
     parser.add_argument("--q-switch-margin-bps", type=float, default=3.0)
     parser.add_argument("--max-switches-per-day", type=int, default=2)
@@ -522,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
         num_envs=args.num_envs,
         episode_length=args.episode_length,
         initial_action=initial_action,
+        cash_idle_penalty_bps=args.cash_idle_penalty_bps,
         constraints=constraints,
     )
     learning_config = DQNLearningConfig(

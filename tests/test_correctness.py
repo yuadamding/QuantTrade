@@ -6561,6 +6561,60 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             [],
         )
 
+    def test_strict_latest_partition_uses_parsed_dates_not_lexicographic_order(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        fn = module.strict_latest_partition_violations
+        # "Latest available" is by PARSED DATE, independent of input order: available passed UNSORTED
+        # must still treat 2026-01-03 as latest, so a full, date-ordered selection is admissible.
+        self.assertEqual(
+            fn(
+                selected_labels=["2026-01-01", "2026-01-02", "2026-01-03"],
+                all_available_labels=["2026-01-03", "2026-01-01", "2026-01-02"],
+                allow_truncated_training_history=False,
+            ),
+            [],
+        )
+        # The REAL partition label format is a date RANGE (start_to_end). chunk_dates produces
+        # non-overlapping consecutive windows -> distinct start prefixes -> unambiguous; a full
+        # date-ordered selection is admissible, and "latest" is order-independent (unsorted available).
+        ranges = ["2026-01-01_to_2026-01-31", "2026-02-01_to_2026-02-28", "2026-03-01_to_2026-03-31"]
+        self.assertEqual(
+            fn(selected_labels=ranges, all_available_labels=ranges, allow_truncated_training_history=False), []
+        )
+        self.assertEqual(
+            fn(
+                selected_labels=ranges,
+                all_available_labels=[ranges[2], ranges[0], ranges[1]],
+                allow_truncated_training_history=False,
+            ),
+            [],
+        )
+        # Same-START-date distinct labels cannot be ordered from the date prefix and lexicographic
+        # tie-breaking is unreliable (e.g. a rebuild leaving two windows that share a start, or the
+        # reviewer's 2026-06-15_v2 vs _v10) -> fail closed with an ambiguity violation, suppressing the
+        # later latest/coverage checks (meaningless without a defined order).
+        for ambiguous_available in (
+            ["2026-06-15_v2", "2026-06-15_v10", "2026-06-16"],
+            ["2026-01-01_to_2026-01-15", "2026-01-01_to_2026-01-31"],
+        ):
+            violations = fn(
+                selected_labels=ambiguous_available,
+                all_available_labels=ambiguous_available,
+                allow_truncated_training_history=True,
+            )
+            self.assertTrue(any("not chronologically unambiguous" in v for v in violations), ambiguous_available)
+
+    def test_chronological_latest_label_ignores_lexicographic_suffix_order(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        latest = module._chronological_latest_label
+        # Unsorted distinct dates -> max by date, not positional [-1].
+        self.assertEqual(latest(["2026-01-03", "2026-01-01", "2026-01-02"]), "2026-01-03")
+        # An unsortable same-date suffix must not flip the latest: 2026-06-16_* is newer than any 06-15.
+        self.assertEqual(latest(["2026-06-15_v10", "2026-06-15_v2", "2026-06-16_v1"]), "2026-06-16_v1")
+        # No parseable dates -> fall back to the last given label; empty -> None.
+        self.assertEqual(latest(["partition_9", "partition_10"]), "partition_10")
+        self.assertIsNone(latest([]))
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
@@ -7360,6 +7414,45 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # The new required field survives finalize() and a device move (.to keeps it co-located).
         split = _finalize_split(raw, feature_mean=torch.zeros(14), feature_std=torch.ones(14))
         self.assertEqual(split.to(torch.device("cpu")).valid_index_mask.tolist(), mask.tolist())
+
+    def test_all_dqn_trainers_bootstrap_on_terminated_not_resets(self) -> None:
+        # The load-bearing RL invariant: the TD bootstrap is masked by `terminated` (a true terminal),
+        # NEVER by resets/dones/truncated -- treating an episode-length truncation as terminal would
+        # bias values toward short horizons. Lock it across every trainer's dqn_td_target call so a new
+        # trainer (or a careless edit) that bootstraps on the reset mask fails the gate.
+        import re
+
+        src = ROOT / "src" / "rl_quant"
+        trainers = ["strategy_dqn.py", "intraday_dqn.py", "hourly_transformer.py", "minute_to_hour_transformer.py"]
+        call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
+        for name in trainers:
+            calls = call_re.findall((src / name).read_text())
+            self.assertTrue(calls, f"{name}: expected a dqn_td_target(...) call")
+            for args in calls:
+                self.assertIn('batch["terminated"]', args, f"{name}: dqn_td_target must bootstrap on terminated")
+                for forbidden in ("resets", "dones", "truncated"):
+                    self.assertNotIn(forbidden, args, f"{name}: dqn_td_target must not bootstrap on {forbidden}")
+
+    def test_news_article_rows_reject_negative_source_latency(self) -> None:
+        # A negative source latency implies availability BEFORE publish (look-ahead). The library must
+        # fail closed at every entry point, not silently clamp to 0 (optimistic) as it once did.
+        from pathlib import Path as _Path
+
+        from rl_quant.features.news_llm import (
+            _raw_article_row,
+            build_news_article_rows,
+            write_news_article_outputs,
+        )
+
+        with self.assertRaises(ValueError):
+            _raw_article_row("AAPL", {"published_utc": "2026-01-02T00:00:00Z"}, 0, source_latency_seconds=-1)
+        with self.assertRaises(ValueError):  # validated up front, before any filesystem access
+            build_news_article_rows(raw_root=_Path("/does/not/exist"), symbols=["AAPL"], source_latency_seconds=-5)
+        with self.assertRaises(ValueError):  # validated before mkdir / parquet write
+            write_news_article_outputs(
+                rows=[], output_root=_Path("/does/not/exist"), raw_root=_Path("/does/not/exist"),
+                symbols=[], errors=[], source_latency_seconds=-1,
+            )
 
     def test_amp_dtype_reaches_minute_to_hour_autocast(self) -> None:
         import unittest.mock as mock

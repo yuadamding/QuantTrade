@@ -273,12 +273,17 @@ def _url_hash(payload: Mapping[str, Any], key: str) -> str:
 def _raw_article_row(
     symbol: str, payload: Mapping[str, Any], line_number: int, *, source_latency_seconds: int = 0
 ) -> dict[str, Any]:
+    if source_latency_seconds < 0:
+        # Fail closed rather than clamp: a negative latency would imply availability BEFORE publish
+        # (a look-ahead), and silently clamping it to 0 would hand a non-CLI caller optimistic
+        # point-in-time availability. The CLI rejects this too; the library must not be more lenient.
+        raise ValueError(f"source_latency_seconds must be non-negative; got {source_latency_seconds}.")
     published = payload.get("published_utc", payload.get("published_at", payload.get("created_at")))
     published_ms = parse_timestamp_ms(published)
     # Source availability defaults to publish time, but publish time is not necessarily pipeline
     # availability. A non-zero --source-latency-seconds yields a more conservative point-in-time
     # availability (published + latency); the policy/latency is recorded in the article manifest.
-    source_available_ms = int(published_ms) + max(0, int(source_latency_seconds)) * 1000
+    source_available_ms = int(published_ms) + int(source_latency_seconds) * 1000
     tickers = _news_tickers(payload)
     primary = canonical_symbol(str(payload.get("primary_ticker", tickers[0] if tickers else symbol)))
     record_hash = stable_json_hash(dict(payload))
@@ -343,6 +348,10 @@ def build_news_article_rows(
     strict: bool = False,
     source_latency_seconds: int = 0,
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    if source_latency_seconds < 0:
+        # Validate up front (not per row): the per-row try/except below would otherwise bury this
+        # config error in the errors list instead of failing closed.
+        raise ValueError(f"source_latency_seconds must be non-negative; got {source_latency_seconds}.")
     articles: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
     for symbol in symbols:
@@ -387,6 +396,8 @@ def write_news_article_outputs(
     errors: list[str],
     source_latency_seconds: int = 0,
 ) -> dict[str, Any]:
+    if source_latency_seconds < 0:
+        raise ValueError(f"source_latency_seconds must be non-negative; got {source_latency_seconds}.")
     import pandas as pd
 
     output_root.mkdir(parents=True, exist_ok=True)

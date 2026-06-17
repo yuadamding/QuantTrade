@@ -1543,6 +1543,7 @@ class MinuteToHourEnvConfig:
     episode_length: int
     reward_scale: float = 10_000.0
     initial_action: int = 0
+    cash_idle_penalty_bps: float = 0.0
     constraints: TradingConstraintConfig = field(default_factory=default_minute_to_hour_constraints)
 
 
@@ -1722,7 +1723,12 @@ class VectorizedMinuteToHourEnv:
         is_switch = actions != previous_actions
         cost_bps = legs * float(self.config.constraints.one_way_cost_bps)
         cost_bps = cost_bps + is_switch.float() * float(self.config.constraints.extra_switch_penalty_bps)
-        rewards = raw_returns * float(self.config.reward_scale) - cost_bps * float(self.config.reward_scale) / 10_000.0
+        cash_idle_penalty_bps = (
+            (actions == int(self.config.constraints.cash_index)).float() * float(self.config.cash_idle_penalty_bps)
+        )
+        rewards = raw_returns * float(self.config.reward_scale) - (
+            cost_bps + cash_idle_penalty_bps
+        ) * float(self.config.reward_scale) / 10_000.0
 
         next_indices = current_indices + 1
         self.indices = next_indices
@@ -2610,6 +2616,7 @@ def train_minute_to_hour_dqn(
         "valid_action_count_trace": valid_action_count_trace,
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
+        "cash_idle_penalty_bps": float(config.env.cash_idle_penalty_bps),
         "model_version": CONSTRAINED_POLICY_MODEL_VERSION,
         "uses_constraint_features": True,
         "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
