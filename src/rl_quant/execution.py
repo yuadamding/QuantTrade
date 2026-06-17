@@ -22,8 +22,17 @@ This module changes no trainer's reward on its own; it is wired in (result-prese
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
+
+
+def _require_finite_nonnegative(name: str, value: float) -> None:
+    # NOTE: a bare ``value < 0`` does NOT reject NaN (every NaN comparison is False), so an explicit
+    # finiteness check is required to keep NaN/Inf out of cost/reward accounting.
+    coerced = float(value)
+    if not math.isfinite(coerced) or coerced < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative; got {value!r}.")
 
 
 class FillLevel(str, Enum):
@@ -43,6 +52,17 @@ class ImpactModel:
     kind: str = "none"  # "none" | "linear"
     coef_per_unit: float = 0.0  # extra $/share per turnover unit (linear market impact)
 
+    def __post_init__(self) -> None:
+        # Only "none"/"linear" are implemented; reject anything else (incl. sqrt/almgren_chriss until
+        # built) so a typo like "liner" can't silently DISABLE impact (the simulator treats any
+        # non-"linear" kind as zero impact).
+        if self.kind not in ("none", "linear"):
+            raise ValueError(
+                f"impact_model.kind must be 'none' or 'linear' (sqrt/almgren_chriss not yet implemented); "
+                f"got {self.kind!r}."
+            )
+        _require_finite_nonnegative("impact_model.coef_per_unit", self.coef_per_unit)
+
 
 @dataclass(frozen=True)
 class ExecutionConfig:
@@ -58,18 +78,21 @@ class ExecutionConfig:
 
     def __post_init__(self) -> None:
         # Fail closed on invalid execution parameters: a research run must never silently claim a
-        # negative latency, a non-positive horizon/lot, or a negative cost/impact.
-        if self.latency_steps < 0:
+        # negative/NaN latency or cost, a non-positive horizon/lot, or an unknown fill level / policy.
+        # Coerce the enums so a valid string is accepted but an unknown one raises clearly (instead of
+        # falling through to quote-side logic and crashing later on a missing .value).
+        object.__setattr__(self, "fill_level", FillLevel(self.fill_level))
+        object.__setattr__(self, "terminal_policy", TerminalPolicy(self.terminal_policy))
+        if int(self.latency_steps) < 0:
             raise ValueError(f"latency_steps must be >= 0 (0 = no latency); got {self.latency_steps}.")
-        if self.step_horizon <= 0:
+        if int(self.step_horizon) <= 0:
             raise ValueError(f"step_horizon must be positive; got {self.step_horizon}.")
-        if self.trade_lot_size <= 0:
+        if int(self.trade_lot_size) <= 0:
             raise ValueError(f"trade_lot_size must be positive; got {self.trade_lot_size}.")
-        for name in ("commission_per_share", "extra_cost_per_share", "spread_multiplier"):
-            if getattr(self, name) < 0:
-                raise ValueError(f"{name} must be non-negative; got {getattr(self, name)}.")
-        if self.impact_model.coef_per_unit < 0:
-            raise ValueError(f"impact coef_per_unit must be non-negative; got {self.impact_model.coef_per_unit}.")
+        _require_finite_nonnegative("commission_per_share", self.commission_per_share)
+        _require_finite_nonnegative("extra_cost_per_share", self.extra_cost_per_share)
+        _require_finite_nonnegative("spread_multiplier", self.spread_multiplier)
+        # impact_model validated in ImpactModel.__post_init__.
 
     @property
     def trade_scale(self) -> float:
@@ -94,6 +117,18 @@ class MarketSnapshot:
     half_spread: float = 0.0
     best_bid: float | None = None
     best_ask: float | None = None
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.mid)):
+            raise ValueError(f"mid must be finite; got {self.mid!r}.")
+        # A negative half_spread would turn the cost into a NEGATIVE cost (paying the agent to trade).
+        _require_finite_nonnegative("half_spread", self.half_spread)
+        for name in ("best_bid", "best_ask"):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite when provided; got {value!r}.")
+        if self.best_bid is not None and self.best_ask is not None and self.best_bid > self.best_ask:
+            raise ValueError(f"best_bid ({self.best_bid}) must be <= best_ask ({self.best_ask}).")
 
 
 @dataclass(frozen=True)

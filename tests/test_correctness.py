@@ -7149,6 +7149,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_execution_config_and_terminal_state_guards(self) -> None:
         from rl_quant.execution import (
             ExecutionConfig,
+            FillLevel,
             ImpactModel,
             MarketSnapshot,
             PositionState,
@@ -7182,10 +7183,26 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             {"trade_lot_size": 0},
             {"commission_per_share": -0.01},
             {"spread_multiplier": -1.0},
-            {"impact_model": ImpactModel(kind="linear", coef_per_unit=-1.0)},
+            # NaN/Inf must be rejected too: a bare `< 0` check passes NaN (every NaN comparison is False).
+            {"commission_per_share": float("nan")},
+            {"spread_multiplier": float("inf")},
+            # Unknown fill level / terminal policy fail closed (not a confusing late crash).
+            {"fill_level": "typo"},
+            {"terminal_policy": "hold_forever"},
         ):
             with self.assertRaises(ValueError):
                 ExecutionConfig(**kwargs)
+        # A valid string fill_level is coerced to the enum (so callers may pass either).
+        self.assertIs(ExecutionConfig(fill_level="quote_side").fill_level, FillLevel.QUOTE_SIDE)
+        # ImpactModel self-validates: unknown kind (silent-impact-disable typo) and NaN/negative coef.
+        for bad in ({"kind": "liner"}, {"kind": "linear", "coef_per_unit": -1.0}, {"kind": "linear", "coef_per_unit": float("nan")}):
+            with self.assertRaises(ValueError):
+                ImpactModel(**bad)
+        # MarketSnapshot rejects a negative/NaN half_spread (negative cost would pay the agent to trade),
+        # a non-finite mid, and an inverted quote.
+        for bad in ({"mid": 100.0, "half_spread": -0.01}, {"mid": float("nan")}, {"mid": 100.0, "best_bid": 100.2, "best_ask": 99.8}):
+            with self.assertRaises(ValueError):
+                MarketSnapshot(**bad)
         # fill_index: negative latency clamps to the current bar (no pre-decision fill); horizon<=0 rejected.
         self.assertEqual(fill_index(10, step_horizon=5, latency_steps=-3), 10)
         with self.assertRaises(ValueError):
