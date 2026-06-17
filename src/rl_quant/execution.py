@@ -165,6 +165,50 @@ def _coerce_impact_model(value: object) -> ImpactModel:
 
 
 @dataclass(frozen=True)
+class WeightExecutionCostConfig:
+    """bps-denominated execution cost for the RETURN/weight-based leg-level path.
+
+    Deliberately separate from ExecutionConfig's per-share DOLLAR fields (commission_per_share /
+    extra_cost_per_share / ImpactModel.coef_per_unit), which belong to the scalar signed-position model:
+    folding $/share into a weight-return model is a units error. Here every cost is in basis points and is
+    charged on a leg's traded weight. The default is zero (leg cost stays spread-only, unchanged)."""
+
+    fee_bps: float = 0.0  # flat per-leg fee (commission + misc) in bps of traded weight
+    impact_kind: str = "none"  # "none" | "linear_bps"
+    linear_impact_bps_per_weight: float = 0.0  # impact_bps = coef * traded_weight (linear market impact)
+
+    def __post_init__(self) -> None:
+        if self.impact_kind not in ("none", "linear_bps"):
+            raise ValueError(
+                f"weight_cost.impact_kind must be 'none' or 'linear_bps' (sqrt/almgren_chriss not yet "
+                f"implemented); got {self.impact_kind!r}."
+            )
+        object.__setattr__(self, "fee_bps", _coerce_finite_nonnegative("weight_cost.fee_bps", self.fee_bps))
+        object.__setattr__(
+            self,
+            "linear_impact_bps_per_weight",
+            _coerce_finite_nonnegative("weight_cost.linear_impact_bps_per_weight", self.linear_impact_bps_per_weight),
+        )
+
+    def impact_bps(self, traded_weight: float) -> float:
+        # Linear market impact: impact in bps grows with trade size, so total impact COST ~ size^2.
+        if self.impact_kind == "linear_bps":
+            return self.linear_impact_bps_per_weight * abs(float(traded_weight))
+        return 0.0
+
+
+def _coerce_weight_cost(value: object) -> WeightExecutionCostConfig:
+    if isinstance(value, WeightExecutionCostConfig):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return WeightExecutionCostConfig(**value)
+        except TypeError as exc:
+            raise ValueError(f"invalid weight_cost mapping: {value!r}") from exc
+    raise ValueError(f"weight_cost must be a WeightExecutionCostConfig or mapping; got {type(value).__name__}.")
+
+
+@dataclass(frozen=True)
 class ExecutionConfig:
     fill_level: FillLevel = FillLevel.DELAYED_CLOSE
     latency_steps: int = 0  # fill bar = min(now + latency, next); see fill_index
@@ -178,6 +222,9 @@ class ExecutionConfig:
     # Default preserves the current leg-level behavior (independent per-leg fills); a future trainer
     # wiring should set ATOMIC_SWITCH for reportable allocator evaluation. Only affects the leg-level path.
     switch_fill_policy: SwitchFillPolicy = SwitchFillPolicy.INDEPENDENT_LEGS
+    # bps-denominated fee/impact for the leg-level (weight-return) path ONLY; default zero -> leg cost stays
+    # spread-only. Distinct from the per-share dollar fields above, which drive the scalar dollar model.
+    weight_cost: WeightExecutionCostConfig = field(default_factory=WeightExecutionCostConfig)
 
     def __post_init__(self) -> None:
         # Fail closed on invalid execution parameters: a research run must never silently claim a
@@ -202,6 +249,7 @@ class ExecutionConfig:
             self, "spread_multiplier", _coerce_finite_nonnegative("spread_multiplier", self.spread_multiplier)
         )
         object.__setattr__(self, "impact_model", _coerce_impact_model(self.impact_model))
+        object.__setattr__(self, "weight_cost", _coerce_weight_cost(self.weight_cost))
         # quote_side_plus_impact must carry a REAL (positive linear) impact: otherwise it is numerically
         # identical to plain quote_side yet would still advertise that it models impact. Fail closed and
         # tell the caller to use quote_side for a zero-impact crossable fill.
@@ -610,6 +658,9 @@ class ExecutionLeg:
     fill_price: float | None  # None at proxy fill levels (delayed_close / mid_plus_spread)
     spread_bps: float
     fill_status: FillStatus
+    fee_bps: float = 0.0  # flat per-leg fee from weight_cost (0 unless filled)
+    impact_bps: float = 0.0  # size-dependent impact from weight_cost (0 unless filled)
+    total_cost_bps: float = 0.0  # spread_bps + fee_bps + impact_bps (the charged bps for this leg)
 
 
 @dataclass(frozen=True)
@@ -648,10 +699,19 @@ def _make_leg(symbol: str, prev_w: float, tgt_w: float, quote: SymbolQuote, conf
         except ValueError:
             status = FillStatus.MISSING_QUOTE
             spread_bps = 0.0
-    cost = traded * spread_bps / 1e4
+    # bps fee/impact apply ONLY to a leg that actually fills; a blocked (MISSING_QUOTE) leg costs nothing.
+    if status == FillStatus.FILLED:
+        fee_bps = config.weight_cost.fee_bps
+        impact_bps = config.weight_cost.impact_bps(traded)
+    else:
+        fee_bps = 0.0
+        impact_bps = 0.0
+    total_cost_bps = spread_bps + fee_bps + impact_bps
+    cost = traded * total_cost_bps / 1e4
     leg = ExecutionLeg(
         symbol=symbol, side=side, traded_weight=traded, mark_before=prev_w,
         mid_at_fill=quote.mid, fill_price=fill_price, spread_bps=spread_bps, fill_status=status,
+        fee_bps=fee_bps, impact_bps=impact_bps, total_cost_bps=total_cost_bps,
     )
     return leg, cost
 

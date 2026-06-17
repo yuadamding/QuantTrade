@@ -7691,6 +7691,73 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(done.execution_complete)
         self.assertEqual({(leg.symbol, leg.side) for leg in done.legs}, {("A", LegSide.SELL), ("B", LegSide.BUY)})
 
+    def test_weight_execution_cost_bps(self) -> None:
+        # PR5: bps-denominated fee/impact for the return/weight-based leg layer (distinct from the scalar
+        # per-share dollar fields). Default is zero -> leg cost stays spread-only (existing behavior).
+        from rl_quant.execution import (
+            ExecutionConfig,
+            FillLevel,
+            FillStatus,
+            Holdings,
+            SymbolQuote,
+            WeightExecutionCostConfig,
+            simulate_action_transition,
+        )
+
+        cash = Holdings(())
+        qqq_full = Holdings.single_slot("QQQ", 1.0)
+        qqq_half = Holdings.single_slot("QQQ", 0.5)
+
+        def q(*, hs=0.05, ret=0.0, mid=100.0, bid=None, ask=None):
+            return SymbolQuote(symbol="QQQ", mid=mid, interval_return=ret, half_spread=hs, best_bid=bid, best_ask=ask)
+
+        # Default weight_cost -> spread-only: fee/impact zero, total == spread, cost unchanged.
+        base = ExecutionConfig(fill_level=FillLevel.DELAYED_CLOSE, spread_multiplier=1.0)
+        out0 = simulate_action_transition(cash, qqq_full, {"QQQ": q(ret=0.02)}, base)
+        leg0 = out0.legs[0]
+        self.assertAlmostEqual(leg0.spread_bps, 5.0)  # 0.05/100*1e4
+        self.assertEqual((leg0.fee_bps, leg0.impact_bps), (0.0, 0.0))
+        self.assertAlmostEqual(leg0.total_cost_bps, 5.0)
+        self.assertAlmostEqual(out0.realized_execution_cost, 1.0 * 5.0 / 1e4)
+
+        # fee + linear impact: total = spread + fee + coef*traded; cost = traded * total / 1e4.
+        cost_cfg = ExecutionConfig(
+            fill_level=FillLevel.DELAYED_CLOSE, spread_multiplier=1.0,
+            weight_cost=WeightExecutionCostConfig(fee_bps=2.0, impact_kind="linear_bps", linear_impact_bps_per_weight=3.0),
+        )
+        full = simulate_action_transition(cash, qqq_full, {"QQQ": q(ret=0.02)}, cost_cfg)
+        legf = full.legs[0]
+        self.assertAlmostEqual(legf.fee_bps, 2.0)
+        self.assertAlmostEqual(legf.impact_bps, 3.0)  # 3.0 bps/weight * 1.0 traded
+        self.assertAlmostEqual(legf.total_cost_bps, 10.0)
+        self.assertAlmostEqual(full.realized_execution_cost, 1.0 * 10.0 / 1e4)
+        self.assertAlmostEqual(full.net_pnl, 0.02 - 0.001)
+
+        # Linear impact is size-dependent: a half-weight trade pays half the impact bps.
+        half = simulate_action_transition(cash, qqq_half, {"QQQ": q(ret=0.02)}, cost_cfg)
+        legh = half.legs[0]
+        self.assertAlmostEqual(legh.impact_bps, 1.5)  # 3.0 * 0.5
+        self.assertAlmostEqual(legh.total_cost_bps, 5.0 + 2.0 + 1.5)
+        self.assertAlmostEqual(half.realized_execution_cost, 0.5 * 8.5 / 1e4)
+
+        # A blocked (MISSING_QUOTE) leg charges NO fee/impact (it did not execute).
+        quote_cost = ExecutionConfig(
+            fill_level=FillLevel.QUOTE_SIDE,
+            weight_cost=WeightExecutionCostConfig(fee_bps=2.0, impact_kind="linear_bps", linear_impact_bps_per_weight=3.0),
+        )
+        blocked = simulate_action_transition(cash, qqq_full, {"QQQ": q(ret=0.02)}, quote_cost)  # no bid/ask
+        self.assertEqual(blocked.legs[0].fill_status, FillStatus.MISSING_QUOTE)
+        self.assertEqual((blocked.legs[0].fee_bps, blocked.legs[0].impact_bps), (0.0, 0.0))
+        self.assertEqual(blocked.realized_execution_cost, 0.0)
+
+        # WeightExecutionCostConfig validation + mapping coercion on ExecutionConfig.
+        for bad in ({"impact_kind": "quadratic"}, {"fee_bps": -1.0}, {"linear_impact_bps_per_weight": -1.0}):
+            with self.assertRaises(ValueError):
+                WeightExecutionCostConfig(**bad)
+        self.assertAlmostEqual(ExecutionConfig(weight_cost={"fee_bps": 2.0}).weight_cost.fee_bps, 2.0)
+        with self.assertRaises(ValueError):
+            ExecutionConfig(weight_cost="bad")
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
