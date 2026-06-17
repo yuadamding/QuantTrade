@@ -305,7 +305,9 @@ def fill_index(now_index: int, *, step_horizon: int, latency_steps: int) -> int:
     return min(now_index + latency, next_index)
 
 
-_INTEGER_TENSOR_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
+# Only wide signed integer dtypes are safe as bar indices: uint8/int8/int16 (and unsigned generally)
+# overflow once a fill bar exceeds their tiny range when adding the horizon/latency offset.
+_INTEGER_INDEX_DTYPES = (torch.int32, torch.int64)
 
 
 def fill_indices(now_indices: torch.Tensor, *, step_horizon: int, latency_steps: int) -> torch.Tensor:
@@ -318,8 +320,11 @@ def fill_indices(now_indices: torch.Tensor, *, step_horizon: int, latency_steps:
     the scalar version (no silent fractional truncation), and requires an integer index tensor."""
     horizon = _require_positive_int("step_horizon", step_horizon)
     latency = _require_int_allow_negative("latency_steps", latency_steps)
-    if now_indices.dtype not in _INTEGER_TENSOR_DTYPES:
-        raise ValueError(f"now_indices must be an integer tensor; got dtype {now_indices.dtype}.")
+    if now_indices.dtype not in _INTEGER_INDEX_DTYPES:
+        raise ValueError(
+            f"now_indices must be an int32/int64 index tensor (smaller/unsigned dtypes overflow); "
+            f"got dtype {now_indices.dtype}."
+        )
     if latency <= 0:
         return now_indices
     next_indices = now_indices + horizon
@@ -638,9 +643,10 @@ def simulate_action_transition(
 
     Fail-closed semantics (a trade that cannot fill does NOT move the book): a symbol with no quote, or a
     quote-side leg with no bid/ask (MISSING_QUOTE), keeps its PRIOR weight -- the transition does not silently
-    teleport to the target -- and the outcome is flagged non-(real-executable) with a warning. Terminal
-    liquidation likewise only flattens symbols whose exit leg fills; a missing terminal quote keeps the
-    holding and flags the outcome. Legs are ordered exits-before-entries for stable, economic logs.
+    teleport to the target -- and the outcome is flagged non-(real-executable) with a warning. A held position
+    (no trade) whose symbol has no quote cannot be VALUED either, so it likewise flags the outcome rather than
+    silently earning a 0 return. Terminal liquidation likewise only flattens symbols whose exit leg fills; a
+    missing terminal quote keeps the holding and flags the outcome. Legs are ordered exits-before-entries.
 
     Each leg fills on its OWN book INDEPENDENTLY, so a partially-fillable switch is NOT weight-conserving:
     if only one leg of an A->B switch can fill, the book is left over-allocated (bought B, could not sell A)
@@ -655,12 +661,23 @@ def simulate_action_transition(
     warnings: list[str] = []
     real = config.real_executable_fill_model
 
-    # The old (prior) position earns its now->fill latency leg on every held symbol that has a quote.
+    def warn(message: str) -> None:
+        # Dedup so the same symbol flagged on multiple legs (latency / interval / trade) warns once.
+        if message not in warnings:
+            warnings.append(message)
+
+    # The old (prior) position earns its now->fill latency leg on every held symbol that has a quote. A
+    # held, non-zero position whose symbol has NO quote cannot be valued -- it is an UNVALUED position, not
+    # a zero-return event -- so fail closed (flag + warn) instead of silently crediting it a 0 return.
     old_latency = 0.0
     for symbol in symbols:
+        prev_w = prev_holdings.weight_of(symbol)
         quote = market_by_symbol.get(symbol)
         if quote is not None:
-            old_latency += prev_holdings.weight_of(symbol) * quote.latency_return
+            old_latency += prev_w * quote.latency_return
+        elif abs(prev_w) > eps:
+            warn(f"missing_quote:{symbol}")
+            real = False
 
     # executed[symbol] = weight ACTUALLY held after fills (== target only where the leg fills).
     executed: dict[str, float] = {}
@@ -678,26 +695,32 @@ def simulate_action_transition(
     for symbol, prev_w, tgt_w in sells + buys:
         quote = market_by_symbol.get(symbol)
         if quote is None:
-            warnings.append(f"missing_quote:{symbol}")
+            warn(f"missing_quote:{symbol}")
             real = False
             executed[symbol] = prev_w  # blocked: no quote -> trade did not fill, keep prior weight
             continue
         leg, cost = _make_leg(symbol, prev_w, tgt_w, quote, config)
         legs.append(leg)
         if leg.fill_status != FillStatus.FILLED:
-            warnings.append(f"missing_quote:{symbol}")
+            warn(f"missing_quote:{symbol}")
             real = False
             executed[symbol] = prev_w  # blocked: unfilled leg keeps prior weight (no teleport, no cost)
         else:
             realized_cost += cost
             executed[symbol] = tgt_w
 
-    # The executed position earns its fill->next interval leg.
+    # The executed position earns its fill->next interval leg. An executed, non-zero position whose symbol
+    # has NO quote cannot be valued -> fail closed (same rule as the latency leg), never a silent 0 return.
     new_interval = 0.0
     for symbol, weight in executed.items():
+        if abs(weight) <= eps:
+            continue
         quote = market_by_symbol.get(symbol)
-        if quote is not None and abs(weight) > eps:
+        if quote is not None:
             new_interval += weight * quote.interval_return
+        else:
+            warn(f"missing_quote:{symbol}")
+            real = False
 
     next_state = Holdings(tuple((s, w) for s, w in executed.items() if abs(w) > eps))
     if is_terminal and config.terminal_policy == TerminalPolicy.LIQUIDATE_AT_NEXT:
@@ -707,14 +730,14 @@ def simulate_action_transition(
                 continue
             quote = market_by_symbol.get(symbol)
             if quote is None:
-                warnings.append(f"terminal_missing_quote:{symbol}")
+                warn(f"terminal_missing_quote:{symbol}")
                 real = False
                 remaining.append((symbol, weight))  # cannot liquidate without a quote -> still held
                 continue
             leg, cost = _make_leg(symbol, weight, 0.0, quote, config)
             legs.append(leg)
             if leg.fill_status != FillStatus.FILLED:
-                warnings.append(f"terminal_missing_quote:{symbol}")
+                warn(f"terminal_missing_quote:{symbol}")
                 real = False
                 remaining.append((symbol, weight))
             else:

@@ -7545,6 +7545,19 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(term_ok.next_state, Holdings(()))
         self.assertGreater(term_ok.realized_execution_cost, 0.0)
 
+        # A HELD position (no trade) whose symbol has no quote cannot be valued: it must be flagged
+        # non-(real-executable) with a warning, NOT silently credited a 0 return while staying "real".
+        held_no_quote = simulate_action_transition(qqq, qqq, {}, quote_cfg)
+        self.assertFalse(held_no_quote.real_executable_fill_model)
+        self.assertIn("missing_quote:QQQ", held_no_quote.warnings)
+        self.assertEqual(held_no_quote.next_state, qqq)  # still held (unvalued, not flattened)
+        self.assertEqual(held_no_quote.gross_mark_pnl, 0.0)  # cannot value it -> 0, but flagged non-real
+        # A held position WITH a quote is valued normally and stays real-executable.
+        held_ok = simulate_action_transition(qqq, qqq, {"QQQ": q("QQQ", ret=0.02, lat=0.01, bid=99.9, ask=100.1)}, quote_cfg)
+        self.assertTrue(held_ok.real_executable_fill_model)
+        self.assertEqual(held_ok.warnings, ())
+        self.assertAlmostEqual(held_ok.gross_mark_pnl, 0.03)
+
         # Holdings fails closed: duplicate symbol, non-finite weight, explicit CASH; ~0 weights are dropped.
         for bad in ((("QQQ", 0.5), ("QQQ", 0.7)), (("QQQ", float("nan")),), (("CASH", 1.0),)):
             with self.assertRaises(ValueError):
@@ -7561,6 +7574,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 fill_indices(_torch.arange(4), **kwargs)
         with self.assertRaises(ValueError):
             fill_indices(_torch.arange(4, dtype=_torch.float32), step_horizon=5, latency_steps=1)
+        # Small/unsigned integer dtypes overflow as bar indices and are rejected; int32/int64 are allowed.
+        for bad_dtype in (_torch.uint8, _torch.int8, _torch.int16):
+            with self.assertRaises(ValueError):
+                fill_indices(_torch.arange(4, dtype=bad_dtype), step_horizon=5, latency_steps=1)
+        for ok_dtype in (_torch.int32, _torch.int64):
+            self.assertEqual(fill_indices(_torch.arange(4, dtype=ok_dtype), step_horizon=5, latency_steps=1).dtype, ok_dtype)
         self.assertEqual(
             fill_indices(_torch.arange(6), step_horizon=5, latency_steps=2).tolist(),
             [fill_index(i, step_horizon=5, latency_steps=2) for i in range(6)],
