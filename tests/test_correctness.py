@@ -9057,7 +9057,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import tempfile
         from pathlib import Path as _Path
 
-        from rl_quant.intraday_data import _finalize_split, _load_raw_split
+        from rl_quant.datasets.intraday import _finalize_split, _load_raw_split
 
         cols = [
             "time", "bucket_start_ns", "bucket_seconds", "close_mid", "best_bid", "best_ask",
