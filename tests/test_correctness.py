@@ -7146,6 +7146,51 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         sell = simulate_transition(PositionState(position=1.0), 0.0, q_now, q_now, q_now, is_terminal=False, config=qcfg)
         self.assertAlmostEqual(sell.entry_fill_price, 99.9)  # closing the long sells at bid
 
+    def test_execution_config_and_terminal_state_guards(self) -> None:
+        from rl_quant.execution import (
+            ExecutionConfig,
+            ImpactModel,
+            MarketSnapshot,
+            PositionState,
+            TerminalPolicy,
+            fill_index,
+            simulate_transition,
+        )
+
+        # Terminal liquidation flattens ALL held state, even on a hold-into-terminal (no stale bars/entry).
+        out = simulate_transition(
+            PositionState(position=1.0, bars_held=7, entry_price=100.0), 1.0,
+            MarketSnapshot(mid=100.0), MarketSnapshot(mid=101.0, half_spread=0.05),
+            MarketSnapshot(mid=102.0, half_spread=0.05), is_terminal=True,
+            config=ExecutionConfig(terminal_policy=TerminalPolicy.LIQUIDATE_AT_NEXT),
+        )
+        self.assertEqual(out.next_state.position, 0.0)
+        self.assertEqual(out.next_state.bars_held, 0)
+        self.assertIsNone(out.next_state.entry_price)
+        # CARRY keeps the held position and increments bars_held on a hold-into-terminal.
+        carry = simulate_transition(
+            PositionState(position=1.0, bars_held=7, entry_price=100.0), 1.0,
+            MarketSnapshot(mid=100.0), MarketSnapshot(mid=101.0), MarketSnapshot(mid=102.0),
+            is_terminal=True, config=ExecutionConfig(terminal_policy=TerminalPolicy.CARRY),
+        )
+        self.assertEqual(carry.next_state.position, 1.0)
+        self.assertEqual(carry.next_state.bars_held, 8)
+        # ExecutionConfig fails closed on invalid execution parameters.
+        for kwargs in (
+            {"latency_steps": -1},
+            {"step_horizon": 0},
+            {"trade_lot_size": 0},
+            {"commission_per_share": -0.01},
+            {"spread_multiplier": -1.0},
+            {"impact_model": ImpactModel(kind="linear", coef_per_unit=-1.0)},
+        ):
+            with self.assertRaises(ValueError):
+                ExecutionConfig(**kwargs)
+        # fill_index: negative latency clamps to the current bar (no pre-decision fill); horizon<=0 rejected.
+        self.assertEqual(fill_index(10, step_horizon=5, latency_steps=-3), 10)
+        with self.assertRaises(ValueError):
+            fill_index(10, step_horizon=0, latency_steps=1)
+
     def test_execution_simulator_reproduces_intraday_reward(self) -> None:
         # Equivalence gate: delayed_close net_return must equal the intraday inline arithmetic exactly,
         # so the later intraday wiring is result-preserving.

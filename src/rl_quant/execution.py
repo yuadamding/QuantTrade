@@ -56,6 +56,21 @@ class ExecutionConfig:
     impact_model: ImpactModel = field(default_factory=ImpactModel)
     terminal_policy: TerminalPolicy = TerminalPolicy.LIQUIDATE_AT_NEXT
 
+    def __post_init__(self) -> None:
+        # Fail closed on invalid execution parameters: a research run must never silently claim a
+        # negative latency, a non-positive horizon/lot, or a negative cost/impact.
+        if self.latency_steps < 0:
+            raise ValueError(f"latency_steps must be >= 0 (0 = no latency); got {self.latency_steps}.")
+        if self.step_horizon <= 0:
+            raise ValueError(f"step_horizon must be positive; got {self.step_horizon}.")
+        if self.trade_lot_size <= 0:
+            raise ValueError(f"trade_lot_size must be positive; got {self.trade_lot_size}.")
+        for name in ("commission_per_share", "extra_cost_per_share", "spread_multiplier"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative; got {getattr(self, name)}.")
+        if self.impact_model.coef_per_unit < 0:
+            raise ValueError(f"impact coef_per_unit must be non-negative; got {self.impact_model.coef_per_unit}.")
+
     @property
     def trade_scale(self) -> float:
         return float(self.trade_lot_size) * 100.0
@@ -103,6 +118,8 @@ def fill_index(now_index: int, *, step_horizon: int, latency_steps: int) -> int:
 
     ``latency_steps <= 0`` collapses the fill to the current bar (decision and fill coincide). Mirrors
     intraday ``_fill_indices`` exactly, so a fill can never be pushed past the holding horizon."""
+    if int(step_horizon) <= 0:
+        raise ValueError(f"step_horizon must be positive; got {step_horizon}.")
     next_index = now_index + int(step_horizon)
     if int(latency_steps) <= 0:
         return now_index
@@ -217,13 +234,17 @@ def simulate_transition(
     total_cost = entry_cost + exit_cost + impact_cost
     net_return = gross_return - total_cost
 
-    next_position = 0.0 if liquidating else new
-    held = new == old
-    next_state = PositionState(
-        position=next_position,
-        bars_held=state.bars_held + 1 if held else 0,
-        entry_price=state.entry_price if held else entry_fill_price,
-    )
+    if liquidating:
+        # A terminal liquidation flattens the book: the (now-closed) leg carries no held bars or entry
+        # price forward -- otherwise a hold-into-terminal would leave a flat position with stale state.
+        next_state = PositionState(position=0.0, bars_held=0, entry_price=None)
+    else:
+        held = new == old
+        next_state = PositionState(
+            position=new,
+            bars_held=state.bars_held + 1 if held else 0,
+            entry_price=state.entry_price if held else entry_fill_price,
+        )
     return TransitionOutcome(
         old_latency_return=old_latency_return,
         new_interval_return=new_interval_return,
