@@ -12,8 +12,9 @@ real fill logs).
 Hard honesty line (unchanged): *real executable trading requires quote-side fills, latency P&L, impact, AND
 real fill-price logs; anything short is labelled causal-research / backtest only.* A config flag is not
 sufficient evidence — reportability is judged from config AND the decision logs. The minute_to_hour data is
-return-based (`action_returns` + `action_target_weights`, no NBBO on disk), so the work below is explicitly a
-**cost-model** experiment, NOT a real-executable claim.
+return-based: `HourFromMinuteDataSplit` carries `action_returns` + `action_names` (no per-row target-weight
+tensor and no NBBO on disk; `action_target_weights` exists only on the unrelated `SecondContextDataSplit`).
+So the work below is explicitly a **cost-model** experiment, NOT a real-executable claim.
 
 ## 1. Current state (post-reorg)
 
@@ -58,20 +59,31 @@ cost-drag/drawdown (+ PSR/DSR); (6) explicit reportability label + reasons; (7) 
 execution-engine reward/cost **alongside** the legacy reward and **log** them — training still uses the legacy
 reward. Default byte-identical; this is the safe first contact between the engine and a trainer.
 
-**Pricing (decision made): weight-bps cost model.** The env is return-based, no NBBO. So the shadow cost is
-`execution.py`'s `WeightExecutionCostConfig` (`fee_bps + linear_impact_bps_per_weight`) applied to the
-transition's **executed target weights** (`action_target_weights[row, executed_action]` legs vs the prior
-held weights). This is a **cost-model A/B**: leg-aware bps execution cost vs the env's current
-`legs * one_way_cost_bps + is_switch * extra_switch_penalty_bps`. It is explicitly **not** real-executable
-(no quote-side fills, no latency P&L) — strict reportability still requires NBBO data that isn't on disk.
+**Pricing (decision made): weight-bps cost model — sourced from action metadata, NOT a dataset field.**
+`HourFromMinuteDataSplit` has **no** `action_target_weights`; the env is single-slot/leg-based. So the
+per-action weight VECTOR is derived from action metadata (`features/action_risk.action_weight_tensor`/
+`action_leverage_tensor` on `build_action_metadata(data.action_names)`) — note these are **static per-symbol
+caps** (a function of leverage), not time-varying targets, and PR-3 must state that limitation. The shadow
+cost is `execution.py`'s `WeightExecutionCostConfig` (`fee_bps + linear_impact_bps_per_weight`) applied to the
+transition **prior-held-weight vector → executed-weight vector** (indexed by `previous_actions`/`actions`,
+not a dataset tensor). The env must therefore track a `execution_shadow_holdings` weight vector (set on reset,
+updated to the executed weight each step, saved/restored on resume when the flag is on — mirror the dynamic
+env-state checkpoint fix). This is a **cost-model A/B**: leg-aware bps cost vs the env's current
+`legs * one_way_cost_bps + is_switch * extra_switch_penalty_bps`. Explicitly **not** real-executable (no
+quote-side fills, no latency P&L) — strict reportability still requires NBBO data that isn't on disk.
 
 **Contract (env `step`, behind `execution_env_reward_shadow: bool = False`, default off):**
 - Legacy path unchanged: `rewards` (the tensor used for training) is computed exactly as today; the trained
   model and every reported number are identical with the flag off OR on (shadow is a pure side-channel).
 - When on, additionally compute (no RNG draws, no reordering, no mutation of the legacy reward):
-  - `execution_cost_bps_shadow` — the weight-bps engine cost for the transition;
-  - `execution_env_reward_shadow = raw_returns * reward_scale - execution_cost_bps_shadow * reward_scale / 1e4`;
-  - `reward_delta = execution_env_reward_shadow - rewards`; `cost_delta = execution_cost_bps_shadow - legacy_cost_bps`;
+  - `execution_cost_bps_shadow = 1e4 * outcome.realized_execution_cost` — the engine returns
+    `realized_execution_cost` in **return units** (`traded · total_cost_bps / 1e4`), so convert to bps with ×1e4;
+  - `execution_env_reward_shadow = raw_returns * reward_scale - (execution_cost_bps_shadow + cash_idle_penalty_bps) * reward_scale / 1e4`
+    — it **must carry the same `cash_idle_penalty_bps` term as the legacy reward** so `reward_delta` isolates the
+    trade-cost-model change, not the cash-idle policy (the legacy reward subtracts `cost_bps + cash_idle_penalty_bps`);
+  - `reward_delta = execution_env_reward_shadow - rewards`; `cost_delta = execution_cost_bps_shadow - legacy_trade_cost_bps`;
+  - `impact_applied_shadow` — the **transition-actual** flag from the outcome (now fixed: a positive impact was
+    charged on a filled leg), not the config-level capability;
   - `execution_transition_issues` (the engine's fail-closed flags, if any).
 - Emit these into the step dict (replay filters unknown keys → harmless), surface per-run aggregates
   (mean/quantiles of `reward_delta`, `cost_delta`) and stamp `execution_env_reward_shadow: true` in the
@@ -92,6 +104,15 @@ A separate flag that makes the env **train on** `execution_env_reward_shadow` in
 This MOVES results, so it merges only through the §2.1 gate: default off + byte-identical; a latest-period A/B
 (test block untouched) reporting the Δ metrics + PSR/DSR; explicit reportability label; one-flag rollback.
 Never bundled with PR-3.
+
+**Prerequisite (known latent drift):** `evaluate_minute_to_hour_policy` currently RECOMPUTES the reward/cost
+ledger inline (`legs`/`cost_bps`/`net_return`/equity) outside the env, and omits the env's
+`cash_idle_penalty_bps` (it isn't even passed to the evaluator). With the default `cash_idle_penalty_bps == 0`
+the two agree today, but they diverge for any nonzero-penalty run, and PR-4 would make this worse (eval must
+score the *execution* reward the env trains on). Before PR-4, route eval scoring through the env (or a single
+shared pure transition/reward primitive called by both `env.step` and the evaluator) so "only env/execution
+computes reward" actually holds. This is the eval-through-env refactor — bounded but multi-call-site (8+
+`evaluate_minute_to_hour_policy` call sites), tracked here, not rushed.
 
 ## 5. Deferred / blocked (honesty line)
 

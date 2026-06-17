@@ -8030,6 +8030,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             cash, qqq_full, {"QQQ": q(bid=99.9, ask=100.1)}, with_leg_impact
         )
         self.assertTrue(out_impact.impact_applied)
+        # Transition-ACTUAL (reorg review): with impact CONFIGURED, a transition that charges no impact must
+        # still report impact_applied=False -- it was config-level (always True for with_leg_impact) before.
+        out_no_trade = simulate_action_transition(  # prev == target -> nothing trades -> no impact charged
+            qqq_full, qqq_full, {"QQQ": q(bid=99.9, ask=100.1)}, with_leg_impact
+        )
+        self.assertFalse(out_no_trade.impact_applied)
+        out_blocked = simulate_action_transition(cash, qqq_full, {}, with_leg_impact)  # buy leg blocked (no quote)
+        self.assertFalse(out_blocked.impact_applied)  # leg never filled -> no impact, despite impact config
 
         # Leg + outcome invariants are enforced at construction.
         from rl_quant.execution import ActionTransitionOutcome, ExecutionLeg, FillStatus, Holdings, LegSide
@@ -8280,10 +8288,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 self.assertTrue(spec.flip_criterion, f"{name}: missing flip_criterion")
                 self.assertTrue(spec.delete_criterion, f"{name}: missing delete_criterion")
 
-        # The dynamic + transition flags are registered as result-moving and match the config defaults.
+        # Result-moving flags: the dynamic + transition model-input flags and the (declared-ahead) training
+        # flip use_execution_env_reward. The shadow flag execution_env_reward_shadow is label-changing only
+        # (moves metrics/manifest, not P&L), so it is NOT result-moving.
         self.assertEqual(
-            set(result_moving_flags()), {"use_dynamic_transition_features", "use_transition_features"}
+            set(result_moving_flags()),
+            {"use_dynamic_transition_features", "use_transition_features", "use_execution_env_reward"},
         )
+        self.assertFalse(FLAG_REGISTRY["execution_env_reward_shadow"].is_result_moving)
         config_defaults = {f.name: f.default for f in dataclasses.fields(MinuteToHourTrainingConfig)}
         for name in ("use_dynamic_transition_features", "use_transition_features"):
             self.assertEqual(

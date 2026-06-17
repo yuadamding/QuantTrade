@@ -70,6 +70,28 @@ FLAG_REGISTRY: dict[str, FlagSpec] = {
         ),
         delete_criterion="remove the flag after two stable cycles at the new default",
     ),
+    # Declared AHEAD of the PR-3/PR-4 execution-engine wiring (see docs/execution_wiring_design.md) so the
+    # governance contract exists before the code does. These are not yet config fields; the drift guard in the
+    # gate test only cross-checks the two flags above against MinuteToHourTrainingConfig.
+    "execution_env_reward_shadow": FlagSpec(
+        name="execution_env_reward_shadow",
+        default=False,
+        # Label-changing only: computes + logs the execution-engine reward/cost ALONGSIDE the legacy reward;
+        # training is unchanged, so this moves artifacts/metrics, NOT a reported P&L number.
+        moves=("metrics", "manifest", "artifact_schema"),
+        required_ab=(),
+        flip_criterion="no default flip -- diagnostic shadow only, unless promoted into PR-4",
+        delete_criterion="remove once use_execution_env_reward replaces it, or if abandoned",
+    ),
+    "use_execution_env_reward": FlagSpec(
+        name="use_execution_env_reward",
+        default=False,
+        # Result-moving: makes the env TRAIN on the execution-engine reward instead of the legacy reward.
+        moves=("reward", "pnl", "td_targets"),
+        required_ab=_STANDARD_AB_METRICS,
+        flip_criterion="latest-period A/B improves the promotion gate without degrading reportability; test block untouched",
+        delete_criterion="remove after two stable cycles at the new default",
+    ),
 }
 
 

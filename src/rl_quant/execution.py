@@ -913,6 +913,10 @@ def simulate_action_transition(
         real_executable_fill_model=real,
         valuation_complete=valuation_complete,
         execution_complete=execution_complete,
-        impact_applied=config.applies_weight_impact,
+        # Transition-ACTUAL, not config-level: impact is "applied" only if at least one leg actually FILLED
+        # and carried a positive weight-impact charge. A no-trade / all-blocked / atomic-blocked transition
+        # charges no impact even when the config enables it, so it must not be labelled impact-priced (impact_bps
+        # is 0 unless weight_cost charged positive impact on a fill, which also implies config.applies_weight_impact).
+        impact_applied=any(leg.fill_status == FillStatus.FILLED and leg.impact_bps > 0.0 for leg in legs),
         warnings=tuple(warnings),
     )
