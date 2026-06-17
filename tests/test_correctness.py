@@ -6590,20 +6590,30 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             ),
             [],
         )
-        # Same-START-date distinct labels cannot be ordered from the date prefix and lexicographic
-        # tie-breaking is unreliable (e.g. a rebuild leaving two windows that share a start, or the
-        # reviewer's 2026-06-15_v2 vs _v10) -> fail closed with an ambiguity violation, suppressing the
-        # later latest/coverage checks (meaningless without a defined order).
-        for ambiguous_available in (
-            ["2026-06-15_v2", "2026-06-15_v10", "2026-06-16"],
-            ["2026-01-01_to_2026-01-15", "2026-01-01_to_2026-01-31"],
+        # Same-START-date distinct VALID range labels (a rebuild leaving two windows that share a
+        # start) cannot be ordered from the start prefix -> fail closed with an ambiguity violation,
+        # suppressing the later latest/coverage checks (meaningless without a defined order).
+        ambiguous = fn(
+            selected_labels=["2026-01-01_to_2026-01-15", "2026-01-01_to_2026-01-31"],
+            all_available_labels=["2026-01-01_to_2026-01-15", "2026-01-01_to_2026-01-31"],
+            allow_truncated_training_history=True,
+        )
+        self.assertTrue(any("not chronologically unambiguous" in v for v in ambiguous))
+        # Malformed labels are rejected as INVALID (the pattern is fully anchored, not a prefix match):
+        # trailing garbage, a version suffix (2026-06-15_v2), and empty/inverted explicit ranges.
+        for bad in (
+            ["2026-06-15_v2", "2026-06-15_v10"],
+            ["2026-01-01abc", "2026-01-02"],
+            ["2026-01-01_to_2026-01-01"],
+            ["2026-02-01_to_2026-01-01"],
         ):
-            violations = fn(
-                selected_labels=ambiguous_available,
-                all_available_labels=ambiguous_available,
-                allow_truncated_training_history=True,
+            self.assertTrue(
+                any(
+                    "invalid labels" in v
+                    for v in fn(selected_labels=bad, all_available_labels=bad, allow_truncated_training_history=True)
+                ),
+                bad,
             )
-            self.assertTrue(any("not chronologically unambiguous" in v for v in violations), ambiguous_available)
         # Distinct-start OVERLAPPING windows (a short window contained in a wide backfill) are rejected:
         # ranking by start would crown the contained 2026-03-15_to_2026-03-20 as latest even though the
         # container holds newer data (through Mar 31), and the windows leak train/test. Fail closed.
@@ -6620,16 +6630,35 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             fn(selected_labels=adjacent, all_available_labels=adjacent, allow_truncated_training_history=False), []
         )
 
-    def test_chronological_latest_label_ignores_lexicographic_suffix_order(self) -> None:
+    def test_chronological_latest_label_ranks_by_window_end(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         latest = module._chronological_latest_label
-        # Unsorted distinct dates -> max by date, not positional [-1].
+        # Unsorted bare dates -> max by date, not positional [-1].
         self.assertEqual(latest(["2026-01-03", "2026-01-01", "2026-01-02"]), "2026-01-03")
-        # An unsortable same-date suffix must not flip the latest: 2026-06-16_* is newer than any 06-15.
-        self.assertEqual(latest(["2026-06-15_v10", "2026-06-15_v2", "2026-06-16_v1"]), "2026-06-16_v1")
-        # No parseable dates -> fall back to the last given label; empty -> None.
+        # Ranges rank by END (most recent data): a wider window that ENDS later outranks a
+        # later-STARTING but earlier-ENDING window.
+        self.assertEqual(
+            latest(["2026-02-01_to_2026-02-28", "2026-01-01_to_2026-03-31"]), "2026-01-01_to_2026-03-31"
+        )
+        # No parseable labels -> fall back to the last given; empty -> None.
         self.assertEqual(latest(["partition_9", "partition_10"]), "partition_10")
         self.assertIsNone(latest([]))
+
+    def test_label_span_is_fully_anchored_and_rejects_malformed(self) -> None:
+        module = load_script("train_hourly_from_second_protocol_partitions")
+        span = module._label_span
+        # Bare date == one-day half-open window [date, date + 1 day) (never empty).
+        start, end = span("2026-01-01")
+        self.assertEqual((end - start).days, 1)
+        # Valid explicit range, end exclusive.
+        start, end = span("2026-01-01_to_2026-02-01")
+        self.assertEqual((start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")), ("2026-01-01", "2026-02-01"))
+        # Fully anchored: trailing garbage / version suffix is rejected, NOT silently truncated.
+        for bad in ("2026-01-01abc", "2026-01-01_to_2026-02-01_garbage", "2026-06-15_v2"):
+            self.assertIsNone(span(bad), bad)
+        # Empty, inverted, and impossible-date ranges are malformed.
+        for bad in ("2026-01-01_to_2026-01-01", "2026-02-01_to_2026-01-01", "2026-99-99", "2026-01-01_to_2026-99-99"):
+            self.assertIsNone(span(bad), bad)
 
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")

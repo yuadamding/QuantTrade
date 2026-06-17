@@ -9,7 +9,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -222,25 +222,33 @@ def partition_selection_reportability_errors(args: argparse.Namespace) -> list[s
     return []
 
 
-_LABEL_RANGE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:_to_(\d{4}-\d{2}-\d{2}))?")
+_LABEL_RANGE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:_to_(\d{4}-\d{2}-\d{2}))?")
 
 
 def _label_span(label: str) -> tuple[datetime, datetime] | None:
     """Parse a partition label into a half-open ``[start, end)`` calendar span.
 
     The real label format is ``<start>_to_<end>`` with ``end`` exclusive (the builder sets
-    ``end = last_trading_day + 1``); a bare ``<date>`` label is treated as a single-day point
-    ``[start, start)``. Returns ``None`` when the start (or a present ``_to_`` end) is not a real
-    calendar date, or when ``end < start`` -- i.e. the label is not a sortable, well-formed window."""
-    match = _LABEL_RANGE.match(label)
+    ``end = last_trading_day + 1``); a bare ``<date>`` label is the one-day window
+    ``[date, date + 1 day)`` (a partition holds at least a day of data, so it is never empty).
+    The pattern is FULLY anchored (``fullmatch``), so any trailing garbage or non-range suffix
+    (``2026-01-01abc``, ``..._to_..._v2``) is rejected rather than silently truncated. Returns
+    ``None`` when a date is not a real calendar date or when an explicit range has ``end <= start``
+    (an empty/inverted range is malformed, not a sortable window)."""
+    match = _LABEL_RANGE.fullmatch(label)
     if not match:
         return None
     try:
         start = datetime.strptime(match.group(1), "%Y-%m-%d")
-        end = datetime.strptime(match.group(2), "%Y-%m-%d") if match.group(2) else start
     except ValueError:
         return None
-    return (start, end) if end >= start else None
+    if match.group(2) is None:
+        return (start, start + timedelta(days=1))
+    try:
+        end = datetime.strptime(match.group(2), "%Y-%m-%d")
+    except ValueError:
+        return None
+    return (start, end) if end > start else None
 
 
 def _chronological_latest_label(labels: list[str]) -> str | None:
