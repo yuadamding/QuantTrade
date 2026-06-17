@@ -12,6 +12,7 @@ from torch import nn
 from rl_quant.core import autocast_context
 from rl_quant.features.stock_second_context import validate_second_context_payload
 from rl_quant.hourly_transformer import _validate_action_return_contract
+from rl_quant.reportability import evaluate_decision_log_reportability
 
 
 @dataclass
@@ -1036,6 +1037,21 @@ def evaluate_second_context_trading_policy(
         return_decision_logs=return_decision_logs,
     )
     metrics.update({"diagnostic_only": False, "cost_model": "sequential_switch_only_cost"})
+    # Reportability LABEL (no P&L movement): this path prices fills from the close + an estimated cost bps,
+    # so it is NOT a crossable quote fill model and cannot claim real executable trading. Stamp the honest
+    # verdict, computed from the decision logs via the shared gate when available (the rows lack crossable /
+    # real-fill fields, so the verdict is False with informative reasons) -- never overstating it as real.
+    decision_logs = metrics.get("decision_logs")
+    if decision_logs is not None:
+        verdict = evaluate_decision_log_reportability(decision_logs, require_real_executable=True)
+        real_reportable = verdict.real_executable_trade_reportable
+        reasons: tuple[str, ...] = tuple(sorted({r.split(":", 1)[-1] for r in verdict.missing_reportability_reasons}))
+    else:
+        real_reportable = False
+        reasons = ("decision_logs_not_emitted",)
+    metrics["sequential_evaluation_type"] = "real_executable" if real_reportable else "close_based_research_backtest"
+    metrics["real_executable_trade_reportable"] = bool(real_reportable)
+    metrics["missing_reportability_reasons"] = reasons
     if return_selected_actions:
         metrics["selected_actions"] = executed_actions
         metrics["executed_actions"] = executed_actions

@@ -3208,6 +3208,10 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(metrics["gap_resets"], 1)
         self.assertEqual(metrics["switches"], 2)
         self.assertAlmostEqual(float(metrics["total_return"]), 0.0, places=6)
+        # Reportability label (no P&L movement): the close-based path must NOT claim real executable trading.
+        self.assertEqual(metrics["sequential_evaluation_type"], "close_based_research_backtest")
+        self.assertFalse(metrics["real_executable_trade_reportable"])
+        self.assertTrue(len(metrics["missing_reportability_reasons"]) > 0)
 
     def test_second_context_min_hold_does_not_force_initial_cash(self) -> None:
         class ConstantActionModel(nn.Module):
