@@ -904,6 +904,8 @@ def train_minute_to_hour_dqn(
 
     checkpoint_path = Path(config.checkpoint_training_state) if config.checkpoint_training_state is not None else None
     checkpoint_every_steps = max(0, int(config.checkpoint_every_steps))
+    shadow_reward_deltas: list[float] = []  # PR-3: per-step mean execution-shadow deltas (stays empty if flag off)
+    shadow_cost_deltas: list[float] = []
     for step in range(start_step, config.learning.train_steps + 1):
         minute, mask, hour, action_features, previous_actions, constraint_features, action_mask = env.observe()
         valid_action_count_trace.append(float(action_mask.sum(dim=1).float().mean().item()))
@@ -941,6 +943,9 @@ def train_minute_to_hour_dqn(
         transition = env.step(actions)
         replay.add(**{key: value for key, value in transition.items() if key in replay.storage})
         reward_trace.append(float(transition["rewards"].mean().item()))
+        if "reward_delta_shadow" in transition:  # PR-3 shadow side-channel (present only when the flag is on)
+            shadow_reward_deltas.append(float(transition["reward_delta_shadow"].mean().item()))
+            shadow_cost_deltas.append(float(transition["cost_delta_shadow"].mean().item()))
         env.reset(transition["resets"].bool())
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
@@ -1119,6 +1124,15 @@ def train_minute_to_hour_dqn(
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
         "cash_idle_penalty_bps": float(config.env.cash_idle_penalty_bps),
+        # PR-3: shadow execution-reward diagnostics (None when the flag is off). Label-changing only -- the
+        # trained model + every other metric are byte-identical to a shadow-off run.
+        "execution_env_reward_shadow": bool(config.env.execution_env_reward_shadow),
+        "execution_shadow_reward_delta_mean": (
+            sum(shadow_reward_deltas) / len(shadow_reward_deltas) if shadow_reward_deltas else None
+        ),
+        "execution_shadow_cost_delta_bps_mean": (
+            sum(shadow_cost_deltas) / len(shadow_cost_deltas) if shadow_cost_deltas else None
+        ),
         "model_version": (
             DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION
             if config.use_dynamic_transition_features

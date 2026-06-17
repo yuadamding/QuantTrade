@@ -9427,6 +9427,54 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(seen)
         self.assertEqual(set(seen), {"bf16"})
 
+    def test_minute_to_hour_execution_shadow_training_byte_identical_and_surfaced(self) -> None:
+        # PR-3 end-to-end: execution_env_reward_shadow must NOT change training (the shadow reward is a logged
+        # side-channel, never trained on) yet MUST surface the shadow deltas in the artifact. Train a tiny run
+        # twice (shadow off vs on, same seed) -> identical loss/reward traces; only the on-run carries the deltas.
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+            n = len(dates)
+            return HourFromMinuteDataSplit(
+                name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
+                next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((n, 1, 1)), action_returns=torch.zeros((n, 2)),
+                action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            )
+
+        train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
+        val = make_split("val", ["2026-06-01", "2026-06-02"])
+
+        def run(shadow: bool) -> dict:
+            learning = DQNLearningConfig(
+                num_envs=2, episode_length=3, replay_capacity=64, batch_size=4, train_steps=6, warmup_steps=2,
+                gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=3, epsilon_start=0.2,
+                epsilon_end=0.0, eval_interval=4, grad_clip=1.0,
+            )
+            config = MinuteToHourTrainingConfig(
+                env=MinuteToHourEnvConfig(num_envs=2, episode_length=3, execution_env_reward_shadow=shadow),
+                learning=learning, d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+                action_embedding_dim=4,
+            )
+            torch.manual_seed(0)
+            return train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)[1]  # artifacts
+
+        off, on = run(False), run(True)
+        self.assertEqual(off["loss_trace"], on["loss_trace"])  # training byte-identical (shadow is a side-channel)
+        self.assertEqual(off["train_reward_trace"], on["train_reward_trace"])
+        self.assertFalse(off["execution_env_reward_shadow"])
+        self.assertIsNone(off["execution_shadow_reward_delta_mean"])
+        self.assertTrue(on["execution_env_reward_shadow"])
+        self.assertIsNotNone(on["execution_shadow_reward_delta_mean"])  # surfaced when on
+
     def test_all_public_rl_quant_modules_import(self) -> None:
         import importlib
         import pkgutil
