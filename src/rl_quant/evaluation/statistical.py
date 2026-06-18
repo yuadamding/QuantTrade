@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import combinations
 from statistics import NormalDist
 
 _NORMAL = NormalDist()
@@ -216,3 +217,74 @@ def deflated_sharpe_promotion_verdict(
         is_credible=is_credible,
         reasons=tuple(reasons),
     )
+
+
+def _series_sharpe(values: Sequence[float]) -> float:
+    """Per-observation Sharpe (mean / population std) of a return series; 0.0 when fewer than 2 points or
+    zero dispersion (a flat series carries no rank information)."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / n
+    if var <= 0.0:
+        return 0.0
+    return mean / math.sqrt(var)
+
+
+def probability_of_backtest_overfitting(
+    performance: Sequence[Sequence[float]], *, n_splits: int = 16
+) -> float:
+    """Probability of Backtest Overfitting via Combinatorially-Symmetric Cross-Validation (Bailey, Borwein,
+    Lopez de Prado & Zhu, 2017). ``performance`` is a matrix with one ROW per observation (time) and one
+    COLUMN per candidate config/strategy (``performance[t][n]`` = config n's return at observation t).
+
+    The T observations are split into ``n_splits`` contiguous blocks; for every way to choose n_splits/2
+    blocks as IN-SAMPLE (the rest OUT-OF-SAMPLE), the config with the best IS Sharpe is found and its OOS
+    RANK among all configs is taken. PBO is the fraction of splits in which that IS-best config lands in the
+    OOS BOTTOM half (logit <= 0) -- i.e. the probability that an in-sample-selected config is, out of sample,
+    no better than the median. ~0.5 means selection is indistinguishable from luck; near 1.0 means the
+    selection procedure overfits; near 0.0 means a genuinely dominant config. The companion to PSR/DSR for a
+    project that searches over many configs/seeds. Pure / stdlib-only; changes no backtest number.
+
+    Raises on a non-rectangular matrix, < 2 configs, an odd or < 2 ``n_splits``, T < n_splits, or non-finite
+    values."""
+    if isinstance(n_splits, bool) or not isinstance(n_splits, int) or n_splits < 2 or n_splits % 2 != 0:
+        raise ValueError(f"n_splits must be an even integer >= 2; got {n_splits!r}.")
+    rows = [list(row) for row in performance]
+    n_obs = len(rows)
+    if n_obs < n_splits:
+        raise ValueError(f"need at least n_splits={n_splits} observations; got {n_obs}.")
+    n_configs = len(rows[0]) if rows else 0
+    if n_configs < 2:
+        raise ValueError(f"need at least 2 configs (matrix columns); got {n_configs}.")
+    for r in rows:
+        if len(r) != n_configs:
+            raise ValueError("performance matrix must be rectangular (every row the same number of configs).")
+        for value in r:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"performance entries must be finite numbers; got {value!r}.")
+
+    # Contiguous, as-even-as-possible blocks of observation indices.
+    bounds = [round(k * n_obs / n_splits) for k in range(n_splits + 1)]
+    blocks = [list(range(bounds[k], bounds[k + 1])) for k in range(n_splits)]
+
+    def sharpe_over(indices: list[int], config: int) -> float:
+        return _series_sharpe([rows[t][config] for t in indices])
+
+    overfit = 0
+    total = 0
+    for is_blocks in combinations(range(n_splits), n_splits // 2):
+        is_set = set(is_blocks)
+        is_rows = [t for b in is_blocks for t in blocks[b]]
+        oos_rows = [t for b in range(n_splits) if b not in is_set for t in blocks[b]]
+        is_sharpe = [sharpe_over(is_rows, n) for n in range(n_configs)]
+        oos_sharpe = [sharpe_over(oos_rows, n) for n in range(n_configs)]
+        best = max(range(n_configs), key=lambda n: is_sharpe[n])  # IS-selected config (first on ties)
+        # OOS rank of the IS-best (1 = worst): relative rank in (0, 1); logit <= 0  <=>  bottom half.
+        rank = sum(1 for s in oos_sharpe if s < oos_sharpe[best]) + 1
+        omega = rank / (n_configs + 1)
+        total += 1
+        if omega <= 0.5:
+            overfit += 1
+    return overfit / total

@@ -3539,6 +3539,37 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertLess(ess(ramp), float(len(ramp)))
         self.assertGreaterEqual(ess(ramp), 1.0)
 
+    def test_probability_of_backtest_overfitting(self) -> None:
+        # PBO via CSCV (Bailey, Borwein, Lopez de Prado & Zhu 2017): the fraction of in-sample/out-of-sample
+        # block splits in which the IS-best config lands in the OOS bottom half. Two deterministic anchors
+        # plus bounds + fail-closed validation. (Verified against Monte Carlo: pure noise -> ~0.5.)
+        from rl_quant.evaluation import probability_of_backtest_overfitting as pbo
+
+        t_obs, n_splits = 24, 6
+        # Config 0 has the highest Sharpe in EVERY block (and OOS), so it is never the OOS loser -> PBO 0.
+        dominant = [[0.020 if t % 2 == 0 else 0.018, 0.001 if t % 2 == 0 else -0.001,
+                     -0.010 if t % 2 == 0 else -0.012] for t in range(t_obs)]
+        self.assertEqual(pbo(dominant, n_splits=n_splits), 0.0)
+        self.assertTrue(0.0 <= pbo(dominant, n_splits=n_splits) <= 1.0)
+
+        # A negated pair with a half-split sign flip: the IS-winner is ALWAYS the OOS-loser -> fully overfit.
+        a = [(0.010 if t % 2 == 0 else 0.012) if t < t_obs // 2 else (-0.010 if t % 2 == 0 else -0.012)
+             for t in range(t_obs)]
+        negated = [[a[t], -a[t]] for t in range(t_obs)]
+        self.assertEqual(pbo(negated, n_splits=n_splits), 1.0)
+
+        # Fail closed: odd/too-large n_splits, < 2 configs, ragged matrix, non-finite entries.
+        with self.assertRaises(ValueError):
+            pbo(dominant, n_splits=5)
+        with self.assertRaises(ValueError):
+            pbo(dominant, n_splits=100)
+        with self.assertRaises(ValueError):
+            pbo([[0.0]] * 8, n_splits=2)
+        with self.assertRaises(ValueError):
+            pbo([[0.0, 1.0], [2.0]] * 4, n_splits=2)
+        with self.assertRaises(ValueError):
+            pbo([[0.0, float("nan")]] * 8, n_splits=2)
+
     def test_protocol_model_input_label_split_validator(self) -> None:
         # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
         # label/future field must NEVER be a model input. Pure/additive (changes no data or training).

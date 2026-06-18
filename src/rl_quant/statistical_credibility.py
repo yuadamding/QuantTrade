@@ -11,6 +11,7 @@ from rl_quant.evaluation.statistical import (
     effective_sample_size,
     expected_maximum_sharpe,
     probabilistic_sharpe_ratio,
+    probability_of_backtest_overfitting,
     psr_is_credible,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "effective_sample_size",
     "expected_maximum_sharpe",
     "probabilistic_sharpe_ratio",
+    "probability_of_backtest_overfitting",
     "psr_is_credible",
 ]
