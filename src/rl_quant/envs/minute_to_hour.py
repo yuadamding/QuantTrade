@@ -250,8 +250,10 @@ class VectorizedMinuteToHourEnv:
         self.reward_scale = coerce_finite_positive("reward_scale", config.reward_scale)
         # Sizing/penalty scalars fail closed at construction (num_envs/episode_length must be positive ints;
         # cash_idle_penalty_bps finite/non-negative). episode_length<=0 would truncate every episode at step 0.
-        require_positive_int("num_envs", config.num_envs)
-        require_positive_int("episode_length", config.episode_length)
+        # Store the validated sizing ints and use them at runtime (the env never reads the raw mutable config
+        # for runtime values; the economic scalars/constraints are likewise normalized + stored above/below).
+        self.num_envs = require_positive_int("num_envs", config.num_envs)
+        self.episode_length = require_positive_int("episode_length", config.episode_length)
         # Store the normalized (canonical float) cash-idle penalty and use it in the reward ledger.
         self.cash_idle_penalty_bps = coerce_finite_nonnegative("cash_idle_penalty_bps", config.cash_idle_penalty_bps)
         # Pin to a CONCRETE device ordinal (concrete_torch_device): the env is typically built with the result
@@ -306,7 +308,7 @@ class VectorizedMinuteToHourEnv:
 
     def reset(self, mask: torch.Tensor | None = None) -> None:
         if mask is None:
-            mask = torch.ones(self.config.num_envs, dtype=torch.bool, device=self.device)
+            mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         count = int(mask.sum().item())
         if count == 0:
             return
@@ -333,7 +335,7 @@ class VectorizedMinuteToHourEnv:
             switches_today=self.switches_today,
             switches_episode=self.switches_episode,
             constraints=self.constraints,
-            episode_length=self.config.episode_length,
+            episode_length=self.episode_length,
             order_legs_today=self.order_legs_today,
             order_legs_episode=self.order_legs_episode,
         )
@@ -415,9 +417,9 @@ class VectorizedMinuteToHourEnv:
             raise ValueError(f"actions must be an integer action-index tensor, got dtype {actions.dtype}.")
         if actions.device != self.device:
             raise ValueError(f"actions must be on device {self.device}, got {actions.device}.")
-        if actions.shape != (self.config.num_envs,):
+        if actions.shape != (self.num_envs,):
             raise ValueError(
-                f"actions must have shape ({self.config.num_envs},), got {tuple(actions.shape)}."
+                f"actions must have shape ({self.num_envs},), got {tuple(actions.shape)}."
             )
         actions = actions.long()
         if bool(((actions < 0) | (actions >= len(self.data.action_names))).any().item()):
@@ -525,7 +527,7 @@ class VectorizedMinuteToHourEnv:
         # must bootstrap through truncations; only `terminated` may zero the TD bootstrap. `resets`
         # ends the episode (terminal OR truncation) and drives env reset (matches strategy/intraday).
         terminated = ~next_valid
-        truncated = self.steps >= int(self.config.episode_length)
+        truncated = self.steps >= self.episode_length
         resets = terminated | truncated
         if bool(in_bounds.any().item()):
             old_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in current_indices[in_bounds].detach().cpu()]
