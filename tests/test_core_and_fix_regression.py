@@ -3773,6 +3773,21 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             _first_present({"other": 1}, "label_valid_mask", "action_valid_mask")
 
+    def test_periods_per_day_raises_on_unsupported_interval(self) -> None:
+        # The annualization factor used to silently default to the 15m value (26.0) for ANY unrecognized
+        # decision_interval -- including second intervals the feature config permits (e.g. "30s") -- which
+        # corrupts every reported Sharpe for that interval. Supported intervals keep their EXACT factors
+        # (no result movement); anything else now raises loudly.
+        from rl_quant.datasets.second_context import _periods_per_day
+
+        self.assertEqual(_periods_per_day("5m"), 78.0)
+        self.assertEqual(_periods_per_day("15m"), 26.0)
+        self.assertEqual(_periods_per_day("30m"), 13.0)
+        self.assertEqual(_periods_per_day("60m"), 6.0)  # deliberate whole-bar floor (not 6.5)
+        for bad in ("30s", "1m", "1h", "", "5min"):
+            with self.assertRaises(ValueError):
+                _periods_per_day(bad)
+
     def test_ranker_metrics(self) -> None:
         # Cross-sectional ranker quality of the action SCORER: IC (Pearson), rank IC (Spearman), top-k realized
         # return, and selection regret. Verified against hand cases before pinning.

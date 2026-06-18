@@ -11,6 +11,27 @@ import torch
 from rl_quant.features.stock_second_context import validate_second_context_payload
 from rl_quant.datasets.hourly import _validate_action_return_contract
 
+# Annualization basis: trading periods per regular session day for each supported decision interval, used to
+# scale Sharpe/return annualization (periods_per_year = 252 * periods_per_day). These are EXACT hand-set
+# values -- note 60m -> 6.0, not the 6.5 a 6.5h-session formula would give (a deliberate whole-bar floor) --
+# so this map is the single source of truth, NOT a computed function. An unsupported interval RAISES rather
+# than silently borrowing the 15m factor (26.0): a wrong annualization would corrupt every reported Sharpe
+# for that interval and pass silently. Second-interval datasets (e.g. "30s"), which the feature config
+# permits, must add an explicit, signed-off factor here before they can build.
+PERIODS_PER_DAY_BY_DECISION_INTERVAL = {"5m": 78.0, "15m": 26.0, "30m": 13.0, "60m": 6.0}
+
+
+def _periods_per_day(decision_interval: str) -> float:
+    try:
+        return PERIODS_PER_DAY_BY_DECISION_INTERVAL[decision_interval]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported decision_interval {decision_interval!r} for annualization; supported: "
+            f"{sorted(PERIODS_PER_DAY_BY_DECISION_INTERVAL)}. Add an explicit periods-per-day factor before "
+            "building this interval -- silently defaulting to the 15m factor would corrupt the Sharpe "
+            "annualization."
+        ) from None
+
 
 @dataclass
 class SecondContextDataSplit:
@@ -216,7 +237,7 @@ def _build_split(
     valid_index_mask[valid_start_indices] = True
     manifest = payload.get("dataset_manifest", {})
     decision_interval = str(manifest.get("decision_interval", "15m"))
-    periods_per_day = {"5m": 78.0, "15m": 26.0, "30m": 13.0, "60m": 6.0}.get(decision_interval, 26.0)
+    periods_per_day = _periods_per_day(decision_interval)
     return SecondContextDataSplit(
         name=name,
         decision_timestamps=[decisions[i] for i in selected],
