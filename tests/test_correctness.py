@@ -8662,6 +8662,123 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIn("UNSEEN_TICKER_ZZ", artifacts["execution_shadow_unknown_action_symbols"])
         self.assertEqual(artifacts["execution_shadow_weight_semantics_status"], "unresolved")
 
+    def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
+        # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
+        # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar
+        # counts, and the optional switch/order-leg caps. Plus env sizing (num_envs / episode_length positive
+        # ints; cash_idle_penalty_bps finite/non-negative). Defaults pass; bad values fail closed.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import (
+            MinuteToHourEnvConfig,
+            VectorizedMinuteToHourEnv,
+            validate_minute_to_hour_constraints,
+        )
+
+        device = torch.device("cpu")
+        names = ["CASH", "QQQ"]
+        base = default_minute_to_hour_constraints()
+        self.assertEqual(validate_minute_to_hour_constraints(base, names), 0)
+        bad_fields = {
+            "q_switch_margin_bps": float("nan"),
+            "min_hold_bars": True,
+            "cooldown_bars": -1,
+            "max_switches_per_day": 1.9,
+            "max_switches_per_episode": -1,
+            "max_order_legs_per_day": -1.0,
+            "max_order_legs_per_episode": "x",
+        }
+        for field_name, bad in bad_fields.items():
+            with self.assertRaises(ValueError):
+                validate_minute_to_hour_constraints(dataclasses.replace(base, **{field_name: bad}), names)
+        # None caps mean "uncapped" and are accepted.
+        validate_minute_to_hour_constraints(
+            dataclasses.replace(base, max_switches_per_day=None, max_order_legs_per_day=None), names)
+        # Env sizing fails closed at construction.
+        for bad in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                VectorizedMinuteToHourEnv(self._two_action_split(names),
+                                          MinuteToHourEnvConfig(num_envs=bad, episode_length=5, constraints=base), device)
+            with self.assertRaises(ValueError):
+                VectorizedMinuteToHourEnv(self._two_action_split(names),
+                                          MinuteToHourEnvConfig(num_envs=1, episode_length=bad, constraints=base), device)
+        for bad in (-1.0, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                VectorizedMinuteToHourEnv(
+                    self._two_action_split(names),
+                    MinuteToHourEnvConfig(num_envs=1, episode_length=5, cash_idle_penalty_bps=bad, constraints=base),
+                    device)
+
+    def test_train_minute_to_hour_validates_constraints_before_transition_table(self) -> None:
+        # The trainer validates constraints at ENTRY, before build_transition_feature_table (model inputs)
+        # consumes cash_index / count_etf -- a malformed constraint fails before model construction.
+        import dataclasses
+
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str) -> HourFromMinuteDataSplit:
+            return HourFromMinuteDataSplit(
+                name=name, decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-03T14:30:00+00:00"],
+                next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-03T15:30:00+00:00"],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
+                action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
+                valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            )
+
+        learning = DQNLearningConfig(
+            num_envs=1, episode_length=2, replay_capacity=8, batch_size=2, train_steps=1, warmup_steps=0,
+            gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=1, epsilon_start=0.0,
+            epsilon_end=0.0, eval_interval=1, grad_clip=1.0,
+        )
+        bad_env = MinuteToHourEnvConfig(
+            num_envs=1, episode_length=2,
+            constraints=dataclasses.replace(default_minute_to_hour_constraints(), count_etf_to_etf_as_two_legs="false"))
+        config = MinuteToHourTrainingConfig(
+            env=bad_env, learning=learning, use_transition_features=True,
+            d_model=8, n_heads=1, minute_layers=1, hour_layers=1, feedforward_dim=8, action_embedding_dim=2,
+        )
+        with self.assertRaises(ValueError):
+            train_minute_to_hour_dqn(make_split("train"), make_split("val"), device=torch.device("cpu"), config=config)
+
+    def test_minute_to_hour_step_fallback_prefers_cash_when_not_first(self) -> None:
+        # When a requested action is masked and CASH is NOT the first valid column, the env de-risks to CASH
+        # (cash_index), not the first valid action. argmax alone would pick the first valid (e.g. SPY).
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+
+        device = torch.device("cpu")
+        names = ["QQQ", "SPY", "CASH"]  # CASH at index 2 (not first)
+        split = HourFromMinuteDataSplit(
+            name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
+            next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=names,
+            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 3)),
+            action_valid_mask=torch.tensor([[False, True, True], [True, True, True]]),  # QQQ invalid at row 0
+            label_valid_mask=torch.ones((2, 3), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        cons = dataclasses.replace(default_minute_to_hour_constraints(), cash_index=2, min_hold_bars=0,
+                                   cooldown_bars=0, max_switches_per_day=None)
+        env = VectorizedMinuteToHourEnv(
+            split, MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=2, constraints=cons), device)
+        env.reset()
+        out = env.step(torch.tensor([0]))  # request QQQ (masked invalid) -> fallback must be CASH(2), not SPY(1)
+        self.assertEqual(int(out["actions"][0].item()), 2)
+
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
         # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.

@@ -763,6 +763,10 @@ def train_minute_to_hour_dqn(
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
     assert_matching_hour_from_minute_schema(train_data, val_data)
+    # Validate constraints HERE, before build_transition_feature_table (model inputs) consumes cash_index /
+    # count_etf below -- the env's own validation at construction happens later, so without this a malformed
+    # constraint could shape the transition-feature table first. Reuse the normalized cash_index everywhere.
+    cash_index = validate_minute_to_hour_constraints(config.env.constraints, train_data.action_names)
     # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
     # passed to this function, so older training rows can be down-weighted without any risk of
     # touching the held-out test block. mode='none' yields uniform weights (no behavior change).
@@ -803,7 +807,7 @@ def train_minute_to_hour_dqn(
         # Use the env's cash_index / leg convention so the table's legs/cost columns match realized cost.
         transition_table = build_transition_feature_table(
             action_count=action_count,
-            cash_index=int(cons.cash_index),
+            cash_index=cash_index,
             one_way_cost_bps=cons.one_way_cost_bps,
             extra_switch_penalty_bps=cons.extra_switch_penalty_bps,
             count_etf_to_etf_as_two_legs=cons.count_etf_to_etf_as_two_legs,
@@ -959,7 +963,7 @@ def train_minute_to_hour_dqn(
                 one_way_cost_bps=config.env.constraints.one_way_cost_bps,
                 extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
                 q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
-                cash_index=config.env.constraints.cash_index,
+                cash_index=cash_index,
                 reward_scale=config.env.reward_scale,
                 count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
             )
@@ -1024,7 +1028,7 @@ def train_minute_to_hour_dqn(
                         one_way_cost_bps=config.env.constraints.one_way_cost_bps,
                         extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
                         q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
-                        cash_index=config.env.constraints.cash_index,
+                        cash_index=cash_index,
                         reward_scale=config.env.reward_scale,
                         count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
                     )

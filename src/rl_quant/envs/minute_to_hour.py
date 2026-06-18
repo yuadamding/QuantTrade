@@ -25,6 +25,8 @@ from rl_quant.execution import (
     coerce_finite_nonnegative,
     coerce_finite_positive,
     require_bool,
+    require_nonnegative_int,
+    require_positive_int,
     weight_transition_cost_bps,
 )
 from rl_quant.features.action_risk import (
@@ -153,8 +155,28 @@ def validate_minute_to_hour_constraints(constraints: TradingConstraintConfig, ac
             "constraints.count_etf_to_etf_as_two_legs must be a bool, got "
             f"{constraints.count_etf_to_etf_as_two_legs!r}."
         )
+    # bps scalars feed the cost ledger / hysteresis scoring; reject bool/NaN/inf/negative. q_switch_margin_bps
+    # in particular would poison hysteresis if NaN (every comparison against it is False).
     coerce_finite_nonnegative("constraints.one_way_cost_bps", constraints.one_way_cost_bps)
     coerce_finite_nonnegative("constraints.extra_switch_penalty_bps", constraints.extra_switch_penalty_bps)
+    coerce_finite_nonnegative("constraints.q_switch_margin_bps", constraints.q_switch_margin_bps)
+    # Hold/cooldown bar counts feed the mask; reject bool / fractional / negative (int(True)/int(1.9) would
+    # silently mis-gate switching).
+    require_nonnegative_int("constraints.min_hold_bars", constraints.min_hold_bars)
+    require_nonnegative_int("constraints.cooldown_bars", constraints.cooldown_bars)
+    # Switch / order-leg caps are optional (None = uncapped); validate only when set.
+    for name, value in (
+        ("constraints.max_switches_per_day", constraints.max_switches_per_day),
+        ("constraints.max_switches_per_episode", constraints.max_switches_per_episode),
+    ):
+        if value is not None:
+            require_nonnegative_int(name, value)
+    for name, value in (
+        ("constraints.max_order_legs_per_day", constraints.max_order_legs_per_day),
+        ("constraints.max_order_legs_per_episode", constraints.max_order_legs_per_episode),
+    ):
+        if value is not None:
+            coerce_finite_nonnegative(name, value)
     return cash_index
 
 
@@ -172,6 +194,11 @@ class VectorizedMinuteToHourEnv:
         # reward_scale multiplies every reward and normalises the shadow bps artifacts, so a zero/negative/
         # non-finite value would zero, flip, or blow them up -- validate and STORE the canonical float.
         self.reward_scale = coerce_finite_positive("reward_scale", config.reward_scale)
+        # Sizing/penalty scalars fail closed at construction (num_envs/episode_length must be positive ints;
+        # cash_idle_penalty_bps finite/non-negative). episode_length<=0 would truncate every episode at step 0.
+        require_positive_int("num_envs", config.num_envs)
+        require_positive_int("episode_length", config.episode_length)
+        coerce_finite_nonnegative("cash_idle_penalty_bps", config.cash_idle_penalty_bps)
         # Pin to a CONCRETE device ordinal (concrete_torch_device): the env is typically built with the result
         # of core.resolve_torch_device, and although that now returns a concrete cuda:<idx>, a caller could
         # still pass an ordinal-free torch.device("cuda"). _validate_step_actions compares an action tensor's
@@ -351,7 +378,16 @@ class VectorizedMinuteToHourEnv:
         action_mask = self.action_mask()
         actions = self._validate_step_actions(actions)
         selected_valid = action_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
-        fallback_actions = torch.argmax(action_mask.long(), dim=1)
+        # On an invalid requested action, de-risk to CASH when it is valid (a masked action should fall back to
+        # cash, not to whatever happens to be the first valid column -- argmax alone only yields CASH if CASH is
+        # index 0). Falls back to the first valid action only when CASH itself is masked. For the canonical
+        # cash_index==0 universe (CASH always valid via the data-quality fallback) this is byte-identical to the
+        # old argmax (both pick index 0), and it removes the dependency on CASH being the first action.
+        first_valid_actions = torch.argmax(action_mask.long(), dim=1)
+        cash_is_valid = action_mask[:, self.cash_index]
+        fallback_actions = torch.where(
+            cash_is_valid, torch.full_like(actions, self.cash_index), first_valid_actions
+        )
         actions = torch.where(selected_valid, actions, fallback_actions)
         label_mask = self.data.label_valid_actions(current_indices)
         selected_label_valid = label_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
