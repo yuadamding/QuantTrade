@@ -8348,6 +8348,116 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             env.step(torch.tensor([0.0]))
 
+    def _two_action_split(self, action_names):
+        n = len(action_names)
+        return HourFromMinuteDataSplit(
+            name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
+            next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
+            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, n)),
+            action_valid_mask=torch.ones((2, n), dtype=torch.bool), label_valid_mask=torch.ones((2, n), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1]), valid_index_mask=torch.tensor([True, True]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+
+    def test_minute_to_hour_initial_action_validation(self) -> None:
+        # Review #6 follow-up: initial_action gets the SAME strict discipline as cash_index in BOTH the env and
+        # the evaluator -- int(True)/int(0.9)/int("0") would otherwise silently start the rollout from the
+        # wrong action. A valid int start is accepted; bool/float/string/out-of-range fail closed.
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+
+        device = torch.device("cpu")
+        base = default_minute_to_hour_constraints()
+        VectorizedMinuteToHourEnv(
+            self._two_action_split(["CASH", "QQQ"]),
+            MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=1, constraints=base), device)
+        for bad in (True, 0.9, "0", 5):
+            with self.assertRaises(ValueError):
+                VectorizedMinuteToHourEnv(
+                    self._two_action_split(["CASH", "QQQ"]),
+                    MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=bad, constraints=base), device)
+            with self.assertRaises(ValueError):
+                evaluate_minute_to_hour_policy(
+                    self._two_action_split(["CASH", "QQQ"]), _ConstantActionModel(2, 0), device=device,
+                    initial_action=bad)
+
+    def test_minute_to_hour_step_action_tensor_validation(self) -> None:
+        # Review #6 follow-up: the env boundary fails closed on a malformed action tensor BEFORE gather --
+        # wrong dtype (float/bool), wrong shape/rank, out-of-range / negative index (and wrong device when
+        # CUDA is present). A valid (num_envs,) integer tensor passes through, returned as long.
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+
+        device = torch.device("cpu")
+        env = VectorizedMinuteToHourEnv(
+            self._two_action_split(["CASH", "QQQ"]),
+            MinuteToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_minute_to_hour_constraints()),
+            device)
+        ok = env._validate_step_actions(torch.tensor([0, 1], dtype=torch.int32))
+        self.assertEqual(ok.dtype, torch.long)
+        for bad in (
+            torch.tensor([0.0, 1.0]),        # float dtype (would truncate)
+            torch.tensor([True, False]),     # bool dtype
+            torch.tensor([0]),               # wrong shape (1,) != (2,)
+            torch.tensor(0, dtype=torch.int32),  # 0-d scalar (shape () != (2,))
+            torch.tensor([[0], [1]]),        # wrong rank (2, 1)
+            torch.tensor([0, 5]),            # out of range (>= action_count)
+            torch.tensor([-1, 0]),           # negative
+        ):
+            with self.assertRaises(ValueError):
+                env._validate_step_actions(bad)
+        if torch.cuda.is_available():
+            with self.assertRaises(ValueError):
+                env._validate_step_actions(torch.tensor([0, 1], device="cuda"))
+
+    def test_transition_trade_cost_bps_rejects_bad_scalars(self) -> None:
+        # Review #6 follow-up: the shared cost ledger rejects bool / NaN / inf / negative / non-numeric-string
+        # bps scalars (via execution._coerce_finite_nonnegative) and bool/float/string cash_index, so a direct
+        # caller (not just env/eval, which validate upstream) cannot produce a silently-garbage cost.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import transition_trade_cost_bps
+
+        base = default_minute_to_hour_constraints()
+        prev = torch.tensor([0], dtype=torch.long)
+        act = torch.tensor([1], dtype=torch.long)
+        for bad in (True, float("nan"), float("inf"), -1.0, "x"):
+            with self.assertRaises(ValueError):
+                transition_trade_cost_bps(prev, act, constraints=base, cash_idle_penalty_bps=bad)
+        for field in ("one_way_cost_bps", "extra_switch_penalty_bps"):
+            for bad in (True, float("inf"), -1.0, "x"):
+                with self.assertRaises(ValueError):
+                    transition_trade_cost_bps(prev, act, constraints=dataclasses.replace(base, **{field: bad}),
+                                              cash_idle_penalty_bps=0.0)
+        for bad in (True, 0.9, "0"):
+            with self.assertRaises(ValueError):
+                transition_trade_cost_bps(prev, act, constraints=dataclasses.replace(base, cash_index=bad),
+                                          cash_idle_penalty_bps=0.0)
+        # A numeric STRING is intentionally accepted and parsed (execution-module config contract); only bool /
+        # NaN / inf / negative / non-numeric strings fail closed. CASH(0)->QQQ(1) is one leg, so "2.0" -> 2.0bps.
+        ok = transition_trade_cost_bps(prev, act, constraints=dataclasses.replace(base, one_way_cost_bps="2.0"),
+                                       cash_idle_penalty_bps=0.0)
+        self.assertEqual(float(ok.leg_cost_bps[0].item()), 2.0)
+
+    def test_minute_to_hour_baselines_rejects_non_cash_cash_index(self) -> None:
+        # Review #6 follow-up: evaluate_minute_to_hour_baselines reads cash_index (to skip the cash baseline /
+        # set initial_action) before delegating, so it must fail closed on a non-cash index too.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.training.minute_to_hour import evaluate_minute_to_hour_baselines
+
+        base = default_minute_to_hour_constraints()
+        with self.assertRaises(ValueError):
+            evaluate_minute_to_hour_baselines(
+                self._two_action_split(["CASH", "QQQ"]), device=torch.device("cpu"),
+                constraints=dataclasses.replace(base, cash_index=1))
+
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
         # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.
@@ -9725,6 +9835,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIsNone(off["execution_shadow_fee_bps"])
         self.assertIs(on["execution_shadow_real_executable"], False)
         self.assertEqual(on["execution_shadow_fee_bps"], float(default_minute_to_hour_constraints().one_way_cost_bps))
+        # #7 auditability: action-metadata fingerprint + kept-regularizer + weight-semantics fields (None off).
+        self.assertIsNone(off["execution_shadow_action_metadata_hash"])
+        self.assertIsNone(off["execution_shadow_keeps_switch_penalty"])
+        self.assertIsInstance(on["execution_shadow_action_metadata_hash"], str)
+        self.assertTrue(on["execution_shadow_action_metadata_complete"])          # CASH + QQQ both known
+        self.assertEqual(on["execution_shadow_unknown_action_symbols"], [])
+        self.assertIs(on["execution_shadow_keeps_switch_penalty"], True)
+        self.assertIs(on["execution_shadow_keeps_cash_idle"], True)
+        self.assertEqual(on["execution_shadow_linear_impact_bps_per_weight"], 0.0)
+        self.assertIn("UNRESOLVED", on["execution_shadow_weight_semantics_assumed"])
 
     def test_all_public_rl_quant_modules_import(self) -> None:
         import importlib

@@ -62,6 +62,11 @@ from rl_quant.envs.minute_to_hour import (
     MinuteToHourEnvConfig,
     VectorizedMinuteToHourEnv,
     transition_trade_cost_bps,
+)
+from rl_quant.features.action_risk import (
+    stable_action_metadata_hash,
+    unknown_action_metadata_symbols,
+    validate_action_index_for_actions,
     validate_cash_index_for_actions,
 )
 
@@ -167,9 +172,11 @@ def evaluate_minute_to_hour_policy(
     capture_rollout: bool = False,
 ) -> MinuteToHourEvaluationResult:
     constraints = constraints or default_minute_to_hour_constraints()
-    # Same fail-closed cash-index check the env runs at construction, so the evaluator cannot silently price the
-    # cash-idle penalty / cash fallback against the wrong (or non-cash) action when scored outside the env.
+    # Same fail-closed index checks the env runs at construction, so the evaluator cannot silently price the
+    # cash-idle penalty / cash fallback against the wrong (or non-cash) action, nor start the rollout from a
+    # bool/float/out-of-range initial_action, when scored outside the env.
     validate_cash_index_for_actions(data.action_names, constraints.cash_index)
+    validate_action_index_for_actions(data.action_names, initial_action, name="initial_action")
     constraint_episode_length = int(episode_length or max(int(data.valid_start_indices.numel()), 1))
     data = data if data.minute_features.device == device else data.to(device)
     model.eval()
@@ -1123,6 +1130,21 @@ def train_minute_to_hour_dqn(
         recency_policy["weight_min"] = float(train_recency_weights.min().item())
         recency_policy["weight_max"] = float(train_recency_weights.max().item())
         recency_policy["weight_mean"] = float(train_recency_weights.mean().item())
+    # PR-3 shadow auditability (#7): when the shadow ran, fingerprint the action metadata so a reviewer can
+    # confirm the priced weights/leverage WITHOUT re-deriving from config, and flag incomplete metadata
+    # (unknown symbols silently treated as 1x long). All None when off; all label-only (no reward effect).
+    if config.env.execution_env_reward_shadow:
+        # Local alias avoids colliding with the conditional function-local ``build_action_metadata`` imported
+        # under ``if config.use_transition_features`` above (which would shadow a top-level import).
+        from rl_quant.features.action_risk import build_action_metadata as _build_action_metadata
+
+        _shadow_unknown_symbols = unknown_action_metadata_symbols(list(train_data.action_names))
+        _shadow_metadata_hash = stable_action_metadata_hash(_build_action_metadata(list(train_data.action_names)))
+        _shadow_metadata_complete = not _shadow_unknown_symbols
+    else:
+        _shadow_unknown_symbols = None
+        _shadow_metadata_hash = None
+        _shadow_metadata_complete = None
     artifacts: dict[str, object] = {
         "best_val_return": best_val_return,
         "best_val_order_legs": best_val_legs,
@@ -1162,6 +1184,27 @@ def train_minute_to_hour_dqn(
         "execution_shadow_impact_kind": ("none" if config.env.execution_env_reward_shadow else None),
         "execution_shadow_fee_bps": (
             float(config.env.constraints.one_way_cost_bps) if config.env.execution_env_reward_shadow else None
+        ),
+        "execution_shadow_linear_impact_bps_per_weight": (
+            0.0 if config.env.execution_env_reward_shadow else None
+        ),
+        # Action-metadata fingerprint + completeness: the weight/leverage the shadow priced is derived from
+        # this metadata, so the hash makes it reproducible and `complete=False`/unknown-symbols warns that an
+        # un-metadata'd (possibly leveraged/inverse) instrument was priced as 1x long. PR-4 must fail closed on
+        # incomplete metadata before TRAINING on this cost.
+        "execution_shadow_action_metadata_hash": _shadow_metadata_hash,
+        "execution_shadow_action_metadata_complete": _shadow_metadata_complete,
+        "execution_shadow_unknown_action_symbols": _shadow_unknown_symbols,
+        # The shadow swaps ONLY the leg/execution cost: the behavioural switch-penalty + cash-idle regularizers
+        # are KEPT, so a future PR-4 flip cannot silently drop them (recorded so the contract is auditable).
+        "execution_shadow_keeps_switch_penalty": (True if config.env.execution_env_reward_shadow else None),
+        "execution_shadow_keeps_cash_idle": (True if config.env.execution_env_reward_shadow else None),
+        # The weight semantics are an UNRESOLVED assumption (see docs §3): max_weight is correct only if
+        # action_returns are metadata-weighted; PR-4 must confirm against the dataset before training.
+        "execution_shadow_weight_semantics_assumed": (
+            "action_metadata.max_weight; assumes action_returns are metadata-weighted portfolio returns "
+            "(UNRESOLVED -- see docs/execution_wiring_design.md §3)"
+            if config.env.execution_env_reward_shadow else None
         ),
         # reward delta in REWARD units (scale-dependent) AND scale-normalised bps (comparable across runs).
         "execution_shadow_reward_delta_mean": (

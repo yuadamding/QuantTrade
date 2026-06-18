@@ -96,8 +96,13 @@ be confirmed against the gold builder before training on the execution reward. T
     cash-idle are held constant across both rewards);
   - emitted into the step dict (replay stores only its declared fields → never reaches training).
 - The train loop aggregates the per-step deltas and stamps the artifact: `execution_env_reward_shadow`,
-  `execution_shadow_cost_model="static_single_slot_weight_bps"`, `execution_shadow_real_executable=False`,
-  and the mean reward/cost deltas (reward units + scale-normalised bps).
+  `execution_shadow_cost_model="static_single_slot_weight_bps"`, `execution_shadow_real_executable` (`None`
+  when the shadow is OFF, `False` — never `True` — when it ran, so a consumer distinguishes "no shadow" from
+  "shadow ran, explicitly not real-executable"), the action-metadata fingerprint (`..._action_metadata_hash`,
+  `..._action_metadata_complete`, `..._unknown_action_symbols`), the kept-regularizer flags
+  (`..._keeps_switch_penalty`, `..._keeps_cash_idle`), the priced fee (`..._fee_bps`, `..._impact_kind="none"`,
+  `..._linear_impact_bps_per_weight=0.0`), the unresolved weight-semantics assumption
+  (`..._weight_semantics_assumed`), and the mean reward/cost deltas (reward units + scale-normalised bps).
 
 **Why it's bounded.** Training reads only `rewards` (legacy); the shadow quantities are computed from existing
 env state + the engine and only logged. Verification: (i) a regression test that `loss_trace`/`reward_trace`/

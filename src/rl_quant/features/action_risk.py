@@ -5,6 +5,7 @@ import json
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from numbers import Integral
 from typing import Any
 
 import torch
@@ -282,6 +283,39 @@ def infer_action_meta(name: str, *, strict: bool = False) -> ActionMeta:
 
 def build_action_metadata(action_names: list[str], *, strict: bool = False) -> list[ActionMeta]:
     return [infer_action_meta(name, strict=strict) for name in action_names]
+
+
+def validate_action_index_for_actions(action_names: list[str], index: object, *, name: str) -> int:
+    """Reject a non-integer (bool/float/string) or out-of-range action index and return it as an int.
+
+    Cross-cutting contract shared by the env (initial_action, cash_index) and the evaluator: an index is
+    gathered against / compared to the action space, so a bool/float/string would silently coerce
+    (``int(True) == 1``, ``int(2.9) == 2``) and select the WRONG action. ``numbers.Integral`` accepts numpy
+    ints while still rejecting ``bool`` (a bool IS an Integral, so it is excluded explicitly)."""
+    if isinstance(index, bool) or not isinstance(index, Integral):
+        raise ValueError(f"{name} must be an integer action index, got {index!r}.")
+    out = int(index)
+    if not (0 <= out < len(action_names)):
+        raise ValueError(f"{name}={out} is outside the action space (0..{len(action_names) - 1}).")
+    return out
+
+
+def validate_cash_index_for_actions(action_names: list[str], cash_index: object) -> int:
+    """Validate that ``cash_index`` is a real CASH action for ``action_names`` and return it as an int.
+
+    Shared by the env and the evaluator so both fail closed identically: ``cash_index`` is special everywhere
+    (cash-idle penalty, zero shadow exposure, label/force-restore fallback), so an out-of-range, wrong-type, or
+    non-cash index would silently mis-charge the idle penalty / zero the wrong action's exposure / restore the
+    wrong action. We inspect ONLY the cash symbol via ``infer_action_meta(strict=True)`` -- building metadata
+    for every action would emit spurious warnings for unknown non-cash symbols (e.g. a new ETF ticker)."""
+    index = validate_action_index_for_actions(action_names, cash_index, name="constraints.cash_index")
+    symbol = str(action_names[index])
+    if infer_action_meta(symbol, strict=True).asset_class != "cash":
+        raise ValueError(
+            f"constraints.cash_index={index} points to {symbol!r}, which is "
+            "not a cash action (action-metadata asset_class != 'cash')."
+        )
+    return index
 
 
 def action_metadata_to_dicts(action_meta: list[ActionMeta]) -> list[dict[str, Any]]:
