@@ -8681,6 +8681,55 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 evaluate_minute_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
                                                device=device, cash_idle_penalty_bps=bad)
 
+    def test_minute_to_hour_env_step_treats_nonfinite_label_as_unusable(self) -> None:
+        # Env/eval parity: a label the mask calls "valid" but whose return is NaN/inf must NOT be traded on
+        # (the env would otherwise produce a NaN reward). The env falls back to CASH exactly like the evaluator.
+        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+
+        device = torch.device("cpu")
+        # Row 0: QQQ is mask-valid but its return is NaN; CASH(0) is finite. Requesting QQQ must execute CASH.
+        split = HourFromMinuteDataSplit(
+            name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
+            next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((2, 1, 1)),
+            action_returns=torch.tensor([[0.0, float("nan")], [0.0, 0.0]]),
+            action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        env = VectorizedMinuteToHourEnv(
+            split, MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=default_minute_to_hour_constraints()),
+            device)
+        env.reset()
+        out = env.step(torch.tensor([1]))  # request QQQ (mask-valid but NaN return) -> must fall back to CASH(0)
+        self.assertEqual(int(out["actions"][0].item()), 0)
+        self.assertTrue(bool(torch.isfinite(out["rewards"][0]).item()))
+
+    def test_minute_to_hour_eval_rejects_empty_valid_start_split(self) -> None:
+        # An evaluation split with no valid decision rows fails closed (a zero/degenerate metric would
+        # otherwise look like a legitimate result), mirroring the env's start-index-pool guard.
+        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
+        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+
+        empty = HourFromMinuteDataSplit(
+            name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
+            next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
+            action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([], dtype=torch.long), valid_index_mask=torch.tensor([False, False]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        with self.assertRaises(ValueError):
+            evaluate_minute_to_hour_policy(empty, _ConstantActionModel(2, 0), device=torch.device("cpu"),
+                                           constraints=default_minute_to_hour_constraints())
+
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
         # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar

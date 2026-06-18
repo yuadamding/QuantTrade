@@ -190,6 +190,10 @@ def evaluate_minute_to_hour_policy(
     # cash_idle_penalty_bps is part of the reward ledger; validate at entry (the env validates it the same
     # way) rather than only indirectly inside transition_trade_cost_bps mid-rollout.
     coerce_finite_nonnegative("cash_idle_penalty_bps", cash_idle_penalty_bps)
+    # Fail closed on an empty split (the env build path also rejects this) so "no valid decisions" cannot be
+    # mistaken for a legitimate zero/degenerate result.
+    if int(data.valid_start_indices.numel()) == 0:
+        raise ValueError("evaluation split has no valid decision start indices.")
     # episode_length must be a positive int when given (the bare ``int(episode_length or ...)`` silently turned
     # 0 into the default, True into 1, and 1.9 into 1); None still means "use the full valid-start span".
     if episode_length is None:
@@ -777,10 +781,12 @@ def train_minute_to_hour_dqn(
     # cash_index / count_etf) -- the env's own validation at construction happens later. Reuse the normalized
     # cash_index everywhere. action_names is device-agnostic, so this is safe pre-`.to(device)`.
     cash_index = validate_minute_to_hour_constraints(config.env.constraints, train_data.action_names)
+    # Schema matching is metadata/shape-level (device-agnostic), so fail on a mismatch BEFORE allocating GPU
+    # memory or moving tensors to device.
+    assert_matching_hour_from_minute_schema(train_data, val_data)
     configure_torch_runtime(device)
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
-    assert_matching_hour_from_minute_schema(train_data, val_data)
     # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
     # passed to this function, so older training rows can be down-weighted without any risk of
     # touching the held-out test block. mode='none' yields uniform weights (no behavior change).

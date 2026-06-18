@@ -389,8 +389,13 @@ class VectorizedMinuteToHourEnv:
             cash_is_valid, torch.full_like(actions, self.cash_index), first_valid_actions
         )
         actions = torch.where(selected_valid, actions, fallback_actions)
+        # A label is only USABLE if the mask says valid AND the return is finite -- otherwise the env would
+        # train on a NaN/inf reward. This matches evaluate_minute_to_hour_policy (which already checks both),
+        # so the env and the evaluator fall back to CASH on exactly the same rows. For clean data (label-valid
+        # implies finite, per the protocol's NaN-marks-invalid contract) this is byte-identical.
         label_mask = self.data.label_valid_actions(current_indices)
-        selected_label_valid = label_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
+        usable_labels = label_mask & torch.isfinite(self.data.action_returns[current_indices])
+        selected_label_valid = usable_labels.gather(1, actions.unsqueeze(1)).squeeze(1)
         cash_actions = torch.full_like(actions, self.cash_index)
         actions = torch.where(selected_label_valid, actions, cash_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
