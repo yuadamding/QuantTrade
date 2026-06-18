@@ -16,6 +16,7 @@ and trainer. All Sharpe inputs are PER-OBSERVATION (non-annualized) Sharpe ratio
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import combinations
@@ -288,3 +289,118 @@ def probability_of_backtest_overfitting(
         if omega <= 0.5:
             overfit += 1
     return overfit / total
+
+
+def _stationary_bootstrap_indices(n_obs: int, mean_block: float, rng: random.Random) -> list[int]:
+    """Politis-Romano stationary-bootstrap index sequence: geometrically-distributed block lengths with mean
+    ``mean_block`` (so serial dependence survives resampling), wrapping at the series end."""
+    restart_prob = 1.0 / mean_block
+    indices: list[int] = []
+    cur = rng.randrange(n_obs)
+    for i in range(n_obs):
+        if i == 0 or rng.random() < restart_prob:
+            cur = rng.randrange(n_obs)
+        else:
+            cur = (cur + 1) % n_obs
+        indices.append(cur)
+    return indices
+
+
+def _validate_differentials(
+    performance_differentials: Sequence[Sequence[float]], n_bootstrap: int, block_size: float | None
+) -> tuple[list[list[float]], int, int, float]:
+    if isinstance(n_bootstrap, bool) or not isinstance(n_bootstrap, int) or n_bootstrap < 1:
+        raise ValueError(f"n_bootstrap must be a positive integer; got {n_bootstrap!r}.")
+    rows = [list(r) for r in performance_differentials]
+    n_obs = len(rows)
+    if n_obs < 2:
+        raise ValueError(f"need at least 2 observations; got {n_obs}.")
+    n_models = len(rows[0]) if rows else 0
+    if n_models < 1:
+        raise ValueError(f"need at least 1 model column; got {n_models}.")
+    for r in rows:
+        if len(r) != n_models:
+            raise ValueError("performance_differentials must be rectangular (every row the same width).")
+        for value in r:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"performance_differentials entries must be finite numbers; got {value!r}.")
+    if block_size is None:
+        mean_block = max(1.0, float(round(math.sqrt(n_obs))))
+    elif isinstance(block_size, bool) or not isinstance(block_size, (int, float)) or block_size < 1:
+        raise ValueError(f"block_size must be a number >= 1; got {block_size!r}.")
+    else:
+        mean_block = float(block_size)
+    return rows, n_obs, n_models, mean_block
+
+
+def _bootstrap_column_means(
+    rows: list[list[float]], n_obs: int, n_models: int, n_bootstrap: int, mean_block: float, rng: random.Random
+) -> list[list[float]]:
+    out: list[list[float]] = []
+    for _ in range(n_bootstrap):
+        idx = _stationary_bootstrap_indices(n_obs, mean_block, rng)
+        out.append([sum(rows[t][k] for t in idx) / n_obs for k in range(n_models)])
+    return out
+
+
+def white_reality_check(
+    performance_differentials: Sequence[Sequence[float]], *, n_bootstrap: int = 1000,
+    block_size: float | None = None, seed: int = 0,
+) -> float:
+    """White's Reality Check (2000) bootstrap p-value for the null that NO model truly outperforms the
+    benchmark, correcting for data-snooping across all ``M`` models. ``performance_differentials[t][k]`` is
+    model k's per-period OUTPERFORMANCE vs the benchmark at observation t (higher = better). A LOW p-value
+    rejects the null -- the best model's edge survives the multiple-comparison correction. Uses the stationary
+    bootstrap (mean block ~ sqrt(T) by default) for serial dependence; deterministic given ``seed``.
+    Pure/stdlib; changes no backtest number."""
+    rows, n_obs, n_models, mean_block = _validate_differentials(performance_differentials, n_bootstrap, block_size)
+    root_n = math.sqrt(n_obs)
+    dbar = [sum(rows[t][k] for t in range(n_obs)) / n_obs for k in range(n_models)]
+    observed = max(root_n * dbar[k] for k in range(n_models))
+    rng = random.Random(seed)
+    exceed = 0
+    for bmeans in _bootstrap_column_means(rows, n_obs, n_models, n_bootstrap, mean_block, rng):
+        stat = max(root_n * (bmeans[k] - dbar[k]) for k in range(n_models))
+        if stat >= observed:
+            exceed += 1
+    return (1 + exceed) / (n_bootstrap + 1)
+
+
+def hansens_spa(
+    performance_differentials: Sequence[Sequence[float]], *, n_bootstrap: int = 1000,
+    block_size: float | None = None, seed: int = 0,
+) -> float:
+    """Hansen's Superior Predictive Ability test (2005): the studentized, less-conservative refinement of
+    White's Reality Check. Same input / convention / null as ``white_reality_check`` (low p-value -> the best
+    model genuinely outperforms the benchmark), but more powerful because it (1) studentizes each differential
+    by its standard deviation and (2) recenters only models that are NOT hopelessly bad -- those above the
+    ``-sqrt(2 log log T)`` studentized threshold -- so poor models do not inflate the null distribution. It is
+    asymptotically MORE POWERFUL than RC (whose inclusion of inferior models makes it conservative); being a
+    different, studentized statistic, its finite-sample p-value is typically -- but not strictly -- below RC's.
+    Deterministic given ``seed``. Pure/stdlib; changes no backtest number."""
+    rows, n_obs, n_models, mean_block = _validate_differentials(performance_differentials, n_bootstrap, block_size)
+    root_n = math.sqrt(n_obs)
+    dbar = [sum(rows[t][k] for t in range(n_obs)) / n_obs for k in range(n_models)]
+    omega = []
+    for k in range(n_models):
+        var = sum((rows[t][k] - dbar[k]) ** 2 for t in range(n_obs)) / n_obs
+        omega.append(math.sqrt(var) if var > 0.0 else 0.0)
+    studentized = [root_n * dbar[k] / omega[k] if omega[k] > 0.0 else 0.0 for k in range(n_models)]
+    observed = max(0.0, max(studentized))
+    # Hansen "consistent" recentering: keep d̄_k only for models above -sqrt(2 log log T) (log log T needs
+    # T >= 3); hopelessly-bad models get g_k = 0 so their (very negative) studentized bootstrap term never
+    # enters the max -- this is the SPA improvement over RC, which recenters (and thus retains) every model.
+    threshold = math.sqrt(2.0 * math.log(math.log(n_obs))) if n_obs >= 3 else 0.0
+    g = [dbar[k] if studentized[k] >= -threshold else 0.0 for k in range(n_models)]
+    rng = random.Random(seed)
+    exceed = 0
+    for bmeans in _bootstrap_column_means(rows, n_obs, n_models, n_bootstrap, mean_block, rng):
+        stat = 0.0
+        for k in range(n_models):
+            if omega[k] > 0.0:
+                val = root_n * (bmeans[k] - g[k]) / omega[k]
+                if val > stat:
+                    stat = val
+        if stat >= observed:
+            exceed += 1
+    return (1 + exceed) / (n_bootstrap + 1)

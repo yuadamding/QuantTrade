@@ -12,9 +12,11 @@ from rl_quant.evaluation.statistical import (
     deflated_sharpe_ratio,
     effective_sample_size,
     expected_maximum_sharpe,
+    hansens_spa,
     probabilistic_sharpe_ratio,
     probability_of_backtest_overfitting,
     psr_is_credible,
+    white_reality_check,
 )
 
 __all__ = [
@@ -25,7 +27,9 @@ __all__ = [
     "deflated_sharpe_ratio",
     "effective_sample_size",
     "expected_maximum_sharpe",
+    "hansens_spa",
     "probabilistic_sharpe_ratio",
     "probability_of_backtest_overfitting",
     "psr_is_credible",
+    "white_reality_check",
 ]

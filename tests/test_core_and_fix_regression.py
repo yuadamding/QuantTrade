@@ -3570,6 +3570,46 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pbo([[0.0, float("nan")]] * 8, n_splits=2)
 
+    def test_white_reality_check_and_hansens_spa(self) -> None:
+        # Data-snooping bootstrap tests for the null "NO model truly beats the benchmark" (White 2000 Reality
+        # Check; Hansen 2005 SPA). performance_differentials[t][k] = model k's per-period outperformance vs
+        # the benchmark. Low p rejects the null (the best model's edge survives the multiple-comparison
+        # correction). Deterministic given seed. (Behaviors verified against Monte Carlo before pinning.)
+        import math as _math
+
+        from rl_quant.evaluation import hansens_spa, white_reality_check
+
+        t_obs, n_boot = 120, 300
+        # A single model with a clear positive edge -> both p-values LOW (reject "no superiority").
+        edge = [[0.01 + 0.002 * ((t % 5) - 2)] for t in range(t_obs)]
+        self.assertLess(white_reality_check(edge, n_bootstrap=n_boot), 0.05)
+        self.assertLess(hansens_spa(edge, n_bootstrap=n_boot), 0.05)
+        # No model beats the benchmark (all differentials exactly 0) -> nothing to reject -> p == 1.0.
+        zero = [[0.0, 0.0, 0.0] for _ in range(t_obs)]
+        self.assertEqual(white_reality_check(zero, n_bootstrap=n_boot), 1.0)
+        self.assertEqual(hansens_spa(zero, n_bootstrap=n_boot), 1.0)
+        # Mean-zero noise across many models -> no genuine winner -> p NOT low (no false rejection).
+        noise = [[0.01 * _math.sin(t * 0.7 + k) for k in range(8)] for t in range(t_obs)]
+        rc_noise = white_reality_check(noise, n_bootstrap=n_boot)
+        spa_noise = hansens_spa(noise, n_bootstrap=n_boot)
+        self.assertGreater(rc_noise, 0.1)
+        self.assertGreater(spa_noise, 0.1)
+        self.assertTrue(0.0 <= rc_noise <= 1.0 and 0.0 <= spa_noise <= 1.0)
+        # Deterministic given the seed.
+        self.assertEqual(white_reality_check(noise, n_bootstrap=n_boot), rc_noise)
+        self.assertEqual(hansens_spa(edge, n_bootstrap=n_boot, seed=3), hansens_spa(edge, n_bootstrap=n_boot, seed=3))
+
+        # Fail closed: < 2 observations, ragged matrix, non-finite entries, non-positive n_bootstrap.
+        for fn in (white_reality_check, hansens_spa):
+            with self.assertRaises(ValueError):
+                fn([[0.0]])
+            with self.assertRaises(ValueError):
+                fn([[0.0, 1.0], [2.0]] * 4)
+            with self.assertRaises(ValueError):
+                fn([[float("nan")]] * 4)
+            with self.assertRaises(ValueError):
+                fn(edge, n_bootstrap=0)
+
     def test_protocol_model_input_label_split_validator(self) -> None:
         # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
         # label/future field must NEVER be a model input. Pure/additive (changes no data or training).
