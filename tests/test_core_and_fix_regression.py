@@ -3790,6 +3790,36 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             assert_causal_timestamp_chain([torch.tensor([5, 5]), torch.tensor([1, 6])])
 
+    def test_cash_contract_validator(self) -> None:
+        # The CASH-fallback contract lifted into the protocol layer: CASH must be SELECTABLE (valid) and carry
+        # a FINITE return on EVERY decision row. Tensors or nested sequences; fails closed both ways.
+        from rl_quant.protocol import assert_cash_contract, validate_cash_contract
+
+        nan = float("nan")
+        # CASH (index 0) valid + finite on every row -> ok.
+        ok, issues = validate_cash_contract([[0.0, 0.01], [0.0, nan]], [[True, True], [True, False]])
+        self.assertTrue(ok)
+        self.assertEqual(issues, ())
+        # CASH masked off on a row -> fail.
+        ok, issues = validate_cash_contract([[0.0, 0.01]], [[False, True]])
+        self.assertFalse(ok)
+        self.assertTrue(any("not selectable" in m for m in issues))
+        # CASH return non-finite on a row -> fail.
+        ok, issues = validate_cash_contract([[nan, 0.01]], [[True, True]])
+        self.assertFalse(ok)
+        self.assertTrue(any("not finite" in m for m in issues))
+        # Non-default cash_index is honored.
+        self.assertTrue(validate_cash_contract([[0.01, 0.0]], [[True, True]], cash_index=1)[0])
+        self.assertFalse(validate_cash_contract([[0.01, nan]], [[True, True]], cash_index=1)[0])
+        # cash_index out of range -> fail closed; malformed cash_index -> ValueError.
+        self.assertFalse(validate_cash_contract([[0.0, 0.01]], [[True, True]], cash_index=5)[0])
+        with self.assertRaises(ValueError):
+            validate_cash_contract([[0.0]], [[True]], cash_index=-1)
+        # torch tensors + the fail-closed assert variant.
+        assert_cash_contract(torch.tensor([[0.0, 0.01]]), torch.tensor([[True, True]]))  # no raise
+        with self.assertRaises(ValueError):
+            assert_cash_contract(torch.tensor([[0.0, 0.01]]), torch.tensor([[False, True]]))
+
     def test_flag_registry_governance(self) -> None:
         # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
         # every result-moving flag carries A/B metrics + flip/delete criteria, and the recorded defaults match

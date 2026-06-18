@@ -154,6 +154,46 @@ def assert_causal_timestamp_chain(chain: Sequence[object], *, names: Sequence[st
         raise ValueError("decision-tensor contract violation (causal-timestamp-ordering): " + "; ".join(issues))
 
 
+def validate_cash_contract(
+    action_returns: object, valid_mask: object, *, cash_index: int = 0, max_issues: int = 20
+) -> tuple[bool, tuple[str, ...]]:
+    """The CASH-fallback contract (docs/decision_tensor_protocol.md): de-risking to the zero-notional CASH
+    position is ALWAYS available and its outcome is ALWAYS observable, so the CASH action must be SELECTABLE
+    (valid_mask True) AND carry a FINITE return on EVERY decision row. A row where CASH is masked off or has a
+    non-finite return is a broken contract (the policy could be trapped with no safe fallback, or CASH's
+    outcome is unscorable). ``action_returns`` and ``valid_mask`` are [rows][actions] (tensors or nested
+    sequences). Returns (ok, issues); raises ValueError for a malformed ``cash_index``. Pure; stdlib only."""
+    if isinstance(cash_index, bool) or not isinstance(cash_index, int) or cash_index < 0:
+        raise ValueError(f"cash_index must be a non-negative integer; got {cash_index!r}.")
+    returns = _to_rows(action_returns)
+    mask = _to_rows(valid_mask)
+    if len(returns) != len(mask):
+        return (False, (f"action_returns has {len(returns)} rows but valid_mask has {len(mask)}",))
+    issues: list[str] = []
+    for t, (rrow, mrow) in enumerate(zip(returns, mask)):
+        if cash_index >= len(rrow) or cash_index >= len(mrow):
+            issues.append(f"row {t}: cash_index {cash_index} out of range (returns width {len(rrow)}, mask width {len(mrow)})")
+        else:
+            ret = rrow[cash_index]
+            finite = isinstance(ret, (int, float)) and not isinstance(ret, bool) and math.isfinite(float(ret))
+            if not bool(mrow[cash_index]):
+                issues.append(f"row {t}: CASH (index {cash_index}) is not selectable (valid_mask is False)")
+            if not finite:
+                issues.append(f"row {t}: CASH (index {cash_index}) return is not finite ({ret!r})")
+        if len(issues) > max_issues:
+            issues = issues[:max_issues]
+            issues.append("... (further issues truncated)")
+            break
+    return (not issues, tuple(issues))
+
+
+def assert_cash_contract(action_returns: object, valid_mask: object, *, cash_index: int = 0) -> None:
+    """Fail closed: raise ValueError if CASH is not selectable-and-finite on every decision row."""
+    ok, issues = validate_cash_contract(action_returns, valid_mask, cash_index=cash_index)
+    if not ok:
+        raise ValueError("decision-tensor contract violation (cash-fallback): " + "; ".join(issues))
+
+
 def validate_decision_tensor_payload(
     payload: Mapping, manifest: Mapping | None = None
 ) -> tuple[bool, tuple[str, ...]]:
