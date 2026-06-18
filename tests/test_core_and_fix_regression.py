@@ -3360,6 +3360,18 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(evaluate_decision_log_reportability([base_row(**iso)], require_real_executable=False).reportable)  # ordered ISO passes
         self.assertIn("ordering", cats(evaluate_decision_log_reportability(  # ISO out of order fails
             [base_row(**{**iso, "exit_execution_ts": "2020-01-01T00:00:00+00:00"})], require_real_executable=False)))
+        # Naive (tz-less) timestamps are REJECTED as malformed: .timestamp() on a naive datetime/string
+        # silently assumes the local system TZ, which would make the parsed epoch -- and this ordering verdict
+        # -- machine-dependent. A tz-aware value parses; a naive one fails closed.
+        from datetime import datetime as _dt, timezone as _tz
+
+        from rl_quant.reportability.decision_log import _parse_timestamp
+        self.assertIsNotNone(_parse_timestamp("2026-01-02T14:30:00+00:00"))                  # aware ISO
+        self.assertIsNotNone(_parse_timestamp(_dt(2026, 1, 2, 14, 30, tzinfo=_tz.utc)))      # aware datetime
+        self.assertIsNone(_parse_timestamp("2026-01-02T14:30:00"))                           # naive ISO -> rejected
+        self.assertIsNone(_parse_timestamp(_dt(2026, 1, 2, 14, 30)))                          # naive datetime -> rejected
+        self.assertIn("malformed", cats(evaluate_decision_log_reportability(  # naive ts in a row -> malformed
+            [base_row(**{**iso, "decision_ts": "2026-01-02T14:30:00"})], require_real_executable=False)))
 
         # Close-only row: base-reportable, but NOT real-executable; strict gaps surfaced regardless.
         close_only = base_row(entry_price=None, exit_price=None)

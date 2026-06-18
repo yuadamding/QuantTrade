@@ -105,18 +105,22 @@ def _is_positive_finite_number(value: object) -> bool:
 
 def _parse_timestamp(value: object) -> float | None:
     """Best-effort timestamp -> comparable epoch seconds. Never raises; returns None if unrecognized.
-    Accepts finite numeric epochs, ISO-8601 strings (datetime.fromisoformat), and datetime objects."""
+    Accepts finite numeric epochs, tz-AWARE ISO-8601 strings (datetime.fromisoformat), and tz-aware datetime
+    objects. A tz-NAIVE datetime/string is rejected (returns None -> flagged malformed by the caller): it has
+    no absolute instant, so ``.timestamp()`` would silently assume the local system timezone, making the
+    parsed epoch -- and the causal-ordering verdict that compares these stamps -- machine-dependent."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
         return float(value) if math.isfinite(float(value)) else None
     if isinstance(value, datetime):
-        return value.timestamp()
+        return value.timestamp() if value.utcoffset() is not None else None
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value).timestamp()
+            parsed = datetime.fromisoformat(value)
         except ValueError:
             return None
+        return parsed.timestamp() if parsed.utcoffset() is not None else None
     return None
 
 
