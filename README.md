@@ -210,61 +210,60 @@ running the canonical `scripts/*.py` entry points directly.)
 
 ## Repository Layout
 
+`src/rl_quant/` is a **protocol-first, layered package**. Code is organized by
+layer, lowest (no rl_quant deps) to highest; a layer may import only from lower
+layers (enforced by `tests/test_correctness.py::test_architecture_layer_import_boundaries`).
+The flat top-level `*.py` files (other than the foundation modules below) are
+**backward-compatibility shims** — 3–6 line re-exports of the canonical package
+modules, kept so old import paths keep working. **New code should import the
+canonical package path**, e.g. `from rl_quant.features.action_risk import ...`,
+not `from rl_quant.action_risk import ...`.
+
 ```text
 QuantTrade/
-  README.md
-  pyproject.toml
-  .env.example
+  README.md  pyproject.toml  .env.example
   docs/
-    decision_tensor_protocol.md
-    stock_covariate_integration.md
-    news_llm_covariate_protocol.md
+    architecture_migration_plan.md   decision_tensor_protocol.md
+    execution_wiring_design.md        news_llm_covariate_protocol.md  ...
   src/rl_quant/
-    core.py
-    cli.py
-    config.py
-    paths.py
-    presets.py
-    action_risk.py
-    confidence.py
-    decision_framework.py
-    hourly_transformer.py
-    intraday_data.py
-    intraday_dqn.py
-    minute_to_hour_transformer.py
-    quote_utils.py
-    research_protocol.py
-    second_context_transformer.py
-    strategy_data.py
-    strategy_dqn.py
-    trading_constraints.py
-    data_sources/
-      polygon_second_aggs.py
-    features/
-      stock_second_context.py
-  scripts/
-    *.py
-  tests/
-    test_correctness.py
+    # --- foundation (no rl_quant deps; imported directly, not shimmed) ---
+    core.py            # torch/CUDA/AMP runtime, replay buffers, DQN target, metrics, DQNLearningConfig
+    execution.py       # transition-P&L / weight-bps execution engine + numeric validation helpers
+    paths.py           # repo/data path helpers
+    # --- canonical layers (each importable only from lower layers) ---
+    protocol/          # the contracts: constraints, flags registry, partition, validators
+    data_sources/      # raw vendor loaders: polygon_second_aggs, polygon_stock_covariates, quote_utils
+    features/          # feature builders: action_risk, stock_covariates, stock_second_context, news_llm
+    datasets/          # gold dataset builders: hour_from_subhour, hourly, intraday, second_context, strategy
+    models/            # Q-network architectures: hourly, intraday, minute_to_hour, second_context, strategy
+    envs/              # state/transition/reward authority: hourly, intraday, minute_to_hour, strategy
+    training/          # DQN training loops + evaluation: hourly, intraday, minute_to_hour, strategy
+    evaluation/        # scoring/credibility: confidence, decision_framework, research_protocol, statistical
+    reportability/     # artifact-driven reportability: decision_log
+    workflows/         # CLI orchestration: cli, config, presets
+    # --- backward-compat shims (flat) ---
+    action_risk.py confidence.py decision_framework.py hourly_transformer.py ...  # -> canonical modules
+  scripts/*.py
+  tests/test_correctness.py
 ```
 
-Important modules:
+Key modules by layer (canonical paths):
 
 | Module | Purpose |
 | --- | --- |
-| `core.py` | Torch runtime setup, CUDA/AMP helpers, replay buffers, metrics, and shared Q-network blocks. |
-| `confidence.py` | Action-level confidence tensors, residual calibration, probability-of-profit estimates, and compressed confidence artifacts. |
-| `research_protocol.py` | Dataset/model manifests, stable hashes, fit-window validation, benchmark registry, and stress evidence helpers. |
-| `decision_framework.py` | Point-in-time feature availability, readiness scoring, action eligibility, and decision dataset checks. |
-| `trading_constraints.py` | Action masks, min-hold, cooldown, switch caps, order-leg caps, and leg-aware hysteresis. |
-| `action_risk.py` | Action metadata, leverage/inverse flags, risk buckets, and stable action metadata hashes. |
-| `hourly_transformer.py` | Direct bar-level causal transformer DQN allocator. |
-| `minute_to_hour_transformer.py` | Hierarchical subhour-to-hour transformer for hourly allocation decisions from minute or second context. |
-| `second_context_transformer.py` | Action-conditioned transformer scorer for compact second-context decision tensors. |
-| `features/stock_second_context.py` | Sparse-aware 1-second stock context compression and gold decision tensor validation. |
-| `data_sources/polygon_second_aggs.py` | Polygon second aggregate manifest loading, timestamp handling, and audit utilities. |
-| `intraday_data.py`, `intraday_dqn.py` | QQQ quote/NBBO feature loading and intraday DQN training. |
-| `strategy_data.py`, `strategy_dqn.py` | Daily strategy-allocation dataset loading and DQN allocation. |
+| `core.py` | Torch runtime/CUDA/AMP, replay buffers, DQN target, metrics, `DQNLearningConfig`. Foundation. |
+| `execution.py` | Transition-P&L scalar engine + leg-level weight-bps engine + shared numeric validation helpers. Foundation. |
+| `protocol/constraints.py` | Action masks, min-hold, cooldown, switch/order-leg caps, leg-aware hysteresis, dynamic transition state. |
+| `protocol/flags.py` | Governance registry of result-moving flags + their A/B-promotion metadata. |
+| `features/action_risk.py` | Action metadata, leverage/inverse flags, action-index/cash validators, stable metadata hashes. |
+| `datasets/hour_from_subhour.py` | Gold subhour→hour dataset builder + normalized constraints + action-return semantics. |
+| `models/minute_to_hour.py` | Hierarchical subhour→hour transformer Q-network. |
+| `envs/minute_to_hour.py` | Subhour→hour env: the state/transition/reward authority (shared cost + reward primitives). |
+| `training/minute_to_hour.py` | Subhour→hour DQN training loop, evaluator, checkpoint/resume, artifacts. |
+| `evaluation/statistical.py` | PSR / expected-max-Sharpe / Deflated Sharpe Ratio (statistical credibility). |
+| `evaluation/research_protocol.py` | Dataset/model manifests, stable hashes, fit-window validation, benchmark/stress registry. |
+| `reportability/decision_log.py` | Tiered (base vs strict real-executable) reportability of persisted decision logs. |
+| `data_sources/polygon_second_aggs.py` | Polygon second-aggregate manifest loading, timestamps, audits. |
 
 ## Architecture
 

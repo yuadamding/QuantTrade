@@ -10623,6 +10623,53 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                             violations.append(f"{layer}/{path.name} -> {module} (forbidden: {layer} must not import {higher})")
         self.assertEqual(violations, [], "layer import-boundary violations:\n" + "\n".join(violations))
 
+    def test_foundation_modules_and_flat_shims_structure(self) -> None:
+        # Lock the layered organization so it cannot erode back into a flat pile of top-level modules:
+        #  (1) the flat FOUNDATION modules (core/execution/paths) depend only on torch/stdlib -- never on an
+        #      rl_quant layer (they are the base every layer imports);
+        #  (2) every OTHER flat top-level module is a backward-compat SHIM: a documented pure re-export of a
+        #      canonical package module that EXISTS (so a moved/renamed target can't leave a dangling shim, and
+        #      a new flat module can't quietly bypass the layered packages without being a recognized shim).
+        import ast
+
+        src = ROOT / "src" / "rl_quant"
+        foundation = {"core.py", "execution.py", "paths.py"}
+        flat = [p for p in sorted(src.glob("*.py")) if p.name != "__init__.py"]
+
+        def imported_modules(tree: ast.AST) -> list[str]:
+            mods: list[str] = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    mods.append(node.module)
+                elif isinstance(node, ast.Import):
+                    mods.extend(alias.name for alias in node.names)
+            return mods
+
+        for path in flat:
+            text = path.read_text()
+            tree = ast.parse(text)
+            if path.name in foundation:
+                for module in imported_modules(tree):
+                    self.assertFalse(
+                        module.startswith("rl_quant"),
+                        f"foundation module {path.name} must depend only on torch/stdlib, not rl_quant ({module}).",
+                    )
+                continue
+            # A non-foundation flat module MUST be a documented shim re-exporting an existing canonical module.
+            self.assertRegex(
+                text[:400].lower(), r"backward-compat|shim",
+                f"flat top-level module {path.name} is neither foundation nor a documented backward-compat shim "
+                "-- new code belongs in a canonical layer package.",
+            )
+            targets = [m for m in imported_modules(tree) if m.startswith("rl_quant.")]
+            self.assertTrue(targets, f"shim {path.name} must re-export from a canonical rl_quant.<layer> module.")
+            for target in targets:
+                rel = target.split(".", 1)[1].replace(".", "/")  # rl_quant.a.b -> a/b
+                self.assertTrue(
+                    (src / f"{rel}.py").exists() or (src / rel).is_dir(),
+                    f"shim {path.name} re-exports a missing target ({target}).",
+                )
+
     def test_news_article_rows_reject_negative_source_latency(self) -> None:
         # A negative source latency implies availability BEFORE publish (look-ahead). The library must
         # fail closed at every entry point, not silently clamp to 0 (optimistic) as it once did.

@@ -1,3 +1,16 @@
+"""Foundation layer: torch/CUDA runtime + DQN training primitives shared by every trainer/env.
+
+Depends only on torch + the stdlib (no rl_quant layer) -- it is the base the layered packages import, and
+the test_foundation_modules_and_flat_shims_structure test pins that. Cohesive enough to stay one module
+(splitting would touch ~40 importers for no behavioural gain). Section map:
+  - DQN config + Q-network    : DQNLearningConfig, TemporalQNetwork
+  - Replay buffers            : TensorReplayBuffer, TensorDictReplayBuffer (+ _validate_replay_batch)
+  - DQN core / exploration    : epsilon_by_step, as_binary_bool_mask, safe_next_row_indices, dqn_td_target
+  - Metrics                   : annualized_sharpe, fractional_max_drawdown, absolute_max_drawdown
+  - Device / runtime          : concrete_torch_device, resolve_torch_device, configure_torch_runtime
+  - AMP / autocast            : resolve_amp_dtype, autocast_context, make_grad_scaler, cuda_amp_enabled
+  - VRAM                      : cuda_memory_report, require_min_free_vram, CudaVramReservation
+"""
 from __future__ import annotations
 
 from contextlib import nullcontext
