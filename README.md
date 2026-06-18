@@ -228,7 +228,7 @@ QuantTrade/
   src/rl_quant/
     # --- foundation (no rl_quant deps; imported directly, not shimmed) ---
     core.py            # torch/CUDA/AMP runtime, replay buffers, DQN target, metrics, DQNLearningConfig
-    execution.py       # transition-P&L / weight-bps execution engine + numeric validation helpers
+    execution/         # transition-P&L / weight-bps engine (engine.py) + numeric validation (validation.py)
     paths.py           # repo/data path helpers
     # --- canonical layers (each importable only from lower layers) ---
     protocol/          # the contracts: constraints, flags registry, partition, validators
@@ -252,7 +252,7 @@ Key modules by layer (canonical paths):
 | Module | Purpose |
 | --- | --- |
 | `core.py` | Torch runtime/CUDA/AMP, replay buffers, DQN target, metrics, `DQNLearningConfig`. Foundation. |
-| `execution.py` | Transition-P&L scalar engine + leg-level weight-bps engine + shared numeric validation helpers. Foundation. |
+| `execution/` | Foundation package: `engine.py` (transition-P&L scalar engine + leg-level weight-bps engine), `validation.py` (shared numeric/integer coercion contracts). `__init__` re-exports the full public surface, so `from rl_quant.execution import ...` is unchanged. |
 | `protocol/constraints.py` | Action masks, min-hold, cooldown, switch/order-leg caps, leg-aware hysteresis, dynamic transition state. |
 | `protocol/flags.py` | Governance registry of result-moving flags + their A/B-promotion metadata. |
 | `features/action_risk.py` | Action metadata, leverage/inverse flags, action-index/cash validators, stable metadata hashes. |

@@ -10655,15 +10655,17 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
     def test_foundation_modules_and_flat_shims_structure(self) -> None:
         # Lock the layered organization so it cannot erode back into a flat pile of top-level modules:
-        #  (1) the flat FOUNDATION modules (core/execution/paths) depend only on torch/stdlib -- never on an
-        #      rl_quant layer (they are the base every layer imports);
+        #  (1) the FOUNDATION layer (core/paths flat modules + the execution package) depends only on
+        #      torch/stdlib -- never on another rl_quant layer (it is the base every layer imports). The
+        #      execution package's submodules may additionally import WITHIN execution (engine -> validation);
         #  (2) every OTHER flat top-level module is a backward-compat SHIM: a documented pure re-export of a
         #      canonical package module that EXISTS (so a moved/renamed target can't leave a dangling shim, and
         #      a new flat module can't quietly bypass the layered packages without being a recognized shim).
         import ast
 
         src = ROOT / "src" / "rl_quant"
-        foundation = {"core.py", "execution.py", "paths.py"}
+        foundation_files = {"core.py", "paths.py"}
+        foundation_pkgs = {"execution"}  # split into a package for maintainability; still a base layer
         flat = [p for p in sorted(src.glob("*.py")) if p.name != "__init__.py"]
 
         def imported_modules(tree: ast.AST) -> list[str]:
@@ -10675,10 +10677,23 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                     mods.extend(alias.name for alias in node.names)
             return mods
 
+        # (1b) Foundation PACKAGES: every submodule imports torch/stdlib or only within its own package.
+        for pkg in foundation_pkgs:
+            pkg_dir = src / pkg
+            self.assertTrue(pkg_dir.is_dir(), f"foundation package {pkg} is missing (expected src/rl_quant/{pkg}/).")
+            for sub in sorted(pkg_dir.glob("*.py")):
+                for module in imported_modules(ast.parse(sub.read_text())):
+                    if module.startswith("rl_quant"):
+                        self.assertTrue(
+                            module == f"rl_quant.{pkg}" or module.startswith(f"rl_quant.{pkg}."),
+                            f"foundation package module {pkg}/{sub.name} must depend only on torch/stdlib or "
+                            f"within rl_quant.{pkg}, not another rl_quant layer ({module}).",
+                        )
+
         for path in flat:
             text = path.read_text()
             tree = ast.parse(text)
-            if path.name in foundation:
+            if path.name in foundation_files:
                 for module in imported_modules(tree):
                     self.assertFalse(
                         module.startswith("rl_quant"),
