@@ -266,7 +266,7 @@ def assert_action_mask(mask: object, *, require_row_selectable: bool = True) -> 
 
 def validate_decision_tensor_payload(
     payload: Mapping, manifest: Mapping | None = None, *,
-    require_full_contract: bool = False, cash_index: int = 0,
+    require_full_contract: bool = False, require_timestamps: bool = False, cash_index: int = 0,
 ) -> tuple[bool, tuple[str, ...]]:
     """Trainer-facing entry: enforce the decision-tensor contract on a payload, aggregating all violations.
 
@@ -283,7 +283,11 @@ def validate_decision_tensor_payload(
     Tensor checks for ABSENT keys are SKIPPED, so a key-only payload (the legacy use) behaves exactly as
     before -- this is backward-compatible. With ``require_full_contract=True`` the core tensors
     (action_returns + a decision mask + a label mask) MUST be present, for reportable training/eval that must
-    not silently skip the contract. Returns (ok, issues). Mask aliases are resolved
+    not silently skip the contract. With ``require_timestamps=True`` the causal anchors
+    (decision_timestamps_ms AND next_timestamps_ms) MUST be present -- otherwise the causal-chain check
+    silently does not run, so a reportable run could omit the timestamps and still pass the "full" contract;
+    this flag closes that gap (it is independent of ``require_full_contract``, which governs only the core
+    tensors). Returns (ok, issues). Mask aliases are resolved
     (decision_action_valid_mask | action_valid_mask; label_valid_mask | action_label_valid_mask)."""
     fallback = manifest or {}
 
@@ -337,6 +341,10 @@ def validate_decision_tensor_payload(
         _add("shapes", validate_decision_tensor_shapes(shape_arrays))
     decision_ts = _present("decision_timestamps_ms")
     next_ts = _present("next_timestamps_ms")
+    if require_timestamps:
+        for label, value in (("decision_timestamps_ms", decision_ts), ("next_timestamps_ms", next_ts)):
+            if value is None:
+                all_issues.append(f"require_timestamps: payload is missing {label}")
     if decision_ts is not None and next_ts is not None:
         _add("causal_chain", validate_causal_timestamp_chain([decision_ts, next_ts],
                                                               names=["decision_ts", "next_ts"]))

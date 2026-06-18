@@ -4099,6 +4099,17 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         ok, issues = validate_decision_tensor_payload(alias_only)
         self.assertFalse(ok)
         self.assertTrue(any("shapes" in m for m in issues), issues)
+        # require_timestamps: the causal-chain check only runs when both *_ms anchors are present, so without
+        # this flag a "full" payload could omit them and still pass. The flag demands they be present (it is
+        # INDEPENDENT of require_full_contract -- the well-formed core tensors alone do not satisfy it).
+        no_ts = {k: v for k, v in good.items() if k not in ("decision_timestamps_ms", "next_timestamps_ms")}
+        self.assertTrue(validate_decision_tensor_payload(no_ts, require_full_contract=True)[0])  # full contract: still passes
+        ok, issues = validate_decision_tensor_payload(no_ts, require_timestamps=True)
+        self.assertFalse(ok)
+        self.assertTrue(any("require_timestamps" in m and "decision_timestamps_ms" in m for m in issues), issues)
+        self.assertTrue(any("require_timestamps" in m and "next_timestamps_ms" in m for m in issues), issues)
+        # A payload WITH the anchors passes require_timestamps (and still runs the causal-chain check).
+        self.assertTrue(validate_decision_tensor_payload(good, require_timestamps=True)[0])
 
     def test_flag_registry_governance(self) -> None:
         # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
