@@ -3820,6 +3820,46 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             assert_cash_contract(torch.tensor([[0.0, 0.01]]), torch.tensor([[False, True]]))
 
+    def test_decision_tensor_shape_consistency_validator(self) -> None:
+        # All decision-tensor arrays must agree on row count, and 2-D arrays on action count -- else labels
+        # silently misalign with inputs. Tensors or nested sequences; fails closed.
+        from rl_quant.protocol import assert_decision_tensor_shapes, validate_decision_tensor_shapes
+
+        ok, issues = validate_decision_tensor_shapes({
+            "decision_ts": [1, 2, 3],
+            "action_returns": [[0.0, 0.1], [0.0, 0.1], [0.0, 0.1]],
+            "valid_mask": [[True, True], [True, False], [True, True]],
+        })
+        self.assertTrue(ok)
+        self.assertEqual(issues, ())
+        # Row-count mismatch (3 vs 2) and action-count mismatch (2 vs 3) and a ragged array all fail.
+        self.assertFalse(validate_decision_tensor_shapes(
+            {"action_returns": [[0.0, 0.1]] * 3, "valid_mask": [[True, True]] * 2})[0])
+        self.assertFalse(validate_decision_tensor_shapes(
+            {"action_returns": [[0.0, 0.1]] * 2, "valid_mask": [[True, True, True]] * 2})[0])
+        self.assertFalse(validate_decision_tensor_shapes({"x": [[0.0, 0.1], [0.0]]})[0])
+        # torch tensors + assert variant.
+        assert_decision_tensor_shapes({"a": torch.zeros((4, 2)), "b": torch.ones((4, 2), dtype=torch.bool)})
+        with self.assertRaises(ValueError):
+            assert_decision_tensor_shapes({"a": torch.zeros((4, 2)), "b": torch.zeros((3, 2))})
+
+    def test_action_mask_validator(self) -> None:
+        # An action mask is a rectangular 2-D boolean array; an ex-ante DECISION mask must leave >=1 selectable
+        # action per row (else the policy is trapped). Tensors or nested sequences; fails closed.
+        from rl_quant.protocol import assert_action_mask, validate_action_mask
+
+        self.assertTrue(validate_action_mask([[True, False], [True, True]])[0])
+        self.assertTrue(validate_action_mask([[1, 0], [0, 1]])[0])               # 0/1 count as boolean
+        ok, issues = validate_action_mask([[True, True], [False, False]])         # a trapped row
+        self.assertFalse(ok)
+        self.assertTrue(any("no selectable action" in m for m in issues))
+        self.assertTrue(validate_action_mask([[False, False]], require_row_selectable=False)[0])  # ok for label mask
+        self.assertFalse(validate_action_mask([[0.5, 1.0]])[0])                   # non-boolean entry
+        self.assertFalse(validate_action_mask([[True, False], [True]])[0])        # ragged
+        assert_action_mask(torch.tensor([[True, False], [True, True]]))           # no raise
+        with self.assertRaises(ValueError):
+            assert_action_mask(torch.tensor([[False, False]]))
+
     def test_flag_registry_governance(self) -> None:
         # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
         # every result-moving flag carries A/B metrics + flip/delete criteria, and the recorded defaults match

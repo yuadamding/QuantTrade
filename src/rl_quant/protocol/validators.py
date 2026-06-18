@@ -194,6 +194,76 @@ def assert_cash_contract(action_returns: object, valid_mask: object, *, cash_ind
         raise ValueError("decision-tensor contract violation (cash-fallback): " + "; ".join(issues))
 
 
+def validate_decision_tensor_shapes(
+    named_arrays: Mapping[str, object], *, max_issues: int = 20
+) -> tuple[bool, tuple[str, ...]]:
+    """All named decision-tensor arrays must agree on the ROW count (axis 0), and every 2-D array must be
+    rectangular and agree on the ACTION count (axis 1). A mismatch means a row/action in one tensor has no
+    counterpart in another (e.g. returns for T rows but a mask for T-1), which silently misaligns labels with
+    inputs. ``named_arrays`` maps a name to a tensor (``.tolist()``) or nested sequence. Returns (ok, issues).
+    Pure; stdlib only."""
+    row_counts: dict[str, int] = {}
+    action_counts: dict[str, int] = {}
+    issues: list[str] = []
+    for name, arr in named_arrays.items():
+        rows = list(arr.tolist() if hasattr(arr, "tolist") else arr)  # type: ignore[union-attr]
+        row_counts[name] = len(rows)
+        widths = {len(r) for r in rows if isinstance(r, (list, tuple))}
+        if len(widths) > 1:
+            issues.append(f"{name}: ragged 2-D array (row widths {sorted(widths)})")
+        elif widths:
+            action_counts[name] = next(iter(widths))
+    if len(set(row_counts.values())) > 1:
+        issues.append(f"inconsistent row counts across arrays: {row_counts}")
+    if len(set(action_counts.values())) > 1:
+        issues.append(f"inconsistent action counts across 2-D arrays: {action_counts}")
+    if len(issues) > max_issues:
+        issues = [*issues[:max_issues], "... (further issues truncated)"]
+    return (not issues, tuple(issues))
+
+
+def assert_decision_tensor_shapes(named_arrays: Mapping[str, object]) -> None:
+    """Fail closed: raise ValueError if the decision-tensor arrays disagree on row or action count."""
+    ok, issues = validate_decision_tensor_shapes(named_arrays)
+    if not ok:
+        raise ValueError("decision-tensor contract violation (shape-consistency): " + "; ".join(issues))
+
+
+def validate_action_mask(
+    mask: object, *, require_row_selectable: bool = True, max_issues: int = 20
+) -> tuple[bool, tuple[str, ...]]:
+    """An action mask must be a rectangular 2-D [rows][actions] array of BOOLEAN entries (True/False or 0/1 --
+    a fractional/other numeric entry is malformed), and -- when ``require_row_selectable`` (the contract for an
+    ex-ante DECISION mask) -- every row must have at least one selectable action, or the policy is trapped
+    with no legal move. (Pass ``require_row_selectable=False`` for an ex-post LABEL mask, where a row may have
+    no scorable action.) Tensor (``.tolist()``) or nested sequence. Returns (ok, issues). Pure; stdlib only."""
+    rows = [list(r) if isinstance(r, (list, tuple)) else r for r in (mask.tolist() if hasattr(mask, "tolist") else mask)]  # type: ignore[union-attr]
+    issues: list[str] = []
+    widths = {len(r) for r in rows if isinstance(r, list)}
+    if len(widths) > 1:
+        return (False, (f"action mask is ragged (row widths {sorted(widths)})",))
+    for t, row in enumerate(rows):
+        if not isinstance(row, list):
+            issues.append(f"row {t}: mask row is not a sequence ({row!r}); expected [actions] booleans")
+            continue
+        if any(value not in (True, False, 0, 1) for value in row):
+            issues.append(f"row {t}: mask has non-boolean entries ({row!r})")
+        if require_row_selectable and not any(bool(value) for value in row):
+            issues.append(f"row {t}: no selectable action (every entry is False) -- the policy has no legal move")
+        if len(issues) > max_issues:
+            issues = [*issues[:max_issues], "... (further issues truncated)"]
+            break
+    return (not issues, tuple(issues))
+
+
+def assert_action_mask(mask: object, *, require_row_selectable: bool = True) -> None:
+    """Fail closed: raise ValueError if the action mask is non-rectangular, non-boolean, or (for a decision
+    mask) leaves a row with no selectable action."""
+    ok, issues = validate_action_mask(mask, require_row_selectable=require_row_selectable)
+    if not ok:
+        raise ValueError("decision-tensor contract violation (action-mask): " + "; ".join(issues))
+
+
 def validate_decision_tensor_payload(
     payload: Mapping, manifest: Mapping | None = None
 ) -> tuple[bool, tuple[str, ...]]:
