@@ -4062,6 +4062,45 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         unregistered = config_bools - set(FLAG_REGISTRY) - non_governance_bools
         self.assertEqual(unregistered, set(), f"unregistered governance flag(s): {unregistered}")
 
+    def test_baseline_stress_coverage_gate(self) -> None:
+        # Reportability gate (review #13/#17): a reportable run must include the minimum baseline + stress
+        # grid (the README documents it; nothing enforced it). Fails closed on any missing required member.
+        from rl_quant.reportability import (
+            REQUIRED_BASELINES,
+            REQUIRED_STRESS,
+            assert_baseline_stress_coverage,
+            validate_baseline_stress_coverage,
+        )
+
+        baselines = list(REQUIRED_BASELINES)
+        stress = list(REQUIRED_STRESS)
+        # Complete grid passes.
+        ok, issues = validate_baseline_stress_coverage(baselines, stress)
+        self.assertTrue(ok)
+        self.assertEqual(issues, ())
+        # A missing baseline / missing stress each fail closed with a named issue.
+        ok, issues = validate_baseline_stress_coverage(baselines[:-1], stress)
+        self.assertFalse(ok)
+        self.assertTrue(any("missing required baseline" in m for m in issues))
+        ok, issues = validate_baseline_stress_coverage(baselines, stress[:-1])
+        self.assertFalse(ok)
+        self.assertTrue(any("missing required stress" in m for m in issues))
+        # buy-and-hold is required by default but droppable when not applicable.
+        no_bh = [b for b in baselines if b != "buy_and_hold"]
+        self.assertFalse(validate_baseline_stress_coverage(no_bh, stress)[0])
+        self.assertTrue(validate_baseline_stress_coverage(no_bh, stress, buy_and_hold_applicable=False)[0])
+        # spread/impact stress required only when crossable quote data exists.
+        self.assertTrue(validate_baseline_stress_coverage(baselines, stress, quote_data_available=False)[0])
+        self.assertFalse(validate_baseline_stress_coverage(baselines, stress, quote_data_available=True)[0])
+        self.assertTrue(validate_baseline_stress_coverage(baselines, [*stress, "spread_impact"],
+                                                          quote_data_available=True)[0])
+        # Case-insensitive; the assert variant raises on an incomplete grid.
+        self.assertTrue(validate_baseline_stress_coverage([b.upper() for b in baselines],
+                                                          [s.upper() for s in stress])[0])
+        assert_baseline_stress_coverage(baselines, stress)  # no raise
+        with self.assertRaises(ValueError):
+            assert_baseline_stress_coverage([], [])
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
