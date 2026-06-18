@@ -649,12 +649,19 @@ def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
 
 
 def _run_semantics_hash(
-    train_data: HourFromMinuteDataSplit, normalized_constraints: object
+    train_data: HourFromMinuteDataSplit,
+    normalized_constraints: object,
+    *,
+    reward_scale: float,
+    cash_idle_penalty_bps: float,
 ) -> str:
     """Stable fingerprint of the run's ECONOMICS / schema -- action space, feature schemas, normalized
-    constraints, and the action-return weight semantics. A resume must match this exactly: identical tensor
-    shapes are NOT enough (a checkpoint resumed with different costs / cash index / return semantics would
-    silently train on different economics), so resume rejects a mismatch."""
+    constraints, the action-return weight semantics, and the two reward-ledger parameters that live on the
+    env config rather than in the constraints: reward_scale (multiplies EVERY reward and normalizes the
+    resume-spanning shadow bps aggregates) and cash_idle_penalty_bps (added to the per-step cost). A resume
+    must match this exactly: identical tensor shapes are NOT enough (a checkpoint resumed with different
+    costs / cash index / return semantics / reward scale would silently train on different economics and
+    corrupt the running shadow sums), so resume rejects a mismatch."""
     payload = json.dumps(
         {
             "action_names": list(train_data.action_names),
@@ -663,6 +670,8 @@ def _run_semantics_hash(
             "action_feature_names": list(train_data.action_feature_names),
             "normalized_constraints": asdict(normalized_constraints),
             "action_return_weight_semantics": train_data.action_return_weight_semantics,
+            "reward_scale": float(reward_scale),
+            "cash_idle_penalty_bps": float(cash_idle_penalty_bps),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -902,7 +911,12 @@ def train_minute_to_hour_dqn(
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
     # Economic/schema fingerprint of THIS run; saved into checkpoints and re-checked on resume so a checkpoint
     # cannot be resumed with different action space / constraints / reward semantics (different economics).
-    run_semantics_hash = _run_semantics_hash(train_data, normalized_constraints)
+    run_semantics_hash = _run_semantics_hash(
+        train_data,
+        normalized_constraints,
+        reward_scale=config.env.reward_scale,
+        cash_idle_penalty_bps=config.env.cash_idle_penalty_bps,
+    )
     # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
     # passed to this function, so older training rows can be down-weighted without any risk of
     # touching the held-out test block. mode='none' yields uniform weights (no behavior change).

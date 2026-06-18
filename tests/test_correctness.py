@@ -9270,6 +9270,61 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
                                          config=cfg(5, state_path, resume=True, constraints=changed))
 
+    def test_run_semantics_hash_covers_reward_scale_and_cash_idle(self) -> None:
+        # reward_scale (multiplies every reward + normalizes the shadow bps aggregates) and
+        # cash_idle_penalty_bps (part of the per-step cost ledger) live on the ENV config, NOT in the
+        # normalized constraints -- so they must be folded into the fingerprint explicitly or a resume that
+        # changed reward economics would slip past the guard. Pin: deterministic for identical inputs;
+        # changes when either reward parameter changes; canonicalizes int vs float of equal magnitude.
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import validate_minute_to_hour_constraints
+        from rl_quant.training.minute_to_hour import _run_semantics_hash
+
+        data = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04"])
+        nc = validate_minute_to_hour_constraints(default_minute_to_hour_constraints(), list(data.action_names))
+
+        def h(reward_scale: float = 10_000.0, cash_idle: float = 0.0) -> str:
+            return _run_semantics_hash(data, nc, reward_scale=reward_scale, cash_idle_penalty_bps=cash_idle)
+
+        base = h()
+        self.assertEqual(base, h())                              # deterministic for identical inputs
+        self.assertNotEqual(base, h(reward_scale=20_000.0))      # reward_scale is now fingerprinted
+        self.assertNotEqual(base, h(cash_idle=5.0))              # cash_idle_penalty_bps is now fingerprinted
+        self.assertEqual(base, h(reward_scale=10_000))           # int vs float of equal magnitude -> same hash
+
+    def test_minute_to_hour_resume_rejects_changed_reward_scale(self) -> None:
+        # reward_scale lives on the ENV config (not the constraints) yet scales every reward + the
+        # resume-spanning shadow aggregates; a resume that changed it must fail closed. This also proves
+        # _run_semantics_hash is wired to config.env.reward_scale at the call site -- a unit test on the
+        # function alone would pass even if the call site forgot to pass it.
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        )
+
+        train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
+        val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"])
+
+        def cfg(train_steps: int, state_path, *, resume: bool, reward_scale: float) -> MinuteToHourTrainingConfig:
+            return MinuteToHourTrainingConfig(
+                env=MinuteToHourEnvConfig(num_envs=2, episode_length=2, reward_scale=reward_scale),
+                learning=DQNLearningConfig(
+                    num_envs=2, episode_length=2, replay_capacity=16, batch_size=2, train_steps=train_steps,
+                    warmup_steps=1, gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=2,
+                    epsilon_start=0.1, epsilon_end=0.0, eval_interval=2, grad_clip=1.0, use_amp=False),
+                d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+                resume_training_state=state_path if resume else None,
+                checkpoint_training_state=state_path, checkpoint_every_steps=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.pt"
+            torch.manual_seed(123)
+            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
+                                     config=cfg(3, state_path, resume=False, reward_scale=10_000.0))
+            with self.assertRaises(ValueError):  # changed reward_scale -> hash mismatch -> fail closed
+                train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
+                                         config=cfg(5, state_path, resume=True, reward_scale=20_000.0))
+
     def test_minute_to_hour_pr4_execution_reward_gate(self) -> None:
         # use_execution_env_reward (PR-4) is fail-closed: it requires RESOLVED action_return_weight_semantics
         # AND complete action metadata. The flag is not a config field yet, so we set it on the env config
