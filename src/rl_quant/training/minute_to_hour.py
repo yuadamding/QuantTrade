@@ -64,7 +64,13 @@ from rl_quant.envs.minute_to_hour import (
     transition_trade_cost_bps,
     validate_minute_to_hour_constraints,
 )
-from rl_quant.execution import coerce_finite_positive, require_bool
+from rl_quant.execution import (
+    coerce_finite_nonnegative,
+    coerce_finite_positive,
+    require_bool,
+    require_nonnegative_int,
+    require_positive_int,
+)
 from rl_quant.features.action_risk import (
     stable_action_metadata_hash,
     unknown_action_metadata_symbols,
@@ -181,7 +187,15 @@ def evaluate_minute_to_hour_policy(
     # reward_scale multiplies the net return into the reward; reject + normalise (zero/negative/non-finite
     # would zero, flip, or blow up the scored reward), matching the env's construction-time guard.
     reward_scale = coerce_finite_positive("reward_scale", reward_scale)
-    constraint_episode_length = int(episode_length or max(int(data.valid_start_indices.numel()), 1))
+    # cash_idle_penalty_bps is part of the reward ledger; validate at entry (the env validates it the same
+    # way) rather than only indirectly inside transition_trade_cost_bps mid-rollout.
+    coerce_finite_nonnegative("cash_idle_penalty_bps", cash_idle_penalty_bps)
+    # episode_length must be a positive int when given (the bare ``int(episode_length or ...)`` silently turned
+    # 0 into the default, True into 1, and 1.9 into 1); None still means "use the full valid-start span".
+    if episode_length is None:
+        constraint_episode_length = max(int(data.valid_start_indices.numel()), 1)
+    else:
+        constraint_episode_length = require_positive_int("episode_length", episode_length)
     data = data if data.minute_features.device == device else data.to(device)
     model.eval()
     # PR-D: evaluate a dynamic-aware model with its dynamic features. The held-position excursion is tracked
@@ -759,14 +773,14 @@ def train_minute_to_hour_dqn(
     # constructor; these two are read directly off the training config here.
     require_bool("use_transition_features", config.use_transition_features)
     require_bool("use_dynamic_transition_features", config.use_dynamic_transition_features)
+    # Fail fast on config BEFORE allocating GPU memory (and before build_transition_feature_table consumes
+    # cash_index / count_etf) -- the env's own validation at construction happens later. Reuse the normalized
+    # cash_index everywhere. action_names is device-agnostic, so this is safe pre-`.to(device)`.
+    cash_index = validate_minute_to_hour_constraints(config.env.constraints, train_data.action_names)
     configure_torch_runtime(device)
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
     assert_matching_hour_from_minute_schema(train_data, val_data)
-    # Validate constraints HERE, before build_transition_feature_table (model inputs) consumes cash_index /
-    # count_etf below -- the env's own validation at construction happens later, so without this a malformed
-    # constraint could shape the transition-feature table first. Reuse the normalized cash_index everywhere.
-    cash_index = validate_minute_to_hour_constraints(config.env.constraints, train_data.action_names)
     # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
     # passed to this function, so older training rows can be down-weighted without any risk of
     # touching the held-out test block. mode='none' yields uniform weights (no behavior change).
@@ -799,7 +813,7 @@ def train_minute_to_hour_dqn(
     transition_feature_dim = 0
     transition_table = None
     if config.use_transition_features:
-        from rl_quant.action_risk import action_leverage_tensor, build_action_metadata, group_ids_for_actions
+        from rl_quant.features.action_risk import action_leverage_tensor, build_action_metadata, group_ids_for_actions
 
         action_meta = build_action_metadata(train_data.action_names)
         action_group_ids, _ = group_ids_for_actions(action_meta, device=device)
@@ -933,7 +947,9 @@ def train_minute_to_hour_dqn(
         }
 
     checkpoint_path = Path(config.checkpoint_training_state) if config.checkpoint_training_state is not None else None
-    checkpoint_every_steps = max(0, int(config.checkpoint_every_steps))
+    # Reject bool / fractional / negative cadence rather than silently clamping (max(0, int(...)) turned True
+    # into 1 and -5 into 0); 0 means "no periodic checkpoint".
+    checkpoint_every_steps = require_nonnegative_int("checkpoint_every_steps", config.checkpoint_every_steps)
     shadow_reward_deltas: list[float] = []  # PR-3: per-step mean execution-shadow deltas (stays empty if flag off)
     shadow_cost_deltas: list[float] = []
     for step in range(start_step, config.learning.train_steps + 1):

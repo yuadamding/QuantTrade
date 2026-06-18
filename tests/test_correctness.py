@@ -8662,6 +8662,25 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIn("UNSEEN_TICKER_ZZ", artifacts["execution_shadow_unknown_action_symbols"])
         self.assertEqual(artifacts["execution_shadow_weight_semantics_status"], "unresolved")
 
+    def test_minute_to_hour_eval_episode_length_and_cash_idle_validation(self) -> None:
+        # The evaluator now fails closed on a bad episode_length (the bare int(episode_length or ...) silently
+        # turned 0 -> default, True -> 1, 1.9 -> 1) and on a bad cash_idle_penalty_bps, matching the env. None
+        # episode_length still means "use the full valid-start span".
+        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+
+        device = torch.device("cpu")
+        names = ["CASH", "QQQ"]
+        evaluate_minute_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
+                                       device=device, episode_length=None)
+        for bad in (0, -1, True, 1.9):
+            with self.assertRaises(ValueError):
+                evaluate_minute_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
+                                               device=device, episode_length=bad)
+        for bad in (-1.0, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                evaluate_minute_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
+                                               device=device, cash_idle_penalty_bps=bad)
+
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
         # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar
