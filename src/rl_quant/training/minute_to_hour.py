@@ -62,6 +62,7 @@ from rl_quant.envs.minute_to_hour import (
     MinuteToHourEnvConfig,
     VectorizedMinuteToHourEnv,
     transition_trade_cost_bps,
+    validate_cash_finite_on_decision_rows,
     validate_minute_to_hour_constraints,
 )
 from rl_quant.execution import (
@@ -197,6 +198,8 @@ def evaluate_minute_to_hour_policy(
     # mistaken for a legitimate zero/degenerate result.
     if int(data.valid_start_indices.numel()) == 0:
         raise ValueError("evaluation split has no valid decision start indices.")
+    # CASH is the forced safety fallback here too; require a finite CASH return on every valid decision row.
+    validate_cash_finite_on_decision_rows(data, cash_index)
     # episode_length must be a positive int when given (the bare ``int(episode_length or ...)`` silently turned
     # 0 into the default, True into 1, and 1.9 into 1); None still means "use the full valid-start span".
     if episode_length is None:
@@ -619,6 +622,9 @@ def _save_minute_to_hour_training_state(
     reward_trace: list[float],
     valid_action_count_trace: list[float],
     eval_trace: list[dict[str, float | int | None | str]],
+    shadow_reward_delta_sum: float,
+    shadow_cost_delta_sum: float,
+    shadow_delta_count: int,
     device: torch.device,
 ) -> None:
     _atomic_torch_save(
@@ -639,6 +645,10 @@ def _save_minute_to_hour_training_state(
             "train_reward_trace": list(reward_trace),
             "valid_action_count_trace": list(valid_action_count_trace),
             "eval_trace": list(eval_trace),
+            # PR-3 shadow aggregates (running sum + count) so a resumed run's artifact covers the whole run.
+            "shadow_reward_delta_sum": float(shadow_reward_delta_sum),
+            "shadow_cost_delta_sum": float(shadow_cost_delta_sum),
+            "shadow_delta_count": int(shadow_delta_count),
             "rng_state": _capture_rng_state(device),
         },
         path,
@@ -791,6 +801,25 @@ def train_minute_to_hour_dqn(
     # Schema matching is metadata/shape-level (device-agnostic), so fail on a mismatch BEFORE allocating GPU
     # memory or moving tensors to device.
     assert_matching_hour_from_minute_schema(train_data, val_data)
+    # PR-4 fail-closed gate: training the env's execution reward (use_execution_env_reward) must NOT happen
+    # until (1) the action_returns weight semantics are RESOLVED -- so the shadow's action_metadata.max_weight
+    # turnover pricing is known correct (see docs/execution_wiring_design.md §3) -- AND (2) action metadata is
+    # complete. use_execution_env_reward is not a config field yet (declared only in protocol/flags.py), so the
+    # getattr keeps this dormant today and ARMED the moment PR-4 wires the field in.
+    if getattr(config.env, "use_execution_env_reward", False):
+        semantics = train_data.action_return_weight_semantics
+        if semantics is None or semantics == "unresolved":
+            raise ValueError(
+                "use_execution_env_reward requires a RESOLVED train_data.action_return_weight_semantics "
+                f"(got {semantics!r}); the gold builder must declare whether action_returns are "
+                "'full_capital_single_slot_returns' or 'metadata_weighted_portfolio_returns' "
+                "(docs/execution_wiring_design.md §3) before training on the execution reward."
+            )
+        unknown = unknown_action_metadata_symbols(list(train_data.action_names))
+        if unknown:
+            raise ValueError(
+                f"use_execution_env_reward requires complete action metadata; unknown symbols: {unknown}."
+            )
     configure_torch_runtime(device)
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
@@ -914,6 +943,13 @@ def train_minute_to_hour_dqn(
     reward_trace: list[float] = []
     valid_action_count_trace: list[float] = []
     eval_trace: list[dict[str, float | int | None | str]] = []
+    # PR-3 shadow aggregates as a running SUM + COUNT (not a list) so they survive checkpoint/resume: a resumed
+    # run continues accumulating instead of summarizing only its post-resume segment. The count increments once
+    # per step the shadow is active, so sum/count reproduces the old mean-of-per-step-means exactly. Stay zero
+    # when the flag is off (artifact fields then resolve to None).
+    shadow_reward_delta_sum = 0.0
+    shadow_cost_delta_sum = 0.0
+    shadow_delta_count = 0
     resume_info: dict[str, object] = {"loaded": False}
     start_step = 1
     resume_path = Path(config.resume_training_state) if config.resume_training_state is not None else None
@@ -947,6 +983,11 @@ def train_minute_to_hour_dqn(
         reward_trace = [float(item) for item in checkpoint.get("train_reward_trace", [])]
         valid_action_count_trace = [float(item) for item in checkpoint.get("valid_action_count_trace", [])]
         eval_trace = list(checkpoint.get("eval_trace", []))
+        # Restore the running shadow aggregates so the resumed run's artifact covers the WHOLE run (older
+        # checkpoints without these keys default to 0 -> post-resume-only summary, which is the prior behaviour).
+        shadow_reward_delta_sum = float(checkpoint.get("shadow_reward_delta_sum", 0.0))
+        shadow_cost_delta_sum = float(checkpoint.get("shadow_cost_delta_sum", 0.0))
+        shadow_delta_count = int(checkpoint.get("shadow_delta_count", 0))
         rng_state = checkpoint.get("rng_state")
         if isinstance(rng_state, dict):
             _restore_rng_state(rng_state, device)
@@ -963,8 +1004,6 @@ def train_minute_to_hour_dqn(
     # Reject bool / fractional / negative cadence rather than silently clamping (max(0, int(...)) turned True
     # into 1 and -5 into 0); 0 means "no periodic checkpoint".
     checkpoint_every_steps = require_nonnegative_int("checkpoint_every_steps", config.checkpoint_every_steps)
-    shadow_reward_deltas: list[float] = []  # PR-3: per-step mean execution-shadow deltas (stays empty if flag off)
-    shadow_cost_deltas: list[float] = []
     for step in range(start_step, config.learning.train_steps + 1):
         minute, mask, hour, action_features, previous_actions, constraint_features, action_mask = env.observe()
         valid_action_count_trace.append(float(action_mask.sum(dim=1).float().mean().item()))
@@ -1003,8 +1042,9 @@ def train_minute_to_hour_dqn(
         replay.add(**{key: value for key, value in transition.items() if key in replay.storage})
         reward_trace.append(float(transition["rewards"].mean().item()))
         if "reward_delta_shadow" in transition:  # PR-3 shadow side-channel (present only when the flag is on)
-            shadow_reward_deltas.append(float(transition["reward_delta_shadow"].mean().item()))
-            shadow_cost_deltas.append(float(transition["cost_delta_shadow"].mean().item()))
+            shadow_reward_delta_sum += float(transition["reward_delta_shadow"].mean().item())
+            shadow_cost_delta_sum += float(transition["cost_delta_shadow"].mean().item())
+            shadow_delta_count += 1
         env.reset(transition["resets"].bool())
 
         if replay.size >= max(config.learning.warmup_steps, config.learning.batch_size):
@@ -1157,6 +1197,9 @@ def train_minute_to_hour_dqn(
                 reward_trace=reward_trace,
                 valid_action_count_trace=valid_action_count_trace,
                 eval_trace=eval_trace,
+                shadow_reward_delta_sum=shadow_reward_delta_sum,
+                shadow_cost_delta_sum=shadow_cost_delta_sum,
+                shadow_delta_count=shadow_delta_count,
                 device=device,
             )
 
@@ -1254,21 +1297,23 @@ def train_minute_to_hour_dqn(
             if config.env.execution_env_reward_shadow else None
         ),
         "execution_shadow_weight_semantics_status": (
-            "unresolved" if config.env.execution_env_reward_shadow else None
+            (train_data.action_return_weight_semantics or "unresolved")
+            if config.env.execution_env_reward_shadow else None
         ),
         "execution_shadow_weight_semantics_assumption": (
             "metadata_weighted_portfolio_returns" if config.env.execution_env_reward_shadow else None
         ),
         # reward delta in REWARD units (scale-dependent) AND scale-normalised bps (comparable across runs).
+        # Computed from the resume-safe running sum / count (None when the shadow never ran).
         "execution_shadow_reward_delta_mean": (
-            sum(shadow_reward_deltas) / len(shadow_reward_deltas) if shadow_reward_deltas else None
+            shadow_reward_delta_sum / shadow_delta_count if shadow_delta_count else None
         ),
         "execution_shadow_reward_delta_bps_mean": (
-            (sum(shadow_reward_deltas) / len(shadow_reward_deltas)) / float(config.env.reward_scale) * 10_000.0
-            if shadow_reward_deltas else None
+            (shadow_reward_delta_sum / shadow_delta_count) / float(config.env.reward_scale) * 10_000.0
+            if shadow_delta_count else None
         ),
         "execution_shadow_cost_delta_bps_mean": (
-            sum(shadow_cost_deltas) / len(shadow_cost_deltas) if shadow_cost_deltas else None
+            shadow_cost_delta_sum / shadow_delta_count if shadow_delta_count else None
         ),
         "model_version": (
             DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION

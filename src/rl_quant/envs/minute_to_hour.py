@@ -210,6 +210,23 @@ def validate_minute_to_hour_constraints(
     )
 
 
+def validate_cash_finite_on_decision_rows(data: HourFromMinuteDataSplit, cash_index: int) -> None:
+    """CASH is the FORCED safety fallback for masked / missing-label actions, and the fallback reads
+    ``action_returns[row, cash_index]`` directly -- so CASH must carry a FINITE return on every valid decision
+    row, else the env / evaluator would emit a NaN reward. (Under the action-return contract label-valid <=>
+    finite, so a non-finite CASH return also means CASH is not a usable label -- a broken safety action.) The
+    env and evaluator both enforce this up front so a malformed split fails closed at construction/entry."""
+    rows = data.valid_start_indices
+    if rows.numel() == 0:
+        return  # an empty split is handled by the caller's own emptiness guard
+    cash_returns = data.action_returns[rows.to(data.action_returns.device), cash_index]
+    if not bool(torch.isfinite(cash_returns).all().item()):
+        raise ValueError(
+            "CASH action must have a finite return on every valid decision row (it is the forced safety "
+            "fallback); the split has a non-finite CASH return."
+        )
+
+
 class VectorizedMinuteToHourEnv:
     def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
         # initial_action gets the SHARED action-index discipline; the rest of the constraint fields that feed
@@ -241,6 +258,8 @@ class VectorizedMinuteToHourEnv:
         self.config = config
         # Derive self.device from the actual moved tensor so it matches what indexed tensors report exactly.
         self.device = self.data.minute_features.device
+        # CASH is the forced safety fallback; require it to be finite on every valid decision row.
+        validate_cash_finite_on_decision_rows(self.data, self.cash_index)
         self.start_indices = self._build_start_index_pool()
         self.indices = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.previous_actions = torch.full((config.num_envs,), self.initial_action, dtype=torch.long, device=device)

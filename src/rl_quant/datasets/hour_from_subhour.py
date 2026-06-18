@@ -68,6 +68,12 @@ class HourFromMinuteDataSplit:
     # split, shrinks it below the full latest period and is gated as non-reportable.
     excluded_missing_label_rows: int = 0
     filter_removed_latest_reward_rows: bool = False
+    # PR-4 gate (see docs/execution_wiring_design.md §3): the weight basis of action_returns. The execution
+    # shadow prices turnover with action_metadata.max_weight, which is correct ONLY for
+    # "metadata_weighted_portfolio_returns"; for "full_capital_single_slot_returns" leveraged turnover is
+    # undercharged. None / "unresolved" means the gold builder has not declared it, which fail-closes
+    # use_execution_env_reward (PR-4) -- it must NOT be trained on until this is resolved AND metadata complete.
+    action_return_weight_semantics: str | None = None
 
     @property
     def effective_context_bars_per_hour(self) -> int:
@@ -1064,6 +1070,8 @@ def _build_split(
         split_policy=dict(split_policy or {}),
         excluded_missing_label_rows=excluded_missing_label_rows,
         filter_removed_latest_reward_rows=filter_removed_latest_reward_rows,
+        # PR-4 gate: carried from the gold payload (None = the builder has not declared it -> fail-closed).
+        action_return_weight_semantics=payload.get("action_return_weight_semantics"),
     )
 
 
