@@ -523,6 +523,35 @@ class VectorizedMinuteToHourEnv:
             self.order_legs_today[valid_positions[reset_today]] = 0.0
         return next_indices, next_position_dynamic, terminated, resets
 
+    def _compute_shadow_execution_reward(
+        self,
+        previous_actions: torch.Tensor,
+        actions: torch.Tensor,
+        is_switch: torch.Tensor,
+        raw_returns: torch.Tensor,
+        cost: TransitionCostBreakdown,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """PR-3 shadow (default-off, logged-only): the weight-bps execution reward computed from the SAME state
+        as the legacy reward. Prices the transition's two legs (sell prior weight + buy new weight; cash = no
+        exposure; only a real switch trades) via the weight-bps model, then swaps ONLY the execution/leg cost
+        into the shared reward formula while KEEPING the behavioural switch-penalty + cash-idle (so the deltas
+        isolate the cost-MODEL change, and PR-4 would not silently drop the anti-churn regularizer). Returns
+        ``(execution_env_reward_shadow, execution_cost_bps_shadow)``. Verbatim from step() -- byte-identical."""
+        cash_idx = self.cash_index
+        w_prev = self._shadow_action_weights[previous_actions]
+        w_next = self._shadow_action_weights[actions]
+        zeros = torch.zeros_like(w_prev)
+        sell_weight = torch.where(is_switch & (previous_actions != cash_idx), w_prev, zeros)
+        buy_weight = torch.where(is_switch & (actions != cash_idx), w_next, zeros)
+        execution_cost_bps_shadow = weight_transition_cost_bps(
+            sell_weight, buy_weight, weight_cost=self._shadow_weight_cost
+        )
+        _, execution_env_reward_shadow = transition_net_return_and_reward(
+            raw_returns, execution_cost_bps_shadow + cost.switch_penalty_bps, cost.cash_idle_bps,
+            reward_scale=self.reward_scale,
+        )
+        return execution_env_reward_shadow, execution_cost_bps_shadow
+
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
         previous_actions = self.previous_actions.clone()
@@ -549,27 +578,11 @@ class VectorizedMinuteToHourEnv:
         _, rewards = transition_net_return_and_reward(
             raw_returns, cost_bps, cash_idle_penalty_bps, reward_scale=self.reward_scale
         )
-        # PR-3 shadow (computed from the SAME state, only logged -- `rewards` above, used for training, is
-        # untouched, so this is byte-identical to shadow-off). Weight-bps cost of the transition's two legs
-        # (sell prior weight + buy new weight; cash = no exposure; only a real switch trades), carrying the same
-        # cash-idle term as the legacy reward so reward_delta isolates the trade-cost-MODEL change.
+        # PR-3 shadow (default-off, logged-only): a weight-bps execution reward from the SAME state. Training
+        # uses the legacy `rewards` above, so a shadow-on run is byte-identical to shadow-off.
         if self.execution_env_reward_shadow:
-            cash_idx = self.cash_index
-            w_prev = self._shadow_action_weights[previous_actions]
-            w_next = self._shadow_action_weights[actions]
-            zeros = torch.zeros_like(w_prev)
-            sell_weight = torch.where(is_switch & (previous_actions != cash_idx), w_prev, zeros)
-            buy_weight = torch.where(is_switch & (actions != cash_idx), w_next, zeros)
-            execution_cost_bps_shadow = weight_transition_cost_bps(
-                sell_weight, buy_weight, weight_cost=self._shadow_weight_cost
-            )
-            # Swap ONLY the execution/leg cost (cost.leg_cost_bps -> execution_cost_bps_shadow); KEEP the
-            # behavioural switch-penalty regularizer + the cash-idle penalty, so reward_delta / cost_delta
-            # isolate the cost-MODEL change and PR-4 would not silently drop the anti-churn regularizer. Same
-            # shared reward formula (its "trade cost" = shadow execution cost + the kept switch penalty).
-            _, execution_env_reward_shadow = transition_net_return_and_reward(
-                raw_returns, execution_cost_bps_shadow + cost.switch_penalty_bps, cash_idle_penalty_bps,
-                reward_scale=self.reward_scale,
+            execution_env_reward_shadow, execution_cost_bps_shadow = self._compute_shadow_execution_reward(
+                previous_actions, actions, is_switch, raw_returns, cost
             )
 
         next_indices, next_position_dynamic, terminated, resets = self._advance_env_state(
