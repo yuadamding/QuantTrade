@@ -112,6 +112,11 @@ class StockSecondContextConfig:
             raise ValueError("max_action_staleness_seconds must be non-negative.")
         if self.execution_latency_ms < 0:
             raise ValueError("execution_latency_ms must be non-negative.")
+        if self.source_bar_interval == "1s" and self.execution_latency_ms < DEFAULT_BAR_LATENCY_MS:
+            # Causal invariant for 1s aggregates (mirrors bar_latency_ms above): the entry fill must occur at
+            # least one bar AFTER the decision, never at the decision bar's already-observed close. A second
+            # source with execution_latency_ms < 1000 would fill at/inside the decision bar -> look-ahead.
+            raise ValueError("execution_latency_ms must be at least 1000 for second (1s) aggregates.")
         if self.default_action_cost_bps < 0 or self.max_action_cost_bps < self.default_action_cost_bps:
             raise ValueError("action cost bps settings are invalid.")
         if self.rth_only and self.include_extended_hours:

@@ -187,7 +187,8 @@ def evaluate_decision_log_reportability(
             if any(seq[k] > seq[k + 1] for k in range(len(seq) - 1)):
                 base_issues.append(ReportabilityIssue(i, "execution_timestamps", "ordering", f"row {i}: timestamps not non-decreasing {seq}"))
 
-        # The selected action must be allowed by the (ex-ante) action mask, when the mask is a name->bool map.
+        # The selected action must be allowed by the (ex-ante) action mask. Two logged shapes: a name->bool
+        # MAP (selected_action is the name) or a positional ARRAY/list of bools (selected_action is the index).
         action_mask = row.get("action_mask")
         selected = row.get("selected_action")
         if isinstance(action_mask, Mapping) and selected is not None:
@@ -197,6 +198,14 @@ def evaluate_decision_log_reportability(
                 allowed = None  # unhashable selected_action
             if allowed is not True:
                 base_issues.append(ReportabilityIssue(i, "action_mask", "mask", f"row {i}: selected_action {selected!r} not allowed by action_mask"))
+        elif isinstance(action_mask, Sequence) and not isinstance(action_mask, (str, bytes)) and selected is not None:
+            # Array/list mask: selected_action must be an in-bounds index whose entry is True. A non-integer
+            # selected_action cannot be resolved against an unnamed array, so it FAILS CLOSED -- a required
+            # field we cannot validate the selection against must not silently pass (the prior code, which
+            # only handled the Mapping shape, skipped array masks entirely).
+            index = selected if isinstance(selected, int) and not isinstance(selected, bool) else None
+            if index is None or not (0 <= index < len(action_mask)) or action_mask[index] is not True:
+                base_issues.append(ReportabilityIssue(i, "action_mask", "mask", f"row {i}: selected_action {selected!r} not an allowed index of the array action_mask"))
 
         # STRICT real-executable tier.
         for field in _REAL_EXECUTABLE_FLAGS:

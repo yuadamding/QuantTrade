@@ -3324,6 +3324,18 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertFalse(evaluate_decision_log_reportability([base_row(order_legs=float("nan"))], require_real_executable=False).reportable)
         # The selected action must be allowed by the ex-ante action mask.
         self.assertIn("mask", cats(evaluate_decision_log_reportability([base_row(action_mask={"CASH": True, "QQQ": False})], require_real_executable=False)))
+        # Array/list action_mask (positional): selected_action is the INDEX. A valid in-bounds True index
+        # passes; a disallowed index, an out-of-bounds index, and a non-integer selection (unresolvable
+        # against an unnamed array) all fail CLOSED. The last previously bypassed validation entirely --
+        # array masks were unchecked, so an invalid selection could slip through as base-reportable.
+        self.assertTrue(evaluate_decision_log_reportability(
+            [base_row(action_mask=[True, True], selected_action=1)], require_real_executable=False).reportable)
+        self.assertIn("mask", cats(evaluate_decision_log_reportability(
+            [base_row(action_mask=[True, False], selected_action=1)], require_real_executable=False)))
+        self.assertIn("mask", cats(evaluate_decision_log_reportability(
+            [base_row(action_mask=[True, True], selected_action=5)], require_real_executable=False)))
+        self.assertIn("mask", cats(evaluate_decision_log_reportability(
+            [base_row(action_mask=[True, True], selected_action="QQQ")], require_real_executable=False)))
 
         # Point-in-time-causal timestamp ordering, now PARSED (numeric, ISO-8601, datetime) and enforced --
         # not skipped. context_available_until must precede decision_ts.

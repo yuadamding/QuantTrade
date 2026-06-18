@@ -1316,6 +1316,19 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(args.execution_latency_ms, 1000)
         self.assertTrue(args.strict_action_sources)
 
+    def test_second_context_config_requires_1s_execution_latency(self) -> None:
+        # Causal invariant: a 1s-aggregate source must fill at least one bar (1000ms) after the decision,
+        # mirroring bar_latency_ms. The config previously enforced only execution_latency_ms >= 0, so a
+        # second source with e.g. 500ms (fill at/inside the decision bar -> look-ahead) slipped through.
+        from rl_quant.features.stock_second_context import StockSecondContextConfig
+
+        base = dict(decision_interval="5m", context_seconds=60, block_seconds=60, min_active_symbols=1,
+                    max_action_staleness_seconds=5)
+        StockSecondContextConfig(**base, execution_latency_ms=1000).validate()  # default-equivalent: OK
+        for bad in (0, 500, 999):
+            with self.assertRaises(ValueError):
+                StockSecondContextConfig(**base, execution_latency_ms=bad, source_bar_interval="1s").validate()
+
     def test_second_context_builder_requires_point_in_time_universe_or_diagnostic_flag(self) -> None:
         module = load_script("build_second_context_decision_dataset")
         first_decision = iso_to_timestamp_ms("2026-06-12T14:35:00+00:00")
