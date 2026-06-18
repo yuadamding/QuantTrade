@@ -439,6 +439,32 @@ class VectorizedMinuteToHourEnv:
             raise ValueError("actions contain an out-of-range action index.")
         return actions
 
+    def _resolve_executed_actions(
+        self, requested_actions: torch.Tensor, action_mask: torch.Tensor, current_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Resolve the policy's REQUESTED actions to the EXECUTED actions via two fail-safe fallbacks (both
+        de-risk to CASH): (1) a masked/invalid action falls back to CASH when CASH is valid (else the first
+        valid column -- argmax alone only yields CASH if CASH is index 0; for the canonical cash_index==0
+        universe this is byte-identical, and it removes the dependency on CASH being first); (2) an action whose
+        label is UNUSABLE (not label-valid OR non-finite return) falls back to CASH, else the env would train on
+        a NaN/inf reward. The usable-label rule (label_valid & isfinite) matches evaluate_minute_to_hour_policy,
+        so env and evaluator fall back on exactly the same rows. Integer/boolean only -- no reward arithmetic --
+        so it is byte-identical to the prior inline step() logic."""
+        actions = self._validate_step_actions(requested_actions)
+        selected_valid = action_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
+        first_valid_actions = torch.argmax(action_mask.long(), dim=1)
+        cash_is_valid = action_mask[:, self.cash_index]
+        fallback_actions = torch.where(
+            cash_is_valid, torch.full_like(actions, self.cash_index), first_valid_actions
+        )
+        actions = torch.where(selected_valid, actions, fallback_actions)
+        usable_labels = self.data.label_valid_actions(current_indices) & torch.isfinite(
+            self.data.action_returns[current_indices]
+        )
+        selected_label_valid = usable_labels.gather(1, actions.unsqueeze(1)).squeeze(1)
+        cash_actions = torch.full_like(actions, self.cash_index)
+        return torch.where(selected_label_valid, actions, cash_actions)
+
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
         previous_actions = self.previous_actions.clone()
@@ -448,28 +474,8 @@ class VectorizedMinuteToHourEnv:
         position_dynamic = self.dynamic_state()
         constraint_features = self.constraint_features()
         action_mask = self.action_mask()
-        actions = self._validate_step_actions(actions)
-        selected_valid = action_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
-        # On an invalid requested action, de-risk to CASH when it is valid (a masked action should fall back to
-        # cash, not to whatever happens to be the first valid column -- argmax alone only yields CASH if CASH is
-        # index 0). Falls back to the first valid action only when CASH itself is masked. For the canonical
-        # cash_index==0 universe (CASH always valid via the data-quality fallback) this is byte-identical to the
-        # old argmax (both pick index 0), and it removes the dependency on CASH being the first action.
-        first_valid_actions = torch.argmax(action_mask.long(), dim=1)
-        cash_is_valid = action_mask[:, self.cash_index]
-        fallback_actions = torch.where(
-            cash_is_valid, torch.full_like(actions, self.cash_index), first_valid_actions
-        )
-        actions = torch.where(selected_valid, actions, fallback_actions)
-        # A label is only USABLE if the mask says valid AND the return is finite -- otherwise the env would
-        # train on a NaN/inf reward. This matches evaluate_minute_to_hour_policy (which already checks both),
-        # so the env and the evaluator fall back to CASH on exactly the same rows. For clean data (label-valid
-        # implies finite, per the protocol's NaN-marks-invalid contract) this is byte-identical.
-        label_mask = self.data.label_valid_actions(current_indices)
-        usable_labels = label_mask & torch.isfinite(self.data.action_returns[current_indices])
-        selected_label_valid = usable_labels.gather(1, actions.unsqueeze(1)).squeeze(1)
-        cash_actions = torch.full_like(actions, self.cash_index)
-        actions = torch.where(selected_label_valid, actions, cash_actions)
+        # Validate + resolve requested -> executed actions (mask fallback, then usable-label fallback to CASH).
+        actions = self._resolve_executed_actions(actions, action_mask, current_indices)
         raw_returns = self.data.action_returns[current_indices, actions]
         is_switch = actions != previous_actions
         cost = transition_trade_cost_bps(
