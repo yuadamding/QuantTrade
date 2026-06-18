@@ -62,13 +62,13 @@ from rl_quant.envs.minute_to_hour import (
     MinuteToHourEnvConfig,
     VectorizedMinuteToHourEnv,
     transition_trade_cost_bps,
+    validate_minute_to_hour_constraints,
 )
-from rl_quant.execution import coerce_finite_positive
+from rl_quant.execution import coerce_finite_positive, require_bool
 from rl_quant.features.action_risk import (
     stable_action_metadata_hash,
     unknown_action_metadata_symbols,
     validate_action_index_for_actions,
-    validate_cash_index_for_actions,
 )
 
 
@@ -173,14 +173,14 @@ def evaluate_minute_to_hour_policy(
     capture_rollout: bool = False,
 ) -> MinuteToHourEvaluationResult:
     constraints = constraints or default_minute_to_hour_constraints()
-    # Same fail-closed index checks the env runs at construction, so the evaluator cannot silently price the
-    # cash-idle penalty / cash fallback against the wrong (or non-cash) action, nor start the rollout from a
-    # bool/float/out-of-range initial_action, when scored outside the env.
-    validate_cash_index_for_actions(data.action_names, constraints.cash_index)
+    # Same fail-closed constraint/index checks the env runs at construction (cash_index is a real CASH action,
+    # count_etf is a real bool, bps scalars finite/non-negative, initial_action in range), so the evaluator
+    # cannot silently price against the wrong action / leg basis or start from a bad initial_action.
+    cash_index = validate_minute_to_hour_constraints(constraints, data.action_names)
     validate_action_index_for_actions(data.action_names, initial_action, name="initial_action")
-    # reward_scale multiplies the net return into the reward; a zero/negative/non-finite value would zero,
-    # flip, or blow up the scored reward (matches the env's construction-time guard).
-    coerce_finite_positive("reward_scale", reward_scale)
+    # reward_scale multiplies the net return into the reward; reject + normalise (zero/negative/non-finite
+    # would zero, flip, or blow up the scored reward), matching the env's construction-time guard.
+    reward_scale = coerce_finite_positive("reward_scale", reward_scale)
     constraint_episode_length = int(episode_length or max(int(data.valid_start_indices.numel()), 1))
     data = data if data.minute_features.device == device else data.to(device)
     model.eval()
@@ -266,14 +266,14 @@ def evaluate_minute_to_hour_policy(
             max_order_legs_per_day=constraints.max_order_legs_per_day,
             order_legs_episode=torch.tensor([order_legs_episode], dtype=torch.float32, device=device),
             max_order_legs_per_episode=constraints.max_order_legs_per_episode,
-            cash_index=constraints.cash_index,
+            cash_index=cash_index,
             count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
         )
         availability_mask = data.valid_actions(torch.tensor([index], dtype=torch.long, device=device))
-        availability_mask[:, int(constraints.cash_index)] = True
+        availability_mask[:, cash_index] = True
         action_mask = action_mask & availability_mask
         if not bool(action_mask.any().item()):
-            action_mask[:, int(constraints.cash_index)] = True
+            action_mask[:, cash_index] = True
         # Pass action_features / dynamic_state only when present so a minimal forward(5-arg) policy (e.g. a
         # test mock or a non-dynamic model) is still called exactly as before -- unchanged default behaviour.
         forward_kwargs: dict[str, torch.Tensor] = {}
@@ -294,7 +294,7 @@ def evaluate_minute_to_hour_policy(
                 one_way_cost_bps=constraints.one_way_cost_bps,
                 extra_switch_penalty_bps=constraints.extra_switch_penalty_bps,
                 q_switch_margin_bps=constraints.q_switch_margin_bps,
-                cash_index=constraints.cash_index,
+                cash_index=cash_index,
                 reward_scale=reward_scale,
                 count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
             )[0].item()
@@ -303,11 +303,11 @@ def evaluate_minute_to_hour_policy(
         action_tensor = torch.tensor([action], dtype=torch.long, device=device)
         label_mask = data.label_valid_actions(torch.tensor([index], dtype=torch.long, device=device))
         requested_label_missing = (
-            action != int(constraints.cash_index)
+            action != cash_index
             and (not bool(label_mask[0, action].item()) or not bool(torch.isfinite(data.action_returns[index, action]).item()))
         )
         if not bool(label_mask[0, action].item()) or not bool(torch.isfinite(data.action_returns[index, action]).item()):
-            action = int(constraints.cash_index)
+            action = cash_index
             action_tensor = torch.tensor([action], dtype=torch.long, device=device)
         evaluated_rows.append(int(index))
         requested_actions.append(int(requested_action))
@@ -382,7 +382,7 @@ def evaluate_minute_to_hour_policy(
         row_indices=evaluated_rows,
         requested_actions=requested_actions,
         executed_actions=executed_actions,
-        cash_index=int(constraints.cash_index),
+        cash_index=cash_index,
     )
     return MinuteToHourEvaluationResult(
         split_name=data.name,
@@ -439,7 +439,7 @@ def evaluate_minute_to_hour_baselines(
     constraints = constraints or default_minute_to_hour_constraints()
     # Fail closed (and normalise to int) before deriving initial_action / the cash skip below; each
     # evaluate_minute_to_hour_policy call re-validates, but the baseline wiring reads cash_index first.
-    cash_index = validate_cash_index_for_actions(data.action_names, constraints.cash_index)
+    cash_index = validate_minute_to_hour_constraints(constraints, data.action_names)
     action_count = len(data.action_names)
     common = dict(
         device=device, constraints=constraints, episode_length=episode_length,
@@ -754,6 +754,11 @@ def train_minute_to_hour_dqn(
     device: torch.device,
     config: MinuteToHourTrainingConfig,
 ) -> tuple[nn.Module, dict[str, object]]:
+    # Governed model-input flags must be REAL bools (bool("false") would be True -- a silent feature flip that
+    # changes the model contract / replay schema). The env's execution_env_reward_shadow is validated in its
+    # constructor; these two are read directly off the training config here.
+    require_bool("use_transition_features", config.use_transition_features)
+    require_bool("use_dynamic_transition_features", config.use_dynamic_transition_features)
     configure_torch_runtime(device)
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)

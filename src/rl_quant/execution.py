@@ -105,6 +105,14 @@ def _require_int_allow_negative(name: str, value: object) -> int:
         raise ValueError(f"{name} must be integer-like; got {value!r}.") from exc
 
 
+def _require_bool(name: str, value: object) -> bool:
+    # Governed flags must be REAL bools: bool("false") is True and bool(0) is False, so coercing a config
+    # flag with bool(...) would silently flip behaviour (and, for a result-moving flag, the reported numbers).
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool, got {value!r}.")
+    return value
+
+
 def _coerce_finite_positive(name: str, value: object) -> float:
     # Strictly-positive finite scalar (e.g. reward_scale): a zero/negative/NaN/inf would zero, flip, or
     # blow up every reward and any bps figure normalised by it.
@@ -118,6 +126,7 @@ def _coerce_finite_positive(name: str, value: object) -> float:
 # as ExecutionConfig instead of int()-truncating a fractional config value or float()-coercing a bool.
 require_positive_int = _require_positive_int
 require_nonnegative_int = _require_nonnegative_int
+require_bool = _require_bool
 coerce_finite_nonnegative = _coerce_finite_nonnegative
 coerce_finite_positive = _coerce_finite_positive
 

@@ -19,10 +19,12 @@ from rl_quant.datasets.hour_from_subhour import (
     HourFromMinuteDataSplit,
     default_minute_to_hour_constraints,
 )
+from rl_quant.core import concrete_torch_device
 from rl_quant.execution import (
     WeightExecutionCostConfig,
     coerce_finite_nonnegative,
     coerce_finite_positive,
+    require_bool,
     weight_transition_cost_bps,
 )
 from rl_quant.features.action_risk import (
@@ -111,6 +113,13 @@ def transition_trade_cost_bps(
             f"{constraints.count_etf_to_etf_as_two_legs!r}."
         )
     if action_count is not None:
+        if isinstance(action_count, bool) or not isinstance(action_count, Integral):
+            raise ValueError(f"action_count must be an integer, got {action_count!r}.")
+        action_count = int(action_count)
+        if action_count <= 0:
+            raise ValueError(f"action_count must be positive, got {action_count}.")
+        if not (0 <= cash_index < action_count):
+            raise ValueError(f"constraints.cash_index={cash_index} is outside action_count={action_count}.")
         out_of_range = (
             (previous_actions < 0) | (previous_actions >= action_count)
             | (actions < 0) | (actions >= action_count)
@@ -132,31 +141,46 @@ def transition_trade_cost_bps(
     )
 
 
+def validate_minute_to_hour_constraints(constraints: TradingConstraintConfig, action_names: list[str]) -> int:
+    """Entry-point validation of the constraint fields that feed BOTH the action mask and the cost ledger, and
+    return the validated cash_index. transition_trade_cost_bps re-checks these per step, but build_action_mask
+    consumes ``count_etf_to_etf_as_two_legs`` (and cash_index) BEFORE the cost helper runs -- so a malformed
+    value (e.g. the truthy string "false") could skew action availability / observe() first. Validating here,
+    at env/eval construction, closes that ordering gap so masks never see an unvalidated constraint."""
+    cash_index = validate_cash_index_for_actions(action_names, constraints.cash_index)
+    if not isinstance(constraints.count_etf_to_etf_as_two_legs, bool):
+        raise ValueError(
+            "constraints.count_etf_to_etf_as_two_legs must be a bool, got "
+            f"{constraints.count_etf_to_etf_as_two_legs!r}."
+        )
+    coerce_finite_nonnegative("constraints.one_way_cost_bps", constraints.one_way_cost_bps)
+    coerce_finite_nonnegative("constraints.extra_switch_penalty_bps", constraints.extra_switch_penalty_bps)
+    return cash_index
+
+
 class VectorizedMinuteToHourEnv:
     def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
-        # Both indices are validated with the SHARED action-index discipline (reject bool/float/string +
-        # range), and cash_index additionally must point to a real CASH action. The NORMALIZED ints are stored
-        # and used throughout env state so the constructor is the single validation point; the re-exported
-        # validate_cash_index_for_actions keeps the evaluator in lockstep.
+        # initial_action gets the SHARED action-index discipline; the rest of the constraint fields that feed
+        # the action mask AND the cost ledger (cash_index must be a real CASH action; count_etf must be a real
+        # bool; the bps scalars finite/non-negative) are validated together at construction -- BEFORE any mask
+        # is built -- so masks/observe() never see an unvalidated constraint. The NORMALIZED ints are stored
+        # and used throughout env state so the constructor is the single validation point.
         self.initial_action = validate_action_index_for_actions(
             data.action_names, config.initial_action, name="initial_action"
         )
-        self.cash_index = validate_cash_index_for_actions(data.action_names, config.constraints.cash_index)
+        self.cash_index = validate_minute_to_hour_constraints(config.constraints, data.action_names)
         # reward_scale multiplies every reward and normalises the shadow bps artifacts, so a zero/negative/
-        # non-finite value would zero, flip, or blow them up -- fail closed at construction.
-        coerce_finite_positive("reward_scale", config.reward_scale)
-        # Normalize the device to a CONCRETE ordinal. This env is typically constructed with the result of
-        # core.resolve_torch_device, which hands back an ordinal-free torch.device("cuda") for "auto"/"cuda";
-        # tensors allocated on it, however, report cuda:<current_device>. _validate_step_actions compares an
-        # action tensor's concrete device against self.device, so an ordinal-free self.device would REJECT
-        # valid CUDA actions on the first step. Resolve the ordinal here (mirroring what allocation does) and
-        # pin self.device + the local `device` used for every state tensor below to that concrete device.
-        device = torch.device(device)
-        if device.type == "cuda" and device.index is None:
-            device = torch.device("cuda", torch.cuda.current_device())
+        # non-finite value would zero, flip, or blow them up -- validate and STORE the canonical float.
+        self.reward_scale = coerce_finite_positive("reward_scale", config.reward_scale)
+        # Pin to a CONCRETE device ordinal (concrete_torch_device): the env is typically built with the result
+        # of core.resolve_torch_device, and although that now returns a concrete cuda:<idx>, a caller could
+        # still pass an ordinal-free torch.device("cuda"). _validate_step_actions compares an action tensor's
+        # concrete device against self.device, so an ordinal-free self.device would REJECT valid CUDA actions.
+        device = concrete_torch_device(device)
         self.data = data if data.minute_features.device == device else data.to(device)
         self.config = config
-        self.device = device
+        # Derive self.device from the actual moved tensor so it matches what indexed tensors report exactly.
+        self.device = self.data.minute_features.device
         self.start_indices = self._build_start_index_pool()
         self.indices = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.previous_actions = torch.full((config.num_envs,), self.initial_action, dtype=torch.long, device=device)
@@ -178,7 +202,10 @@ class VectorizedMinuteToHourEnv:
         # PR-3 shadow mode: per-action STATIC weights from action metadata (cash zeroed in step), so the prior
         # held weight is determined by previous_action -- no separate shadow-holdings state needed. The shadow
         # fee rate is the env's one_way_cost_bps, so the A/B isolates the costing METHOD, not the rate.
-        self.execution_env_reward_shadow = bool(config.execution_env_reward_shadow)
+        # Governed flag: require a REAL bool (bool("false") would be True -- a silent enable of the shadow).
+        self.execution_env_reward_shadow = require_bool(
+            "execution_env_reward_shadow", config.execution_env_reward_shadow
+        )
         if self.execution_env_reward_shadow:
             self._shadow_action_weights = action_weight_tensor(
                 build_action_metadata(list(self.data.action_names)), device=device
@@ -342,9 +369,9 @@ class VectorizedMinuteToHourEnv:
         legs = cost.legs
         cost_bps = cost.trade_cost_bps  # leg cost + switch penalty (the legacy combined trade cost)
         cash_idle_penalty_bps = cost.cash_idle_bps
-        rewards = raw_returns * float(self.config.reward_scale) - (
+        rewards = raw_returns * self.reward_scale - (
             cost_bps + cash_idle_penalty_bps
-        ) * float(self.config.reward_scale) / 10_000.0
+        ) * self.reward_scale / 10_000.0
         # PR-3 shadow (computed from the SAME state, only logged -- `rewards` above, used for training, is
         # untouched, so this is byte-identical to shadow-off). Weight-bps cost of the transition's two legs
         # (sell prior weight + buy new weight; cash = no exposure; only a real switch trades), carrying the same
@@ -362,9 +389,9 @@ class VectorizedMinuteToHourEnv:
             # Swap ONLY the execution/leg cost (cost.leg_cost_bps -> execution_cost_bps_shadow); KEEP the
             # behavioural switch-penalty regularizer + the cash-idle penalty, so reward_delta / cost_delta
             # isolate the cost-MODEL change and PR-4 would not silently drop the anti-churn regularizer.
-            execution_env_reward_shadow = raw_returns * float(self.config.reward_scale) - (
+            execution_env_reward_shadow = raw_returns * self.reward_scale - (
                 execution_cost_bps_shadow + cost.switch_penalty_bps + cash_idle_penalty_bps
-            ) * float(self.config.reward_scale) / 10_000.0
+            ) * self.reward_scale / 10_000.0
 
         next_indices = current_indices + 1
         self.indices = next_indices

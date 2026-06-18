@@ -378,16 +378,33 @@ def absolute_max_drawdown(equity: list[float]) -> float:
     return worst
 
 
+def concrete_torch_device(device: "torch.device | str") -> torch.device:
+    """Resolve an ordinal-free CUDA device to a concrete ``cuda:<index>``.
+
+    ``torch.device("cuda")`` carries no ordinal, but tensors allocated on it report ``cuda:<current_device>``,
+    so an exact ``tensor.device == torch.device("cuda")`` comparison is False. Any code that compares devices
+    for equality (e.g. the minute->hour env's action-tensor guard) must pin to the concrete device this
+    returns. CPU / MPS / explicit ``cuda:N`` pass through unchanged."""
+    out = torch.device(device)
+    if out.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is false.")
+        if out.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+    return out
+
+
 def resolve_torch_device(preference: str = "auto") -> torch.device:
     normalized = preference.strip().lower()
     if normalized == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Return a CONCRETE cuda:<idx> (not ordinal-free "cuda") so downstream device-equality checks hold.
+        return concrete_torch_device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     if normalized == "cpu":
         return torch.device("cpu")
     if normalized == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is false.")
-        return torch.device("cuda")
+        return concrete_torch_device("cuda")
     if normalized.startswith("cuda:"):
         if not torch.cuda.is_available():
             raise RuntimeError(f"{preference} was requested, but CUDA is unavailable.")

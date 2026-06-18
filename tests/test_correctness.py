@@ -8476,6 +8476,94 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             # A tensor built with ordinal-free "cuda" reports cuda:<current> and MUST be accepted.
             env_cuda._validate_step_actions(torch.zeros(2, dtype=torch.long, device=torch.device("cuda")))
 
+    def test_concrete_torch_device_and_env_device_matches_tensors(self) -> None:
+        # concrete_torch_device pins ordinal-free CUDA to cuda:<current>; CPU/explicit-ordinal pass through.
+        # The env derives self.device from the moved tensor, so it equals what indexed tensors report.
+        from rl_quant.core import concrete_torch_device
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+
+        self.assertEqual(concrete_torch_device("cpu"), torch.device("cpu"))
+        self.assertEqual(concrete_torch_device(torch.device("cpu")), torch.device("cpu"))
+        cfg = MinuteToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_minute_to_hour_constraints())
+        env = VectorizedMinuteToHourEnv(self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cpu"))
+        self.assertEqual(env.device, env.data.minute_features.device)
+        if torch.cuda.is_available():
+            dev = concrete_torch_device("cuda")
+            self.assertEqual(dev.type, "cuda")
+            self.assertIsNotNone(dev.index)
+            env_cuda = VectorizedMinuteToHourEnv(
+                self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cuda"))
+            self.assertIsNotNone(env_cuda.device.index)
+            self.assertEqual(env_cuda.device, env_cuda.data.minute_features.device)
+
+    def test_minute_to_hour_env_entry_constraint_and_flag_validation(self) -> None:
+        # Entry-point validation: a non-bool count_etf (truthy "false" would skew the action mask) and a
+        # non-bool governed flag (execution_env_reward_shadow="false" would silently ENABLE the shadow) must
+        # both fail closed at env CONSTRUCTION, before any mask/observe can consume the malformed value.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import (
+            MinuteToHourEnvConfig,
+            VectorizedMinuteToHourEnv,
+            validate_minute_to_hour_constraints,
+        )
+
+        device = torch.device("cpu")
+        base = default_minute_to_hour_constraints()
+        with self.assertRaises(ValueError):
+            VectorizedMinuteToHourEnv(
+                self._two_action_split(["CASH", "QQQ"]),
+                MinuteToHourEnvConfig(num_envs=1, episode_length=5,
+                                      constraints=dataclasses.replace(base, count_etf_to_etf_as_two_legs="false")),
+                device)
+        with self.assertRaises(ValueError):
+            VectorizedMinuteToHourEnv(
+                self._two_action_split(["CASH", "QQQ"]),
+                MinuteToHourEnvConfig(num_envs=1, episode_length=5, execution_env_reward_shadow="false",
+                                      constraints=base),
+                device)
+        # The shared constraint validator returns the validated cash_index and rejects a non-cash one.
+        self.assertEqual(validate_minute_to_hour_constraints(base, ["CASH", "QQQ"]), 0)
+        with self.assertRaises(ValueError):
+            validate_minute_to_hour_constraints(dataclasses.replace(base, cash_index=1), ["CASH", "QQQ"])
+
+    def test_train_minute_to_hour_rejects_non_bool_feature_flags(self) -> None:
+        # Governed model-input flags must be real bools at train entry (a truthy string would flip the model
+        # contract / replay schema). The check is at the top of train_minute_to_hour_dqn, before any work.
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str) -> HourFromMinuteDataSplit:
+            return HourFromMinuteDataSplit(
+                name=name, decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-03T14:30:00+00:00"],
+                next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-03T15:30:00+00:00"],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
+                action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
+                valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            )
+
+        learning = DQNLearningConfig(
+            num_envs=1, episode_length=2, replay_capacity=8, batch_size=2, train_steps=1, warmup_steps=0,
+            gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=1, epsilon_start=0.0,
+            epsilon_end=0.0, eval_interval=1, grad_clip=1.0,
+        )
+        for flag in ("use_transition_features", "use_dynamic_transition_features"):
+            config = MinuteToHourTrainingConfig(
+                env=MinuteToHourEnvConfig(num_envs=1, episode_length=2), learning=learning,
+                d_model=8, n_heads=1, minute_layers=1, hour_layers=1, feedforward_dim=8, action_embedding_dim=2,
+                **{flag: "false"},
+            )
+            with self.assertRaises(ValueError):
+                train_minute_to_hour_dqn(make_split("train"), make_split("val"), device=torch.device("cpu"), config=config)
+
     def test_minute_to_hour_reward_scale_validation(self) -> None:
         # reward_scale multiplies every reward and normalises the shadow bps artifact; a zero / negative /
         # non-finite / bool value must fail closed in BOTH the env and the evaluator.
@@ -8519,6 +8607,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 transition_trade_cost_bps(long([0]), long([1]),
                                           constraints=dataclasses.replace(base, count_etf_to_etf_as_two_legs=bad),
                                           cash_idle_penalty_bps=0.0)
+        # action_count, when supplied, must itself be a positive integer (reject bool/float/<=0)...
+        for bad_ac in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                transition_trade_cost_bps(long([0]), long([1]), constraints=base, cash_idle_penalty_bps=0.0,
+                                          action_count=bad_ac)
+        # ...and cash_index must be inside it (a direct caller with cash_index=99 + action_count=2 fails closed).
+        with self.assertRaises(ValueError):
+            transition_trade_cost_bps(long([0]), long([1]), constraints=dataclasses.replace(base, cash_index=99),
+                                      cash_idle_penalty_bps=0.0, action_count=2)
 
     def test_minute_to_hour_shadow_artifact_flags_incomplete_metadata(self) -> None:
         # PR-3 auditability: with shadow ON and an UNKNOWN (un-metadata'd) non-cash ticker, the artifact must
