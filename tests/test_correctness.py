@@ -8770,6 +8770,36 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                                                   constraints=cons)
         self.assertIsNone(res_cash.probabilistic_sharpe_ratio)
 
+    def test_minute_to_hour_train_eval_trace_records_psr(self) -> None:
+        # The PSR added to the evaluation RESULT must reach the persisted training artifact: each eval_trace
+        # entry carries val_probabilistic_sharpe_ratio + its estimability status (so a run's artifact has the
+        # statistical-credibility metric, not only the raw Sharpe). Status is "ok" iff the value is present.
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        )
+
+        train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
+        val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02", "2026-02-03"])
+        config = MinuteToHourTrainingConfig(
+            env=MinuteToHourEnvConfig(num_envs=2, episode_length=2),
+            learning=DQNLearningConfig(
+                num_envs=2, episode_length=2, replay_capacity=16, batch_size=2, train_steps=2, warmup_steps=1,
+                gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=2, epsilon_start=0.1,
+                epsilon_end=0.0, eval_interval=2, grad_clip=1.0, use_amp=False),
+            d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4)
+        torch.manual_seed(0)
+        _, artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+        eval_trace = artifacts["eval_trace"]
+        self.assertTrue(eval_trace)  # at least one validation eval ran
+        last = eval_trace[-1]
+        self.assertIn("val_probabilistic_sharpe_ratio", last)
+        self.assertIn("val_probabilistic_sharpe_ratio_status", last)
+        self.assertEqual(
+            last["val_probabilistic_sharpe_ratio_status"] == "ok",
+            last["val_probabilistic_sharpe_ratio"] is not None,
+        )
+
     def test_minute_to_hour_eval_rejects_empty_valid_start_split(self) -> None:
         # An evaluation split with no valid decision rows fails closed (a zero/degenerate metric would
         # otherwise look like a legitimate result), mirroring the env's start-index-pool guard.

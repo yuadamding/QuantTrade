@@ -1241,6 +1241,13 @@ def train_minute_to_hour_dqn(
                     "val_return": val_result.total_return,
                     "val_order_legs": val_result.market_order_legs,
                     "val_sharpe": val_result.annualized_sharpe,
+                    # PSR is None when not estimable (< 2 net returns / zero dispersion); persist it (and the
+                    # estimability status) so the training artifact's eval_trace carries the statistical-
+                    # credibility metric, not just the raw Sharpe.
+                    "val_probabilistic_sharpe_ratio": val_result.probabilistic_sharpe_ratio,
+                    "val_probabilistic_sharpe_ratio_status": (
+                        "ok" if val_result.probabilistic_sharpe_ratio is not None else "not_estimable"
+                    ),
                     "average_loss": sum(loss_trace[-200:]) / max(len(loss_trace[-200:]), 1),
                     "average_train_reward": sum(reward_trace[-200:]) / max(len(reward_trace[-200:]), 1),
                     "average_valid_action_count": sum(valid_action_count_trace[-200:])
