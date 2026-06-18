@@ -556,6 +556,11 @@ def statistical_credibility_report(
         "psr_is_credible": psr_is_credible(psr, n_obs),
         "deflated_sharpe_ratio": dsr,
         "deflated_sharpe_promotion": promotion,
+        # Stable schema: the data-snooping fields are always present (None when their optional input was not
+        # supplied), so a consumer never has to distinguish "absent" from "not computed".
+        "probability_of_backtest_overfitting": None,
+        "white_reality_check_p_value": None,
+        "hansen_spa_p_value": None,
     })
     if candidate_performance is not None:
         report["probability_of_backtest_overfitting"] = probability_of_backtest_overfitting(candidate_performance)

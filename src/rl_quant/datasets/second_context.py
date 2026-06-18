@@ -96,6 +96,16 @@ def _load_payload(path: str | bytes | PathLike[str]) -> dict[str, Any]:
     return payload
 
 
+def _first_present(payload: Any, *keys: str) -> Any:
+    """Return payload[<first key that is present>] (alias-aware), or raise KeyError if none are present.
+    Avoids the ``dict.get(k, payload[other])`` trap, where the indexed default is evaluated eagerly and
+    KeyErrors on a canonical-only payload even when ``k`` is present."""
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    raise KeyError(f"payload missing all of {keys}")
+
+
 def _masked_mean_std(features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     valid = mask.unsqueeze(-1).to(features.dtype)
     count = valid.sum(dim=(0, 1)).clamp_min(1.0)
@@ -160,8 +170,13 @@ def _build_split(
     market_context_available_timestamps_ms = payload["market_context_available_timestamps_ms"].long()[selected]
     raw_action_features = payload["action_features"].float()[selected]
     action_returns = payload["action_returns"].float()[selected]
-    action_valid_mask = payload.get("decision_action_valid_mask", payload["action_valid_mask"]).bool()[selected]
-    label_valid_mask = payload.get("label_valid_mask", payload["action_valid_mask"]).bool()[selected]
+    # Alias-aware lookup: `dict.get(k, payload[other])` would evaluate the default EAGERLY and KeyError on a
+    # canonical-only payload (decision_action_valid_mask but no legacy action_valid_mask). Pick the first key
+    # that is actually present instead. label falls back through its alias, then the legacy decision mask.
+    action_valid_mask = _first_present(payload, "decision_action_valid_mask", "action_valid_mask").bool()[selected]
+    label_valid_mask = _first_present(
+        payload, "label_valid_mask", "action_label_valid_mask", "action_valid_mask"
+    ).bool()[selected]
     _validate_action_return_contract(action_returns, label_valid_mask)
     action_cost_bps = payload["action_cost_bps"].float()[selected]
     if "action_target_weights" in payload:

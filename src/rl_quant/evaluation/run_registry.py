@@ -64,10 +64,20 @@ class RunRegistry:
         return sum(1 for t in self.trials if t.status == "failed")
 
     def n_for_multiple_testing(self) -> int:
-        """The honest trial count for DSR / PBO / RC / SPA: every trial flagged ``included_in_multiple_testing``
-        (completed OR failed -- a failed attempt is still a try that could have been the winner). At least 1
-        so the controls are always defined for a non-empty included set."""
-        return sum(1 for t in self.trials if t.included_in_multiple_testing)
+        """The honest trial count for DSR / PBO / RC / SPA: the number of FINISHED included trials --
+        ``complete`` or ``failed`` (a failed attempt is still a try that could have been the winner) flagged
+        ``included_in_multiple_testing``. Running (unfinished) trials are EXCLUDED -- they have no result to
+        compare; use ``is_final()`` to confirm the family is complete before treating this as the search size.
+        May be 0 for an empty / all-running / all-excluded registry, in which case the downstream DSR/PBO/RC/SPA
+        controls (which require n_trials >= 1) fail closed."""
+        return sum(
+            1 for t in self.trials if t.included_in_multiple_testing and t.status in ("complete", "failed")
+        )
+
+    def is_final(self) -> bool:
+        """True iff NO included trial is still ``running`` -- the experiment family is complete and its
+        multiple-testing count is stable. A final credibility report should require this."""
+        return not any(t.included_in_multiple_testing and t.status == "running" for t in self.trials)
 
     def to_manifest(self) -> dict[str, object]:
         """A JSON-serializable snapshot for the run/credibility artifact -- the auditable counts plus the
@@ -78,6 +88,7 @@ class RunRegistry:
             "n_completed_trials": self.n_completed(),
             "n_failed_trials": self.n_failed(),
             "n_trials_for_multiple_testing": self.n_for_multiple_testing(),
+            "is_final": self.is_final(),
             "trials": [
                 {"run_id": t.run_id, "status": t.status,
                  "included_in_multiple_testing": t.included_in_multiple_testing}

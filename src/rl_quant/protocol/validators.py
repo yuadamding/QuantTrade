@@ -325,10 +325,13 @@ def validate_decision_tensor_payload(
         _add("label_mask", validate_action_mask(label_mask, require_row_selectable=False))
     if action_returns is not None and decision_mask is not None:
         _add("cash_contract", validate_cash_contract(action_returns, decision_mask, cash_index=cash_index))
+    # Shape-check the RESOLVED tensors (alias-aware), not hardcoded canonical keys -- otherwise a payload
+    # carrying only the ``action_label_valid_mask`` alias (no ``label_valid_mask``) would skip its shape check.
     shape_arrays = {
-        name: payload[name]
-        for name in ("action_returns", "decision_action_valid_mask", "action_valid_mask", "label_valid_mask")
-        if payload.get(name) is not None
+        name: value
+        for name, value in (("action_returns", action_returns), ("decision_mask", decision_mask),
+                            ("label_mask", label_mask))
+        if value is not None
     }
     if len(shape_arrays) >= 2:
         _add("shapes", validate_decision_tensor_shapes(shape_arrays))

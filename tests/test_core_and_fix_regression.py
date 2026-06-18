@@ -3689,7 +3689,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertGreater(r1["probabilistic_sharpe_ratio"], 0.5)
         self.assertAlmostEqual(r1["deflated_sharpe_ratio"], r1["probabilistic_sharpe_ratio"], places=9)  # n_trials=1
         self.assertIsNotNone(r1["deflated_sharpe_promotion"])
-        self.assertNotIn("probability_of_backtest_overfitting", r1)  # optional, not supplied
+        # Optional data-snooping fields are PRESENT but None when their input is not supplied (stable schema).
+        for key in ("probability_of_backtest_overfitting", "white_reality_check_p_value", "hansen_spa_p_value"):
+            self.assertIsNone(r1[key])
         # Deflation: more trials -> higher expected-max, no-greater DSR.
         r100 = report(rets, n_trials=100)
         self.assertGreater(r100["expected_maximum_sharpe"], r1["expected_maximum_sharpe"])
@@ -3712,9 +3714,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         _json.dumps(full)  # the report is the reportable artifact -> must serialize
 
     def test_run_registry(self) -> None:
-        # The auditable trial count for the multiple-testing controls: count EVERY included trial (completed
-        # OR failed -- a failed attempt is still a try), not just the submitted winner; compose with the
-        # credibility report; JSON-serializable manifest; fail closed on duplicates / bad status / empty ids.
+        # The auditable trial count for the multiple-testing controls: count the FINISHED included trials
+        # (complete OR failed -- a failed attempt is still a try), EXCLUDING running (no result) and the
+        # cherry-picked-only winner; expose is_final(); compose with the credibility report; JSON-serializable
+        # manifest; fail closed on duplicates / bad status / empty ids.
         import json as _json
 
         from rl_quant.evaluation import RunRegistry, TrialRecord, statistical_credibility_report
@@ -3729,13 +3732,21 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(reg.n_declared(), 5)
         self.assertEqual(reg.n_completed(), 3)
         self.assertEqual(reg.n_failed(), 1)
-        self.assertEqual(reg.n_for_multiple_testing(), 4)  # r1..r4 included; r5 excluded
+        # complete+failed AND included: r1, r2, r3 (r4 running excluded; r5 not included) -> 3.
+        self.assertEqual(reg.n_for_multiple_testing(), 3)
+        self.assertFalse(reg.is_final())  # r4 (included) is still running
         manifest = reg.to_manifest()
-        self.assertEqual(manifest["n_trials_for_multiple_testing"], 4)
-        _json.dumps(manifest)
+        self.assertEqual(manifest["n_trials_for_multiple_testing"], 3)
+        self.assertFalse(manifest["is_final"])
+        _json.dumps(manifest)  # snapshot works even mid-sweep (does not raise)
+        # A finished family is final; a count of 0 (empty/all-excluded) is allowed (downstream n_trials>=1 gates).
+        final = RunRegistry("fam_v2", (TrialRecord("a", "complete"), TrialRecord("b", "failed")))
+        self.assertTrue(final.is_final())
+        self.assertEqual(final.n_for_multiple_testing(), 2)
+        self.assertEqual(RunRegistry("empty", ()).n_for_multiple_testing(), 0)
         # Composes with the credibility report -> the registry supplies the honest n_trials.
-        rep = statistical_credibility_report([0.01, -0.005, 0.02, 0.0] * 8, n_trials=reg.n_for_multiple_testing())
-        self.assertEqual(rep["n_trials"], 4)
+        rep = statistical_credibility_report([0.01, -0.005, 0.02, 0.0] * 8, n_trials=final.n_for_multiple_testing())
+        self.assertEqual(rep["n_trials"], 2)
         # Fail closed.
         with self.assertRaises(ValueError):
             RunRegistry("fam", (TrialRecord("dup", "complete"), TrialRecord("dup", "failed")))
@@ -3745,6 +3756,22 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             RunRegistry("", ())
         with self.assertRaises(ValueError):
             TrialRecord("", "complete")
+
+    def test_second_context_mask_alias_lookup_no_eager_keyerror(self) -> None:
+        # _build_split previously used payload.get("decision_action_valid_mask", payload["action_valid_mask"]),
+        # whose indexed default is evaluated EAGERLY -> KeyError on a canonical-only payload (no legacy alias).
+        # _first_present returns the first present key WITHOUT touching the others.
+        from rl_quant.datasets.second_context import _first_present
+
+        # Canonical key present -> returned; the absent legacy fallback is never indexed (no KeyError).
+        self.assertEqual(
+            _first_present({"decision_action_valid_mask": 7}, "decision_action_valid_mask", "action_valid_mask"), 7)
+        # Falls through aliases to the present one (label -> action_label_valid_mask -> legacy).
+        self.assertEqual(
+            _first_present({"action_label_valid_mask": 9}, "label_valid_mask", "action_label_valid_mask",
+                           "action_valid_mask"), 9)
+        with self.assertRaises(KeyError):
+            _first_present({"other": 1}, "label_valid_mask", "action_valid_mask")
 
     def test_ranker_metrics(self) -> None:
         # Cross-sectional ranker quality of the action SCORER: IC (Pearson), rank IC (Spearman), top-k realized
@@ -4009,6 +4036,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("require_full_contract" in m for m in issues))
         self.assertTrue(validate_decision_tensor_payload(good, require_full_contract=True)[0])
+        # Shape check uses the RESOLVED tensors, so a label mask carried ONLY via the action_label_valid_mask
+        # alias (no canonical label_valid_mask) and shaped wrong is still caught (previously skipped: the
+        # alias was absent from the hardcoded shape-key list, so only one array survived and the check no-op'd).
+        alias_only = {"decision_action_valid_mask": [[True, True], [True, True]],   # 2x2
+                      "action_label_valid_mask": [[True, True, True]]}              # 1x3 -- mismatched
+        ok, issues = validate_decision_tensor_payload(alias_only)
+        self.assertFalse(ok)
+        self.assertTrue(any("shapes" in m for m in issues), issues)
 
     def test_flag_registry_governance(self) -> None:
         # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
