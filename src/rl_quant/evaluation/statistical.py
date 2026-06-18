@@ -404,3 +404,83 @@ def hansens_spa(
         if stat >= observed:
             exceed += 1
     return (1 + exceed) / (n_bootstrap + 1)
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    """Linear-interpolated quantile (q in [0, 1]) of an already-sorted list (numpy 'linear' convention)."""
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = q * (len(sorted_values) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return sorted_values[int(lo)]
+    frac = pos - lo
+    return sorted_values[int(lo)] * (1.0 - frac) + sorted_values[int(hi)] * frac
+
+
+def _finite_floats(values: Sequence[float], name: str) -> list[float]:
+    """Validate that every entry is a finite, non-bool real number and return them as floats (ValueError
+    otherwise -- so a misuse fails closed with a clear message instead of a bare TypeError)."""
+    out: list[float] = []
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+            raise ValueError(f"{name} entries must be finite numbers; got {v!r}.")
+        out.append(float(v))
+    return out
+
+
+def walk_forward_degradation_ratio(
+    in_sample_scores: Sequence[float], out_of_sample_scores: Sequence[float]
+) -> float:
+    """Walk-forward efficiency (Pardo): mean OUT-OF-SAMPLE score / mean IN-SAMPLE score across walk-forward
+    folds. 1.0 = out-of-sample matches in-sample (no degradation); 0 < r < 1 = the edge degrades out of sample
+    (lower = more overfit); r <= 0 = the OOS edge vanished or reversed. Inputs are equal-length per-fold
+    performance scores (e.g. Sharpe or return per fold). Requires a POSITIVE in-sample mean -- there must be
+    an in-sample edge to degrade FROM. Pure; changes no backtest number."""
+    is_scores = _finite_floats(in_sample_scores, "in_sample_scores")
+    oos_scores = _finite_floats(out_of_sample_scores, "out_of_sample_scores")
+    if len(is_scores) != len(oos_scores):
+        raise ValueError("in_sample_scores and out_of_sample_scores must have equal length (one pair per fold).")
+    if len(is_scores) < 1:
+        raise ValueError("need at least one walk-forward fold.")
+    is_mean = sum(is_scores) / len(is_scores)
+    if is_mean <= 0.0:
+        raise ValueError(f"in-sample mean score must be positive to measure degradation; got {is_mean!r}.")
+    return (sum(oos_scores) / len(oos_scores)) / is_mean
+
+
+def block_bootstrap_confidence_interval(
+    returns: Sequence[float], *, statistic: str = "mean", confidence: float = 0.95,
+    n_bootstrap: int = 1000, block_size: float | None = None, seed: int = 0,
+) -> tuple[float, float]:
+    """Percentile confidence interval ``(low, high)`` for a return series' ``statistic`` -- "mean" or "sharpe"
+    (per-observation mean/std) -- via the Politis-Romano STATIONARY block bootstrap (mean block ~ sqrt(n) by
+    default), which preserves serial dependence rather than assuming i.i.d. returns. ``confidence`` is the
+    two-sided coverage (0.95 -> the 2.5th/97.5th bootstrap percentiles). Deterministic given ``seed``.
+    Pure/stdlib; changes no backtest number."""
+    if statistic not in ("mean", "sharpe"):
+        raise ValueError(f"statistic must be 'mean' or 'sharpe'; got {statistic!r}.")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not (0.0 < float(confidence) < 1.0):
+        raise ValueError(f"confidence must be a number in (0, 1); got {confidence!r}.")
+    if isinstance(n_bootstrap, bool) or not isinstance(n_bootstrap, int) or n_bootstrap < 1:
+        raise ValueError(f"n_bootstrap must be a positive integer; got {n_bootstrap!r}.")
+    values = _finite_floats(returns, "returns")
+    n_obs = len(values)
+    if n_obs < 2:
+        raise ValueError(f"need at least 2 observations; got {n_obs}.")
+    if block_size is None:
+        mean_block = max(1.0, float(round(math.sqrt(n_obs))))
+    elif isinstance(block_size, bool) or not isinstance(block_size, (int, float)) or block_size < 1:
+        raise ValueError(f"block_size must be a number >= 1; got {block_size!r}.")
+    else:
+        mean_block = float(block_size)
+    rng = random.Random(seed)
+    stats: list[float] = []
+    for _ in range(n_bootstrap):
+        idx = _stationary_bootstrap_indices(n_obs, mean_block, rng)
+        sample = [values[t] for t in idx]
+        stats.append(sum(sample) / n_obs if statistic == "mean" else _series_sharpe(sample))
+    stats.sort()
+    alpha = (1.0 - float(confidence)) / 2.0
+    return (_percentile(stats, alpha), _percentile(stats, 1.0 - alpha))

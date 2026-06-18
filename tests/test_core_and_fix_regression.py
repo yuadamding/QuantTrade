@@ -3610,6 +3610,57 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fn(edge, n_bootstrap=0)
 
+    def test_walk_forward_degradation_and_block_bootstrap_ci(self) -> None:
+        # Walk-forward efficiency (Pardo): mean OOS / mean IS across folds. Block-bootstrap CI: stationary-
+        # bootstrap percentile interval for a series' mean/Sharpe (preserves serial dependence). Both pure and
+        # deterministic given seed. (Behaviors verified against Monte Carlo before pinning.)
+        import math as _math
+
+        from rl_quant.evaluation import (
+            block_bootstrap_confidence_interval as bci,
+            walk_forward_degradation_ratio as wfd,
+        )
+
+        # Degradation ratio: half the IS edge survives OOS -> 0.5; matched -> 1.0; gone -> 0.0; reversed -> <0.
+        self.assertAlmostEqual(wfd([1.0, 1.0, 1.0], [0.5, 0.5, 0.5]), 0.5, places=12)
+        self.assertAlmostEqual(wfd([2.0, 1.0], [2.0, 1.0]), 1.0, places=12)
+        self.assertAlmostEqual(wfd([2.0, 1.0], [-1.0, 1.0]), 0.0, places=12)
+        self.assertLess(wfd([1.0, 1.0], [-0.5, -0.5]), 0.0)
+        with self.assertRaises(ValueError):
+            wfd([1.0], [1.0, 1.0])                       # length mismatch
+        with self.assertRaises(ValueError):
+            wfd([0.0, 0.0], [1.0, 1.0])                  # non-positive in-sample mean
+        with self.assertRaises(ValueError):
+            wfd([float("nan"), 1.0], [1.0, 1.0])         # non-finite
+
+        # Block-bootstrap CI: a constant series collapses to a point; a varied series' CI brackets the mean,
+        # is ordered lo <= hi, and a higher confidence is not narrower; deterministic given the seed.
+        lo, hi = bci([0.01] * 80, statistic="mean", n_bootstrap=300)
+        self.assertAlmostEqual(lo, 0.01, places=9)
+        self.assertAlmostEqual(hi, 0.01, places=9)
+        series = [0.01 + 0.02 * _math.sin(t * 0.5) for t in range(200)]
+        mean = sum(series) / len(series)
+        lo, hi = bci(series, statistic="mean", confidence=0.95, n_bootstrap=400)
+        self.assertLessEqual(lo, mean)
+        self.assertLessEqual(mean, hi)
+        self.assertLess(lo, hi)
+        lo99, hi99 = bci(series, statistic="mean", confidence=0.99, n_bootstrap=400)
+        self.assertLessEqual(hi - lo, (hi99 - lo99) + 1e-12)     # higher confidence -> not narrower
+        self.assertEqual(bci(series, n_bootstrap=200), bci(series, n_bootstrap=200))   # deterministic
+        lo_s, hi_s = bci(series, statistic="sharpe", n_bootstrap=300)
+        self.assertLessEqual(lo_s, hi_s)
+        # Fail closed: bad statistic, confidence out of (0,1), < 2 obs, non-finite, n_bootstrap < 1.
+        with self.assertRaises(ValueError):
+            bci(series, statistic="median")
+        with self.assertRaises(ValueError):
+            bci(series, confidence=1.0)
+        with self.assertRaises(ValueError):
+            bci([0.01])
+        with self.assertRaises(ValueError):
+            bci([0.0, float("nan")])
+        with self.assertRaises(ValueError):
+            bci(series, n_bootstrap=0)
+
     def test_protocol_model_input_label_split_validator(self) -> None:
         # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
         # label/future field must NEVER be a model input. Pure/additive (changes no data or training).

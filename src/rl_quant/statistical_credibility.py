@@ -6,6 +6,7 @@ from rl_quant.evaluation.statistical import (
     DSR_PROMOTION_CONFIDENCE,
     PSR_MIN_CREDIBLE_OBSERVATIONS,
     PromotionVerdict,
+    block_bootstrap_confidence_interval,
     deflated_sharpe_promotion_verdict,
     deflated_sharpe_ratio,
     effective_sample_size,
@@ -14,6 +15,7 @@ from rl_quant.evaluation.statistical import (
     probabilistic_sharpe_ratio,
     probability_of_backtest_overfitting,
     psr_is_credible,
+    walk_forward_degradation_ratio,
     white_reality_check,
 )
 
@@ -21,6 +23,7 @@ __all__ = [
     "DSR_PROMOTION_CONFIDENCE",
     "PSR_MIN_CREDIBLE_OBSERVATIONS",
     "PromotionVerdict",
+    "block_bootstrap_confidence_interval",
     "deflated_sharpe_promotion_verdict",
     "deflated_sharpe_ratio",
     "effective_sample_size",
@@ -29,5 +32,6 @@ __all__ = [
     "probabilistic_sharpe_ratio",
     "probability_of_backtest_overfitting",
     "psr_is_credible",
+    "walk_forward_degradation_ratio",
     "white_reality_check",
 ]
