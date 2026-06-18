@@ -16,6 +16,7 @@ and trainer. All Sharpe inputs are PER-OBSERVATION (non-annualized) Sharpe ratio
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from statistics import NormalDist
 
 _NORMAL = NormalDist()
@@ -108,4 +109,75 @@ def deflated_sharpe_ratio(
         n_observations=n_observations,
         skewness=skewness,
         kurtosis=kurtosis,
+    )
+
+
+# Confidence the Deflated Sharpe must clear to PROMOTE (one-sided). 0.95 is the conventional 5%
+# selection-risk bar; like the PSR observation floor it is a REPORTABILITY/decision threshold, not a hard
+# statistical law, and it gates nothing on its own -- the A/B / report layer reads the verdict and decides.
+DSR_PROMOTION_CONFIDENCE = 0.95
+
+
+@dataclass(frozen=True)
+class PromotionVerdict:
+    """A reportable promotion decision for a candidate Sharpe AFTER deflating for the number of configs/seeds
+    tried. ``promote`` is True ONLY when the Deflated Sharpe clears the confidence bar AND the estimate rests
+    on enough net returns to be credible. ``reasons`` is empty when promoted and otherwise names every failed
+    gate, so a report can show WHY a candidate was held -- not merely that it was."""
+
+    promote: bool
+    deflated_sharpe_ratio: float
+    n_trials: int
+    n_observations: int
+    confidence: float
+    is_significant: bool
+    is_credible: bool
+    reasons: tuple[str, ...]
+
+
+def deflated_sharpe_promotion_verdict(
+    observed_sharpe: float,
+    *,
+    n_trials: int,
+    n_observations: int,
+    skewness: float = 0.0,
+    kurtosis: float = 3.0,
+    trials_sharpe_std: float = 1.0,
+    confidence: float = DSR_PROMOTION_CONFIDENCE,
+) -> PromotionVerdict:
+    """Synthesize the two controls a promotion gate needs into ONE verdict -- the review's point that PSR
+    alone (n_trials = 1) is NOT a promotion gate. (1) The Deflated Sharpe Ratio (probability the observed
+    per-period Sharpe is real AFTER deflating for selection over ``n_trials`` configs/seeds) must reach
+    ``confidence``; AND (2) the estimate must rest on at least ``PSR_MIN_CREDIBLE_OBSERVATIONS`` net returns
+    (a high DSR off a handful of points is not promotable). A pure decision helper: it changes no backtest
+    number and gates nothing on its own. Requires ``n_observations >= 2`` (inherited from the DSR/PSR
+    contract -- caller pre-checks estimability); raises on a confidence outside (0, 1)."""
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not (0.0 < float(confidence) < 1.0):
+        raise ValueError(f"confidence must be a number in (0, 1); got {confidence!r}.")
+    dsr = deflated_sharpe_ratio(
+        observed_sharpe,
+        n_trials=n_trials,
+        n_observations=n_observations,
+        skewness=skewness,
+        kurtosis=kurtosis,
+        trials_sharpe_std=trials_sharpe_std,
+    )
+    is_significant = dsr >= float(confidence)
+    is_credible = n_observations >= PSR_MIN_CREDIBLE_OBSERVATIONS
+    reasons: list[str] = []
+    if not is_significant:
+        reasons.append(f"deflated_sharpe_ratio {dsr:.4f} < confidence {float(confidence):.4f}")
+    if not is_credible:
+        reasons.append(
+            f"n_observations {n_observations} < PSR_MIN_CREDIBLE_OBSERVATIONS {PSR_MIN_CREDIBLE_OBSERVATIONS}"
+        )
+    return PromotionVerdict(
+        promote=is_significant and is_credible,
+        deflated_sharpe_ratio=dsr,
+        n_trials=n_trials,
+        n_observations=n_observations,
+        confidence=float(confidence),
+        is_significant=is_significant,
+        is_credible=is_credible,
+        reasons=tuple(reasons),
     )

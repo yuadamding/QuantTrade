@@ -9648,6 +9648,63 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             expected_maximum_sharpe(0)
 
+    def test_deflated_sharpe_promotion_verdict(self) -> None:
+        # The promotion synthesis the review insists on: PSR alone is NOT a gate. A verdict promotes ONLY when
+        # the Deflated Sharpe (deflated for n_trials) clears the confidence bar AND the estimate rests on
+        # enough observations. Both gates are reported explicitly so a held candidate shows WHY it was held.
+        from rl_quant.evaluation import (  # also exercises the package re-export
+            DSR_PROMOTION_CONFIDENCE,
+            PSR_MIN_CREDIBLE_OBSERVATIONS,
+            deflated_sharpe_promotion_verdict,
+            deflated_sharpe_ratio,
+            probabilistic_sharpe_ratio,
+        )
+
+        floor = PSR_MIN_CREDIBLE_OBSERVATIONS
+
+        # (a) Strong edge, single trial (no selection), plenty of observations -> promote, no reasons.
+        good = deflated_sharpe_promotion_verdict(0.3, n_trials=1, n_observations=200)
+        self.assertTrue(good.promote)
+        self.assertTrue(good.is_significant and good.is_credible)
+        self.assertEqual(good.reasons, ())
+        # The verdict's DSR must equal the standalone DSR exactly; for n_trials=1 that is PSR vs 0.
+        self.assertEqual(good.deflated_sharpe_ratio, deflated_sharpe_ratio(0.3, n_trials=1, n_observations=200))
+        self.assertAlmostEqual(
+            good.deflated_sharpe_ratio, probabilistic_sharpe_ratio(0.3, benchmark_sharpe=0.0, n_observations=200),
+            places=12,
+        )
+
+        # (b) Significant but BELOW the observation floor -> not credible -> held, reason names observations only.
+        thin = deflated_sharpe_promotion_verdict(0.5, n_trials=1, n_observations=floor - 1)
+        self.assertTrue(thin.is_significant)        # DSR clears the bar...
+        self.assertFalse(thin.is_credible)          # ...but too few observations
+        self.assertFalse(thin.promote)
+        self.assertEqual(len(thin.reasons), 1)
+        self.assertIn("n_observations", thin.reasons[0])
+
+        # (c) Selection over MANY trials deflates a real-looking edge below the bar -> held on significance.
+        deflated = deflated_sharpe_promotion_verdict(0.5, n_trials=1000, n_observations=500)
+        self.assertFalse(deflated.is_significant)
+        self.assertTrue(deflated.is_credible)
+        self.assertFalse(deflated.promote)
+        self.assertIn("deflated_sharpe_ratio", deflated.reasons[0])
+
+        # Deflation is monotone: more trials never RAISES the DSR (so never makes a held candidate promotable).
+        self.assertGreaterEqual(
+            deflated_sharpe_promotion_verdict(0.3, n_trials=1, n_observations=200).deflated_sharpe_ratio,
+            deflated_sharpe_promotion_verdict(0.3, n_trials=100, n_observations=200).deflated_sharpe_ratio,
+        )
+        # promote is exactly the conjunction of the two gates, and reasons is empty iff promoted.
+        for v in (good, thin, deflated):
+            self.assertEqual(v.promote, v.is_significant and v.is_credible)
+            self.assertEqual(v.reasons == (), v.promote)
+        self.assertEqual(good.confidence, DSR_PROMOTION_CONFIDENCE)
+
+        # confidence must be a probability in (0, 1); boundaries and out-of-range fail closed.
+        for bad in (0.0, 1.0, -0.1, 1.5, True):
+            with self.assertRaises(ValueError):
+                deflated_sharpe_promotion_verdict(0.3, n_trials=1, n_observations=200, confidence=bad)
+
     def test_protocol_model_input_label_split_validator(self) -> None:
         # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
         # label/future field must NEVER be a model input. Pure/additive (changes no data or training).

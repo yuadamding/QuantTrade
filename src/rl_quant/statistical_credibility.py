@@ -3,13 +3,23 @@
 import path working (see architecture_migration_plan.md)."""
 
 from rl_quant.evaluation.statistical import (
+    DSR_PROMOTION_CONFIDENCE,
+    PSR_MIN_CREDIBLE_OBSERVATIONS,
+    PromotionVerdict,
+    deflated_sharpe_promotion_verdict,
     deflated_sharpe_ratio,
     expected_maximum_sharpe,
     probabilistic_sharpe_ratio,
+    psr_is_credible,
 )
 
 __all__ = [
+    "DSR_PROMOTION_CONFIDENCE",
+    "PSR_MIN_CREDIBLE_OBSERVATIONS",
+    "PromotionVerdict",
+    "deflated_sharpe_promotion_verdict",
     "deflated_sharpe_ratio",
     "expected_maximum_sharpe",
     "probabilistic_sharpe_ratio",
+    "psr_is_credible",
 ]
