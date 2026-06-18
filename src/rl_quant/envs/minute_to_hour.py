@@ -465,6 +465,64 @@ class VectorizedMinuteToHourEnv:
         cash_actions = torch.full_like(actions, self.cash_index)
         return torch.where(selected_label_valid, actions, cash_actions)
 
+    def _advance_env_state(
+        self,
+        current_indices: torch.Tensor,
+        actions: torch.Tensor,
+        is_switch: torch.Tensor,
+        legs: torch.Tensor,
+        raw_returns: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Advance env state ONE step after the executed actions are known: roll indices + held-state forward,
+        update the constraint counters (incl. the day-boundary reset of the daily counters), advance the
+        dynamic position excursion, and compute terminal-vs-truncation. Returns
+        ``(next_indices, next_position_dynamic, terminated, resets)``. Verbatim state mutation moved out of
+        step() -- byte-identical."""
+        next_indices = current_indices + 1
+        self.indices = next_indices
+        self.previous_actions = actions
+        self.bars_held = torch.where(is_switch, torch.ones_like(self.bars_held), self.bars_held + 1)
+        self.cooldown_remaining = torch.where(
+            is_switch,
+            torch.full_like(self.cooldown_remaining, int(self.constraints.cooldown_bars)),
+            torch.clamp_min(self.cooldown_remaining - 1, 0),
+        )
+        self.switches_today = self.switches_today + is_switch.long()
+        self.switches_episode = self.switches_episode + is_switch.long()
+        self.order_legs_today = self.order_legs_today + legs
+        self.order_legs_episode = self.order_legs_episode + legs
+        self.steps = self.steps + 1
+        # D0 dynamic bookkeeping (computed from existing state only; not fed to reward/model/replay): on a HOLD
+        # compound this step's return into the position held since entry and extend MAE/MFE; on a SWITCH the new
+        # position starts fresh this step (entry row = the current decision row). Held across a day boundary is
+        # still held, so unlike the daily switch/leg counters below, this state is NOT reset on a new day.
+        held = ~is_switch
+        self.entry_index = torch.where(is_switch, current_indices, self.entry_index)
+        self.unrealized_pnl, self.mae, self.mfe = advance_position_excursion(
+            self.unrealized_pnl, self.mae, self.mfe, raw_returns, held=held
+        )
+        next_position_dynamic = self.dynamic_state()  # PR-D: post-action dynamic state (enters the next bar)
+
+        in_bounds = next_indices < self.data.action_returns.shape[0]
+        next_valid = torch.zeros_like(in_bounds)
+        if bool(in_bounds.any().item()):
+            next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
+        # Distinguish a TRUE terminal (no valid next row -> nothing to bootstrap from) from a mere
+        # episode-length TRUNCATION (a rollout boundary whose next row is a real continuation). DQN
+        # must bootstrap through truncations; only `terminated` may zero the TD bootstrap. `resets`
+        # ends the episode (terminal OR truncation) and drives env reset (matches strategy/intraday).
+        terminated = ~next_valid
+        truncated = self.steps >= self.episode_length
+        resets = terminated | truncated
+        if bool(in_bounds.any().item()):
+            old_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in current_indices[in_bounds].detach().cpu()]
+            new_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in next_indices[in_bounds].detach().cpu()]
+            reset_today = torch.tensor([old != new for old, new in zip(old_dates, new_dates)], dtype=torch.bool, device=self.device)
+            valid_positions = torch.where(in_bounds)[0]
+            self.switches_today[valid_positions[reset_today]] = 0
+            self.order_legs_today[valid_positions[reset_today]] = 0.0
+        return next_indices, next_position_dynamic, terminated, resets
+
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
         previous_actions = self.previous_actions.clone()
@@ -514,49 +572,9 @@ class VectorizedMinuteToHourEnv:
                 reward_scale=self.reward_scale,
             )
 
-        next_indices = current_indices + 1
-        self.indices = next_indices
-        self.previous_actions = actions
-        self.bars_held = torch.where(is_switch, torch.ones_like(self.bars_held), self.bars_held + 1)
-        self.cooldown_remaining = torch.where(
-            is_switch,
-            torch.full_like(self.cooldown_remaining, int(self.constraints.cooldown_bars)),
-            torch.clamp_min(self.cooldown_remaining - 1, 0),
+        next_indices, next_position_dynamic, terminated, resets = self._advance_env_state(
+            current_indices, actions, is_switch, legs, raw_returns
         )
-        self.switches_today = self.switches_today + is_switch.long()
-        self.switches_episode = self.switches_episode + is_switch.long()
-        self.order_legs_today = self.order_legs_today + legs
-        self.order_legs_episode = self.order_legs_episode + legs
-        self.steps = self.steps + 1
-        # D0 dynamic bookkeeping (computed from existing state only; not fed to reward/model/replay): on a HOLD
-        # compound this step's return into the position held since entry and extend MAE/MFE; on a SWITCH the new
-        # position starts fresh this step (entry row = the current decision row). Held across a day boundary is
-        # still held, so unlike the daily switch/leg counters below, this state is NOT reset on a new day.
-        held = ~is_switch
-        self.entry_index = torch.where(is_switch, current_indices, self.entry_index)
-        self.unrealized_pnl, self.mae, self.mfe = advance_position_excursion(
-            self.unrealized_pnl, self.mae, self.mfe, raw_returns, held=held
-        )
-        next_position_dynamic = self.dynamic_state()  # PR-D: post-action dynamic state (enters the next bar)
-
-        in_bounds = next_indices < self.data.action_returns.shape[0]
-        next_valid = torch.zeros_like(in_bounds)
-        if bool(in_bounds.any().item()):
-            next_valid[in_bounds] = self.data.valid_index_mask[next_indices[in_bounds]]
-        # Distinguish a TRUE terminal (no valid next row -> nothing to bootstrap from) from a mere
-        # episode-length TRUNCATION (a rollout boundary whose next row is a real continuation). DQN
-        # must bootstrap through truncations; only `terminated` may zero the TD bootstrap. `resets`
-        # ends the episode (terminal OR truncation) and drives env reset (matches strategy/intraday).
-        terminated = ~next_valid
-        truncated = self.steps >= self.episode_length
-        resets = terminated | truncated
-        if bool(in_bounds.any().item()):
-            old_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in current_indices[in_bounds].detach().cpu()]
-            new_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in next_indices[in_bounds].detach().cpu()]
-            reset_today = torch.tensor([old != new for old, new in zip(old_dates, new_dates)], dtype=torch.bool, device=self.device)
-            valid_positions = torch.where(in_bounds)[0]
-            self.switches_today[valid_positions[reset_today]] = 0
-            self.order_legs_today[valid_positions[reset_today]] = 0.0
 
         next_constraint_features = self.constraint_features()
         next_action_mask = self.action_mask(next_indices)
