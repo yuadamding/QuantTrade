@@ -212,7 +212,7 @@ running the canonical `scripts/*.py` entry points directly.)
 
 `src/rl_quant/` is a **protocol-first, layered package**. Code is organized by
 layer, lowest (no rl_quant deps) to highest; a layer may import only from lower
-layers (enforced by `tests/test_correctness.py::test_architecture_layer_import_boundaries`).
+layers (enforced by `tests/test_core_and_fix_regression.py::CoreAndFixRegressionTests::test_architecture_layer_import_boundaries`).
 The flat top-level `*.py` files (other than the foundation modules below) are
 **backward-compatibility shims** — 3–6 line re-exports of the canonical package
 modules, kept so old import paths keep working. **New code should import the
@@ -244,7 +244,7 @@ QuantTrade/
     # --- backward-compat shims (flat) ---
     action_risk.py confidence.py decision_framework.py hourly_transformer.py ...  # -> canonical modules
   scripts/*.py
-  tests/test_correctness.py
+  tests/                 # _support.py (ROOT/SRC/load_script) + per-domain test_*.py suites
 ```
 
 Key modules by layer (canonical paths):
@@ -1204,10 +1204,17 @@ conda run -n ml1 python -m compileall -q src scripts tests
 conda run -n ml1 pytest -q
 ```
 
-Current tests are concentrated in:
+The suite lives under `tests/` as per-domain files (run all with `pytest tests/`), sharing
+`tests/_support.py` (`ROOT` / `SRC` / `load_script`):
 
 ```text
-tests/test_correctness.py
+tests/
+  _support.py                       test_action_risk.py
+  test_bar_dataset.py               test_core_and_fix_regression.py
+  test_daily_parser.py              test_decision_framework.py
+  test_evaluation.py                test_hourly_split.py
+  test_minute_to_hour.py            test_repository_hygiene.py
+  test_research_protocol.py         test_schema.py
 ```
 
 The tests cover:
