@@ -143,41 +143,71 @@ def transition_trade_cost_bps(
     )
 
 
-def validate_minute_to_hour_constraints(constraints: TradingConstraintConfig, action_names: list[str]) -> int:
-    """Entry-point validation of the constraint fields that feed BOTH the action mask and the cost ledger, and
-    return the validated cash_index. transition_trade_cost_bps re-checks these per step, but build_action_mask
-    consumes ``count_etf_to_etf_as_two_legs`` (and cash_index) BEFORE the cost helper runs -- so a malformed
-    value (e.g. the truthy string "false") could skew action availability / observe() first. Validating here,
-    at env/eval construction, closes that ordering gap so masks never see an unvalidated constraint."""
+@dataclass(frozen=True)
+class NormalizedMinuteToHourConstraints:
+    """The validated, CANONICAL-typed form of the minute->hour trading constraints.
+
+    Field names mirror TradingConstraintConfig so this is a drop-in for the attribute-reading consumers
+    (transition_trade_cost_bps, make_constraint_features, build_action_mask kwargs). Every field has been
+    coerced to a canonical Python type (int/float/bool, or None for an unset cap), so a numeric-string or
+    numpy-scalar config value can never reach the runtime un-normalized. Frozen, so the validated values cannot
+    be mutated after construction. The env/evaluator store and use THIS object instead of the raw config, which
+    is what closes the "validated but still raw" drift the review flagged."""
+
+    cash_index: int
+    count_etf_to_etf_as_two_legs: bool
+    one_way_cost_bps: float
+    extra_switch_penalty_bps: float
+    q_switch_margin_bps: float
+    min_hold_bars: int
+    cooldown_bars: int
+    max_switches_per_day: int | None
+    max_switches_per_episode: int | None
+    max_order_legs_per_day: float | None
+    max_order_legs_per_episode: float | None
+
+
+def validate_minute_to_hour_constraints(
+    constraints: TradingConstraintConfig, action_names: list[str]
+) -> NormalizedMinuteToHourConstraints:
+    """Validate the constraint fields that feed BOTH the action mask and the cost ledger and return their
+    NORMALIZED (canonical-typed) form. Consumers should use the returned object rather than the raw config so a
+    validated value is the only value used. transition_trade_cost_bps re-checks these per step, but
+    build_action_mask consumes ``count_etf_to_etf_as_two_legs`` (and cash_index) BEFORE the cost helper runs --
+    so a malformed value (e.g. the truthy string "false") could skew action availability / observe() first.
+    Validating here, at env/eval construction, closes that ordering gap so masks never see an unvalidated (or
+    un-normalized) constraint."""
     cash_index = validate_cash_index_for_actions(action_names, constraints.cash_index)
     if not isinstance(constraints.count_etf_to_etf_as_two_legs, bool):
         raise ValueError(
             "constraints.count_etf_to_etf_as_two_legs must be a bool, got "
             f"{constraints.count_etf_to_etf_as_two_legs!r}."
         )
-    # bps scalars feed the cost ledger / hysteresis scoring; reject bool/NaN/inf/negative. q_switch_margin_bps
-    # in particular would poison hysteresis if NaN (every comparison against it is False).
-    coerce_finite_nonnegative("constraints.one_way_cost_bps", constraints.one_way_cost_bps)
-    coerce_finite_nonnegative("constraints.extra_switch_penalty_bps", constraints.extra_switch_penalty_bps)
-    coerce_finite_nonnegative("constraints.q_switch_margin_bps", constraints.q_switch_margin_bps)
-    # Hold/cooldown bar counts feed the mask; reject bool / fractional / negative (int(True)/int(1.9) would
-    # silently mis-gate switching).
-    require_nonnegative_int("constraints.min_hold_bars", constraints.min_hold_bars)
-    require_nonnegative_int("constraints.cooldown_bars", constraints.cooldown_bars)
-    # Switch / order-leg caps are optional (None = uncapped); validate only when set.
-    for name, value in (
-        ("constraints.max_switches_per_day", constraints.max_switches_per_day),
-        ("constraints.max_switches_per_episode", constraints.max_switches_per_episode),
-    ):
-        if value is not None:
-            require_nonnegative_int(name, value)
-    for name, value in (
-        ("constraints.max_order_legs_per_day", constraints.max_order_legs_per_day),
-        ("constraints.max_order_legs_per_episode", constraints.max_order_legs_per_episode),
-    ):
-        if value is not None:
-            coerce_finite_nonnegative(name, value)
-    return cash_index
+
+    def _opt_int(name: str, value: object) -> int | None:  # optional cap: None = uncapped
+        return None if value is None else require_nonnegative_int(name, value)
+
+    def _opt_bps(name: str, value: object) -> float | None:
+        return None if value is None else coerce_finite_nonnegative(name, value)
+
+    # bps scalars feed the cost ledger / hysteresis scoring; reject bool/NaN/inf/negative (q_switch_margin_bps
+    # NaN would poison hysteresis -- every comparison against it is False). Hold/cooldown bar counts feed the
+    # mask; reject bool / fractional / negative (int(True)/int(1.9) would silently mis-gate switching).
+    return NormalizedMinuteToHourConstraints(
+        cash_index=cash_index,
+        count_etf_to_etf_as_two_legs=bool(constraints.count_etf_to_etf_as_two_legs),
+        one_way_cost_bps=coerce_finite_nonnegative("constraints.one_way_cost_bps", constraints.one_way_cost_bps),
+        extra_switch_penalty_bps=coerce_finite_nonnegative(
+            "constraints.extra_switch_penalty_bps", constraints.extra_switch_penalty_bps),
+        q_switch_margin_bps=coerce_finite_nonnegative("constraints.q_switch_margin_bps", constraints.q_switch_margin_bps),
+        min_hold_bars=require_nonnegative_int("constraints.min_hold_bars", constraints.min_hold_bars),
+        cooldown_bars=require_nonnegative_int("constraints.cooldown_bars", constraints.cooldown_bars),
+        max_switches_per_day=_opt_int("constraints.max_switches_per_day", constraints.max_switches_per_day),
+        max_switches_per_episode=_opt_int("constraints.max_switches_per_episode", constraints.max_switches_per_episode),
+        max_order_legs_per_day=_opt_bps("constraints.max_order_legs_per_day", constraints.max_order_legs_per_day),
+        max_order_legs_per_episode=_opt_bps(
+            "constraints.max_order_legs_per_episode", constraints.max_order_legs_per_episode),
+    )
 
 
 class VectorizedMinuteToHourEnv:
@@ -190,7 +220,10 @@ class VectorizedMinuteToHourEnv:
         self.initial_action = validate_action_index_for_actions(
             data.action_names, config.initial_action, name="initial_action"
         )
-        self.cash_index = validate_minute_to_hour_constraints(config.constraints, data.action_names)
+        # Store the NORMALIZED constraints (canonical types) and use them everywhere instead of the raw config,
+        # so a numeric-string / numpy-scalar config value can never reach the mask / cost ledger un-normalized.
+        self.constraints = validate_minute_to_hour_constraints(config.constraints, data.action_names)
+        self.cash_index = self.constraints.cash_index
         # reward_scale multiplies every reward and normalises the shadow bps artifacts, so a zero/negative/
         # non-finite value would zero, flip, or blow them up -- validate and STORE the canonical float.
         self.reward_scale = coerce_finite_positive("reward_scale", config.reward_scale)
@@ -256,7 +289,7 @@ class VectorizedMinuteToHourEnv:
         random_ids = torch.randint(0, self.start_indices.shape[0], (count,), device=self.device)
         self.indices[mask] = self.start_indices[random_ids]
         self.previous_actions[mask] = self.initial_action
-        self.bars_held[mask] = int(self.config.constraints.min_hold_bars)
+        self.bars_held[mask] = int(self.constraints.min_hold_bars)
         self.cooldown_remaining[mask] = 0
         self.switches_today[mask] = 0
         self.switches_episode[mask] = 0
@@ -275,7 +308,7 @@ class VectorizedMinuteToHourEnv:
             cooldown_remaining=self.cooldown_remaining,
             switches_today=self.switches_today,
             switches_episode=self.switches_episode,
-            constraints=self.config.constraints,
+            constraints=self.constraints,
             episode_length=self.config.episode_length,
             order_legs_today=self.order_legs_today,
             order_legs_episode=self.order_legs_episode,
@@ -287,17 +320,17 @@ class VectorizedMinuteToHourEnv:
             bars_held=self.bars_held,
             cooldown_remaining=self.cooldown_remaining,
             switches_today=self.switches_today,
-            max_switches_per_day=self.config.constraints.max_switches_per_day,
-            min_hold_bars=self.config.constraints.min_hold_bars,
+            max_switches_per_day=self.constraints.max_switches_per_day,
+            min_hold_bars=self.constraints.min_hold_bars,
             action_count=len(self.data.action_names),
             switches_episode=self.switches_episode,
-            max_switches_per_episode=self.config.constraints.max_switches_per_episode,
+            max_switches_per_episode=self.constraints.max_switches_per_episode,
             order_legs_today=self.order_legs_today,
-            max_order_legs_per_day=self.config.constraints.max_order_legs_per_day,
+            max_order_legs_per_day=self.constraints.max_order_legs_per_day,
             order_legs_episode=self.order_legs_episode,
-            max_order_legs_per_episode=self.config.constraints.max_order_legs_per_episode,
+            max_order_legs_per_episode=self.constraints.max_order_legs_per_episode,
             cash_index=self.cash_index,
-            count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
+            count_etf_to_etf_as_two_legs=self.constraints.count_etf_to_etf_as_two_legs,
         )
         if row_indices is None:
             row_indices = self.indices
@@ -403,7 +436,7 @@ class VectorizedMinuteToHourEnv:
         cost = transition_trade_cost_bps(
             previous_actions,
             actions,
-            constraints=self.config.constraints,
+            constraints=self.constraints,
             cash_idle_penalty_bps=self.config.cash_idle_penalty_bps,
             action_count=len(self.data.action_names),
         )
@@ -440,7 +473,7 @@ class VectorizedMinuteToHourEnv:
         self.bars_held = torch.where(is_switch, torch.ones_like(self.bars_held), self.bars_held + 1)
         self.cooldown_remaining = torch.where(
             is_switch,
-            torch.full_like(self.cooldown_remaining, int(self.config.constraints.cooldown_bars)),
+            torch.full_like(self.cooldown_remaining, int(self.constraints.cooldown_bars)),
             torch.clamp_min(self.cooldown_remaining - 1, 0),
         )
         self.switches_today = self.switches_today + is_switch.long()

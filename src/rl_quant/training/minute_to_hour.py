@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from os import PathLike
 from pathlib import Path
 from typing import Any
@@ -181,8 +181,11 @@ def evaluate_minute_to_hour_policy(
     constraints = constraints or default_minute_to_hour_constraints()
     # Same fail-closed constraint/index checks the env runs at construction (cash_index is a real CASH action,
     # count_etf is a real bool, bps scalars finite/non-negative, initial_action in range), so the evaluator
-    # cannot silently price against the wrong action / leg basis or start from a bad initial_action.
-    cash_index = validate_minute_to_hour_constraints(constraints, data.action_names)
+    # cannot silently price against the wrong action / leg basis or start from a bad initial_action. Rebinding
+    # `constraints` to the NORMALIZED object means every downstream read (masks, hysteresis, cost, features)
+    # uses canonical-typed values -- the evaluator never touches the raw config again.
+    constraints = validate_minute_to_hour_constraints(constraints, data.action_names)
+    cash_index = constraints.cash_index
     validate_action_index_for_actions(data.action_names, initial_action, name="initial_action")
     # reward_scale multiplies the net return into the reward; reject + normalise (zero/negative/non-finite
     # would zero, flip, or blow up the scored reward), matching the env's construction-time guard.
@@ -455,9 +458,11 @@ def evaluate_minute_to_hour_baselines(
     baseline is not expressible here; the references are always-cash and per-action buy-and-hold. This is an
     EVALUATION-ONLY helper: it changes no training/reward path."""
     constraints = constraints or default_minute_to_hour_constraints()
-    # Fail closed (and normalise to int) before deriving initial_action / the cash skip below; each
-    # evaluate_minute_to_hour_policy call re-validates, but the baseline wiring reads cash_index first.
-    cash_index = validate_minute_to_hour_constraints(constraints, data.action_names)
+    # Fail closed + NORMALIZE before deriving initial_action / the cash skip below; each
+    # evaluate_minute_to_hour_policy call re-validates, but the baseline wiring reads cash_index first and the
+    # normalized constraints are passed straight through to every baseline evaluation.
+    constraints = validate_minute_to_hour_constraints(constraints, data.action_names)
+    cash_index = constraints.cash_index
     action_count = len(data.action_names)
     common = dict(
         device=device, constraints=constraints, episode_length=episode_length,
@@ -778,9 +783,11 @@ def train_minute_to_hour_dqn(
     require_bool("use_transition_features", config.use_transition_features)
     require_bool("use_dynamic_transition_features", config.use_dynamic_transition_features)
     # Fail fast on config BEFORE allocating GPU memory (and before build_transition_feature_table consumes
-    # cash_index / count_etf) -- the env's own validation at construction happens later. Reuse the normalized
-    # cash_index everywhere. action_names is device-agnostic, so this is safe pre-`.to(device)`.
-    cash_index = validate_minute_to_hour_constraints(config.env.constraints, train_data.action_names)
+    # cash_index / count_etf) -- the env's own validation at construction happens later. Reuse the NORMALIZED
+    # constraints (canonical types) for the transition table + hysteresis. action_names is device-agnostic, so
+    # this is safe pre-`.to(device)`.
+    normalized_constraints = validate_minute_to_hour_constraints(config.env.constraints, train_data.action_names)
+    cash_index = normalized_constraints.cash_index
     # Schema matching is metadata/shape-level (device-agnostic), so fail on a mismatch BEFORE allocating GPU
     # memory or moving tensors to device.
     assert_matching_hour_from_minute_schema(train_data, val_data)
@@ -823,7 +830,7 @@ def train_minute_to_hour_dqn(
 
         action_meta = build_action_metadata(train_data.action_names)
         action_group_ids, _ = group_ids_for_actions(action_meta, device=device)
-        cons = config.env.constraints
+        cons = normalized_constraints  # normalized (canonical-typed) -- matches what the env/eval price against
         # Use the env's cash_index / leg convention so the table's legs/cost columns match realized cost.
         transition_table = build_transition_feature_table(
             action_count=action_count,
@@ -982,12 +989,12 @@ def train_minute_to_hour_dqn(
                 q_values,
                 previous_actions,
                 action_mask,
-                one_way_cost_bps=config.env.constraints.one_way_cost_bps,
-                extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
-                q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
+                one_way_cost_bps=normalized_constraints.one_way_cost_bps,
+                extra_switch_penalty_bps=normalized_constraints.extra_switch_penalty_bps,
+                q_switch_margin_bps=normalized_constraints.q_switch_margin_bps,
                 cash_index=cash_index,
                 reward_scale=config.env.reward_scale,
-                count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
+                count_etf_to_etf_as_two_legs=normalized_constraints.count_etf_to_etf_as_two_legs,
             )
             random_actions = sample_valid_actions(action_mask)
             explore = torch.rand(greedy_actions.shape, device=device) < epsilon
@@ -1047,12 +1054,12 @@ def train_minute_to_hour_dqn(
                         next_online,
                         batch["next_previous_actions"],
                         batch["next_action_mask"],
-                        one_way_cost_bps=config.env.constraints.one_way_cost_bps,
-                        extra_switch_penalty_bps=config.env.constraints.extra_switch_penalty_bps,
-                        q_switch_margin_bps=config.env.constraints.q_switch_margin_bps,
+                        one_way_cost_bps=normalized_constraints.one_way_cost_bps,
+                        extra_switch_penalty_bps=normalized_constraints.extra_switch_penalty_bps,
+                        q_switch_margin_bps=normalized_constraints.q_switch_margin_bps,
                         cash_index=cash_index,
                         reward_scale=config.env.reward_scale,
-                        count_etf_to_etf_as_two_legs=config.env.constraints.count_etf_to_etf_as_two_legs,
+                        count_etf_to_etf_as_two_legs=normalized_constraints.count_etf_to_etf_as_two_legs,
                     )
                     next_target = target_network(
                         next_minute,
@@ -1192,6 +1199,9 @@ def train_minute_to_hour_dqn(
         "eval_trace": eval_trace,
         "vram_reservation": reservation.report,
         "cash_idle_penalty_bps": float(config.env.cash_idle_penalty_bps),
+        # The NORMALIZED (canonical-typed) constraints actually used by the env/eval/transition table -- so a
+        # run can be reviewed (and its mask/cost economics reproduced) from the artifact alone.
+        "normalized_constraints": asdict(normalized_constraints),
         # PR-3: shadow execution-reward diagnostics (None when the flag is off). Label-changing only -- the
         # trained model + every other metric are byte-identical to a shadow-off run. Honesty labels: this is a
         # STATIC single-slot weight-bps COST-MODEL shadow, NOT real-executable (no NBBO / quote-side fills /
@@ -1219,7 +1229,7 @@ def train_minute_to_hour_dqn(
         # cost/impact stress grid, and so the priced fee is auditable against the constraint config.
         "execution_shadow_impact_kind": ("none" if config.env.execution_env_reward_shadow else None),
         "execution_shadow_fee_bps": (
-            float(config.env.constraints.one_way_cost_bps) if config.env.execution_env_reward_shadow else None
+            float(normalized_constraints.one_way_cost_bps) if config.env.execution_env_reward_shadow else None
         ),
         "execution_shadow_linear_impact_bps_per_weight": (
             0.0 if config.env.execution_env_reward_shadow else None

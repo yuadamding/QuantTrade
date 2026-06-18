@@ -8548,8 +8548,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 MinuteToHourEnvConfig(num_envs=1, episode_length=5, execution_env_reward_shadow="false",
                                       constraints=base),
                 device)
-        # The shared constraint validator returns the validated cash_index and rejects a non-cash one.
-        self.assertEqual(validate_minute_to_hour_constraints(base, ["CASH", "QQQ"]), 0)
+        # The shared constraint validator returns the NORMALIZED constraints (cash_index field) and rejects a
+        # non-cash cash_index.
+        self.assertEqual(validate_minute_to_hour_constraints(base, ["CASH", "QQQ"]).cash_index, 0)
         with self.assertRaises(ValueError):
             validate_minute_to_hour_constraints(dataclasses.replace(base, cash_index=1), ["CASH", "QQQ"])
 
@@ -8958,6 +8959,44 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertAlmostEqual(float(out["legs"][0].item()), float(rec["market_order_legs"]), places=6)
             self.assertAlmostEqual(float(out["rewards"][0].item()) / 10_000.0, float(rec["net_return"]), places=6)
 
+    def test_minute_to_hour_constraints_normalized_object(self) -> None:
+        # validate_minute_to_hour_constraints returns a FROZEN NormalizedMinuteToHourConstraints whose fields
+        # are canonical Python types (a numeric-string bps -> float, a numpy int index/count -> int), and the
+        # env stores + uses that object -- so a non-canonical config value can never reach the runtime raw.
+        import dataclasses
+
+        import numpy as np
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import (
+            MinuteToHourEnvConfig,
+            NormalizedMinuteToHourConstraints,
+            VectorizedMinuteToHourEnv,
+            validate_minute_to_hour_constraints,
+        )
+
+        names = ["CASH", "QQQ"]
+        # Non-canonical-but-valid inputs: a numeric-string bps and numpy integer index/bar counts.
+        raw = dataclasses.replace(
+            default_minute_to_hour_constraints(),
+            one_way_cost_bps="2.0", cash_index=np.int64(0), min_hold_bars=np.int64(1))
+        norm = validate_minute_to_hour_constraints(raw, names)
+        self.assertIsInstance(norm, NormalizedMinuteToHourConstraints)
+        self.assertIsInstance(norm.one_way_cost_bps, float)
+        self.assertEqual(norm.one_way_cost_bps, 2.0)
+        self.assertIsInstance(norm.cash_index, int)
+        self.assertNotIsInstance(norm.cash_index, np.integer)
+        self.assertIsInstance(norm.min_hold_bars, int)
+        with self.assertRaises(dataclasses.FrozenInstanceError):  # frozen: validated values can't be mutated
+            norm.cash_index = 1  # type: ignore[misc]
+        # The env stores and exposes the normalized object.
+        env = VectorizedMinuteToHourEnv(
+            self._two_action_split(names),
+            MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=raw), torch.device("cpu"))
+        self.assertIsInstance(env.constraints, NormalizedMinuteToHourConstraints)
+        self.assertEqual(env.constraints.one_way_cost_bps, 2.0)
+        self.assertIsInstance(env.constraints.one_way_cost_bps, float)
+
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
         # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar
@@ -8975,7 +9014,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         device = torch.device("cpu")
         names = ["CASH", "QQQ"]
         base = default_minute_to_hour_constraints()
-        self.assertEqual(validate_minute_to_hour_constraints(base, names), 0)
+        self.assertEqual(validate_minute_to_hour_constraints(base, names).cash_index, 0)
         bad_fields = {
             "q_switch_margin_bps": float("nan"),
             "min_hold_bars": True,
