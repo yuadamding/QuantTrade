@@ -282,11 +282,16 @@ def probability_of_backtest_overfitting(
         is_sharpe = [sharpe_over(is_rows, n) for n in range(n_configs)]
         oos_sharpe = [sharpe_over(oos_rows, n) for n in range(n_configs)]
         best = max(range(n_configs), key=lambda n: is_sharpe[n])  # IS-selected config (first on ties)
-        # OOS rank of the IS-best (1 = worst): relative rank in (0, 1); logit <= 0  <=>  bottom half.
-        rank = sum(1 for s in oos_sharpe if s < oos_sharpe[best]) + 1
-        omega = rank / (n_configs + 1)
+        # OOS MIDRANK of the IS-best (ties averaged): relative rank omega in (0, 1). Midranks matter when OOS
+        # scores tie -- a strict "< best" count would push every tie down to rank 1 and spuriously flag
+        # overfitting. The IS-best is "overfit" only when it is STRICTLY below the OOS median (omega < 0.5);
+        # exactly at the median (e.g. all-tied/degenerate configs -> omega == 0.5) is uninformative, not overfit.
+        below = sum(1 for s in oos_sharpe if s < oos_sharpe[best])
+        ties = sum(1 for s in oos_sharpe if s == oos_sharpe[best])  # includes the best itself
+        midrank = below + (ties + 1) / 2.0
+        omega = midrank / (n_configs + 1)
         total += 1
-        if omega <= 0.5:
+        if omega < 0.5:
             overfit += 1
     return overfit / total
 
@@ -385,6 +390,13 @@ def hansens_spa(
     for k in range(n_models):
         var = sum((rows[t][k] - dbar[k]) ** 2 for t in range(n_obs)) / n_obs
         omega.append(math.sqrt(var) if var > 0.0 else 0.0)
+    # A zero-variance POSITIVE differential is DETERMINISTIC out-performance (the model beats the benchmark
+    # every single period): the studentized statistic is +inf (divide-by-zero). Reject at the minimum p-value
+    # rather than studentizing to 0 and dropping the column -- which would falsely report "no evidence" for a
+    # model that dominates the benchmark with certainty. (Float roundoff hides this for non-exact constants
+    # like 0.001, where var is tiny-positive and the column already rejects; this catches the exact-zero case.)
+    if any(omega[k] == 0.0 and dbar[k] > 0.0 for k in range(n_models)):
+        return 1.0 / (n_bootstrap + 1)
     studentized = [root_n * dbar[k] / omega[k] if omega[k] > 0.0 else 0.0 for k in range(n_models)]
     observed = max(0.0, max(studentized))
     # Hansen "consistent" recentering: keep d̄_k only for models above -sqrt(2 log log T) (log log T needs

@@ -3558,6 +3558,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         negated = [[a[t], -a[t]] for t in range(t_obs)]
         self.assertEqual(pbo(negated, n_splits=n_splits), 1.0)
 
+        # All-identical (degenerate) configs are UNINFORMATIVE, not overfit: midrank ties put the IS-best
+        # exactly at the OOS median (omega == 0.5), which the strict "< 0.5" overfit rule does not count.
+        # (A naive strict-"<" rank count would have spuriously reported PBO == 1.0 here.)
+        self.assertEqual(pbo([[0.0] * 6 for _ in range(48)], n_splits=6), 0.0)
+
         # Fail closed: odd/too-large n_splits, < 2 configs, ragged matrix, non-finite entries.
         with self.assertRaises(ValueError):
             pbo(dominant, n_splits=5)
@@ -3584,6 +3589,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         edge = [[0.01 + 0.002 * ((t % 5) - 2)] for t in range(t_obs)]
         self.assertLess(white_reality_check(edge, n_bootstrap=n_boot), 0.05)
         self.assertLess(hansens_spa(edge, n_bootstrap=n_boot), 0.05)
+        # SPA zero-variance dominance edge case: a model that DETERMINISTICALLY beats the benchmark every
+        # period (constant positive differential -> zero variance) is infinitely-strong evidence. SPA must
+        # reject at the minimum p-value, not studentize it to 0 and report "no evidence". (Exactly-representable
+        # constants make the variance exactly 0; a naive implementation returns ~1.0 here.)
+        deterministic = [[1.0] for _ in range(80)]
+        self.assertAlmostEqual(hansens_spa(deterministic, n_bootstrap=399, seed=1), 1.0 / 400, places=12)
+        mixed_det = [[1.0, 0.0001 * ((t % 7) - 3)] for t in range(80)]  # dominant + a noisy column
+        self.assertLess(hansens_spa(mixed_det, n_bootstrap=399, seed=1), 0.01)
         # No model beats the benchmark (all differentials exactly 0) -> nothing to reject -> p == 1.0.
         zero = [[0.0, 0.0, 0.0] for _ in range(t_obs)]
         self.assertEqual(white_reality_check(zero, n_bootstrap=n_boot), 1.0)
