@@ -8754,6 +8754,82 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             evaluate_minute_to_hour_policy(empty, _ConstantActionModel(2, 0), device=torch.device("cpu"),
                                            constraints=default_minute_to_hour_constraints())
 
+    def test_minute_to_hour_env_eval_golden_ledger_parity(self) -> None:
+        # GOLDEN PARITY: the vectorized env (step) and the sequential evaluator must compute the SAME ledger for
+        # the same requested-action sequence over the same rows -- executed action (incl. the missing-label ->
+        # CASH fallback applied INDEPENDENTLY by each path), order legs, and reward (= reward_scale * eval
+        # net_return), cumulatively too. This is the guardrail against future drift between the two reward
+        # paths: they share transition_trade_cost_bps but reconstruct the rest of the rollout separately.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.training.minute_to_hour import evaluate_minute_to_hour_policy
+
+        class FavorQQQ(nn.Module):  # always strongly prefers QQQ(1): enters from CASH, then holds
+            def forward(self, minute, mask, hour, previous_actions, constraint_features,
+                        action_features=None, dynamic_state=None):
+                q = torch.zeros((previous_actions.shape[0], 2), device=previous_actions.device)
+                q[:, 1] = 1000.0
+                return q
+
+        device = torch.device("cpu")
+        n = 6  # rows 0..4 are decisions; row 5 provides the next-state boundary
+        # QQQ return is NaN at row 3 -> both paths must de-risk to CASH there; CASH return is 0 everywhere. All
+        # timestamps share one day (no day reset); rows are contiguous (no segment reset after the first).
+        qqq = [0.01, -0.004, 0.02, float("nan"), 0.013, 0.0]
+        base = HourFromMinuteDataSplit(
+            name="t",
+            decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
+            next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((n, 1, 1)),
+            action_returns=torch.tensor([[0.0, q] for q in qqq]),
+            action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1, 2, 3, 4]), valid_index_mask=torch.ones(n, dtype=torch.bool),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        cons = dataclasses.replace(
+            default_minute_to_hour_constraints(), max_switches_per_day=None, max_switches_per_episode=None,
+            q_switch_margin_bps=0.0, one_way_cost_bps=2.0, extra_switch_penalty_bps=3.0, min_hold_bars=1, cooldown_bars=0)
+        reward_scale, cash_idle = 10_000.0, 5.0
+
+        eval_result = evaluate_minute_to_hour_policy(
+            base, FavorQQQ(), device=device, initial_action=0, constraints=cons,
+            episode_length=10, reward_scale=reward_scale, cash_idle_penalty_bps=cash_idle, capture_rollout=True)
+        records = eval_result.rollout_records
+        self.assertEqual(len(records), 5)
+        # Non-trivial path: an entering switch, two holds, the NaN-label de-risk to CASH, and a re-entry.
+        self.assertEqual([int(r["executed_action"]) for r in records], [1, 1, 1, 0, 1])
+
+        # Drive the env over the same rows from a single deterministic start (0), feeding the eval's REQUESTED
+        # actions so the env runs its OWN mask + finite-label fallback independently.
+        env = VectorizedMinuteToHourEnv(
+            dataclasses.replace(base, valid_start_indices=torch.tensor([0])),
+            MinuteToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=reward_scale,
+                                  initial_action=0, cash_idle_penalty_bps=cash_idle, constraints=cons),
+            device)
+        env.reset()
+        env_equity, env_switches, env_legs_total, prev = 1.0, 0, 0.0, 0
+        for rec in records:
+            out = env.step(torch.tensor([int(rec["requested_action"])]))
+            executed = int(out["actions"][0].item())
+            self.assertEqual(executed, int(rec["executed_action"]))                                   # fallback parity
+            self.assertAlmostEqual(float(out["legs"][0].item()), float(rec["market_order_legs"]), places=6)  # legs
+            net = float(out["rewards"][0].item()) / reward_scale
+            self.assertAlmostEqual(net, float(rec["net_return"]), places=6)                           # reward/cost
+            env_equity *= 1.0 + net
+            env_switches += int(executed != prev)
+            env_legs_total += float(out["legs"][0].item())
+            prev = executed
+
+        # Cumulative parity.
+        self.assertAlmostEqual(env_equity - 1.0, eval_result.total_return, places=6)
+        self.assertEqual(env_switches, eval_result.allocation_switches)
+        self.assertAlmostEqual(env_legs_total, eval_result.market_order_legs, places=6)
+
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
         # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar
