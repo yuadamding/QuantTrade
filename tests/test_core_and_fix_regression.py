@@ -3377,6 +3377,21 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(
             probabilistic_sharpe_ratio(0.1, benchmark_sharpe=0.0, n_observations=100), 0.8395, places=3
         )
+        # Lock the non-normality denominator convention (an audit false-positive proposed (kurtosis-3)/4).
+        # The correct coefficient is (kurtosis-1)/4: Lo (2002)'s i.i.d.-normal SR-estimator variance term
+        # SR^2/2 COMBINES with Mertens (2002)'s excess-kurtosis term (kurtosis-3)/4*SR^2 to give
+        # (kurtosis-1)/4*SR^2. So for NORMAL returns (skew 0, non-excess kurtosis 3) the denominator is
+        # sqrt(1 + SR^2/2) -- NOT 1. Pin PSR to that closed form at high precision (the (kurtosis-3)/4 error
+        # gives 0.840129 here, off by ~6e-4, and fails this assertion).
+        import math
+        from statistics import NormalDist
+
+        sr, n_obs = 0.1, 100
+        normal_denominator = math.sqrt(1.0 + 0.5 * sr * sr)  # Lo (2002); NOT sqrt(1) == 1
+        expected = NormalDist().cdf(sr * math.sqrt(n_obs - 1) / normal_denominator)
+        self.assertAlmostEqual(
+            probabilistic_sharpe_ratio(sr, benchmark_sharpe=0.0, n_observations=n_obs), expected, places=12
+        )
         # More observations of the same edge -> more confident.
         self.assertLess(
             probabilistic_sharpe_ratio(0.1, benchmark_sharpe=0.0, n_observations=50),

@@ -32,8 +32,13 @@ def _require_positive_int(name: str, value: int) -> int:
 
 
 def _non_normality_denominator(sharpe: float, skewness: float, kurtosis: float) -> float:
-    # sqrt(1 - skew*SR + (kurtosis-1)/4 * SR^2) -- the standard-error adjustment for non-normal returns
-    # (kurtosis is NON-excess: 3 for a normal distribution). Clamped > 0 to stay defined.
+    # sqrt(1 - skew*SR + (kurtosis-1)/4 * SR^2) -- the standard-error adjustment for non-normal returns;
+    # kurtosis is NON-excess (3 for a normal). The (kurtosis-1)/4 coefficient is NOT a typo for
+    # (kurtosis-3)/4: it is Lo (2002)'s i.i.d.-normal SR-estimator variance term SR^2/2 COMBINED with
+    # Mertens (2002)'s excess-kurtosis term (kurtosis-3)/4 * SR^2 -- i.e.
+    # SR^2/2 + (kurtosis-3)/4 * SR^2 = (kurtosis-1)/4 * SR^2. So for a normal return (kurtosis=3) the
+    # denominator is sqrt(1 + SR^2/2) (the classic Sharpe-estimator variance), NOT 1. Clamped > 0 to stay
+    # defined. (A test pins this against the closed form; Monte Carlo confirms the SR^2/2 term is real.)
     value = 1.0 - skewness * sharpe + ((kurtosis - 1.0) / 4.0) * sharpe * sharpe
     return math.sqrt(max(value, 1e-12))
 
