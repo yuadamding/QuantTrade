@@ -8,6 +8,7 @@ only; changes no data, number, or training behavior."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 
 
@@ -55,6 +56,53 @@ def assert_no_model_input_leakage(
     )
     if not ok:
         raise ValueError("decision-tensor contract violation: " + "; ".join(issues))
+
+
+def _to_rows(value: object) -> list[list[object]]:
+    """Coerce a 2-D tensor (anything with .tolist()) or a nested sequence to a list-of-lists, so the
+    validators stay torch-free + work on either representation."""
+    listed = value.tolist() if hasattr(value, "tolist") else value
+    return [list(row) for row in listed]  # type: ignore[union-attr]
+
+
+def validate_invalid_returns_are_nan(
+    action_returns: object, valid_mask: object, *, max_issues: int = 20
+) -> tuple[bool, tuple[str, ...]]:
+    """The decision-tensor honesty rule (docs/decision_tensor_protocol.md): an action's outcome is observable
+    -- a FINITE return -- IF AND ONLY IF the action is marked VALID. An INVALID action must carry a non-finite
+    (NaN) return, never a silent 0/finite value (which would let a missing outcome masquerade as a flat
+    result); and a VALID action must carry a finite return (a 'valid' outcome cannot be NaN). The builders
+    enforce this inline at build time; this lifts it into a reusable validator (mirroring
+    ``validate_model_input_label_split``) so any payload can be checked uniformly. ``action_returns`` and
+    ``valid_mask`` are [rows][actions] -- tensors (``.tolist()``) or nested sequences. Returns (ok, issues),
+    issues capped at ``max_issues``. Pure; stdlib only."""
+    returns = _to_rows(action_returns)
+    mask = _to_rows(valid_mask)
+    if len(returns) != len(mask):
+        return (False, (f"action_returns has {len(returns)} rows but valid_mask has {len(mask)}",))
+    issues: list[str] = []
+    for t, (rrow, mrow) in enumerate(zip(returns, mask)):
+        if len(rrow) != len(mrow):
+            issues.append(f"row {t}: action_returns width {len(rrow)} != valid_mask width {len(mrow)}")
+        else:
+            for a, (ret, valid) in enumerate(zip(rrow, mrow)):
+                finite = isinstance(ret, (int, float)) and not isinstance(ret, bool) and math.isfinite(float(ret))
+                if bool(valid) and not finite:
+                    issues.append(f"row {t} action {a}: marked VALID but return is not finite ({ret!r})")
+                elif not bool(valid) and finite:
+                    issues.append(f"row {t} action {a}: marked INVALID but return is finite ({ret!r}); must be NaN")
+        if len(issues) > max_issues:
+            issues = issues[:max_issues]
+            issues.append("... (further issues truncated)")
+            break
+    return (not issues, tuple(issues))
+
+
+def assert_invalid_returns_are_nan(action_returns: object, valid_mask: object) -> None:
+    """Fail closed: raise ValueError if the valid-mask / finite-return honesty contract is violated."""
+    ok, issues = validate_invalid_returns_are_nan(action_returns, valid_mask)
+    if not ok:
+        raise ValueError("decision-tensor contract violation (invalid-returns-must-be-NaN): " + "; ".join(issues))
 
 
 def validate_decision_tensor_payload(

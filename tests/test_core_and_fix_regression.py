@@ -3738,6 +3738,33 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         )
         self.assertTrue(ok_manifest)
 
+    def test_invalid_returns_must_be_nan_validator(self) -> None:
+        # The decision-tensor honesty rule lifted into the protocol layer (mirroring the model-input/label
+        # split validator): an action's return is FINITE iff the action is VALID. Fails closed both ways --
+        # an invalid action with a finite return (silent-finite leakage) and a valid action with a NaN return.
+        from rl_quant.protocol import assert_invalid_returns_are_nan, validate_invalid_returns_are_nan
+
+        nan = float("nan")
+        # Consistent: valid -> finite, invalid -> NaN.
+        ok, issues = validate_invalid_returns_are_nan([[0.01, nan], [0.0, 0.02]], [[True, False], [True, True]])
+        self.assertTrue(ok)
+        self.assertEqual(issues, ())
+        # Invalid action carrying a FINITE return (the silent-finite leakage risk) -> fail.
+        ok, issues = validate_invalid_returns_are_nan([[0.01, 0.0]], [[True, False]])
+        self.assertFalse(ok)
+        self.assertTrue(any("must be NaN" in m for m in issues))
+        # Valid action carrying a NaN return -> fail (a 'valid' outcome cannot be NaN).
+        ok, issues = validate_invalid_returns_are_nan([[0.01, nan]], [[True, True]])
+        self.assertFalse(ok)
+        self.assertTrue(any("not finite" in m for m in issues))
+        # Works on torch tensors (the real payload representation) + the fail-closed assert variant.
+        assert_invalid_returns_are_nan(torch.tensor([[0.01, nan]]), torch.tensor([[True, False]]))  # no raise
+        with self.assertRaises(ValueError):
+            assert_invalid_returns_are_nan(torch.tensor([[0.01, 0.0]]), torch.tensor([[True, False]]))
+        # Shape mismatch fails closed (row count and per-row width).
+        self.assertFalse(validate_invalid_returns_are_nan([[0.01]], [[True, False]])[0])
+        self.assertFalse(validate_invalid_returns_are_nan([[0.01], [0.02]], [[True]])[0])
+
     def test_flag_registry_governance(self) -> None:
         # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
         # every result-moving flag carries A/B metrics + flip/delete criteria, and the recorded defaults match
