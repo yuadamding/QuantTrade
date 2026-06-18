@@ -3941,10 +3941,11 @@ class MinuteToHourTests(unittest.TestCase):
             action_count=10,
         )
 
-        # Turnover budget (daily switch cap) exhausted: a switch to cash also consumes
-        # turnover, so the cap legitimately restricts to holding the current action only.
-        self.assertEqual(int(mask.sum().item()), 1)
+        # Daily switch cap exhausted: new non-cash positions are masked, but Policy A keeps the held action
+        # (4) AND the CASH (0) de-risk selectable -- de-risking to cash is never blocked by a turnover budget.
+        self.assertEqual(int(mask.sum().item()), 2)
         self.assertTrue(bool(mask[0, 4].item()))
+        self.assertTrue(bool(mask[0, 0].item()))
 
     def test_episode_switch_cap_masks_new_positions(self) -> None:
         mask = build_action_mask(
@@ -3959,10 +3960,11 @@ class MinuteToHourTests(unittest.TestCase):
             max_switches_per_episode=3,
         )
 
-        # Episode turnover budget exhausted: restrict to the current action (cash switch
-        # also consumes turnover and is not exempt from the budget).
-        self.assertEqual(int(mask.sum().item()), 1)
+        # Episode switch cap exhausted: the held action (2) AND the CASH (0) de-risk stay selectable under
+        # Policy A (de-risking to cash overrides an exhausted turnover budget).
+        self.assertEqual(int(mask.sum().item()), 2)
         self.assertTrue(bool(mask[0, 2].item()))
+        self.assertTrue(bool(mask[0, 0].item()))
 
     def test_order_leg_cap_blocks_two_leg_rotation(self) -> None:
         mask = build_action_mask(
@@ -3980,6 +3982,24 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertTrue(bool(mask[0, 0].item()))
         self.assertTrue(bool(mask[0, 2].item()))
         self.assertFalse(bool(mask[0, 5].item()))
+
+    def test_order_leg_cap_does_not_block_cash_derisk(self) -> None:
+        # Policy A: even when the order-leg budget is fully exhausted (current -> CASH itself would exceed it),
+        # CASH (0) de-risk stays available while every non-cash rotation is blocked, holding the current action.
+        mask = build_action_mask(
+            current_action=torch.tensor([2]),
+            bars_held=torch.tensor([5]),
+            cooldown_remaining=torch.tensor([0]),
+            switches_today=torch.tensor([0]),
+            max_switches_per_day=5,
+            min_hold_bars=1,
+            action_count=6,
+            order_legs_today=torch.tensor([0.0]),
+            max_order_legs_per_day=0.0,  # no legs affordable: current->CASH (1 leg) would exceed the budget
+        )
+        self.assertTrue(bool(mask[0, 0].item()))   # CASH de-risk forced valid (Policy A)
+        self.assertTrue(bool(mask[0, 2].item()))   # held action always selectable
+        self.assertFalse(bool(mask[0, 5].item()))  # a 2-leg ETF rotation stays blocked by the budget
 
     def test_etf_to_etf_switch_counts_two_legs(self) -> None:
         self.assertEqual(float(trade_legs(torch.tensor([2]), torch.tensor([5]))[0].item()), 2.0)
@@ -5280,8 +5300,12 @@ class EvaluationTests(unittest.TestCase):
             episode_length=2,
         )
 
-        self.assertEqual(result.total_switches, 2)
-        self.assertEqual(result.market_order_legs, 2.0)
+        # Policy A: de-risking to CASH overrides an exhausted turnover budget (shared build_action_mask), so
+        # OppositePolicy now also takes the 1->CASH de-risk leg each episode that Policy B used to block. The
+        # per-episode cap still resets (it is the reset that lets each episode re-take the capped 0->1 ENTER),
+        # so the count is 2 enter + 2 de-risk = 4 switches / 4 order legs over the two episodes.
+        self.assertEqual(result.total_switches, 4)
+        self.assertEqual(result.market_order_legs, 4.0)
 
     def test_direct_hourly_eval_applies_daily_switch_cap(self) -> None:
         class FixedPolicy(nn.Module):
