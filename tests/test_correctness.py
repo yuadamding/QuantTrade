@@ -8896,6 +8896,68 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # Sanity: the excursion was actually non-trivial (not all zeros) at least once after the first hold.
         self.assertTrue(any(bool(s.abs().sum().item() > 0.0) for s in spy.seen))
 
+    def test_minute_to_hour_env_eval_day_boundary_cap_parity(self) -> None:
+        # GOLDEN PARITY (day boundary + turnover cap): with max_switches_per_day=1, a day-1 entry exhausts the
+        # daily cap; the cap must RESET on the day-2 boundary so a day-2 re-entry is selectable again. The env
+        # and the evaluator must reset the per-day counter at the same point AND the env's OWN mask must agree
+        # with the evaluator's (so feeding the env the requested QQQ re-enters on day 2 instead of mask-falling
+        # back to CASH). A wrong env day-reset would mask the day-2 entry and diverge here.
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.training.minute_to_hour import evaluate_minute_to_hour_policy
+
+        class FavorQQQ(nn.Module):
+            def forward(self, minute, mask, hour, previous_actions, constraint_features,
+                        action_features=None, dynamic_state=None):
+                q = torch.zeros((previous_actions.shape[0], 2), device=previous_actions.device)
+                q[:, 1] = 1000.0
+                return q
+
+        device = torch.device("cpu")
+        # rows 0,1 -> day 1; rows 2,3 -> day 2 (row 4 = next-state boundary). QQQ is NaN at row 1 -> day-1
+        # de-risk to CASH, so the position entering day 2 is CASH and a fresh QQQ entry is needed there.
+        dates = ["2026-01-02", "2026-01-02", "2026-01-03", "2026-01-03", "2026-01-03"]
+        qqq = [0.01, float("nan"), 0.02, 0.015, 0.0]
+        n = 5
+        base = HourFromMinuteDataSplit(
+            name="t",
+            decision_timestamps=[f"{d}T1{i}:30:00+00:00" for i, d in enumerate(dates)],
+            next_timestamps=[f"{d}T1{i + 1}:30:00+00:00" for i, d in enumerate(dates)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((n, 1, 1)),
+            action_returns=torch.tensor([[0.0, q] for q in qqq]),
+            action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0, 1, 2, 3]), valid_index_mask=torch.ones(n, dtype=torch.bool),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        cons = dataclasses.replace(
+            default_minute_to_hour_constraints(), max_switches_per_day=1, max_switches_per_episode=None,
+            q_switch_margin_bps=0.0, one_way_cost_bps=2.0, extra_switch_penalty_bps=3.0, min_hold_bars=1, cooldown_bars=0)
+
+        eval_result = evaluate_minute_to_hour_policy(
+            base, FavorQQQ(), device=device, initial_action=0, constraints=cons,
+            episode_length=10, reward_scale=10_000.0, cash_idle_penalty_bps=5.0, capture_rollout=True)
+        records = eval_result.rollout_records
+        # Day 1: enter QQQ, then NaN-label de-risk to CASH (cap now exhausted on day 1). Day 2: cap reset lets
+        # the QQQ entry happen again, then hold. If the cap did NOT reset, row 2 would mask QQQ -> CASH.
+        self.assertEqual([int(r["executed_action"]) for r in records], [1, 0, 1, 1])
+
+        env = VectorizedMinuteToHourEnv(
+            dataclasses.replace(base, valid_start_indices=torch.tensor([0])),
+            MinuteToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=10_000.0,
+                                  initial_action=0, cash_idle_penalty_bps=5.0, constraints=cons),
+            device)
+        env.reset()
+        for rec in records:
+            out = env.step(torch.tensor([int(rec["requested_action"])]))
+            self.assertEqual(int(out["actions"][0].item()), int(rec["executed_action"]))       # mask/cap/day-reset parity
+            self.assertAlmostEqual(float(out["legs"][0].item()), float(rec["market_order_legs"]), places=6)
+            self.assertAlmostEqual(float(out["rewards"][0].item()) / 10_000.0, float(rec["net_return"]), places=6)
+
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
         # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar
