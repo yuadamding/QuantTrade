@@ -143,6 +143,19 @@ def transition_trade_cost_bps(
     )
 
 
+def transition_net_return_and_reward(raw_return, trade_cost_bps, cash_idle_bps, *, reward_scale):
+    """The SINGLE source of the minute->hour reward formula: net return and the scaled reward from a raw
+    return plus the transition's combined cost (trade cost + cash-idle), in bps. Used by BOTH env.step and the
+    evaluator so the reward formula cannot drift between training and evaluation. It is element-wise, so it is
+    byte-identical whether called with the env's float32 tensors or the evaluator's float64 scalars (and the
+    operation order matches each path's prior inline expression exactly). Returns ``(net_return, reward)``;
+    callers use whichever they need (env: reward; evaluator: net_return)."""
+    combined_cost_bps = trade_cost_bps + cash_idle_bps
+    net_return = raw_return - combined_cost_bps / 10_000.0
+    reward = raw_return * reward_scale - combined_cost_bps * reward_scale / 10_000.0
+    return net_return, reward
+
+
 @dataclass(frozen=True)
 class NormalizedMinuteToHourConstraints:
     """The validated, CANONICAL-typed form of the minute->hour trading constraints.
@@ -469,9 +482,9 @@ class VectorizedMinuteToHourEnv:
         legs = cost.legs
         cost_bps = cost.trade_cost_bps  # leg cost + switch penalty (the legacy combined trade cost)
         cash_idle_penalty_bps = cost.cash_idle_bps
-        rewards = raw_returns * self.reward_scale - (
-            cost_bps + cash_idle_penalty_bps
-        ) * self.reward_scale / 10_000.0
+        _, rewards = transition_net_return_and_reward(
+            raw_returns, cost_bps, cash_idle_penalty_bps, reward_scale=self.reward_scale
+        )
         # PR-3 shadow (computed from the SAME state, only logged -- `rewards` above, used for training, is
         # untouched, so this is byte-identical to shadow-off). Weight-bps cost of the transition's two legs
         # (sell prior weight + buy new weight; cash = no exposure; only a real switch trades), carrying the same
@@ -488,10 +501,12 @@ class VectorizedMinuteToHourEnv:
             )
             # Swap ONLY the execution/leg cost (cost.leg_cost_bps -> execution_cost_bps_shadow); KEEP the
             # behavioural switch-penalty regularizer + the cash-idle penalty, so reward_delta / cost_delta
-            # isolate the cost-MODEL change and PR-4 would not silently drop the anti-churn regularizer.
-            execution_env_reward_shadow = raw_returns * self.reward_scale - (
-                execution_cost_bps_shadow + cost.switch_penalty_bps + cash_idle_penalty_bps
-            ) * self.reward_scale / 10_000.0
+            # isolate the cost-MODEL change and PR-4 would not silently drop the anti-churn regularizer. Same
+            # shared reward formula (its "trade cost" = shadow execution cost + the kept switch penalty).
+            _, execution_env_reward_shadow = transition_net_return_and_reward(
+                raw_returns, execution_cost_bps_shadow + cost.switch_penalty_bps, cash_idle_penalty_bps,
+                reward_scale=self.reward_scale,
+            )
 
         next_indices = current_indices + 1
         self.indices = next_indices

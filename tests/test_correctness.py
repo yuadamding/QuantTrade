@@ -8755,6 +8755,24 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             evaluate_minute_to_hour_policy(empty, _ConstantActionModel(2, 0), device=torch.device("cpu"),
                                            constraints=default_minute_to_hour_constraints())
 
+    def test_transition_net_return_and_reward_formula(self) -> None:
+        # Pins the ABSOLUTE correctness of the shared reward primitive (the golden env/eval parity test only
+        # pins their agreement now that BOTH call this primitive -- a consistent error there would slip past
+        # it). net = raw - (trade_cost + cash_idle)/1e4; reward = net * reward_scale. Works on scalars + tensors.
+        from rl_quant.envs.minute_to_hour import transition_net_return_and_reward
+
+        net, reward = transition_net_return_and_reward(0.01, 5.0, 0.0, reward_scale=10_000.0)
+        self.assertAlmostEqual(net, 0.0095, places=10)        # 0.01 - 5/1e4
+        self.assertAlmostEqual(reward, 95.0, places=6)        # 0.0095 * 1e4
+        net2, reward2 = transition_net_return_and_reward(0.0, 5.0, 5.0, reward_scale=10_000.0)
+        self.assertAlmostEqual(net2, -0.001, places=10)       # 0 - (5+5)/1e4
+        self.assertAlmostEqual(reward2, -10.0, places=6)
+        # Element-wise on tensors (the env path).
+        net_t, reward_t = transition_net_return_and_reward(
+            torch.tensor([0.01, 0.0]), torch.tensor([5.0, 5.0]), torch.tensor([0.0, 5.0]), reward_scale=10_000.0)
+        self.assertTrue(torch.allclose(net_t, torch.tensor([0.0095, -0.001]), atol=1e-7))
+        self.assertTrue(torch.allclose(reward_t, torch.tensor([95.0, -10.0]), atol=1e-4))
+
     def test_minute_to_hour_env_eval_golden_ledger_parity(self) -> None:
         # GOLDEN PARITY: the vectorized env (step) and the sequential evaluator must compute the SAME ledger for
         # the same requested-action sequence over the same rows -- executed action (incl. the missing-label ->

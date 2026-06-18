@@ -64,6 +64,7 @@ from rl_quant.datasets.hour_from_subhour import (
 from rl_quant.envs.minute_to_hour import (
     MinuteToHourEnvConfig,
     VectorizedMinuteToHourEnv,
+    transition_net_return_and_reward,
     transition_trade_cost_bps,
     validate_cash_usable_on_decision_rows,
     validate_minute_to_hour_constraints,
@@ -350,7 +351,10 @@ def evaluate_minute_to_hour_policy(
         is_switch = action != previous_action
         cost_bps = float(cost.trade_cost_bps[0].item())  # leg cost + switch penalty (the legacy combined cost)
         gross_return = float(data.action_returns[index, action].item())
-        net_return = gross_return - (cost_bps + float(cost.cash_idle_bps[0].item())) / 10_000.0
+        # Same shared reward primitive the env uses (float64 scalars here) so eval net return cannot drift.
+        net_return, _ = transition_net_return_and_reward(
+            gross_return, cost_bps, float(cost.cash_idle_bps[0].item()), reward_scale=reward_scale
+        )
         equity *= 1.0 + net_return
         equity_curve.append(equity)
         returns.append(net_return)
