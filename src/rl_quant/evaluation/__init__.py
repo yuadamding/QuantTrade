@@ -10,6 +10,7 @@ from rl_quant.evaluation.ranking import (
     selection_regret,
     top_k_mean_return,
 )
+from rl_quant.evaluation.run_registry import RunRegistry, TrialRecord
 from rl_quant.evaluation.statistical import (
     DSR_PROMOTION_CONFIDENCE,
     PSR_MIN_CREDIBLE_OBSERVATIONS,
@@ -32,6 +33,8 @@ __all__ = [
     "DSR_PROMOTION_CONFIDENCE",
     "PSR_MIN_CREDIBLE_OBSERVATIONS",
     "PromotionVerdict",
+    "RunRegistry",
+    "TrialRecord",
     "block_bootstrap_confidence_interval",
     "deflated_sharpe_promotion_verdict",
     "deflated_sharpe_ratio",

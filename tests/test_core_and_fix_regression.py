@@ -3711,6 +3711,41 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         _json.dumps(r1)
         _json.dumps(full)  # the report is the reportable artifact -> must serialize
 
+    def test_run_registry(self) -> None:
+        # The auditable trial count for the multiple-testing controls: count EVERY included trial (completed
+        # OR failed -- a failed attempt is still a try), not just the submitted winner; compose with the
+        # credibility report; JSON-serializable manifest; fail closed on duplicates / bad status / empty ids.
+        import json as _json
+
+        from rl_quant.evaluation import RunRegistry, TrialRecord, statistical_credibility_report
+
+        reg = RunRegistry("fam_v1", (
+            TrialRecord("r1", "complete"),
+            TrialRecord("r2", "complete"),
+            TrialRecord("r3", "failed"),
+            TrialRecord("r4", "running"),
+            TrialRecord("r5", "complete", included_in_multiple_testing=False),  # excluded (e.g. smoke test)
+        ))
+        self.assertEqual(reg.n_declared(), 5)
+        self.assertEqual(reg.n_completed(), 3)
+        self.assertEqual(reg.n_failed(), 1)
+        self.assertEqual(reg.n_for_multiple_testing(), 4)  # r1..r4 included; r5 excluded
+        manifest = reg.to_manifest()
+        self.assertEqual(manifest["n_trials_for_multiple_testing"], 4)
+        _json.dumps(manifest)
+        # Composes with the credibility report -> the registry supplies the honest n_trials.
+        rep = statistical_credibility_report([0.01, -0.005, 0.02, 0.0] * 8, n_trials=reg.n_for_multiple_testing())
+        self.assertEqual(rep["n_trials"], 4)
+        # Fail closed.
+        with self.assertRaises(ValueError):
+            RunRegistry("fam", (TrialRecord("dup", "complete"), TrialRecord("dup", "failed")))
+        with self.assertRaises(ValueError):
+            TrialRecord("x", "weird")
+        with self.assertRaises(ValueError):
+            RunRegistry("", ())
+        with self.assertRaises(ValueError):
+            TrialRecord("", "complete")
+
     def test_ranker_metrics(self) -> None:
         # Cross-sectional ranker quality of the action SCORER: IC (Pearson), rank IC (Spearman), top-k realized
         # return, and selection regret. Verified against hand cases before pinning.
