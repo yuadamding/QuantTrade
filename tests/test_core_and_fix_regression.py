@@ -3765,6 +3765,31 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertFalse(validate_invalid_returns_are_nan([[0.01]], [[True, False]])[0])
         self.assertFalse(validate_invalid_returns_are_nan([[0.01], [0.02]], [[True]])[0])
 
+    def test_causal_timestamp_chain_validator(self) -> None:
+        # Point-in-time causality lifted into the protocol layer: per-row timestamp arrays, given in causal
+        # order, must be NON-DECREASING within every row; a decreasing step is look-ahead. Tensors or nested
+        # sequences; fails closed on a violation, non-finite timestamp, or length mismatch.
+        from rl_quant.protocol import assert_causal_timestamp_chain, validate_causal_timestamp_chain
+
+        names = ["context_available", "decision", "entry_exec", "reward_end", "exit_exec"]
+        chain_ok = [[1, 10], [1, 10], [2, 11], [5, 20], [6, 21]]  # each stage >= previous, every row
+        ok, issues = validate_causal_timestamp_chain(chain_ok, names=names)
+        self.assertTrue(ok)
+        self.assertEqual(issues, ())
+        # Decision BEFORE context availability -> look-ahead.
+        ok, issues = validate_causal_timestamp_chain([[5], [1]], names=["context_available", "decision"])
+        self.assertFalse(ok)
+        self.assertTrue(any("look-ahead" in m for m in issues))
+        # Non-finite timestamp and length mismatch both fail closed.
+        self.assertFalse(validate_causal_timestamp_chain([[1.0], [float("nan")]])[0])
+        self.assertFalse(validate_causal_timestamp_chain([[1, 2], [1]])[0])
+        # Fewer than two stages -> nothing to order -> ok.
+        self.assertTrue(validate_causal_timestamp_chain([[1, 2, 3]])[0])
+        # Works on torch tensors + the fail-closed assert variant.
+        assert_causal_timestamp_chain([torch.tensor([1, 1]), torch.tensor([2, 3])])  # no raise
+        with self.assertRaises(ValueError):
+            assert_causal_timestamp_chain([torch.tensor([5, 5]), torch.tensor([1, 6])])
+
     def test_flag_registry_governance(self) -> None:
         # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
         # every result-moving flag carries A/B metrics + flip/delete criteria, and the recorded defaults match

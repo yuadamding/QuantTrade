@@ -4,16 +4,20 @@ code, independent of any builder or trainer. Part of the protocol-first layered 
 validators; the full DecisionTensorPayload loader and the trading_constraints contract re-export follow."""
 
 from rl_quant.protocol.validators import (
+    assert_causal_timestamp_chain,
     assert_invalid_returns_are_nan,
     assert_no_model_input_leakage,
+    validate_causal_timestamp_chain,
     validate_decision_tensor_payload,
     validate_invalid_returns_are_nan,
     validate_model_input_label_split,
 )
 
 __all__ = [
+    "assert_causal_timestamp_chain",
     "assert_invalid_returns_are_nan",
     "assert_no_model_input_leakage",
+    "validate_causal_timestamp_chain",
     "validate_decision_tensor_payload",
     "validate_invalid_returns_are_nan",
     "validate_model_input_label_split",

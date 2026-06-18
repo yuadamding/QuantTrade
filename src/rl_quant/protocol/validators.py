@@ -105,6 +105,55 @@ def assert_invalid_returns_are_nan(action_returns: object, valid_mask: object) -
         raise ValueError("decision-tensor contract violation (invalid-returns-must-be-NaN): " + "; ".join(issues))
 
 
+def _to_list(value: object) -> list[object]:
+    """Coerce a 1-D tensor (anything with .tolist()) or a sequence to a list, keeping the layer torch-free."""
+    return list(value.tolist() if hasattr(value, "tolist") else value)  # type: ignore[union-attr]
+
+
+def validate_causal_timestamp_chain(
+    chain: Sequence[object], *, names: Sequence[str] | None = None, max_issues: int = 20
+) -> tuple[bool, tuple[str, ...]]:
+    """Point-in-time causality (docs/decision_tensor_protocol.md): a sequence of equal-length per-row
+    timestamp arrays, given in CAUSAL ORDER (e.g. context_available_until, decision_ts, entry_execution_ts,
+    reward_end_ts, exit_execution_ts), must be NON-DECREASING within every row -- ``chain[i][row] <=
+    chain[i+1][row]``. A decreasing step is LOOK-AHEAD: a later stage is timestamped before an earlier one,
+    so the model could have seen the future. Each array is a tensor (``.tolist()``) or sequence; all must be
+    the same length, and every timestamp must be finite. Returns (ok, issues), capped at ``max_issues``.
+    Pure; stdlib only -- the reusable, vectorized-over-rows counterpart of the decision-log timestamp chain."""
+    arrays = [_to_list(a) for a in chain]
+    stage = list(names) if names is not None else [f"stage[{i}]" for i in range(len(arrays))]
+    if len(arrays) < 2:
+        return (True, ())  # zero/one stage: nothing to order
+    n_rows = len(arrays[0])
+    for i, a in enumerate(arrays):
+        if len(a) != n_rows:
+            return (False, (f"{stage[i]} has {len(a)} rows but {stage[0]} has {n_rows}",))
+
+    def _finite(value: object) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+    issues: list[str] = []
+    for row in range(n_rows):
+        for i in range(len(arrays) - 1):
+            lo, hi = arrays[i][row], arrays[i + 1][row]
+            if not _finite(lo) or not _finite(hi):
+                issues.append(f"row {row}: non-finite timestamp ({stage[i]}={lo!r}, {stage[i + 1]}={hi!r})")
+            elif float(lo) > float(hi):
+                issues.append(f"row {row}: {stage[i]} ({lo!r}) > {stage[i + 1]} ({hi!r}) -- look-ahead")
+        if len(issues) > max_issues:
+            issues = issues[:max_issues]
+            issues.append("... (further issues truncated)")
+            break
+    return (not issues, tuple(issues))
+
+
+def assert_causal_timestamp_chain(chain: Sequence[object], *, names: Sequence[str] | None = None) -> None:
+    """Fail closed: raise ValueError if the per-row timestamp chain is not non-decreasing (look-ahead)."""
+    ok, issues = validate_causal_timestamp_chain(chain, names=names)
+    if not ok:
+        raise ValueError("decision-tensor contract violation (causal-timestamp-ordering): " + "; ".join(issues))
+
+
 def validate_decision_tensor_payload(
     payload: Mapping, manifest: Mapping | None = None
 ) -> tuple[bool, tuple[str, ...]]:
