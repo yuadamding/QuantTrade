@@ -10715,6 +10715,40 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                     f"shim {path.name} re-exports a missing target ({target}).",
                 )
 
+    def test_package_dunder_all_entries_are_string_literals(self) -> None:
+        # A literal __all__ written with bare NAMES instead of strings (e.g. `__all__ = [ExecutionConfig]`)
+        # imports fine and passes the suite UNLESS something does `from pkg import *` -- then it explodes with
+        # "Item in __all__ must be str, not type". Generated re-export __init__s are exactly where this slips
+        # in, so guard the whole class statically (no import side effects): every literal-list/tuple __all__ in
+        # the source tree must contain only string constants.
+        import ast
+
+        src = ROOT / "src" / "rl_quant"
+        for path in sorted(src.rglob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in tree.body:
+                if not (isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)):
+                    continue
+                if not isinstance(node.value, (ast.List, ast.Tuple)):
+                    continue  # dynamically-built __all__ can't be checked statically; skip
+                for el in node.value.elts:
+                    self.assertTrue(
+                        isinstance(el, ast.Constant) and isinstance(el.value, str),
+                        f"{path.relative_to(src)}: __all__ must contain string literals, not bare names "
+                        f"(offending entry at line {getattr(el, 'lineno', node.lineno)}).",
+                    )
+
+        # And the execution package -- the one with a generated re-export __all__ -- must actually star-import.
+        import importlib
+
+        exec_pkg = importlib.import_module("rl_quant.execution")
+        self.assertTrue(all(isinstance(n, str) for n in exec_pkg.__all__))
+        ns: dict[str, object] = {}
+        exec("from rl_quant.execution import *", ns)  # would raise TypeError on a non-str __all__ entry
+        for name in exec_pkg.__all__:
+            self.assertIn(name, ns, f"rl_quant.execution.__all__ lists {name!r} but `import *` did not bind it.")
+
     def test_news_article_rows_reject_negative_source_latency(self) -> None:
         # A negative source latency implies availability BEFORE publish (look-ahead). The library must
         # fail closed at every entry point, not silently clamp to 0 (optimistic) as it once did.
