@@ -265,18 +265,77 @@ def assert_action_mask(mask: object, *, require_row_selectable: bool = True) -> 
 
 
 def validate_decision_tensor_payload(
-    payload: Mapping, manifest: Mapping | None = None
+    payload: Mapping, manifest: Mapping | None = None, *,
+    require_full_contract: bool = False, cash_index: int = 0,
 ) -> tuple[bool, tuple[str, ...]]:
-    """Trainer-facing entry: pull the three key lists from a payload (falling back to a manifest, mirroring
-    the builder's guard) and validate the split. Require this before training/eval on a payload so a leaking
-    or malformed split fails closed rather than silently feeding a label into the model."""
+    """Trainer-facing entry: enforce the decision-tensor contract on a payload, aggregating all violations.
+
+    ALWAYS validates the model-input / label / forbidden-key SPLIT (the anti-leakage rule; pulls the three key
+    lists from the payload, falling back to ``manifest``). ADDITIONALLY runs each tensor contract validator
+    for whatever decision-tensor TENSORS are present in the payload:
+      * invalid-returns-are-NaN  (action_returns vs the label-valid mask),
+      * action-mask validity     (the ex-ante decision mask must leave a selectable action per row; the
+                                   ex-post label mask need not),
+      * the CASH fallback        (CASH selectable + finite on every row),
+      * shape consistency        (all present [rows][actions] tensors agree),
+      * the per-row causal chain  (decision_timestamps_ms <= next_timestamps_ms), when numeric ``*_ms``
+                                   anchors are present.
+    Tensor checks for ABSENT keys are SKIPPED, so a key-only payload (the legacy use) behaves exactly as
+    before -- this is backward-compatible. With ``require_full_contract=True`` the core tensors
+    (action_returns + a decision mask + a label mask) MUST be present, for reportable training/eval that must
+    not silently skip the contract. Returns (ok, issues). Mask aliases are resolved
+    (decision_action_valid_mask | action_valid_mask; label_valid_mask | action_label_valid_mask)."""
     fallback = manifest or {}
 
     def _keys(name: str) -> Sequence[str]:
         return payload.get(name, fallback.get(name, []))
 
-    return validate_model_input_label_split(
+    ok, issues = validate_model_input_label_split(
         model_input_keys=_keys("model_input_keys"),
         label_keys=_keys("label_keys"),
         forbidden_model_input_keys=_keys("forbidden_model_input_keys"),
     )
+    all_issues: list[str] = list(issues)
+
+    def _present(*names: str) -> object | None:
+        for n in names:
+            value = payload.get(n)
+            if value is not None:
+                return value
+        return None
+
+    action_returns = _present("action_returns")
+    decision_mask = _present("decision_action_valid_mask", "action_valid_mask")
+    label_mask = _present("label_valid_mask", "action_label_valid_mask")
+
+    if require_full_contract:
+        for label, value in (("action_returns", action_returns), ("decision mask", decision_mask),
+                             ("label mask", label_mask)):
+            if value is None:
+                all_issues.append(f"require_full_contract: payload is missing {label}")
+
+    def _add(prefix: str, result: tuple[bool, tuple[str, ...]]) -> None:
+        all_issues.extend(f"{prefix}: {m}" for m in result[1])
+
+    if action_returns is not None and label_mask is not None:
+        _add("invalid_returns_are_nan", validate_invalid_returns_are_nan(action_returns, label_mask))
+    if decision_mask is not None:
+        _add("decision_mask", validate_action_mask(decision_mask, require_row_selectable=True))
+    if label_mask is not None:
+        _add("label_mask", validate_action_mask(label_mask, require_row_selectable=False))
+    if action_returns is not None and decision_mask is not None:
+        _add("cash_contract", validate_cash_contract(action_returns, decision_mask, cash_index=cash_index))
+    shape_arrays = {
+        name: payload[name]
+        for name in ("action_returns", "decision_action_valid_mask", "action_valid_mask", "label_valid_mask")
+        if payload.get(name) is not None
+    }
+    if len(shape_arrays) >= 2:
+        _add("shapes", validate_decision_tensor_shapes(shape_arrays))
+    decision_ts = _present("decision_timestamps_ms")
+    next_ts = _present("next_timestamps_ms")
+    if decision_ts is not None and next_ts is not None:
+        _add("causal_chain", validate_causal_timestamp_chain([decision_ts, next_ts],
+                                                              names=["decision_ts", "next_ts"]))
+
+    return (not all_issues, tuple(all_issues))

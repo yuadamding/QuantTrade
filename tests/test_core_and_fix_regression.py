@@ -3860,6 +3860,44 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             assert_action_mask(torch.tensor([[False, False]]))
 
+    def test_decision_tensor_payload_full_contract_wiring(self) -> None:
+        # validate_decision_tensor_payload now enforces the FULL contract on whatever tensors are present
+        # (backward-compatible: a key-only payload is unaffected), aggregating every validator's issues;
+        # require_full_contract demands the core tensors be present (reportable runs).
+        from rl_quant.protocol import validate_decision_tensor_payload
+
+        nan = float("nan")
+        keys = {"model_input_keys": ["x"], "label_keys": ["action_returns"],
+                "forbidden_model_input_keys": ["action_returns"]}
+        # Key-only payload: tensor checks skipped -> identical to the key-split validator (backward-compatible).
+        self.assertTrue(validate_decision_tensor_payload(dict(keys))[0])
+        # Full, well-formed payload passes the whole contract (cash=0 finite; action1 NaN exactly where the
+        # label mask is False; decision_ts <= next_ts).
+        good = {**keys,
+                "action_returns": [[0.0, 0.01], [0.0, nan]],
+                "decision_action_valid_mask": [[True, True], [True, True]],
+                "label_valid_mask": [[True, True], [True, False]],
+                "decision_timestamps_ms": [1000, 2000], "next_timestamps_ms": [2000, 3000]}
+        ok, issues = validate_decision_tensor_payload(good)
+        self.assertTrue(ok, issues)
+        # An invalid action carrying a FINITE return -> the NaN validator fires (via the wiring).
+        ok, issues = validate_decision_tensor_payload({**good, "action_returns": [[0.0, 0.01], [0.0, 0.5]]})
+        self.assertFalse(ok)
+        self.assertTrue(any("invalid_returns_are_nan" in m for m in issues))
+        # CASH masked off on a row -> the CASH-contract validator fires.
+        ok, issues = validate_decision_tensor_payload({**good, "decision_action_valid_mask": [[False, True], [True, True]]})
+        self.assertFalse(ok)
+        self.assertTrue(any("cash_contract" in m for m in issues))
+        # Look-ahead in the causal anchors (next < decision) -> the causal-chain validator fires.
+        ok, issues = validate_decision_tensor_payload({**good, "next_timestamps_ms": [500, 3000]})
+        self.assertFalse(ok)
+        self.assertTrue(any("causal_chain" in m for m in issues))
+        # require_full_contract: a key-only payload now FAILS (missing tensors); the full payload passes.
+        ok, issues = validate_decision_tensor_payload(dict(keys), require_full_contract=True)
+        self.assertFalse(ok)
+        self.assertTrue(any("require_full_contract" in m for m in issues))
+        self.assertTrue(validate_decision_tensor_payload(good, require_full_contract=True)[0])
+
     def test_flag_registry_governance(self) -> None:
         # Governance: every opt-in flag in the registry is well-formed and defaults OFF (default-preserving),
         # every result-moving flag carries A/B metrics + flip/delete criteria, and the recorded defaults match
