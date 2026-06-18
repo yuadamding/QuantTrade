@@ -3674,6 +3674,46 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bci(series, n_bootstrap=0)
 
+    def test_ranker_metrics(self) -> None:
+        # Cross-sectional ranker quality of the action SCORER: IC (Pearson), rank IC (Spearman), top-k realized
+        # return, and selection regret. Verified against hand cases before pinning.
+        import math as _math
+
+        from rl_quant.evaluation import (
+            information_coefficient,
+            rank_information_coefficient,
+            selection_regret,
+            top_k_mean_return,
+        )
+
+        scores = [[1.0, 2.0, 3.0]]
+        realized = [[0.01, 0.02, 0.03]]
+        # Perfect (linear) ranking: IC == rank IC == 1; the scorer's top pick is the best -> regret 0.
+        self.assertAlmostEqual(information_coefficient(scores, realized), 1.0, places=9)
+        self.assertAlmostEqual(rank_information_coefficient(scores, realized), 1.0, places=9)
+        self.assertAlmostEqual(selection_regret(scores, realized), 0.0, places=12)
+        self.assertAlmostEqual(top_k_mean_return(scores, realized, 1), 0.03, places=12)
+        self.assertAlmostEqual(top_k_mean_return(scores, realized, 2), 0.025, places=12)
+        # Inverted ranking: IC/rank IC == -1; the scorer picks the worst -> regret == best - worst.
+        self.assertAlmostEqual(information_coefficient([[3.0, 2.0, 1.0]], realized), -1.0, places=9)
+        self.assertAlmostEqual(rank_information_coefficient([[3.0, 2.0, 1.0]], realized), -1.0, places=9)
+        self.assertAlmostEqual(selection_regret([[3.0, 2.0, 1.0]], realized), 0.02, places=12)
+        # valid_mask restricts the cross-section; a row with < 2 valid actions is undefined and skipped.
+        self.assertAlmostEqual(
+            information_coefficient([[1.0, 2.0, 9.0], [9.0, 1.0, 1.0]],
+                                    [[0.01, 0.02, 0.03], [0.0, 0.0, 0.0]],
+                                    [[True, True, False], [True, False, False]]),
+            1.0, places=9)
+        self.assertTrue(_math.isnan(information_coefficient([[1.0]], [[0.5]])))  # no defined row
+        # top-k clamps to the valid count; k < 1 raises.
+        self.assertEqual(top_k_mean_return(scores, realized, 5), top_k_mean_return(scores, realized, 3))
+        with self.assertRaises(ValueError):
+            top_k_mean_return(scores, realized, 0)
+        # Works on torch tensors; row-count mismatch fails closed.
+        self.assertAlmostEqual(information_coefficient(torch.tensor(scores), torch.tensor(realized)), 1.0, places=6)
+        with self.assertRaises(ValueError):
+            information_coefficient([[1.0, 2.0]], [[0.1, 0.2], [0.3, 0.4]])
+
     def test_protocol_model_input_label_split_validator(self) -> None:
         # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
         # label/future field must NEVER be a model input. Pure/additive (changes no data or training).

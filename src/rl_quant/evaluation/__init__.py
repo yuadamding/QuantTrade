@@ -4,6 +4,12 @@ Part of the protocol-first layered architecture (see architecture_migration_plan
 statistical-credibility metrics; baseline/sequential-eval helpers still live in their workflow modules and
 are migrated in later phases."""
 
+from rl_quant.evaluation.ranking import (
+    information_coefficient,
+    rank_information_coefficient,
+    selection_regret,
+    top_k_mean_return,
+)
 from rl_quant.evaluation.statistical import (
     DSR_PROMOTION_CONFIDENCE,
     PSR_MIN_CREDIBLE_OBSERVATIONS,
@@ -31,9 +37,13 @@ __all__ = [
     "effective_sample_size",
     "expected_maximum_sharpe",
     "hansens_spa",
+    "information_coefficient",
     "probabilistic_sharpe_ratio",
     "probability_of_backtest_overfitting",
     "psr_is_credible",
+    "rank_information_coefficient",
+    "selection_regret",
+    "top_k_mean_return",
     "walk_forward_degradation_ratio",
     "white_reality_check",
 ]
