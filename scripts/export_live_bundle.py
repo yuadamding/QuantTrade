@@ -138,15 +138,40 @@ def _decision_tensor_schema() -> DecisionTensorSchema:
     })
 
 
-def _golden_scores(model: SecondContextTransformerQNetwork, batch: DecisionTensorBatch) -> np.ndarray:
-    """Run the REAL rl_quant forward (CPU, eval, no-grad) and mask exactly as the
-    live TorchScorer will: invalid actions -> -inf (force-cash all False here)."""
+_CLAMP = 8.0  # rl_quant clamps z-scored features to [-8, 8] (datasets/second_context.py)
+
+
+def _zscore(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return np.clip((values - mean) / std, -_CLAMP, _CLAMP).astype(np.float32)
+
+
+def _golden_scores(
+    model: SecondContextTransformerQNetwork,
+    batch: DecisionTensorBatch,
+    *,
+    method: str,
+    market_mean: np.ndarray,
+    market_std: np.ndarray,
+    action_mean: np.ndarray,
+    action_std: np.ndarray,
+) -> np.ndarray:
+    """Normalize (per ``method``) → run the REAL rl_quant forward (CPU/eval/no-grad)
+    → mask exactly as the live TorchScorer will (invalid → -inf; force-cash all
+    False here). The golden TENSORS stay raw, so the live side re-normalizes — that
+    is what gates the normalizer reproduction."""
+    market = np.asarray(batch.market_context, dtype=np.float32)
+    action = np.asarray(batch.action_features, dtype=np.float32)
+    if method == "zscore":
+        mask = np.asarray(batch.market_context_mask, dtype=bool)
+        market = _zscore(market, market_mean, market_std)
+        market = np.where(mask[:, :, None], market, np.float32(0.0)).astype(np.float32)  # clamp THEN mask-fill
+        action = _zscore(action, action_mean, action_std)
     model.eval()
     with torch.no_grad():
         raw = model(
-            torch.from_numpy(batch.market_context),
+            torch.from_numpy(market),
             torch.from_numpy(batch.market_context_mask),
-            torch.from_numpy(batch.action_features),
+            torch.from_numpy(action),
             torch.from_numpy(batch.portfolio_state),
             torch.from_numpy(batch.constraint_state),
             torch.from_numpy(batch.action_ids),
@@ -155,27 +180,47 @@ def _golden_scores(model: SecondContextTransformerQNetwork, batch: DecisionTenso
     return np.where(batch.decision_action_valid_mask, raw_np, -np.inf).astype(np.float32)
 
 
-def build_skeleton_bundle(dest: str | Path, *, seed: int = 0) -> Path:
+def build_skeleton_bundle(dest: str | Path, *, seed: int = 0, normalizer: str = "zscore") -> Path:
     dest = Path(dest)
+    rng = np.random.default_rng(seed)
     torch.manual_seed(seed)  # seed BEFORE init so weights are deterministic
     model = SecondContextTransformerQNetwork(**{k: _ARCH[k] for k in _CTOR_KEYS})
 
     batch = _build_batch(seed)
     dts = _decision_tensor_schema()
     batch.validate(dts)  # fail-closed: never export a batch the live validator would reject
-    scores = _golden_scores(model, batch)
 
-    flat_names = (*_MARKET_NAMES, *_ACTION_NAMES, *_PORTFOLIO_NAMES, *_CONSTRAINT_NAMES)
+    # Per-block z-score stats (synthetic but valid: std safely > 0). Frozen into the
+    # bundle; the live scorer must apply EXACTLY these with the same clamp/mask order.
+    market_mean = (0.1 * rng.standard_normal(len(_MARKET_NAMES))).astype(np.float32)
+    market_std = (1.0 + 0.5 * rng.random(len(_MARKET_NAMES))).astype(np.float32)
+    action_mean = (0.1 * rng.standard_normal(len(_ACTION_NAMES))).astype(np.float32)
+    action_std = (1.0 + 0.5 * rng.random(len(_ACTION_NAMES))).astype(np.float32)
+    scores = _golden_scores(
+        model, batch, method=normalizer,
+        market_mean=market_mean, market_std=market_std, action_mean=action_mean, action_std=action_std,
+    )
+
+    # The normalizer covers the NORMALIZED inputs (market 28 + action 12); portfolio
+    # / constraint are fed raw, so they are not in the feature schema / normalizer.
+    flat_names = (*_MARKET_NAMES, *_ACTION_NAMES)
     feature_schema = FeatureSchema(
         schema_version=_SCHEMA_VERSION, feature_names=flat_names, dtypes=("float32",) * len(flat_names),
     )
     action_schema = ActionSchema(
         action_names=("CASH", "A1", "A2", "A3"), cash_action_name="CASH", cash_action_index=0,
     )
-    normalizer = Normalizer(  # identity: the bundle ships model-ready tensors (skeleton)
-        method="identity", feature_names=flat_names,
-        center=tuple(0.0 for _ in flat_names), scale=tuple(1.0 for _ in flat_names),
-    )
+    if normalizer == "zscore":
+        normalizer_obj = Normalizer(
+            method="zscore", feature_names=flat_names,
+            center=tuple(float(x) for x in (*market_mean, *action_mean)),
+            scale=tuple(float(x) for x in (*market_std, *action_std)),
+        )
+    else:  # identity: the bundle ships model-ready tensors
+        normalizer_obj = Normalizer(
+            method="identity", feature_names=flat_names,
+            center=tuple(0.0 for _ in flat_names), scale=tuple(1.0 for _ in flat_names),
+        )
 
     with tempfile.TemporaryDirectory() as tmp:
         weights_path = Path(tmp) / "model.safetensors"
@@ -188,7 +233,7 @@ def build_skeleton_bundle(dest: str | Path, *, seed: int = 0) -> Path:
             model_class="SecondContextTransformerQNetwork",
             feature_schema=feature_schema,
             action_schema=action_schema,
-            normalizer=normalizer,
+            normalizer=normalizer_obj,
             constraints={},
             approved_for=("observe", "paper"),
             not_approved_for=("live", "live_tiny"),
