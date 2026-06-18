@@ -3930,6 +3930,62 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertTrue(bool(mask[0, 2].item()))
         self.assertTrue(bool(mask[0, 0].item()))
 
+    def test_build_action_mask_reasons_explains_mask(self) -> None:
+        # build_action_mask_reasons is a NON-INVASIVE diagnostic: its .mask field IS build_action_mask's
+        # output, and reconstructing the mask from its reason tensors (plus the always-selectable current
+        # action and CASH) must reproduce that mask EXACTLY. This proves the per-constraint attribution fully
+        # explains the mask and cannot silently diverge from it. Randomized over rows and every cap combo.
+        import random
+
+        from rl_quant.protocol.constraints import ActionMaskResult, build_action_mask, build_action_mask_reasons
+
+        torch.manual_seed(0)
+        random.seed(0)
+        action_count, cash_index = 4, 0
+        for trial in range(200):
+            batch = random.randint(1, 6)
+            current = torch.randint(0, action_count, (batch,))
+            kw = dict(
+                current_action=current,
+                bars_held=torch.randint(0, 5, (batch,)),
+                cooldown_remaining=torch.randint(0, 3, (batch,)),
+                switches_today=torch.randint(0, 4, (batch,)),
+                min_hold_bars=random.choice([0, 1, 2, 3]),
+                action_count=action_count, cash_index=cash_index,
+                count_etf_to_etf_as_two_legs=bool(random.getrandbits(1)),
+            )
+            if random.getrandbits(1):
+                kw["max_switches_per_day"] = random.choice([0, 1, 2])
+            if random.getrandbits(1):
+                kw["max_switches_per_episode"] = random.choice([0, 1, 3])
+                kw["switches_episode"] = torch.randint(0, 6, (batch,))
+            if random.getrandbits(1):
+                kw["max_order_legs_per_day"] = random.choice([0.0, 1.0, 2.0])
+                kw["order_legs_today"] = torch.randint(0, 4, (batch,)).float()
+            if random.getrandbits(1):
+                kw["max_order_legs_per_episode"] = random.choice([0.0, 2.0, 4.0])
+                kw["order_legs_episode"] = torch.randint(0, 8, (batch,)).float()
+
+            result = build_action_mask_reasons(**kw)
+            self.assertIsInstance(result, ActionMaskResult)
+            # The mask field must be byte-identical to build_action_mask (it is produced by it).
+            self.assertTrue(torch.equal(result.mask, build_action_mask(**kw)))
+
+            constrained = result.min_hold_block | result.cooldown_block | result.switch_cap_block
+            recon = torch.zeros(batch, action_count, dtype=torch.bool)
+            for r in range(batch):
+                for a in range(action_count):
+                    if a == cash_index or a == int(current[r]):
+                        recon[r, a] = True            # CASH (Policy A) and the current action are always selectable
+                    elif bool(constrained[r]):
+                        recon[r, a] = False           # a row-level constraint pins the row to its current action
+                    else:
+                        recon[r, a] = not bool(result.order_leg_block[r, a])  # else only the order-leg budget blocks
+            self.assertTrue(
+                torch.equal(recon, result.mask),
+                f"reason tensors do not reconstruct the mask (trial {trial}): {kw}",
+            )
+
     def test_daily_switch_cap_masks_new_positions(self) -> None:
         mask = build_action_mask(
             current_action=torch.tensor([4]),

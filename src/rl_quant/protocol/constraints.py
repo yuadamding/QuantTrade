@@ -277,6 +277,104 @@ def build_action_mask(
     return mask
 
 
+@dataclass(frozen=True)
+class ActionMaskResult:
+    """``build_action_mask``'s selectable mask PLUS the per-constraint attribution of WHY actions are blocked
+    -- a diagnostic companion that answers "the policy could not switch because the row is still in its
+    minimum hold / post-switch cooldown / has exhausted its switch budget / the candidate exceeds an
+    order-leg cap". ``mask`` IS exactly ``build_action_mask(...)`` for the same inputs (this never recomputes
+    it). The three row-level flags pin the row to its current action (only the current action and CASH stay
+    selectable -- Policy A); ``order_leg_block`` is the per-candidate turnover-budget block BEFORE those
+    overrides. So a True reason flag never implies the current action or CASH are unavailable -- both are
+    always selectable."""
+
+    mask: torch.Tensor              # [batch, action_count] bool -- identical to build_action_mask(...)
+    min_hold_block: torch.Tensor    # [batch] bool -- row still inside its minimum hold
+    cooldown_block: torch.Tensor    # [batch] bool -- row still in post-switch cooldown
+    switch_cap_block: torch.Tensor  # [batch] bool -- per-day OR per-episode switch budget exhausted
+    order_leg_block: torch.Tensor   # [batch, action_count] bool -- candidate would exceed an order-leg budget
+
+
+def build_action_mask_reasons(
+    *,
+    current_action: torch.Tensor,
+    bars_held: torch.Tensor,
+    cooldown_remaining: torch.Tensor,
+    switches_today: torch.Tensor,
+    min_hold_bars: int,
+    action_count: int,
+    max_switches_per_day: int | None = None,
+    switches_episode: torch.Tensor | None = None,
+    max_switches_per_episode: int | None = None,
+    order_legs_today: torch.Tensor | None = None,
+    max_order_legs_per_day: float | None = None,
+    order_legs_episode: torch.Tensor | None = None,
+    max_order_legs_per_episode: float | None = None,
+    cash_index: int = 0,
+    count_etf_to_etf_as_two_legs: bool = True,
+) -> ActionMaskResult:
+    """Diagnostic companion to ``build_action_mask``: the SAME mask plus the per-constraint reason tensors
+    that explain it. The ``mask`` field is produced by ``build_action_mask`` itself (byte-identical, and so
+    this helper can never silently drift from the real mask); the reason tensors recompute the same
+    per-constraint conditions. Not on the env step path and changes no reward -- it is for inspecting /
+    logging why an action was unavailable."""
+    mask = build_action_mask(
+        current_action=current_action,
+        bars_held=bars_held,
+        cooldown_remaining=cooldown_remaining,
+        switches_today=switches_today,
+        min_hold_bars=min_hold_bars,
+        action_count=action_count,
+        max_switches_per_day=max_switches_per_day,
+        switches_episode=switches_episode,
+        max_switches_per_episode=max_switches_per_episode,
+        order_legs_today=order_legs_today,
+        max_order_legs_per_day=max_order_legs_per_day,
+        order_legs_episode=order_legs_episode,
+        max_order_legs_per_episode=max_order_legs_per_episode,
+        cash_index=cash_index,
+        count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+    )
+    batch = current_action.shape[0]
+    device = current_action.device
+    # Mirror the per-constraint conditions build_action_mask derives (must_hold / in_cooldown / exhausted).
+    min_hold_block = bars_held < int(min_hold_bars)
+    cooldown_block = cooldown_remaining > 0
+    switch_cap_block = torch.zeros(batch, dtype=torch.bool, device=device)
+    if max_switches_per_day is not None:
+        switch_cap_block = switch_cap_block | (switches_today >= int(max_switches_per_day))
+    if max_switches_per_episode is not None:
+        if switches_episode is None:
+            raise ValueError("switches_episode is required when max_switches_per_episode is set.")
+        switch_cap_block = switch_cap_block | (switches_episode >= int(max_switches_per_episode))
+    order_leg_block = torch.zeros(batch, action_count, dtype=torch.bool, device=device)
+    if max_order_legs_per_day is not None or max_order_legs_per_episode is not None:
+        candidates = torch.arange(action_count, dtype=torch.long, device=device).unsqueeze(0).expand(batch, -1)
+        previous = current_action.long().unsqueeze(1).expand_as(candidates)
+        candidate_legs = trade_legs(
+            previous, candidates, cash_index=cash_index, count_etf_to_etf_as_two_legs=count_etf_to_etf_as_two_legs,
+        )
+        if max_order_legs_per_day is not None:
+            if order_legs_today is None:
+                raise ValueError("order_legs_today is required when max_order_legs_per_day is set.")
+            order_leg_block = order_leg_block | (
+                (order_legs_today.float().unsqueeze(1) + candidate_legs) > float(max_order_legs_per_day)
+            )
+        if max_order_legs_per_episode is not None:
+            if order_legs_episode is None:
+                raise ValueError("order_legs_episode is required when max_order_legs_per_episode is set.")
+            order_leg_block = order_leg_block | (
+                (order_legs_episode.float().unsqueeze(1) + candidate_legs) > float(max_order_legs_per_episode)
+            )
+    return ActionMaskResult(
+        mask=mask,
+        min_hold_block=min_hold_block,
+        cooldown_block=cooldown_block,
+        switch_cap_block=switch_cap_block,
+        order_leg_block=order_leg_block,
+    )
+
+
 def apply_leg_aware_hysteresis(
     q_values: torch.Tensor,
     current_action: torch.Tensor,
