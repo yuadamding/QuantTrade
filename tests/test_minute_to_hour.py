@@ -1329,6 +1329,43 @@ class MinuteToHourTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 StockSecondContextConfig(**base, execution_latency_ms=bad, source_bar_interval="1s").validate()
 
+    def test_decision_tensor_payload_full_contract_on_real_builder_payloads(self) -> None:
+        # Teeth against the BUILDERS (not just synthetic dicts): a real second-context payload exposes the
+        # keys the wired validate_decision_tensor_payload expects (so the contract actually ENGAGES, not
+        # silently skips) and satisfies the full contract; corrupting it trips the matching validator. A
+        # minute-to-hour-style payload (ISO timestamps -> causal check gracefully skips) behaves the same.
+        from rl_quant.protocol import validate_decision_tensor_payload
+
+        payload = self._small_second_context_payload()
+        for key in ("action_returns", "decision_action_valid_mask", "label_valid_mask",
+                    "decision_timestamps_ms", "next_timestamps_ms"):
+            self.assertIn(key, payload)  # the wiring engages on a real builder payload
+        ok, issues = validate_decision_tensor_payload(payload, require_full_contract=True)
+        self.assertTrue(ok, issues)
+        # Corrupt the real payload: mask CASH off -> the CASH-contract validator fires through the entry.
+        corrupt_mask = payload["decision_action_valid_mask"].clone()
+        corrupt_mask[:, 0] = False
+        ok, issues = validate_decision_tensor_payload({**payload, "decision_action_valid_mask": corrupt_mask})
+        self.assertFalse(ok)
+        self.assertTrue(any("cash_contract" in m for m in issues))
+
+        # Minute-to-hour-style payload dict (ISO-string timestamps; *_ms absent -> causal check skips).
+        nan = float("nan")
+        m2h = {
+            "model_input_keys": ["minute_features"], "label_keys": ["action_returns"],
+            "forbidden_model_input_keys": ["action_returns"],
+            "action_names": ["CASH", "QQQ"],
+            "action_returns": torch.tensor([[0.0, 0.01], [0.0, nan]]),
+            "action_valid_mask": torch.tensor([[True, True], [True, True]]),
+            "label_valid_mask": torch.tensor([[True, True], [True, False]]),
+        }
+        self.assertTrue(validate_decision_tensor_payload(m2h, require_full_contract=True)[0])
+        corrupt_returns = m2h["action_returns"].clone()
+        corrupt_returns[1, 1] = 0.5  # invalid action (label False) given a finite return
+        ok, issues = validate_decision_tensor_payload({**m2h, "action_returns": corrupt_returns})
+        self.assertFalse(ok)
+        self.assertTrue(any("invalid_returns_are_nan" in m for m in issues))
+
     def test_second_context_builder_requires_point_in_time_universe_or_diagnostic_flag(self) -> None:
         module = load_script("build_second_context_decision_dataset")
         first_decision = iso_to_timestamp_ms("2026-06-12T14:35:00+00:00")
