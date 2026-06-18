@@ -152,6 +152,36 @@ def _parse_utc_timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _validate_split_chronology(
+    *, train_start: str | None, train_end: str, val_end: str, test_start: str, test_end: str | None
+) -> None:
+    """Fail fast on split boundaries that would leak or invert, BEFORE loading the dataset. The splits are
+    train ``[train_start, train_end]``, val ``(train_end, val_end]`` (capped ``< test_start``), and test
+    ``[test_start, test_end]``, so coherent, leak-free splits require
+
+        train_start <= train_end < val_end <= test_start <= test_end.
+
+    A ``test_start`` at or before ``train_end`` would place the SAME rows in train and test (the classic
+    train/test leak -- caught transitively via ``train_end < val_end <= test_start``); a ``val_end`` at or
+    before ``train_end`` would silently empty val; a ``val_end`` past ``test_start`` would let val and test
+    overlap (val is otherwise silently truncated at ``test_start``). Boundaries must be tz-aware ISO-8601."""
+    train_end_dt = _parse_utc_timestamp(train_end)
+    val_end_dt = _parse_utc_timestamp(val_end)
+    test_start_dt = _parse_utc_timestamp(test_start)
+    if train_start is not None and _parse_utc_timestamp(train_start) > train_end_dt:
+        raise ValueError(f"split chronology: train_start {train_start!r} must be <= train_end {train_end!r}.")
+    if not train_end_dt < val_end_dt:
+        raise ValueError(
+            f"split chronology: train_end {train_end!r} must be < val_end {val_end!r} (else val is empty)."
+        )
+    if not val_end_dt <= test_start_dt:
+        raise ValueError(
+            f"split chronology: val_end {val_end!r} must be <= test_start {test_start!r} (else val/test overlap)."
+        )
+    if test_end is not None and _parse_utc_timestamp(test_end) < test_start_dt:
+        raise ValueError(f"split chronology: test_end {test_end!r} must be >= test_start {test_start!r}.")
+
+
 def _build_split(
     *,
     name: str,
@@ -281,6 +311,9 @@ def build_second_context_splits(
     train_start: str | None = None,
     test_end: str | None = None,
 ) -> tuple[SecondContextDataSplit, SecondContextDataSplit, SecondContextDataSplit]:
+    _validate_split_chronology(
+        train_start=train_start, train_end=train_end, val_end=val_end, test_start=test_start, test_end=test_end
+    )
     payload = _load_payload(dataset_path)
     train = _build_split(name="train", payload=payload, start=train_start, end=train_end)
     val = _build_split(

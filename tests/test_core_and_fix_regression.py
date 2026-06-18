@@ -3800,6 +3800,34 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _periods_per_day(bad)
 
+    def test_split_chronology_validation(self) -> None:
+        # build_second_context_splits now fails fast on boundaries that would leak or invert, BEFORE loading
+        # the dataset. Required ordering: train_start <= train_end < val_end <= test_start <= test_end.
+        from rl_quant.datasets.second_context import _validate_split_chronology
+
+        ok = dict(train_start="2026-01-01T00:00:00+00:00", train_end="2026-01-31T00:00:00+00:00",
+                  val_end="2026-02-28T00:00:00+00:00", test_start="2026-03-01T00:00:00+00:00",
+                  test_end="2026-03-31T00:00:00+00:00")
+        _validate_split_chronology(**ok)  # canonical valid split: no raise
+        # val_end == test_start is allowed (the production builder uses exactly this); train_start/test_end optional.
+        _validate_split_chronology(train_start=None, train_end="2026-06-12T14:35:00+00:00",
+                                   val_end="2026-06-12T14:45:00+00:00", test_start="2026-06-12T14:45:00+00:00",
+                                   test_end=None)
+        # Each violation raises (leak / inversion / empty val / overlap).
+        with self.assertRaises(ValueError):  # train_start after train_end
+            _validate_split_chronology(**{**ok, "train_start": "2026-02-01T00:00:00+00:00"})
+        with self.assertRaises(ValueError):  # val_end <= train_end -> empty val
+            _validate_split_chronology(**{**ok, "val_end": "2026-01-15T00:00:00+00:00"})
+        with self.assertRaises(ValueError):  # val_end > test_start -> val/test overlap
+            _validate_split_chronology(**{**ok, "val_end": "2026-03-15T00:00:00+00:00"})
+        with self.assertRaises(ValueError):  # test_end < test_start -> inverted test
+            _validate_split_chronology(**{**ok, "test_end": "2026-02-15T00:00:00+00:00"})
+        # The classic train/test leak (test_start <= train_end) is caught transitively via the val ordering.
+        with self.assertRaises(ValueError):
+            _validate_split_chronology(train_start=None, train_end="2026-03-01T00:00:00+00:00",
+                                       val_end="2026-02-28T00:00:00+00:00", test_start="2026-01-31T00:00:00+00:00",
+                                       test_end=None)
+
     def test_ranker_metrics(self) -> None:
         # Cross-sectional ranker quality of the action SCORER: IC (Pearson), rank IC (Spearman), top-k realized
         # return, and selection regret. Verified against hand cases before pinning.
