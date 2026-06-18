@@ -8997,30 +8997,37 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(env.constraints.one_way_cost_bps, 2.0)
         self.assertIsInstance(env.constraints.one_way_cost_bps, float)
 
-    def test_minute_to_hour_requires_finite_cash_return_on_valid_rows(self) -> None:
-        # CASH is the forced safety fallback; a non-finite CASH return on a valid decision row must fail closed
-        # at env construction AND at evaluator entry (otherwise the fallback would emit a NaN reward).
+    def test_minute_to_hour_requires_usable_cash_on_valid_rows(self) -> None:
+        # CASH is the forced safety fallback; it must be USABLE (label-valid AND finite return) on every valid
+        # decision row. BOTH a non-finite CASH return AND a finite-but-label-invalid CASH must fail closed at
+        # env construction AND at evaluator entry (the fallback reads the CASH return directly).
         from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
         from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
         from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
 
         device = torch.device("cpu")
-        bad = HourFromMinuteDataSplit(  # CASH (index 0) return is NaN at row 0, a valid decision row
-            name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
-            next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
-            hour_features=torch.zeros((2, 1, 1)),
-            action_returns=torch.tensor([[float("nan"), 0.0], [0.0, 0.0]]),
-            action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
-            valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
         base = default_minute_to_hour_constraints()
-        with self.assertRaises(ValueError):
-            VectorizedMinuteToHourEnv(bad, MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
-        with self.assertRaises(ValueError):
-            evaluate_minute_to_hour_policy(bad, _ConstantActionModel(2, 0), device=device, constraints=base)
+
+        def split(action_returns, label_valid_mask) -> HourFromMinuteDataSplit:
+            return HourFromMinuteDataSplit(
+                name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
+                next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((2, 1, 1)), action_returns=action_returns,
+                action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=label_valid_mask,
+                valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
+
+        nan_cash = split(torch.tensor([[float("nan"), 0.0], [0.0, 0.0]]), torch.ones((2, 2), dtype=torch.bool))
+        # CASH return finite (0.0) but its label is marked invalid at the valid row 0 -> still unusable.
+        label_invalid_cash = split(torch.zeros((2, 2)), torch.tensor([[False, True], [True, True]]))
+        for bad in (nan_cash, label_invalid_cash):
+            with self.assertRaises(ValueError):
+                VectorizedMinuteToHourEnv(bad, MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+            with self.assertRaises(ValueError):
+                evaluate_minute_to_hour_policy(bad, _ConstantActionModel(2, 0), device=device, constraints=base)
 
     def _shadow_resume_split(self, name: str, dates: list[str]):
         from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit
@@ -9072,6 +9079,43 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertEqual(saved_again["shadow_delta_count"], 5)  # full run (3 restored + 2 more), not just 2
             self.assertIsNotNone(resumed["execution_shadow_reward_delta_mean"])
 
+    def test_minute_to_hour_resume_rejects_changed_economics(self) -> None:
+        # A checkpoint must not be resumed with DIFFERENT economics (here: a changed one_way_cost_bps). The run
+        # semantics hash saved in the checkpoint mismatches the resuming run's, so resume fails closed -- same
+        # tensor shapes are not enough to share a run.
+        import dataclasses
+
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.minute_to_hour_transformer import (
+            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        )
+
+        train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
+        val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"])
+
+        def cfg(train_steps: int, state_path, *, resume: bool, constraints) -> MinuteToHourTrainingConfig:
+            return MinuteToHourTrainingConfig(
+                env=MinuteToHourEnvConfig(num_envs=2, episode_length=2, constraints=constraints),
+                learning=DQNLearningConfig(
+                    num_envs=2, episode_length=2, replay_capacity=16, batch_size=2, train_steps=train_steps,
+                    warmup_steps=1, gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=2,
+                    epsilon_start=0.1, epsilon_end=0.0, eval_interval=2, grad_clip=1.0, use_amp=False),
+                d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+                resume_training_state=state_path if resume else None,
+                checkpoint_training_state=state_path, checkpoint_every_steps=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.pt"
+            torch.manual_seed(123)
+            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
+                                     config=cfg(3, state_path, resume=False, constraints=default_minute_to_hour_constraints()))
+            # Resume with a DIFFERENT one_way_cost_bps -> changed economics -> hash mismatch -> fail closed.
+            changed = dataclasses.replace(default_minute_to_hour_constraints(), one_way_cost_bps=2.0)
+            with self.assertRaises(ValueError):
+                train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
+                                         config=cfg(5, state_path, resume=True, constraints=changed))
+
     def test_minute_to_hour_pr4_execution_reward_gate(self) -> None:
         # use_execution_env_reward (PR-4) is fail-closed: it requires RESOLVED action_return_weight_semantics
         # AND complete action metadata. The flag is not a config field yet, so we set it on the env config
@@ -9113,7 +9157,23 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             action_return_weight_semantics="full_capital_single_slot_returns")
         with self.assertRaises(ValueError):
             run(unknown_train, unknown_val, arm=True)
-        # (c) NOT armed (the normal path) trains fine even with unresolved semantics -- the guard is dormant.
+        # (c) armed + a non-enum semantics string ("resolved" is not in the allowed vocabulary) -> fail closed.
+        bogus_train = dataclasses.replace(
+            self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"]), action_return_weight_semantics="resolved")
+        bogus_val = dataclasses.replace(
+            self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"]), action_return_weight_semantics="resolved")
+        with self.assertRaises(ValueError):
+            run(bogus_train, bogus_val, arm=True)
+        # (d) armed + train/val disagree on semantics -> fail closed.
+        mt = dataclasses.replace(
+            self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"]),
+            action_return_weight_semantics="metadata_weighted_portfolio_returns")
+        mv = dataclasses.replace(
+            self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"]),
+            action_return_weight_semantics="full_capital_single_slot_returns")
+        with self.assertRaises(ValueError):
+            run(mt, mv, arm=True)
+        # (e) NOT armed (the normal path) trains fine even with unresolved semantics -- the guard is dormant.
         run(train, val, arm=False)
 
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:

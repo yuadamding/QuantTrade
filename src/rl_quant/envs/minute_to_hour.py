@@ -210,20 +210,24 @@ def validate_minute_to_hour_constraints(
     )
 
 
-def validate_cash_finite_on_decision_rows(data: HourFromMinuteDataSplit, cash_index: int) -> None:
-    """CASH is the FORCED safety fallback for masked / missing-label actions, and the fallback reads
-    ``action_returns[row, cash_index]`` directly -- so CASH must carry a FINITE return on every valid decision
-    row, else the env / evaluator would emit a NaN reward. (Under the action-return contract label-valid <=>
-    finite, so a non-finite CASH return also means CASH is not a usable label -- a broken safety action.) The
-    env and evaluator both enforce this up front so a malformed split fails closed at construction/entry."""
+def validate_cash_usable_on_decision_rows(data: HourFromMinuteDataSplit, cash_index: int) -> None:
+    """CASH is the FORCED safety fallback for masked / missing-label actions, so it must be USABLE on every
+    valid decision row: its label must be VALID *and* its return FINITE. The fallback reads
+    ``action_returns[row, cash_index]`` directly (a non-finite return would emit a NaN reward) and the
+    usable-label rule everywhere else is ``label_valid & isfinite`` -- a finite-but-label-invalid CASH would be
+    a broken safety action. The action-return contract makes label-valid <=> finite for builder-produced
+    splits, but a hand-constructed split (tests/research) can violate it, so the env and evaluator both enforce
+    the full usability up front and fail closed at construction/entry."""
     rows = data.valid_start_indices
     if rows.numel() == 0:
         return  # an empty split is handled by the caller's own emptiness guard
-    cash_returns = data.action_returns[rows.to(data.action_returns.device), cash_index]
-    if not bool(torch.isfinite(cash_returns).all().item()):
+    rows = rows.to(data.action_returns.device)
+    cash_returns = data.action_returns[rows, cash_index]
+    cash_label_valid = data.label_valid_actions(rows)[:, cash_index]
+    if not bool((cash_label_valid & torch.isfinite(cash_returns)).all().item()):
         raise ValueError(
-            "CASH action must have a finite return on every valid decision row (it is the forced safety "
-            "fallback); the split has a non-finite CASH return."
+            "CASH action must be USABLE (label-valid AND finite return) on every valid decision row "
+            "(it is the forced safety fallback); the split has an unusable CASH action."
         )
 
 
@@ -248,7 +252,8 @@ class VectorizedMinuteToHourEnv:
         # cash_idle_penalty_bps finite/non-negative). episode_length<=0 would truncate every episode at step 0.
         require_positive_int("num_envs", config.num_envs)
         require_positive_int("episode_length", config.episode_length)
-        coerce_finite_nonnegative("cash_idle_penalty_bps", config.cash_idle_penalty_bps)
+        # Store the normalized (canonical float) cash-idle penalty and use it in the reward ledger.
+        self.cash_idle_penalty_bps = coerce_finite_nonnegative("cash_idle_penalty_bps", config.cash_idle_penalty_bps)
         # Pin to a CONCRETE device ordinal (concrete_torch_device): the env is typically built with the result
         # of core.resolve_torch_device, and although that now returns a concrete cuda:<idx>, a caller could
         # still pass an ordinal-free torch.device("cuda"). _validate_step_actions compares an action tensor's
@@ -258,8 +263,8 @@ class VectorizedMinuteToHourEnv:
         self.config = config
         # Derive self.device from the actual moved tensor so it matches what indexed tensors report exactly.
         self.device = self.data.minute_features.device
-        # CASH is the forced safety fallback; require it to be finite on every valid decision row.
-        validate_cash_finite_on_decision_rows(self.data, self.cash_index)
+        # CASH is the forced safety fallback; require it to be USABLE (label-valid + finite) on every valid row.
+        validate_cash_usable_on_decision_rows(self.data, self.cash_index)
         self.start_indices = self._build_start_index_pool()
         self.indices = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.previous_actions = torch.full((config.num_envs,), self.initial_action, dtype=torch.long, device=device)
@@ -289,7 +294,7 @@ class VectorizedMinuteToHourEnv:
             self._shadow_action_weights = action_weight_tensor(
                 build_action_metadata(list(self.data.action_names)), device=device
             )
-            self._shadow_weight_cost = WeightExecutionCostConfig(fee_bps=float(config.constraints.one_way_cost_bps))
+            self._shadow_weight_cost = WeightExecutionCostConfig(fee_bps=self.constraints.one_way_cost_bps)
         self.reset()
 
     def _build_start_index_pool(self) -> torch.Tensor:
@@ -456,7 +461,7 @@ class VectorizedMinuteToHourEnv:
             previous_actions,
             actions,
             constraints=self.constraints,
-            cash_idle_penalty_bps=self.config.cash_idle_penalty_bps,
+            cash_idle_penalty_bps=self.cash_idle_penalty_bps,
             action_count=len(self.data.action_names),
         )
         legs = cost.legs

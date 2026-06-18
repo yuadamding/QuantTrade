@@ -1,6 +1,8 @@
 """Training layer: minute->hour DQN training loop + evaluation + checkpointing + recency weighting (extracted from rl_quant.minute_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
@@ -52,6 +54,7 @@ from rl_quant.models.minute_to_hour import (  # re-export: model moved to the mo
     MinuteToHourCausalTransformerQNetwork,
 )
 from rl_quant.datasets.hour_from_subhour import (
+    ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS,
     HourFromMinuteDataSplit,
     _timestamp_to_epoch_ms,
     assert_matching_hour_from_minute_schema,
@@ -62,7 +65,7 @@ from rl_quant.envs.minute_to_hour import (
     MinuteToHourEnvConfig,
     VectorizedMinuteToHourEnv,
     transition_trade_cost_bps,
-    validate_cash_finite_on_decision_rows,
+    validate_cash_usable_on_decision_rows,
     validate_minute_to_hour_constraints,
 )
 from rl_quant.execution import (
@@ -199,7 +202,7 @@ def evaluate_minute_to_hour_policy(
     if int(data.valid_start_indices.numel()) == 0:
         raise ValueError("evaluation split has no valid decision start indices.")
     # CASH is the forced safety fallback here too; require a finite CASH return on every valid decision row.
-    validate_cash_finite_on_decision_rows(data, cash_index)
+    validate_cash_usable_on_decision_rows(data, cash_index)
     # episode_length must be a positive int when given (the bare ``int(episode_length or ...)`` silently turned
     # 0 into the default, True into 1, and 1.9 into 1); None still means "use the full valid-start span".
     if episode_length is None:
@@ -605,6 +608,28 @@ def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
     tmp_path.replace(path)
 
 
+def _run_semantics_hash(
+    train_data: HourFromMinuteDataSplit, normalized_constraints: object
+) -> str:
+    """Stable fingerprint of the run's ECONOMICS / schema -- action space, feature schemas, normalized
+    constraints, and the action-return weight semantics. A resume must match this exactly: identical tensor
+    shapes are NOT enough (a checkpoint resumed with different costs / cash index / return semantics would
+    silently train on different economics), so resume rejects a mismatch."""
+    payload = json.dumps(
+        {
+            "action_names": list(train_data.action_names),
+            "minute_feature_names": list(train_data.minute_feature_names),
+            "hour_feature_names": list(train_data.hour_feature_names),
+            "action_feature_names": list(train_data.action_feature_names),
+            "normalized_constraints": asdict(normalized_constraints),
+            "action_return_weight_semantics": train_data.action_return_weight_semantics,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _save_minute_to_hour_training_state(
     path: Path,
     *,
@@ -625,6 +650,7 @@ def _save_minute_to_hour_training_state(
     shadow_reward_delta_sum: float,
     shadow_cost_delta_sum: float,
     shadow_delta_count: int,
+    run_semantics_hash: str,
     device: torch.device,
 ) -> None:
     _atomic_torch_save(
@@ -649,6 +675,8 @@ def _save_minute_to_hour_training_state(
             "shadow_reward_delta_sum": float(shadow_reward_delta_sum),
             "shadow_cost_delta_sum": float(shadow_cost_delta_sum),
             "shadow_delta_count": int(shadow_delta_count),
+            # Economic/schema fingerprint -- resume rejects a run with different economics (see _run_semantics_hash).
+            "run_semantics_hash": str(run_semantics_hash),
             "rng_state": _capture_rng_state(device),
         },
         path,
@@ -808,13 +836,22 @@ def train_minute_to_hour_dqn(
     # getattr keeps this dormant today and ARMED the moment PR-4 wires the field in.
     if getattr(config.env, "use_execution_env_reward", False):
         semantics = train_data.action_return_weight_semantics
-        if semantics is None or semantics == "unresolved":
+        # (1) Resolved to one of the ALLOWED enum values -- reject None / "unresolved" / typos / vague strings,
+        # so the execution-reward turnover cost basis is unambiguous (docs/execution_wiring_design.md §3).
+        if semantics not in ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS:
             raise ValueError(
-                "use_execution_env_reward requires a RESOLVED train_data.action_return_weight_semantics "
-                f"(got {semantics!r}); the gold builder must declare whether action_returns are "
-                "'full_capital_single_slot_returns' or 'metadata_weighted_portfolio_returns' "
-                "(docs/execution_wiring_design.md §3) before training on the execution reward."
+                "use_execution_env_reward requires train_data.action_return_weight_semantics to be one of "
+                f"{sorted(ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS)} (got {semantics!r}); the gold builder must "
+                "declare the action_returns weight basis before training on the execution reward."
             )
+        # (2) train and val MUST agree -- a split disagreeing on the cost basis would score train and selection
+        # on different economics.
+        if val_data.action_return_weight_semantics != semantics:
+            raise ValueError(
+                "use_execution_env_reward requires train and val to share action_return_weight_semantics "
+                f"(train={semantics!r}, val={val_data.action_return_weight_semantics!r})."
+            )
+        # (3) Action metadata must be complete (no unknown symbols priced as 1x long).
         unknown = unknown_action_metadata_symbols(list(train_data.action_names))
         if unknown:
             raise ValueError(
@@ -823,6 +860,9 @@ def train_minute_to_hour_dqn(
     configure_torch_runtime(device)
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
+    # Economic/schema fingerprint of THIS run; saved into checkpoints and re-checked on resume so a checkpoint
+    # cannot be resumed with different action space / constraints / reward semantics (different economics).
+    run_semantics_hash = _run_semantics_hash(train_data, normalized_constraints)
     # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
     # passed to this function, so older training rows can be down-weighted without any risk of
     # touching the held-out test block. mode='none' yields uniform weights (no behavior change).
@@ -957,6 +997,15 @@ def train_minute_to_hour_dqn(
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         if not isinstance(checkpoint, dict) or checkpoint.get("checkpoint_kind") != "minute_to_hour_dqn_training_state":
             raise ValueError("Resume checkpoint is not a minute-to-hour DQN training state.")
+        # Reject resuming a run with DIFFERENT economics (action space / feature schema / normalized
+        # constraints / action-return semantics). Older checkpoints without the hash skip this (prior behaviour).
+        saved_semantics_hash = checkpoint.get("run_semantics_hash")
+        if saved_semantics_hash is not None and saved_semantics_hash != run_semantics_hash:
+            raise ValueError(
+                "Resume checkpoint run-semantics mismatch: the action space / feature schema / normalized "
+                "constraints / action-return weight semantics differ from the checkpointed run; refusing to "
+                "resume with different economics."
+            )
         q_network.load_state_dict(checkpoint["q_network_state_dict"], strict=True)
         target_network.load_state_dict(checkpoint["target_network_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1200,6 +1249,7 @@ def train_minute_to_hour_dqn(
                 shadow_reward_delta_sum=shadow_reward_delta_sum,
                 shadow_cost_delta_sum=shadow_cost_delta_sum,
                 shadow_delta_count=shadow_delta_count,
+                run_semantics_hash=run_semantics_hash,
                 device=device,
             )
 

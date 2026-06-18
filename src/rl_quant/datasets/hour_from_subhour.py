@@ -29,6 +29,14 @@ def default_minute_to_hour_constraints() -> TradingConstraintConfig:
     return TradingConstraintConfig(max_switches_per_day=2, q_switch_margin_bps=3.0)
 
 
+# The only accepted values for HourFromMinuteDataSplit.action_return_weight_semantics (PR-4 gate). Anything
+# else -- None, "unresolved", a typo, a vague string -- fail-closes use_execution_env_reward. See
+# docs/execution_wiring_design.md §3: the value determines the execution-reward turnover cost basis.
+ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS = frozenset(
+    {"metadata_weighted_portfolio_returns", "full_capital_single_slot_returns"}
+)
+
+
 @dataclass
 class HourFromMinuteDataSplit:
     name: str
@@ -975,7 +983,11 @@ def _build_split(
         scorable_label_ok = label_valid_mask.bool() & torch.isfinite(returns)
     non_cash_actions = torch.ones(returns.shape[1], dtype=torch.bool, device=returns.device)
     action_names = list(payload["action_names"])
-    cash_index = action_names.index("CASH") if "CASH" in action_names else 0
+    # CASH is a hard invariant (forced safety fallback, cash-idle, zero exposure); a silent fallback to index 0
+    # would corrupt missing-label filtering / reportability before the env later rejects the split.
+    if "CASH" not in action_names:
+        raise ValueError("hour-from-subhour dataset requires an explicit 'CASH' action in action_names.")
+    cash_index = action_names.index("CASH")
     if 0 <= cash_index < int(non_cash_actions.numel()):
         non_cash_actions[cash_index] = False
     rows_with_selectable_missing_labels = (
