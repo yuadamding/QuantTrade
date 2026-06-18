@@ -69,7 +69,7 @@ from rl_quant.envs.minute_to_hour import (
     validate_cash_usable_on_decision_rows,
     validate_minute_to_hour_constraints,
 )
-from rl_quant.evaluation.statistical import probabilistic_sharpe_ratio
+from rl_quant.evaluation.statistical import probabilistic_sharpe_ratio, psr_is_credible
 from rl_quant.execution import (
     coerce_finite_nonnegative,
     coerce_finite_positive,
@@ -154,6 +154,16 @@ class MinuteToHourEvaluationResult:
     # Sharpe; None when there are < 2 net returns or zero dispersion. (DSR needs the #trials and stays a
     # promotion-protocol concern.)
     probabilistic_sharpe_ratio: float | None = None
+    # Number of net per-period returns the PSR was computed from (0 when none were available). PSR off a
+    # handful of points is fragile however high it reads, so the raw count travels WITH the value and a
+    # derived ``*_is_credible`` flag applies the reportability threshold once. Neither changes the PSR value.
+    probabilistic_sharpe_ratio_observations: int = 0
+
+    @property
+    def probabilistic_sharpe_ratio_is_credible(self) -> bool:
+        """Whether the PSR is estimable AND rests on enough net returns to report (PSR_MIN_CREDIBLE_OBSERVATIONS).
+        False when PSR is None or estimated from too few observations; the value itself, when present, is unchanged."""
+        return psr_is_credible(self.probabilistic_sharpe_ratio, self.probabilistic_sharpe_ratio_observations)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -166,6 +176,8 @@ class MinuteToHourEvaluationResult:
             "max_drawdown": self.max_drawdown,
             "annualized_sharpe": self.annualized_sharpe,
             "probabilistic_sharpe_ratio": self.probabilistic_sharpe_ratio,
+            "probabilistic_sharpe_ratio_observations": self.probabilistic_sharpe_ratio_observations,
+            "probabilistic_sharpe_ratio_is_credible": self.probabilistic_sharpe_ratio_is_credible,
             "rollout_records": self.rollout_records,
             "evaluation_reportable": self.evaluation_reportable,
             "reportability_errors": self.reportability_errors,
@@ -446,6 +458,7 @@ def evaluate_minute_to_hour_policy(
         max_drawdown=fractional_max_drawdown(equity_curve),
         annualized_sharpe=annualized_sharpe(returns, periods_per_year=data.periods_per_year),
         probabilistic_sharpe_ratio=psr,
+        probabilistic_sharpe_ratio_observations=n_returns,
         rollout_records=records,
         evaluation_reportable=bool(report["evaluation_reportable"]),
         reportability_errors=list(report["reportability_errors"]),
@@ -1243,11 +1256,14 @@ def train_minute_to_hour_dqn(
                     "val_sharpe": val_result.annualized_sharpe,
                     # PSR is None when not estimable (< 2 net returns / zero dispersion); persist it (and the
                     # estimability status) so the training artifact's eval_trace carries the statistical-
-                    # credibility metric, not just the raw Sharpe.
+                    # credibility metric, not just the raw Sharpe. The observation count + is_credible flag
+                    # travel alongside so a reader can tell a credible 0.9 from a 0.9 off a handful of points.
                     "val_probabilistic_sharpe_ratio": val_result.probabilistic_sharpe_ratio,
                     "val_probabilistic_sharpe_ratio_status": (
                         "ok" if val_result.probabilistic_sharpe_ratio is not None else "not_estimable"
                     ),
+                    "val_probabilistic_sharpe_ratio_observations": val_result.probabilistic_sharpe_ratio_observations,
+                    "val_probabilistic_sharpe_ratio_is_credible": val_result.probabilistic_sharpe_ratio_is_credible,
                     "average_loss": sum(loss_trace[-200:]) / max(len(loss_trace[-200:]), 1),
                     "average_train_reward": sum(reward_trace[-200:]) / max(len(reward_trace[-200:]), 1),
                     "average_valid_action_count": sum(valid_action_count_trace[-200:])

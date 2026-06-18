@@ -8799,6 +8799,50 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             last["val_probabilistic_sharpe_ratio_status"] == "ok",
             last["val_probabilistic_sharpe_ratio"] is not None,
         )
+        # The observation count + credibility flag must travel with the value so a reader can tell a credible
+        # PSR from one off a handful of points. The count is a non-negative int; is_credible is a bool that
+        # is never True without an estimable value, and never True below the reportability observation floor.
+        from rl_quant.evaluation.statistical import PSR_MIN_CREDIBLE_OBSERVATIONS
+
+        n_obs = last["val_probabilistic_sharpe_ratio_observations"]
+        credible = last["val_probabilistic_sharpe_ratio_is_credible"]
+        self.assertIsInstance(n_obs, int)
+        self.assertGreaterEqual(n_obs, 0)
+        self.assertIsInstance(credible, bool)
+        if credible:
+            self.assertIsNotNone(last["val_probabilistic_sharpe_ratio"])
+            self.assertGreaterEqual(n_obs, PSR_MIN_CREDIBLE_OBSERVATIONS)
+        if last["val_probabilistic_sharpe_ratio"] is None or n_obs < PSR_MIN_CREDIBLE_OBSERVATIONS:
+            self.assertFalse(credible)
+
+    def test_psr_is_credible_threshold_and_result_property(self) -> None:
+        # psr_is_credible gates on BOTH estimability (not None) and the observation floor, and the
+        # MinuteToHourEvaluationResult property must defer to exactly that helper (no divergent inline logic).
+        from rl_quant.evaluation.statistical import PSR_MIN_CREDIBLE_OBSERVATIONS, psr_is_credible
+        from rl_quant.training.minute_to_hour import MinuteToHourEvaluationResult
+
+        floor = PSR_MIN_CREDIBLE_OBSERVATIONS
+        self.assertGreaterEqual(floor, 2)  # PSR itself needs >= 2 observations to even be estimable
+        # None value is never credible, regardless of how many observations.
+        self.assertFalse(psr_is_credible(None, floor + 100))
+        # Estimable but below the floor -> not credible; at/above the floor -> credible.
+        self.assertFalse(psr_is_credible(0.99, floor - 1))
+        self.assertTrue(psr_is_credible(0.50, floor))
+        self.assertTrue(psr_is_credible(0.01, floor + 1))
+
+        def make(psr: float | None, n: int) -> MinuteToHourEvaluationResult:
+            return MinuteToHourEvaluationResult(
+                split_name="t", total_return=0.0, total_reward_bps=0.0, allocation_switches=0,
+                market_order_legs=0.0, max_drawdown=0.0, annualized_sharpe=None, rollout_records=[],
+                probabilistic_sharpe_ratio=psr, probabilistic_sharpe_ratio_observations=n,
+            )
+        # The property and to_dict must mirror the helper exactly.
+        for psr, n in [(None, 0), (None, floor + 5), (0.9, floor - 1), (0.9, floor), (0.2, floor + 50)]:
+            result = make(psr, n)
+            expected = psr_is_credible(psr, n)
+            self.assertEqual(result.probabilistic_sharpe_ratio_is_credible, expected)
+            self.assertEqual(result.to_dict()["probabilistic_sharpe_ratio_is_credible"], expected)
+            self.assertEqual(result.to_dict()["probabilistic_sharpe_ratio_observations"], n)
 
     def test_minute_to_hour_eval_rejects_empty_valid_start_split(self) -> None:
         # An evaluation split with no valid decision rows fails closed (a zero/degenerate metric would

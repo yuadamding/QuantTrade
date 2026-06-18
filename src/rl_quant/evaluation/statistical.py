@@ -58,6 +58,21 @@ def probabilistic_sharpe_ratio(
     return _NORMAL.cdf(z)
 
 
+# A PSR computed from very few net returns is fragile no matter how high it reads: the skew/kurtosis
+# standard-error correction is itself estimated from that same handful of points, and the normal-CDF
+# mapping leans on the per-period Sharpe estimator being roughly Gaussian -- only true once n is large
+# enough. This is the observation count below which a PSR should be reported as "present but not yet
+# credible". It is a REPORTABILITY heuristic (the common CLT rule of thumb), NOT a hard statistical law:
+# it gates NO model selection and changes NO PSR value -- it only annotates how much to trust one.
+PSR_MIN_CREDIBLE_OBSERVATIONS = 30
+
+
+def psr_is_credible(probabilistic_sharpe: float | None, n_observations: int) -> bool:
+    """True iff a PSR was estimable (not ``None``) AND rests on at least ``PSR_MIN_CREDIBLE_OBSERVATIONS``
+    net returns. A reportability annotation only -- it never changes the PSR value or any selection."""
+    return probabilistic_sharpe is not None and n_observations >= PSR_MIN_CREDIBLE_OBSERVATIONS
+
+
 def expected_maximum_sharpe(n_trials: int, *, trials_sharpe_std: float = 1.0) -> float:
     """Expected MAXIMUM of ``n_trials`` i.i.d. ``N(0, trials_sharpe_std^2)`` Sharpe estimates under the null
     (no skill) -- the benchmark the Deflated Sharpe deflates against. More trials => higher expected max by
