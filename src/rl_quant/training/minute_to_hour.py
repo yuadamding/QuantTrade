@@ -69,7 +69,11 @@ from rl_quant.envs.minute_to_hour import (
     validate_cash_usable_on_decision_rows,
     validate_minute_to_hour_constraints,
 )
-from rl_quant.evaluation.statistical import probabilistic_sharpe_ratio, psr_is_credible
+from rl_quant.evaluation.statistical import (
+    effective_sample_size,
+    probabilistic_sharpe_ratio,
+    psr_is_credible,
+)
 from rl_quant.execution import (
     coerce_finite_nonnegative,
     coerce_finite_positive,
@@ -158,6 +162,10 @@ class MinuteToHourEvaluationResult:
     # handful of points is fragile however high it reads, so the raw count travels WITH the value and a
     # derived ``*_is_credible`` flag applies the reportability threshold once. Neither changes the PSR value.
     probabilistic_sharpe_ratio_observations: int = 0
+    # Autocorrelation-deflated effective sample size of the net returns: PSR/Sharpe assume i.i.d. returns, so
+    # when this is materially below the raw observation count the PSR (and is_credible, which uses the raw
+    # count) is over-confident. Transparency companion -- it changes no PSR value or selection.
+    probabilistic_sharpe_ratio_effective_observations: float = 0.0
     # Aggregate diagnostic: how many evaluated decision rows each constraint pinned to the current action
     # (min_hold / cooldown / switch_cap) or had a candidate order-leg-blocked, plus the decision_rows total.
     # Explains a policy's turnover (e.g. "min-hold pinned 40% of rows") and changes no mask/selection/reward.
@@ -181,6 +189,7 @@ class MinuteToHourEvaluationResult:
             "annualized_sharpe": self.annualized_sharpe,
             "probabilistic_sharpe_ratio": self.probabilistic_sharpe_ratio,
             "probabilistic_sharpe_ratio_observations": self.probabilistic_sharpe_ratio_observations,
+            "probabilistic_sharpe_ratio_effective_observations": self.probabilistic_sharpe_ratio_effective_observations,
             "probabilistic_sharpe_ratio_is_credible": self.probabilistic_sharpe_ratio_is_credible,
             "mask_block_reason_row_counts": self.mask_block_reason_row_counts,
             "rollout_records": self.rollout_records,
@@ -464,6 +473,9 @@ def evaluate_minute_to_hour_policy(
                 avg / math.sqrt(m2), benchmark_sharpe=0.0, n_observations=n_returns,
                 skewness=m3 / (m2 ** 1.5), kurtosis=m4 / (m2 ** 2),  # non-excess kurtosis (normal = 3.0)
             )
+    # Autocorrelation-deflated effective n: reported alongside the raw count so a reader can see when serial
+    # correlation makes the PSR over-confident. Same series/moment convention as the PSR above.
+    psr_effective_observations = effective_sample_size(returns)
     return MinuteToHourEvaluationResult(
         split_name=data.name,
         total_return=equity - 1.0,
@@ -474,6 +486,7 @@ def evaluate_minute_to_hour_policy(
         annualized_sharpe=annualized_sharpe(returns, periods_per_year=data.periods_per_year),
         probabilistic_sharpe_ratio=psr,
         probabilistic_sharpe_ratio_observations=n_returns,
+        probabilistic_sharpe_ratio_effective_observations=psr_effective_observations,
         mask_block_reason_row_counts=mask_block_rows,
         rollout_records=records,
         evaluation_reportable=bool(report["evaluation_reportable"]),

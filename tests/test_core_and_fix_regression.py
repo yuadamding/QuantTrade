@@ -2514,10 +2514,22 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertLessEqual(psr, 1.0)
         self.assertGreater(psr, 0.5)                                  # positive-Sharpe returns
         self.assertEqual(res.to_dict()["probabilistic_sharpe_ratio"], psr)
+        # Autocorrelation-deflated effective n travels alongside: in [1, raw n] and surfaced in to_dict.
+        obs = res.probabilistic_sharpe_ratio_observations
+        eff = res.probabilistic_sharpe_ratio_effective_observations
+        self.assertGreaterEqual(obs, 2)
+        self.assertGreaterEqual(eff, 1.0)
+        self.assertLessEqual(eff, float(obs))
+        self.assertEqual(res.to_dict()["probabilistic_sharpe_ratio_effective_observations"], eff)
         # All-CASH policy -> constant zero net returns -> no dispersion -> PSR is None.
         res_cash = evaluate_minute_to_hour_policy(split, _ConstantActionModel(2, 0), device=device, initial_action=0,
                                                   constraints=cons)
         self.assertIsNone(res_cash.probabilistic_sharpe_ratio)
+        # Constant returns -> zero variance -> no autocorrelation estimate -> effective == raw observations.
+        self.assertEqual(
+            res_cash.probabilistic_sharpe_ratio_effective_observations,
+            float(res_cash.probabilistic_sharpe_ratio_observations),
+        )
 
     def test_minute_to_hour_train_eval_trace_records_psr(self) -> None:
         # The PSR added to the evaluation RESULT must reach the persisted training artifact: each eval_trace
@@ -3453,6 +3465,24 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         for bad in (0.0, 1.0, -0.1, 1.5, True):
             with self.assertRaises(ValueError):
                 deflated_sharpe_promotion_verdict(0.3, n_trials=1, n_observations=200, confidence=bad)
+
+    def test_effective_sample_size_autocorrelation(self) -> None:
+        # Effective N deflates the raw count for POSITIVE serial correlation (PSR's i.i.d. assumption), via
+        # the initial-positive-sequence estimator n/(1 + 2*sum rho_k). Never inflates above n.
+        from rl_quant.evaluation.statistical import effective_sample_size as ess
+
+        # Hand-computed: [1,1,-1,-1] -> rho_1 = 0.25 (kept), rho_2 = -0.5 (truncates) -> 4/(1 + 2*0.25) = 4/1.5.
+        self.assertAlmostEqual(ess([1.0, 1.0, -1.0, -1.0]), 4.0 / 1.5, places=9)
+        # Zero variance and n < 2 -> no autocorrelation to estimate -> raw n.
+        self.assertEqual(ess([3.0, 3.0, 3.0]), 3.0)
+        self.assertEqual(ess([5.0]), 1.0)
+        self.assertEqual(ess([]), 0.0)
+        # Anti-correlation must NOT inflate above n (the positive-sequence sum truncates to empty).
+        self.assertEqual(ess([1.0, -1.0, 1.0, -1.0]), 4.0)
+        # Strong positive autocorrelation (monotone ramp) deflates below the raw count, but stays >= 1.
+        ramp = [float(i) for i in range(10)]
+        self.assertLess(ess(ramp), float(len(ramp)))
+        self.assertGreaterEqual(ess(ramp), 1.0)
 
     def test_protocol_model_input_label_split_validator(self) -> None:
         # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a

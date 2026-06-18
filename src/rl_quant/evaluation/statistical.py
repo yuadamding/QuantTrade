@@ -16,6 +16,7 @@ and trainer. All Sharpe inputs are PER-OBSERVATION (non-annualized) Sharpe ratio
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from statistics import NormalDist
 
@@ -72,6 +73,35 @@ def psr_is_credible(probabilistic_sharpe: float | None, n_observations: int) -> 
     """True iff a PSR was estimable (not ``None``) AND rests on at least ``PSR_MIN_CREDIBLE_OBSERVATIONS``
     net returns. A reportability annotation only -- it never changes the PSR value or any selection."""
     return probabilistic_sharpe is not None and n_observations >= PSR_MIN_CREDIBLE_OBSERVATIONS
+
+
+def effective_sample_size(returns: Sequence[float]) -> float:
+    """Autocorrelation-deflated effective sample size of a return series: ``n / (1 + 2 * sum_k rho_k)``,
+    summing the lag-k autocorrelations over the INITIAL POSITIVE SEQUENCE (stop at the first ``rho_k <= 0``),
+    clamped to ``[1, n]``.
+
+    PSR / Sharpe assume i.i.d. returns; with POSITIVE serial correlation the independent information is LESS
+    than ``n``, so a PSR computed from the raw count is over-confident -- this is the honest ``n`` to judge it
+    against (``effective_observations < observations`` flags that inflation). Uses population (1/n) moments to
+    match the PSR moment convention. Returns ``float(n)`` when ``n < 2`` or the series has zero variance (no
+    autocorrelation to estimate), and NEVER inflates above the raw count: negative autocorrelation truncates
+    the sum to empty rather than claiming MORE independent observations than were collected."""
+    n = len(returns)
+    if n < 2:
+        return float(n)
+    mean = sum(returns) / n
+    centered = [r - mean for r in returns]
+    c0 = sum(c * c for c in centered) / n
+    if c0 <= 0.0:
+        return float(n)
+    total = 0.0
+    for k in range(1, n):
+        ck = sum(centered[t] * centered[t + k] for t in range(n - k)) / n
+        rho = ck / c0
+        if rho <= 0.0:
+            break
+        total += rho
+    return max(1.0, min(float(n), n / (1.0 + 2.0 * total)))
 
 
 def expected_maximum_sharpe(n_trials: int, *, trials_sharpe_std: float = 1.0) -> float:
