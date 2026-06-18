@@ -23,6 +23,7 @@ from rl_quant.evaluation.statistical import (
     probabilistic_sharpe_ratio,
     probability_of_backtest_overfitting,
     psr_is_credible,
+    statistical_credibility_report,
     walk_forward_degradation_ratio,
     white_reality_check,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "psr_is_credible",
     "rank_information_coefficient",
     "selection_regret",
+    "statistical_credibility_report",
     "top_k_mean_return",
     "walk_forward_degradation_ratio",
     "white_reality_check",

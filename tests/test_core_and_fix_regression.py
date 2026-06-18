@@ -3674,6 +3674,43 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bci(series, n_bootstrap=0)
 
+    def test_statistical_credibility_report(self) -> None:
+        # The capstone assembly (the review's statistical_credibility.json) ties every control together for
+        # one candidate's returns selected from n_trials: PSR + effective-N + expected-max / DSR / promotion,
+        # plus PBO/RC/SPA when a candidate matrix / benchmark differentials are supplied. JSON-serializable.
+        import json as _json
+
+        from rl_quant.evaluation import statistical_credibility_report as report
+
+        rets = [0.01, -0.005, 0.02, 0.0, 0.015, 0.008, -0.002, 0.012] * 6  # 48 obs, positive edge
+        r1 = report(rets, n_trials=1)
+        self.assertEqual(r1["n_observations"], 48)
+        self.assertLessEqual(r1["effective_observations"], 48.0)
+        self.assertGreater(r1["probabilistic_sharpe_ratio"], 0.5)
+        self.assertAlmostEqual(r1["deflated_sharpe_ratio"], r1["probabilistic_sharpe_ratio"], places=9)  # n_trials=1
+        self.assertIsNotNone(r1["deflated_sharpe_promotion"])
+        self.assertNotIn("probability_of_backtest_overfitting", r1)  # optional, not supplied
+        # Deflation: more trials -> higher expected-max, no-greater DSR.
+        r100 = report(rets, n_trials=100)
+        self.assertGreater(r100["expected_maximum_sharpe"], r1["expected_maximum_sharpe"])
+        self.assertLessEqual(r100["deflated_sharpe_ratio"], r1["deflated_sharpe_ratio"])
+        # Supplying a candidate matrix + benchmark differentials adds the data-snooping controls.
+        cand = [[0.02 if t % 2 == 0 else 0.018, 0.0, -0.01] for t in range(48)]  # config 0 dominates -> PBO 0
+        diff = [[0.01 + 0.002 * ((t % 5) - 2)] for t in range(48)]              # clear edge -> RC/SPA low
+        full = report(rets, n_trials=8, candidate_performance=cand, benchmark_differentials=diff)
+        self.assertEqual(full["probability_of_backtest_overfitting"], 0.0)
+        self.assertLess(full["white_reality_check_p_value"], 0.05)
+        self.assertLess(full["hansen_spa_p_value"], 0.05)
+        # Not estimable (< 2 returns): Sharpe/PSR/DSR/promotion None; effective == n; expected-max still set.
+        edge = report([0.01], n_trials=5)
+        for key in ("per_period_sharpe", "probabilistic_sharpe_ratio", "deflated_sharpe_ratio",
+                    "deflated_sharpe_promotion"):
+            self.assertIsNone(edge[key])
+        self.assertEqual(edge["effective_observations"], 1.0)
+        self.assertFalse(edge["psr_is_credible"])
+        _json.dumps(r1)
+        _json.dumps(full)  # the report is the reportable artifact -> must serialize
+
     def test_ranker_metrics(self) -> None:
         # Cross-sectional ranker quality of the action SCORER: IC (Pearson), rank IC (Spearman), top-k realized
         # return, and selection regret. Verified against hand cases before pinning.

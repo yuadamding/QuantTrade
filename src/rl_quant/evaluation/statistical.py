@@ -496,3 +496,70 @@ def block_bootstrap_confidence_interval(
     stats.sort()
     alpha = (1.0 - float(confidence)) / 2.0
     return (_percentile(stats, alpha), _percentile(stats, 1.0 - alpha))
+
+
+def statistical_credibility_report(
+    returns: Sequence[float], *, n_trials: int,
+    candidate_performance: Sequence[Sequence[float]] | None = None,
+    benchmark_differentials: Sequence[Sequence[float]] | None = None,
+    confidence: float = DSR_PROMOTION_CONFIDENCE, trials_sharpe_std: float = 1.0, seed: int = 0,
+) -> dict[str, object]:
+    """Assemble the full statistical-credibility report for ONE candidate's per-period net ``returns`` that
+    was selected from ``n_trials`` configs/seeds/universes -- the single artifact (the review's
+    ``statistical_credibility.json``) that combines every control in this module so a result is never judged
+    by a raw Sharpe alone:
+
+      * the per-period Sharpe + its Probabilistic Sharpe Ratio (skew/kurtosis-adjusted) and credibility flag;
+      * the autocorrelation-deflated effective sample size (PSR/Sharpe assume i.i.d.);
+      * the expected-maximum-Sharpe / Deflated Sharpe Ratio / promotion verdict for the DECLARED trial count
+        (so the edge is deflated for selection, not taken at face value);
+      * and -- only when supplied -- the Probability of Backtest Overfitting (from a full
+        ``candidate_performance`` matrix) and White's Reality Check / Hansen's SPA p-values (from
+        ``benchmark_differentials``), the data-snooping controls across the whole candidate family.
+
+    Pure / stdlib, deterministic given ``seed``. Fields are ``None`` where a metric is not estimable (e.g.
+    fewer than 2 returns, or zero dispersion). ``n_trials`` is caller-supplied (a declared or registry-inferred
+    count); raises (via the underlying primitives) on an invalid ``n_trials`` or malformed inputs."""
+    n_obs = len(returns)
+    report: dict[str, object] = {
+        "n_observations": n_obs,
+        "n_trials": n_trials,
+        "effective_observations": effective_sample_size(returns),
+        "expected_maximum_sharpe": expected_maximum_sharpe(n_trials, trials_sharpe_std=trials_sharpe_std),
+    }
+    per_period_sharpe: float | None = None
+    psr: float | None = None
+    dsr: float | None = None
+    promotion: dict[str, object] | None = None
+    if n_obs >= 2:
+        avg = sum(returns) / n_obs
+        m2 = sum((r - avg) ** 2 for r in returns) / n_obs
+        if m2 > 0.0:
+            per_period_sharpe = avg / math.sqrt(m2)
+            skewness = (sum((r - avg) ** 3 for r in returns) / n_obs) / (m2 ** 1.5)
+            kurtosis = (sum((r - avg) ** 4 for r in returns) / n_obs) / (m2 ** 2)
+            psr = probabilistic_sharpe_ratio(per_period_sharpe, benchmark_sharpe=0.0, n_observations=n_obs,
+                                             skewness=skewness, kurtosis=kurtosis)
+            dsr = deflated_sharpe_ratio(per_period_sharpe, n_trials=n_trials, n_observations=n_obs,
+                                        skewness=skewness, kurtosis=kurtosis, trials_sharpe_std=trials_sharpe_std)
+            verdict = deflated_sharpe_promotion_verdict(
+                per_period_sharpe, n_trials=n_trials, n_observations=n_obs, skewness=skewness, kurtosis=kurtosis,
+                trials_sharpe_std=trials_sharpe_std, confidence=confidence)
+            promotion = {
+                "promote": verdict.promote, "is_significant": verdict.is_significant,
+                "is_credible": verdict.is_credible, "confidence": verdict.confidence,
+                "reasons": list(verdict.reasons),
+            }
+    report.update({
+        "per_period_sharpe": per_period_sharpe,
+        "probabilistic_sharpe_ratio": psr,
+        "psr_is_credible": psr_is_credible(psr, n_obs),
+        "deflated_sharpe_ratio": dsr,
+        "deflated_sharpe_promotion": promotion,
+    })
+    if candidate_performance is not None:
+        report["probability_of_backtest_overfitting"] = probability_of_backtest_overfitting(candidate_performance)
+    if benchmark_differentials is not None:
+        report["white_reality_check_p_value"] = white_reality_check(benchmark_differentials, seed=seed)
+        report["hansen_spa_p_value"] = hansens_spa(benchmark_differentials, seed=seed)
+    return report
