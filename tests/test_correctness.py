@@ -8458,6 +8458,113 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 self._two_action_split(["CASH", "QQQ"]), device=torch.device("cpu"),
                 constraints=dataclasses.replace(base, cash_index=1))
 
+    def test_minute_to_hour_env_device_normalization(self) -> None:
+        # The env pins self.device to a CONCRETE ordinal: resolve_torch_device returns an ordinal-free
+        # torch.device("cuda"), but tensors allocated on it report cuda:<idx>, so _validate_step_actions would
+        # reject valid CUDA actions if self.device stayed ordinal-free. CPU is a no-op; CUDA is the real test.
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+
+        cfg = MinuteToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_minute_to_hour_constraints())
+        env = VectorizedMinuteToHourEnv(self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cpu"))
+        self.assertEqual(env.device.type, "cpu")
+        env._validate_step_actions(torch.zeros(2, dtype=torch.long, device=env.device))  # no raise
+        if torch.cuda.is_available():
+            env_cuda = VectorizedMinuteToHourEnv(
+                self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cuda"))
+            self.assertIsNotNone(env_cuda.device.index)  # concrete ordinal, e.g. cuda:0
+            # A tensor built with ordinal-free "cuda" reports cuda:<current> and MUST be accepted.
+            env_cuda._validate_step_actions(torch.zeros(2, dtype=torch.long, device=torch.device("cuda")))
+
+    def test_minute_to_hour_reward_scale_validation(self) -> None:
+        # reward_scale multiplies every reward and normalises the shadow bps artifact; a zero / negative /
+        # non-finite / bool value must fail closed in BOTH the env and the evaluator.
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+
+        base = default_minute_to_hour_constraints()
+        device = torch.device("cpu")
+        for bad in (0.0, -1.0, float("nan"), float("inf"), True):
+            with self.assertRaises(ValueError):
+                VectorizedMinuteToHourEnv(
+                    self._two_action_split(["CASH", "QQQ"]),
+                    MinuteToHourEnvConfig(num_envs=1, episode_length=5, reward_scale=bad, constraints=base), device)
+            with self.assertRaises(ValueError):
+                evaluate_minute_to_hour_policy(
+                    self._two_action_split(["CASH", "QQQ"]), _ConstantActionModel(2, 0), device=device,
+                    reward_scale=bad)
+
+    def test_transition_trade_cost_bps_action_count_range_and_count_etf_bool(self) -> None:
+        # action_count (optional) range-checks the action indices for a DIRECT caller; count_etf must be a real
+        # bool (a truthy string would silently pick the two-leg path).
+        import dataclasses
+
+        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import transition_trade_cost_bps
+
+        base = default_minute_to_hour_constraints()
+        long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
+        # in-range with action_count=2 is fine; out-of-range / negative fail closed.
+        transition_trade_cost_bps(long([0]), long([1]), constraints=base, cash_idle_penalty_bps=0.0, action_count=2)
+        for prev, act in [([-1], [0]), ([0], [-1]), ([0], [2]), ([2], [0])]:
+            with self.assertRaises(ValueError):
+                transition_trade_cost_bps(long(prev), long(act), constraints=base, cash_idle_penalty_bps=0.0,
+                                          action_count=2)
+        # Without action_count the range is NOT checked (backward compatible) -- an OOR index does not raise here.
+        transition_trade_cost_bps(long([0]), long([5]), constraints=base, cash_idle_penalty_bps=0.0)
+        # count_etf_to_etf_as_two_legs must be a real bool, not a truthy/other value.
+        for bad in ("false", 1, 0, None):
+            with self.assertRaises(ValueError):
+                transition_trade_cost_bps(long([0]), long([1]),
+                                          constraints=dataclasses.replace(base, count_etf_to_etf_as_two_legs=bad),
+                                          cash_idle_penalty_bps=0.0)
+
+    def test_minute_to_hour_shadow_artifact_flags_incomplete_metadata(self) -> None:
+        # PR-3 auditability: with shadow ON and an UNKNOWN (un-metadata'd) non-cash ticker, the artifact must
+        # flag execution_shadow_action_metadata_complete=False and list the unknown symbol, so PR-4 can fail
+        # closed on it (an unknown leveraged/inverse instrument would otherwise be priced as 1x long).
+        import warnings
+
+        from rl_quant.core import DQNLearningConfig
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        )
+
+        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+            n = len(dates)
+            return HourFromMinuteDataSplit(
+                name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
+                next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
+                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "UNSEEN_TICKER_ZZ"],
+                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                hour_features=torch.zeros((n, 1, 1)), action_returns=torch.zeros((n, 2)),
+                action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+                valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            )
+
+        train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
+        val = make_split("val", ["2026-06-01", "2026-06-02"])
+        learning = DQNLearningConfig(
+            num_envs=2, episode_length=3, replay_capacity=64, batch_size=4, train_steps=6, warmup_steps=2,
+            gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=3, epsilon_start=0.2,
+            epsilon_end=0.0, eval_interval=4, grad_clip=1.0,
+        )
+        config = MinuteToHourTrainingConfig(
+            env=MinuteToHourEnvConfig(num_envs=2, episode_length=3, execution_env_reward_shadow=True),
+            learning=learning, d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+            action_embedding_dim=4,
+        )
+        torch.manual_seed(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # unknown-symbol metadata fallback warns by design
+            artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)[1]
+        self.assertFalse(artifacts["execution_shadow_action_metadata_complete"])
+        self.assertIn("UNSEEN_TICKER_ZZ", artifacts["execution_shadow_unknown_action_symbols"])
+        self.assertEqual(artifacts["execution_shadow_weight_semantics_status"], "unresolved")
+
     def test_decision_log_reportability_gate(self) -> None:
         # Additive, LABEL-ONLY reportability validator (moves no P&L). Tiered (base vs strict real-executable)
         # + semantic (finite/sign/equity/ordering, defensive). Aligned to docs/decision_tensor_protocol.md.

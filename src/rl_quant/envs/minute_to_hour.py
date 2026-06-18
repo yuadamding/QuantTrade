@@ -21,7 +21,8 @@ from rl_quant.datasets.hour_from_subhour import (
 )
 from rl_quant.execution import (
     WeightExecutionCostConfig,
-    _coerce_finite_nonnegative,
+    coerce_finite_nonnegative,
+    coerce_finite_positive,
     weight_transition_cost_bps,
 )
 from rl_quant.features.action_risk import (
@@ -74,9 +75,12 @@ def transition_trade_cost_bps(
     *,
     constraints: TradingConstraintConfig,
     cash_idle_penalty_bps: float,
+    action_count: int | None = None,
 ) -> TransitionCostBreakdown:
     """Compute the shared minute->hour transition cost breakdown (see TransitionCostBreakdown). Tensor-shaped,
-    so it serves both the vectorized env and a 1-element evaluation step."""
+    so it serves both the vectorized env and a 1-element evaluation step. Pass ``action_count`` (the size of
+    the action space) to additionally range-check the action indices -- env/eval do this before calling, but a
+    direct caller otherwise gets a syntactically-valid but meaningless ledger from an out-of-range index."""
     # Central reward/cost accounting: reject impossible inputs (cheap metadata/scalar checks -- no device sync).
     if previous_actions.shape != actions.shape:
         raise ValueError("previous_actions and actions must have the same shape.")
@@ -90,15 +94,29 @@ def transition_trade_cost_bps(
     # negative / non-numeric-string bps scalar fails closed instead of silently producing a garbage cost
     # ledger. (A numeric string like "1" is still accepted and parsed, matching the execution-module config
     # contract; the guard's purpose is rejecting bool and genuinely-invalid values, not type-purity.)
-    cash_idle = _coerce_finite_nonnegative("cash_idle_penalty_bps", cash_idle_penalty_bps)
-    one_way = _coerce_finite_nonnegative("constraints.one_way_cost_bps", constraints.one_way_cost_bps)
-    extra_switch = _coerce_finite_nonnegative("constraints.extra_switch_penalty_bps", constraints.extra_switch_penalty_bps)
+    cash_idle = coerce_finite_nonnegative("cash_idle_penalty_bps", cash_idle_penalty_bps)
+    one_way = coerce_finite_nonnegative("constraints.one_way_cost_bps", constraints.one_way_cost_bps)
+    extra_switch = coerce_finite_nonnegative("constraints.extra_switch_penalty_bps", constraints.extra_switch_penalty_bps)
     # cash_index is compared against action indices below; reject silent bool/float/string coercion. This
     # helper has no action_names to semantically validate "is it cash" -- env/eval do that before calling --
     # but it must not let cash_index=True/0.9/"0" pick the wrong slot when called directly.
     if isinstance(constraints.cash_index, bool) or not isinstance(constraints.cash_index, Integral):
         raise ValueError(f"constraints.cash_index must be an integer, got {constraints.cash_index!r}.")
     cash_index = int(constraints.cash_index)
+    # count_etf_to_etf_as_two_legs selects the leg-count branch in trade_legs; a non-bool (e.g. the string
+    # "false", which is truthy) would silently pick the two-leg path, so require a real bool.
+    if not isinstance(constraints.count_etf_to_etf_as_two_legs, bool):
+        raise ValueError(
+            "constraints.count_etf_to_etf_as_two_legs must be a bool, got "
+            f"{constraints.count_etf_to_etf_as_two_legs!r}."
+        )
+    if action_count is not None:
+        out_of_range = (
+            (previous_actions < 0) | (previous_actions >= action_count)
+            | (actions < 0) | (actions >= action_count)
+        )
+        if bool(out_of_range.any().item()):
+            raise ValueError("previous_actions/actions contain an out-of-range action index.")
     legs = trade_legs(
         previous_actions,
         actions,
@@ -117,16 +135,31 @@ def transition_trade_cost_bps(
 class VectorizedMinuteToHourEnv:
     def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
         # Both indices are validated with the SHARED action-index discipline (reject bool/float/string +
-        # range), and cash_index additionally must point to a real CASH action. validate_cash_index_for_actions
-        # is re-exported here so callers can import it from the env (and the evaluator stays in lockstep).
-        validate_action_index_for_actions(data.action_names, config.initial_action, name="initial_action")
-        validate_cash_index_for_actions(data.action_names, config.constraints.cash_index)
+        # range), and cash_index additionally must point to a real CASH action. The NORMALIZED ints are stored
+        # and used throughout env state so the constructor is the single validation point; the re-exported
+        # validate_cash_index_for_actions keeps the evaluator in lockstep.
+        self.initial_action = validate_action_index_for_actions(
+            data.action_names, config.initial_action, name="initial_action"
+        )
+        self.cash_index = validate_cash_index_for_actions(data.action_names, config.constraints.cash_index)
+        # reward_scale multiplies every reward and normalises the shadow bps artifacts, so a zero/negative/
+        # non-finite value would zero, flip, or blow them up -- fail closed at construction.
+        coerce_finite_positive("reward_scale", config.reward_scale)
+        # Normalize the device to a CONCRETE ordinal. This env is typically constructed with the result of
+        # core.resolve_torch_device, which hands back an ordinal-free torch.device("cuda") for "auto"/"cuda";
+        # tensors allocated on it, however, report cuda:<current_device>. _validate_step_actions compares an
+        # action tensor's concrete device against self.device, so an ordinal-free self.device would REJECT
+        # valid CUDA actions on the first step. Resolve the ordinal here (mirroring what allocation does) and
+        # pin self.device + the local `device` used for every state tensor below to that concrete device.
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         self.data = data if data.minute_features.device == device else data.to(device)
         self.config = config
         self.device = device
         self.start_indices = self._build_start_index_pool()
         self.indices = torch.zeros(config.num_envs, dtype=torch.long, device=device)
-        self.previous_actions = torch.full((config.num_envs,), int(config.initial_action), dtype=torch.long, device=device)
+        self.previous_actions = torch.full((config.num_envs,), self.initial_action, dtype=torch.long, device=device)
         self.bars_held = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.cooldown_remaining = torch.zeros(config.num_envs, dtype=torch.long, device=device)
         self.switches_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
@@ -168,7 +201,7 @@ class VectorizedMinuteToHourEnv:
             return
         random_ids = torch.randint(0, self.start_indices.shape[0], (count,), device=self.device)
         self.indices[mask] = self.start_indices[random_ids]
-        self.previous_actions[mask] = int(self.config.initial_action)
+        self.previous_actions[mask] = self.initial_action
         self.bars_held[mask] = int(self.config.constraints.min_hold_bars)
         self.cooldown_remaining[mask] = 0
         self.switches_today[mask] = 0
@@ -209,7 +242,7 @@ class VectorizedMinuteToHourEnv:
             max_order_legs_per_day=self.config.constraints.max_order_legs_per_day,
             order_legs_episode=self.order_legs_episode,
             max_order_legs_per_episode=self.config.constraints.max_order_legs_per_episode,
-            cash_index=self.config.constraints.cash_index,
+            cash_index=self.cash_index,
             count_etf_to_etf_as_two_legs=self.config.constraints.count_etf_to_etf_as_two_legs,
         )
         if row_indices is None:
@@ -225,11 +258,11 @@ class VectorizedMinuteToHourEnv:
         availability_mask = self.data.valid_actions(safe_indices)
         if bool((~in_bounds).any().item()):
             availability_mask[~in_bounds] = False
-        availability_mask[:, int(self.config.constraints.cash_index)] = True
+        availability_mask[:, self.cash_index] = True
         mask = constraint_mask & availability_mask
         empty_rows = ~mask.any(dim=1)
         if bool(empty_rows.any().item()):
-            mask[empty_rows, int(self.config.constraints.cash_index)] = True
+            mask[empty_rows, self.cash_index] = True
         return mask
 
     def observe(
@@ -295,7 +328,7 @@ class VectorizedMinuteToHourEnv:
         actions = torch.where(selected_valid, actions, fallback_actions)
         label_mask = self.data.label_valid_actions(current_indices)
         selected_label_valid = label_mask.gather(1, actions.unsqueeze(1)).squeeze(1)
-        cash_actions = torch.full_like(actions, int(self.config.constraints.cash_index))
+        cash_actions = torch.full_like(actions, self.cash_index)
         actions = torch.where(selected_label_valid, actions, cash_actions)
         raw_returns = self.data.action_returns[current_indices, actions]
         is_switch = actions != previous_actions
@@ -304,6 +337,7 @@ class VectorizedMinuteToHourEnv:
             actions,
             constraints=self.config.constraints,
             cash_idle_penalty_bps=self.config.cash_idle_penalty_bps,
+            action_count=len(self.data.action_names),
         )
         legs = cost.legs
         cost_bps = cost.trade_cost_bps  # leg cost + switch penalty (the legacy combined trade cost)
@@ -316,7 +350,7 @@ class VectorizedMinuteToHourEnv:
         # (sell prior weight + buy new weight; cash = no exposure; only a real switch trades), carrying the same
         # cash-idle term as the legacy reward so reward_delta isolates the trade-cost-MODEL change.
         if self.execution_env_reward_shadow:
-            cash_idx = int(self.config.constraints.cash_index)
+            cash_idx = self.cash_index
             w_prev = self._shadow_action_weights[previous_actions]
             w_next = self._shadow_action_weights[actions]
             zeros = torch.zeros_like(w_prev)

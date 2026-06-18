@@ -105,10 +105,21 @@ def _require_int_allow_negative(name: str, value: object) -> int:
         raise ValueError(f"{name} must be integer-like; got {value!r}.") from exc
 
 
-# Public aliases so other modules (e.g. the intraday env) can enforce the SAME integer-like bar/lot
-# validation as ExecutionConfig instead of int()-truncating a fractional config value.
+def _coerce_finite_positive(name: str, value: object) -> float:
+    # Strictly-positive finite scalar (e.g. reward_scale): a zero/negative/NaN/inf would zero, flip, or
+    # blow up every reward and any bps figure normalised by it.
+    coerced = _coerce_finite(name, value)
+    if coerced <= 0.0:
+        raise ValueError(f"{name} must be finite and positive; got {value!r}.")
+    return coerced
+
+
+# Public aliases so other modules (e.g. the intraday env) can enforce the SAME numeric/integer validation
+# as ExecutionConfig instead of int()-truncating a fractional config value or float()-coercing a bool.
 require_positive_int = _require_positive_int
 require_nonnegative_int = _require_nonnegative_int
+coerce_finite_nonnegative = _coerce_finite_nonnegative
+coerce_finite_positive = _coerce_finite_positive
 
 
 class FillLevel(str, Enum):

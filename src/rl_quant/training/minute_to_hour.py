@@ -63,6 +63,7 @@ from rl_quant.envs.minute_to_hour import (
     VectorizedMinuteToHourEnv,
     transition_trade_cost_bps,
 )
+from rl_quant.execution import coerce_finite_positive
 from rl_quant.features.action_risk import (
     stable_action_metadata_hash,
     unknown_action_metadata_symbols,
@@ -177,6 +178,9 @@ def evaluate_minute_to_hour_policy(
     # bool/float/out-of-range initial_action, when scored outside the env.
     validate_cash_index_for_actions(data.action_names, constraints.cash_index)
     validate_action_index_for_actions(data.action_names, initial_action, name="initial_action")
+    # reward_scale multiplies the net return into the reward; a zero/negative/non-finite value would zero,
+    # flip, or blow up the scored reward (matches the env's construction-time guard).
+    coerce_finite_positive("reward_scale", reward_scale)
     constraint_episode_length = int(episode_length or max(int(data.valid_start_indices.numel()), 1))
     data = data if data.minute_features.device == device else data.to(device)
     model.eval()
@@ -312,7 +316,8 @@ def evaluate_minute_to_hour_policy(
         # reward, and it now applies the env's cash_idle_penalty_bps (omitted before -> a latent drift for
         # nonzero-penalty runs). For the default penalty (0) this is byte-identical to the prior inline cost.
         cost = transition_trade_cost_bps(
-            prev_tensor, action_tensor, constraints=constraints, cash_idle_penalty_bps=cash_idle_penalty_bps
+            prev_tensor, action_tensor, constraints=constraints, cash_idle_penalty_bps=cash_idle_penalty_bps,
+            action_count=len(data.action_names),
         )
         legs = float(cost.legs[0].item())
         is_switch = action != previous_action
@@ -1200,11 +1205,18 @@ def train_minute_to_hour_dqn(
         "execution_shadow_keeps_switch_penalty": (True if config.env.execution_env_reward_shadow else None),
         "execution_shadow_keeps_cash_idle": (True if config.env.execution_env_reward_shadow else None),
         # The weight semantics are an UNRESOLVED assumption (see docs §3): max_weight is correct only if
-        # action_returns are metadata-weighted; PR-4 must confirm against the dataset before training.
+        # action_returns are metadata-weighted; PR-4 must confirm against the dataset before training. The
+        # free-text field stays human-readable; the structured status/assumption fields are query/gate-able.
         "execution_shadow_weight_semantics_assumed": (
             "action_metadata.max_weight; assumes action_returns are metadata-weighted portfolio returns "
             "(UNRESOLVED -- see docs/execution_wiring_design.md §3)"
             if config.env.execution_env_reward_shadow else None
+        ),
+        "execution_shadow_weight_semantics_status": (
+            "unresolved" if config.env.execution_env_reward_shadow else None
+        ),
+        "execution_shadow_weight_semantics_assumption": (
+            "metadata_weighted_portfolio_returns" if config.env.execution_env_reward_shadow else None
         ),
         # reward delta in REWARD units (scale-dependent) AND scale-normalised bps (comparable across runs).
         "execution_shadow_reward_delta_mean": (
