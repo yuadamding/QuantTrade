@@ -69,6 +69,7 @@ from rl_quant.envs.minute_to_hour import (
     validate_cash_usable_on_decision_rows,
     validate_minute_to_hour_constraints,
 )
+from rl_quant.evaluation.statistical import probabilistic_sharpe_ratio
 from rl_quant.execution import (
     coerce_finite_nonnegative,
     coerce_finite_positive,
@@ -148,6 +149,11 @@ class MinuteToHourEvaluationResult:
     requested_action_missing_label_count: int = 0
     executed_action_missing_label_count: int = 0
     policy_unscorable_rows: int = 0
+    # Probability the TRUE Sharpe exceeds 0 given the observed per-period Sharpe, sample length, and return
+    # skew/kurtosis (Bailey & Lopez de Prado). A statistical-credibility companion to the raw annualized
+    # Sharpe; None when there are < 2 net returns or zero dispersion. (DSR needs the #trials and stays a
+    # promotion-protocol concern.)
+    probabilistic_sharpe_ratio: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -159,6 +165,7 @@ class MinuteToHourEvaluationResult:
             "market_order_legs": self.market_order_legs,
             "max_drawdown": self.max_drawdown,
             "annualized_sharpe": self.annualized_sharpe,
+            "probabilistic_sharpe_ratio": self.probabilistic_sharpe_ratio,
             "rollout_records": self.rollout_records,
             "evaluation_reportable": self.evaluation_reportable,
             "reportability_errors": self.reportability_errors,
@@ -415,6 +422,21 @@ def evaluate_minute_to_hour_policy(
         executed_actions=executed_actions,
         cash_index=cash_index,
     )
+    # Probabilistic Sharpe Ratio: P(true per-period Sharpe > 0) given sample length + return skew/kurtosis.
+    # Uses the SAME population (ddof=0) moments as annualized_sharpe for consistency; None when < 2 returns or
+    # zero dispersion. A statistical-credibility companion to the raw Sharpe (Bailey & Lopez de Prado).
+    psr: float | None = None
+    n_returns = len(returns)
+    if n_returns >= 2:
+        avg = sum(returns) / n_returns
+        m2 = sum((r - avg) ** 2 for r in returns) / n_returns
+        if m2 > 0.0:
+            m3 = sum((r - avg) ** 3 for r in returns) / n_returns
+            m4 = sum((r - avg) ** 4 for r in returns) / n_returns
+            psr = probabilistic_sharpe_ratio(
+                avg / math.sqrt(m2), benchmark_sharpe=0.0, n_observations=n_returns,
+                skewness=m3 / (m2 ** 1.5), kurtosis=m4 / (m2 ** 2),  # non-excess kurtosis (normal = 3.0)
+            )
     return MinuteToHourEvaluationResult(
         split_name=data.name,
         total_return=equity - 1.0,
@@ -423,6 +445,7 @@ def evaluate_minute_to_hour_policy(
         market_order_legs=order_legs,
         max_drawdown=fractional_max_drawdown(equity_curve),
         annualized_sharpe=annualized_sharpe(returns, periods_per_year=data.periods_per_year),
+        probabilistic_sharpe_ratio=psr,
         rollout_records=records,
         evaluation_reportable=bool(report["evaluation_reportable"]),
         reportability_errors=list(report["reportability_errors"]),

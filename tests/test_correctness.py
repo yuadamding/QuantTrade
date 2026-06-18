@@ -8734,6 +8734,42 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(int(out["actions"][0].item()), 0)
         self.assertTrue(bool(torch.isfinite(out["rewards"][0]).item()))
 
+    def test_minute_to_hour_eval_reports_probabilistic_sharpe(self) -> None:
+        # The evaluator reports a Probabilistic Sharpe Ratio (P(true per-period Sharpe > 0)) alongside the raw
+        # annualized Sharpe: in [0,1] and > 0.5 for a clearly-positive-return policy; None when the net-return
+        # series has no dispersion (e.g. an all-CASH policy -> constant zero returns).
+        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
+        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+
+        device = torch.device("cpu")
+        n = 6
+        qqq = [0.01, 0.006, 0.018, 0.009, 0.013, 0.0]  # varied, positive -> positive per-period Sharpe
+        split = HourFromMinuteDataSplit(
+            name="t",
+            decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
+            next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((n, 1, 1)), action_returns=torch.tensor([[0.0, q] for q in qqq]),
+            action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
+            valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
+        cons = default_minute_to_hour_constraints()
+
+        res = evaluate_minute_to_hour_policy(split, _ConstantActionModel(2, 1), device=device, initial_action=0,
+                                             constraints=cons)
+        psr = res.probabilistic_sharpe_ratio
+        self.assertIsNotNone(psr)
+        self.assertGreaterEqual(psr, 0.0)
+        self.assertLessEqual(psr, 1.0)
+        self.assertGreater(psr, 0.5)                                  # positive-Sharpe returns
+        self.assertEqual(res.to_dict()["probabilistic_sharpe_ratio"], psr)
+        # All-CASH policy -> constant zero net returns -> no dispersion -> PSR is None.
+        res_cash = evaluate_minute_to_hour_policy(split, _ConstantActionModel(2, 0), device=device, initial_action=0,
+                                                  constraints=cons)
+        self.assertIsNone(res_cash.probabilistic_sharpe_ratio)
+
     def test_minute_to_hour_eval_rejects_empty_valid_start_split(self) -> None:
         # An evaluation split with no valid decision rows fails closed (a zero/degenerate metric would
         # otherwise look like a legitimate result), mirroring the env's start-index-pool guard.
