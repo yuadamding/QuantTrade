@@ -42,7 +42,7 @@ from rl_quant.trading_constraints import (
     DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION,
     advance_position_excursion,
     apply_leg_aware_hysteresis,
-    build_action_mask,
+    build_action_mask_reasons,
     build_dynamic_transition_features,
     build_transition_feature_table,
     make_constraint_features,
@@ -158,6 +158,10 @@ class MinuteToHourEvaluationResult:
     # handful of points is fragile however high it reads, so the raw count travels WITH the value and a
     # derived ``*_is_credible`` flag applies the reportability threshold once. Neither changes the PSR value.
     probabilistic_sharpe_ratio_observations: int = 0
+    # Aggregate diagnostic: how many evaluated decision rows each constraint pinned to the current action
+    # (min_hold / cooldown / switch_cap) or had a candidate order-leg-blocked, plus the decision_rows total.
+    # Explains a policy's turnover (e.g. "min-hold pinned 40% of rows") and changes no mask/selection/reward.
+    mask_block_reason_row_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def probabilistic_sharpe_ratio_is_credible(self) -> bool:
@@ -178,6 +182,7 @@ class MinuteToHourEvaluationResult:
             "probabilistic_sharpe_ratio": self.probabilistic_sharpe_ratio,
             "probabilistic_sharpe_ratio_observations": self.probabilistic_sharpe_ratio_observations,
             "probabilistic_sharpe_ratio_is_credible": self.probabilistic_sharpe_ratio_is_credible,
+            "mask_block_reason_row_counts": self.mask_block_reason_row_counts,
             "rollout_records": self.rollout_records,
             "evaluation_reportable": self.evaluation_reportable,
             "reportability_errors": self.reportability_errors,
@@ -260,6 +265,8 @@ def evaluate_minute_to_hour_policy(
     requested_actions: list[int] = []
     executed_actions: list[int] = []
     episode_steps = 0
+    # Per-constraint mask-block tally (diagnostic only): why the policy was pinned / could not switch.
+    mask_block_rows = {"decision_rows": 0, "min_hold": 0, "cooldown": 0, "switch_cap": 0, "order_leg": 0}
     for index in data.valid_start_indices.detach().cpu().tolist():
         current_date = data.decision_timestamps[index][:10]
         segment_reset = previous_index is None or index != previous_index + 1
@@ -299,7 +306,7 @@ def evaluate_minute_to_hour_policy(
             order_legs_today=torch.tensor([order_legs_today], dtype=torch.float32, device=device),
             order_legs_episode=torch.tensor([order_legs_episode], dtype=torch.float32, device=device),
         )
-        action_mask = build_action_mask(
+        mask_reasons = build_action_mask_reasons(
             current_action=prev_tensor,
             bars_held=bars_tensor,
             cooldown_remaining=cooldown_tensor,
@@ -316,6 +323,14 @@ def evaluate_minute_to_hour_policy(
             cash_index=cash_index,
             count_etf_to_etf_as_two_legs=constraints.count_etf_to_etf_as_two_legs,
         )
+        # .mask is byte-identical to build_action_mask(...) -- selection/reward unchanged; the reason tensors
+        # are a pure diagnostic tally of WHY a row was pinned to its current action / could not switch.
+        action_mask = mask_reasons.mask
+        mask_block_rows["decision_rows"] += 1
+        mask_block_rows["min_hold"] += int(bool(mask_reasons.min_hold_block[0].item()))
+        mask_block_rows["cooldown"] += int(bool(mask_reasons.cooldown_block[0].item()))
+        mask_block_rows["switch_cap"] += int(bool(mask_reasons.switch_cap_block[0].item()))
+        mask_block_rows["order_leg"] += int(bool(mask_reasons.order_leg_block[0].any().item()))
         availability_mask = data.valid_actions(torch.tensor([index], dtype=torch.long, device=device))
         availability_mask[:, cash_index] = True
         action_mask = action_mask & availability_mask
@@ -459,6 +474,7 @@ def evaluate_minute_to_hour_policy(
         annualized_sharpe=annualized_sharpe(returns, periods_per_year=data.periods_per_year),
         probabilistic_sharpe_ratio=psr,
         probabilistic_sharpe_ratio_observations=n_returns,
+        mask_block_reason_row_counts=mask_block_rows,
         rollout_records=records,
         evaluation_reportable=bool(report["evaluation_reportable"]),
         reportability_errors=list(report["reportability_errors"]),

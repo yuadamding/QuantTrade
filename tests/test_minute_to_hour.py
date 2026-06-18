@@ -4241,6 +4241,56 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual([row["requested_asset"] for row in result.rollout_records], ["QQQ"])
         self.assertEqual([row["executed_asset"] for row in result.rollout_records], ["QQQ"])
 
+    def test_minute_to_hour_eval_reports_mask_block_reasons(self) -> None:
+        # The evaluator now tallies WHY each decision row's mask pinned the policy (a diagnostic that explains
+        # turnover). The mask itself is unchanged -- build_action_mask_reasons(...).mask IS build_action_mask's
+        # output -- so this is additive. A high min-hold must show up in the tally (teeth); min_hold_bars=0 must
+        # not (no false positives); counts are bounded by the number of decision rows.
+        from rl_quant.minute_to_hour_transformer import (
+            HourFromMinuteDataSplit,
+            TradingConstraintConfig,
+            evaluate_minute_to_hour_policy,
+        )
+        from rl_quant.training.minute_to_hour import _ConstantActionModel
+
+        n = 5
+        split = HourFromMinuteDataSplit(
+            name="t",
+            decision_timestamps=[f"2026-01-02T{10 + i}:30:00+00:00" for i in range(n + 1)],
+            next_timestamps=[f"2026-01-02T{11 + i}:30:00+00:00" for i in range(n + 1)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((n + 1, 1, 1, 1)), minute_mask=torch.ones((n + 1, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((n + 1, 1, 1)), action_returns=torch.zeros((n + 1, 2)),
+            action_valid_mask=torch.ones((n + 1, 2), dtype=torch.bool),
+            label_valid_mask=torch.ones((n + 1, 2), dtype=torch.bool),
+            valid_start_indices=torch.arange(n, dtype=torch.long),
+            valid_index_mask=torch.tensor([True] * n + [False]),
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+        )
+        always_qqq = _ConstantActionModel(2, 1)
+
+        pinned = evaluate_minute_to_hour_policy(
+            split, always_qqq, device=torch.device("cpu"), initial_action=0,
+            constraints=TradingConstraintConfig(one_way_cost_bps=0.0, min_hold_bars=10),
+        )
+        counts = pinned.mask_block_reason_row_counts
+        self.assertEqual(set(counts), {"decision_rows", "min_hold", "cooldown", "switch_cap", "order_leg"})
+        self.assertEqual(counts["decision_rows"], n)
+        for key in ("min_hold", "cooldown", "switch_cap", "order_leg"):
+            self.assertGreaterEqual(counts[key], 0)
+            self.assertLessEqual(counts[key], n)
+        self.assertGreaterEqual(counts["min_hold"], 1)  # teeth: a high min-hold pins rows
+        self.assertEqual(pinned.to_dict()["mask_block_reason_row_counts"], counts)  # surfaced verbatim
+
+        # No false positives: with no minimum hold, nothing is min-hold-pinned.
+        free = evaluate_minute_to_hour_policy(
+            split, always_qqq, device=torch.device("cpu"), initial_action=0,
+            constraints=TradingConstraintConfig(one_way_cost_bps=0.0, min_hold_bars=0),
+        )
+        self.assertEqual(free.mask_block_reason_row_counts["min_hold"], 0)
+        self.assertEqual(free.mask_block_reason_row_counts["decision_rows"], n)
+
     def test_latest_holdout_uses_final_complete_sessions_and_train_normalizer(self) -> None:
         module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
         sessions = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]
