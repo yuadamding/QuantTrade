@@ -1,6 +1,7 @@
 """Evaluation layer: second-context action-scorer / trading-policy evaluation + baselines + scoring utils (extracted from rl_quant.second_context_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,6 +10,12 @@ import torch.nn.functional as F
 
 from rl_quant.models.second_context import SecondContextTransformerQNetwork
 from rl_quant.core import autocast_context
+from rl_quant.evaluation.ranking import (
+    information_coefficient,
+    rank_information_coefficient,
+    selection_regret,
+    top_k_mean_return,
+)
 from rl_quant.reportability import evaluate_decision_log_reportability
 from rl_quant.datasets.second_context import SecondContextDataSplit, _parse_utc_timestamp
 
@@ -523,6 +530,10 @@ def evaluate_second_context_action_scorer(
                 "cost_model": "rowwise_from_cash_cost_each_decision",
                 "diagnostic_rows": "all_rows" if evaluate_all_rows else "valid_start_indices",
                 "evaluated_rows": 0,
+                "information_coefficient": None,
+                "rank_information_coefficient": None,
+                "selection_regret": None,
+                "top_1_realized_return": None,
             }
         )
         return metrics
@@ -543,6 +554,23 @@ def evaluate_second_context_action_scorer(
     metrics = _summarize_returns(net_returns, periods_per_year=split.periods_per_year)
     metrics.update(second_context_missing_label_report(split, row_indices=rows, selected_actions=actions))
     cash_share = float((actions.detach().cpu() == 0).float().mean().item()) if actions.numel() else 1.0
+    # Ranker-quality diagnostics (review #16): does the Q-score rank the SCORABLE actions by realized return,
+    # cross-sectionally? Computed over the same evaluated rows from the raw per-action returns and the
+    # label-valid mask. Additive -- changes no existing metric, the selected actions, or any net return.
+    ranker_scores = q_rows.detach().cpu()
+    ranker_realized = split.action_returns[rows].detach().cpu()
+    ranker_mask = split.label_valid_mask[rows].detach().cpu() if split.label_valid_mask is not None else None
+    metrics.update(
+        {
+            key: (None if math.isnan(value) else value)
+            for key, value in {
+                "information_coefficient": information_coefficient(ranker_scores, ranker_realized, ranker_mask),
+                "rank_information_coefficient": rank_information_coefficient(ranker_scores, ranker_realized, ranker_mask),
+                "selection_regret": selection_regret(ranker_scores, ranker_realized, ranker_mask),
+                "top_1_realized_return": top_k_mean_return(ranker_scores, ranker_realized, 1, ranker_mask),
+            }.items()
+        }
+    )
     metrics.update(
         {
             "cash_action_share": cash_share,

@@ -2753,6 +2753,31 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(metrics["total_return"]), 0.0095, places=6)
 
+    def test_second_context_scorer_reports_ranker_metrics(self) -> None:
+        # The action-scorer eval now reports ranker-quality diagnostics (IC / rank IC / regret / top-1 realized)
+        # over the evaluated rows -- additive, alongside the sequential-policy metrics. A model that scores the
+        # higher-return action higher -> IC = 1, regret = 0; scoring it lower -> IC = -1, regret = foregone return.
+        class CorrectRanker(nn.Module):
+            def forward(self, *args):
+                del args
+                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)  # QQQ scored above CASH
+
+        class WrongRanker(nn.Module):
+            def forward(self, *args):
+                del args
+                return torch.tensor([[1.0, 0.0]], dtype=torch.float32)  # CASH scored above QQQ
+
+        split = self._second_context_split(returns=[[0.0, 0.04]], costs=[[0.0, 0.0]], weights=[[1.0, 1.0]])
+        good = evaluate_second_context_action_scorer(split, CorrectRanker(), device=torch.device("cpu"))
+        for key in ("information_coefficient", "rank_information_coefficient", "selection_regret",
+                    "top_1_realized_return"):
+            self.assertIn(key, good)
+        self.assertAlmostEqual(float(good["information_coefficient"]), 1.0, places=6)
+        self.assertAlmostEqual(float(good["selection_regret"]), 0.0, places=9)
+        bad = evaluate_second_context_action_scorer(split, WrongRanker(), device=torch.device("cpu"))
+        self.assertAlmostEqual(float(bad["information_coefficient"]), -1.0, places=6)
+        self.assertAlmostEqual(float(bad["selection_regret"]), 0.04, places=6)  # the foregone QQQ return
+
     def test_second_context_rowwise_scorer_uses_valid_start_indices_by_default(self) -> None:
         class WeightedModel(nn.Module):
             def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
