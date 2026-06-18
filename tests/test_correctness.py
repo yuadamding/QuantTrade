@@ -9047,6 +9047,32 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 evaluate_minute_to_hour_policy(bad, _ConstantActionModel(2, 0), device=device, constraints=base)
 
+    def test_minute_to_hour_cash_usable_checked_on_continuation_rows(self) -> None:
+        # The CASH usability invariant covers EVERY valid decision row (valid_index_mask), not just episode
+        # starts: the env steps through continuation rows the policy can de-risk on. CASH usable at the start
+        # (row 0) but NON-usable at a continuation row (row 1) must still fail closed (the prior
+        # valid_start_indices-only check would have missed it).
+        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
+        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+
+        split = HourFromMinuteDataSplit(
+            name="t",
+            decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(3)],
+            next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(3)],
+            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            minute_features=torch.zeros((3, 1, 1, 1)), minute_mask=torch.ones((3, 1, 1), dtype=torch.bool),
+            hour_features=torch.zeros((3, 1, 1)),
+            action_returns=torch.tensor([[0.0, 0.01], [float("nan"), 0.02], [0.0, 0.0]]),  # CASH NaN at row 1
+            action_valid_mask=torch.ones((3, 2), dtype=torch.bool), label_valid_mask=torch.ones((3, 2), dtype=torch.bool),
+            valid_start_indices=torch.tensor([0]),                 # only row 0 is an episode start
+            valid_index_mask=torch.tensor([True, True, False]),    # rows 0,1 are valid decisions (1 = continuation)
+            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
+        with self.assertRaises(ValueError):
+            VectorizedMinuteToHourEnv(
+                split, MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=default_minute_to_hour_constraints()),
+                torch.device("cpu"))
+
     def _shadow_resume_split(self, name: str, dates: list[str]):
         from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit
         n = len(dates)

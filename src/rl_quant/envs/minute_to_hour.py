@@ -231,7 +231,9 @@ def validate_cash_usable_on_decision_rows(data: HourFromMinuteDataSplit, cash_in
     a broken safety action. The action-return contract makes label-valid <=> finite for builder-produced
     splits, but a hand-constructed split (tests/research) can violate it, so the env and evaluator both enforce
     the full usability up front and fail closed at construction/entry."""
-    rows = data.valid_start_indices
+    # EVERY valid decision row (valid_index_mask), not just episode-start indices: the env steps through
+    # continuation rows the policy can de-risk on, so a non-usable CASH on a non-start row still breaks fallback.
+    rows = torch.nonzero(data.valid_index_mask, as_tuple=False).flatten()
     if rows.numel() == 0:
         return  # an empty split is handled by the caller's own emptiness guard
     rows = rows.to(data.action_returns.device)
@@ -281,23 +283,23 @@ class VectorizedMinuteToHourEnv:
         # CASH is the forced safety fallback; require it to be USABLE (label-valid + finite) on every valid row.
         validate_cash_usable_on_decision_rows(self.data, self.cash_index)
         self.start_indices = self._build_start_index_pool()
-        self.indices = torch.zeros(config.num_envs, dtype=torch.long, device=device)
-        self.previous_actions = torch.full((config.num_envs,), self.initial_action, dtype=torch.long, device=device)
-        self.bars_held = torch.zeros(config.num_envs, dtype=torch.long, device=device)
-        self.cooldown_remaining = torch.zeros(config.num_envs, dtype=torch.long, device=device)
-        self.switches_today = torch.zeros(config.num_envs, dtype=torch.long, device=device)
-        self.switches_episode = torch.zeros(config.num_envs, dtype=torch.long, device=device)
-        self.order_legs_today = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
-        self.order_legs_episode = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
-        self.steps = torch.zeros(config.num_envs, dtype=torch.long, device=device)
+        self.indices = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self.previous_actions = torch.full((self.num_envs,), self.initial_action, dtype=torch.long, device=device)
+        self.bars_held = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self.cooldown_remaining = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self.switches_today = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self.switches_episode = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self.order_legs_today = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self.order_legs_episode = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self.steps = torch.zeros(self.num_envs, dtype=torch.long, device=device)
         # PR-D / D0 dynamic position bookkeeping: maintained as internal env state but NOT yet consumed by
         # the reward, the model forward, the replay buffer, or the step() dict -- so training is byte-identical
         # (see pr_d_dynamic_state_design.md). This is a RETURN-based env (no prices/target weights), so we track
         # the entry row, the compounded return since entry, and the max adverse/favorable excursion since entry.
-        self.entry_index = torch.zeros(config.num_envs, dtype=torch.long, device=device)
-        self.unrealized_pnl = torch.zeros(config.num_envs, dtype=torch.float32, device=device)
-        self.mae = torch.zeros(config.num_envs, dtype=torch.float32, device=device)  # max adverse excursion (<= 0)
-        self.mfe = torch.zeros(config.num_envs, dtype=torch.float32, device=device)  # max favorable excursion (>= 0)
+        self.entry_index = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self.unrealized_pnl = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        self.mae = torch.zeros(self.num_envs, dtype=torch.float32, device=device)  # max adverse excursion (<= 0)
+        self.mfe = torch.zeros(self.num_envs, dtype=torch.float32, device=device)  # max favorable excursion (>= 0)
         # PR-3 shadow mode: per-action STATIC weights from action metadata (cash zeroed in step), so the prior
         # held weight is determined by previous_action -- no separate shadow-holdings state needed. The shadow
         # fee rate is the env's one_way_cost_bps, so the A/B isolates the costing METHOD, not the rate.
