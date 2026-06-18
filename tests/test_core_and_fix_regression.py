@@ -3337,6 +3337,19 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIn("mask", cats(evaluate_decision_log_reportability(
             [base_row(action_mask=[True, True], selected_action="QQQ")], require_real_executable=False)))
 
+        # Report-only LEDGER check: equity must compound by net_return row-to-row. A consistent multi-row log
+        # raises no "ledger" issue; an inconsistent equity_after surfaces one -- but NON-gating (reportable
+        # stays True, and "ledger:*" is NOT a missing_reportability reason). Row 0 is never checked.
+        ok_log = [base_row(net_return=0.01, equity_after=1.01), base_row(net_return=0.02, equity_after=1.01 * 1.02)]
+        v = evaluate_decision_log_reportability(ok_log, require_real_executable=False)
+        self.assertTrue(v.reportable)
+        self.assertNotIn("ledger", cats(v))
+        bad_log = [base_row(net_return=0.01, equity_after=1.01), base_row(net_return=0.02, equity_after=2.0)]
+        v = evaluate_decision_log_reportability(bad_log, require_real_executable=False)
+        self.assertIn("ledger", cats(v))                                  # surfaced for diagnostics
+        self.assertTrue(v.reportable)                                     # but does NOT gate
+        self.assertNotIn("ledger:equity_after", v.missing_reportability_reasons)
+
         # Point-in-time-causal timestamp ordering, now PARSED (numeric, ISO-8601, datetime) and enforced --
         # not skipped. context_available_until must precede decision_ts.
         self.assertIn("ordering", cats(evaluate_decision_log_reportability([base_row(exit_execution_ts=0)], require_real_executable=False)))

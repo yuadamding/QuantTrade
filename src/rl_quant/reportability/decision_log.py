@@ -79,7 +79,7 @@ _TIMESTAMP_CHAIN = ("context_available_until", "decision_ts", "entry_execution_t
 class ReportabilityIssue:
     row_index: int | None
     field: str | None
-    category: str  # "missing" | "malformed" | "negative" | "nonpositive_equity" | "ordering" | "mask" | "strict"
+    category: str  # "missing" | "malformed" | "negative" | "nonpositive_equity" | "ordering" | "mask" | "strict" | "ledger"
     message: str
 
 
@@ -216,11 +216,34 @@ def evaluate_decision_log_reportability(
         if row.get("requires_exit_price") and not _is_positive_finite_number(row.get("exit_price")):
             strict_issues.append(ReportabilityIssue(i, "exit_price", "strict", f"row {i}: needs a finite positive exit_price ({row.get('exit_price')!r})"))
 
+    # Report-only LEDGER check (NON-gating): the equity curve must compound by net_return row-to-row,
+    # equity_after[i] == equity_after[i-1] * (1 + net_return[i]) (the eval keeps a single continuous,
+    # full-precision equity that is never reset mid-log -- only the position resets on a path break). It is
+    # surfaced as a "ledger" issue for diagnostics but does NOT gate base/real reportability: the cost
+    # convention is path-specific and not every emitter is confirmed to maintain this invariant. Row 0 is
+    # skipped (equity_before is not a logged field). Tolerance is generous (full-precision -> ~exact match).
+    ledger_issues: list[ReportabilityIssue] = []
+    for i in range(1, len(rows)):
+        prev, cur = rows[i - 1], rows[i]
+        if not (isinstance(prev, Mapping) and isinstance(cur, Mapping)):
+            continue
+        eq_prev, eq_cur, net = prev.get("equity_after"), cur.get("equity_after"), cur.get("net_return")
+        if not (_is_finite_number(eq_prev) and _is_finite_number(eq_cur) and _is_finite_number(net)):
+            continue  # missing/malformed numerics are already base issues
+        expected = float(eq_prev) * (1.0 + float(net))
+        if abs(expected - float(eq_cur)) > 1e-6 * max(1.0, abs(float(eq_cur))):
+            ledger_issues.append(ReportabilityIssue(
+                i, "equity_after", "ledger",
+                f"row {i}: equity_after {float(eq_cur)!r} != equity_after[{i - 1}]*(1+net_return) = {expected!r}",
+            ))
+
     base_reportable = not base_issues
     real_ok = base_reportable and not strict_issues
     reportable = base_reportable and (real_ok if require_real_executable else True)
-    all_issues = (*base_issues, *strict_issues)
-    reasons = tuple(sorted({f"{issue.category}:{issue.field}" for issue in all_issues}))
+    gating_issues = (*base_issues, *strict_issues)
+    all_issues = (*gating_issues, *ledger_issues)
+    # reasons = GATING categories only; the non-gating ledger diagnostic must not read as a reportability fail.
+    reasons = tuple(sorted({f"{issue.category}:{issue.field}" for issue in gating_issues}))
     return ReportabilityVerdict(
         reportable=reportable,
         base_reportable=base_reportable,
