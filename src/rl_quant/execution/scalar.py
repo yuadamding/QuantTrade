@@ -118,6 +118,7 @@ def transition_pnl(
     trade_scale: float,
     commission_per_share: float,
     extra_cost_per_share: float,
+    terminal_policy: TerminalPolicy = TerminalPolicy.LIQUIDATE_AT_NEXT,
 ):
     """Vectorized ``delayed_close`` transition reward in scaled dollars -- the single source of truth for
     the intraday env-step / eval / pretraining-target reward (previously inlined three times).
@@ -125,17 +126,24 @@ def transition_pnl(
     Operates on torch tensors OR python scalars via ``+ - * abs`` only (no torch import, no ``.float()``
     casts -- long*float and bool*float promote identically), so the same function serves the vectorized
     env/grid and the scalar eval loop. The held (old) position earns ``mid_now -> mid_fill`` (the latency
-    leg) and the new position earns ``mid_fill -> mid_next``; turnover pays the fill-bar cost and a true
-    terminal pays an extra ``|new|`` liquidation cost at the next bar. Equals
-    ``simulate_transition(...).net_return`` for the delayed_close fill level (cross-checked in tests)."""
+    leg) and the new position earns ``mid_fill -> mid_next``; turnover pays the fill-bar cost.
+
+    ``terminal_policy`` gates the terminal liquidation cost so this matches ``simulate_transition``:
+    ``LIQUIDATE_AT_NEXT`` (the default) charges ``|new| * cost_next`` at a true terminal; ``CARRY``
+    (episode-length truncation / bootstrap-through) charges NOTHING. Equals
+    ``simulate_transition(...).net_return`` for the delayed_close fill level under the SAME terminal_policy
+    (cross-checked in tests)."""
     cost_fill = half_spread_fill + extra_cost_per_share + commission_per_share
     cost_next = half_spread_next + extra_cost_per_share + commission_per_share
     turnover = abs(new_position - old_position)
+    liquidation = terminal * abs(new_position) * cost_next
+    if terminal_policy != TerminalPolicy.LIQUIDATE_AT_NEXT:
+        liquidation = liquidation * 0.0  # CARRY: no terminal liquidation (preserves scalar/tensor shape)
     return (
         old_position * (mid_fill - mid_now)
         + new_position * (mid_next - mid_fill)
         - turnover * cost_fill
-        - terminal * abs(new_position) * cost_next
+        - liquidation
     ) * trade_scale
 
 

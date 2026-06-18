@@ -1393,30 +1393,45 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             ExecutionConfig,
             MarketSnapshot,
             PositionState,
+            TerminalPolicy,
             simulate_transition,
             transition_pnl,
         )
 
         scale, comm, extra = 200.0, 0.01, 0.005
 
-        def inline(old, new, mn, mf, mx, hf, hn, term):
+        def inline(old, new, mn, mf, mx, hf, hn, term, liquidates):
             r = (old * (mf - mn) + new * (mx - mf) - abs(new - old) * (hf + extra + comm)) * scale
-            return r - (1.0 if term else 0.0) * abs(new) * (hn + extra + comm) * scale
+            return r - (1.0 if (term and liquidates) else 0.0) * abs(new) * (hn + extra + comm) * scale
 
-        # Scalar: transition_pnl == inline, and == simulate_transition.net_return (delayed_close).
-        cfg = ExecutionConfig(trade_lot_size=2, commission_per_share=comm, extra_cost_per_share=extra)
-        for old in (-1.0, 0.0, 1.0):
-            for new in (-1.0, 0.0, 1.0):
-                for term in (False, True):
-                    tp = transition_pnl(old, new, 100.0, 101.0, 99.0, 0.03, 0.04, term,
-                                        trade_scale=scale, commission_per_share=comm, extra_cost_per_share=extra)
-                    self.assertAlmostEqual(tp, inline(old, new, 100.0, 101.0, 99.0, 0.03, 0.04, term), places=6)
-                    sim = simulate_transition(
-                        PositionState(position=old), new,
-                        MarketSnapshot(mid=100.0), MarketSnapshot(mid=101.0, half_spread=0.03),
-                        MarketSnapshot(mid=99.0, half_spread=0.04), is_terminal=term, config=cfg,
-                    )
-                    self.assertAlmostEqual(sim.net_return, tp, places=6)
+        # Scalar: transition_pnl == inline, and == simulate_transition.net_return (delayed_close) -- under
+        # BOTH terminal policies. CARRY must charge NO terminal liquidation; LIQUIDATE_AT_NEXT must charge it.
+        for policy in (TerminalPolicy.LIQUIDATE_AT_NEXT, TerminalPolicy.CARRY):
+            cfg = ExecutionConfig(trade_lot_size=2, commission_per_share=comm, extra_cost_per_share=extra,
+                                  terminal_policy=policy)
+            liquidates = policy == TerminalPolicy.LIQUIDATE_AT_NEXT
+            for old in (-1.0, 0.0, 1.0):
+                for new in (-1.0, 0.0, 1.0):
+                    for term in (False, True):
+                        tp = transition_pnl(old, new, 100.0, 101.0, 99.0, 0.03, 0.04, term,
+                                            trade_scale=scale, commission_per_share=comm,
+                                            extra_cost_per_share=extra, terminal_policy=policy)
+                        self.assertAlmostEqual(tp, inline(old, new, 100.0, 101.0, 99.0, 0.03, 0.04, term, liquidates),
+                                               places=6)
+                        sim = simulate_transition(
+                            PositionState(position=old), new,
+                            MarketSnapshot(mid=100.0), MarketSnapshot(mid=101.0, half_spread=0.03),
+                            MarketSnapshot(mid=99.0, half_spread=0.04), is_terminal=term, config=cfg,
+                        )
+                        self.assertAlmostEqual(sim.net_return, tp, places=6)
+        # The default terminal_policy is LIQUIDATE_AT_NEXT, so omitting it charges the liquidation (held short
+        # to a true terminal differs from CARRY by exactly |new| * cost_next * scale).
+        liq = transition_pnl(-1.0, -1.0, 100.0, 100.0, 100.0, 0.02, 0.02, True,
+                             trade_scale=scale, commission_per_share=comm, extra_cost_per_share=extra)
+        carry = transition_pnl(-1.0, -1.0, 100.0, 100.0, 100.0, 0.02, 0.02, True,
+                               trade_scale=scale, commission_per_share=comm, extra_cost_per_share=extra,
+                               terminal_policy=TerminalPolicy.CARRY)
+        self.assertAlmostEqual(carry - liq, 1.0 * (0.02 + extra + comm) * scale, places=6)
 
         # Vectorized (env path): long positions, float price/spread tensors, bool terminal -> elementwise match.
         old = torch.tensor([-1, 0, 1, 1], dtype=torch.long)
