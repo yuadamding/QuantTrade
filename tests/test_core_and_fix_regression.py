@@ -3909,6 +3909,40 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             _first_present({"other": 1}, "label_valid_mask", "action_valid_mask")
 
+    def test_reportability_canonical_extraction_foundation(self) -> None:
+        # Foundation for the canonical reportability rewire (item 2, 2a): the stress-side canonicalizer
+        # (parameter-proven cost multiplier -> canonical id) + the pure summary extraction adapters. These are
+        # NOT yet wired into validate_reportable_summary (no verdict moves yet).
+        from rl_quant.evaluation.decision_framework import extract_baseline_ids, extract_stress_ids
+        from rl_quant.protocol import canonicalize_cost_stress_id
+
+        # Cost-stress level is proven by MULTIPLIER, never by name: 2x -> cost_doubled, 3x -> cost_tripled.
+        self.assertEqual(canonicalize_cost_stress_id(2.0), "cost_doubled")
+        self.assertEqual(canonicalize_cost_stress_id(3.0), "cost_tripled")
+        self.assertEqual(canonicalize_cost_stress_id("2.0"), "cost_doubled")  # numeric-coercible
+        for bad in (1.0, 2.5, 0.0, None, "x", float("nan")):
+            self.assertIsNone(canonicalize_cost_stress_id(bad), bad)
+
+        summary = {
+            "baselines": {
+                "CASH": {}, "BuyAndHold_QQQ": {}, "RandomSameTurnover": {}, "RandomSameActionDistribution": {},
+                "RandomSameTurnoverSameTiming": {}, "Junk": {},  # variant + unknown -> dropped
+            },
+            "cost_stress": {
+                "fixed_rollout": {"1bps": {"cost_multiplier": 1.0}, "2bps": {"cost_multiplier": 2.0}},
+                "adaptive": {"2bps": {"cost_multiplier": 2.0}, "3bps": {"cost_multiplier": 3.0}},
+            },
+        }
+        self.assertEqual(extract_baseline_ids(summary),
+                         {"cash", "buy_and_hold", "same_turnover_random", "random_action_distribution"})
+        self.assertEqual(extract_stress_ids(summary), {"cost_doubled", "cost_tripled"})
+        # Missing / malformed sections -> empty sets (no crash); a leg without cost_multiplier yields nothing
+        # (no name-based inference -- the whole point of parameter-proving).
+        self.assertEqual(extract_baseline_ids({}), set())
+        self.assertEqual(extract_stress_ids({}), set())
+        self.assertEqual(extract_stress_ids({"cost_stress": {"fixed_rollout": {"2bps": {}}}}), set())
+        self.assertEqual(extract_baseline_ids({"baselines": "notadict"}), set())
+
     def test_periods_per_day_raises_on_unsupported_interval(self) -> None:
         # The annualization factor used to silently default to the 15m value (26.0) for ANY unrecognized
         # decision_interval -- including second intervals the feature config permits (e.g. "30s") -- which

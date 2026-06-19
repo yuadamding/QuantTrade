@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from rl_quant.protocol.reportability_contract import canonicalize_baseline_id, canonicalize_cost_stress_id
 from rl_quant.research_protocol import ResearchProtocolError, parse_iso_timestamp, stable_json_hash
 
 
@@ -477,6 +478,41 @@ def _has_path(payload: dict[str, Any], path: str) -> bool:
             return False
         current = current[part]
     return True
+
+
+def extract_baseline_ids(summary: dict[str, Any]) -> set[str]:
+    """Canonical baseline ids actually present in a run summary's ``baselines`` section: each produced name
+    (CASH, BuyAndHold_QQQ, RandomSameTurnover, ...) is mapped to its canonical logical id via the protocol name
+    map; unrecognized / more-specific variants (e.g. RandomSameTurnoverSameTiming) are dropped. Pure -- this is
+    the canonical INPUT to validate_baseline_stress_coverage, not a reportability decision by itself.
+
+    NOTE: foundation for the canonical reportability rewire; NOT yet consumed by validate_reportable_summary."""
+    baselines = summary.get("baselines")
+    if not isinstance(baselines, dict):
+        return set()
+    return {cid for name in baselines if (cid := canonicalize_baseline_id(str(name))) is not None}
+
+
+def extract_stress_ids(summary: dict[str, Any]) -> set[str]:
+    """Canonical stress ids present in a run summary's ``cost_stress`` section, proven by PARAMETER. Each
+    rollout leg (fixed_rollout / adaptive) is a dict of {label: metrics}; a leg entry maps to a canonical stress
+    id only when its metrics carry a ``cost_multiplier`` that canonicalize_cost_stress_id recognizes (2x ->
+    cost_doubled, 3x -> cost_tripled). A produced rollout-mode NAME never implies a cost level. Pure.
+
+    NOTE: foundation for the canonical reportability rewire; NOT yet consumed by validate_reportable_summary."""
+    cost_stress = summary.get("cost_stress")
+    if not isinstance(cost_stress, dict):
+        return set()
+    ids: set[str] = set()
+    for leg in cost_stress.values():
+        if not isinstance(leg, dict):
+            continue
+        for entry in leg.values():
+            if isinstance(entry, dict):
+                sid = canonicalize_cost_stress_id(entry.get("cost_multiplier"))
+                if sid is not None:
+                    ids.add(sid)
+    return ids
 
 
 def validate_reportable_summary(summary: dict[str, Any]) -> list[str]:

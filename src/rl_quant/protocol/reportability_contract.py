@@ -187,3 +187,26 @@ def canonicalize_baseline_id(produced_name: str) -> str | None:
     if _BUY_AND_HOLD_SYMBOL_RE.fullmatch(key):
         return "buy_and_hold"
     return None
+
+
+# Stress half of the produced->canonical name map (sibling to canonicalize_baseline_id): a cost-stress result
+# is canonical "cost_doubled" iff its MULTIPLIER (swept cost / base cost) is 2x, "cost_tripled" iff 3x. Mapped
+# by PARAMETER (the proven multiplier), never by a produced rollout-mode name -- so a key like "fixed_rollout"
+# can never masquerade as a cost level. cost_doubled is the only REQUIRED produced scenario; cost_tripled is
+# ASPIRATIONAL (see ASPIRATIONAL_STRESS_SPECS). Stdlib-only to preserve the protocol-layer purity invariant.
+_COST_STRESS_MULTIPLIER_IDS: tuple[tuple[float, str], ...] = ((2.0, "cost_doubled"), (3.0, "cost_tripled"))
+
+
+def canonicalize_cost_stress_id(cost_multiplier: object) -> str | None:
+    """Map a cost-stress MULTIPLIER (swept cost / base cost) to its canonical stress id, or None if it is not a
+    recognized canonical level (e.g. the 1x baseline leg, or an unswept/foreign value). 2.0 -> cost_doubled,
+    3.0 -> cost_tripled. Parameter-proven: a cost level is NEVER inferred from a produced name. Non-numeric or
+    unrecognized inputs return None (the caller treats that as 'not a canonical stress scenario')."""
+    try:
+        multiplier = float(cost_multiplier)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    for value, stress_id in _COST_STRESS_MULTIPLIER_IDS:
+        if abs(multiplier - value) <= 1e-9:
+            return stress_id
+    return None
