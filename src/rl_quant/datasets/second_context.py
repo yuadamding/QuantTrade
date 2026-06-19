@@ -194,6 +194,7 @@ def _build_split(
     market_std: torch.Tensor | None = None,
     action_feature_mean: torch.Tensor | None = None,
     action_feature_std: torch.Tensor | None = None,
+    mask_action_feature_normalizer: bool = False,
 ) -> SecondContextDataSplit:
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
@@ -251,10 +252,19 @@ def _build_split(
 
     if market_mean is None or market_std is None:
         market_mean, market_std = _masked_mean_std(raw_market, market_mask)
-    if action_feature_mean is None:
-        action_feature_mean = raw_action_features.mean(dim=(0, 1))
-    if action_feature_std is None:
-        action_feature_std = raw_action_features.std(dim=(0, 1), unbiased=False).clamp_min(1e-6)
+    if mask_action_feature_normalizer:
+        # Opt-in (flag mask_action_feature_normalizer): fit the action-feature normalizer over the
+        # DECISION-VALID action rows only (action_valid_mask = decision_action_valid_mask | action_valid_mask),
+        # excluding padded/invalid rows whose features are sentinels/stale -- mirroring the market-context
+        # normalizer, which is already masked. Result-moving (changes the normalized action_features the scorer
+        # sees), so it is governed + default-OFF; the default below reproduces the prior unmasked stats exactly.
+        if action_feature_mean is None or action_feature_std is None:
+            action_feature_mean, action_feature_std = _masked_mean_std(raw_action_features, action_valid_mask)
+    else:
+        if action_feature_mean is None:
+            action_feature_mean = raw_action_features.mean(dim=(0, 1))
+        if action_feature_std is None:
+            action_feature_std = raw_action_features.std(dim=(0, 1), unbiased=False).clamp_min(1e-6)
 
     market = ((raw_market - market_mean) / market_std).clamp_(-8.0, 8.0)
     market = market.masked_fill(~market_mask.unsqueeze(-1), 0.0)
@@ -310,12 +320,16 @@ def build_second_context_splits(
     test_start: str,
     train_start: str | None = None,
     test_end: str | None = None,
+    mask_action_feature_normalizer: bool = False,
 ) -> tuple[SecondContextDataSplit, SecondContextDataSplit, SecondContextDataSplit]:
     _validate_split_chronology(
         train_start=train_start, train_end=train_end, val_end=val_end, test_start=test_start, test_end=test_end
     )
     payload = _load_payload(dataset_path)
-    train = _build_split(name="train", payload=payload, start=train_start, end=train_end)
+    # The normalizer is FITTED on train (its action_feature_mean/std are None); val/test receive train's stats,
+    # so the flag only takes effect on the train fit. Passed through for consistency.
+    train = _build_split(name="train", payload=payload, start=train_start, end=train_end,
+                         mask_action_feature_normalizer=mask_action_feature_normalizer)
     val = _build_split(
         name="val",
         payload=payload,
@@ -326,6 +340,7 @@ def build_second_context_splits(
         market_std=train.market_std,
         action_feature_mean=train.action_feature_mean,
         action_feature_std=train.action_feature_std,
+        mask_action_feature_normalizer=mask_action_feature_normalizer,
     )
     test = _build_split(
         name="test",
@@ -336,6 +351,7 @@ def build_second_context_splits(
         market_std=train.market_std,
         action_feature_mean=train.action_feature_mean,
         action_feature_std=train.action_feature_std,
+        mask_action_feature_normalizer=mask_action_feature_normalizer,
     )
     assert_matching_second_context_schema(train, val, test)
     return train, val, test

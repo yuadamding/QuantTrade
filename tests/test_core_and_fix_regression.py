@@ -3817,6 +3817,59 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ResearchProtocolError):
             parse_iso_timestamp("not-a-timestamp")
 
+    def test_mask_action_feature_normalizer_flag(self) -> None:
+        # P0-5: the action-feature normalizer is fitted UNMASKED by default (includes padded/invalid action
+        # rows whose features may be sentinels), while the market-context normalizer is already masked. The
+        # opt-in, default-OFF mask_action_feature_normalizer flag fits it over decision-valid rows only.
+        # Result-moving (model_inputs), so governed + default-OFF -> the default path is byte-identical.
+        import torch as _t
+
+        from rl_quant.datasets.second_context import _build_split
+
+        nan = float("nan")
+
+        def payload(valid_mask, returns, feats):
+            n = len(valid_mask)
+            return {
+                "decision_timestamps": [f"2026-01-02T14:3{i}:00+00:00" for i in range(n)],
+                "next_timestamps": [f"2026-01-02T14:3{i}:30+00:00" for i in range(n)],
+                "market_context": _t.zeros(n, 1, 1),
+                "market_context_mask": _t.ones(n, 1, dtype=_t.bool),
+                "market_context_available_timestamps_ms": _t.zeros(n, dtype=_t.long),
+                "action_features": _t.tensor(feats).float(),
+                "action_returns": _t.tensor(returns).float(),
+                "decision_action_valid_mask": _t.tensor(valid_mask, dtype=_t.bool),
+                "label_valid_mask": _t.tensor(valid_mask, dtype=_t.bool),
+                "action_cost_bps": _t.zeros(n, 2),
+                "entry_execution_timestamps_ms": _t.zeros(n, dtype=_t.long),
+                "exit_execution_timestamps_ms": _t.ones(n, dtype=_t.long),
+                "portfolio_state": _t.zeros(n, 1),
+                "constraint_state": _t.zeros(n, 1),
+                "action_names": ["CASH", "AAA"],
+                "feature_names": {"action": ["f0"], "market": ["m0"]},
+            }
+
+        # Row 1's action 1 is decision-INVALID and carries an extreme feature (100.0) + a NaN return.
+        p = payload(valid_mask=[[True, True], [True, False]],
+                    returns=[[0.0, 0.01], [0.0, nan]],
+                    feats=[[[1.0], [1.0]], [[1.0], [100.0]]])
+        off = _build_split(name="t", payload=p)
+        on = _build_split(name="t", payload=p, mask_action_feature_normalizer=True)
+        # Default (off) = unmasked mean over all rows/actions = (1+1+1+100)/4 = 25.75.
+        self.assertAlmostEqual(float(off.action_feature_mean[0]), 25.75, places=5)
+        # Masked (on) excludes the invalid action 1 of row 1 -> (1+1+1)/3 = 1.0.
+        self.assertAlmostEqual(float(on.action_feature_mean[0]), 1.0, places=5)
+        self.assertNotAlmostEqual(float(off.action_feature_mean[0]), float(on.action_feature_mean[0]))
+
+        # Flip-criterion property: with EVERY action row decision-valid, masked == unmasked (flag is a no-op).
+        q = payload(valid_mask=[[True, True], [True, True]],
+                    returns=[[0.0, 0.01], [0.0, 0.02]],
+                    feats=[[[1.0], [2.0]], [[3.0], [4.0]]])
+        off_q = _build_split(name="t", payload=q)
+        on_q = _build_split(name="t", payload=q, mask_action_feature_normalizer=True)
+        self.assertTrue(_t.allclose(off_q.action_feature_mean, on_q.action_feature_mean, atol=1e-6))
+        self.assertTrue(_t.allclose(off_q.action_feature_std, on_q.action_feature_std, atol=1e-6))
+
     def test_split_chronology_validation(self) -> None:
         # build_second_context_splits now fails fast on boundaries that would leak or invert, BEFORE loading
         # the dataset. Required ordering: train_start <= train_end < val_end <= test_start <= test_end.
@@ -4155,12 +4208,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 self.assertTrue(spec.flip_criterion, f"{name}: missing flip_criterion")
                 self.assertTrue(spec.delete_criterion, f"{name}: missing delete_criterion")
 
-        # Result-moving flags: the dynamic + transition model-input flags and the (declared-ahead) training
-        # flip use_execution_env_reward. The shadow flag execution_env_reward_shadow is label-changing only
-        # (moves metrics/manifest, not P&L), so it is NOT result-moving.
+        # Result-moving flags: the dynamic + transition model-input flags, the (declared-ahead) training flip
+        # use_execution_env_reward, and the second-context action-feature normalizer mask (model_inputs). The
+        # shadow flag execution_env_reward_shadow is label-changing only (moves metrics/manifest, not P&L), so
+        # it is NOT result-moving.
         self.assertEqual(
             set(result_moving_flags()),
-            {"use_dynamic_transition_features", "use_transition_features", "use_execution_env_reward"},
+            {"use_dynamic_transition_features", "use_transition_features", "use_execution_env_reward",
+             "mask_action_feature_normalizer"},
         )
         self.assertFalse(FLAG_REGISTRY["execution_env_reward_shadow"].is_result_moving)
         config_defaults = {f.name: f.default for f in dataclasses.fields(MinuteToHourTrainingConfig)}

@@ -93,6 +93,23 @@ FLAG_REGISTRY: dict[str, FlagSpec] = {
         flip_criterion="latest-period A/B improves the promotion gate without degrading reportability; test block untouched",
         delete_criterion="remove after two stable cycles at the new default",
     ),
+    # Second-context dataset flag (threaded through build_second_context_splits, not a MinuteToHour config
+    # field). Result-moving via model_inputs: fits the ACTION-feature normalizer (mean/std) over the
+    # decision-valid action rows only, excluding padded/invalid rows whose features are sentinels/stale, which
+    # changes the normalized action_features the scorer sees. The market-context normalizer is already masked
+    # (_masked_mean_std); this brings the action-feature normalizer in line. Default OFF reproduces the current
+    # unmasked statistics byte-for-byte.
+    "mask_action_feature_normalizer": FlagSpec(
+        name="mask_action_feature_normalizer",
+        default=False,
+        moves=("model_inputs",),
+        required_ab=_STANDARD_AB_METRICS,
+        flip_criterion=(
+            "latest-period A/B does not degrade the promotion gate with the masked normalizer; masked and "
+            "unmasked stats are verified to coincide when every action row is decision-valid; test block untouched"
+        ),
+        delete_criterion="remove the flag (make masked the only path) after two stable cycles at the new default",
+    ),
 }
 
 
