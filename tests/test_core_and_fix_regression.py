@@ -3800,6 +3800,23 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _periods_per_day(bad)
 
+    def test_research_protocol_parse_iso_timestamp_rejects_naive(self) -> None:
+        # Consistency with decision_log / second_context: research_protocol.parse_iso_timestamp used to
+        # silently assume UTC for a tz-naive timestamp, making the fit/train/val/test chronology checks depend
+        # on an implicit assumption. It now rejects naive timestamps; tz-aware ones parse unchanged.
+        from rl_quant.research_protocol import ResearchProtocolError, parse_iso_timestamp, utc_now_iso
+
+        aware = parse_iso_timestamp("2026-01-02T14:30:00+00:00")
+        self.assertIsNotNone(aware.tzinfo)
+        # The codebase's own timestamp generator is tz-aware, so it round-trips through the strict parser.
+        self.assertIsNotNone(parse_iso_timestamp(utc_now_iso()).tzinfo)
+        for naive in ("2026-01-02T14:30:00", "2026-01-02T14:30:00.5", "2026-01-02"):
+            with self.assertRaises(ResearchProtocolError):
+                parse_iso_timestamp(naive)
+        # Still rejects malformed (non-ISO) input.
+        with self.assertRaises(ResearchProtocolError):
+            parse_iso_timestamp("not-a-timestamp")
+
     def test_split_chronology_validation(self) -> None:
         # build_second_context_splits now fails fast on boundaries that would leak or invert, BEFORE loading
         # the dataset. Required ordering: train_start <= train_end < val_end <= test_start <= test_end.

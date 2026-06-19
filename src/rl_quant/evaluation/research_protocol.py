@@ -22,7 +22,11 @@ def parse_iso_timestamp(value: str) -> datetime:
     except ValueError as exc:
         raise ResearchProtocolError(f"Invalid ISO timestamp {value!r}.") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        # A tz-naive timestamp has no absolute instant -- silently assuming UTC made the chronology checks
+        # (fit/train/val/test windows, decision causality) depend on an implicit assumption. Reject it, as the
+        # decision-log and second-context parsers already do; reportable artifacts must carry tz-aware ISO-8601.
+        # Every timestamp this codebase emits is tz-aware (utc_now_iso -> datetime.now(timezone.utc)).
+        raise ResearchProtocolError(f"Timestamp {value!r} must include timezone information.")
     return parsed
 
 
