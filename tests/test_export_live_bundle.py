@@ -49,3 +49,15 @@ def test_export_is_deterministic(tmp_path: Path) -> None:
     a = build_skeleton_bundle(tmp_path / "a", seed=0)
     b = build_skeleton_bundle(tmp_path / "b", seed=0)
     assert load_golden(a / "parity").content_hash == load_golden(b / "parity").content_hash
+
+
+def test_exported_bundle_satisfies_paper_provenance_gate(tmp_path: Path) -> None:
+    # The bundle is approved_for paper, so the live loader's feature-data provenance
+    # gate REQUIRES a cutoff. A fully-enforced paper load must succeed -> proves the
+    # producer stamps the feature_data_through_utc the consumer now demands.
+    from rl_quant_live.artifact_contract.loader import load_bundle
+    from rl_quant_live.protocol.enums import Environment
+
+    bundle = build_skeleton_bundle(tmp_path / "bundle", seed=0)
+    loaded = load_bundle(bundle, environment=Environment.PAPER, risk_policy_id="paper_default_v1")
+    assert loaded.manifest.feature_data_through_utc  # present (non-empty)

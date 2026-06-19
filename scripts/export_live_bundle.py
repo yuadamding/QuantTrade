@@ -38,6 +38,7 @@ from rl_quant_live.artifact_contract.hashing import stable_json_hash
 from rl_quant_live.artifact_contract.normalizer import Normalizer
 from rl_quant_live.panel.decision_tensor import DecisionTensorBatch
 from rl_quant_live.parity.golden import save_golden
+from rl_quant_live.protocol.timestamps import utc_now_iso
 
 _SCHEMA_VERSION = "stock_second_context_decision_v3"
 _PROTOCOL_VERSION = "decision_tensor_v1"
@@ -180,8 +181,16 @@ def _golden_scores(
     return np.where(batch.decision_action_valid_mask, raw_np, -np.inf).astype(np.float32)
 
 
-def build_skeleton_bundle(dest: str | Path, *, seed: int = 0, normalizer: str = "zscore") -> Path:
+def build_skeleton_bundle(
+    dest: str | Path, *, seed: int = 0, normalizer: str = "zscore", feature_data_through_utc: str | None = None
+) -> Path:
     dest = Path(dest)
+    # Feature-data provenance ("as-of" cutoff). The live loader REQUIRES this for any
+    # trading env (paper/live) and rejects a cutoff that post-dates the export. This is
+    # a freshly-built bundle, so its features are as-of ~now; a real export would pass
+    # the training/feature data cutoff here.
+    if feature_data_through_utc is None:
+        feature_data_through_utc = utc_now_iso()
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)  # seed BEFORE init so weights are deterministic
     model = SecondContextTransformerQNetwork(**{k: _ARCH[k] for k in _CTOR_KEYS})
@@ -239,6 +248,7 @@ def build_skeleton_bundle(dest: str | Path, *, seed: int = 0, normalizer: str = 
             not_approved_for=("live", "live_tiny"),
             reportability_status="reportable",
             statistical_status="passed",
+            feature_data_through_utc=feature_data_through_utc,
             decision_frequency="15m",
             requires_position_state=True,
             decision_tensor_schema=dts,
@@ -266,8 +276,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Export a frozen rl_quant -> rl_quant_live parity bundle")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--feature-data-through",
+        default=None,
+        help="ISO-8601 UTC feature-data 'as-of' cutoff stamped in the manifest "
+        "(defaults to export time). The live loader requires it for trading envs.",
+    )
     args = parser.parse_args()
-    out = build_skeleton_bundle(args.output_dir, seed=args.seed)
+    out = build_skeleton_bundle(
+        args.output_dir, seed=args.seed, feature_data_through_utc=args.feature_data_through
+    )
     print(f"wrote parity bundle -> {out}")
     return 0
 
