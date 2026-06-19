@@ -4202,6 +4202,28 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             assert_baseline_stress_coverage([], [])
 
+    def test_baseline_stress_contract_is_single_protocol_layer_source(self) -> None:
+        # Review #6 name-drift fix: the canonical baseline/stress contract lives in the lowest (protocol)
+        # layer so BOTH reportability (higher) and evaluation (lower, cannot import reportability) share ONE
+        # source. Assert every export is the SAME object across all three import paths -- a forked copy (the
+        # drift this prevents) would fail identity.
+        import rl_quant.protocol as protocol
+        import rl_quant.protocol.reportability_contract as contract
+        import rl_quant.reportability as reportability
+        import rl_quant.reportability.baselines as baselines_shim
+
+        for name in ("REQUIRED_BASELINES", "REQUIRED_STRESS", "QUOTE_CONDITIONAL_STRESS",
+                     "validate_baseline_stress_coverage", "assert_baseline_stress_coverage"):
+            canonical = getattr(contract, name)
+            self.assertIs(getattr(protocol, name), canonical, name)
+            self.assertIs(getattr(reportability, name), canonical, name)
+            self.assertIs(getattr(baselines_shim, name), canonical, name)
+        # The contract module is stdlib-only (protocol layer must not import a higher rl_quant layer).
+        import ast
+        source = (ROOT / "src" / "rl_quant" / "protocol" / "reportability_contract.py").read_text()
+        imported = [n.module for n in ast.walk(ast.parse(source)) if isinstance(n, ast.ImportFrom) and n.module]
+        self.assertFalse([m for m in imported if m.startswith("rl_quant.")], imported)
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [
