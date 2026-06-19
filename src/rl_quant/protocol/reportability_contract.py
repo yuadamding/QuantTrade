@@ -148,3 +148,32 @@ def assert_baseline_stress_coverage(
     )
     if not ok:
         raise ValueError("reportability contract violation (baseline/stress grid): " + "; ".join(issues))
+
+
+# Explicit map from a PRODUCED baseline name (what evaluation.second_context emits and
+# decision_framework.validate_reportable_summary checks) to its canonical logical id. This is the BASELINE
+# half of the documented name map (the stress half awaits the cost_doubled<->produced-key pairing decision).
+# Exact, case-insensitive match -- NOT fuzzy substring -- except BuyAndHold_<symbol>, where the symbol is a
+# parameter and matches by prefix. The producer's more-specific random variants (RandomSameTurnoverSameTiming,
+# RandomSameSegments) are intentionally NOT mapped: they are extra baselines, not the canonical required four.
+# NOTE: this is the tested FOUNDATION; it is deliberately NOT yet wired into validate_reportable_summary (that
+# rewrite + the stress mapping move reportability verdicts and need the pairing sign-off).
+_BASELINE_PRODUCED_ALIASES: dict[str, str] = {
+    "cash": "cash",
+    "randomsameactiondistribution": "random_action_distribution",
+    "random_action_distribution": "random_action_distribution",
+    "randomsameturnover": "same_turnover_random",
+    "same_turnover_random": "same_turnover_random",
+}
+
+
+def canonicalize_baseline_id(produced_name: str) -> str | None:
+    """Map a produced/summary baseline name to its canonical logical id in REQUIRED_BASELINES, or None if it is
+    not one of the canonical required baselines (e.g. a more-specific random variant). Case-insensitive;
+    BuyAndHold_<symbol> -> buy_and_hold by prefix (the symbol is a parameter, not part of the id)."""
+    key = str(produced_name).strip().lower()
+    if key in _BASELINE_PRODUCED_ALIASES:
+        return _BASELINE_PRODUCED_ALIASES[key]
+    if key.startswith("buyandhold"):
+        return "buy_and_hold"
+    return None

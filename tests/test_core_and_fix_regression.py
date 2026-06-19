@@ -4356,6 +4356,26 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(aspirational_ids, {"cost_tripled", "latency_plus_one_bar"})
         self.assertTrue(aspirational_ids.isdisjoint(REQUIRED_STRESS))  # aspirational != required
 
+    def test_canonicalize_baseline_id_name_map(self) -> None:
+        # The BASELINE half of the produced->canonical name map (foundation for wiring the gate to real run
+        # summaries; NOT yet wired -- moves no verdict). The producer (evaluation.second_context) emits CASH,
+        # BuyAndHold_<sym>, RandomSameActionDistribution, RandomSameTurnover (+ extra variants); each canonical
+        # required baseline must be reachable, and extra/unknown names map to None.
+        from rl_quant.protocol import REQUIRED_BASELINES, canonicalize_baseline_id
+
+        self.assertEqual(canonicalize_baseline_id("CASH"), "cash")
+        self.assertEqual(canonicalize_baseline_id("BuyAndHold_QQQ"), "buy_and_hold")
+        self.assertEqual(canonicalize_baseline_id("BuyAndHold_SPY"), "buy_and_hold")
+        self.assertEqual(canonicalize_baseline_id("RandomSameActionDistribution"), "random_action_distribution")
+        self.assertEqual(canonicalize_baseline_id("RandomSameTurnover"), "same_turnover_random")
+        self.assertEqual(canonicalize_baseline_id(" randomsameturnover "), "same_turnover_random")  # case/space
+        # Every canonical required baseline is reachable from a real produced name (drift guard).
+        produced = ["CASH", "BuyAndHold_QQQ", "RandomSameActionDistribution", "RandomSameTurnover"]
+        self.assertEqual({canonicalize_baseline_id(n) for n in produced}, set(REQUIRED_BASELINES))
+        # Extra / more-specific variants and unknowns are NOT the canonical four -> None (not silently merged).
+        for extra in ("RandomSameTurnoverSameTiming", "RandomSameSegments", "Nonsense", ""):
+            self.assertIsNone(canonicalize_baseline_id(extra), extra)
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [

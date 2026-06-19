@@ -12,6 +12,7 @@ from rl_quant.protocol.reportability_contract import (
     BaselineSpec,
     StressScenarioSpec,
     assert_baseline_stress_coverage,
+    canonicalize_baseline_id,
     validate_baseline_stress_coverage,
 )
 from rl_quant.protocol.validators import (
@@ -40,6 +41,7 @@ __all__ = [
     "StressScenarioSpec",
     "assert_action_mask",
     "assert_baseline_stress_coverage",
+    "canonicalize_baseline_id",
     "assert_cash_contract",
     "assert_causal_timestamp_chain",
     "assert_decision_tensor_shapes",
