@@ -1006,6 +1006,13 @@ def main() -> int:
             "label_valid_mask": label_valid_mask,
             "action_label_valid_mask": label_valid_mask,
             "action_mask_semantics": action_mask_semantics,
+            # action_returns are the RAW simple return of holding the single chosen action at full capital
+            # from entry_fill to exit_fill (clipped_simple_return above) -- no metadata weighting. Declaring
+            # this resolves the PR-4 gate's weight-basis requirement (ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS in
+            # rl_quant.datasets.hour_from_subhour); previously absent -> None -> use_execution_env_reward
+            # stays fail-closed. Purely declarative metadata: the default (legacy) reward path is unaffected;
+            # PR-4 remains dormant until use_execution_env_reward is wired + A/B'd.
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
             "dataset_reportable": dataset_reportable,
