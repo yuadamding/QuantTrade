@@ -510,7 +510,9 @@ def statistical_credibility_report(
     by a raw Sharpe alone:
 
       * the per-period Sharpe + its Probabilistic Sharpe Ratio (skew/kurtosis-adjusted) and credibility flag;
-      * the autocorrelation-deflated effective sample size (PSR/Sharpe assume i.i.d.);
+      * the autocorrelation-deflated effective sample size -- which the PSR/DSR VERDICT is judged against (more
+        conservative than raw-n for an above-benchmark candidate, the regime promotion lives in), since PSR/
+        Sharpe assume i.i.d. returns (raw-n PSR/DSR are retained as the ``*_raw_n`` diagnostic fields);
       * the expected-maximum-Sharpe / Deflated Sharpe Ratio / promotion verdict for the DECLARED trial count
         (so the edge is deflated for selection, not taken at face value);
       * and -- only when supplied -- the Probability of Backtest Overfitting (from a full
@@ -521,16 +523,29 @@ def statistical_credibility_report(
     fewer than 2 returns, or zero dispersion). ``n_trials`` is caller-supplied (a declared or registry-inferred
     count); raises (via the underlying primitives) on an invalid ``n_trials`` or malformed inputs."""
     n_obs = len(returns)
+    effective_obs = effective_sample_size(returns)
     report: dict[str, object] = {
         "n_observations": n_obs,
         "n_trials": n_trials,
-        "effective_observations": effective_sample_size(returns),
+        "effective_observations": effective_obs,
         "expected_maximum_sharpe": expected_maximum_sharpe(n_trials, trials_sharpe_std=trials_sharpe_std),
+        # The reportable credibility VERDICT (PSR / DSR / promotion / credibility flag) is judged against the
+        # autocorrelation-deflated EFFECTIVE sample size, not the raw count: PSR/Sharpe assume i.i.d. returns, so
+        # for an ABOVE-benchmark candidate (the regime promotion lives in) a raw-n PSR/DSR is OVER-confident on
+        # serially-correlated returns and effective-n is the honest, strictly-more-conservative count. (For a
+        # BELOW-benchmark candidate the monotonicity reverses -- effective-n reads less extreme, nearer 0.5 --
+        # but the promotion bar sits entirely in the above-benchmark regime, so the verdict is never made
+        # anti-conservatively.) Raw-n PSR/DSR are retained as the *_raw_n diagnostics; psr_n_observations_used
+        # records the n the verdict actually used.
+        "credibility_verdict_observation_basis": "effective_observations",
     }
     per_period_sharpe: float | None = None
     psr: float | None = None
     dsr: float | None = None
     promotion: dict[str, object] | None = None
+    psr_raw_n: float | None = None
+    dsr_raw_n: float | None = None
+    n_effective: int | None = None
     if n_obs >= 2:
         avg = sum(returns) / n_obs
         m2 = sum((r - avg) ** 2 for r in returns) / n_obs
@@ -538,24 +553,36 @@ def statistical_credibility_report(
             per_period_sharpe = avg / math.sqrt(m2)
             skewness = (sum((r - avg) ** 3 for r in returns) / n_obs) / (m2 ** 1.5)
             kurtosis = (sum((r - avg) ** 4 for r in returns) / n_obs) / (m2 ** 2)
-            psr = probabilistic_sharpe_ratio(per_period_sharpe, benchmark_sharpe=0.0, n_observations=n_obs,
+            # Conservative verdict count: the autocorrelation-deflated effective sample size, floored and
+            # clamped to [2, n_obs] (== n_obs when there is no positive serial correlation).
+            n_effective = max(2, min(n_obs, int(math.floor(effective_obs))))
+            psr = probabilistic_sharpe_ratio(per_period_sharpe, benchmark_sharpe=0.0, n_observations=n_effective,
                                              skewness=skewness, kurtosis=kurtosis)
-            dsr = deflated_sharpe_ratio(per_period_sharpe, n_trials=n_trials, n_observations=n_obs,
+            dsr = deflated_sharpe_ratio(per_period_sharpe, n_trials=n_trials, n_observations=n_effective,
                                         skewness=skewness, kurtosis=kurtosis, trials_sharpe_std=trials_sharpe_std)
             verdict = deflated_sharpe_promotion_verdict(
-                per_period_sharpe, n_trials=n_trials, n_observations=n_obs, skewness=skewness, kurtosis=kurtosis,
-                trials_sharpe_std=trials_sharpe_std, confidence=confidence)
+                per_period_sharpe, n_trials=n_trials, n_observations=n_effective, skewness=skewness,
+                kurtosis=kurtosis, trials_sharpe_std=trials_sharpe_std, confidence=confidence)
             promotion = {
                 "promote": verdict.promote, "is_significant": verdict.is_significant,
                 "is_credible": verdict.is_credible, "confidence": verdict.confidence,
                 "reasons": list(verdict.reasons),
             }
+            # Raw-count diagnostics: what the over-confident i.i.d. assumption would have reported.
+            psr_raw_n = probabilistic_sharpe_ratio(per_period_sharpe, benchmark_sharpe=0.0, n_observations=n_obs,
+                                                   skewness=skewness, kurtosis=kurtosis)
+            dsr_raw_n = deflated_sharpe_ratio(per_period_sharpe, n_trials=n_trials, n_observations=n_obs,
+                                              skewness=skewness, kurtosis=kurtosis, trials_sharpe_std=trials_sharpe_std)
     report.update({
         "per_period_sharpe": per_period_sharpe,
         "probabilistic_sharpe_ratio": psr,
-        "psr_is_credible": psr_is_credible(psr, n_obs),
+        "psr_is_credible": psr_is_credible(psr, n_effective if n_effective is not None else n_obs),
         "deflated_sharpe_ratio": dsr,
         "deflated_sharpe_promotion": promotion,
+        # Verdict-n disclosure + raw-count diagnostics (None when the verdict is not estimable).
+        "psr_n_observations_used": n_effective,
+        "probabilistic_sharpe_ratio_raw_n": psr_raw_n,
+        "deflated_sharpe_ratio_raw_n": dsr_raw_n,
         # Stable schema: the data-snooping fields are always present (None when their optional input was not
         # supplied), so a consumer never has to distinguish "absent" from "not computed".
         "probability_of_backtest_overfitting": None,

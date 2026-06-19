@@ -3828,6 +3828,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # Optional data-snooping fields are PRESENT but None when their input is not supplied (stable schema).
         for key in ("probability_of_backtest_overfitting", "white_reality_check_p_value", "hansen_spa_p_value"):
             self.assertIsNone(r1[key])
+        # The reportable verdict is judged against the EFFECTIVE sample size; raw-n PSR/DSR are kept as
+        # diagnostics. This series has no positive serial correlation -> effective n == raw n == 48, so the
+        # verdict equals the raw-n diagnostic here (the deflation case is covered in the dedicated test below).
+        self.assertEqual(r1["credibility_verdict_observation_basis"], "effective_observations")
+        self.assertEqual(r1["psr_n_observations_used"], 48)
+        self.assertAlmostEqual(r1["probabilistic_sharpe_ratio_raw_n"], r1["probabilistic_sharpe_ratio"], places=9)
+        self.assertAlmostEqual(r1["deflated_sharpe_ratio_raw_n"], r1["deflated_sharpe_ratio"], places=9)
         # Deflation: more trials -> higher expected-max, no-greater DSR.
         r100 = report(rets, n_trials=100)
         self.assertGreater(r100["expected_maximum_sharpe"], r1["expected_maximum_sharpe"])
@@ -3839,15 +3846,56 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(full["probability_of_backtest_overfitting"], 0.0)
         self.assertLess(full["white_reality_check_p_value"], 0.05)
         self.assertLess(full["hansen_spa_p_value"], 0.05)
-        # Not estimable (< 2 returns): Sharpe/PSR/DSR/promotion None; effective == n; expected-max still set.
+        # Not estimable (< 2 returns): Sharpe/PSR/DSR/promotion + verdict-n + raw-n diagnostics all None;
+        # effective == n; expected-max still set.
         edge = report([0.01], n_trials=5)
         for key in ("per_period_sharpe", "probabilistic_sharpe_ratio", "deflated_sharpe_ratio",
-                    "deflated_sharpe_promotion"):
+                    "deflated_sharpe_promotion", "psr_n_observations_used",
+                    "probabilistic_sharpe_ratio_raw_n", "deflated_sharpe_ratio_raw_n"):
             self.assertIsNone(edge[key])
         self.assertEqual(edge["effective_observations"], 1.0)
         self.assertFalse(edge["psr_is_credible"])
         _json.dumps(r1)
         _json.dumps(full)  # the report is the reportable artifact -> must serialize
+
+    def test_statistical_credibility_report_judges_verdict_on_effective_n(self) -> None:
+        # On a SERIALLY-CORRELATED return series the i.i.d. PSR/Sharpe is over-confident, so the reportable
+        # verdict must be judged against the autocorrelation-deflated EFFECTIVE sample size; raw-n PSR/DSR are
+        # retained only as diagnostics.
+        from rl_quant.evaluation import statistical_credibility_report as report
+
+        def ar1(drift: float) -> list[float]:
+            # Deterministic positively-autocorrelated AR(1) series (phi=0.7) -> effective_observations << n.
+            vals: list[float] = []
+            prev = 0.0
+            seed = 0.0123456789
+            for _ in range(60):
+                seed = (seed * 9301 + 0.49297) % 1.0
+                prev = 0.7 * prev + 0.3 * drift + (seed - 0.5) * 0.02
+                vals.append(round(prev, 6))
+            return vals
+
+        # WINNING regime (positive Sharpe = above the zero benchmark): effective-n is STRICTLY more conservative,
+        # which is the direction that matters for promotion.
+        r = report(ar1(0.0006), n_trials=1)
+        self.assertLess(r["effective_observations"], 60)                     # deflated by positive autocorrelation
+        self.assertLess(r["psr_n_observations_used"], r["n_observations"])    # verdict uses the smaller effective n
+        self.assertEqual(r["credibility_verdict_observation_basis"], "effective_observations")
+        self.assertLess(r["probabilistic_sharpe_ratio"], r["probabilistic_sharpe_ratio_raw_n"])
+        self.assertLessEqual(r["deflated_sharpe_ratio"], r["deflated_sharpe_ratio_raw_n"])
+        # ~16 effective obs < PSR_MIN_CREDIBLE_OBSERVATIONS (30) -> NOT credible, despite raw n=60 >= 30.
+        self.assertGreaterEqual(r["n_observations"], 30)
+        self.assertFalse(r["psr_is_credible"])
+
+        # LOSING regime (negative Sharpe = below benchmark): PSR/DSR monotonicity REVERSES, so effective-n reads
+        # LESS extreme (nearer 0.5) than raw-n -- it is NOT universally "more conservative". The point is that
+        # the promotion bar lives entirely in the above-benchmark regime, so a loser still cannot promote
+        # regardless of which n is used (the verdict is never made anti-conservatively).
+        loser = report(ar1(-0.006), n_trials=5)
+        self.assertLess(loser["per_period_sharpe"], 0.0)                                     # genuinely a loser
+        self.assertLess(loser["probabilistic_sharpe_ratio"], 0.5)
+        self.assertGreater(loser["probabilistic_sharpe_ratio"], loser["probabilistic_sharpe_ratio_raw_n"])  # reversal
+        self.assertFalse(loser["deflated_sharpe_promotion"]["promote"])                      # gate stays sound
 
     def test_run_registry(self) -> None:
         # The auditable trial count for the multiple-testing controls: count the FINISHED included trials
