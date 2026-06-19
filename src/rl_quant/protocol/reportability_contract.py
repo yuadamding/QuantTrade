@@ -25,13 +25,15 @@ stress. REQUIRED_STRESS is therefore just ``cost_doubled`` (+ quote-conditional 
 required while quote data is absent); ``cost_tripled`` / ``latency_plus_one_bar`` are retained as
 ASPIRATIONAL_STRESS_SPECS to promote when the producer emits them. See the comment above REQUIRED_STRESS_SPECS.
 
-OUTSTANDING RECONCILIATION (intentionally not encoded here -- it MOVES verdicts, so it needs sign-off): the
-producers/summary validators still emit DIFFERENT on-the-wire NAMES than these logical ids --
-``evaluation.second_context`` emits CamelCase (``CASH``, ``RandomSameTurnover``, ``BuyAndHold_<symbol>``) and
-``evaluation.decision_framework.validate_reportable_summary`` checks dotted summary paths
-(``baselines.CASH``, ``cost_stress.fixed_rollout``). Wiring the gate against real run summaries still needs a
-name map (logical id -> produced/summary key); a future ``produced_key`` field on these records is the natural
-home for it. (The stress-COVERAGE question above is now resolved; only the name mapping remains.)
+NAME MAP -- now built AND wired (signed off 2026-06): producers emit DIFFERENT on-the-wire NAMES than these
+logical ids (``evaluation.second_context`` emits CamelCase ``CASH`` / ``RandomSameTurnover`` /
+``BuyAndHold_<symbol>``; cost stress is keyed by rollout mode with a ``cost_multiplier`` per entry). The
+produced->canonical map lives here as the pure helpers ``canonicalize_baseline_id`` (baselines) and
+``canonicalize_cost_stress_id`` (cost-stress, by 2x/3x multiplier -- never by name). ``evaluation.decision_framework``
+extracts canonical ids from a run summary through these helpers and now decides the reportability verdict via
+``validate_baseline_stress_coverage`` (replacing its legacy hardcoded ``baselines.CASH`` / ``cost_stress.*``
+path checks). Both coverage halves are therefore reconciled; the only remaining producer-side polish is the
+second-context scorer summary shape (which does not call validate_reportable_summary).
 """
 
 from __future__ import annotations

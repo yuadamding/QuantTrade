@@ -364,6 +364,29 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["100bps"]["total_traded_notional"], 0.5)
         self.assertLess(result["100bps"]["total_return"], result["0bps"]["total_return"])
 
+    def test_fixed_rollout_cost_stress_emits_cost_multiplier(self) -> None:
+        # The cost-stress entry now records cost_multiplier = swept_bps / base_cost_bps so the canonical
+        # reportability gate proves cost_doubled by PARAMETER. None when no base supplied (legacy) or base 0.
+        from rl_quant.protocol import canonicalize_cost_stress_id
+        module = load_script("train_hourly_causal_transformer_rl")
+        records = [{"action": 1, "previous_action": 0, "market_order_legs": 1.0, "gross_return": 0.01}]
+
+        with_base = module.fixed_rollout_cost_stress(
+            records, cost_bps_values=[1.0, 2.0, 3.0], extra_switch_penalty_bps=0.0,
+            periods_per_year=252.0, base_cost_bps=1.0)
+        self.assertEqual(with_base["2bps"]["cost_multiplier"], 2.0)
+        self.assertEqual(with_base["3bps"]["cost_multiplier"], 3.0)
+        self.assertEqual(with_base["1bps"]["cost_multiplier"], 1.0)
+        # ...and the 2x entry canonicalizes to cost_doubled (the reportability gate's parameter proof).
+        self.assertEqual(canonicalize_cost_stress_id(with_base["2bps"]["cost_multiplier"]), "cost_doubled")
+        # Backward-compatible: no base (default) or base 0 -> cost_multiplier None.
+        no_base = module.fixed_rollout_cost_stress(
+            records, cost_bps_values=[2.0], extra_switch_penalty_bps=0.0, periods_per_year=252.0)
+        self.assertIsNone(no_base["2bps"]["cost_multiplier"])
+        zero_base = module.fixed_rollout_cost_stress(
+            records, cost_bps_values=[2.0], extra_switch_penalty_bps=0.0, periods_per_year=252.0, base_cost_bps=0.0)
+        self.assertIsNone(zero_base["2bps"]["cost_multiplier"])
+
     def test_fixed_rollout_cost_stress_preserves_old_rollout_cost_formula(self) -> None:
         module = load_script("train_hourly_causal_transformer_rl")
 
@@ -553,14 +576,22 @@ class EvaluationTests(unittest.TestCase):
                 model_version=3,
                 constraint_feature_names=[],
             )
+        # Canonical reportability: all four required baselines + cost_doubled (2x) under BOTH rollout legs,
+        # proven by cost_multiplier (the legacy 2-baseline / empty-cost_stress shape no longer passes coverage).
+        canonical_cost_entry = {"cost_multiplier": 2.0, "total_return": 0.0}
         summary = {
             **artifacts,
             "test_metrics": {"total_return": 0.0},
             "baselines": {
                 "CASH": {"test": {"total_return": 0.0}},
+                "BuyAndHold_QQQ": {"test": {"total_return": 0.0}},
+                "RandomSameActionDistribution": {"test": {"total_return": 0.0}},
                 "RandomSameTurnover": {"test": {"total_return": 0.0}},
             },
-            "cost_stress": {"fixed_rollout": {}, "adaptive": {}},
+            "cost_stress": {
+                "fixed_rollout": {"2bps": dict(canonical_cost_entry)},
+                "adaptive": {"2bps": dict(canonical_cost_entry)},
+            },
             "action_concentration": {"max_risky_group_share": 0.0, "leveraged_action_share": 0.0},
             "return_diagnostics": {},
         }

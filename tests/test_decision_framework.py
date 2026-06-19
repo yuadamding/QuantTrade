@@ -21,6 +21,25 @@ from rl_quant.decision_framework import (
 )
 
 
+def _canonical_cost_stress() -> dict:
+    # cost_doubled (2x) produced under BOTH rollout legs, proven by cost_multiplier (the canonical contract).
+    return {
+        "fixed_rollout": {"2bps": {"cost_multiplier": 2.0, "total_return": 0.0}},
+        "adaptive": {"2bps": {"cost_multiplier": 2.0, "total_return": 0.0}},
+    }
+
+
+def _canonical_baselines(*, cash: float = 0.0, qqq: float = 0.0, turnover: float = 0.0) -> dict:
+    # All four canonical required baselines: cash, buy_and_hold (via BuyAndHold_QQQ), random_action_distribution
+    # (via RandomSameActionDistribution), same_turnover_random (via RandomSameTurnover), with per-split metrics.
+    return {
+        "CASH": {"test": {"total_return": cash}},
+        "BuyAndHold_QQQ": {"test": {"total_return": qqq}},
+        "RandomSameActionDistribution": {"test": {"total_return": 0.0}},
+        "RandomSameTurnover": {"test": {"total_return": turnover}},
+    }
+
+
 class DecisionFrameworkTests(unittest.TestCase):
     def _eligibility(
         self,
@@ -274,7 +293,12 @@ class DecisionFrameworkTests(unittest.TestCase):
         )
 
         self.assertIn("missing dataset_manifest", errors)
-        self.assertIn("missing baselines.RandomSameTurnover", errors)
+        # Canonical coverage now decides baseline/stress (the legacy "missing baselines.RandomSameTurnover" path
+        # check is replaced): only CASH + BuyAndHold_QQQ are present, so same_turnover_random is missing, and
+        # the empty cost_stress legs miss cost_doubled.
+        self.assertIn("missing required baseline: same_turnover_random", errors)
+        self.assertIn("missing required stress scenario: cost_doubled", errors)
+        self.assertIn("missing cost_doubled under cost_stress.fixed_rollout", errors)
         self.assertIn("test_return_below_cash", errors)
         self.assertIn("max_group_share_exceeds_limit", errors)
 
@@ -287,11 +311,8 @@ class DecisionFrameworkTests(unittest.TestCase):
                 "data_quality_report": {},
                 "action_eligibility": [],
                 "test_metrics": {"total_return": 0.0},
-                "baselines": {
-                    "CASH": {"test": {"total_return": 0.0}},
-                    "RandomSameTurnover": {"test": {"total_return": 0.0}},
-                },
-                "cost_stress": {"fixed_rollout": {}, "adaptive": {}},
+                "baselines": _canonical_baselines(),
+                "cost_stress": _canonical_cost_stress(),
                 "action_concentration": {
                     "max_risky_group_share": 0.0,
                     "leveraged_action_share": 0.0,
@@ -311,11 +332,8 @@ class DecisionFrameworkTests(unittest.TestCase):
                 "data_quality_report": {},
                 "action_eligibility": [],
                 "test_metrics": {"total_return": 0.0},
-                "baselines": {
-                    "CASH": {"test": {"total_return": 0.0}},
-                    "RandomSameTurnover": {"test": {"total_return": 0.0}},
-                },
-                "cost_stress": {"fixed_rollout": {}, "adaptive": {}},
+                "baselines": _canonical_baselines(),
+                "cost_stress": _canonical_cost_stress(),
                 "action_concentration": {
                     "max_risky_group_share": 0.0,
                     "leveraged_action_share": 0.0,

@@ -188,6 +188,7 @@ def fixed_rollout_cost_stress(
     cost_bps_values: list[float],
     extra_switch_penalty_bps: float,
     periods_per_year: float,
+    base_cost_bps: float | None = None,
 ) -> dict[str, dict[str, float | int | None]]:
     results: dict[str, dict[str, float | int | None]] = {}
     for cost_bps in unique_cost_stresses(cost_bps_values):
@@ -230,6 +231,12 @@ def fixed_rollout_cost_stress(
             ),
             "max_drawdown": metric_max_drawdown(equity_curve),
             "annualized_sharpe": metric_sharpe(returns, periods_per_year=periods_per_year),
+            # Cost level relative to the base one-way cost, so the canonical reportability gate can prove
+            # cost_doubled (== 2x) by PARAMETER rather than by name. None when no base is supplied (legacy) or
+            # the base is 0 (a multiple of zero base is undefined).
+            "cost_multiplier": (
+                float(cost_bps) / float(base_cost_bps) if base_cost_bps else None
+            ),
         }
     return results
 
@@ -1216,25 +1223,45 @@ def main() -> int:
         episode_length=args.episode_length,
         capture_rollout=True,
     )
+    # Base one-way cost for cost-stress MULTIPLIER annotation (swept_bps / base): both rollout legs stamp it so
+    # the canonical reportability gate proves cost_doubled (== 2x) by parameter, not by rollout-mode name. The
+    # adaptive arm sets one_way_cost_bps=cost_bps, so the consistent base is args.switch_cost_bps.
+    _base_cost_bps = float(args.switch_cost_bps)
+    # Guarantee the canonical cost_doubled (2x) scenario is always PRODUCED: inject 2x base into the swept grid
+    # so reportability never silently fails just because a non-default --switch-cost-bps left no 2x point in the
+    # static grid. unique_cost_stresses dedups -> a no-op for the default (base 1.0, grid already has 2.0). Skip
+    # when base is 0 (a multiple of zero base is undefined; cost_doubled is then unprovable by design).
+    _cost_stress_grid = (
+        [*args.cost_stress_bps, 2.0 * _base_cost_bps] if _base_cost_bps else list(args.cost_stress_bps)
+    )
+
+    def _stamp_cost_multiplier(metrics: dict[str, object], cost_bps: float) -> dict[str, object]:
+        metrics["cost_multiplier"] = (float(cost_bps) / _base_cost_bps if _base_cost_bps else None)
+        return metrics
+
     adaptive_cost_stress = {
-        f"{cost_bps:g}bps": evaluate_hourly_policy(
-            test_split.to(device),
-            model,
-            device=device,
-            initial_action=initial_action,
-            switch_cost_bps=cost_bps,
-            constraints=replace(constraints, one_way_cost_bps=cost_bps),
-            exposure_constraints=exposure_constraints,
-            action_meta=action_meta,
-            episode_length=args.episode_length,
-        ).to_dict()
-        for cost_bps in unique_cost_stresses(args.cost_stress_bps)
+        f"{cost_bps:g}bps": _stamp_cost_multiplier(
+            evaluate_hourly_policy(
+                test_split.to(device),
+                model,
+                device=device,
+                initial_action=initial_action,
+                switch_cost_bps=cost_bps,
+                constraints=replace(constraints, one_way_cost_bps=cost_bps),
+                exposure_constraints=exposure_constraints,
+                action_meta=action_meta,
+                episode_length=args.episode_length,
+            ).to_dict(),
+            cost_bps,
+        )
+        for cost_bps in unique_cost_stresses(_cost_stress_grid)
     }
     fixed_cost_stress = fixed_rollout_cost_stress(
         test_result.rollout_records,
-        cost_bps_values=args.cost_stress_bps,
+        cost_bps_values=_cost_stress_grid,
         extra_switch_penalty_bps=args.extra_switch_penalty_bps,
         periods_per_year=test_split.periods_per_year,
+        base_cost_bps=_base_cost_bps,
     )
 
     class FixedActionPolicy(torch.nn.Module):

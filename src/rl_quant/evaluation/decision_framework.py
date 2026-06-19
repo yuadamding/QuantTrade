@@ -7,7 +7,11 @@ from typing import Any
 
 import torch
 
-from rl_quant.protocol.reportability_contract import canonicalize_baseline_id, canonicalize_cost_stress_id
+from rl_quant.protocol.reportability_contract import (
+    canonicalize_baseline_id,
+    canonicalize_cost_stress_id,
+    validate_baseline_stress_coverage,
+)
 from rl_quant.research_protocol import ResearchProtocolError, parse_iso_timestamp, stable_json_hash
 
 
@@ -486,7 +490,7 @@ def extract_baseline_ids(summary: dict[str, Any]) -> set[str]:
     map; unrecognized / more-specific variants (e.g. RandomSameTurnoverSameTiming) are dropped. Pure -- this is
     the canonical INPUT to validate_baseline_stress_coverage, not a reportability decision by itself.
 
-    NOTE: foundation for the canonical reportability rewire; NOT yet consumed by validate_reportable_summary."""
+    Consumed by validate_reportable_summary below as the canonical baseline-coverage input."""
     baselines = summary.get("baselines")
     if not isinstance(baselines, dict):
         return set()
@@ -499,7 +503,7 @@ def extract_stress_ids(summary: dict[str, Any]) -> set[str]:
     id only when its metrics carry a ``cost_multiplier`` that canonicalize_cost_stress_id recognizes (2x ->
     cost_doubled, 3x -> cost_tripled). A produced rollout-mode NAME never implies a cost level. Pure.
 
-    NOTE: foundation for the canonical reportability rewire; NOT yet consumed by validate_reportable_summary."""
+    Consumed by validate_reportable_summary below as the canonical stress-coverage input."""
     cost_stress = summary.get("cost_stress")
     if not isinstance(cost_stress, dict):
         return set()
@@ -515,24 +519,54 @@ def extract_stress_ids(summary: dict[str, Any]) -> set[str]:
     return ids
 
 
+_REQUIRED_COST_STRESS_ROLLOUT_POLICIES = ("fixed_rollout", "adaptive")
+
+
+def _cost_stress_rollout_completeness(summary: dict[str, Any]) -> list[str]:
+    """Producer completeness for cost_doubled: the 2x cost stress must be produced under BOTH rollout policies
+    (fixed_rollout AND adaptive). This preserves the legacy requirement that both cost_stress.fixed_rollout and
+    cost_stress.adaptive exist, now proven by a 2x cost_multiplier rather than mere key presence."""
+    cost_stress = summary.get("cost_stress")
+    errors: list[str] = []
+    for policy in _REQUIRED_COST_STRESS_ROLLOUT_POLICIES:
+        leg = cost_stress.get(policy) if isinstance(cost_stress, dict) else None
+        produced = isinstance(leg, dict) and any(
+            isinstance(entry, dict) and canonicalize_cost_stress_id(entry.get("cost_multiplier")) == "cost_doubled"
+            for entry in leg.values()
+        )
+        if not produced:
+            errors.append(f"missing cost_doubled under cost_stress.{policy}")
+    return errors
+
+
 def validate_reportable_summary(summary: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    # Structural artifact sections (unchanged). The baseline/stress requirements moved OUT of this list to the
+    # canonical protocol contract below (the legacy baselines.CASH / cost_stress.* path checks are replaced).
     required_paths = [
         "dataset_manifest",
         "feature_manifest",
         "model_manifest",
         "data_quality_report",
         "action_eligibility",
-        "baselines.CASH",
-        "baselines.RandomSameTurnover",
-        "cost_stress.fixed_rollout",
-        "cost_stress.adaptive",
         "action_concentration",
         "return_diagnostics",
     ]
     for path in required_paths:
         if not _has_path(summary, path):
             errors.append(f"missing {path}")
+
+    # Canonical baseline/stress COVERAGE is now the reportability verdict source (protocol contract over
+    # canonical ids extracted from the summary), replacing the hardcoded legacy dotted-path checks. Coverage
+    # requires the produced grid (cash / buy_and_hold / random_action_distribution / same_turnover_random and
+    # the cost_doubled stress); _cost_stress_rollout_completeness then preserves the old both-rollout-legs rigor.
+    ok, issues = validate_baseline_stress_coverage(
+        sorted(extract_baseline_ids(summary)),
+        sorted(extract_stress_ids(summary)),
+    )
+    if not ok:
+        errors.extend(issues)
+    errors.extend(_cost_stress_rollout_completeness(summary))
 
     dataset_manifest = summary.get("dataset_manifest")
     if isinstance(dataset_manifest, dict) and dataset_manifest.get("manifest_available") is False:
