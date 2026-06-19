@@ -3175,6 +3175,33 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # (e) NOT armed (the normal path) trains fine even with unresolved semantics -- the guard is dormant.
         run(train, val, arm=False)
 
+    def test_run_semantics_hash_captures_full_return_basis(self) -> None:
+        # The run-semantics fingerprint (the resume guard) must capture the FULL action-return basis, not just
+        # the weight label: two datasets sharing the weight semantics but differing in return formula / clip /
+        # version are different economics and must NOT resume into each other. Legacy splits (basis fields None)
+        # keep their fingerprint unchanged (backward-compatible -- the fields are added only when present).
+        import dataclasses
+
+        from rl_quant.minute_to_hour_transformer import TradingConstraintConfig
+        from rl_quant.training.minute_to_hour import _run_semantics_hash
+
+        constraints = TradingConstraintConfig()
+        base = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"])
+
+        def h(split):
+            return _run_semantics_hash(split, constraints, reward_scale=10_000.0, cash_idle_penalty_bps=0.0)
+
+        full = dict(action_return_weight_semantics="full_capital_single_slot_returns",
+                    action_return_formula="clipped_simple_return",
+                    action_return_clip_min=-1.0, action_return_clip_max=1.0, action_return_semantics_version="v1")
+        legacy_hash = h(base)                                                  # all basis fields None
+        full_hash = h(dataclasses.replace(base, **full))
+        self.assertNotEqual(legacy_hash, full_hash)                            # the basis is in the fingerprint
+        # Each component independently perturbs the fingerprint (same weight label).
+        self.assertNotEqual(full_hash, h(dataclasses.replace(base, **{**full, "action_return_formula": "log_return"})))
+        self.assertNotEqual(full_hash, h(dataclasses.replace(base, **{**full, "action_return_clip_max": 2.0})))
+        self.assertNotEqual(full_hash, h(dataclasses.replace(base, **{**full, "action_return_semantics_version": "v2"})))
+
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
         # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar

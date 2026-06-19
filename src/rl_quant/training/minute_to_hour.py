@@ -691,20 +691,29 @@ def _run_semantics_hash(
     must match this exactly: identical tensor shapes are NOT enough (a checkpoint resumed with different
     costs / cash index / return semantics / reward scale would silently train on different economics and
     corrupt the running shadow sums), so resume rejects a mismatch."""
-    payload = json.dumps(
-        {
-            "action_names": list(train_data.action_names),
-            "minute_feature_names": list(train_data.minute_feature_names),
-            "hour_feature_names": list(train_data.hour_feature_names),
-            "action_feature_names": list(train_data.action_feature_names),
-            "normalized_constraints": asdict(normalized_constraints),
-            "action_return_weight_semantics": train_data.action_return_weight_semantics,
-            "reward_scale": float(reward_scale),
-            "cash_idle_penalty_bps": float(cash_idle_penalty_bps),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    fingerprint: dict[str, object] = {
+        "action_names": list(train_data.action_names),
+        "minute_feature_names": list(train_data.minute_feature_names),
+        "hour_feature_names": list(train_data.hour_feature_names),
+        "action_feature_names": list(train_data.action_feature_names),
+        "normalized_constraints": asdict(normalized_constraints),
+        "action_return_weight_semantics": train_data.action_return_weight_semantics,
+        "reward_scale": float(reward_scale),
+        "cash_idle_penalty_bps": float(cash_idle_penalty_bps),
+    }
+    # The rest of the action-return BASIS, included ONLY when present so a legacy payload (all None) produces
+    # the SAME fingerprint as before this field set existed -- existing checkpoints still resume. When the
+    # builder records them, a change to the formula / clip / version (same weight label) now changes the
+    # fingerprint and correctly blocks a resume on different economics.
+    for key, value in (
+        ("action_return_formula", train_data.action_return_formula),
+        ("action_return_clip_min", train_data.action_return_clip_min),
+        ("action_return_clip_max", train_data.action_return_clip_max),
+        ("action_return_semantics_version", train_data.action_return_semantics_version),
+    ):
+        if value is not None:
+            fingerprint[key] = float(value) if "clip" in key else value
+    payload = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -928,6 +937,17 @@ def train_minute_to_hour_dqn(
             raise ValueError(
                 "use_execution_env_reward requires train and val to share action_return_weight_semantics "
                 f"(train={semantics!r}, val={val_data.action_return_weight_semantics!r})."
+            )
+        # ...and the rest of the return basis (formula / clip / version): a split disagreeing on these is
+        # different economics even with the same weight label.
+        _basis = ("action_return_formula", "action_return_clip_min", "action_return_clip_max",
+                  "action_return_semantics_version")
+        train_basis = {f: getattr(train_data, f) for f in _basis}
+        val_basis = {f: getattr(val_data, f) for f in _basis}
+        if train_basis != val_basis:
+            raise ValueError(
+                "use_execution_env_reward requires train and val to share the full action-return basis "
+                f"(train={train_basis}, val={val_basis})."
             )
         # (3) Action metadata must be complete (no unknown symbols priced as 1x long).
         unknown = unknown_action_metadata_symbols(list(train_data.action_names))

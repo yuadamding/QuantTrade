@@ -82,6 +82,14 @@ class HourFromMinuteDataSplit:
     # undercharged. None / "unresolved" means the gold builder has not declared it, which fail-closes
     # use_execution_env_reward (PR-4) -- it must NOT be trained on until this is resolved AND metadata complete.
     action_return_weight_semantics: str | None = None
+    # The rest of the action-return BASIS (recorded by the builder alongside the weight label). Carried so the
+    # run-semantics fingerprint can capture the FULL basis: two datasets sharing the weight label but differing
+    # in return formula / clip bounds / semantics version are NOT economically equivalent. None on legacy
+    # payloads that predate these fields (and then they do not perturb the fingerprint -- backward-compatible).
+    action_return_formula: str | None = None
+    action_return_clip_min: float | None = None
+    action_return_clip_max: float | None = None
+    action_return_semantics_version: str | None = None
 
     @property
     def effective_context_bars_per_hour(self) -> int:
@@ -1084,6 +1092,10 @@ def _build_split(
         filter_removed_latest_reward_rows=filter_removed_latest_reward_rows,
         # PR-4 gate: carried from the gold payload (None = the builder has not declared it -> fail-closed).
         action_return_weight_semantics=payload.get("action_return_weight_semantics"),
+        action_return_formula=payload.get("action_return_formula"),
+        action_return_clip_min=payload.get("action_return_clip_min"),
+        action_return_clip_max=payload.get("action_return_clip_max"),
+        action_return_semantics_version=payload.get("action_return_semantics_version"),
     )
 
 
