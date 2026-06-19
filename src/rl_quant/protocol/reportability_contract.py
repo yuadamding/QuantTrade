@@ -19,15 +19,19 @@ This contract COMPLEMENTS, and does not replace, ``ModelManifest``'s reportabili
 governs which artifacts a run must carry; this governs which comparison baselines/stress members it must
 include. Pure, stdlib only; changes no backtest number.
 
+STRESS GRID -- RECONCILED to production reality (signed off 2026-06): the produced stress axis is the
+cost-stress grid's 2x multiplier (cost_doubled) only; there is no 3x multiplier, latency, or spread/impact
+stress. REQUIRED_STRESS is therefore just ``cost_doubled`` (+ quote-conditional ``spread_impact``, never
+required while quote data is absent); ``cost_tripled`` / ``latency_plus_one_bar`` are retained as
+ASPIRATIONAL_STRESS_SPECS to promote when the producer emits them. See the comment above REQUIRED_STRESS_SPECS.
+
 OUTSTANDING RECONCILIATION (intentionally not encoded here -- it MOVES verdicts, so it needs sign-off): the
-producers/summary validators currently emit DIFFERENT on-the-wire names than these logical ids --
+producers/summary validators still emit DIFFERENT on-the-wire NAMES than these logical ids --
 ``evaluation.second_context`` emits CamelCase (``CASH``, ``RandomSameTurnover``, ``BuyAndHold_<symbol>``) and
 ``evaluation.decision_framework.validate_reportable_summary`` checks dotted summary paths
-(``baselines.CASH``, ``cost_stress.fixed_rollout``). Wiring the gate against real run summaries needs a map
-(logical id -> produced/summary key) AND a domain decision on whether the produced stress axis
-(fixed_rollout / adaptive, cost multipliers [1.0, 2.0]) actually covers the contract's cost_doubled /
-cost_tripled / latency_plus_one_bar members. A future ``produced_key`` field on these records is the natural
-home for that map.
+(``baselines.CASH``, ``cost_stress.fixed_rollout``). Wiring the gate against real run summaries still needs a
+name map (logical id -> produced/summary key); a future ``produced_key`` field on these records is the natural
+home for it. (The stress-COVERAGE question above is now resolved; only the name mapping remains.)
 """
 
 from __future__ import annotations
@@ -69,12 +73,26 @@ REQUIRED_BASELINE_SPECS: tuple[BaselineSpec, ...] = (
                  "A random policy matched on TURNOVER isolates selection skill from turnover -- the baseline "
                  "that matters most, since many policies 'win' only by trading more.", None),
 )
+# The REQUIRED stress grid is RELAXED to what the production pipeline ACTUALLY produces (verified against the
+# evaluation protocol + producers, 2026-06): the cost-stress grid emits a 2x multiplier (-> cost_doubled). It
+# does NOT produce a 3x multiplier, an execution-latency stress, or a spread/impact stress, so requiring those
+# would (once this gate is wired to real summaries) mark every real run non-reportable. cost_doubled is
+# required; spread_impact stays quote-conditional (never required while quote data is absent -- the production
+# reality). The 3x-cost and +1-bar-latency scenarios are retained as ASPIRATIONAL_STRESS_SPECS below: promote
+# them back into REQUIRED_STRESS_SPECS once the producer emits them (a deliberate, reportability-TIGHTENING
+# change, not a silent one).
 REQUIRED_STRESS_SPECS: tuple[StressScenarioSpec, ...] = (
-    StressScenarioSpec("cost_doubled", "Robustness to a 2x transaction-cost shock.", None),
-    StressScenarioSpec("cost_tripled", "Robustness to a 3x transaction-cost shock.", None),
-    StressScenarioSpec("latency_plus_one_bar", "Robustness to one extra bar of execution latency.", None),
+    StressScenarioSpec("cost_doubled",
+                       "Robustness to a 2x transaction-cost shock (produced by the cost-stress grid).", None),
     StressScenarioSpec("spread_impact", "Spread/impact stress -- requires crossable quote data to model.",
                        "quote_data_available"),
+)
+# Documented but NOT YET REQUIRED -- the production pipeline does not produce these (no 3x cost multiplier, no
+# execution-latency stress). They are the intended next bar; promote into REQUIRED_STRESS_SPECS when produced.
+ASPIRATIONAL_STRESS_SPECS: tuple[StressScenarioSpec, ...] = (
+    StressScenarioSpec("cost_tripled", "Robustness to a 3x transaction-cost shock (not yet produced).", None),
+    StressScenarioSpec("latency_plus_one_bar",
+                       "Robustness to one extra bar of execution latency (not yet produced).", None),
 )
 
 # Legacy tuples, DERIVED from the records so the two cannot drift. REQUIRED_BASELINES is the default-required

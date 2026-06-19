@@ -4347,6 +4347,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(gates["buy_and_hold"], "buy_and_hold_applicable")
         self.assertEqual(gates["spread_impact"], "quote_data_available")
         self.assertIsNone(gates["cash"])
+        # Stress grid is RELAXED to production reality: only the produced 2x cost stress is REQUIRED; the
+        # not-yet-produced 3x-cost / +1-bar-latency scenarios are retained as ASPIRATIONAL (documented, not
+        # enforced) so the bar can be raised when the producer emits them.
+        from rl_quant.protocol.reportability_contract import ASPIRATIONAL_STRESS_SPECS
+        self.assertEqual(REQUIRED_STRESS, ("cost_doubled",))
+        aspirational_ids = {s.id for s in ASPIRATIONAL_STRESS_SPECS}
+        self.assertEqual(aspirational_ids, {"cost_tripled", "latency_plus_one_bar"})
+        self.assertTrue(aspirational_ids.isdisjoint(REQUIRED_STRESS))  # aspirational != required
 
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
