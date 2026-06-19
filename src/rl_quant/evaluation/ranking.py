@@ -79,7 +79,14 @@ def _mean_over_rows(scores: object, realized: object, valid_mask: object | None,
         raise ValueError("scores, realized, and valid_mask must have the same number of rows.")
     total = 0.0
     count = 0
-    for s_row, r_row, m_row in zip(s_rows, r_rows, m_rows):
+    for i, (s_row, r_row, m_row) in enumerate(zip(s_rows, r_rows, m_rows)):
+        # Per-row action widths must agree. _valid_pairs zips scores/returns and indexes the mask positionally,
+        # so a width mismatch would SILENTLY truncate (or misalign the mask) and report a wrong metric instead
+        # of failing. Fail closed on mismatch rather than scoring a partial row.
+        if len(s_row) != len(r_row):
+            raise ValueError(f"row {i}: scores width {len(s_row)} != realized width {len(r_row)}.")
+        if m_row is not None and len(m_row) != len(s_row):
+            raise ValueError(f"row {i}: valid_mask width {len(m_row)} != scores width {len(s_row)}.")
         value = per_row(*_valid_pairs(s_row, r_row, m_row))
         if value is not None:
             total += value

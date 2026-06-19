@@ -3867,6 +3867,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(information_coefficient(torch.tensor(scores), torch.tensor(realized)), 1.0, places=6)
         with self.assertRaises(ValueError):
             information_coefficient([[1.0, 2.0]], [[0.1, 0.2], [0.3, 0.4]])
+        # Per-row action-width mismatch fails closed too -- zip(scores,returns) would otherwise SILENTLY
+        # truncate to the shorter (and misalign the positionally-indexed mask), scoring a wrong partial row.
+        with self.assertRaises(ValueError):
+            information_coefficient([[1.0, 2.0, 3.0]], [[0.1, 0.2]])          # scores wider than realized
+        with self.assertRaises(ValueError):
+            information_coefficient([[1.0, 2.0]], [[0.1, 0.2, 0.3]])          # realized wider than scores
+        with self.assertRaises(ValueError):
+            information_coefficient([[1.0, 2.0]], [[0.1, 0.2]], [[True]])     # mask width != scores width
 
     def test_protocol_model_input_label_split_validator(self) -> None:
         # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
