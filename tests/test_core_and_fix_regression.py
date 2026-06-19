@@ -4369,9 +4369,18 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(canonicalize_baseline_id("RandomSameActionDistribution"), "random_action_distribution")
         self.assertEqual(canonicalize_baseline_id("RandomSameTurnover"), "same_turnover_random")
         self.assertEqual(canonicalize_baseline_id(" randomsameturnover "), "same_turnover_random")  # case/space
+        # IDEMPOTENT: every canonical id maps to itself (incl. buy_and_hold) -- so wiring it into a path that
+        # already emits canonical ids does not drop a baseline.
+        for baseline_id in REQUIRED_BASELINES:
+            self.assertEqual(canonicalize_baseline_id(baseline_id), baseline_id, baseline_id)
         # Every canonical required baseline is reachable from a real produced name (drift guard).
         produced = ["CASH", "BuyAndHold_QQQ", "RandomSameActionDistribution", "RandomSameTurnover"]
         self.assertEqual({canonicalize_baseline_id(n) for n in produced}, set(REQUIRED_BASELINES))
+        # The BuyAndHold_<symbol> match is EXACT prefix + symbol token, NOT a permissive substring: malformed
+        # near-misses must NOT canonicalize to buy_and_hold.
+        for false_positive in ("BuyAndHolding", "BuyAndHoldSameTurnover", "BuyAndHold_"):
+            self.assertNotEqual(canonicalize_baseline_id(false_positive), "buy_and_hold", false_positive)
+        self.assertEqual(canonicalize_baseline_id("BuyAndHold"), "buy_and_hold")  # bare canonical alias is fine
         # Extra / more-specific variants and unknowns are NOT the canonical four -> None (not silently merged).
         for extra in ("RandomSameTurnoverSameTiming", "RandomSameSegments", "Nonsense", ""):
             self.assertIsNone(canonicalize_baseline_id(extra), extra)

@@ -36,6 +36,7 @@ home for it. (The stress-COVERAGE question above is now resolved; only the name 
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -158,22 +159,31 @@ def assert_baseline_stress_coverage(
 # RandomSameSegments) are intentionally NOT mapped: they are extra baselines, not the canonical required four.
 # NOTE: this is the tested FOUNDATION; it is deliberately NOT yet wired into validate_reportable_summary (that
 # rewrite + the stress mapping move reportability verdicts and need the pairing sign-off).
+# Includes the canonical ids themselves so canonicalize_baseline_id is IDEMPOTENT (a canonical id maps to
+# itself) -- important once this is wired into a path that already emits canonical ids.
 _BASELINE_PRODUCED_ALIASES: dict[str, str] = {
     "cash": "cash",
+    "buy_and_hold": "buy_and_hold",
+    "buy-and-hold": "buy_and_hold",
+    "buyandhold": "buy_and_hold",
     "randomsameactiondistribution": "random_action_distribution",
     "random_action_distribution": "random_action_distribution",
     "randomsameturnover": "same_turnover_random",
     "same_turnover_random": "same_turnover_random",
 }
+# A produced BuyAndHold_<symbol> name carries the symbol as a parameter; the symbol token must be a plain
+# ticker (letters/digits/./-). Matched by EXACT prefix + token, NOT a permissive substring -- so
+# "BuyAndHolding" / "BuyAndHoldSameTurnover" / "BuyAndHold_" (no/invalid symbol) must NOT canonicalize.
+_BUY_AND_HOLD_SYMBOL_RE = re.compile(r"buyandhold_([a-z0-9.\-]+)$")
 
 
 def canonicalize_baseline_id(produced_name: str) -> str | None:
     """Map a produced/summary baseline name to its canonical logical id in REQUIRED_BASELINES, or None if it is
     not one of the canonical required baselines (e.g. a more-specific random variant). Case-insensitive;
-    BuyAndHold_<symbol> -> buy_and_hold by prefix (the symbol is a parameter, not part of the id)."""
+    idempotent on canonical ids; BuyAndHold_<symbol> -> buy_and_hold (the symbol is a parameter)."""
     key = str(produced_name).strip().lower()
     if key in _BASELINE_PRODUCED_ALIASES:
         return _BASELINE_PRODUCED_ALIASES[key]
-    if key.startswith("buyandhold"):
+    if _BUY_AND_HOLD_SYMBOL_RE.fullmatch(key):
         return "buy_and_hold"
     return None
