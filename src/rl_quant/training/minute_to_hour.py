@@ -776,16 +776,22 @@ def _execution_shadow_cost_basis_status(train_data: HourFromMinuteDataSplit) -> 
     turnover with action_metadata.max_weight, which is exact for ``metadata_weighted_portfolio_returns`` and,
     for ``full_capital_single_slot_returns``, ONLY when every non-cash action is unit-weight + unleveraged
     (otherwise leveraged turnover is undercharged -- see the PR-4 gate / docs/execution_wiring_design.md §3)."""
+    from rl_quant.features.action_risk import build_action_metadata, unknown_action_metadata_symbols
     semantics = train_data.action_return_weight_semantics
     if semantics is None:
         return "unresolved_missing_semantics"
+    # The shadow derives weight/leverage from action_metadata, and an UNKNOWN symbol falls back to "1x long,
+    # non-inverse". Claiming compatibility on that fallback would OVERSTATE certainty -- an unknown leveraged/
+    # inverse instrument would be priced as 1x. Gate on unknown metadata for ANY resolved semantics (the shadow
+    # uses max_weight in both branches) before trusting leverage/max_weight.
+    if unknown_action_metadata_symbols(list(train_data.action_names)):
+        return "unresolved_unknown_action_metadata"
     if semantics == "metadata_weighted_portfolio_returns":
         return "native_metadata_weighted"
     if semantics == "full_capital_single_slot_returns":
-        from rl_quant.features.action_risk import build_action_metadata
         leveraged = [
             meta.name
-            for meta in build_action_metadata(list(train_data.action_names))
+            for meta in build_action_metadata(list(train_data.action_names), strict=True)
             if meta.asset_class != "cash" and (abs(meta.leverage - 1.0) > 1e-9 or abs(meta.max_weight - 1.0) > 1e-9)
         ]
         return ("incompatible_full_capital_leveraged_or_fractional" if leveraged

@@ -3250,6 +3250,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             status(dataclasses.replace(base, action_names=["CASH", "TQQQ"],
                                        action_return_weight_semantics="full_capital_single_slot_returns")),
             "incompatible_full_capital_leveraged_or_fractional")                  # TQQQ is 3x
+        # UNKNOWN action metadata must NOT be claimed compatible: the fallback is "1x long", so an unknown
+        # (possibly leveraged) instrument would be silently priced as 1x. Gate to unresolved for BOTH bases.
+        for sem in ("full_capital_single_slot_returns", "metadata_weighted_portfolio_returns"):
+            self.assertEqual(
+                status(dataclasses.replace(base, action_names=["CASH", "NEWLEVERAGED_XYZ"],
+                                           action_return_weight_semantics=sem)),
+                "unresolved_unknown_action_metadata", sem)
 
     def test_run_semantics_hash_captures_full_return_basis(self) -> None:
         # The run-semantics fingerprint (the resume guard) must capture the FULL action-return basis, not just
