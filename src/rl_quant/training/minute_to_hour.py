@@ -717,6 +717,20 @@ def _run_semantics_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _dataset_content_hash(train_data: HourFromMinuteDataSplit) -> str:
+    """Content fingerprint of the actual training DATA -- decision timestamps + realized action_returns +
+    validity masks -- DISTINCT from _run_semantics_hash (schema/economics). Lets resume detect that it is
+    continuing against a DIFFERENT dataset that merely shares the schema/semantics. Tensor bytes are taken on
+    CPU and are deterministic across loads (NaN bit-patterns included), so the same data reproduces the same
+    hash."""
+    digest = hashlib.sha256()
+    digest.update("\n".join(train_data.decision_timestamps).encode("utf-8"))
+    for tensor in (train_data.action_returns, train_data.action_valid_mask, train_data.label_valid_mask):
+        digest.update(b"\x00" if tensor is None
+                      else tensor.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _save_minute_to_hour_training_state(
     path: Path,
     *,
@@ -738,6 +752,7 @@ def _save_minute_to_hour_training_state(
     shadow_cost_delta_sum: float,
     shadow_delta_count: int,
     run_semantics_hash: str,
+    dataset_content_hash: str,
     device: torch.device,
 ) -> None:
     _atomic_torch_save(
@@ -764,6 +779,9 @@ def _save_minute_to_hour_training_state(
             "shadow_delta_count": int(shadow_delta_count),
             # Economic/schema fingerprint -- resume rejects a run with different economics (see _run_semantics_hash).
             "run_semantics_hash": str(run_semantics_hash),
+            # Data-content fingerprint -- resume rejects continuing against a DIFFERENT dataset that merely
+            # shares the schema/economics (see _dataset_content_hash).
+            "dataset_content_hash": str(dataset_content_hash),
             "rng_state": _capture_rng_state(device),
         },
         path,
@@ -985,6 +1003,7 @@ def train_minute_to_hour_dqn(
         reward_scale=config.env.reward_scale,
         cash_idle_penalty_bps=config.env.cash_idle_penalty_bps,
     )
+    dataset_content_hash = _dataset_content_hash(train_data)
     # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
     # passed to this function, so older training rows can be down-weighted without any risk of
     # touching the held-out test block. mode='none' yields uniform weights (no behavior change).
@@ -1127,6 +1146,15 @@ def train_minute_to_hour_dqn(
                 "Resume checkpoint run-semantics mismatch: the action space / feature schema / normalized "
                 "constraints / action-return weight semantics differ from the checkpointed run; refusing to "
                 "resume with different economics."
+            )
+        # Also reject resuming against DIFFERENT data with the same schema/economics (different timestamps /
+        # realized returns / masks). Older checkpoints without the hash skip this (prior behaviour).
+        saved_content_hash = checkpoint.get("dataset_content_hash")
+        if saved_content_hash is not None and saved_content_hash != _dataset_content_hash(train_data):
+            raise ValueError(
+                "Resume checkpoint dataset-content mismatch: the decision timestamps / action returns / "
+                "validity masks differ from the checkpointed run; refusing to resume against a different "
+                "dataset (same schema is not enough)."
             )
         q_network.load_state_dict(checkpoint["q_network_state_dict"], strict=True)
         target_network.load_state_dict(checkpoint["target_network_state_dict"], strict=True)
@@ -1382,6 +1410,7 @@ def train_minute_to_hour_dqn(
                 shadow_cost_delta_sum=shadow_cost_delta_sum,
                 shadow_delta_count=shadow_delta_count,
                 run_semantics_hash=run_semantics_hash,
+                dataset_content_hash=dataset_content_hash,
                 device=device,
             )
 

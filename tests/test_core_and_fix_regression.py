@@ -3045,6 +3045,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
                                          config=cfg(5, state_path, resume=True, constraints=changed))
+            # Resume with the SAME economics but DIFFERENT DATA (perturbed action_returns, same schema) ->
+            # dataset-content hash mismatch -> fail closed. Same schema is not enough to share a run.
+            other_data = dataclasses.replace(train, action_returns=train.action_returns + 0.01)
+            with self.assertRaises(ValueError):
+                train_minute_to_hour_dqn(other_data, val, device=torch.device("cpu"),
+                                         config=cfg(5, state_path, resume=True, constraints=default_minute_to_hour_constraints()))
 
     def test_run_semantics_hash_covers_reward_scale_and_cash_idle(self) -> None:
         # reward_scale (multiplies every reward + normalizes the shadow bps aggregates) and
@@ -3067,6 +3073,24 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertNotEqual(base, h(reward_scale=20_000.0))      # reward_scale is now fingerprinted
         self.assertNotEqual(base, h(cash_idle=5.0))              # cash_idle_penalty_bps is now fingerprinted
         self.assertEqual(base, h(reward_scale=10_000))           # int vs float of equal magnitude -> same hash
+
+    def test_dataset_content_hash_distinguishes_data(self) -> None:
+        # The dataset-content fingerprint (DISTINCT from the schema/economics hash) detects that a resume is
+        # continuing against a DIFFERENT dataset that merely shares the schema: it changes when the realized
+        # action_returns, decision timestamps, or validity masks change, and is deterministic for identical data.
+        import dataclasses
+
+        from rl_quant.training.minute_to_hour import _dataset_content_hash
+
+        base = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04"])
+        h0 = _dataset_content_hash(base)
+        self.assertEqual(h0, _dataset_content_hash(base))                                         # deterministic
+        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, action_returns=base.action_returns + 0.01)))
+        self.assertNotEqual(h0, _dataset_content_hash(self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"])))  # different timestamps/rows
+        if base.action_valid_mask is not None:
+            flipped = base.action_valid_mask.clone()
+            flipped[0, 0] = ~flipped[0, 0]
+            self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, action_valid_mask=flipped)))
 
     def test_minute_to_hour_resume_rejects_changed_reward_scale(self) -> None:
         # reward_scale lives on the ENV config (not the constraints) yet scales every reward + the
