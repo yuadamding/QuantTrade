@@ -935,6 +935,25 @@ def train_minute_to_hour_dqn(
             raise ValueError(
                 f"use_execution_env_reward requires complete action metadata; unknown symbols: {unknown}."
             )
+        # (4) "full_capital_single_slot_returns" deploys full capital into ONE slot, so the execution shadow's
+        # action_metadata.max_weight turnover pricing is exact ONLY when every non-cash action is unit-weight
+        # and unleveraged; a leveraged action would have its turnover UNDERCHARGED (docs/execution_wiring_design.md
+        # §3). Enforce the basis the declared label asserts rather than trusting the label -- fail closed on any
+        # leveraged / non-unit-max-weight action so the cost basis can never be silently wrong.
+        if semantics == "full_capital_single_slot_returns":
+            from rl_quant.features.action_risk import build_action_metadata as _build_action_metadata
+            leveraged = [
+                meta.name
+                for meta in _build_action_metadata(list(train_data.action_names))
+                if meta.asset_class != "cash"
+                and (abs(meta.leverage - 1.0) > 1e-9 or abs(meta.max_weight - 1.0) > 1e-9)
+            ]
+            if leveraged:
+                raise ValueError(
+                    "use_execution_env_reward with full_capital_single_slot_returns requires every non-cash "
+                    "action to have leverage=1.0 and max_weight=1.0 (the execution shadow's max_weight turnover "
+                    f"pricing undercharges leveraged turnover otherwise); leveraged actions: {leveraged[:5]}."
+                )
     configure_torch_runtime(device)
     train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
     val_data = val_data if val_data.minute_features.device == device else val_data.to(device)

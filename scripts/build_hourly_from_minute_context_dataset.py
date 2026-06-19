@@ -1013,6 +1013,13 @@ def main() -> int:
             # stays fail-closed. Purely declarative metadata: the default (legacy) reward path is unaffected;
             # PR-4 remains dormant until use_execution_env_reward is wired + A/B'd.
             "action_return_weight_semantics": "full_capital_single_slot_returns",
+            # Record the FULL return basis, not just the weight label, so a future builder edit that changes the
+            # formula / clip / fill timing while keeping the same weight label is detectable (the recorded basis
+            # would change). Fill/latency conventions are also in execution_model above.
+            "action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
+            "action_return_clip_min": -1.0,
+            "action_return_clip_max": 1.0,
+            "action_return_semantics_version": "v1",
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
             "dataset_reportable": dataset_reportable,

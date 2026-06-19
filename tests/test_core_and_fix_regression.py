@@ -3158,6 +3158,20 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             action_return_weight_semantics="full_capital_single_slot_returns")
         with self.assertRaises(ValueError):
             run(mt, mv, arm=True)
+        # (f) armed + full_capital_single_slot_returns + a KNOWN LEVERAGED action (TQQQ, 3x) -> fail closed: the
+        # execution shadow's max_weight turnover pricing undercharges leveraged turnover under this basis, so the
+        # declared cost basis would be silently wrong. (TQQQ is registry-known, so it passes the unknown-symbol
+        # check and is caught by the leverage invariant.)
+        lev_train = dataclasses.replace(
+            self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"]),
+            action_names=["CASH", "TQQQ"],
+            action_return_weight_semantics="full_capital_single_slot_returns")
+        lev_val = dataclasses.replace(
+            self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"]),
+            action_names=["CASH", "TQQQ"],
+            action_return_weight_semantics="full_capital_single_slot_returns")
+        with self.assertRaises(ValueError):
+            run(lev_train, lev_val, arm=True)
         # (e) NOT armed (the normal path) trains fine even with unresolved semantics -- the guard is dormant.
         run(train, val, arm=False)
 
