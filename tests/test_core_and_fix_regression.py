@@ -3175,6 +3175,27 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # (e) NOT armed (the normal path) trains fine even with unresolved semantics -- the guard is dormant.
         run(train, val, arm=False)
 
+    def test_action_return_basis_partial_metadata_fails_closed(self) -> None:
+        # The action-return basis detail (formula / clip_min / clip_max / semantics_version) must be ALL
+        # present or ALL absent. A partial basis (e.g. formula recorded but clip bounds dropped by a buggy
+        # migration) is under-specified and would make the run fingerprint ambiguous, so it fails closed.
+        from rl_quant.datasets.hour_from_subhour import validate_action_return_basis
+
+        full = {"action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
+                "action_return_clip_min": -1.0, "action_return_clip_max": 1.0,
+                "action_return_semantics_version": "v1"}
+        validate_action_return_basis(full)   # all present -> ok
+        validate_action_return_basis({})      # all absent (legacy) -> ok
+        validate_action_return_basis({"action_returns": 1})  # unrelated keys only -> ok
+        # Each single-field-missing variant fails closed.
+        for drop in full:
+            partial = {k: v for k, v in full.items() if k != drop}
+            with self.assertRaises(ValueError):
+                validate_action_return_basis(partial)
+        # And a lone field present is also rejected.
+        with self.assertRaises(ValueError):
+            validate_action_return_basis({"action_return_formula": "clipped_simple_return(entry_fill, exit_fill)"})
+
     def test_run_semantics_hash_captures_full_return_basis(self) -> None:
         # The run-semantics fingerprint (the resume guard) must capture the FULL action-return basis, not just
         # the weight label: two datasets sharing the weight semantics but differing in return formula / clip /

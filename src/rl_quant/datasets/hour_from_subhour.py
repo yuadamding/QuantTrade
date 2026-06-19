@@ -714,6 +714,30 @@ def validate_action_feature_tensors(payload: dict[str, Any]) -> None:
         raise ValueError("action_features must be finite.")
 
 
+# The action-return BASIS detail (recorded by the builder alongside the weight label). Must be ALL present or
+# ALL absent: a partial basis (e.g. a formula with no clip bounds) is under-specified -- the run-semantics
+# fingerprint and any cost-basis reasoning would be ambiguous. Absent ENTIRELY is allowed (legacy payloads
+# predate these fields; their execution-reward variant is gated separately via action_return_weight_semantics).
+_ACTION_RETURN_BASIS_DETAIL_KEYS = (
+    "action_return_formula",
+    "action_return_clip_min",
+    "action_return_clip_max",
+    "action_return_semantics_version",
+)
+
+
+def validate_action_return_basis(payload: dict[str, Any]) -> None:
+    """Fail closed on a PARTIALLY-populated action-return basis (some of formula / clip_min / clip_max /
+    semantics_version present, others missing). All-present or all-absent only."""
+    present = [k for k in _ACTION_RETURN_BASIS_DETAIL_KEYS if payload.get(k) is not None]
+    if present and len(present) != len(_ACTION_RETURN_BASIS_DETAIL_KEYS):
+        missing = [k for k in _ACTION_RETURN_BASIS_DETAIL_KEYS if payload.get(k) is None]
+        raise ValueError(
+            f"partial action-return basis metadata: present={present} but missing={missing}; the basis "
+            "detail must be all-present or all-absent."
+        )
+
+
 def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
     payload = _canonicalize_subhour_payload(payload)
     decisions = list(payload["decision_timestamps"])
@@ -807,6 +831,7 @@ def _load_payload(
     validate_hour_level_decision_grid(payload)
     validate_minute_timestamp_grid(payload)
     validate_action_feature_tensors(payload)
+    validate_action_return_basis(payload)
     return payload
 
 
