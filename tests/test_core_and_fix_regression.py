@@ -4224,6 +4224,36 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         imported = [n.module for n in ast.walk(ast.parse(source)) if isinstance(n, ast.ImportFrom) and n.module]
         self.assertFalse([m for m in imported if m.startswith("rl_quant.")], imported)
 
+    def test_baseline_stress_contract_structured_records(self) -> None:
+        # The contract is structured records (each carries id + rationale + applicability gate), and the legacy
+        # string tuples are DERIVED from them so the two cannot drift. Behavior is identical to the bare-tuple
+        # version (the coverage gate test above still passes); these assert the record structure + derivation.
+        from rl_quant.protocol.reportability_contract import (
+            QUOTE_CONDITIONAL_STRESS,
+            REQUIRED_BASELINE_SPECS,
+            REQUIRED_BASELINES,
+            REQUIRED_STRESS,
+            REQUIRED_STRESS_SPECS,
+            BaselineSpec,
+            StressScenarioSpec,
+        )
+
+        # Every record is the right distinct type and self-documents (non-empty rationale).
+        self.assertTrue(all(isinstance(s, BaselineSpec) and s.rationale for s in REQUIRED_BASELINE_SPECS))
+        self.assertTrue(all(isinstance(s, StressScenarioSpec) and s.rationale for s in REQUIRED_STRESS_SPECS))
+        # Distinct kinds with identical fields do not compare equal (type-safe).
+        self.assertNotEqual(BaselineSpec("x", "r"), StressScenarioSpec("x", "r"))
+        # Legacy tuples are exactly the derivation from the records (order preserved).
+        self.assertEqual(REQUIRED_BASELINES, tuple(s.id for s in REQUIRED_BASELINE_SPECS))
+        self.assertEqual(REQUIRED_STRESS, tuple(s.id for s in REQUIRED_STRESS_SPECS if s.gate_flag is None))
+        self.assertEqual(QUOTE_CONDITIONAL_STRESS,
+                         tuple(s.id for s in REQUIRED_STRESS_SPECS if s.gate_flag == "quote_data_available"))
+        # The two gated members carry their gates (buy_and_hold waivable; spread_impact quote-conditional).
+        gates = {s.id: s.gate_flag for s in (*REQUIRED_BASELINE_SPECS, *REQUIRED_STRESS_SPECS)}
+        self.assertEqual(gates["buy_and_hold"], "buy_and_hold_applicable")
+        self.assertEqual(gates["spread_impact"], "quote_data_available")
+        self.assertIsNone(gates["cash"])
+
     def test_official_test_block_summarizes_latest_partition(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
         records = [

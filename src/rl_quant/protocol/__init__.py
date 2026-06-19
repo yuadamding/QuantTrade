@@ -5,8 +5,12 @@ validators; the full DecisionTensorPayload loader and the trading_constraints co
 
 from rl_quant.protocol.reportability_contract import (
     QUOTE_CONDITIONAL_STRESS,
+    REQUIRED_BASELINE_SPECS,
     REQUIRED_BASELINES,
     REQUIRED_STRESS,
+    REQUIRED_STRESS_SPECS,
+    BaselineSpec,
+    StressScenarioSpec,
     assert_baseline_stress_coverage,
     validate_baseline_stress_coverage,
 )
@@ -29,7 +33,11 @@ from rl_quant.protocol.validators import (
 __all__ = [
     "QUOTE_CONDITIONAL_STRESS",
     "REQUIRED_BASELINES",
+    "REQUIRED_BASELINE_SPECS",
     "REQUIRED_STRESS",
+    "REQUIRED_STRESS_SPECS",
+    "BaselineSpec",
+    "StressScenarioSpec",
     "assert_action_mask",
     "assert_baseline_stress_coverage",
     "assert_cash_contract",
