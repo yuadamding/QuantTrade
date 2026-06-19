@@ -717,17 +717,56 @@ def _run_semantics_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _dataset_content_hash(train_data: HourFromMinuteDataSplit) -> str:
-    """Content fingerprint of the actual training DATA -- decision timestamps + realized action_returns +
-    validity masks -- DISTINCT from _run_semantics_hash (schema/economics). Lets resume detect that it is
-    continuing against a DIFFERENT dataset that merely shares the schema/semantics. Tensor bytes are taken on
-    CPU and are deterministic across loads (NaN bit-patterns included), so the same data reproduces the same
-    hash."""
+# v2 widens the content fingerprint from labels/masks/timestamps to the FULL split: MODEL-INPUT tensors
+# (minute/hour/action features + masks), labels, validity/index masks, AND the fitted normalizer stats, each
+# tagged with name+dtype+shape so a mismatch is self-describing. v1 (03387e5) hashed only labels/masks, so a
+# resume against different MODEL INPUTS or a different VALIDATION split slipped past. Versioned + stored under
+# a new key, so v1/legacy checkpoints (which lack it) simply skip the check (backward-compatible).
+_DATASET_CONTENT_HASH_VERSION = 2
+
+
+def _dataset_content_hash(split: HourFromMinuteDataSplit) -> str:
+    """Content fingerprint of ONE split's actual DATA -- model inputs, labels, masks, timestamps, and fitted
+    normalizer stats -- DISTINCT from _run_semantics_hash (schema/economics). CPU bytes are deterministic
+    across loads (NaN bit-patterns included), so the same data reproduces the same hash; computed once per run."""
     digest = hashlib.sha256()
-    digest.update("\n".join(train_data.decision_timestamps).encode("utf-8"))
-    for tensor in (train_data.action_returns, train_data.action_valid_mask, train_data.label_valid_mask):
-        digest.update(b"\x00" if tensor is None
-                      else tensor.detach().cpu().contiguous().numpy().tobytes())
+    digest.update(f"dataset_content_hash.v{_DATASET_CONTENT_HASH_VERSION}\x1e".encode())
+    for name, values in (
+        ("decision_timestamps", split.decision_timestamps),
+        ("next_timestamps", split.next_timestamps),
+        ("action_names", split.action_names),
+        ("minute_feature_names", split.minute_feature_names),
+        ("hour_feature_names", split.hour_feature_names),
+        ("action_feature_names", split.action_feature_names),
+    ):
+        digest.update(f"{name}\x1f".encode())
+        digest.update(json.dumps(list(values)).encode("utf-8"))
+        digest.update(b"\x1e")
+    for name, tensor in (
+        ("minute_features", split.minute_features),
+        ("minute_mask", split.minute_mask),
+        ("hour_features", split.hour_features),
+        ("action_features", split.action_features),
+        ("action_returns", split.action_returns),
+        ("action_valid_mask", split.action_valid_mask),
+        ("label_valid_mask", split.label_valid_mask),
+        ("valid_start_indices", split.valid_start_indices),
+        ("valid_index_mask", split.valid_index_mask),
+        ("minute_feature_mean", split.minute_feature_mean),
+        ("minute_feature_std", split.minute_feature_std),
+        ("hour_feature_mean", split.hour_feature_mean),
+        ("hour_feature_std", split.hour_feature_std),
+        ("action_feature_mean", split.action_feature_mean),
+        ("action_feature_std", split.action_feature_std),
+    ):
+        digest.update(f"{name}\x1f".encode())
+        if tensor is None:
+            digest.update(b"NONE\x1e")
+            continue
+        arr = tensor.detach().cpu().contiguous()
+        digest.update(f"{arr.dtype}\x1f{list(arr.shape)}\x1f".encode())
+        digest.update(arr.numpy().tobytes())
+        digest.update(b"\x1e")
     return digest.hexdigest()
 
 
@@ -752,7 +791,7 @@ def _save_minute_to_hour_training_state(
     shadow_cost_delta_sum: float,
     shadow_delta_count: int,
     run_semantics_hash: str,
-    dataset_content_hash: str,
+    dataset_content_hashes: dict[str, str],
     device: torch.device,
 ) -> None:
     _atomic_torch_save(
@@ -779,9 +818,9 @@ def _save_minute_to_hour_training_state(
             "shadow_delta_count": int(shadow_delta_count),
             # Economic/schema fingerprint -- resume rejects a run with different economics (see _run_semantics_hash).
             "run_semantics_hash": str(run_semantics_hash),
-            # Data-content fingerprint -- resume rejects continuing against a DIFFERENT dataset that merely
-            # shares the schema/economics (see _dataset_content_hash).
-            "dataset_content_hash": str(dataset_content_hash),
+            # Data-content fingerprints (train + validation) -- resume rejects continuing against a DIFFERENT
+            # dataset that merely shares the schema/economics (see _dataset_content_hash).
+            "dataset_content_hashes": dict(dataset_content_hashes),
             "rng_state": _capture_rng_state(device),
         },
         path,
@@ -1003,7 +1042,12 @@ def train_minute_to_hour_dqn(
         reward_scale=config.env.reward_scale,
         cash_idle_penalty_bps=config.env.cash_idle_penalty_bps,
     )
-    dataset_content_hash = _dataset_content_hash(train_data)
+    # Guard BOTH splits: validation controls selection / best-state, so resuming on a different validation
+    # split (same train) must also fail closed.
+    dataset_content_hashes = {
+        "train": _dataset_content_hash(train_data),
+        "validation": _dataset_content_hash(val_data),
+    }
     # Recency weighting is anchored to the earliest VALIDATION decision; the test split is never
     # passed to this function, so older training rows can be down-weighted without any risk of
     # touching the held-out test block. mode='none' yields uniform weights (no behavior change).
@@ -1147,15 +1191,19 @@ def train_minute_to_hour_dqn(
                 "constraints / action-return weight semantics differ from the checkpointed run; refusing to "
                 "resume with different economics."
             )
-        # Also reject resuming against DIFFERENT data with the same schema/economics (different timestamps /
-        # realized returns / masks). Older checkpoints without the hash skip this (prior behaviour).
-        saved_content_hash = checkpoint.get("dataset_content_hash")
-        if saved_content_hash is not None and saved_content_hash != _dataset_content_hash(train_data):
-            raise ValueError(
-                "Resume checkpoint dataset-content mismatch: the decision timestamps / action returns / "
-                "validity masks differ from the checkpointed run; refusing to resume against a different "
-                "dataset (same schema is not enough)."
-            )
+        # Also reject resuming against DIFFERENT data with the same schema/economics: compare the train AND
+        # validation content fingerprints (model inputs + labels + masks + normalizer stats). Older / v1
+        # checkpoints lack the dataset_content_hashes key and skip this (backward-compatible; v1's narrow
+        # single-split hash under the old key is superseded, not re-checked).
+        saved_content_hashes = checkpoint.get("dataset_content_hashes")
+        if isinstance(saved_content_hashes, dict):
+            for split_name, current in (("train", train_data), ("validation", val_data)):
+                if saved_content_hashes.get(split_name) != _dataset_content_hash(current):
+                    raise ValueError(
+                        f"Resume checkpoint {split_name} dataset-content mismatch: the model inputs / labels / "
+                        "masks / normalizer stats differ from the checkpointed run; refusing to resume against "
+                        "a different dataset (same schema is not enough)."
+                    )
         q_network.load_state_dict(checkpoint["q_network_state_dict"], strict=True)
         target_network.load_state_dict(checkpoint["target_network_state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1410,7 +1458,7 @@ def train_minute_to_hour_dqn(
                 shadow_cost_delta_sum=shadow_cost_delta_sum,
                 shadow_delta_count=shadow_delta_count,
                 run_semantics_hash=run_semantics_hash,
-                dataset_content_hash=dataset_content_hash,
+                dataset_content_hashes=dataset_content_hashes,
                 device=device,
             )
 

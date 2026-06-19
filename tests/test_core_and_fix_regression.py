@@ -3045,12 +3045,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
                                          config=cfg(5, state_path, resume=True, constraints=changed))
-            # Resume with the SAME economics but DIFFERENT DATA (perturbed action_returns, same schema) ->
-            # dataset-content hash mismatch -> fail closed. Same schema is not enough to share a run.
-            other_data = dataclasses.replace(train, action_returns=train.action_returns + 0.01)
-            with self.assertRaises(ValueError):
-                train_minute_to_hour_dqn(other_data, val, device=torch.device("cpu"),
-                                         config=cfg(5, state_path, resume=True, constraints=default_minute_to_hour_constraints()))
+            # Resume with the SAME economics but DIFFERENT DATA (same schema) -> dataset-content mismatch ->
+            # fail closed. Covers a label change, a MODEL-INPUT change, and a VALIDATION-split change.
+            default_c = default_minute_to_hour_constraints()
+            other_labels = dataclasses.replace(train, action_returns=train.action_returns + 0.01)
+            other_inputs = dataclasses.replace(train, minute_features=train.minute_features + 0.5)
+            other_val = dataclasses.replace(val, action_returns=val.action_returns + 0.01)
+            for bad_train, bad_val in ((other_labels, val), (other_inputs, val), (train, other_val)):
+                with self.assertRaises(ValueError):
+                    train_minute_to_hour_dqn(bad_train, bad_val, device=torch.device("cpu"),
+                                             config=cfg(5, state_path, resume=True, constraints=default_c))
 
     def test_run_semantics_hash_covers_reward_scale_and_cash_idle(self) -> None:
         # reward_scale (multiplies every reward + normalizes the shadow bps aggregates) and
@@ -3091,6 +3095,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             flipped = base.action_valid_mask.clone()
             flipped[0, 0] = ~flipped[0, 0]
             self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, action_valid_mask=flipped)))
+        # v2 widening: MODEL INPUTS and fitted normalizer stats are now in the fingerprint (v1 hashed only
+        # labels/masks, so a resume against different model inputs slipped past).
+        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, minute_features=base.minute_features + 0.5)))
+        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, hour_features=base.hour_features + 0.5)))
+        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, minute_feature_mean=base.minute_feature_mean + 1.0)))
 
     def test_minute_to_hour_resume_rejects_changed_reward_scale(self) -> None:
         # reward_scale lives on the ENV config (not the constraints) yet scales every reward + the
