@@ -37,6 +37,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-end", default="2026-06-12T18:00:00+00:00")
     parser.add_argument("--test-start", default="2026-06-12T18:00:00+00:00")
     parser.add_argument("--test-end")
+    parser.add_argument(
+        "--mask-action-feature-normalizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fit the action-feature normalizer over decision-valid action rows only (excluding padded/invalid "
+            "rows whose features can be sentinels), mirroring the masked market-context normalizer. "
+            "Result-moving (governed flag, default OFF) -- use for the latest-period A/B before flipping."
+        ),
+    )
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--temporal-layers", type=int, default=2)
@@ -311,6 +321,7 @@ def main() -> int:
         val_end=args.val_end,
         test_start=args.test_start,
         test_end=args.test_end,
+        mask_action_feature_normalizer=args.mask_action_feature_normalizer,
     )
     model = SecondContextTransformerQNetwork(
         market_feature_dim=train.market_context.shape[-1],
