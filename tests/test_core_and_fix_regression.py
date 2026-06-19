@@ -3229,6 +3229,28 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_action_return_basis({"action_return_formula": "clipped_simple_return(entry_fill, exit_fill)"})
 
+    def test_execution_shadow_cost_basis_status(self) -> None:
+        # The artifact must report what the PR-3 shadow's max_weight turnover pricing PROVES for the resolved
+        # basis, not merely what the shadow assumes. Unresolved when semantics absent; native for
+        # metadata-weighted; for full_capital_single_slot it is compatible only when every non-cash action is
+        # unit-weight/unleveraged (TQQQ at 3x -> incompatible).
+        import dataclasses
+
+        from rl_quant.training.minute_to_hour import _execution_shadow_cost_basis_status as status
+
+        base = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"])   # action_names = [CASH, QQQ]
+        self.assertEqual(status(base), "unresolved_missing_semantics")            # default semantics None
+        self.assertEqual(
+            status(dataclasses.replace(base, action_return_weight_semantics="metadata_weighted_portfolio_returns")),
+            "native_metadata_weighted")
+        self.assertEqual(
+            status(dataclasses.replace(base, action_return_weight_semantics="full_capital_single_slot_returns")),
+            "compatible_full_capital_unit_weight_unleveraged")                    # QQQ is unit-weight/unleveraged
+        self.assertEqual(
+            status(dataclasses.replace(base, action_names=["CASH", "TQQQ"],
+                                       action_return_weight_semantics="full_capital_single_slot_returns")),
+            "incompatible_full_capital_leveraged_or_fractional")                  # TQQQ is 3x
+
     def test_run_semantics_hash_captures_full_return_basis(self) -> None:
         # The run-semantics fingerprint (the resume guard) must capture the FULL action-return basis, not just
         # the weight label: two datasets sharing the weight semantics but differing in return formula / clip /
@@ -5684,7 +5706,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIs(on["execution_shadow_keeps_switch_penalty"], True)
         self.assertIs(on["execution_shadow_keeps_cash_idle"], True)
         self.assertEqual(on["execution_shadow_linear_impact_bps_per_weight"], 0.0)
-        self.assertIn("UNRESOLVED", on["execution_shadow_weight_semantics_assumed"])
+        self.assertIn("UNRESOLVED", on["execution_shadow_weight_semantics_assumed"])  # split declares no semantics
+        # The proven cost-basis status reflects the resolved semantics (None here -> unresolved); None when off.
+        self.assertIsNone(off["execution_shadow_cost_basis_status"])
+        self.assertEqual(on["execution_shadow_cost_basis_status"], "unresolved_missing_semantics")
 
     def test_all_public_rl_quant_modules_import(self) -> None:
         import importlib

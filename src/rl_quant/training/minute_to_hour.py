@@ -770,6 +770,29 @@ def _dataset_content_hash(split: HourFromMinuteDataSplit) -> str:
     return digest.hexdigest()
 
 
+def _execution_shadow_cost_basis_status(train_data: HourFromMinuteDataSplit) -> str:
+    """Whether the PR-3 execution shadow's turnover pricing is PROVEN correct for this dataset's declared
+    action-return basis (reports what is proven, not merely what the shadow assumes). The shadow prices
+    turnover with action_metadata.max_weight, which is exact for ``metadata_weighted_portfolio_returns`` and,
+    for ``full_capital_single_slot_returns``, ONLY when every non-cash action is unit-weight + unleveraged
+    (otherwise leveraged turnover is undercharged -- see the PR-4 gate / docs/execution_wiring_design.md §3)."""
+    semantics = train_data.action_return_weight_semantics
+    if semantics is None:
+        return "unresolved_missing_semantics"
+    if semantics == "metadata_weighted_portfolio_returns":
+        return "native_metadata_weighted"
+    if semantics == "full_capital_single_slot_returns":
+        from rl_quant.features.action_risk import build_action_metadata
+        leveraged = [
+            meta.name
+            for meta in build_action_metadata(list(train_data.action_names))
+            if meta.asset_class != "cash" and (abs(meta.leverage - 1.0) > 1e-9 or abs(meta.max_weight - 1.0) > 1e-9)
+        ]
+        return ("incompatible_full_capital_leveraged_or_fractional" if leveraged
+                else "compatible_full_capital_unit_weight_unleveraged")
+    return "unresolved_unknown_semantics"
+
+
 def _save_minute_to_hour_training_state(
     path: Path,
     *,
@@ -1547,12 +1570,22 @@ def train_minute_to_hour_dqn(
         # are KEPT, so a future PR-4 flip cannot silently drop them (recorded so the contract is auditable).
         "execution_shadow_keeps_switch_penalty": (True if config.env.execution_env_reward_shadow else None),
         "execution_shadow_keeps_cash_idle": (True if config.env.execution_env_reward_shadow else None),
-        # The weight semantics are an UNRESOLVED assumption (see docs §3): max_weight is correct only if
-        # action_returns are metadata-weighted; PR-4 must confirm against the dataset before training. The
-        # free-text field stays human-readable; the structured status/assumption fields are query/gate-able.
+        # Two distinct facts, both recorded: (a) what the shadow ASSUMES when pricing turnover -- it always
+        # uses action_metadata.max_weight, i.e. it assumes metadata-weighted returns (the _assumed/_assumption
+        # fields describe this fixed shadow behaviour); and (b) whether that assumption is PROVEN correct for
+        # THIS dataset's declared basis (_cost_basis_status, computed from the resolved semantics + the
+        # leverage/max_weight check). _status reports the dataset's actual declared semantics.
         "execution_shadow_weight_semantics_assumed": (
-            "action_metadata.max_weight; assumes action_returns are metadata-weighted portfolio returns "
-            "(UNRESOLVED -- see docs/execution_wiring_design.md §3)"
+            (
+                "action_metadata.max_weight; the shadow prices turnover as if action_returns are "
+                "metadata-weighted portfolio returns. "
+                + (
+                    f"Dataset declares {train_data.action_return_weight_semantics!r} -- see "
+                    "execution_shadow_cost_basis_status for whether max_weight pricing holds."
+                    if train_data.action_return_weight_semantics is not None
+                    else "Dataset semantics UNRESOLVED -- see docs/execution_wiring_design.md §3."
+                )
+            )
             if config.env.execution_env_reward_shadow else None
         ),
         "execution_shadow_weight_semantics_status": (
@@ -1561,6 +1594,10 @@ def train_minute_to_hour_dqn(
         ),
         "execution_shadow_weight_semantics_assumption": (
             "metadata_weighted_portfolio_returns" if config.env.execution_env_reward_shadow else None
+        ),
+        # PROVEN cost-basis compatibility for the resolved semantics (what was checked, not what was assumed).
+        "execution_shadow_cost_basis_status": (
+            _execution_shadow_cost_basis_status(train_data) if config.env.execution_env_reward_shadow else None
         ),
         # reward delta in REWARD units (scale-dependent) AND scale-normalised bps (comparable across runs).
         # Computed from the resume-safe running sum / count (None when the shadow never ran).
