@@ -61,7 +61,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--article-root", type=Path, default=DEFAULT_ARTICLE_ROOT)
     parser.add_argument("--output-file-name", default="action_news_llm_covariates.pt")
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force", action="store_true", help="Rebuild every selected sidecar, even if an existing one validates.")
+    parser.add_argument(
+        "--resume-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Resume an interrupted build by validating and skipping existing sidecars. "
+            "Stale or unreadable sidecars are rebuilt. Enabled by default; --force disables reuse."
+        ),
+    )
     parser.add_argument("--max-partitions", type=int, default=0)
     parser.add_argument(
         "--partition-selection",
@@ -261,13 +270,14 @@ def build_sidecar(
     article_manifest_hash: str | None,
     feature_manifest_reportability_errors: list[str],
     force: bool,
+    resume_existing: bool,
 ) -> dict[str, Any]:
     output = dataset_path.with_name(output_file_name)
     payload = torch.load(dataset_path, map_location="cpu", weights_only=True)
     stale_existing_error: str | None = None
-    if output.exists() and not force:
-        sidecar = torch.load(output, map_location="cpu", weights_only=True)
+    if output.exists() and resume_existing and not force:
         try:
+            sidecar = torch.load(output, map_location="cpu", weights_only=True)
             validate_existing_sidecar(
                 sidecar=sidecar,
                 dataset_path=dataset_path,
@@ -275,8 +285,8 @@ def build_sidecar(
                 news_llm_manifest_hash=news_llm_manifest_hash,
                 article_manifest_hash=article_manifest_hash,
             )
-        except ValueError as exc:
-            stale_existing_error = str(exc)
+        except Exception as exc:
+            stale_existing_error = f"{type(exc).__name__}: {exc}"
         else:
             return {
                 "partition": dataset_path.parent.name,
@@ -405,7 +415,12 @@ def main(argv: list[str] | None = None) -> int:
         args.news_llm_root, action_names, allow_nonreportable=True
     )
     records: list[dict[str, Any]] = []
-    print(f"Building news LLM action sidecars for {len(paths)} partitions with workers={args.workers}", flush=True)
+    print(
+        "Building news LLM action sidecars for "
+        f"{len(paths)} partitions with workers={args.workers} "
+        f"resume_existing={bool(args.resume_existing and not args.force)} force={bool(args.force)}",
+        flush=True,
+    )
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
             executor.submit(
@@ -419,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
                 article_manifest_hash=article_manifest_hash,
                 feature_manifest_reportability_errors=feature_manifest_reportability_errors,
                 force=args.force,
+                resume_existing=args.resume_existing,
             )
             for path in paths
         ]
@@ -443,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
         "news_llm_manifest_hash": news_llm_manifest_hash,
         "news_article_manifest_hash": article_manifest_hash,
         "partition_selection": args.partition_selection,
+        "resume_existing": bool(args.resume_existing and not args.force),
+        "force": bool(args.force),
         "partition_count": len(paths),
         "written_count": sum(1 for item in records if item["status"] == "written"),
         "rewritten_stale_existing_count": sum(1 for item in records if item["status"] == "rewritten_stale_existing"),
