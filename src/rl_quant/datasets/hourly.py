@@ -39,6 +39,22 @@ class HourlyDataSplit:
     periods_per_year: float = 252.0 * 6.5
     bar_interval: str = "1h"
     action_valid_mask: torch.Tensor | None = None
+    # Canonical action-return basis (carried from the payload; None on payloads that predate it). Mirrors the
+    # fields on HourFromMinuteDataSplit so ReturnBasis.from_mapping(split) is meaningful for the direct-hourly
+    # reportable path too. Optional/default-preserving -- the basis is recorded, not required to load. (Non-tensor
+    # fields are preserved by replace() in to(), so no device handling is needed.)
+    action_return_weight_semantics: str | None = None
+    action_return_formula: str | None = None
+    action_return_clip_min: float | None = None
+    action_return_clip_max: float | None = None
+    action_return_semantics_version: str | None = None
+    action_return_fill_convention: str | None = None
+    action_return_basis_version: str | None = None
+    action_return_entry_fill_rule: str | None = None
+    action_return_exit_fill_rule: str | None = None
+    action_return_execution_latency_ms: int | None = None
+    action_return_source_bar_interval: str | None = None
+    action_return_price_source: str | None = None
 
     def to(self, device: torch.device | str) -> "HourlyDataSplit":
         return replace(
@@ -213,6 +229,18 @@ def _build_split(
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.5)),
         bar_interval=str(payload.get("bar_interval", "1h")),
         action_valid_mask=action_valid_mask,
+        action_return_weight_semantics=payload.get("action_return_weight_semantics"),
+        action_return_formula=payload.get("action_return_formula"),
+        action_return_clip_min=payload.get("action_return_clip_min"),
+        action_return_clip_max=payload.get("action_return_clip_max"),
+        action_return_semantics_version=payload.get("action_return_semantics_version"),
+        action_return_fill_convention=payload.get("action_return_fill_convention"),
+        action_return_basis_version=payload.get("action_return_basis_version"),
+        action_return_entry_fill_rule=payload.get("action_return_entry_fill_rule"),
+        action_return_exit_fill_rule=payload.get("action_return_exit_fill_rule"),
+        action_return_execution_latency_ms=payload.get("action_return_execution_latency_ms"),
+        action_return_source_bar_interval=payload.get("action_return_source_bar_interval"),
+        action_return_price_source=payload.get("action_return_price_source"),
     )
 
 

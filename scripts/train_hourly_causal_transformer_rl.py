@@ -71,11 +71,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--strict-return-basis",
         action="store_true",
         help=(
-            "Require a COMPLETE action-return basis on both the evaluation and dataset-manifest sides for the "
-            "run to be reportable (validate_reportable_summary strict mode). Off by default (default-preserving: "
-            "a legacy / partially-declared basis still reports); enable to guarantee a reportable artifact "
-            "declares its full, agreeing return basis. A dataset built by the current builder emits a complete "
-            "v2 basis, so a fresh run passes; an older dataset would be flagged until rebuilt."
+            "Require a COMPLETE, valid action-return basis on both the evaluation and dataset-manifest sides for "
+            "the run to be reportable (validate_reportable_summary strict mode), checked fast at startup. Off by "
+            "default (default-preserving: a legacy / partially-declared basis still reports). This requires a "
+            "basis-aware dataset AND loader: a dataset/loader that does not carry action_return_* provenance is "
+            "flagged until rebuilt or migrated. Enable to guarantee a reportable artifact declares its full, "
+            "agreeing return basis."
         ),
     )
     parser.add_argument("--random-baseline-paths", type=int, default=256)
@@ -915,7 +916,7 @@ def build_reportability_artifacts(
     model_version: int,
     constraint_feature_names: list[str],
 ) -> dict[str, object]:
-    from rl_quant.datasets.hour_from_subhour import ReturnBasis
+    from rl_quant.protocol.action_return_basis import ReturnBasis
 
     created_at = utc_now_iso()
     dataset_manifest_path = args.dataset.parent / "dataset_manifest.json"
@@ -1121,7 +1122,7 @@ def main() -> int:
     except ModuleNotFoundError as exc:
         if exc.name == "torch":
             raise SystemExit(
-                "Torch is required. Use: conda run -n ml1 python scripts/train_hourly_causal_transformer_rl.py"
+                "Torch is required. Use: conda run -n quanttrade python scripts/train_hourly_causal_transformer_rl.py"
             ) from exc
         raise
 
@@ -1142,6 +1143,29 @@ def main() -> int:
         test_end=args.test_end,
     )
     assert_matching_hourly_schema(train_split, val_split, test_split)
+    if args.strict_return_basis:
+        # Fail FAST (before the expensive training/evaluation) rather than only at the final reportability
+        # verdict: --strict-return-basis requires every split to carry a complete, valid action-return basis.
+        # A loader/dataset that does not declare the basis (e.g. a direct-hourly dataset built without it) is
+        # flagged here with an actionable message instead of wasting a full run to discover it is non-reportable.
+        # NOTE: this preflight checks the EVAL/split (.pt) side only; the final validate_reportable_summary
+        # backstop additionally requires the dataset_manifest side to be complete, so a basis-carrying .pt can
+        # still fail late if dataset_manifest.json does not also declare the basis.
+        from rl_quant.protocol.action_return_basis import ReturnBasis as _ReturnBasis
+
+        for _split in (train_split, val_split, test_split):
+            _basis = _ReturnBasis.from_mapping(_split)
+            _problems = _basis.validation_errors()
+            if _problems:
+                raise SystemExit(
+                    f"--strict-return-basis: split {_split.name!r} has an invalid action-return basis: {_problems}."
+                )
+            if not _basis.is_complete():
+                raise SystemExit(
+                    f"--strict-return-basis: split {_split.name!r} does not carry a COMPLETE action-return basis "
+                    "(the loaded dataset declares no/partial action_return_* provenance). Rebuild the dataset "
+                    "with a basis-aware builder, or drop --strict-return-basis to use legacy reportability."
+                )
     initial_action = action_index(train_split.action_names, args.initial_action)
     cash_index = train_split.action_names.index("CASH") if "CASH" in train_split.action_names else initial_action
     constraints = build_constraints_from_args(args, cash_index=cash_index)
@@ -1469,6 +1493,14 @@ def main() -> int:
     summary["reportability"] = {
         "reportable": bool(reportability["reportable"]) and not reportability_errors,
         "reasons": list(dict.fromkeys([*reportability.get("reasons", []), *reportability_errors])),
+        # Record the return-basis enforcement mode so reportability.json is self-auditable without the full
+        # summary -- a reviewer can see whether strict completeness was enforced or only legacy agreement/validity.
+        "strict_return_basis": bool(args.strict_return_basis),
+        "return_basis_policy": (
+            "strict_complete_eval_and_dataset_manifest" if args.strict_return_basis
+            else "legacy_agreement_and_validity_only"
+        ),
+        "return_basis_content_hash": summary.get("return_basis_content_hash"),
     }
     with (run_dir / "summary.json").open("w") as sink:
         json.dump(summary, sink, indent=2)

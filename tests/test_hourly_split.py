@@ -93,6 +93,46 @@ class HourlySplitTests(unittest.TestCase):
 
         self.assertEqual(split.timestamps[1], "2026-01-02T09:45:00-05:00")
 
+    def test_hourly_split_carries_action_return_basis_when_present(self) -> None:
+        # The direct-hourly loader now propagates the action-return basis from the payload onto HourlyDataSplit,
+        # so ReturnBasis.from_mapping(split) is meaningful on the direct-hourly reportable path. Default-preserving:
+        # a payload without the basis yields an all-None (not complete) basis.
+        from rl_quant.protocol.action_return_basis import ReturnBasis
+
+        hourly = __import__("rl_quant.datasets.hourly", fromlist=["_build_split"])
+        base = {
+            "timestamps": [f"2026-01-02T14:{m:02d}:00+00:00" for m in range(30, 34)],
+            "next_timestamps": [f"2026-01-02T14:{m:02d}:00+00:00" for m in range(31, 35)],
+            "feature_names": ["x"],
+            "action_names": ["CASH", "QQQ"],
+            "features": torch.zeros((4, 1), dtype=torch.float32),
+            "action_returns": torch.zeros((4, 2), dtype=torch.float32),
+        }
+        # Legacy payload (no basis) -> all-None, not complete (default-preserving).
+        legacy = hourly._build_split(name="train", payload=base, lookback=1)
+        self.assertIsNone(legacy.action_return_weight_semantics)
+        self.assertFalse(ReturnBasis.from_mapping(legacy).is_complete())
+        # A basis-carrying payload (a v2 direct-hourly build) -> the split carries it and the basis is complete.
+        v2 = {
+            **base,
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
+            "action_return_formula": "clipped_simple_return(decision_bar_close, next_bar_close)",
+            "action_return_clip_min": -1.0,
+            "action_return_clip_max": 1.0,
+            "action_return_semantics_version": "v1",
+            "action_return_fill_convention": "decision_bar_close_to_next_bar_close",
+            "action_return_basis_version": "v2",
+            "action_return_entry_fill_rule": "decision_bar_close",
+            "action_return_exit_fill_rule": "next_bar_close",
+            "action_return_execution_latency_ms": 0,
+            "action_return_source_bar_interval": "1h",
+            "action_return_price_source": "bar_close",
+        }
+        split = hourly._build_split(name="train", payload=v2, lookback=1)
+        self.assertEqual(split.action_return_entry_fill_rule, "decision_bar_close")
+        self.assertEqual(split.action_return_execution_latency_ms, 0)
+        self.assertTrue(ReturnBasis.from_mapping(split).is_complete())
+
     def test_direct_hourly_split_rejects_finite_returns_for_invalid_actions(self) -> None:
         hourly = __import__("rl_quant.datasets.hourly", fromlist=["_build_split"])
         payload = {
