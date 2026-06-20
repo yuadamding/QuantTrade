@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -26,11 +27,131 @@ from rl_quant.features.stock_second_context import (
     StockSecondContextConfig,
     build_market_context_from_frames,
     regular_session_decision_grid_ms,
+    session_gating_method,
 )
 from rl_quant.paths import default_data_root
 
 DATA_ROOT = default_data_root()
 DEFAULT_SECOND_ROOT = DATA_ROOT / "polygon" / "second_aggs" / "top500_common_stocks_2025_to_2026-06-15"
+
+# Bumped when the feature SEMANTICS change (so a stale feature_manifest is distinguishable); the schema version
+# is bumped when the manifest's own SHAPE changes. Both are recorded for reproducibility/provenance.
+BUILDER_VERSION = "stock_second_silver/1"
+FEATURE_MANIFEST_SCHEMA_VERSION = "1"
+
+
+def build_feature_manifest(
+    *,
+    source_root: Path,
+    stock_second_manifest: Path,
+    dataset_manifest: Path,
+    manifest_content_hash: str,
+    dataset_manifest_content_hash: str | None,
+    session_gating_method: str,
+    start: str,
+    end_exclusive: str,
+    block_seconds: int,
+    min_active_symbols: int,
+    include_extended_hours: bool,
+    symbol_limit: int,
+    max_files: int,
+    selected_symbols: list[str],
+    loaded_symbols: list[str],
+    rows: int,
+    files_considered: int,
+    files_used: int,
+    total_symbols_available: int,
+    data_quality_report: dict,
+    created_at_utc: str,
+) -> dict:
+    """Build the reproducibility manifest for a silver feature build (pure: no I/O, deterministic).
+
+    Records the full set of inputs that determine the produced feature table -- the window, block size,
+    active-symbol threshold, extended-hours flag, the symbol/file limits and whether they actually TRUNCATED,
+    the deterministic (source-manifest-order) symbol selection, the session-gating path (real NYSE calendar vs
+    weekend+RTH heuristic, which changes the emitted decision grid), and a content hash over exactly those
+    determinative inputs (excluding ``created_at_utc`` and output diagnostics, so the hash is reproducible across
+    rebuilds of the same inputs). Adds fields only -- every field the prior manifest carried
+    (``source``/``rows``/``symbols``/``feature_names``/``block_seconds``/``data_quality_report``) is preserved.
+
+    The input manifests are folded into the hash by their CONTENT digest (``manifest_content_hash`` /
+    ``dataset_manifest_content_hash``, computed by the caller), NOT by path string -- a manifest edit (row
+    add/remove/reorder, status flip, output_path change) or an upstream re-download changes the produced features
+    and so must move the hash, while merely relocating the dataset to a different path must not.
+    """
+    files_truncated = max_files > 0 and files_considered > files_used
+    symbols_truncated = symbol_limit > 0 and total_symbols_available > len(selected_symbols)
+    # The determinative inputs (NOT created_at_utc, NOT output-derived rows/loaded symbols/quality report, NOT
+    # the location PATHs): a change to any of these changes the produced features, so it must change the hash; a
+    # pure rerun (and a relocation to a new path with identical content) must not.
+    determinative = {
+        "builder_version": BUILDER_VERSION,
+        "manifest_content_hash": manifest_content_hash,
+        "dataset_manifest_content_hash": dataset_manifest_content_hash,
+        "session_gating_method": session_gating_method,
+        "start": start,
+        "end_exclusive": end_exclusive,
+        "block_seconds": int(block_seconds),
+        "min_active_symbols": int(min_active_symbols),
+        "include_extended_hours": bool(include_extended_hours),
+        "symbol_limit": int(symbol_limit),
+        "max_files": int(max_files),
+        "selected_symbols": list(selected_symbols),
+        "feature_names": list(MARKET_CONTEXT_FEATURE_NAMES),
+    }
+    inputs_content_hash = hashlib.sha256(
+        json.dumps(determinative, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    return {
+        "created_at_utc": created_at_utc,
+        "builder_version": BUILDER_VERSION,
+        "feature_manifest_schema_version": FEATURE_MANIFEST_SCHEMA_VERSION,
+        "session_gating_method": session_gating_method,
+        "source": str(source_root),
+        "manifests": {
+            "stock_second_manifest": str(stock_second_manifest),
+            "dataset_manifest": str(dataset_manifest),
+            "manifest_content_hash": manifest_content_hash,
+            "dataset_manifest_content_hash": dataset_manifest_content_hash,
+        },
+        "window": {"start": start, "end_exclusive": end_exclusive},
+        "block_seconds": int(block_seconds),
+        "min_active_symbols": int(min_active_symbols),
+        "include_extended_hours": bool(include_extended_hours),
+        "rows": int(rows),
+        "symbols": sorted(loaded_symbols),
+        "feature_names": MARKET_CONTEXT_FEATURE_NAMES,
+        "symbol_selection": {
+            # source-manifest order, NOT sorted: --symbol-limit keeps the FIRST N symbols in manifest order, so
+            # sorting here would change WHICH symbols survive the limit (a result-moving change). The order is
+            # documented and the selection recorded for reproducibility instead.
+            "order": "source_manifest_order",
+            "limit": int(symbol_limit),
+            "total_available": int(total_symbols_available),
+            "selected_count": len(selected_symbols),
+            # A selected symbol whose in-window days are all empty/extended-hours-only loads zero frames and is
+            # dropped (the all-empty case raises upstream); record the gap so `symbols` shrinking below
+            # selected_count is attested, not just derivable.
+            "loaded_count": len(loaded_symbols),
+            "dropped_at_load": len(selected_symbols) - len(loaded_symbols),
+            "truncated": symbols_truncated,
+        },
+        "file_selection": {
+            "max_files": int(max_files),
+            "considered": int(files_considered),
+            "used": int(files_used),
+            "truncated": files_truncated,
+        },
+        "inputs_content_hash": inputs_content_hash,
+        "data_quality_report": data_quality_report,
+    }
+
+
+def _file_content_hash(path: Path) -> str | None:
+    """SHA-256 of a file's bytes, or None if it does not exist (the dataset_manifest may be absent)."""
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -67,8 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         for path in iter_symbol_day_files(rows)
         if args.start[:10] <= path.stem < args.end_exclusive[:10]
     ]
+    files_considered = len(files)
     if args.max_files > 0:
         files = files[: args.max_files]
+    files_used = len(files)
     import pandas as pd
 
     # Group day files by SYMBOL (layout SYMBOL/YYYY/MM/DATE.parquet) and select the first
@@ -79,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
     files_by_symbol: dict[str, list[Path]] = {}
     for path in files:
         files_by_symbol.setdefault(path.parents[2].name.upper(), []).append(path)
+    total_symbols_available = len(files_by_symbol)
+    # Selection is source-manifest order (the order iter_symbol_day_files yields, which follows the manifest
+    # CSV): --symbol-limit keeps the FIRST N. Deterministic given the manifest; recorded in the feature manifest.
     selected_symbols = (
         list(files_by_symbol)[: args.symbol_limit] if args.symbol_limit > 0 else list(files_by_symbol)
     )
@@ -130,15 +256,29 @@ def main(argv: list[str] | None = None) -> int:
                     *[f"{float(value):.10g}" for value in context[row_id, 0].tolist()],
                 ]
             )
-    feature_manifest = {
-        "created_at_utc": utc_now_iso(),
-        "source": str(args.stock_second_root),
-        "rows": int(context.shape[0]),
-        "symbols": sorted(frames_by_symbol),
-        "feature_names": MARKET_CONTEXT_FEATURE_NAMES,
-        "block_seconds": args.block_seconds,
-        "data_quality_report": report,
-    }
+    feature_manifest = build_feature_manifest(
+        source_root=args.stock_second_root,
+        stock_second_manifest=args.stock_second_manifest,
+        dataset_manifest=args.dataset_manifest,
+        manifest_content_hash=_file_content_hash(args.stock_second_manifest),
+        dataset_manifest_content_hash=_file_content_hash(args.dataset_manifest),
+        session_gating_method=session_gating_method(),
+        start=args.start,
+        end_exclusive=args.end_exclusive,
+        block_seconds=args.block_seconds,
+        min_active_symbols=min_active_symbols,
+        include_extended_hours=args.include_extended_hours,
+        symbol_limit=args.symbol_limit,
+        max_files=args.max_files,
+        selected_symbols=selected_symbols,
+        loaded_symbols=list(frames_by_symbol),
+        rows=int(context.shape[0]),
+        files_considered=files_considered,
+        files_used=files_used,
+        total_symbols_available=total_symbols_available,
+        data_quality_report=report,
+        created_at_utc=utc_now_iso(),
+    )
     args.output.with_name("feature_manifest.json").write_text(json.dumps(feature_manifest, indent=2, sort_keys=True) + "\n")
     print(f"Rows: {context.shape[0]} | Symbols: {len(frames_by_symbol)}")
     print(f"Silver features -> {args.output}")

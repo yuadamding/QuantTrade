@@ -29,6 +29,7 @@ _DISPATCH: dict[tuple[str, str], str] = {
     ("build", "direct-bar"): "build_hourly_transformer_dataset.py",
     ("build", "subhour"): "build_hourly_from_minute_context_dataset.py",
     ("build", "second-context"): "build_second_context_decision_dataset.py",
+    ("build", "stock-second-silver"): "build_stock_second_silver_features.py",
     ("evaluate", "second-context"): "evaluate_second_context_dataset.py",
     ("validate", "protocol"): "validate_research_protocol.py",
 }

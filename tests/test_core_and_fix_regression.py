@@ -6147,6 +6147,86 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             path = scripts_dir() / script
             self.assertTrue(path.exists(), f"qt {group} {workflow} -> missing script {path}")
 
+    def test_stock_second_silver_feature_manifest_reproducibility(self) -> None:
+        # The silver feature manifest records the full reproducibility surface (window, thresholds, the symbol/
+        # file limits AND whether they truncated, the input manifests, the deterministic selection, builder/
+        # schema version) plus a content hash over exactly the determinative INPUTS -- reproducible across
+        # reruns (created_at / output counts do not move it) but sensitive to any input that changes the output.
+        from rl_quant.workflows.commands.build_stock_second_silver_features import (
+            BUILDER_VERSION,
+            build_feature_manifest,
+        )
+
+        base = dict(
+            source_root=Path("/data/src"), stock_second_manifest=Path("/data/src/manifest.csv"),
+            dataset_manifest=Path("/data/src/dataset_manifest.json"),
+            manifest_content_hash="m_hash_v1", dataset_manifest_content_hash="d_hash_v1",
+            session_gating_method="weekend_rth_heuristic", start="2026-06-12T00:00:00+00:00",
+            end_exclusive="2026-06-13T00:00:00+00:00", block_seconds=300, min_active_symbols=250,
+            include_extended_hours=False, symbol_limit=2, max_files=5,
+            selected_symbols=["AAA", "BBB"], loaded_symbols=["BBB", "AAA"], rows=78,
+            files_considered=10, files_used=5, total_symbols_available=3,
+            data_quality_report={"ok": True}, created_at_utc="2026-06-20T00:00:00+00:00",
+        )
+        manifest = build_feature_manifest(**base)
+        # All legacy fields preserved (consumers reading the old manifest are unaffected).
+        for legacy in ("source", "rows", "symbols", "feature_names", "block_seconds", "data_quality_report"):
+            self.assertIn(legacy, manifest)
+        self.assertEqual(manifest["symbols"], ["AAA", "BBB"])  # sorted regardless of load order
+        self.assertEqual(manifest["builder_version"], BUILDER_VERSION)
+        self.assertEqual(manifest["window"], {"start": base["start"], "end_exclusive": base["end_exclusive"]})
+        self.assertEqual(manifest["manifests"]["stock_second_manifest"], "/data/src/manifest.csv")
+        self.assertEqual(manifest["manifests"]["manifest_content_hash"], "m_hash_v1")
+        self.assertEqual(manifest["session_gating_method"], "weekend_rth_heuristic")
+        # Truncation is recorded honestly: 3 available > 2 selected, 10 considered > 5 used.
+        self.assertEqual(manifest["symbol_selection"]["order"], "source_manifest_order")
+        self.assertTrue(manifest["symbol_selection"]["truncated"])
+        self.assertTrue(manifest["file_selection"]["truncated"])
+        # Hash: stable across created_at, OUTPUT-derived changes, AND location-only path changes (a pure rerun,
+        # or a relocation to a new path with identical content, must not move it)...
+        rerun = build_feature_manifest(**{**base, "created_at_utc": "2099-01-01T00:00:00+00:00",
+                                          "rows": 999, "loaded_symbols": ["AAA"],
+                                          "source_root": Path("/elsewhere"),
+                                          "stock_second_manifest": Path("/elsewhere/manifest.csv")})
+        self.assertEqual(manifest["inputs_content_hash"], rerun["inputs_content_hash"])
+        # ...but sensitive to every input that changes the produced features: the window/block, the input
+        # manifest CONTENT (not its path), and the session-gating path (which changes the emitted decision grid).
+        for moved in ({"block_seconds": 600}, {"manifest_content_hash": "m_hash_v2"},
+                      {"dataset_manifest_content_hash": "d_hash_v2"},
+                      {"session_gating_method": "pandas_market_calendars_nyse"}):
+            self.assertNotEqual(
+                manifest["inputs_content_hash"],
+                build_feature_manifest(**{**base, **moved})["inputs_content_hash"], moved,
+            )
+        # A selected symbol that loads zero frames is recorded as a load-drop, not silently lost.
+        dropped = build_feature_manifest(**{**base, "selected_symbols": ["A", "B", "C", "D", "E"],
+                                            "loaded_symbols": ["A", "B"], "total_symbols_available": 5})
+        self.assertEqual(dropped["symbol_selection"]["selected_count"], 5)
+        self.assertEqual(dropped["symbol_selection"]["loaded_count"], 2)
+        self.assertEqual(dropped["symbol_selection"]["dropped_at_load"], 3)
+        # No-truncation case is recorded as not-truncated.
+        clean = build_feature_manifest(**{**base, "symbol_limit": 0, "max_files": 0, "total_symbols_available": 2})
+        self.assertFalse(clean["symbol_selection"]["truncated"])
+        self.assertFalse(clean["file_selection"]["truncated"])
+
+    def test_stock_second_silver_parse_args_and_qt_dispatch(self) -> None:
+        from rl_quant.paths import scripts_dir
+        from rl_quant.workflows.cli import _DISPATCH
+        from rl_quant.workflows.commands.build_stock_second_silver_features import parse_args
+
+        # parse_args smoke: defaults resolve, and explicit overrides are honored.
+        defaults = parse_args([])
+        self.assertEqual(defaults.block_seconds, 300)
+        self.assertEqual(defaults.symbol_limit, 500)
+        self.assertEqual(defaults.max_files, 0)
+        self.assertFalse(defaults.include_extended_hours)
+        overridden = parse_args(["--block-seconds", "60", "--symbol-limit", "10", "--smoke", "--include-extended-hours"])
+        self.assertEqual((overridden.block_seconds, overridden.symbol_limit), (60, 10))
+        self.assertTrue(overridden.smoke and overridden.include_extended_hours)
+        # qt exposes the migrated builder and the wrapper script it dispatches to exists.
+        self.assertEqual(_DISPATCH[("build", "stock-second-silver")], "build_stock_second_silver_features.py")
+        self.assertTrue((scripts_dir() / _DISPATCH[("build", "stock-second-silver")]).exists())
+
     def test_qt_cli_dispatch_expands_preset_and_forwards_args(self) -> None:
         from rl_quant.cli import build_parser, resolve_workflow
         from rl_quant.paths import scripts_dir
