@@ -124,6 +124,16 @@ class DatasetManifest:
         # rather than raising -- acceptable because the manifest is machine-generated from a single dict; a
         # misspelled REQUIRED field still fails (its positional arg ends up absent).
         known = {f.name for f in fields(cls)}
+        # ...EXCEPT the action_return_* basis keys, which are the protected reportability contract: a
+        # silently-dropped typo there (e.g. action_return_fill_conventon) would degrade the manifest-side basis
+        # to all-None and make the return-basis agreement check vacuous, so reject any unknown action_return_* key.
+        protected_typos = sorted(k for k in payload if k.startswith("action_return_") and k not in known)
+        if protected_typos:
+            raise ResearchProtocolError(
+                f"unknown action_return_* key(s) on DatasetManifest (likely a typo of a basis field): "
+                f"{protected_typos}. The action-return basis is the protected reportability contract; a "
+                "silently-dropped typo would make the return-basis agreement check vacuous."
+            )
         kwargs = {key: value for key, value in payload.items() if key in known}
         kwargs["feature_fit_windows"] = windows
         return cls(**kwargs)

@@ -96,6 +96,11 @@ class ResearchProtocolTests(unittest.TestCase):
         restored = DatasetManifest.from_dict(enriched)
         self.assertEqual(restored, manifest)
 
+        # A TYPO of a protected action_return_* basis key is REJECTED (not silently dropped): a dropped typo
+        # would vacuum the manifest-side basis and the agreement check.
+        with self.assertRaisesRegex(ResearchProtocolError, "action_return_"):
+            DatasetManifest.from_dict({**payload, "action_return_fill_conventon": "x"})
+
         # The basis lands where the reportability agreement check reads it (action_return_* keys via ReturnBasis).
         from rl_quant.datasets.hour_from_subhour import ReturnBasis
         self.assertTrue(ReturnBasis.from_mapping(payload).is_complete())

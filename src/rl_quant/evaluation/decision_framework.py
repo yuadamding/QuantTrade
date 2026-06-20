@@ -539,8 +539,14 @@ def _cost_stress_rollout_completeness(summary: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_reportable_summary(summary: dict[str, Any]) -> list[str]:
+def validate_reportable_summary(summary: dict[str, Any], *, strict: bool = False) -> list[str]:
+    """Return the reportability reasons (empty == reportable). ``strict`` (default False, default-preserving)
+    additionally requires the action-return basis to be COMPLETE on both the eval and dataset-manifest sides --
+    the stricter posture for a NEW reportable artifact. With ``strict=False`` the basis is checked for AGREEMENT
+    and value VALIDITY only (a contradiction, an invalid weight semantics, or a corrupt clip), so a legacy /
+    partially-declared basis stays reportable."""
     errors: list[str] = []
+    declared_manifest = summary.get("dataset_manifest") if isinstance(summary.get("dataset_manifest"), dict) else {}
     # Structural artifact sections (unchanged). The baseline/stress requirements moved OUT of this list to the
     # canonical protocol contract below (the legacy baselines.CASH / cost_stress.* path checks are replaced).
     required_paths = [
@@ -560,27 +566,46 @@ def validate_reportable_summary(summary: dict[str, Any]) -> list[str]:
     # canonical ids extracted from the summary), replacing the hardcoded legacy dotted-path checks. Coverage
     # requires the produced grid (cash / buy_and_hold / random_action_distribution / same_turnover_random and
     # the cost_doubled stress); _cost_stress_rollout_completeness then preserves the old both-rollout-legs rigor.
+    # Quote-conditional spread_impact + buy-and-hold applicability are honored from EXPLICIT declarations
+    # (summary or dataset manifest), defaulting to the safe coverage defaults: buy-and-hold required, and
+    # spread_impact NOT required while crossable quotes are absent. QuantTrade's current OHLCV-aggregate
+    # datasets carry no quotes, so quote_data_available stays False unless a dataset explicitly declares it --
+    # at which point a run with crossable quotes can no longer skip the spread/impact stress.
+    quote_data_available = bool(
+        summary.get("quote_data_available", declared_manifest.get("quote_data_available", False))
+    )
+    buy_and_hold_applicable = bool(
+        summary.get("buy_and_hold_applicable", declared_manifest.get("buy_and_hold_applicable", True))
+    )
     ok, issues = validate_baseline_stress_coverage(
         sorted(extract_baseline_ids(summary)),
         sorted(extract_stress_ids(summary)),
+        buy_and_hold_applicable=buy_and_hold_applicable,
+        quote_data_available=quote_data_available,
     )
     if not ok:
         errors.extend(issues)
     errors.extend(_cost_stress_rollout_completeness(summary))
 
-    dataset_manifest = summary.get("dataset_manifest")
-    if isinstance(dataset_manifest, dict) and dataset_manifest.get("manifest_available") is False:
+    if declared_manifest.get("manifest_available") is False:
         errors.append("dataset_manifest_file_missing")
 
-    # Unconditional return-basis agreement (item #7): the evaluation's declared basis (summary["return_basis"],
-    # canonical fields) and the dataset manifest's declared basis (action_return_* keys) must AGREE -- no
-    # contradiction on a jointly-declared field, and no invalid weight semantics reaching a reportable artifact.
-    # Default-preserving: a basis that declares nothing (the legacy shape) yields no error.
+    # Return-basis reportability check: the evaluation's declared basis (summary["return_basis"], canonical
+    # fields) and the dataset manifest's declared basis (action_return_* keys) must (a) AGREE -- no contradiction
+    # on a jointly-declared field, no invalid weight semantics -- and (b) be value-VALID (no corrupt clip).
+    # Default-preserving: a basis that declares nothing (the legacy shape) yields no agreement/validity error.
+    # Only ``strict`` additionally requires the basis to be COMPLETE on both sides.
     from rl_quant.datasets.hour_from_subhour import ReturnBasis, return_basis_agreement_errors
 
     eval_basis = ReturnBasis.from_canonical(summary.get("return_basis") or {})
-    declared_basis = ReturnBasis.from_mapping(dataset_manifest if isinstance(dataset_manifest, dict) else {})
+    declared_basis = ReturnBasis.from_mapping(declared_manifest)
     errors.extend(return_basis_agreement_errors(eval_basis, declared_basis))
+    for label, basis in (("eval", eval_basis), ("dataset_manifest", declared_basis)):
+        errors.extend(f"return_basis_invalid[{label}]:{problem}" for problem in basis.validation_errors())
+    if strict:
+        for label, basis in (("eval", eval_basis), ("dataset_manifest", declared_basis)):
+            if not basis.is_complete():
+                errors.append(f"return_basis_incomplete[{label}]")
 
     reportability = summary.get("reportability")
     if isinstance(reportability, dict):

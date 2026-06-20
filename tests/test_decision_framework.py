@@ -394,3 +394,44 @@ class DecisionFrameworkTests(unittest.TestCase):
     def _agreement_errors(summary: dict) -> list:
         # Only the return-basis reasons (the rest of the summary is fully reportable in this fixture).
         return [e for e in validate_reportable_summary(summary) if e.startswith("return_basis_")]
+
+    def test_validate_reportable_summary_basis_validity_and_strict_completeness(self) -> None:
+        complete_eval = {
+            "weight_semantics": "full_capital_single_slot_returns",
+            "formula": "clipped_simple_return(entry_fill, exit_fill)",
+            "clip_min": -1.0, "clip_max": 1.0, "semantics_version": "v1",
+            "fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        }
+        # A CORRUPT clip is flagged even in non-strict mode (validity teeth; absence still yields no error).
+        corrupt = {**complete_eval, "clip_min": float("nan")}
+        errs = self._agreement_errors(self._reportable_summary_with_basis(return_basis=corrupt, dataset_manifest={}))
+        self.assertTrue(any("return_basis_invalid[eval]" in e for e in errs), errs)
+        # Non-strict: a complete eval basis with the manifest declaring nothing is reportable (default-preserving).
+        self.assertEqual(
+            self._agreement_errors(self._reportable_summary_with_basis(
+                return_basis=complete_eval, dataset_manifest={})),
+            [],
+        )
+        # Strict: requires BOTH sides complete -> a manifest declaring no basis fails.
+        summary = self._reportable_summary_with_basis(return_basis=complete_eval, dataset_manifest={})
+        strict_errs = [e for e in validate_reportable_summary(summary, strict=True) if e.startswith("return_basis_")]
+        self.assertIn("return_basis_incomplete[dataset_manifest]", strict_errs)
+        # Strict passes when both sides carry a complete basis.
+        full_manifest = {
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
+            "action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
+            "action_return_clip_min": -1.0, "action_return_clip_max": 1.0,
+            "action_return_semantics_version": "v1",
+            "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        }
+        summary2 = self._reportable_summary_with_basis(return_basis=complete_eval, dataset_manifest=full_manifest)
+        self.assertEqual(
+            [e for e in validate_reportable_summary(summary2, strict=True) if e.startswith("return_basis_")], [])
+
+    def test_validate_reportable_summary_quote_conditional_spread_impact(self) -> None:
+        # Default (no quote data declared): spread_impact is NOT required (current OHLCV-aggregate data).
+        base = self._reportable_summary_with_basis(return_basis={}, dataset_manifest={})
+        self.assertFalse(any("spread_impact" in str(e) for e in validate_reportable_summary(base)))
+        # A run that explicitly DECLARES crossable quote data must include the spread/impact stress.
+        with_quotes = {**base, "quote_data_available": True}
+        self.assertTrue(any("spread_impact" in str(e) for e in validate_reportable_summary(with_quotes)))

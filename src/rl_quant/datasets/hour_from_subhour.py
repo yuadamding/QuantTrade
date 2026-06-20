@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from os import PathLike
@@ -810,6 +811,31 @@ class ReturnBasis:
         """True iff a weight_semantics is declared but is NOT a recognized value (a typo / unresolved string
         reaching a reportable artifact). A None (undeclared) value is not "invalid" here."""
         return self.weight_semantics is not None and self.weight_semantics not in ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS
+
+    def validation_errors(self) -> list[str]:
+        """VALUE-level problems with the DECLARED fields, independent of completeness: a non-numeric /
+        non-finite clip bound, or clip_min > clip_max. (Weight-semantics validity is reported separately via
+        invalid_weight_semantics / the agreement check; formula and fill_convention are free-form descriptive
+        strings, not validated against a closed allow-list.) An undeclared (None) field contributes no error,
+        so this stays default-preserving for a partially-declared legacy basis while still catching a CORRUPT
+        declared value -- 'complete' must not be mistaken for 'valid'."""
+        errors: list[str] = []
+        for name in ("clip_min", "clip_max"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                errors.append(f"non_numeric_{name}:{value!r}")
+            elif not math.isfinite(value):
+                errors.append(f"non_finite_{name}:{value!r}")
+        cmin, cmax = self.clip_min, self.clip_max
+        if (
+            isinstance(cmin, (int, float)) and not isinstance(cmin, bool) and math.isfinite(cmin)
+            and isinstance(cmax, (int, float)) and not isinstance(cmax, bool) and math.isfinite(cmax)
+            and cmin > cmax
+        ):
+            errors.append(f"clip_min_exceeds_clip_max:{cmin!r}>{cmax!r}")
+        return errors
 
     def disagreements_with(self, other: "ReturnBasis") -> list[str]:
         """Fields that BOTH self and other declare (non-None) but with different values -- a genuine basis

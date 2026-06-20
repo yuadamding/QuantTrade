@@ -3277,6 +3277,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         nan_basis = ReturnBasis.from_mapping({**payload, "action_return_clip_min": float("nan")})
         self.assertEqual(nan_basis.disagreements_with(nan_basis), [])
 
+        # validation_errors separates VALIDITY from completeness: a "complete" basis can still be corrupt.
+        self.assertEqual(basis.validation_errors(), [])  # the good basis is valid
+        self.assertTrue(nan_basis.is_complete())  # all 6 declared + recognized weight semantics -> "complete"...
+        self.assertTrue(any("non_finite_clip_min" in e for e in nan_basis.validation_errors()))  # ...but NOT valid
+        inverted = ReturnBasis.from_mapping({**payload, "action_return_clip_min": 1.0, "action_return_clip_max": -1.0})
+        self.assertTrue(any("clip_min_exceeds_clip_max" in e for e in inverted.validation_errors()))
+        # Default-preserving: a partially-declared basis validates only what is present (no completeness demand).
+        self.assertEqual(ReturnBasis(weight_semantics="full_capital_single_slot_returns").validation_errors(), [])
+
     def test_execution_shadow_cost_basis_status(self) -> None:
         # The artifact must report what the PR-3 shadow's max_weight turnover pricing PROVES for the resolved
         # basis, not merely what the shadow assumes. Unresolved when semantics absent; native for
