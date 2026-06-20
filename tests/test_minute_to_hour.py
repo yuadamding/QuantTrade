@@ -59,6 +59,7 @@ from rl_quant.features.stock_second_context import (
     build_second_context_payload,
     regular_session_decision_grid_ms,
     save_second_context_payload,
+    session_gating_method,
     validate_second_context_payload,
 )
 from rl_quant.research_protocol import stable_json_hash
@@ -2366,6 +2367,120 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual(timestamp_ms_to_iso(decisions[-1]), "2026-06-12T19:30:00+00:00")
         self.assertEqual(timestamp_ms_to_iso(allowed[-1]), "2026-06-12T19:45:00+00:00")
+
+    def test_session_gating_heuristic_fallback_is_default_preserving(self) -> None:
+        # With no trading-calendar dep (forced None), the grid keeps its historical weekend+RTH behaviour:
+        # a holiday WEEKDAY (New Year's Day 2026-01-01, a Thursday) still emits a full grid (no calendar to
+        # exclude it), while weekends are excluded -- byte-identical to the pre-#6 code.
+        from unittest.mock import patch
+
+        import rl_quant.features.stock_second_context as ssc
+
+        with patch.object(ssc, "_nyse_calendar", return_value=None):
+            self.assertEqual(session_gating_method(), "weekend_rth_heuristic")
+            grid = regular_session_decision_grid_ms(
+                start="2026-01-01T00:00:00+00:00",       # Thu (New Year's holiday)
+                end_exclusive="2026-01-05T00:00:00+00:00",  # through Sun 2026-01-04
+                decision_interval="30m",
+            )
+        dates = {timestamp_ms_to_iso(ms)[:10] for ms in grid}
+        self.assertIn("2026-01-01", dates)   # holiday weekday NOT excluded by the heuristic (default-preserving)
+        self.assertIn("2026-01-02", dates)   # Fri trading day present
+        self.assertNotIn("2026-01-03", dates)  # Sat excluded
+        self.assertNotIn("2026-01-04", dates)  # Sun excluded
+
+    def test_session_gating_uses_real_calendar_when_available(self) -> None:
+        # With the optional calendar present (mocked), the grid excludes holidays and honours early closes.
+        from datetime import date, datetime
+        from unittest.mock import patch
+        from zoneinfo import ZoneInfo
+
+        import rl_quant.features.stock_second_context as ssc
+
+        eastern = ZoneInfo("America/New_York")
+        # Fake schedule: 2026-01-01 (Thu) is a HOLIDAY (absent); 2026-01-02 (Fri) is an EARLY CLOSE at 13:00 ET.
+        fake_schedule = {
+            date(2026, 1, 2): (
+                datetime(2026, 1, 2, 9, 30, tzinfo=eastern),
+                datetime(2026, 1, 2, 13, 0, tzinfo=eastern),
+            )
+        }
+        with patch.object(ssc, "_nyse_calendar", return_value=object()), patch.object(
+            ssc, "_real_session_schedule", return_value=fake_schedule
+        ):
+            self.assertEqual(session_gating_method(), "pandas_market_calendars_nyse")
+            grid = regular_session_decision_grid_ms(
+                start="2026-01-01T00:00:00+00:00",
+                end_exclusive="2026-01-03T00:00:00+00:00",
+                decision_interval="15m",
+            )
+        dates = {timestamp_ms_to_iso(ms)[:10] for ms in grid}
+        self.assertEqual(dates, {"2026-01-02"})  # holiday 01-01 excluded; only the trading day remains
+        # Early close 13:00 ET (= 18:00 UTC in EST): last 15m decision with reward exit <= close is 12:45 ET.
+        self.assertEqual(timestamp_ms_to_iso(grid[-1]), "2026-01-02T17:45:00+00:00")
+
+    def test_session_gating_method_recorded_in_manifest(self) -> None:
+        # The dataset manifest declares the session-gating path, and the heuristic limitation is present iff
+        # the heuristic path is active -- so a reportable artifact states whether sessions were calendar-aware.
+        payload = self._small_second_context_payload()
+        manifest = payload["dataset_manifest"]
+        method = session_gating_method()
+        self.assertEqual(manifest["session_gating_method"], method)
+        has_heuristic_limit = any("weekend+RTH heuristic" in lim for lim in manifest["known_limitations"])
+        self.assertEqual(has_heuristic_limit, method == "weekend_rth_heuristic")
+
+    def test_session_grid_reversed_or_degenerate_range_is_empty(self) -> None:
+        # A reversed or zero-width [start, end_exclusive) window yields no decisions and never reaches the real
+        # calendar's schedule() (guard short-circuits before resolving it). Matches the historical empty result.
+        reversed_grid = regular_session_decision_grid_ms(
+            start="2026-06-13T00:00:00+00:00",
+            end_exclusive="2026-06-12T00:00:00+00:00",
+            decision_interval="15m",
+        )
+        same = regular_session_decision_grid_ms(
+            start="2026-06-12T00:00:00+00:00",
+            end_exclusive="2026-06-12T00:00:00+00:00",
+            decision_interval="15m",
+        )
+        self.assertEqual(reversed_grid, [])
+        self.assertEqual(same, [])
+
+    def test_real_session_schedule_rejects_tz_naive_bounds(self) -> None:
+        # Defensive: pandas_market_calendars returns tz-aware UTC bounds; a tz-naive value would be silently
+        # localized to the host timezone by .astimezone(). The helper must fail loud instead.
+        from datetime import date as _date
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+
+        import rl_quant.features.stock_second_context as ssc
+
+        class _FakeTs:
+            def __init__(self, value: _dt) -> None:
+                self._value = value
+
+            def to_pydatetime(self) -> _dt:
+                return self._value
+
+        class _FakeIndex:
+            def __init__(self, value: _date) -> None:
+                self._value = value
+
+            def date(self) -> _date:
+                return self._value
+
+        class _FakeSchedule:
+            def iterrows(self):
+                naive = _dt(2026, 1, 2, 9, 30)  # tz-naive on purpose
+                yield _FakeIndex(_date(2026, 1, 2)), {"market_open": _FakeTs(naive), "market_close": _FakeTs(naive)}
+
+        class _FakeCalendar:
+            def schedule(self, *, start_date: str, end_date: str) -> "_FakeSchedule":
+                return _FakeSchedule()
+
+        with self.assertRaisesRegex(ValueError, "tz-naive"):
+            ssc._real_session_schedule(
+                _FakeCalendar(), _date(2026, 1, 2), _date(2026, 1, 2), ZoneInfo("America/New_York")
+            )
 
     def test_second_context_postclose_exit_flag_is_reportability_metadata(self) -> None:
         payload = self._small_second_context_payload(allow_post_close_exit=True)

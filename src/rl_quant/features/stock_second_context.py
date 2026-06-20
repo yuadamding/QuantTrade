@@ -4,7 +4,7 @@ import bisect
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -149,6 +149,75 @@ def parse_duration_seconds(value: str) -> int:
     return seconds
 
 
+# --- Optional NYSE trading-calendar session gating ------------------------------------------------------
+# The decision grid below gates sessions by the real NYSE calendar (holidays + early closes) WHEN the
+# optional ``pandas_market_calendars`` dependency is importable, and otherwise falls back to a weekend-only +
+# fixed 9:30-16:00 RTH heuristic that is byte-identical to the historical behaviour. The path actually taken
+# is reported by ``session_gating_method()`` and recorded in the dataset manifest, so a reportable artifact
+# declares whether its sessions were holiday/early-close aware.
+_NYSE_CALENDAR_UNRESOLVED = object()
+_nyse_calendar_cache: Any = _NYSE_CALENDAR_UNRESOLVED
+
+
+def _nyse_calendar() -> Any:
+    """The pandas_market_calendars NYSE calendar if the optional dep is importable, else None (cached). Any
+    import/construction failure falls back to None -- the heuristic path is always safe, and the fallback is
+    made observable via ``session_gating_method()`` rather than hidden."""
+    global _nyse_calendar_cache
+    if _nyse_calendar_cache is _NYSE_CALENDAR_UNRESOLVED:
+        try:
+            import pandas_market_calendars as mcal
+        except ImportError:
+            _nyse_calendar_cache = None
+        else:
+            try:
+                _nyse_calendar_cache = mcal.get_calendar("NYSE")
+            except Exception as exc:
+                # The dep is INSTALLED but construction failed (version / tzdata misconfiguration). The
+                # heuristic fallback is still safe, but unlike a plain absent-dep this is unexpected: warn so an
+                # operator who installed pmc is not silently downgraded (the manifest also records the path).
+                import warnings
+
+                warnings.warn(
+                    f"pandas_market_calendars is installed but get_calendar('NYSE') failed ({exc!r}); falling "
+                    "back to the weekend+RTH session-gating heuristic (session_gating_method reports it).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                _nyse_calendar_cache = None
+    return _nyse_calendar_cache
+
+
+def session_gating_method() -> str:
+    """Which session-gating path is active: the real NYSE calendar (holiday/early-close aware) when the
+    optional ``pandas_market_calendars`` dependency is importable, else the weekend+RTH heuristic."""
+    return "pandas_market_calendars_nyse" if _nyse_calendar() is not None else "weekend_rth_heuristic"
+
+
+def _real_session_schedule(
+    calendar: Any, start_date: date, end_date: date, exchange_tz: ZoneInfo
+) -> dict[date, tuple[datetime, datetime]]:
+    """{trading_date: (session_open, session_close)} in ``exchange_tz`` from the NYSE calendar over the
+    inclusive [start_date, end_date] range. Non-trading days (weekends + holidays) are simply ABSENT from the
+    mapping; early closes carry their real (e.g. 13:00 ET) close. Only called when ``calendar`` is not None."""
+    schedule = calendar.schedule(start_date=start_date.isoformat(), end_date=end_date.isoformat())
+    out: dict[date, tuple[datetime, datetime]] = {}
+    for index, row in schedule.iterrows():
+        trading_date = index.date()
+        open_raw = row["market_open"].to_pydatetime()
+        close_raw = row["market_close"].to_pydatetime()
+        if open_raw.tzinfo is None or close_raw.tzinfo is None:
+            # pandas_market_calendars returns tz-aware UTC bounds; a tz-naive value would be localized to the
+            # HOST timezone by .astimezone(), silently shifting every session by the host UTC offset. Fail loud
+            # rather than emit an environment-dependent grid.
+            raise ValueError(
+                f"pandas_market_calendars returned tz-naive session bounds for {trading_date}; expected tz-aware "
+                "UTC market_open/market_close. Refusing to localize to the host timezone."
+            )
+        out[trading_date] = (open_raw.astimezone(exchange_tz), close_raw.astimezone(exchange_tz))
+    return out
+
+
 def regular_session_decision_grid_ms(
     *,
     start: str,
@@ -172,26 +241,50 @@ def regular_session_decision_grid_ms(
 
     start_dt = _aware_utc(start).astimezone(exchange_tz)
     end_dt = _aware_utc(end_exclusive).astimezone(exchange_tz)
+    if end_dt <= start_dt:
+        # Degenerate / reversed [start, end_exclusive) window emits no decisions (the historical heuristic
+        # already yielded an empty grid here via the window filter); short-circuit so the real calendar's
+        # schedule() is never called with a reversed range.
+        return []
     execution_latency = timedelta(milliseconds=execution_latency_ms)
     decisions: list[int] = []
+    # Prefer the real NYSE calendar (holiday + early-close aware) when the optional dep is importable;
+    # otherwise fall back to the weekend-only + fixed-RTH heuristic. session_gating_method() reports which.
+    calendar = _nyse_calendar()
+    schedule = (
+        _real_session_schedule(calendar, start_dt.date(), end_dt.date(), exchange_tz)
+        if calendar is not None
+        else None
+    )
     current_date = start_dt.date()
     while current_date <= end_dt.date():
-        # KNOWN LIMITATION: only weekends are excluded -- there is no market-holiday/early-close
-        # calendar, so holiday weekdays still emit a full decision grid. Those rows come back
-        # all-invalid (no second data) and are masked, so there is no leakage, but they inflate
-        # row/segment counts and quality denominators. A trading calendar should gate sessions.
-        if current_date.weekday() < 5:
+        if schedule is not None:
+            bounds = schedule.get(current_date)
+            if bounds is None:
+                # Non-trading day per the real calendar (weekend OR holiday): emit no decisions.
+                current_date += timedelta(days=1)
+                continue
+            session_start, session_end = bounds
+        elif current_date.weekday() < 5:
+            # KNOWN LIMITATION of the heuristic fallback: only weekends are excluded -- there is no
+            # market-holiday/early-close calendar, so holiday weekdays still emit a full 9:30-16:00 grid.
+            # Those rows come back all-invalid (no second data) and are masked, so there is no leakage, but
+            # they inflate row/segment counts and quality denominators. Install pandas_market_calendars to
+            # gate sessions by the real calendar (session_gating_method() records which path was used).
             session_start = datetime.combine(current_date, RTH_START, tzinfo=exchange_tz)
             session_end = datetime.combine(current_date, RTH_END, tzinfo=exchange_tz)
-            decision = session_start + timedelta(seconds=interval_seconds)
-            while decision + timedelta(seconds=interval_seconds) <= session_end:
-                reward_exit = decision + timedelta(seconds=interval_seconds) + execution_latency
-                if not allow_post_close_exit and reward_exit > session_end:
-                    break
-                decision_utc = decision.astimezone(timezone.utc)
-                if start_dt.astimezone(timezone.utc) <= decision_utc < end_dt.astimezone(timezone.utc):
-                    decisions.append(int(decision_utc.timestamp() * 1000))
-                decision += timedelta(seconds=interval_seconds)
+        else:
+            current_date += timedelta(days=1)
+            continue
+        decision = session_start + timedelta(seconds=interval_seconds)
+        while decision + timedelta(seconds=interval_seconds) <= session_end:
+            reward_exit = decision + timedelta(seconds=interval_seconds) + execution_latency
+            if not allow_post_close_exit and reward_exit > session_end:
+                break
+            decision_utc = decision.astimezone(timezone.utc)
+            if start_dt.astimezone(timezone.utc) <= decision_utc < end_dt.astimezone(timezone.utc):
+                decisions.append(int(decision_utc.timestamp() * 1000))
+            decision += timedelta(seconds=interval_seconds)
         current_date += timedelta(days=1)
     return decisions
 
@@ -944,6 +1037,9 @@ def build_second_context_payload(
     reportability_scope = (
         "extended_reward_exit_allowed" if config.allow_post_close_exit else "regular_session_reward_exits_only"
     )
+    # Resolve once so the manifest field and the conditional known-limitation cannot disagree (and the
+    # optional-dep lookup runs a single time).
+    session_method = session_gating_method()
     manifest = {
         **base_manifest,
         "schema_version": "stock_second_context_decision_v3",
@@ -985,6 +1081,7 @@ def build_second_context_payload(
         "ingestion_latency_ms": config.ingestion_latency_ms,
         "execution_latency_ms": config.execution_latency_ms,
         "allow_post_close_exit": config.allow_post_close_exit,
+        "session_gating_method": session_method,
         "execution_model": config.execution_model,
         "execution_model_detail": execution_model,
         "tensor_availability": tensor_availability,
@@ -1002,6 +1099,15 @@ def build_second_context_payload(
             "Top-stock second bars provide market context; action returns require separate tradable action bars.",
             "Sparse seconds are preserved through masks and active-second features.",
             "Action-return labels use first available action bar at or after the decision and reward timestamps.",
+            *(
+                [
+                    "Session gating uses a weekend+RTH heuristic (no market-holiday/early-close calendar): "
+                    "holiday weekdays still emit a full decision grid and inflate row/segment counts. Install "
+                    "pandas_market_calendars for holiday/early-close-aware sessions (session_gating_method)."
+                ]
+                if session_method != "pandas_market_calendars_nyse"
+                else []
+            ),
         ],
     }
     payload = {
