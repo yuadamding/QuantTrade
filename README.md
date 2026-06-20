@@ -107,11 +107,11 @@ datasets, generated model checkpoints, or generated run directories.
 
 ## Environment
 
-Use the `ml1` conda environment used by this workspace:
+Use the `quanttrade` conda environment (Python 3.11) for this project:
 
 ```bash
 cd QuantTrade
-conda run -n ml1 python -m pip install -e ".[dev,data]"
+conda run -n quanttrade python -m pip install -e ".[dev,data]"
 ```
 
 Core dependencies are intentionally small:
@@ -127,7 +127,7 @@ Core dependencies are intentionally small:
 For offline LLM feature extraction with the downloaded local model:
 
 ```bash
-conda run -n ml1 python -m pip install -e ".[llm]"
+conda run -n quanttrade python -m pip install -e ".[llm]"
 ```
 
 When `scripts/build_news_llm_features.py` imports precomputed LLM outputs and
@@ -852,9 +852,9 @@ carried forward until the action changes or the position is liquidated.
 ### Quality Checks
 
 ```bash
-conda run -n ml1 ruff check .
-conda run -n ml1 python -m compileall -q src scripts tests
-conda run -n ml1 pytest -q
+conda run -n quanttrade ruff check .
+conda run -n quanttrade python -m compileall -q src scripts tests
+conda run -n quanttrade pytest -q
 ```
 
 ### CUDA Check
@@ -867,14 +867,14 @@ Verify availability directly: `python -c "import torch; print(torch.cuda.is_avai
 Fetch top US market-cap universe:
 
 ```bash
-conda run -n ml1 python scripts/fetch_top_us_market_cap_universe.py \
+conda run -n quanttrade python scripts/fetch_top_us_market_cap_universe.py \
   --limit 1000
 ```
 
 Fetch top-volume stock and ETF universes:
 
 ```bash
-conda run -n ml1 python scripts/fetch_top_volume_universes.py \
+conda run -n quanttrade python scripts/fetch_top_volume_universes.py \
   --stock-limit 1000 \
   --etf-limit 500
 ```
@@ -884,19 +884,19 @@ conda run -n ml1 python scripts/fetch_top_volume_universes.py \
 Daily:
 
 ```bash
-conda run -n ml1 python scripts/download_daily_ohlcv.py --help
+conda run -n quanttrade python scripts/download_daily_ohlcv.py --help
 ```
 
 Hourly:
 
 ```bash
-conda run -n ml1 python scripts/download_hourly_ohlcv.py --help
+conda run -n quanttrade python scripts/download_hourly_ohlcv.py --help
 ```
 
 Minute:
 
 ```bash
-conda run -n ml1 python scripts/download_intraday_ohlcv.py --help
+conda run -n quanttrade python scripts/download_intraday_ohlcv.py --help
 ```
 
 Yahoo Finance limits true `1m` data to a short recent window. Use explicit
@@ -911,7 +911,7 @@ repo to `../archive/quanttrade_scripts/`. Restore them from there if needed.
 Train the daily strategy allocator (`qt train strategy`):
 
 ```bash
-conda run -n ml1 python scripts/train_strategy_allocator.py \
+conda run -n quanttrade python scripts/train_strategy_allocator.py \
   --device auto \
   --amp
 ```
@@ -921,14 +921,14 @@ conda run -n ml1 python scripts/train_strategy_allocator.py \
 Build an hourly transformer dataset:
 
 ```bash
-conda run -n ml1 python scripts/build_hourly_transformer_dataset.py \
+conda run -n quanttrade python scripts/build_hourly_transformer_dataset.py \
   --output-dir derived/rl_hourly/top_volume_2026
 ```
 
 Train the hourly causal-transformer DQN:
 
 ```bash
-conda run -n ml1 python scripts/train_hourly_causal_transformer_rl.py \
+conda run -n quanttrade python scripts/train_hourly_causal_transformer_rl.py \
   --dataset derived/rl_hourly/top_volume_2026/hourly_transformer_dataset.pt \
   --device auto \
   --amp \
@@ -951,13 +951,13 @@ The direct bar trainer is risk-aware by default. It supports:
 Build the default recent minute dataset:
 
 ```bash
-conda run -n ml1 python scripts/build_minute_transformer_dataset.py
+conda run -n quanttrade python scripts/build_minute_transformer_dataset.py
 ```
 
 Train the minute-level causal-transformer DQN:
 
 ```bash
-conda run -n ml1 python scripts/train_minute_causal_transformer_rl.py \
+conda run -n quanttrade python scripts/train_minute_causal_transformer_rl.py \
   --device auto \
   --amp \
   --min-free-vram-gb 2
@@ -971,13 +971,13 @@ stable research because it can overfit and switch too frequently.
 Build hourly decisions from minute context:
 
 ```bash
-conda run -n ml1 python scripts/build_hourly_from_minute_context_dataset.py
+conda run -n quanttrade python scripts/build_hourly_from_minute_context_dataset.py
 ```
 
 Train the hierarchical minute-to-hour transformer:
 
 ```bash
-conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
+conda run -n quanttrade python scripts/train_hourly_from_minute_context_rl.py \
   --device auto \
   --amp \
   --min-free-vram-gb 2 \
@@ -988,7 +988,7 @@ conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
 Warm-start rolling periods from a prior checkpoint:
 
 ```bash
-conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py \
+conda run -n quanttrade python scripts/train_hourly_from_minute_context_rl.py \
   --device auto \
   --amp \
   --min-free-vram-gb 2 \
@@ -1004,13 +1004,13 @@ dataset and code.
 Build hourly decisions from Polygon 1-second aggregate context:
 
 ```bash
-conda run -n ml1 python scripts/build_hourly_from_second_context_dataset.py
+conda run -n quanttrade python scripts/build_hourly_from_second_context_dataset.py
 ```
 
 Train the second-to-hour transformer:
 
 ```bash
-conda run -n ml1 python scripts/train_hourly_from_second_context_rl.py \
+conda run -n quanttrade python scripts/train_hourly_from_second_context_rl.py \
   --device auto \
   --amp \
   --min-free-vram-gb 2
@@ -1025,7 +1025,7 @@ to `--max-subhour-tokens` before intrahour attention.
 Build compact silver features:
 
 ```bash
-conda run -n ml1 python scripts/build_stock_second_silver_features.py \
+conda run -n quanttrade python scripts/build_stock_second_silver_features.py \
   --start 2026-06-12T00:00:00+00:00 \
   --end-exclusive 2026-06-13T00:00:00+00:00 \
   --block-seconds 300 \
@@ -1035,7 +1035,7 @@ conda run -n ml1 python scripts/build_stock_second_silver_features.py \
 Build a gold second-context decision dataset:
 
 ```bash
-conda run -n ml1 python scripts/build_second_context_decision_dataset.py \
+conda run -n quanttrade python scripts/build_second_context_decision_dataset.py \
   --decision-interval 15m \
   --context-seconds 3600 \
   --block-seconds 300 \
@@ -1048,7 +1048,7 @@ conda run -n ml1 python scripts/build_second_context_decision_dataset.py \
 Train the action-conditioned second-context scorer:
 
 ```bash
-conda run -n ml1 python scripts/train_second_context_action_scorer.py \
+conda run -n quanttrade python scripts/train_second_context_action_scorer.py \
   --device auto \
   --amp \
   --epochs 500 \
@@ -1071,7 +1071,7 @@ test scoring, and confidence artifacts use `--eval-batch-size` and are also batc
 Evaluate a second-context dataset:
 
 ```bash
-conda run -n ml1 python scripts/evaluate_second_context_dataset.py
+conda run -n quanttrade python scripts/evaluate_second_context_dataset.py
 ```
 
 ### QQQ Intraday NBBO
@@ -1079,13 +1079,13 @@ conda run -n ml1 python scripts/evaluate_second_context_dataset.py
 Extract quote/NBBO features when raw quote data is available:
 
 ```bash
-conda run -n ml1 python scripts/extract_nbbo_features.py --help
+conda run -n quanttrade python scripts/extract_nbbo_features.py --help
 ```
 
 Train the QQQ intraday DQN:
 
 ```bash
-conda run -n ml1 python scripts/train_dqn_agent.py \
+conda run -n quanttrade python scripts/train_dqn_agent.py \
   --train-dates 2025-01-02,2025-01-03 \
   --val-dates 2025-01-06 \
   --test-dates 2025-01-07 \
@@ -1099,7 +1099,7 @@ conda run -n ml1 python scripts/train_dqn_agent.py \
 Validate dataset and model manifests:
 
 ```bash
-conda run -n ml1 python scripts/validate_research_protocol.py \
+conda run -n quanttrade python scripts/validate_research_protocol.py \
   --dataset-manifest data/rl_hour_from_minute/top_volume_1m_recent/dataset_manifest.json
 ```
 
@@ -1199,9 +1199,9 @@ Evaluation:
 Run these before committing or pushing:
 
 ```bash
-conda run -n ml1 ruff check .
-conda run -n ml1 python -m compileall -q src scripts tests
-conda run -n ml1 pytest -q
+conda run -n quanttrade ruff check .
+conda run -n quanttrade python -m compileall -q src scripts tests
+conda run -n quanttrade pytest -q
 ```
 
 The suite lives under `tests/` as per-domain files (run all with `pytest tests/`), sharing
@@ -1238,7 +1238,7 @@ The tests cover:
 Run commands from the repository root and install the package:
 
 ```bash
-conda run -n ml1 python -m pip install -e ".[dev,data]"
+conda run -n quanttrade python -m pip install -e ".[dev,data]"
 ```
 
 ### CUDA is not used

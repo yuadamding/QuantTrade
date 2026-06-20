@@ -24,6 +24,7 @@ from rl_quant.research_protocol import (  # noqa: E402
     stable_json_hash,
     utc_now_iso,
 )
+from rl_quant.protocol.action_return_basis import ReturnBasis  # noqa: E402
 
 SYMBOL_DATE_RE = re.compile(r"^(?P<symbol>.+?)_\d{4}-\d{2}-\d{2}_")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -237,21 +238,31 @@ def _direct_hourly_action_return_basis(bar_interval: str) -> dict:
     next_bar_close): entry at the DECISION bar's own close, exit at the next bar's close, ZERO execution latency
     -- a decide-and-fill-at-close convention that is MORE OPTIMISTIC than a latency-aware fill (it assumes you
     transact at the exact close you just observed). Returns are clipped to [-1, 1]; CASH is 0 and the chosen
-    action gets full capital (single slot)."""
-    return {
-        "action_return_weight_semantics": "full_capital_single_slot_returns",
-        "action_return_formula": "clipped_simple_return(decision_bar_close, next_bar_close)",
-        "action_return_clip_min": -1.0,
-        "action_return_clip_max": 1.0,
-        "action_return_semantics_version": "v1",
-        "action_return_fill_convention": "decision_bar_close_to_next_bar_close",
-        "action_return_basis_version": "v2",
-        "action_return_entry_fill_rule": "decision_bar_close",
-        "action_return_exit_fill_rule": "next_bar_close",
-        "action_return_execution_latency_ms": 0,
-        "action_return_source_bar_interval": bar_interval,
-        "action_return_price_source": "bar_close",
-    }
+    action gets full capital (single slot).
+
+    Built via the canonical ReturnBasis (no hand-spelled action_return_* keys) and validated at write time --
+    the builder is the source of truth for dataset semantics, so an incomplete/invalid basis fails the build
+    rather than silently writing a manifest that DatasetManifest.validate() would not catch."""
+    basis = ReturnBasis(
+        weight_semantics="full_capital_single_slot_returns",
+        formula="clipped_simple_return(decision_bar_close, next_bar_close)",
+        clip_min=-1.0,
+        clip_max=1.0,
+        semantics_version="v1",
+        fill_convention="decision_bar_close_to_next_bar_close",
+        basis_version="v2",
+        entry_fill_rule="decision_bar_close",
+        exit_fill_rule="next_bar_close",
+        execution_latency_ms=0,
+        source_bar_interval=bar_interval,
+        price_source="bar_close",
+    )
+    problems = basis.validation_errors()
+    if problems or not basis.is_complete():
+        raise ValueError(
+            f"direct-hourly action-return basis is invalid/incomplete: errors={problems}, basis={basis!r}"
+        )
+    return basis.to_payload_mapping()
 
 
 def aggregate_stock_features(values: list[BarFeature], *, total_symbols: int) -> list[float]:
@@ -525,8 +536,12 @@ def main() -> int:
     dataset_file_name = args.dataset_file_name or f"{interval_label(bar_interval)}_transformer_dataset.pt"
     dataset_path = args.output_dir / dataset_file_name
     # Canonical action-return basis, recorded ONCE and written into BOTH the .pt payload and dataset_manifest.json
-    # (via the DatasetManifest below) so the reportability agreement check has matching declared copies.
+    # (via the DatasetManifest below) so the reportability agreement check has matching declared copies. The
+    # content hash is a single stable stamp over the declared basis -- persisted for audit and folded into
+    # source_metadata so source_manifest_hash captures the basis economics (two datasets with identical source
+    # inputs but different action-return economics no longer collide on the same hash).
     action_return_basis = _direct_hourly_action_return_basis(bar_interval)
+    return_basis_content_hash = ReturnBasis.from_mapping(action_return_basis).content_hash()
     torch.save(
         {
             "timestamps": timestamps,
@@ -541,6 +556,7 @@ def main() -> int:
             "action_label_valid_mask": label_valid_mask,
             "action_mask_semantics": action_mask_semantics,
             **action_return_basis,
+            "return_basis_content_hash": return_basis_content_hash,
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
             "dataset_reportable": dataset_reportable,
@@ -606,6 +622,10 @@ def main() -> int:
         "dataset_reportable": dataset_reportable,
         "dataset_reportability_errors": dataset_reportability_errors,
         "future_label_filtered_rows": future_label_filtered_rows,
+        # Fold the action-return basis into the source hash so source_manifest_hash captures the dataset's
+        # return ECONOMICS, not just its inputs (a basis change now changes the provenance hash).
+        "action_return_basis": action_return_basis,
+        "return_basis_content_hash": return_basis_content_hash,
     }
     metadata = {
         "rows": len(timestamps),
@@ -647,6 +667,9 @@ def main() -> int:
         next_timestamps_hash=hash_string_sequence(next_timestamps),
         first_timestamp=timestamps[0],
         last_timestamp=timestamps[-1],
+        # INVARIANT: source_manifest_hash is PROVENANCE only -- it is never read back as a cache/resume key in
+        # this builder. Folding the action-return basis into source_metadata is therefore safe; do not start
+        # gating caching/resume on this hash, or a basis change would silently invalidate prior datasets.
         source_manifest_hash=stable_json_hash(source_metadata),
         known_limitations=[
             "Yahoo intraday history is short and may contain missing bars.",
@@ -669,6 +692,7 @@ def main() -> int:
                 "future_label_filtered_rows": future_label_filtered_rows,
                 "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
                 "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
+                "return_basis_content_hash": return_basis_content_hash,
             }
         )
     except ResearchProtocolError as exc:
@@ -684,6 +708,7 @@ def main() -> int:
                 "future_label_filtered_rows": future_label_filtered_rows,
                 "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
                 "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
+                "return_basis_content_hash": return_basis_content_hash,
             }
         )
     (args.output_dir / "dataset_manifest.json").write_text(

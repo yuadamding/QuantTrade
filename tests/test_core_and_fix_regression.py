@@ -3250,6 +3250,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(basis.fill_convention, "first_close_at_or_after_decision_plus_execution_latency")
         # Round-trips through the canonical (summary) representation.
         self.assertEqual(ReturnBasis.from_canonical(basis.to_dict()), basis)
+        # to_payload_mapping is the inverse of from_mapping (action_return_* keys), for builders writing the basis.
+        self.assertTrue(all(k.startswith("action_return_") for k in basis.to_payload_mapping()))
+        self.assertEqual(ReturnBasis.from_mapping(basis.to_payload_mapping()), basis)
         # from_mapping also reads attributes off a split-like object.
         from types import SimpleNamespace
         self.assertEqual(ReturnBasis.from_mapping(SimpleNamespace(**payload)), basis)

@@ -105,6 +105,11 @@ class ReturnBasis:
         """All canonical fields (including None), for the reportability summary."""
         return {name: getattr(self, name) for name in _RETURN_BASIS_FIELD_KEYS}
 
+    def to_payload_mapping(self) -> dict[str, Any]:
+        """The basis keyed by the ``action_return_*`` PAYLOAD/manifest keys (the inverse of from_mapping), so a
+        builder can write it into a dataset payload / DatasetManifest without hand-spelling the keys."""
+        return {key: getattr(self, name) for name, key in _RETURN_BASIS_FIELD_KEYS.items()}
+
     def declared(self) -> dict[str, Any]:
         """Only the fields that are declared (non-None)."""
         return {name: value for name, value in self.to_dict().items() if value is not None}
