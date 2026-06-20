@@ -67,6 +67,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-group-share-observations", type=int, default=20)
     parser.add_argument("--reportable-max-group-share", type=float, default=0.75)
     parser.add_argument("--reportable-max-leveraged-share", type=float, default=0.50)
+    parser.add_argument(
+        "--strict-return-basis",
+        action="store_true",
+        help=(
+            "Require a COMPLETE action-return basis on both the evaluation and dataset-manifest sides for the "
+            "run to be reportable (validate_reportable_summary strict mode). Off by default (default-preserving: "
+            "a legacy / partially-declared basis still reports); enable to guarantee a reportable artifact "
+            "declares its full, agreeing return basis. A dataset built by the current builder emits a complete "
+            "v2 basis, so a fresh run passes; an older dataset would be flagged until rebuilt."
+        ),
+    )
     parser.add_argument("--random-baseline-paths", type=int, default=256)
     parser.add_argument(
         "--cost-stress-bps",
@@ -1454,7 +1465,7 @@ def main() -> int:
         "return_diagnostics": return_diagnostics,
         "reportability": reportability,
     }
-    reportability_errors = validate_reportable_summary(summary)
+    reportability_errors = validate_reportable_summary(summary, strict=args.strict_return_basis)
     summary["reportability"] = {
         "reportable": bool(reportability["reportable"]) and not reportability_errors,
         "reasons": list(dict.fromkeys([*reportability.get("reasons", []), *reportability_errors])),

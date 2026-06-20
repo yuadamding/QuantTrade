@@ -598,6 +598,14 @@ class EvaluationTests(unittest.TestCase):
 
         self.assertEqual(validate_reportable_summary(summary), [])
 
+    def test_strict_return_basis_flag_is_opt_in(self) -> None:
+        # The opt-in --strict-return-basis flag (default off, default-preserving) makes the strict reportability
+        # gate reachable from the production trainer; it is plumbed to validate_reportable_summary(strict=...).
+        module = load_script("train_hourly_causal_transformer_rl")
+        self.assertFalse(module.parse_args(["--dataset", "d.pt", "--run-name", "u"]).strict_return_basis)
+        self.assertTrue(
+            module.parse_args(["--dataset", "d.pt", "--run-name", "u", "--strict-return-basis"]).strict_return_basis)
+
     def test_evaluation_uses_valid_indices_and_resets_at_gaps(self) -> None:
         class FixedPolicy(nn.Module):
             def forward(
