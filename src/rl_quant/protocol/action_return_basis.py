@@ -11,6 +11,8 @@ Pure, stdlib only; changes no backtest number.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -31,7 +33,26 @@ _RETURN_BASIS_FIELD_KEYS = {
     "clip_max": "action_return_clip_max",
     "semantics_version": "action_return_semantics_version",
     "fill_convention": "action_return_fill_convention",
+    # Structured v2 provenance: the precise economics summarized by the fill_convention label. Optional/None on
+    # a v1 (or version-less) basis -- a basis_version=="v2" basis declares all of them.
+    "basis_version": "action_return_basis_version",
+    "entry_fill_rule": "action_return_entry_fill_rule",
+    "exit_fill_rule": "action_return_exit_fill_rule",
+    "execution_latency_ms": "action_return_execution_latency_ms",
+    "source_bar_interval": "action_return_source_bar_interval",
+    "price_source": "action_return_price_source",
 }
+
+# The v1 core basis (the original flat fields). v2 ADDS the structured provenance fields below. Completeness is
+# version-aware so an existing version-less complete basis stays complete (default-preserving).
+_V1_BASIS_FIELDS = ("weight_semantics", "formula", "clip_min", "clip_max", "semantics_version", "fill_convention")
+_V2_STRUCTURED_FIELDS = (
+    "entry_fill_rule", "exit_fill_rule", "execution_latency_ms", "source_bar_interval", "price_source",
+)
+# Recognized basis-SCHEMA versions (None == version-less, treated as v1). basis_version versions the SCHEMA
+# (which provenance fields are mandatory), which is ORTHOGONAL to semantics_version (the return-FORMULA
+# economics) -- a v2-schema basis legitimately carries semantics_version "v1".
+_KNOWN_BASIS_VERSIONS = frozenset({"v1", "v2"})
 
 
 def _basis_value_differs(a: Any, b: Any) -> bool:
@@ -57,6 +78,14 @@ class ReturnBasis:
     clip_max: float | None = None
     semantics_version: str | None = None
     fill_convention: str | None = None
+    # Structured v2 provenance (declared together when basis_version == "v2"): the precise entry/exit fill
+    # rules, execution latency, source bar interval, and price source behind the fill_convention summary label.
+    basis_version: str | None = None
+    entry_fill_rule: str | None = None
+    exit_fill_rule: str | None = None
+    execution_latency_ms: int | None = None
+    source_bar_interval: str | None = None
+    price_source: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: Any) -> "ReturnBasis":
@@ -81,11 +110,26 @@ class ReturnBasis:
         return {name: value for name, value in self.to_dict().items() if value is not None}
 
     def is_complete(self) -> bool:
-        """True iff every field is declared AND the weight semantics is a recognized value."""
-        return (
-            len(self.declared()) == len(_RETURN_BASIS_FIELD_KEYS)
-            and self.weight_semantics in ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS
-        )
+        """True iff the basis is fully declared FOR ITS VERSION and the weight semantics is recognized. A v1
+        (or version-less) basis requires the core flat fields; a basis_version == "v2" basis additionally
+        requires the structured provenance (entry/exit fill rule, execution latency, source bar interval, price
+        source). Default-preserving: an existing version-less complete basis is still complete."""
+        if self.weight_semantics not in ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS:
+            return False
+        if any(getattr(self, name) is None for name in _V1_BASIS_FIELDS):
+            return False
+        # Fail-closed on the discriminator: a version-less or explicit "v1" basis needs only the core fields,
+        # but ANY other version -- the structured "v2", a future version, or a typo ("V2", "v3", " v2") -- must
+        # declare the structured provenance. A basis claiming a structured version must not pass with none.
+        if self.basis_version not in (None, "v1"):
+            return all(getattr(self, name) is not None for name in _V2_STRUCTURED_FIELDS)
+        return True
+
+    def content_hash(self) -> str:
+        """A stable sha256 over the DECLARED basis fields -- a single provenance stamp for strict reportability
+        (two economically-different bases hash differently; an undeclared field never affects the hash)."""
+        payload = json.dumps(self.declared(), sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def invalid_weight_semantics(self) -> bool:
         """True iff a weight_semantics is declared but is NOT a recognized value (a typo / unresolved string
@@ -115,6 +159,16 @@ class ReturnBasis:
             and cmin > cmax
         ):
             errors.append(f"clip_min_exceeds_clip_max:{cmin!r}>{cmax!r}")
+        latency = self.execution_latency_ms
+        if latency is not None:
+            if not isinstance(latency, int) or isinstance(latency, bool):
+                errors.append(f"non_integer_execution_latency_ms:{latency!r}")
+            elif latency < 0:
+                errors.append(f"negative_execution_latency_ms:{latency!r}")
+        if self.basis_version is not None and self.basis_version not in _KNOWN_BASIS_VERSIONS:
+            # An unrecognized schema version (typo / future) is fail-closed: we cannot know its requirements,
+            # so it is invalid rather than silently treated as the laxer v1.
+            errors.append(f"unrecognized_basis_version:{self.basis_version!r}")
         return errors
 
     def disagreements_with(self, other: "ReturnBasis") -> list[str]:

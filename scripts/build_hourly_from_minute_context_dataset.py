@@ -1000,6 +1000,15 @@ def main() -> int:
         "action_return_clip_max": 1.0,
         "action_return_semantics_version": "v1",
         "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        # Structured v2 provenance: the precise economics summarized by fill_convention. entry/exit fills are
+        # the first source-bar close at or after the decision / next-decision timestamp plus execution latency
+        # (entry_fill_ms / exit_fill_ms below), at the recorded latency, source interval, and close price.
+        "action_return_basis_version": "v2",
+        "action_return_entry_fill_rule": "first_close_at_or_after_decision_plus_execution_latency",
+        "action_return_exit_fill_rule": "first_close_at_or_after_next_decision_plus_execution_latency",
+        "action_return_execution_latency_ms": int(args.execution_latency_ms),
+        "action_return_source_bar_interval": source_bar_interval,
+        "action_return_price_source": "source_bar_close",
     }
     torch.save(
         {

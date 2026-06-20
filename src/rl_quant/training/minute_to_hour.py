@@ -711,6 +711,14 @@ def _run_semantics_hash(
         ("action_return_clip_max", train_data.action_return_clip_max),
         ("action_return_semantics_version", train_data.action_return_semantics_version),
         ("action_return_fill_convention", train_data.action_return_fill_convention),
+        # Structured v2 provenance -- a change to any of these is different economics and must perturb the
+        # resume fingerprint. Only-when-present, so a v1 (all-None) split keeps a byte-identical fingerprint.
+        ("action_return_basis_version", train_data.action_return_basis_version),
+        ("action_return_entry_fill_rule", train_data.action_return_entry_fill_rule),
+        ("action_return_exit_fill_rule", train_data.action_return_exit_fill_rule),
+        ("action_return_execution_latency_ms", train_data.action_return_execution_latency_ms),
+        ("action_return_source_bar_interval", train_data.action_return_source_bar_interval),
+        ("action_return_price_source", train_data.action_return_price_source),
     ):
         if value is not None:
             fingerprint[key] = float(value) if "clip" in key else value

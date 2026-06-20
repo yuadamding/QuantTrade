@@ -96,6 +96,13 @@ class HourFromMinuteDataSplit:
     # "next_bar_open", "decision_bar_close"). Part of the canonical ReturnBasis. None on payloads that predate
     # the field; it is recorded and participates in basis agreement, but its absence does not break loading.
     action_return_fill_convention: str | None = None
+    # Structured v2 provenance (carried from the gold payload alongside the flat fields; None on v1 payloads).
+    action_return_basis_version: str | None = None
+    action_return_entry_fill_rule: str | None = None
+    action_return_exit_fill_rule: str | None = None
+    action_return_execution_latency_ms: int | None = None
+    action_return_source_bar_interval: str | None = None
+    action_return_price_source: str | None = None
 
     @property
     def effective_context_bars_per_hour(self) -> int:
@@ -1128,6 +1135,12 @@ def _build_split(
         action_return_clip_max=payload.get("action_return_clip_max"),
         action_return_semantics_version=payload.get("action_return_semantics_version"),
         action_return_fill_convention=payload.get("action_return_fill_convention"),
+        action_return_basis_version=payload.get("action_return_basis_version"),
+        action_return_entry_fill_rule=payload.get("action_return_entry_fill_rule"),
+        action_return_exit_fill_rule=payload.get("action_return_exit_fill_rule"),
+        action_return_execution_latency_ms=payload.get("action_return_execution_latency_ms"),
+        action_return_source_bar_interval=payload.get("action_return_source_bar_interval"),
+        action_return_price_source=payload.get("action_return_price_source"),
     )
 
 

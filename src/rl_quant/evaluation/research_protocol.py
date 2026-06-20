@@ -87,6 +87,13 @@ class DatasetManifest:
     action_return_clip_max: float | None = None
     action_return_semantics_version: str | None = None
     action_return_fill_convention: str | None = None
+    # Structured v2 provenance (the precise economics behind fill_convention). Optional/None on v1 manifests.
+    action_return_basis_version: str | None = None
+    action_return_entry_fill_rule: str | None = None
+    action_return_exit_fill_rule: str | None = None
+    action_return_execution_latency_ms: int | None = None
+    action_return_source_bar_interval: str | None = None
+    action_return_price_source: str | None = None
 
     def validate(self) -> None:
         if not self.dataset_id:

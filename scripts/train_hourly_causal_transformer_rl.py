@@ -1058,6 +1058,7 @@ def build_reportability_artifacts(
             }
         ],
     }
+    eval_return_basis = ReturnBasis.from_mapping(train_split)
     return {
         "dataset_manifest": dataset_manifest,
         "feature_manifest": feature_manifest,
@@ -1065,8 +1066,10 @@ def build_reportability_artifacts(
         "data_quality_report": data_quality_report,
         "action_eligibility": action_eligibility,
         # The evaluation's declared action-return basis (canonical fields), carried so the reportability gate
-        # can assert it AGREES with the dataset manifest's declared basis (item #7).
-        "return_basis": ReturnBasis.from_mapping(train_split).to_dict(),
+        # can assert it AGREES with the dataset manifest's declared basis. The content hash is a single
+        # provenance stamp over the declared basis (item #7 / structured v2).
+        "return_basis": eval_return_basis.to_dict(),
+        "return_basis_content_hash": eval_return_basis.content_hash(),
     }
 
 

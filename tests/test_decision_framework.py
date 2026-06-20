@@ -428,6 +428,24 @@ class DecisionFrameworkTests(unittest.TestCase):
         self.assertEqual(
             [e for e in validate_reportable_summary(summary2, strict=True) if e.startswith("return_basis_")], [])
 
+        # Structured v2 (version-aware completeness): a basis that DECLARES v2 but omits the structured fields
+        # fails strict; a complete v2 basis on both sides passes.
+        v2_struct = {
+            "entry_fill_rule": "first_close_at_or_after_decision_plus_execution_latency",
+            "exit_fill_rule": "first_close_at_or_after_next_decision_plus_execution_latency",
+            "execution_latency_ms": 1000, "source_bar_interval": "1s", "price_source": "source_bar_close",
+        }
+        v2_missing = self._reportable_summary_with_basis(
+            return_basis={**complete_eval, "basis_version": "v2"}, dataset_manifest=full_manifest)
+        self.assertIn("return_basis_incomplete[eval]",
+                      [e for e in validate_reportable_summary(v2_missing, strict=True) if e.startswith("return_basis_")])
+        v2_eval = {**complete_eval, "basis_version": "v2", **v2_struct}
+        v2_manifest = {**full_manifest, "action_return_basis_version": "v2",
+                       **{f"action_return_{k}": v for k, v in v2_struct.items()}}
+        v2_ok = self._reportable_summary_with_basis(return_basis=v2_eval, dataset_manifest=v2_manifest)
+        self.assertEqual(
+            [e for e in validate_reportable_summary(v2_ok, strict=True) if e.startswith("return_basis_")], [])
+
     def test_validate_reportable_summary_quote_conditional_spread_impact(self) -> None:
         # Default (no quote data declared): spread_impact is NOT required (current OHLCV-aggregate data).
         base = self._reportable_summary_with_basis(return_basis={}, dataset_manifest={})

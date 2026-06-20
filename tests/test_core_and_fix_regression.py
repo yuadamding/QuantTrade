@@ -3286,6 +3286,46 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # Default-preserving: a partially-declared basis validates only what is present (no completeness demand).
         self.assertEqual(ReturnBasis(weight_semantics="full_capital_single_slot_returns").validation_errors(), [])
 
+        # Structured v2: completeness is version-aware. A version-less (v1) core-6 basis is still complete; a
+        # basis_version=="v2" basis additionally REQUIRES the structured provenance fields.
+        self.assertTrue(basis.is_complete())  # 'basis' is a version-less core-6 basis -> v1 complete
+        v2_payload = {
+            **payload,
+            "action_return_basis_version": "v2",
+            "action_return_entry_fill_rule": "first_close_at_or_after_decision_plus_execution_latency",
+            "action_return_exit_fill_rule": "first_close_at_or_after_next_decision_plus_execution_latency",
+            "action_return_execution_latency_ms": 1000,
+            "action_return_source_bar_interval": "1s",
+            "action_return_price_source": "source_bar_close",
+        }
+        v2 = ReturnBasis.from_mapping(v2_payload)
+        self.assertTrue(v2.is_complete())
+        self.assertEqual(ReturnBasis.from_canonical(v2.to_dict()), v2)  # 12-field round-trip
+        # v2 declared but structured fields missing -> incomplete.
+        self.assertFalse(ReturnBasis.from_mapping({**payload, "action_return_basis_version": "v2"}).is_complete())
+        # Fail-closed discriminator: an UNRECOGNIZED/typo'd version ("v3", "V2") must NOT downgrade to the laxer
+        # v1 completeness -- it requires the structured provenance AND is flagged invalid (so it cannot slip
+        # through strict reportability claiming a structured version with zero provenance).
+        for bogus in ("v3", "V2", " v2"):
+            lax = ReturnBasis.from_mapping({**payload, "action_return_basis_version": bogus})
+            self.assertFalse(lax.is_complete(), bogus)  # core-6 only is NOT enough for a non-v1 version
+            self.assertTrue(any("unrecognized_basis_version" in e for e in lax.validation_errors()), bogus)
+        # Recognized versions are not flagged.
+        self.assertEqual(v2.validation_errors(), [])
+        self.assertEqual(ReturnBasis.from_mapping({**payload, "action_return_basis_version": "v1"}).validation_errors(), [])
+        # execution_latency_ms validity: negative / non-int flagged.
+        self.assertTrue(any("negative_execution_latency_ms" in e
+                            for e in ReturnBasis(execution_latency_ms=-5).validation_errors()))
+        self.assertTrue(any("non_integer_execution_latency_ms" in e
+                            for e in ReturnBasis(execution_latency_ms=1.5).validation_errors()))
+        # content_hash: stable, changes on a declared-field change, and an undeclared field never affects it.
+        self.assertEqual(v2.content_hash(), ReturnBasis.from_mapping(v2_payload).content_hash())
+        self.assertNotEqual(
+            v2.content_hash(),
+            ReturnBasis.from_mapping({**v2_payload, "action_return_execution_latency_ms": 2000}).content_hash())
+        self.assertEqual(basis.content_hash(),  # adding an undeclared (None) field changes nothing
+                         ReturnBasis.from_mapping({**payload, "action_return_price_source": None}).content_hash())
+
     def test_execution_shadow_cost_basis_status(self) -> None:
         # The artifact must report what the PR-3 shadow's max_weight turnover pricing PROVES for the resolved
         # basis, not merely what the shadow assumes. Unresolved when semantics absent; native for
@@ -3345,6 +3385,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # must perturb the fingerprint too (added only when present, so legacy splits are unaffected).
         self.assertNotEqual(
             full_hash, h(dataclasses.replace(base, **{**full, "action_return_fill_convention": "next_bar_open"})))
+        # Structured v2 provenance also perturbs the fingerprint (only-when-present): a different execution
+        # latency is different economics and must not resume into the same checkpoint.
+        self.assertNotEqual(
+            full_hash, h(dataclasses.replace(base, **{**full, "action_return_execution_latency_ms": 2000})))
 
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
