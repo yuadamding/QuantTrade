@@ -35,7 +35,7 @@ LEGACY_NON_WRAPPER_SCRIPTS = {
     "build_news_llm_features.py",
     "build_second_context_decision_dataset.py",
     # build_stock_covariate_silver_features.py MIGRATED -> rl_quant.workflows.commands.* (now a thin wrapper).
-    "build_stock_second_silver_features.py",
+    # build_stock_second_silver_features.py MIGRATED -> rl_quant.workflows.commands.* (now a thin wrapper).
     "convert_polygon_second_to_protocol.py",
     "download_daily_ohlcv.py",
     "download_hourly_ohlcv.py",
