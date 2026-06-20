@@ -178,13 +178,20 @@ class ModelManifest:
     selected_by: str
     feature_names_hash: str
     action_names_hash: str
+    # Structured selection record. selection_split is the anti-leakage GATE (must be "validation" for a
+    # strict-reportable model -- a checkpoint chosen on the test split is leakage); it replaces the brittle
+    # "test" in selected_by heuristic. selected_by stays a human-readable description, no longer the enforced
+    # field. selection_metric / selection_artifact_hash are optional provenance (recorded, not enforced).
+    selection_split: str | None = None
+    selection_metric: str | None = None
+    selection_artifact_hash: str | None = None
     baseline_results: list[BaselineResult] = field(default_factory=list)
     cost_stress_results: list[StressTestResult] = field(default_factory=list)
     frequency_stress_results: list[StressTestResult] = field(default_factory=list)
     allowed_use: str = "research only"
     not_allowed_use: str = "unattended live trading"
 
-    def validate_reportable(self) -> None:
+    def validate_reportable(self, *, strict: bool = True) -> None:
         if not self.model_id:
             raise ResearchProtocolError("model_id is required.")
         if self.hyperparameter_trials < 1:
@@ -193,7 +200,23 @@ class ModelManifest:
             raise ResearchProtocolError("hyperparameter_search_space_hash is required.")
         if not self.selected_by:
             raise ResearchProtocolError("selected_by is required.")
-        if "test" in self.selected_by.lower():
+        if strict:
+            # Structured anti-leakage gate: a reportable model MUST be selected on the validation split. A
+            # non-validation (or missing) selection_split fails closed -- regardless of the free-text
+            # selected_by label, and never INFERRED from that label.
+            if self.selection_split != "validation":
+                raise ResearchProtocolError(
+                    f"reportable model must declare selection_split == 'validation' (got {self.selection_split!r}); "
+                    "selecting a checkpoint on the test split is leakage. A legacy manifest lacking the field "
+                    "must be re-validated with strict=False and migrated to the structured field."
+                )
+            for required_name in ("created_at_utc", "algorithm", "encoder", "training_dataset_id",
+                                  "feature_names_hash", "action_names_hash"):
+                if not getattr(self, required_name):
+                    raise ResearchProtocolError(f"{required_name} is required for reportability.")
+        elif "test" in self.selected_by.lower():
+            # Legacy compatibility (no structured selection_split): fall back to the brittle selected_by text
+            # heuristic so an old manifest still trips on an obvious test-split selection.
             raise ResearchProtocolError(
                 "selected_by must reference validation, not test; selecting a checkpoint on the test "
                 "split is leakage."

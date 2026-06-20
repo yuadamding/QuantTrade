@@ -93,6 +93,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-manifest", type=Path, action="append", default=[])
     parser.add_argument("--model-manifest", type=Path, action="append", default=[])
     parser.add_argument("--registry", type=Path, help="Optional JSONL registry file to append validation records.")
+    parser.add_argument(
+        "--allow-legacy-selection",
+        action="store_true",
+        help=(
+            "Validate model manifests in legacy mode (strict=False): skip the structured "
+            "selection_split=='validation' anti-leakage gate and fall back to the brittle 'test' in "
+            "selected_by heuristic. For re-validating historical manifests written before selection_split "
+            "existed; new trainer-written manifests should pass strict validation without this flag."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -124,8 +134,9 @@ def main() -> int:
     for path in args.model_manifest:
         try:
             manifest = load_model_manifest(json.loads(path.read_text()))
-            manifest.validate_reportable()
-            print(f"OK model manifest: {path} ({manifest.model_id})")
+            manifest.validate_reportable(strict=not args.allow_legacy_selection)
+            selection_mode = "legacy" if args.allow_legacy_selection else "strict"
+            print(f"OK model manifest ({selection_mode}): {path} ({manifest.model_id})")
             if registry:
                 registry.append(
                     {
@@ -133,6 +144,7 @@ def main() -> int:
                         "validated_at_utc": utc_now_iso(),
                         "path": str(path),
                         "model_id": manifest.model_id,
+                        "selection_validation_mode": selection_mode,
                         "status": "ok",
                     }
                 )

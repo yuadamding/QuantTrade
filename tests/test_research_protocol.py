@@ -94,6 +94,7 @@ class ResearchProtocolTests(unittest.TestCase):
             selected_by="validation_net_return",
             feature_names_hash="features",
             action_names_hash="actions",
+            selection_split="validation",
         )
         with self.assertRaises(ResearchProtocolError):
             manifest.validate_reportable()
@@ -127,6 +128,7 @@ class ResearchProtocolTests(unittest.TestCase):
             selected_by="validation_net_return",
             feature_names_hash="features",
             action_names_hash="actions",
+            selection_split="validation",
             baseline_results=[BaselineResult("CASH", 0.0, None, 0.0)],
             cost_stress_results=[StressTestResult("2x_cost", "cost", "multiplier", 2.0, 0.0, None, 0.0)],
             frequency_stress_results=[
@@ -136,10 +138,37 @@ class ResearchProtocolTests(unittest.TestCase):
 
     def test_model_manifest_rejects_test_split_selection(self) -> None:
         manifest = self._reportable_manifest()
-        manifest.validate_reportable()
+        manifest.validate_reportable()  # selection_split="validation" -> ok
+        # The central design claim: selection_split is the gate, selected_by is descriptive-only. In strict mode a
+        # selected_by that mentions "test" must NOT trip the gate as long as selection_split=="validation" (the
+        # free-text label is genuinely ignored -- the leakage check is never inferred from it under strict).
+        manifest.selected_by = "best_on_test_set_metric"
+        manifest.validate_reportable()  # selection_split="validation" still ok despite "test" in selected_by
+        manifest.selected_by = "validation_net_return"
+        # Structured anti-leakage gate: a missing or non-validation selection_split fails strict reportability,
+        # regardless of the free-text selected_by label (no longer the enforced field, and never inferred from).
+        manifest.selection_split = None
+        with self.assertRaisesRegex(ResearchProtocolError, "selection_split"):
+            manifest.validate_reportable()
+        manifest.selection_split = "test"
+        with self.assertRaisesRegex(ResearchProtocolError, "selection_split"):
+            manifest.validate_reportable()
+        # Legacy compatibility (strict=False) falls back to the brittle selected_by text heuristic.
+        manifest.selection_split = None
         manifest.selected_by = "test_total_return"
         with self.assertRaisesRegex(ResearchProtocolError, "selected_by must reference validation"):
-            manifest.validate_reportable()
+            manifest.validate_reportable(strict=False)
+        manifest.selected_by = "validation_net_return"
+        manifest.validate_reportable(strict=False)  # legacy: 'validation' in the label -> ok
+
+    def test_model_manifest_strict_requires_nonempty_identity_fields(self) -> None:
+        # Strict reportability requires the identity/provenance fields to be non-empty (not just present).
+        for field_name in ("created_at_utc", "algorithm", "encoder", "training_dataset_id",
+                            "feature_names_hash", "action_names_hash"):
+            manifest = self._reportable_manifest()
+            setattr(manifest, field_name, "")
+            with self.assertRaisesRegex(ResearchProtocolError, field_name):
+                manifest.validate_reportable()
 
     def test_model_manifest_rejects_unproduced_benchmark(self) -> None:
         manifest = self._reportable_manifest()

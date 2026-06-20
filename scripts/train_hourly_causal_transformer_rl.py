@@ -1031,6 +1031,10 @@ def build_reportability_artifacts(
             }
         ),
         "selected_by": "best_validation_total_return_then_switch_count",
+        # Structured anti-leakage record: the checkpoint is chosen on the VALIDATION split (never test), which
+        # ModelManifest.validate_reportable enforces via selection_split rather than the free-text selected_by.
+        "selection_split": "validation",
+        "selection_metric": "total_return_then_switch_count",
         "feature_names_hash": hash_string_sequence(train_split.feature_names),
         "action_names_hash": hash_string_sequence(train_split.action_names),
         "action_metadata_hash": action_metadata_hash,

@@ -142,6 +142,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             "training_dataset": "/data/demo.pt",
             "hyperparameters_hash": "abc",
             "selected_by": "best_validation_total_return",
+            "selection_split": "validation",
             "feature_names_hash": "fh",
             "action_names_hash": "ah",
             "validation_protocol": {
