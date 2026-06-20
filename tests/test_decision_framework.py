@@ -14,6 +14,7 @@ from rl_quant.decision_framework import (
     action_eligibilities_to_mask,
     apply_data_quality_gate,
     assert_available_at,
+    classify_reportability,
     decision_readiness_score,
     filter_point_in_time_rows,
     readiness_band,
@@ -358,6 +359,57 @@ class DecisionFrameworkTests(unittest.TestCase):
             "return_diagnostics": {},
             "return_basis": return_basis,
         }
+
+    def test_classify_reportability_tiers(self) -> None:
+        # reportable=true ONLY for the strict tier; base-reportable-but-not-strict is legacy_diagnostic; a base
+        # failure (contradiction / below-cash) is non_reportable.
+        complete_eval = {
+            "weight_semantics": "full_capital_single_slot_returns",
+            "formula": "clipped_simple_return(entry_fill, exit_fill)",
+            "clip_min": -1.0, "clip_max": 1.0, "semantics_version": "v1",
+            "fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        }
+        full_manifest = {
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
+            "action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
+            "action_return_clip_min": -1.0, "action_return_clip_max": 1.0,
+            "action_return_semantics_version": "v1",
+            "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        }
+        # STRICT: complete, agreeing basis on both sides -> reportable, tier=strict.
+        strict = classify_reportability(
+            self._reportable_summary_with_basis(return_basis=complete_eval, dataset_manifest=full_manifest))
+        self.assertTrue(strict["reportable"])
+        self.assertEqual(strict["reportable_tier"], "strict")
+        self.assertTrue(strict["base_reportable"] and strict["strict_return_basis"])
+
+        # LEGACY_DIAGNOSTIC: base-reportable but the manifest side declares no basis -> not reportable.
+        legacy = classify_reportability(
+            self._reportable_summary_with_basis(return_basis=complete_eval, dataset_manifest={}))
+        self.assertFalse(legacy["reportable"])
+        self.assertEqual(legacy["reportable_tier"], "legacy_diagnostic")
+        self.assertTrue(legacy["base_reportable"])
+        self.assertIn("strict_return_basis_not_enforced", legacy["reasons"])
+
+        # NON_REPORTABLE: a basis CONTRADICTION fails the base contract.
+        conflict = classify_reportability(self._reportable_summary_with_basis(
+            return_basis=complete_eval,
+            dataset_manifest={**full_manifest, "action_return_fill_convention": "next_bar_open"}))
+        self.assertFalse(conflict["reportable"])
+        self.assertEqual(conflict["reportable_tier"], "non_reportable")
+
+        # NON_REPORTABLE: below-cash also fails the base contract (even with a strict basis).
+        below = self._reportable_summary_with_basis(return_basis=complete_eval, dataset_manifest=full_manifest)
+        below["test_metrics"] = {"total_return": -0.5}
+        below["baselines"] = {**below["baselines"], "CASH": {"test": {"total_return": 0.0}}}
+        verdict = classify_reportability(below)
+        self.assertEqual(verdict["reportable_tier"], "non_reportable")
+        self.assertIn("test_return_below_cash", verdict["reasons"])
+
+        # An upstream reportability_flags failure forces non_reportable regardless of the basis.
+        flagged = self._reportable_summary_with_basis(return_basis=complete_eval, dataset_manifest=full_manifest)
+        flagged["reportability"] = {"reportable": False, "reasons": ["some_flag_reason"]}
+        self.assertEqual(classify_reportability(flagged)["reportable_tier"], "non_reportable")
 
     def test_validate_reportable_summary_return_basis_agreement(self) -> None:
         # Item #7: the eval's declared basis (summary["return_basis"], canonical fields) and the dataset

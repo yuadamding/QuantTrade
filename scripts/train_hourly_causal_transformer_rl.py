@@ -71,12 +71,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--strict-return-basis",
         action="store_true",
         help=(
-            "Require a COMPLETE, valid action-return basis on both the evaluation and dataset-manifest sides for "
-            "the run to be reportable (validate_reportable_summary strict mode), checked fast at startup. Off by "
-            "default (default-preserving: a legacy / partially-declared basis still reports). This requires a "
-            "basis-aware dataset AND loader: a dataset/loader that does not carry action_return_* provenance is "
-            "flagged until rebuilt or migrated. Enable to guarantee a reportable artifact declares its full, "
-            "agreeing return basis."
+            "FAIL FAST at startup if this run cannot be STRICTLY reportable -- i.e. a split does not carry a "
+            "complete, valid action-return basis -- instead of completing and being classified "
+            "reportable_tier=legacy_diagnostic. reportable=true ALWAYS requires the strict tier regardless of this "
+            "flag (classify_reportability tiers every run: strict / legacy_diagnostic / non_reportable); this flag "
+            "only turns a would-be legacy_diagnostic run into an early hard error, for a serious reportable run on "
+            "a basis-aware dataset."
         ),
     )
     parser.add_argument("--random-baseline-paths", type=int, default=256)
@@ -1108,7 +1108,7 @@ def main() -> int:
             resolve_torch_device,
             torch_runtime_summary,
         )
-        from rl_quant.decision_framework import validate_reportable_summary
+        from rl_quant.decision_framework import classify_reportability
         from rl_quant.action_risk import (
             action_concentration,
             action_metadata_to_dicts,
@@ -1148,9 +1148,9 @@ def main() -> int:
         # verdict: --strict-return-basis requires every split to carry a complete, valid action-return basis.
         # A loader/dataset that does not declare the basis (e.g. a direct-hourly dataset built without it) is
         # flagged here with an actionable message instead of wasting a full run to discover it is non-reportable.
-        # NOTE: this preflight checks the EVAL/split (.pt) side only; the final validate_reportable_summary
-        # backstop additionally requires the dataset_manifest side to be complete, so a basis-carrying .pt can
-        # still fail late if dataset_manifest.json does not also declare the basis.
+        # NOTE: this preflight checks the EVAL/split (.pt) side only; the final classify_reportability backstop
+        # additionally requires the dataset_manifest side to be complete for the strict tier, so a basis-carrying
+        # .pt can still be classified legacy_diagnostic if dataset_manifest.json does not also declare the basis.
         from rl_quant.protocol.action_return_basis import ReturnBasis as _ReturnBasis
 
         for _split in (train_split, val_split, test_split):
@@ -1489,17 +1489,13 @@ def main() -> int:
         "return_diagnostics": return_diagnostics,
         "reportability": reportability,
     }
-    reportability_errors = validate_reportable_summary(summary, strict=args.strict_return_basis)
+    # Tier the verdict so reportable=true means a STRICT artifact (complete, agreeing, valid return basis on
+    # both sides). A base-reportable run without a complete basis is legacy_diagnostic (reportable=false), not a
+    # strict result -- so reportable=true no longer means two different things. The reportability_flags verdict
+    # (concentration / floors / etc.) is carried via summary["reportability"], which classify_reportability reads.
     summary["reportability"] = {
-        "reportable": bool(reportability["reportable"]) and not reportability_errors,
-        "reasons": list(dict.fromkeys([*reportability.get("reasons", []), *reportability_errors])),
-        # Record the return-basis enforcement mode so reportability.json is self-auditable without the full
-        # summary -- a reviewer can see whether strict completeness was enforced or only legacy agreement/validity.
-        "strict_return_basis": bool(args.strict_return_basis),
-        "return_basis_policy": (
-            "strict_complete_eval_and_dataset_manifest" if args.strict_return_basis
-            else "legacy_agreement_and_validity_only"
-        ),
+        **classify_reportability(summary),
+        # Self-auditable provenance stamp (independent of the full summary).
         "return_basis_content_hash": summary.get("return_basis_content_hash"),
     }
     with (run_dir / "summary.json").open("w") as sink:

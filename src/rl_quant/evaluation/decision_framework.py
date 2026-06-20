@@ -627,3 +627,52 @@ def validate_reportable_summary(summary: dict[str, Any], *, strict: bool = False
         if float(concentration.get("leveraged_action_share", 0.0)) > 0.50:
             errors.append("leveraged_action_share_exceeds_limit")
     return list(dict.fromkeys(errors))
+
+
+def classify_reportability(summary: dict[str, Any]) -> dict[str, Any]:
+    """Tier a run's reportability so ``reportable: true`` means ONE thing -- a strictly-validated artifact.
+
+    Three tiers:
+      * ``strict`` -- passes the base contract AND a COMPLETE, agreeing, valid return basis on both the eval and
+        dataset-manifest sides. This is the ONLY tier with ``reportable == True``.
+      * ``legacy_diagnostic`` -- base-reportable (structure / coverage / agreement / no below-cash) but the
+        return basis is not strictly complete. Readable and classified, but NOT ``reportable`` -- so an old or
+        partially-declared run can no longer be mistaken for a strict research result.
+      * ``non_reportable`` -- fails the base contract (missing artifacts/baselines/stress, a basis contradiction
+        or invalid value, below-cash, over-concentration, ...).
+
+    Default-preserving in spirit: nothing is deleted; a legacy run is downgraded a tier, not broken. The verdict
+    is pure (depends only on the summary) and testable without a training run. summary["reportability"] is read
+    for the upstream reportability_flags verdict/reasons (a False flag or any flag reason forces non_reportable).
+    """
+    flags = summary.get("reportability") if isinstance(summary.get("reportability"), dict) else {}
+    # The flag channel is permissive by default: an ABSENT / non-dict reportability section (or a missing
+    # "reportable" key) defaults to True, so it never alone fails a run -- the base and strict CONTRACTS below
+    # still gate everything. A flag that is explicitly False, or carries any reason, does force non_reportable.
+    flags_reportable = bool(flags.get("reportable", True))
+    base_errors = validate_reportable_summary(summary, strict=False)
+    strict_errors = validate_reportable_summary(summary, strict=True)
+    base_reportable = flags_reportable and not base_errors
+    strict_reportable = flags_reportable and not strict_errors
+
+    if not base_reportable:
+        tier, reportable, reasons = "non_reportable", False, list(base_errors)
+    elif not strict_reportable:
+        # The strict-only gap (what strict adds beyond the base contract), plus an explicit marker.
+        strict_only = [e for e in strict_errors if e not in base_errors]
+        tier, reportable = "legacy_diagnostic", False
+        reasons = ["strict_return_basis_not_enforced", *strict_only]
+    else:
+        tier, reportable, reasons = "strict", True, []
+
+    return {
+        "reportable": reportable,
+        "reportable_tier": tier,
+        "base_reportable": base_reportable,
+        "strict_return_basis": strict_reportable,
+        "return_basis_policy": (
+            "strict_complete_eval_and_dataset_manifest" if strict_reportable
+            else "legacy_agreement_and_validity_only"
+        ),
+        "reasons": list(dict.fromkeys(reasons)),
+    }
