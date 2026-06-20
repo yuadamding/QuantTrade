@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -77,6 +77,16 @@ class DatasetManifest:
     feature_fit_windows: list[FitWindow] = field(default_factory=list)
     source_manifest_hash: str | None = None
     known_limitations: list[str] = field(default_factory=list)
+    # Canonical action-return basis recorded on the manifest -- not only in the .pt payload -- so the
+    # reportability agreement check can compare the dataset's DECLARED basis against the evaluation's (the
+    # ReturnBasis in rl_quant.datasets.hour_from_subhour reads these exact keys). All optional/None on legacy
+    # manifests (default-preserving); they do not affect validate().
+    action_return_weight_semantics: str | None = None
+    action_return_formula: str | None = None
+    action_return_clip_min: float | None = None
+    action_return_clip_max: float | None = None
+    action_return_semantics_version: str | None = None
+    action_return_fill_convention: str | None = None
 
     def validate(self) -> None:
         if not self.dataset_id:
@@ -106,9 +116,17 @@ class DatasetManifest:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "DatasetManifest":
         windows = [FitWindow(**item) for item in payload.get("feature_fit_windows", [])]
-        payload = dict(payload)
-        payload["feature_fit_windows"] = windows
-        return cls(**payload)
+        # The on-disk manifest is intentionally a SUPERSET: the builder adds reportable / reportability_errors /
+        # missing_* extras via update(). Filter to declared fields so from_dict round-trips an enriched manifest
+        # instead of raising on those extras. Unknown keys are dropped here; callers that need them (e.g. the
+        # reportability summary's basis-agreement check) read the raw JSON dict directly. Trade-off: a MISSPELLED
+        # OPTIONAL field (e.g. a typo'd action_return_* key) is silently dropped and degrades to its default
+        # rather than raising -- acceptable because the manifest is machine-generated from a single dict; a
+        # misspelled REQUIRED field still fails (its positional arg ends up absent).
+        known = {f.name for f in fields(cls)}
+        kwargs = {key: value for key, value in payload.items() if key in known}
+        kwargs["feature_fit_windows"] = windows
+        return cls(**kwargs)
 
     def write_json(self, path: Path) -> None:
         self.validate()

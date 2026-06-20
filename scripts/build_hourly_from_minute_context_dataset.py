@@ -985,6 +985,22 @@ def main() -> int:
     dataset_path = args.output_dir / args.dataset_file_name
     periods_per_year = infer_periods_per_year(decision_timestamps)
     median_decisions_per_day = periods_per_year / 252.0
+    # Canonical action-return basis, recorded ONCE and written into BOTH the .pt payload AND
+    # dataset_manifest.json (via the DatasetManifest below) so the reportability agreement check compares two
+    # independently-stored copies. action_returns are the RAW simple return of holding the single chosen action
+    # at full capital from entry_fill to exit_fill (clipped_simple_return) -- no metadata weighting -- which
+    # resolves the PR-4 weight-basis requirement (ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS in
+    # rl_quant.datasets.hour_from_subhour). formula/clip/version/fill_convention pin the FULL basis so a future
+    # builder edit that changes the economics (same weight label) is detectable. fill_convention ==
+    # action_fill_rule below. Purely declarative: the default (legacy) reward path is unaffected.
+    action_return_basis = {
+        "action_return_weight_semantics": "full_capital_single_slot_returns",
+        "action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
+        "action_return_clip_min": -1.0,
+        "action_return_clip_max": 1.0,
+        "action_return_semantics_version": "v1",
+        "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+    }
     torch.save(
         {
             "decision_timestamps": decision_timestamps,
@@ -1006,24 +1022,9 @@ def main() -> int:
             "label_valid_mask": label_valid_mask,
             "action_label_valid_mask": label_valid_mask,
             "action_mask_semantics": action_mask_semantics,
-            # action_returns are the RAW simple return of holding the single chosen action at full capital
-            # from entry_fill to exit_fill (clipped_simple_return above) -- no metadata weighting. Declaring
-            # this resolves the PR-4 gate's weight-basis requirement (ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS in
-            # rl_quant.datasets.hour_from_subhour); previously absent -> None -> use_execution_env_reward
-            # stays fail-closed. Purely declarative metadata: the default (legacy) reward path is unaffected;
-            # PR-4 remains dormant until use_execution_env_reward is wired + A/B'd.
-            "action_return_weight_semantics": "full_capital_single_slot_returns",
-            # Record the FULL return basis, not just the weight label, so a future builder edit that changes the
-            # formula / clip / fill timing while keeping the same weight label is detectable (the recorded basis
-            # would change). Fill/latency conventions are also in execution_model above.
-            "action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
-            "action_return_clip_min": -1.0,
-            "action_return_clip_max": 1.0,
-            "action_return_semantics_version": "v1",
-            # The fill convention completing the canonical ReturnBasis: positions realize at the first close at
-            # or after the decision/reward timestamp plus execution latency (== action_fill_rule below). Carried
-            # so a reportable artifact declares its fill timing and the basis-agreement check can compare it.
-            "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+            # Canonical action-return basis (defined once above; also written into dataset_manifest.json so the
+            # reportability agreement check compares two independently-stored copies).
+            **action_return_basis,
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
             "dataset_reportable": dataset_reportable,
@@ -1170,6 +1171,9 @@ def main() -> int:
             "US regular-session timing uses simplified 9:30-16:00 assumptions.",
             "Rows are retained from decision-time action availability; missing reward labels remain NaN.",
         ],
+        # Record the canonical action-return basis on the manifest too (not just the .pt payload), so the
+        # reportability agreement check has a declared-side basis to compare against the evaluation's.
+        **action_return_basis,
     )
     try:
         manifest.validate()

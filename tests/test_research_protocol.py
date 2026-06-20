@@ -59,6 +59,57 @@ class ResearchProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ResearchProtocolError, "universe_selection_date is required"):
             missing.validate()
 
+    def test_dataset_manifest_records_return_basis_and_tolerates_superset_keys(self) -> None:
+        # The manifest now carries the canonical action-return basis (so the reportability agreement check has a
+        # declared-side basis), and from_dict tolerates the builder's SUPERSET extras (reportable / missing_*)
+        # by filtering to declared fields rather than raising.
+        manifest = DatasetManifest(
+            dataset_id="demo",
+            created_at_utc="2026-06-14T00:00:00+00:00",
+            source_vendor="synthetic",
+            symbols=["QQQ"],
+            universe_selection_date="2026-01-01T00:00:00+00:00",
+            bar_interval="1h",
+            timezone="UTC",
+            adjustment="synthetic",
+            feature_names=["x"],
+            action_names=["CASH", "QQQ"],
+            timestamps_hash=hash_string_sequence(["2026-01-02T00:00:00+00:00"]),
+            next_timestamps_hash=hash_string_sequence(["2026-01-02T01:00:00+00:00"]),
+            first_timestamp="2026-01-02T00:00:00+00:00",
+            last_timestamp="2026-01-02T00:00:00+00:00",
+            action_return_weight_semantics="full_capital_single_slot_returns",
+            action_return_formula="clipped_simple_return(entry_fill, exit_fill)",
+            action_return_clip_min=-1.0,
+            action_return_clip_max=1.0,
+            action_return_semantics_version="v1",
+            action_return_fill_convention="first_close_at_or_after_decision_plus_execution_latency",
+        )
+        manifest.validate()  # basis fields do not affect validate()
+        payload = manifest.to_dict()
+        self.assertEqual(payload["action_return_weight_semantics"], "full_capital_single_slot_returns")
+        self.assertEqual(payload["action_return_fill_convention"],
+                         "first_close_at_or_after_decision_plus_execution_latency")
+        # Round-trips, and from_dict drops the builder's non-field extras (reportable / reportability_errors /
+        # missing_*) instead of raising on them.
+        enriched = {**payload, "reportable": True, "reportability_errors": [], "missing_action_source_symbols": []}
+        restored = DatasetManifest.from_dict(enriched)
+        self.assertEqual(restored, manifest)
+
+        # The basis lands where the reportability agreement check reads it (action_return_* keys via ReturnBasis).
+        from rl_quant.datasets.hour_from_subhour import ReturnBasis
+        self.assertTrue(ReturnBasis.from_mapping(payload).is_complete())
+
+    def test_dataset_manifest_basis_field_names_match_return_basis_reader(self) -> None:
+        # Cross-module invariant: the manifest's action_return_* field names MUST equal the payload keys that
+        # ReturnBasis reads, or the declared-side basis silently goes all-None (agreement vacuous) on a rename.
+        from dataclasses import fields as dc_fields
+
+        from rl_quant.datasets.hour_from_subhour import _RETURN_BASIS_FIELD_KEYS
+
+        manifest_basis_fields = {f.name for f in dc_fields(DatasetManifest) if f.name.startswith("action_return_")}
+        self.assertEqual(manifest_basis_fields, set(_RETURN_BASIS_FIELD_KEYS.values()))
+
     def test_universe_selection_date_resolver_uses_latest_universe_file_date(self) -> None:
         module = load_script("build_hourly_transformer_dataset")
         args = module.parse_args(
