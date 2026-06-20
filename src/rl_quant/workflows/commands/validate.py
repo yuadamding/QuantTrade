@@ -21,6 +21,7 @@ from rl_quant.evaluation.research_protocol import (
     ResearchProtocolError,
     utc_now_iso,
 )
+from rl_quant.protocol.action_return_basis import validate_return_basis_surfaces
 
 
 def adapt_trainer_model_manifest(payload: dict) -> dict:
@@ -95,6 +96,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-manifest", type=Path, action="append", default=[])
     parser.add_argument("--registry", type=Path, help="Optional JSONL registry file to append validation records.")
     parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "A built dataset directory; cross-checks that its dataset_manifest.json and metadata.json agree on "
+            "the action-return basis AND its persisted return_basis_content_hash (a tamper/partial-write "
+            "tripwire). Surfaces that do not declare a basis are skipped."
+        ),
+    )
+    parser.add_argument(
         "--allow-legacy-selection",
         action="store_true",
         help=(
@@ -109,8 +121,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if not args.dataset_manifest and not args.model_manifest:
-        raise SystemExit("Provide at least one --dataset-manifest or --model-manifest.")
+    if not args.dataset_manifest and not args.model_manifest and not args.dataset_dir:
+        raise SystemExit("Provide at least one --dataset-manifest, --model-manifest, or --dataset-dir.")
 
     registry = ExperimentRegistry(args.registry) if args.registry else None
     failures: list[str] = []
@@ -151,6 +163,31 @@ def main(argv: list[str] | None = None) -> int:
                 )
         except (OSError, json.JSONDecodeError, TypeError, ResearchProtocolError) as exc:
             failures.append(f"{path}: {type(exc).__name__}: {exc}")
+
+    for dataset_dir in args.dataset_dir:
+        try:
+            surfaces = {}
+            for label, name in (("dataset_manifest", "dataset_manifest.json"), ("metadata", "metadata.json")):
+                artifact = dataset_dir / name
+                if artifact.exists():
+                    surfaces[label] = json.loads(artifact.read_text())
+            reasons = validate_return_basis_surfaces(surfaces)
+            if reasons:
+                failures.append(f"{dataset_dir}: return-basis surfaces disagree: {reasons}")
+            else:
+                print(f"OK return-basis surfaces agree: {dataset_dir} ({sorted(surfaces)})")
+            if registry:
+                registry.append(
+                    {
+                        "record_type": "return_basis_surface_validation",
+                        "validated_at_utc": utc_now_iso(),
+                        "path": str(dataset_dir),
+                        "surfaces": sorted(surfaces),
+                        "status": "ok" if not reasons else "failed",
+                    }
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            failures.append(f"{dataset_dir}: {type(exc).__name__}: {exc}")
 
     if failures:
         for failure in failures:

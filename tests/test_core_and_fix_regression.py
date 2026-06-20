@@ -3329,6 +3329,86 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(basis.content_hash(),  # adding an undeclared (None) field changes nothing
                          ReturnBasis.from_mapping({**payload, "action_return_price_source": None}).content_hash())
 
+    def test_validate_return_basis_surfaces_cross_artifact(self) -> None:
+        # The cross-artifact preflight compares the SAME return basis as written to multiple surfaces of one
+        # built dataset (the .pt/manifest flat keys vs the metadata nested "action_return_basis" block) and
+        # the per-surface persisted return_basis_content_hash. It is fail-closed on disagreement but
+        # default-preserving: surfaces that declare no basis are skipped, and <2 declaring surfaces never error.
+        from rl_quant.protocol.action_return_basis import ReturnBasis, validate_return_basis_surfaces
+
+        flat = {
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
+            "action_return_formula": "clipped_simple_return(decision_bar_close, next_bar_close)",
+            "action_return_clip_min": -1.0,
+            "action_return_clip_max": 1.0,
+            "action_return_semantics_version": "v1",
+            "action_return_fill_convention": "decision_bar_close_to_next_bar_close",
+            "action_return_basis_version": "v2",
+            "action_return_entry_fill_rule": "decision_bar_close",
+            "action_return_exit_fill_rule": "next_bar_close",
+            "action_return_execution_latency_ms": 0,
+            "action_return_source_bar_interval": "1h",
+            "action_return_price_source": "bar_close",
+        }
+        content_hash = ReturnBasis.from_mapping(flat).content_hash()
+        manifest = {**flat, "return_basis_content_hash": content_hash}  # flat (dataset_manifest/.pt) surface
+        metadata = {"action_return_basis": flat, "return_basis_content_hash": content_hash}  # nested surface
+
+        # Agreeing surfaces -> no reasons (both shapes resolve to the same basis + same persisted hash).
+        self.assertEqual(validate_return_basis_surfaces({"manifest": manifest, "metadata": metadata}), [])
+        # A single declaring surface (or a basis-less companion) cannot disagree with itself -> no reasons.
+        self.assertEqual(validate_return_basis_surfaces({"manifest": manifest}), [])
+        self.assertEqual(validate_return_basis_surfaces({"manifest": manifest, "empty": {"foo": 1}}), [])
+        # A genuine cross-surface contradiction on a jointly-declared field is flagged.
+        diverged = {"action_return_basis": {**flat, "action_return_price_source": "next_bar_open"},
+                    "return_basis_content_hash": content_hash}
+        reasons = validate_return_basis_surfaces({"manifest": manifest, "metadata": diverged})
+        self.assertTrue(any("return_basis_surface_disagreement" in r for r in reasons), reasons)
+        # A stale/hand-edited persisted hash on a surface (self-inconsistent) is flagged independently.
+        stale = {**metadata, "return_basis_content_hash": "deadbeef"}
+        reasons2 = validate_return_basis_surfaces({"manifest": manifest, "metadata": stale})
+        self.assertTrue(any("return_basis_content_hash_mismatch:metadata" in r for r in reasons2), reasons2)
+
+    def test_validate_command_dataset_dir_cross_artifact(self) -> None:
+        # The --dataset-dir CLI wiring loads dataset_manifest.json + metadata.json (JSON, torch-free) from a
+        # built dataset directory and runs the cross-artifact preflight: agreeing surfaces -> rc 0; a corrupted
+        # metadata basis -> rc 1.
+        from rl_quant.protocol.action_return_basis import ReturnBasis
+        from rl_quant.workflows.commands.validate import main
+
+        flat = {
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
+            "action_return_formula": "clipped_simple_return(decision_bar_close, next_bar_close)",
+            "action_return_clip_min": -1.0,
+            "action_return_clip_max": 1.0,
+            "action_return_semantics_version": "v1",
+            "action_return_fill_convention": "decision_bar_close_to_next_bar_close",
+            "action_return_basis_version": "v2",
+            "action_return_entry_fill_rule": "decision_bar_close",
+            "action_return_exit_fill_rule": "next_bar_close",
+            "action_return_execution_latency_ms": 0,
+            "action_return_source_bar_interval": "1h",
+            "action_return_price_source": "bar_close",
+        }
+        content_hash = ReturnBasis.from_mapping(flat).content_hash()
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_dir = Path(directory)
+            (dataset_dir / "dataset_manifest.json").write_text(
+                json.dumps({**flat, "return_basis_content_hash": content_hash})
+            )
+            (dataset_dir / "metadata.json").write_text(
+                json.dumps({"action_return_basis": flat, "return_basis_content_hash": content_hash})
+            )
+            self.assertEqual(main(["--dataset-dir", str(dataset_dir)]), 0)
+            # Corrupt the metadata-side basis so the surfaces disagree -> failure.
+            (dataset_dir / "metadata.json").write_text(
+                json.dumps({
+                    "action_return_basis": {**flat, "action_return_price_source": "WRONG"},
+                    "return_basis_content_hash": content_hash,
+                })
+            )
+            self.assertEqual(main(["--dataset-dir", str(dataset_dir)]), 1)
+
     def test_execution_shadow_cost_basis_status(self) -> None:
         # The artifact must report what the PR-3 shadow's max_weight turnover pricing PROVES for the resolved
         # basis, not merely what the shadow assumes. Unresolved when semantics absent; native for

@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any
 
 # The only accepted values for the action-return weight semantics (PR-4 gate). Anything else -- None,
@@ -214,3 +215,33 @@ def return_basis_agreement_errors(eval_basis: ReturnBasis, declared_basis: Retur
             f"(eval={eval_basis.declared().get(name)!r},dataset_manifest={declared_basis.declared().get(name)!r})"
         )
     return errors
+
+
+def validate_return_basis_surfaces(surfaces: dict[str, Any]) -> list[str]:
+    """Cross-ARTIFACT agreement: every persisted surface that declares the return basis (the .pt payload,
+    dataset_manifest.json, metadata.json, ...) must agree on the basis AND on the persisted
+    ``return_basis_content_hash``. Returns reasons (empty == agree).
+
+    Each payload is read with ReturnBasis.from_mapping (nested-``action_return_basis``-aware), so flat
+    (.pt/manifest) and nested (metadata) surfaces are handled uniformly. Surfaces that declare NO basis (empty
+    ReturnBasis) are skipped -- a surface that simply does not carry the basis is not a disagreement -- and fewer
+    than two declaring surfaces yields no reasons. In a clean build all surfaces are written from ONE basis, so a
+    disagreement here means a hand-edit, a stale artifact, a partial write, or a cross-build mix (a tamper /
+    divergence tripwire). The persisted hash on a surface must also match THAT surface's own declared basis."""
+    bases = {label: ReturnBasis.from_mapping(payload) for label, payload in surfaces.items()}
+    declaring = {label: basis for label, basis in bases.items() if basis.declared()}
+    reasons: list[str] = []
+    if len(declaring) >= 2:
+        labels = list(declaring)
+        reference_label, reference = labels[0], declaring[labels[0]]
+        for label in labels[1:]:
+            diffs = reference.disagreements_with(declaring[label])
+            if diffs:
+                reasons.append(f"return_basis_surface_disagreement:{reference_label}!={label}:{sorted(diffs)}")
+    for label, payload in surfaces.items():
+        if label not in declaring:
+            continue
+        stored = payload.get("return_basis_content_hash") if hasattr(payload, "get") else None
+        if stored is not None and stored != declaring[label].content_hash():
+            reasons.append(f"return_basis_content_hash_mismatch:{label}")
+    return reasons
