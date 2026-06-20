@@ -3369,6 +3369,28 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         reasons2 = validate_return_basis_surfaces({"manifest": manifest, "metadata": stale})
         self.assertTrue(any("return_basis_content_hash_mismatch:metadata" in r for r in reasons2), reasons2)
 
+        # FULL pairwise (not star-vs-one-reference): a contradiction between two surfaces on a field the
+        # alphabetically-first (reference) surface does NOT declare is still caught.
+        sparse = {"action_return_weight_semantics": "full_capital_single_slot_returns"}  # declares only WS
+        surf_a = {**flat, "action_return_price_source": "close"}
+        surf_b = {**flat, "action_return_price_source": "vwap"}
+        pairwise = validate_return_basis_surfaces({"aaa_ref": sparse, "m_a": surf_a, "m_b": surf_b})
+        self.assertTrue(any("return_basis_surface_disagreement:m_a!=m_b" in r for r in pairwise), pairwise)
+        # Determinism: labels in the reason are sorted, so the verdict is insertion-order-independent.
+        self.assertEqual(
+            validate_return_basis_surfaces({"m_b": surf_b, "m_a": surf_a}),
+            validate_return_basis_surfaces({"m_a": surf_a, "m_b": surf_b}),
+        )
+
+        # VALIDITY: a uniformly-corrupt-but-AGREEING basis (no cross-surface disagreement) is still flagged --
+        # an inverted clip range and an unrecognized weight semantics on every surface.
+        corrupt = {**flat, "action_return_clip_min": 5.0, "action_return_clip_max": -5.0,
+                   "action_return_weight_semantics": "not_a_real_semantics"}
+        invalid = validate_return_basis_surfaces({"s1": corrupt, "s2": corrupt})
+        self.assertTrue(any("return_basis_surface_invalid:s1" in r and "clip_min_exceeds_clip_max" in r
+                            for r in invalid), invalid)
+        self.assertTrue(any("invalid_weight_semantics" in r for r in invalid), invalid)
+
     def test_validate_command_dataset_dir_cross_artifact(self) -> None:
         # The --dataset-dir CLI wiring loads dataset_manifest.json + metadata.json (JSON, torch-free) from a
         # built dataset directory and runs the cross-artifact preflight: agreeing surfaces -> rc 0; a corrupted
@@ -3408,6 +3430,18 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 })
             )
             self.assertEqual(main(["--dataset-dir", str(dataset_dir)]), 1)
+            # A structurally-corrupt artifact (valid JSON, not an object) is surfaced as a failure, not silently
+            # skipped as "declares no basis".
+            (dataset_dir / "metadata.json").write_text(json.dumps(["not", "a", "dict"]))
+            self.assertEqual(main(["--dataset-dir", str(dataset_dir)]), 1)
+            # A single present surface: nothing to cross-check, but self-validated -> ok (rc 0).
+            (dataset_dir / "metadata.json").unlink()
+            self.assertEqual(main(["--dataset-dir", str(dataset_dir)]), 0)
+        # "Nothing to check" must never read as success: a nonexistent dir and an existing-but-empty dir both fail.
+        with tempfile.TemporaryDirectory() as directory:
+            empty_dir = Path(directory)
+            self.assertEqual(main(["--dataset-dir", str(empty_dir / "does_not_exist")]), 1)
+            self.assertEqual(main(["--dataset-dir", str(empty_dir)]), 1)
 
     def test_execution_shadow_cost_basis_status(self) -> None:
         # The artifact must report what the PR-3 shadow's max_weight turnover pricing PROVES for the resolved

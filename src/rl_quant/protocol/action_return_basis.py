@@ -218,30 +218,50 @@ def return_basis_agreement_errors(eval_basis: ReturnBasis, declared_basis: Retur
 
 
 def validate_return_basis_surfaces(surfaces: dict[str, Any]) -> list[str]:
-    """Cross-ARTIFACT agreement: every persisted surface that declares the return basis (the .pt payload,
-    dataset_manifest.json, metadata.json, ...) must agree on the basis AND on the persisted
-    ``return_basis_content_hash``. Returns reasons (empty == agree).
+    """Cross-ARTIFACT agreement AND per-surface validity for the return basis as persisted to every surface of
+    one built dataset (the ``.pt`` payload, ``dataset_manifest.json``, ``metadata.json``, ...). Returns reasons
+    (empty == every declaring surface agrees, is value-valid, and is self-consistent with its persisted hash).
 
     Each payload is read with ReturnBasis.from_mapping (nested-``action_return_basis``-aware), so flat
-    (.pt/manifest) and nested (metadata) surfaces are handled uniformly. Surfaces that declare NO basis (empty
-    ReturnBasis) are skipped -- a surface that simply does not carry the basis is not a disagreement -- and fewer
-    than two declaring surfaces yields no reasons. In a clean build all surfaces are written from ONE basis, so a
-    disagreement here means a hand-edit, a stale artifact, a partial write, or a cross-build mix (a tamper /
-    divergence tripwire). The persisted hash on a surface must also match THAT surface's own declared basis."""
+    (.pt/manifest) and nested (metadata) surfaces are handled uniformly. Surfaces that declare NO basis (an empty
+    ReturnBasis -- a dict that simply omits the keys, or a non-mapping value) are skipped: an absent basis is not
+    a disagreement. The checks, all order-independent and fail-closed only on a real problem:
+
+    * AGREEMENT -- FULL pairwise across declaring surfaces (not star-vs-one-reference), so a contradiction on a
+      field that only two NON-reference surfaces declare is still caught the moment a third surface is compared.
+    * VALIDITY -- each declaring surface must declare a VALID basis (recognized weight semantics + no corrupt
+      value); a uniformly-corrupt-but-agreeing basis is still flagged, and on the metadata surface (not a
+      DatasetManifest) this is the only basis validation it gets.
+    * HASH SELF-CONSISTENCY -- a surface's persisted ``return_basis_content_hash`` must match its OWN declared
+      basis (a stale / hand-edited hash tripwire).
+
+    In a clean build all surfaces are written from ONE valid basis, so any reason here means a hand-edit, a stale
+    or partial artifact, a cross-build mix, or a corrupt value (a tamper / divergence tripwire)."""
     bases = {label: ReturnBasis.from_mapping(payload) for label, payload in surfaces.items()}
-    declaring = {label: basis for label, basis in bases.items() if basis.declared()}
+    # Sorted so the verdict (and the labels in each reason) are deterministic regardless of dict insertion order.
+    declaring = sorted(
+        ((label, basis) for label, basis in bases.items() if basis.declared()),
+        key=lambda item: item[0],
+    )
     reasons: list[str] = []
-    if len(declaring) >= 2:
-        labels = list(declaring)
-        reference_label, reference = labels[0], declaring[labels[0]]
-        for label in labels[1:]:
-            diffs = reference.disagreements_with(declaring[label])
-            if diffs:
-                reasons.append(f"return_basis_surface_disagreement:{reference_label}!={label}:{sorted(diffs)}")
+    # AGREEMENT: full pairwise (not star) -- independent of which surface is the sparsest.
+    for (label_a, basis_a), (label_b, basis_b) in combinations(declaring, 2):
+        diffs = basis_a.disagreements_with(basis_b)
+        if diffs:
+            reasons.append(f"return_basis_surface_disagreement:{label_a}!={label_b}:{sorted(diffs)}")
+    # VALIDITY: a declaring surface must declare a value-valid basis with recognized weight semantics.
+    for label, basis in declaring:
+        errors = basis.validation_errors()
+        if basis.invalid_weight_semantics():
+            errors = [*errors, f"invalid_weight_semantics:{basis.weight_semantics!r}"]
+        if errors:
+            reasons.append(f"return_basis_surface_invalid:{label}:{sorted(errors)}")
+    # HASH SELF-CONSISTENCY: each surface's persisted hash must match its own declared basis.
+    declaring_basis = dict(declaring)
     for label, payload in surfaces.items():
-        if label not in declaring:
+        if label not in declaring_basis:
             continue
         stored = payload.get("return_basis_content_hash") if hasattr(payload, "get") else None
-        if stored is not None and stored != declaring[label].content_hash():
+        if stored is not None and stored != declaring_basis[label].content_hash():
             reasons.append(f"return_basis_content_hash_mismatch:{label}")
     return reasons

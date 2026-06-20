@@ -165,15 +165,41 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(f"{path}: {type(exc).__name__}: {exc}")
 
     for dataset_dir in args.dataset_dir:
+        # A user-supplied path that is not a directory (typo, never-built, wrong cwd) is an input error, NOT a
+        # vacuous pass: finding "nothing to check" must never read as "surfaces agree".
+        if not dataset_dir.is_dir():
+            failures.append(f"{dataset_dir}: not a directory (cannot cross-check return-basis surfaces)")
+            continue
         try:
             surfaces = {}
+            malformed: list[str] = []
             for label, name in (("dataset_manifest", "dataset_manifest.json"), ("metadata", "metadata.json")):
                 artifact = dataset_dir / name
-                if artifact.exists():
-                    surfaces[label] = json.loads(artifact.read_text())
+                if not artifact.exists():
+                    continue
+                parsed = json.loads(artifact.read_text())
+                # A structurally-corrupt artifact (valid JSON but not an object) would be silently treated as
+                # "declares no basis" and skipped; surface it as a failure instead.
+                if not isinstance(parsed, dict):
+                    malformed.append(f"{name} is not a JSON object")
+                    continue
+                surfaces[label] = parsed
+            if malformed:
+                failures.append(f"{dataset_dir}: malformed return-basis surface(s): {malformed}")
+                continue
+            if not surfaces:
+                failures.append(
+                    f"{dataset_dir}: no return-basis surfaces found "
+                    "(expected dataset_manifest.json and/or metadata.json)"
+                )
+                continue
             reasons = validate_return_basis_surfaces(surfaces)
             if reasons:
                 failures.append(f"{dataset_dir}: return-basis surfaces disagree: {reasons}")
+            elif len(surfaces) < 2:
+                # Only one surface present: nothing to cross-check, but it was self-validated (value-valid +
+                # hash self-consistent). Report honestly rather than implying a cross-surface agreement.
+                print(f"OK return-basis surface self-consistent (only {sorted(surfaces)}, no cross-check): {dataset_dir}")
             else:
                 print(f"OK return-basis surfaces agree: {dataset_dir} ({sorted(surfaces)})")
             if registry:
