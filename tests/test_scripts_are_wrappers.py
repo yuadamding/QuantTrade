@@ -54,7 +54,7 @@ LEGACY_NON_WRAPPER_SCRIPTS = {
     "train_hourly_from_second_protocol_partitions.py",
     "train_second_context_action_scorer.py",
     "train_strategy_allocator.py",
-    "validate_research_protocol.py",
+    # validate_research_protocol.py MIGRATED -> rl_quant.workflows.commands.validate (now a thin wrapper).
 }
 
 

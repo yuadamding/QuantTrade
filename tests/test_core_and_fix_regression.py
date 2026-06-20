@@ -133,7 +133,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(any("model_available_timestamp_ms must be > 0" in error for error in errors))
 
     def test_model_manifest_adapter_accepts_trainer_schema(self) -> None:
-        module = load_script("validate_research_protocol")
+        from rl_quant.workflows.commands import validate as module
         trainer_manifest = {
             "model_id": "demo",
             "created_at_utc": "2026-06-14T00:00:00+00:00",
