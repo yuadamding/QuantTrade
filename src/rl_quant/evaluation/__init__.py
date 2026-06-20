@@ -10,7 +10,11 @@ from rl_quant.evaluation.ranking import (
     selection_regret,
     top_k_mean_return,
 )
-from rl_quant.evaluation.run_registry import RunRegistry, TrialRecord
+from rl_quant.evaluation.run_registry import (
+    RunRegistry,
+    TrialRecord,
+    validate_final_reportability_inputs,
+)
 from rl_quant.evaluation.statistical import (
     DSR_PROMOTION_CONFIDENCE,
     PSR_MIN_CREDIBLE_OBSERVATIONS,
@@ -49,6 +53,7 @@ __all__ = [
     "selection_regret",
     "statistical_credibility_report",
     "top_k_mean_return",
+    "validate_final_reportability_inputs",
     "walk_forward_degradation_ratio",
     "white_reality_check",
 ]

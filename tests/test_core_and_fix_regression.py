@@ -3932,6 +3932,30 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # Composes with the credibility report -> the registry supplies the honest n_trials.
         rep = statistical_credibility_report([0.01, -0.005, 0.02, 0.0] * 8, n_trials=final.n_for_multiple_testing())
         self.assertEqual(rep["n_trials"], 2)
+        # Richer record: optional provenance fields round-trip into the manifest; selected names the winner.
+        rich = RunRegistry("fam_v3", (
+            TrialRecord("w", "complete", selected=True, config_hash="cfg_abc", notes="best val"),
+            TrialRecord("o", "failed", config_hash="cfg_def"),
+        ))
+        self.assertEqual(rich.selected_trial().run_id, "w")
+        rm = rich.to_manifest()
+        self.assertEqual(rm["selected_run_id"], "w")
+        self.assertEqual(rm["trials"][0]["config_hash"], "cfg_abc")
+        self.assertTrue(rm["trials"][0]["selected"])
+        self.assertEqual(rm["trials"][0]["notes"], "best val")
+        _json.dumps(rm)  # richer snapshot still JSON-serializable
+        # Backward compat: a registry with no selected trial reports None and still serializes.
+        self.assertIsNone(final.selected_trial())
+        self.assertIsNone(final.to_manifest()["selected_run_id"])
+        # The trials container is coerced to a tuple so the frozen guarantee is real: a list passed in cannot be
+        # mutated afterwards to smuggle in a duplicate run_id or a second winner past the construction-time checks.
+        from_list = RunRegistry("fam_list", [TrialRecord("a", "complete"), TrialRecord("b", "failed")])
+        self.assertIsInstance(from_list.trials, tuple)
+        with self.assertRaises(AttributeError):
+            from_list.trials.append(TrialRecord("c", "complete"))  # tuple has no append
+        # Non-TrialRecord elements are rejected (a stray dict/str would silently defeat per-trial checks).
+        with self.assertRaisesRegex(ValueError, "must be a TrialRecord"):
+            RunRegistry("fam_bad_elem", ("not_a_record",))
         # Fail closed.
         with self.assertRaises(ValueError):
             RunRegistry("fam", (TrialRecord("dup", "complete"), TrialRecord("dup", "failed")))
@@ -3941,6 +3965,85 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             RunRegistry("", ())
         with self.assertRaises(ValueError):
             TrialRecord("", "complete")
+        # At most one submitted winner per family.
+        with self.assertRaisesRegex(ValueError, "at most one trial may be selected"):
+            RunRegistry("two_winners", (TrialRecord("a", "complete", selected=True),
+                                        TrialRecord("b", "complete", selected=True)))
+        # New optional fields are type-checked.
+        with self.assertRaises(ValueError):
+            TrialRecord("a", "complete", selected="yes")  # not a bool
+        with self.assertRaises(ValueError):
+            TrialRecord("a", "complete", config_hash="")  # empty string not allowed (None or non-empty)
+
+    def test_validate_final_reportability_inputs(self) -> None:
+        # The fail-closed gate a FINAL credibility report routes through: it refuses a non-final family, an
+        # empty honest-trial count, or a missing/incoherent submitted winner, and returns the honest n_trials.
+        from rl_quant.evaluation import (
+            RunRegistry,
+            TrialRecord,
+            statistical_credibility_report,
+            validate_final_reportability_inputs,
+        )
+
+        returns = [0.01, -0.005, 0.02, 0.0] * 8
+        # Happy path: final family, one complete+included winner, enough returns -> returns honest n_trials,
+        # which feeds the credibility report directly.
+        ok = RunRegistry("fam_ok", (
+            TrialRecord("w", "complete", selected=True),
+            TrialRecord("o1", "complete"),
+            TrialRecord("o2", "failed"),
+        ))
+        n = validate_final_reportability_inputs(ok, candidate_returns=returns)
+        self.assertEqual(n, 3)  # complete+failed+included: w, o1, o2
+        self.assertEqual(statistical_credibility_report(returns, n_trials=n)["n_trials"], 3)
+        # Not final: an included trial is still running -> raise, naming the blocking run_id.
+        not_final = RunRegistry("fam_run", (
+            TrialRecord("w", "complete", selected=True),
+            TrialRecord("pending", "running"),
+        ))
+        with self.assertRaisesRegex(ValueError, "not final"):
+            validate_final_reportability_inputs(not_final, candidate_returns=returns)
+        self.assertIn("pending", str(not_final.running_included_run_ids()))
+        # No selected winner -> raise.
+        with self.assertRaisesRegex(ValueError, "no trial is flagged selected"):
+            validate_final_reportability_inputs(
+                RunRegistry("fam_nw", (TrialRecord("a", "complete"),)), candidate_returns=returns
+            )
+        # Selected winner not complete (failed) -> raise.
+        with self.assertRaisesRegex(ValueError, "not 'complete'"):
+            validate_final_reportability_inputs(
+                RunRegistry("fam_bw", (TrialRecord("w", "failed", selected=True),)),
+                candidate_returns=returns,
+            )
+        # Selected winner excluded from multiple testing -> raise (an included finished trial keeps the count
+        # positive so this trips the winner-integrity check, not the count check).
+        with self.assertRaisesRegex(ValueError, "excluded from multiple testing"):
+            validate_final_reportability_inputs(
+                RunRegistry("fam_ew", (
+                    TrialRecord("w", "complete", selected=True, included_in_multiple_testing=False),
+                    TrialRecord("o", "complete"),
+                )),
+                candidate_returns=returns,
+            )
+        # Honest trial count 0: the only trial is running AND excluded, so the family is final (no included
+        # running trial) but nothing finished+included remains to deflate for -> count gate fires first.
+        with self.assertRaisesRegex(ValueError, "honest trial count is 0"):
+            validate_final_reportability_inputs(
+                RunRegistry("fam_zero", (TrialRecord("r", "running", included_in_multiple_testing=False),)),
+                candidate_returns=returns,
+            )
+        # Too few candidate returns -> raise (default floor 2); the count is bound to the ACTUAL series length.
+        with self.assertRaisesRegex(ValueError, "fewer than"):
+            validate_final_reportability_inputs(ok, candidate_returns=returns[:1])
+        # min_returns cannot be lowered below 2 (the floor is not caller-nullifiable).
+        with self.assertRaisesRegex(ValueError, "min_returns must be an int >= 2"):
+            validate_final_reportability_inputs(ok, candidate_returns=returns, min_returns=1)
+        # A non-finite / corrupt return series is refused even when long enough.
+        with self.assertRaisesRegex(ValueError, "non-finite or non-numeric"):
+            validate_final_reportability_inputs(ok, candidate_returns=[0.01, float("nan"), 0.02, 0.0])
+        # candidate_returns must be a sized sequence -- a bare int (the old footgun) is rejected outright.
+        with self.assertRaisesRegex(ValueError, "sized sequence"):
+            validate_final_reportability_inputs(ok, candidate_returns=999)
 
     def test_second_context_mask_alias_lookup_no_eager_keyerror(self) -> None:
         # _build_split previously used payload.get("decision_action_valid_mask", payload["action_valid_mask"]),
