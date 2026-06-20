@@ -174,6 +174,14 @@ class ReturnBasis:
             # An unrecognized schema version (typo / future) is fail-closed: we cannot know its requirements,
             # so it is invalid rather than silently treated as the laxer v1.
             errors.append(f"unrecognized_basis_version:{self.basis_version!r}")
+        # Declared string fields must be non-blank: a DECLARED "" passes the None-based completeness check yet is
+        # a degenerate value (formula / fill_convention / etc. are free-form, but "" is never a valid value).
+        # weight_semantics and basis_version have their own recognized-value checks above.
+        for name in ("formula", "semantics_version", "fill_convention",
+                     "entry_fill_rule", "exit_fill_rule", "source_bar_interval", "price_source"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                errors.append(f"blank_or_non_string_{name}:{value!r}")
         return errors
 
     def disagreements_with(self, other: "ReturnBasis") -> list[str]:

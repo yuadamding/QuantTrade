@@ -102,8 +102,15 @@ class ResearchProtocolTests(unittest.TestCase):
             DatasetManifest.from_dict({**payload, "action_return_fill_conventon": "x"})
 
         # The basis lands where the reportability agreement check reads it (action_return_* keys via ReturnBasis).
-        from rl_quant.datasets.hour_from_subhour import ReturnBasis
+        from rl_quant.protocol.action_return_basis import ReturnBasis
         self.assertTrue(ReturnBasis.from_mapping(payload).is_complete())
+
+        # return_basis_content_hash, when recorded, MUST match the declared basis -- a matching hash validates;
+        # a stale / hand-edited hash raises (the basis and its stamp must agree). None is unaffected.
+        expected = ReturnBasis.from_mapping(manifest).content_hash()
+        DatasetManifest.from_dict({**payload, "return_basis_content_hash": expected}).validate()  # ok
+        with self.assertRaisesRegex(ResearchProtocolError, "does not match"):
+            DatasetManifest.from_dict({**payload, "return_basis_content_hash": "stale_hash"}).validate()
 
     def test_dataset_manifest_basis_field_names_match_return_basis_reader(self) -> None:
         # Cross-module invariant: the manifest's action_return_* field names MUST equal the payload keys that

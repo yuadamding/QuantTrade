@@ -94,6 +94,11 @@ class DatasetManifest:
     action_return_execution_latency_ms: int | None = None
     action_return_source_bar_interval: str | None = None
     action_return_price_source: str | None = None
+    # The basis content hash (sha256 over the declared basis), persisted as a first-class field so it round-trips
+    # through from_dict/to_dict and validate() can confirm it matches the declared basis (catching a stale /
+    # hand-edited hash). Optional/None on manifests that do not record it. This is NOT an action_return_* key, so
+    # it is not subject to the protected-prefix typo guard.
+    return_basis_content_hash: str | None = None
 
     def validate(self) -> None:
         if not self.dataset_id:
@@ -116,6 +121,19 @@ class DatasetManifest:
             raise ResearchProtocolError("universe_selection_date must be before or at first_timestamp.")
         for window in self.feature_fit_windows:
             window.validate_prior_only()
+        # If a return-basis content hash is recorded, it MUST match the declared action_return_* basis -- this
+        # catches a stale or hand-edited hash (the basis economics and their stamp must agree). A manifest that
+        # records no hash is unaffected (default-preserving). Imported lazily to keep this module's import graph
+        # free of the protocol-layer dependency at module load.
+        if self.return_basis_content_hash is not None:
+            from rl_quant.protocol.action_return_basis import ReturnBasis
+
+            expected = ReturnBasis.from_mapping(self).content_hash()
+            if self.return_basis_content_hash != expected:
+                raise ResearchProtocolError(
+                    f"return_basis_content_hash {self.return_basis_content_hash!r} does not match the declared "
+                    f"action-return basis (expected {expected!r}); the basis and its content hash must agree."
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

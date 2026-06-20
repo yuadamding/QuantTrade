@@ -232,13 +232,14 @@ def clipped_simple_return(current_close: float, next_close: float) -> float:
     return max(min(next_close / current_close - 1.0, 1.0), -1.0)
 
 
-def _direct_hourly_action_return_basis(bar_interval: str) -> dict:
+def _direct_hourly_action_return_basis(bar_interval: str) -> dict[str, object]:
     """The canonical, TRUTHFUL action-return basis for the direct-hourly builder, recorded for reportability
     (it does NOT change the returns). Each non-cash action return is clipped_simple_return(decision_bar_close,
     next_bar_close): entry at the DECISION bar's own close, exit at the next bar's close, ZERO execution latency
     -- a decide-and-fill-at-close convention that is MORE OPTIMISTIC than a latency-aware fill (it assumes you
-    transact at the exact close you just observed). Returns are clipped to [-1, 1]; CASH is 0 and the chosen
-    action gets full capital (single slot).
+    transact at the exact close you just observed). The "close" is the ADJUSTED close when available, else the
+    raw close (see load: row.get("Adj Close") or row.get("Close")), recorded in price_source. Returns are
+    clipped to [-1, 1]; CASH is 0 and the chosen action gets full capital (single slot).
 
     Built via the canonical ReturnBasis (no hand-spelled action_return_* keys) and validated at write time --
     the builder is the source of truth for dataset semantics, so an incomplete/invalid basis fails the build
@@ -255,7 +256,7 @@ def _direct_hourly_action_return_basis(bar_interval: str) -> dict:
         exit_fill_rule="next_bar_close",
         execution_latency_ms=0,
         source_bar_interval=bar_interval,
-        price_source="bar_close",
+        price_source="adjusted_close_when_available_else_close",
     )
     problems = basis.validation_errors()
     if problems or not basis.is_complete():
@@ -592,6 +593,10 @@ def main() -> int:
                 "dataset_reportable": dataset_reportable,
                 "dataset_reportability_errors": dataset_reportability_errors,
                 "future_label_filtered_rows": future_label_filtered_rows,
+                # Return-basis provenance on the nested source dict too, so a reader of .pt["source"] alone
+                # sees the declared economics and their stamp.
+                "action_return_basis": action_return_basis,
+                "return_basis_content_hash": return_basis_content_hash,
             },
         },
         dataset_path,
@@ -622,10 +627,11 @@ def main() -> int:
         "dataset_reportable": dataset_reportable,
         "dataset_reportability_errors": dataset_reportability_errors,
         "future_label_filtered_rows": future_label_filtered_rows,
-        # Fold the action-return basis into the source hash so source_manifest_hash captures the dataset's
-        # return ECONOMICS, not just its inputs (a basis change now changes the provenance hash).
+        # Fold the action-return BASIS (not its content hash) into the source hash so source_manifest_hash
+        # captures the dataset's return ECONOMICS, not just its inputs (a basis change now changes the provenance
+        # hash). Deliberately NOT the content hash: that would make source_manifest_hash depend on the hash
+        # ALGORITHM, perturbing it if content_hash() ever changes while the economics stay identical.
         "action_return_basis": action_return_basis,
-        "return_basis_content_hash": return_basis_content_hash,
     }
     metadata = {
         "rows": len(timestamps),
@@ -650,6 +656,10 @@ def main() -> int:
         "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "state_features_csv": str(args.output_dir / "state_features.csv"),
         "action_returns_csv": str(args.output_dir / "action_returns.csv"),
+        # Carry the return-basis provenance here too, so a reader of metadata.json alone sees the declared
+        # economics and their stamp (not only the .pt payload / dataset_manifest.json).
+        "action_return_basis": action_return_basis,
+        "return_basis_content_hash": return_basis_content_hash,
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     manifest = DatasetManifest(
@@ -681,6 +691,8 @@ def main() -> int:
             "action_return_* basis (execution_latency_ms=0).",
         ],
         **action_return_basis,
+        # First-class field (round-trips through from_dict/to_dict); validate() confirms it matches the basis.
+        return_basis_content_hash=return_basis_content_hash,
     )
     try:
         manifest.validate()
@@ -692,7 +704,6 @@ def main() -> int:
                 "future_label_filtered_rows": future_label_filtered_rows,
                 "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
                 "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
-                "return_basis_content_hash": return_basis_content_hash,
             }
         )
     except ResearchProtocolError as exc:
@@ -708,7 +719,6 @@ def main() -> int:
                 "future_label_filtered_rows": future_label_filtered_rows,
                 "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
                 "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
-                "return_basis_content_hash": return_basis_content_hash,
             }
         )
     (args.output_dir / "dataset_manifest.json").write_text(
