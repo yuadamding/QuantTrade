@@ -133,6 +133,21 @@ class HourlySplitTests(unittest.TestCase):
         self.assertEqual(split.action_return_execution_latency_ms, 0)
         self.assertTrue(ReturnBasis.from_mapping(split).is_complete())
 
+    def test_direct_hourly_builder_emits_complete_truthful_basis(self) -> None:
+        # The direct-hourly builder emits a COMPLETE, VALID v2 basis that truthfully describes its computation
+        # (clipped_simple_return(decision_bar_close, next_bar_close), zero execution latency). A run on a freshly
+        # built dataset can therefore pass --strict-return-basis.
+        from rl_quant.protocol.action_return_basis import ReturnBasis
+
+        module = load_script("build_hourly_transformer_dataset")
+        basis = ReturnBasis.from_mapping(module._direct_hourly_action_return_basis("1h"))
+        self.assertTrue(basis.is_complete())              # complete v2 (all structured fields present)
+        self.assertEqual(basis.validation_errors(), [])   # valid (latency 0 ok; clips finite, ordered)
+        self.assertEqual(basis.execution_latency_ms, 0)    # truthful: zero-latency decision-bar-close fill
+        self.assertEqual(basis.entry_fill_rule, "decision_bar_close")
+        self.assertEqual(basis.exit_fill_rule, "next_bar_close")
+        self.assertEqual(basis.source_bar_interval, "1h")  # carries the actual bar interval
+
     def test_direct_hourly_split_rejects_finite_returns_for_invalid_actions(self) -> None:
         hourly = __import__("rl_quant.datasets.hourly", fromlist=["_build_split"])
         payload = {

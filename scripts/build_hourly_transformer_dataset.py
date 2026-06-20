@@ -231,6 +231,29 @@ def clipped_simple_return(current_close: float, next_close: float) -> float:
     return max(min(next_close / current_close - 1.0, 1.0), -1.0)
 
 
+def _direct_hourly_action_return_basis(bar_interval: str) -> dict:
+    """The canonical, TRUTHFUL action-return basis for the direct-hourly builder, recorded for reportability
+    (it does NOT change the returns). Each non-cash action return is clipped_simple_return(decision_bar_close,
+    next_bar_close): entry at the DECISION bar's own close, exit at the next bar's close, ZERO execution latency
+    -- a decide-and-fill-at-close convention that is MORE OPTIMISTIC than a latency-aware fill (it assumes you
+    transact at the exact close you just observed). Returns are clipped to [-1, 1]; CASH is 0 and the chosen
+    action gets full capital (single slot)."""
+    return {
+        "action_return_weight_semantics": "full_capital_single_slot_returns",
+        "action_return_formula": "clipped_simple_return(decision_bar_close, next_bar_close)",
+        "action_return_clip_min": -1.0,
+        "action_return_clip_max": 1.0,
+        "action_return_semantics_version": "v1",
+        "action_return_fill_convention": "decision_bar_close_to_next_bar_close",
+        "action_return_basis_version": "v2",
+        "action_return_entry_fill_rule": "decision_bar_close",
+        "action_return_exit_fill_rule": "next_bar_close",
+        "action_return_execution_latency_ms": 0,
+        "action_return_source_bar_interval": bar_interval,
+        "action_return_price_source": "bar_close",
+    }
+
+
 def aggregate_stock_features(values: list[BarFeature], *, total_symbols: int) -> list[float]:
     if not values:
         return [0.0] * 14
@@ -349,7 +372,7 @@ def main() -> int:
     try:
         import torch
     except ModuleNotFoundError as exc:
-        raise SystemExit("Torch is required. Use: conda run -n ml1 python scripts/build_hourly_transformer_dataset.py") from exc
+        raise SystemExit("Torch is required. Use: conda run -n quanttrade python scripts/build_hourly_transformer_dataset.py") from exc
 
     bar_interval = args.bar_interval.strip().lower()
     universe_selection_date = resolve_universe_selection_date(args)
@@ -501,6 +524,9 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset_file_name = args.dataset_file_name or f"{interval_label(bar_interval)}_transformer_dataset.pt"
     dataset_path = args.output_dir / dataset_file_name
+    # Canonical action-return basis, recorded ONCE and written into BOTH the .pt payload and dataset_manifest.json
+    # (via the DatasetManifest below) so the reportability agreement check has matching declared copies.
+    action_return_basis = _direct_hourly_action_return_basis(bar_interval)
     torch.save(
         {
             "timestamps": timestamps,
@@ -514,6 +540,7 @@ def main() -> int:
             "label_valid_mask": label_valid_mask,
             "action_label_valid_mask": label_valid_mask,
             "action_mask_semantics": action_mask_semantics,
+            **action_return_basis,
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
             "dataset_reportable": dataset_reportable,
@@ -626,7 +653,11 @@ def main() -> int:
             "Universe selection date is validated to be no later than the first dataset timestamp.",
             "US regular-session timing uses simplified 9:30-16:00 assumptions.",
             "Legacy direct bar builder requires all selected action labels before retaining a row.",
+            "Action returns use a ZERO-LATENCY decision-bar-close fill (entry at the decision bar's own close, "
+            "exit at the next bar's close) -- more optimistic than a latency-aware fill; see the recorded "
+            "action_return_* basis (execution_latency_ms=0).",
         ],
+        **action_return_basis,
     )
     try:
         manifest.validate()
