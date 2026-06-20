@@ -710,6 +710,7 @@ def _run_semantics_hash(
         ("action_return_clip_min", train_data.action_return_clip_min),
         ("action_return_clip_max", train_data.action_return_clip_max),
         ("action_return_semantics_version", train_data.action_return_semantics_version),
+        ("action_return_fill_convention", train_data.action_return_fill_convention),
     ):
         if value is not None:
             fingerprint[key] = float(value) if "clip" in key else value

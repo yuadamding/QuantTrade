@@ -904,6 +904,8 @@ def build_reportability_artifacts(
     model_version: int,
     constraint_feature_names: list[str],
 ) -> dict[str, object]:
+    from rl_quant.datasets.hour_from_subhour import ReturnBasis
+
     created_at = utc_now_iso()
     dataset_manifest_path = args.dataset.parent / "dataset_manifest.json"
     dataset_manifest = read_json_if_exists(dataset_manifest_path) or {
@@ -1062,6 +1064,9 @@ def build_reportability_artifacts(
         "model_manifest": model_manifest,
         "data_quality_report": data_quality_report,
         "action_eligibility": action_eligibility,
+        # The evaluation's declared action-return basis (canonical fields), carried so the reportability gate
+        # can assert it AGREES with the dataset manifest's declared basis (item #7).
+        "return_basis": ReturnBasis.from_mapping(train_split).to_dict(),
     }
 
 

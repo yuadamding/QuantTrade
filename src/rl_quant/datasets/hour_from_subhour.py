@@ -90,6 +90,10 @@ class HourFromMinuteDataSplit:
     action_return_clip_min: float | None = None
     action_return_clip_max: float | None = None
     action_return_semantics_version: str | None = None
+    # The fill convention: the price/timing assumption under which a position is realized (e.g.
+    # "next_bar_open", "decision_bar_close"). Part of the canonical ReturnBasis. None on payloads that predate
+    # the field; it is recorded and participates in basis agreement, but its absence does not break loading.
+    action_return_fill_convention: str | None = None
 
     @property
     def effective_context_bars_per_hour(self) -> int:
@@ -738,6 +742,103 @@ def validate_action_return_basis(payload: dict[str, Any]) -> None:
         )
 
 
+# Canonical field name -> the payload/split attribute key it wraps. The ReturnBasis object reads/writes these.
+_RETURN_BASIS_FIELD_KEYS = {
+    "weight_semantics": "action_return_weight_semantics",
+    "formula": "action_return_formula",
+    "clip_min": "action_return_clip_min",
+    "clip_max": "action_return_clip_max",
+    "semantics_version": "action_return_semantics_version",
+    "fill_convention": "action_return_fill_convention",
+}
+
+
+def _basis_value_differs(a: Any, b: Any) -> bool:
+    """NaN-safe inequality for basis-field comparison: two NaN floats are treated as EQUAL so a basis never
+    contradicts itself (NaN != NaN would otherwise surface a corrupt NaN clip bound as a spurious
+    self-disagreement). Any other values use ordinary ``!=`` (so -0.0 == 0.0, -1.0 == -1, etc.)."""
+    if isinstance(a, float) and isinstance(b, float) and a != a and b != b:  # both NaN
+        return False
+    return a != b
+
+
+@dataclass(frozen=True)
+class ReturnBasis:
+    """Canonical, hashable wrapper for the FULL action-return basis -- the weight semantics (the PR-4 cost
+    basis), the return formula, clip bounds, semantics version, and fill convention. It WRAPS the loose
+    ``action_return_*`` fields the dataset already records (additive; it does not replace them). Used to declare
+    the evaluation's basis in the reportability summary and to assert AGREEMENT between what the dataset
+    declares and what the evaluation used. A field is "declared" when it is not None."""
+
+    weight_semantics: str | None = None
+    formula: str | None = None
+    clip_min: float | None = None
+    clip_max: float | None = None
+    semantics_version: str | None = None
+    fill_convention: str | None = None
+
+    @classmethod
+    def from_mapping(cls, payload: Any) -> "ReturnBasis":
+        """Build from a mapping (dataset manifest dict) OR any object exposing the ``action_return_*`` attributes
+        (a HourFromMinuteDataSplit). Missing keys/attributes resolve to None."""
+        getter = payload.get if hasattr(payload, "get") else (lambda key, default=None: getattr(payload, key, default))
+        return cls(**{name: getter(key, None) for name, key in _RETURN_BASIS_FIELD_KEYS.items()})
+
+    @classmethod
+    def from_canonical(cls, payload: Any) -> "ReturnBasis":
+        """Build from a mapping keyed by the CANONICAL field names -- i.e. the round-trip of ``to_dict()`` as
+        stored in the reportability summary's ``return_basis`` section. Missing keys resolve to None."""
+        getter = payload.get if hasattr(payload, "get") else (lambda key, default=None: getattr(payload, key, default))
+        return cls(**{name: getter(name, None) for name in _RETURN_BASIS_FIELD_KEYS})
+
+    def to_dict(self) -> dict[str, Any]:
+        """All canonical fields (including None), for the reportability summary."""
+        return {name: getattr(self, name) for name in _RETURN_BASIS_FIELD_KEYS}
+
+    def declared(self) -> dict[str, Any]:
+        """Only the fields that are declared (non-None)."""
+        return {name: value for name, value in self.to_dict().items() if value is not None}
+
+    def is_complete(self) -> bool:
+        """True iff every field is declared AND the weight semantics is a recognized value."""
+        return (
+            len(self.declared()) == len(_RETURN_BASIS_FIELD_KEYS)
+            and self.weight_semantics in ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS
+        )
+
+    def invalid_weight_semantics(self) -> bool:
+        """True iff a weight_semantics is declared but is NOT a recognized value (a typo / unresolved string
+        reaching a reportable artifact). A None (undeclared) value is not "invalid" here."""
+        return self.weight_semantics is not None and self.weight_semantics not in ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS
+
+    def disagreements_with(self, other: "ReturnBasis") -> list[str]:
+        """Fields that BOTH self and other declare (non-None) but with different values -- a genuine basis
+        contradiction. Fields declared by only one side are not contradictions (nothing to compare)."""
+        out: list[str] = []
+        mine, theirs = self.declared(), other.declared()
+        for name in _RETURN_BASIS_FIELD_KEYS:
+            if name in mine and name in theirs and _basis_value_differs(mine[name], theirs[name]):
+                out.append(name)
+        return out
+
+
+def return_basis_agreement_errors(eval_basis: ReturnBasis, declared_basis: ReturnBasis) -> list[str]:
+    """Fail-closed agreement check for a reportable result. Returns reasons (empty == agree) when EITHER side
+    declares an invalid weight semantics, OR the two bases CONTRADICT on a jointly-declared field. It is
+    default-preserving: a basis that declares nothing (or only one side declares a field) yields no error --
+    the check fires only on a real contradiction or an invalid declared value, never merely on absence."""
+    errors: list[str] = []
+    for basis, label in ((eval_basis, "eval"), (declared_basis, "dataset_manifest")):
+        if basis.invalid_weight_semantics():
+            errors.append(f"return_basis_invalid_weight_semantics[{label}]:{basis.weight_semantics!r}")
+    for name in eval_basis.disagreements_with(declared_basis):
+        errors.append(
+            f"return_basis_disagreement:{name}"
+            f"(eval={eval_basis.declared().get(name)!r},dataset_manifest={declared_basis.declared().get(name)!r})"
+        )
+    return errors
+
+
 def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
     payload = _canonicalize_subhour_payload(payload)
     decisions = list(payload["decision_timestamps"])
@@ -1121,6 +1222,7 @@ def _build_split(
         action_return_clip_min=payload.get("action_return_clip_min"),
         action_return_clip_max=payload.get("action_return_clip_max"),
         action_return_semantics_version=payload.get("action_return_semantics_version"),
+        action_return_fill_convention=payload.get("action_return_fill_convention"),
     )
 
 

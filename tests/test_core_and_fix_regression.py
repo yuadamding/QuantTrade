@@ -3230,6 +3230,53 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_action_return_basis({"action_return_formula": "clipped_simple_return(entry_fill, exit_fill)"})
 
+    def test_return_basis_canonical_object_and_agreement(self) -> None:
+        # The canonical ReturnBasis wraps the loose action_return_* fields and drives the unconditional
+        # reportability AGREEMENT check (item #7). It reads either payload keys (manifest/split) or canonical
+        # field names (the summary round-trip), and the agreement check is fail-closed but default-preserving.
+        from rl_quant.datasets.hour_from_subhour import ReturnBasis, return_basis_agreement_errors
+
+        payload = {
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
+            "action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
+            "action_return_clip_min": -1.0,
+            "action_return_clip_max": 1.0,
+            "action_return_semantics_version": "v1",
+            "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        }
+        basis = ReturnBasis.from_mapping(payload)
+        self.assertTrue(basis.is_complete())
+        self.assertEqual(basis.weight_semantics, "full_capital_single_slot_returns")
+        self.assertEqual(basis.fill_convention, "first_close_at_or_after_decision_plus_execution_latency")
+        # Round-trips through the canonical (summary) representation.
+        self.assertEqual(ReturnBasis.from_canonical(basis.to_dict()), basis)
+        # from_mapping also reads attributes off a split-like object.
+        from types import SimpleNamespace
+        self.assertEqual(ReturnBasis.from_mapping(SimpleNamespace(**payload)), basis)
+
+        # Agreement: identical bases agree (no error).
+        self.assertEqual(return_basis_agreement_errors(basis, basis), [])
+        # Default-preserving: an empty (undeclared) basis on either/both sides yields no error.
+        self.assertEqual(return_basis_agreement_errors(ReturnBasis(), ReturnBasis()), [])
+        self.assertEqual(return_basis_agreement_errors(basis, ReturnBasis()), [])
+        # A field declared by only ONE side is not a contradiction.
+        self.assertEqual(
+            return_basis_agreement_errors(basis, ReturnBasis(weight_semantics=basis.weight_semantics)), []
+        )
+        # A genuine contradiction on a jointly-declared field is flagged.
+        conflicting = ReturnBasis.from_mapping({**payload, "action_return_fill_convention": "next_bar_open"})
+        errs = return_basis_agreement_errors(basis, conflicting)
+        self.assertTrue(any("return_basis_disagreement:fill_convention" in e for e in errs), errs)
+        # An invalid (typo / unresolved) declared weight semantics reaching a reportable artifact is flagged.
+        bad_ws = ReturnBasis.from_mapping({**payload, "action_return_weight_semantics": "unresolved"})
+        self.assertFalse(bad_ws.is_complete())
+        self.assertTrue(bad_ws.invalid_weight_semantics())
+        errs2 = return_basis_agreement_errors(bad_ws, bad_ws)
+        self.assertTrue(any("return_basis_invalid_weight_semantics" in e for e in errs2), errs2)
+        # NaN-safe: a (corrupt) NaN clip bound must NOT make a basis disagree with itself.
+        nan_basis = ReturnBasis.from_mapping({**payload, "action_return_clip_min": float("nan")})
+        self.assertEqual(nan_basis.disagreements_with(nan_basis), [])
+
     def test_execution_shadow_cost_basis_status(self) -> None:
         # The artifact must report what the PR-3 shadow's max_weight turnover pricing PROVES for the resolved
         # basis, not merely what the shadow assumes. Unresolved when semantics absent; native for
@@ -3285,6 +3332,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertNotEqual(full_hash, h(dataclasses.replace(base, **{**full, "action_return_formula": "log_return"})))
         self.assertNotEqual(full_hash, h(dataclasses.replace(base, **{**full, "action_return_clip_max": 2.0})))
         self.assertNotEqual(full_hash, h(dataclasses.replace(base, **{**full, "action_return_semantics_version": "v2"})))
+        # The fill convention (item #7) is part of the basis: a fill-timing change is different economics and
+        # must perturb the fingerprint too (added only when present, so legacy splits are unaffected).
+        self.assertNotEqual(
+            full_hash, h(dataclasses.replace(base, **{**full, "action_return_fill_convention": "next_bar_open"})))
 
     def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just

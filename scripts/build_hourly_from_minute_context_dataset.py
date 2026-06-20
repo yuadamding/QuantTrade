@@ -1020,6 +1020,10 @@ def main() -> int:
             "action_return_clip_min": -1.0,
             "action_return_clip_max": 1.0,
             "action_return_semantics_version": "v1",
+            # The fill convention completing the canonical ReturnBasis: positions realize at the first close at
+            # or after the decision/reward timestamp plus execution latency (== action_fill_rule below). Carried
+            # so a reportable artifact declares its fill timing and the basis-agreement check can compare it.
+            "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
             "dataset_reportable": dataset_reportable,

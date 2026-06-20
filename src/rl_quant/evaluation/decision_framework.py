@@ -572,6 +572,16 @@ def validate_reportable_summary(summary: dict[str, Any]) -> list[str]:
     if isinstance(dataset_manifest, dict) and dataset_manifest.get("manifest_available") is False:
         errors.append("dataset_manifest_file_missing")
 
+    # Unconditional return-basis agreement (item #7): the evaluation's declared basis (summary["return_basis"],
+    # canonical fields) and the dataset manifest's declared basis (action_return_* keys) must AGREE -- no
+    # contradiction on a jointly-declared field, and no invalid weight semantics reaching a reportable artifact.
+    # Default-preserving: a basis that declares nothing (the legacy shape) yields no error.
+    from rl_quant.datasets.hour_from_subhour import ReturnBasis, return_basis_agreement_errors
+
+    eval_basis = ReturnBasis.from_canonical(summary.get("return_basis") or {})
+    declared_basis = ReturnBasis.from_mapping(dataset_manifest if isinstance(dataset_manifest, dict) else {})
+    errors.extend(return_basis_agreement_errors(eval_basis, declared_basis))
+
     reportability = summary.get("reportability")
     if isinstance(reportability, dict):
         for reason in reportability.get("reasons", []):

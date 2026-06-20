@@ -343,3 +343,54 @@ class DecisionFrameworkTests(unittest.TestCase):
         )
 
         self.assertEqual(errors, ["dataset_manifest_file_missing"])
+
+    def _reportable_summary_with_basis(self, *, return_basis: dict, dataset_manifest: dict) -> dict:
+        return {
+            "dataset_manifest": dataset_manifest,
+            "feature_manifest": {},
+            "model_manifest": {},
+            "data_quality_report": {},
+            "action_eligibility": [],
+            "test_metrics": {"total_return": 0.0},
+            "baselines": _canonical_baselines(),
+            "cost_stress": _canonical_cost_stress(),
+            "action_concentration": {"max_risky_group_share": 0.0, "leveraged_action_share": 0.0},
+            "return_diagnostics": {},
+            "return_basis": return_basis,
+        }
+
+    def test_validate_reportable_summary_return_basis_agreement(self) -> None:
+        # Item #7: the eval's declared basis (summary["return_basis"], canonical fields) and the dataset
+        # manifest's declared basis (action_return_* keys) must AGREE. Default-preserving + fail-closed.
+        eval_basis = {
+            "weight_semantics": "full_capital_single_slot_returns",
+            "formula": "clipped_simple_return(entry_fill, exit_fill)",
+            "clip_min": -1.0,
+            "clip_max": 1.0,
+            "semantics_version": "v1",
+            "fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        }
+        agreeing_manifest = {
+            "action_return_weight_semantics": "full_capital_single_slot_returns",
+            "action_return_fill_convention": "first_close_at_or_after_decision_plus_execution_latency",
+        }
+        # Agreeing basis -> no error.
+        self.assertEqual(
+            self._agreement_errors(self._reportable_summary_with_basis(
+                return_basis=eval_basis, dataset_manifest=agreeing_manifest)),
+            [],
+        )
+        # Contradiction on fill_convention -> flagged.
+        conflicting_manifest = {**agreeing_manifest, "action_return_fill_convention": "next_bar_open"}
+        errs = self._agreement_errors(self._reportable_summary_with_basis(
+            return_basis=eval_basis, dataset_manifest=conflicting_manifest))
+        self.assertTrue(any("return_basis_disagreement:fill_convention" in e for e in errs), errs)
+        # Invalid declared weight semantics reaching a reportable summary -> flagged.
+        errs2 = self._agreement_errors(self._reportable_summary_with_basis(
+            return_basis={**eval_basis, "weight_semantics": "unresolved"}, dataset_manifest=agreeing_manifest))
+        self.assertTrue(any("return_basis_invalid_weight_semantics" in e for e in errs2), errs2)
+
+    @staticmethod
+    def _agreement_errors(summary: dict) -> list:
+        # Only the return-basis reasons (the rest of the summary is fully reportable in this fixture).
+        return [e for e in validate_reportable_summary(summary) if e.startswith("return_basis_")]
