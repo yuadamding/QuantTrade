@@ -128,7 +128,23 @@ class DatasetManifest:
         if self.return_basis_content_hash is not None:
             from rl_quant.protocol.action_return_basis import ReturnBasis
 
-            expected = ReturnBasis.from_mapping(self).content_hash()
+            basis = ReturnBasis.from_mapping(self)
+            # Recording a hash is opting into a COMPLETE, VALUE-VALID basis -- not merely "the hash equals
+            # whatever fields happen to be declared". So a recorded hash requires the declared basis to be valid
+            # (no corrupt clip / latency / blank string / unrecognized version) AND complete; otherwise a partial
+            # or invalid basis could be hashed over and still pass. (A manifest with no hash is unaffected.)
+            basis_errors = basis.validation_errors()
+            if basis_errors:
+                raise ResearchProtocolError(
+                    f"return_basis_content_hash is recorded but the declared action-return basis is invalid: "
+                    f"{basis_errors}."
+                )
+            if not basis.is_complete():
+                raise ResearchProtocolError(
+                    "return_basis_content_hash is recorded but the declared action-return basis is incomplete; "
+                    "a hashed basis must be complete."
+                )
+            expected = basis.content_hash()
             if self.return_basis_content_hash != expected:
                 raise ResearchProtocolError(
                     f"return_basis_content_hash {self.return_basis_content_hash!r} does not match the declared "
@@ -149,15 +165,19 @@ class DatasetManifest:
         # rather than raising -- acceptable because the manifest is machine-generated from a single dict; a
         # misspelled REQUIRED field still fails (its positional arg ends up absent).
         known = {f.name for f in fields(cls)}
-        # ...EXCEPT the action_return_* basis keys, which are the protected reportability contract: a
-        # silently-dropped typo there (e.g. action_return_fill_conventon) would degrade the manifest-side basis
-        # to all-None and make the return-basis agreement check vacuous, so reject any unknown action_return_* key.
-        protected_typos = sorted(k for k in payload if k.startswith("action_return_") and k not in known)
+        # ...EXCEPT the basis-governance keys (action_return_* AND return_basis_*), which are the protected
+        # reportability contract: a silently-dropped typo there (e.g. action_return_fill_conventon, or
+        # return_basis_content_hahs) would degrade the manifest-side basis to all-None / disable the hash check,
+        # making the return-basis governance vacuous -- so reject any unknown key with those prefixes.
+        protected_typos = sorted(
+            k for k in payload
+            if (k.startswith("action_return_") or k.startswith("return_basis_")) and k not in known
+        )
         if protected_typos:
             raise ResearchProtocolError(
-                f"unknown action_return_* key(s) on DatasetManifest (likely a typo of a basis field): "
-                f"{protected_typos}. The action-return basis is the protected reportability contract; a "
-                "silently-dropped typo would make the return-basis agreement check vacuous."
+                f"unknown protected basis key(s) on DatasetManifest (likely a typo of a basis/hash field): "
+                f"{protected_typos}. The action-return basis and its content hash are the protected reportability "
+                "contract; a silently-dropped typo would make the return-basis governance vacuous."
             )
         kwargs = {key: value for key, value in payload.items() if key in known}
         kwargs["feature_fit_windows"] = windows

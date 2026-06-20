@@ -104,6 +104,9 @@ class ResearchProtocolTests(unittest.TestCase):
         # The basis lands where the reportability agreement check reads it (action_return_* keys via ReturnBasis).
         from rl_quant.protocol.action_return_basis import ReturnBasis
         self.assertTrue(ReturnBasis.from_mapping(payload).is_complete())
+        # from_mapping also reads a NESTED {"action_return_basis": {...}} surface (metadata.json / .pt["source"]).
+        self.assertEqual(ReturnBasis.from_mapping({"action_return_basis": payload, "x": 1}),
+                         ReturnBasis.from_mapping(payload))
 
         # return_basis_content_hash, when recorded, MUST match the declared basis -- a matching hash validates;
         # a stale / hand-edited hash raises (the basis and its stamp must agree). None is unaffected.
@@ -111,6 +114,21 @@ class ResearchProtocolTests(unittest.TestCase):
         DatasetManifest.from_dict({**payload, "return_basis_content_hash": expected}).validate()  # ok
         with self.assertRaisesRegex(ResearchProtocolError, "does not match"):
             DatasetManifest.from_dict({**payload, "return_basis_content_hash": "stale_hash"}).validate()
+
+        # A recorded hash requires the basis to be COMPLETE and VALID, not merely hash-agreeing.
+        # (a) a matching hash over an INVALID basis (inverted clips) raises.
+        invalid = {**payload, "action_return_clip_min": 1.0, "action_return_clip_max": -1.0}
+        invalid["return_basis_content_hash"] = ReturnBasis.from_mapping(invalid).content_hash()
+        with self.assertRaisesRegex(ResearchProtocolError, "basis is invalid"):
+            DatasetManifest.from_dict(invalid).validate()
+        # (b) a matching hash over an INCOMPLETE basis (missing fill_convention) raises.
+        incomplete = {**payload, "action_return_fill_convention": None}
+        incomplete["return_basis_content_hash"] = ReturnBasis.from_mapping(incomplete).content_hash()
+        with self.assertRaisesRegex(ResearchProtocolError, "incomplete"):
+            DatasetManifest.from_dict(incomplete).validate()
+        # A typo of a protected return_basis_* key is rejected (not silently dropped, which would disable the check).
+        with self.assertRaisesRegex(ResearchProtocolError, "unknown protected basis key"):
+            DatasetManifest.from_dict({**payload, "return_basis_content_hahs": "x"})
 
     def test_dataset_manifest_basis_field_names_match_return_basis_reader(self) -> None:
         # Cross-module invariant: the manifest's action_return_* field names MUST equal the payload keys that

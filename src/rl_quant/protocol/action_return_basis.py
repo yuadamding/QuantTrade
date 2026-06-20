@@ -90,7 +90,11 @@ class ReturnBasis:
     @classmethod
     def from_mapping(cls, payload: Any) -> "ReturnBasis":
         """Build from a mapping (dataset manifest dict) OR any object exposing the ``action_return_*`` attributes
-        (a HourFromMinuteDataSplit). Missing keys/attributes resolve to None."""
+        (a HourFromMinuteDataSplit). Missing keys/attributes resolve to None. A NESTED
+        ``{"action_return_basis": {...}}`` surface (metadata.json, .pt["source"]) carries the basis one level
+        down; it is read transparently so from_mapping works on every artifact surface, not only flat ones."""
+        if hasattr(payload, "get") and isinstance(payload.get("action_return_basis"), dict):
+            payload = payload["action_return_basis"]
         getter = payload.get if hasattr(payload, "get") else (lambda key, default=None: getattr(payload, key, default))
         return cls(**{name: getter(key, None) for name, key in _RETURN_BASIS_FIELD_KEYS.items()})
 

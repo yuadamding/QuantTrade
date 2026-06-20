@@ -538,9 +538,10 @@ def main() -> int:
     dataset_path = args.output_dir / dataset_file_name
     # Canonical action-return basis, recorded ONCE and written into BOTH the .pt payload and dataset_manifest.json
     # (via the DatasetManifest below) so the reportability agreement check has matching declared copies. The
-    # content hash is a single stable stamp over the declared basis -- persisted for audit and folded into
-    # source_metadata so source_manifest_hash captures the basis economics (two datasets with identical source
-    # inputs but different action-return economics no longer collide on the same hash).
+    # content hash is a single stable stamp over the declared basis, persisted for audit. The BASIS values (NOT
+    # the content hash) are folded into source_metadata below, so source_manifest_hash captures the return
+    # economics -- two datasets with identical source inputs but different economics no longer collide on the
+    # same hash -- without making it depend on the content_hash() algorithm.
     action_return_basis = _direct_hourly_action_return_basis(bar_interval)
     return_basis_content_hash = ReturnBasis.from_mapping(action_return_basis).content_hash()
     torch.save(
@@ -633,6 +634,9 @@ def main() -> int:
         # ALGORITHM, perturbing it if content_hash() ever changes while the economics stay identical.
         "action_return_basis": action_return_basis,
     }
+    # Compute the provenance hash ONCE so metadata.json and the DatasetManifest carry the SAME value (a reader
+    # of metadata.json alone gets the source-provenance hash, not only the manifest).
+    source_manifest_hash = stable_json_hash(source_metadata)
     metadata = {
         "rows": len(timestamps),
         "feature_count": len(feature_names),
@@ -656,10 +660,11 @@ def main() -> int:
         "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "state_features_csv": str(args.output_dir / "state_features.csv"),
         "action_returns_csv": str(args.output_dir / "action_returns.csv"),
-        # Carry the return-basis provenance here too, so a reader of metadata.json alone sees the declared
-        # economics and their stamp (not only the .pt payload / dataset_manifest.json).
+        # Carry the return-basis + source provenance here too, so a reader of metadata.json alone sees the
+        # declared economics, their stamp, and the source-manifest hash (not only the .pt / dataset_manifest.json).
         "action_return_basis": action_return_basis,
         "return_basis_content_hash": return_basis_content_hash,
+        "source_manifest_hash": source_manifest_hash,
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     manifest = DatasetManifest(
@@ -680,7 +685,7 @@ def main() -> int:
         # INVARIANT: source_manifest_hash is PROVENANCE only -- it is never read back as a cache/resume key in
         # this builder. Folding the action-return basis into source_metadata is therefore safe; do not start
         # gating caching/resume on this hash, or a basis change would silently invalidate prior datasets.
-        source_manifest_hash=stable_json_hash(source_metadata),
+        source_manifest_hash=source_manifest_hash,
         known_limitations=[
             "Yahoo intraday history is short and may contain missing bars.",
             "Universe selection date is validated to be no later than the first dataset timestamp.",
