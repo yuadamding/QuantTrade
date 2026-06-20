@@ -3,6 +3,11 @@ code, independent of any builder or trainer. Part of the protocol-first layered 
 (see architecture_migration_plan.md). Phase 2 ships the model-input/label/forbidden-key anti-leakage
 validators; the full DecisionTensorPayload loader and the trading_constraints contract re-export follow."""
 
+from rl_quant.protocol.action_return_basis import (
+    ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS,
+    ReturnBasis,
+    return_basis_agreement_errors,
+)
 from rl_quant.protocol.reportability_contract import (
     QUOTE_CONDITIONAL_STRESS,
     REQUIRED_BASELINE_SPECS,
@@ -33,7 +38,10 @@ from rl_quant.protocol.validators import (
 )
 
 __all__ = [
+    "ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS",
     "QUOTE_CONDITIONAL_STRESS",
+    "ReturnBasis",
+    "return_basis_agreement_errors",
     "REQUIRED_BASELINES",
     "REQUIRED_BASELINE_SPECS",
     "REQUIRED_STRESS",

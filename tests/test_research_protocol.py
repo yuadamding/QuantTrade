@@ -110,10 +110,23 @@ class ResearchProtocolTests(unittest.TestCase):
         # ReturnBasis reads, or the declared-side basis silently goes all-None (agreement vacuous) on a rename.
         from dataclasses import fields as dc_fields
 
-        from rl_quant.datasets.hour_from_subhour import _RETURN_BASIS_FIELD_KEYS
+        from rl_quant.protocol.action_return_basis import _RETURN_BASIS_FIELD_KEYS
 
         manifest_basis_fields = {f.name for f in dc_fields(DatasetManifest) if f.name.startswith("action_return_")}
         self.assertEqual(manifest_basis_fields, set(_RETURN_BASIS_FIELD_KEYS.values()))
+
+    def test_return_basis_canonical_home_is_protocol_with_back_compat_reexport(self) -> None:
+        # The action-return basis contract lives in the protocol layer; the datasets module re-exports the SAME
+        # objects for backward compatibility, and the protocol package surfaces them.
+        from rl_quant.datasets.hour_from_subhour import ReturnBasis as DatasetsReturnBasis
+        from rl_quant.datasets.hour_from_subhour import return_basis_agreement_errors as datasets_fn
+        from rl_quant.protocol import ReturnBasis as PackageReturnBasis
+        from rl_quant.protocol.action_return_basis import ReturnBasis as ProtocolReturnBasis
+        from rl_quant.protocol.action_return_basis import return_basis_agreement_errors as protocol_fn
+
+        self.assertIs(DatasetsReturnBasis, ProtocolReturnBasis)  # datasets re-export is the same object
+        self.assertIs(PackageReturnBasis, ProtocolReturnBasis)   # protocol package surfaces it
+        self.assertIs(datasets_fn, protocol_fn)
 
     def test_universe_selection_date_resolver_uses_latest_universe_file_date(self) -> None:
         module = load_script("build_hourly_transformer_dataset")

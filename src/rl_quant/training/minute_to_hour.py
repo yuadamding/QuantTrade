@@ -54,7 +54,6 @@ from rl_quant.models.minute_to_hour import (  # re-export: model moved to the mo
     MinuteToHourCausalTransformerQNetwork,
 )
 from rl_quant.datasets.hour_from_subhour import (
-    ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS,
     HourFromMinuteDataSplit,
     _timestamp_to_epoch_ms,
     assert_matching_hour_from_minute_schema,
@@ -69,6 +68,7 @@ from rl_quant.envs.minute_to_hour import (
     validate_cash_usable_on_decision_rows,
     validate_minute_to_hour_constraints,
 )
+from rl_quant.protocol.action_return_basis import ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS
 from rl_quant.evaluation.statistical import (
     effective_sample_size,
     probabilistic_sharpe_ratio,

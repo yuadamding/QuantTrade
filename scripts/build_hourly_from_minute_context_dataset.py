@@ -990,7 +990,7 @@ def main() -> int:
     # independently-stored copies. action_returns are the RAW simple return of holding the single chosen action
     # at full capital from entry_fill to exit_fill (clipped_simple_return) -- no metadata weighting -- which
     # resolves the PR-4 weight-basis requirement (ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS in
-    # rl_quant.datasets.hour_from_subhour). formula/clip/version/fill_convention pin the FULL basis so a future
+    # rl_quant.protocol.action_return_basis). formula/clip/version/fill_convention pin the FULL basis so a future
     # builder edit that changes the economics (same weight label) is detectable. fill_convention ==
     # action_fill_rule below. Purely declarative: the default (legacy) reward path is unaffected.
     action_return_basis = {

@@ -595,7 +595,7 @@ def validate_reportable_summary(summary: dict[str, Any], *, strict: bool = False
     # on a jointly-declared field, no invalid weight semantics -- and (b) be value-VALID (no corrupt clip).
     # Default-preserving: a basis that declares nothing (the legacy shape) yields no agreement/validity error.
     # Only ``strict`` additionally requires the basis to be COMPLETE on both sides.
-    from rl_quant.datasets.hour_from_subhour import ReturnBasis, return_basis_agreement_errors
+    from rl_quant.protocol.action_return_basis import ReturnBasis, return_basis_agreement_errors
 
     eval_basis = ReturnBasis.from_canonical(summary.get("return_basis") or {})
     declared_basis = ReturnBasis.from_mapping(declared_manifest)

@@ -79,7 +79,7 @@ class DatasetManifest:
     known_limitations: list[str] = field(default_factory=list)
     # Canonical action-return basis recorded on the manifest -- not only in the .pt payload -- so the
     # reportability agreement check can compare the dataset's DECLARED basis against the evaluation's (the
-    # ReturnBasis in rl_quant.datasets.hour_from_subhour reads these exact keys). All optional/None on legacy
+    # ReturnBasis in rl_quant.protocol.action_return_basis reads these exact keys). All optional/None on legacy
     # manifests (default-preserving); they do not affect validate().
     action_return_weight_semantics: str | None = None
     action_return_formula: str | None = None
