@@ -167,6 +167,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume-state-file", default="training_state.pt")
     parser.add_argument("--checkpoint-every-steps", type=int, default=250)
     parser.add_argument("--payload-progress-every", type=int, default=5)
+    parser.add_argument(
+        "--strict-protocol-mask-repair",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Normalize loaded decision/label mask aliases, intersect label_valid_mask with "
+            "decision_action_valid_mask, and set now-invalid action_returns to NaN before split construction."
+        ),
+    )
     parser.add_argument("--recency-weighting", choices=["none", "exponential"], default="none")
     parser.add_argument("--recency-half-life-days", type=float, default=120.0)
     parser.add_argument("--recency-min-weight", type=float, default=0.05)
@@ -294,12 +303,51 @@ def _same_schema(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _strict_protocol_repair_masks(payload: dict[str, Any]) -> list[str]:
+    repairs: list[str] = []
+    decision = payload.get("decision_action_valid_mask", payload.get("action_valid_mask"))
+    label = payload.get("label_valid_mask", payload.get("action_label_valid_mask"))
+    returns = payload.get("action_returns")
+
+    if torch.is_tensor(decision):
+        decision = decision.bool()
+        payload["decision_action_valid_mask"] = decision
+        payload["action_valid_mask"] = decision.clone()
+
+    if torch.is_tensor(label):
+        label = label.bool()
+        if torch.is_tensor(decision) and tuple(label.shape) == tuple(decision.shape):
+            outside_decision = label & ~decision
+            outside_count = int(outside_decision.sum().item())
+            if outside_count:
+                repairs.append(f"label_valid_mask_intersected_with_decision_action_valid_mask:{outside_count}")
+                label = label & decision
+        payload["label_valid_mask"] = label
+        payload["action_label_valid_mask"] = label.clone()
+
+        if torch.is_tensor(returns) and tuple(returns.shape) == tuple(label.shape):
+            invalid_finite = ~label & torch.isfinite(returns)
+            invalid_finite_count = int(invalid_finite.sum().item())
+            if invalid_finite_count:
+                repairs.append(f"non_label_valid_action_returns_set_to_nan:{invalid_finite_count}")
+                repaired_returns = returns.clone()
+                repaired_returns[invalid_finite] = float("nan")
+                payload["action_returns"] = repaired_returns
+
+    if repairs:
+        payload["strict_protocol_repairs"] = list(
+            dict.fromkeys([*list(payload.get("strict_protocol_repairs", [])), *repairs])
+        )
+    return repairs
+
+
 def concatenate_payloads(
     paths: list[Path],
     *,
     action_covariate_sidecar: str,
     news_llm_sidecar: str,
     progress_every: int = 5,
+    strict_protocol_mask_repair: bool = True,
 ) -> dict[str, Any]:
     from rl_quant.minute_to_hour_transformer import _load_payload
 
@@ -310,6 +358,8 @@ def concatenate_payloads(
     row_lists: dict[str, list[Any]] = {key: [] for key in ROW_LIST_KEYS}
     row_tensors: dict[str, list[torch.Tensor]] = {key: [] for key in ROW_TENSOR_KEYS}
     errors: list[str] = []
+    strict_protocol_repairs: list[str] = []
+    repair_counts: dict[str, int] = {}
     dataset_reportable = True
     loaded_count = 0
     row_count = 0
@@ -317,6 +367,14 @@ def concatenate_payloads(
     print(f"Loading {len(paths)} partition payloads with sidecars...", flush=True)
     for index, path in enumerate(paths, start=1):
         payload = _load_payload(path, action_covariate_sidecar=action_covariate_sidecar, news_llm_sidecar=news_llm_sidecar)
+        if strict_protocol_mask_repair:
+            for repair in _strict_protocol_repair_masks(payload):
+                strict_protocol_repairs.append(f"{path.parent.name}:{repair}")
+                repair_name, _, raw_count = repair.partition(":")
+                try:
+                    repair_counts[repair_name] = repair_counts.get(repair_name, 0) + int(raw_count)
+                except ValueError:
+                    repair_counts[repair_name] = repair_counts.get(repair_name, 0) + 1
         if first is None:
             first = payload
             for key in SCHEMA_KEYS:
@@ -364,6 +422,20 @@ def concatenate_payloads(
             out[key] = torch.cat(tensors, dim=0)
     out["dataset_reportability_errors"] = list(dict.fromkeys(errors))
     out["dataset_reportable"] = dataset_reportable and not errors
+    if strict_protocol_repairs:
+        out["strict_protocol_repairs"] = strict_protocol_repairs
+        print(
+            "Applied strict protocol mask repairs before split construction: "
+            + json.dumps(
+                {
+                    "partition_count": len({item.split(":", 1)[0] for item in strict_protocol_repairs}),
+                    "repair_counts": repair_counts,
+                    "examples": strict_protocol_repairs[:10],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     out["composite_partition_count"] = len(paths)
     out["composite_partition_start"] = paths[0].parent.name
     out["composite_partition_end"] = paths[-1].parent.name
@@ -564,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         action_covariate_sidecar=args.action_covariate_sidecar,
         news_llm_sidecar=args.news_llm_sidecar,
         progress_every=args.payload_progress_every,
+        strict_protocol_mask_repair=args.strict_protocol_mask_repair,
     )
     print("Building calendar train/val/test splits...", flush=True)
     selection_errors, manual_split_used = calendar_selection_reportability(args, paths)
