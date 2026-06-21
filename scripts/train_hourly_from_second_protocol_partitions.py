@@ -98,6 +98,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skip-failed-partitions",
+        action="store_true",
+        help=(
+            "Record a partition that fails to build/train/evaluate as status='failed' and CONTINUE to the next "
+            "partition (warm-starting from the last GOOD checkpoint), instead of aborting the whole run. Off by "
+            "default (fail-loud): a single malformed partition raises. Opt in for a long full-history run so a "
+            "few bad partitions (e.g. a gold partition violating a mask contract) do not derail the protocol -- "
+            "the failures stay visible in failed_count/records, and corrupt data is skipped, never trained on."
+        ),
+    )
+    parser.add_argument(
         "--recency-weighting",
         choices=["none", "exponential"],
         default="none",
@@ -821,7 +832,11 @@ def main(argv: list[str] | None = None) -> int:
             }
             records.append(record)
             print(f"[{ordinal}/{len(paths)}] failed {label}: {exc!r}", flush=True)
-            raise
+            # Default: fail loud (re-raise). With --skip-failed-partitions, record the failure and continue to
+            # the next partition -- previous_checkpoint is NOT updated, so the next partition warm-starts from the
+            # last GOOD model and the corrupt partition is skipped (never trained on), staying visible in records.
+            if not args.skip_failed_partitions:
+                raise
         finally:
             gc.collect()
             if device.type == "cuda":
