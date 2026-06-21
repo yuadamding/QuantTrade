@@ -180,6 +180,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recency-half-life-days", type=float, default=120.0)
     parser.add_argument("--recency-min-weight", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument(
+        "--expected-action-count",
+        type=int,
+        default=0,
+        help="Optional fail-closed action count check, including CASH. Use 501 for TOP500+cash.",
+    )
+    parser.add_argument(
+        "--fail-on-cash-collapse",
+        action="store_true",
+        help="Exit nonzero when the test rollout requests only CASH despite usable non-CASH test actions.",
+    )
     return parser.parse_args(argv)
 
 
@@ -575,6 +586,78 @@ def split_window(split) -> dict[str, str | int | None]:
     }
 
 
+def action_opportunity_diagnostics(split, *, cash_index: int) -> dict[str, object]:
+    rows = split.valid_start_indices.detach().cpu().long()
+    selected_returns = split.action_returns.detach().cpu().float()[rows]
+    if split.action_valid_mask is None:
+        decision_valid = torch.ones_like(selected_returns, dtype=torch.bool)
+    else:
+        decision_valid = split.action_valid_mask.detach().cpu()[rows].bool()
+    if split.label_valid_mask is None:
+        label_valid = torch.isfinite(selected_returns)
+    else:
+        label_valid = split.label_valid_mask.detach().cpu()[rows].bool()
+    usable = decision_valid & label_valid & torch.isfinite(selected_returns)
+    non_cash = torch.ones(selected_returns.shape[1], dtype=torch.bool)
+    if 0 <= int(cash_index) < int(non_cash.numel()):
+        non_cash[int(cash_index)] = False
+    non_cash_usable = usable & non_cash.unsqueeze(0)
+    rows_with_non_cash = non_cash_usable.any(dim=1)
+    masked_returns = selected_returns.masked_fill(~non_cash_usable, float("-inf"))
+    best_non_cash = masked_returns.max(dim=1).values
+    finite_best = torch.isfinite(best_non_cash)
+    positive_best = finite_best & (best_non_cash > 0)
+    per_action_counts = non_cash_usable.sum(dim=0)
+    per_action_sum_returns = selected_returns.masked_fill(~non_cash_usable, 0.0).sum(dim=0)
+    top_actions: list[dict[str, object]] = []
+    for action in torch.argsort(per_action_sum_returns, descending=True).tolist():
+        if action == int(cash_index) or int(per_action_counts[action].item()) <= 0:
+            continue
+        top_actions.append(
+            {
+                "action": int(action),
+                "asset": split.action_names[action],
+                "usable_rows": int(per_action_counts[action].item()),
+                "sum_return": float(per_action_sum_returns[action].item()),
+                "mean_return": float(
+                    (per_action_sum_returns[action] / per_action_counts[action].clamp_min(1)).item()
+                ),
+            }
+        )
+        if len(top_actions) >= 10:
+            break
+    return {
+        "rows": int(rows.numel()),
+        "action_count": len(split.action_names),
+        "non_cash_action_count": max(len(split.action_names) - 1, 0),
+        "rows_with_non_cash_usable": int(rows_with_non_cash.sum().item()),
+        "rows_with_positive_best_non_cash": int(positive_best.sum().item()),
+        "best_non_cash_sum_return": float(best_non_cash[finite_best].sum().item()) if bool(finite_best.any().item()) else 0.0,
+        "best_non_cash_mean_return": float(best_non_cash[finite_best].mean().item()) if bool(finite_best.any().item()) else 0.0,
+        "top_non_cash_actions_by_sum_return": top_actions,
+    }
+
+
+def rollout_action_diagnostics(records: list[dict[str, object]], *, cash_index: int) -> dict[str, object]:
+    rows = len(records)
+    requested_cash = 0
+    executed_cash = 0
+    for record in records:
+        requested = int(record.get("requested_action", record.get("action", cash_index)))
+        executed = int(record.get("executed_action", record.get("action", cash_index)))
+        requested_cash += int(requested == int(cash_index))
+        executed_cash += int(executed == int(cash_index))
+    return {
+        "rows": rows,
+        "requested_cash_rows": requested_cash,
+        "executed_cash_rows": executed_cash,
+        "requested_non_cash_rows": max(rows - requested_cash, 0),
+        "executed_non_cash_rows": max(rows - executed_cash, 0),
+        "requested_all_cash": bool(rows > 0 and requested_cash == rows),
+        "executed_all_cash": bool(rows > 0 and executed_cash == rows),
+    }
+
+
 def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
     if not records:
         return
@@ -651,6 +734,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     constraints = build_constraints_from_args(args)
     initial_action = action_index(train_split.action_names, args.initial_action)
+    if int(args.expected_action_count) > 0 and len(train_split.action_names) != int(args.expected_action_count):
+        raise ValueError(
+            f"Action universe mismatch: expected {int(args.expected_action_count)} actions including CASH, "
+            f"got {len(train_split.action_names)}. First actions={train_split.action_names[:12]}"
+        )
+    opportunity_diagnostics = {
+        "train": action_opportunity_diagnostics(train_split, cash_index=initial_action),
+        "val": action_opportunity_diagnostics(val_split, cash_index=initial_action),
+        "test": action_opportunity_diagnostics(test_split, cash_index=initial_action),
+    }
     runtime = torch_runtime_summary(device)
     config_payload = {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()}
     run_dir = args.output_dir / args.run_name
@@ -788,6 +881,25 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_path,
         )
         write_rollout(run_dir / "test_rollout.csv", test_result.rollout_records)
+        rollout_diagnostics = rollout_action_diagnostics(test_result.rollout_records, cash_index=initial_action)
+        cash_collapse = bool(
+            rollout_diagnostics["requested_all_cash"]
+            and int(opportunity_diagnostics["test"]["rows_with_non_cash_usable"]) > 0
+        )
+        policy_diagnostics = {
+            "cash_collapse": cash_collapse,
+            "cash_collapse_definition": (
+                "test rollout requested CASH on every row while the test split had at least one usable non-CASH action"
+            ),
+            "test_rollout": rollout_diagnostics,
+            "opportunity": opportunity_diagnostics,
+        }
+        if cash_collapse:
+            for result in (train_result, val_result, test_result):
+                result.evaluation_reportable = False
+                result.reportability_errors = list(
+                    dict.fromkeys([*result.reportability_errors, "cash_collapse_all_requested_cash"])
+                )
         summary = {
             "run_name": args.run_name,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -802,6 +914,13 @@ def main(argv: list[str] | None = None) -> int:
             "torch_runtime": runtime,
             "config": config_payload,
             "constraints": asdict(constraints),
+            "action_universe": {
+                "action_count": len(train_split.action_names),
+                "non_cash_action_count": max(len(train_split.action_names) - 1, 0),
+                "action_names_head": train_split.action_names[:20],
+                "action_names_tail": train_split.action_names[-20:],
+            },
+            "policy_diagnostics": policy_diagnostics,
             "checkpoint": str(checkpoint_path),
             "training_state_checkpoint": str(training_state_path),
             "split_windows": {
@@ -839,6 +958,14 @@ def main(argv: list[str] | None = None) -> int:
         with (run_dir / "calendar_holdout_summary.json").open("w") as sink:
             json.dump(summary, sink, indent=2)
         print(f"Calendar holdout training complete. Summary -> {run_dir / 'calendar_holdout_summary.json'}", flush=True)
+        if cash_collapse and args.fail_on_cash_collapse:
+            print(
+                "Cash-collapse gate failed: test rollout requested only CASH while non-CASH actions were usable. "
+                f"Summary -> {run_dir / 'calendar_holdout_summary.json'}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 3
         return 0
     finally:
         gc.collect()
