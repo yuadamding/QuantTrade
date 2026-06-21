@@ -47,7 +47,7 @@ def _build_subhour_second_context() -> list[str]:
         "--output-dir", str(data_root / "rl_hour_from_second" / "top500_1s_recent"),
         "--dataset-file-name", "hour_from_second_dataset.pt",
         "--start", "2026-06-12T00:00:00+00:00", "--end-exclusive", "2026-06-13T00:00:00+00:00",
-        "--stock-limit", "500", "--action-count", "16", "--context-bars-per-hour", "3600",
+        "--stock-limit", "500", "--action-count", "500", "--context-bars-per-hour", "3600",
         "--min-active-stock-fraction", "0.01", "--min-context-valid-fraction", "0.005",
         "--max-action-staleness-seconds", "300", "--dense-hourly-grid", "--allow-missing-action-context",
     ]

@@ -76,7 +76,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--end-exclusive", default="2026-06-15")
     parser.add_argument("--source-access", choices=["REST", "AWS S3"], default="REST")
     parser.add_argument("--stock-limit", type=int, default=500)
-    parser.add_argument("--action-count", type=int, default=16)
+    parser.add_argument("--action-count", type=int, default=500)
     parser.add_argument("--actions", help="Comma-separated action symbols. Defaults to top symbols from --universe.")
     parser.add_argument("--decision-interval", choices=["5m", "15m", "30m", "60m"], default="15m")
     parser.add_argument("--context-seconds", type=int, default=3600)

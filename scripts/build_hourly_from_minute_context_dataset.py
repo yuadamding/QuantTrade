@@ -167,7 +167,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--start", default="2026-05-25T00:00:00+00:00")
     parser.add_argument("--end-exclusive", default="2026-06-15T00:00:00+00:00")
     parser.add_argument("--stock-limit", type=int, default=1000)
-    parser.add_argument("--action-count", type=int, default=16)
+    parser.add_argument("--action-count", type=int, default=500)
     parser.add_argument("--actions", help="Comma-separated ETF action symbols. CASH is added automatically.")
     parser.add_argument(
         "--universe-selection-date",

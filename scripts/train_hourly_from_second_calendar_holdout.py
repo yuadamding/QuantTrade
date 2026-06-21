@@ -12,7 +12,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:  # Keep --help usable outside the training environment.
+    torch = None  # type: ignore[assignment]
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = PACKAGE_ROOT.parent if PACKAGE_ROOT.name == "rl_quant" else PACKAGE_ROOT
@@ -176,6 +179,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "decision_action_valid_mask, and set now-invalid action_returns to NaN before split construction."
         ),
     )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Validate selected partitions, action universe, and calendar reportability, then exit before payload load.",
+    )
     parser.add_argument("--recency-weighting", choices=["none", "exponential"], default="none")
     parser.add_argument("--recency-half-life-days", type=float, default=120.0)
     parser.add_argument("--recency-min-weight", type=float, default=0.05)
@@ -274,6 +282,56 @@ def partition_paths(args: argparse.Namespace) -> list[Path]:
     if not paths:
         raise FileNotFoundError(f"No {args.dataset_file_name} files under {args.partitions_root}")
     return paths
+
+
+def _load_action_names_for_preflight(path: Path) -> list[str]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Partition payload must be a dictionary: {path}")
+    action_names = payload.get("action_names")
+    if action_names is None:
+        raise ValueError(f"Partition payload is missing action_names: {path}")
+    return [str(item) for item in action_names]
+
+
+def preflight_action_universe(paths: list[Path], *, expected_action_count: int) -> None:
+    expected = int(expected_action_count)
+    if expected <= 0:
+        return
+    sample_paths = [paths[0]]
+    if paths[-1] != paths[0]:
+        sample_paths.append(paths[-1])
+
+    reference_names: list[str] | None = None
+    for path in sample_paths:
+        action_names = _load_action_names_for_preflight(path)
+        if len(action_names) != expected:
+            non_cash_hint = max(len(action_names) - 1, 0)
+            expected_non_cash_hint = max(expected - 1, 0)
+            raise ValueError(
+                "Action universe mismatch before payload load: "
+                f"expected {expected} actions including CASH, got {len(action_names)} in {path}. "
+                f"First actions={action_names[:12]}. "
+                f"This looks like a dataset built with --action-count {non_cash_hint}; "
+                f"rebuild the protocol partitions with --action-count {expected_non_cash_hint}."
+            )
+        if "CASH" not in action_names:
+            raise ValueError(f"Action universe missing CASH in {path}. First actions={action_names[:12]}")
+        if reference_names is None:
+            reference_names = action_names
+        elif action_names != reference_names:
+            raise ValueError(
+                "Action universe differs between sampled partitions before payload load: "
+                f"{sample_paths[0]} and {path}. "
+                f"First head={reference_names[:12]}, current head={action_names[:12]}"
+            )
+
+    print(
+        "Action universe preflight passed: "
+        f"expected_action_count={expected} checked_partitions={len(sample_paths)} "
+        f"first_actions={reference_names[:12] if reference_names else []}",
+        flush=True,
+    )
 
 
 def calendar_boundaries(args: argparse.Namespace, paths: list[Path]) -> dict[str, str | int]:
@@ -670,6 +728,11 @@ def write_rollout(path: Path, records: list[dict[str, object]]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if torch is None:
+        raise SystemExit(
+            "train_hourly_from_second_calendar_holdout.py requires torch. "
+            "Run it inside the quanttrade training environment."
+        )
     from rl_quant.core import (
         DQNLearningConfig,
         configure_torch_runtime,
@@ -687,14 +750,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     from rl_quant.trading_constraints import CONSTRAINED_POLICY_MODEL_VERSION, CONSTRAINT_FEATURE_NAMES
 
-    device = resolve_torch_device(args.device)
-    configure_torch_runtime(device)
-    require_min_free_vram(device, args.min_free_vram_gb)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
     paths = partition_paths(args)
+    preflight_action_universe(paths, expected_action_count=args.expected_action_count)
     boundaries = calendar_boundaries(args, paths)
     print(
         json.dumps(
@@ -714,6 +771,40 @@ def main(argv: list[str] | None = None) -> int:
         ),
         flush=True,
     )
+    selection_errors, manual_split_used = calendar_selection_reportability(args, paths)
+    if selection_errors:
+        print(
+            "calendar-holdout partition selection is NOT latest-period reportable:\n  - "
+            + "\n  - ".join(selection_errors),
+            flush=True,
+        )
+    if args.preflight_only:
+        print(
+            json.dumps(
+                {
+                    "preflight_only": True,
+                    "partition_count": len(paths),
+                    "first_partition": paths[0].parent.name,
+                    "last_partition": paths[-1].parent.name,
+                    "expected_action_count": int(args.expected_action_count),
+                    "calendar_reportable": not selection_errors,
+                    "calendar_reportability_errors": selection_errors,
+                    "manual_split_used": manual_split_used,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 1 if selection_errors else 0
+
+    device = resolve_torch_device(args.device)
+    configure_torch_runtime(device)
+    require_min_free_vram(device, args.min_free_vram_gb)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     payload = concatenate_payloads(
         paths,
         action_covariate_sidecar=args.action_covariate_sidecar,
@@ -722,13 +813,6 @@ def main(argv: list[str] | None = None) -> int:
         strict_protocol_mask_repair=args.strict_protocol_mask_repair,
     )
     print("Building calendar train/val/test splits...", flush=True)
-    selection_errors, manual_split_used = calendar_selection_reportability(args, paths)
-    if selection_errors:
-        print(
-            "calendar-holdout partition selection is NOT latest-period reportable:\n  - "
-            + "\n  - ".join(selection_errors),
-            flush=True,
-        )
     train_split, val_split, test_split = build_calendar_splits(
         payload, boundaries, selection_errors=selection_errors, manual_split_used=manual_split_used
     )
