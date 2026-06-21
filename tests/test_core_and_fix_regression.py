@@ -4691,6 +4691,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         ok, issues = validate_decision_tensor_payload({**good, "decision_action_valid_mask": [[False, True], [True, True]]})
         self.assertFalse(ok)
         self.assertTrue(any("cash_contract" in m for m in issues))
+        # A label cannot be marked scorable for an action that was not decision-valid.
+        subset_bad = {
+            **good,
+            "action_returns": [[0.0, 0.01], [0.0, nan]],
+            "decision_action_valid_mask": [[True, False], [True, True]],
+            "label_valid_mask": [[True, True], [True, False]],
+        }
+        ok, issues = validate_decision_tensor_payload(subset_bad)
+        self.assertFalse(ok)
+        self.assertTrue(any("label_mask_subset" in m for m in issues), issues)
         # Look-ahead in the causal anchors (next < decision) -> the causal-chain validator fires.
         ok, issues = validate_decision_tensor_payload({**good, "next_timestamps_ms": [500, 3000]})
         self.assertFalse(ok)

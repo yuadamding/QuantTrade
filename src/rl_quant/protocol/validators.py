@@ -194,6 +194,31 @@ def assert_cash_contract(action_returns: object, valid_mask: object, *, cash_ind
         raise ValueError("decision-tensor contract violation (cash-fallback): " + "; ".join(issues))
 
 
+def validate_label_mask_subset_of_decision_mask(
+    label_mask: object, decision_mask: object, *, max_issues: int = 20
+) -> tuple[bool, tuple[str, ...]]:
+    """The ex-post label-valid mask must never mark an action scorable if the ex-ante decision mask says the
+    policy could not select that action. Such labels are future observations for non-decision-valid actions and
+    must be dropped before training/evaluation."""
+    labels = _to_rows(label_mask)
+    decisions = _to_rows(decision_mask)
+    if len(labels) != len(decisions):
+        return (False, (f"label_mask has {len(labels)} rows but decision_mask has {len(decisions)}",))
+    issues: list[str] = []
+    for t, (label_row, decision_row) in enumerate(zip(labels, decisions)):
+        if len(label_row) != len(decision_row):
+            issues.append(f"row {t}: label_mask width {len(label_row)} != decision_mask width {len(decision_row)}")
+        else:
+            for a, (label_valid, decision_valid) in enumerate(zip(label_row, decision_row)):
+                if bool(label_valid) and not bool(decision_valid):
+                    issues.append(f"row {t} action {a}: label_valid_mask is true while decision mask is false")
+        if len(issues) > max_issues:
+            issues = issues[:max_issues]
+            issues.append("... (further issues truncated)")
+            break
+    return (not issues, tuple(issues))
+
+
 def validate_decision_tensor_shapes(
     named_arrays: Mapping[str, object], *, max_issues: int = 20
 ) -> tuple[bool, tuple[str, ...]]:
@@ -276,6 +301,7 @@ def validate_decision_tensor_payload(
       * invalid-returns-are-NaN  (action_returns vs the label-valid mask),
       * action-mask validity     (the ex-ante decision mask must leave a selectable action per row; the
                                    ex-post label mask need not),
+      * label subset             (label_valid_mask must be a subset of decision_action_valid_mask),
       * the CASH fallback        (CASH selectable + finite on every row),
       * shape consistency        (all present [rows][actions] tensors agree),
       * the per-row causal chain  (decision_timestamps_ms <= next_timestamps_ms), when numeric ``*_ms``
@@ -327,6 +353,8 @@ def validate_decision_tensor_payload(
         _add("decision_mask", validate_action_mask(decision_mask, require_row_selectable=True))
     if label_mask is not None:
         _add("label_mask", validate_action_mask(label_mask, require_row_selectable=False))
+    if decision_mask is not None and label_mask is not None:
+        _add("label_mask_subset", validate_label_mask_subset_of_decision_mask(label_mask, decision_mask))
     if action_returns is not None and decision_mask is not None:
         _add("cash_contract", validate_cash_contract(action_returns, decision_mask, cash_index=cash_index))
     # Shape-check the RESOLVED tensors (alias-aware), not hardcoded canonical keys -- otherwise a payload
