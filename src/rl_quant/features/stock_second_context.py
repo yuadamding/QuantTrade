@@ -339,11 +339,15 @@ def _symbol_block_summary(frame: Any) -> dict[str, float] | None:
     last_close = _finite(frame["close"].iloc[-1], default=0.0)
     if first_close <= 0 or last_close <= 0:
         return None
-    volume = float(frame["volume"].fillna(0.0).clip(lower=0.0).sum()) if "volume" in frame.columns else 0.0
+    # Clip per-bar volume ONCE (fillna(0), drop negatives) and use it for BOTH the volume feature and
+    # dollar_volume, so a bad negative-volume tick cannot distort the dollar-volume features while the plain
+    # volume feature is already clipped. No-op on clean (>=0) data, so existing/golden outputs are unchanged.
+    volume_clipped = frame["volume"].fillna(0.0).clip(lower=0.0) if "volume" in frame.columns else 0.0
+    volume = float(volume_clipped.sum()) if "volume" in frame.columns else 0.0
     if "vwap" in frame.columns:
-        dollar_volume = float((frame["vwap"].fillna(frame["close"]) * frame.get("volume", 0.0)).fillna(0.0).sum())
+        dollar_volume = float((frame["vwap"].fillna(frame["close"]) * volume_clipped).fillna(0.0).sum())
     else:
-        dollar_volume = float((frame["close"] * frame.get("volume", 0.0)).fillna(0.0).sum())
+        dollar_volume = float((frame["close"] * volume_clipped).fillna(0.0).sum())
     transactions = float(frame["transactions"].fillna(0.0).clip(lower=0.0).sum()) if "transactions" in frame.columns else 0.0
     close = frame["close"].replace(0, float("nan"))
     ranges = ((frame["high"] - frame["low"]) / close * 10_000.0).replace([float("inf"), -float("inf")], float("nan"))
