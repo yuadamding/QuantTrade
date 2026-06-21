@@ -673,6 +673,7 @@ def _merge_news_llm_sidecar(
     feature_names["action_features"] = list(merged["action_feature_names"])
     merged["feature_names"] = feature_names
     merged["feature_names_by_tensor"] = feature_names
+    sidecar_metadata: dict[str, Any] = {}
     for key, value in sidecar.items():
         if key in {
             "base_dataset_file_name",
@@ -689,11 +690,29 @@ def _merge_news_llm_sidecar(
             "action_features_available_timestamps_ms",
             "action_features_any_available_timestamps_ms",
             "action_feature_groups",
+            "action_features_are_news_llm_sidecar_only",
+            "action_features_augmented_with_news_llm",
         }:
             continue
+        if key in {
+            "integration_schema_version",
+            "created_at_utc",
+            "tensor_content_hashes",
+            "action_features_tensor_hash",
+            "action_feature_available_timestamps_ms_tensor_hash",
+        }:
+            sidecar_metadata[key] = value
+            continue
         if key in merged:
-            raise ValueError(f"News LLM sidecar key already exists in dataset payload: {key}")
+            if key.startswith(("action_news_llm_", "news_llm_", "news_article_")):
+                raise ValueError(f"News LLM sidecar key already exists in dataset payload: {key}")
+            sidecar_metadata[key] = value
+            continue
         merged[key] = value
+    if sidecar_metadata:
+        existing_metadata = dict(merged.get("action_news_llm_sidecar_metadata", {}))
+        existing_metadata.update(sidecar_metadata)
+        merged["action_news_llm_sidecar_metadata"] = existing_metadata
     merged["action_news_llm_sidecar_path"] = str(sidecar_path)
     merged["action_features_augmented_with_news_llm"] = True
     errors = list(merged.get("dataset_reportability_errors", []))
