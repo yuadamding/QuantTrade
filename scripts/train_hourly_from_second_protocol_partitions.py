@@ -6,6 +6,7 @@ import csv
 import gc
 import json
 import sys
+import traceback
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -103,9 +104,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Record a partition that fails to build/train/evaluate as status='failed' and CONTINUE to the next "
             "partition (warm-starting from the last GOOD checkpoint), instead of aborting the whole run. Off by "
-            "default (fail-loud): a single malformed partition raises. Opt in for a long full-history run so a "
-            "few bad partitions (e.g. a gold partition violating a mask contract) do not derail the protocol -- "
-            "the failures stay visible in failed_count/records, and corrupt data is skipped, never trained on."
+            "default (fail-loud): a single malformed partition raises. A resource/OOM failure still aborts even "
+            "when set. Opt in for a long full-history run so a few bad partitions (e.g. a gold partition "
+            "violating a mask contract) do not derail the protocol. A failed partition never advances the "
+            "retained warm-start checkpoint (if it failed after transient training, that model is discarded, not "
+            "promoted), and -- crucially -- ANY skipped selected partition marks the whole run non-reportable "
+            "(aggregate_reportable=false), so a holed lineage is never mistaken for a clean full-history result."
         ),
     )
     parser.add_argument(
@@ -301,6 +305,62 @@ def official_test_block(records: list[dict[str, object]], final_test_is_latest_a
         "val_total_return": official.get("val_total_return"),
         "checkpoint_selected_on": "validation",
         "test_used_for_selection": False,
+    }
+
+
+# Exceptions that are NOT a skippable data-partition problem: a resource/interrupt failure must abort even under
+# --skip-failed-partitions (continuing past an OOM or a real resource failure would produce meaningless results).
+# (KeyboardInterrupt/SystemExit already bypass `except Exception`.) A typed skippable/fatal exception hierarchy is
+# a cleaner future refactor; until then, Rule B below is the safety net: ANY skip makes the run non-reportable.
+FATAL_PARTITION_EXCEPTIONS: tuple[type[BaseException], ...] = (MemoryError,)
+
+
+def aggregate_reportability(
+    records: list[dict[str, object]],
+    *,
+    official_test_label: str | None,
+    final_test_is_latest_available: bool,
+) -> dict[str, object]:
+    """Whole-run reportability for the rolling protocol (pure; testable without a training run).
+
+    A run is reportable ONLY if (a) the official latest partition completed AND is itself reportable, (b) NO
+    selected partition was skipped/failed, and (c) the official test is the latest available partition. A skipped
+    training-history partition (via --skip-failed-partitions) leaves a HOLE in the warm-start lineage, so the
+    official result is a DIAGNOSTIC walk-forward with omitted windows, not a clean full-history strict result --
+    we mark it non-reportable rather than let a contradictory ``failed_count > 0`` + ``reportable: true`` slip
+    through (the central review P0). Default-preserving: a clean run (no skips, reportable official partition,
+    latest coverage) stays reportable exactly as before.
+    """
+    skipped = [str(r.get("partition")) for r in records if r.get("status") != "ok"]
+    skipped_before_official = [
+        label
+        for label in skipped
+        if official_test_label is None or label < str(official_test_label)
+    ]
+    official = next((r for r in records if r.get("is_official_latest_test")), None)
+    official_reportable = (
+        official is not None
+        and official.get("status") == "ok"
+        and bool(official.get("evaluation_reportable", False))
+    )
+    errors: list[str] = []
+    if skipped:
+        errors.append(f"selected_partitions_failed_or_skipped:{','.join(skipped)}")
+    if official is None or official.get("status") != "ok":
+        errors.append("official_latest_test_did_not_complete")
+    elif not official.get("evaluation_reportable", False):
+        errors.append("official_latest_test_non_reportable")
+    if not final_test_is_latest_available:
+        errors.append("final_test_not_latest_available")
+    return {
+        "aggregate_reportable": not errors,
+        "aggregate_reportability_errors": errors,
+        "skipped_partition_count": len(skipped),
+        "skipped_partition_labels": skipped,
+        "skipped_partition_labels_before_official_test": skipped_before_official,
+        "all_prior_partitions_completed": len(skipped_before_official) == 0,
+        # The official KPI is reportable only if it is itself reportable AND no prior selected partition was skipped.
+        "official_latest_reportable": bool(official_reportable and not skipped_before_official),
     }
 
 
@@ -823,19 +883,30 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
         except Exception as exc:
+            # A resource/interrupt failure (e.g. OOM) is NOT a skippable data partition: abort even under the
+            # flag, because continuing past it would produce meaningless downstream results.
+            fatal = isinstance(exc, FATAL_PARTITION_EXCEPTIONS)
             record = {
                 "partition": label,
                 "ordinal": ordinal,
                 "status": "failed",
+                "exception_type": type(exc).__name__,
                 "error": repr(exc),
+                "traceback": traceback.format_exc(),
+                "skipped": bool(args.skip_failed_partitions and not fatal),
+                # A failed partition can only raise BEFORE the success-path checkpoint advance, so it never
+                # advances the retained warm-start checkpoint -- the next partition warm-starts from the last GOOD
+                # model regardless. (Always False by construction; recorded explicitly for post-mortem clarity.)
+                "warm_start_checkpoint_advanced": False,
                 "elapsed_seconds": round((datetime.now() - started).total_seconds(), 3),
             }
             records.append(record)
             print(f"[{ordinal}/{len(paths)}] failed {label}: {exc!r}", flush=True)
-            # Default: fail loud (re-raise). With --skip-failed-partitions, record the failure and continue to
-            # the next partition -- previous_checkpoint is NOT updated, so the next partition warm-starts from the
-            # last GOOD model and the corrupt partition is skipped (never trained on), staying visible in records.
-            if not args.skip_failed_partitions:
+            # Default: fail loud (re-raise). With --skip-failed-partitions, record the failure and continue to the
+            # next partition -- previous_checkpoint is NOT advanced, so the next partition warm-starts from the last
+            # GOOD model (corrupt data never advances the lineage). A fatal/resource exception aborts regardless,
+            # and ANY skip makes the whole run non-reportable (aggregate_reportability, Rule B).
+            if fatal or not args.skip_failed_partitions:
                 raise
         finally:
             gc.collect()
@@ -844,6 +915,19 @@ def main(argv: list[str] | None = None) -> int:
             # Persist the aggregate manifest in `finally` (runs before a re-raised partition
             # failure propagates), so the failed record and incremented failed_count survive for
             # post-mortem rather than being lost when the loop aborts.
+            agg_report = aggregate_reportability(
+                records,
+                official_test_label=official_test_label,
+                final_test_is_latest_available=final_test_is_latest_available,
+            )
+            official_block = official_test_block(records, final_test_is_latest_available)
+            if official_block is not None:
+                # Rule B: a skipped prior training-history partition leaves a hole in the warm-start lineage, so
+                # the official KPI is NOT a clean full-history result -- mark it non-reportable accordingly.
+                official_block["reportable"] = bool(agg_report["official_latest_reportable"])
+                official_block["skipped_prior_partition_count"] = len(
+                    agg_report["skipped_partition_labels_before_official_test"]
+                )
             aggregate = {
                 "run_name": args.run_name,
                 "created_at": datetime.now().isoformat(),
@@ -867,7 +951,18 @@ def main(argv: list[str] | None = None) -> int:
                 "allow_truncated_training_history": bool(args.allow_truncated_training_history),
                 # First-class official result so dashboards/papers do not have to scan `records`
                 # for is_official_latest_test (None until the official/latest partition completes).
-                "official_test": official_test_block(records, final_test_is_latest_available),
+                "official_test": official_block,
+                # Whole-run reportability (Rule B): reportable ONLY if the official partition is reportable AND no
+                # selected partition was skipped/failed AND the official test is the latest available. A skipped
+                # training-history partition makes this False even when the official partition itself looks ok.
+                "aggregate_reportable": agg_report["aggregate_reportable"],
+                "aggregate_reportability_errors": agg_report["aggregate_reportability_errors"],
+                "all_prior_partitions_completed": agg_report["all_prior_partitions_completed"],
+                "skipped_partition_count": agg_report["skipped_partition_count"],
+                "skipped_partition_labels": agg_report["skipped_partition_labels"],
+                "skipped_partition_labels_before_official_test": agg_report[
+                    "skipped_partition_labels_before_official_test"
+                ],
                 "official_partition_count": sum(1 for item in records if item.get("is_official_latest_test")),
                 "diagnostic_partition_count": sum(
                     1 for item in records if item["status"] == "ok" and not item.get("is_official_latest_test")
@@ -881,6 +976,19 @@ def main(argv: list[str] | None = None) -> int:
                 json.dump(aggregate, sink, indent=2)
 
     print(f"Rolling training complete. Summary -> {manifest_path}", flush=True)
+    # Under strict reportability, a non-reportable run (e.g. a skipped/holed training history, or a failed/missing
+    # official latest test) must FAIL the process -- a successful exit code must never mean "reportable" when it
+    # is not, so CI/dashboards/automation cannot mistake a diagnostic run for a clean full-history result.
+    final_report = aggregate_reportability(
+        records,
+        official_test_label=official_test_label,
+        final_test_is_latest_available=final_test_is_latest_available,
+    )
+    if args.reportability_policy == "strict" and not final_report["aggregate_reportable"]:
+        raise SystemExit(
+            "strict reportability: run is NOT reportable "
+            f"({final_report['aggregate_reportability_errors']}); see {manifest_path}"
+        )
     return 0
 
 
