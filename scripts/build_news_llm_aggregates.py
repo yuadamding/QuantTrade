@@ -61,6 +61,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--article-root", type=Path, default=DEFAULT_ARTICLE_ROOT)
     parser.add_argument("--output-file-name", default="action_news_llm_covariates.pt")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--expected-action-count",
+        type=int,
+        default=0,
+        help="Expected action dimension, including CASH. Use 501 for TOP500 and 1501 for TOP501-2000.",
+    )
     parser.add_argument("--force", action="store_true", help="Rebuild every selected sidecar, even if an existing one validates.")
     parser.add_argument(
         "--resume-existing",
@@ -216,11 +222,35 @@ def validate_existing_sidecar(
         raise ValueError("tensor_content_hashes mismatch")
 
 
-def load_action_names(paths: list[Path]) -> list[str]:
+def load_action_names(paths: list[Path], *, expected_action_count: int = 0) -> list[str]:
     payload = torch.load(paths[0], map_location="cpu", weights_only=True)
     action_names = list(payload["action_names"])
     if not action_names or action_names[0] != "CASH":
         raise ValueError("Expected hour-from-second action_names to begin with CASH.")
+    if expected_action_count > 0 and len(action_names) != expected_action_count:
+        raise ValueError(
+            f"Action universe mismatch in {paths[0]}: got {len(action_names)} actions, "
+            f"expected {expected_action_count}. First actions={action_names[:12]}"
+        )
+    mismatches: list[dict[str, Any]] = []
+    for path in paths[1:]:
+        other = torch.load(path, map_location="cpu", weights_only=True)
+        other_names = list(other.get("action_names", []))
+        if other_names != action_names:
+            mismatches.append(
+                {
+                    "partition": path.parent.name,
+                    "action_count": len(other_names),
+                    "action_names_head": other_names[:12],
+                }
+            )
+            if len(mismatches) >= 20:
+                break
+    if mismatches:
+        raise ValueError(
+            "Partition action_names are not identical across the selected build; "
+            f"first mismatches={mismatches}"
+        )
     return action_names
 
 
@@ -407,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         article_manifest_hash = None
         source_symbols = []
         feature_manifest_reportability_errors.append("news_article_manifest_missing")
-    action_names = load_action_names(paths)
+    action_names = load_action_names(paths, expected_action_count=int(args.expected_action_count))
     # Read diagnostically: the news-LLM feature manifest's reportability errors are already merged
     # into feature_manifest_reportability_errors and propagate into each sidecar, so a non-reportable
     # feature table yields non-reportable sidecars rather than aborting the build here.
