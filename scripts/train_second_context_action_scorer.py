@@ -297,6 +297,7 @@ def main() -> int:
         fixed_rollout_cost_stress,
         predict_second_context_q_values,
         second_context_missing_label_report,
+        sequential_path_reportability_errors,
     )
 
     args = parse_args()
@@ -940,6 +941,10 @@ def main() -> int:
     evaluation_errors: list[str] = []
     if test_policy_metrics.get("final_position_open"):
         evaluation_errors.append("test_final_position_open")
+    # Turn the test-path execution diagnostics into hard gates: a missing-label fallback, a row with no valid
+    # action, a frozen-weight contract violation, or an all-CASH path with no positive active edge each make the
+    # run non-reportable (so CASH fallback can no longer hide a broken data/reward pipeline as "success").
+    evaluation_errors.extend(sequential_path_reportability_errors(test_policy_metrics))
     if "RandomSameTurnoverSameTiming" not in test_baselines:
         evaluation_errors.append("missing_random_same_turnover_same_timing_baseline")
     test_missing_label_report = split_missing_label_reportability["test"]

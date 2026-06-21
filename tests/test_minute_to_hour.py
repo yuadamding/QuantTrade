@@ -1290,6 +1290,64 @@ class MinuteToHourTests(unittest.TestCase):
             label_valid_mask=label_valid_tensor,
         )
 
+    def test_second_context_weight_freeze_drift_detected(self) -> None:
+        from rl_quant.evaluation.second_context import (
+            _evaluate_action_path,
+            sequential_path_reportability_errors,
+        )
+
+        # Action 1 (QQQ) is HELD across two rows. With a CONSTANT target weight the freeze-executed-weight
+        # contract holds (no drift). With a DRIFTING target weight (1.0 -> 2.0) while the action id is held, the
+        # freeze silently diverges from the declared exposure -- it must be counted AND gated.
+        clean = self._second_context_split(returns=[[0.0, 0.01], [0.0, 0.01]], weights=[[0.0, 1.0], [0.0, 1.0]])
+        clean_metrics = _evaluate_action_path(clean, torch.tensor([1, 1]), assume_prefix_rows=True)
+        self.assertEqual(clean_metrics["same_action_target_weight_drift_count"], 0)
+        self.assertEqual(sequential_path_reportability_errors(clean_metrics), [])
+
+        drift = self._second_context_split(returns=[[0.0, 0.01], [0.0, 0.01]], weights=[[0.0, 1.0], [0.0, 2.0]])
+        drift_metrics = _evaluate_action_path(drift, torch.tensor([1, 1]), assume_prefix_rows=True)
+        self.assertEqual(drift_metrics["same_action_target_weight_drift_count"], 1)
+        self.assertIn(
+            "sequential_path_same_action_target_weight_drift",
+            sequential_path_reportability_errors(drift_metrics),
+        )
+
+    def test_sequential_path_reportability_errors_gates(self) -> None:
+        from rl_quant.evaluation.second_context import sequential_path_reportability_errors as gate
+
+        clean = {
+            "fallback_due_to_missing_label_count": 0,
+            "rows_with_no_valid_action": 0,
+            "same_action_target_weight_drift_count": 0,
+            "cash_action_share": 0.5,
+            "active_window_diagnostics": {"active_net_return": 0.02},
+        }
+        self.assertEqual(gate(clean), [])
+        # Each genuine path pathology becomes a hard gate.
+        self.assertIn(
+            "sequential_path_missing_label_fallback",
+            gate({**clean, "fallback_due_to_missing_label_count": 1}),
+        )
+        self.assertIn(
+            "sequential_path_rows_with_no_valid_action",
+            gate({**clean, "rows_with_no_valid_action": 1}),
+        )
+        # All-CASH WITH no positive active edge is gated (CASH hiding a broken pipeline)...
+        self.assertIn(
+            "all_cash_no_active_edge",
+            gate({**clean, "cash_action_share": 1.0, "active_window_diagnostics": {"active_net_return": 0.0}}),
+        )
+        # ...but a high cash share WITH a positive active edge is NOT gated (all-CASH can be a correct no-edge call),
+        # and a cash share just below the threshold is not gated either.
+        self.assertEqual(
+            gate({**clean, "cash_action_share": 1.0, "active_window_diagnostics": {"active_net_return": 0.05}}),
+            [],
+        )
+        self.assertEqual(
+            gate({**clean, "cash_action_share": 0.98, "active_window_diagnostics": {"active_net_return": -0.01}}),
+            [],
+        )
+
     def test_second_context_payload_uses_latency_and_masks_sparse_blocks(self) -> None:
         payload = self._small_second_context_payload()
 

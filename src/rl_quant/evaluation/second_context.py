@@ -260,6 +260,7 @@ def _evaluate_action_path(
     fallback_to_cash_count = 0
     fallback_due_to_missing_label_count = 0
     rows_with_no_valid_action = 0
+    same_action_target_weight_drift_count = 0
     for position, row in enumerate(rows.tolist()):
         reset_reason = _path_reset_reason(split, previous_row, row)
         if reset_reason is not None:
@@ -321,6 +322,12 @@ def _evaluate_action_path(
             executed_weight = 0.0
         else:
             executed_weight = previous_executed_weight
+            # Freeze contract: while an action id is HELD (no switch), its declared per-row target_weight must
+            # equal the carried executed weight. If the dataset's target_weight drifts mid-hold, freezing
+            # silently diverges from the declared exposure (P&L/turnover understated, no rebalance cost charged).
+            # Record the violation so the reportability gate can fail closed rather than report incoherent P&L.
+            if abs(target_weight - previous_executed_weight) > 1e-9:
+                same_action_target_weight_drift_count += 1
         gross = gross_raw * executed_weight
         legs = _trade_legs(previous_action, action)
         traded_notional = _trade_notional(previous_weight_before, target_weight) if legs > 0 else 0.0
@@ -475,6 +482,7 @@ def _evaluate_action_path(
             "fallback_to_cash_count": fallback_to_cash_count,
             "fallback_due_to_missing_label_count": fallback_due_to_missing_label_count,
             "rows_with_no_valid_action": rows_with_no_valid_action,
+            "same_action_target_weight_drift_count": same_action_target_weight_drift_count,
             "evaluated_rows": int(actions.numel()),
             "warnings": (
                 ["final_position_open"] if final_action != 0 and abs(final_executed_weight) > 1e-12 and not liquidate_at_end else []
@@ -491,6 +499,38 @@ def _evaluate_action_path(
     if return_decision_logs:
         metrics["decision_logs"] = decision_logs
     return metrics
+
+
+def sequential_path_reportability_errors(metrics: dict[str, Any], *, max_cash_share: float = 0.99) -> list[str]:
+    """Path-level reportability gate reasons for a sequential second-context evaluation (the dict returned by the
+    path evaluator). Empty == no path pathology.
+
+    Default-preserving and fail-closed-ONLY-on-a-real-problem: each reason fires only when a genuine pathology
+    actually occurred on the EVALUATED path -- it turns diagnostics the evaluator already records into hard gates
+    so a broken data/reward pipeline cannot masquerade as a successful (often all-CASH) policy:
+      * ``sequential_path_missing_label_fallback`` -- a non-CASH action was requested/executed whose realized
+        label was missing, so the path silently fell back to CASH.
+      * ``sequential_path_rows_with_no_valid_action`` -- a decision row had NO valid action at all (data gap).
+      * ``sequential_path_same_action_target_weight_drift`` -- the freeze-executed-weight contract was violated
+        (declared ``target_weight`` drifted while an action id was HELD), so P&L/turnover are incoherent.
+      * ``all_cash_no_active_edge`` -- the policy sat in CASH for ~all rows AND its active (non-CASH) window had
+        no positive net edge. A high cash share ALONE is not gated (all-CASH can be a correct no-edge outcome);
+        only cash share WITH a non-positive active net return is, since that is the case that hides a pathology.
+
+    A clean path returns []."""
+    reasons: list[str] = []
+    if int(metrics.get("fallback_due_to_missing_label_count", 0) or 0) > 0:
+        reasons.append("sequential_path_missing_label_fallback")
+    if int(metrics.get("rows_with_no_valid_action", 0) or 0) > 0:
+        reasons.append("sequential_path_rows_with_no_valid_action")
+    if int(metrics.get("same_action_target_weight_drift_count", 0) or 0) > 0:
+        reasons.append("sequential_path_same_action_target_weight_drift")
+    cash_share = float(metrics.get("cash_action_share", 0.0) or 0.0)
+    active = metrics.get("active_window_diagnostics") or {}
+    active_net = float(active.get("active_net_return", 0.0) or 0.0) if isinstance(active, dict) else 0.0
+    if cash_share >= max_cash_share and active_net <= 0.0:
+        reasons.append("all_cash_no_active_edge")
+    return reasons
 
 
 @torch.no_grad()
