@@ -71,7 +71,7 @@ FLAG_REGISTRY: dict[str, FlagSpec] = {
         delete_criterion="remove the flag after two stable cycles at the new default",
     ),
     # Execution-engine reward flags (see docs/execution_wiring_design.md). execution_env_reward_shadow is now a
-    # real MinuteToHourEnvConfig field (PR-3 shipped); use_execution_env_reward is declared ahead of the PR-4
+    # real SecondToHourEnvConfig field (PR-3 shipped); use_execution_env_reward is declared ahead of the PR-4
     # training-reward flip and is not yet a config field. The gate test cross-checks each registered flag's
     # default against its config field where that field exists.
     "execution_env_reward_shadow": FlagSpec(
@@ -93,7 +93,7 @@ FLAG_REGISTRY: dict[str, FlagSpec] = {
         flip_criterion="latest-period A/B improves the promotion gate without degrading reportability; test block untouched",
         delete_criterion="remove after two stable cycles at the new default",
     ),
-    # Second-context dataset flag (threaded through build_second_context_splits, not a MinuteToHour config
+    # Second-context dataset flag (threaded through build_second_context_splits, not a SecondToHour config
     # field). Result-moving via model_inputs: fits the ACTION-feature normalizer (mean/std) over the
     # decision-valid action rows only, excluding padded/invalid rows whose features are sentinels/stale, which
     # changes the normalized action_features the scorer sees. The market-context normalizer is already masked

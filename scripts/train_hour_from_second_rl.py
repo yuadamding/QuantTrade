@@ -91,7 +91,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--action-embedding-dim", type=int, default=32)
     parser.add_argument(
-        "--max-subhour-tokens",
+        "--max-second-tokens",
         type=int,
         default=512,
         help="Compress each hour of source bars to at most this many intrahour transformer tokens.",
@@ -131,7 +131,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_constraints_from_args(args: argparse.Namespace):
-    from rl_quant.minute_to_hour_transformer import TradingConstraintConfig
+    from rl_quant.second_to_hour_transformer import TradingConstraintConfig
 
     return TradingConstraintConfig(
         max_switches_per_day=args.max_switches_per_day,
@@ -172,18 +172,18 @@ def main() -> int:
             CONSTRAINED_POLICY_MODEL_VERSION,
             CONSTRAINT_FEATURE_NAMES,
         )
-        from rl_quant.minute_to_hour_transformer import (
-            MinuteToHourEnvConfig,
-            MinuteToHourTrainingConfig,
+        from rl_quant.second_to_hour_transformer import (
+            SecondToHourEnvConfig,
+            SecondToHourTrainingConfig,
             action_index,
             build_hour_from_minute_splits,
-            evaluate_minute_to_hour_policy,
-            train_minute_to_hour_dqn,
+            evaluate_second_to_hour_policy,
+            train_second_to_hour_dqn,
         )
     except ModuleNotFoundError as exc:
         if exc.name == "torch":
             raise SystemExit(
-                "Torch is required. Use: conda run -n ml1 python scripts/train_hourly_from_minute_context_rl.py"
+                "Torch is required. Use: conda run -n ml1 python scripts/train_hourly_from_second_context_rl.py"
             ) from exc
         raise
 
@@ -223,14 +223,14 @@ def main() -> int:
         f"{len(val_split.decision_timestamps)}/{len(test_split.decision_timestamps)}"
     )
     print(
-        f"Subhour tensor: {tuple(train_split.minute_features.shape[1:])} | "
+        f"Second tensor: {tuple(train_split.second_features.shape[1:])} | "
         f"Hour tensor: {tuple(train_split.hour_features.shape[1:])} | "
         f"Source interval: {train_split.source_bar_interval} | "
         f"Actions: {len(train_split.action_names)}"
     )
 
     constraints = build_constraints_from_args(args)
-    env_config = MinuteToHourEnvConfig(
+    env_config = SecondToHourEnvConfig(
         num_envs=args.num_envs,
         episode_length=args.episode_length,
         initial_action=initial_action,
@@ -254,12 +254,12 @@ def main() -> int:
         use_amp=args.amp,
         amp_dtype=args.amp_dtype,
     )
-    config = MinuteToHourTrainingConfig(
+    config = SecondToHourTrainingConfig(
         env=env_config,
         learning=learning_config,
         d_model=args.d_model,
         n_heads=args.n_heads,
-        minute_layers=args.minute_layers,
+        second_layers=args.second_layers,
         hour_layers=args.hour_layers,
         feedforward_dim=args.feedforward_dim,
         dropout=args.dropout,
@@ -267,10 +267,10 @@ def main() -> int:
         target_vram_gb=args.target_vram_gb,
         vram_safety_gb=args.vram_safety_gb,
         warm_start_model=args.warm_start_model,
-        max_subhour_tokens=args.max_subhour_tokens,
+        max_second_tokens=args.max_second_tokens,
     )
-    model, artifacts = train_minute_to_hour_dqn(train_split, val_split, device=device, config=config)
-    train_result = evaluate_minute_to_hour_policy(
+    model, artifacts = train_second_to_hour_dqn(train_split, val_split, device=device, config=config)
+    train_result = evaluate_second_to_hour_policy(
         train_split.to(device),
         model,
         device=device,
@@ -278,7 +278,7 @@ def main() -> int:
         constraints=constraints,
         episode_length=args.episode_length,
     )
-    val_result = evaluate_minute_to_hour_policy(
+    val_result = evaluate_second_to_hour_policy(
         val_split.to(device),
         model,
         device=device,
@@ -286,7 +286,7 @@ def main() -> int:
         constraints=constraints,
         episode_length=args.episode_length,
     )
-    test_result = evaluate_minute_to_hour_policy(
+    test_result = evaluate_second_to_hour_policy(
         test_split.to(device),
         model,
         device=device,
@@ -296,7 +296,7 @@ def main() -> int:
         capture_rollout=True,
     )
 
-    run_name = args.run_name or f"minute_to_hour_{datetime.now():%Y%m%d_%H%M%S}"
+    run_name = args.run_name or f"second_to_hour_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir = args.output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     serializable_args = {
@@ -309,8 +309,8 @@ def main() -> int:
             "uses_constraint_features": True,
             "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
             "model_state_dict": model.state_dict(),
-            "minute_feature_mean": train_split.minute_feature_mean.detach().cpu(),
-            "minute_feature_std": train_split.minute_feature_std.detach().cpu(),
+            "second_feature_mean": train_split.second_feature_mean.detach().cpu(),
+            "second_feature_std": train_split.second_feature_std.detach().cpu(),
             "hour_feature_mean": train_split.hour_feature_mean.detach().cpu(),
             "hour_feature_std": train_split.hour_feature_std.detach().cpu(),
             "action_feature_mean": (
@@ -323,14 +323,14 @@ def main() -> int:
                 if train_split.action_feature_std is not None
                 else None
             ),
-            "minute_feature_names": train_split.minute_feature_names,
+            "second_feature_names": train_split.second_feature_names,
             "hour_feature_names": train_split.hour_feature_names,
             "action_feature_names": train_split.action_feature_names,
             "action_feature_groups": train_split.action_feature_groups,
             "action_names": train_split.action_names,
             "source_bar_interval": train_split.source_bar_interval,
             "context_bars_per_hour": train_split.effective_context_bars_per_hour,
-            "max_subhour_tokens": args.max_subhour_tokens,
+            "max_second_tokens": args.max_second_tokens,
             "split_policy": train_split.split_policy,
             "constraints": asdict(constraints),
             "config": serializable_args,
@@ -345,12 +345,12 @@ def main() -> int:
         "torch_runtime": runtime,
         "config": serializable_args,
         "constraints": asdict(constraints),
-        "minute_feature_names": train_split.minute_feature_names,
+        "second_feature_names": train_split.second_feature_names,
         "hour_feature_names": train_split.hour_feature_names,
         "action_names": train_split.action_names,
         "source_bar_interval": train_split.source_bar_interval,
         "context_bars_per_hour": train_split.effective_context_bars_per_hour,
-        "max_subhour_tokens": args.max_subhour_tokens,
+        "max_second_tokens": args.max_second_tokens,
         "split_policy": train_split.split_policy,
         "training": artifacts,
         "train_metrics": train_result.to_dict(),

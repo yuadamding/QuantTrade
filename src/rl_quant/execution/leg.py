@@ -1,5 +1,5 @@
 """Leg-level RETURN-based multi-symbol execution path (the ETF allocation paths: second_context /
-minute_to_hour). P&L = sum over symbols of weight * interval_return, with cost in bps of each symbol's
+second_to_hour). P&L = sum over symbols of weight * interval_return, with cost in bps of each symbol's
 mid charged on traded weight. Distinct from the scalar dollar model; the two share only the fill-level
 vocabulary (``FillLevel`` / ``_fill_price``).
 """
@@ -31,7 +31,7 @@ from rl_quant.execution.validation import (
 #
 # transition_pnl / simulate_transition above are the intraday SIGNED-POSITION DOLLAR model (one
 # instrument, P&L = units * mid-diff * scale). The layer below is a DISTINCT, RETURN-based per-symbol
-# model that matches the ETF allocation paths (second_context / minute_to_hour): P&L = sum over symbols
+# model that matches the ETF allocation paths (second_context / second_to_hour): P&L = sum over symbols
 # of weight * interval_return, with cost in bps of the symbol's mid charged on traded weight. A
 # QQQ -> SQQQ switch decomposes into a SELL-QQQ leg (filled at QQQ's bid) and a BUY-SQQQ leg (filled at
 # SQQQ's ask). inverse/leverage is already baked into each symbol's own return label, so there is NO

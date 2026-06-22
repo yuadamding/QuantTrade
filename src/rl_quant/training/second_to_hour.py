@@ -1,4 +1,4 @@
-"""Training layer: minute->hour DQN training loop + evaluation + checkpointing + recency weighting (extracted from rl_quant.minute_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
+"""Training layer: minute->hour DQN training loop + evaluation + checkpointing + recency weighting (extracted from rl_quant.second_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
 from __future__ import annotations
 
 import hashlib
@@ -49,24 +49,24 @@ from rl_quant.trading_constraints import (
     sample_valid_actions,
 )
 
-from rl_quant.models.minute_to_hour import (  # re-export: model moved to the models layer
-    DEFAULT_MAX_SUBHOUR_TOKENS,
-    MinuteToHourCausalTransformerQNetwork,
+from rl_quant.models.second_to_hour import (  # re-export: model moved to the models layer
+    DEFAULT_MAX_SECOND_TOKENS,
+    SecondToHourPolicyQNetwork,
 )
-from rl_quant.datasets.hour_from_subhour import (
+from rl_quant.datasets.hour_from_second import (
     HourFromMinuteDataSplit,
     _timestamp_to_epoch_ms,
     assert_matching_hour_from_minute_schema,
-    default_minute_to_hour_constraints,
-    minute_to_hour_missing_label_report,
+    default_second_to_hour_constraints,
+    second_to_hour_missing_label_report,
 )
-from rl_quant.envs.minute_to_hour import (
-    MinuteToHourEnvConfig,
-    VectorizedMinuteToHourEnv,
+from rl_quant.envs.second_to_hour import (
+    SecondToHourEnvConfig,
+    VectorizedSecondToHourEnv,
     transition_net_return_and_reward,
     transition_trade_cost_bps,
     validate_cash_usable_on_decision_rows,
-    validate_minute_to_hour_constraints,
+    validate_second_to_hour_constraints,
 )
 from rl_quant.protocol.action_return_basis import ALLOWED_ACTION_RETURN_WEIGHT_SEMANTICS
 from rl_quant.evaluation.statistical import (
@@ -106,12 +106,12 @@ class RecencyWeightConfig:
 
 
 @dataclass
-class MinuteToHourTrainingConfig:
-    env: MinuteToHourEnvConfig
+class SecondToHourTrainingConfig:
+    env: SecondToHourEnvConfig
     learning: DQNLearningConfig
     d_model: int = 256
     n_heads: int = 8
-    minute_layers: int = 2
+    second_layers: int = 2
     hour_layers: int = 4
     feedforward_dim: int = 768
     dropout: float = 0.05
@@ -122,7 +122,7 @@ class MinuteToHourTrainingConfig:
     resume_training_state: str | bytes | PathLike[str] | None = None
     checkpoint_training_state: str | bytes | PathLike[str] | None = None
     checkpoint_every_steps: int = 0
-    max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS
+    max_second_tokens: int | None = DEFAULT_MAX_SECOND_TOKENS
     recency: RecencyWeightConfig = field(default_factory=RecencyWeightConfig)
     # Opt-in position-aware transition features (default off -> no new model params, existing
     # checkpoints load unchanged). When True, the Q-network scores each candidate with the cost/risk of
@@ -137,7 +137,7 @@ class MinuteToHourTrainingConfig:
 
 
 @dataclass
-class MinuteToHourEvaluationResult:
+class SecondToHourEvaluationResult:
     split_name: str
     total_return: float
     total_reward_bps: float
@@ -204,7 +204,7 @@ class MinuteToHourEvaluationResult:
 
 
 @torch.no_grad()
-def evaluate_minute_to_hour_policy(
+def evaluate_second_to_hour_policy(
     data: HourFromMinuteDataSplit,
     model: nn.Module,
     *,
@@ -215,14 +215,14 @@ def evaluate_minute_to_hour_policy(
     reward_scale: float = 10_000.0,
     cash_idle_penalty_bps: float = 0.0,
     capture_rollout: bool = False,
-) -> MinuteToHourEvaluationResult:
-    constraints = constraints or default_minute_to_hour_constraints()
+) -> SecondToHourEvaluationResult:
+    constraints = constraints or default_second_to_hour_constraints()
     # Same fail-closed constraint/index checks the env runs at construction (cash_index is a real CASH action,
     # count_etf is a real bool, bps scalars finite/non-negative, initial_action in range), so the evaluator
     # cannot silently price against the wrong action / leg basis or start from a bad initial_action. Rebinding
     # `constraints` to the NORMALIZED object means every downstream read (masks, hysteresis, cost, features)
     # uses canonical-typed values -- the evaluator never touches the raw config again.
-    constraints = validate_minute_to_hour_constraints(constraints, data.action_names)
+    constraints = validate_second_to_hour_constraints(constraints, data.action_names)
     cash_index = constraints.cash_index
     validate_action_index_for_actions(data.action_names, initial_action, name="initial_action")
     # reward_scale multiplies the net return into the reward; reject + normalise (zero/negative/non-finite
@@ -243,7 +243,7 @@ def evaluate_minute_to_hour_policy(
         constraint_episode_length = max(int(data.valid_start_indices.numel()), 1)
     else:
         constraint_episode_length = require_positive_int("episode_length", episode_length)
-    data = data if data.minute_features.device == device else data.to(device)
+    data = data if data.second_features.device == device else data.to(device)
     model.eval()
     # PR-D: evaluate a dynamic-aware model with its dynamic features. The held-position excursion is tracked
     # continuously and reset only on a data-segment break (a walk-forward backtest has no artificial episode
@@ -451,7 +451,7 @@ def evaluate_minute_to_hour_policy(
         previous_date = current_date
         episode_steps += 1
 
-    report = minute_to_hour_missing_label_report(
+    report = second_to_hour_missing_label_report(
         data,
         row_indices=evaluated_rows,
         requested_actions=requested_actions,
@@ -476,7 +476,7 @@ def evaluate_minute_to_hour_policy(
     # Autocorrelation-deflated effective n: reported alongside the raw count so a reader can see when serial
     # correlation makes the PSR over-confident. Same series/moment convention as the PSR above.
     psr_effective_observations = effective_sample_size(returns)
-    return MinuteToHourEvaluationResult(
+    return SecondToHourEvaluationResult(
         split_name=data.name,
         total_return=equity - 1.0,
         total_reward_bps=total_reward_bps,
@@ -501,7 +501,7 @@ def evaluate_minute_to_hour_policy(
 
 class _ConstantActionModel(nn.Module):
     """A deterministic baseline 'policy': emits a Q-vector that, after the eval's cost-aware hysteresis,
-    enters and holds a single target action. Used only by evaluate_minute_to_hour_baselines -- the Q value
+    enters and holds a single target action. Used only by evaluate_second_to_hour_baselines -- the Q value
     is large so it dominates the switch-cost margin (the target is entered when valid and then held)."""
 
     def __init__(self, action_count: int, target_action: int) -> None:
@@ -516,7 +516,7 @@ class _ConstantActionModel(nn.Module):
         return q
 
 
-def evaluate_minute_to_hour_baselines(
+def evaluate_second_to_hour_baselines(
     data: HourFromMinuteDataSplit,
     *,
     device: torch.device,
@@ -525,32 +525,32 @@ def evaluate_minute_to_hour_baselines(
     reward_scale: float = 10_000.0,
     cash_idle_penalty_bps: float = 0.0,
     include_buy_and_hold: bool = True,
-) -> dict[str, MinuteToHourEvaluationResult]:
+) -> dict[str, SecondToHourEvaluationResult]:
     """Deterministic reference policies run through the SAME eval path as a trained model (identical cost /
     constraint / reportability / drawdown / Sharpe accounting), so a policy -- or a PR-D flag-on-vs-off A/B
     -- can be benchmarked against cash and buy-and-hold. A model that does not beat these under cost should
     not be promoted (per the review). NOTE: the action space is single-slot/discrete, so an equal-weight
     baseline is not expressible here; the references are always-cash and per-action buy-and-hold. This is an
     EVALUATION-ONLY helper: it changes no training/reward path."""
-    constraints = constraints or default_minute_to_hour_constraints()
+    constraints = constraints or default_second_to_hour_constraints()
     # Fail closed + NORMALIZE before deriving initial_action / the cash skip below; each
-    # evaluate_minute_to_hour_policy call re-validates, but the baseline wiring reads cash_index first and the
+    # evaluate_second_to_hour_policy call re-validates, but the baseline wiring reads cash_index first and the
     # normalized constraints are passed straight through to every baseline evaluation.
-    constraints = validate_minute_to_hour_constraints(constraints, data.action_names)
+    constraints = validate_second_to_hour_constraints(constraints, data.action_names)
     cash_index = constraints.cash_index
     action_count = len(data.action_names)
     common = dict(
         device=device, constraints=constraints, episode_length=episode_length,
         reward_scale=reward_scale, cash_idle_penalty_bps=cash_idle_penalty_bps, initial_action=cash_index,
     )
-    results: dict[str, MinuteToHourEvaluationResult] = {
-        "always_cash": evaluate_minute_to_hour_policy(data, _ConstantActionModel(action_count, cash_index), **common),
+    results: dict[str, SecondToHourEvaluationResult] = {
+        "always_cash": evaluate_second_to_hour_policy(data, _ConstantActionModel(action_count, cash_index), **common),
     }
     if include_buy_and_hold:
         for action in range(action_count):
             if action == cash_index:
                 continue
-            results[f"buy_and_hold:{data.action_names[action]}"] = evaluate_minute_to_hour_policy(
+            results[f"buy_and_hold:{data.action_names[action]}"] = evaluate_second_to_hour_policy(
                 data, _ConstantActionModel(action_count, action), **common
             )
     return results
@@ -616,7 +616,7 @@ _LEGACY_ENV_STATE_KEYS = (
 _DYNAMIC_ENV_STATE_KEYS = ("entry_index", "unrealized_pnl", "mae", "mfe")
 
 
-def _env_state_to_cpu(env: VectorizedMinuteToHourEnv) -> dict[str, torch.Tensor]:
+def _env_state_to_cpu(env: VectorizedSecondToHourEnv) -> dict[str, torch.Tensor]:
     return {
         key: getattr(env, key).detach().cpu().clone()
         for key in (*_LEGACY_ENV_STATE_KEYS, *_DYNAMIC_ENV_STATE_KEYS)
@@ -624,7 +624,7 @@ def _env_state_to_cpu(env: VectorizedMinuteToHourEnv) -> dict[str, torch.Tensor]
 
 
 def _load_env_state(
-    env: VectorizedMinuteToHourEnv,
+    env: VectorizedSecondToHourEnv,
     state: dict[str, torch.Tensor],
     device: torch.device,
     *,
@@ -693,7 +693,7 @@ def _run_semantics_hash(
     corrupt the running shadow sums), so resume rejects a mismatch."""
     fingerprint: dict[str, object] = {
         "action_names": list(train_data.action_names),
-        "minute_feature_names": list(train_data.minute_feature_names),
+        "second_feature_names": list(train_data.second_feature_names),
         "hour_feature_names": list(train_data.hour_feature_names),
         "action_feature_names": list(train_data.action_feature_names),
         "normalized_constraints": asdict(normalized_constraints),
@@ -744,7 +744,7 @@ def _dataset_content_hash(split: HourFromMinuteDataSplit) -> str:
         ("decision_timestamps", split.decision_timestamps),
         ("next_timestamps", split.next_timestamps),
         ("action_names", split.action_names),
-        ("minute_feature_names", split.minute_feature_names),
+        ("second_feature_names", split.second_feature_names),
         ("hour_feature_names", split.hour_feature_names),
         ("action_feature_names", split.action_feature_names),
     ):
@@ -752,8 +752,8 @@ def _dataset_content_hash(split: HourFromMinuteDataSplit) -> str:
         digest.update(json.dumps(list(values)).encode("utf-8"))
         digest.update(b"\x1e")
     for name, tensor in (
-        ("minute_features", split.minute_features),
-        ("minute_mask", split.minute_mask),
+        ("second_features", split.second_features),
+        ("second_mask", split.second_mask),
         ("hour_features", split.hour_features),
         ("action_features", split.action_features),
         ("action_returns", split.action_returns),
@@ -761,8 +761,8 @@ def _dataset_content_hash(split: HourFromMinuteDataSplit) -> str:
         ("label_valid_mask", split.label_valid_mask),
         ("valid_start_indices", split.valid_start_indices),
         ("valid_index_mask", split.valid_index_mask),
-        ("minute_feature_mean", split.minute_feature_mean),
-        ("minute_feature_std", split.minute_feature_std),
+        ("second_feature_mean", split.second_feature_mean),
+        ("second_feature_std", split.second_feature_std),
         ("hour_feature_mean", split.hour_feature_mean),
         ("hour_feature_std", split.hour_feature_std),
         ("action_feature_mean", split.action_feature_mean),
@@ -808,7 +808,7 @@ def _execution_shadow_cost_basis_status(train_data: HourFromMinuteDataSplit) -> 
     return "unresolved_unknown_semantics"
 
 
-def _save_minute_to_hour_training_state(
+def _save_second_to_hour_training_state(
     path: Path,
     *,
     step: int,
@@ -817,7 +817,7 @@ def _save_minute_to_hour_training_state(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     replay: TensorDictReplayBuffer,
-    env: VectorizedMinuteToHourEnv,
+    env: VectorizedSecondToHourEnv,
     best_val_return: float,
     best_val_legs: float,
     best_state: dict[str, torch.Tensor],
@@ -834,7 +834,7 @@ def _save_minute_to_hour_training_state(
 ) -> None:
     _atomic_torch_save(
         {
-            "checkpoint_kind": "minute_to_hour_dqn_training_state",
+            "checkpoint_kind": "second_to_hour_dqn_training_state",
             "checkpoint_version": 1,
             "step": int(step),
             "q_network_state_dict": _state_dict_to_cpu(q_network),
@@ -868,7 +868,7 @@ def _save_minute_to_hour_training_state(
 def _assert_checkpoint_schema(
     checkpoint: dict[str, Any],
     *,
-    minute_feature_names: list[str],
+    second_feature_names: list[str],
     hour_feature_names: list[str],
     action_names: list[str],
     action_feature_names: list[str],
@@ -876,7 +876,7 @@ def _assert_checkpoint_schema(
     dynamic_feature_dim: int = 0,
 ) -> None:
     expected = {
-        "minute_feature_names": minute_feature_names,
+        "second_feature_names": second_feature_names,
         "hour_feature_names": hour_feature_names,
         "action_names": action_names,
     }
@@ -923,7 +923,7 @@ def _assert_checkpoint_schema(
         )
 
 
-def load_minute_to_hour_warm_start(
+def load_second_to_hour_warm_start(
     model: nn.Module,
     *,
     checkpoint_path: str | bytes | PathLike[str],
@@ -934,7 +934,7 @@ def load_minute_to_hour_warm_start(
         raise ValueError("Warm-start checkpoint must be a saved minute-to-hour model artifact with model_state_dict.")
     _assert_checkpoint_schema(
         checkpoint,
-        minute_feature_names=train_data.minute_feature_names,
+        second_feature_names=train_data.second_feature_names,
         hour_feature_names=train_data.hour_feature_names,
         action_names=train_data.action_names,
         action_feature_names=train_data.action_feature_names,
@@ -990,12 +990,12 @@ def compute_recency_weights(
     return weights
 
 
-def train_minute_to_hour_dqn(
+def train_second_to_hour_dqn(
     train_data: HourFromMinuteDataSplit,
     val_data: HourFromMinuteDataSplit,
     *,
     device: torch.device,
-    config: MinuteToHourTrainingConfig,
+    config: SecondToHourTrainingConfig,
 ) -> tuple[nn.Module, dict[str, object]]:
     # Governed model-input flags must be REAL bools (bool("false") would be True -- a silent feature flip that
     # changes the model contract / replay schema). The env's execution_env_reward_shadow is validated in its
@@ -1006,7 +1006,7 @@ def train_minute_to_hour_dqn(
     # cash_index / count_etf) -- the env's own validation at construction happens later. Reuse the NORMALIZED
     # constraints (canonical types) for the transition table + hysteresis. action_names is device-agnostic, so
     # this is safe pre-`.to(device)`.
-    normalized_constraints = validate_minute_to_hour_constraints(config.env.constraints, train_data.action_names)
+    normalized_constraints = validate_second_to_hour_constraints(config.env.constraints, train_data.action_names)
     cash_index = normalized_constraints.cash_index
     # Schema matching is metadata/shape-level (device-agnostic), so fail on a mismatch BEFORE allocating GPU
     # memory or moving tensors to device.
@@ -1070,8 +1070,8 @@ def train_minute_to_hour_dqn(
                     f"pricing undercharges leveraged turnover otherwise); leveraged actions: {leveraged[:5]}."
                 )
     configure_torch_runtime(device)
-    train_data = train_data if train_data.minute_features.device == device else train_data.to(device)
-    val_data = val_data if val_data.minute_features.device == device else val_data.to(device)
+    train_data = train_data if train_data.second_features.device == device else train_data.to(device)
+    val_data = val_data if val_data.second_features.device == device else val_data.to(device)
     # Economic/schema fingerprint of THIS run; saved into checkpoints and re-checked on resume so a checkpoint
     # cannot be resumed with different action space / constraints / reward semantics (different economics).
     run_semantics_hash = _run_semantics_hash(
@@ -1136,20 +1136,20 @@ def train_minute_to_hour_dqn(
         )
         transition_feature_dim = TRANSITION_FEATURE_DIM
     dynamic_feature_dim = DYNAMIC_TRANSITION_FEATURE_DIM if config.use_dynamic_transition_features else 0
-    q_network = MinuteToHourCausalTransformerQNetwork(
-        minute_feature_dim=train_data.minute_features.shape[-1],
+    q_network = SecondToHourPolicyQNetwork(
+        second_feature_dim=train_data.second_features.shape[-1],
         hour_feature_dim=train_data.hour_features.shape[-1],
         action_count=action_count,
         hours_lookback=train_data.hours_lookback,
-        minutes_per_hour=train_data.minutes_per_hour,
+        seconds_per_hour=train_data.seconds_per_hour,
         d_model=config.d_model,
         n_heads=config.n_heads,
-        minute_layers=config.minute_layers,
+        second_layers=config.second_layers,
         hour_layers=config.hour_layers,
         feedforward_dim=config.feedforward_dim,
         dropout=config.dropout,
         action_embedding_dim=config.action_embedding_dim,
-        max_subhour_tokens=config.max_subhour_tokens,
+        max_second_tokens=config.max_second_tokens,
         action_feature_dim=0 if train_data.action_features is None else int(train_data.action_features.shape[-1]),
         transition_feature_dim=transition_feature_dim,
         transition_table=transition_table,
@@ -1157,7 +1157,7 @@ def train_minute_to_hour_dqn(
     ).to(device)
     warm_start_info: dict[str, object] | None = None
     if config.warm_start_model is not None:
-        warm_start_info = load_minute_to_hour_warm_start(
+        warm_start_info = load_second_to_hour_warm_start(
             q_network,
             checkpoint_path=config.warm_start_model,
             train_data=train_data,
@@ -1194,7 +1194,7 @@ def train_minute_to_hour_dqn(
         device=device,
         fields=replay_fields,
     )
-    env = VectorizedMinuteToHourEnv(train_data, config.env, device)
+    env = VectorizedSecondToHourEnv(train_data, config.env, device)
     reservation = CudaVramReservation(target_gb=config.target_vram_gb, safety_gb=config.vram_safety_gb)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -1218,7 +1218,7 @@ def train_minute_to_hour_dqn(
     resume_path = Path(config.resume_training_state) if config.resume_training_state is not None else None
     if resume_path is not None and resume_path.exists():
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-        if not isinstance(checkpoint, dict) or checkpoint.get("checkpoint_kind") != "minute_to_hour_dqn_training_state":
+        if not isinstance(checkpoint, dict) or checkpoint.get("checkpoint_kind") != "second_to_hour_dqn_training_state":
             raise ValueError("Resume checkpoint is not a minute-to-hour DQN training state.")
         # Reject resuming a run with DIFFERENT economics (action space / feature schema / normalized
         # constraints / action-return semantics). Older checkpoints without the hash skip this (prior behaviour).
@@ -1430,7 +1430,7 @@ def train_minute_to_hour_dqn(
             target_network.load_state_dict(q_network.state_dict())
 
         if step % config.learning.eval_interval == 0 or step == config.learning.train_steps:
-            val_result = evaluate_minute_to_hour_policy(
+            val_result = evaluate_second_to_hour_policy(
                 val_data,
                 q_network,
                 device=device,
@@ -1476,7 +1476,7 @@ def train_minute_to_hour_dqn(
         if checkpoint_path is not None and checkpoint_every_steps > 0 and (
             step % checkpoint_every_steps == 0 or step == config.learning.train_steps
         ):
-            _save_minute_to_hour_training_state(
+            _save_second_to_hour_training_state(
                 checkpoint_path,
                 step=step,
                 q_network=q_network,
@@ -1656,7 +1656,7 @@ def train_minute_to_hour_dqn(
         "checkpoint_every_steps": checkpoint_every_steps,
         "source_bar_interval": train_data.source_bar_interval,
         "context_bars_per_hour": train_data.effective_context_bars_per_hour,
-        "max_subhour_tokens": config.max_subhour_tokens,
+        "max_second_tokens": config.max_second_tokens,
         "split_policy": train_data.split_policy,
         "action_feature_names": train_data.action_feature_names,
         "action_feature_dim": 0 if train_data.action_features is None else int(train_data.action_features.shape[-1]),

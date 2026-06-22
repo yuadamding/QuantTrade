@@ -73,11 +73,11 @@ POLYGON_TOP500_UNIVERSE = DATA_ROOT / "polygon" / "universes" / "top_500_s3_volu
 
 def validate_hourly_grid_args(args: argparse.Namespace) -> None:
     if args.decision_stride_minutes != DEFAULT_DECISION_GRID_MINUTES:
-        raise ValueError("Subhour-source RL datasets use an hourly decision grid; decision-stride-minutes must be 60.")
+        raise ValueError("Second-source RL datasets use an hourly decision grid; decision-stride-minutes must be 60.")
     expected = expected_context_bars_per_grid(args.source_bar_interval)
-    if args.minutes_per_hour != expected:
+    if args.seconds_per_hour != expected:
         raise ValueError(
-            "Subhour-source hourly context must encode one hour of source bars; "
+            "Second-source hourly context must encode one hour of source bars; "
             f"{args.source_bar_interval} expects {expected} bars per hour."
         )
 
@@ -106,13 +106,13 @@ def expected_context_bars_per_grid(source_bar_interval: str) -> int:
 def default_stock_bar_dir(source_bar_interval: str) -> Path:
     if source_bar_interval == SECOND_SOURCE_BAR_INTERVAL:
         return POLYGON_SECOND_ROOT
-    return DATA_ROOT / "minute_ohlcv" / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15"
+    return DATA_ROOT / "second_ohlcv" / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15"
 
 
 def default_action_bar_dir(source_bar_interval: str) -> Path:
     if source_bar_interval == SECOND_SOURCE_BAR_INTERVAL:
         return POLYGON_SECOND_ROOT
-    return DATA_ROOT / "minute_ohlcv" / "top_us_volume_etfs_500_2026-06-14_1m_2026-05-25_2026-06-15"
+    return DATA_ROOT / "second_ohlcv" / "top_us_volume_etfs_500_2026-06-14_1m_2026-05-25_2026-06-15"
 
 
 def default_stock_universe(source_bar_interval: str) -> Path:
@@ -129,7 +129,7 @@ def default_action_universe(source_bar_interval: str) -> Path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build an hourly-decision dataset with causal subhour context windows.",
+        description="Build an hourly-decision dataset with causal second context windows.",
     )
     parser.add_argument(
         "--source-bar-interval",
@@ -140,14 +140,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--stock-minute-dir",
         "--stock-bar-dir",
         type=Path,
-        dest="stock_minute_dir",
+        dest="stock_second_dir",
         default=default_stock_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL),
     )
     parser.add_argument(
         "--etf-minute-dir",
         "--action-bar-dir",
         type=Path,
-        dest="etf_minute_dir",
+        dest="etf_second_dir",
         default=default_action_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL),
     )
     parser.add_argument(
@@ -178,7 +178,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--minutes-per-hour",
         "--context-bars-per-hour",
-        dest="minutes_per_hour",
+        dest="seconds_per_hour",
         type=int,
         default=DEFAULT_CONTEXT_MINUTES_PER_GRID,
         help="Number of source bars inside each hour context token; use 60 for 1m or 3600 for 1s.",
@@ -234,10 +234,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     if args.source_bar_interval == SECOND_SOURCE_BAR_INTERVAL:
-        if args.stock_minute_dir == default_stock_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL):
-            args.stock_minute_dir = default_stock_bar_dir(SECOND_SOURCE_BAR_INTERVAL)
-        if args.etf_minute_dir == default_action_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL):
-            args.etf_minute_dir = default_action_bar_dir(SECOND_SOURCE_BAR_INTERVAL)
+        if args.stock_second_dir == default_stock_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL):
+            args.stock_second_dir = default_stock_bar_dir(SECOND_SOURCE_BAR_INTERVAL)
+        if args.etf_second_dir == default_action_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL):
+            args.etf_second_dir = default_action_bar_dir(SECOND_SOURCE_BAR_INTERVAL)
         if args.stock_universe == default_stock_universe(DEFAULT_SOURCE_BAR_INTERVAL):
             args.stock_universe = default_stock_universe(SECOND_SOURCE_BAR_INTERVAL)
         if args.etf_universe == default_action_universe(DEFAULT_SOURCE_BAR_INTERVAL):
@@ -246,8 +246,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             args.output_dir = DATA_ROOT / "rl_hour_from_second" / "top500_1s_recent"
         if args.dataset_file_name == "hour_from_minute_dataset.pt":
             args.dataset_file_name = "hour_from_second_dataset.pt"
-        if args.minutes_per_hour == DEFAULT_CONTEXT_MINUTES_PER_GRID:
-            args.minutes_per_hour = DEFAULT_SECOND_CONTEXT_BARS_PER_GRID
+        if args.seconds_per_hour == DEFAULT_CONTEXT_MINUTES_PER_GRID:
+            args.seconds_per_hour = DEFAULT_SECOND_CONTEXT_BARS_PER_GRID
         if args.max_action_staleness_seconds == 0:
             args.max_action_staleness_seconds = 300
         if args.bar_latency_ms == 0:
@@ -647,11 +647,11 @@ def main() -> int:
     try:
         import torch
     except ModuleNotFoundError as exc:
-        raise SystemExit("Torch is required. Use: conda run -n ml1 python scripts/build_hourly_from_minute_context_dataset.py") from exc
+        raise SystemExit("Torch is required. Use: conda run -n ml1 python scripts/build_hourly_from_second_context_dataset.py") from exc
 
     source_bar_interval = args.source_bar_interval.strip().lower()
     source_bar_seconds = source_interval_seconds(source_bar_interval)
-    if args.hours_lookback <= 0 or args.minutes_per_hour <= 0 or args.decision_stride_minutes <= 0:
+    if args.hours_lookback <= 0 or args.seconds_per_hour <= 0 or args.decision_stride_minutes <= 0:
         raise ValueError("hours-lookback, context-bars-per-hour, and decision-stride-minutes must be positive.")
     if args.bar_latency_ms < 0:
         raise ValueError("bar-latency-ms must be non-negative.")
@@ -665,8 +665,8 @@ def main() -> int:
     dense_hourly_grid = bool(args.dense_hourly_grid or sparse_source)
     allow_missing_action_context = bool(args.allow_missing_action_context)
 
-    stock_map = bar_source_map(args.stock_minute_dir, interval=source_bar_interval)
-    etf_map = bar_source_map(args.etf_minute_dir, interval=source_bar_interval)
+    stock_map = bar_source_map(args.stock_second_dir, interval=source_bar_interval)
+    etf_map = bar_source_map(args.etf_second_dir, interval=source_bar_interval)
     intended_stocks = read_ranked_symbols(args.stock_universe)
     intended_stock_slice = intended_stocks[: args.stock_limit]
     missing_intended_stock_source_symbols = [symbol for symbol in intended_stock_slice if symbol not in stock_map]
@@ -732,7 +732,7 @@ def main() -> int:
         if len(stock_by_time.get(timestamp, [])) >= min_active
         and (timestamp in exchange_times or dense_hourly_grid or timestamp in exact_action_common_times)
     ]
-    if len(common_times) < args.minutes_per_hour:
+    if len(common_times) < args.seconds_per_hour:
         raise ValueError("Too few aligned source rows after stock and action filtering.")
     action_price_lookup = {symbol: make_action_lookup(rows) for symbol, rows in etf_features.items()}
     exchange_lookup = ExchangeTimestampLookup.from_exchange_maps(stock_exchange_times, exchange_times)
@@ -775,7 +775,7 @@ def main() -> int:
                 f"etf_{symbol}_log_dollar_volume",
             ]
         )
-    minute_feature_names = [*stock_feature_names, *path_feature_names, *time_feature_names, *etf_feature_names]
+    second_feature_names = [*stock_feature_names, *path_feature_names, *time_feature_names, *etf_feature_names]
     hour_feature_names = ["hour_valid_fraction", "hour_session_progress_centered"]
 
     exchange_time_feature_cache: dict[str, tuple[float, ...]] = {}
@@ -787,8 +787,8 @@ def main() -> int:
             exchange_time_feature_cache[exchange_timestamp] = cached
         return cached
 
-    minute_feature_by_time: dict[str, list[float]] = {}
-    minute_exchange_date_by_time: dict[str, str] = {}
+    second_feature_by_time: dict[str, list[float]] = {}
+    second_exchange_date_by_time: dict[str, str] = {}
     cumulative_by_date: dict[str, float] = {}
     count_by_date: dict[str, int] = {}
     return_sum_by_date: dict[str, float] = {}
@@ -825,19 +825,19 @@ def main() -> int:
                 break
             etf_row.extend([current.bar_return, current.intraday_ret, current.range_bps, current.log_dollar_volume])
         if not missing:
-            minute_feature_by_time[timestamp] = [*stock_features, *path_features, *time_features, *etf_row]
-            minute_exchange_date_by_time[timestamp] = date_key
+            second_feature_by_time[timestamp] = [*stock_features, *path_features, *time_features, *etf_row]
+            second_exchange_date_by_time[timestamp] = date_key
 
     decision_timestamps: list[str] = []
     next_timestamps: list[str] = []
-    minute_timestamp_grid: list[list[list[str]]] = []
-    minute_feature_rows: list[list[list[list[float]]]] = []
-    minute_mask_rows: list[list[list[bool]]] = []
+    second_timestamp_grid: list[list[list[str]]] = []
+    second_feature_rows: list[list[list[list[float]]]] = []
+    second_mask_rows: list[list[list[bool]]] = []
     hour_feature_rows: list[list[list[float]]] = []
     action_return_rows: list[list[float]] = []
     action_valid_rows: list[list[bool]] = []
     action_label_valid_rows: list[list[bool]] = []
-    feature_dim = len(minute_feature_names)
+    feature_dim = len(second_feature_names)
     zero_feature = [0.0] * feature_dim
     source_bar_ms = source_bar_seconds * 1_000
     decision_source_times = (
@@ -847,15 +847,15 @@ def main() -> int:
     )
     decision_stride_seconds = int(args.decision_stride_minutes) * 60
     decision_stride_ms = decision_stride_seconds * 1_000
-    minute_feature_by_ms: dict[int, list[float]] = {}
-    minute_timestamp_by_ms: dict[int, str] = {}
-    minute_exchange_date_by_ms: dict[int, str] = {}
-    for timestamp, features in minute_feature_by_time.items():
+    second_feature_by_ms: dict[int, list[float]] = {}
+    second_timestamp_by_ms: dict[int, str] = {}
+    second_exchange_date_by_ms: dict[int, str] = {}
+    for timestamp, features in second_feature_by_time.items():
         timestamp_ms = timestamp_to_epoch_ms(timestamp)
-        minute_feature_by_ms[timestamp_ms] = features
-        minute_timestamp_by_ms[timestamp_ms] = timestamp
-        if timestamp in minute_exchange_date_by_time:
-            minute_exchange_date_by_ms[timestamp_ms] = minute_exchange_date_by_time[timestamp]
+        second_feature_by_ms[timestamp_ms] = features
+        second_timestamp_by_ms[timestamp_ms] = timestamp
+        if timestamp in second_exchange_date_by_time:
+            second_exchange_date_by_ms[timestamp_ms] = second_exchange_date_by_time[timestamp]
     for decision_ts in decision_source_times:
         exchange_timestamp = exchange_lookup.get(decision_ts)
         if exchange_timestamp is None:
@@ -869,7 +869,7 @@ def main() -> int:
         decision_context_ms = decision_ms - int(args.bar_latency_ms)
         execution_latency_ms = int(args.execution_latency_ms)
         decision_date = exchange_timestamp[:10]
-        minute_tensor: list[list[list[float]]] = []
+        second_tensor: list[list[list[float]]] = []
         mask_tensor: list[list[bool]] = []
         timestamp_tensor: list[list[str]] = []
         hour_rows: list[list[float]] = []
@@ -877,31 +877,31 @@ def main() -> int:
         for hour_index in range(args.hours_lookback):
             offset_hours = args.hours_lookback - 1 - hour_index
             hour_end_ms = decision_context_ms - (offset_hours * decision_stride_ms)
-            hour_start_ms = hour_end_ms - ((args.minutes_per_hour - 1) * source_bar_ms)
-            minute_rows: list[list[float]] = []
+            hour_start_ms = hour_end_ms - ((args.seconds_per_hour - 1) * source_bar_ms)
+            second_rows: list[list[float]] = []
             mask_rows: list[bool] = []
             ts_rows: list[str] = []
             hour_valid_count = 0
-            for minute_offset in range(args.minutes_per_hour):
-                minute_ms = hour_start_ms + (minute_offset * source_bar_ms)
-                minute_feature = minute_feature_by_ms.get(minute_ms)
+            for second_offset in range(args.seconds_per_hour):
+                second_ms = hour_start_ms + (second_offset * source_bar_ms)
+                second_feature = second_feature_by_ms.get(second_ms)
                 is_valid = (
-                    minute_ms <= decision_context_ms
-                    and minute_feature is not None
-                    and minute_exchange_date_by_ms.get(minute_ms) == decision_date
+                    second_ms <= decision_context_ms
+                    and second_feature is not None
+                    and second_exchange_date_by_ms.get(second_ms) == decision_date
                 )
-                ts_rows.append(minute_timestamp_by_ms[minute_ms] if is_valid else "")
+                ts_rows.append(second_timestamp_by_ms[second_ms] if is_valid else "")
                 mask_rows.append(is_valid)
-                minute_rows.append(minute_feature if is_valid and minute_feature is not None else zero_feature)
+                second_rows.append(second_feature if is_valid and second_feature is not None else zero_feature)
                 valid_count += int(is_valid)
                 hour_valid_count += int(is_valid)
-            valid_fraction = hour_valid_count / float(args.minutes_per_hour)
+            valid_fraction = hour_valid_count / float(args.seconds_per_hour)
             hour_exchange_timestamp = exchange_lookup.get_ms(hour_end_ms) or exchange_timestamp
             hour_rows.append([valid_fraction, parse_exchange_time_cached(hour_exchange_timestamp)[0]])
             timestamp_tensor.append(ts_rows)
             mask_tensor.append(mask_rows)
-            minute_tensor.append(minute_rows)
-        if valid_count / float(args.hours_lookback * args.minutes_per_hour) < args.min_context_valid_fraction:
+            second_tensor.append(second_rows)
+        if valid_count / float(args.hours_lookback * args.seconds_per_hour) < args.min_context_valid_fraction:
             continue
         action_returns = [0.0]
         decision_action_valid = [True]
@@ -942,9 +942,9 @@ def main() -> int:
             continue
         decision_timestamps.append(decision_ts)
         next_timestamps.append(next_ts)
-        minute_timestamp_grid.append(timestamp_tensor)
-        minute_feature_rows.append(minute_tensor)
-        minute_mask_rows.append(mask_tensor)
+        second_timestamp_grid.append(timestamp_tensor)
+        second_feature_rows.append(second_tensor)
+        second_mask_rows.append(mask_tensor)
         hour_feature_rows.append(hour_rows)
         action_return_rows.append(action_returns)
         action_valid_rows.append(decision_action_valid)
@@ -958,8 +958,8 @@ def main() -> int:
             f"{len(decision_timestamps)} < {args.min_decision_rows}."
         )
 
-    minute_features = torch.tensor(minute_feature_rows, dtype=torch.float32)
-    minute_mask = torch.tensor(minute_mask_rows, dtype=torch.bool)
+    second_features = torch.tensor(second_feature_rows, dtype=torch.float32)
+    second_mask = torch.tensor(second_mask_rows, dtype=torch.bool)
     hour_features = torch.tensor(hour_feature_rows, dtype=torch.float32)
     action_returns = torch.tensor(action_return_rows, dtype=torch.float32)
     action_valid_mask = torch.tensor(action_valid_rows, dtype=torch.bool)
@@ -971,8 +971,8 @@ def main() -> int:
         "action_label_valid_mask": "Legacy alias for label_valid_mask.",
     }
     model_input_keys = [
-        "minute_features",
-        "minute_mask",
+        "second_features",
+        "second_mask",
         "hour_features",
         "decision_action_valid_mask",
         "action_valid_mask",
@@ -1014,16 +1014,16 @@ def main() -> int:
         {
             "decision_timestamps": decision_timestamps,
             "next_timestamps": next_timestamps,
-            "subhour_timestamp_grid": minute_timestamp_grid,
-            "minute_timestamp_grid": minute_timestamp_grid,
-            "subhour_feature_names": minute_feature_names,
-            "minute_feature_names": minute_feature_names,
+            "second_timestamp_grid": second_timestamp_grid,
+            "second_timestamp_grid": second_timestamp_grid,
+            "second_feature_names": second_feature_names,
+            "second_feature_names": second_feature_names,
             "hour_feature_names": hour_feature_names,
             "action_names": action_names,
-            "subhour_features": minute_features,
-            "minute_features": minute_features,
-            "subhour_mask": minute_mask,
-            "minute_mask": minute_mask,
+            "second_features": second_features,
+            "second_features": second_features,
+            "second_mask": second_mask,
+            "second_mask": second_mask,
             "hour_features": hour_features,
             "action_returns": action_returns,
             "decision_action_valid_mask": action_valid_mask,
@@ -1041,8 +1041,8 @@ def main() -> int:
             "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
             "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
             "hours_lookback": args.hours_lookback,
-            "minutes_per_hour": args.minutes_per_hour,
-            "context_bars_per_hour": args.minutes_per_hour,
+            "seconds_per_hour": args.seconds_per_hour,
+            "context_bars_per_hour": args.seconds_per_hour,
             "source_bar_interval": source_bar_interval,
             "source_bar_seconds": source_bar_seconds,
             "bar_latency_ms": int(args.bar_latency_ms),
@@ -1059,8 +1059,8 @@ def main() -> int:
             "periods_per_year_formula": "252 * median_decisions_per_utc_day",
             "median_decisions_per_day": median_decisions_per_day,
             "source": {
-                "stock_minute_dir": str(args.stock_minute_dir),
-                "etf_minute_dir": str(args.etf_minute_dir),
+                "stock_second_dir": str(args.stock_second_dir),
+                "etf_second_dir": str(args.etf_second_dir),
                 "stock_universe": str(args.stock_universe),
                 "etf_universe": str(args.etf_universe),
                 "stock_limit": len(selected_stocks),
@@ -1094,8 +1094,8 @@ def main() -> int:
     )
     write_action_returns(args.output_dir / "action_returns.csv", action_names, decision_timestamps, action_return_rows)
     source_metadata = {
-        "stock_minute_dir": str(args.stock_minute_dir),
-        "etf_minute_dir": str(args.etf_minute_dir),
+        "stock_second_dir": str(args.stock_second_dir),
+        "etf_second_dir": str(args.etf_second_dir),
         "stock_universe": str(args.stock_universe),
         "etf_universe": str(args.etf_universe),
         "stock_limit": len(selected_stocks),
@@ -1111,8 +1111,8 @@ def main() -> int:
         "dense_hourly_grid": dense_hourly_grid,
         "allow_missing_action_context": allow_missing_action_context,
         "hours_lookback": args.hours_lookback,
-        "minutes_per_hour": args.minutes_per_hour,
-        "context_bars_per_hour": args.minutes_per_hour,
+        "seconds_per_hour": args.seconds_per_hour,
+        "context_bars_per_hour": args.seconds_per_hour,
         "source_bar_interval": source_bar_interval,
         "source_bar_seconds": source_bar_seconds,
         "decision_grid": DEFAULT_DECISION_GRID_NAME,
@@ -1131,8 +1131,8 @@ def main() -> int:
     }
     metadata = {
         "rows": len(decision_timestamps),
-        "subhour_shape": list(minute_features.shape),
-        "minute_shape": list(minute_features.shape),
+        "second_shape": list(second_features.shape),
+        "second_shape": list(second_features.shape),
         "hour_shape": list(hour_features.shape),
         "action_count": len(action_names),
         "decision_action_valid_fraction": float(action_valid_mask.float().mean().item()),
@@ -1145,7 +1145,7 @@ def main() -> int:
         "source_bar_interval": source_bar_interval,
         "source_bar_seconds": source_bar_seconds,
         "bar_latency_ms": int(args.bar_latency_ms),
-        "context_bars_per_hour": args.minutes_per_hour,
+        "context_bars_per_hour": args.seconds_per_hour,
         "decision_grid": DEFAULT_DECISION_GRID_NAME,
         "decision_grid_minutes": DEFAULT_DECISION_GRID_MINUTES,
         "periods_per_year": periods_per_year,
@@ -1167,7 +1167,7 @@ def main() -> int:
         bar_interval=f"1h decision / {source_bar_interval} context",
         timezone="UTC timestamps with exchange timestamp features",
         adjustment="Adjusted close when available, otherwise close",
-        feature_names=[*minute_feature_names, *[f"hour_{name}" for name in hour_feature_names]],
+        feature_names=[*second_feature_names, *[f"hour_{name}" for name in hour_feature_names]],
         action_names=action_names,
         timestamps_hash=hash_string_sequence(decision_timestamps),
         next_timestamps_hash=hash_string_sequence(next_timestamps),
@@ -1220,7 +1220,7 @@ def main() -> int:
             json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n"
         )
     (args.output_dir / "README.md").write_text(
-        f"""# Hourly Decisions From Subhour Context Dataset
+        f"""# Hourly Decisions From Second Context Dataset
 
 Each row is an hourly allocation decision. State tensors contain only
 `{source_bar_interval}` bars with timestamps less than or equal to the decision
@@ -1228,7 +1228,7 @@ timestamp. Action returns are close-to-close returns from the decision timestamp
 to the next hourly decision timestamp, using as-of prices when configured.
 
 - Rows: {len(decision_timestamps)}
-- Context tensor: {list(minute_features.shape)}
+- Context tensor: {list(second_features.shape)}
 - Hour tensor: {list(hour_features.shape)}
 - Actions: {", ".join(action_names)}
 - Decision action mask: `decision_action_valid_mask` / `action_valid_mask`.
@@ -1237,13 +1237,13 @@ to the next hourly decision timestamp, using as-of prices when configured.
 - Reportability errors: {", ".join(dataset_reportability_errors) if dataset_reportability_errors else "none"}
 - Source bar interval: {source_bar_interval}
 - Bar latency: {int(args.bar_latency_ms)} ms
-- Context bars per hour: {args.minutes_per_hour}
+- Context bars per hour: {args.seconds_per_hour}
 - Decision grid: {DEFAULT_DECISION_GRID_NAME} ({DEFAULT_DECISION_GRID_MINUTES} minutes)
 - Periods per year: {periods_per_year:.1f}
 - Median decisions per day: {median_decisions_per_day:.1f}
 """
     )
-    print(f"Rows: {len(decision_timestamps)} | Context tensor: {tuple(minute_features.shape)} | Actions: {len(action_names)}")
+    print(f"Rows: {len(decision_timestamps)} | Context tensor: {tuple(second_features.shape)} | Actions: {len(action_names)}")
     print(f"Dataset -> {dataset_path}")
     return 0
 

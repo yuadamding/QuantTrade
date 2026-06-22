@@ -52,17 +52,17 @@ DEFAULT_PARTITIONS_ROOT = (
 ROW_LIST_KEYS = {
     "decision_timestamps",
     "next_timestamps",
-    "minute_timestamp_grid",
-    "subhour_timestamp_grid",
+    "second_timestamp_grid",
+    "second_timestamp_grid",
     "decision_timestamps_ms",
     "session_ids",
     "session_dates",
 }
 ROW_TENSOR_KEYS = {
-    "minute_features",
-    "subhour_features",
-    "minute_mask",
-    "subhour_mask",
+    "second_features",
+    "second_features",
+    "second_mask",
+    "second_mask",
     "hour_features",
     "action_returns",
     "decision_action_valid_mask",
@@ -75,8 +75,8 @@ ROW_TENSOR_KEYS = {
     "action_features_any_available_timestamps_ms",
 }
 SCHEMA_KEYS = {
-    "minute_feature_names",
-    "subhour_feature_names",
+    "second_feature_names",
+    "second_feature_names",
     "hour_feature_names",
     "action_names",
     "action_feature_names",
@@ -84,7 +84,7 @@ SCHEMA_KEYS = {
     "feature_names_by_tensor",
     "action_feature_groups",
     "hours_lookback",
-    "minutes_per_hour",
+    "seconds_per_hour",
     "context_bars_per_hour",
     "source_bar_interval",
     "decision_grid_minutes",
@@ -144,7 +144,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--feedforward-dim", type=int, default=384)
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--action-embedding-dim", type=int, default=32)
-    parser.add_argument("--max-subhour-tokens", type=int, default=256)
+    parser.add_argument("--max-second-tokens", type=int, default=256)
     parser.add_argument("--one-way-cost-bps", type=float, default=1.0)
     parser.add_argument(
         "--cash-idle-penalty-bps",
@@ -418,7 +418,7 @@ def concatenate_payloads(
     progress_every: int = 5,
     strict_protocol_mask_repair: bool = True,
 ) -> dict[str, Any]:
-    from rl_quant.minute_to_hour_transformer import _load_payload
+    from rl_quant.second_to_hour_transformer import _load_payload
 
     started = time.monotonic()
     progress_every = max(1, int(progress_every))
@@ -523,7 +523,7 @@ def build_calendar_splits(
     selection_errors: list[str] | None = None,
     manual_split_used: bool = False,
 ):
-    from rl_quant.minute_to_hour_transformer import _build_split
+    from rl_quant.second_to_hour_transformer import _build_split
 
     # Reportability comes from the actual partition selection, not an unconditional True: a restricted
     # or manually-bounded run cannot claim the latest complete period (see calendar_selection_reportability).
@@ -581,8 +581,8 @@ def build_calendar_splits(
         end_ts=str(boundaries["val_end_ts"]),
         reward_start_ts=str(boundaries["val_start_ts"]),
         reward_end_ts=str(boundaries["val_end_ts"]),
-        minute_feature_mean=train.minute_feature_mean,
-        minute_feature_std=train.minute_feature_std,
+        second_feature_mean=train.second_feature_mean,
+        second_feature_std=train.second_feature_std,
         hour_feature_mean=train.hour_feature_mean,
         hour_feature_std=train.hour_feature_std,
         action_feature_mean=train.action_feature_mean,
@@ -596,8 +596,8 @@ def build_calendar_splits(
         end_ts=str(boundaries["test_end_ts"]),
         reward_start_ts=str(boundaries["test_start_ts"]),
         reward_end_ts=str(boundaries["test_end_ts"]),
-        minute_feature_mean=train.minute_feature_mean,
-        minute_feature_std=train.minute_feature_std,
+        second_feature_mean=train.second_feature_mean,
+        second_feature_std=train.second_feature_std,
         hour_feature_mean=train.hour_feature_mean,
         hour_feature_std=train.hour_feature_std,
         action_feature_mean=train.action_feature_mean,
@@ -608,7 +608,7 @@ def build_calendar_splits(
 
 
 def build_constraints_from_args(args: argparse.Namespace):
-    from rl_quant.minute_to_hour_transformer import TradingConstraintConfig
+    from rl_quant.second_to_hour_transformer import TradingConstraintConfig
 
     return TradingConstraintConfig(
         max_switches_per_day=args.max_switches_per_day,
@@ -740,13 +740,13 @@ def main(argv: list[str] | None = None) -> int:
         resolve_torch_device,
         torch_runtime_summary,
     )
-    from rl_quant.minute_to_hour_transformer import (
-        MinuteToHourEnvConfig,
-        MinuteToHourTrainingConfig,
+    from rl_quant.second_to_hour_transformer import (
+        SecondToHourEnvConfig,
+        SecondToHourTrainingConfig,
         RecencyWeightConfig,
         action_index,
-        evaluate_minute_to_hour_policy,
-        train_minute_to_hour_dqn,
+        evaluate_second_to_hour_policy,
+        train_second_to_hour_dqn,
     )
     from rl_quant.trading_constraints import CONSTRAINED_POLICY_MODEL_VERSION, CONSTRAINT_FEATURE_NAMES
 
@@ -850,7 +850,7 @@ def main(argv: list[str] | None = None) -> int:
         f"test={test_split.valid_start_indices.numel()}",
         flush=True,
     )
-    env_config = MinuteToHourEnvConfig(
+    env_config = SecondToHourEnvConfig(
         num_envs=args.num_envs,
         episode_length=args.episode_length,
         initial_action=initial_action,
@@ -875,19 +875,19 @@ def main(argv: list[str] | None = None) -> int:
         use_amp=args.amp,
         amp_dtype=args.amp_dtype,
     )
-    train_config = MinuteToHourTrainingConfig(
+    train_config = SecondToHourTrainingConfig(
         env=env_config,
         learning=learning_config,
         d_model=args.d_model,
         n_heads=args.n_heads,
-        minute_layers=args.minute_layers,
+        second_layers=args.second_layers,
         hour_layers=args.hour_layers,
         feedforward_dim=args.feedforward_dim,
         dropout=args.dropout,
         action_embedding_dim=args.action_embedding_dim,
         target_vram_gb=args.target_vram_gb,
         vram_safety_gb=args.vram_safety_gb,
-        max_subhour_tokens=args.max_subhour_tokens,
+        max_second_tokens=args.max_second_tokens,
         resume_training_state=training_state_path if args.resume else None,
         checkpoint_training_state=training_state_path if args.checkpoint_every_steps > 0 else None,
         checkpoint_every_steps=args.checkpoint_every_steps,
@@ -899,8 +899,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     started = datetime.now(timezone.utc)
     try:
-        model, artifacts = train_minute_to_hour_dqn(train_split, val_split, device=device, config=train_config)
-        train_result = evaluate_minute_to_hour_policy(
+        model, artifacts = train_second_to_hour_dqn(train_split, val_split, device=device, config=train_config)
+        train_result = evaluate_second_to_hour_policy(
             train_split.to(device),
             model,
             device=device,
@@ -909,7 +909,7 @@ def main(argv: list[str] | None = None) -> int:
             episode_length=args.episode_length,
             cash_idle_penalty_bps=args.cash_idle_penalty_bps,
         )
-        val_result = evaluate_minute_to_hour_policy(
+        val_result = evaluate_second_to_hour_policy(
             val_split.to(device),
             model,
             device=device,
@@ -918,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
             episode_length=args.episode_length,
             cash_idle_penalty_bps=args.cash_idle_penalty_bps,
         )
-        test_result = evaluate_minute_to_hour_policy(
+        test_result = evaluate_second_to_hour_policy(
             test_split.to(device),
             model,
             device=device,
@@ -935,8 +935,8 @@ def main(argv: list[str] | None = None) -> int:
                 "uses_constraint_features": True,
                 "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
                 "model_state_dict": model.state_dict(),
-                "minute_feature_mean": train_split.minute_feature_mean.detach().cpu(),
-                "minute_feature_std": train_split.minute_feature_std.detach().cpu(),
+                "second_feature_mean": train_split.second_feature_mean.detach().cpu(),
+                "second_feature_std": train_split.second_feature_std.detach().cpu(),
                 "hour_feature_mean": train_split.hour_feature_mean.detach().cpu(),
                 "hour_feature_std": train_split.hour_feature_std.detach().cpu(),
                 "action_feature_mean": (
@@ -949,14 +949,14 @@ def main(argv: list[str] | None = None) -> int:
                     if train_split.action_feature_std is not None
                     else None
                 ),
-                "minute_feature_names": train_split.minute_feature_names,
+                "second_feature_names": train_split.second_feature_names,
                 "hour_feature_names": train_split.hour_feature_names,
                 "action_feature_names": train_split.action_feature_names,
                 "action_feature_groups": train_split.action_feature_groups,
                 "action_names": train_split.action_names,
                 "source_bar_interval": train_split.source_bar_interval,
                 "context_bars_per_hour": train_split.effective_context_bars_per_hour,
-                "max_subhour_tokens": args.max_subhour_tokens,
+                "max_second_tokens": args.max_second_tokens,
                 "split_policy": train_split.split_policy,
                 "constraints": asdict(constraints),
                 "config": config_payload,

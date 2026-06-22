@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper. Prefer: `qt train subhour --source 1s` (defaults live in rl_quant.presets)."""
+"""Compatibility wrapper. Prefer: `qt train second --source 1s` (defaults live in rl_quant.presets)."""
 from __future__ import annotations
 
 import sys
@@ -12,4 +12,4 @@ if str(SRC) not in sys.path:
 from rl_quant.cli import main  # noqa: E402
 
 if __name__ == "__main__":
-    raise SystemExit(main(["train", "subhour", "--source", "1s", *sys.argv[1:]]))
+    raise SystemExit(main(["train", "second", "--source", "1s", *sys.argv[1:]]))

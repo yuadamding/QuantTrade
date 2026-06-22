@@ -495,12 +495,9 @@ def existing_gold_dataset_is_current(path: Path, expected_identity: dict[str, An
     try:
         import torch
 
-        from rl_quant.features.stock_second_context import validate_second_context_payload
-
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if not REQUIRED_GOLD_PROTOCOL_KEYS.issubset(payload):
             return False
-        validate_second_context_payload(payload)
         manifest = payload.get("dataset_manifest", {})
         if validate_cache_identity(dict(manifest), expected_identity):
             return False
@@ -705,7 +702,7 @@ def build_hourly_command(
 ) -> list[str]:
     command = [
         sys.executable,
-        str(SCRIPT_DIR / "build_hourly_from_minute_context_dataset.py"),
+        str(SCRIPT_DIR / "build_hourly_from_second_context_dataset.py"),
         "--source-bar-interval",
         "1s",
         "--stock-bar-dir",
@@ -877,6 +874,12 @@ def convert_chunks(
     source_manifest = args.source_manifest or args.source_root / "manifest.csv"
     records: list[dict[str, Any]] = []
     if args.build_gold:
+        # The second_context_gold (Model-2) build was removed; this repo is Model-1 (second->hour) only.
+        # Use --build-hourly (build_hourly_command -> build_hour_from_second_dataset.py) instead.
+        raise SystemExit(
+            "convert: --build-gold (second_context_gold) was removed; this repo is Model-1 (second->hour) only. "
+            "Use --build-hourly."
+        )
         chunks = chunk_dates(dates, args.gold_chunk_trading_days)
         if args.max_gold_chunks > 0:
             chunks = chunks[: args.max_gold_chunks]
