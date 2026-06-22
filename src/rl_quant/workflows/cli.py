@@ -18,35 +18,25 @@ import sys
 from rl_quant.paths import scripts_dir
 from rl_quant.presets import PRESETS, resolve_preset
 
-# (group, workflow) -> the single underlying entry-point script for that workflow family.
+# (group, workflow) -> the single underlying entry-point script. Model 1 (second->hour) only.
 _DISPATCH: dict[tuple[str, str], str] = {
-    ("train", "strategy"): "train_strategy_allocator.py",
-    ("train", "direct-bar"): "train_hourly_causal_transformer_rl.py",
-    ("train", "subhour"): "train_hourly_from_minute_context_rl.py",
+    ("train", "second"): "train_hour_from_second_rl.py",
     ("train", "partitions"): "train_hourly_from_second_protocol_partitions.py",
-    ("train", "second-context"): "train_second_context_action_scorer.py",
-    ("train", "intraday-nbbo"): "train_dqn_agent.py",
-    ("build", "direct-bar"): "build_hourly_transformer_dataset.py",
-    ("build", "subhour"): "build_hourly_from_minute_context_dataset.py",
-    ("build", "second-context"): "build_second_context_decision_dataset.py",
-    ("build", "stock-second-silver"): "build_stock_second_silver_features.py",
-    ("evaluate", "second-context"): "evaluate_second_context_dataset.py",
+    ("build", "second"): "build_hour_from_second_dataset.py",
     ("validate", "protocol"): "validate_research_protocol.py",
 }
 
-# When no explicit --preset is given, an --interval/--source selector can pick a default preset.
+# When no explicit --preset is given, the 1s source selector picks the default preset.
 _DEFAULT_PRESETS: dict[tuple[str, str, str], str] = {
-    ("train", "direct-bar", "1m"): "train.direct-bar.minute",
-    ("build", "direct-bar", "1m"): "build.direct-bar.minute",
-    ("train", "subhour", "1s"): "train.subhour.second-context",
-    ("build", "subhour", "1s"): "build.subhour.second-context",
+    ("train", "second", "1s"): "train.second",
+    ("build", "second", "1s"): "build.second",
 }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qt", description="QuantTrade unified CLI.")
     groups = parser.add_subparsers(dest="group", required=True)
-    for group in ("train", "build", "evaluate", "validate"):
+    for group in ("train", "build", "validate"):
         group_parser = groups.add_parser(group, help=f"{group} workflows")
         workflows = group_parser.add_subparsers(dest="workflow", required=True)
         for (dispatch_group, workflow) in _DISPATCH:
@@ -55,10 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
             # allow_abbrev=False so script-specific args are never mis-consumed as qt options.
             wp = workflows.add_parser(workflow, allow_abbrev=False, help=f"{group} {workflow}")
             wp.add_argument("--preset", help="Named preset (see `qt preset list`).")
-            if workflow == "direct-bar":
-                wp.add_argument("--interval", choices=["1h", "1m"], default="1h", help="Bar interval (selects default preset).")
-            if workflow == "subhour":
-                wp.add_argument("--source", choices=["1m", "1s"], default="1m", help="Context source (selects default preset).")
+            if workflow == "second":
+                wp.add_argument("--source", choices=["1s"], default="1s", help="Context source (1-second bars).")
     preset_parser = groups.add_parser("preset", help="Inspect named presets")
     preset_sub = preset_parser.add_subparsers(dest="preset_cmd", required=True)
     preset_sub.add_parser("list", help="List all presets")

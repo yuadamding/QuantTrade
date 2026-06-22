@@ -12,14 +12,14 @@ REGULAR_SESSION_END_NS = 16 * 60 * 60 * NANOS_PER_SECOND
 
 
 def parse_time_to_ns(value: str) -> int:
-    hour_text, minute_text, rest = value.split(":", 2)
+    hour_text, second_text, rest = value.split(":", 2)
     if "." in rest:
         second_text, fractional_text = rest.split(".", 1)
     else:
         second_text, fractional_text = rest, ""
 
     fractional_ns = int((fractional_text + "000000000")[:9])
-    total_seconds = int(hour_text) * 3600 + int(minute_text) * 60 + int(second_text)
+    total_seconds = int(hour_text) * 3600 + int(second_text) * 60 + int(second_text)
     return total_seconds * NANOS_PER_SECOND + fractional_ns
 
 

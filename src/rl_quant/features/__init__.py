@@ -1,25 +1,6 @@
-"""Feature builders for model-ready RL datasets."""
+"""Feature builders for model-ready RL datasets.
 
-from rl_quant.features.stock_second_context import (
-    ACTION_FEATURE_NAMES,
-    MARKET_CONTEXT_FEATURE_NAMES,
-    StockSecondContextConfig,
-    build_second_context_payload,
-    build_market_context_from_frames,
-    regular_session_decision_grid_ms,
-    save_second_context_payload,
-    session_gating_method,
-    validate_second_context_payload,
-)
-
-__all__ = [
-    "ACTION_FEATURE_NAMES",
-    "MARKET_CONTEXT_FEATURE_NAMES",
-    "StockSecondContextConfig",
-    "build_second_context_payload",
-    "build_market_context_from_frames",
-    "regular_session_decision_grid_ms",
-    "save_second_context_payload",
-    "session_gating_method",
-    "validate_second_context_payload",
-]
+Model 1 (second_to_hour) uses ``news_llm`` (LLM news aggregates), ``stock_covariates`` (point-in-time
+covariates), and ``action_risk``. The per-second market-context reducer lives in the dataset-build script
+``scripts/build_hourly_transformer_dataset.py`` (``aggregate_stock_features``), not here. Import submodules
+directly (e.g. ``from rl_quant.features.news_llm import ...``)."""

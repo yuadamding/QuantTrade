@@ -1,9 +1,9 @@
 """Models layer: the minute->hour causal-transformer Q-network.
 
-Extracted verbatim from ``minute_to_hour_transformer`` in the protocol-first reorganization
+Extracted verbatim from ``second_to_hour_transformer`` in the protocol-first reorganization
 (architecture_migration_plan.md, Phase 4). Pure model code: it consumes typed tensors and returns per-action
 Q-values; it owns no portfolio state, reward, or data loading. Re-exported from
-``rl_quant.minute_to_hour_transformer`` for backward compatibility; behaviour is byte-identical to the
+``rl_quant.second_to_hour_transformer`` for backward compatibility; behaviour is byte-identical to the
 pre-extraction class."""
 
 from __future__ import annotations
@@ -16,27 +16,27 @@ from torch import nn
 from rl_quant.protocol.constraints import CONSTRAINT_FEATURE_DIM
 
 # Default number of sub-hour tokens the model attends to before mean-pool compression (a model-architecture knob).
-DEFAULT_MAX_SUBHOUR_TOKENS = 512
+DEFAULT_MAX_SECOND_TOKENS = 512
 
 
-class MinuteToHourCausalTransformerQNetwork(nn.Module):
+class SecondToHourCausalTransformerQNetwork(nn.Module):
     def __init__(
         self,
         *,
-        minute_feature_dim: int,
+        second_feature_dim: int,
         hour_feature_dim: int,
         action_count: int,
         hours_lookback: int,
-        minutes_per_hour: int,
+        seconds_per_hour: int,
         d_model: int = 256,
         n_heads: int = 8,
-        minute_layers: int = 2,
+        second_layers: int = 2,
         hour_layers: int = 4,
         feedforward_dim: int = 768,
         dropout: float = 0.05,
         action_embedding_dim: int = 32,
         constraint_feature_dim: int = CONSTRAINT_FEATURE_DIM,
-        max_subhour_tokens: int | None = DEFAULT_MAX_SUBHOUR_TOKENS,
+        max_second_tokens: int | None = DEFAULT_MAX_SECOND_TOKENS,
         action_feature_dim: int = 0,
         transition_feature_dim: int = 0,
         transition_table: torch.Tensor | None = None,
@@ -45,19 +45,19 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
-        if max_subhour_tokens is not None and int(max_subhour_tokens) <= 0:
-            raise ValueError("max_subhour_tokens must be positive when provided.")
+        if max_second_tokens is not None and int(max_second_tokens) <= 0:
+            raise ValueError("max_second_tokens must be positive when provided.")
         self.hours_lookback = int(hours_lookback)
-        self.minutes_per_hour = int(minutes_per_hour)
-        self.max_subhour_tokens = None if max_subhour_tokens is None else int(max_subhour_tokens)
+        self.seconds_per_hour = int(seconds_per_hour)
+        self.max_second_tokens = None if max_second_tokens is None else int(max_second_tokens)
         self.action_count = int(action_count)
         self.action_feature_dim = int(action_feature_dim)
         self.transition_feature_dim = int(transition_feature_dim)
         self.dynamic_feature_dim = int(dynamic_feature_dim)
         self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
-        self.minute_proj = nn.Sequential(nn.Linear(minute_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
-        self.minute_pos = nn.Parameter(torch.zeros(minutes_per_hour, d_model))
-        minute_layer = nn.TransformerEncoderLayer(
+        self.second_proj = nn.Sequential(nn.Linear(second_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
+        self.second_pos = nn.Parameter(torch.zeros(seconds_per_hour, d_model))
+        second_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=feedforward_dim,
@@ -66,7 +66,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.minute_encoder = nn.TransformerEncoder(minute_layer, num_layers=minute_layers)
+        self.second_encoder = nn.TransformerEncoder(second_layer, num_layers=second_layers)
         self.hour_proj = nn.Sequential(
             nn.Linear(d_model + hour_feature_dim, d_model),
             nn.LayerNorm(d_model),
@@ -200,15 +200,15 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
             )
         return self.transition_table[ids]
 
-    def _compress_subhour_tokens(
+    def _compress_second_tokens(
         self,
         tokens: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         length = tokens.shape[1]
-        if self.max_subhour_tokens is None or length <= self.max_subhour_tokens:
+        if self.max_second_tokens is None or length <= self.max_second_tokens:
             return tokens, valid_mask
-        chunk_size = int(math.ceil(length / float(self.max_subhour_tokens)))
+        chunk_size = int(math.ceil(length / float(self.max_second_tokens)))
         chunk_count = int(math.ceil(length / float(chunk_size)))
         padded_length = chunk_count * chunk_size
         if padded_length != length:
@@ -234,17 +234,17 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
 
     def forward(
         self,
-        minute_features: torch.Tensor,
-        minute_mask: torch.Tensor,
+        second_features: torch.Tensor,
+        second_mask: torch.Tensor,
         hour_features: torch.Tensor,
         previous_actions: torch.Tensor,
         constraint_features: torch.Tensor,
         action_features: torch.Tensor | None = None,
         dynamic_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch, hours, minutes, _ = minute_features.shape
-        if hours > self.hours_lookback or minutes > self.minutes_per_hour:
-            raise ValueError("Input context exceeds configured hours_lookback or minutes_per_hour.")
+        batch, hours, minutes, _ = second_features.shape
+        if hours > self.hours_lookback or minutes > self.seconds_per_hour:
+            raise ValueError("Input context exceeds configured hours_lookback or seconds_per_hour.")
         # A model built with dynamic_feature_dim > 0 MUST be given dynamic_state -- silently omitting it would
         # let a "dynamic-aware" run (so labelled in its manifest) score like the non-dynamic model. Fail
         # closed. For a zero ablation, pass an explicit zero tensor and record that in the run manifest. Shape
@@ -261,17 +261,17 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
                     f"dynamic_state shape {tuple(dynamic_state.shape)} does not match "
                     f"(batch={batch}, dynamic_feature_dim={self.dynamic_feature_dim})."
                 )
-        x = self.minute_proj(minute_features)
-        x = x + self.minute_pos[:minutes][None, None, :, :]
+        x = self.second_proj(second_features)
+        x = x + self.second_pos[:minutes][None, None, :, :]
         x = x.reshape(batch * hours, minutes, -1)
-        flat_mask = minute_mask.reshape(batch * hours, minutes).bool()
-        x, flat_mask = self._compress_subhour_tokens(x, flat_mask)
+        flat_mask = second_mask.reshape(batch * hours, minutes).bool()
+        x, flat_mask = self._compress_second_tokens(x, flat_mask)
         minutes = x.shape[1]
         safe_padding_mask = ~flat_mask
         empty_rows = ~flat_mask.any(dim=1)
         if bool(empty_rows.any().item()):
             safe_padding_mask[empty_rows, 0] = False
-        minute_context = self.minute_encoder(
+        second_context = self.second_encoder(
             x,
             mask=self._causal_mask(minutes, x.device),
             src_key_padding_mask=safe_padding_mask,
@@ -279,7 +279,7 @@ class MinuteToHourCausalTransformerQNetwork(nn.Module):
         valid_positions = torch.arange(minutes, device=x.device).expand(batch * hours, -1)
         last_valid = torch.where(flat_mask, valid_positions, torch.full_like(valid_positions, -1)).max(dim=1).values
         last_valid = last_valid.clamp_min(0)
-        hour_context = minute_context[
+        hour_context = second_context[
             torch.arange(batch * hours, device=x.device),
             last_valid,
         ].reshape(batch, hours, -1)

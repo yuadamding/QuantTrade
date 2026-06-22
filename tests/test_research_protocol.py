@@ -143,8 +143,8 @@ class ResearchProtocolTests(unittest.TestCase):
     def test_return_basis_canonical_home_is_protocol_with_back_compat_reexport(self) -> None:
         # The action-return basis contract lives in the protocol layer; the datasets module re-exports the SAME
         # objects for backward compatibility, and the protocol package surfaces them.
-        from rl_quant.datasets.hour_from_subhour import ReturnBasis as DatasetsReturnBasis
-        from rl_quant.datasets.hour_from_subhour import return_basis_agreement_errors as datasets_fn
+        from rl_quant.datasets.hour_from_second import ReturnBasis as DatasetsReturnBasis
+        from rl_quant.datasets.hour_from_second import return_basis_agreement_errors as datasets_fn
         from rl_quant.protocol import ReturnBasis as PackageReturnBasis
         from rl_quant.protocol.action_return_basis import ReturnBasis as ProtocolReturnBasis
         from rl_quant.protocol.action_return_basis import return_basis_agreement_errors as protocol_fn
@@ -180,7 +180,7 @@ class ResearchProtocolTests(unittest.TestCase):
             model_id="demo_model",
             created_at_utc="2026-06-14T00:00:00+00:00",
             algorithm="DQN",
-            encoder="MinuteToHourTransformer",
+            encoder="SecondToHourTransformer",
             training_dataset_id="demo",
             validation_protocol=protocol,
             hyperparameter_search_space_hash="abc",
@@ -214,7 +214,7 @@ class ResearchProtocolTests(unittest.TestCase):
             model_id="demo_model",
             created_at_utc="2026-06-14T00:00:00+00:00",
             algorithm="DQN",
-            encoder="MinuteToHourTransformer",
+            encoder="SecondToHourTransformer",
             training_dataset_id="demo",
             validation_protocol=protocol,
             hyperparameter_search_space_hash="abc",

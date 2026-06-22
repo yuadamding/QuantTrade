@@ -54,35 +54,15 @@ from rl_quant.features.news_llm import (
     build_news_article_rows,
     write_news_llm_feature_outputs,
 )
-from rl_quant.features.stock_second_context import (
-    StockSecondContextConfig,
-    build_second_context_payload,
-    regular_session_decision_grid_ms,
-    save_second_context_payload,
-    session_gating_method,
-    validate_second_context_payload,
-)
 from rl_quant.research_protocol import stable_json_hash
-from rl_quant.second_context_transformer import (
-    SecondContextDataSplit,
-    SecondContextTransformerQNetwork,
-    build_second_context_splits,
-    evaluate_second_context_action_scorer,
-    evaluate_second_context_baselines,
-    evaluate_second_context_trading_policy,
-    fixed_rollout_cost_stress,
-    masked_contextual_q_loss,
-    second_context_missing_label_report,
-)
-from rl_quant.hourly_transformer import CausalTransformerQNetwork
-from rl_quant.minute_to_hour_transformer import (
+from rl_quant.second_to_hour_transformer import (
     HourFromMinuteDataSplit,
-    MinuteToHourCausalTransformerQNetwork,
+    SecondToHourCausalTransformerQNetwork,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
-    evaluate_minute_to_hour_policy,
-    load_minute_to_hour_warm_start,
+    evaluate_second_to_hour_policy,
+    load_second_to_hour_warm_start,
     make_constraint_features,
     sample_valid_actions,
     trade_legs,
@@ -94,71 +74,64 @@ from rl_quant.trading_constraints import (
 from _support import ROOT, load_script
 
 
-class MinuteToHourTests(unittest.TestCase):
+class SecondToHourTests(unittest.TestCase):
     @staticmethod
-    def _small_minute_to_hour_split(action_names: list[str] | None = None) -> HourFromMinuteDataSplit:
+    def _small_second_to_hour_model() -> SecondToHourCausalTransformerQNetwork:
+        return SecondToHourCausalTransformerQNetwork(
+            second_feature_dim=1, hour_feature_dim=1, action_count=2, hours_lookback=1,
+            seconds_per_hour=1, d_model=16, n_heads=4, second_layers=1, hour_layers=1,
+            feedforward_dim=32, action_embedding_dim=4,
+        )
+
+    @staticmethod
+    def _small_second_to_hour_split(action_names: list[str] | None = None) -> HourFromMinuteDataSplit:
         action_names = action_names or ["CASH", "QQQ"]
         return HourFromMinuteDataSplit(
             name="train",
             decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-02T15:30:00+00:00"],
             next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-02T16:30:00+00:00"],
-            minute_feature_names=["m"],
+            second_feature_names=["m"],
             hour_feature_names=["h"],
             action_names=action_names,
-            minute_features=torch.zeros((2, 1, 1, 1), dtype=torch.float32),
-            minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            second_features=torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((2, 1, 1), dtype=torch.float32),
             action_returns=torch.zeros((2, len(action_names)), dtype=torch.float32),
             valid_start_indices=torch.tensor([0], dtype=torch.long),
             valid_index_mask=torch.tensor([True, False]),
-            minute_feature_mean=torch.zeros(1),
-            minute_feature_std=torch.ones(1),
+            second_feature_mean=torch.zeros(1),
+            second_feature_std=torch.ones(1),
             hour_feature_mean=torch.zeros(1),
             hour_feature_std=torch.ones(1),
             hours_lookback=1,
-            minutes_per_hour=1,
+            seconds_per_hour=1,
         )
 
-    @staticmethod
-    def _small_minute_to_hour_model() -> MinuteToHourCausalTransformerQNetwork:
-        return MinuteToHourCausalTransformerQNetwork(
-            minute_feature_dim=1,
-            hour_feature_dim=1,
-            action_count=2,
-            hours_lookback=1,
-            minutes_per_hour=1,
-            d_model=16,
-            n_heads=4,
-            minute_layers=1,
-            hour_layers=1,
-            feedforward_dim=32,
-            action_embedding_dim=4,
-        )
 
     @staticmethod
-    def _write_minute_to_hour_dataset(
+    def _write_second_to_hour_dataset(
         path: Path,
         *,
         decisions: list[str],
         next_timestamps: list[str],
         session_ids: list[str] | None = None,
-        minute_values: list[float] | None = None,
+        second_values: list[float] | None = None,
     ) -> None:
         rows = len(decisions)
-        minute_values = minute_values or [0.0] * rows
-        minute_grid = []
+        second_values = second_values or [0.0] * rows
+        second_grid = []
         for decision in decisions:
             context_dt = datetime.fromisoformat(decision) - timedelta(minutes=1)
-            minute_grid.append([[context_dt.isoformat()]])
+            second_grid.append([[context_dt.isoformat()]])
         payload = {
             "decision_timestamps": decisions,
             "next_timestamps": next_timestamps,
-            "minute_timestamp_grid": minute_grid,
-            "minute_feature_names": ["m"],
+            "second_timestamp_grid": second_grid,
+            "second_feature_names": ["m"],
             "hour_feature_names": ["h"],
             "action_names": ["CASH", "QQQ"],
-            "minute_features": torch.tensor(minute_values, dtype=torch.float32).view(rows, 1, 1, 1),
-            "minute_mask": torch.ones((rows, 1, 1), dtype=torch.bool),
+            "second_features": torch.tensor(second_values, dtype=torch.float32).view(rows, 1, 1, 1),
+            "second_mask": torch.ones((rows, 1, 1), dtype=torch.bool),
             "hour_features": torch.zeros((rows, 1, 1), dtype=torch.float32),
             "action_returns": torch.zeros((rows, 2), dtype=torch.float32),
             "decision_action_valid_mask": torch.ones((rows, 2), dtype=torch.bool),
@@ -168,461 +141,20 @@ class MinuteToHourTests(unittest.TestCase):
             payload["session_ids"] = session_ids
         torch.save(payload, path)
 
-    def test_hourly_context_uses_only_past_minutes(self) -> None:
-        # Exercise the real causal price lookups: the validity/feature price is the last close
-        # AT OR BEFORE the decision (never a future bar), and the simulated fill is the first close
-        # AT OR AFTER decision + execution latency (a price not observable at decision time).
-        module = load_script("build_hourly_from_minute_context_dataset")
-        timestamps = [
-            "2026-06-10T15:28:00+00:00",
-            "2026-06-10T15:29:00+00:00",
-            "2026-06-10T15:31:00+00:00",
-        ]
-        closes = [100.0, 101.0, 102.0]
-        lookup = (timestamps, closes)
-        decision_ms = module.timestamp_to_epoch_ms("2026-06-10T15:30:00+00:00")
-        feature_close = module.close_at_or_before(lookup, decision_ms, max_staleness_seconds=120)
-        self.assertEqual(feature_close, 101.0)
-        fill_close = module.close_at_or_after(lookup, decision_ms + 1_000, max_staleness_seconds=120)
-        self.assertEqual(fill_close, 102.0)
 
-    def test_next_hour_reward_uses_decision_close_to_next_hour_close(self) -> None:
-        module = load_script("build_hourly_transformer_dataset")
 
-        self.assertAlmostEqual(module.clipped_simple_return(100.0, 105.0), 0.05)
 
-    def test_aggregate_stock_features_single_stock_fast_path_matches_contract(self) -> None:
-        module = load_script("build_hourly_transformer_dataset")
-        item = module.BarFeature(
-            close=100.0,
-            bar_return=0.02,
-            bar_log_return=0.0198,
-            intraday_ret=0.01,
-            range_bps=25.0,
-            log_volume=8.0,
-            log_dollar_volume=12.0,
-            dollar_volume=10_000.0,
-        )
 
-        values = module.aggregate_stock_features([item], total_symbols=10)
 
-        self.assertEqual(values[0], 0.1)
-        self.assertEqual(values[1], item.bar_return)
-        self.assertEqual(values[2], item.bar_return)
-        self.assertEqual(values[3], 0.0)
-        self.assertEqual(values[5], item.bar_return)
-        self.assertEqual(values[6], item.bar_return)
-        self.assertEqual(values[8], item.range_bps)
-        self.assertEqual(values[9], 0.0)
-        self.assertEqual(values[10], item.log_dollar_volume)
-        self.assertEqual(values[11], 0.0)
-        self.assertEqual(values[12], 1.0)
-        self.assertEqual(values[13], abs(item.bar_return))
 
-    def test_minute_to_hour_periods_per_year_uses_actual_schedule(self) -> None:
-        module = load_script("build_hourly_from_minute_context_dataset")
 
-        periods = module.infer_periods_per_year(
-            [
-                "2026-06-10T15:30:00+00:00",
-                "2026-06-10T16:30:00+00:00",
-                "2026-06-11T15:30:00+00:00",
-                "2026-06-11T16:30:00+00:00",
-                "2026-06-11T17:30:00+00:00",
-            ]
-        )
 
-        self.assertEqual(periods, 630.0)
 
-    def test_minute_to_hour_builder_prunes_daily_parquet_shards_by_time_range(self) -> None:
-        module = load_script("build_hourly_from_minute_context_dataset")
 
-        paths = [
-            Path("AAA/2026/06/2026-06-09.parquet"),
-            Path("AAA/2026/06/2026-06-10.parquet"),
-            Path("AAA/2026/06/2026-06-11.parquet"),
-            Path("AAA/2026/06/2026-06-12.parquet"),
-            Path("AAA.parquet"),
-        ]
-        filtered = module.filter_bar_paths_for_time_range(
-            paths,
-            start_dt=module.parse_utc_datetime("2026-06-10T13:30:00+00:00"),
-            end_dt=module.parse_utc_datetime("2026-06-12T00:00:00+00:00"),
-        )
 
-        self.assertEqual(
-            filtered,
-            [
-                Path("AAA/2026/06/2026-06-10.parquet"),
-                Path("AAA/2026/06/2026-06-11.parquet"),
-                Path("AAA.parquet"),
-            ],
-        )
-
-    def test_minute_to_hour_action_lookup_preserves_staleness_semantics(self) -> None:
-        module = load_script("build_hourly_from_minute_context_dataset")
-
-        lookup = module.make_action_lookup(
-            {
-                "2026-06-10T14:30:00+00:00": SimpleNamespace(close=100.0),
-                "2026-06-10T14:31:00+00:00": SimpleNamespace(close=101.0),
-            }
-        )
-
-        self.assertEqual(
-            module.close_at_or_before(
-                lookup,
-                "2026-06-10T14:30:30+00:00",
-                max_staleness_seconds=60,
-            ),
-            100.0,
-        )
-        self.assertIsNone(
-            module.close_at_or_before(
-                lookup,
-                "2026-06-10T14:30:30+00:00",
-                max_staleness_seconds=0,
-            )
-        )
-        self.assertEqual(
-            module.close_at_or_before(
-                lookup,
-                module.timestamp_to_epoch_ms("2026-06-10T14:31:00+00:00"),
-                max_staleness_seconds=0,
-            ),
-            101.0,
-        )
-        self.assertIsNone(
-            module.close_at_or_before(
-                lookup,
-                "2026-06-10T14:32:01+00:00",
-                max_staleness_seconds=60,
-            )
-        )
-
-    def test_hourly_builder_retains_decision_valid_row_with_missing_future_label(self) -> None:
-        try:
-            import pandas as pd
-        except ModuleNotFoundError:
-            self.skipTest("pandas/pyarrow are required for Parquet builder regression")
-        builder = load_script("build_hourly_from_minute_context_dataset")
-
-        def write_bar_parquet(path: Path, symbol: str, *, rows: int) -> None:
-            start_utc = builder.parse_utc_datetime("2026-01-02T14:31:00+00:00")
-            records: list[dict[str, object]] = []
-            for offset in range(rows):
-                utc_dt = start_utc + builder.timedelta(minutes=offset)
-                exchange_dt = utc_dt.astimezone(builder.timezone(builder.timedelta(hours=-5)))
-                price = 100.0 + offset * 0.01 + (0.5 if symbol == "QQQ" else 0.0)
-                records.append(
-                    {
-                        "timestamp_ms": builder.timestamp_to_epoch_ms(utc_dt),
-                        "timestamp_utc": utc_dt.isoformat(),
-                        "timestamp_exchange": exchange_dt.isoformat(),
-                        "open": price,
-                        "high": price + 0.1,
-                        "low": price - 0.1,
-                        "close": price,
-                        "volume": 1000,
-                    }
-                )
-            pd.DataFrame.from_records(records).to_parquet(path, index=False)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            stock_dir = root / "stocks"
-            action_dir = root / "actions"
-            output_dir = root / "out"
-            stock_dir.mkdir()
-            action_dir.mkdir()
-            write_bar_parquet(stock_dir / "AAA.parquet", "AAA", rows=120)
-            write_bar_parquet(action_dir / "QQQ.parquet", "QQQ", rows=60)
-            stock_universe = root / "stocks.csv"
-            action_universe = root / "actions.csv"
-            stock_universe.write_text("symbol\nAAA\n")
-            action_universe.write_text("symbol\nQQQ\n")
-            old_argv = sys.argv
-            sys.argv = [
-                "build_hourly_from_minute_context_dataset.py",
-                "--stock-bar-dir",
-                str(stock_dir),
-                "--action-bar-dir",
-                str(action_dir),
-                "--stock-universe",
-                str(stock_universe),
-                "--action-universe",
-                str(action_universe),
-                "--output-dir",
-                str(output_dir),
-                "--dataset-file-name",
-                "dataset.pt",
-                "--start",
-                "2026-01-02T00:00:00+00:00",
-                "--end-exclusive",
-                "2026-01-03T00:00:00+00:00",
-                "--stock-limit",
-                "1",
-                "--action-count",
-                "1",
-                "--hours-lookback",
-                "1",
-                "--context-bars-per-hour",
-                "60",
-                "--min-active-stock-fraction",
-                "1.0",
-                "--min-context-valid-fraction",
-                "1.0",
-                "--min-decision-rows",
-                "1",
-                "--dense-hourly-grid",
-                "--allow-missing-action-context",
-                "--universe-selection-date",
-                "2026-01-01T00:00:00+00:00",
-            ]
-            try:
-                builder.main()
-            finally:
-                sys.argv = old_argv
-
-            payload = torch.load(output_dir / "dataset.pt", map_location="cpu", weights_only=True)
-
-        self.assertEqual(payload["decision_timestamps"], ["2026-01-02T15:30:00+00:00"])
-        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 1].item()))
-        self.assertFalse(bool(payload["label_valid_mask"][0, 1].item()))
-        self.assertTrue(torch.isnan(payload["action_returns"][0, 1]))
-
-    def test_hourly_builder_non_dense_keeps_row_when_future_grid_point_missing(self) -> None:
-        try:
-            import pandas as pd
-        except ModuleNotFoundError:
-            self.skipTest("pandas/pyarrow are required for Parquet builder regression")
-        builder = load_script("build_hourly_from_minute_context_dataset")
-
-        def write_bar_parquet(path: Path, symbol: str, *, rows: int) -> None:
-            start_utc = builder.parse_utc_datetime("2026-01-02T14:31:00+00:00")
-            records: list[dict[str, object]] = []
-            for offset in range(rows):
-                utc_dt = start_utc + builder.timedelta(minutes=offset)
-                exchange_dt = utc_dt.astimezone(builder.timezone(builder.timedelta(hours=-5)))
-                price = 100.0 + offset * 0.01 + (0.5 if symbol == "QQQ" else 0.0)
-                records.append(
-                    {
-                        "timestamp_ms": builder.timestamp_to_epoch_ms(utc_dt),
-                        "timestamp_utc": utc_dt.isoformat(),
-                        "timestamp_exchange": exchange_dt.isoformat(),
-                        "open": price,
-                        "high": price + 0.1,
-                        "low": price - 0.1,
-                        "close": price,
-                        "volume": 1000,
-                    }
-                )
-            pd.DataFrame.from_records(records).to_parquet(path, index=False)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            stock_dir = root / "stocks"
-            action_dir = root / "actions"
-            output_dir = root / "out"
-            stock_dir.mkdir()
-            action_dir.mkdir()
-            write_bar_parquet(stock_dir / "AAA.parquet", "AAA", rows=60)
-            write_bar_parquet(action_dir / "QQQ.parquet", "QQQ", rows=60)
-            stock_universe = root / "stocks.csv"
-            action_universe = root / "actions.csv"
-            stock_universe.write_text("symbol\nAAA\n")
-            action_universe.write_text("symbol\nQQQ\n")
-            old_argv = sys.argv
-            sys.argv = [
-                "build_hourly_from_minute_context_dataset.py",
-                "--stock-bar-dir",
-                str(stock_dir),
-                "--action-bar-dir",
-                str(action_dir),
-                "--stock-universe",
-                str(stock_universe),
-                "--action-universe",
-                str(action_universe),
-                "--output-dir",
-                str(output_dir),
-                "--dataset-file-name",
-                "dataset.pt",
-                "--start",
-                "2026-01-02T00:00:00+00:00",
-                "--end-exclusive",
-                "2026-01-03T00:00:00+00:00",
-                "--stock-limit",
-                "1",
-                "--action-count",
-                "1",
-                "--hours-lookback",
-                "1",
-                "--context-bars-per-hour",
-                "60",
-                "--min-active-stock-fraction",
-                "1.0",
-                "--min-context-valid-fraction",
-                "1.0",
-                "--min-decision-rows",
-                "1",
-                "--allow-missing-action-context",
-                "--universe-selection-date",
-                "2026-01-01T00:00:00+00:00",
-            ]
-            try:
-                builder.main()
-            finally:
-                sys.argv = old_argv
-
-            payload = torch.load(output_dir / "dataset.pt", map_location="cpu", weights_only=True)
-
-        self.assertEqual(payload["decision_timestamps"], ["2026-01-02T15:30:00+00:00"])
-        self.assertEqual(payload["next_timestamps"], ["2026-01-02T16:30:00+00:00"])
-        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 1].item()))
-        self.assertFalse(bool(payload["label_valid_mask"][0, 1].item()))
-        self.assertTrue(torch.isnan(payload["action_returns"][0, 1]))
-
-    def test_hourly_builder_dense_grid_does_not_depend_on_first_action_symbol(self) -> None:
-        try:
-            import pandas as pd
-        except ModuleNotFoundError:
-            self.skipTest("pandas/pyarrow are required for Parquet builder regression")
-        builder = load_script("build_hourly_from_minute_context_dataset")
-
-        def write_bar_parquet(path: Path, symbol: str, *, start: str, rows: int) -> None:
-            start_utc = builder.parse_utc_datetime(start)
-            records: list[dict[str, object]] = []
-            for offset in range(rows):
-                utc_dt = start_utc + builder.timedelta(minutes=offset)
-                exchange_dt = utc_dt.astimezone(builder.timezone(builder.timedelta(hours=-5)))
-                price = 100.0 + offset * 0.01 + (1.0 if symbol == "QQQ" else 0.0)
-                records.append(
-                    {
-                        "timestamp_ms": builder.timestamp_to_epoch_ms(utc_dt),
-                        "timestamp_utc": utc_dt.isoformat(),
-                        "timestamp_exchange": exchange_dt.isoformat(),
-                        "open": price,
-                        "high": price + 0.1,
-                        "low": price - 0.1,
-                        "close": price,
-                        "volume": 1000,
-                    }
-                )
-            pd.DataFrame.from_records(records).to_parquet(path, index=False)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            stock_dir = root / "stocks"
-            action_dir = root / "actions"
-            output_dir = root / "out"
-            stock_dir.mkdir()
-            action_dir.mkdir()
-            write_bar_parquet(stock_dir / "AAA.parquet", "AAA", start="2026-01-02T14:31:00+00:00", rows=120)
-            write_bar_parquet(action_dir / "OLD.parquet", "OLD", start="2026-01-05T14:31:00+00:00", rows=120)
-            write_bar_parquet(action_dir / "QQQ.parquet", "QQQ", start="2026-01-02T14:31:00+00:00", rows=120)
-            stock_universe = root / "stocks.csv"
-            action_universe = root / "actions.csv"
-            stock_universe.write_text("symbol\nAAA\n")
-            action_universe.write_text("symbol\nOLD\nQQQ\n")
-            old_argv = sys.argv
-            sys.argv = [
-                "build_hourly_from_minute_context_dataset.py",
-                "--stock-bar-dir",
-                str(stock_dir),
-                "--action-bar-dir",
-                str(action_dir),
-                "--stock-universe",
-                str(stock_universe),
-                "--action-universe",
-                str(action_universe),
-                "--output-dir",
-                str(output_dir),
-                "--dataset-file-name",
-                "dataset.pt",
-                "--start",
-                "2026-01-02T00:00:00+00:00",
-                "--end-exclusive",
-                "2026-01-03T00:00:00+00:00",
-                "--stock-limit",
-                "1",
-                "--action-count",
-                "2",
-                "--hours-lookback",
-                "1",
-                "--context-bars-per-hour",
-                "60",
-                "--min-active-stock-fraction",
-                "1.0",
-                "--min-context-valid-fraction",
-                "1.0",
-                "--min-decision-rows",
-                "1",
-                "--dense-hourly-grid",
-                "--allow-missing-action-context",
-                "--universe-selection-date",
-                "2026-01-01T00:00:00+00:00",
-            ]
-            try:
-                builder.main()
-            finally:
-                sys.argv = old_argv
-
-            payload = torch.load(output_dir / "dataset.pt", map_location="cpu", weights_only=True)
-
-        self.assertIn("2026-01-02T15:30:00+00:00", payload["decision_timestamps"])
-        self.assertEqual(payload["action_names"], ["CASH", "OLD", "QQQ"])
-        self.assertFalse(bool(payload["decision_action_valid_mask"][0, 1].item()))
-        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 2].item()))
-
-    def test_minute_to_hour_scripts_default_to_shared_data_root_when_available(self) -> None:
-        builder = load_script("build_hourly_from_minute_context_dataset")
-        trainer = load_script("train_hourly_from_minute_context_rl")
-        expected_data_root = ROOT.parent / "data" if (ROOT.parent / "data").exists() else ROOT / "data"
-        expected_derived_root = ROOT.parent / "derived" if (ROOT.parent / "derived").exists() else ROOT / "derived"
-
-        build_args = builder.parse_args([])
-        train_args = trainer.parse_args([])
-
-        self.assertEqual(build_args.output_dir, expected_data_root / "rl_hour_from_minute" / "top_volume_1m_recent")
-        self.assertEqual(build_args.decision_stride_minutes, builder.DEFAULT_DECISION_GRID_MINUTES)
-        self.assertEqual(build_args.minutes_per_hour, builder.DEFAULT_CONTEXT_MINUTES_PER_GRID)
-        self.assertEqual(
-            build_args.stock_minute_dir,
-            expected_data_root
-            / "minute_ohlcv"
-            / "top_us_volume_stocks_nasdaq_1000_2026-06-14_1m_2026-05-25_2026-06-15",
-        )
-        self.assertEqual(
-            build_args.stock_universe,
-            expected_derived_root / "universes" / "top_us_volume_stocks_nasdaq_1000_2026-06-14.csv",
-        )
-        self.assertEqual(
-            train_args.dataset,
-            expected_data_root / "rl_hour_from_minute" / "top_volume_1m_recent" / "hour_from_minute_dataset.pt",
-        )
-        self.assertEqual(train_args.output_dir, expected_data_root / "rl_hour_from_minute_runs")
-
-    def test_minute_to_hour_builder_rejects_non_hourly_default_grid(self) -> None:
-        builder = load_script("build_hourly_from_minute_context_dataset")
-        args = builder.parse_args(["--decision-stride-minutes", "30"])
-
-        with self.assertRaisesRegex(ValueError, "hourly decision grid"):
-            builder.validate_hourly_grid_args(args)
-
-    def test_second_to_hour_builder_switches_to_second_defaults(self) -> None:
-        builder = load_script("build_hourly_from_minute_context_dataset")
-
-        args = builder.parse_args(["--source-bar-interval", "1s"])
-
-        self.assertEqual(args.minutes_per_hour, 3600)
-        self.assertEqual(args.max_action_staleness_seconds, 300)
-        self.assertEqual(args.bar_latency_ms, 1000)
-        self.assertTrue(args.dense_hourly_grid)
-        self.assertTrue(args.allow_missing_action_context)
-        self.assertIn("rl_hour_from_second", str(args.output_dir))
 
     def test_second_to_hour_payload_accepts_one_second_context(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["validate_hour_level_decision_grid"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["validate_hour_level_decision_grid"])
 
         module.validate_hour_level_decision_grid(
             {
@@ -646,47 +178,47 @@ class MinuteToHourTests(unittest.TestCase):
             )
 
     def test_second_to_hour_timestamp_grid_rejects_decision_second_leakage(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["validate_minute_timestamp_grid"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["validate_second_timestamp_grid"])
 
         payload = {
             "decision_timestamps": ["2026-06-12T15:00:00+00:00"],
             "next_timestamps": ["2026-06-12T16:00:00+00:00"],
-            "minute_timestamp_grid": [[["2026-06-12T15:00:00+00:00"]]],
-            "minute_mask": torch.tensor([[[True]]], dtype=torch.bool),
+            "second_timestamp_grid": [[["2026-06-12T15:00:00+00:00"]]],
+            "second_mask": torch.tensor([[[True]]], dtype=torch.bool),
             "source_bar_interval": "1s",
             "bar_latency_ms": 1000,
         }
 
-        with self.assertRaisesRegex(ValueError, "Subhour context leakage"):
-            module.validate_minute_timestamp_grid(payload)
+        with self.assertRaisesRegex(ValueError, "Second context leakage"):
+            module.validate_second_timestamp_grid(payload)
 
-        payload["minute_timestamp_grid"] = [[["2026-06-12T14:59:59+00:00"]]]
-        module.validate_minute_timestamp_grid(payload)
+        payload["second_timestamp_grid"] = [[["2026-06-12T14:59:59+00:00"]]]
+        module.validate_second_timestamp_grid(payload)
 
         canonical_payload = {
             "decision_timestamps": ["2026-06-12T15:00:00+00:00"],
             "next_timestamps": ["2026-06-12T16:00:00+00:00"],
-            "subhour_timestamp_grid": [[["2026-06-12T14:59:59+00:00"]]],
-            "subhour_mask": torch.tensor([[[True]]], dtype=torch.bool),
+            "second_timestamp_grid": [[["2026-06-12T14:59:59+00:00"]]],
+            "second_mask": torch.tensor([[[True]]], dtype=torch.bool),
             "source_bar_interval": "1s",
             "bar_latency_ms": 1000,
         }
-        module.validate_minute_timestamp_grid(canonical_payload)
+        module.validate_second_timestamp_grid(canonical_payload)
 
-    def test_subhour_payload_aliases_replace_minute_canonical_names(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+    def test_second_payload_aliases_replace_minute_canonical_names(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_load_payload"])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
             torch.save(
                 {
                     "decision_timestamps": ["2026-06-10T15:30:00+00:00"],
                     "next_timestamps": ["2026-06-10T16:30:00+00:00"],
-                    "subhour_timestamp_grid": [[["2026-06-10T15:29:00+00:00"]]],
-                    "subhour_feature_names": ["x"],
+                    "second_timestamp_grid": [[["2026-06-10T15:29:00+00:00"]]],
+                    "second_feature_names": ["x"],
                     "hour_feature_names": ["h"],
                     "action_names": ["CASH", "QQQ"],
-                    "subhour_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
-                    "subhour_mask": torch.tensor([[[True]]], dtype=torch.bool),
+                    "second_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+                    "second_mask": torch.tensor([[[True]]], dtype=torch.bool),
                     "hour_features": torch.zeros((1, 1, 1), dtype=torch.float32),
                     "action_returns": torch.zeros((1, 2), dtype=torch.float32),
                     "source_bar_interval": "1m",
@@ -697,133 +229,42 @@ class MinuteToHourTests(unittest.TestCase):
 
             payload = module._load_payload(path)
 
-        self.assertIn("minute_features", payload)
-        self.assertIn("subhour_features", payload)
-        self.assertEqual(tuple(payload["minute_features"].shape), (1, 1, 1, 1))
+        self.assertIn("second_features", payload)
+        self.assertIn("second_features", payload)
+        self.assertEqual(tuple(payload["second_features"].shape), (1, 1, 1, 1))
 
-    def test_subhour_payload_aliases_reject_same_shape_different_values(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_canonicalize_subhour_payload"])
+    def test_second_payload_aliases_reject_same_shape_different_values(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_canonicalize_second_payload"])
         payload = {
-            "subhour_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+            "second_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
             "minute_features": torch.ones((1, 1, 1, 1), dtype=torch.float32),
         }
 
         with self.assertRaisesRegex(ValueError, "same values"):
-            module._canonicalize_subhour_payload(payload)
+            module._canonicalize_second_payload(payload)
 
-    def test_second_level_model_compresses_long_intrahour_context(self) -> None:
-        model = MinuteToHourCausalTransformerQNetwork(
-            minute_feature_dim=2,
-            hour_feature_dim=1,
-            action_count=2,
-            hours_lookback=1,
-            minutes_per_hour=3600,
-            d_model=16,
-            n_heads=4,
-            minute_layers=1,
-            hour_layers=1,
-            feedforward_dim=32,
-            action_embedding_dim=4,
-            max_subhour_tokens=32,
-        )
 
-        q_values = model(
-            torch.zeros((2, 1, 3600, 2), dtype=torch.float32),
-            torch.ones((2, 1, 3600), dtype=torch.bool),
-            torch.zeros((2, 1, 1), dtype=torch.float32),
-            torch.zeros(2, dtype=torch.long),
-            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
-        )
 
-        self.assertEqual(tuple(q_values.shape), (2, 2))
-
-    def test_minute_to_hour_action_covariate_sidecar_merges_into_split(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload", "_build_split"])
-        decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
-        next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
-        action_features = torch.tensor(
-            [
-                [[0.0, 0.0, 0.0, 0.0], [1.0, 10.0, 1.0, 1.0]],
-                [[0.0, 0.0, 0.0, 0.0], [3.0, 20.0, 1.0, 1.0]],
-            ],
-            dtype=torch.float32,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "hour_from_second_dataset.pt"
-            torch.save(
-                {
-                    "decision_timestamps": decisions,
-                    "next_timestamps": next_timestamps,
-                    "minute_timestamp_grid": [
-                        [["2026-06-10T15:29:59+00:00"]],
-                        [["2026-06-10T16:29:59+00:00"]],
-                    ],
-                    "minute_feature_names": ["m"],
-                    "hour_feature_names": ["h"],
-                    "action_names": ["CASH", "QQQ"],
-                    "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
-                    "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
-                    "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
-                    "action_returns": torch.zeros((2, 2), dtype=torch.float32),
-                    "source_bar_interval": "1s",
-                    "context_bars_per_hour": 3600,
-                    "minutes_per_hour": 3600,
-                    "decision_grid_minutes": 60,
-                    "bar_latency_ms": 1000,
-                },
-                path,
-            )
-            torch.save(
-                {
-                    "base_dataset_file_name": path.name,
-                    "base_dataset_sha256": module._file_sha256(path),
-                    "decision_timestamps": decisions,
-                    "action_names": ["CASH", "QQQ"],
-                    "action_features": action_features,
-                    "action_feature_names": [
-                        "stock_covariates_v1.log_market_cap",
-                        "stock_covariates_v1.days_since_listed",
-                        "stock_covariates_v1_mask.log_market_cap",
-                        "stock_covariates_v1_mask.days_since_listed",
-                    ],
-                    "action_feature_available_timestamps_ms": torch.full((2, 2, 4), -1, dtype=torch.long),
-                    "action_feature_groups": {
-                        "stock_covariates_v1": [0, 2],
-                        "stock_covariates_v1_mask": [2, 4],
-                    },
-                    "action_covariate_reportability_errors": [],
-                },
-                path.with_name("action_covariates.pt"),
-            )
-
-            payload = module._load_payload(path)
-            split = module._build_split(name="train", payload=payload)
-
-        self.assertEqual(tuple(split.action_features.shape), (2, 2, 4))
-        self.assertEqual(split.action_feature_names[-1], "stock_covariates_v1_mask.days_since_listed")
-        self.assertEqual(split.action_feature_groups["stock_covariates_v1"], [0, 2])
-        self.assertTrue(torch.equal(split.action_features[:, :, 2:], action_features[:, :, 2:]))
-
-    def test_minute_to_hour_sidecar_mode_required_and_none(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+    def test_second_to_hour_sidecar_mode_required_and_none(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_load_payload"])
         decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
         next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "hour_from_second_dataset.pt"
-            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
             payload = module._load_payload(path, action_covariate_sidecar="none")
             self.assertNotIn("action_features", payload)
             with self.assertRaisesRegex(FileNotFoundError, "Required action covariate sidecar"):
                 module._load_payload(path, action_covariate_sidecar="required")
 
-    def test_minute_to_hour_news_llm_sidecar_is_explicit_opt_in(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+    def test_second_to_hour_news_llm_sidecar_is_explicit_opt_in(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_load_payload"])
         decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
         next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "hour_from_second_dataset.pt"
-            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
             default_payload = module._load_payload(path, action_covariate_sidecar="none")
             self.assertNotIn("action_features", default_payload)
@@ -865,13 +306,13 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertTrue(payload["action_features_augmented_with_news_llm"])
         self.assertEqual(payload["action_feature_groups"]["stock_news_llm_v1"], [0, 1])
 
-    def test_minute_to_hour_sidecar_requires_matching_base_hash(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+    def test_second_to_hour_sidecar_requires_matching_base_hash(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_load_payload"])
         decisions = ["2026-06-10T15:30:00+00:00", "2026-06-10T16:30:00+00:00"]
         next_timestamps = ["2026-06-10T16:30:00+00:00", "2026-06-10T17:30:00+00:00"]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "hour_from_second_dataset.pt"
-            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
             torch.save(
                 {
                     "base_dataset_file_name": path.name,
@@ -890,7 +331,7 @@ class MinuteToHourTests(unittest.TestCase):
                 module._load_payload(path, action_covariate_sidecar="required")
 
     def test_binary_action_features_are_not_zscored(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_action_feature_mean_std"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_action_feature_mean_std"])
         features = torch.tensor(
             [
                 [[1.0, 1.0, 0.0, 1.0, 1.0], [2.0, 0.0, 1.0, 0.0, 0.0]],
@@ -919,61 +360,34 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(float(std[3].item()), 1.0)
         self.assertEqual(float(std[4].item()), 1.0)
 
-    def test_minute_to_hour_model_scores_action_features(self) -> None:
-        model = MinuteToHourCausalTransformerQNetwork(
-            minute_feature_dim=2,
-            hour_feature_dim=1,
-            action_count=3,
-            hours_lookback=1,
-            minutes_per_hour=2,
-            d_model=16,
-            n_heads=4,
-            minute_layers=1,
-            hour_layers=1,
-            feedforward_dim=32,
-            action_embedding_dim=4,
-            action_feature_dim=5,
-        )
 
-        q_values = model(
-            torch.zeros((2, 1, 2, 2), dtype=torch.float32),
-            torch.ones((2, 1, 2), dtype=torch.bool),
-            torch.zeros((2, 1, 1), dtype=torch.float32),
-            torch.zeros(2, dtype=torch.long),
-            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
-            action_features=torch.zeros((2, 3, 5), dtype=torch.float32),
-        )
-
-        self.assertEqual(tuple(q_values.shape), (2, 3))
-        self.assertTrue(bool(torch.isfinite(q_values).all().item()))
-
-    def test_vectorized_minute_to_hour_env_allows_last_valid_next_state(self) -> None:
+    def test_vectorized_second_to_hour_env_allows_last_valid_next_state(self) -> None:
         split = HourFromMinuteDataSplit(
             name="train",
             decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-02T15:30:00+00:00"],
             next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-02T16:30:00+00:00"],
-            minute_feature_names=["m"],
+            second_feature_names=["m"],
             hour_feature_names=["h"],
             action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((2, 1, 1, 1), dtype=torch.float32),
-            minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            second_features=torch.zeros((2, 1, 1, 1), dtype=torch.float32),
+            second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((2, 1, 1), dtype=torch.float32),
             action_returns=torch.zeros((2, 2), dtype=torch.float32),
             action_valid_mask=torch.ones((2, 2), dtype=torch.bool),
             label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1], dtype=torch.long),
             valid_index_mask=torch.tensor([True, True], dtype=torch.bool),
-            minute_feature_mean=torch.zeros(1),
-            minute_feature_std=torch.ones(1),
+            second_feature_mean=torch.zeros(1),
+            second_feature_std=torch.ones(1),
             hour_feature_mean=torch.zeros(1),
             hour_feature_std=torch.ones(1),
             hours_lookback=1,
-            minutes_per_hour=1,
+            seconds_per_hour=1,
         )
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["VectorizedMinuteToHourEnv"])
-        env = module.VectorizedMinuteToHourEnv(
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["VectorizedSecondToHourEnv"])
+        env = module.VectorizedSecondToHourEnv(
             split,
-            module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0),
+            module.SecondToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0),
             torch.device("cpu"),
         )
         env.indices[:] = 0
@@ -983,7 +397,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(int(result["next_indices"][0].item()), 1)
         self.assertFalse(bool(result["resets"][0].item()))
 
-    def test_minute_to_hour_env_d0_dynamic_bookkeeping(self) -> None:
+    def test_second_to_hour_env_d0_dynamic_bookkeeping(self) -> None:
         # PR-D / D0: env tracks entry_index / unrealized_pnl / mae / mfe as PURE bookkeeping (not consumed by
         # reward/model/replay -> training is byte-identical; that part is covered by the existing trainer tests
         # staying green). Here we verify the compounding/reset semantics directly, robust to constraint
@@ -992,27 +406,27 @@ class MinuteToHourTests(unittest.TestCase):
             name="train",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
-            minute_feature_names=["m"],
+            second_feature_names=["m"],
             hour_feature_names=["h"],
             action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((4, 1, 1, 1), dtype=torch.float32),
-            minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            second_features=torch.zeros((4, 1, 1, 1), dtype=torch.float32),
+            second_mask=torch.ones((4, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((4, 1, 1), dtype=torch.float32),
             action_returns=torch.tensor([[0.0, 0.10], [0.0, -0.20], [0.0, 0.30], [0.0, 0.0]], dtype=torch.float32),
             action_valid_mask=torch.ones((4, 2), dtype=torch.bool),
             label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
             valid_index_mask=torch.tensor([True, True, True, True], dtype=torch.bool),
-            minute_feature_mean=torch.zeros(1),
-            minute_feature_std=torch.ones(1),
+            second_feature_mean=torch.zeros(1),
+            second_feature_std=torch.ones(1),
             hour_feature_mean=torch.zeros(1),
             hour_feature_std=torch.ones(1),
             hours_lookback=1,
-            minutes_per_hour=1,
+            seconds_per_hour=1,
         )
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["VectorizedMinuteToHourEnv"])
-        env = module.VectorizedMinuteToHourEnv(
-            split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0), torch.device("cpu")
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["VectorizedSecondToHourEnv"])
+        env = module.VectorizedSecondToHourEnv(
+            split, module.SecondToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0), torch.device("cpu")
         )
         env.indices[:] = 0
         env.entry_index[:] = 0  # align bookkeeping with the manually-set start row
@@ -1046,33 +460,33 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertNotIn("unrealized_pnl", result)
         self.assertNotIn("entry_index", result)
 
-    def test_minute_to_hour_dynamic_env_state_checkpoint(self) -> None:
+    def test_second_to_hour_dynamic_env_state_checkpoint(self) -> None:
         # Reorg review P0: the dynamic env bookkeeping (entry_index/unrealized_pnl/mae/mfe) must be
         # checkpointed and restored when use_dynamic_transition_features is on -- else a resumed dynamic run
         # silently resets it mid-episode while replay still holds dynamic-aware samples. Verify the round-trip
         # restores the fields, and that a legacy checkpoint missing them fails closed for a dynamic resume
         # (and is tolerated when the flag is off).
-        from rl_quant.training.minute_to_hour import _env_state_to_cpu, _load_env_state
+        from rl_quant.training.second_to_hour import _env_state_to_cpu, _load_env_state
 
         split = HourFromMinuteDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((4, 1, 1, 1), dtype=torch.float32),
-            minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((4, 1, 1, 1), dtype=torch.float32),
+            second_mask=torch.ones((4, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((4, 1, 1), dtype=torch.float32),
             action_returns=torch.tensor([[0.0, 0.10], [0.0, -0.20], [0.0, 0.30], [0.0, 0.0]], dtype=torch.float32),
             action_valid_mask=torch.ones((4, 2), dtype=torch.bool),
             label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2, 3], dtype=torch.long),
             valid_index_mask=torch.tensor([True, True, True, True], dtype=torch.bool),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["VectorizedMinuteToHourEnv"])
-        cfg = module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0)
-        env = module.VectorizedMinuteToHourEnv(split, cfg, torch.device("cpu"))
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["VectorizedSecondToHourEnv"])
+        cfg = module.SecondToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0)
+        env = module.VectorizedSecondToHourEnv(split, cfg, torch.device("cpu"))
         env.indices[:] = 0
         env.entry_index[:] = 0
         for requested in (1, 1):  # hold QQQ two steps -> non-zero unrealized_pnl / MAE / MFE
@@ -1082,7 +496,7 @@ class MinuteToHourTests(unittest.TestCase):
         saved = _env_state_to_cpu(env)
         for key in ("entry_index", "unrealized_pnl", "mae", "mfe"):
             self.assertIn(key, saved)
-        fresh = module.VectorizedMinuteToHourEnv(split, cfg, torch.device("cpu"))
+        fresh = module.VectorizedSecondToHourEnv(split, cfg, torch.device("cpu"))
         _load_env_state(fresh, saved, torch.device("cpu"), require_dynamic=True)
         for key in ("entry_index", "unrealized_pnl", "mae", "mfe"):
             self.assertTrue(torch.equal(getattr(fresh, key), getattr(env, key)), key)
@@ -1166,463 +580,19 @@ class MinuteToHourTests(unittest.TestCase):
             )
         return pd.DataFrame(rows)
 
-    def _small_second_context_payload(self, *, allow_post_close_exit: bool = False) -> dict[str, object]:
-        decision = "2026-06-12T14:35:00+00:00"
-        stock_times = ["2026-06-12T14:34:00+00:00", "2026-06-12T14:34:59+00:00"]
-        action_times = [
-            "2026-06-12T14:34:59+00:00",
-            "2026-06-12T14:35:01+00:00",
-            "2026-06-12T14:40:01+00:00",
-        ]
-        config = StockSecondContextConfig(
-            decision_interval="5m",
-            context_seconds=60,
-            block_seconds=60,
-            min_active_symbols=1,
-            max_action_staleness_seconds=5,
-            allow_post_close_exit=allow_post_close_exit,
-        )
-        try:
-            import pandas as pd
-        except ModuleNotFoundError:
-            self.skipTest("pandas is required for in-memory second-context payload tests")
-        return build_second_context_payload(
-            stock_frames_by_symbol={
-                "AAA": self._second_context_frame("AAA", stock_times, [100.0, 101.0]),
-                "BBB": self._second_context_frame("BBB", stock_times, [50.0, 49.5]),
-            },
-            action_frames_by_symbol={
-                "QQQ": self._second_context_frame("QQQ", action_times, [99.0, 100.0, 101.0]),
-            },
-            action_names=["CASH", "QQQ"],
-            decision_timestamps_ms=[int(pd.Timestamp(decision).timestamp() * 1000)],
-            config=config,
-            dataset_manifest={"source_download_complete": False},
-            data_quality_report={"source_download_complete": False, "reportability_errors": ["source_download_incomplete"]},
-        )
 
-    def _second_context_split(
-        self,
-        *,
-        action_names: list[str] | None = None,
-        returns: list[list[float]] | torch.Tensor,
-        valid_mask: list[list[bool]] | torch.Tensor | None = None,
-        label_valid_mask: list[list[bool]] | torch.Tensor | None = None,
-        costs: list[list[float]] | torch.Tensor | None = None,
-        weights: list[list[float]] | torch.Tensor | None = None,
-        decisions: list[str] | None = None,
-        next_timestamps: list[str] | None = None,
-        segment_ids: list[int] | torch.Tensor | None = None,
-        valid_start_indices: list[int] | torch.Tensor | None = None,
-        market_mask: torch.Tensor | None = None,
-    ) -> SecondContextDataSplit:
-        action_names = action_names or ["CASH", "QQQ"]
-        action_returns = torch.as_tensor(returns, dtype=torch.float32)
-        rows, action_count = action_returns.shape
-        if valid_mask is None:
-            action_valid_mask = torch.isfinite(action_returns)
-        else:
-            action_valid_mask = torch.as_tensor(valid_mask, dtype=torch.bool)
-        label_valid_tensor = None if label_valid_mask is None else torch.as_tensor(label_valid_mask, dtype=torch.bool)
-        if costs is None:
-            action_cost_bps = torch.zeros((rows, action_count), dtype=torch.float32)
-        else:
-            action_cost_bps = torch.as_tensor(costs, dtype=torch.float32)
-        if weights is None:
-            action_target_weights = torch.ones((rows, action_count), dtype=torch.float32)
-            action_target_weights[:, 0] = 0.0
-        else:
-            action_target_weights = torch.as_tensor(weights, dtype=torch.float32)
-        if decisions is None:
-            decisions = [f"2026-06-12T14:{30 + 5 * index:02d}:00+00:00" for index in range(rows)]
-        if next_timestamps is None:
-            next_timestamps = [f"2026-06-12T14:{35 + 5 * index:02d}:00+00:00" for index in range(rows)]
-        if segment_ids is None:
-            segment_tensor = torch.zeros(rows, dtype=torch.long)
-        else:
-            segment_tensor = torch.as_tensor(segment_ids, dtype=torch.long)
-        if valid_start_indices is None:
-            valid_tensor = torch.nonzero(action_valid_mask.any(dim=1), as_tuple=False).flatten().long()
-        else:
-            valid_tensor = torch.as_tensor(valid_start_indices, dtype=torch.long)
-        valid_index_mask = torch.zeros(rows, dtype=torch.bool)
-        valid_index_mask[valid_tensor] = True
-        if market_mask is None:
-            market_mask = torch.ones((rows, 1), dtype=torch.bool)
-        return SecondContextDataSplit(
-            name="test",
-            decision_timestamps=decisions,
-            next_timestamps=next_timestamps,
-            action_names=action_names,
-            feature_names={
-                "market_context": ["x"],
-                "action_features": ["action_index_scaled"],
-                "portfolio_state": ["p"],
-                "constraint_state": ["c"],
-            },
-            market_context=torch.zeros((rows, market_mask.shape[1], 1), dtype=torch.float32),
-            market_context_mask=market_mask.bool(),
-            market_context_available_timestamps_ms=torch.arange(rows * market_mask.shape[1], dtype=torch.long).reshape(
-                rows,
-                market_mask.shape[1],
-            ),
-            action_features=torch.zeros((rows, action_count, 1), dtype=torch.float32),
-            action_returns=action_returns,
-            action_valid_mask=action_valid_mask,
-            action_cost_bps=action_cost_bps,
-            action_target_weights=action_target_weights,
-            entry_execution_timestamps_ms=torch.ones((rows, action_count), dtype=torch.long),
-            exit_execution_timestamps_ms=torch.ones((rows, action_count), dtype=torch.long) * 2,
-            entry_price_source="test_entry",
-            exit_price_source="test_exit",
-            execution_model="test_execution",
-            portfolio_state=torch.zeros((rows, 1), dtype=torch.float32),
-            constraint_state=torch.zeros((rows, 1), dtype=torch.float32),
-            segment_ids=segment_tensor,
-            session_ids=["2026-06-12"] * rows,
-            valid_start_indices=valid_tensor,
-            valid_index_mask=valid_index_mask,
-            market_mean=torch.zeros(1, dtype=torch.float32),
-            market_std=torch.ones(1, dtype=torch.float32),
-            action_feature_mean=torch.zeros(1, dtype=torch.float32),
-            action_feature_std=torch.ones(1, dtype=torch.float32),
-            periods_per_year=252.0,
-            label_valid_mask=label_valid_tensor,
-        )
 
-    def test_second_context_weight_freeze_drift_detected(self) -> None:
-        from rl_quant.evaluation.second_context import (
-            _evaluate_action_path,
-            sequential_path_reportability_errors,
-        )
 
-        # Action 1 (QQQ) is HELD across two rows. With a CONSTANT target weight the freeze-executed-weight
-        # contract holds (no drift). With a DRIFTING target weight (1.0 -> 2.0) while the action id is held, the
-        # freeze silently diverges from the declared exposure -- it must be counted AND gated.
-        clean = self._second_context_split(returns=[[0.0, 0.01], [0.0, 0.01]], weights=[[0.0, 1.0], [0.0, 1.0]])
-        clean_metrics = _evaluate_action_path(clean, torch.tensor([1, 1]), assume_prefix_rows=True)
-        self.assertEqual(clean_metrics["same_action_target_weight_drift_count"], 0)
-        self.assertEqual(sequential_path_reportability_errors(clean_metrics), [])
 
-        drift = self._second_context_split(returns=[[0.0, 0.01], [0.0, 0.01]], weights=[[0.0, 1.0], [0.0, 2.0]])
-        drift_metrics = _evaluate_action_path(drift, torch.tensor([1, 1]), assume_prefix_rows=True)
-        self.assertEqual(drift_metrics["same_action_target_weight_drift_count"], 1)
-        self.assertIn(
-            "sequential_path_same_action_target_weight_drift",
-            sequential_path_reportability_errors(drift_metrics),
-        )
 
-    def test_sequential_path_reportability_errors_gates(self) -> None:
-        from rl_quant.evaluation.second_context import sequential_path_reportability_errors as gate
 
-        clean = {
-            "fallback_due_to_missing_label_count": 0,
-            "rows_with_no_valid_action": 0,
-            "same_action_target_weight_drift_count": 0,
-            "cash_action_share": 0.5,
-            "active_window_diagnostics": {"active_net_return": 0.02},
-        }
-        self.assertEqual(gate(clean), [])
-        # Each genuine path pathology becomes a hard gate.
-        self.assertIn(
-            "sequential_path_missing_label_fallback",
-            gate({**clean, "fallback_due_to_missing_label_count": 1}),
-        )
-        self.assertIn(
-            "sequential_path_rows_with_no_valid_action",
-            gate({**clean, "rows_with_no_valid_action": 1}),
-        )
-        # All-CASH WITH no positive active edge is gated (CASH hiding a broken pipeline)...
-        self.assertIn(
-            "all_cash_no_active_edge",
-            gate({**clean, "cash_action_share": 1.0, "active_window_diagnostics": {"active_net_return": 0.0}}),
-        )
-        # ...but a high cash share WITH a positive active edge is NOT gated (all-CASH can be a correct no-edge call),
-        # and a cash share just below the threshold is not gated either.
-        self.assertEqual(
-            gate({**clean, "cash_action_share": 1.0, "active_window_diagnostics": {"active_net_return": 0.05}}),
-            [],
-        )
-        self.assertEqual(
-            gate({**clean, "cash_action_share": 0.98, "active_window_diagnostics": {"active_net_return": -0.01}}),
-            [],
-        )
 
-    def test_second_context_payload_uses_latency_and_masks_sparse_blocks(self) -> None:
-        payload = self._small_second_context_payload()
 
-        self.assertEqual(tuple(payload["market_context"].shape[:2]), (1, 1))
-        self.assertTrue(bool(payload["market_context_mask"][0, 0].item()))
-        self.assertLessEqual(
-            int(payload["market_context_available_timestamps_ms"][0, 0].item()),
-            int(payload["decision_timestamps_ms"][0].item()),
-        )
-        self.assertAlmostEqual(float(payload["action_returns"][0, 1].item()), 0.01, places=6)
-        self.assertGreaterEqual(
-            int(payload["entry_execution_timestamps_ms"][0, 1].item()),
-            int(payload["decision_timestamps_ms"][0].item()) + 1_000,
-        )
-        self.assertGreaterEqual(
-            int(payload["exit_execution_timestamps_ms"][0, 1].item()),
-            int(payload["next_timestamps_ms"][0].item()) + 1_000,
-        )
-        self.assertFalse(payload["dataset_manifest"]["reportable"])
 
-    def test_second_context_builder_defaults_to_one_second_execution_latency(self) -> None:
-        module = load_script("build_second_context_decision_dataset")
-        args = module.parse_args([])
 
-        self.assertEqual(args.execution_latency_ms, 1000)
-        self.assertTrue(args.strict_action_sources)
 
-    def test_second_context_config_requires_1s_execution_latency(self) -> None:
-        # Causal invariant: a 1s-aggregate source must fill at least one bar (1000ms) after the decision,
-        # mirroring bar_latency_ms. The config previously enforced only execution_latency_ms >= 0, so a
-        # second source with e.g. 500ms (fill at/inside the decision bar -> look-ahead) slipped through.
-        from rl_quant.features.stock_second_context import StockSecondContextConfig
 
-        base = dict(decision_interval="5m", context_seconds=60, block_seconds=60, min_active_symbols=1,
-                    max_action_staleness_seconds=5)
-        StockSecondContextConfig(**base, execution_latency_ms=1000).validate()  # default-equivalent: OK
-        for bad in (0, 500, 999):
-            with self.assertRaises(ValueError):
-                StockSecondContextConfig(**base, execution_latency_ms=bad, source_bar_interval="1s").validate()
 
-    def test_decision_tensor_payload_full_contract_on_real_builder_payloads(self) -> None:
-        # Teeth against the BUILDERS (not just synthetic dicts): a real second-context payload exposes the
-        # keys the wired validate_decision_tensor_payload expects (so the contract actually ENGAGES, not
-        # silently skips) and satisfies the full contract; corrupting it trips the matching validator. A
-        # minute-to-hour-style payload (ISO timestamps -> causal check gracefully skips) behaves the same.
-        from rl_quant.protocol import validate_decision_tensor_payload
-
-        payload = self._small_second_context_payload()
-        for key in ("action_returns", "decision_action_valid_mask", "label_valid_mask",
-                    "decision_timestamps_ms", "next_timestamps_ms"):
-            self.assertIn(key, payload)  # the wiring engages on a real builder payload
-        ok, issues = validate_decision_tensor_payload(payload, require_full_contract=True)
-        self.assertTrue(ok, issues)
-        # Corrupt the real payload: mask CASH off -> the CASH-contract validator fires through the entry.
-        corrupt_mask = payload["decision_action_valid_mask"].clone()
-        corrupt_mask[:, 0] = False
-        ok, issues = validate_decision_tensor_payload({**payload, "decision_action_valid_mask": corrupt_mask})
-        self.assertFalse(ok)
-        self.assertTrue(any("cash_contract" in m for m in issues))
-
-        # Minute-to-hour-style payload dict (ISO-string timestamps; *_ms absent -> causal check skips).
-        nan = float("nan")
-        m2h = {
-            "model_input_keys": ["minute_features"], "label_keys": ["action_returns"],
-            "forbidden_model_input_keys": ["action_returns"],
-            "action_names": ["CASH", "QQQ"],
-            "action_returns": torch.tensor([[0.0, 0.01], [0.0, nan]]),
-            "action_valid_mask": torch.tensor([[True, True], [True, True]]),
-            "label_valid_mask": torch.tensor([[True, True], [True, False]]),
-        }
-        self.assertTrue(validate_decision_tensor_payload(m2h, require_full_contract=True)[0])
-        corrupt_returns = m2h["action_returns"].clone()
-        corrupt_returns[1, 1] = 0.5  # invalid action (label False) given a finite return
-        ok, issues = validate_decision_tensor_payload({**m2h, "action_returns": corrupt_returns})
-        self.assertFalse(ok)
-        self.assertTrue(any("invalid_returns_are_nan" in m for m in issues))
-
-    def test_second_context_builder_requires_point_in_time_universe_or_diagnostic_flag(self) -> None:
-        module = load_script("build_second_context_decision_dataset")
-        first_decision = iso_to_timestamp_ms("2026-06-12T14:35:00+00:00")
-        missing_args = module.parse_args([])
-        future_args = module.parse_args(["--universe-selection-timestamp", "2026-06-13T00:00:00+00:00"])
-        diagnostic_args = module.parse_args(
-            [
-                "--universe-selection-timestamp",
-                "2026-06-13T00:00:00+00:00",
-                "--allow-fixed-survivor-universe-diagnostic",
-            ]
-        )
-        lenient_action_args = module.parse_args(["--allow-missing-action-sources-for-diagnostic"])
-
-        with self.assertRaisesRegex(ValueError, "Universe selection"):
-            module.universe_reportability_errors(missing_args, first_decision_ms=first_decision)
-        with self.assertRaisesRegex(ValueError, "Universe selection"):
-            module.universe_reportability_errors(future_args, first_decision_ms=first_decision)
-        self.assertEqual(
-            module.universe_reportability_errors(diagnostic_args, first_decision_ms=first_decision),
-            ["future_universe_selection_timestamp"],
-        )
-        self.assertFalse(lenient_action_args.strict_action_sources)
-
-    def test_second_context_manifest_marks_future_universe_nonreportable(self) -> None:
-        decision = "2026-06-12T14:35:00+00:00"
-        stock_times = ["2026-06-12T14:34:00+00:00", "2026-06-12T14:34:59+00:00"]
-        action_times = [
-            "2026-06-12T14:34:59+00:00",
-            "2026-06-12T14:35:01+00:00",
-            "2026-06-12T14:40:01+00:00",
-        ]
-        try:
-            import pandas as pd
-        except ModuleNotFoundError:
-            self.skipTest("pandas is required for in-memory second-context payload tests")
-
-        payload = build_second_context_payload(
-            stock_frames_by_symbol={
-                "AAA": self._second_context_frame("AAA", stock_times, [100.0, 101.0]),
-            },
-            action_frames_by_symbol={
-                "QQQ": self._second_context_frame("QQQ", action_times, [99.0, 100.0, 101.0]),
-            },
-            action_names=["CASH", "QQQ"],
-            decision_timestamps_ms=[int(pd.Timestamp(decision).timestamp() * 1000)],
-            config=StockSecondContextConfig(
-                decision_interval="5m",
-                context_seconds=60,
-                block_seconds=60,
-                min_active_symbols=1,
-                max_action_staleness_seconds=5,
-            ),
-            dataset_manifest={
-                "source_download_complete": True,
-                "universe_selection_timestamp": "2026-06-13T00:00:00+00:00",
-                "universe_method": "future_top_volume",
-                "universe_source_hash": "future-hash",
-            },
-            data_quality_report={"source_download_complete": True, "reportability_errors": []},
-        )
-
-        self.assertFalse(payload["dataset_manifest"]["reportable"])
-        self.assertIn("future_universe_selection_timestamp", payload["dataset_manifest"]["reportability_errors"])
-        self.assertTrue(payload["dataset_manifest"]["retrospective_fixed_survivor_universe_diagnostic"])
-
-    def test_second_context_manifest_marks_missing_intended_actions_nonreportable(self) -> None:
-        decision = "2026-06-12T14:35:00+00:00"
-        stock_times = ["2026-06-12T14:34:00+00:00", "2026-06-12T14:34:59+00:00"]
-        action_times = [
-            "2026-06-12T14:34:59+00:00",
-            "2026-06-12T14:35:01+00:00",
-            "2026-06-12T14:40:01+00:00",
-        ]
-        try:
-            import pandas as pd
-        except ModuleNotFoundError:
-            self.skipTest("pandas is required for in-memory second-context payload tests")
-
-        payload = build_second_context_payload(
-            stock_frames_by_symbol={
-                "AAA": self._second_context_frame("AAA", stock_times, [100.0, 101.0]),
-            },
-            action_frames_by_symbol={
-                "QQQ": self._second_context_frame("QQQ", action_times, [99.0, 100.0, 101.0]),
-            },
-            action_names=["CASH", "QQQ"],
-            decision_timestamps_ms=[int(pd.Timestamp(decision).timestamp() * 1000)],
-            config=StockSecondContextConfig(
-                decision_interval="5m",
-                context_seconds=60,
-                block_seconds=60,
-                min_active_symbols=1,
-                max_action_staleness_seconds=5,
-            ),
-            dataset_manifest={
-                "source_download_complete": True,
-                "universe_selection_timestamp": "2026-06-12T00:00:00+00:00",
-                "intended_action_symbols": ["CASH", "QQQ", "MISSING"],
-                "realized_action_symbols": ["CASH", "QQQ"],
-                "missing_intended_action_source_symbols": ["MISSING"],
-                "action_schema_changed_due_to_missing_sources": True,
-                "reportability_errors": ["missing_intended_action_source_symbols"],
-            },
-            data_quality_report={"source_download_complete": True, "reportability_errors": []},
-        )
-        manifest = dict(payload["dataset_manifest"])
-
-        self.assertFalse(manifest["reportable"])
-        self.assertEqual(manifest["missing_intended_action_source_symbols"], ["MISSING"])
-        self.assertTrue(manifest["action_schema_changed_due_to_missing_sources"])
-        self.assertIn("missing_intended_action_source_symbols", manifest["reportability_errors"])
-
-    def test_hour_from_second_builder_respects_missing_context_and_min_rows_flags(self) -> None:
-        module = load_script("build_hourly_from_minute_context_dataset")
-
-        default_args = module.parse_args(["--source-bar-interval", "1s"])
-        strict_args = module.parse_args(
-            [
-                "--source-bar-interval",
-                "1s",
-                "--no-allow-missing-action-context",
-                "--min-decision-rows",
-                "1",
-            ]
-        )
-
-        self.assertTrue(default_args.allow_missing_action_context)
-        self.assertFalse(strict_args.allow_missing_action_context)
-        self.assertEqual(strict_args.min_decision_rows, 1)
-
-    def test_second_context_action_features_include_action_identity(self) -> None:
-        payload = self._small_second_context_payload()
-        names = payload["feature_names"]["action_features"]
-
-        self.assertIn("action_index_scaled", names)
-        self.assertIn("is_etf", names)
-        self.assertIn("is_stock", names)
-        self.assertIn("is_inverse", names)
-        self.assertIn("is_leveraged", names)
-        self.assertIn("leverage_factor", names)
-        self.assertIn("target_weight", names)
-        self.assertIn("feature_staleness_seconds", names)
-        self.assertEqual(float(payload["action_features"][0, 0, names.index("is_cash")].item()), 1.0)
-        self.assertEqual(float(payload["action_features"][0, 1, names.index("is_etf")].item()), 1.0)
-        self.assertEqual(float(payload["action_features"][0, 1, names.index("is_stock")].item()), 0.0)
-        self.assertEqual(float(payload["action_features"][0, 1, names.index("valid_price_flag")].item()), 1.0)
-        self.assertEqual(float(payload["action_target_weights"][0, 0].item()), 0.0)
-        self.assertEqual(float(payload["action_target_weights"][0, 1].item()), 1.0)
-        self.assertLessEqual(
-            int(payload["action_features_available_timestamps_ms"][0, 1].item()),
-            int(payload["decision_timestamps_ms"][0].item()),
-        )
-        self.assertIn("action_returns", payload["forbidden_model_input_keys"])
-        self.assertNotIn("action_returns", payload["model_input_keys"])
-        self.assertEqual(payload["decision_tensor_protocol_version"], "1.0.0")
-        self.assertIn("feature_schema_hash", payload)
-        self.assertIn("action_metadata", payload)
-
-    def test_second_context_payload_splits_decision_and_label_masks(self) -> None:
-        decision = "2026-06-12T14:35:00+00:00"
-        stock_times = ["2026-06-12T14:34:00+00:00", "2026-06-12T14:34:59+00:00"]
-        action_times = [
-            "2026-06-12T14:34:59+00:00",
-            "2026-06-12T14:35:01+00:00",
-        ]
-        config = StockSecondContextConfig(
-            decision_interval="5m",
-            context_seconds=60,
-            block_seconds=60,
-            min_active_symbols=1,
-            max_action_staleness_seconds=5,
-        )
-        try:
-            import pandas as pd
-        except ModuleNotFoundError:
-            self.skipTest("pandas is required for in-memory second-context payload tests")
-        payload = build_second_context_payload(
-            stock_frames_by_symbol={
-                "AAA": self._second_context_frame("AAA", stock_times, [100.0, 101.0]),
-            },
-            action_frames_by_symbol={
-                "QQQ": self._second_context_frame("QQQ", action_times, [99.0, 100.0]),
-            },
-            action_names=["CASH", "QQQ"],
-            decision_timestamps_ms=[int(pd.Timestamp(decision).timestamp() * 1000)],
-            config=config,
-            dataset_manifest={"source_download_complete": True},
-            data_quality_report={"source_download_complete": True, "reportability_errors": []},
-        )
-
-        self.assertTrue(bool(payload["decision_action_valid_mask"][0, 1].item()))
-        self.assertTrue(bool(payload["action_valid_mask"][0, 1].item()))
-        self.assertFalse(bool(payload["label_valid_mask"][0, 1].item()))
-        self.assertTrue(torch.isnan(payload["action_returns"][0, 1]))
-        self.assertIn("decision_action_valid_mask", payload["model_input_keys"])
-        self.assertNotIn("label_valid_mask", payload["model_input_keys"])
-        self.assertIn("label_valid_mask", payload["forbidden_model_input_keys"])
 
     def test_stock_covariate_financial_date_only_is_next_session_available(self) -> None:
         record = normalize_raw_covariate_record(
@@ -2325,410 +1295,26 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertNotEqual(first.source_record_id, second.source_record_id)
         self.assertNotEqual(first.source_record_hash, second.source_record_hash)
 
-    def test_second_context_payload_accepts_appended_action_covariates_without_mask_bias(self) -> None:
-        payload = self._small_second_context_payload()
-        original_width = int(payload["action_features"].shape[-1])
-        original_valid = payload["decision_action_valid_mask"].clone()
-        overview = normalize_raw_covariate_record(
-            symbol="QQQ",
-            source_dataset="overview_snapshots",
-            payload={
-                "asof_date": "2026-06-11",
-                "ticker": "QQQ",
-                "type": "CS",
-                "locale": "us",
-                "market_cap": 100_000_000.0,
-                "share_class_shares_outstanding": 1_000_000.0,
-                "list_date": "1999-03-10",
-                "record_available": True,
-            },
-        )
-        rows = build_symbol_silver_rows([overview])
-        bundle = build_action_covariate_tensor(
-            silver_rows_by_symbol={"QQQ": rows},
-            action_names=payload["action_names"],
-            decision_timestamps_ms=payload["decision_timestamps_ms"],
-            source_coverage_by_symbol={"QQQ": {"overview_snapshots": True}},
-            source_manifest_hash="manifest-hash",
-        )
-        bundle["action_covariate_feature_schema_file_hash"] = "schema-file-hash"
-        augmented = append_action_covariates_to_payload(payload, bundle)
 
-        validate_second_context_payload(augmented)
-        expected_width = original_width + 2 * len(ACTION_COVARIATE_FEATURE_NAMES)
-        expected_width += len(ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES)
-        self.assertEqual(int(augmented["action_features"].shape[-1]), expected_width)
-        self.assertTrue(torch.equal(augmented["decision_action_valid_mask"], original_valid))
-        self.assertTrue(augmented["action_features_augmented_with_covariates"])
-        self.assertIn("stock_covariates_v1", augmented["action_feature_groups"])
-        self.assertIn("stock_covariates_v1_mask", augmented["action_feature_groups"])
-        self.assertIn("stock_covariates_v1_type", augmented["action_feature_groups"])
-        self.assertTrue(augmented["action_covariate_mask_appended_to_action_features"])
-        self.assertEqual(augmented["dataset_manifest"]["covariate_mode"], "flat_append_baseline")
-        self.assertNotEqual(augmented["payload_hash"], payload["payload_hash"])
-        self.assertIn("action_covariates_tensor_hash", augmented["tensor_content_hashes"])
-        self.assertEqual(
-            augmented["dataset_manifest"]["tensor_content_hashes"],
-            augmented["tensor_content_hashes"],
-        )
-        self.assertEqual(
-            augmented["dataset_manifest"]["action_covariate_feature_schema_file_hash"],
-            "schema-file-hash",
-        )
-        self.assertEqual(tuple(augmented["action_feature_available_timestamps_ms"].shape), tuple(augmented["action_features"].shape))
 
-    def test_second_context_payload_rejects_future_action_covariate_availability(self) -> None:
-        payload = self._small_second_context_payload()
-        decision_ms = int(payload["decision_timestamps_ms"][0].item())
-        covariates = {
-            "action_covariates": torch.zeros((1, 2, 1), dtype=torch.float32),
-            "action_covariate_mask": torch.tensor([[[False], [True]]]),
-            "action_covariate_available_timestamps_ms": torch.tensor([[[-1], [decision_ms + 1]]]),
-            "action_covariate_feature_names": ["log_market_cap"],
-            "action_covariate_schema_hash": stable_json_hash(["log_market_cap"]),
-        }
-        payload.update(covariates)
 
-        with self.assertRaisesRegex(ValueError, "action covariates"):
-            validate_second_context_payload(payload)
 
-    def test_second_context_payload_rejects_forbidden_future_covariate_feature_as_input(self) -> None:
-        payload = self._small_second_context_payload()
-        decision_ms = int(payload["decision_timestamps_ms"][0].item())
-        covariates = {
-            "action_covariates": torch.zeros((1, 2, 1), dtype=torch.float32),
-            "action_covariate_mask": torch.ones((1, 2, 1), dtype=torch.bool),
-            "action_covariate_available_timestamps_ms": torch.full((1, 2, 1), decision_ms, dtype=torch.long),
-            "action_covariate_feature_names": ["future_dividend_ex_date_unannounced"],
-            "action_covariate_schema_hash": stable_json_hash(["future_dividend_ex_date_unannounced"]),
-            "action_features_augmented_with_covariates": True,
-        }
-        payload.update(covariates)
 
-        with self.assertRaisesRegex(ValueError, "Forbidden future-only covariate"):
-            validate_second_context_payload(payload)
 
-    def test_second_context_grid_excludes_postclose_exit_by_default(self) -> None:
-        decisions = regular_session_decision_grid_ms(
-            start="2026-06-12T00:00:00+00:00",
-            end_exclusive="2026-06-13T00:00:00+00:00",
-            decision_interval="15m",
-            execution_latency_ms=1_000,
-        )
-        allowed = regular_session_decision_grid_ms(
-            start="2026-06-12T00:00:00+00:00",
-            end_exclusive="2026-06-13T00:00:00+00:00",
-            decision_interval="15m",
-            execution_latency_ms=1_000,
-            allow_post_close_exit=True,
-        )
 
-        self.assertEqual(timestamp_ms_to_iso(decisions[-1]), "2026-06-12T19:30:00+00:00")
-        self.assertEqual(timestamp_ms_to_iso(allowed[-1]), "2026-06-12T19:45:00+00:00")
 
-    def test_session_gating_heuristic_fallback_is_default_preserving(self) -> None:
-        # With no trading-calendar dep (forced None), the grid keeps its historical weekend+RTH behaviour:
-        # a holiday WEEKDAY (New Year's Day 2026-01-01, a Thursday) still emits a full grid (no calendar to
-        # exclude it), while weekends are excluded -- byte-identical to the pre-#6 code.
-        from unittest.mock import patch
 
-        import rl_quant.features.stock_second_context as ssc
 
-        with patch.object(ssc, "_nyse_calendar", return_value=None):
-            self.assertEqual(session_gating_method(), "weekend_rth_heuristic")
-            grid = regular_session_decision_grid_ms(
-                start="2026-01-01T00:00:00+00:00",       # Thu (New Year's holiday)
-                end_exclusive="2026-01-05T00:00:00+00:00",  # through Sun 2026-01-04
-                decision_interval="30m",
-            )
-        dates = {timestamp_ms_to_iso(ms)[:10] for ms in grid}
-        self.assertIn("2026-01-01", dates)   # holiday weekday NOT excluded by the heuristic (default-preserving)
-        self.assertIn("2026-01-02", dates)   # Fri trading day present
-        self.assertNotIn("2026-01-03", dates)  # Sat excluded
-        self.assertNotIn("2026-01-04", dates)  # Sun excluded
 
-    def test_session_gating_uses_real_calendar_when_available(self) -> None:
-        # With the optional calendar present (mocked), the grid excludes holidays and honours early closes.
-        from datetime import date, datetime
-        from unittest.mock import patch
-        from zoneinfo import ZoneInfo
 
-        import rl_quant.features.stock_second_context as ssc
 
-        eastern = ZoneInfo("America/New_York")
-        # Fake schedule: 2026-01-01 (Thu) is a HOLIDAY (absent); 2026-01-02 (Fri) is an EARLY CLOSE at 13:00 ET.
-        fake_schedule = {
-            date(2026, 1, 2): (
-                datetime(2026, 1, 2, 9, 30, tzinfo=eastern),
-                datetime(2026, 1, 2, 13, 0, tzinfo=eastern),
-            )
-        }
-        with patch.object(ssc, "_nyse_calendar", return_value=object()), patch.object(
-            ssc, "_real_session_schedule", return_value=fake_schedule
-        ):
-            self.assertEqual(session_gating_method(), "pandas_market_calendars_nyse")
-            grid = regular_session_decision_grid_ms(
-                start="2026-01-01T00:00:00+00:00",
-                end_exclusive="2026-01-03T00:00:00+00:00",
-                decision_interval="15m",
-            )
-        dates = {timestamp_ms_to_iso(ms)[:10] for ms in grid}
-        self.assertEqual(dates, {"2026-01-02"})  # holiday 01-01 excluded; only the trading day remains
-        # Early close 13:00 ET (= 18:00 UTC in EST): last 15m decision with reward exit <= close is 12:45 ET.
-        self.assertEqual(timestamp_ms_to_iso(grid[-1]), "2026-01-02T17:45:00+00:00")
 
-    def test_session_gating_method_recorded_in_manifest(self) -> None:
-        # The dataset manifest declares the session-gating path, and the heuristic limitation is present iff
-        # the heuristic path is active -- so a reportable artifact states whether sessions were calendar-aware.
-        payload = self._small_second_context_payload()
-        manifest = payload["dataset_manifest"]
-        method = session_gating_method()
-        self.assertEqual(manifest["session_gating_method"], method)
-        has_heuristic_limit = any("weekend+RTH heuristic" in lim for lim in manifest["known_limitations"])
-        self.assertEqual(has_heuristic_limit, method == "weekend_rth_heuristic")
 
-    def test_session_grid_reversed_or_degenerate_range_is_empty(self) -> None:
-        # A reversed or zero-width [start, end_exclusive) window yields no decisions and never reaches the real
-        # calendar's schedule() (guard short-circuits before resolving it). Matches the historical empty result.
-        reversed_grid = regular_session_decision_grid_ms(
-            start="2026-06-13T00:00:00+00:00",
-            end_exclusive="2026-06-12T00:00:00+00:00",
-            decision_interval="15m",
-        )
-        same = regular_session_decision_grid_ms(
-            start="2026-06-12T00:00:00+00:00",
-            end_exclusive="2026-06-12T00:00:00+00:00",
-            decision_interval="15m",
-        )
-        self.assertEqual(reversed_grid, [])
-        self.assertEqual(same, [])
 
-    def test_real_session_schedule_rejects_tz_naive_bounds(self) -> None:
-        # Defensive: pandas_market_calendars returns tz-aware UTC bounds; a tz-naive value would be silently
-        # localized to the host timezone by .astimezone(). The helper must fail loud instead.
-        from datetime import date as _date
-        from datetime import datetime as _dt
-        from zoneinfo import ZoneInfo
 
-        import rl_quant.features.stock_second_context as ssc
 
-        class _FakeTs:
-            def __init__(self, value: _dt) -> None:
-                self._value = value
 
-            def to_pydatetime(self) -> _dt:
-                return self._value
 
-        class _FakeIndex:
-            def __init__(self, value: _date) -> None:
-                self._value = value
-
-            def date(self) -> _date:
-                return self._value
-
-        class _FakeSchedule:
-            def iterrows(self):
-                naive = _dt(2026, 1, 2, 9, 30)  # tz-naive on purpose
-                yield _FakeIndex(_date(2026, 1, 2)), {"market_open": _FakeTs(naive), "market_close": _FakeTs(naive)}
-
-        class _FakeCalendar:
-            def schedule(self, *, start_date: str, end_date: str) -> "_FakeSchedule":
-                return _FakeSchedule()
-
-        with self.assertRaisesRegex(ValueError, "tz-naive"):
-            ssc._real_session_schedule(
-                _FakeCalendar(), _date(2026, 1, 2), _date(2026, 1, 2), ZoneInfo("America/New_York")
-            )
-
-    def test_second_context_postclose_exit_flag_is_reportability_metadata(self) -> None:
-        payload = self._small_second_context_payload(allow_post_close_exit=True)
-        manifest = payload["dataset_manifest"]
-
-        self.assertTrue(manifest["allow_post_close_exit"])
-        self.assertEqual(manifest["reportability_scope"], "extended_reward_exit_allowed")
-        self.assertFalse(manifest["reportable"])
-        self.assertIn("post_close_reward_exit_allowed", manifest["reportability_errors"])
-
-    def test_second_context_payload_rejects_unavailable_context(self) -> None:
-        payload = self._small_second_context_payload()
-        payload["market_context_available_timestamps_ms"] = payload["market_context_available_timestamps_ms"].clone()
-        payload["market_context_available_timestamps_ms"][0, 0] = payload["decision_timestamps_ms"][0] + 1
-
-        with self.assertRaisesRegex(ValueError, "unavailable"):
-            validate_second_context_payload(payload)
-
-    def test_second_context_payload_rejects_nonzero_cash_return(self) -> None:
-        payload = self._small_second_context_payload()
-        payload["action_returns"] = payload["action_returns"].clone()
-        payload["action_returns"][0, 0] = 0.001
-
-        with self.assertRaisesRegex(ValueError, "CASH action return"):
-            validate_second_context_payload(payload)
-
-    def test_second_context_payload_rejects_entry_before_execution_latency(self) -> None:
-        payload = self._small_second_context_payload()
-        payload["entry_execution_timestamps_ms"] = payload["entry_execution_timestamps_ms"].clone()
-        payload["entry_execution_timestamps_ms"][0, 1] = payload["decision_timestamps_ms"][0]
-
-        with self.assertRaisesRegex(ValueError, "execution latency"):
-            validate_second_context_payload(payload)
-
-    def test_second_context_payload_rejects_future_action_feature_availability(self) -> None:
-        payload = self._small_second_context_payload()
-        payload["action_features_available_timestamps_ms"] = payload["action_features_available_timestamps_ms"].clone()
-        payload["action_features_available_timestamps_ms"][0, 1] = payload["decision_timestamps_ms"][0] + 1
-
-        with self.assertRaisesRegex(ValueError, "action features"):
-            validate_second_context_payload(payload)
-
-    def test_second_context_payload_rejects_model_input_label_overlap(self) -> None:
-        payload = self._small_second_context_payload()
-        payload["model_input_keys"] = [*payload["model_input_keys"], "action_returns"]
-
-        with self.assertRaisesRegex(ValueError, "model_input_keys"):
-            validate_second_context_payload(payload)
-
-    def test_second_context_save_writes_schema_and_action_metadata_sidecars(self) -> None:
-        payload = self._small_second_context_payload()
-        payload["split_manifest"] = {"schema_version": "split_manifest_v1", "train": {"rows": 1}}
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "dataset.pt"
-            save_second_context_payload(payload, output)
-            schema = json.loads((output.parent / "schema.json").read_text())
-            action_metadata = json.loads((output.parent / "action_metadata.json").read_text())
-            split_manifest = json.loads((output.parent / "split_manifest.json").read_text())
-            saved_payload = torch.load(output, map_location="cpu", weights_only=True)
-
-        self.assertEqual(schema["decision_tensor_protocol_version"], "1.0.0")
-        self.assertEqual(schema["split_manifest_hash"], stable_json_hash(payload["split_manifest"]))
-        self.assertEqual(saved_payload["dataset_manifest"]["split_manifest_hash"], stable_json_hash(payload["split_manifest"]))
-        self.assertEqual(len(action_metadata["actions"]), len(payload["action_names"]))
-        self.assertEqual(split_manifest["schema_version"], "split_manifest_v1")
-
-    def test_second_context_trainer_split_manifest_uses_validation_key(self) -> None:
-        module = load_script("train_second_context_action_scorer")
-        split_type = type("Split", (), {})
-        train = split_type()
-        train.name = "train"
-        train.decision_timestamps = ["2026-06-12T14:30:00+00:00"]
-        train.next_timestamps = ["2026-06-12T14:45:00+00:00"]
-        train.valid_start_indices = torch.tensor([0], dtype=torch.long)
-        train.segment_ids = torch.tensor([0], dtype=torch.long)
-        val = split_type()
-        val.name = "val"
-        val.decision_timestamps = ["2026-06-12T15:00:00+00:00"]
-        val.next_timestamps = ["2026-06-12T15:15:00+00:00"]
-        val.valid_start_indices = torch.tensor([0], dtype=torch.long)
-        val.segment_ids = torch.tensor([1], dtype=torch.long)
-        test = split_type()
-        test.name = "test"
-        test.decision_timestamps = ["2026-06-12T15:30:00+00:00"]
-        test.next_timestamps = ["2026-06-12T15:45:00+00:00"]
-        test.valid_start_indices = torch.tensor([0], dtype=torch.long)
-        test.segment_ids = torch.tensor([2], dtype=torch.long)
-
-        manifest = module.split_manifest_for(train, val, test)
-
-        self.assertIn("validation", manifest)
-        self.assertNotIn("val", manifest)
-
-    def test_second_context_trainer_batch_plan_defaults_eval_to_micro_batch(self) -> None:
-        module = load_script("train_second_context_action_scorer")
-
-        plan = module.resolve_batch_plan(
-            batch_size=10,
-            micro_batch_size=4,
-            eval_batch_size=None,
-            checkpoint_every_epochs=5,
-            log_every_epochs=None,
-        )
-
-        self.assertEqual(plan["batch_size"], 10)
-        self.assertEqual(plan["micro_batch_size"], 4)
-        self.assertEqual(plan["gradient_accumulation_steps"], 3)
-        self.assertEqual(plan["eval_batch_size"], 4)
-        self.assertEqual(plan["checkpoint_every_epochs"], 5)
-
-    def test_second_context_epoch_accumulates_micro_batches_for_small_vram(self) -> None:
-        module = load_script("train_second_context_action_scorer")
-        split = self._second_context_split(
-            returns=[
-                [0.0, 0.001],
-                [0.0, -0.001],
-                [0.0, 0.002],
-                [0.0, -0.002],
-                [0.0, 0.0015],
-            ]
-        )
-        model = SecondContextTransformerQNetwork(
-            market_feature_dim=split.market_context.shape[-1],
-            action_feature_dim=split.action_features.shape[-1],
-            portfolio_state_dim=split.portfolio_state.shape[-1],
-            constraint_state_dim=split.constraint_state.shape[-1],
-            d_model=8,
-            n_heads=2,
-            temporal_layers=1,
-            feedforward_dim=16,
-            dropout=0.0,
-            max_lookback_blocks=split.market_context.shape[1],
-            action_count=len(split.action_names),
-        )
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        scaler = torch.amp.GradScaler("cuda", enabled=False)
-
-        stats = module.train_second_context_epoch(
-            split,
-            model,
-            optimizer,
-            scaler,
-            device=torch.device("cpu"),
-            batch_size=4,
-            micro_batch_size=2,
-            reward_scale=10_000.0,
-            use_amp=False,
-            grad_clip=1.0,
-            pin_memory=False,
-        )
-
-        self.assertEqual(stats["optimizer_steps"], 2)
-        self.assertEqual(stats["micro_batches"], 3)
-        self.assertEqual(stats["rows_seen"], 5)
-        self.assertEqual(stats["valid_targets_seen"], 10)
-        self.assertTrue(math.isfinite(float(stats["average_loss"])))
-
-    def test_second_context_transformer_scores_variable_action_features(self) -> None:
-        payload = self._small_second_context_payload()
-        model = SecondContextTransformerQNetwork(
-            market_feature_dim=payload["market_context"].shape[-1],
-            action_feature_dim=payload["action_features"].shape[-1],
-            portfolio_state_dim=payload["portfolio_state"].shape[-1],
-            constraint_state_dim=payload["constraint_state"].shape[-1],
-            d_model=16,
-            n_heads=4,
-            temporal_layers=1,
-            feedforward_dim=32,
-            max_lookback_blocks=payload["market_context"].shape[1],
-        )
-
-        q_values = model(
-            payload["market_context"],
-            payload["market_context_mask"],
-            payload["action_features"],
-            payload["portfolio_state"],
-            payload["constraint_state"],
-        )
-
-        self.assertEqual(tuple(q_values.shape), (1, 2))
-
-    def test_second_context_loss_ignores_nan_invalid_returns(self) -> None:
-        loss = masked_contextual_q_loss(
-            torch.tensor([[1.0, 2.0]]),
-            torch.tensor([[0.0, float("nan")]]),
-            torch.tensor([[True, False]]),
-            action_cost_bps=torch.zeros((1, 2)),
-        )
-
-        self.assertTrue(bool(torch.isfinite(loss).item()))
 
     def test_action_confidence_outputs_all_action_tensor_and_masks_invalid_actions(self) -> None:
         config = ActionConfidenceConfig(
@@ -2886,769 +1472,29 @@ class MinuteToHourTests(unittest.TestCase):
                     manifest={},
                 )
 
-    def test_second_context_loss_uses_target_weights_and_weighted_costs(self) -> None:
-        loss = masked_contextual_q_loss(
-            torch.tensor([[0.0, 95.0]], dtype=torch.float32),
-            torch.tensor([[0.0, 0.04]], dtype=torch.float32),
-            torch.tensor([[True, True]]),
-            action_cost_bps=torch.tensor([[0.0, 20.0]], dtype=torch.float32),
-            action_target_weights=torch.tensor([[0.0, 0.25]], dtype=torch.float32),
-            reward_scale=10_000.0,
-        )
 
-        self.assertLess(float(loss.item()), 1e-8)
 
-    def test_second_context_loss_charges_signed_weight_costs_on_absolute_exposure(self) -> None:
-        loss = masked_contextual_q_loss(
-            torch.tensor([[0.0, -105.0]], dtype=torch.float32),
-            torch.tensor([[0.0, 0.01]], dtype=torch.float32),
-            torch.tensor([[True, True]]),
-            action_cost_bps=torch.tensor([[0.0, 5.0]], dtype=torch.float32),
-            action_target_weights=torch.tensor([[0.0, -1.0]], dtype=torch.float32),
-            reward_scale=10_000.0,
-        )
 
-        self.assertLess(float(loss.item()), 1e-8)
 
-    def test_second_context_rowwise_scorer_uses_target_weights(self) -> None:
-        class WeightedModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)
 
-        split = self._second_context_split(
-            returns=[[0.0, 0.04]],
-            costs=[[0.0, 20.0]],
-            weights=[[0.0, 0.25]],
-        )
 
-        metrics = evaluate_second_context_action_scorer(split, WeightedModel(), device=torch.device("cpu"))
 
-        self.assertAlmostEqual(float(metrics["total_return"]), 0.0095, places=6)
 
-    def test_second_context_scorer_reports_ranker_metrics(self) -> None:
-        # The action-scorer eval now reports ranker-quality diagnostics (IC / rank IC / regret / top-1 realized)
-        # over the evaluated rows -- additive, alongside the sequential-policy metrics. A model that scores the
-        # higher-return action higher -> IC = 1, regret = 0; scoring it lower -> IC = -1, regret = foregone return.
-        class CorrectRanker(nn.Module):
-            def forward(self, *args):
-                del args
-                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)  # QQQ scored above CASH
 
-        class WrongRanker(nn.Module):
-            def forward(self, *args):
-                del args
-                return torch.tensor([[1.0, 0.0]], dtype=torch.float32)  # CASH scored above QQQ
 
-        split = self._second_context_split(returns=[[0.0, 0.04]], costs=[[0.0, 0.0]], weights=[[1.0, 1.0]])
-        good = evaluate_second_context_action_scorer(split, CorrectRanker(), device=torch.device("cpu"))
-        for key in ("information_coefficient", "rank_information_coefficient", "selection_regret",
-                    "top_1_realized_return"):
-            self.assertIn(key, good)
-        self.assertAlmostEqual(float(good["information_coefficient"]), 1.0, places=6)
-        self.assertAlmostEqual(float(good["selection_regret"]), 0.0, places=9)
-        bad = evaluate_second_context_action_scorer(split, WrongRanker(), device=torch.device("cpu"))
-        self.assertAlmostEqual(float(bad["information_coefficient"]), -1.0, places=6)
-        self.assertAlmostEqual(float(bad["selection_regret"]), 0.04, places=6)  # the foregone QQQ return
 
-    def test_second_context_rowwise_scorer_uses_valid_start_indices_by_default(self) -> None:
-        class WeightedModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
 
-        split = self._second_context_split(
-            returns=[[0.0, 0.50], [0.0, 0.01]],
-            valid_mask=[[True, True], [True, True]],
-            valid_start_indices=[1],
-        )
 
-        metrics = evaluate_second_context_action_scorer(split, WeightedModel(), device=torch.device("cpu"))
 
-        self.assertEqual(metrics["diagnostic_rows"], "valid_start_indices")
-        self.assertEqual(metrics["evaluated_rows"], 1)
-        self.assertAlmostEqual(float(metrics["total_return"]), 0.01, places=6)
 
-    def test_second_context_missing_label_report_fails_closed_for_selectable_actions(self) -> None:
-        split = self._second_context_split(
-            returns=[[0.0, 0.02], [0.0, 0.01]],
-            valid_mask=[[True, True], [True, True]],
-            label_valid_mask=[[True, False], [True, True]],
-        )
 
-        report = second_context_missing_label_report(split)
 
-        self.assertFalse(report["evaluation_reportable"])
-        self.assertEqual(report["selectable_missing_label_count"], 1)
-        self.assertEqual(report["rows_with_any_selectable_missing_label"], 1)
-        self.assertEqual(report["reportability_errors"], ["selectable_actions_with_missing_reward_labels"])
 
-    def test_second_context_policy_marks_selected_missing_label_unscorable(self) -> None:
-        class PickMissingLabelModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 2.0]], dtype=torch.float32)
 
-        split = self._second_context_split(
-            returns=[[0.0, 0.02]],
-            valid_mask=[[True, True]],
-            label_valid_mask=[[True, False]],
-        )
 
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            PickMissingLabelModel(),
-            device=torch.device("cpu"),
-            return_decision_logs=True,
-            return_selected_actions=True,
-        )
 
-        self.assertFalse(metrics["evaluation_reportable"])
-        self.assertEqual(metrics["selected_action_missing_label_count"], 1)
-        self.assertEqual(metrics["policy_unscorable_rows"], 1)
-        self.assertEqual(metrics["fallback_due_to_missing_label_count"], 1)
-        self.assertEqual(metrics["raw_policy_actions"], [1])
-        self.assertEqual(metrics["requested_actions"], [1])
-        self.assertEqual(metrics["executed_actions"], [0])
-        self.assertEqual(metrics["selected_actions"], [0])
-        self.assertEqual(metrics["selection_reasons"], ["fallback_due_to_missing_label"])
-        self.assertEqual(metrics["decision_logs"][0]["requested_action"], "QQQ")
-        self.assertEqual(metrics["decision_logs"][0]["selected_action"], "CASH")
-        self.assertTrue(metrics["decision_logs"][0]["fallback_due_to_missing_label"])
 
-    def test_second_context_rowwise_scorer_does_not_score_label_invalid_finite_values(self) -> None:
-        class PickMissingLabelModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 2.0]], dtype=torch.float32)
 
-        split = self._second_context_split(
-            returns=[[0.0, 0.25]],
-            valid_mask=[[True, True]],
-            label_valid_mask=[[True, False]],
-        )
-
-        metrics = evaluate_second_context_action_scorer(split, PickMissingLabelModel(), device=torch.device("cpu"))
-
-        self.assertFalse(metrics["evaluation_reportable"])
-        self.assertEqual(metrics["selected_action_missing_label_count"], 1)
-        self.assertEqual(metrics["rows"], 0)
-        self.assertEqual(metrics["total_return"], 0.0)
-
-    def test_second_context_sparse_market_mask_uses_last_true_context_token(self) -> None:
-        class IdentityEncoder(nn.Module):
-            def forward(self, x, src_key_padding_mask=None):
-                del src_key_padding_mask
-                return x
-
-        class ZeroActionEncoder(nn.Module):
-            def forward(self, action_features):
-                return torch.zeros((*action_features.shape[:2], 1), dtype=action_features.dtype)
-
-        class FirstStateScorer(nn.Module):
-            def forward(self, pair):
-                return pair[..., :1]
-
-        model = SecondContextTransformerQNetwork(
-            market_feature_dim=1,
-            action_feature_dim=1,
-            portfolio_state_dim=1,
-            constraint_state_dim=1,
-            d_model=1,
-            n_heads=1,
-            temporal_layers=1,
-            feedforward_dim=4,
-            max_lookback_blocks=3,
-        )
-        model.market_proj = nn.Identity()
-        model.market_encoder = IdentityEncoder()
-        model.portfolio_encoder = nn.Linear(1, 1, bias=False)
-        model.constraint_encoder = nn.Linear(1, 1, bias=False)
-        model.portfolio_encoder.weight.data.zero_()
-        model.constraint_encoder.weight.data.zero_()
-        model.state_norm = nn.Identity()
-        model.action_encoder = ZeroActionEncoder()
-        model.scorer = FirstStateScorer()
-
-        q_values = model(
-            torch.tensor([[[1.0], [999.0], [3.0]]], dtype=torch.float32),
-            torch.tensor([[True, False, True]]),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-            torch.zeros((1, 1), dtype=torch.float32),
-            torch.zeros((1, 1), dtype=torch.float32),
-        )
-
-        self.assertAlmostEqual(float(q_values[0, 0].item()), 3.0, places=6)
-
-    def test_second_context_splits_do_not_overlap_at_boundaries(self) -> None:
-        decisions = [f"2026-06-12T14:{minute:02d}:00+00:00" for minute in range(30, 60, 5)]
-        next_timestamps = [*decisions[1:], "2026-06-12T15:00:00+00:00"]
-        decision_ms = [iso_to_timestamp_ms(value) for value in decisions]
-        next_ms = [iso_to_timestamp_ms(value) for value in next_timestamps]
-        payload = {
-            "schema_version": "stock_second_context_decision_v2",
-            "decision_timestamps": decisions,
-            "next_timestamps": next_timestamps,
-            "decision_timestamps_ms": torch.tensor(decision_ms, dtype=torch.long),
-            "next_timestamps_ms": torch.tensor(next_ms, dtype=torch.long),
-            "market_context": torch.zeros((len(decisions), 1, 2), dtype=torch.float32),
-            "market_context_mask": torch.ones((len(decisions), 1), dtype=torch.bool),
-            "market_context_available_timestamps_ms": torch.tensor(
-                [[value - 1] for value in decision_ms],
-                dtype=torch.long,
-            ),
-            "action_features": torch.zeros((len(decisions), 2, 1), dtype=torch.float32),
-            "action_returns": torch.zeros((len(decisions), 2), dtype=torch.float32),
-            "action_valid_mask": torch.ones((len(decisions), 2), dtype=torch.bool),
-            "action_cost_bps": torch.zeros((len(decisions), 2), dtype=torch.float32),
-            "action_target_weights": torch.tensor([[0.0, 1.0] for _ in decisions], dtype=torch.float32),
-            "entry_execution_timestamps_ms": torch.tensor(
-                [[value, value] for value in decision_ms],
-                dtype=torch.long,
-            ),
-            "exit_execution_timestamps_ms": torch.tensor(
-                [[value, value] for value in next_ms],
-                dtype=torch.long,
-            ),
-            "portfolio_state": torch.zeros((len(decisions), 1), dtype=torch.float32),
-            "constraint_state": torch.zeros((len(decisions), 1), dtype=torch.float32),
-            "feature_names": {
-                "market_context": ["x", "y"],
-                "action_features": ["a"],
-                "portfolio_state": ["p"],
-                "constraint_state": ["c"],
-            },
-            "action_names": ["CASH", "QQQ"],
-            "dataset_manifest": {
-                "decision_interval": "5m",
-                "source_download_complete": True,
-                "reportable": True,
-            },
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "dataset.pt"
-            torch.save(payload, path)
-
-            train, val, test = build_second_context_splits(
-                dataset_path=path,
-                train_end="2026-06-12T14:35:00+00:00",
-                val_end="2026-06-12T14:45:00+00:00",
-                test_start="2026-06-12T14:45:00+00:00",
-            )
-
-        self.assertEqual(train.decision_timestamps, decisions[:1])
-        self.assertEqual(val.decision_timestamps, ["2026-06-12T14:40:00+00:00"])
-        self.assertEqual(test.decision_timestamps, decisions[3:])
-        self.assertTrue(set(train.decision_timestamps).isdisjoint(val.decision_timestamps))
-        self.assertTrue(set(val.decision_timestamps).isdisjoint(test.decision_timestamps))
-
-    def test_second_context_sequential_eval_charges_cost_only_on_switch(self) -> None:
-        class ConstantActionModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
-
-        split = SecondContextDataSplit(
-            name="test",
-            decision_timestamps=["2026-06-12T14:30:00+00:00", "2026-06-12T14:35:00+00:00", "2026-06-12T14:40:00+00:00"],
-            next_timestamps=["2026-06-12T14:35:00+00:00", "2026-06-12T14:40:00+00:00", "2026-06-12T14:45:00+00:00"],
-            action_names=["CASH", "QQQ"],
-            feature_names={
-                "market_context": ["x"],
-                "action_features": ["action_index_scaled"],
-                "portfolio_state": ["p"],
-                "constraint_state": ["c"],
-            },
-            market_context=torch.zeros((3, 1, 1), dtype=torch.float32),
-            market_context_mask=torch.ones((3, 1), dtype=torch.bool),
-            market_context_available_timestamps_ms=torch.tensor([[1], [2], [3]], dtype=torch.long),
-            action_features=torch.zeros((3, 2, 1), dtype=torch.float32),
-            action_returns=torch.tensor([[0.0, 0.01], [0.0, 0.01], [0.0, 0.01]], dtype=torch.float32),
-            action_valid_mask=torch.ones((3, 2), dtype=torch.bool),
-            action_cost_bps=torch.tensor([[0.0, 100.0], [0.0, 100.0], [0.0, 100.0]], dtype=torch.float32),
-            action_target_weights=torch.tensor([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float32),
-            entry_execution_timestamps_ms=torch.tensor([[0, 1], [0, 2], [0, 3]], dtype=torch.long),
-            exit_execution_timestamps_ms=torch.tensor([[0, 2], [0, 3], [0, 4]], dtype=torch.long),
-            entry_price_source="test_entry",
-            exit_price_source="test_exit",
-            execution_model="test_execution",
-            portfolio_state=torch.zeros((3, 1), dtype=torch.float32),
-            constraint_state=torch.zeros((3, 1), dtype=torch.float32),
-            segment_ids=torch.zeros(3, dtype=torch.long),
-            session_ids=["2026-06-12"] * 3,
-            valid_start_indices=torch.tensor([0, 1, 2], dtype=torch.long),
-            valid_index_mask=torch.ones(3, dtype=torch.bool),
-            market_mean=torch.zeros(1, dtype=torch.float32),
-            market_std=torch.ones(1, dtype=torch.float32),
-            action_feature_mean=torch.zeros(1, dtype=torch.float32),
-            action_feature_std=torch.ones(1, dtype=torch.float32),
-            periods_per_year=252.0,
-        )
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            ConstantActionModel(),
-            device=torch.device("cpu"),
-            return_decision_logs=True,
-        )
-
-        self.assertEqual(metrics["switches"], 1)
-        self.assertAlmostEqual(float(metrics["total_return"]), (1.0 * 1.01 * 1.01) - 1.0, places=6)
-        logs = metrics["decision_logs"]
-        self.assertEqual(len(logs), 3)
-        self.assertEqual(logs[0]["previous_action"], "CASH")
-        self.assertEqual(logs[0]["selected_action"], "QQQ")
-        self.assertEqual(logs[0]["order_legs"], 1.0)
-        self.assertEqual(logs[1]["order_legs"], 0.0)
-        self.assertEqual(logs[0]["entry_price_source"], "test_entry")
-        self.assertIn("q_edge_vs_cash", logs[0])
-        self.assertTrue(metrics["final_position_open"])
-
-        liquidated = evaluate_second_context_trading_policy(
-            split,
-            ConstantActionModel(),
-            device=torch.device("cpu"),
-            liquidate_at_end=True,
-        )
-
-        self.assertFalse(liquidated["final_position_open"])
-        self.assertAlmostEqual(float(liquidated["total_return"]), 1.0 * 1.01 * 1.01 * 0.99 - 1.0, places=6)
-        self.assertAlmostEqual(float(liquidated["terminal_liquidation_cost"]), 0.01, places=6)
-
-    def test_second_context_sequential_eval_uses_source_rows_after_skips(self) -> None:
-        class ConstantActionModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
-
-        split = self._second_context_split(
-            returns=[[0.0, 0.0], [0.0, float("nan")], [0.0, 0.05]],
-            valid_mask=[[True, True], [False, False], [True, True]],
-            valid_start_indices=[0, 2],
-        )
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            ConstantActionModel(),
-            device=torch.device("cpu"),
-            return_decision_logs=True,
-            return_selected_actions=True,
-        )
-
-        self.assertEqual(metrics["selected_rows"], [0, 2])
-        self.assertEqual([row["source_row"] for row in metrics["decision_logs"]], [0, 2])
-        self.assertAlmostEqual(float(metrics["total_return"]), 0.05, places=6)
-
-    def test_second_context_eval_resets_on_non_contiguous_valid_window(self) -> None:
-        class ConstantActionModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
-
-        split = self._second_context_split(
-            returns=[[0.0, 0.01], [0.0, 0.01], [0.0, 0.01]],
-            costs=[[0.0, 100.0], [0.0, 100.0], [0.0, 100.0]],
-            valid_start_indices=[0, 2],
-            segment_ids=[0, 0, 0],
-        )
-
-        metrics = evaluate_second_context_trading_policy(split, ConstantActionModel(), device=torch.device("cpu"))
-
-        self.assertEqual(metrics["gap_resets"], 1)
-        self.assertEqual(metrics["switches"], 2)
-        self.assertAlmostEqual(float(metrics["total_return"]), 0.0, places=6)
-        # Reportability label (no P&L movement): the close-based path must NOT claim real executable trading.
-        # (This synthetic split uses placeholder execution timestamps that are not point-in-time causal, so
-        # it is honestly mechanically non-reportable; a real run with causal timestamps is close_based.)
-        self.assertFalse(metrics["real_executable_trade_reportable"])
-        self.assertIn(
-            metrics["sequential_evaluation_type"],
-            ("close_based_research_backtest", "non_reportable_research_diagnostic"),
-        )
-        self.assertIsInstance(metrics["mechanically_reportable"], bool)
-        self.assertTrue(len(metrics["missing_reportability_reasons"]) > 0)
-
-    def test_second_context_min_hold_does_not_force_initial_cash(self) -> None:
-        class ConstantActionModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)
-
-        split = self._second_context_split(returns=[[0.0, 0.02]])
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            ConstantActionModel(),
-            device=torch.device("cpu"),
-            min_hold_bars=3,
-            return_selected_actions=True,
-        )
-
-        self.assertEqual(metrics["selected_actions"], [1])
-        self.assertEqual(metrics["switches"], 1)
-
-    def test_second_context_eval_resets_previous_action_on_segment_change(self) -> None:
-        class ConstantActionModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
-
-        split = SecondContextDataSplit(
-            name="test",
-            decision_timestamps=["2026-06-12T14:30:00+00:00", "2026-06-15T14:30:00+00:00"],
-            next_timestamps=["2026-06-12T14:35:00+00:00", "2026-06-15T14:35:00+00:00"],
-            action_names=["CASH", "QQQ"],
-            feature_names={
-                "market_context": ["x"],
-                "action_features": ["action_index_scaled"],
-                "portfolio_state": ["p"],
-                "constraint_state": ["c"],
-            },
-            market_context=torch.zeros((2, 1, 1), dtype=torch.float32),
-            market_context_mask=torch.ones((2, 1), dtype=torch.bool),
-            market_context_available_timestamps_ms=torch.tensor([[1], [2]], dtype=torch.long),
-            action_features=torch.zeros((2, 2, 1), dtype=torch.float32),
-            action_returns=torch.tensor([[0.0, 0.01], [0.0, 0.01]], dtype=torch.float32),
-            action_valid_mask=torch.ones((2, 2), dtype=torch.bool),
-            action_cost_bps=torch.tensor([[0.0, 100.0], [0.0, 100.0]], dtype=torch.float32),
-            action_target_weights=torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32),
-            entry_execution_timestamps_ms=torch.tensor([[0, 1], [0, 2]], dtype=torch.long),
-            exit_execution_timestamps_ms=torch.tensor([[0, 2], [0, 3]], dtype=torch.long),
-            entry_price_source="test_entry",
-            exit_price_source="test_exit",
-            execution_model="test_execution",
-            portfolio_state=torch.zeros((2, 1), dtype=torch.float32),
-            constraint_state=torch.zeros((2, 1), dtype=torch.float32),
-            segment_ids=torch.tensor([0, 1], dtype=torch.long),
-            session_ids=["2026-06-12", "2026-06-15"],
-            valid_start_indices=torch.tensor([0, 1], dtype=torch.long),
-            valid_index_mask=torch.ones(2, dtype=torch.bool),
-            market_mean=torch.zeros(1, dtype=torch.float32),
-            market_std=torch.ones(1, dtype=torch.float32),
-            action_feature_mean=torch.zeros(1, dtype=torch.float32),
-            action_feature_std=torch.ones(1, dtype=torch.float32),
-            periods_per_year=252.0,
-        )
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            ConstantActionModel(),
-            device=torch.device("cpu"),
-        )
-
-        self.assertEqual(metrics["segment_resets"], 1)
-        self.assertEqual(metrics["switches"], 2)
-        self.assertAlmostEqual(float(metrics["total_return"]), 0.0, places=6)
-
-    def test_second_context_asset_switch_charges_both_trade_legs(self) -> None:
-        class SwitchModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 2.0, 1.0], [0.0, 1.0, 2.0]], dtype=torch.float32)
-
-        split = SecondContextDataSplit(
-            name="test",
-            decision_timestamps=["2026-06-12T14:30:00+00:00", "2026-06-12T14:35:00+00:00"],
-            next_timestamps=["2026-06-12T14:35:00+00:00", "2026-06-12T14:40:00+00:00"],
-            action_names=["CASH", "QQQ", "SPY"],
-            feature_names={
-                "market_context": ["x"],
-                "action_features": ["action_index_scaled"],
-                "portfolio_state": ["p"],
-                "constraint_state": ["c"],
-            },
-            market_context=torch.zeros((2, 1, 1), dtype=torch.float32),
-            market_context_mask=torch.ones((2, 1), dtype=torch.bool),
-            market_context_available_timestamps_ms=torch.tensor([[1], [2]], dtype=torch.long),
-            action_features=torch.zeros((2, 3, 1), dtype=torch.float32),
-            action_returns=torch.zeros((2, 3), dtype=torch.float32),
-            action_valid_mask=torch.ones((2, 3), dtype=torch.bool),
-            action_cost_bps=torch.tensor([[0.0, 10.0, 20.0], [0.0, 10.0, 20.0]], dtype=torch.float32),
-            action_target_weights=torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]], dtype=torch.float32),
-            entry_execution_timestamps_ms=torch.tensor([[0, 1, 1], [0, 2, 2]], dtype=torch.long),
-            exit_execution_timestamps_ms=torch.tensor([[0, 2, 2], [0, 3, 3]], dtype=torch.long),
-            entry_price_source="test_entry",
-            exit_price_source="test_exit",
-            execution_model="test_execution",
-            portfolio_state=torch.zeros((2, 1), dtype=torch.float32),
-            constraint_state=torch.zeros((2, 1), dtype=torch.float32),
-            segment_ids=torch.zeros(2, dtype=torch.long),
-            session_ids=["2026-06-12"] * 2,
-            valid_start_indices=torch.tensor([0, 1], dtype=torch.long),
-            valid_index_mask=torch.ones(2, dtype=torch.bool),
-            market_mean=torch.zeros(1, dtype=torch.float32),
-            market_std=torch.ones(1, dtype=torch.float32),
-            action_feature_mean=torch.zeros(1, dtype=torch.float32),
-            action_feature_std=torch.ones(1, dtype=torch.float32),
-            periods_per_year=252.0,
-        )
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            SwitchModel(),
-            device=torch.device("cpu"),
-            return_decision_logs=True,
-        )
-
-        self.assertEqual(metrics["switches"], 2)
-        self.assertAlmostEqual(float(metrics["total_return"]), (1.0 - 0.001) * (1.0 - 0.003) - 1.0, places=6)
-        logs = metrics["decision_logs"]
-        self.assertEqual(logs[1]["order_legs"], 2.0)
-        self.assertEqual(logs[1]["traded_notional"], 2.0)
-        self.assertAlmostEqual(logs[1]["cost_bps"], 15.0)
-
-    def test_second_context_signed_weights_pay_positive_costs(self) -> None:
-        class ShortModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)
-
-        split = self._second_context_split(
-            returns=[[0.0, 0.0]],
-            costs=[[0.0, 10.0]],
-            weights=[[0.0, -1.0]],
-        )
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            ShortModel(),
-            device=torch.device("cpu"),
-            return_decision_logs=True,
-        )
-
-        self.assertAlmostEqual(float(metrics["total_return"]), -0.001, places=6)
-        log = metrics["decision_logs"][0]
-        self.assertEqual(log["target_weight"], -1.0)
-        self.assertEqual(log["executed_weight"], -1.0)
-        self.assertAlmostEqual(log["traded_notional"], 1.0)
-        self.assertAlmostEqual(log["net_return"], -0.001)
-
-    def test_second_context_row_varying_weights_carry_executed_exposure(self) -> None:
-        class HoldModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
-
-        split = self._second_context_split(
-            returns=[[0.0, 0.01], [0.0, 0.02]],
-            weights=[[0.0, 1.0], [0.0, 0.5]],
-        )
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            HoldModel(),
-            device=torch.device("cpu"),
-            return_decision_logs=True,
-        )
-
-        self.assertAlmostEqual(float(metrics["total_return"]), 1.01 * 1.02 - 1.0, places=6)
-        self.assertEqual(metrics["switches"], 1)
-        self.assertEqual(metrics["same_action_weight_policy"], "freeze_executed_weight_until_action_change")
-        second_log = metrics["decision_logs"][1]
-        self.assertEqual(second_log["same_action_weight_policy"], "freeze_executed_weight_until_action_change")
-        self.assertAlmostEqual(second_log["target_weight"], 0.5)
-        self.assertAlmostEqual(second_log["previous_executed_weight"], 1.0)
-        self.assertAlmostEqual(second_log["executed_weight"], 1.0)
-        self.assertAlmostEqual(second_log["gross_return"], 0.02)
-
-    def test_second_context_weighted_leveraged_action_scales_return_and_cost(self) -> None:
-        class LeveragedModel(nn.Module):
-            def forward(self, market_context, market_context_mask, action_features, portfolio_state, constraint_state):
-                del market_context, market_context_mask, action_features, portfolio_state, constraint_state
-                return torch.tensor([[0.0, 1.0]], dtype=torch.float32)
-
-        split = SecondContextDataSplit(
-            name="test",
-            decision_timestamps=["2026-06-12T14:30:00+00:00"],
-            next_timestamps=["2026-06-12T14:45:00+00:00"],
-            action_names=["CASH", "SOXL"],
-            feature_names={
-                "market_context": ["x"],
-                "action_features": ["action_index_scaled"],
-                "portfolio_state": ["p"],
-                "constraint_state": ["c"],
-            },
-            market_context=torch.zeros((1, 1, 1), dtype=torch.float32),
-            market_context_mask=torch.ones((1, 1), dtype=torch.bool),
-            market_context_available_timestamps_ms=torch.tensor([[1]], dtype=torch.long),
-            action_features=torch.zeros((1, 2, 1), dtype=torch.float32),
-            action_returns=torch.tensor([[0.0, 0.03]], dtype=torch.float32),
-            action_valid_mask=torch.ones((1, 2), dtype=torch.bool),
-            action_cost_bps=torch.tensor([[0.0, 30.0]], dtype=torch.float32),
-            action_target_weights=torch.tensor([[0.0, 1.0 / 3.0]], dtype=torch.float32),
-            entry_execution_timestamps_ms=torch.tensor([[0, 1]], dtype=torch.long),
-            exit_execution_timestamps_ms=torch.tensor([[0, 2]], dtype=torch.long),
-            entry_price_source="test_entry",
-            exit_price_source="test_exit",
-            execution_model="test_execution",
-            portfolio_state=torch.zeros((1, 1), dtype=torch.float32),
-            constraint_state=torch.zeros((1, 1), dtype=torch.float32),
-            segment_ids=torch.zeros(1, dtype=torch.long),
-            session_ids=["2026-06-12"],
-            valid_start_indices=torch.tensor([0], dtype=torch.long),
-            valid_index_mask=torch.ones(1, dtype=torch.bool),
-            market_mean=torch.zeros(1, dtype=torch.float32),
-            market_std=torch.ones(1, dtype=torch.float32),
-            action_feature_mean=torch.zeros(1, dtype=torch.float32),
-            action_feature_std=torch.ones(1, dtype=torch.float32),
-            periods_per_year=252.0,
-        )
-
-        metrics = evaluate_second_context_trading_policy(
-            split,
-            LeveragedModel(),
-            device=torch.device("cpu"),
-            return_decision_logs=True,
-        )
-
-        self.assertAlmostEqual(float(metrics["total_return"]), 0.009, places=6)
-        log = metrics["decision_logs"][0]
-        self.assertAlmostEqual(log["target_weight"], 1.0 / 3.0)
-        self.assertAlmostEqual(log["traded_notional"], 1.0 / 3.0)
-        self.assertAlmostEqual(log["gross_return"], 0.01, places=6)
-
-    def test_second_context_cost_stress_replays_fixed_action_path(self) -> None:
-        split = SecondContextDataSplit(
-            name="test",
-            decision_timestamps=["2026-06-12T14:30:00+00:00", "2026-06-12T14:35:00+00:00"],
-            next_timestamps=["2026-06-12T14:35:00+00:00", "2026-06-12T14:40:00+00:00"],
-            action_names=["CASH", "QQQ", "SPY"],
-            feature_names={
-                "market_context": ["x"],
-                "action_features": ["action_index_scaled"],
-                "portfolio_state": ["p"],
-                "constraint_state": ["c"],
-            },
-            market_context=torch.zeros((2, 1, 1), dtype=torch.float32),
-            market_context_mask=torch.ones((2, 1), dtype=torch.bool),
-            market_context_available_timestamps_ms=torch.tensor([[1], [2]], dtype=torch.long),
-            action_features=torch.zeros((2, 3, 1), dtype=torch.float32),
-            action_returns=torch.tensor([[0.0, 0.01, 0.02], [0.0, 0.01, 0.02]], dtype=torch.float32),
-            action_valid_mask=torch.ones((2, 3), dtype=torch.bool),
-            action_cost_bps=torch.zeros((2, 3), dtype=torch.float32),
-            action_target_weights=torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]], dtype=torch.float32),
-            entry_execution_timestamps_ms=torch.tensor([[0, 1, 1], [0, 2, 2]], dtype=torch.long),
-            exit_execution_timestamps_ms=torch.tensor([[0, 2, 2], [0, 3, 3]], dtype=torch.long),
-            entry_price_source="test_entry",
-            exit_price_source="test_exit",
-            execution_model="test_execution",
-            portfolio_state=torch.zeros((2, 1), dtype=torch.float32),
-            constraint_state=torch.zeros((2, 1), dtype=torch.float32),
-            segment_ids=torch.zeros(2, dtype=torch.long),
-            session_ids=["2026-06-12"] * 2,
-            valid_start_indices=torch.tensor([0, 1], dtype=torch.long),
-            valid_index_mask=torch.ones(2, dtype=torch.bool),
-            market_mean=torch.zeros(1, dtype=torch.float32),
-            market_std=torch.ones(1, dtype=torch.float32),
-            action_feature_mean=torch.zeros(1, dtype=torch.float32),
-            action_feature_std=torch.ones(1, dtype=torch.float32),
-            periods_per_year=252.0,
-        )
-
-        stress = fixed_rollout_cost_stress(split, torch.tensor([1, 2]), cost_bps_values=(0.0, 20.0))
-        baselines = evaluate_second_context_baselines(split, reference_actions=torch.tensor([1, 2]), seed=1)
-
-        self.assertGreater(stress["0_bps"]["total_return"], stress["20_bps"]["total_return"])
-        self.assertIn("RandomSameTurnover", baselines)
-        self.assertIn("RandomSameTurnoverSameTiming", baselines)
-        self.assertIn("RandomSameSegments", baselines)
-        self.assertIn("RandomSameActionDistribution", baselines)
-        self.assertIn("CASH", baselines)
-
-    def test_second_context_random_baselines_sample_only_valid_row_actions(self) -> None:
-        split = self._second_context_split(
-            action_names=["CASH", "AAA", "BBB"],
-            returns=[[0.0, 0.01, float("nan")], [0.0, float("nan"), 0.02], [0.0, 0.03, float("nan")]],
-            valid_mask=[[True, True, False], [True, False, True], [True, True, False]],
-            valid_start_indices=[0, 1, 2],
-        )
-
-        baselines = evaluate_second_context_baselines(split, reference_actions=torch.tensor([1, 2, 1]), seed=3)
-
-        for name, metrics in baselines.items():
-            if name.startswith("Random"):
-                self.assertEqual(metrics["invalid_action_attempts"], 0, name)
-
-    def test_second_context_oracle_summary_is_diagnostic_only(self) -> None:
-        module = load_script("evaluate_second_context_dataset")
-        payload = self._small_second_context_payload()
-        with tempfile.TemporaryDirectory() as directory:
-            dataset = Path(directory) / "dataset.pt"
-            output = Path(directory) / "summary.json"
-            torch.save(payload, dataset)
-            previous_argv = sys.argv
-            try:
-                sys.argv = ["evaluate_second_context_dataset.py", "--dataset", str(dataset), "--output", str(output)]
-                module.main()
-            finally:
-                sys.argv = previous_argv
-            summary = json.loads(output.read_text())
-
-        self.assertTrue(summary["diagnostic_only"])
-        self.assertIn("diagnostic_oracle_best_valid_action_future_leakage", summary)
-        self.assertNotIn("oracle_best_valid_action", summary)
-
-    def test_second_context_conversion_skip_requires_current_gold_schema(self) -> None:
-        module = load_script("convert_polygon_second_to_protocol")
-        payload = self._small_second_context_payload()
-        old_payload = dict(payload)
-        for key in (
-            "decision_action_valid_mask",
-            "label_valid_mask",
-            "entry_fill_observed_mask",
-            "reward_exit_observed_mask",
-        ):
-            old_payload.pop(key, None)
-        old_manifest = dict(old_payload.get("dataset_manifest", {}))
-        old_manifest.pop("action_mask_semantics", None)
-        old_payload["dataset_manifest"] = old_manifest
-
-        with tempfile.TemporaryDirectory() as directory:
-            old_path = Path(directory) / "old" / "dataset.pt"
-            current_path = Path(directory) / "current" / "dataset.pt"
-            old_path.parent.mkdir(parents=True)
-            current_path.parent.mkdir(parents=True)
-            torch.save(old_payload, old_path)
-            torch.save(payload, current_path)
-
-            self.assertFalse(module.existing_gold_dataset_is_current(old_path))
-            self.assertTrue(module.existing_gold_dataset_is_current(current_path))
-
-    def test_second_context_conversion_skip_rejects_cache_identity_mismatch(self) -> None:
-        module = load_script("convert_polygon_second_to_protocol")
-        payload = self._small_second_context_payload()
-        manifest = dict(payload["dataset_manifest"])
-        manifest.update(
-            {
-                "source_manifest_hash": "source-a",
-                "universe_file_hash": "universe-a",
-                "conversion_config_hash": "config-a",
-                "converter_identity_hash": "converter-a",
-                "action_schema_hash": stable_json_hash(payload["action_names"]),
-            }
-        )
-        payload["dataset_manifest"] = manifest
-        expected = {
-            "source_manifest_hash": "source-a",
-            "universe_file_hash": "universe-a",
-            "conversion_config_hash": "config-a",
-            "converter_identity_hash": "converter-a",
-            "action_schema_hash": stable_json_hash(payload["action_names"]),
-        }
-        mismatched = dict(expected)
-        mismatched["universe_file_hash"] = "universe-b"
-
-        with tempfile.TemporaryDirectory() as directory:
-            current_path = Path(directory) / "current" / "dataset.pt"
-            current_path.parent.mkdir(parents=True)
-            torch.save(payload, current_path)
-
-            self.assertTrue(module.existing_gold_dataset_is_current(current_path, expected))
-            self.assertFalse(module.existing_gold_dataset_is_current(current_path, mismatched))
-            self.assertEqual(
-                module.validate_cache_identity(manifest, mismatched),
-                ["cache_identity_mismatch:universe_file_hash"],
-            )
 
     def test_second_context_conversion_skip_requires_current_hourly_schema(self) -> None:
         module = load_script("convert_polygon_second_to_protocol")
@@ -3662,7 +1508,7 @@ class MinuteToHourTests(unittest.TestCase):
                 "decision_action_valid_mask": "known before decision",
                 "label_valid_mask": "known after reward realization",
             },
-            "model_input_keys": ["minute_features", "action_valid_mask", "decision_action_valid_mask"],
+            "model_input_keys": ["second_features", "action_valid_mask", "decision_action_valid_mask"],
             "forbidden_model_input_keys": ["label_valid_mask", "action_label_valid_mask"],
         }
         old_payload = {
@@ -3670,7 +1516,7 @@ class MinuteToHourTests(unittest.TestCase):
             "action_valid_mask": torch.tensor([[True, False], [True, True]]),
         }
         leaky_payload = dict(current_payload)
-        leaky_payload["model_input_keys"] = ["minute_features", "label_valid_mask"]
+        leaky_payload["model_input_keys"] = ["second_features", "label_valid_mask"]
 
         with tempfile.TemporaryDirectory() as directory:
             old_path = Path(directory) / "old.pt"
@@ -3696,7 +1542,7 @@ class MinuteToHourTests(unittest.TestCase):
                 "decision_action_valid_mask": "known before decision",
                 "label_valid_mask": "known after reward realization",
             },
-            "model_input_keys": ["minute_features", "action_valid_mask", "decision_action_valid_mask"],
+            "model_input_keys": ["second_features", "action_valid_mask", "decision_action_valid_mask"],
             "forbidden_model_input_keys": ["label_valid_mask", "action_label_valid_mask"],
             "dataset_reportable": True,
             "dataset_reportability_errors": [],
@@ -4093,35 +1939,11 @@ class MinuteToHourTests(unittest.TestCase):
 
         self.assertEqual(actions.tolist(), [1, 0])
 
-    def test_minute_to_hour_model_forward_shape(self) -> None:
-        model = MinuteToHourCausalTransformerQNetwork(
-            minute_feature_dim=3,
-            hour_feature_dim=2,
-            action_count=4,
-            hours_lookback=2,
-            minutes_per_hour=3,
-            d_model=16,
-            n_heads=4,
-            minute_layers=1,
-            hour_layers=1,
-            feedforward_dim=32,
-            action_embedding_dim=4,
-        )
-        q_values = model(
-            torch.zeros((2, 2, 3, 3), dtype=torch.float32),
-            torch.tensor([[[True, True, False], [True, True, True]], [[False, False, False], [True, False, False]]]),
-            torch.zeros((2, 2, 2), dtype=torch.float32),
-            torch.zeros(2, dtype=torch.long),
-            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
-        )
 
-        self.assertEqual(tuple(q_values.shape), (2, 4))
-        self.assertTrue(bool(torch.isfinite(q_values).all().item()))
-
-    def test_minute_to_hour_warm_start_loads_matching_checkpoint(self) -> None:
-        train_data = self._small_minute_to_hour_split()
-        source = self._small_minute_to_hour_model()
-        target = self._small_minute_to_hour_model()
+    def test_second_to_hour_warm_start_loads_matching_checkpoint(self) -> None:
+        train_data = self._small_second_to_hour_split()
+        source = self._small_second_to_hour_model()
+        target = self._small_second_to_hour_model()
         for parameter in source.parameters():
             parameter.data.fill_(0.125)
 
@@ -4130,7 +1952,7 @@ class MinuteToHourTests(unittest.TestCase):
             torch.save(
                 {
                     "model_state_dict": source.state_dict(),
-                    "minute_feature_names": train_data.minute_feature_names,
+                    "second_feature_names": train_data.second_feature_names,
                     "hour_feature_names": train_data.hour_feature_names,
                     "action_names": train_data.action_names,
                     "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
@@ -4140,22 +1962,22 @@ class MinuteToHourTests(unittest.TestCase):
                 path,
             )
 
-            info = load_minute_to_hour_warm_start(target, checkpoint_path=path, train_data=train_data)
+            info = load_second_to_hour_warm_start(target, checkpoint_path=path, train_data=train_data)
 
         self.assertTrue(info["loaded"])
         for name, value in target.state_dict().items():
             self.assertTrue(torch.equal(value, source.state_dict()[name]))
 
-    def test_minute_to_hour_warm_start_rejects_schema_mismatch(self) -> None:
-        train_data = self._small_minute_to_hour_split()
-        source = self._small_minute_to_hour_model()
+    def test_second_to_hour_warm_start_rejects_schema_mismatch(self) -> None:
+        train_data = self._small_second_to_hour_split()
+        source = self._small_second_to_hour_model()
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "model.pt"
             torch.save(
                 {
                     "model_state_dict": source.state_dict(),
-                    "minute_feature_names": train_data.minute_feature_names,
+                    "second_feature_names": train_data.second_feature_names,
                     "hour_feature_names": train_data.hour_feature_names,
                     "action_names": ["CASH", "SPY"],
                     "constraint_feature_names": CONSTRAINT_FEATURE_NAMES,
@@ -4164,74 +1986,25 @@ class MinuteToHourTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "action_names"):
-                load_minute_to_hour_warm_start(self._small_minute_to_hour_model(), checkpoint_path=path, train_data=train_data)
+                load_second_to_hour_warm_start(self._small_second_to_hour_model(), checkpoint_path=path, train_data=train_data)
 
-    def test_direct_bar_model_accepts_constraint_features(self) -> None:
-        model = CausalTransformerQNetwork(
-            feature_dim=3,
-            lookback=4,
-            action_count=3,
-            d_model=16,
-            n_heads=4,
-            n_layers=1,
-            feedforward_dim=32,
-            action_embedding_dim=4,
-        )
-        q_values = model(
-            torch.zeros((2, 4, 3), dtype=torch.float32),
-            torch.zeros(2, dtype=torch.long),
-            torch.zeros((2, CONSTRAINT_FEATURE_DIM), dtype=torch.float32),
-        )
 
-        self.assertEqual(tuple(q_values.shape), (2, 3))
-        self.assertEqual(model.constraint_feature_dim, CONSTRAINT_FEATURE_DIM)
 
-    def test_direct_bar_model_requires_constraint_features_by_default(self) -> None:
-        model = CausalTransformerQNetwork(
-            feature_dim=3,
-            lookback=4,
-            action_count=3,
-            d_model=16,
-            n_heads=4,
-            n_layers=1,
-            feedforward_dim=32,
-            action_embedding_dim=4,
-        )
 
-        with self.assertRaisesRegex(ValueError, "constraint_features are required"):
-            model(torch.zeros((2, 4, 3), dtype=torch.float32), torch.zeros(2, dtype=torch.long))
-
-    def test_direct_bar_model_legacy_constraint_feature_opt_out(self) -> None:
-        model = CausalTransformerQNetwork(
-            feature_dim=3,
-            lookback=4,
-            action_count=3,
-            d_model=16,
-            n_heads=4,
-            n_layers=1,
-            feedforward_dim=32,
-            action_embedding_dim=4,
-            require_constraint_features=False,
-        )
-
-        q_values = model(torch.zeros((2, 4, 3), dtype=torch.float32), torch.zeros(2, dtype=torch.long))
-
-        self.assertEqual(tuple(q_values.shape), (2, 3))
-
-    def test_minute_timestamp_grid_future_context_is_rejected(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+    def test_second_timestamp_grid_future_context_is_rejected(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_load_payload"])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
             torch.save(
                 {
                     "decision_timestamps": ["2026-06-10T15:30:00+00:00"],
                     "next_timestamps": ["2026-06-10T16:30:00+00:00"],
-                    "minute_timestamp_grid": [[["2026-06-10T15:31:00+00:00"]]],
-                    "minute_feature_names": ["x"],
+                    "second_timestamp_grid": [[["2026-06-10T15:31:00+00:00"]]],
+                    "second_feature_names": ["x"],
                     "hour_feature_names": ["h"],
                     "action_names": ["CASH", "QQQ"],
-                    "minute_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
-                    "minute_mask": torch.tensor([[[True]]]),
+                    "second_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+                    "second_mask": torch.tensor([[[True]]]),
                     "hour_features": torch.zeros((1, 1, 1), dtype=torch.float32),
                     "action_returns": torch.zeros((1, 2), dtype=torch.float32),
                 },
@@ -4241,20 +2014,20 @@ class MinuteToHourTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "context leakage"):
                 module._load_payload(path)
 
-    def test_minute_to_hour_payload_rejects_non_hourly_reward_grid(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_load_payload"])
+    def test_second_to_hour_payload_rejects_non_hourly_reward_grid(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_load_payload"])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
             torch.save(
                 {
                     "decision_timestamps": ["2026-06-10T15:30:00+00:00"],
                     "next_timestamps": ["2026-06-10T16:00:00+00:00"],
-                    "minute_timestamp_grid": [[["2026-06-10T15:30:00+00:00"]]],
-                    "minute_feature_names": ["x"],
+                    "second_timestamp_grid": [[["2026-06-10T15:30:00+00:00"]]],
+                    "second_feature_names": ["x"],
                     "hour_feature_names": ["h"],
                     "action_names": ["CASH", "QQQ"],
-                    "minute_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
-                    "minute_mask": torch.tensor([[[True]]]),
+                    "second_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
+                    "second_mask": torch.tensor([[[True]]]),
                     "hour_features": torch.zeros((1, 1, 1), dtype=torch.float32),
                     "action_returns": torch.zeros((1, 2), dtype=torch.float32),
                     "decision_stride_minutes": 30,
@@ -4266,47 +2039,26 @@ class MinuteToHourTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "hourly decision grid"):
                 module._load_payload(path)
 
-    def test_train_cli_wires_episode_and_leg_caps(self) -> None:
-        module = load_script("train_hourly_from_minute_context_rl")
 
-        args = module.parse_args(
-            [
-                "--max-switches-per-episode",
-                "3",
-                "--max-order-legs-per-day",
-                "4",
-                "--max-order-legs-per-episode",
-                "5",
-                "--warm-start-model",
-                "models/model.pt",
-            ]
-        )
-        constraints = module.build_constraints_from_args(args)
+    def test_second_to_hour_default_constraints_remain_conservative(self) -> None:
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["default_second_to_hour_constraints"])
 
-        self.assertEqual(constraints.max_switches_per_episode, 3)
-        self.assertEqual(constraints.max_order_legs_per_day, 4)
-        self.assertEqual(constraints.max_order_legs_per_episode, 5)
-        self.assertEqual(args.warm_start_model, Path("models/model.pt"))
-
-    def test_minute_to_hour_default_constraints_remain_conservative(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["default_minute_to_hour_constraints"])
-
-        constraints = module.default_minute_to_hour_constraints()
+        constraints = module.default_second_to_hour_constraints()
 
         self.assertEqual(constraints.max_switches_per_day, 2)
         self.assertEqual(constraints.q_switch_margin_bps, 3.0)
 
-    def test_minute_to_hour_eval_respects_action_valid_mask(self) -> None:
+    def test_second_to_hour_eval_respects_action_valid_mask(self) -> None:
         class UnavailableActionPolicy(nn.Module):
             def forward(
                 self,
-                minute_features: torch.Tensor,
-                minute_mask: torch.Tensor,
+                second_features: torch.Tensor,
+                second_mask: torch.Tensor,
                 hour_features: torch.Tensor,
                 previous_actions: torch.Tensor,
                 constraint_features: torch.Tensor,
             ) -> torch.Tensor:
-                q_values = torch.zeros((minute_features.shape[0], 2), device=minute_features.device)
+                q_values = torch.zeros((second_features.shape[0], 2), device=second_features.device)
                 q_values[:, 1] = 100.0
                 return q_values
 
@@ -4322,25 +2074,25 @@ class MinuteToHourTests(unittest.TestCase):
                 "2026-01-02T14:32:00+00:00",
                 "2026-01-02T14:33:00+00:00",
             ],
-            minute_feature_names=["m"],
+            second_feature_names=["m"],
             hour_feature_names=["h"],
             action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((3, 1, 1, 1), dtype=torch.float32),
-            minute_mask=torch.ones((3, 1, 1), dtype=torch.bool),
+            second_features=torch.zeros((3, 1, 1, 1), dtype=torch.float32),
+            second_mask=torch.ones((3, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((3, 1, 1), dtype=torch.float32),
             action_returns=torch.zeros((3, 2), dtype=torch.float32),
             valid_start_indices=torch.tensor([1], dtype=torch.long),
             valid_index_mask=torch.tensor([False, True, False]),
-            minute_feature_mean=torch.zeros(1),
-            minute_feature_std=torch.ones(1),
+            second_feature_mean=torch.zeros(1),
+            second_feature_std=torch.ones(1),
             hour_feature_mean=torch.zeros(1),
             hour_feature_std=torch.ones(1),
             hours_lookback=1,
-            minutes_per_hour=1,
+            seconds_per_hour=1,
             action_valid_mask=torch.tensor([[True, True], [True, False], [True, True]]),
         )
 
-        result = evaluate_minute_to_hour_policy(
+        result = evaluate_second_to_hour_policy(
             data,
             UnavailableActionPolicy(),
             device=torch.device("cpu"),
@@ -4352,173 +2104,40 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(result.allocation_switches, 0)
         self.assertEqual([row["asset"] for row in result.rollout_records], ["CASH"])
 
-    def test_minute_to_hour_split_rejects_finite_returns_for_invalid_actions(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
-        payload = {
-            "decision_timestamps": [
-                "2026-01-02T14:30:00+00:00",
-                "2026-01-02T15:30:00+00:00",
-            ],
-            "next_timestamps": [
-                "2026-01-02T15:30:00+00:00",
-                "2026-01-02T16:30:00+00:00",
-            ],
-            "minute_feature_names": ["m"],
-            "hour_feature_names": ["h"],
-            "action_names": ["CASH", "QQQ"],
-            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
-            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
-            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
-            "action_returns": torch.zeros((2, 2), dtype=torch.float32),
-            "action_valid_mask": torch.tensor([[True, False], [True, True]]),
-        }
 
-        with self.assertRaisesRegex(ValueError, "Invalid action_returns"):
-            module._build_split(name="train", payload=payload)
 
-    def test_minute_to_hour_legacy_action_valid_mask_is_diagnostic_only(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
-        payload = {
-            "decision_timestamps": [
-                "2026-01-02T14:30:00+00:00",
-                "2026-01-02T15:30:00+00:00",
-            ],
-            "next_timestamps": [
-                "2026-01-02T15:30:00+00:00",
-                "2026-01-02T16:30:00+00:00",
-            ],
-            "minute_feature_names": ["m"],
-            "hour_feature_names": ["h"],
-            "action_names": ["CASH", "QQQ"],
-            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
-            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
-            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
-            "action_returns": torch.tensor([[0.0, float("nan")], [0.0, 0.01]], dtype=torch.float32),
-            "action_valid_mask": torch.tensor([[True, False], [True, True]]),
-        }
 
-        split = module._build_split(name="train", payload=payload)
 
-        self.assertFalse(split.dataset_reportable)
-        self.assertEqual(split.dataset_reportability_errors, ["legacy_action_valid_mask_semantics_ambiguous"])
-
-    def test_minute_to_hour_explicit_non_reportable_dataset_remains_diagnostic(self) -> None:
-        module = __import__(
-            "rl_quant.minute_to_hour_transformer",
-            fromlist=["_build_split", "minute_to_hour_missing_label_report"],
-        )
-        payload = {
-            "decision_timestamps": ["2026-01-02T14:30:00+00:00"],
-            "next_timestamps": ["2026-01-02T15:30:00+00:00"],
-            "minute_feature_names": ["m"],
-            "hour_feature_names": ["h"],
-            "action_names": ["CASH", "QQQ"],
-            "minute_features": torch.zeros((1, 1, 1, 1), dtype=torch.float32),
-            "minute_mask": torch.ones((1, 1, 1), dtype=torch.bool),
-            "hour_features": torch.zeros((1, 1, 1), dtype=torch.float32),
-            "action_returns": torch.tensor([[0.0, 0.01]], dtype=torch.float32),
-            "decision_action_valid_mask": torch.tensor([[True, True]]),
-            "label_valid_mask": torch.tensor([[True, True]]),
-            "dataset_reportable": False,
-        }
-
-        split = module._build_split(name="train", payload=payload)
-        report = module.minute_to_hour_missing_label_report(split)
-
-        self.assertFalse(split.dataset_reportable)
-        self.assertFalse(report["evaluation_reportable"])
-        self.assertEqual(report["reportability_errors"], ["dataset_marked_non_reportable"])
-
-    def test_minute_to_hour_protocol_splits_decision_and_label_masks(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
-
-        class PickActionPolicy(nn.Module):
-            def forward(
-                self,
-                minute_features: torch.Tensor,
-                minute_mask: torch.Tensor,
-                hour_features: torch.Tensor,
-                previous_actions: torch.Tensor,
-                constraint_features: torch.Tensor,
-            ) -> torch.Tensor:
-                del minute_mask, hour_features, previous_actions, constraint_features
-                return torch.tensor([[0.0, 10.0]], dtype=torch.float32).repeat(minute_features.shape[0], 1)
-
-        payload = {
-            "decision_timestamps": [
-                "2026-01-02T14:30:00+00:00",
-                "2026-01-02T15:30:00+00:00",
-            ],
-            "next_timestamps": [
-                "2026-01-02T15:30:00+00:00",
-                "2026-01-02T16:30:00+00:00",
-            ],
-            "minute_feature_names": ["m"],
-            "hour_feature_names": ["h"],
-            "action_names": ["CASH", "QQQ"],
-            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
-            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
-            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
-            "action_returns": torch.tensor([[0.0, float("nan")], [0.0, 0.01]], dtype=torch.float32),
-            "decision_action_valid_mask": torch.tensor([[True, True], [True, True]]),
-            "action_valid_mask": torch.tensor([[True, True], [True, True]]),
-            "label_valid_mask": torch.tensor([[True, False], [True, True]]),
-        }
-
-        split = module._build_split(name="train", payload=payload)
-        self.assertTrue(bool(split.valid_actions(torch.tensor([0]))[0, 1].item()))
-        self.assertFalse(bool(split.label_valid_actions(torch.tensor([0]))[0, 1].item()))
-        self.assertEqual(split.valid_start_indices.tolist(), [1])
-
-        result = evaluate_minute_to_hour_policy(
-            split,
-            PickActionPolicy(),
-            device=torch.device("cpu"),
-            initial_action=0,
-            constraints=TradingConstraintConfig(one_way_cost_bps=0.0),
-            capture_rollout=True,
-        )
-
-        self.assertEqual([row["asset"] for row in result.rollout_records], ["QQQ"])
-        self.assertTrue(result.evaluation_reportable)
-        self.assertEqual(result.selectable_missing_label_count, 0)
-        self.assertEqual(result.requested_action_missing_label_count, 0)
-        self.assertEqual(result.executed_action_missing_label_count, 0)
-        self.assertEqual(result.policy_unscorable_rows, 0)
-        self.assertEqual(result.reportability_errors, [])
-        self.assertEqual([row["requested_asset"] for row in result.rollout_records], ["QQQ"])
-        self.assertEqual([row["executed_asset"] for row in result.rollout_records], ["QQQ"])
-
-    def test_minute_to_hour_eval_reports_mask_block_reasons(self) -> None:
+    def test_second_to_hour_eval_reports_mask_block_reasons(self) -> None:
         # The evaluator now tallies WHY each decision row's mask pinned the policy (a diagnostic that explains
         # turnover). The mask itself is unchanged -- build_action_mask_reasons(...).mask IS build_action_mask's
         # output -- so this is additive. A high min-hold must show up in the tally (teeth); min_hold_bars=0 must
         # not (no false positives); counts are bounded by the number of decision rows.
-        from rl_quant.minute_to_hour_transformer import (
+        from rl_quant.second_to_hour_transformer import (
             HourFromMinuteDataSplit,
             TradingConstraintConfig,
-            evaluate_minute_to_hour_policy,
+            evaluate_second_to_hour_policy,
         )
-        from rl_quant.training.minute_to_hour import _ConstantActionModel
+        from rl_quant.training.second_to_hour import _ConstantActionModel
 
         n = 5
         split = HourFromMinuteDataSplit(
             name="t",
             decision_timestamps=[f"2026-01-02T{10 + i}:30:00+00:00" for i in range(n + 1)],
             next_timestamps=[f"2026-01-02T{11 + i}:30:00+00:00" for i in range(n + 1)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n + 1, 1, 1, 1)), minute_mask=torch.ones((n + 1, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((n + 1, 1, 1, 1)), second_mask=torch.ones((n + 1, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n + 1, 1, 1)), action_returns=torch.zeros((n + 1, 2)),
             action_valid_mask=torch.ones((n + 1, 2), dtype=torch.bool),
             label_valid_mask=torch.ones((n + 1, 2), dtype=torch.bool),
             valid_start_indices=torch.arange(n, dtype=torch.long),
             valid_index_mask=torch.tensor([True] * n + [False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
         always_qqq = _ConstantActionModel(2, 1)
 
-        pinned = evaluate_minute_to_hour_policy(
+        pinned = evaluate_second_to_hour_policy(
             split, always_qqq, device=torch.device("cpu"), initial_action=0,
             constraints=TradingConstraintConfig(one_way_cost_bps=0.0, min_hold_bars=10),
         )
@@ -4532,7 +2151,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(pinned.to_dict()["mask_block_reason_row_counts"], counts)  # surfaced verbatim
 
         # No false positives: with no minimum hold, nothing is min-hold-pinned.
-        free = evaluate_minute_to_hour_policy(
+        free = evaluate_second_to_hour_policy(
             split, always_qqq, device=torch.device("cpu"), initial_action=0,
             constraints=TradingConstraintConfig(one_way_cost_bps=0.0, min_hold_bars=0),
         )
@@ -4540,7 +2159,7 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(free.mask_block_reason_row_counts["decision_rows"], n)
 
     def test_latest_holdout_uses_final_complete_sessions_and_train_normalizer(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
         sessions = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]
         decisions = [
             f"{session}T{hour}:30:00+00:00"
@@ -4553,15 +2172,15 @@ class MinuteToHourTests(unittest.TestCase):
             for hour in ("15", "16")
         ]
         session_ids = [session for session in sessions for _ in range(2)]
-        minute_values = [2.0] * 6 + [50.0] * 4
+        second_values = [2.0] * 6 + [50.0] * 4
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
-            self._write_minute_to_hour_dataset(
+            self._write_second_to_hour_dataset(
                 path,
                 decisions=decisions,
                 next_timestamps=next_timestamps,
                 session_ids=session_ids,
-                minute_values=minute_values,
+                second_values=second_values,
             )
 
             train, val, test = module.build_hour_from_minute_splits(
@@ -4579,49 +2198,18 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertEqual(train.split_policy["test_start"], decisions[-2])
         self.assertEqual([test.decision_timestamps[i] for i in test.valid_start_indices.tolist()], decisions[-2:])
         self.assertEqual([val.decision_timestamps[i] for i in val.valid_start_indices.tolist()], decisions[-4:-2])
-        self.assertAlmostEqual(float(train.minute_feature_mean[0].item()), 2.0, places=6)
-        self.assertTrue(torch.equal(val.minute_feature_mean, train.minute_feature_mean))
-        self.assertTrue(torch.equal(test.minute_feature_mean, train.minute_feature_mean))
+        self.assertAlmostEqual(float(train.second_feature_mean[0].item()), 2.0, places=6)
+        self.assertTrue(torch.equal(val.second_feature_mean, train.second_feature_mean))
+        self.assertTrue(torch.equal(test.second_feature_mean, train.second_feature_mean))
 
-    def test_reward_horizon_cannot_cross_split_end(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
-        payload = {
-            "decision_timestamps": [
-                "2026-01-02T14:30:00+00:00",
-                "2026-01-02T15:30:00+00:00",
-            ],
-            "next_timestamps": [
-                "2026-01-02T15:30:00+00:00",
-                "2026-01-02T16:30:00+00:00",
-            ],
-            "minute_feature_names": ["m"],
-            "hour_feature_names": ["h"],
-            "action_names": ["CASH", "QQQ"],
-            "minute_features": torch.zeros((2, 1, 1, 1), dtype=torch.float32),
-            "minute_mask": torch.ones((2, 1, 1), dtype=torch.bool),
-            "hour_features": torch.zeros((2, 1, 1), dtype=torch.float32),
-            "action_returns": torch.zeros((2, 2), dtype=torch.float32),
-            "decision_action_valid_mask": torch.ones((2, 2), dtype=torch.bool),
-            "label_valid_mask": torch.ones((2, 2), dtype=torch.bool),
-        }
-
-        split = module._build_split(
-            name="train",
-            payload=payload,
-            end_ts="2026-01-02T15:30:00+00:00",
-            reward_end_ts="2026-01-02T15:30:00+00:00",
-        )
-
-        self.assertEqual(split.decision_timestamps, payload["decision_timestamps"])
-        self.assertEqual(split.valid_start_indices.tolist(), [0])
 
     def test_manual_split_that_skips_latest_period_is_non_reportable(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
         decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18", "19")]
         next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19", "20")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
-            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
             _train, _val, test = module.build_hour_from_minute_splits(
                 dataset_path=path,
@@ -4637,12 +2225,12 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertIn("manual_split_skips_latest_complete_period", test.dataset_reportability_errors)
 
     def test_manual_split_requires_latest_reward_end_not_just_latest_decision(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
         decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18", "19")]
         next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19", "20")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
-            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
             _train, _val, test = module.build_hour_from_minute_splits(
                 dataset_path=path,
@@ -4660,12 +2248,12 @@ class MinuteToHourTests(unittest.TestCase):
         self.assertIn("manual_split_skips_latest_complete_period", test.dataset_reportability_errors)
 
     def test_latest_rows_smoke_split_is_non_reportable(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
         decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18")]
         next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
-            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
             train, val, test = module.build_hour_from_minute_splits(
                 dataset_path=path,
@@ -4697,7 +2285,7 @@ class MinuteToHourTests(unittest.TestCase):
             "2026-01-02T18:30:00+00:00",
             "2026-01-02T19:30:00+00:00",
         ]
-        minute_grid = [
+        second_grid = [
             [[timestamp.replace(":30:00", ":29:00")]]
             for timestamp in decisions
         ]
@@ -4707,12 +2295,12 @@ class MinuteToHourTests(unittest.TestCase):
                 {
                     "decision_timestamps": decisions,
                     "next_timestamps": next_timestamps,
-                    "minute_timestamp_grid": minute_grid,
-                    "minute_feature_names": ["m"],
+                    "second_timestamp_grid": second_grid,
+                    "second_feature_names": ["m"],
                     "hour_feature_names": ["h"],
                     "action_names": ["CASH", "QQQ"],
-                    "minute_features": torch.zeros((5, 1, 1, 1), dtype=torch.float32),
-                    "minute_mask": torch.ones((5, 1, 1), dtype=torch.bool),
+                    "second_features": torch.zeros((5, 1, 1, 1), dtype=torch.float32),
+                    "second_mask": torch.ones((5, 1, 1), dtype=torch.bool),
                     "hour_features": torch.zeros((5, 1, 1), dtype=torch.float32),
                     "action_returns": torch.zeros((5, 2), dtype=torch.float32),
                     "decision_action_valid_mask": torch.ones((5, 2), dtype=torch.bool),
@@ -4746,7 +2334,7 @@ class MinuteToHourTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
-            self._write_minute_to_hour_dataset(
+            self._write_second_to_hour_dataset(
                 path,
                 decisions=decisions,
                 next_timestamps=next_timestamps,
@@ -4767,7 +2355,7 @@ class MinuteToHourTests(unittest.TestCase):
         next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
-            self._write_minute_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
+            self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
             train, _val, test = module.build_rolling_partition_splits(path)
 

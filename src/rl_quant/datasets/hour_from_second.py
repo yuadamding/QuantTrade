@@ -1,4 +1,4 @@
-"""Datasets layer: hour-from-sub-hour dataset split + builders / validators / split-policy inference (extracted from rl_quant.minute_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
+"""Datasets layer: hour-from-sub-hour dataset split + builders / validators / split-policy inference (extracted from rl_quant.second_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
 from __future__ import annotations
 
 import hashlib
@@ -35,7 +35,7 @@ DEFAULT_EXCHANGE_CALENDAR_ID = "XNYS_decision_timestamp_sessions_America_New_Yor
 _EASTERN = ZoneInfo("America/New_York")
 
 
-def default_minute_to_hour_constraints() -> TradingConstraintConfig:
+def default_second_to_hour_constraints() -> TradingConstraintConfig:
     return TradingConstraintConfig(max_switches_per_day=2, q_switch_margin_bps=3.0)
 
 
@@ -44,21 +44,21 @@ class HourFromMinuteDataSplit:
     name: str
     decision_timestamps: list[str]
     next_timestamps: list[str]
-    minute_feature_names: list[str]
+    second_feature_names: list[str]
     hour_feature_names: list[str]
     action_names: list[str]
-    minute_features: torch.Tensor
-    minute_mask: torch.Tensor
+    second_features: torch.Tensor
+    second_mask: torch.Tensor
     hour_features: torch.Tensor
     action_returns: torch.Tensor
     valid_start_indices: torch.Tensor
     valid_index_mask: torch.Tensor
-    minute_feature_mean: torch.Tensor
-    minute_feature_std: torch.Tensor
+    second_feature_mean: torch.Tensor
+    second_feature_std: torch.Tensor
     hour_feature_mean: torch.Tensor
     hour_feature_std: torch.Tensor
     hours_lookback: int
-    minutes_per_hour: int
+    seconds_per_hour: int
     decision_grid_minutes: int = DEFAULT_HOUR_DECISION_GRID_MINUTES
     periods_per_year: float = 252.0 * 6.0
     action_valid_mask: torch.Tensor | None = None
@@ -106,13 +106,13 @@ class HourFromMinuteDataSplit:
 
     @property
     def effective_context_bars_per_hour(self) -> int:
-        return int(self.context_bars_per_hour or self.minutes_per_hour)
+        return int(self.context_bars_per_hour or self.seconds_per_hour)
 
     def to(self, device: torch.device | str) -> "HourFromMinuteDataSplit":
         return replace(
             self,
-            minute_features=self.minute_features.to(device),
-            minute_mask=self.minute_mask.to(device),
+            second_features=self.second_features.to(device),
+            second_mask=self.second_mask.to(device),
             hour_features=self.hour_features.to(device),
             action_returns=self.action_returns.to(device),
             action_valid_mask=self.action_valid_mask.to(device) if self.action_valid_mask is not None else None,
@@ -120,8 +120,8 @@ class HourFromMinuteDataSplit:
             action_features=self.action_features.to(device) if self.action_features is not None else None,
             valid_start_indices=self.valid_start_indices.to(device),
             valid_index_mask=self.valid_index_mask.to(device),
-            minute_feature_mean=self.minute_feature_mean.to(device),
-            minute_feature_std=self.minute_feature_std.to(device),
+            second_feature_mean=self.second_feature_mean.to(device),
+            second_feature_std=self.second_feature_std.to(device),
             hour_feature_mean=self.hour_feature_mean.to(device),
             hour_feature_std=self.hour_feature_std.to(device),
             action_feature_mean=self.action_feature_mean.to(device) if self.action_feature_mean is not None else None,
@@ -129,7 +129,7 @@ class HourFromMinuteDataSplit:
         )
 
     def state(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.minute_features[indices], self.minute_mask[indices], self.hour_features[indices]
+        return self.second_features[indices], self.second_mask[indices], self.hour_features[indices]
 
     def action_feature_state(self, indices: torch.Tensor) -> torch.Tensor | None:
         return None if self.action_features is None else self.action_features[indices]
@@ -203,22 +203,24 @@ def _assert_alias_compatible(payload: dict[str, Any], *, canonical: str, legacy:
         raise ValueError(f"{canonical} and {legacy} aliases must contain the same values.")
 
 
-def _canonicalize_subhour_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _canonicalize_second_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # Canonical tensor keys are ``second_*``. Older datasets stored ``minute_*`` / ``subhour_*`` aliases for the
+    # SAME tensors; read either alias and canonicalize to ``second_*`` so existing .pt caches still load, failing
+    # closed if two present aliases disagree (same shape, different values).
     resolved = dict(payload)
-    for canonical, legacy in (
-        ("subhour_timestamp_grid", "minute_timestamp_grid"),
-        ("subhour_feature_names", "minute_feature_names"),
-        ("subhour_features", "minute_features"),
-        ("subhour_mask", "minute_mask"),
+    for canonical, legacies in (
+        ("second_timestamp_grid", ("minute_timestamp_grid", "subhour_timestamp_grid")),
+        ("second_feature_names", ("minute_feature_names", "subhour_feature_names")),
+        ("second_features", ("minute_features", "subhour_features")),
+        ("second_mask", ("minute_mask", "subhour_mask")),
     ):
-        has_canonical = canonical in resolved
-        has_legacy = legacy in resolved
-        if has_canonical and has_legacy:
-            _assert_alias_compatible(resolved, canonical=canonical, legacy=legacy)
-        elif has_canonical:
-            resolved[legacy] = resolved[canonical]
-        elif has_legacy:
-            resolved[canonical] = resolved[legacy]
+        for legacy in legacies:
+            if legacy not in resolved:
+                continue
+            if canonical in resolved:
+                _assert_alias_compatible(resolved, canonical=canonical, legacy=legacy)
+            else:
+                resolved[canonical] = resolved[legacy]
     return resolved
 
 
@@ -770,12 +772,12 @@ def validate_action_return_basis(payload: dict[str, Any]) -> None:
         )
 
 
-def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
-    payload = _canonicalize_subhour_payload(payload)
+def validate_second_timestamp_grid(payload: dict[str, Any]) -> None:
+    payload = _canonicalize_second_payload(payload)
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
-    grid = payload["minute_timestamp_grid"]
-    mask = payload["minute_mask"].bool()
+    grid = payload["second_timestamp_grid"]
+    mask = payload["second_mask"].bool()
     source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
     default_latency_ms = DEFAULT_SECOND_BAR_LATENCY_MS if source_interval == DEFAULT_SECOND_SOURCE_INTERVAL else 0
     bar_latency_ms = int(payload.get("bar_latency_ms", default_latency_ms))
@@ -785,43 +787,43 @@ def validate_minute_timestamp_grid(payload: dict[str, Any]) -> None:
         raise ValueError("One-second aggregate context requires bar_latency_ms >= 1000.")
     latency_delta = timedelta(milliseconds=bar_latency_ms)
     if len(grid) != len(decisions):
-        raise ValueError("minute_timestamp_grid length must match decision_timestamps length.")
+        raise ValueError("second_timestamp_grid length must match decision_timestamps length.")
     if mask.shape[0] != len(decisions):
-        raise ValueError("minute_mask row count must match decision_timestamps length.")
+        raise ValueError("second_mask row count must match decision_timestamps length.")
     for row_id, (decision_ts, next_ts) in enumerate(zip(decisions, next_timestamps)):
         decision_dt = _parse_utc_timestamp(decision_ts)
         next_dt = _parse_utc_timestamp(next_ts)
         if decision_dt >= next_dt:
             raise ValueError(f"decision_timestamps must be before next_timestamps at row {row_id}.")
         if len(grid[row_id]) != mask.shape[1]:
-            raise ValueError(f"minute_timestamp_grid hour count does not match minute_mask at row {row_id}.")
+            raise ValueError(f"second_timestamp_grid hour count does not match second_mask at row {row_id}.")
         for hour_id, hour in enumerate(grid[row_id]):
             if len(hour) != mask.shape[2]:
                 raise ValueError(
-                    f"minute_timestamp_grid minute count does not match minute_mask at row {row_id}, hour {hour_id}."
+                    f"second_timestamp_grid minute count does not match second_mask at row {row_id}, hour {hour_id}."
                 )
-            for minute_id, minute_ts in enumerate(hour):
-                if not minute_ts:
+            for second_id, second_ts in enumerate(hour):
+                if not second_ts:
                     continue
-                minute_dt = _parse_utc_timestamp(str(minute_ts))
-                if bool(mask[row_id, hour_id, minute_id]) and minute_dt + latency_delta > decision_dt:
+                second_dt = _parse_utc_timestamp(str(second_ts))
+                if bool(mask[row_id, hour_id, second_id]) and second_dt + latency_delta > decision_dt:
                     raise ValueError(
-                        "Subhour context leakage at "
-                        f"row={row_id}, hour={hour_id}, minute={minute_id}: "
-                        f"{minute_ts} available after {decision_ts}."
+                        "Second context leakage at "
+                        f"row={row_id}, hour={hour_id}, minute={second_id}: "
+                        f"{second_ts} available after {decision_ts}."
                     )
 
 
 def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
     explicit_stride = payload.get("decision_stride_minutes", payload.get("decision_grid_minutes"))
     if explicit_stride is not None and int(explicit_stride) != DEFAULT_HOUR_DECISION_GRID_MINUTES:
-        raise ValueError("Subhour-to-hour datasets must use an hourly decision grid with 60-minute rewards.")
+        raise ValueError("Second-to-hour datasets must use an hourly decision grid with 60-minute rewards.")
     source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
     expected_bars = expected_context_bars_per_hour(source_interval)
-    explicit_context_bars = payload.get("context_bars_per_hour", payload.get("minutes_per_hour"))
+    explicit_context_bars = payload.get("context_bars_per_hour", payload.get("seconds_per_hour"))
     if explicit_context_bars is not None and int(explicit_context_bars) != expected_bars:
         raise ValueError(
-            "Subhour-to-hour datasets must encode exactly one hour of source bars per hour token; "
+            "Second-to-hour datasets must encode exactly one hour of source bars per hour token; "
             f"{source_interval} expects {expected_bars} bars."
         )
 
@@ -842,18 +844,18 @@ def _load_payload(
     action_covariate_sidecar: str | bytes | PathLike[str] = "auto",
     news_llm_sidecar: str | bytes | PathLike[str] = "none",
 ) -> dict[str, Any]:
-    payload = _canonicalize_subhour_payload(torch.load(path, map_location="cpu", weights_only=True))
+    payload = _canonicalize_second_payload(torch.load(path, map_location="cpu", weights_only=True))
     payload = _merge_action_covariate_sidecar(path, payload, action_covariate_sidecar=action_covariate_sidecar)
     payload = _merge_news_llm_sidecar(path, payload, news_llm_sidecar=news_llm_sidecar)
     required = {
         "decision_timestamps",
         "next_timestamps",
-        "minute_timestamp_grid",
-        "minute_feature_names",
+        "second_timestamp_grid",
+        "second_feature_names",
         "hour_feature_names",
         "action_names",
-        "minute_features",
-        "minute_mask",
+        "second_features",
+        "second_mask",
         "hour_features",
         "action_returns",
     }
@@ -861,7 +863,7 @@ def _load_payload(
     if missing:
         raise ValueError(f"Minute-to-hour dataset is missing required keys: {sorted(missing)}")
     validate_hour_level_decision_grid(payload)
-    validate_minute_timestamp_grid(payload)
+    validate_second_timestamp_grid(payload)
     validate_action_feature_tensors(payload)
     validate_action_return_basis(payload)
     return payload
@@ -949,8 +951,8 @@ def _build_split(
     reward_start_ts: str | None = None,
     reward_after_ts: str | None = None,
     reward_end_ts: str | None = None,
-    minute_feature_mean: torch.Tensor | None = None,
-    minute_feature_std: torch.Tensor | None = None,
+    second_feature_mean: torch.Tensor | None = None,
+    second_feature_std: torch.Tensor | None = None,
     hour_feature_mean: torch.Tensor | None = None,
     hour_feature_std: torch.Tensor | None = None,
     action_feature_mean: torch.Tensor | None = None,
@@ -970,8 +972,8 @@ def _build_split(
         if following_dt <= current_dt:
             raise ValueError(f"next_timestamps must be after decisions; got {decision_ts!r} -> {next_ts!r}.")
 
-    all_minute_features = payload["minute_features"].float()
-    all_minute_mask = payload["minute_mask"].bool()
+    all_second_features = payload["second_features"].float()
+    all_second_mask = payload["second_mask"].bool()
     all_hour_features = payload["hour_features"].float()
     all_returns = payload["action_returns"].float()
     all_action_features = payload.get("action_features")
@@ -1005,7 +1007,7 @@ def _build_split(
             raise ValueError("label_valid_mask must be a subset of decision action validity.")
     _validate_action_return_contract(all_returns, all_label_valid if raw_label_valid is not None else all_action_valid)
     row_count = len(decisions)
-    if all_minute_features.shape[0] != row_count or all_minute_mask.shape[0] != row_count:
+    if all_second_features.shape[0] != row_count or all_second_mask.shape[0] != row_count:
         raise ValueError("minute feature/mask row counts must match decision_timestamps length.")
     if all_hour_features.shape[0] != row_count or all_returns.shape[0] != row_count:
         raise ValueError("hour_features and action_returns rows must match decision_timestamps length.")
@@ -1030,8 +1032,8 @@ def _build_split(
     next_subset = [next_timestamps[i] for i in selected]
     decision_subset_dt = [decision_dt[i] for i in selected]
     next_subset_dt = [next_dt[i] for i in selected]
-    raw_minute = all_minute_features[selected]
-    raw_mask = all_minute_mask[selected]
+    raw_second = all_second_features[selected]
+    raw_mask = all_second_mask[selected]
     raw_hour = all_hour_features[selected]
     raw_action_features = all_action_features[selected] if all_action_features is not None else None
     returns = all_returns[selected]
@@ -1051,7 +1053,7 @@ def _build_split(
     # CASH is a hard invariant (forced safety fallback, cash-idle, zero exposure); a silent fallback to index 0
     # would corrupt missing-label filtering / reportability before the env later rejects the split.
     if "CASH" not in action_names:
-        raise ValueError("hour-from-subhour dataset requires an explicit 'CASH' action in action_names.")
+        raise ValueError("hour-from-second dataset requires an explicit 'CASH' action in action_names.")
     cash_index = action_names.index("CASH")
     if 0 <= cash_index < int(non_cash_actions.numel()):
         non_cash_actions[cash_index] = False
@@ -1093,8 +1095,8 @@ def _build_split(
         )
         dataset_reportable = False
 
-    if minute_feature_mean is None or minute_feature_std is None:
-        minute_feature_mean, minute_feature_std = _masked_mean_std(raw_minute, raw_mask)
+    if second_feature_mean is None or second_feature_std is None:
+        second_feature_mean, second_feature_std = _masked_mean_std(raw_second, raw_mask)
     if hour_feature_mean is None:
         hour_feature_mean = raw_hour.mean(dim=(0, 1))
     if hour_feature_std is None:
@@ -1105,7 +1107,7 @@ def _build_split(
             action_feature_mean, action_feature_std = _action_feature_mean_std(raw_action_features, action_feature_names)
         action_features = ((raw_action_features - action_feature_mean) / action_feature_std).clamp_(-8.0, 8.0)
 
-    minute = ((raw_minute - minute_feature_mean) / minute_feature_std).clamp_(-8.0, 8.0)
+    minute = ((raw_second - second_feature_mean) / second_feature_std).clamp_(-8.0, 8.0)
     minute = minute.masked_fill(~raw_mask.unsqueeze(-1), 0.0)
     hour = ((raw_hour - hour_feature_mean) / hour_feature_std).clamp_(-8.0, 8.0)
     valid_start_indices = torch.tensor(valid, dtype=torch.long)
@@ -1116,27 +1118,27 @@ def _build_split(
         name=name,
         decision_timestamps=decision_subset,
         next_timestamps=next_subset,
-        minute_feature_names=list(payload["minute_feature_names"]),
+        second_feature_names=list(payload["second_feature_names"]),
         hour_feature_names=list(payload["hour_feature_names"]),
         action_names=list(payload["action_names"]),
-        minute_features=minute,
-        minute_mask=raw_mask,
+        second_features=minute,
+        second_mask=raw_mask,
         hour_features=hour,
         action_returns=returns,
         action_valid_mask=action_valid_mask,
         label_valid_mask=label_valid_mask,
         valid_start_indices=valid_start_indices,
         valid_index_mask=valid_index_mask,
-        minute_feature_mean=minute_feature_mean,
-        minute_feature_std=minute_feature_std,
+        second_feature_mean=second_feature_mean,
+        second_feature_std=second_feature_std,
         hour_feature_mean=hour_feature_mean,
         hour_feature_std=hour_feature_std,
-        hours_lookback=int(payload.get("hours_lookback", raw_minute.shape[1])),
-        minutes_per_hour=int(payload.get("minutes_per_hour", raw_minute.shape[2])),
+        hours_lookback=int(payload.get("hours_lookback", raw_second.shape[1])),
+        seconds_per_hour=int(payload.get("seconds_per_hour", raw_second.shape[2])),
         decision_grid_minutes=int(payload.get("decision_grid_minutes", payload.get("decision_stride_minutes", DEFAULT_HOUR_DECISION_GRID_MINUTES))),
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.0)),
         source_bar_interval=str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL)),
-        context_bars_per_hour=int(payload.get("context_bars_per_hour", payload.get("minutes_per_hour", raw_minute.shape[2]))),
+        context_bars_per_hour=int(payload.get("context_bars_per_hour", payload.get("seconds_per_hour", raw_second.shape[2]))),
         dataset_reportable=dataset_reportable,
         dataset_reportability_errors=dataset_reportability_errors,
         action_features=action_features,
@@ -1216,8 +1218,8 @@ def build_hour_from_minute_splits(
             end_ts=str(val_block["end"]),
             reward_start_ts=str(val_block["reward_start"]),
             reward_end_ts=str(val_block["reward_end"]),
-            minute_feature_mean=train.minute_feature_mean,
-            minute_feature_std=train.minute_feature_std,
+            second_feature_mean=train.second_feature_mean,
+            second_feature_std=train.second_feature_std,
             hour_feature_mean=train.hour_feature_mean,
             hour_feature_std=train.hour_feature_std,
             action_feature_mean=train.action_feature_mean,
@@ -1231,8 +1233,8 @@ def build_hour_from_minute_splits(
             end_ts=str(test_block["end"]),
             reward_start_ts=str(test_block["reward_start"]),
             reward_end_ts=str(test_block["reward_end"]),
-            minute_feature_mean=train.minute_feature_mean,
-            minute_feature_std=train.minute_feature_std,
+            second_feature_mean=train.second_feature_mean,
+            second_feature_std=train.second_feature_std,
             hour_feature_mean=train.hour_feature_mean,
             hour_feature_std=train.hour_feature_std,
             action_feature_mean=train.action_feature_mean,
@@ -1267,8 +1269,8 @@ def build_hour_from_minute_splits(
             end_ts=str(val_block["end"]),
             reward_start_ts=str(val_block["reward_start"]),
             reward_end_ts=str(val_block["reward_end"]),
-            minute_feature_mean=train.minute_feature_mean,
-            minute_feature_std=train.minute_feature_std,
+            second_feature_mean=train.second_feature_mean,
+            second_feature_std=train.second_feature_std,
             hour_feature_mean=train.hour_feature_mean,
             hour_feature_std=train.hour_feature_std,
             action_feature_mean=train.action_feature_mean,
@@ -1282,8 +1284,8 @@ def build_hour_from_minute_splits(
             end_ts=str(test_block["end"]),
             reward_start_ts=str(test_block["reward_start"]),
             reward_end_ts=str(test_block["reward_end"]),
-            minute_feature_mean=train.minute_feature_mean,
-            minute_feature_std=train.minute_feature_std,
+            second_feature_mean=train.second_feature_mean,
+            second_feature_std=train.second_feature_std,
             hour_feature_mean=train.hour_feature_mean,
             hour_feature_std=train.hour_feature_std,
             action_feature_mean=train.action_feature_mean,
@@ -1316,8 +1318,8 @@ def build_hour_from_minute_splits(
             end_ts=val_end,
             reward_after_ts=train_end,
             reward_end_ts=val_end,
-            minute_feature_mean=train.minute_feature_mean,
-            minute_feature_std=train.minute_feature_std,
+            second_feature_mean=train.second_feature_mean,
+            second_feature_std=train.second_feature_std,
             hour_feature_mean=train.hour_feature_mean,
             hour_feature_std=train.hour_feature_std,
             action_feature_mean=train.action_feature_mean,
@@ -1331,8 +1333,8 @@ def build_hour_from_minute_splits(
             end_ts=test_end,
             reward_start_ts=test_start,
             reward_end_ts=test_end,
-            minute_feature_mean=train.minute_feature_mean,
-            minute_feature_std=train.minute_feature_std,
+            second_feature_mean=train.second_feature_mean,
+            second_feature_std=train.second_feature_std,
             hour_feature_mean=train.hour_feature_mean,
             hour_feature_std=train.hour_feature_std,
             action_feature_mean=train.action_feature_mean,
@@ -1350,7 +1352,7 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
         return
     reference = splits[0]
     for split in splits[1:]:
-        if split.minute_feature_names != reference.minute_feature_names:
+        if split.second_feature_names != reference.second_feature_names:
             raise ValueError(f"Minute feature names/order differ between {reference.name!r} and {split.name!r}.")
         if split.hour_feature_names != reference.hour_feature_names:
             raise ValueError(f"Hour feature names/order differ between {reference.name!r} and {split.name!r}.")
@@ -1374,15 +1376,15 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
             raise ValueError("Splits must agree on whether label_valid_mask is present.")
         if split.label_valid_mask is not None and split.label_valid_mask.shape[1] != reference.action_returns.shape[1]:
             raise ValueError(f"Label-valid mask dimensions differ for split {split.name!r}.")
-        if split.minute_features.shape[1:] != reference.minute_features.shape[1:]:
-            raise ValueError(f"Subhour tensor shape differs between {reference.name!r} and {split.name!r}.")
+        if split.second_features.shape[1:] != reference.second_features.shape[1:]:
+            raise ValueError(f"Second tensor shape differs between {reference.name!r} and {split.name!r}.")
         if split.hour_features.shape[1:] != reference.hour_features.shape[1:]:
             raise ValueError(f"Hour tensor shape differs between {reference.name!r} and {split.name!r}.")
         if split.action_features is not None and split.action_features.shape[1:] != reference.action_features.shape[1:]:
             raise ValueError(f"Action feature tensor shape differs between {reference.name!r} and {split.name!r}.")
 
 
-def minute_to_hour_missing_label_report(
+def second_to_hour_missing_label_report(
     split: HourFromMinuteDataSplit,
     *,
     row_indices: torch.Tensor | list[int] | None = None,

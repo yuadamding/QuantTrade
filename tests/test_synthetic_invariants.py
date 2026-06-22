@@ -24,19 +24,19 @@ import unittest
 import torch
 
 from rl_quant.core import DQNLearningConfig
-from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-from rl_quant.envs.minute_to_hour import (
-    MinuteToHourEnvConfig,
+from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+from rl_quant.envs.second_to_hour import (
+    SecondToHourEnvConfig,
     transition_net_return_and_reward,
     transition_trade_cost_bps,
 )
-from rl_quant.minute_to_hour_transformer import HourFromMinuteDataSplit
-from rl_quant.training.minute_to_hour import (
-    MinuteToHourTrainingConfig,
+from rl_quant.second_to_hour_transformer import HourFromMinuteDataSplit
+from rl_quant.training.second_to_hour import (
+    SecondToHourTrainingConfig,
     _ConstantActionModel,
-    evaluate_minute_to_hour_baselines,
-    evaluate_minute_to_hour_policy,
-    train_minute_to_hour_dqn,
+    evaluate_second_to_hour_baselines,
+    evaluate_second_to_hour_policy,
+    train_second_to_hour_dqn,
 )
 
 CPU = torch.device("cpu")
@@ -46,7 +46,7 @@ def _zero_cost_constraints():
     """Default minute-to-hour constraints with all trading frictions zeroed (so a hold of a profitable action
     accrues its raw return with no leg/switch drag) -- lets a test isolate the return accounting from costs."""
     return dataclasses.replace(
-        default_minute_to_hour_constraints(),
+        default_second_to_hour_constraints(),
         one_way_cost_bps=0.0,
         extra_switch_penalty_bps=0.0,
         cash_index=0,
@@ -69,23 +69,23 @@ def _two_action_split(per_row_returns, *, name="eval", label_valid=None):
         name=name,
         decision_timestamps=[f"2026-01-02T{10 + i:02d}:30:00+00:00" for i in range(rows)],
         next_timestamps=[f"2026-01-02T{11 + i:02d}:30:00+00:00" for i in range(rows)],
-        minute_feature_names=["m"],
+        second_feature_names=["m"],
         hour_feature_names=["h"],
         action_names=["CASH", "QQQ"],
-        minute_features=torch.zeros((rows, 1, 1, 1)),
-        minute_mask=torch.ones((rows, 1, 1), dtype=torch.bool),
+        second_features=torch.zeros((rows, 1, 1, 1)),
+        second_mask=torch.ones((rows, 1, 1), dtype=torch.bool),
         hour_features=torch.zeros((rows, 1, 1)),
         action_returns=action_returns,
         action_valid_mask=torch.ones((rows, 2), dtype=torch.bool),
         label_valid_mask=label_valid_mask,
         valid_start_indices=torch.arange(rows, dtype=torch.long),
         valid_index_mask=torch.ones(rows, dtype=torch.bool),
-        minute_feature_mean=torch.zeros(1),
-        minute_feature_std=torch.ones(1),
+        second_feature_mean=torch.zeros(1),
+        second_feature_std=torch.ones(1),
         hour_feature_mean=torch.zeros(1),
         hour_feature_std=torch.ones(1),
         hours_lookback=1,
-        minutes_per_hour=1,
+        seconds_per_hour=1,
     )
 
 
@@ -96,10 +96,10 @@ class SyntheticEconomicInvariants(unittest.TestCase):
         # held in cash. If the loop were mis-wired (e.g. reward sign, action indexing), this fails.
         split = _two_action_split([[0.0, 0.001]] * 4)
         cons = _zero_cost_constraints()
-        qqq = evaluate_minute_to_hour_policy(
+        qqq = evaluate_second_to_hour_policy(
             split, _ConstantActionModel(2, 1), device=CPU, constraints=cons, cash_idle_penalty_bps=0.0
         )
-        cash = evaluate_minute_to_hour_policy(
+        cash = evaluate_second_to_hour_policy(
             split, _ConstantActionModel(2, 0), device=CPU, constraints=cons, cash_idle_penalty_bps=0.0
         )
         self.assertAlmostEqual(cash.total_return, 0.0, places=9)
@@ -114,10 +114,10 @@ class SyntheticEconomicInvariants(unittest.TestCase):
         # not simply biased toward (or against) trading.
         split = _two_action_split([[0.0, -0.001]] * 4)
         cons = _zero_cost_constraints()
-        qqq = evaluate_minute_to_hour_policy(
+        qqq = evaluate_second_to_hour_policy(
             split, _ConstantActionModel(2, 1), device=CPU, constraints=cons, cash_idle_penalty_bps=0.0
         )
-        cash = evaluate_minute_to_hour_policy(
+        cash = evaluate_second_to_hour_policy(
             split, _ConstantActionModel(2, 0), device=CPU, constraints=cons, cash_idle_penalty_bps=0.0
         )
         self.assertLess(qqq.total_return, 0.0)
@@ -152,7 +152,7 @@ class SyntheticEconomicInvariants(unittest.TestCase):
             [[0.0, nan], [0.0, nan], [0.0, nan]],
             label_valid=[[True, False], [True, False], [True, False]],
         )
-        result = evaluate_minute_to_hour_policy(
+        result = evaluate_second_to_hour_policy(
             split, _ConstantActionModel(2, 1), device=CPU, constraints=_zero_cost_constraints(),
             cash_idle_penalty_bps=0.0,
         )
@@ -172,32 +172,32 @@ class SyntheticEconomicInvariants(unittest.TestCase):
             gamma=0.9, learning_rate=3e-3, weight_decay=0.0, target_update_interval=25, epsilon_start=0.5,
             epsilon_end=0.0, eval_interval=1000, grad_clip=1.0,
         )
-        config = MinuteToHourTrainingConfig(
-            env=MinuteToHourEnvConfig(num_envs=4, episode_length=4, constraints=cons, cash_idle_penalty_bps=0.0),
-            learning=learning, d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+        config = SecondToHourTrainingConfig(
+            env=SecondToHourEnvConfig(num_envs=4, episode_length=4, constraints=cons, cash_idle_penalty_bps=0.0),
+            learning=learning, d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16,
             action_embedding_dim=4,
         )
         # Genuineness guard against a vacuous pass: a FRESH (untrained) model of the SAME architecture captures
         # nothing here -- it stays in CASH (empirically verified across seeds), so the trained policy's positive
         # return below is attributable to LEARNING, not initialization luck or a structural bias toward QQQ.
-        from rl_quant.minute_to_hour_transformer import MinuteToHourCausalTransformerQNetwork
+        from rl_quant.second_to_hour_transformer import SecondToHourCausalTransformerQNetwork
 
         torch.manual_seed(0)
-        untrained = MinuteToHourCausalTransformerQNetwork(
-            minute_feature_dim=1, hour_feature_dim=1, action_count=2, hours_lookback=1, minutes_per_hour=1,
-            d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+        untrained = SecondToHourCausalTransformerQNetwork(
+            second_feature_dim=1, hour_feature_dim=1, action_count=2, hours_lookback=1, seconds_per_hour=1,
+            d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
         )
-        untrained_eval = evaluate_minute_to_hour_policy(
+        untrained_eval = evaluate_second_to_hour_policy(
             val, untrained, device=CPU, constraints=cons, cash_idle_penalty_bps=0.0
         )
         self.assertAlmostEqual(untrained_eval.total_return, 0.0, places=9)  # untrained captures nothing -> CASH
 
         torch.manual_seed(0)
-        model, _artifacts = train_minute_to_hour_dqn(train, val, device=CPU, config=config)
-        trained = evaluate_minute_to_hour_policy(
+        model, _artifacts = train_second_to_hour_dqn(train, val, device=CPU, config=config)
+        trained = evaluate_second_to_hour_policy(
             val, model, device=CPU, constraints=cons, cash_idle_penalty_bps=0.0
         )
-        baselines = evaluate_minute_to_hour_baselines(
+        baselines = evaluate_second_to_hour_baselines(
             val, device=CPU, constraints=cons, cash_idle_penalty_bps=0.0, include_buy_and_hold=False
         )
         always_cash = baselines["always_cash"]

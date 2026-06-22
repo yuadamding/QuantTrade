@@ -1,4 +1,4 @@
-"""Envs layer: the hour-allocation environment over sub-hour context -- state/transition/reward authority (extracted from rl_quant.minute_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
+"""Envs layer: the hour-allocation environment over sub-hour context -- state/transition/reward authority (extracted from rl_quant.second_to_hour_transformer, protocol-first reorg Phase 4; verbatim/byte-identical, see architecture_migration_plan.md)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -15,9 +15,9 @@ from rl_quant.trading_constraints import (
     trade_legs,
 )
 
-from rl_quant.datasets.hour_from_subhour import (
+from rl_quant.datasets.hour_from_second import (
     HourFromMinuteDataSplit,
-    default_minute_to_hour_constraints,
+    default_second_to_hour_constraints,
 )
 from rl_quant.core import concrete_torch_device
 from rl_quant.execution import (
@@ -38,7 +38,7 @@ from rl_quant.features.action_risk import (
 
 
 @dataclass
-class MinuteToHourEnvConfig:
+class SecondToHourEnvConfig:
     num_envs: int
     episode_length: int
     reward_scale: float = 10_000.0
@@ -48,7 +48,7 @@ class MinuteToHourEnvConfig:
     # execution reward/cost per transition and logs it + deltas in the step dict; training still uses the
     # legacy `rewards`. A cost-model A/B (turnover-weighted vs leg-count), NOT real-executable (no NBBO).
     execution_env_reward_shadow: bool = False
-    constraints: TradingConstraintConfig = field(default_factory=default_minute_to_hour_constraints)
+    constraints: TradingConstraintConfig = field(default_factory=default_second_to_hour_constraints)
 
 
 @dataclass(frozen=True)
@@ -157,7 +157,7 @@ def transition_net_return_and_reward(raw_return, trade_cost_bps, cash_idle_bps, 
 
 
 @dataclass(frozen=True)
-class NormalizedMinuteToHourConstraints:
+class NormalizedSecondToHourConstraints:
     """The validated, CANONICAL-typed form of the minute->hour trading constraints.
 
     Field names mirror TradingConstraintConfig so this is a drop-in for the attribute-reading consumers
@@ -180,9 +180,9 @@ class NormalizedMinuteToHourConstraints:
     max_order_legs_per_episode: float | None
 
 
-def validate_minute_to_hour_constraints(
+def validate_second_to_hour_constraints(
     constraints: TradingConstraintConfig, action_names: list[str]
-) -> NormalizedMinuteToHourConstraints:
+) -> NormalizedSecondToHourConstraints:
     """Validate the constraint fields that feed BOTH the action mask and the cost ledger and return their
     NORMALIZED (canonical-typed) form. Consumers should use the returned object rather than the raw config so a
     validated value is the only value used. transition_trade_cost_bps re-checks these per step, but
@@ -206,7 +206,7 @@ def validate_minute_to_hour_constraints(
     # bps scalars feed the cost ledger / hysteresis scoring; reject bool/NaN/inf/negative (q_switch_margin_bps
     # NaN would poison hysteresis -- every comparison against it is False). Hold/cooldown bar counts feed the
     # mask; reject bool / fractional / negative (int(True)/int(1.9) would silently mis-gate switching).
-    return NormalizedMinuteToHourConstraints(
+    return NormalizedSecondToHourConstraints(
         cash_index=cash_index,
         count_etf_to_etf_as_two_legs=bool(constraints.count_etf_to_etf_as_two_legs),
         one_way_cost_bps=coerce_finite_nonnegative("constraints.one_way_cost_bps", constraints.one_way_cost_bps),
@@ -246,8 +246,8 @@ def validate_cash_usable_on_decision_rows(data: HourFromMinuteDataSplit, cash_in
         )
 
 
-class VectorizedMinuteToHourEnv:
-    def __init__(self, data: HourFromMinuteDataSplit, config: MinuteToHourEnvConfig, device: torch.device) -> None:
+class VectorizedSecondToHourEnv:
+    def __init__(self, data: HourFromMinuteDataSplit, config: SecondToHourEnvConfig, device: torch.device) -> None:
         # initial_action gets the SHARED action-index discipline; the rest of the constraint fields that feed
         # the action mask AND the cost ledger (cash_index must be a real CASH action; count_etf must be a real
         # bool; the bps scalars finite/non-negative) are validated together at construction -- BEFORE any mask
@@ -258,7 +258,7 @@ class VectorizedMinuteToHourEnv:
         )
         # Store the NORMALIZED constraints (canonical types) and use them everywhere instead of the raw config,
         # so a numeric-string / numpy-scalar config value can never reach the mask / cost ledger un-normalized.
-        self.constraints = validate_minute_to_hour_constraints(config.constraints, data.action_names)
+        self.constraints = validate_second_to_hour_constraints(config.constraints, data.action_names)
         self.cash_index = self.constraints.cash_index
         # reward_scale multiplies every reward and normalises the shadow bps artifacts, so a zero/negative/
         # non-finite value would zero, flip, or blow them up -- validate and STORE the canonical float.
@@ -276,10 +276,10 @@ class VectorizedMinuteToHourEnv:
         # still pass an ordinal-free torch.device("cuda"). _validate_step_actions compares an action tensor's
         # concrete device against self.device, so an ordinal-free self.device would REJECT valid CUDA actions.
         device = concrete_torch_device(device)
-        self.data = data if data.minute_features.device == device else data.to(device)
+        self.data = data if data.second_features.device == device else data.to(device)
         self.config = config
         # Derive self.device from the actual moved tensor so it matches what indexed tensors report exactly.
-        self.device = self.data.minute_features.device
+        self.device = self.data.second_features.device
         # CASH is the forced safety fallback; require it to be USABLE (label-valid + finite) on every valid row.
         validate_cash_usable_on_decision_rows(self.data, self.cash_index)
         self.start_indices = self._build_start_index_pool()
@@ -449,7 +449,7 @@ class VectorizedMinuteToHourEnv:
         valid column -- argmax alone only yields CASH if CASH is index 0; for the canonical cash_index==0
         universe this is byte-identical, and it removes the dependency on CASH being first); (2) an action whose
         label is UNUSABLE (not label-valid OR non-finite return) falls back to CASH, else the env would train on
-        a NaN/inf reward. The usable-label rule (label_valid & isfinite) matches evaluate_minute_to_hour_policy,
+        a NaN/inf reward. The usable-label rule (label_valid & isfinite) matches evaluate_second_to_hour_policy,
         so env and evaluator fall back on exactly the same rows. Integer/boolean only -- no reward arithmetic --
         so it is byte-identical to the prior inline step() logic."""
         actions = self._validate_step_actions(requested_actions)

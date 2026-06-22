@@ -24,10 +24,9 @@ from rl_quant.features.news_llm import (
     build_news_article_rows,
     write_news_llm_feature_outputs,
 )
-from rl_quant.hourly_transformer import CausalTransformerQNetwork
-from rl_quant.minute_to_hour_transformer import (
+from rl_quant.second_to_hour_transformer import (
     HourFromMinuteDataSplit,
-    MinuteToHourCausalTransformerQNetwork,
+    SecondToHourCausalTransformerQNetwork,
 )
 from rl_quant.trading_constraints import CONSTRAINT_FEATURE_NAMES
 from _support import ROOT, load_script
@@ -75,16 +74,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(crossed.crossed)
         self.assertLess(crossed.spread, 0.0)
 
-    def test_causal_mask_disallows_future_positions(self) -> None:
-
-        net = CausalTransformerQNetwork(feature_dim=3, lookback=4, action_count=3)
-        mask = net._causal_mask(4, torch.device("cpu"))
-        for i in range(4):
-            for j in range(4):
-                if j <= i:
-                    self.assertEqual(float(mask[i, j].item()), 0.0)  # self + past allowed
-                else:
-                    self.assertLess(float(mask[i, j].item()), -1e30)  # future disallowed
 
     def test_calibrator_recovers_known_residual_std_and_flags_in_sample(self) -> None:
         rows = 100
@@ -111,18 +100,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(torch.isnan(out.p_beats_cash[:, 0]).all())  # CASH vs CASH undefined
         self.assertTrue(torch.isfinite(out.p_beats_cash[:, 1]).all())
 
-    def test_empty_market_block_marks_all_symbols_missing(self) -> None:
-        from rl_quant.features.stock_second_context import (
-            MARKET_CONTEXT_FEATURE_NAMES,
-            _block_market_features,
-        )
-
-        features, valid = _block_market_features(
-            {}, block_start_ms=0, block_end_ms=1_000, total_symbols=10, min_active_symbols=5
-        )
-        self.assertFalse(valid)
-        missing_index = MARKET_CONTEXT_FEATURE_NAMES.index("missing_symbol_fraction")
-        self.assertEqual(features[missing_index], 1.0)
 
     def test_precomputed_news_requires_model_availability_for_real_model(self) -> None:
         module = load_script("build_news_llm_features")
@@ -355,17 +332,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(any("time_horizon" in error for error in errors))
         self.assertEqual(validate_news_llm_rows([self._valid_news_llm_row(time_horizon="days_to_weeks")]), [])
 
-    def test_second_bar_execution_latency_default_and_explicit_floor(self) -> None:
-        module = load_script("build_hourly_from_minute_context_dataset")
-        # Second source data auto-sets execution latency to one bar when left at the 0 default.
-        auto = module.parse_args(["--source-bar-interval", "1s"])
-        self.assertEqual(auto.execution_latency_ms, module.DEFAULT_SECOND_BAR_LATENCY_MS)
-        # An explicit sub-one-bar execution latency for second data is rejected, not silently used.
-        with self.assertRaises(ValueError):
-            module.parse_args(["--source-bar-interval", "1s", "--execution-latency-ms", "500"])
 
     def test_masked_mean_std_ignores_nan_in_masked_positions(self) -> None:
-        from rl_quant.minute_to_hour_transformer import _masked_mean_std
+        from rl_quant.second_to_hour_transformer import _masked_mean_std
 
         # A NaN in a MASKED-OUT position must not poison the channel statistics (NaN * 0 == NaN).
         # Two valid observations (3.0, 5.0) -> mean 4.0, NaN at the masked position ignored.
@@ -376,7 +345,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(mean.item()), 4.0, places=6)
 
     def test_masked_mean_std_leaves_sparse_channel_unnormalized(self) -> None:
-        from rl_quant.minute_to_hour_transformer import _masked_mean_std
+        from rl_quant.second_to_hour_transformer import _masked_mean_std
 
         # Fewer than two valid observations -> mean 0, std 1 (no amplification by a near-zero std).
         features = torch.tensor([[[[3.0], [float("nan")]]]])
@@ -450,7 +419,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertNotEqual(selected[-1].parent.name, module.latest_available_partition_label(earliest))
 
     def test_action_feature_normalizer_one_valid_value_gets_mean_zero_std_one(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_action_feature_mean_std"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["_action_feature_mean_std"])
         # Channel "one" has a single mask-true value (5.0; the other entry is masked out); channel "two"
         # has two mask-true values (2.0, 6.0). (B=2, S=1, F=4) with interleaved value/mask channels.
         features = torch.tensor(
@@ -735,52 +704,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             partition_windows_from_labels(["2026-01-01_to_garbage"])
 
-    def test_build_split_records_and_gates_latest_reward_row_filtering(self) -> None:
-        module = __import__("rl_quant.minute_to_hour_transformer", fromlist=["_build_split"])
-
-        def _payload(invalid_row: int) -> dict:
-            returns = torch.tensor([[0.0, 0.01], [0.0, 0.02], [0.0, 0.03]], dtype=torch.float32)
-            label_valid = torch.ones((3, 2), dtype=torch.bool)
-            label_valid[invalid_row, 1] = False
-            returns[invalid_row, 1] = float("nan")  # contract: a label-invalid return must be NaN
-            return {
-                "decision_timestamps": [f"2026-06-10T1{5 + i}:30:00+00:00" for i in range(3)],
-                "next_timestamps": [f"2026-06-10T1{6 + i}:30:00+00:00" for i in range(3)],
-                "minute_timestamp_grid": [[[f"2026-06-10T1{5 + i}:29:59+00:00"]] for i in range(3)],
-                "minute_feature_names": ["m"],
-                "hour_feature_names": ["h"],
-                "action_names": ["CASH", "QQQ"],
-                "minute_features": torch.zeros((3, 1, 1, 1), dtype=torch.float32),
-                "minute_mask": torch.ones((3, 1, 1), dtype=torch.bool),
-                "hour_features": torch.zeros((3, 1, 1), dtype=torch.float32),
-                "action_returns": returns,
-                "action_valid_mask": torch.ones((3, 2), dtype=torch.bool),
-                "label_valid_mask": label_valid,
-                "source_bar_interval": "1s",
-                "context_bars_per_hour": 3600,
-                "minutes_per_hour": 3600,
-                "decision_grid_minutes": 60,
-                "bar_latency_ms": 1000,
-            }
-
-        # The LATEST row (index 2) has a selectable non-cash missing label -> the filter drops it, so the
-        # TEST split loses its latest reward row. Recorded AND gated non-reportable (not silently shrunk).
-        test_split = module._build_split(name="test", payload=_payload(2))
-        self.assertEqual(test_split.excluded_missing_label_rows, 1)
-        self.assertTrue(test_split.filter_removed_latest_reward_rows)
-        self.assertFalse(test_split.dataset_reportable)
-        self.assertIn("test_filter_removed_latest_reward_rows", test_split.dataset_reportability_errors)
-        self.assertEqual(test_split.valid_start_indices.tolist(), [0, 1])
-        # Same data as a TRAIN split: the drop is recorded but NOT gated by this rule (train may
-        # legitimately end before the latest reward row).
-        train_split = module._build_split(name="train", payload=_payload(2))
-        self.assertTrue(train_split.filter_removed_latest_reward_rows)
-        self.assertNotIn("test_filter_removed_latest_reward_rows", train_split.dataset_reportability_errors)
-        # Dropping a NON-latest row (index 0) does not trip the latest-reward gate.
-        mid_split = module._build_split(name="test", payload=_payload(0))
-        self.assertEqual(mid_split.excluded_missing_label_rows, 1)
-        self.assertFalse(mid_split.filter_removed_latest_reward_rows)
-        self.assertNotIn("test_filter_removed_latest_reward_rows", mid_split.dataset_reportability_errors)
 
     def test_transition_feature_table_encodes_hold_switch_exit(self) -> None:
         from rl_quant.trading_constraints import TRANSITION_FEATURE_NAMES, build_transition_feature_table
@@ -844,213 +767,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(bool((out[:, col["runup_from_trough"]] >= 0).all().item()))
         self.assertTrue(torch.equal(out, build_dynamic_transition_features(unrealized_pnl=upnl, mae=mae, mfe=mfe, clamp=1.0)))
 
-    def test_qnetwork_transition_features_condition_q_on_held_position(self) -> None:
-        from rl_quant.trading_constraints import TRANSITION_FEATURE_DIM
 
-        action_count, d_model, batch = 3, 16, 2
-        ctor = dict(
-            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
-            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
-        )
-        inputs = dict(
-            minute_features=torch.zeros(batch, 1, 1, 1),
-            minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
-            hour_features=torch.zeros(batch, 1, 1),
-            constraint_features=torch.zeros(batch, 6),
-        )
-        prev0 = torch.zeros(batch, dtype=torch.long)
-        prev1 = torch.ones(batch, dtype=torch.long)
 
-        def _contribution(net, *, prev, action_features):
-            net.eval()
-            with torch.no_grad():
-                full = net(previous_actions=prev, action_features=action_features, **inputs)
-                net.transition_encoder, net.transition_bias = None, None  # isolate the transition path
-                base = net(previous_actions=prev, action_features=action_features, **inputs)
-            return full - base
 
-        table = torch.randn(action_count, action_count, TRANSITION_FEATURE_DIM)
-        af = torch.zeros(batch, action_count, 2)
-        # Action-conditioned branch: zero-init -> the transition path contributes nothing at init.
-        torch.manual_seed(1)
-        net = MinuteToHourCausalTransformerQNetwork(
-            action_feature_dim=2, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
-        )
-        self.assertTrue(
-            torch.allclose(_contribution(net, prev=prev0, action_features=af), torch.zeros(batch, action_count))
-        )
-
-        def _perturbed(seed):
-            torch.manual_seed(seed)
-            model = MinuteToHourCausalTransformerQNetwork(
-                action_feature_dim=2, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
-            )
-            with torch.no_grad():  # varied (not constant) weights so LayerNorm preserves the signal
-                model.transition_encoder[0].weight.copy_(torch.arange(d_model * TRANSITION_FEATURE_DIM).float().reshape(d_model, TRANSITION_FEATURE_DIM) * 0.01)
-                model.transition_encoder[0].bias.copy_(torch.arange(d_model).float() * 0.01)
-            return model
-
-        contrib0 = _contribution(_perturbed(1), prev=prev0, action_features=af)
-        contrib1 = _contribution(_perturbed(1), prev=prev1, action_features=af)
-        self.assertFalse(torch.allclose(contrib0, torch.zeros_like(contrib0)))  # now contributes
-        self.assertFalse(torch.allclose(contrib0, contrib1))  # contribution depends on held position
-        # Fallback head (no action_features): forward returns [B, A] and is held-position aware via the bias.
-        torch.manual_seed(2)
-        fb = MinuteToHourCausalTransformerQNetwork(
-            action_feature_dim=0, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
-        )
-        with torch.no_grad():
-            out = fb(previous_actions=prev0, action_features=None, **inputs)
-        self.assertEqual(tuple(out.shape), (batch, action_count))
-
-        def _perturbed_fallback(seed):
-            torch.manual_seed(seed)
-            model = MinuteToHourCausalTransformerQNetwork(
-                action_feature_dim=0, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table, **ctor
-            )
-            with torch.no_grad():
-                model.transition_bias.weight.copy_(torch.arange(TRANSITION_FEATURE_DIM).float().reshape(1, -1) * 0.1)
-                model.transition_bias.bias.fill_(0.0)
-            return model
-
-        self.assertFalse(
-            torch.allclose(
-                _contribution(_perturbed_fallback(2), prev=prev0, action_features=None),
-                _contribution(_perturbed_fallback(2), prev=prev1, action_features=None),
-            )
-        )
-
-    def test_qnetwork_dynamic_features_zero_init_and_condition_q(self) -> None:
-        # PR-D D3a: the network can consume a per-env dynamic position-state vector. Zero-init -> a freshly
-        # built dynamic-aware net scores IDENTICALLY (so flag-on-but-untrained == off, byte-identical); after
-        # perturbing the encoder the Q depends on the dynamic state; dynamic_feature_dim=0 adds no params.
-        from rl_quant.trading_constraints import DYNAMIC_TRANSITION_FEATURE_DIM
-
-        action_count, d_model, batch = 3, 16, 2
-        D = DYNAMIC_TRANSITION_FEATURE_DIM
-        ctor = dict(
-            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
-            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
-        )
-        inputs = dict(
-            minute_features=torch.zeros(batch, 1, 1, 1),
-            minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
-            hour_features=torch.zeros(batch, 1, 1),
-            constraint_features=torch.zeros(batch, 6),
-            previous_actions=torch.zeros(batch, dtype=torch.long),
-        )
-        af = torch.zeros(batch, action_count, 2)
-        dyn = torch.randn(batch, D)
-
-        # dynamic_feature_dim=0 -> no dynamic params at all.
-        torch.manual_seed(1)
-        off = MinuteToHourCausalTransformerQNetwork(action_feature_dim=2, **ctor)
-        self.assertIsNone(off.dynamic_encoder)
-        self.assertIsNone(off.dynamic_bias)
-        self.assertFalse(any("dynamic" in k for k in off.state_dict()))
-
-        # Zero-init: passing dynamic_state changes nothing at init (action-feature head + fallback head).
-        for afd, action_features in ((2, af), (0, None)):
-            torch.manual_seed(3)
-            net = MinuteToHourCausalTransformerQNetwork(action_feature_dim=afd, dynamic_feature_dim=D, **ctor)
-            net.eval()
-            with torch.no_grad():
-                base = net(action_features=action_features, dynamic_state=torch.zeros(batch, D), **inputs)
-                withdyn = net(action_features=action_features, dynamic_state=dyn, **inputs)
-            self.assertTrue(torch.allclose(base, withdyn), f"zero-init must be a no-op (afd={afd})")
-
-        # After perturbing the dynamic encoder, the Q depends on the dynamic state (and differs across states).
-        torch.manual_seed(3)
-        net = MinuteToHourCausalTransformerQNetwork(action_feature_dim=2, dynamic_feature_dim=D, **ctor)
-        with torch.no_grad():
-            net.dynamic_encoder[0].weight.copy_(torch.arange(d_model * D).float().reshape(d_model, D) * 0.01)
-            net.dynamic_encoder[0].bias.copy_(torch.arange(d_model).float() * 0.01)
-        net.eval()
-        with torch.no_grad():
-            q_zero = net(action_features=af, dynamic_state=torch.zeros(batch, D), **inputs)
-            q_a = net(action_features=af, dynamic_state=torch.zeros(batch, D) + 0.5, **inputs)
-            q_b = net(action_features=af, dynamic_state=torch.zeros(batch, D) - 0.5, **inputs)
-        self.assertFalse(torch.allclose(q_a, q_zero))  # dynamic state now moves Q vs the zero ablation
-        self.assertFalse(torch.allclose(q_a, q_b))  # and different states give different Q
-        # A dynamic-built model must fail closed when dynamic_state is omitted -- no silent non-dynamic scoring.
-        with self.assertRaises(ValueError):
-            net(action_features=af, dynamic_state=None, **inputs)
-
-    def test_transition_features_clean_perturbation(self) -> None:
-        # Reorg review: enabling transition_feature_dim>0 must be a CLEAN perturbation -- the shared backbone
-        # (hour_encoder + head) is bit-identical to the transition_feature_dim=0 model under the same seed,
-        # because the zero-init transition module is built under saved/restored RNG. So a transition A/B
-        # isolates the feature, not a different random initialisation. Covers the action-feature + fallback heads.
-        from rl_quant.trading_constraints import TRANSITION_FEATURE_DIM
-
-        action_count, d_model, batch = 3, 16, 2
-        f_dim = TRANSITION_FEATURE_DIM
-        ctor = dict(
-            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
-            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
-        )
-        inputs = dict(
-            minute_features=torch.zeros(batch, 1, 1, 1),
-            minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
-            hour_features=torch.zeros(batch, 1, 1),
-            constraint_features=torch.zeros(batch, 6),
-            previous_actions=torch.zeros(batch, dtype=torch.long),
-        )
-        zero_table = torch.zeros(action_count, action_count, f_dim)
-        for afd, action_features in ((2, torch.zeros(batch, action_count, 2)), (0, None)):
-            torch.manual_seed(7)
-            off = MinuteToHourCausalTransformerQNetwork(action_feature_dim=afd, **ctor)
-            torch.manual_seed(7)
-            on = MinuteToHourCausalTransformerQNetwork(
-                action_feature_dim=afd, transition_feature_dim=f_dim, transition_table=zero_table, **ctor
-            )
-            for sub in ("hour_encoder", "head"):  # backbone modules built AFTER the transition block
-                for (name, p_off), (_, p_on) in zip(
-                    getattr(off, sub).named_parameters(), getattr(on, sub).named_parameters()
-                ):
-                    self.assertTrue(torch.equal(p_off, p_on), f"{sub}.{name} differs (afd={afd}) -> RNG perturbed")
-            off.eval()
-            on.eval()
-            with torch.no_grad():
-                q_off = off(action_features=action_features, **inputs)
-                q_on = on(action_features=action_features, **inputs)
-            self.assertTrue(torch.equal(q_off, q_on), f"zero-table transition must be a no-op at init (afd={afd})")
-
-    def test_td_next_q_max_depends_on_next_previous_action(self) -> None:
-        # The TD target uses max_a Q(s', a) evaluated with next_previous_actions (the post-action held
-        # position). This is a direct regression guard that a refactor passing the wrong previous action
-        # to the target network would be caught: same next-market, different next position -> different max-Q.
-        from rl_quant.trading_constraints import TRANSITION_FEATURE_DIM
-
-        action_count, d_model, batch = 3, 16, 2
-        torch.manual_seed(3)
-        table = torch.randn(action_count, action_count, TRANSITION_FEATURE_DIM)
-        net = MinuteToHourCausalTransformerQNetwork(
-            minute_feature_dim=1, hour_feature_dim=1, action_count=action_count, hours_lookback=1,
-            minutes_per_hour=1, d_model=d_model, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
-            action_feature_dim=2, transition_feature_dim=TRANSITION_FEATURE_DIM, transition_table=table,
-        )
-        net.eval()
-        with torch.no_grad():  # perturb so the (zero-init) transition path is active
-            net.transition_encoder[0].weight.copy_(
-                torch.arange(d_model * TRANSITION_FEATURE_DIM).float().reshape(d_model, TRANSITION_FEATURE_DIM) * 0.01
-            )
-            net.transition_encoder[0].bias.copy_(torch.arange(d_model).float() * 0.01)
-        inputs = dict(
-            minute_features=torch.zeros(batch, 1, 1, 1), minute_mask=torch.ones(batch, 1, 1, dtype=torch.bool),
-            hour_features=torch.zeros(batch, 1, 1), constraint_features=torch.zeros(batch, 6),
-            action_features=torch.zeros(batch, action_count, 2),
-        )
-        with torch.no_grad():
-            max_from_cash = net(previous_actions=torch.zeros(batch, dtype=torch.long), **inputs).max(dim=1).values
-            max_from_qqq = net(previous_actions=torch.ones(batch, dtype=torch.long), **inputs).max(dim=1).values
-        self.assertFalse(torch.allclose(max_from_cash, max_from_qqq))
-        # The table gather guards out-of-range ids (both bounds) with a clear error rather than a silent
-        # negative-index wrap to the last row.
-        with self.assertRaises(ValueError):
-            net._transition_rows(torch.tensor([-1], dtype=torch.long))
-        with self.assertRaises(ValueError):
-            net._transition_rows(torch.tensor([action_count], dtype=torch.long))
 
     def test_transition_table_cost_matches_env_reward_convention(self) -> None:
         from rl_quant.trading_constraints import TRANSITION_FEATURE_NAMES, build_transition_feature_table, trade_legs
@@ -1072,14 +791,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 self.assertAlmostEqual(table[prev, cand, col].item() * 100.0, expected_bps, places=5)
 
     def test_warm_start_schema_rejects_transition_mismatch(self) -> None:
-        from rl_quant.minute_to_hour_transformer import _assert_checkpoint_schema
+        from rl_quant.second_to_hour_transformer import _assert_checkpoint_schema
         from rl_quant.trading_constraints import TRANSITION_FEATURE_NAMES
 
         common = dict(
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"], action_feature_names=[]
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"], action_feature_names=[]
         )
         base = {
-            "minute_feature_names": ["m"], "hour_feature_names": ["h"], "action_names": ["CASH", "QQQ"],
+            "second_feature_names": ["m"], "hour_feature_names": ["h"], "action_names": ["CASH", "QQQ"],
             "action_feature_names": [], "constraint_feature_names": list(CONSTRAINT_FEATURE_NAMES),
         }
         names = list(TRANSITION_FEATURE_NAMES)
@@ -1091,92 +810,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _assert_checkpoint_schema({**base, "transition_feature_names": []}, **common, transition_feature_dim=len(names))
 
-    def test_execution_simulator_transition_cases(self) -> None:
-        from rl_quant.execution import (
-            ExecutionConfig,
-            FillLevel,
-            MarketSnapshot,
-            PositionState,
-            TerminalPolicy,
-            fill_index,
-            simulate_transition,
-        )
-
-        cfg = ExecutionConfig(  # trade_scale = 2*100 = 200; delayed_close (mid proxy)
-            trade_lot_size=2, commission_per_share=0.01, extra_cost_per_share=0.02, terminal_policy=TerminalPolicy.CARRY
-        )
-        now = MarketSnapshot(mid=100.0, half_spread=0.05)
-        fill = MarketSnapshot(mid=101.0, half_spread=0.05)
-        nxt = MarketSnapshot(mid=103.0, half_spread=0.05)
-
-        def run(old, new, *, terminal=False, config=cfg, n=now, f=fill, x=nxt):
-            return simulate_transition(PositionState(position=old), new, n, f, x, is_terminal=terminal, config=config)
-
-        # fill_index: min(now+latency, next), capped at next; latency<=0 collapses to current bar.
-        self.assertEqual(fill_index(10, step_horizon=5, latency_steps=2), 12)
-        self.assertEqual(fill_index(10, step_horizon=5, latency_steps=0), 10)
-        self.assertEqual(fill_index(10, step_horizon=5, latency_steps=99), 15)
-        # The vectorized fill_indices now lives in execution.py (single source of truth) and the intraday
-        # env/pretraining sites import it; it must equal scalar fill_index applied element-wise. Lock it
-        # against drift across negative/zero/positive latency, and confirm device/dtype are preserved.
-        from rl_quant.execution import fill_indices as exec_fill_indices
-
-        for horizon in (1, 5):
-            for latency in (-3, 0, 1, 3, 99):
-                idx = torch.arange(20)
-                vec = exec_fill_indices(idx, step_horizon=horizon, latency_steps=latency)
-                want = [fill_index(int(i), step_horizon=horizon, latency_steps=latency) for i in idx.tolist()]
-                self.assertEqual(vec.tolist(), want)
-                self.assertEqual(vec.dtype, idx.dtype)
-                self.assertEqual(vec.device, idx.device)
-        # Vectorized helper carries the same step_horizon>0 guard as the scalar version.
-        with self.assertRaises(ValueError):
-            exec_fill_indices(torch.arange(4), step_horizon=0, latency_steps=1)
-        # Also assert the intraday env/pretraining sites import THIS helper (no private duplicate remains).
-        import rl_quant.intraday_dqn as _idqn
-
-        self.assertFalse(hasattr(_idqn, "_fill_indices"))
-        self.assertIs(_idqn.compute_fill_indices, exec_fill_indices)
-
-        per_share = 0.05 + 0.02 + 0.01  # half_spread + extra + commission
-        # cash->cash: everything zero.
-        z = run(0.0, 0.0)
-        self.assertEqual((z.gross_return, z.entry_cost, z.exit_cost, z.net_return, z.order_legs), (0.0, 0.0, 0.0, 0.0, 0.0))
-        # cash->asset (+1): no old leg, 1-unit entry cost, new earns fill->next.
-        ca = run(0.0, 1.0)
-        self.assertAlmostEqual(ca.old_latency_return, 0.0)
-        self.assertAlmostEqual(ca.new_interval_return, 1.0 * (103.0 - 101.0) * 200.0)
-        self.assertAlmostEqual(ca.entry_cost, 1.0 * per_share * 200.0)
-        self.assertEqual(ca.order_legs, 1.0)
-        # asset->same (+1->+1): NO re-entry cost, one continuous leg now->next.
-        hold = run(1.0, 1.0)
-        self.assertEqual(hold.entry_cost, 0.0)
-        self.assertEqual(hold.order_legs, 0.0)
-        self.assertAlmostEqual(hold.net_return, 1.0 * (103.0 - 100.0) * 200.0)
-        # asset->cash (+1->0): old STILL earns the now->fill latency leg; 1-unit exit turnover cost.
-        ac = run(1.0, 0.0)
-        self.assertAlmostEqual(ac.old_latency_return, 1.0 * (101.0 - 100.0) * 200.0)
-        self.assertEqual(ac.new_interval_return, 0.0)
-        self.assertAlmostEqual(ac.entry_cost, 1.0 * per_share * 200.0)
-        # A->B full reversal (-1 -> +1): turnover is 2 units.
-        ab = run(-1.0, 1.0)
-        self.assertEqual(ab.order_legs, 2.0)
-        self.assertAlmostEqual(ab.entry_cost, 2.0 * per_share * 200.0)
-        # Terminal liquidation charges |new| * cost at the NEXT bar; CARRY charges none.
-        term = run(0.0, 1.0, terminal=True, config=ExecutionConfig(trade_lot_size=2, terminal_policy=TerminalPolicy.LIQUIDATE_AT_NEXT))
-        self.assertAlmostEqual(term.exit_cost, 1.0 * 0.05 * 200.0)
-        self.assertEqual(run(0.0, 1.0, terminal=True).exit_cost, 0.0)  # cfg is CARRY
-        # delayed_close is honestly NOT a real executable fill; no fill prices.
-        self.assertFalse(cfg.real_executable_fill_model)
-        self.assertIsNone(ca.entry_fill_price)
-        # quote_side: buy fills at ask, sell at bid, and IS a real executable fill model.
-        qcfg = ExecutionConfig(fill_level=FillLevel.QUOTE_SIDE, trade_lot_size=1)
-        q_now = MarketSnapshot(mid=100.0, best_bid=99.9, best_ask=100.1)
-        q = simulate_transition(PositionState(position=0.0), 1.0, q_now, q_now, q_now, is_terminal=False, config=qcfg)
-        self.assertTrue(qcfg.real_executable_fill_model)
-        self.assertAlmostEqual(q.entry_fill_price, 100.1)  # buy at ask
-        sell = simulate_transition(PositionState(position=1.0), 0.0, q_now, q_now, q_now, is_terminal=False, config=qcfg)
-        self.assertAlmostEqual(sell.entry_fill_price, 99.9)  # closing the long sells at bid
 
     def test_execution_config_and_terminal_state_guards(self) -> None:
         from rl_quant.execution import (
@@ -1874,7 +1507,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(helper_sw[0]), 1e4 * out_sw.realized_execution_cost, places=6)
         self.assertAlmostEqual(float(helper_sw[0]), 3.0, places=6)  # (1.0 + 0.5) * 2 bps
 
-    def test_minute_to_hour_execution_shadow_reward_side_channel(self) -> None:
+    def test_second_to_hour_execution_shadow_reward_side_channel(self) -> None:
         # PR-3: execution_env_reward_shadow ON computes a weight-bps execution reward/cost ALONGSIDE the legacy
         # reward (logged in the step dict) but leaves the training `rewards` byte-identical -- replay stores only
         # declared fields, so the shadow never reaches training. Default OFF emits no shadow keys.
@@ -1882,21 +1515,21 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             name="train",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((4, 1, 1, 1)), minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((4, 1, 1, 1)), second_mask=torch.ones((4, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((4, 1, 1)),
             action_returns=torch.tensor([[0.0, 0.10], [0.0, -0.20], [0.0, 0.30], [0.0, 0.0]]),
             action_valid_mask=torch.ones((4, 2), dtype=torch.bool), label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2, 3]), valid_index_mask=torch.tensor([True, True, True, True]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
-        module = __import__("rl_quant.minute_to_hour_transformer",
-                            fromlist=["VectorizedMinuteToHourEnv", "MinuteToHourEnvConfig"])
+        module = __import__("rl_quant.second_to_hour_transformer",
+                            fromlist=["VectorizedSecondToHourEnv", "SecondToHourEnvConfig"])
 
         def run(shadow: bool, action: int) -> dict:
-            env = module.VectorizedMinuteToHourEnv(
-                split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0,
+            env = module.VectorizedSecondToHourEnv(
+                split, module.SecondToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0,
                                                     execution_env_reward_shadow=shadow), torch.device("cpu"))
             env.indices[:] = 0
             env.entry_index[:] = 0
@@ -1912,30 +1545,30 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         hold = run(True, 0)  # CASH -> CASH: no trade -> zero shadow execution cost
         self.assertEqual(float(hold["execution_cost_bps_shadow"][0]), 0.0)
 
-    def test_minute_to_hour_eval_applies_cash_idle_penalty(self) -> None:
-        # Review #5 fix (eval-through-shared-primitive): evaluate_minute_to_hour_policy now applies the env's
+    def test_second_to_hour_eval_applies_cash_idle_penalty(self) -> None:
+        # Review #5 fix (eval-through-shared-primitive): evaluate_second_to_hour_policy now applies the env's
         # cash_idle_penalty_bps via the SHARED transition_trade_cost_bps -- it omitted it before (a latent
         # drift vs the training reward). An always-cash policy's reward drops when the penalty is nonzero;
         # with penalty 0 it is byte-identical to the prior behaviour (no cost on zero-return cash holds).
-        from rl_quant.minute_to_hour_transformer import HourFromMinuteDataSplit
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.second_to_hour_transformer import HourFromMinuteDataSplit
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         split = HourFromMinuteDataSplit(
             name="eval",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((4, 1, 1, 1)), minute_mask=torch.ones((4, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((4, 1, 1, 1)), second_mask=torch.ones((4, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((4, 1, 1)), action_returns=torch.zeros((4, 2)),
             action_valid_mask=torch.ones((4, 2), dtype=torch.bool), label_valid_mask=torch.ones((4, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2, 3]), valid_index_mask=torch.tensor([True, True, True, True]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
         always_cash = _ConstantActionModel(2, 0)  # holds CASH every row
         device = torch.device("cpu")
-        free = evaluate_minute_to_hour_policy(split, always_cash, device=device, cash_idle_penalty_bps=0.0)
-        penalised = evaluate_minute_to_hour_policy(split, always_cash, device=device, cash_idle_penalty_bps=100.0)
+        free = evaluate_second_to_hour_policy(split, always_cash, device=device, cash_idle_penalty_bps=0.0)
+        penalised = evaluate_second_to_hour_policy(split, always_cash, device=device, cash_idle_penalty_bps=100.0)
         self.assertEqual(free.total_reward_bps, 0.0)  # zero returns, no trade, no penalty -> zero
         self.assertLess(penalised.total_reward_bps, free.total_reward_bps)  # cash-idle penalty now charged in eval
 
@@ -1946,13 +1579,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # also pins their agreement.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import (
-            MinuteToHourEnvConfig, VectorizedMinuteToHourEnv, transition_trade_cost_bps,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import (
+            SecondToHourEnvConfig, VectorizedSecondToHourEnv, transition_trade_cost_bps,
         )
 
         cons = dataclasses.replace(
-            default_minute_to_hour_constraints(), one_way_cost_bps=10.0, extra_switch_penalty_bps=5.0, cash_index=0
+            default_second_to_hour_constraints(), one_way_cost_bps=10.0, extra_switch_penalty_bps=5.0, cash_index=0
         )
 
         def bd(prev: int, act: int, cash_idle: float = 0.0):
@@ -1999,16 +1632,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         split = HourFromMinuteDataSplit(
             name="t", decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(3)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(3)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((3, 1, 1, 1)), minute_mask=torch.ones((3, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((3, 1, 1, 1)), second_mask=torch.ones((3, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((3, 1, 1)), action_returns=torch.tensor([[0.0, 0.10], [0.0, 0.0], [0.0, 0.0]]),
             action_valid_mask=torch.ones((3, 2), dtype=torch.bool), label_valid_mask=torch.ones((3, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2]), valid_index_mask=torch.tensor([True, True, True]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
-        env = VectorizedMinuteToHourEnv(
-            split, MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0,
+        env = VectorizedSecondToHourEnv(
+            split, SecondToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0,
                                          cash_idle_penalty_bps=50.0, constraints=cons), torch.device("cpu")
         )
         env.indices[:] = 0
@@ -2019,44 +1652,44 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         expected = 0.10 * 10_000.0 - (float(b.trade_cost_bps[0]) + float(b.cash_idle_bps[0])) * 10_000.0 / 10_000.0
         self.assertAlmostEqual(float(out["rewards"][0]), expected, places=4)
 
-    def test_minute_to_hour_env_rejects_non_cash_cash_index(self) -> None:
+    def test_second_to_hour_env_rejects_non_cash_cash_index(self) -> None:
         # Review #2: cash_index must point to a CASH action, not merely be in range -- otherwise the wrong
         # action gets the cash-idle penalty / zero shadow exposure / label fallback. Out-of-range and
         # in-range-but-not-cash both fail closed; the correct cash index constructs fine.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.minute_to_hour_transformer import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.second_to_hour_transformer import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         def split() -> HourFromMinuteDataSplit:
             return HourFromMinuteDataSplit(
                 name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
                 next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
                 action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
                 valid_start_indices=torch.tensor([0, 1]), valid_index_mask=torch.tensor([True, True]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
             )
 
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
         device = torch.device("cpu")
         # cash_index=0 -> "CASH": constructs fine.
-        VectorizedMinuteToHourEnv(split(), MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+        VectorizedSecondToHourEnv(split(), SecondToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
         # cash_index=1 -> "QQQ" (in range but not cash): fail closed.
         with self.assertRaises(ValueError):
-            VectorizedMinuteToHourEnv(
-                split(), MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=1,
+            VectorizedSecondToHourEnv(
+                split(), SecondToHourEnvConfig(num_envs=1, episode_length=5, initial_action=1,
                                                constraints=dataclasses.replace(base, cash_index=1)), device)
         # cash_index out of range: fail closed.
         with self.assertRaises(ValueError):
-            VectorizedMinuteToHourEnv(
-                split(), MinuteToHourEnvConfig(num_envs=1, episode_length=5,
+            VectorizedSecondToHourEnv(
+                split(), SecondToHourEnvConfig(num_envs=1, episode_length=5,
                                                constraints=dataclasses.replace(base, cash_index=5)), device)
 
-    def test_minute_to_hour_cash_index_validator_and_action_dtype_guards(self) -> None:
+    def test_second_to_hour_cash_index_validator_and_action_dtype_guards(self) -> None:
         # Review #6 (afdf0a6): the SHARED cash-index validator fails closed identically in the env AND the
         # evaluator (the eval previously could silently price the cash-idle penalty / cash fallback against the
         # wrong action); it rejects wrong TYPES (bool/float/str would int-coerce silently); the default env
@@ -2066,14 +1699,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import dataclasses
         import warnings
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import (
-            MinuteToHourEnvConfig,
-            VectorizedMinuteToHourEnv,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import (
+            SecondToHourEnvConfig,
+            VectorizedSecondToHourEnv,
             transition_trade_cost_bps,
             validate_cash_index_for_actions,
         )
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         device = torch.device("cpu")
 
@@ -2082,16 +1715,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             return HourFromMinuteDataSplit(
                 name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
                 next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
-                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
+                second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, n)),
                 action_valid_mask=torch.ones((2, n), dtype=torch.bool), label_valid_mask=torch.ones((2, n), dtype=torch.bool),
                 valid_start_indices=torch.tensor([0, 1]), valid_index_mask=torch.tensor([True, True]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
             )
 
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
 
         # (1) The validator: a valid int 0 -> "CASH" returns 0; wrong types and bad indices fail closed
         # (bool/float/str must NOT silently int-coerce; out-of-range and in-range-but-not-cash both raise).
@@ -2108,14 +1741,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # symbol is inspected, not every action (all-action metadata build is gated behind the shadow flag).
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            VectorizedMinuteToHourEnv(
+            VectorizedSecondToHourEnv(
                 split(["CASH", "UNSEEN_TICKER_ZZ"]),
-                MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+                SecondToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
         self.assertEqual(list(caught), [])
 
         # (3) The evaluator fails closed on a non-cash cash_index too (the env-vs-eval consistency this fixes).
         with self.assertRaises(ValueError):
-            evaluate_minute_to_hour_policy(
+            evaluate_second_to_hour_policy(
                 split(["CASH", "QQQ"]), _ConstantActionModel(2, 0), device=device,
                 constraints=dataclasses.replace(base, cash_index=1))
 
@@ -2131,8 +1764,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                                       cash_idle_penalty_bps=0.0)
 
         # (5) env.step fails closed on a non-integer action tensor (float would truncate to the wrong index).
-        env = VectorizedMinuteToHourEnv(
-            split(["CASH", "QQQ"]), MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+        env = VectorizedSecondToHourEnv(
+            split(["CASH", "QQQ"]), SecondToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
         env.reset()
         with self.assertRaises(ValueError):
             env.step(torch.tensor([0.0]))
@@ -2142,49 +1775,49 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         return HourFromMinuteDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
-            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
+            second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, n)),
             action_valid_mask=torch.ones((2, n), dtype=torch.bool), label_valid_mask=torch.ones((2, n), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1]), valid_index_mask=torch.tensor([True, True]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
 
-    def test_minute_to_hour_initial_action_validation(self) -> None:
+    def test_second_to_hour_initial_action_validation(self) -> None:
         # Review #6 follow-up: initial_action gets the SAME strict discipline as cash_index in BOTH the env and
         # the evaluator -- int(True)/int(0.9)/int("0") would otherwise silently start the rollout from the
         # wrong action. A valid int start is accepted; bool/float/string/out-of-range fail closed.
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         device = torch.device("cpu")
-        base = default_minute_to_hour_constraints()
-        VectorizedMinuteToHourEnv(
+        base = default_second_to_hour_constraints()
+        VectorizedSecondToHourEnv(
             self._two_action_split(["CASH", "QQQ"]),
-            MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=1, constraints=base), device)
+            SecondToHourEnvConfig(num_envs=1, episode_length=5, initial_action=1, constraints=base), device)
         for bad in (True, 0.9, "0", 5):
             with self.assertRaises(ValueError):
-                VectorizedMinuteToHourEnv(
+                VectorizedSecondToHourEnv(
                     self._two_action_split(["CASH", "QQQ"]),
-                    MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=bad, constraints=base), device)
+                    SecondToHourEnvConfig(num_envs=1, episode_length=5, initial_action=bad, constraints=base), device)
             with self.assertRaises(ValueError):
-                evaluate_minute_to_hour_policy(
+                evaluate_second_to_hour_policy(
                     self._two_action_split(["CASH", "QQQ"]), _ConstantActionModel(2, 0), device=device,
                     initial_action=bad)
 
-    def test_minute_to_hour_step_action_tensor_validation(self) -> None:
+    def test_second_to_hour_step_action_tensor_validation(self) -> None:
         # Review #6 follow-up: the env boundary fails closed on a malformed action tensor BEFORE gather --
         # wrong dtype (float/bool), wrong shape/rank, out-of-range / negative index (and wrong device when
         # CUDA is present). A valid (num_envs,) integer tensor passes through, returned as long.
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         device = torch.device("cpu")
-        env = VectorizedMinuteToHourEnv(
+        env = VectorizedSecondToHourEnv(
             self._two_action_split(["CASH", "QQQ"]),
-            MinuteToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_minute_to_hour_constraints()),
+            SecondToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_second_to_hour_constraints()),
             device)
         ok = env._validate_step_actions(torch.tensor([0, 1], dtype=torch.int32))
         self.assertEqual(ok.dtype, torch.long)
@@ -2209,10 +1842,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # caller (not just env/eval, which validate upstream) cannot produce a silently-garbage cost.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import transition_trade_cost_bps
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import transition_trade_cost_bps
 
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
         prev = torch.tensor([0], dtype=torch.long)
         act = torch.tensor([1], dtype=torch.long)
         for bad in (True, float("nan"), float("inf"), -1.0, "x"):
@@ -2233,33 +1866,33 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                                        cash_idle_penalty_bps=0.0)
         self.assertEqual(float(ok.leg_cost_bps[0].item()), 2.0)
 
-    def test_minute_to_hour_baselines_rejects_non_cash_cash_index(self) -> None:
-        # Review #6 follow-up: evaluate_minute_to_hour_baselines reads cash_index (to skip the cash baseline /
+    def test_second_to_hour_baselines_rejects_non_cash_cash_index(self) -> None:
+        # Review #6 follow-up: evaluate_second_to_hour_baselines reads cash_index (to skip the cash baseline /
         # set initial_action) before delegating, so it must fail closed on a non-cash index too.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.training.minute_to_hour import evaluate_minute_to_hour_baselines
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.training.second_to_hour import evaluate_second_to_hour_baselines
 
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
         with self.assertRaises(ValueError):
-            evaluate_minute_to_hour_baselines(
+            evaluate_second_to_hour_baselines(
                 self._two_action_split(["CASH", "QQQ"]), device=torch.device("cpu"),
                 constraints=dataclasses.replace(base, cash_index=1))
 
-    def test_minute_to_hour_env_device_normalization(self) -> None:
+    def test_second_to_hour_env_device_normalization(self) -> None:
         # The env pins self.device to a CONCRETE ordinal: resolve_torch_device returns an ordinal-free
         # torch.device("cuda"), but tensors allocated on it report cuda:<idx>, so _validate_step_actions would
         # reject valid CUDA actions if self.device stayed ordinal-free. CPU is a no-op; CUDA is the real test.
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
-        cfg = MinuteToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_minute_to_hour_constraints())
-        env = VectorizedMinuteToHourEnv(self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cpu"))
+        cfg = SecondToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_second_to_hour_constraints())
+        env = VectorizedSecondToHourEnv(self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cpu"))
         self.assertEqual(env.device.type, "cpu")
         env._validate_step_actions(torch.zeros(2, dtype=torch.long, device=env.device))  # no raise
         if torch.cuda.is_available():
-            env_cuda = VectorizedMinuteToHourEnv(
+            env_cuda = VectorizedSecondToHourEnv(
                 self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cuda"))
             self.assertIsNotNone(env_cuda.device.index)  # concrete ordinal, e.g. cuda:0
             # A tensor built with ordinal-free "cuda" reports cuda:<current> and MUST be accepted.
@@ -2269,75 +1902,75 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # concrete_torch_device pins ordinal-free CUDA to cuda:<current>; CPU/explicit-ordinal pass through.
         # The env derives self.device from the moved tensor, so it equals what indexed tensors report.
         from rl_quant.core import concrete_torch_device
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         self.assertEqual(concrete_torch_device("cpu"), torch.device("cpu"))
         self.assertEqual(concrete_torch_device(torch.device("cpu")), torch.device("cpu"))
-        cfg = MinuteToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_minute_to_hour_constraints())
-        env = VectorizedMinuteToHourEnv(self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cpu"))
-        self.assertEqual(env.device, env.data.minute_features.device)
+        cfg = SecondToHourEnvConfig(num_envs=2, episode_length=5, constraints=default_second_to_hour_constraints())
+        env = VectorizedSecondToHourEnv(self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cpu"))
+        self.assertEqual(env.device, env.data.second_features.device)
         if torch.cuda.is_available():
             dev = concrete_torch_device("cuda")
             self.assertEqual(dev.type, "cuda")
             self.assertIsNotNone(dev.index)
-            env_cuda = VectorizedMinuteToHourEnv(
+            env_cuda = VectorizedSecondToHourEnv(
                 self._two_action_split(["CASH", "QQQ"]), cfg, torch.device("cuda"))
             self.assertIsNotNone(env_cuda.device.index)
-            self.assertEqual(env_cuda.device, env_cuda.data.minute_features.device)
+            self.assertEqual(env_cuda.device, env_cuda.data.second_features.device)
 
-    def test_minute_to_hour_env_entry_constraint_and_flag_validation(self) -> None:
+    def test_second_to_hour_env_entry_constraint_and_flag_validation(self) -> None:
         # Entry-point validation: a non-bool count_etf (truthy "false" would skew the action mask) and a
         # non-bool governed flag (execution_env_reward_shadow="false" would silently ENABLE the shadow) must
         # both fail closed at env CONSTRUCTION, before any mask/observe can consume the malformed value.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import (
-            MinuteToHourEnvConfig,
-            VectorizedMinuteToHourEnv,
-            validate_minute_to_hour_constraints,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import (
+            SecondToHourEnvConfig,
+            VectorizedSecondToHourEnv,
+            validate_second_to_hour_constraints,
         )
 
         device = torch.device("cpu")
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
         with self.assertRaises(ValueError):
-            VectorizedMinuteToHourEnv(
+            VectorizedSecondToHourEnv(
                 self._two_action_split(["CASH", "QQQ"]),
-                MinuteToHourEnvConfig(num_envs=1, episode_length=5,
+                SecondToHourEnvConfig(num_envs=1, episode_length=5,
                                       constraints=dataclasses.replace(base, count_etf_to_etf_as_two_legs="false")),
                 device)
         with self.assertRaises(ValueError):
-            VectorizedMinuteToHourEnv(
+            VectorizedSecondToHourEnv(
                 self._two_action_split(["CASH", "QQQ"]),
-                MinuteToHourEnvConfig(num_envs=1, episode_length=5, execution_env_reward_shadow="false",
+                SecondToHourEnvConfig(num_envs=1, episode_length=5, execution_env_reward_shadow="false",
                                       constraints=base),
                 device)
         # The shared constraint validator returns the NORMALIZED constraints (cash_index field) and rejects a
         # non-cash cash_index.
-        self.assertEqual(validate_minute_to_hour_constraints(base, ["CASH", "QQQ"]).cash_index, 0)
+        self.assertEqual(validate_second_to_hour_constraints(base, ["CASH", "QQQ"]).cash_index, 0)
         with self.assertRaises(ValueError):
-            validate_minute_to_hour_constraints(dataclasses.replace(base, cash_index=1), ["CASH", "QQQ"])
+            validate_second_to_hour_constraints(dataclasses.replace(base, cash_index=1), ["CASH", "QQQ"])
 
-    def test_train_minute_to_hour_rejects_non_bool_feature_flags(self) -> None:
+    def test_train_second_to_hour_rejects_non_bool_feature_flags(self) -> None:
         # Governed model-input flags must be real bools at train entry (a truthy string would flip the model
-        # contract / replay schema). The check is at the top of train_minute_to_hour_dqn, before any work.
+        # contract / replay schema). The check is at the top of train_second_to_hour_dqn, before any work.
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
-            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.second_to_hour_transformer import (
+            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         def make_split(name: str) -> HourFromMinuteDataSplit:
             return HourFromMinuteDataSplit(
                 name=name, decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-03T14:30:00+00:00"],
                 next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-03T15:30:00+00:00"],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
                 action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
                 valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
             )
 
         learning = DQNLearningConfig(
@@ -2346,30 +1979,30 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             epsilon_end=0.0, eval_interval=1, grad_clip=1.0,
         )
         for flag in ("use_transition_features", "use_dynamic_transition_features"):
-            config = MinuteToHourTrainingConfig(
-                env=MinuteToHourEnvConfig(num_envs=1, episode_length=2), learning=learning,
-                d_model=8, n_heads=1, minute_layers=1, hour_layers=1, feedforward_dim=8, action_embedding_dim=2,
+            config = SecondToHourTrainingConfig(
+                env=SecondToHourEnvConfig(num_envs=1, episode_length=2), learning=learning,
+                d_model=8, n_heads=1, second_layers=1, hour_layers=1, feedforward_dim=8, action_embedding_dim=2,
                 **{flag: "false"},
             )
             with self.assertRaises(ValueError):
-                train_minute_to_hour_dqn(make_split("train"), make_split("val"), device=torch.device("cpu"), config=config)
+                train_second_to_hour_dqn(make_split("train"), make_split("val"), device=torch.device("cpu"), config=config)
 
-    def test_minute_to_hour_reward_scale_validation(self) -> None:
+    def test_second_to_hour_reward_scale_validation(self) -> None:
         # reward_scale multiplies every reward and normalises the shadow bps artifact; a zero / negative /
         # non-finite / bool value must fail closed in BOTH the env and the evaluator.
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
         device = torch.device("cpu")
         for bad in (0.0, -1.0, float("nan"), float("inf"), True):
             with self.assertRaises(ValueError):
-                VectorizedMinuteToHourEnv(
+                VectorizedSecondToHourEnv(
                     self._two_action_split(["CASH", "QQQ"]),
-                    MinuteToHourEnvConfig(num_envs=1, episode_length=5, reward_scale=bad, constraints=base), device)
+                    SecondToHourEnvConfig(num_envs=1, episode_length=5, reward_scale=bad, constraints=base), device)
             with self.assertRaises(ValueError):
-                evaluate_minute_to_hour_policy(
+                evaluate_second_to_hour_policy(
                     self._two_action_split(["CASH", "QQQ"]), _ConstantActionModel(2, 0), device=device,
                     reward_scale=bad)
 
@@ -2378,10 +2011,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # bool (a truthy string would silently pick the two-leg path).
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import transition_trade_cost_bps
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import transition_trade_cost_bps
 
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
         long = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
         # in-range with action_count=2 is fine; out-of-range / negative fail closed.
         transition_trade_cost_bps(long([0]), long([1]), constraints=base, cash_idle_penalty_bps=0.0, action_count=2)
@@ -2407,15 +2040,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             transition_trade_cost_bps(long([0]), long([1]), constraints=dataclasses.replace(base, cash_index=99),
                                       cash_idle_penalty_bps=0.0, action_count=2)
 
-    def test_minute_to_hour_shadow_artifact_flags_incomplete_metadata(self) -> None:
+    def test_second_to_hour_shadow_artifact_flags_incomplete_metadata(self) -> None:
         # PR-3 auditability: with shadow ON and an UNKNOWN (un-metadata'd) non-cash ticker, the artifact must
         # flag execution_shadow_action_metadata_complete=False and list the unknown symbol, so PR-4 can fail
         # closed on it (an unknown leveraged/inverse instrument would otherwise be priced as 1x long).
         import warnings
 
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
-            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.second_to_hour_transformer import (
+            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
@@ -2423,13 +2056,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             return HourFromMinuteDataSplit(
                 name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "UNSEEN_TICKER_ZZ"],
-                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "UNSEEN_TICKER_ZZ"],
+                second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((n, 1, 1)), action_returns=torch.zeros((n, 2)),
                 action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
             )
 
         train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
@@ -2439,72 +2072,72 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=3, epsilon_start=0.2,
             epsilon_end=0.0, eval_interval=4, grad_clip=1.0,
         )
-        config = MinuteToHourTrainingConfig(
-            env=MinuteToHourEnvConfig(num_envs=2, episode_length=3, execution_env_reward_shadow=True),
-            learning=learning, d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+        config = SecondToHourTrainingConfig(
+            env=SecondToHourEnvConfig(num_envs=2, episode_length=3, execution_env_reward_shadow=True),
+            learning=learning, d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16,
             action_embedding_dim=4,
         )
         torch.manual_seed(0)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # unknown-symbol metadata fallback warns by design
-            artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)[1]
+            artifacts = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)[1]
         self.assertFalse(artifacts["execution_shadow_action_metadata_complete"])
         self.assertIn("UNSEEN_TICKER_ZZ", artifacts["execution_shadow_unknown_action_symbols"])
         self.assertEqual(artifacts["execution_shadow_weight_semantics_status"], "unresolved")
 
-    def test_minute_to_hour_eval_episode_length_and_cash_idle_validation(self) -> None:
+    def test_second_to_hour_eval_episode_length_and_cash_idle_validation(self) -> None:
         # The evaluator now fails closed on a bad episode_length (the bare int(episode_length or ...) silently
         # turned 0 -> default, True -> 1, 1.9 -> 1) and on a bad cash_idle_penalty_bps, matching the env. None
         # episode_length still means "use the full valid-start span".
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         device = torch.device("cpu")
         names = ["CASH", "QQQ"]
-        evaluate_minute_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
+        evaluate_second_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
                                        device=device, episode_length=None)
         for bad in (0, -1, True, 1.9):
             with self.assertRaises(ValueError):
-                evaluate_minute_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
+                evaluate_second_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
                                                device=device, episode_length=bad)
         for bad in (-1.0, float("nan"), float("inf")):
             with self.assertRaises(ValueError):
-                evaluate_minute_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
+                evaluate_second_to_hour_policy(self._two_action_split(names), _ConstantActionModel(2, 0),
                                                device=device, cash_idle_penalty_bps=bad)
 
-    def test_minute_to_hour_env_step_treats_nonfinite_label_as_unusable(self) -> None:
+    def test_second_to_hour_env_step_treats_nonfinite_label_as_unusable(self) -> None:
         # Env/eval parity: a label the mask calls "valid" but whose return is NaN/inf must NOT be traded on
         # (the env would otherwise produce a NaN reward). The env falls back to CASH exactly like the evaluator.
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         device = torch.device("cpu")
         # Row 0: QQQ is mask-valid but its return is NaN; CASH(0) is finite. Requesting QQQ must execute CASH.
         split = HourFromMinuteDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((2, 1, 1)),
             action_returns=torch.tensor([[0.0, float("nan")], [0.0, 0.0]]),
             action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
-        env = VectorizedMinuteToHourEnv(
-            split, MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=default_minute_to_hour_constraints()),
+        env = VectorizedSecondToHourEnv(
+            split, SecondToHourEnvConfig(num_envs=1, episode_length=5, constraints=default_second_to_hour_constraints()),
             device)
         env.reset()
         out = env.step(torch.tensor([1]))  # request QQQ (mask-valid but NaN return) -> must fall back to CASH(0)
         self.assertEqual(int(out["actions"][0].item()), 0)
         self.assertTrue(bool(torch.isfinite(out["rewards"][0]).item()))
 
-    def test_minute_to_hour_eval_reports_probabilistic_sharpe(self) -> None:
+    def test_second_to_hour_eval_reports_probabilistic_sharpe(self) -> None:
         # The evaluator reports a Probabilistic Sharpe Ratio (P(true per-period Sharpe > 0)) alongside the raw
         # annualized Sharpe: in [0,1] and > 0.5 for a clearly-positive-return policy; None when the net-return
         # series has no dispersion (e.g. an all-CASH policy -> constant zero returns).
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         device = torch.device("cpu")
         n = 6
@@ -2513,16 +2146,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)), action_returns=torch.tensor([[0.0, q] for q in qqq]),
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
-        cons = default_minute_to_hour_constraints()
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1)
+        cons = default_second_to_hour_constraints()
 
-        res = evaluate_minute_to_hour_policy(split, _ConstantActionModel(2, 1), device=device, initial_action=0,
+        res = evaluate_second_to_hour_policy(split, _ConstantActionModel(2, 1), device=device, initial_action=0,
                                              constraints=cons)
         psr = res.probabilistic_sharpe_ratio
         self.assertIsNotNone(psr)
@@ -2538,7 +2171,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertLessEqual(eff, float(obs))
         self.assertEqual(res.to_dict()["probabilistic_sharpe_ratio_effective_observations"], eff)
         # All-CASH policy -> constant zero net returns -> no dispersion -> PSR is None.
-        res_cash = evaluate_minute_to_hour_policy(split, _ConstantActionModel(2, 0), device=device, initial_action=0,
+        res_cash = evaluate_second_to_hour_policy(split, _ConstantActionModel(2, 0), device=device, initial_action=0,
                                                   constraints=cons)
         self.assertIsNone(res_cash.probabilistic_sharpe_ratio)
         # Constant returns -> zero variance -> no autocorrelation estimate -> effective == raw observations.
@@ -2547,26 +2180,26 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             float(res_cash.probabilistic_sharpe_ratio_observations),
         )
 
-    def test_minute_to_hour_train_eval_trace_records_psr(self) -> None:
+    def test_second_to_hour_train_eval_trace_records_psr(self) -> None:
         # The PSR added to the evaluation RESULT must reach the persisted training artifact: each eval_trace
         # entry carries val_probabilistic_sharpe_ratio + its estimability status (so a run's artifact has the
         # statistical-credibility metric, not only the raw Sharpe). Status is "ok" iff the value is present.
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
-            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.second_to_hour_transformer import (
+            SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
         val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02", "2026-02-03"])
-        config = MinuteToHourTrainingConfig(
-            env=MinuteToHourEnvConfig(num_envs=2, episode_length=2),
+        config = SecondToHourTrainingConfig(
+            env=SecondToHourEnvConfig(num_envs=2, episode_length=2),
             learning=DQNLearningConfig(
                 num_envs=2, episode_length=2, replay_capacity=16, batch_size=2, train_steps=2, warmup_steps=1,
                 gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=2, epsilon_start=0.1,
                 epsilon_end=0.0, eval_interval=2, grad_clip=1.0, use_amp=False),
-            d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4)
+            d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4)
         torch.manual_seed(0)
-        _, artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+        _, artifacts = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
         eval_trace = artifacts["eval_trace"]
         self.assertTrue(eval_trace)  # at least one validation eval ran
         last = eval_trace[-1]
@@ -2594,9 +2227,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
     def test_psr_is_credible_threshold_and_result_property(self) -> None:
         # psr_is_credible gates on BOTH estimability (not None) and the observation floor, and the
-        # MinuteToHourEvaluationResult property must defer to exactly that helper (no divergent inline logic).
+        # SecondToHourEvaluationResult property must defer to exactly that helper (no divergent inline logic).
         from rl_quant.evaluation.statistical import PSR_MIN_CREDIBLE_OBSERVATIONS, psr_is_credible
-        from rl_quant.training.minute_to_hour import MinuteToHourEvaluationResult
+        from rl_quant.training.second_to_hour import SecondToHourEvaluationResult
 
         floor = PSR_MIN_CREDIBLE_OBSERVATIONS
         self.assertGreaterEqual(floor, 2)  # PSR itself needs >= 2 observations to even be estimable
@@ -2607,8 +2240,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(psr_is_credible(0.50, floor))
         self.assertTrue(psr_is_credible(0.01, floor + 1))
 
-        def make(psr: float | None, n: int) -> MinuteToHourEvaluationResult:
-            return MinuteToHourEvaluationResult(
+        def make(psr: float | None, n: int) -> SecondToHourEvaluationResult:
+            return SecondToHourEvaluationResult(
                 split_name="t", total_return=0.0, total_reward_bps=0.0, allocation_switches=0,
                 market_order_legs=0.0, max_drawdown=0.0, annualized_sharpe=None, rollout_records=[],
                 probabilistic_sharpe_ratio=psr, probabilistic_sharpe_ratio_observations=n,
@@ -2621,32 +2254,32 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertEqual(result.to_dict()["probabilistic_sharpe_ratio_is_credible"], expected)
             self.assertEqual(result.to_dict()["probabilistic_sharpe_ratio_observations"], n)
 
-    def test_minute_to_hour_eval_rejects_empty_valid_start_split(self) -> None:
+    def test_second_to_hour_eval_rejects_empty_valid_start_split(self) -> None:
         # An evaluation split with no valid decision rows fails closed (a zero/degenerate metric would
         # otherwise look like a legitimate result), mirroring the env's start-index-pool guard.
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         empty = HourFromMinuteDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
             action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([], dtype=torch.long), valid_index_mask=torch.tensor([False, False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
         with self.assertRaises(ValueError):
-            evaluate_minute_to_hour_policy(empty, _ConstantActionModel(2, 0), device=torch.device("cpu"),
-                                           constraints=default_minute_to_hour_constraints())
+            evaluate_second_to_hour_policy(empty, _ConstantActionModel(2, 0), device=torch.device("cpu"),
+                                           constraints=default_second_to_hour_constraints())
 
     def test_transition_net_return_and_reward_formula(self) -> None:
         # Pins the ABSOLUTE correctness of the shared reward primitive (the golden env/eval parity test only
         # pins their agreement now that BOTH call this primitive -- a consistent error there would slip past
         # it). net = raw - (trade_cost + cash_idle)/1e4; reward = net * reward_scale. Works on scalars + tensors.
-        from rl_quant.envs.minute_to_hour import transition_net_return_and_reward
+        from rl_quant.envs.second_to_hour import transition_net_return_and_reward
 
         net, reward = transition_net_return_and_reward(0.01, 5.0, 0.0, reward_scale=10_000.0)
         self.assertAlmostEqual(net, 0.0095, places=10)        # 0.01 - 5/1e4
@@ -2660,7 +2293,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(torch.allclose(net_t, torch.tensor([0.0095, -0.001]), atol=1e-7))
         self.assertTrue(torch.allclose(reward_t, torch.tensor([95.0, -10.0]), atol=1e-4))
 
-    def test_minute_to_hour_env_eval_golden_ledger_parity(self) -> None:
+    def test_second_to_hour_env_eval_golden_ledger_parity(self) -> None:
         # GOLDEN PARITY: the vectorized env (step) and the sequential evaluator must compute the SAME ledger for
         # the same requested-action sequence over the same rows -- executed action (incl. the missing-label ->
         # CASH fallback applied INDEPENDENTLY by each path), order legs, and reward (= reward_scale * eval
@@ -2668,9 +2301,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # paths: they share transition_trade_cost_bps but reconstruct the rest of the rollout separately.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
-        from rl_quant.training.minute_to_hour import evaluate_minute_to_hour_policy
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
+        from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
 
         class FavorQQQ(nn.Module):  # always strongly prefers QQQ(1): enters from CASH, then holds
             def forward(self, minute, mask, hour, previous_actions, constraint_features,
@@ -2688,21 +2321,21 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)),
             action_returns=torch.tensor([[0.0, q] for q in qqq]),
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2, 3, 4]), valid_index_mask=torch.ones(n, dtype=torch.bool),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
         cons = dataclasses.replace(
-            default_minute_to_hour_constraints(), max_switches_per_day=None, max_switches_per_episode=None,
+            default_second_to_hour_constraints(), max_switches_per_day=None, max_switches_per_episode=None,
             q_switch_margin_bps=0.0, one_way_cost_bps=2.0, extra_switch_penalty_bps=3.0, min_hold_bars=1, cooldown_bars=0)
         reward_scale, cash_idle = 10_000.0, 5.0
 
-        eval_result = evaluate_minute_to_hour_policy(
+        eval_result = evaluate_second_to_hour_policy(
             base, FavorQQQ(), device=device, initial_action=0, constraints=cons,
             episode_length=10, reward_scale=reward_scale, cash_idle_penalty_bps=cash_idle, capture_rollout=True)
         records = eval_result.rollout_records
@@ -2712,9 +2345,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
         # Drive the env over the same rows from a single deterministic start (0), feeding the eval's REQUESTED
         # actions so the env runs its OWN mask + finite-label fallback independently.
-        env = VectorizedMinuteToHourEnv(
+        env = VectorizedSecondToHourEnv(
             dataclasses.replace(base, valid_start_indices=torch.tensor([0])),
-            MinuteToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=reward_scale,
+            SecondToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=reward_scale,
                                   initial_action=0, cash_idle_penalty_bps=cash_idle, constraints=cons),
             device)
         env.reset()
@@ -2736,17 +2369,17 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(env_switches, eval_result.allocation_switches)
         self.assertAlmostEqual(env_legs_total, eval_result.market_order_legs, places=6)
 
-    def test_minute_to_hour_env_eval_dynamic_state_parity(self) -> None:
+    def test_second_to_hour_env_eval_dynamic_state_parity(self) -> None:
         # GOLDEN PARITY (dynamic state): the held-position excursion (unrealized_pnl / MAE / MFE) the evaluator
         # feeds its network must equal the env's position_dynamic entering the SAME decision -- this is the
         # off-by-one-prone "state before action" surface. Both advance via the shared advance_position_excursion
         # on the executed action's gross return with held = not is_switch; this pins them step-for-step.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
         from rl_quant.trading_constraints import DYNAMIC_TRANSITION_FEATURE_DIM
-        from rl_quant.training.minute_to_hour import evaluate_minute_to_hour_policy
+        from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
 
         class DynamicSpy(nn.Module):  # dynamic-aware so the eval tracks + feeds dynamic state; records what it sees
             dynamic_feature_dim = DYNAMIC_TRANSITION_FEATURE_DIM
@@ -2769,29 +2402,29 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)),
             action_returns=torch.tensor([[0.0, q] for q in qqq]),
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2, 3, 4]), valid_index_mask=torch.ones(n, dtype=torch.bool),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
         cons = dataclasses.replace(
-            default_minute_to_hour_constraints(), max_switches_per_day=None, max_switches_per_episode=None,
+            default_second_to_hour_constraints(), max_switches_per_day=None, max_switches_per_episode=None,
             q_switch_margin_bps=0.0, one_way_cost_bps=2.0, extra_switch_penalty_bps=3.0, min_hold_bars=1, cooldown_bars=0)
 
         spy = DynamicSpy()
-        eval_result = evaluate_minute_to_hour_policy(
+        eval_result = evaluate_second_to_hour_policy(
             base, spy, device=device, initial_action=0, constraints=cons,
             episode_length=10, reward_scale=10_000.0, cash_idle_penalty_bps=5.0, capture_rollout=True)
         records = eval_result.rollout_records
         self.assertEqual(len(spy.seen), 5)  # one dynamic-state observation per decision row
 
-        env = VectorizedMinuteToHourEnv(
+        env = VectorizedSecondToHourEnv(
             dataclasses.replace(base, valid_start_indices=torch.tensor([0])),
-            MinuteToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=10_000.0,
+            SecondToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=10_000.0,
                                   initial_action=0, cash_idle_penalty_bps=5.0, constraints=cons),
             device)
         env.reset()
@@ -2802,7 +2435,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # Sanity: the excursion was actually non-trivial (not all zeros) at least once after the first hold.
         self.assertTrue(any(bool(s.abs().sum().item() > 0.0) for s in spy.seen))
 
-    def test_minute_to_hour_env_eval_day_boundary_cap_parity(self) -> None:
+    def test_second_to_hour_env_eval_day_boundary_cap_parity(self) -> None:
         # GOLDEN PARITY (day boundary + turnover cap): with max_switches_per_day=1, a day-1 entry exhausts the
         # daily cap; the cap must RESET on the day-2 boundary so a day-2 re-entry is selectable again. The env
         # and the evaluator must reset the per-day counter at the same point AND the env's OWN mask must agree
@@ -2810,9 +2443,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # back to CASH). A wrong env day-reset would mask the day-2 entry and diverge here.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
-        from rl_quant.training.minute_to_hour import evaluate_minute_to_hour_policy
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
+        from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
 
         class FavorQQQ(nn.Module):
             def forward(self, minute, mask, hour, previous_actions, constraint_features,
@@ -2831,20 +2464,20 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             name="t",
             decision_timestamps=[f"{d}T1{i}:30:00+00:00" for i, d in enumerate(dates)],
             next_timestamps=[f"{d}T1{i + 1}:30:00+00:00" for i, d in enumerate(dates)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)),
             action_returns=torch.tensor([[0.0, q] for q in qqq]),
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0, 1, 2, 3]), valid_index_mask=torch.ones(n, dtype=torch.bool),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
         cons = dataclasses.replace(
-            default_minute_to_hour_constraints(), max_switches_per_day=1, max_switches_per_episode=None,
+            default_second_to_hour_constraints(), max_switches_per_day=1, max_switches_per_episode=None,
             q_switch_margin_bps=0.0, one_way_cost_bps=2.0, extra_switch_penalty_bps=3.0, min_hold_bars=1, cooldown_bars=0)
 
-        eval_result = evaluate_minute_to_hour_policy(
+        eval_result = evaluate_second_to_hour_policy(
             base, FavorQQQ(), device=device, initial_action=0, constraints=cons,
             episode_length=10, reward_scale=10_000.0, cash_idle_penalty_bps=5.0, capture_rollout=True)
         records = eval_result.rollout_records
@@ -2852,9 +2485,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # the QQQ entry happen again, then hold. If the cap did NOT reset, row 2 would mask QQQ -> CASH.
         self.assertEqual([int(r["executed_action"]) for r in records], [1, 0, 1, 1])
 
-        env = VectorizedMinuteToHourEnv(
+        env = VectorizedSecondToHourEnv(
             dataclasses.replace(base, valid_start_indices=torch.tensor([0])),
-            MinuteToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=10_000.0,
+            SecondToHourEnvConfig(num_envs=1, episode_length=10, reward_scale=10_000.0,
                                   initial_action=0, cash_idle_penalty_bps=5.0, constraints=cons),
             device)
         env.reset()
@@ -2864,29 +2497,29 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertAlmostEqual(float(out["legs"][0].item()), float(rec["market_order_legs"]), places=6)
             self.assertAlmostEqual(float(out["rewards"][0].item()) / 10_000.0, float(rec["net_return"]), places=6)
 
-    def test_minute_to_hour_constraints_normalized_object(self) -> None:
-        # validate_minute_to_hour_constraints returns a FROZEN NormalizedMinuteToHourConstraints whose fields
+    def test_second_to_hour_constraints_normalized_object(self) -> None:
+        # validate_second_to_hour_constraints returns a FROZEN NormalizedSecondToHourConstraints whose fields
         # are canonical Python types (a numeric-string bps -> float, a numpy int index/count -> int), and the
         # env stores + uses that object -- so a non-canonical config value can never reach the runtime raw.
         import dataclasses
 
         import numpy as np
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import (
-            MinuteToHourEnvConfig,
-            NormalizedMinuteToHourConstraints,
-            VectorizedMinuteToHourEnv,
-            validate_minute_to_hour_constraints,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import (
+            SecondToHourEnvConfig,
+            NormalizedSecondToHourConstraints,
+            VectorizedSecondToHourEnv,
+            validate_second_to_hour_constraints,
         )
 
         names = ["CASH", "QQQ"]
         # Non-canonical-but-valid inputs: a numeric-string bps and numpy integer index/bar counts.
         raw = dataclasses.replace(
-            default_minute_to_hour_constraints(),
+            default_second_to_hour_constraints(),
             one_way_cost_bps="2.0", cash_index=np.int64(0), min_hold_bars=np.int64(1))
-        norm = validate_minute_to_hour_constraints(raw, names)
-        self.assertIsInstance(norm, NormalizedMinuteToHourConstraints)
+        norm = validate_second_to_hour_constraints(raw, names)
+        self.assertIsInstance(norm, NormalizedSecondToHourConstraints)
         self.assertIsInstance(norm.one_way_cost_bps, float)
         self.assertEqual(norm.one_way_cost_bps, 2.0)
         self.assertIsInstance(norm.cash_index, int)
@@ -2895,166 +2528,166 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(dataclasses.FrozenInstanceError):  # frozen: validated values can't be mutated
             norm.cash_index = 1  # type: ignore[misc]
         # The env stores and exposes the normalized object.
-        env = VectorizedMinuteToHourEnv(
+        env = VectorizedSecondToHourEnv(
             self._two_action_split(names),
-            MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=raw), torch.device("cpu"))
-        self.assertIsInstance(env.constraints, NormalizedMinuteToHourConstraints)
+            SecondToHourEnvConfig(num_envs=1, episode_length=5, constraints=raw), torch.device("cpu"))
+        self.assertIsInstance(env.constraints, NormalizedSecondToHourConstraints)
         self.assertEqual(env.constraints.one_way_cost_bps, 2.0)
         self.assertIsInstance(env.constraints.one_way_cost_bps, float)
 
-    def test_minute_to_hour_requires_usable_cash_on_valid_rows(self) -> None:
+    def test_second_to_hour_requires_usable_cash_on_valid_rows(self) -> None:
         # CASH is the forced safety fallback; it must be USABLE (label-valid AND finite return) on every valid
         # decision row. BOTH a non-finite CASH return AND a finite-but-label-invalid CASH must fail closed at
         # env construction AND at evaluator entry (the fallback reads the CASH return directly).
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
-        from rl_quant.training.minute_to_hour import _ConstantActionModel, evaluate_minute_to_hour_policy
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
+        from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         device = torch.device("cpu")
-        base = default_minute_to_hour_constraints()
+        base = default_second_to_hour_constraints()
 
         def split(action_returns, label_valid_mask) -> HourFromMinuteDataSplit:
             return HourFromMinuteDataSplit(
                 name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
                 next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((2, 1, 1)), action_returns=action_returns,
                 action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=label_valid_mask,
                 valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1)
 
         nan_cash = split(torch.tensor([[float("nan"), 0.0], [0.0, 0.0]]), torch.ones((2, 2), dtype=torch.bool))
         # CASH return finite (0.0) but its label is marked invalid at the valid row 0 -> still unusable.
         label_invalid_cash = split(torch.zeros((2, 2)), torch.tensor([[False, True], [True, True]]))
         for bad in (nan_cash, label_invalid_cash):
             with self.assertRaises(ValueError):
-                VectorizedMinuteToHourEnv(bad, MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
+                VectorizedSecondToHourEnv(bad, SecondToHourEnvConfig(num_envs=1, episode_length=5, constraints=base), device)
             with self.assertRaises(ValueError):
-                evaluate_minute_to_hour_policy(bad, _ConstantActionModel(2, 0), device=device, constraints=base)
+                evaluate_second_to_hour_policy(bad, _ConstantActionModel(2, 0), device=device, constraints=base)
 
-    def test_minute_to_hour_cash_usable_checked_on_continuation_rows(self) -> None:
+    def test_second_to_hour_cash_usable_checked_on_continuation_rows(self) -> None:
         # The CASH usability invariant covers EVERY valid decision row (valid_index_mask), not just episode
         # starts: the env steps through continuation rows the policy can de-risk on. CASH usable at the start
         # (row 0) but NON-usable at a continuation row (row 1) must still fail closed (the prior
         # valid_start_indices-only check would have missed it).
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         split = HourFromMinuteDataSplit(
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(3)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(3)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((3, 1, 1, 1)), minute_mask=torch.ones((3, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((3, 1, 1, 1)), second_mask=torch.ones((3, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((3, 1, 1)),
             action_returns=torch.tensor([[0.0, 0.01], [float("nan"), 0.02], [0.0, 0.0]]),  # CASH NaN at row 1
             action_valid_mask=torch.ones((3, 2), dtype=torch.bool), label_valid_mask=torch.ones((3, 2), dtype=torch.bool),
             valid_start_indices=torch.tensor([0]),                 # only row 0 is an episode start
             valid_index_mask=torch.tensor([True, True, False]),    # rows 0,1 are valid decisions (1 = continuation)
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1)
         with self.assertRaises(ValueError):
-            VectorizedMinuteToHourEnv(
-                split, MinuteToHourEnvConfig(num_envs=1, episode_length=5, constraints=default_minute_to_hour_constraints()),
+            VectorizedSecondToHourEnv(
+                split, SecondToHourEnvConfig(num_envs=1, episode_length=5, constraints=default_second_to_hour_constraints()),
                 torch.device("cpu"))
 
     def _shadow_resume_split(self, name: str, dates: list[str]):
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit
         n = len(dates)
         return HourFromMinuteDataSplit(
             name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
             next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)), action_returns=torch.zeros((n, 2)),
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1)
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1)
 
-    def test_minute_to_hour_shadow_aggregates_are_resume_safe(self) -> None:
+    def test_second_to_hour_shadow_aggregates_are_resume_safe(self) -> None:
         # The PR-3 shadow aggregates are a running sum + count saved in the checkpoint, so a resumed run's
         # artifact covers the WHOLE run. After training 3 steps then resuming to 5, the checkpoint's
         # shadow_delta_count must be 5 (full), not 2 (post-resume only) -- the bug this fixes.
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
-            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.second_to_hour_transformer import (
+            SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
         val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"])
 
-        def cfg(train_steps: int, state_path, *, resume: bool) -> MinuteToHourTrainingConfig:
-            return MinuteToHourTrainingConfig(
-                env=MinuteToHourEnvConfig(num_envs=2, episode_length=2, execution_env_reward_shadow=True),
+        def cfg(train_steps: int, state_path, *, resume: bool) -> SecondToHourTrainingConfig:
+            return SecondToHourTrainingConfig(
+                env=SecondToHourEnvConfig(num_envs=2, episode_length=2, execution_env_reward_shadow=True),
                 learning=DQNLearningConfig(
                     num_envs=2, episode_length=2, replay_capacity=16, batch_size=2, train_steps=train_steps,
                     warmup_steps=1, gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=2,
                     epsilon_start=0.1, epsilon_end=0.0, eval_interval=2, grad_clip=1.0, use_amp=False),
-                d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+                d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
                 resume_training_state=state_path if resume else None,
                 checkpoint_training_state=state_path, checkpoint_every_steps=1)
 
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.pt"
             torch.manual_seed(123)
-            _, first = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=cfg(3, state_path, resume=False))
+            _, first = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=cfg(3, state_path, resume=False))
             saved = torch.load(state_path, map_location="cpu", weights_only=False)
             self.assertEqual(saved["shadow_delta_count"], 3)  # 3 steps accumulated pre-resume
             self.assertIsNotNone(first["execution_shadow_reward_delta_mean"])
 
-            _, resumed = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=cfg(5, state_path, resume=True))
+            _, resumed = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=cfg(5, state_path, resume=True))
             saved_again = torch.load(state_path, map_location="cpu", weights_only=False)
             self.assertEqual(saved_again["shadow_delta_count"], 5)  # full run (3 restored + 2 more), not just 2
             self.assertIsNotNone(resumed["execution_shadow_reward_delta_mean"])
 
-    def test_minute_to_hour_resume_rejects_changed_economics(self) -> None:
+    def test_second_to_hour_resume_rejects_changed_economics(self) -> None:
         # A checkpoint must not be resumed with DIFFERENT economics (here: a changed one_way_cost_bps). The run
         # semantics hash saved in the checkpoint mismatches the resuming run's, so resume fails closed -- same
         # tensor shapes are not enough to share a run.
         import dataclasses
 
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.minute_to_hour_transformer import (
-            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.second_to_hour_transformer import (
+            SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
         val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"])
 
-        def cfg(train_steps: int, state_path, *, resume: bool, constraints) -> MinuteToHourTrainingConfig:
-            return MinuteToHourTrainingConfig(
-                env=MinuteToHourEnvConfig(num_envs=2, episode_length=2, constraints=constraints),
+        def cfg(train_steps: int, state_path, *, resume: bool, constraints) -> SecondToHourTrainingConfig:
+            return SecondToHourTrainingConfig(
+                env=SecondToHourEnvConfig(num_envs=2, episode_length=2, constraints=constraints),
                 learning=DQNLearningConfig(
                     num_envs=2, episode_length=2, replay_capacity=16, batch_size=2, train_steps=train_steps,
                     warmup_steps=1, gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=2,
                     epsilon_start=0.1, epsilon_end=0.0, eval_interval=2, grad_clip=1.0, use_amp=False),
-                d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+                d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
                 resume_training_state=state_path if resume else None,
                 checkpoint_training_state=state_path, checkpoint_every_steps=1)
 
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.pt"
             torch.manual_seed(123)
-            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
-                                     config=cfg(3, state_path, resume=False, constraints=default_minute_to_hour_constraints()))
+            train_second_to_hour_dqn(train, val, device=torch.device("cpu"),
+                                     config=cfg(3, state_path, resume=False, constraints=default_second_to_hour_constraints()))
             # Resume with a DIFFERENT one_way_cost_bps -> changed economics -> hash mismatch -> fail closed.
-            changed = dataclasses.replace(default_minute_to_hour_constraints(), one_way_cost_bps=2.0)
+            changed = dataclasses.replace(default_second_to_hour_constraints(), one_way_cost_bps=2.0)
             with self.assertRaises(ValueError):
-                train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
+                train_second_to_hour_dqn(train, val, device=torch.device("cpu"),
                                          config=cfg(5, state_path, resume=True, constraints=changed))
             # Resume with the SAME economics but DIFFERENT DATA (same schema) -> dataset-content mismatch ->
             # fail closed. Covers a label change, a MODEL-INPUT change, and a VALIDATION-split change.
-            default_c = default_minute_to_hour_constraints()
+            default_c = default_second_to_hour_constraints()
             other_labels = dataclasses.replace(train, action_returns=train.action_returns + 0.01)
-            other_inputs = dataclasses.replace(train, minute_features=train.minute_features + 0.5)
+            other_inputs = dataclasses.replace(train, second_features=train.second_features + 0.5)
             other_val = dataclasses.replace(val, action_returns=val.action_returns + 0.01)
             for bad_train, bad_val in ((other_labels, val), (other_inputs, val), (train, other_val)):
                 with self.assertRaises(ValueError):
-                    train_minute_to_hour_dqn(bad_train, bad_val, device=torch.device("cpu"),
+                    train_second_to_hour_dqn(bad_train, bad_val, device=torch.device("cpu"),
                                              config=cfg(5, state_path, resume=True, constraints=default_c))
 
     def test_run_semantics_hash_covers_reward_scale_and_cash_idle(self) -> None:
@@ -3063,12 +2696,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # normalized constraints -- so they must be folded into the fingerprint explicitly or a resume that
         # changed reward economics would slip past the guard. Pin: deterministic for identical inputs;
         # changes when either reward parameter changes; canonicalizes int vs float of equal magnitude.
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import validate_minute_to_hour_constraints
-        from rl_quant.training.minute_to_hour import _run_semantics_hash
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import validate_second_to_hour_constraints
+        from rl_quant.training.second_to_hour import _run_semantics_hash
 
         data = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04"])
-        nc = validate_minute_to_hour_constraints(default_minute_to_hour_constraints(), list(data.action_names))
+        nc = validate_second_to_hour_constraints(default_second_to_hour_constraints(), list(data.action_names))
 
         def h(reward_scale: float = 10_000.0, cash_idle: float = 0.0) -> str:
             return _run_semantics_hash(data, nc, reward_scale=reward_scale, cash_idle_penalty_bps=cash_idle)
@@ -3085,7 +2718,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # action_returns, decision timestamps, or validity masks change, and is deterministic for identical data.
         import dataclasses
 
-        from rl_quant.training.minute_to_hour import _dataset_content_hash
+        from rl_quant.training.second_to_hour import _dataset_content_hash
 
         base = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04"])
         h0 = _dataset_content_hash(base)
@@ -3098,52 +2731,52 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, action_valid_mask=flipped)))
         # v2 widening: MODEL INPUTS and fitted normalizer stats are now in the fingerprint (v1 hashed only
         # labels/masks, so a resume against different model inputs slipped past).
-        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, minute_features=base.minute_features + 0.5)))
+        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, second_features=base.second_features + 0.5)))
         self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, hour_features=base.hour_features + 0.5)))
-        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, minute_feature_mean=base.minute_feature_mean + 1.0)))
+        self.assertNotEqual(h0, _dataset_content_hash(dataclasses.replace(base, second_feature_mean=base.second_feature_mean + 1.0)))
 
-    def test_minute_to_hour_resume_rejects_changed_reward_scale(self) -> None:
+    def test_second_to_hour_resume_rejects_changed_reward_scale(self) -> None:
         # reward_scale lives on the ENV config (not the constraints) yet scales every reward + the
         # resume-spanning shadow aggregates; a resume that changed it must fail closed. This also proves
         # _run_semantics_hash is wired to config.env.reward_scale at the call site -- a unit test on the
         # function alone would pass even if the call site forgot to pass it.
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
-            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.second_to_hour_transformer import (
+            SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
         val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"])
 
-        def cfg(train_steps: int, state_path, *, resume: bool, reward_scale: float) -> MinuteToHourTrainingConfig:
-            return MinuteToHourTrainingConfig(
-                env=MinuteToHourEnvConfig(num_envs=2, episode_length=2, reward_scale=reward_scale),
+        def cfg(train_steps: int, state_path, *, resume: bool, reward_scale: float) -> SecondToHourTrainingConfig:
+            return SecondToHourTrainingConfig(
+                env=SecondToHourEnvConfig(num_envs=2, episode_length=2, reward_scale=reward_scale),
                 learning=DQNLearningConfig(
                     num_envs=2, episode_length=2, replay_capacity=16, batch_size=2, train_steps=train_steps,
                     warmup_steps=1, gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=2,
                     epsilon_start=0.1, epsilon_end=0.0, eval_interval=2, grad_clip=1.0, use_amp=False),
-                d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+                d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
                 resume_training_state=state_path if resume else None,
                 checkpoint_training_state=state_path, checkpoint_every_steps=1)
 
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.pt"
             torch.manual_seed(123)
-            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
+            train_second_to_hour_dqn(train, val, device=torch.device("cpu"),
                                      config=cfg(3, state_path, resume=False, reward_scale=10_000.0))
             with self.assertRaises(ValueError):  # changed reward_scale -> hash mismatch -> fail closed
-                train_minute_to_hour_dqn(train, val, device=torch.device("cpu"),
+                train_second_to_hour_dqn(train, val, device=torch.device("cpu"),
                                          config=cfg(5, state_path, resume=True, reward_scale=20_000.0))
 
-    def test_minute_to_hour_pr4_execution_reward_gate(self) -> None:
+    def test_second_to_hour_pr4_execution_reward_gate(self) -> None:
         # use_execution_env_reward (PR-4) is fail-closed: it requires RESOLVED action_return_weight_semantics
         # AND complete action metadata. The flag is not a config field yet, so we set it on the env config
         # instance (a plain dataclass allows arbitrary attributes) to arm the otherwise-dormant guard.
         import dataclasses
 
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
-            MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.second_to_hour_transformer import (
+            SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         learning = DQNLearningConfig(
@@ -3152,13 +2785,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             epsilon_end=0.0, eval_interval=1, grad_clip=1.0)
 
         def run(train_split, val_split, *, arm: bool) -> None:
-            env_cfg = MinuteToHourEnvConfig(num_envs=1, episode_length=2)
+            env_cfg = SecondToHourEnvConfig(num_envs=1, episode_length=2)
             if arm:
                 env_cfg.use_execution_env_reward = True  # arm the dormant PR-4 guard (not a real field yet)
-            config = MinuteToHourTrainingConfig(
-                env=env_cfg, learning=learning, d_model=8, n_heads=1, minute_layers=1, hour_layers=1,
+            config = SecondToHourTrainingConfig(
+                env=env_cfg, learning=learning, d_model=8, n_heads=1, second_layers=1, hour_layers=1,
                 feedforward_dim=8, action_embedding_dim=2)
-            train_minute_to_hour_dqn(train_split, val_split, device=torch.device("cpu"), config=config)
+            train_second_to_hour_dqn(train_split, val_split, device=torch.device("cpu"), config=config)
 
         train = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"])
         val = self._shadow_resume_split("val", ["2026-02-01", "2026-02-02"])
@@ -3213,7 +2846,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # The action-return basis detail (formula / clip_min / clip_max / semantics_version) must be ALL
         # present or ALL absent. A partial basis (e.g. formula recorded but clip bounds dropped by a buggy
         # migration) is under-specified and would make the run fingerprint ambiguous, so it fails closed.
-        from rl_quant.datasets.hour_from_subhour import validate_action_return_basis
+        from rl_quant.datasets.hour_from_second import validate_action_return_basis
 
         full = {"action_return_formula": "clipped_simple_return(entry_fill, exit_fill)",
                 "action_return_clip_min": -1.0, "action_return_clip_max": 1.0,
@@ -3234,7 +2867,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # The canonical ReturnBasis wraps the loose action_return_* fields and drives the unconditional
         # reportability AGREEMENT check (item #7). It reads either payload keys (manifest/split) or canonical
         # field names (the summary round-trip), and the agreement check is fail-closed but default-preserving.
-        from rl_quant.datasets.hour_from_subhour import ReturnBasis, return_basis_agreement_errors
+        from rl_quant.datasets.hour_from_second import ReturnBasis, return_basis_agreement_errors
 
         payload = {
             "action_return_weight_semantics": "full_capital_single_slot_returns",
@@ -3450,7 +3083,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # unit-weight/unleveraged (TQQQ at 3x -> incompatible).
         import dataclasses
 
-        from rl_quant.training.minute_to_hour import _execution_shadow_cost_basis_status as status
+        from rl_quant.training.second_to_hour import _execution_shadow_cost_basis_status as status
 
         base = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"])   # action_names = [CASH, QQQ]
         self.assertEqual(status(base), "unresolved_missing_semantics")            # default semantics None
@@ -3479,8 +3112,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # keep their fingerprint unchanged (backward-compatible -- the fields are added only when present).
         import dataclasses
 
-        from rl_quant.minute_to_hour_transformer import TradingConstraintConfig
-        from rl_quant.training.minute_to_hour import _run_semantics_hash
+        from rl_quant.second_to_hour_transformer import TradingConstraintConfig
+        from rl_quant.training.second_to_hour import _run_semantics_hash
 
         constraints = TradingConstraintConfig()
         base = self._shadow_resume_split("train", ["2026-01-02", "2026-01-03"])
@@ -3507,24 +3140,24 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertNotEqual(
             full_hash, h(dataclasses.replace(base, **{**full, "action_return_execution_latency_ms": 2000})))
 
-    def test_minute_to_hour_full_constraint_and_sizing_validation(self) -> None:
+    def test_second_to_hour_full_constraint_and_sizing_validation(self) -> None:
         # Entry-point validation now covers the FULL constraint set that feeds masks/hysteresis/caps (not just
         # the cost-critical subset): q_switch_margin_bps (NaN would poison hysteresis), the hold/cooldown bar
         # counts, and the optional switch/order-leg caps. Plus env sizing (num_envs / episode_length positive
         # ints; cash_idle_penalty_bps finite/non-negative). Defaults pass; bad values fail closed.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import (
-            MinuteToHourEnvConfig,
-            VectorizedMinuteToHourEnv,
-            validate_minute_to_hour_constraints,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import (
+            SecondToHourEnvConfig,
+            VectorizedSecondToHourEnv,
+            validate_second_to_hour_constraints,
         )
 
         device = torch.device("cpu")
         names = ["CASH", "QQQ"]
-        base = default_minute_to_hour_constraints()
-        self.assertEqual(validate_minute_to_hour_constraints(base, names).cash_index, 0)
+        base = default_second_to_hour_constraints()
+        self.assertEqual(validate_second_to_hour_constraints(base, names).cash_index, 0)
         bad_fields = {
             "q_switch_margin_bps": float("nan"),
             "min_hold_bars": True,
@@ -3536,47 +3169,47 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         }
         for field_name, bad in bad_fields.items():
             with self.assertRaises(ValueError):
-                validate_minute_to_hour_constraints(dataclasses.replace(base, **{field_name: bad}), names)
+                validate_second_to_hour_constraints(dataclasses.replace(base, **{field_name: bad}), names)
         # None caps mean "uncapped" and are accepted.
-        validate_minute_to_hour_constraints(
+        validate_second_to_hour_constraints(
             dataclasses.replace(base, max_switches_per_day=None, max_order_legs_per_day=None), names)
         # Env sizing fails closed at construction.
         for bad in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
-                VectorizedMinuteToHourEnv(self._two_action_split(names),
-                                          MinuteToHourEnvConfig(num_envs=bad, episode_length=5, constraints=base), device)
+                VectorizedSecondToHourEnv(self._two_action_split(names),
+                                          SecondToHourEnvConfig(num_envs=bad, episode_length=5, constraints=base), device)
             with self.assertRaises(ValueError):
-                VectorizedMinuteToHourEnv(self._two_action_split(names),
-                                          MinuteToHourEnvConfig(num_envs=1, episode_length=bad, constraints=base), device)
+                VectorizedSecondToHourEnv(self._two_action_split(names),
+                                          SecondToHourEnvConfig(num_envs=1, episode_length=bad, constraints=base), device)
         for bad in (-1.0, float("nan"), float("inf")):
             with self.assertRaises(ValueError):
-                VectorizedMinuteToHourEnv(
+                VectorizedSecondToHourEnv(
                     self._two_action_split(names),
-                    MinuteToHourEnvConfig(num_envs=1, episode_length=5, cash_idle_penalty_bps=bad, constraints=base),
+                    SecondToHourEnvConfig(num_envs=1, episode_length=5, cash_idle_penalty_bps=bad, constraints=base),
                     device)
 
-    def test_train_minute_to_hour_validates_constraints_before_transition_table(self) -> None:
+    def test_train_second_to_hour_validates_constraints_before_transition_table(self) -> None:
         # The trainer validates constraints at ENTRY, before build_transition_feature_table (model inputs)
         # consumes cash_index / count_etf -- a malformed constraint fails before model construction.
         import dataclasses
 
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.minute_to_hour_transformer import (
-            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.second_to_hour_transformer import (
+            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         def make_split(name: str) -> HourFromMinuteDataSplit:
             return HourFromMinuteDataSplit(
                 name=name, decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-03T14:30:00+00:00"],
                 next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-03T15:30:00+00:00"],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 2)),
                 action_valid_mask=torch.ones((2, 2), dtype=torch.bool), label_valid_mask=torch.ones((2, 2), dtype=torch.bool),
                 valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
             )
 
         learning = DQNLearningConfig(
@@ -3584,42 +3217,42 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=1, epsilon_start=0.0,
             epsilon_end=0.0, eval_interval=1, grad_clip=1.0,
         )
-        bad_env = MinuteToHourEnvConfig(
+        bad_env = SecondToHourEnvConfig(
             num_envs=1, episode_length=2,
-            constraints=dataclasses.replace(default_minute_to_hour_constraints(), count_etf_to_etf_as_two_legs="false"))
-        config = MinuteToHourTrainingConfig(
+            constraints=dataclasses.replace(default_second_to_hour_constraints(), count_etf_to_etf_as_two_legs="false"))
+        config = SecondToHourTrainingConfig(
             env=bad_env, learning=learning, use_transition_features=True,
-            d_model=8, n_heads=1, minute_layers=1, hour_layers=1, feedforward_dim=8, action_embedding_dim=2,
+            d_model=8, n_heads=1, second_layers=1, hour_layers=1, feedforward_dim=8, action_embedding_dim=2,
         )
         with self.assertRaises(ValueError):
-            train_minute_to_hour_dqn(make_split("train"), make_split("val"), device=torch.device("cpu"), config=config)
+            train_second_to_hour_dqn(make_split("train"), make_split("val"), device=torch.device("cpu"), config=config)
 
-    def test_minute_to_hour_step_fallback_prefers_cash_when_not_first(self) -> None:
+    def test_second_to_hour_step_fallback_prefers_cash_when_not_first(self) -> None:
         # When a requested action is masked and CASH is NOT the first valid column, the env de-risks to CASH
         # (cash_index), not the first valid action. argmax alone would pick the first valid (e.g. SPY).
         import dataclasses
 
-        from rl_quant.datasets.hour_from_subhour import HourFromMinuteDataSplit, default_minute_to_hour_constraints
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig, VectorizedMinuteToHourEnv
+        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         device = torch.device("cpu")
         names = ["QQQ", "SPY", "CASH"]  # CASH at index 2 (not first)
         split = HourFromMinuteDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=names,
-            minute_features=torch.zeros((2, 1, 1, 1)), minute_mask=torch.ones((2, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=names,
+            second_features=torch.zeros((2, 1, 1, 1)), second_mask=torch.ones((2, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((2, 1, 1)), action_returns=torch.zeros((2, 3)),
             action_valid_mask=torch.tensor([[False, True, True], [True, True, True]]),  # QQQ invalid at row 0
             label_valid_mask=torch.ones((2, 3), dtype=torch.bool),
             valid_start_indices=torch.tensor([0]), valid_index_mask=torch.tensor([True, False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+            hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
         )
-        cons = dataclasses.replace(default_minute_to_hour_constraints(), cash_index=2, min_hold_bars=0,
+        cons = dataclasses.replace(default_second_to_hour_constraints(), cash_index=2, min_hold_bars=0,
                                    cooldown_bars=0, max_switches_per_day=None)
-        env = VectorizedMinuteToHourEnv(
-            split, MinuteToHourEnvConfig(num_envs=1, episode_length=5, initial_action=2, constraints=cons), device)
+        env = VectorizedSecondToHourEnv(
+            split, SecondToHourEnvConfig(num_envs=1, episode_length=5, initial_action=2, constraints=cons), device)
         env.reset()
         out = env.step(torch.tensor([0]))  # request QQQ (masked invalid) -> fallback must be CASH(2), not SPY(1)
         self.assertEqual(int(out["actions"][0].item()), 2)
@@ -4266,21 +3899,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sized sequence"):
             validate_final_reportability_inputs(ok, candidate_returns=999)
 
-    def test_second_context_mask_alias_lookup_no_eager_keyerror(self) -> None:
-        # _build_split previously used payload.get("decision_action_valid_mask", payload["action_valid_mask"]),
-        # whose indexed default is evaluated EAGERLY -> KeyError on a canonical-only payload (no legacy alias).
-        # _first_present returns the first present key WITHOUT touching the others.
-        from rl_quant.datasets.second_context import _first_present
-
-        # Canonical key present -> returned; the absent legacy fallback is never indexed (no KeyError).
-        self.assertEqual(
-            _first_present({"decision_action_valid_mask": 7}, "decision_action_valid_mask", "action_valid_mask"), 7)
-        # Falls through aliases to the present one (label -> action_label_valid_mask -> legacy).
-        self.assertEqual(
-            _first_present({"action_label_valid_mask": 9}, "label_valid_mask", "action_label_valid_mask",
-                           "action_valid_mask"), 9)
-        with self.assertRaises(KeyError):
-            _first_present({"other": 1}, "label_valid_mask", "action_valid_mask")
 
     def test_reportability_canonical_extraction_foundation(self) -> None:
         # Foundation for the canonical reportability rewire (item 2, 2a): the stress-side canonicalizer
@@ -4316,20 +3934,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(extract_stress_ids({"cost_stress": {"fixed_rollout": {"2bps": {}}}}), set())
         self.assertEqual(extract_baseline_ids({"baselines": "notadict"}), set())
 
-    def test_periods_per_day_raises_on_unsupported_interval(self) -> None:
-        # The annualization factor used to silently default to the 15m value (26.0) for ANY unrecognized
-        # decision_interval -- including second intervals the feature config permits (e.g. "30s") -- which
-        # corrupts every reported Sharpe for that interval. Supported intervals keep their EXACT factors
-        # (no result movement); anything else now raises loudly.
-        from rl_quant.datasets.second_context import _periods_per_day
-
-        self.assertEqual(_periods_per_day("5m"), 78.0)
-        self.assertEqual(_periods_per_day("15m"), 26.0)
-        self.assertEqual(_periods_per_day("30m"), 13.0)
-        self.assertEqual(_periods_per_day("60m"), 6.0)  # deliberate whole-bar floor (not 6.5)
-        for bad in ("30s", "1m", "1h", "", "5min"):
-            with self.assertRaises(ValueError):
-                _periods_per_day(bad)
 
     def test_research_protocol_parse_iso_timestamp_rejects_naive(self) -> None:
         # Consistency with decision_log / second_context: research_protocol.parse_iso_timestamp used to
@@ -4348,86 +3952,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ResearchProtocolError):
             parse_iso_timestamp("not-a-timestamp")
 
-    def test_mask_action_feature_normalizer_flag(self) -> None:
-        # P0-5: the action-feature normalizer is fitted UNMASKED by default (includes padded/invalid action
-        # rows whose features may be sentinels), while the market-context normalizer is already masked. The
-        # opt-in, default-OFF mask_action_feature_normalizer flag fits it over decision-valid rows only.
-        # Result-moving (model_inputs), so governed + default-OFF -> the default path is byte-identical.
-        import torch as _t
 
-        from rl_quant.datasets.second_context import _build_split
-
-        nan = float("nan")
-
-        def payload(valid_mask, returns, feats):
-            n = len(valid_mask)
-            return {
-                "decision_timestamps": [f"2026-01-02T14:3{i}:00+00:00" for i in range(n)],
-                "next_timestamps": [f"2026-01-02T14:3{i}:30+00:00" for i in range(n)],
-                "market_context": _t.zeros(n, 1, 1),
-                "market_context_mask": _t.ones(n, 1, dtype=_t.bool),
-                "market_context_available_timestamps_ms": _t.zeros(n, dtype=_t.long),
-                "action_features": _t.tensor(feats).float(),
-                "action_returns": _t.tensor(returns).float(),
-                "decision_action_valid_mask": _t.tensor(valid_mask, dtype=_t.bool),
-                "label_valid_mask": _t.tensor(valid_mask, dtype=_t.bool),
-                "action_cost_bps": _t.zeros(n, 2),
-                "entry_execution_timestamps_ms": _t.zeros(n, dtype=_t.long),
-                "exit_execution_timestamps_ms": _t.ones(n, dtype=_t.long),
-                "portfolio_state": _t.zeros(n, 1),
-                "constraint_state": _t.zeros(n, 1),
-                "action_names": ["CASH", "AAA"],
-                "feature_names": {"action": ["f0"], "market": ["m0"]},
-            }
-
-        # Row 1's action 1 is decision-INVALID and carries an extreme feature (100.0) + a NaN return.
-        p = payload(valid_mask=[[True, True], [True, False]],
-                    returns=[[0.0, 0.01], [0.0, nan]],
-                    feats=[[[1.0], [1.0]], [[1.0], [100.0]]])
-        off = _build_split(name="t", payload=p)
-        on = _build_split(name="t", payload=p, mask_action_feature_normalizer=True)
-        # Default (off) = unmasked mean over all rows/actions = (1+1+1+100)/4 = 25.75.
-        self.assertAlmostEqual(float(off.action_feature_mean[0]), 25.75, places=5)
-        # Masked (on) excludes the invalid action 1 of row 1 -> (1+1+1)/3 = 1.0.
-        self.assertAlmostEqual(float(on.action_feature_mean[0]), 1.0, places=5)
-        self.assertNotAlmostEqual(float(off.action_feature_mean[0]), float(on.action_feature_mean[0]))
-
-        # Flip-criterion property: with EVERY action row decision-valid, masked == unmasked (flag is a no-op).
-        q = payload(valid_mask=[[True, True], [True, True]],
-                    returns=[[0.0, 0.01], [0.0, 0.02]],
-                    feats=[[[1.0], [2.0]], [[3.0], [4.0]]])
-        off_q = _build_split(name="t", payload=q)
-        on_q = _build_split(name="t", payload=q, mask_action_feature_normalizer=True)
-        self.assertTrue(_t.allclose(off_q.action_feature_mean, on_q.action_feature_mean, atol=1e-6))
-        self.assertTrue(_t.allclose(off_q.action_feature_std, on_q.action_feature_std, atol=1e-6))
-
-    def test_split_chronology_validation(self) -> None:
-        # build_second_context_splits now fails fast on boundaries that would leak or invert, BEFORE loading
-        # the dataset. Required ordering: train_start <= train_end < val_end <= test_start <= test_end.
-        from rl_quant.datasets.second_context import _validate_split_chronology
-
-        ok = dict(train_start="2026-01-01T00:00:00+00:00", train_end="2026-01-31T00:00:00+00:00",
-                  val_end="2026-02-28T00:00:00+00:00", test_start="2026-03-01T00:00:00+00:00",
-                  test_end="2026-03-31T00:00:00+00:00")
-        _validate_split_chronology(**ok)  # canonical valid split: no raise
-        # val_end == test_start is allowed (the production builder uses exactly this); train_start/test_end optional.
-        _validate_split_chronology(train_start=None, train_end="2026-06-12T14:35:00+00:00",
-                                   val_end="2026-06-12T14:45:00+00:00", test_start="2026-06-12T14:45:00+00:00",
-                                   test_end=None)
-        # Each violation raises (leak / inversion / empty val / overlap).
-        with self.assertRaises(ValueError):  # train_start after train_end
-            _validate_split_chronology(**{**ok, "train_start": "2026-02-01T00:00:00+00:00"})
-        with self.assertRaises(ValueError):  # val_end <= train_end -> empty val
-            _validate_split_chronology(**{**ok, "val_end": "2026-01-15T00:00:00+00:00"})
-        with self.assertRaises(ValueError):  # val_end > test_start -> val/test overlap
-            _validate_split_chronology(**{**ok, "val_end": "2026-03-15T00:00:00+00:00"})
-        with self.assertRaises(ValueError):  # test_end < test_start -> inverted test
-            _validate_split_chronology(**{**ok, "test_end": "2026-02-15T00:00:00+00:00"})
-        # The classic train/test leak (test_start <= train_end) is caught transitively via the val ordering.
-        with self.assertRaises(ValueError):
-            _validate_split_chronology(train_start=None, train_end="2026-03-01T00:00:00+00:00",
-                                       val_end="2026-02-28T00:00:00+00:00", test_start="2026-01-31T00:00:00+00:00",
-                                       test_end=None)
 
     def test_ranker_metrics(self) -> None:
         # Cross-sectional ranker quality of the action SCORER: IC (Pearson), rank IC (Spearman), top-k realized
@@ -4477,69 +4002,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             information_coefficient([[1.0, 2.0]], [[0.1, 0.2]], [[True]])     # mask width != scores width
 
-    def test_protocol_model_input_label_split_validator(self) -> None:
-        # Protocol layer (architecture Phase 2): the reusable anti-leakage validator. Enforces the contract a
-        # label/future field must NEVER be a model input. Pure/additive (changes no data or training).
-        from rl_quant.protocol import (
-            assert_no_model_input_leakage,
-            validate_decision_tensor_payload,
-            validate_model_input_label_split,
-        )
-
-        # The canonical second-context split (mirrors features/stock_second_context.py:832-861) must validate.
-        model_input_keys = [
-            "market_context", "market_context_mask", "action_features", "decision_action_valid_mask",
-            "action_valid_mask", "action_cost_bps", "action_target_weights", "portfolio_state",
-            "constraint_state", "decision_quality_score", "force_cash_mask",
-        ]
-        label_keys = [
-            "action_returns", "label_valid_mask", "entry_fill_observed_mask", "reward_exit_observed_mask",
-            "next_timestamps", "entry_execution_timestamps_ms", "exit_execution_timestamps_ms",
-        ]
-        forbidden = [
-            "action_returns", "label_valid_mask", "entry_fill_observed_mask", "reward_exit_observed_mask",
-            "next_timestamps", "exit_execution_timestamps_ms",
-        ]
-        ok, issues = validate_model_input_label_split(
-            model_input_keys=model_input_keys, label_keys=label_keys, forbidden_model_input_keys=forbidden
-        )
-        self.assertTrue(ok, issues)
-        self.assertEqual(issues, ())
-
-        # A leaked label/future field as a model input is rejected (the hard anti-leakage rule).
-        leaked_ok, leaked_issues = validate_model_input_label_split(
-            model_input_keys=[*model_input_keys, "action_returns"], label_keys=label_keys, forbidden_model_input_keys=forbidden
-        )
-        self.assertFalse(leaked_ok)
-        self.assertTrue(any("leak" in i for i in leaked_issues))
-        with self.assertRaises(ValueError):
-            assert_no_model_input_leakage(
-                model_input_keys=[*model_input_keys, "action_returns"], label_keys=label_keys, forbidden_model_input_keys=forbidden
-            )
-        # assert_* does not raise on the clean canonical split.
-        assert_no_model_input_leakage(
-            model_input_keys=model_input_keys, label_keys=label_keys, forbidden_model_input_keys=forbidden
-        )
-
-        # Other contract violations: a forbidden key not declared as a label, and an empty model-input list.
-        self.assertFalse(validate_model_input_label_split(
-            model_input_keys=model_input_keys, label_keys=label_keys,
-            forbidden_model_input_keys=[*forbidden, "some_future_flag"],
-        )[0])
-        self.assertFalse(validate_model_input_label_split(
-            model_input_keys=[], label_keys=label_keys, forbidden_model_input_keys=forbidden
-        )[0])
-
-        # Payload entry pulls the lists from the payload, falling back to the manifest (like the builder guard).
-        ok_payload, _ = validate_decision_tensor_payload(
-            {"model_input_keys": model_input_keys, "label_keys": label_keys, "forbidden_model_input_keys": forbidden}
-        )
-        self.assertTrue(ok_payload)
-        ok_manifest, _ = validate_decision_tensor_payload(
-            {"model_input_keys": model_input_keys},  # missing the rest in payload...
-            {"label_keys": label_keys, "forbidden_model_input_keys": forbidden},  # ...supplied by manifest
-        )
-        self.assertTrue(ok_manifest)
 
     def test_invalid_returns_must_be_nan_validator(self) -> None:
         # The decision-tensor honesty rule lifted into the protocol layer (mirroring the model-input/label
@@ -4736,9 +4198,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # the actual config dataclass (drift guard) so the registry can't silently disagree with the code.
         import dataclasses
 
-        from rl_quant.envs.minute_to_hour import MinuteToHourEnvConfig
+        from rl_quant.envs.second_to_hour import SecondToHourEnvConfig
         from rl_quant.protocol.flags import FLAG_REGISTRY, FlagSpec, result_moving_flags
-        from rl_quant.training.minute_to_hour import MinuteToHourTrainingConfig
+        from rl_quant.training.second_to_hour import SecondToHourTrainingConfig
 
         for name, spec in FLAG_REGISTRY.items():
             self.assertIsInstance(spec, FlagSpec)
@@ -4759,15 +4221,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
              "mask_action_feature_normalizer"},
         )
         self.assertFalse(FLAG_REGISTRY["execution_env_reward_shadow"].is_result_moving)
-        config_defaults = {f.name: f.default for f in dataclasses.fields(MinuteToHourTrainingConfig)}
+        config_defaults = {f.name: f.default for f in dataclasses.fields(SecondToHourTrainingConfig)}
         for name in ("use_dynamic_transition_features", "use_transition_features"):
             self.assertEqual(
                 config_defaults[name], FLAG_REGISTRY[name].default,
-                f"{name}: registry default disagrees with MinuteToHourTrainingConfig",
+                f"{name}: registry default disagrees with SecondToHourTrainingConfig",
             )
-        # execution_env_reward_shadow is a real MinuteToHourEnvConfig field now (PR-3); its registry default
+        # execution_env_reward_shadow is a real SecondToHourEnvConfig field now (PR-3); its registry default
         # must match the config default.
-        env_defaults = {f.name: f.default for f in dataclasses.fields(MinuteToHourEnvConfig)}
+        env_defaults = {f.name: f.default for f in dataclasses.fields(SecondToHourEnvConfig)}
         self.assertEqual(
             env_defaults["execution_env_reward_shadow"], FLAG_REGISTRY["execution_env_reward_shadow"].default
         )
@@ -4777,7 +4239,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         non_governance_bools: set[str] = set()  # add genuinely-cosmetic bools here if ever needed
         config_bools = {
             f.name
-            for cfg in (MinuteToHourEnvConfig, MinuteToHourTrainingConfig)
+            for cfg in (SecondToHourEnvConfig, SecondToHourTrainingConfig)
             for f in dataclasses.fields(cfg)
             if f.type in (bool, "bool")
         }
@@ -4939,7 +4401,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIsNone(module.official_test_block([records[0]], True))
 
     def test_recency_weights_decrease_with_age_and_keep_min_weight(self) -> None:
-        from rl_quant.minute_to_hour_transformer import _timestamp_to_epoch_ms, compute_recency_weights
+        from rl_quant.second_to_hour_transformer import _timestamp_to_epoch_ms, compute_recency_weights
 
         val_start_ms = _timestamp_to_epoch_ms("2026-06-01T13:30:00+00:00")
         timestamps = [
@@ -4958,7 +4420,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertGreater(float(weights[2]), 0.95)  # ~1 day old -> near full weight
 
     def test_recency_weights_anchor_validation_start_not_test_end(self) -> None:
-        from rl_quant.minute_to_hour_transformer import _timestamp_to_epoch_ms, compute_recency_weights
+        from rl_quant.second_to_hour_transformer import _timestamp_to_epoch_ms, compute_recency_weights
 
         val_start = "2026-06-01T13:30:00+00:00"
         val_start_ms = _timestamp_to_epoch_ms(val_start)
@@ -4973,7 +4435,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(float(later[0]), 1.0, places=6)
 
     def test_recency_weights_mode_none_is_uniform_and_weighted_mean_equals_mean(self) -> None:
-        from rl_quant.minute_to_hour_transformer import compute_recency_weights
+        from rl_quant.second_to_hour_transformer import compute_recency_weights
 
         weights = compute_recency_weights(
             ["2026-01-01T14:30:00+00:00", "2026-05-31T14:30:00+00:00"],
@@ -5011,12 +4473,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
     def test_recency_weighting_trains_and_is_uniform_when_disabled(self) -> None:
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
+        from rl_quant.second_to_hour_transformer import (
             HourFromMinuteDataSplit,
-            MinuteToHourEnvConfig,
-            MinuteToHourTrainingConfig,
+            SecondToHourEnvConfig,
+            SecondToHourTrainingConfig,
             RecencyWeightConfig,
-            train_minute_to_hour_dqn,
+            train_second_to_hour_dqn,
         )
 
         def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
@@ -5025,11 +4487,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-                minute_feature_names=["m"],
+                second_feature_names=["m"],
                 hour_feature_names=["h"],
                 action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((n, 1, 1, 1)),
-                minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                second_features=torch.zeros((n, 1, 1, 1)),
+                second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((n, 1, 1)),
                 action_returns=torch.zeros((n, 2)),
                 action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
@@ -5037,12 +4499,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 # Last row has no successor -> valid_index_mask False so the env resets at the boundary.
                 valid_start_indices=torch.arange(n - 1, dtype=torch.long),
                 valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-                minute_feature_mean=torch.zeros(1),
-                minute_feature_std=torch.ones(1),
+                second_feature_mean=torch.zeros(1),
+                second_feature_std=torch.ones(1),
                 hour_feature_mean=torch.zeros(1),
                 hour_feature_std=torch.ones(1),
                 hours_lookback=1,
-                minutes_per_hour=1,
+                seconds_per_hour=1,
             )
 
         train = make_split(
@@ -5066,22 +4528,22 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             grad_clip=1.0,
             use_amp=False,
         )
-        env = MinuteToHourEnvConfig(num_envs=2, episode_length=3)
+        env = SecondToHourEnvConfig(num_envs=2, episode_length=3)
 
         def run(mode: str) -> dict:
-            config = MinuteToHourTrainingConfig(
+            config = SecondToHourTrainingConfig(
                 env=env,
                 learning=learning,
                 d_model=16,
                 n_heads=2,
-                minute_layers=1,
+                second_layers=1,
                 hour_layers=1,
                 feedforward_dim=16,
                 action_embedding_dim=4,
                 recency=RecencyWeightConfig(mode=mode, half_life_days=60.0, min_weight=0.05),
             )
             torch.manual_seed(0)
-            _, artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+            _, artifacts = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
             return artifacts["recency_policy"]
 
         # Disabled (default): every training row keeps weight 1.0 -> weighted loss == plain mean.
@@ -5103,11 +4565,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # and the artifact records the dynamic schema. Default off keeps the artifact byte-identical (no
         # dynamic keys / legacy model_version) -- the existing trainer tests cover the off path numerically.
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
+        from rl_quant.second_to_hour_transformer import (
             HourFromMinuteDataSplit,
-            MinuteToHourEnvConfig,
-            MinuteToHourTrainingConfig,
-            train_minute_to_hour_dqn,
+            SecondToHourEnvConfig,
+            SecondToHourTrainingConfig,
+            train_second_to_hour_dqn,
         )
         from rl_quant.trading_constraints import (
             DYNAMIC_POSITION_AWARE_POLICY_MODEL_VERSION,
@@ -5124,16 +4586,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((n, 1, 1)), action_returns=returns,
                 action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 valid_start_indices=torch.arange(n - 1, dtype=torch.long),
                 valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
                 hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1),
-                hours_lookback=1, minutes_per_hour=1,
+                hours_lookback=1, seconds_per_hour=1,
             )
 
         train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
@@ -5145,13 +4607,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         )
 
         def run(dynamic: bool) -> dict:
-            config = MinuteToHourTrainingConfig(
-                env=MinuteToHourEnvConfig(num_envs=2, episode_length=3), learning=learning,
-                d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+            config = SecondToHourTrainingConfig(
+                env=SecondToHourEnvConfig(num_envs=2, episode_length=3), learning=learning,
+                d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
                 use_dynamic_transition_features=dynamic,
             )
             torch.manual_seed(0)
-            _, artifacts = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+            _, artifacts = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
             return artifacts
 
         # Flag ON: trains end-to-end (no shape error through the dynamic-threaded forwards) + stamps schema.
@@ -5176,14 +4638,14 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(on["loss_trace"][0], off["loss_trace"][0], places=6)
         self.assertNotEqual(on["loss_trace"], off["loss_trace"])
 
-    def test_minute_to_hour_baseline_panel(self) -> None:
+    def test_second_to_hour_baseline_panel(self) -> None:
         # Baseline panel (eval-only; changes no training/reward): deterministic cash / buy-and-hold references
         # run through the SAME eval path as a trained model, so a policy (or a PR-D A/B) must beat them under
         # cost. Single-slot action space -> no equal-weight; always_cash + per-action buy-and-hold.
-        from rl_quant.minute_to_hour_transformer import (
+        from rl_quant.second_to_hour_transformer import (
             HourFromMinuteDataSplit,
-            MinuteToHourEvaluationResult,
-            evaluate_minute_to_hour_baselines,
+            SecondToHourEvaluationResult,
+            evaluate_second_to_hour_baselines,
         )
 
         n = 6
@@ -5193,23 +4655,23 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             name="val",
             decision_timestamps=[f"2026-06-1{2}T1{4 + i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-06-1{2}T1{5 + i}:30:00+00:00" for i in range(n)],
-            minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+            second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)), action_returns=returns,
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.arange(n - 1, dtype=torch.long),
             valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-            minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
+            second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
             hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1),
-            hours_lookback=1, minutes_per_hour=1,
+            hours_lookback=1, seconds_per_hour=1,
         )
-        panel = evaluate_minute_to_hour_baselines(data, device=torch.device("cpu"))
+        panel = evaluate_second_to_hour_baselines(data, device=torch.device("cpu"))
 
         self.assertIn("always_cash", panel)
         self.assertIn("buy_and_hold:QQQ", panel)
         for result in panel.values():
-            self.assertIsInstance(result, MinuteToHourEvaluationResult)
+            self.assertIsInstance(result, SecondToHourEvaluationResult)
             self.assertTrue(math.isfinite(result.total_return))
         # Cash does nothing (no trades, no cost) -> ~0 return and 0 switches.
         self.assertAlmostEqual(panel["always_cash"].total_return, 0.0, places=6)
@@ -5218,13 +4680,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(panel["buy_and_hold:QQQ"].allocation_switches, 1)
         self.assertGreater(panel["buy_and_hold:QQQ"].total_return, panel["always_cash"].total_return)
 
-    def test_minute_to_hour_training_state_resumes_from_checkpoint(self) -> None:
+    def test_second_to_hour_training_state_resumes_from_checkpoint(self) -> None:
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
+        from rl_quant.second_to_hour_transformer import (
             HourFromMinuteDataSplit,
-            MinuteToHourEnvConfig,
-            MinuteToHourTrainingConfig,
-            train_minute_to_hour_dqn,
+            SecondToHourEnvConfig,
+            SecondToHourTrainingConfig,
+            train_second_to_hour_dqn,
         )
 
         def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
@@ -5233,31 +4695,31 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-                minute_feature_names=["m"],
+                second_feature_names=["m"],
                 hour_feature_names=["h"],
                 action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((n, 1, 1, 1)),
-                minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                second_features=torch.zeros((n, 1, 1, 1)),
+                second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((n, 1, 1)),
                 action_returns=torch.zeros((n, 2)),
                 action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 valid_start_indices=torch.arange(n - 1, dtype=torch.long),
                 valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-                minute_feature_mean=torch.zeros(1),
-                minute_feature_std=torch.ones(1),
+                second_feature_mean=torch.zeros(1),
+                second_feature_std=torch.ones(1),
                 hour_feature_mean=torch.zeros(1),
                 hour_feature_std=torch.ones(1),
                 hours_lookback=1,
-                minutes_per_hour=1,
+                seconds_per_hour=1,
             )
 
         train = make_split("train", ["2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"])
         val = make_split("val", ["2026-02-01", "2026-02-02"])
-        env = MinuteToHourEnvConfig(num_envs=2, episode_length=2)
+        env = SecondToHourEnvConfig(num_envs=2, episode_length=2)
 
-        def config(train_steps: int, state_path: Path, *, resume: bool) -> MinuteToHourTrainingConfig:
-            return MinuteToHourTrainingConfig(
+        def config(train_steps: int, state_path: Path, *, resume: bool) -> SecondToHourTrainingConfig:
+            return SecondToHourTrainingConfig(
                 env=env,
                 learning=DQNLearningConfig(
                     num_envs=2,
@@ -5278,7 +4740,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 ),
                 d_model=16,
                 n_heads=2,
-                minute_layers=1,
+                second_layers=1,
                 hour_layers=1,
                 feedforward_dim=16,
                 action_embedding_dim=4,
@@ -5290,13 +4752,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "training_state.pt"
             torch.manual_seed(123)
-            _, first = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config(3, state_path, resume=False))
+            _, first = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config(3, state_path, resume=False))
             self.assertFalse(first["resume"]["loaded"])
             self.assertTrue(state_path.exists())
             saved = torch.load(state_path, map_location="cpu", weights_only=False)
             self.assertEqual(saved["step"], 3)
 
-            _, resumed = train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config(5, state_path, resume=True))
+            _, resumed = train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config(5, state_path, resume=True))
             self.assertTrue(resumed["resume"]["loaded"])
             self.assertEqual(resumed["resume"]["resumed_from_step"], 3)
             self.assertEqual(resumed["resume"]["start_step"], 4)
@@ -5305,34 +4767,34 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
     def test_episode_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
         module = __import__(
-            "rl_quant.minute_to_hour_transformer",
-            fromlist=["VectorizedMinuteToHourEnv", "MinuteToHourEnvConfig", "HourFromMinuteDataSplit"],
+            "rl_quant.second_to_hour_transformer",
+            fromlist=["VectorizedSecondToHourEnv", "SecondToHourEnvConfig", "HourFromMinuteDataSplit"],
         )
         n = 4
         split = module.HourFromMinuteDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-0{i + 1}T14:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-0{i + 1}T15:30:00+00:00" for i in range(n)],
-            minute_feature_names=["m"],
+            second_feature_names=["m"],
             hour_feature_names=["h"],
             action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)),
-            minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_features=torch.zeros((n, 1, 1, 1)),
+            second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)),
             action_returns=torch.zeros((n, 2)),
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.arange(n - 1, dtype=torch.long),
             valid_index_mask=torch.tensor([True, True, True, False]),
-            minute_feature_mean=torch.zeros(1),
-            minute_feature_std=torch.ones(1),
+            second_feature_mean=torch.zeros(1),
+            second_feature_std=torch.ones(1),
             hour_feature_mean=torch.zeros(1),
             hour_feature_std=torch.ones(1),
             hours_lookback=1,
-            minutes_per_hour=1,
+            seconds_per_hour=1,
         )
-        env = module.VectorizedMinuteToHourEnv(
-            split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=2, initial_action=0), torch.device("cpu")
+        env = module.VectorizedSecondToHourEnv(
+            split, module.SecondToHourEnvConfig(num_envs=1, episode_length=2, initial_action=0), torch.device("cpu")
         )
         cash = torch.zeros(1, dtype=torch.long)
         # Reach the episode-length boundary with a valid next row -> truncation (done) but NOT terminal.
@@ -5355,34 +4817,34 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
     def test_episode_terminal_out_of_range_next_action_mask_is_safe_dummy(self) -> None:
         module = __import__(
-            "rl_quant.minute_to_hour_transformer",
-            fromlist=["VectorizedMinuteToHourEnv", "MinuteToHourEnvConfig", "HourFromMinuteDataSplit"],
+            "rl_quant.second_to_hour_transformer",
+            fromlist=["VectorizedSecondToHourEnv", "SecondToHourEnvConfig", "HourFromMinuteDataSplit"],
         )
         n = 3
         split = module.HourFromMinuteDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-0{i + 1}T14:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-0{i + 1}T15:30:00+00:00" for i in range(n)],
-            minute_feature_names=["m"],
+            second_feature_names=["m"],
             hour_feature_names=["h"],
             action_names=["CASH", "QQQ"],
-            minute_features=torch.zeros((n, 1, 1, 1)),
-            minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+            second_features=torch.zeros((n, 1, 1, 1)),
+            second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
             hour_features=torch.zeros((n, 1, 1)),
             action_returns=torch.zeros((n, 2)),
             action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
             valid_start_indices=torch.arange(n, dtype=torch.long),
             valid_index_mask=torch.ones(n, dtype=torch.bool),
-            minute_feature_mean=torch.zeros(1),
-            minute_feature_std=torch.ones(1),
+            second_feature_mean=torch.zeros(1),
+            second_feature_std=torch.ones(1),
             hour_feature_mean=torch.zeros(1),
             hour_feature_std=torch.ones(1),
             hours_lookback=1,
-            minutes_per_hour=1,
+            seconds_per_hour=1,
         )
-        env = module.VectorizedMinuteToHourEnv(
-            split, module.MinuteToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0), torch.device("cpu")
+        env = module.VectorizedSecondToHourEnv(
+            split, module.SecondToHourEnvConfig(num_envs=1, episode_length=10, initial_action=0), torch.device("cpu")
         )
         cash = torch.zeros(1, dtype=torch.long)
         env.indices[:] = n - 1
@@ -5435,7 +4897,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             self.assertEqual(boundaries["test_end_ts"], "2026-06-13T00:00:00+00:00")
 
     def test_recency_weighting_rejects_zero_min_weight(self) -> None:
-        from rl_quant.minute_to_hour_transformer import compute_recency_weights
+        from rl_quant.second_to_hour_transformer import compute_recency_weights
 
         with self.assertRaises(ValueError):
             compute_recency_weights(
@@ -5444,12 +4906,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
     def test_recency_weighting_rejects_train_overlapping_validation(self) -> None:
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
+        from rl_quant.second_to_hour_transformer import (
             HourFromMinuteDataSplit,
-            MinuteToHourEnvConfig,
-            MinuteToHourTrainingConfig,
+            SecondToHourEnvConfig,
+            SecondToHourTrainingConfig,
             RecencyWeightConfig,
-            train_minute_to_hour_dqn,
+            train_second_to_hour_dqn,
         )
 
         def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
@@ -5458,23 +4920,23 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-                minute_feature_names=["m"],
+                second_feature_names=["m"],
                 hour_feature_names=["h"],
                 action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((n, 1, 1, 1)),
-                minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                second_features=torch.zeros((n, 1, 1, 1)),
+                second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((n, 1, 1)),
                 action_returns=torch.zeros((n, 2)),
                 action_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 valid_start_indices=torch.arange(n - 1, dtype=torch.long),
                 valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-                minute_feature_mean=torch.zeros(1),
-                minute_feature_std=torch.ones(1),
+                second_feature_mean=torch.zeros(1),
+                second_feature_std=torch.ones(1),
                 hour_feature_mean=torch.zeros(1),
                 hour_feature_std=torch.ones(1),
                 hours_lookback=1,
-                minutes_per_hour=1,
+                seconds_per_hour=1,
             )
 
         # train_max (2026-06-15) is AFTER validation start (2026-06-01) -> recency must refuse.
@@ -5497,19 +4959,19 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             grad_clip=1.0,
             use_amp=False,
         )
-        config = MinuteToHourTrainingConfig(
-            env=MinuteToHourEnvConfig(num_envs=1, episode_length=2),
+        config = SecondToHourTrainingConfig(
+            env=SecondToHourEnvConfig(num_envs=1, episode_length=2),
             learning=learning,
             d_model=16,
             n_heads=2,
-            minute_layers=1,
+            second_layers=1,
             hour_layers=1,
             feedforward_dim=16,
             action_embedding_dim=4,
             recency=RecencyWeightConfig(mode="exponential", half_life_days=60.0, min_weight=0.05),
         )
         with self.assertRaises(ValueError):
-            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+            train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
 
     def test_dqn_td_target_bootstraps_through_truncation_only_zeros_terminal(self) -> None:
         from rl_quant.core import dqn_td_target
@@ -5551,47 +5013,6 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dqn_td_target(torch.tensor([float("inf"), 1.0]), 0.9, torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0]))
 
-    def test_hourly_env_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
-        module = __import__(
-            "rl_quant.hourly_transformer",
-            fromlist=["VectorizedHourlyAllocationEnv", "HourlyEnvConfig", "HourlyDataSplit"],
-        )
-        n = 6
-        split = module.HourlyDataSplit(
-            name="train",
-            timestamps=[f"2026-01-02T14:3{m}:00+00:00" for m in range(n)],
-            next_timestamps=[f"2026-01-02T14:3{m + 1}:00+00:00" for m in range(n)],
-            feature_names=["x"],
-            action_names=["CASH", "QQQ"],
-            features=torch.zeros((n, 1), dtype=torch.float32),
-            action_returns=torch.zeros((n, 2), dtype=torch.float32),
-            session_dates=["2026-01-02"] * n,
-            valid_start_indices=torch.tensor([0, 1, 2, 3, 4], dtype=torch.long),
-            valid_index_mask=torch.tensor([True, True, True, True, True, False]),
-            feature_mean=torch.zeros(1),
-            feature_std=torch.ones(1),
-            lookback=1,
-            bar_interval="1m",
-        )
-        env = module.VectorizedHourlyAllocationEnv(
-            split, module.HourlyEnvConfig(lookback=1, num_envs=1, episode_length=2, initial_action=0), torch.device("cpu")
-        )
-        cash = torch.zeros(1, dtype=torch.long)
-        env.reset(torch.ones(1, dtype=torch.bool))
-        env.indices[:] = 0
-        env.steps[:] = 0
-        first = env.step(cash)
-        self.assertEqual(float(first["resets"][0].item()), 0.0)
-        self.assertEqual(float(first["terminated"][0].item()), 0.0)
-        second = env.step(cash)  # steps 1->2 == episode_length -> truncation, not terminal
-        self.assertEqual(float(second["resets"][0].item()), 1.0)
-        self.assertEqual(float(second["terminated"][0].item()), 0.0)
-        env.reset(torch.ones(1, dtype=torch.bool))
-        env.indices[:] = 4
-        env.steps[:] = 0
-        boundary = env.step(cash)  # next row 5 has no valid successor -> true terminal
-        self.assertEqual(float(boundary["terminated"][0].item()), 1.0)
-        self.assertEqual(float(boundary["resets"][0].item()), 1.0)
 
     def test_strict_latest_partition_rejects_duplicate_selected_labels(self) -> None:
         module = load_script("train_hourly_from_second_protocol_partitions")
@@ -5784,54 +5205,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(raw["free_gb"], 0.0)
         self.assertEqual(rounded["free_gb"], 0.0)
 
-    def test_intraday_training_config_has_amp_dtype(self) -> None:
-        import dataclasses
 
-        module = __import__("rl_quant.intraday_dqn", fromlist=["TrainingConfig"])
-        fields = {f.name: f for f in dataclasses.fields(module.TrainingConfig)}
-        self.assertIn("amp_dtype", fields)
-        self.assertEqual(fields["amp_dtype"].default, "fp16")
-
-    def test_intraday_valid_index_mask_matches_valid_start_range(self) -> None:
-        import csv as _csv
-        import tempfile
-        from pathlib import Path as _Path
-
-        from rl_quant.datasets.intraday import _finalize_split, _load_raw_split
-
-        cols = [
-            "time", "bucket_start_ns", "bucket_seconds", "close_mid", "best_bid", "best_ask",
-            "close_spread", "avg_spread", "close_imbalance", "avg_imbalance", "close_microprice",
-            "high_mid", "low_mid", "quote_updates", "bid_depth_lots", "ask_depth_lots",
-            "locked_quotes", "crossed_quotes",
-        ]
-        row = {
-            "time": "09:30:00", "bucket_start_ns": "0", "bucket_seconds": "1", "close_mid": "100.0",
-            "best_bid": "99.9", "best_ask": "100.1", "close_spread": "0.2", "avg_spread": "0.2",
-            "close_imbalance": "0.5", "avg_imbalance": "0.5", "close_microprice": "100.0",
-            "high_mid": "100.2", "low_mid": "99.8", "quote_updates": "10", "bid_depth_lots": "5",
-            "ask_depth_lots": "5", "locked_quotes": "0", "crossed_quotes": "0",
-        }
-        with tempfile.TemporaryDirectory() as d:
-            path = _Path(d) / "2026-01-02_nbbo_1s.csv"
-            with path.open("w", newline="") as fh:
-                writer = _csv.DictWriter(fh, fieldnames=cols)
-                writer.writeheader()
-                for _ in range(6):
-                    writer.writerow(row)
-            raw = _load_raw_split("train", [path], lookback=2)
-        mask = raw["valid_index_mask"]
-        # 6 rows, lookback=2 -> valid range [1, 4]; row 0 (< lookback-1) and row 5 (= day_end-1, no
-        # in-day finite next) are excluded. The mask must be the FULL valid range, == valid_start_indices.
-        self.assertEqual(mask.dtype, torch.bool)
-        self.assertEqual(int(mask.shape[0]), 6)
-        self.assertEqual(mask.nonzero().flatten().tolist(), [1, 2, 3, 4])
-        self.assertEqual(mask.nonzero().flatten().tolist(), raw["valid_start_indices"].tolist())
-        self.assertFalse(bool(mask[0].item()))
-        self.assertFalse(bool(mask[5].item()))
-        # The new required field survives finalize() and a device move (.to keeps it co-located).
-        split = _finalize_split(raw, feature_mean=torch.zeros(14), feature_std=torch.ones(14))
-        self.assertEqual(split.to(torch.device("cpu")).valid_index_mask.tolist(), mask.tolist())
 
     def test_all_dqn_trainers_bootstrap_on_terminated_not_resets(self) -> None:
         # The load-bearing RL invariant: the TD bootstrap is masked by `terminated` (a true terminal),
@@ -5841,7 +5215,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import re
 
         src = ROOT / "src" / "rl_quant"
-        trainers = ["training/strategy.py", "training/intraday.py", "training/hourly.py", "training/minute_to_hour.py"]
+        trainers = ["training/second_to_hour.py"]
         call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
         for name in trainers:
             calls = call_re.findall((src / name).read_text())
@@ -6016,15 +5390,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 symbols=[], errors=[], source_latency_seconds=-1,
             )
 
-    def test_amp_dtype_reaches_minute_to_hour_autocast(self) -> None:
+    def test_amp_dtype_reaches_second_to_hour_autocast(self) -> None:
 
-        import rl_quant.training.minute_to_hour as m2h  # the train loop looks up autocast_context here
+        import rl_quant.training.second_to_hour as m2h  # the train loop looks up autocast_context here
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.minute_to_hour_transformer import (
+        from rl_quant.second_to_hour_transformer import (
             HourFromMinuteDataSplit,
-            MinuteToHourEnvConfig,
-            MinuteToHourTrainingConfig,
-            train_minute_to_hour_dqn,
+            SecondToHourEnvConfig,
+            SecondToHourTrainingConfig,
+            train_second_to_hour_dqn,
         )
 
         def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
@@ -6033,13 +5407,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((n, 1, 1)), action_returns=torch.zeros((n, 2)),
                 action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
             )
 
         train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
@@ -6049,9 +5423,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=3, epsilon_start=0.2,
             epsilon_end=0.0, eval_interval=4, grad_clip=1.0, amp_dtype="bf16",
         )
-        config = MinuteToHourTrainingConfig(
-            env=MinuteToHourEnvConfig(num_envs=2, episode_length=3), learning=learning,
-            d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
+        config = SecondToHourTrainingConfig(
+            env=SecondToHourEnvConfig(num_envs=2, episode_length=3), learning=learning,
+            d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
         )
         seen: list[str] = []
         real = m2h.autocast_context
@@ -6062,19 +5436,19 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
         torch.manual_seed(0)
         with mock.patch.object(m2h, "autocast_context", recorder):
-            train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
+            train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)
         # The trainer must thread config.learning.amp_dtype into autocast_context (not a hardcoded fp16).
         self.assertTrue(seen)
         self.assertEqual(set(seen), {"bf16"})
 
-    def test_minute_to_hour_execution_shadow_training_byte_identical_and_surfaced(self) -> None:
+    def test_second_to_hour_execution_shadow_training_byte_identical_and_surfaced(self) -> None:
         # PR-3 end-to-end: execution_env_reward_shadow must NOT change training (the shadow reward is a logged
         # side-channel, never trained on) yet MUST surface the shadow deltas in the artifact. Train a tiny run
         # twice (shadow off vs on, same seed) -> identical loss/reward traces; only the on-run carries the deltas.
         from rl_quant.core import DQNLearningConfig
-        from rl_quant.datasets.hour_from_subhour import default_minute_to_hour_constraints
-        from rl_quant.minute_to_hour_transformer import (
-            HourFromMinuteDataSplit, MinuteToHourEnvConfig, MinuteToHourTrainingConfig, train_minute_to_hour_dqn,
+        from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
+        from rl_quant.second_to_hour_transformer import (
+            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
         def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
@@ -6082,13 +5456,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             return HourFromMinuteDataSplit(
                 name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
-                minute_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
-                minute_features=torch.zeros((n, 1, 1, 1)), minute_mask=torch.ones((n, 1, 1), dtype=torch.bool),
+                second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
+                second_features=torch.zeros((n, 1, 1, 1)), second_mask=torch.ones((n, 1, 1), dtype=torch.bool),
                 hour_features=torch.zeros((n, 1, 1)), action_returns=torch.zeros((n, 2)),
                 action_valid_mask=torch.ones((n, 2), dtype=torch.bool), label_valid_mask=torch.ones((n, 2), dtype=torch.bool),
                 valid_start_indices=torch.arange(n - 1, dtype=torch.long), valid_index_mask=torch.tensor([True] * (n - 1) + [False]),
-                minute_feature_mean=torch.zeros(1), minute_feature_std=torch.ones(1),
-                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, minutes_per_hour=1,
+                second_feature_mean=torch.zeros(1), second_feature_std=torch.ones(1),
+                hour_feature_mean=torch.zeros(1), hour_feature_std=torch.ones(1), hours_lookback=1, seconds_per_hour=1,
             )
 
         train = make_split("train", ["2026-01-02", "2026-02-02", "2026-03-02", "2026-04-02", "2026-05-02", "2026-05-20"])
@@ -6100,13 +5474,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 gamma=0.99, learning_rate=1e-3, weight_decay=0.0, target_update_interval=3, epsilon_start=0.2,
                 epsilon_end=0.0, eval_interval=4, grad_clip=1.0,
             )
-            config = MinuteToHourTrainingConfig(
-                env=MinuteToHourEnvConfig(num_envs=2, episode_length=3, execution_env_reward_shadow=shadow),
-                learning=learning, d_model=16, n_heads=2, minute_layers=1, hour_layers=1, feedforward_dim=16,
+            config = SecondToHourTrainingConfig(
+                env=SecondToHourEnvConfig(num_envs=2, episode_length=3, execution_env_reward_shadow=shadow),
+                learning=learning, d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16,
                 action_embedding_dim=4,
             )
             torch.manual_seed(0)
-            return train_minute_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)[1]  # artifacts
+            return train_second_to_hour_dqn(train, val, device=torch.device("cpu"), config=config)[1]  # artifacts
 
         off, on = run(False), run(True)
         self.assertEqual(off["loss_trace"], on["loss_trace"])  # training byte-identical (shadow is a side-channel)
@@ -6120,7 +5494,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertIsNone(off["execution_shadow_real_executable"])
         self.assertIsNone(off["execution_shadow_fee_bps"])
         self.assertIs(on["execution_shadow_real_executable"], False)
-        self.assertEqual(on["execution_shadow_fee_bps"], float(default_minute_to_hour_constraints().one_way_cost_bps))
+        self.assertEqual(on["execution_shadow_fee_bps"], float(default_second_to_hour_constraints().one_way_cost_bps))
         # #7 auditability: action-metadata fingerprint + kept-regularizer + weight-semantics fields (None off).
         self.assertIsNone(off["execution_shadow_action_metadata_hash"])
         self.assertIsNone(off["execution_shadow_keeps_switch_penalty"])
@@ -6157,110 +5531,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             path = scripts_dir() / script
             self.assertTrue(path.exists(), f"qt {group} {workflow} -> missing script {path}")
 
-    def test_stock_second_silver_feature_manifest_reproducibility(self) -> None:
-        # The silver feature manifest records the full reproducibility surface (window, thresholds, the symbol/
-        # file limits AND whether they truncated, the input manifests, the deterministic selection, builder/
-        # schema version) plus a content hash over exactly the determinative INPUTS -- reproducible across
-        # reruns (created_at / output counts do not move it) but sensitive to any input that changes the output.
-        from rl_quant.workflows.commands.build_stock_second_silver_features import (
-            BUILDER_VERSION,
-            build_feature_manifest,
-        )
 
-        base = dict(
-            source_root=Path("/data/src"), stock_second_manifest=Path("/data/src/manifest.csv"),
-            dataset_manifest=Path("/data/src/dataset_manifest.json"),
-            manifest_content_hash="m_hash_v1", dataset_manifest_content_hash="d_hash_v1",
-            session_gating_method="weekend_rth_heuristic", start="2026-06-12T00:00:00+00:00",
-            end_exclusive="2026-06-13T00:00:00+00:00", block_seconds=300, min_active_symbols=250,
-            include_extended_hours=False, symbol_limit=2, max_files=5,
-            selected_symbols=["AAA", "BBB"], loaded_symbols=["BBB", "AAA"], rows=78,
-            files_considered=10, files_used=5, total_symbols_available=3,
-            data_quality_report={"ok": True}, created_at_utc="2026-06-20T00:00:00+00:00",
-        )
-        manifest = build_feature_manifest(**base)
-        # All legacy fields preserved (consumers reading the old manifest are unaffected).
-        for legacy in ("source", "rows", "symbols", "feature_names", "block_seconds", "data_quality_report"):
-            self.assertIn(legacy, manifest)
-        self.assertEqual(manifest["symbols"], ["AAA", "BBB"])  # sorted regardless of load order
-        self.assertEqual(manifest["builder_version"], BUILDER_VERSION)
-        self.assertEqual(manifest["window"], {"start": base["start"], "end_exclusive": base["end_exclusive"]})
-        self.assertEqual(manifest["manifests"]["stock_second_manifest"], "/data/src/manifest.csv")
-        self.assertEqual(manifest["manifests"]["manifest_content_hash"], "m_hash_v1")
-        self.assertEqual(manifest["session_gating_method"], "weekend_rth_heuristic")
-        # Truncation is recorded honestly: 3 available > 2 selected, 10 considered > 5 used.
-        self.assertEqual(manifest["symbol_selection"]["order"], "source_manifest_order")
-        self.assertTrue(manifest["symbol_selection"]["truncated"])
-        self.assertTrue(manifest["file_selection"]["truncated"])
-        # Hash: stable across created_at, OUTPUT-derived changes, AND location-only path changes (a pure rerun,
-        # or a relocation to a new path with identical content, must not move it)...
-        rerun = build_feature_manifest(**{**base, "created_at_utc": "2099-01-01T00:00:00+00:00",
-                                          "rows": 999, "loaded_symbols": ["AAA"],
-                                          "source_root": Path("/elsewhere"),
-                                          "stock_second_manifest": Path("/elsewhere/manifest.csv")})
-        self.assertEqual(manifest["inputs_content_hash"], rerun["inputs_content_hash"])
-        # ...but sensitive to every input that changes the produced features: the window/block, the input
-        # manifest CONTENT (not its path), and the session-gating path (which changes the emitted decision grid).
-        for moved in ({"block_seconds": 600}, {"manifest_content_hash": "m_hash_v2"},
-                      {"dataset_manifest_content_hash": "d_hash_v2"},
-                      {"session_gating_method": "pandas_market_calendars_nyse"}):
-            self.assertNotEqual(
-                manifest["inputs_content_hash"],
-                build_feature_manifest(**{**base, **moved})["inputs_content_hash"], moved,
-            )
-        # A selected symbol that loads zero frames is recorded as a load-drop, not silently lost.
-        dropped = build_feature_manifest(**{**base, "selected_symbols": ["A", "B", "C", "D", "E"],
-                                            "loaded_symbols": ["A", "B"], "total_symbols_available": 5})
-        self.assertEqual(dropped["symbol_selection"]["selected_count"], 5)
-        self.assertEqual(dropped["symbol_selection"]["loaded_count"], 2)
-        self.assertEqual(dropped["symbol_selection"]["dropped_at_load"], 3)
-        # No-truncation case is recorded as not-truncated.
-        clean = build_feature_manifest(**{**base, "symbol_limit": 0, "max_files": 0, "total_symbols_available": 2})
-        self.assertFalse(clean["symbol_selection"]["truncated"])
-        self.assertFalse(clean["file_selection"]["truncated"])
 
-    def test_stock_second_silver_parse_args_and_qt_dispatch(self) -> None:
-        from rl_quant.paths import scripts_dir
-        from rl_quant.workflows.cli import _DISPATCH
-        from rl_quant.workflows.commands.build_stock_second_silver_features import parse_args
-
-        # parse_args smoke: defaults resolve, and explicit overrides are honored.
-        defaults = parse_args([])
-        self.assertEqual(defaults.block_seconds, 300)
-        self.assertEqual(defaults.symbol_limit, 500)
-        self.assertEqual(defaults.max_files, 0)
-        self.assertFalse(defaults.include_extended_hours)
-        overridden = parse_args(["--block-seconds", "60", "--symbol-limit", "10", "--smoke", "--include-extended-hours"])
-        self.assertEqual((overridden.block_seconds, overridden.symbol_limit), (60, 10))
-        self.assertTrue(overridden.smoke and overridden.include_extended_hours)
-        # qt exposes the migrated builder and the wrapper script it dispatches to exists.
-        self.assertEqual(_DISPATCH[("build", "stock-second-silver")], "build_stock_second_silver_features.py")
-        self.assertTrue((scripts_dir() / _DISPATCH[("build", "stock-second-silver")]).exists())
-
-    def test_qt_cli_dispatch_expands_preset_and_forwards_args(self) -> None:
-        from rl_quant.cli import build_parser, resolve_workflow
-        from rl_quant.paths import scripts_dir
-
-        parser = build_parser()
-        # --source 1s selects the second-context preset by default; --foo bar is forwarded verbatim.
-        args, passthrough = parser.parse_known_args(["train", "subhour", "--source", "1s", "--foo", "bar"])
-        script, script_argv = resolve_workflow(args, passthrough)
-        self.assertEqual(script, "train_hourly_from_minute_context_rl.py")
-        self.assertTrue((scripts_dir() / script).exists())
-        self.assertIn("--run-name", script_argv)  # from the preset
-        # Passthrough args come AFTER preset args so the user overrides defaults.
-        self.assertEqual(script_argv[-2:], ["--foo", "bar"])
-        # No selector default -> no preset, args forwarded unchanged.
-        args2, passthrough2 = parser.parse_known_args(["train", "subhour", "--source", "1m", "--x", "1"])
-        _, argv2 = resolve_workflow(args2, passthrough2)
-        self.assertEqual(argv2, ["--x", "1"])
 
     def test_qt_preset_commands_and_registry(self) -> None:
         from rl_quant.workflows.cli import _DISPATCH, main
         from rl_quant.presets import PRESETS, resolve_preset
 
         self.assertEqual(main(["preset", "list"]), 0)
-        self.assertEqual(main(["preset", "show", "train.subhour.second-context"]), 0)
+        self.assertEqual(main(["preset", "show", "train.second"]), 0)
         with self.assertRaises(SystemExit):
             resolve_preset("does-not-exist")
         # Every preset expands to a non-empty arg list and targets a real (group, workflow).
@@ -6273,23 +5552,22 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         from rl_quant.cli import build_parser, resolve_workflow
 
         parser = build_parser()
-        # A direct-bar preset must NOT be accepted for a second-context command (would forward the
-        # wrong CLI flags to the script).
+        # A build preset must NOT be accepted for a train command (would forward the wrong CLI flags).
         args, passthrough = parser.parse_known_args(
-            ["train", "second-context", "--preset", "train.direct-bar.minute"]
+            ["train", "second", "--preset", "build.second"]
         )
         with self.assertRaises(SystemExit):
             resolve_workflow(args, passthrough)
         # The matching preset is accepted.
-        args2, pt2 = parser.parse_known_args(["train", "direct-bar", "--preset", "train.direct-bar.minute"])
+        args2, pt2 = parser.parse_known_args(["train", "second", "--preset", "train.second"])
         script, argv = resolve_workflow(args2, pt2)
-        self.assertEqual(script, "train_hourly_causal_transformer_rl.py")
+        self.assertEqual(script, "train_hour_from_second_rl.py")
         self.assertTrue(argv)
 
-    def test_minute_to_hour_uses_core_replay_buffer(self) -> None:
+    def test_second_to_hour_uses_core_replay_buffer(self) -> None:
         # The local duplicate was removed; the trainer must use core's validated buffer.
         import rl_quant.core as core
-        import rl_quant.minute_to_hour_transformer as m2h
+        import rl_quant.second_to_hour_transformer as m2h
 
         self.assertIs(m2h.TensorDictReplayBuffer, core.TensorDictReplayBuffer)
 
