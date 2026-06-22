@@ -180,10 +180,10 @@ class SyntheticEconomicInvariants(unittest.TestCase):
         # Genuineness guard against a vacuous pass: a FRESH (untrained) model of the SAME architecture captures
         # nothing here -- it stays in CASH (empirically verified across seeds), so the trained policy's positive
         # return below is attributable to LEARNING, not initialization luck or a structural bias toward QQQ.
-        from rl_quant.second_to_hour_transformer import SecondToHourCausalTransformerQNetwork
+        from rl_quant.second_to_hour_transformer import SecondToHourPolicyQNetwork
 
         torch.manual_seed(0)
-        untrained = SecondToHourCausalTransformerQNetwork(
+        untrained = SecondToHourPolicyQNetwork(
             second_feature_dim=1, hour_feature_dim=1, action_count=2, hours_lookback=1, seconds_per_hour=1,
             d_model=16, n_heads=2, second_layers=1, hour_layers=1, feedforward_dim=16, action_embedding_dim=4,
         )

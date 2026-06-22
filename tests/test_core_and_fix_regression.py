@@ -26,7 +26,7 @@ from rl_quant.features.news_llm import (
 )
 from rl_quant.second_to_hour_transformer import (
     HourFromMinuteDataSplit,
-    SecondToHourCausalTransformerQNetwork,
+    SecondToHourPolicyQNetwork,
 )
 from rl_quant.trading_constraints import CONSTRAINT_FEATURE_NAMES
 from _support import ROOT, load_script

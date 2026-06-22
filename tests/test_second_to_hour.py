@@ -57,7 +57,7 @@ from rl_quant.features.news_llm import (
 from rl_quant.research_protocol import stable_json_hash
 from rl_quant.second_to_hour_transformer import (
     HourFromMinuteDataSplit,
-    SecondToHourCausalTransformerQNetwork,
+    SecondToHourPolicyQNetwork,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
     build_action_mask,
@@ -76,8 +76,8 @@ from _support import ROOT, load_script
 
 class SecondToHourTests(unittest.TestCase):
     @staticmethod
-    def _small_second_to_hour_model() -> SecondToHourCausalTransformerQNetwork:
-        return SecondToHourCausalTransformerQNetwork(
+    def _small_second_to_hour_model() -> SecondToHourPolicyQNetwork:
+        return SecondToHourPolicyQNetwork(
             second_feature_dim=1, hour_feature_dim=1, action_count=2, hours_lookback=1,
             seconds_per_hour=1, d_model=16, n_heads=4, second_layers=1, hour_layers=1,
             feedforward_dim=32, action_embedding_dim=4,

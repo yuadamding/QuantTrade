@@ -1,10 +1,16 @@
-"""Models layer: the minute->hour causal-transformer Q-network.
+"""Context-learning ONLY: the second->hour causal-transformer market-context ENCODER.
 
-Extracted verbatim from ``second_to_hour_transformer`` in the protocol-first reorganization
-(architecture_migration_plan.md, Phase 4). Pure model code: it consumes typed tensors and returns per-action
-Q-values; it owns no portfolio state, reward, or data loading. Re-exported from
-``rl_quant.second_to_hour_transformer`` for backward compatibility; behaviour is byte-identical to the
-pre-extraction class."""
+``SecondToHourContextEncoder`` consumes the whole-market per-second context (``second_features`` over a 4-hour
+lookback + ``hour_features``) and emits an hourly market embedding. It owns NO decision-policy concern -- there is
+no action universe, previous-action, constraint state, Q-head, or reward here. Decision-policy lives in
+``rl_quant.models.decision_policy.DecisionPolicyQNetwork`` and consumes this encoder's (frozen) embedding.
+
+This split makes the two stages independent (architecture_migration_plan.md): the context encoder is trained
+SELF-SUPERVISED via ``SecondContextForwardHead`` (predict the next-period market move/vol) then frozen, and the
+policy is trained by DQN on the precomputed embeddings. ``SecondToHourPolicyQNetwork`` is a transitional
+composition (encoder o policy) that preserves the pre-split end-to-end forward signature so the existing
+training/eval/env stack keeps working while Stage-2 is wired up.
+"""
 
 from __future__ import annotations
 
@@ -13,13 +19,148 @@ import math
 import torch
 from torch import nn
 
+from rl_quant.models.decision_policy import DecisionPolicyQNetwork
 from rl_quant.protocol.constraints import CONSTRAINT_FEATURE_DIM
 
-# Default number of sub-hour tokens the model attends to before mean-pool compression (a model-architecture knob).
+# Default number of sub-hour tokens the encoder attends to before mean-pool compression (architecture knob).
 DEFAULT_MAX_SECOND_TOKENS = 512
 
 
-class SecondToHourCausalTransformerQNetwork(nn.Module):
+class SecondToHourContextEncoder(nn.Module):
+    """Policy-free market-context encoder: (second_features, second_mask, hour_features) -> hourly embedding."""
+
+    def __init__(
+        self,
+        *,
+        second_feature_dim: int,
+        hour_feature_dim: int,
+        hours_lookback: int,
+        seconds_per_hour: int,
+        d_model: int = 256,
+        n_heads: int = 8,
+        second_layers: int = 2,
+        hour_layers: int = 4,
+        feedforward_dim: int = 768,
+        dropout: float = 0.05,
+        max_second_tokens: int | None = DEFAULT_MAX_SECOND_TOKENS,
+    ) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads")
+        if max_second_tokens is not None and int(max_second_tokens) <= 0:
+            raise ValueError("max_second_tokens must be positive when provided.")
+        self.hours_lookback = int(hours_lookback)
+        self.seconds_per_hour = int(seconds_per_hour)
+        self.d_model = int(d_model)
+        self.max_second_tokens = None if max_second_tokens is None else int(max_second_tokens)
+        self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+        self.second_proj = nn.Sequential(nn.Linear(second_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
+        self.second_pos = nn.Parameter(torch.zeros(seconds_per_hour, d_model))
+        second_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=feedforward_dim, dropout=dropout,
+            activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.second_encoder = nn.TransformerEncoder(second_layer, num_layers=second_layers)
+        self.hour_proj = nn.Sequential(
+            nn.Linear(d_model + hour_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU(),
+        )
+        self.hour_pos = nn.Parameter(torch.zeros(hours_lookback, d_model))
+        hour_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=feedforward_dim, dropout=dropout,
+            activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.hour_encoder = nn.TransformerEncoder(hour_layer, num_layers=hour_layers)
+
+    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
+        key = (length, device)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            mask = torch.triu(torch.ones((length, length), dtype=torch.bool, device=device), diagonal=1)
+            self._mask_cache[key] = mask
+        return mask
+
+    def _compress_second_tokens(
+        self, tokens: torch.Tensor, valid_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        length = tokens.shape[1]
+        if self.max_second_tokens is None or length <= self.max_second_tokens:
+            return tokens, valid_mask
+        chunk_size = int(math.ceil(length / float(self.max_second_tokens)))
+        chunk_count = int(math.ceil(length / float(chunk_size)))
+        padded_length = chunk_count * chunk_size
+        if padded_length != length:
+            pad_tokens = torch.zeros(
+                (tokens.shape[0], padded_length - length, tokens.shape[2]), dtype=tokens.dtype, device=tokens.device
+            )
+            pad_mask = torch.zeros(
+                (valid_mask.shape[0], padded_length - length), dtype=valid_mask.dtype, device=valid_mask.device
+            )
+            tokens = torch.cat([tokens, pad_tokens], dim=1)
+            valid_mask = torch.cat([valid_mask, pad_mask], dim=1)
+        grouped_tokens = tokens.reshape(tokens.shape[0], chunk_count, chunk_size, tokens.shape[2])
+        grouped_mask = valid_mask.reshape(valid_mask.shape[0], chunk_count, chunk_size)
+        weights = grouped_mask.to(tokens.dtype).unsqueeze(-1)
+        counts = weights.sum(dim=2).clamp_min(1.0)
+        compressed = (grouped_tokens * weights).sum(dim=2) / counts
+        compressed_mask = grouped_mask.any(dim=2)
+        return compressed, compressed_mask
+
+    def encode_hours(
+        self, second_features: torch.Tensor, second_mask: torch.Tensor, hour_features: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-hour causal market tokens ``[B, H, d_model]`` (tier-1 over seconds -> per-hour token -> tier-2)."""
+        batch, hours, seconds, _ = second_features.shape
+        if hours > self.hours_lookback or seconds > self.seconds_per_hour:
+            raise ValueError("Input context exceeds configured hours_lookback or seconds_per_hour.")
+        x = self.second_proj(second_features)
+        x = x + self.second_pos[:seconds][None, None, :, :]
+        x = x.reshape(batch * hours, seconds, -1)
+        flat_mask = second_mask.reshape(batch * hours, seconds).bool()
+        x, flat_mask = self._compress_second_tokens(x, flat_mask)
+        seconds = x.shape[1]
+        safe_padding_mask = ~flat_mask
+        empty_rows = ~flat_mask.any(dim=1)
+        if bool(empty_rows.any().item()):
+            safe_padding_mask[empty_rows, 0] = False
+        second_context = self.second_encoder(
+            x, mask=self._causal_mask(seconds, x.device), src_key_padding_mask=safe_padding_mask
+        )
+        valid_positions = torch.arange(seconds, device=x.device).expand(batch * hours, -1)
+        last_valid = torch.where(flat_mask, valid_positions, torch.full_like(valid_positions, -1)).max(dim=1).values
+        last_valid = last_valid.clamp_min(0)
+        hour_context = second_context[torch.arange(batch * hours, device=x.device), last_valid].reshape(batch, hours, -1)
+        hour_context = hour_context.masked_fill(empty_rows.reshape(batch, hours, 1), 0.0)
+        hour_tokens = self.hour_proj(torch.cat([hour_context, hour_features], dim=-1))
+        hour_tokens = hour_tokens + self.hour_pos[:hours][None, :, :]
+        return self.hour_encoder(hour_tokens, mask=self._causal_mask(hours, x.device))
+
+    def forward(
+        self, second_features: torch.Tensor, second_mask: torch.Tensor, hour_features: torch.Tensor
+    ) -> torch.Tensor:
+        """Hourly market-context embedding ``[B, d_model]`` (the final causal hour token)."""
+        return self.encode_hours(second_features, second_mask, hour_features)[:, -1, :]
+
+
+class SecondContextForwardHead(nn.Module):
+    """Self-supervised pretraining head: predict the next-period whole-market move + realized vol from the hourly
+    context embedding. Trained jointly with the encoder in Stage 1; discarded (encoder frozen) for Stage 2."""
+
+    def __init__(self, *, d_model: int, target_dim: int = 2, hidden_dim: int = 256, dropout: float = 0.05) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model), nn.Linear(d_model, hidden_dim), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(hidden_dim, target_dim),
+        )
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        return self.net(context)
+
+
+class SecondToHourPolicyQNetwork(nn.Module):
+    """Transitional composition (context encoder o decision policy) preserving the pre-split end-to-end forward
+    signature, so the existing DQN training/eval/env stack runs unchanged while Stage-2 is wired. The ENCODER is
+    still policy-free; this class only wires it to a DecisionPolicyQNetwork."""
+
     def __init__(
         self,
         *,
@@ -43,194 +184,26 @@ class SecondToHourCausalTransformerQNetwork(nn.Module):
         dynamic_feature_dim: int = 0,
     ) -> None:
         super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError("d_model must be divisible by n_heads")
-        if max_second_tokens is not None and int(max_second_tokens) <= 0:
-            raise ValueError("max_second_tokens must be positive when provided.")
-        self.hours_lookback = int(hours_lookback)
-        self.seconds_per_hour = int(seconds_per_hour)
-        self.max_second_tokens = None if max_second_tokens is None else int(max_second_tokens)
-        self.action_count = int(action_count)
-        self.action_feature_dim = int(action_feature_dim)
-        self.transition_feature_dim = int(transition_feature_dim)
-        self.dynamic_feature_dim = int(dynamic_feature_dim)
-        self._mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
-        self.second_proj = nn.Sequential(nn.Linear(second_feature_dim, d_model), nn.LayerNorm(d_model), nn.GELU())
-        self.second_pos = nn.Parameter(torch.zeros(seconds_per_hour, d_model))
-        second_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=feedforward_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.encoder = SecondToHourContextEncoder(
+            second_feature_dim=second_feature_dim, hour_feature_dim=hour_feature_dim,
+            hours_lookback=hours_lookback, seconds_per_hour=seconds_per_hour, d_model=d_model, n_heads=n_heads,
+            second_layers=second_layers, hour_layers=hour_layers, feedforward_dim=feedforward_dim,
+            dropout=dropout, max_second_tokens=max_second_tokens,
         )
-        self.second_encoder = nn.TransformerEncoder(second_layer, num_layers=second_layers)
-        self.hour_proj = nn.Sequential(
-            nn.Linear(d_model + hour_feature_dim, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
+        self.policy = DecisionPolicyQNetwork(
+            d_model=d_model, action_count=action_count, action_embedding_dim=action_embedding_dim,
+            constraint_feature_dim=constraint_feature_dim, feedforward_dim=feedforward_dim, dropout=dropout,
+            action_feature_dim=action_feature_dim, transition_feature_dim=transition_feature_dim,
+            transition_table=transition_table, dynamic_feature_dim=dynamic_feature_dim,
         )
-        self.hour_pos = nn.Parameter(torch.zeros(hours_lookback, d_model))
-        self.previous_action_embedding = nn.Embedding(action_count, action_embedding_dim)
-        self.action_context = nn.Linear(action_embedding_dim, d_model)
-        self.constraint_context = nn.Linear(constraint_feature_dim, d_model)
-        if self.action_feature_dim > 0:
-            self.action_id_embedding = nn.Embedding(action_count, d_model)
-            self.action_feature_encoder = nn.Sequential(
-                nn.Linear(self.action_feature_dim, d_model),
-                nn.LayerNorm(d_model),
-                nn.GELU(),
-            )
-            self.action_feature_head = nn.Sequential(
-                nn.LayerNorm(d_model),
-                nn.Linear(d_model, feedforward_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(feedforward_dim, 1),
-            )
-        else:
-            self.action_id_embedding = None
-            self.action_feature_encoder = None
-            self.action_feature_head = None
-        # Position-aware transition features (opt-in). When enabled, a static [A, A, F] table of
-        # (previous_action, candidate_action) features is gathered by previous_action id inside forward
-        # and fed per-candidate into the Q head. The encoders are ZERO-INITIALISED so a freshly-built
-        # transition-aware model scores identically to the pre-feature model until trained (and a model
-        # built with transition_feature_dim=0 has no new params at all -> existing checkpoints load strict).
-        if self.transition_feature_dim > 0:
-            if transition_table is None:
-                raise ValueError("transition_feature_dim > 0 requires a transition_table [A, A, F].")
-            self.register_buffer("transition_table", transition_table.float())
-            # Build the (zero-init) transition submodule WITHOUT perturbing the construction RNG of the rest
-            # of the network (hour_encoder/head are built below). Like the dynamic block, its random init is
-            # immediately overwritten by zeros_, so saving/restoring the RNG makes the shared backbone's init
-            # identical whether transition_feature_dim is 0 or > 0 -> a freshly built transition-aware model is
-            # a CLEAN perturbation of the non-transition one (same backbone init + zero-init head => identical
-            # until trained), so a transition A/B isolates the feature, not a different random initialization.
-            _rng_state = torch.get_rng_state()
-            if self.action_feature_dim > 0:
-                self.transition_encoder = nn.Sequential(
-                    nn.Linear(self.transition_feature_dim, d_model),
-                    nn.LayerNorm(d_model),
-                    nn.GELU(),
-                )
-                nn.init.zeros_(self.transition_encoder[0].weight)
-                nn.init.zeros_(self.transition_encoder[0].bias)
-                self.transition_bias = None
-            else:
-                # Fallback head emits Q[B, A] from one Linear over context, with no per-candidate tokens
-                # to add to; inject transition awareness as an additive per-candidate [B, A] bias instead.
-                self.transition_encoder = None
-                self.transition_bias = nn.Linear(self.transition_feature_dim, 1)
-                nn.init.zeros_(self.transition_bias.weight)
-                nn.init.zeros_(self.transition_bias.bias)
-            torch.set_rng_state(_rng_state)
-        else:
-            self.transition_table = None
-            self.transition_encoder = None
-            self.transition_bias = None
-        # Dynamic position-state features (opt-in, PR-D). A per-env [B, dynamic_feature_dim] vector of the
-        # HELD position's realized-P&L excursion is passed into forward() and injected per-candidate
-        # (broadcast across candidates, since it is position-level not candidate-level). Encoders are
-        # ZERO-INITIALISED so a freshly-built dynamic-aware model scores identically until trained; and
-        # dynamic_feature_dim=0 registers no params at all -> existing checkpoints load strict.
-        if self.dynamic_feature_dim > 0:
-            # Build the (zero-init) dynamic submodule WITHOUT perturbing the construction RNG of the rest of
-            # the network (hour_encoder/head are built below). Its random init is immediately overwritten by
-            # zeros_, so saving/restoring the RNG makes the shared backbone's init identical whether the flag
-            # is off or on -> a freshly built dynamic-aware model is a CLEAN perturbation of the non-dynamic
-            # one (same backbone init + zero-init dynamic head => identical until trained), so the D4 A/B
-            # isolates the feature rather than a different random initialization.
-            _rng_state = torch.get_rng_state()
-            if self.action_feature_dim > 0:
-                self.dynamic_encoder = nn.Sequential(
-                    nn.Linear(self.dynamic_feature_dim, d_model),
-                    nn.LayerNorm(d_model),
-                    nn.GELU(),
-                )
-                nn.init.zeros_(self.dynamic_encoder[0].weight)
-                nn.init.zeros_(self.dynamic_encoder[0].bias)
-                self.dynamic_bias = None
-            else:
-                self.dynamic_encoder = None
-                self.dynamic_bias = nn.Linear(self.dynamic_feature_dim, 1)
-                nn.init.zeros_(self.dynamic_bias.weight)
-                nn.init.zeros_(self.dynamic_bias.bias)
-            torch.set_rng_state(_rng_state)
-        else:
-            self.dynamic_encoder = None
-            self.dynamic_bias = None
-        hour_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=feedforward_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.hour_encoder = nn.TransformerEncoder(hour_layer, num_layers=hour_layers)
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, feedforward_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(feedforward_dim, action_count),
-        )
-
-    def _causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
-        key = (length, device)
-        mask = self._mask_cache.get(key)
-        if mask is None:
-            mask = torch.triu(torch.ones((length, length), dtype=torch.bool, device=device), diagonal=1)
-            self._mask_cache[key] = mask
-        return mask
-
-    def _transition_rows(self, previous_actions: torch.Tensor) -> torch.Tensor:
-        # Gather the [B, A, F] per-candidate transition features for the held positions. Validate the
-        # ids up front so an out-of-range previous_action raises a clear error instead of silently
-        # wrapping (negative index) or tripping a cryptic CUDA assert deep in the gather.
-        ids = previous_actions.long()
-        if bool(((ids < 0) | (ids >= self.action_count)).any().item()):
-            raise ValueError(
-                f"previous_actions must be valid action ids in [0, {self.action_count}); "
-                "got an out-of-range id (CASH=0 is the expected reset state)."
-            )
-        return self.transition_table[ids]
-
-    def _compress_second_tokens(
-        self,
-        tokens: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        length = tokens.shape[1]
-        if self.max_second_tokens is None or length <= self.max_second_tokens:
-            return tokens, valid_mask
-        chunk_size = int(math.ceil(length / float(self.max_second_tokens)))
-        chunk_count = int(math.ceil(length / float(chunk_size)))
-        padded_length = chunk_count * chunk_size
-        if padded_length != length:
-            pad_tokens = torch.zeros(
-                (tokens.shape[0], padded_length - length, tokens.shape[2]),
-                dtype=tokens.dtype,
-                device=tokens.device,
-            )
-            pad_mask = torch.zeros(
-                (valid_mask.shape[0], padded_length - length),
-                dtype=valid_mask.dtype,
-                device=valid_mask.device,
-            )
-            tokens = torch.cat([tokens, pad_tokens], dim=1)
-            valid_mask = torch.cat([valid_mask, pad_mask], dim=1)
-        grouped_tokens = tokens.reshape(tokens.shape[0], chunk_count, chunk_size, tokens.shape[2])
-        grouped_mask = valid_mask.reshape(valid_mask.shape[0], chunk_count, chunk_size)
-        weights = grouped_mask.to(tokens.dtype).unsqueeze(-1)
-        counts = weights.sum(dim=2).clamp_min(1.0)
-        compressed = (grouped_tokens * weights).sum(dim=2) / counts
-        compressed_mask = grouped_mask.any(dim=2)
-        return compressed, compressed_mask
+        # Passthrough attributes the training/eval code reads off the model.
+        self.action_count = self.policy.action_count
+        self.action_feature_dim = self.policy.action_feature_dim
+        self.transition_feature_dim = self.policy.transition_feature_dim
+        self.dynamic_feature_dim = self.policy.dynamic_feature_dim
+        self.hours_lookback = self.encoder.hours_lookback
+        self.seconds_per_hour = self.encoder.seconds_per_hour
+        self.max_second_tokens = self.encoder.max_second_tokens
 
     def forward(
         self,
@@ -242,79 +215,8 @@ class SecondToHourCausalTransformerQNetwork(nn.Module):
         action_features: torch.Tensor | None = None,
         dynamic_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch, hours, minutes, _ = second_features.shape
-        if hours > self.hours_lookback or minutes > self.seconds_per_hour:
-            raise ValueError("Input context exceeds configured hours_lookback or seconds_per_hour.")
-        # A model built with dynamic_feature_dim > 0 MUST be given dynamic_state -- silently omitting it would
-        # let a "dynamic-aware" run (so labelled in its manifest) score like the non-dynamic model. Fail
-        # closed. For a zero ablation, pass an explicit zero tensor and record that in the run manifest. Shape
-        # is checked here (cheap, no device sync); finiteness is left to the env/dataset boundary to avoid a
-        # per-step GPU sync on the training hot path.
-        if self.dynamic_feature_dim > 0:
-            if dynamic_state is None:
-                raise ValueError(
-                    "dynamic_state is required because the model was built with dynamic_feature_dim > 0 "
-                    "(pass an explicit zero tensor for a zero-ablation and record it in the manifest)."
-                )
-            if tuple(dynamic_state.shape) != (batch, self.dynamic_feature_dim):
-                raise ValueError(
-                    f"dynamic_state shape {tuple(dynamic_state.shape)} does not match "
-                    f"(batch={batch}, dynamic_feature_dim={self.dynamic_feature_dim})."
-                )
-        x = self.second_proj(second_features)
-        x = x + self.second_pos[:minutes][None, None, :, :]
-        x = x.reshape(batch * hours, minutes, -1)
-        flat_mask = second_mask.reshape(batch * hours, minutes).bool()
-        x, flat_mask = self._compress_second_tokens(x, flat_mask)
-        minutes = x.shape[1]
-        safe_padding_mask = ~flat_mask
-        empty_rows = ~flat_mask.any(dim=1)
-        if bool(empty_rows.any().item()):
-            safe_padding_mask[empty_rows, 0] = False
-        second_context = self.second_encoder(
-            x,
-            mask=self._causal_mask(minutes, x.device),
-            src_key_padding_mask=safe_padding_mask,
+        context = self.encoder(second_features, second_mask, hour_features)
+        return self.policy(
+            context, previous_actions, constraint_features,
+            action_features=action_features, dynamic_state=dynamic_state,
         )
-        valid_positions = torch.arange(minutes, device=x.device).expand(batch * hours, -1)
-        last_valid = torch.where(flat_mask, valid_positions, torch.full_like(valid_positions, -1)).max(dim=1).values
-        last_valid = last_valid.clamp_min(0)
-        hour_context = second_context[
-            torch.arange(batch * hours, device=x.device),
-            last_valid,
-        ].reshape(batch, hours, -1)
-        hour_context = hour_context.masked_fill(empty_rows.reshape(batch, hours, 1), 0.0)
-
-        hour_tokens = self.hour_proj(torch.cat([hour_context, hour_features], dim=-1))
-        hour_tokens = hour_tokens + self.hour_pos[:hours][None, :, :]
-        action_ctx = self.action_context(self.previous_action_embedding(previous_actions.long()))
-        constraint_ctx = self.constraint_context(constraint_features.float())
-        hour_tokens = hour_tokens + action_ctx[:, None, :] + constraint_ctx[:, None, :]
-        encoded = self.hour_encoder(hour_tokens, mask=self._causal_mask(hours, x.device))
-        context = encoded[:, -1, :]
-        if self.action_feature_encoder is None:
-            out = self.head(context)
-            if self.transition_bias is not None:
-                # Per-candidate transition bias gathered by the held position id (zero at init).
-                out = out + self.transition_bias(self._transition_rows(previous_actions)).squeeze(-1)
-            if self.dynamic_bias is not None and dynamic_state is not None:
-                # Per-env dynamic position-state bias, broadcast across candidates ([B,1]->[B,A]; zero at init).
-                out = out + self.dynamic_bias(dynamic_state.float())
-            return out
-        if action_features is None:
-            raise ValueError("Model was configured with action_feature_dim > 0 but action_features were not provided.")
-        if action_features.shape[1] != self.action_count or action_features.shape[2] != self.action_feature_dim:
-            raise ValueError("action_features shape does not match configured action count/feature dimension.")
-        action_ids = torch.arange(self.action_count, device=action_features.device)
-        action_tokens = self.action_feature_encoder(action_features.float())
-        action_tokens = action_tokens + self.action_id_embedding(action_ids)[None, :, :]
-        if self.transition_encoder is not None:
-            # Add a per-candidate token encoding the cost/risk of moving from the held position
-            # (previous_actions) to each candidate. Gathered from the static table; zero at init.
-            action_tokens = action_tokens + self.transition_encoder(self._transition_rows(previous_actions))
-        if self.dynamic_encoder is not None and dynamic_state is not None:
-            # Add the held position's dynamic state (P&L excursion) as a per-env token, broadcast across
-            # candidates ([B,d_model]->[B,1,d_model]); zero at init so an untrained dynamic model is identical.
-            action_tokens = action_tokens + self.dynamic_encoder(dynamic_state.float())[:, None, :]
-        q_tokens = context[:, None, :] + action_tokens
-        return self.action_feature_head(q_tokens).squeeze(-1)

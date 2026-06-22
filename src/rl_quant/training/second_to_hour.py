@@ -51,7 +51,7 @@ from rl_quant.trading_constraints import (
 
 from rl_quant.models.second_to_hour import (  # re-export: model moved to the models layer
     DEFAULT_MAX_SECOND_TOKENS,
-    SecondToHourCausalTransformerQNetwork,
+    SecondToHourPolicyQNetwork,
 )
 from rl_quant.datasets.hour_from_second import (
     HourFromMinuteDataSplit,
@@ -1136,7 +1136,7 @@ def train_second_to_hour_dqn(
         )
         transition_feature_dim = TRANSITION_FEATURE_DIM
     dynamic_feature_dim = DYNAMIC_TRANSITION_FEATURE_DIM if config.use_dynamic_transition_features else 0
-    q_network = SecondToHourCausalTransformerQNetwork(
+    q_network = SecondToHourPolicyQNetwork(
         second_feature_dim=train_data.second_features.shape[-1],
         hour_feature_dim=train_data.hour_features.shape[-1],
         action_count=action_count,
