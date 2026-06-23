@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, time, timezone
@@ -258,7 +257,11 @@ def validate_manifest(
     if missing_files:
         errors.append("manifest_references_missing_files")
     for key in REPORTABILITY_METADATA_KEYS:
-        if key not in payload and key not in source_meta:
+        # source_meta is the NORMALIZED dict, which always contains every key (some default to None),
+        # so a key-presence test can never fire. Check the resolved VALUE instead: None or blank string
+        # is "missing". bool/int values (e.g. adjusted=False) are present and never flagged.
+        value = source_meta.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
             errors.append(f"source_metadata_missing_{key}")
     if str(source_meta["source_access"]).lower() == "unknown":
         errors.append("source_access_unknown")
@@ -319,10 +322,6 @@ def available_timestamp_ms(
     return int(timestamp_ms) + int(bar_latency_ms) + int(ingestion_latency_ms)
 
 
-def timestamp_ms_to_iso(timestamp_ms: int) -> str:
-    return datetime.fromtimestamp(int(timestamp_ms) / 1000.0, tz=timezone.utc).replace(microsecond=0).isoformat()
-
-
 def iso_to_timestamp_ms(value: str) -> int:
     text = value[:-1] + "+00:00" if value.endswith("Z") else value
     parsed = datetime.fromisoformat(text)
@@ -359,7 +358,11 @@ def _ensure_timestamp_ms(frame: Any) -> Any:
 def _regular_session_mask(frame: Any) -> Any:
     pd = _require_pandas()
     if "timestamp_exchange" in frame.columns:
-        exchange_ts = pd.to_datetime(frame["timestamp_exchange"], errors="coerce")
+        # Parse with utc=True then convert to Eastern: a mixed-offset column otherwise yields object dtype,
+        # on which `.dt.time` raises. This matches the canonical-timestamp branch's tz handling below.
+        exchange_ts = pd.to_datetime(frame["timestamp_exchange"], utc=True, errors="coerce").dt.tz_convert(
+            "America/New_York"
+        )
         exchange_time = exchange_ts.dt.time
         return (exchange_time >= RTH_START) & (exchange_time < RTH_END)
     eastern = frame["timestamp"].dt.tz_convert("America/New_York")
@@ -375,6 +378,7 @@ def normalize_symbol_day_frame(
     include_extended_hours: bool = False,
     require_adjusted: bool = True,
 ) -> Any:
+    pd = _require_pandas()
     out = _ensure_timestamp_ms(frame)
     if symbol_hint and "symbol" not in out.columns:
         out["symbol"] = symbol_hint.upper()
@@ -385,8 +389,10 @@ def normalize_symbol_day_frame(
         if bool(bad_timespan.any()):
             raise ValueError("Expected Polygon second aggregate timespan='second'.")
     if "multiplier" in out.columns:
-        bad_multiplier = out["multiplier"].fillna(SECOND_MULTIPLIER).astype(int) != SECOND_MULTIPLIER
-        if bool(bad_multiplier.any()):
+        # Coerce non-numeric multipliers to NaN (-> default) instead of letting .astype(int) raise an opaque
+        # error; a genuinely-wrong numeric multiplier still trips the descriptive ValueError below.
+        multiplier = pd.to_numeric(out["multiplier"], errors="coerce").fillna(SECOND_MULTIPLIER).astype("int64")
+        if bool((multiplier != SECOND_MULTIPLIER).any()):
             raise ValueError("Expected Polygon second aggregate multiplier=1.")
     if rth_only and not include_extended_hours:
         out = out.loc[_regular_session_mask(out)].copy()
@@ -481,55 +487,8 @@ def audit_symbol_day_files(
     return dict(totals)
 
 
-def build_source_manifest(
-    rows: ManifestRows,
-    config: PolygonSecondAggConfig,
-    *,
-    source_access: str | None = None,
-) -> PolygonSecondAggManifest:
-    payload = load_dataset_manifest(config.dataset_manifest_json)
-    source_meta = normalize_source_metadata(payload, source_access=source_access)
-    report = validate_manifest(rows, config, source_access=source_access)
-    return PolygonSecondAggManifest(
-        root=config.root,
-        symbols=_manifest_symbols(rows),
-        start=str(payload.get("start") or ""),
-        end_exclusive=str(payload.get("end_exclusive") or ""),
-        market_weekdays=int(float(payload.get("market_weekdays", 0) or 0)),
-        source=str(source_meta["source"]),
-        source_access=str(source_meta["source_access"]),
-        adjusted=bool(source_meta["adjusted"]),
-        timespan=str(source_meta["timespan"]),
-        multiplier=int(source_meta["multiplier"]),
-        source_download_complete=report.source_download_complete,
-        universe_asof=source_meta.get("universe_asof"),
-    )
-
-
 def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
 
 
-def write_coverage_csv(path: Path, rows: ManifestRows, *, group_key: str) -> None:
-    counts: dict[str, Counter[str]] = defaultdict(Counter)
-    for row in rows:
-        key = str(row.get(group_key, ""))
-        if not key:
-            continue
-        counts[key][str(row.get("status", "")).lower()] += 1
-    statuses = sorted({status for counter in counts.values() for status in counter})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as sink:
-        writer = csv.writer(sink)
-        writer.writerow([group_key, "total", *statuses])
-        for key in sorted(counts):
-            total = sum(counts[key].values())
-            writer.writerow([key, total, *[counts[key].get(status, 0) for status in statuses]])
-
-
-def finite_or_nan(value: float | int | None) -> float:
-    if value is None:
-        return math.nan
-    out = float(value)
-    return out if math.isfinite(out) else math.nan

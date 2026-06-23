@@ -33,9 +33,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         type=Path,
-        default=DATA_ROOT / "rl_hour_from_minute" / "top_volume_1m_recent" / "hour_from_minute_dataset.pt",
+        default=DATA_ROOT / "rl_hour_from_second" / "top500_1s_recent" / "hour_from_second_dataset.pt",
     )
-    parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_minute_runs")
+    parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_second_runs")
     parser.add_argument("--run-name")
     parser.add_argument("--warm-start-model", type=Path, help="Fine-tune from a previous minute-to-hour model.pt checkpoint.")
     parser.add_argument(
@@ -85,7 +85,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--d-model", type=int, default=192)
     parser.add_argument("--n-heads", type=int, default=6)
-    parser.add_argument("--minute-layers", type=int, default=2)
+    parser.add_argument("--second-layers", type=int, default=2)
     parser.add_argument("--hour-layers", type=int, default=3)
     parser.add_argument("--feedforward-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.05)
@@ -176,7 +176,7 @@ def main() -> int:
             SecondToHourEnvConfig,
             SecondToHourTrainingConfig,
             action_index,
-            build_hour_from_minute_splits,
+            build_hour_from_second_splits,
             evaluate_second_to_hour_policy,
             train_second_to_hour_dqn,
         )
@@ -194,7 +194,7 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    train_split, val_split, test_split = build_hour_from_minute_splits(
+    train_split, val_split, test_split = build_hour_from_second_splits(
         dataset_path=args.dataset,
         split_mode=args.split_mode,
         train_start=args.train_start,

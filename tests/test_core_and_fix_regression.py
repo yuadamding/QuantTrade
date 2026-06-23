@@ -25,8 +25,7 @@ from rl_quant.features.news_llm import (
     write_news_llm_feature_outputs,
 )
 from rl_quant.second_to_hour_transformer import (
-    HourFromMinuteDataSplit,
-    SecondToHourPolicyQNetwork,
+    HourFromSecondDataSplit,
 )
 from rl_quant.trading_constraints import CONSTRAINT_FEATURE_NAMES
 from _support import ROOT, load_script
@@ -74,6 +73,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(crossed.crossed)
         self.assertLess(crossed.spread, 0.0)
 
+    def test_parse_time_to_ns_keeps_wall_clock_minute_field(self) -> None:
+        # Regression: the minute->second rename once clobbered the MINUTE field of HH:MM:SS,
+        # collapsing 09:30:15 to 33315s instead of 34215s. Pin all three fields + fractional ns.
+        from rl_quant.data_sources.quote_utils import NANOS_PER_SECOND, parse_time_to_ns
+
+        self.assertEqual(parse_time_to_ns("09:30:15"), 34215 * NANOS_PER_SECOND)  # 9*3600 + 30*60 + 15
+        self.assertEqual(parse_time_to_ns("16:00:00"), 16 * 3600 * NANOS_PER_SECOND)
+        self.assertEqual(parse_time_to_ns("00:01:00"), 60 * NANOS_PER_SECOND)  # minute alone, not seconds
+        self.assertEqual(parse_time_to_ns("09:30:15.250"), 34215 * NANOS_PER_SECOND + 250_000_000)
 
     def test_calibrator_recovers_known_residual_std_and_flags_in_sample(self) -> None:
         rows = 100
@@ -1511,7 +1519,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # PR-3: execution_env_reward_shadow ON computes a weight-bps execution reward/cost ALONGSIDE the legacy
         # reward (logged in the step dict) but leaves the training `rewards` byte-identical -- replay stores only
         # declared fields, so the shadow never reaches training. Default OFF emits no shadow keys.
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
@@ -1550,10 +1558,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # cash_idle_penalty_bps via the SHARED transition_trade_cost_bps -- it omitted it before (a latent
         # drift vs the training reward). An always-cash policy's reward drops when the penalty is nonzero;
         # with penalty 0 it is byte-identical to the prior behaviour (no cost on zero-return cash holds).
-        from rl_quant.second_to_hour_transformer import HourFromMinuteDataSplit
+        from rl_quant.second_to_hour_transformer import HourFromSecondDataSplit
         from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="eval",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
@@ -1629,7 +1637,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertEqual(legs_one, 1.0)  # counted as a single switch leg
 
         # The env reward uses exactly (trade_cost_bps + cash_idle_bps) from the SAME primitive.
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="t", decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(3)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(3)],
             second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -1661,8 +1669,8 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
         from rl_quant.second_to_hour_transformer import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
-        def split() -> HourFromMinuteDataSplit:
-            return HourFromMinuteDataSplit(
+        def split() -> HourFromSecondDataSplit:
+            return HourFromSecondDataSplit(
                 name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
                 next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
                 second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -1712,7 +1720,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
         def split(action_names):
             n = len(action_names)
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
                 next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
                 second_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
@@ -1772,7 +1780,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
     def _two_action_split(self, action_names):
         n = len(action_names)
-        return HourFromMinuteDataSplit(
+        return HourFromSecondDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
             second_feature_names=["m"], hour_feature_names=["h"], action_names=list(action_names),
@@ -1957,11 +1965,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # contract / replay schema). The check is at the top of train_second_to_hour_dqn, before any work.
         from rl_quant.core import DQNLearningConfig
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
+            HourFromSecondDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
-        def make_split(name: str) -> HourFromMinuteDataSplit:
-            return HourFromMinuteDataSplit(
+        def make_split(name: str) -> HourFromSecondDataSplit:
+            return HourFromSecondDataSplit(
                 name=name, decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-03T14:30:00+00:00"],
                 next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-03T15:30:00+00:00"],
                 second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -2048,12 +2056,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
 
         from rl_quant.core import DQNLearningConfig
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
+            HourFromSecondDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
-        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+        def make_split(name: str, dates: list[str]) -> HourFromSecondDataSplit:
             n = len(dates)
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
                 second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "UNSEEN_TICKER_ZZ"],
@@ -2107,12 +2115,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_second_to_hour_env_step_treats_nonfinite_label_as_unusable(self) -> None:
         # Env/eval parity: a label the mask calls "valid" but whose return is NaN/inf must NOT be traded on
         # (the env would otherwise produce a NaN reward). The env falls back to CASH exactly like the evaluator.
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         device = torch.device("cpu")
         # Row 0: QQQ is mask-valid but its return is NaN; CASH(0) is finite. Requesting QQQ must execute CASH.
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
             second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -2136,13 +2144,13 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # The evaluator reports a Probabilistic Sharpe Ratio (P(true per-period Sharpe > 0)) alongside the raw
         # annualized Sharpe: in [0,1] and > 0.5 for a clearly-positive-return policy; None when the net-return
         # series has no dispersion (e.g. an all-CASH policy -> constant zero returns).
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         device = torch.device("cpu")
         n = 6
         qqq = [0.01, 0.006, 0.018, 0.009, 0.013, 0.0]  # varied, positive -> positive per-period Sharpe
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
@@ -2257,10 +2265,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_second_to_hour_eval_rejects_empty_valid_start_split(self) -> None:
         # An evaluation split with no valid decision rows fails closed (a zero/degenerate metric would
         # otherwise look like a legitimate result), mirroring the env's start-index-pool guard.
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
-        empty = HourFromMinuteDataSplit(
+        empty = HourFromSecondDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
             second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -2301,7 +2309,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # paths: they share transition_trade_cost_bps but reconstruct the rest of the rollout separately.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
         from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
 
@@ -2317,7 +2325,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # QQQ return is NaN at row 3 -> both paths must de-risk to CASH there; CASH return is 0 everywhere. All
         # timestamps share one day (no day reset); rows are contiguous (no segment reset after the first).
         qqq = [0.01, -0.004, 0.02, float("nan"), 0.013, 0.0]
-        base = HourFromMinuteDataSplit(
+        base = HourFromSecondDataSplit(
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
@@ -2376,7 +2384,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # on the executed action's gross return with held = not is_switch; this pins them step-for-step.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
         from rl_quant.trading_constraints import DYNAMIC_TRANSITION_FEATURE_DIM
         from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
@@ -2398,7 +2406,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         device = torch.device("cpu")
         n = 6
         qqq = [0.01, -0.004, 0.02, float("nan"), 0.013, 0.0]
-        base = HourFromMinuteDataSplit(
+        base = HourFromSecondDataSplit(
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(n)],
@@ -2443,7 +2451,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # back to CASH). A wrong env day-reset would mask the day-2 entry and diverge here.
         import dataclasses
 
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
         from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
 
@@ -2460,7 +2468,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         dates = ["2026-01-02", "2026-01-02", "2026-01-03", "2026-01-03", "2026-01-03"]
         qqq = [0.01, float("nan"), 0.02, 0.015, 0.0]
         n = 5
-        base = HourFromMinuteDataSplit(
+        base = HourFromSecondDataSplit(
             name="t",
             decision_timestamps=[f"{d}T1{i}:30:00+00:00" for i, d in enumerate(dates)],
             next_timestamps=[f"{d}T1{i + 1}:30:00+00:00" for i, d in enumerate(dates)],
@@ -2539,15 +2547,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # CASH is the forced safety fallback; it must be USABLE (label-valid AND finite return) on every valid
         # decision row. BOTH a non-finite CASH return AND a finite-but-label-invalid CASH must fail closed at
         # env construction AND at evaluator entry (the fallback reads the CASH return directly).
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
         from rl_quant.training.second_to_hour import _ConstantActionModel, evaluate_second_to_hour_policy
 
         device = torch.device("cpu")
         base = default_second_to_hour_constraints()
 
-        def split(action_returns, label_valid_mask) -> HourFromMinuteDataSplit:
-            return HourFromMinuteDataSplit(
+        def split(action_returns, label_valid_mask) -> HourFromSecondDataSplit:
+            return HourFromSecondDataSplit(
                 name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
                 next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
                 second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -2572,10 +2580,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # starts: the env steps through continuation rows the policy can de-risk on. CASH usable at the start
         # (row 0) but NON-usable at a continuation row (row 1) must still fail closed (the prior
         # valid_start_indices-only check would have missed it).
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="t",
             decision_timestamps=[f"2026-01-02T1{i}:30:00+00:00" for i in range(3)],
             next_timestamps=[f"2026-01-02T1{i + 1}:30:00+00:00" for i in range(3)],
@@ -2594,9 +2602,9 @@ class CoreAndFixRegressionTests(unittest.TestCase):
                 torch.device("cpu"))
 
     def _shadow_resume_split(self, name: str, dates: list[str]):
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit
         n = len(dates)
-        return HourFromMinuteDataSplit(
+        return HourFromSecondDataSplit(
             name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
             next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
             second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -3196,11 +3204,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         from rl_quant.core import DQNLearningConfig
         from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
+            HourFromSecondDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
-        def make_split(name: str) -> HourFromMinuteDataSplit:
-            return HourFromMinuteDataSplit(
+        def make_split(name: str) -> HourFromSecondDataSplit:
+            return HourFromSecondDataSplit(
                 name=name, decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-03T14:30:00+00:00"],
                 next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-03T15:30:00+00:00"],
                 second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
@@ -3232,12 +3240,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # (cash_index), not the first valid action. argmax alone would pick the first valid (e.g. SPY).
         import dataclasses
 
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit, default_second_to_hour_constraints
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit, default_second_to_hour_constraints
         from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 
         device = torch.device("cpu")
         names = ["QQQ", "SPY", "CASH"]  # CASH at index 2 (not first)
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="t", decision_timestamps=["2026-01-02T10:30:00+00:00", "2026-01-02T11:30:00+00:00"],
             next_timestamps=["2026-01-02T11:30:00+00:00", "2026-01-02T12:30:00+00:00"],
             second_feature_names=["m"], hour_feature_names=["h"], action_names=names,
@@ -4474,16 +4482,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_recency_weighting_trains_and_is_uniform_when_disabled(self) -> None:
         from rl_quant.core import DQNLearningConfig
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit,
+            HourFromSecondDataSplit,
             SecondToHourEnvConfig,
             SecondToHourTrainingConfig,
             RecencyWeightConfig,
             train_second_to_hour_dqn,
         )
 
-        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+        def make_split(name: str, dates: list[str]) -> HourFromSecondDataSplit:
             n = len(dates)
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
@@ -4566,7 +4574,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # dynamic keys / legacy model_version) -- the existing trainer tests cover the off path numerically.
         from rl_quant.core import DQNLearningConfig
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit,
+            HourFromSecondDataSplit,
             SecondToHourEnvConfig,
             SecondToHourTrainingConfig,
             train_second_to_hour_dqn,
@@ -4578,11 +4586,11 @@ class CoreAndFixRegressionTests(unittest.TestCase):
             DYNAMIC_TRANSITION_FEATURE_SCHEMA_VERSION,
         )
 
-        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+        def make_split(name: str, dates: list[str]) -> HourFromSecondDataSplit:
             n = len(dates)
             returns = torch.zeros((n, 2))
             returns[:, 1] = 0.01  # non-trivial QQQ return so the dynamic P&L-excursion state is non-degenerate
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
@@ -4643,7 +4651,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         # run through the SAME eval path as a trained model, so a policy (or a PR-D A/B) must beat them under
         # cost. Single-slot action space -> no equal-weight; always_cash + per-action buy-and-hold.
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit,
+            HourFromSecondDataSplit,
             SecondToHourEvaluationResult,
             evaluate_second_to_hour_baselines,
         )
@@ -4651,7 +4659,7 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         n = 6
         returns = torch.zeros((n, 2))
         returns[:, 1] = 0.01  # QQQ earns +1%/bar; CASH earns 0
-        data = HourFromMinuteDataSplit(
+        data = HourFromSecondDataSplit(
             name="val",
             decision_timestamps=[f"2026-06-1{2}T1{4 + i}:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-06-1{2}T1{5 + i}:30:00+00:00" for i in range(n)],
@@ -4683,15 +4691,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_second_to_hour_training_state_resumes_from_checkpoint(self) -> None:
         from rl_quant.core import DQNLearningConfig
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit,
+            HourFromSecondDataSplit,
             SecondToHourEnvConfig,
             SecondToHourTrainingConfig,
             train_second_to_hour_dqn,
         )
 
-        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+        def make_split(name: str, dates: list[str]) -> HourFromSecondDataSplit:
             n = len(dates)
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
@@ -4768,10 +4776,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_episode_truncation_is_not_terminal_but_data_boundary_is(self) -> None:
         module = __import__(
             "rl_quant.second_to_hour_transformer",
-            fromlist=["VectorizedSecondToHourEnv", "SecondToHourEnvConfig", "HourFromMinuteDataSplit"],
+            fromlist=["VectorizedSecondToHourEnv", "SecondToHourEnvConfig", "HourFromSecondDataSplit"],
         )
         n = 4
-        split = module.HourFromMinuteDataSplit(
+        split = module.HourFromSecondDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-0{i + 1}T14:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-0{i + 1}T15:30:00+00:00" for i in range(n)],
@@ -4818,10 +4826,10 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_episode_terminal_out_of_range_next_action_mask_is_safe_dummy(self) -> None:
         module = __import__(
             "rl_quant.second_to_hour_transformer",
-            fromlist=["VectorizedSecondToHourEnv", "SecondToHourEnvConfig", "HourFromMinuteDataSplit"],
+            fromlist=["VectorizedSecondToHourEnv", "SecondToHourEnvConfig", "HourFromSecondDataSplit"],
         )
         n = 3
-        split = module.HourFromMinuteDataSplit(
+        split = module.HourFromSecondDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-0{i + 1}T14:30:00+00:00" for i in range(n)],
             next_timestamps=[f"2026-01-0{i + 1}T15:30:00+00:00" for i in range(n)],
@@ -4907,16 +4915,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
     def test_recency_weighting_rejects_train_overlapping_validation(self) -> None:
         from rl_quant.core import DQNLearningConfig
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit,
+            HourFromSecondDataSplit,
             SecondToHourEnvConfig,
             SecondToHourTrainingConfig,
             RecencyWeightConfig,
             train_second_to_hour_dqn,
         )
 
-        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+        def make_split(name: str, dates: list[str]) -> HourFromSecondDataSplit:
             n = len(dates)
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
@@ -5215,7 +5223,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import re
 
         src = ROOT / "src" / "rl_quant"
-        trainers = ["training/second_to_hour.py"]
+        # Glob EVERY trainer (not a hardcoded single path) so the "every trainer" promise actually holds: any
+        # module under training/ that calls dqn_td_target is checked, including the Stage-2 decision_policy
+        # trainer. core.py (which DEFINES dqn_td_target) lives outside training/, so its signature is not
+        # mis-scanned as a call.
+        training_dir = src / "training"
+        trainers = sorted(
+            f"training/{p.name}" for p in training_dir.glob("*.py") if "dqn_td_target(" in p.read_text()
+        )
+        self.assertIn("training/second_to_hour.py", trainers)
+        self.assertIn("training/decision_policy.py", trainers)
         call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
         for name in trainers:
             calls = call_re.findall((src / name).read_text())
@@ -5395,15 +5412,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import rl_quant.training.second_to_hour as m2h  # the train loop looks up autocast_context here
         from rl_quant.core import DQNLearningConfig
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit,
+            HourFromSecondDataSplit,
             SecondToHourEnvConfig,
             SecondToHourTrainingConfig,
             train_second_to_hour_dqn,
         )
 
-        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+        def make_split(name: str, dates: list[str]) -> HourFromSecondDataSplit:
             n = len(dates)
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name=name,
                 decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
@@ -5448,12 +5465,12 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         from rl_quant.core import DQNLearningConfig
         from rl_quant.datasets.hour_from_second import default_second_to_hour_constraints
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
+            HourFromSecondDataSplit, SecondToHourEnvConfig, SecondToHourTrainingConfig, train_second_to_hour_dqn,
         )
 
-        def make_split(name: str, dates: list[str]) -> HourFromMinuteDataSplit:
+        def make_split(name: str, dates: list[str]) -> HourFromSecondDataSplit:
             n = len(dates)
-            return HourFromMinuteDataSplit(
+            return HourFromSecondDataSplit(
                 name=name, decision_timestamps=[f"{d}T14:30:00+00:00" for d in dates],
                 next_timestamps=[f"{d}T15:30:00+00:00" for d in dates],
                 second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],

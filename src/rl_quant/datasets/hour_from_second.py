@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 
 import torch
 
-from rl_quant.datasets.hourly import _validate_action_return_contract
 # The action-return basis contract lives in the protocol layer so the loader, the DatasetManifest, and the
 # reportability validators share ONE definition. Re-exported here so existing importers of these names from this
 # module keep working unchanged (the canonical home is rl_quant.protocol.action_return_basis).
@@ -28,7 +27,6 @@ from rl_quant.trading_constraints import (
 
 
 DEFAULT_HOUR_DECISION_GRID_MINUTES = 60
-DEFAULT_MINUTE_SOURCE_INTERVAL = "1m"
 DEFAULT_SECOND_SOURCE_INTERVAL = "1s"
 DEFAULT_SECOND_BAR_LATENCY_MS = 1000
 DEFAULT_EXCHANGE_CALENDAR_ID = "XNYS_decision_timestamp_sessions_America_New_York_v1"
@@ -39,8 +37,21 @@ def default_second_to_hour_constraints() -> TradingConstraintConfig:
     return TradingConstraintConfig(max_switches_per_day=2, q_switch_margin_bps=3.0)
 
 
+def _validate_action_return_contract(action_returns: torch.Tensor, action_valid_mask: torch.Tensor | None) -> None:
+    if action_valid_mask is None:
+        if not bool(torch.isfinite(action_returns).all().item()):
+            raise ValueError("action_returns must be finite when no action_valid_mask is provided.")
+        return
+    valid_returns = action_returns[action_valid_mask]
+    if valid_returns.numel() and not bool(torch.isfinite(valid_returns).all().item()):
+        raise ValueError("Valid action_returns must be finite.")
+    invalid_returns = action_returns[~action_valid_mask]
+    if invalid_returns.numel() and not bool(torch.isnan(invalid_returns).all().item()):
+        raise ValueError("Invalid action_returns must be NaN when action_valid_mask is false.")
+
+
 @dataclass
-class HourFromMinuteDataSplit:
+class HourFromSecondDataSplit:
     name: str
     decision_timestamps: list[str]
     next_timestamps: list[str]
@@ -63,7 +74,7 @@ class HourFromMinuteDataSplit:
     periods_per_year: float = 252.0 * 6.0
     action_valid_mask: torch.Tensor | None = None
     label_valid_mask: torch.Tensor | None = None
-    source_bar_interval: str = DEFAULT_MINUTE_SOURCE_INTERVAL
+    source_bar_interval: str = DEFAULT_SECOND_SOURCE_INTERVAL
     context_bars_per_hour: int | None = None
     dataset_reportable: bool = True
     dataset_reportability_errors: list[str] = field(default_factory=list)
@@ -108,7 +119,7 @@ class HourFromMinuteDataSplit:
     def effective_context_bars_per_hour(self) -> int:
         return int(self.context_bars_per_hour or self.seconds_per_hour)
 
-    def to(self, device: torch.device | str) -> "HourFromMinuteDataSplit":
+    def to(self, device: torch.device | str) -> "HourFromSecondDataSplit":
         return replace(
             self,
             second_features=self.second_features.to(device),
@@ -778,7 +789,7 @@ def validate_second_timestamp_grid(payload: dict[str, Any]) -> None:
     next_timestamps = list(payload["next_timestamps"])
     grid = payload["second_timestamp_grid"]
     mask = payload["second_mask"].bool()
-    source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
+    source_interval = str(payload.get("source_bar_interval", DEFAULT_SECOND_SOURCE_INTERVAL))
     default_latency_ms = DEFAULT_SECOND_BAR_LATENCY_MS if source_interval == DEFAULT_SECOND_SOURCE_INTERVAL else 0
     bar_latency_ms = int(payload.get("bar_latency_ms", default_latency_ms))
     if bar_latency_ms < 0:
@@ -803,10 +814,19 @@ def validate_second_timestamp_grid(payload: dict[str, Any]) -> None:
                     f"second_timestamp_grid minute count does not match second_mask at row {row_id}, hour {hour_id}."
                 )
             for second_id, second_ts in enumerate(hour):
+                is_valid = bool(mask[row_id, hour_id, second_id])
                 if not second_ts:
+                    # Fail closed: a mask-VALID bar with no timestamp cannot be checked for point-in-time
+                    # availability, so it must not silently pass the leakage guard. (The in-repo producer
+                    # derives timestamp and mask in lockstep, so this never trips on builder output.)
+                    if is_valid:
+                        raise ValueError(
+                            f"masked-valid second-context bar at row={row_id}, hour={hour_id}, "
+                            f"second={second_id} has no timestamp; cannot verify point-in-time availability."
+                        )
                     continue
                 second_dt = _parse_utc_timestamp(str(second_ts))
-                if bool(mask[row_id, hour_id, second_id]) and second_dt + latency_delta > decision_dt:
+                if is_valid and second_dt + latency_delta > decision_dt:
                     raise ValueError(
                         "Second context leakage at "
                         f"row={row_id}, hour={hour_id}, minute={second_id}: "
@@ -818,7 +838,7 @@ def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
     explicit_stride = payload.get("decision_stride_minutes", payload.get("decision_grid_minutes"))
     if explicit_stride is not None and int(explicit_stride) != DEFAULT_HOUR_DECISION_GRID_MINUTES:
         raise ValueError("Second-to-hour datasets must use an hourly decision grid with 60-minute rewards.")
-    source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
+    source_interval = str(payload.get("source_bar_interval", DEFAULT_SECOND_SOURCE_INTERVAL))
     expected_bars = expected_context_bars_per_hour(source_interval)
     explicit_context_bars = payload.get("context_bars_per_hour", payload.get("seconds_per_hour"))
     if explicit_context_bars is not None and int(explicit_context_bars) != expected_bars:
@@ -866,6 +886,11 @@ def _load_payload(
     validate_second_timestamp_grid(payload)
     validate_action_feature_tensors(payload)
     validate_action_return_basis(payload)
+    # hour_features are normalized with a plain mean/std + clamp_ (not the finite-safe _masked_mean_std
+    # used for second_features), and clamp_ does not remove NaN/Inf — so one non-finite value would poison
+    # the entire hour channel into the encoder. Reject it up front, matching the action_features contract.
+    if not bool(torch.isfinite(payload["hour_features"].float()).all().item()):
+        raise ValueError("hour_features must be finite.")
     return payload
 
 
@@ -958,7 +983,7 @@ def _build_split(
     action_feature_mean: torch.Tensor | None = None,
     action_feature_std: torch.Tensor | None = None,
     split_policy: dict[str, object] | None = None,
-) -> HourFromMinuteDataSplit:
+) -> HourFromSecondDataSplit:
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
     if not decisions:
@@ -1114,7 +1139,7 @@ def _build_split(
     valid_index_mask = torch.zeros(len(decision_subset), dtype=torch.bool)
     valid_index_mask[valid_start_indices] = True
 
-    return HourFromMinuteDataSplit(
+    return HourFromSecondDataSplit(
         name=name,
         decision_timestamps=decision_subset,
         next_timestamps=next_subset,
@@ -1137,7 +1162,7 @@ def _build_split(
         seconds_per_hour=int(payload.get("seconds_per_hour", raw_second.shape[2])),
         decision_grid_minutes=int(payload.get("decision_grid_minutes", payload.get("decision_stride_minutes", DEFAULT_HOUR_DECISION_GRID_MINUTES))),
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.0)),
-        source_bar_interval=str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL)),
+        source_bar_interval=str(payload.get("source_bar_interval", DEFAULT_SECOND_SOURCE_INTERVAL)),
         context_bars_per_hour=int(payload.get("context_bars_per_hour", payload.get("seconds_per_hour", raw_second.shape[2]))),
         dataset_reportable=dataset_reportable,
         dataset_reportability_errors=dataset_reportability_errors,
@@ -1165,7 +1190,7 @@ def _build_split(
     )
 
 
-def build_hour_from_minute_splits(
+def build_hour_from_second_splits(
     *,
     dataset_path,
     split_mode: str = "latest_holdout",
@@ -1183,7 +1208,7 @@ def build_hour_from_minute_splits(
     min_train_rows: int = 1,
     action_covariate_sidecar: str | bytes | PathLike[str] = "auto",
     news_llm_sidecar: str | bytes | PathLike[str] = "none",
-) -> tuple[HourFromMinuteDataSplit, HourFromMinuteDataSplit, HourFromMinuteDataSplit]:
+) -> tuple[HourFromSecondDataSplit, HourFromSecondDataSplit, HourFromSecondDataSplit]:
     payload = _load_payload(
         dataset_path,
         action_covariate_sidecar=action_covariate_sidecar,
@@ -1343,11 +1368,11 @@ def build_hour_from_minute_splits(
         )
     else:
         raise ValueError(f"Unsupported split_mode {split_mode!r}.")
-    assert_matching_hour_from_minute_schema(train, val, test)
+    assert_matching_hour_from_second_schema(train, val, test)
     return train, val, test
 
 
-def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) -> None:
+def assert_matching_hour_from_second_schema(*splits: HourFromSecondDataSplit) -> None:
     if not splits:
         return
     reference = splits[0]
@@ -1385,7 +1410,7 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
 
 
 def second_to_hour_missing_label_report(
-    split: HourFromMinuteDataSplit,
+    split: HourFromSecondDataSplit,
     *,
     row_indices: torch.Tensor | list[int] | None = None,
     requested_actions: torch.Tensor | list[int] | None = None,

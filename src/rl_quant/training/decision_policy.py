@@ -15,10 +15,12 @@ encoding is paid once in Stage 1, so reward/constraint/policy iteration here nev
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from rl_quant.core import (
@@ -27,7 +29,7 @@ from rl_quant.core import (
     epsilon_by_step,
     safe_next_row_indices,
 )
-from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit
+from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit
 from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 from rl_quant.models.decision_policy import DecisionPolicyQNetwork
 from rl_quant.models.second_to_hour import SecondToHourContextEncoder
@@ -38,28 +40,45 @@ from rl_quant.training.context_pretrain import encode_split
 
 @dataclass(frozen=True)
 class DecisionPolicyConfig:
-    # model
-    d_model: int = 256
+    # model: a SMALL head over the frozen context embedding (the heavy per-second encoder is Stage-1 + frozen,
+    # so the policy has few params -> far less reward-overfit than the joint trainer). d_model/feedforward/dropout
+    # must match the Stage-1 encoder to load into the SecondToHourPolicyQNetwork bridge for OOS eval.
+    d_model: int = 128
     action_embedding_dim: int = 32
-    feedforward_dim: int = 768
-    dropout: float = 0.05
-    action_feature_dim: int = 0
+    feedforward_dim: int = 256
+    dropout: float = 0.15
+    action_feature_dim: int = 0  # set to the news/covariate width (e.g. 56) to feed those features at the policy
     transition_feature_dim: int = 0
     dynamic_feature_dim: int = 0
-    # env / DQN
-    num_envs: int = 64
-    episode_length: int = 32
+    # env / DQN -- scaled to the small per-window data + stronger weight decay to regularize the head
+    num_envs: int = 24
+    episode_length: int = 8
     reward_scale: float = 10_000.0
     train_steps: int = 2_000
-    batch_size: int = 256
-    warmup_steps: int = 256
-    replay_capacity: int = 100_000
+    batch_size: int = 64
+    warmup_steps: int = 200
+    replay_capacity: int = 20_000
     gamma: float = 0.99
     lr: float = 3e-4
-    weight_decay: float = 1e-2
+    weight_decay: float = 3e-2
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    target_update_interval: int = 250
+    target_update_interval: int = 150
+    eval_interval: int = 250  # val-eval cadence when a validation split is supplied (best-val selection)
+
+
+@contextmanager
+def _eval_for_action_selection(module):
+    """Temporarily eval() a module for a no-grad action-selection / bootstrap-target forward so dropout cannot
+    perturb the greedy argmax used to COLLECT transitions or the double-DQN next-action argmax, then restore
+    its prior mode. The gradient-bearing forward stays in train()."""
+    was_training = module.training
+    module.eval()
+    try:
+        yield
+    finally:
+        if was_training:
+            module.train()
 
 
 def freeze_encoder(encoder: SecondToHourContextEncoder) -> SecondToHourContextEncoder:
@@ -70,11 +89,44 @@ def freeze_encoder(encoder: SecondToHourContextEncoder) -> SecondToHourContextEn
     return encoder
 
 
+class _StagePolicyEvalBridge(nn.Module):
+    """Eval-only composition of the FROZEN Stage-1 encoder and the LIVE Stage-2 policy, exposing the
+    end-to-end ``(second, mask, hour, prev, constraint, ...)`` forward + the passthrough attributes
+    ``evaluate_second_to_hour_policy`` reads. It holds REFERENCES (no copy), so evaluating it always
+    reflects the current policy weights -- used purely for best-validation checkpoint selection, the
+    same eval path the joint trainer uses, so the Stage-2 selection metric is apples-to-apples with it."""
+
+    def __init__(self, encoder: SecondToHourContextEncoder, policy: DecisionPolicyQNetwork) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.policy = policy
+        self.action_count = policy.action_count
+        self.action_feature_dim = policy.action_feature_dim
+        self.transition_feature_dim = policy.transition_feature_dim
+        self.dynamic_feature_dim = policy.dynamic_feature_dim
+        self.hours_lookback = encoder.hours_lookback
+        self.seconds_per_hour = encoder.seconds_per_hour
+        self.max_second_tokens = encoder.max_second_tokens
+
+    def forward(self, second_features, second_mask, hour_features, previous_actions, constraint_features,
+                action_features=None, dynamic_state=None):
+        context = self.encoder(second_features, second_mask, hour_features)
+        return self.policy(context, previous_actions, constraint_features,
+                           action_features=action_features, dynamic_state=dynamic_state)
+
+
 def precompute_context_embeddings(
-    encoder: SecondToHourContextEncoder, data: HourFromMinuteDataSplit, *, device: torch.device | str = "cpu"
+    encoder: SecondToHourContextEncoder, data: HourFromSecondDataSplit, *, device: torch.device | str = "cpu"
 ) -> torch.Tensor:
     """Frozen hourly embedding ``[D, d_model]`` per decision row -- the Stage-2 observation source."""
-    return encode_split(freeze_encoder(encoder), data, device=device)
+    embeddings = encode_split(freeze_encoder(encoder), data, device=device)
+    # Stamp the split identity so train_decision_policy_dqn can reject embeddings precomputed for a
+    # different (same-row-count) split. Opt-in attribute -> non-breaking for plain encode_split callers.
+    try:
+        embeddings._qt_split_key = tuple(data.decision_timestamps)
+    except (AttributeError, TypeError):
+        pass
+    return embeddings
 
 
 def build_decision_policy(
@@ -93,21 +145,57 @@ def build_decision_policy(
 
 def train_decision_policy_dqn(
     embeddings: torch.Tensor,
-    data: HourFromMinuteDataSplit,
+    data: HourFromSecondDataSplit,
     config: DecisionPolicyConfig = DecisionPolicyConfig(),
     *,
     device: torch.device | str = "cpu",
     transition_table: torch.Tensor | None = None,
+    encoder: SecondToHourContextEncoder | None = None,
+    val_data: HourFromSecondDataSplit | None = None,
+    initial_action: int = 0,
 ) -> tuple[DecisionPolicyQNetwork, dict]:
     """Double-DQN over the precomputed context ``embeddings [D, d_model]``. Reuses the second->hour env (state
     machine + reward + constraint masks) and the shared DQN helpers; the observation is ``embeddings[indices]``
-    and the model is a ``DecisionPolicyQNetwork`` (no transformer in the loop). Returns ``(policy, metrics)``."""
+    and the model is a ``DecisionPolicyQNetwork`` (no transformer in the loop). Returns ``(policy, metrics)``.
+
+    Best-validation checkpoint selection (review #4): pass BOTH ``encoder`` (the FROZEN Stage-1 encoder) and
+    ``val_data`` (a held-out split) to evaluate the policy every ``config.eval_interval`` steps on the SAME
+    eval path the joint trainer uses, keep the best-validation ``state_dict``, and return THAT checkpoint
+    (not the final, possibly-overfit one). With either omitted the function returns the final policy, exactly
+    as before -- so existing callers are unaffected."""
     device = torch.device(device)
     data = data.to(device)
+    split_key = getattr(embeddings, "_qt_split_key", None)  # captured before .to() drops custom attrs
     embeddings = embeddings.to(device)
     if embeddings.shape[0] != int(data.action_returns.shape[0]):
         raise ValueError("embeddings rows must equal the number of decision rows in the split.")
-    d_model = int(embeddings.shape[1])
+    # Identity (not just row count): embeddings precomputed for a different split with the same row count
+    # would gather misaligned per-row context. precompute_context_embeddings stamps this key.
+    if split_key is not None and split_key != tuple(data.decision_timestamps):
+        raise ValueError(
+            "embeddings were precomputed for a DIFFERENT split (decision_timestamps mismatch); row counts "
+            "match but the per-row context would be misaligned. Re-run precompute_context_embeddings on this split."
+        )
+    # Stage-2 does not thread the joint trainer's dynamic-position state or transition table, and must not
+    # silently drop per-action features the split actually carries. Fail fast on misconfiguration.
+    if config.dynamic_feature_dim > 0:
+        raise ValueError(
+            "DecisionPolicyConfig.dynamic_feature_dim > 0 is not supported by train_decision_policy_dqn: the "
+            "Stage-2 env/replay do not carry dynamic position state. Use the joint trainer if you need it."
+        )
+    if config.transition_feature_dim > 0 and transition_table is None:
+        raise ValueError("DecisionPolicyConfig.transition_feature_dim > 0 requires a transition_table.")
+    data_action_feature_dim = 0 if data.action_features is None else int(data.action_features.shape[-1])
+    if config.action_feature_dim and config.action_feature_dim != data_action_feature_dim:
+        raise ValueError(
+            f"action_feature_dim={config.action_feature_dim} but the split carries "
+            f"{data_action_feature_dim} action-feature columns."
+        )
+    if config.action_feature_dim == 0 and data_action_feature_dim > 0:
+        raise ValueError(
+            f"The split carries {data_action_feature_dim} action-feature columns but action_feature_dim=0 would "
+            f"silently drop them; set DecisionPolicyConfig.action_feature_dim={data_action_feature_dim}."
+        )
     action_count = len(data.action_names)
     use_action_features = config.action_feature_dim > 0
 
@@ -146,6 +234,36 @@ def train_decision_policy_dqn(
     def action_feats(indices):
         return data.action_feature_state(indices) if use_action_features else None
 
+    # Best-validation selection: enabled only when both the frozen encoder and a val split are supplied.
+    do_val_selection = encoder is not None and val_data is not None
+    eval_bridge = _StagePolicyEvalBridge(freeze_encoder(encoder), policy) if do_val_selection else None
+    best_val_return = -float("inf")
+    best_val_step: int | None = None
+    best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+    val_trace: list[dict] = []
+
+    def _maybe_select_on_val(step: int) -> None:
+        nonlocal best_val_return, best_val_step, best_state
+        if not do_val_selection:
+            return
+        if step % config.eval_interval != 0 and step != config.train_steps:
+            return
+        from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
+
+        was_training = policy.training
+        val_result = evaluate_second_to_hour_policy(
+            val_data, eval_bridge, device=device, initial_action=initial_action,
+            constraints=env.constraints, episode_length=config.episode_length, reward_scale=config.reward_scale,
+        )
+        if was_training:
+            policy.train()  # the evaluator put the shared policy in eval(); restore train() for grad steps
+        val_trace.append({"step": step, "val_return": val_result.total_return,
+                          "val_order_legs": val_result.market_order_legs})
+        if val_result.total_return > best_val_return:
+            best_val_return = val_result.total_return
+            best_val_step = step
+            best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+
     reward_trace: list[float] = []
     loss_trace: list[float] = []
     for step in range(1, config.train_steps + 1):
@@ -153,7 +271,7 @@ def train_decision_policy_dqn(
         context = embeddings[env.indices]
         epsilon = epsilon_by_step(step=step, train_steps=config.train_steps,
                                   start=config.epsilon_start, end=config.epsilon_end)
-        with torch.no_grad():
+        with torch.no_grad(), _eval_for_action_selection(policy):
             q = policy(context, previous_actions, constraint_features, action_features=action_feats(env.indices))
             greedy = hysteresis(q, previous_actions, action_mask)
             explore = torch.rand(greedy.shape, device=device) < epsilon
@@ -175,7 +293,7 @@ def train_decision_policy_dqn(
             q = policy(ctx, batch["previous_actions"], batch["constraint_features"],
                        action_features=action_feats(batch["indices"]))
             chosen_q = q.gather(1, batch["actions"].unsqueeze(1)).squeeze(1)
-            with torch.no_grad():
+            with torch.no_grad(), _eval_for_action_selection(policy):
                 next_online = policy(next_ctx, batch["next_previous_actions"], batch["next_constraint_features"],
                                      action_features=action_feats(safe_next))
                 next_actions = hysteresis(next_online, batch["next_previous_actions"], batch["next_action_mask"])
@@ -184,13 +302,25 @@ def train_decision_policy_dqn(
                 next_q = next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
                 target_q = dqn_td_target(batch["rewards"], config.gamma, batch["terminated"], next_q)
             loss = F.smooth_l1_loss(chosen_q.float(), target_q.float())
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
             loss_trace.append(float(loss.detach()))
             if step % config.target_update_interval == 0:
                 target.load_state_dict(policy.state_dict())
+
+        _maybe_select_on_val(step)
+
+    # Return the best-VALIDATION checkpoint (not the final, possibly-overfit one) when val selection ran.
+    if do_val_selection:
+        policy.load_state_dict(best_state)
 
     return policy, {
         "train_steps": config.train_steps,
         "final_loss": loss_trace[-1] if loss_trace else None,
         "mean_reward_last_100": (sum(reward_trace[-100:]) / len(reward_trace[-100:])) if reward_trace else None,
+        "val_selected": do_val_selection,
+        "best_val_return": best_val_return if do_val_selection else None,
+        "best_val_step": best_val_step,
+        "val_trace": val_trace,
     }

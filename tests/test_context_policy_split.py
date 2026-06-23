@@ -99,6 +99,41 @@ class ContextPolicySplitTests(unittest.TestCase):
         self.assertEqual(tuple(q.shape), (rows, len(data.action_names)))
         self.assertTrue(bool(torch.isfinite(q).all()))
 
+    def test_stage2_best_validation_selection_returns_best_checkpoint(self) -> None:
+        """Review #4: with the frozen encoder + a val split, Stage-2 must select the best-VALIDATION
+        checkpoint (not the final one) and report the selection metrics."""
+        import math
+
+        import torch
+
+        from rl_quant.training.decision_policy import (
+            DecisionPolicyConfig,
+            precompute_context_embeddings,
+            train_decision_policy_dqn,
+        )
+
+        torch.manual_seed(0)
+        data = SecondToHourTests._small_second_to_hour_split()
+        encoder, _head, _ = train_second_context_encoder(
+            data,
+            ContextPretrainConfig(epochs=1, batch_size=2, d_model=16, n_heads=2, second_layers=1,
+                                  hour_layers=1, feedforward_dim=16, max_second_tokens=None),
+        )
+        embeddings = precompute_context_embeddings(encoder, data)
+        policy, metrics = train_decision_policy_dqn(
+            embeddings, data,
+            DecisionPolicyConfig(d_model=16, num_envs=4, episode_length=4, train_steps=40,
+                                 batch_size=8, warmup_steps=8, target_update_interval=10, eval_interval=10),
+            encoder=encoder, val_data=data,
+        )
+        self.assertTrue(metrics["val_selected"])
+        self.assertIsNotNone(metrics["best_val_return"])
+        self.assertTrue(math.isfinite(metrics["best_val_return"]))
+        self.assertIsNotNone(metrics["best_val_step"])
+        # The val trace was populated and the encoder stayed frozen (selection must not train Stage-1).
+        self.assertGreaterEqual(len(metrics["val_trace"]), 1)
+        self.assertFalse(any(p.requires_grad for p in encoder.parameters()))
+
 
 if __name__ == "__main__":
     unittest.main()

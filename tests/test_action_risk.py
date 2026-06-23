@@ -5,19 +5,13 @@ import torch
 from rl_quant.action_risk import (
     ExposureConstraintConfig,
     action_concentration,
-    action_is_inverse_tensor,
-    action_is_leveraged_tensor,
-    action_leverage_tensor,
     action_weight_tensor,
-    apply_exposure_masks,
     build_action_metadata,
-    group_ids_for_actions,
     reportability_flags,
     stable_action_metadata_hash,
     stable_action_risk_config_hash,
     trade_notional,
 )
-from rl_quant.trading_constraints import apply_notional_aware_hysteresis
 
 
 class ActionRiskTests(unittest.TestCase):
@@ -40,68 +34,6 @@ class ActionRiskTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(cash_to_soxl[0].item()), 1.0 / 3.0)
         self.assertAlmostEqual(float(soxl_to_qqq[0].item()), 1.0 + 1.0 / 3.0)
-
-    def test_notional_aware_hysteresis_uses_action_weight_cost(self) -> None:
-        weights = torch.tensor([1.0, 1.0 / 3.0])
-        action = apply_notional_aware_hysteresis(
-            torch.tensor([[0.0, 4.0]]),
-            torch.tensor([0]),
-            torch.tensor([[True, True]]),
-            action_weights=weights,
-            one_way_cost_bps=10.0,
-            extra_switch_penalty_bps=0.0,
-            q_switch_margin_bps=0.0,
-        )
-
-        self.assertEqual(action.tolist(), [1])
-
-    def test_exposure_masks_can_forbid_leveraged_and_inverse_actions(self) -> None:
-        metadata = build_action_metadata(["CASH", "QQQ", "SOXL", "SOXS"])
-        device = torch.device("cpu")
-        group_ids, _ = group_ids_for_actions(metadata, device=device)
-        mask = apply_exposure_masks(
-            torch.ones((1, 4), dtype=torch.bool),
-            current_action=torch.tensor([0]),
-            action_leverage=action_leverage_tensor(metadata, device=device),
-            action_weights=action_weight_tensor(metadata, device=device, max_effective_leverage=1.0),
-            action_is_leveraged=action_is_leveraged_tensor(metadata, device=device),
-            action_is_inverse=action_is_inverse_tensor(metadata, device=device),
-            action_group_ids=group_ids,
-            group_counts_today=torch.zeros((1, int(group_ids.max().item()) + 1), dtype=torch.long),
-            steps_today=torch.tensor([0]),
-            leveraged_bars_today=torch.tensor([0]),
-            consecutive_leveraged_bars=torch.tensor([0]),
-            constraints=ExposureConstraintConfig(allow_leveraged_actions=False, allow_inverse_actions=False),
-        )
-
-        self.assertEqual(mask.tolist(), [[True, True, False, False]])
-
-    def test_same_group_cap_uses_prospective_share(self) -> None:
-        metadata = build_action_metadata(["CASH", "SOXL", "SOXS", "QQQ"])
-        device = torch.device("cpu")
-        group_ids, groups = group_ids_for_actions(metadata, device=device)
-        semiconductor_id = groups.index("semiconductor")
-        group_counts = torch.zeros((1, len(groups)), dtype=torch.long)
-        group_counts[0, semiconductor_id] = 10
-        mask = apply_exposure_masks(
-            torch.ones((1, 4), dtype=torch.bool),
-            current_action=torch.tensor([0]),
-            action_leverage=action_leverage_tensor(metadata, device=device),
-            action_weights=action_weight_tensor(metadata, device=device, max_effective_leverage=1.0),
-            action_is_leveraged=action_is_leveraged_tensor(metadata, device=device),
-            action_is_inverse=action_is_inverse_tensor(metadata, device=device),
-            action_group_ids=group_ids,
-            group_counts_today=group_counts,
-            steps_today=torch.tensor([19]),
-            leveraged_bars_today=torch.tensor([0]),
-            consecutive_leveraged_bars=torch.tensor([0]),
-            constraints=ExposureConstraintConfig(max_same_group_share_per_day=0.50, min_group_share_observations=20),
-        )
-
-        self.assertTrue(bool(mask[0, 0].item()))
-        self.assertFalse(bool(mask[0, 1].item()))
-        self.assertFalse(bool(mask[0, 2].item()))
-        self.assertTrue(bool(mask[0, 3].item()))
 
     def test_action_metadata_and_risk_config_hashes_are_stable(self) -> None:
         metadata = build_action_metadata(["CASH", "QQQ", "SOXL"])

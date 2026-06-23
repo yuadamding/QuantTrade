@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
-import sys
 import tempfile
 import unittest
 from datetime import (
@@ -11,7 +10,6 @@ from datetime import (
     timedelta,
 )
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 import torch
 from torch import nn
@@ -26,7 +24,6 @@ from rl_quant.data_sources.polygon_second_aggs import (
     available_timestamp_ms,
     iso_to_timestamp_ms,
     load_manifest,
-    timestamp_ms_to_iso,
     validate_manifest,
 )
 from rl_quant.data_sources.polygon_stock_covariates import (
@@ -37,7 +34,6 @@ from rl_quant.features.stock_covariates import (
     ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES,
     ACTION_COVARIATE_FEATURE_NAMES,
     ACTION_COVARIATE_SCHEMA_HASH,
-    append_action_covariates_to_payload,
     build_action_covariate_tensor,
     build_symbol_silver_rows,
     read_covariate_coverage_manifest,
@@ -54,9 +50,8 @@ from rl_quant.features.news_llm import (
     build_news_article_rows,
     write_news_llm_feature_outputs,
 )
-from rl_quant.research_protocol import stable_json_hash
 from rl_quant.second_to_hour_transformer import (
-    HourFromMinuteDataSplit,
+    HourFromSecondDataSplit,
     SecondToHourPolicyQNetwork,
     TradingConstraintConfig,
     apply_leg_aware_hysteresis,
@@ -71,7 +66,7 @@ from rl_quant.trading_constraints import (
     CONSTRAINT_FEATURE_DIM,
     CONSTRAINT_FEATURE_NAMES,
 )
-from _support import ROOT, load_script
+from _support import load_script
 
 
 class SecondToHourTests(unittest.TestCase):
@@ -84,9 +79,9 @@ class SecondToHourTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _small_second_to_hour_split(action_names: list[str] | None = None) -> HourFromMinuteDataSplit:
+    def _small_second_to_hour_split(action_names: list[str] | None = None) -> HourFromSecondDataSplit:
         action_names = action_names or ["CASH", "QQQ"]
-        return HourFromMinuteDataSplit(
+        return HourFromSecondDataSplit(
             name="train",
             decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-02T15:30:00+00:00"],
             next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-02T16:30:00+00:00"],
@@ -230,7 +225,6 @@ class SecondToHourTests(unittest.TestCase):
             payload = module._load_payload(path)
 
         self.assertIn("second_features", payload)
-        self.assertIn("second_features", payload)
         self.assertEqual(tuple(payload["second_features"].shape), (1, 1, 1, 1))
 
     def test_second_payload_aliases_reject_same_shape_different_values(self) -> None:
@@ -362,7 +356,7 @@ class SecondToHourTests(unittest.TestCase):
 
 
     def test_vectorized_second_to_hour_env_allows_last_valid_next_state(self) -> None:
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="train",
             decision_timestamps=["2026-01-02T14:30:00+00:00", "2026-01-02T15:30:00+00:00"],
             next_timestamps=["2026-01-02T15:30:00+00:00", "2026-01-02T16:30:00+00:00"],
@@ -402,7 +396,7 @@ class SecondToHourTests(unittest.TestCase):
         # reward/model/replay -> training is byte-identical; that part is covered by the existing trainer tests
         # staying green). Here we verify the compounding/reset semantics directly, robust to constraint
         # redirection by reading the ACTUALLY-executed action from the step result.
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
@@ -468,7 +462,7 @@ class SecondToHourTests(unittest.TestCase):
         # (and is tolerated when the flag is off).
         from rl_quant.training.second_to_hour import _env_state_to_cpu, _load_env_state
 
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="train",
             decision_timestamps=[f"2026-01-02T1{h}:30:00+00:00" for h in range(4)],
             next_timestamps=[f"2026-01-02T1{h + 1}:30:00+00:00" for h in range(4)],
@@ -666,6 +660,13 @@ class SecondToHourTests(unittest.TestCase):
 
         self.assertEqual(float(bundle["action_covariates"][0, 1, news_1h_idx].item()), 0.0)
         self.assertAlmostEqual(float(bundle["action_covariates"][1, 1, news_1h_idx].item()), math.log1p(1.0), places=6)
+
+        # #7 regression: row 0 is "news-covered but no PRIOR news" (the article is at 15:00:01, after the
+        # 15:00:00 decision). news_age_seconds must be masked INVALID (not a fabricated age=0 marked valid),
+        # matching dividends/splits. Row 1 has a prior article, so its age is valid.
+        news_age_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_age_seconds")
+        self.assertFalse(bool(bundle["action_covariate_mask"][0, 1, news_age_idx].item()))
+        self.assertTrue(bool(bundle["action_covariate_mask"][1, 1, news_age_idx].item()))
 
     def test_stock_covariate_news_dedupes_and_weights_multi_ticker_articles(self) -> None:
         first = normalize_raw_covariate_record(
@@ -2062,7 +2063,7 @@ class SecondToHourTests(unittest.TestCase):
                 q_values[:, 1] = 100.0
                 return q_values
 
-        data = HourFromMinuteDataSplit(
+        data = HourFromSecondDataSplit(
             name="test",
             decision_timestamps=[
                 "2026-01-02T14:30:00+00:00",
@@ -2114,14 +2115,14 @@ class SecondToHourTests(unittest.TestCase):
         # output -- so this is additive. A high min-hold must show up in the tally (teeth); min_hold_bars=0 must
         # not (no false positives); counts are bounded by the number of decision rows.
         from rl_quant.second_to_hour_transformer import (
-            HourFromMinuteDataSplit,
+            HourFromSecondDataSplit,
             TradingConstraintConfig,
             evaluate_second_to_hour_policy,
         )
         from rl_quant.training.second_to_hour import _ConstantActionModel
 
         n = 5
-        split = HourFromMinuteDataSplit(
+        split = HourFromSecondDataSplit(
             name="t",
             decision_timestamps=[f"2026-01-02T{10 + i}:30:00+00:00" for i in range(n + 1)],
             next_timestamps=[f"2026-01-02T{11 + i}:30:00+00:00" for i in range(n + 1)],
@@ -2159,7 +2160,7 @@ class SecondToHourTests(unittest.TestCase):
         self.assertEqual(free.mask_block_reason_row_counts["decision_rows"], n)
 
     def test_latest_holdout_uses_final_complete_sessions_and_train_normalizer(self) -> None:
-        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_second_splits"])
         sessions = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]
         decisions = [
             f"{session}T{hour}:30:00+00:00"
@@ -2183,7 +2184,7 @@ class SecondToHourTests(unittest.TestCase):
                 second_values=second_values,
             )
 
-            train, val, test = module.build_hour_from_minute_splits(
+            train, val, test = module.build_hour_from_second_splits(
                 dataset_path=path,
                 split_mode="latest_holdout",
                 val_sessions=1,
@@ -2204,14 +2205,14 @@ class SecondToHourTests(unittest.TestCase):
 
 
     def test_manual_split_that_skips_latest_period_is_non_reportable(self) -> None:
-        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_second_splits"])
         decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18", "19")]
         next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19", "20")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
             self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
-            _train, _val, test = module.build_hour_from_minute_splits(
+            _train, _val, test = module.build_hour_from_second_splits(
                 dataset_path=path,
                 split_mode="manual",
                 train_end=decisions[1],
@@ -2225,14 +2226,14 @@ class SecondToHourTests(unittest.TestCase):
         self.assertIn("manual_split_skips_latest_complete_period", test.dataset_reportability_errors)
 
     def test_manual_split_requires_latest_reward_end_not_just_latest_decision(self) -> None:
-        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_second_splits"])
         decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18", "19")]
         next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19", "20")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
             self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
-            _train, _val, test = module.build_hour_from_minute_splits(
+            _train, _val, test = module.build_hour_from_second_splits(
                 dataset_path=path,
                 split_mode="manual",
                 train_end=decisions[1],
@@ -2248,14 +2249,14 @@ class SecondToHourTests(unittest.TestCase):
         self.assertIn("manual_split_skips_latest_complete_period", test.dataset_reportability_errors)
 
     def test_latest_rows_smoke_split_is_non_reportable(self) -> None:
-        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_minute_splits"])
+        module = __import__("rl_quant.second_to_hour_transformer", fromlist=["build_hour_from_second_splits"])
         decisions = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("14", "15", "16", "17", "18")]
         next_timestamps = [f"2026-01-02T{hour}:30:00+00:00" for hour in ("15", "16", "17", "18", "19")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dataset.pt"
             self._write_second_to_hour_dataset(path, decisions=decisions, next_timestamps=next_timestamps)
 
-            train, val, test = module.build_hour_from_minute_splits(
+            train, val, test = module.build_hour_from_second_splits(
                 dataset_path=path,
                 split_mode="latest_rows_smoke",
                 val_rows=1,

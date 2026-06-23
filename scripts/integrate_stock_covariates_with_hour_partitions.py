@@ -45,7 +45,7 @@ DEFAULT_PARTITIONS_ROOT = (
     DATA_ROOT
     / "protocol"
     / "polygon_second_top500_2025_to_2026-06-15"
-    / "hour_from_second_1s"
+    / "hour_from_second_1s_top50"
     / "partitions"
 )
 DEFAULT_COVARIATE_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "silver" / "top500_2023_to_present"

@@ -16,32 +16,40 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit
+from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit
 from rl_quant.models.second_to_hour import SecondContextForwardHead, SecondToHourContextEncoder
 
 
 @dataclass(frozen=True)
 class ContextPretrainConfig:
-    d_model: int = 256
-    n_heads: int = 8
-    second_layers: int = 2
-    hour_layers: int = 4
-    feedforward_dim: int = 768
-    dropout: float = 0.05
-    max_second_tokens: int | None = 512
-    epochs: int = 5
+    # Settings tuned for the small per-window data regime (~150-200 train rows): a compact context encoder
+    # learned on the DENSE self-supervised market-move target, regularized to generalize OOS. The SSL target
+    # is dense (every row), so more epochs help WITHOUT the joint trainer's reward-overfit.
+    d_model: int = 128
+    n_heads: int = 4
+    second_layers: int = 1
+    hour_layers: int = 2
+    feedforward_dim: int = 256
+    dropout: float = 0.15
+    max_second_tokens: int | None = 128
+    epochs: int = 20
     batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 1e-2
     huber_beta: float = 1.0
 
 
-def forward_market_targets(action_returns: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+def forward_market_targets(
+    action_returns: torch.Tensor, valid_mask: torch.Tensor, *, cash_index: int = 0
+) -> torch.Tensor:
     """Self-supervised target ``[B, 2]`` per decision: (equal-weighted mean, dispersion) of the realized
-    next-period returns across the **non-CASH** universe (CASH = index 0). A market-move + volatility proxy
-    derived purely from labels already in the dataset — no new inputs. NaN (invalid) cells are masked out."""
-    r = action_returns[:, 1:]
-    m = valid_mask[:, 1:].to(r.dtype)
+    next-period returns across the **non-CASH** universe. A market-move + volatility proxy derived purely
+    from labels already in the dataset — no new inputs. NaN (invalid) cells are masked out. ``cash_index``
+    is the column to exclude (derived from ``action_names.index('CASH')``, not assumed to be 0)."""
+    non_cash = torch.ones(action_returns.shape[1], dtype=torch.bool, device=action_returns.device)
+    non_cash[cash_index] = False
+    r = action_returns[:, non_cash]
+    m = valid_mask[:, non_cash].to(r.dtype)
     count = m.sum(dim=1).clamp_min(1.0)
     r0 = torch.nan_to_num(r, nan=0.0) * m
     mean = r0.sum(dim=1) / count
@@ -50,7 +58,7 @@ def forward_market_targets(action_returns: torch.Tensor, valid_mask: torch.Tenso
 
 
 def train_second_context_encoder(
-    train_data: HourFromMinuteDataSplit,
+    train_data: HourFromSecondDataSplit,
     config: ContextPretrainConfig = ContextPretrainConfig(),
     *,
     device: torch.device | str = "cpu",
@@ -71,6 +79,7 @@ def train_second_context_encoder(
         [*encoder.parameters(), *head.parameters()], lr=config.lr, weight_decay=config.weight_decay
     )
     loss_fn = nn.SmoothL1Loss(beta=config.huber_beta)
+    cash_index = data.action_names.index("CASH")
     idx_all = data.valid_start_indices.to(device).long()
     first, last = 0.0, 0.0
     for epoch in range(config.epochs):
@@ -80,11 +89,16 @@ def train_second_context_encoder(
         for start in range(0, perm.shape[0], config.batch_size):
             idx = perm[start:start + config.batch_size]
             second, mask, hour = data.state(idx)
-            target = forward_market_targets(data.action_returns[idx], data.label_valid_actions(idx))
+            target = forward_market_targets(
+                data.action_returns[idx], data.label_valid_actions(idx), cash_index=cash_index
+            )
             pred = head(encoder(second, mask, hour))
             loss = loss_fn(pred, target)
-            opt.zero_grad(); loss.backward(); opt.step()
-            epoch_loss += float(loss.detach()); n_batches += 1
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += float(loss.detach())
+            n_batches += 1
         mean_loss = epoch_loss / max(n_batches, 1)
         if epoch == 0:
             first = mean_loss
@@ -94,7 +108,7 @@ def train_second_context_encoder(
 
 @torch.no_grad()
 def encode_split(
-    encoder: SecondToHourContextEncoder, data: HourFromMinuteDataSplit, *, batch_size: int = 256,
+    encoder: SecondToHourContextEncoder, data: HourFromSecondDataSplit, *, batch_size: int = 256,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     """Precompute the frozen hourly context embedding ``[D, d_model]`` for every decision row -- the compact

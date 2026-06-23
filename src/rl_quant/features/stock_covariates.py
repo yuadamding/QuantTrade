@@ -432,6 +432,10 @@ def _add_financials(
 ) -> tuple[bool, float]:
     valid = source_available and latest is not None
     available = -1 if latest is None else int(latest.get("available_timestamp_ms", -1))
+    # Financials are counted by AVAILABLE (filing) timestamp, intentionally NOT by event_timestamp_ms like
+    # dividends/splits (_count_recent): "filings that became available in the last 365d" is the point-in-time
+    # basis for a filing, whereas dividends/splits count the economic EVENT (ex-date). The availability cutoff
+    # (<= decision_ms) is the leakage guard either way.
     recent = [
         row
         for row in rows
@@ -543,7 +547,12 @@ def _add_news(
     builder.add(float(len({str(row.get("news_publisher_id", "")) for row in news_1d if row.get("news_publisher_id")})), builder.decision_ms, valid=source_available)
     builder.add(float(len({str(row.get("news_publisher_id", "")) for row in news_7d if row.get("news_publisher_id")})), builder.decision_ms, valid=source_available)
     builder.add(_top_publisher_share(news_7d), builder.decision_ms, valid=source_available)
-    builder.add(age, available, valid=latest is not None or source_available)
+    # Consistency with _add_dividends / _add_splits: news_age_seconds is masked-INVALID when no prior
+    # news exists (latest is None), not marked valid with a fabricated age=0. The known-zero ("covered but
+    # no news") state is already carried by the count channels (valid=source_available) + the missing flag,
+    # so masking the age channel stops a fake age=0 biasing the normalizer and stops "no news" being
+    # indistinguishable from "news at the decision instant".
+    builder.add(age, available, valid=latest is not None)
     builder.add_known_now(float(not source_available))
     return source_available, age
 
@@ -678,197 +687,6 @@ def build_action_covariate_tensor(
         "action_covariate_coverage_report": coverage_summary,
         "action_covariate_reportability_errors": list(dict.fromkeys(reportability_errors)),
     }
-
-
-def append_action_covariates_to_payload(
-    payload: Mapping[str, Any],
-    covariates: Mapping[str, Any],
-    *,
-    append_to_action_features: bool = True,
-    append_mask_features: bool = True,
-) -> dict[str, Any]:
-    out = dict(payload)
-    action_covariates = covariates["action_covariates"].float()
-    action_covariate_mask = covariates["action_covariate_mask"].bool()
-    action_covariate_available = covariates["action_covariate_available_timestamps_ms"].long()
-    if tuple(action_covariates.shape[:2]) != tuple(out["action_returns"].shape):
-        raise ValueError("action_covariates first two dimensions must match action_returns.")
-    if tuple(action_covariate_mask.shape) != tuple(action_covariates.shape):
-        raise ValueError("action_covariate_mask shape must match action_covariates.")
-    if tuple(action_covariate_available.shape) != tuple(action_covariates.shape):
-        raise ValueError("action_covariate_available_timestamps_ms shape must match action_covariates.")
-    decisions = out.get("decision_timestamps_ms")
-    if decisions is None:
-        raise ValueError("decision_timestamps_ms is required before appending action covariates.")
-    decision_ms = torch.as_tensor(decisions, dtype=torch.long).view(-1, 1, 1)
-    decision_covariate_ms = decision_ms.expand_as(action_covariate_available)
-    known_covariates = action_covariate_mask & (action_covariate_available >= 0)
-    if bool((action_covariate_available[known_covariates] > decision_covariate_ms[known_covariates]).any().item()):
-        raise ValueError("action covariate availability timestamp exceeds decision timestamp.")
-
-    out.update(dict(covariates))
-    feature_names = {key: list(value) for key, value in dict(out["feature_names"]).items()}
-    feature_names["action_covariates"] = list(covariates["action_covariate_feature_names"])
-    if append_to_action_features:
-        base_features = out["action_features"].float()
-        base_width = int(base_features.shape[-1])
-        appended_features = [action_covariates]
-        appended_names = [
-            *[f"stock_covariates_v1.{name}" for name in covariates["action_covariate_feature_names"]],
-        ]
-        if append_mask_features:
-            appended_features.append(action_covariate_mask.float())
-            appended_names.extend(
-                f"stock_covariates_v1_mask.{name}"
-                for name in covariates["action_covariate_feature_names"]
-            )
-        action_type_features = covariates.get("action_covariate_action_type_features")
-        action_type_width = 0
-        if action_type_features is not None:
-            action_type_features = action_type_features.float()
-            if tuple(action_type_features.shape[:2]) != tuple(out["action_returns"].shape):
-                raise ValueError("action_covariate_action_type_features first two dimensions must match action_returns.")
-            appended_features.append(action_type_features)
-            action_type_width = int(action_type_features.shape[-1])
-            appended_names.extend(
-                f"stock_covariates_v1_type.{name}"
-                for name in covariates.get(
-                    "action_covariate_action_type_feature_names",
-                    ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES,
-                )
-            )
-        appended_feature_tensor = torch.cat(appended_features, dim=-1)
-        out["action_features"] = torch.cat([base_features, appended_feature_tensor], dim=-1)
-        feature_names["action_features"] = [
-            *feature_names.get("action_features", []),
-            *appended_names,
-        ]
-        base_available = out.get("action_feature_available_timestamps_ms")
-        if base_available is None:
-            base_available = out.get("action_features_available_timestamps_ms")
-        if base_available is None:
-            raise ValueError("Base action feature availability is required before appending covariates.")
-        base_available = base_available.long()
-        if base_available.ndim == 2:
-            base_available = base_available.unsqueeze(-1).expand(*base_available.shape, base_width)
-        appended_available = [action_covariate_available]
-        if append_mask_features:
-            appended_available.append(decision_ms.expand_as(action_covariate_available))
-        if action_type_width:
-            appended_available.append(
-                decision_ms.expand(decision_ms.shape[0], action_covariates.shape[1], action_type_width)
-            )
-        per_feature_available = torch.cat([base_available, *appended_available], dim=-1)
-        decision_feature_ms = decision_ms.expand_as(per_feature_available)
-        known_features = per_feature_available >= 0
-        if bool((per_feature_available[known_features] > decision_feature_ms[known_features]).any().item()):
-            raise ValueError("action feature availability timestamp exceeds decision timestamp after covariate append.")
-        out["action_feature_available_timestamps_ms"] = per_feature_available
-        known = per_feature_available >= 0
-        row_level = torch.where(known, per_feature_available, torch.full_like(per_feature_available, -1)).amax(dim=-1)
-        out["action_features_available_timestamps_ms"] = row_level
-        out["action_features_augmented_with_covariates"] = True
-        out["action_covariate_mask_appended_to_action_features"] = bool(append_mask_features)
-        out["covariate_mode"] = "flat_append_baseline"
-        out["covariate_protocol_version"] = COVARIATE_FLAT_PROTOCOL_VERSION
-        out["action_feature_groups"] = {
-            "base_action_features": [0, base_width],
-            "stock_covariates_v1": [base_width, base_width + int(action_covariates.shape[-1])],
-        }
-        if append_mask_features:
-            mask_start = base_width + int(action_covariates.shape[-1])
-            out["action_feature_groups"]["stock_covariates_v1_mask"] = [
-                mask_start,
-                mask_start + int(action_covariates.shape[-1]),
-            ]
-        if action_type_width:
-            type_start = base_width + int(action_covariates.shape[-1])
-            if append_mask_features:
-                type_start += int(action_covariates.shape[-1])
-            out["action_feature_groups"]["stock_covariates_v1_type"] = [
-                type_start,
-                type_start + action_type_width,
-            ]
-    else:
-        out["action_features_augmented_with_covariates"] = False
-        out["action_covariate_mask_appended_to_action_features"] = False
-        out["covariate_mode"] = "audit_only"
-        out["covariate_protocol_version"] = "stock_covariates_audit_v1"
-    out["feature_names"] = feature_names
-    out["feature_names_by_tensor"] = feature_names
-    out["feature_schema_hash"] = stable_json_hash(feature_names)
-    out["tensor_content_hashes"] = tensor_content_hashes(
-        out,
-        [
-            "market_context",
-            "action_returns",
-            "action_features",
-            "action_covariates",
-            "action_covariate_mask",
-            "action_covariate_available_timestamps_ms",
-            "action_source_coverage",
-            "action_covariate_action_type_features",
-        ],
-    )
-    out.update(out["tensor_content_hashes"])
-    base_payload_hash = out.get("payload_hash")
-    payload_hash = stable_json_hash(
-        {
-            "base_payload_hash": base_payload_hash,
-            "decision_timestamps": list(out.get("decision_timestamps", [])),
-            "action_names": list(out.get("action_names", [])),
-            "config": out.get("config", {}),
-            "feature_schema_hash": out["feature_schema_hash"],
-            "action_covariate_schema_hash": covariates["action_covariate_schema_hash"],
-            "action_covariate_source_manifest_hash": covariates.get("action_covariate_source_manifest_hash"),
-            "action_covariate_feature_schema_file_hash": covariates.get("action_covariate_feature_schema_file_hash"),
-            "action_feature_groups": out.get("action_feature_groups", {}),
-            "action_covariate_mask_appended_to_action_features": out.get("action_covariate_mask_appended_to_action_features"),
-            "covariate_mode": out.get("covariate_mode"),
-            "tensor_content_hashes": out["tensor_content_hashes"],
-            "dataset_manifest": {
-                key: value
-                for key, value in dict(out.get("dataset_manifest", {})).items()
-                if key
-                not in {
-                    "payload_hash",
-                    "base_payload_hash_before_action_covariates",
-                    "covariate_augmented_payload_hash",
-                }
-            },
-        }
-    )
-    out["base_payload_hash_before_action_covariates"] = base_payload_hash
-    out["payload_hash"] = payload_hash
-
-    manifest = dict(out.get("dataset_manifest", {}))
-    errors = list(manifest.get("reportability_errors", []))
-    errors.extend(covariates.get("action_covariate_reportability_errors", []))
-    manifest.update(
-        {
-            "action_covariate_schema_hash": covariates["action_covariate_schema_hash"],
-            "action_covariate_source_manifest_hash": covariates.get("action_covariate_source_manifest_hash"),
-            "action_covariate_feature_schema_file_hash": covariates.get("action_covariate_feature_schema_file_hash"),
-            "action_features_augmented_with_covariates": bool(append_to_action_features),
-            "action_covariate_mask_appended_to_action_features": bool(append_to_action_features and append_mask_features),
-            "covariate_mode": "flat_append_baseline",
-            "covariate_protocol_version": COVARIATE_FLAT_PROTOCOL_VERSION,
-            "action_feature_groups": out.get("action_feature_groups", {}),
-            "feature_schema_hash": out["feature_schema_hash"],
-            "tensor_content_hashes": out["tensor_content_hashes"],
-            "base_payload_hash_before_action_covariates": base_payload_hash,
-            "payload_hash": payload_hash,
-            "covariate_augmented_payload_hash": payload_hash,
-            "action_covariate_cash_semantics": (
-                "CASH covariate values are zero-imputed and mask=false; explicit "
-                "stock_covariates_v1_type action-type channels disambiguate CASH from true zero values."
-            ),
-            "reportability_errors": list(dict.fromkeys(errors)),
-        }
-    )
-    manifest["reportable"] = bool(manifest.get("reportable", True)) and not manifest["reportability_errors"]
-    out["dataset_manifest"] = manifest
-    return out
 
 
 def write_silver_outputs(

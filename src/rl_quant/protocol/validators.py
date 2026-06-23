@@ -91,6 +91,8 @@ def validate_invalid_returns_are_nan(
                     issues.append(f"row {t} action {a}: marked VALID but return is not finite ({ret!r})")
                 elif not bool(valid) and finite:
                     issues.append(f"row {t} action {a}: marked INVALID but return is finite ({ret!r}); must be NaN")
+                if len(issues) > max_issues:
+                    break  # bound a single wide row (e.g. ~2000 actions) to the cap, not 2000 issues
         if len(issues) > max_issues:
             issues = issues[:max_issues]
             issues.append("... (further issues truncated)")
@@ -212,6 +214,8 @@ def validate_label_mask_subset_of_decision_mask(
             for a, (label_valid, decision_valid) in enumerate(zip(label_row, decision_row)):
                 if bool(label_valid) and not bool(decision_valid):
                     issues.append(f"row {t} action {a}: label_valid_mask is true while decision mask is false")
+                if len(issues) > max_issues:
+                    break  # bound a single wide row to the cap, not its full width
         if len(issues) > max_issues:
             issues = issues[:max_issues]
             issues.append("... (further issues truncated)")
@@ -271,7 +275,9 @@ def validate_action_mask(
         if not isinstance(row, list):
             issues.append(f"row {t}: mask row is not a sequence ({row!r}); expected [actions] booleans")
             continue
-        if any(value not in (True, False, 0, 1) for value in row):
+        # bool first (bool subclasses int); accept only bool or int 0/1. This rejects float 1.0/0.0/0.5
+        # and int 2 — `value not in (0, 1)` would NOT, since 1.0 in (0, 1) is True.
+        if any(not (isinstance(value, bool) or (isinstance(value, int) and value in (0, 1))) for value in row):
             issues.append(f"row {t}: mask has non-boolean entries ({row!r})")
         if require_row_selectable and not any(bool(value) for value in row):
             issues.append(f"row {t}: no selectable action (every entry is False) -- the policy has no legal move")

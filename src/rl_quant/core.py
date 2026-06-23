@@ -3,7 +3,7 @@
 Depends only on torch + the stdlib (no rl_quant layer) -- it is the base the layered packages import, and
 the test_foundation_modules_and_flat_shims_structure test pins that. Cohesive enough to stay one module
 (splitting would touch ~40 importers for no behavioural gain). Section map:
-  - DQN config + Q-network    : DQNLearningConfig, TemporalQNetwork
+  - DQN config                : DQNLearningConfig
   - Replay buffers            : TensorReplayBuffer, TensorDictReplayBuffer (+ _validate_replay_batch)
   - DQN core / exploration    : epsilon_by_step, as_binary_bool_mask, safe_next_row_indices, dqn_td_target
   - Metrics                   : annualized_sharpe, fractional_max_drawdown, absolute_max_drawdown
@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torch import nn
 
 
 @dataclass
@@ -41,57 +40,6 @@ class DQNLearningConfig:
     grad_clip: float
     use_amp: bool = False
     amp_dtype: str = "fp16"  # AMP autocast precision when use_amp: "fp16" (default) or "bf16".
-
-
-class TemporalQNetwork(nn.Module):
-    """Small shared Q-network for windowed market states plus a previous action."""
-
-    def __init__(
-        self,
-        *,
-        feature_dim: int,
-        lookback: int,
-        action_count: int,
-        previous_action_count: int,
-        hidden_size: int = 128,
-        previous_action_embedding_dim: int = 8,
-    ) -> None:
-        super().__init__()
-        if feature_dim <= 0:
-            raise ValueError("feature_dim must be positive")
-        if lookback <= 0:
-            raise ValueError("lookback must be positive")
-        if action_count <= 1:
-            raise ValueError("action_count must be greater than one")
-        if previous_action_count <= 0:
-            raise ValueError("previous_action_count must be positive")
-
-        self.lookback = lookback
-        self.action_count = action_count
-        self.temporal = nn.Sequential(
-            nn.Conv1d(feature_dim, 64, kernel_size=5, padding=2),
-            nn.SiLU(),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),
-            nn.SiLU(),
-        )
-        self.previous_action_embedding = nn.Embedding(
-            previous_action_count,
-            previous_action_embedding_dim,
-        )
-        self.head = nn.Sequential(
-            nn.Linear(64 * lookback + previous_action_embedding_dim, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, action_count),
-        )
-
-    def forward(self, state_windows: torch.Tensor, previous_actions: torch.Tensor) -> torch.Tensor:
-        x = self.temporal(state_windows.transpose(1, 2)).reshape(state_windows.shape[0], -1)
-        previous_action_features = self.previous_action_embedding(previous_actions.long())
-        return self.head(torch.cat([x, previous_action_features], dim=1))
 
 
 def _validate_replay_batch(

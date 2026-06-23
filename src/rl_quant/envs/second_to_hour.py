@@ -16,7 +16,7 @@ from rl_quant.trading_constraints import (
 )
 
 from rl_quant.datasets.hour_from_second import (
-    HourFromMinuteDataSplit,
+    HourFromSecondDataSplit,
     default_second_to_hour_constraints,
 )
 from rl_quant.core import concrete_torch_device
@@ -223,7 +223,7 @@ def validate_second_to_hour_constraints(
     )
 
 
-def validate_cash_usable_on_decision_rows(data: HourFromMinuteDataSplit, cash_index: int) -> None:
+def validate_cash_usable_on_decision_rows(data: HourFromSecondDataSplit, cash_index: int) -> None:
     """CASH is the FORCED safety fallback for masked / missing-label actions, so it must be USABLE on every
     valid decision row: its label must be VALID *and* its return FINITE. The fallback reads
     ``action_returns[row, cash_index]`` directly (a non-finite return would emit a NaN reward) and the
@@ -247,7 +247,7 @@ def validate_cash_usable_on_decision_rows(data: HourFromMinuteDataSplit, cash_in
 
 
 class VectorizedSecondToHourEnv:
-    def __init__(self, data: HourFromMinuteDataSplit, config: SecondToHourEnvConfig, device: torch.device) -> None:
+    def __init__(self, data: HourFromSecondDataSplit, config: SecondToHourEnvConfig, device: torch.device) -> None:
         # initial_action gets the SHARED action-index discipline; the rest of the constraint fields that feed
         # the action mask AND the cost ledger (cash_index must be a real CASH action; count_etf must be a real
         # bool; the bps scalars finite/non-negative) are validated together at construction -- BEFORE any mask
@@ -280,6 +280,18 @@ class VectorizedSecondToHourEnv:
         self.config = config
         # Derive self.device from the actual moved tensor so it matches what indexed tensors report exactly.
         self.device = self.data.second_features.device
+        # Per-row UTC day id (factorized date-prefix decision_timestamps[i][:10]) so the per-step day-boundary
+        # reset of switches_today / order_legs_today is a pure on-device tensor compare instead of an
+        # O(num_envs) Python loop with two host<->device syncs. Same prefix -> same id, so this is byte-identical
+        # to comparing the [:10] strings (do NOT substitute an Eastern session id -- that would move boundaries).
+        _day_index: dict[str, int] = {}
+        _day_ids: list[int] = []
+        for _ts in self.data.decision_timestamps:
+            _prefix = str(_ts)[:10]
+            if _prefix not in _day_index:
+                _day_index[_prefix] = len(_day_index)
+            _day_ids.append(_day_index[_prefix])
+        self._day_id = torch.tensor(_day_ids, dtype=torch.long, device=self.device)
         # CASH is the forced safety fallback; require it to be USABLE (label-valid + finite) on every valid row.
         validate_cash_usable_on_decision_rows(self.data, self.cash_index)
         self.start_indices = self._build_start_index_pool()
@@ -516,13 +528,14 @@ class VectorizedSecondToHourEnv:
         terminated = ~next_valid
         truncated = self.steps >= self.episode_length
         resets = terminated | truncated
-        if bool(in_bounds.any().item()):
-            old_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in current_indices[in_bounds].detach().cpu()]
-            new_dates = [self.data.decision_timestamps[int(i.item())][:10] for i in next_indices[in_bounds].detach().cpu()]
-            reset_today = torch.tensor([old != new for old, new in zip(old_dates, new_dates)], dtype=torch.bool, device=self.device)
-            valid_positions = torch.where(in_bounds)[0]
-            self.switches_today[valid_positions[reset_today]] = 0
-            self.order_legs_today[valid_positions[reset_today]] = 0.0
+        # Reset the per-DAY counters wherever an in-bounds env crosses a UTC day boundary. Vectorized via the
+        # precomputed per-row day ids (byte-identical to the old [:10] string compare). next_indices is clamped
+        # for the lookup only; out-of-bounds envs have in_bounds=False so they never reset here regardless.
+        n_rows = self.data.action_returns.shape[0]
+        day_changed = self._day_id[next_indices.clamp(max=n_rows - 1)] != self._day_id[current_indices]
+        reset_today = in_bounds & day_changed
+        self.switches_today[reset_today] = 0
+        self.order_legs_today[reset_today] = 0.0
         return next_indices, next_position_dynamic, terminated, resets
 
     def _compute_shadow_execution_reward(
@@ -556,6 +569,15 @@ class VectorizedSecondToHourEnv:
 
     def step(self, actions: torch.Tensor) -> dict[str, torch.Tensor]:
         current_indices = self.indices.clone()
+        # Fail closed: step() advances self.indices unconditionally and never auto-resets, so a caller that
+        # forgets env.reset(resets) would read action_returns on a terminal/excluded row (valid_index_mask
+        # False), where the CASH-fallback finiteness is NOT guaranteed -> a silent NaN reward. Both live
+        # trainers reset every step, so this is byte-identical for them and only trips a misuse.
+        if not bool(self.data.valid_index_mask[current_indices].all()):
+            raise RuntimeError(
+                "step() called on an unreset terminal/excluded row; the caller must env.reset(resets) "
+                "after each step before stepping again."
+            )
         previous_actions = self.previous_actions.clone()
         # PR-D: snapshot the dynamic state of the position held ENTERING this decision (before the update
         # below). Always computed and returned (the replay add() filters unknown keys, so it is harmless when
