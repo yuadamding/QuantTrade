@@ -1102,6 +1102,8 @@ def aggregate_news_llm_features_for_symbol(
         ),
         window_rows=rows_7d,
     )
+    # NB: llm_company_specific_fraction_1d is the weight-weighted MEAN of the continuous company_specificity
+    # score in [0, 1] -- NOT a row-count fraction / probability. (Name kept for artifact-schema stability.)
     builder.add_mean_value(_weighted_mean(rows_1d, "company_specificity"), window_rows=rows_1d)
     builder.add_mean_value(_weighted_mean(rows_1d, "is_broad_market_or_sector"), window_rows=rows_1d)
     builder.add_mean_value(

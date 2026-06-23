@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import asdict, dataclass
 from numbers import Integral
 from typing import Any
@@ -11,18 +11,6 @@ from typing import Any
 import torch
 
 _WARNED_UNKNOWN_ACTION_SYMBOLS: set[str] = set()
-
-RISK_AWARE_POLICY_MODEL_VERSION = 3
-
-EXPOSURE_FEATURE_NAMES = [
-    "steps_today_over_episode_length",
-    "leveraged_bars_today_over_cap",
-    "consecutive_leveraged_bars_over_cap",
-    "current_effective_leverage",
-    "current_action_is_leveraged",
-    "current_group_share_today",
-]
-EXPOSURE_FEATURE_DIM = len(EXPOSURE_FEATURE_NAMES)
 
 
 @dataclass(frozen=True)
@@ -230,11 +218,6 @@ def _default_max_weight(leverage: float) -> float:
     return min(1.0, 1.0 / max(float(leverage), 1.0))
 
 
-def is_known_action_symbol(name: str) -> bool:
-    """True when an explicit risk-metadata entry exists for the symbol."""
-    return name.upper() in KNOWN_ACTION_META
-
-
 def unknown_action_metadata_symbols(action_names: list[str]) -> list[str]:
     """Action names with no explicit risk metadata (leverage/inverse are inferred, not known).
 
@@ -352,14 +335,6 @@ def action_leverage_tensor(action_meta: list[ActionMeta], *, device: torch.devic
     return torch.tensor([item.leverage for item in action_meta], dtype=torch.float32, device=device)
 
 
-def action_is_leveraged_tensor(action_meta: list[ActionMeta], *, device: torch.device | str) -> torch.Tensor:
-    return torch.tensor([item.leverage > 1.0 for item in action_meta], dtype=torch.bool, device=device)
-
-
-def action_is_inverse_tensor(action_meta: list[ActionMeta], *, device: torch.device | str) -> torch.Tensor:
-    return torch.tensor([item.inverse for item in action_meta], dtype=torch.bool, device=device)
-
-
 def group_ids_for_actions(action_meta: list[ActionMeta], *, device: torch.device | str) -> tuple[torch.Tensor, list[str]]:
     groups = sorted({item.group for item in action_meta})
     group_index = {group: index for index, group in enumerate(groups)}
@@ -383,120 +358,6 @@ def trade_notional(
     )
     next_weights = torch.where(action.long() == int(cash_index), torch.zeros_like(next_weights), next_weights)
     return torch.where(changed, previous_weights + next_weights, torch.zeros_like(next_weights))
-
-
-def make_exposure_features(
-    *,
-    current_action: torch.Tensor,
-    action_leverage: torch.Tensor,
-    action_weights: torch.Tensor,
-    action_is_leveraged: torch.Tensor,
-    action_group_ids: torch.Tensor,
-    group_counts_today: torch.Tensor,
-    steps_today: torch.Tensor,
-    leveraged_bars_today: torch.Tensor,
-    consecutive_leveraged_bars: torch.Tensor,
-    constraints: ExposureConstraintConfig,
-    episode_length: int,
-) -> torch.Tensor:
-    current_action = current_action.long()
-    current_group = action_group_ids[current_action]
-    current_group_count = group_counts_today.gather(1, current_group.unsqueeze(1)).squeeze(1)
-    group_share = current_group_count.float() / steps_today.float().clamp_min(1.0)
-    leverage_cap = constraints.max_effective_leverage if constraints.max_effective_leverage is not None else 1.0
-    leveraged_cap = (
-        constraints.max_leveraged_bars_per_day
-        if constraints.max_leveraged_bars_per_day is not None
-        else max(int(episode_length), 1)
-    )
-    consecutive_cap = (
-        constraints.max_consecutive_leveraged_bars
-        if constraints.max_consecutive_leveraged_bars is not None
-        else max(int(episode_length), 1)
-    )
-    current_effective_leverage = action_leverage[current_action] * action_weights[current_action]
-    return torch.stack(
-        [
-            steps_today.float() / max(float(episode_length), 1.0),
-            leveraged_bars_today.float() / max(float(leveraged_cap), 1.0),
-            consecutive_leveraged_bars.float() / max(float(consecutive_cap), 1.0),
-            current_effective_leverage / max(float(leverage_cap), 1.0),
-            action_is_leveraged[current_action].float(),
-            group_share,
-        ],
-        dim=1,
-    ).clamp(0.0, 8.0)
-
-
-def apply_exposure_masks(
-    mask: torch.Tensor,
-    *,
-    current_action: torch.Tensor,
-    action_leverage: torch.Tensor,
-    action_weights: torch.Tensor,
-    action_is_leveraged: torch.Tensor,
-    action_group_ids: torch.Tensor,
-    group_counts_today: torch.Tensor,
-    steps_today: torch.Tensor,
-    leveraged_bars_today: torch.Tensor,
-    consecutive_leveraged_bars: torch.Tensor,
-    constraints: ExposureConstraintConfig,
-    action_is_inverse: torch.Tensor | None = None,
-    cash_index: int = 0,
-) -> torch.Tensor:
-    out = mask.clone()
-    action_count = out.shape[1]
-    candidates = torch.arange(action_count, dtype=torch.long, device=out.device).unsqueeze(0).expand_as(out)
-    candidate_leverage = action_leverage[candidates]
-    candidate_weights = action_weights[candidates]
-    candidate_is_leveraged = action_is_leveraged[candidates]
-    candidate_is_inverse = action_is_inverse[candidates] if action_is_inverse is not None else torch.zeros_like(out)
-    cash_column = int(cash_index)
-
-    if constraints.max_effective_leverage is not None:
-        effective_leverage = candidate_leverage * candidate_weights
-        out = out & (effective_leverage <= float(constraints.max_effective_leverage) + 1e-12)
-
-    if not constraints.allow_leveraged_actions:
-        out = out & ~candidate_is_leveraged
-
-    if not constraints.allow_inverse_actions:
-        out = out & ~candidate_is_inverse
-
-    if constraints.max_leveraged_bars_per_day is not None:
-        exhausted = leveraged_bars_today >= int(constraints.max_leveraged_bars_per_day)
-        out = out & ~(exhausted.unsqueeze(1) & candidate_is_leveraged)
-
-    if constraints.max_consecutive_leveraged_bars is not None:
-        exhausted = consecutive_leveraged_bars >= int(constraints.max_consecutive_leveraged_bars)
-        out = out & ~(exhausted.unsqueeze(1) & candidate_is_leveraged)
-
-    if constraints.max_same_group_share_per_day is not None:
-        min_obs = max(int(constraints.min_group_share_observations), 1)
-        next_steps = (steps_today.float() + 1.0).clamp_min(1.0)
-        # Warmup blind spot: the same-group-share cap is intentionally disabled for the first
-        # `min_group_share_observations` bars of each day to avoid noisy ratios on tiny samples.
-        # Full-period over-concentration is still caught by action_concentration/reportability_flags,
-        # which operate on the whole rollout rather than per-step.
-        enough_history = next_steps >= float(min_obs)
-        candidate_groups = action_group_ids[candidates]
-        candidate_group_counts = torch.gather(group_counts_today, 1, candidate_groups)
-        candidate_group_share = (candidate_group_counts.float() + 1.0) / next_steps.unsqueeze(1)
-        group_exhausted = enough_history.unsqueeze(1) & (
-            candidate_group_share > float(constraints.max_same_group_share_per_day)
-        )
-        out = out & ~group_exhausted
-
-    # Exposure caps (leverage/inverse/group) must never *remove* CASH (it carries zero
-    # leverage and zero notional), so restore it to its pre-exposure value. We inherit
-    # rather than force-True so that an upstream turnover budget (switch/order-leg cap)
-    # that legitimately dropped CASH is respected; position-level holds keep CASH via
-    # build_action_mask, and data-quality gates force CASH upstream.
-    out[:, cash_column] = mask[:, cash_column]
-    empty_rows = ~out.any(dim=1)
-    if bool(empty_rows.any().item()):
-        out[empty_rows, cash_column] = True
-    return out
 
 
 def action_concentration(
@@ -550,72 +411,6 @@ def action_concentration(
         "action_counts": dict(action_counts),
         "group_counts": dict(group_counts),
         "risky_group_counts": dict(risky_group_counts),
-    }
-
-
-def rollout_return_diagnostics(rollout_records: list[dict[str, Any]]) -> dict[str, Any]:
-    by_action: dict[str, dict[str, float | int]] = defaultdict(
-        lambda: {"rows": 0, "gross_sum": 0.0, "net_sum": 0.0, "min_net": float("inf"), "max_net": -float("inf")}
-    )
-    by_day: dict[str, dict[str, float | int]] = defaultdict(
-        lambda: {"rows": 0, "gross_sum": 0.0, "net_sum": 0.0, "min_equity": float("inf"), "max_equity": -float("inf")}
-    )
-    segments: list[dict[str, Any]] = []
-    current_segment: dict[str, Any] | None = None
-    previous_asset: str | None = None
-    for row in rollout_records:
-        asset = str(row.get("asset", row.get("action", "")))
-        gross = float(row.get("gross_return", 0.0))
-        net = float(row.get("bar_return", row.get("net_return", 0.0)))
-        equity = float(row.get("equity", 1.0))
-        timestamp = str(row.get("timestamp", row.get("decision_timestamp", "")))
-        day = timestamp[:10]
-
-        action_bucket = by_action[asset]
-        action_bucket["rows"] = int(action_bucket["rows"]) + 1
-        action_bucket["gross_sum"] = float(action_bucket["gross_sum"]) + gross
-        action_bucket["net_sum"] = float(action_bucket["net_sum"]) + net
-        action_bucket["min_net"] = min(float(action_bucket["min_net"]), net)
-        action_bucket["max_net"] = max(float(action_bucket["max_net"]), net)
-
-        day_bucket = by_day[day]
-        day_bucket["rows"] = int(day_bucket["rows"]) + 1
-        day_bucket["gross_sum"] = float(day_bucket["gross_sum"]) + gross
-        day_bucket["net_sum"] = float(day_bucket["net_sum"]) + net
-        day_bucket["min_equity"] = min(float(day_bucket["min_equity"]), equity)
-        day_bucket["max_equity"] = max(float(day_bucket["max_equity"]), equity)
-        day_bucket["last_equity"] = equity
-
-        if current_segment is None or asset != previous_asset:
-            if current_segment is not None:
-                segments.append(current_segment)
-            current_segment = {
-                "start": timestamp,
-                "end": timestamp,
-                "asset": asset,
-                "rows": 0,
-                "gross_sum": 0.0,
-                "net_sum": 0.0,
-                "start_equity": equity,
-                "end_equity": equity,
-            }
-        current_segment["rows"] += 1
-        current_segment["gross_sum"] += gross
-        current_segment["net_sum"] += net
-        current_segment["end"] = timestamp
-        current_segment["end_equity"] = equity
-        previous_asset = asset
-    if current_segment is not None:
-        segments.append(current_segment)
-
-    rows = max(len(rollout_records), 1)
-    for bucket in by_action.values():
-        bucket["row_share"] = int(bucket["rows"]) / rows
-        bucket["mean_net"] = float(bucket["net_sum"]) / max(int(bucket["rows"]), 1)
-    return {
-        "by_action": dict(by_action),
-        "by_day": dict(by_day),
-        "holding_segments": segments,
     }
 
 

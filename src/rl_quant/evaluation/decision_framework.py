@@ -55,53 +55,6 @@ def filter_point_in_time_rows(
 
 
 @dataclass(frozen=True)
-class MarketDataManifest:
-    dataset_id: str
-    created_at: str
-    source: str
-    source_version: str
-    symbols: list[str]
-    symbol_id_map_hash: str
-    start_ts: str
-    end_ts: str
-    bar_interval: str
-    timezone: str
-    corporate_action_policy: str
-    calendar_id: str
-    raw_payload_hash: str
-    quality_report_hash: str
-
-    def validate(self) -> None:
-        for name in (
-            "dataset_id",
-            "created_at",
-            "source",
-            "source_version",
-            "symbol_id_map_hash",
-            "start_ts",
-            "end_ts",
-            "bar_interval",
-            "timezone",
-            "corporate_action_policy",
-            "calendar_id",
-            "raw_payload_hash",
-            "quality_report_hash",
-        ):
-            _require_nonempty(str(getattr(self, name)), name=name)
-        if not self.symbols:
-            raise DecisionFrameworkError("symbols must not be empty.")
-        if parse_iso_timestamp(self.start_ts) > parse_iso_timestamp(self.end_ts):
-            raise DecisionFrameworkError("start_ts must be <= end_ts.")
-        parse_iso_timestamp(self.created_at)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    def content_hash(self) -> str:
-        return stable_json_hash(self.to_dict())
-
-
-@dataclass(frozen=True)
 class FeatureManifest:
     feature_set_id: str
     input_dataset_ids: list[str]

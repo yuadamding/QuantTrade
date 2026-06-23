@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import unittest
 
-from tests._support import load_script
+from _support import load_script
 
 
 class PartitionTrainerReportabilityTests(unittest.TestCase):

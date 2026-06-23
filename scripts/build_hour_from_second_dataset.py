@@ -41,6 +41,7 @@ from rl_quant.research_protocol import (  # noqa: E402
     stable_json_hash,
     utc_now_iso,
 )
+from rl_quant.protocol.action_return_basis import ReturnBasis  # noqa: E402
 
 
 def default_data_root() -> Path:
@@ -59,7 +60,7 @@ def default_derived_root() -> Path:
 
 DATA_ROOT = default_data_root()
 DERIVED_ROOT = default_derived_root()
-DEFAULT_SOURCE_BAR_INTERVAL = "1m"
+DEFAULT_SOURCE_BAR_INTERVAL = "1s"
 SECOND_SOURCE_BAR_INTERVAL = "1s"
 SOURCE_BAR_INTERVAL = DEFAULT_SOURCE_BAR_INTERVAL
 DEFAULT_DECISION_GRID_MINUTES = 60
@@ -110,9 +111,9 @@ def default_stock_bar_dir(source_bar_interval: str) -> Path:
 
 
 def default_action_bar_dir(source_bar_interval: str) -> Path:
-    if source_bar_interval == SECOND_SOURCE_BAR_INTERVAL:
-        return POLYGON_SECOND_ROOT
-    return DATA_ROOT / "second_ohlcv" / "top_us_volume_etfs_500_2026-06-14_1m_2026-05-25_2026-06-15"
+    # Actions are STOCKS (#actions = #stocks + 1, CASH included); the action bar source is the same stock
+    # second-aggregate store as the context stocks. (The legacy ETF action universe is removed.)
+    return default_stock_bar_dir(source_bar_interval)
 
 
 def default_stock_universe(source_bar_interval: str) -> Path:
@@ -122,9 +123,8 @@ def default_stock_universe(source_bar_interval: str) -> Path:
 
 
 def default_action_universe(source_bar_interval: str) -> Path:
-    if source_bar_interval == SECOND_SOURCE_BAR_INTERVAL:
-        return POLYGON_TOP500_UNIVERSE
-    return DERIVED_ROOT / "universes" / "top_us_volume_etfs_500_2026-06-14.csv"
+    # Actions = stocks (+CASH), NEVER the legacy 16-ETF universe. action universe == stock universe.
+    return default_stock_universe(source_bar_interval)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -144,10 +144,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_stock_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL),
     )
     parser.add_argument(
-        "--etf-minute-dir",
         "--action-bar-dir",
         type=Path,
-        dest="etf_second_dir",
+        dest="action_second_dir",
         default=default_action_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL),
     )
     parser.add_argument(
@@ -156,19 +155,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_stock_universe(DEFAULT_SOURCE_BAR_INTERVAL),
     )
     parser.add_argument(
-        "--etf-universe",
         "--action-universe",
         type=Path,
-        dest="etf_universe",
+        dest="action_universe",
         default=default_action_universe(DEFAULT_SOURCE_BAR_INTERVAL),
     )
-    parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_minute" / "top_volume_1m_recent")
-    parser.add_argument("--dataset-file-name", default="hour_from_minute_dataset.pt")
+    parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "rl_hour_from_second" / "top500_1s_recent")
+    parser.add_argument("--dataset-file-name", default="hour_from_second_dataset.pt")
     parser.add_argument("--start", default="2026-05-25T00:00:00+00:00")
     parser.add_argument("--end-exclusive", default="2026-06-15T00:00:00+00:00")
     parser.add_argument("--stock-limit", type=int, default=1000)
     parser.add_argument("--action-count", type=int, default=500)
-    parser.add_argument("--actions", help="Comma-separated ETF action symbols. CASH is added automatically.")
+    parser.add_argument("--actions", help="Comma-separated stock action symbols. CASH is added automatically.")
     parser.add_argument(
         "--universe-selection-date",
         help="Optional ISO timestamp/date proving the universe was selected before the dataset starts.",
@@ -236,12 +234,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.source_bar_interval == SECOND_SOURCE_BAR_INTERVAL:
         if args.stock_second_dir == default_stock_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL):
             args.stock_second_dir = default_stock_bar_dir(SECOND_SOURCE_BAR_INTERVAL)
-        if args.etf_second_dir == default_action_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL):
-            args.etf_second_dir = default_action_bar_dir(SECOND_SOURCE_BAR_INTERVAL)
+        if args.action_second_dir == default_action_bar_dir(DEFAULT_SOURCE_BAR_INTERVAL):
+            args.action_second_dir = default_action_bar_dir(SECOND_SOURCE_BAR_INTERVAL)
         if args.stock_universe == default_stock_universe(DEFAULT_SOURCE_BAR_INTERVAL):
             args.stock_universe = default_stock_universe(SECOND_SOURCE_BAR_INTERVAL)
-        if args.etf_universe == default_action_universe(DEFAULT_SOURCE_BAR_INTERVAL):
-            args.etf_universe = default_action_universe(SECOND_SOURCE_BAR_INTERVAL)
+        if args.action_universe == default_action_universe(DEFAULT_SOURCE_BAR_INTERVAL):
+            args.action_universe = default_action_universe(SECOND_SOURCE_BAR_INTERVAL)
         if args.output_dir == DATA_ROOT / "rl_hour_from_minute" / "top_volume_1m_recent":
             args.output_dir = DATA_ROOT / "rl_hour_from_second" / "top500_1s_recent"
         if args.dataset_file_name == "hour_from_minute_dataset.pt":
@@ -666,7 +664,7 @@ def main() -> int:
     allow_missing_action_context = bool(args.allow_missing_action_context)
 
     stock_map = bar_source_map(args.stock_second_dir, interval=source_bar_interval)
-    etf_map = bar_source_map(args.etf_second_dir, interval=source_bar_interval)
+    action_map = bar_source_map(args.action_second_dir, interval=source_bar_interval)
     intended_stocks = read_ranked_symbols(args.stock_universe)
     intended_stock_slice = intended_stocks[: args.stock_limit]
     missing_intended_stock_source_symbols = [symbol for symbol in intended_stock_slice if symbol not in stock_map]
@@ -678,13 +676,13 @@ def main() -> int:
     if args.actions:
         intended_action_symbols = [symbol.strip().upper() for symbol in args.actions.split(",") if symbol.strip()]
     else:
-        intended_action_symbols = read_ranked_symbols(args.etf_universe)[: args.action_count]
-    missing_intended_action_source_symbols = [symbol for symbol in intended_action_symbols if symbol not in etf_map]
-    etf_symbols = [symbol for symbol in intended_action_symbols if symbol in etf_map]
-    etf_symbols = list(dict.fromkeys(symbol for symbol in etf_symbols if symbol in etf_map))
-    if not etf_symbols:
+        intended_action_symbols = read_ranked_symbols(args.action_universe)[: args.action_count]
+    missing_intended_action_source_symbols = [symbol for symbol in intended_action_symbols if symbol not in action_map]
+    action_symbols = [symbol for symbol in intended_action_symbols if symbol in action_map]
+    action_symbols = list(dict.fromkeys(symbol for symbol in action_symbols if symbol in action_map))
+    if not action_symbols:
         raise ValueError("No action source-bar files matched the selected universe.")
-    action_names = ["CASH", *etf_symbols]
+    action_names = ["CASH", *action_symbols]
     dataset_reportability_errors: list[str] = []
     if missing_intended_stock_source_symbols or missing_intended_action_source_symbols:
         dataset_reportability_errors.append("missing_intended_universe_source_symbols")
@@ -707,23 +705,23 @@ def main() -> int:
         if index % 100 == 0:
             print(f"  loaded {index}/{len(selected_stocks)} stocks", flush=True)
 
-    print(f"Loading {len(etf_symbols)} action {source_bar_interval} series...")
-    etf_features = {}
-    etf_exchange_times = {}
-    for symbol in etf_symbols:
+    print(f"Loading {len(action_symbols)} action {source_bar_interval} series...")
+    action_bar_features = {}
+    action_exchange_times = {}
+    for symbol in action_symbols:
         rows, exchange = split_features_and_exchange(
-            load_bar_features(etf_map[symbol], start=args.start, end_exclusive=args.end_exclusive)
+            load_bar_features(action_map[symbol], start=args.start, end_exclusive=args.end_exclusive)
         )
-        etf_features[symbol] = rows
-        etf_exchange_times[symbol] = exchange
+        action_bar_features[symbol] = rows
+        action_exchange_times[symbol] = exchange
     action_exchange_times: dict[str, str] = {}
-    for exchange in etf_exchange_times.values():
+    for exchange in action_exchange_times.values():
         for timestamp, exchange_timestamp in exchange.items():
             action_exchange_times.setdefault(timestamp, exchange_timestamp)
     exchange_times = dict(stock_exchange_times)
     for timestamp, exchange_timestamp in action_exchange_times.items():
         exchange_times.setdefault(timestamp, exchange_timestamp)
-    exact_action_common_times = sorted(set.intersection(*(set(rows) for rows in etf_features.values())))
+    exact_action_common_times = sorted(set.intersection(*(set(rows) for rows in action_bar_features.values())))
     common_times = sorted(stock_by_time)
     min_active = max(1, int(len(selected_stocks) * args.min_active_stock_fraction))
     common_times = [
@@ -734,7 +732,7 @@ def main() -> int:
     ]
     if len(common_times) < args.seconds_per_hour:
         raise ValueError("Too few aligned source rows after stock and action filtering.")
-    action_price_lookup = {symbol: make_action_lookup(rows) for symbol, rows in etf_features.items()}
+    action_price_lookup = {symbol: make_action_lookup(rows) for symbol, rows in action_bar_features.items()}
     exchange_lookup = ExchangeTimestampLookup.from_exchange_maps(stock_exchange_times, exchange_times)
 
     stock_feature_names = [
@@ -765,17 +763,17 @@ def main() -> int:
         "weekday_sin",
         "weekday_cos",
     ]
-    etf_feature_names: list[str] = []
-    for symbol in etf_symbols:
-        etf_feature_names.extend(
+    action_bar_feature_names: list[str] = []
+    for symbol in action_symbols:
+        action_bar_feature_names.extend(
             [
-                f"etf_{symbol}_ret_{source_bar_interval}",
-                f"etf_{symbol}_intraday_ret",
-                f"etf_{symbol}_range_bps",
-                f"etf_{symbol}_log_dollar_volume",
+                f"action_{symbol}_ret_{source_bar_interval}",
+                f"action_{symbol}_intraday_ret",
+                f"action_{symbol}_range_bps",
+                f"action_{symbol}_log_dollar_volume",
             ]
         )
-    second_feature_names = [*stock_feature_names, *path_feature_names, *time_feature_names, *etf_feature_names]
+    second_feature_names = [*stock_feature_names, *path_feature_names, *time_feature_names, *action_bar_feature_names]
     hour_feature_names = ["hour_valid_fraction", "hour_session_progress_centered"]
 
     exchange_time_feature_cache: dict[str, tuple[float, ...]] = {}
@@ -813,19 +811,19 @@ def main() -> int:
         avg_log_dollar_volume_so_far = min(volume_by_date[date_key] / max(float(count), 1.0), 1e6)
         path_features = [cumulative_by_date[date_key], realized_vol, avg_log_dollar_volume_so_far]
         time_features = list(parse_exchange_time_cached(exchange_timestamp))
-        etf_row: list[float] = []
+        action_row: list[float] = []
         missing = False
-        for symbol in etf_symbols:
-            current = etf_features[symbol].get(timestamp)
+        for symbol in action_symbols:
+            current = action_bar_features[symbol].get(timestamp)
             if current is None:
                 if allow_missing_action_context:
-                    etf_row.extend([0.0, 0.0, 0.0, 0.0])
+                    action_row.extend([0.0, 0.0, 0.0, 0.0])
                     continue
                 missing = True
                 break
-            etf_row.extend([current.bar_return, current.intraday_ret, current.range_bps, current.log_dollar_volume])
+            action_row.extend([current.bar_return, current.intraday_ret, current.range_bps, current.log_dollar_volume])
         if not missing:
-            second_feature_by_time[timestamp] = [*stock_features, *path_features, *time_features, *etf_row]
+            second_feature_by_time[timestamp] = [*stock_features, *path_features, *time_features, *action_row]
             second_exchange_date_by_time[timestamp] = date_key
 
     decision_timestamps: list[str] = []
@@ -908,7 +906,7 @@ def main() -> int:
         label_valid = [True]
         entry_fill_ms = decision_ms + execution_latency_ms
         exit_fill_ms = next_ms + execution_latency_ms
-        for symbol in etf_symbols:
+        for symbol in action_symbols:
             lookup = action_price_lookup[symbol]
             # Decision-time validity uses the last price observable at/before the decision (minus
             # bar latency). The realized return is priced from simulated FILLS at/after the
@@ -1010,19 +1008,19 @@ def main() -> int:
         "action_return_source_bar_interval": source_bar_interval,
         "action_return_price_source": "source_bar_close",
     }
+    # Tamper/partial-write tripwire: a content hash over the canonical basis, persisted alongside the basis on
+    # every surface (.pt payload, manifest, metadata). DatasetManifest.validate() and validate_return_basis_surfaces
+    # recompute it from the declared basis and reject a mismatch. Without this the advertised hash check is inert.
+    return_basis_content_hash = ReturnBasis.from_mapping(action_return_basis).content_hash()
     torch.save(
         {
             "decision_timestamps": decision_timestamps,
             "next_timestamps": next_timestamps,
             "second_timestamp_grid": second_timestamp_grid,
-            "second_timestamp_grid": second_timestamp_grid,
-            "second_feature_names": second_feature_names,
             "second_feature_names": second_feature_names,
             "hour_feature_names": hour_feature_names,
             "action_names": action_names,
             "second_features": second_features,
-            "second_features": second_features,
-            "second_mask": second_mask,
             "second_mask": second_mask,
             "hour_features": hour_features,
             "action_returns": action_returns,
@@ -1034,6 +1032,7 @@ def main() -> int:
             # Canonical action-return basis (defined once above; also written into dataset_manifest.json so the
             # reportability agreement check compares two independently-stored copies).
             **action_return_basis,
+            "return_basis_content_hash": return_basis_content_hash,
             "model_input_keys": model_input_keys,
             "forbidden_model_input_keys": forbidden_model_input_keys,
             "dataset_reportable": dataset_reportable,
@@ -1060,13 +1059,13 @@ def main() -> int:
             "median_decisions_per_day": median_decisions_per_day,
             "source": {
                 "stock_second_dir": str(args.stock_second_dir),
-                "etf_second_dir": str(args.etf_second_dir),
+                "action_second_dir": str(args.action_second_dir),
                 "stock_universe": str(args.stock_universe),
-                "etf_universe": str(args.etf_universe),
+                "action_universe": str(args.action_universe),
                 "stock_limit": len(selected_stocks),
                 "intended_stock_symbols": intended_stock_slice,
                 "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
-                "action_symbols": etf_symbols,
+                "action_symbols": action_symbols,
                 "intended_action_symbols": intended_action_symbols,
                 "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
                 "min_active_stock_fraction": args.min_active_stock_fraction,
@@ -1095,13 +1094,13 @@ def main() -> int:
     write_action_returns(args.output_dir / "action_returns.csv", action_names, decision_timestamps, action_return_rows)
     source_metadata = {
         "stock_second_dir": str(args.stock_second_dir),
-        "etf_second_dir": str(args.etf_second_dir),
+        "action_second_dir": str(args.action_second_dir),
         "stock_universe": str(args.stock_universe),
-        "etf_universe": str(args.etf_universe),
+        "action_universe": str(args.action_universe),
         "stock_limit": len(selected_stocks),
         "intended_stock_symbols": intended_stock_slice,
         "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
-        "action_symbols": etf_symbols,
+        "action_symbols": action_symbols,
         "intended_action_symbols": intended_action_symbols,
         "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "min_active_stock_fraction": args.min_active_stock_fraction,
@@ -1132,7 +1131,6 @@ def main() -> int:
     metadata = {
         "rows": len(decision_timestamps),
         "second_shape": list(second_features.shape),
-        "second_shape": list(second_features.shape),
         "hour_shape": list(hour_features.shape),
         "action_count": len(action_names),
         "decision_action_valid_fraction": float(action_valid_mask.float().mean().item()),
@@ -1156,13 +1154,18 @@ def main() -> int:
         "missing_intended_stock_source_symbols": missing_intended_stock_source_symbols,
         "missing_intended_action_source_symbols": missing_intended_action_source_symbols,
         "dataset": str(dataset_path),
+        # Declare the canonical basis + its hash on metadata.json too. validate --dataset-dir reads only the
+        # manifest + metadata (not the .pt), so a SECOND declaring surface here is what arms the cross-surface
+        # return-basis AGREEMENT check (one declaring surface alone leaves it inert).
+        **action_return_basis,
+        "return_basis_content_hash": return_basis_content_hash,
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     manifest = DatasetManifest(
         dataset_id=f"{source_bar_interval}_to_hour_{hash_string_sequence(decision_timestamps)[:12]}",
         created_at_utc=utc_now_iso(),
         source_vendor="Polygon aggregates" if source_bar_interval == SECOND_SOURCE_BAR_INTERVAL else "Yahoo Finance chart",
-        symbols=[*selected_stocks, *etf_symbols],
+        symbols=[*selected_stocks, *action_symbols],
         universe_selection_date=universe_selection_date,
         bar_interval=f"1h decision / {source_bar_interval} context",
         timezone="UTC timestamps with exchange timestamp features",
@@ -1183,6 +1186,7 @@ def main() -> int:
         # Record the canonical action-return basis on the manifest too (not just the .pt payload), so the
         # reportability agreement check has a declared-side basis to compare against the evaluation's.
         **action_return_basis,
+        return_basis_content_hash=return_basis_content_hash,
     )
     try:
         manifest.validate()

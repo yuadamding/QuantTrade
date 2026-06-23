@@ -228,6 +228,10 @@ class EvaluationProtocol:
         train_end = parse_iso_timestamp(self.train_end)
         val_end = parse_iso_timestamp(self.val_end)
         test_start = parse_iso_timestamp(self.test_start)
+        if self.train_start is not None:
+            # parse_iso_timestamp also rejects tz-naive / malformed values.
+            if parse_iso_timestamp(self.train_start) > train_end:
+                raise ResearchProtocolError("train_start must be <= train_end.")
         if train_end >= val_end:
             raise ResearchProtocolError("train_end must be before val_end.")
         if val_end >= test_start:
@@ -324,16 +328,6 @@ class ModelManifest:
             StressTestResult(**item) for item in payload.get("frequency_stress_results", [])
         ]
         return cls(**payload)
-
-
-DEFAULT_BENCHMARKS = [
-    "CASH",
-    "BuyAndHold_QQQ",
-    "BuyAndHold_SPY",
-    "EqualWeight_ETFs",
-    "PreviousActionNoTrade",
-    "RandomSameTurnover",
-]
 
 
 def default_benchmark_registry(action_names: list[str]) -> list[str]:

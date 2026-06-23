@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 
 import torch
 
-from rl_quant.datasets.hourly import _validate_action_return_contract
 # The action-return basis contract lives in the protocol layer so the loader, the DatasetManifest, and the
 # reportability validators share ONE definition. Re-exported here so existing importers of these names from this
 # module keep working unchanged (the canonical home is rl_quant.protocol.action_return_basis).
@@ -37,6 +36,19 @@ _EASTERN = ZoneInfo("America/New_York")
 
 def default_second_to_hour_constraints() -> TradingConstraintConfig:
     return TradingConstraintConfig(max_switches_per_day=2, q_switch_margin_bps=3.0)
+
+
+def _validate_action_return_contract(action_returns: torch.Tensor, action_valid_mask: torch.Tensor | None) -> None:
+    if action_valid_mask is None:
+        if not bool(torch.isfinite(action_returns).all().item()):
+            raise ValueError("action_returns must be finite when no action_valid_mask is provided.")
+        return
+    valid_returns = action_returns[action_valid_mask]
+    if valid_returns.numel() and not bool(torch.isfinite(valid_returns).all().item()):
+        raise ValueError("Valid action_returns must be finite.")
+    invalid_returns = action_returns[~action_valid_mask]
+    if invalid_returns.numel() and not bool(torch.isnan(invalid_returns).all().item()):
+        raise ValueError("Invalid action_returns must be NaN when action_valid_mask is false.")
 
 
 @dataclass
@@ -803,10 +815,19 @@ def validate_second_timestamp_grid(payload: dict[str, Any]) -> None:
                     f"second_timestamp_grid minute count does not match second_mask at row {row_id}, hour {hour_id}."
                 )
             for second_id, second_ts in enumerate(hour):
+                is_valid = bool(mask[row_id, hour_id, second_id])
                 if not second_ts:
+                    # Fail closed: a mask-VALID bar with no timestamp cannot be checked for point-in-time
+                    # availability, so it must not silently pass the leakage guard. (The in-repo producer
+                    # derives timestamp and mask in lockstep, so this never trips on builder output.)
+                    if is_valid:
+                        raise ValueError(
+                            f"masked-valid second-context bar at row={row_id}, hour={hour_id}, "
+                            f"second={second_id} has no timestamp; cannot verify point-in-time availability."
+                        )
                     continue
                 second_dt = _parse_utc_timestamp(str(second_ts))
-                if bool(mask[row_id, hour_id, second_id]) and second_dt + latency_delta > decision_dt:
+                if is_valid and second_dt + latency_delta > decision_dt:
                     raise ValueError(
                         "Second context leakage at "
                         f"row={row_id}, hour={hour_id}, minute={second_id}: "
@@ -866,6 +887,11 @@ def _load_payload(
     validate_second_timestamp_grid(payload)
     validate_action_feature_tensors(payload)
     validate_action_return_basis(payload)
+    # hour_features are normalized with a plain mean/std + clamp_ (not the finite-safe _masked_mean_std
+    # used for second_features), and clamp_ does not remove NaN/Inf — so one non-finite value would poison
+    # the entire hour channel into the encoder. Reject it up front, matching the action_features contract.
+    if not bool(torch.isfinite(payload["hour_features"].float()).all().item()):
+        raise ValueError("hour_features must be finite.")
     return payload
 
 

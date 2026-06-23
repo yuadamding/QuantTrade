@@ -26,7 +26,6 @@ from rl_quant.features.news_llm import (
 )
 from rl_quant.second_to_hour_transformer import (
     HourFromMinuteDataSplit,
-    SecondToHourPolicyQNetwork,
 )
 from rl_quant.trading_constraints import CONSTRAINT_FEATURE_NAMES
 from _support import ROOT, load_script
@@ -74,6 +73,15 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         self.assertTrue(crossed.crossed)
         self.assertLess(crossed.spread, 0.0)
 
+    def test_parse_time_to_ns_keeps_wall_clock_minute_field(self) -> None:
+        # Regression: the minute->second rename once clobbered the MINUTE field of HH:MM:SS,
+        # collapsing 09:30:15 to 33315s instead of 34215s. Pin all three fields + fractional ns.
+        from rl_quant.data_sources.quote_utils import NANOS_PER_SECOND, parse_time_to_ns
+
+        self.assertEqual(parse_time_to_ns("09:30:15"), 34215 * NANOS_PER_SECOND)  # 9*3600 + 30*60 + 15
+        self.assertEqual(parse_time_to_ns("16:00:00"), 16 * 3600 * NANOS_PER_SECOND)
+        self.assertEqual(parse_time_to_ns("00:01:00"), 60 * NANOS_PER_SECOND)  # minute alone, not seconds
+        self.assertEqual(parse_time_to_ns("09:30:15.250"), 34215 * NANOS_PER_SECOND + 250_000_000)
 
     def test_calibrator_recovers_known_residual_std_and_flags_in_sample(self) -> None:
         rows = 100
@@ -5215,7 +5223,16 @@ class CoreAndFixRegressionTests(unittest.TestCase):
         import re
 
         src = ROOT / "src" / "rl_quant"
-        trainers = ["training/second_to_hour.py"]
+        # Glob EVERY trainer (not a hardcoded single path) so the "every trainer" promise actually holds: any
+        # module under training/ that calls dqn_td_target is checked, including the Stage-2 decision_policy
+        # trainer. core.py (which DEFINES dqn_td_target) lives outside training/, so its signature is not
+        # mis-scanned as a call.
+        training_dir = src / "training"
+        trainers = sorted(
+            f"training/{p.name}" for p in training_dir.glob("*.py") if "dqn_td_target(" in p.read_text()
+        )
+        self.assertIn("training/second_to_hour.py", trainers)
+        self.assertIn("training/decision_policy.py", trainers)
         call_re = re.compile(r"dqn_td_target\(([^\n]*)\)")
         for name in trainers:
             calls = call_re.findall((src / name).read_text())

@@ -42,7 +42,7 @@ def default_data_root() -> Path:
 DATA_ROOT = default_data_root()
 DEFAULT_ARTICLE_ROOT = DATA_ROOT / "polygon" / "stock_covariates" / "news_articles_v1" / "top500_2023_to_present"
 DEFAULT_PROTOCOL_ROOT = DATA_ROOT / "protocol" / "polygon_second_top500_2023_to_2026-06-15"
-DEFAULT_PARTITIONS_ROOT = DEFAULT_PROTOCOL_ROOT / "hour_from_second_1s" / "partitions"
+DEFAULT_PARTITIONS_ROOT = DEFAULT_PROTOCOL_ROOT / "hour_from_second_1s_top50" / "partitions"
 DEFAULT_OUTPUT_JSONL = (
     DATA_ROOT
     / "polygon"

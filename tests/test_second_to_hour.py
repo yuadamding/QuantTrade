@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
-import sys
 import tempfile
 import unittest
 from datetime import (
@@ -11,7 +10,6 @@ from datetime import (
     timedelta,
 )
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 import torch
 from torch import nn
@@ -26,7 +24,6 @@ from rl_quant.data_sources.polygon_second_aggs import (
     available_timestamp_ms,
     iso_to_timestamp_ms,
     load_manifest,
-    timestamp_ms_to_iso,
     validate_manifest,
 )
 from rl_quant.data_sources.polygon_stock_covariates import (
@@ -37,7 +34,6 @@ from rl_quant.features.stock_covariates import (
     ACTION_COVARIATE_ACTION_TYPE_FEATURE_NAMES,
     ACTION_COVARIATE_FEATURE_NAMES,
     ACTION_COVARIATE_SCHEMA_HASH,
-    append_action_covariates_to_payload,
     build_action_covariate_tensor,
     build_symbol_silver_rows,
     read_covariate_coverage_manifest,
@@ -54,7 +50,6 @@ from rl_quant.features.news_llm import (
     build_news_article_rows,
     write_news_llm_feature_outputs,
 )
-from rl_quant.research_protocol import stable_json_hash
 from rl_quant.second_to_hour_transformer import (
     HourFromMinuteDataSplit,
     SecondToHourPolicyQNetwork,
@@ -71,7 +66,7 @@ from rl_quant.trading_constraints import (
     CONSTRAINT_FEATURE_DIM,
     CONSTRAINT_FEATURE_NAMES,
 )
-from _support import ROOT, load_script
+from _support import load_script
 
 
 class SecondToHourTests(unittest.TestCase):
@@ -229,7 +224,6 @@ class SecondToHourTests(unittest.TestCase):
 
             payload = module._load_payload(path)
 
-        self.assertIn("second_features", payload)
         self.assertIn("second_features", payload)
         self.assertEqual(tuple(payload["second_features"].shape), (1, 1, 1, 1))
 
@@ -666,6 +660,13 @@ class SecondToHourTests(unittest.TestCase):
 
         self.assertEqual(float(bundle["action_covariates"][0, 1, news_1h_idx].item()), 0.0)
         self.assertAlmostEqual(float(bundle["action_covariates"][1, 1, news_1h_idx].item()), math.log1p(1.0), places=6)
+
+        # #7 regression: row 0 is "news-covered but no PRIOR news" (the article is at 15:00:01, after the
+        # 15:00:00 decision). news_age_seconds must be masked INVALID (not a fabricated age=0 marked valid),
+        # matching dividends/splits. Row 1 has a prior article, so its age is valid.
+        news_age_idx = ACTION_COVARIATE_FEATURE_NAMES.index("news_age_seconds")
+        self.assertFalse(bool(bundle["action_covariate_mask"][0, 1, news_age_idx].item()))
+        self.assertTrue(bool(bundle["action_covariate_mask"][1, 1, news_age_idx].item()))
 
     def test_stock_covariate_news_dedupes_and_weights_multi_ticker_articles(self) -> None:
         first = normalize_raw_covariate_record(

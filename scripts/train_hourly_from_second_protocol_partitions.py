@@ -37,7 +37,7 @@ DEFAULT_PARTITIONS_ROOT = (
     DATA_ROOT
     / "protocol"
     / "polygon_second_top500_2025_to_2026-06-15"
-    / "hour_from_second_1s"
+    / "hour_from_second_1s_top50"
     / "partitions"
 )
 
@@ -168,7 +168,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--minute-layers", type=int, default=2)
+    parser.add_argument("--second-layers", type=int, default=2)
     parser.add_argument("--hour-layers", type=int, default=2)
     parser.add_argument("--feedforward-dim", type=int, default=384)
     parser.add_argument("--dropout", type=float, default=0.05)
