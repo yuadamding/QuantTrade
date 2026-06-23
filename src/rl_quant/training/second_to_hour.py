@@ -55,9 +55,9 @@ from rl_quant.models.second_to_hour import (  # re-export: model moved to the mo
     SecondToHourPolicyQNetwork,
 )
 from rl_quant.datasets.hour_from_second import (
-    HourFromMinuteDataSplit,
+    HourFromSecondDataSplit,
     _timestamp_to_epoch_ms,
-    assert_matching_hour_from_minute_schema,
+    assert_matching_hour_from_second_schema,
     default_second_to_hour_constraints,
     second_to_hour_missing_label_report,
 )
@@ -221,7 +221,7 @@ def _eval_for_action_selection(module: nn.Module):
 
 
 def evaluate_second_to_hour_policy(
-    data: HourFromMinuteDataSplit,
+    data: HourFromSecondDataSplit,
     model: nn.Module,
     *,
     device: torch.device,
@@ -533,7 +533,7 @@ class _ConstantActionModel(nn.Module):
 
 
 def evaluate_second_to_hour_baselines(
-    data: HourFromMinuteDataSplit,
+    data: HourFromSecondDataSplit,
     *,
     device: torch.device,
     constraints: TradingConstraintConfig | None = None,
@@ -703,7 +703,7 @@ def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
 
 
 def _run_semantics_hash(
-    train_data: HourFromMinuteDataSplit,
+    train_data: HourFromSecondDataSplit,
     normalized_constraints: object,
     *,
     reward_scale: float,
@@ -759,7 +759,7 @@ def _run_semantics_hash(
 _DATASET_CONTENT_HASH_VERSION = 2
 
 
-def _dataset_content_hash(split: HourFromMinuteDataSplit) -> str:
+def _dataset_content_hash(split: HourFromSecondDataSplit) -> str:
     """Content fingerprint of ONE split's actual DATA -- model inputs, labels, masks, timestamps, and fitted
     normalizer stats -- DISTINCT from _run_semantics_hash (schema/economics). CPU bytes are deterministic
     across loads (NaN bit-patterns included), so the same data reproduces the same hash; computed once per run."""
@@ -804,7 +804,7 @@ def _dataset_content_hash(split: HourFromMinuteDataSplit) -> str:
     return digest.hexdigest()
 
 
-def _execution_shadow_cost_basis_status(train_data: HourFromMinuteDataSplit) -> str:
+def _execution_shadow_cost_basis_status(train_data: HourFromSecondDataSplit) -> str:
     """Whether the PR-3 execution shadow's turnover pricing is PROVEN correct for this dataset's declared
     action-return basis (reports what is proven, not merely what the shadow assumes). The shadow prices
     turnover with action_metadata.max_weight, which is exact for ``metadata_weighted_portfolio_returns`` and,
@@ -952,7 +952,7 @@ def load_second_to_hour_warm_start(
     model: nn.Module,
     *,
     checkpoint_path: str | bytes | PathLike[str],
-    train_data: HourFromMinuteDataSplit,
+    train_data: HourFromSecondDataSplit,
 ) -> dict[str, object]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
@@ -1016,8 +1016,8 @@ def compute_recency_weights(
 
 
 def train_second_to_hour_dqn(
-    train_data: HourFromMinuteDataSplit,
-    val_data: HourFromMinuteDataSplit,
+    train_data: HourFromSecondDataSplit,
+    val_data: HourFromSecondDataSplit,
     *,
     device: torch.device,
     config: SecondToHourTrainingConfig,
@@ -1035,7 +1035,7 @@ def train_second_to_hour_dqn(
     cash_index = normalized_constraints.cash_index
     # Schema matching is metadata/shape-level (device-agnostic), so fail on a mismatch BEFORE allocating GPU
     # memory or moving tensors to device.
-    assert_matching_hour_from_minute_schema(train_data, val_data)
+    assert_matching_hour_from_second_schema(train_data, val_data)
     # PR-4 fail-closed gate: training the env's execution reward (use_execution_env_reward) must NOT happen
     # until (1) the action_returns weight semantics are RESOLVED -- so the shadow's action_metadata.max_weight
     # turnover pricing is known correct (see docs/execution_wiring_design.md §3) -- AND (2) action metadata is
@@ -1689,6 +1689,27 @@ def train_second_to_hour_dqn(
         "action_feature_dim": 0 if train_data.action_features is None else int(train_data.action_features.shape[-1]),
         "action_feature_groups": train_data.action_feature_groups,
     }
+    # Val-curve honesty summary (review #4): the returned policy is the best-VALIDATION checkpoint, but a
+    # flat OOS is only interpretable once the learning curve has actually moved. Surface, derived from the
+    # (resume-spanning) eval_trace, the initial / best / final val return + the step the best was reached,
+    # so a reader can tell "trained to convergence" from "best == the first near-init eval" (under-trained)
+    # without re-deriving it from the raw trace.
+    if eval_trace:
+        _best_eval = max(eval_trace, key=lambda entry: (entry["val_return"], -entry["val_order_legs"]))
+        artifacts["val_curve_summary"] = {
+            "evals": len(eval_trace),
+            "initial_val_return": eval_trace[0]["val_return"],
+            "initial_val_step": eval_trace[0]["step"],
+            "final_val_return": eval_trace[-1]["val_return"],
+            "final_val_step": eval_trace[-1]["step"],
+            "best_val_return": best_val_return,
+            "best_val_step": _best_eval["step"],
+            # The returned best checkpoint never improved on the FIRST (near-init) evaluation -> the policy
+            # is under-trained and a flat/negative OOS result is NOT yet interpretable as "no signal".
+            "best_equals_initial_eval": _best_eval["step"] == eval_trace[0]["step"],
+        }
+    else:
+        artifacts["val_curve_summary"] = {"evals": 0}
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         free, total = torch.cuda.mem_get_info(device)

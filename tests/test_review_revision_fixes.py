@@ -61,6 +61,88 @@ class SslCashIndexTests(unittest.TestCase):
         self.assertAlmostEqual(float(default_target[0, 0]), 0.15, places=5)  # mean(0.0, 0.30), col 0 excluded
 
 
+class NewsLlmAnachronisticModelGuardTests(unittest.TestCase):
+    """Methodology-review fix: the merge-level reportability for the news-LLM sidecar was silently
+    defeated by a sentinel model_available_timestamp_ms (e.g. 1000 ms = 1970), which predates any
+    backtest and so passed the "available before first decision" check while hiding that the scoring
+    model did not exist / encodes future knowledge. The guard must now fire on a sentinel availability
+    and on an unknown / post-first-decision training cutoff, while leaving the deterministic baseline
+    (model_available_timestamp_ms == 0) reportable."""
+
+    def _article(self, published_iso: str) -> dict:
+        from rl_quant.data_sources.polygon_second_aggs import iso_to_timestamp_ms
+
+        return {
+            "article_id": "article-1",
+            "published_utc": published_iso,
+            "published_timestamp_ms": iso_to_timestamp_ms(published_iso),
+            "source_available_timestamp_ms": iso_to_timestamp_ms(published_iso),
+            "title": "QQQ beats earnings and raises guidance",
+            "description": "Analysts upgrade the stock after strong profit growth.",
+            "tickers_json": '["QQQ"]',
+            "primary_ticker": "QQQ",
+        }
+
+    def _merge(self, rows, decision_iso: str) -> list[str]:
+        from rl_quant.data_sources.polygon_second_aggs import iso_to_timestamp_ms
+        from rl_quant.features.news_llm import build_action_news_llm_tensor
+
+        bundle = build_action_news_llm_tensor(
+            news_llm_rows_by_symbol={"QQQ": rows},
+            action_names=["CASH", "QQQ"],
+            decision_timestamps_ms=[iso_to_timestamp_ms(decision_iso)],
+            source_symbols=["QQQ"],
+            source_manifest_hash="news-llm-manifest-hash",
+        )
+        return list(bundle["action_news_llm_reportability_errors"])
+
+    def test_sentinel_availability_and_unknown_cutoff_are_nonreportable(self) -> None:
+        from rl_quant.features.news_llm import build_deterministic_news_llm_rows
+
+        rows = build_deterministic_news_llm_rows(
+            [self._article("2024-01-05T15:00:00+00:00")],
+            model_id="Qwen/Qwen3-1.7B",
+            model_available_timestamp_ms=1000,  # the 1970 sentinel that defeated the old guard
+            vendor_latency_seconds=0,
+            processing_latency_seconds=0,
+        )
+        errors = self._merge(rows, "2024-06-01T15:00:00+00:00")
+        self.assertIn("news_llm_model_available_timestamp_implausible", errors)
+        self.assertIn("news_llm_model_training_cutoff_unknown", errors)
+
+    def test_anachronistic_training_cutoff_is_nonreportable(self) -> None:
+        from rl_quant.features.news_llm import build_deterministic_news_llm_rows
+
+        # Model released BEFORE the first decision (passes availability + floor) but trained on data
+        # through AFTER the first decision -> its weights encode future knowledge.
+        rows = build_deterministic_news_llm_rows(
+            [self._article("2023-06-05T15:00:00+00:00")],
+            model_id="Qwen/Qwen3-1.7B",
+            model_available_timestamp_ms=1_577_836_800_000,  # 2020-01-01
+            model_training_cutoff_utc="2025-06-01T00:00:00+00:00",
+            vendor_latency_seconds=0,
+            processing_latency_seconds=0,
+        )
+        errors = self._merge(rows, "2024-01-02T15:00:00+00:00")  # first decision 2024-01-02
+        self.assertIn("news_llm_model_training_cutoff_after_first_decision", errors)
+        self.assertNotIn("news_llm_model_available_timestamp_implausible", errors)
+        self.assertNotIn("news_llm_model_available_after_first_decision", errors)
+
+    def test_deterministic_baseline_stays_reportable(self) -> None:
+        from rl_quant.features.news_llm import build_deterministic_news_llm_rows
+
+        rows = build_deterministic_news_llm_rows(
+            [self._article("2024-01-05T15:00:00+00:00")],
+            model_available_timestamp_ms=0,  # no scoring model -> exempt from the anachronism guard
+            vendor_latency_seconds=0,
+            processing_latency_seconds=0,
+        )
+        errors = self._merge(rows, "2024-06-01T15:00:00+00:00")
+        self.assertNotIn("news_llm_model_available_timestamp_implausible", errors)
+        self.assertNotIn("news_llm_model_training_cutoff_unknown", errors)
+        self.assertNotIn("news_llm_model_training_cutoff_after_first_decision", errors)
+
+
 class EvaluationProtocolTrainStartTests(unittest.TestCase):
     def _proto(self, **overrides):
         from rl_quant.evaluation.research_protocol import EvaluationProtocol
@@ -219,7 +301,7 @@ class NewsLlmAggregateGoldenTests(unittest.TestCase):
 
 class EnvDayBoundaryParityTests(unittest.TestCase):
     def _multi_day_split(self):
-        from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit
+        from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit
 
         ts = [
             "2026-01-02T14:30:00+00:00", "2026-01-02T15:30:00+00:00",
@@ -230,7 +312,7 @@ class EnvDayBoundaryParityTests(unittest.TestCase):
             "2026-01-05T15:30:00+00:00", "2026-01-05T16:30:00+00:00",
         ]
         n = len(ts)
-        return HourFromMinuteDataSplit(
+        return HourFromSecondDataSplit(
             name="t", decision_timestamps=ts, next_timestamps=nxt,
             second_feature_names=["m"], hour_feature_names=["h"], action_names=["CASH", "QQQ"],
             second_features=torch.zeros((n, 1, 1, 1), dtype=torch.float32),

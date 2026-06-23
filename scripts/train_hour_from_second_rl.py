@@ -176,7 +176,7 @@ def main() -> int:
             SecondToHourEnvConfig,
             SecondToHourTrainingConfig,
             action_index,
-            build_hour_from_minute_splits,
+            build_hour_from_second_splits,
             evaluate_second_to_hour_policy,
             train_second_to_hour_dqn,
         )
@@ -194,7 +194,7 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    train_split, val_split, test_split = build_hour_from_minute_splits(
+    train_split, val_split, test_split = build_hour_from_second_splits(
         dataset_path=args.dataset,
         split_mode=args.split_mode,
         train_start=args.train_start,

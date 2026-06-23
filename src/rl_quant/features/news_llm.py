@@ -187,6 +187,29 @@ def parse_timestamp_ms(value: str | int | float | None, *, default: int | None =
     return parse_utc_timestamp_ms(text)
 
 
+# Earliest plausible public availability for an LLM capable of structured news extraction
+# (2018-01-01T00:00:00Z in ms). A positive model_available_timestamp_ms below this floor is a
+# sentinel placeholder (e.g. 1000 ms = 1970), not a real release, and must not silently satisfy the
+# point-in-time availability guard.
+_LLM_EXTRACTOR_AVAILABILITY_FLOOR_MS = 1_514_764_800_000
+
+
+def _parse_model_training_cutoff_ms(value: Any) -> int | None:
+    """Parse a model_training_cutoff_utc field to epoch ms, or None when it is not a real, provable
+    date. Sentinels used for downloaded/unknown-provenance models ("unknown", "not_applicable...",
+    empty) and any unparseable value return None so the caller can treat an unprovable cutoff as a
+    reportability error rather than as "safe"."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or not text[0].isdigit():
+        return None
+    try:
+        return parse_timestamp_ms(text)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def json_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -1257,6 +1280,31 @@ def build_action_news_llm_tensor(
         reportability_errors.append("news_llm_source_coverage_missing")
     if first_decision is not None and model_available_timestamp_ms > first_decision:
         reportability_errors.append("news_llm_model_available_after_first_decision")
+    # Anachronistic / sentinel scoring-model guard. Only LLM-scored rows carry a positive
+    # model_available_timestamp_ms; the deterministic keyword baseline reports 0 and is exempt. The
+    # plain "available before first decision" check above is silently defeated by a sentinel
+    # availability such as 1000 ms (1970-01-01): it trivially predates any backtest while hiding that
+    # the scoring model did not exist at decision time. Two extra checks close that hole:
+    #   (1) a positive availability below a plausible LLM-era floor is a sentinel, not a real release;
+    #   (2) the scoring model's training cutoff must be a real date that does NOT postdate the first
+    #       decision -- otherwise its weights encode information from after the backtest start
+    #       (anachronistic-model look-ahead). An unknown/non-date cutoff cannot be proven safe.
+    llm_scored_rows = [
+        row
+        for rows in rows_by_symbol.values()
+        for row in rows
+        if int(_finite(row.get("model_available_timestamp_ms"), default=0.0)) > 0
+    ]
+    if llm_scored_rows:
+        if 0 < model_available_timestamp_ms < _LLM_EXTRACTOR_AVAILABILITY_FLOOR_MS:
+            reportability_errors.append("news_llm_model_available_timestamp_implausible")
+        cutoffs = [_parse_model_training_cutoff_ms(row.get("model_training_cutoff_utc")) for row in llm_scored_rows]
+        if any(cutoff is None for cutoff in cutoffs):
+            reportability_errors.append("news_llm_model_training_cutoff_unknown")
+        if first_decision is not None and any(
+            cutoff is not None and cutoff > first_decision for cutoff in cutoffs
+        ):
+            reportability_errors.append("news_llm_model_training_cutoff_after_first_decision")
     features = torch.tensor(value_rows, dtype=torch.float32)
     mask = torch.tensor(mask_rows, dtype=torch.bool)
     available = torch.tensor(available_rows, dtype=torch.long)

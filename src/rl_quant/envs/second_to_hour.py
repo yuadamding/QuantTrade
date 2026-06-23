@@ -16,7 +16,7 @@ from rl_quant.trading_constraints import (
 )
 
 from rl_quant.datasets.hour_from_second import (
-    HourFromMinuteDataSplit,
+    HourFromSecondDataSplit,
     default_second_to_hour_constraints,
 )
 from rl_quant.core import concrete_torch_device
@@ -223,7 +223,7 @@ def validate_second_to_hour_constraints(
     )
 
 
-def validate_cash_usable_on_decision_rows(data: HourFromMinuteDataSplit, cash_index: int) -> None:
+def validate_cash_usable_on_decision_rows(data: HourFromSecondDataSplit, cash_index: int) -> None:
     """CASH is the FORCED safety fallback for masked / missing-label actions, so it must be USABLE on every
     valid decision row: its label must be VALID *and* its return FINITE. The fallback reads
     ``action_returns[row, cash_index]`` directly (a non-finite return would emit a NaN reward) and the
@@ -247,7 +247,7 @@ def validate_cash_usable_on_decision_rows(data: HourFromMinuteDataSplit, cash_in
 
 
 class VectorizedSecondToHourEnv:
-    def __init__(self, data: HourFromMinuteDataSplit, config: SecondToHourEnvConfig, device: torch.device) -> None:
+    def __init__(self, data: HourFromSecondDataSplit, config: SecondToHourEnvConfig, device: torch.device) -> None:
         # initial_action gets the SHARED action-index discipline; the rest of the constraint fields that feed
         # the action mask AND the cost ledger (cash_index must be a real CASH action; count_etf must be a real
         # bool; the bps scalars finite/non-negative) are validated together at construction -- BEFORE any mask

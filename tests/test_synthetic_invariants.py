@@ -30,7 +30,7 @@ from rl_quant.envs.second_to_hour import (
     transition_net_return_and_reward,
     transition_trade_cost_bps,
 )
-from rl_quant.second_to_hour_transformer import HourFromMinuteDataSplit
+from rl_quant.second_to_hour_transformer import HourFromSecondDataSplit
 from rl_quant.training.second_to_hour import (
     SecondToHourTrainingConfig,
     _ConstantActionModel,
@@ -65,7 +65,7 @@ def _two_action_split(per_row_returns, *, name="eval", label_valid=None):
         if label_valid is None
         else torch.as_tensor(label_valid, dtype=torch.bool)
     )
-    return HourFromMinuteDataSplit(
+    return HourFromSecondDataSplit(
         name=name,
         decision_timestamps=[f"2026-01-02T{10 + i:02d}:30:00+00:00" for i in range(rows)],
         next_timestamps=[f"2026-01-02T{11 + i:02d}:30:00+00:00" for i in range(rows)],

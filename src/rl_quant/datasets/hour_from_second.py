@@ -27,7 +27,6 @@ from rl_quant.trading_constraints import (
 
 
 DEFAULT_HOUR_DECISION_GRID_MINUTES = 60
-DEFAULT_MINUTE_SOURCE_INTERVAL = "1m"
 DEFAULT_SECOND_SOURCE_INTERVAL = "1s"
 DEFAULT_SECOND_BAR_LATENCY_MS = 1000
 DEFAULT_EXCHANGE_CALENDAR_ID = "XNYS_decision_timestamp_sessions_America_New_York_v1"
@@ -52,7 +51,7 @@ def _validate_action_return_contract(action_returns: torch.Tensor, action_valid_
 
 
 @dataclass
-class HourFromMinuteDataSplit:
+class HourFromSecondDataSplit:
     name: str
     decision_timestamps: list[str]
     next_timestamps: list[str]
@@ -75,7 +74,7 @@ class HourFromMinuteDataSplit:
     periods_per_year: float = 252.0 * 6.0
     action_valid_mask: torch.Tensor | None = None
     label_valid_mask: torch.Tensor | None = None
-    source_bar_interval: str = DEFAULT_MINUTE_SOURCE_INTERVAL
+    source_bar_interval: str = DEFAULT_SECOND_SOURCE_INTERVAL
     context_bars_per_hour: int | None = None
     dataset_reportable: bool = True
     dataset_reportability_errors: list[str] = field(default_factory=list)
@@ -120,7 +119,7 @@ class HourFromMinuteDataSplit:
     def effective_context_bars_per_hour(self) -> int:
         return int(self.context_bars_per_hour or self.seconds_per_hour)
 
-    def to(self, device: torch.device | str) -> "HourFromMinuteDataSplit":
+    def to(self, device: torch.device | str) -> "HourFromSecondDataSplit":
         return replace(
             self,
             second_features=self.second_features.to(device),
@@ -790,7 +789,7 @@ def validate_second_timestamp_grid(payload: dict[str, Any]) -> None:
     next_timestamps = list(payload["next_timestamps"])
     grid = payload["second_timestamp_grid"]
     mask = payload["second_mask"].bool()
-    source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
+    source_interval = str(payload.get("source_bar_interval", DEFAULT_SECOND_SOURCE_INTERVAL))
     default_latency_ms = DEFAULT_SECOND_BAR_LATENCY_MS if source_interval == DEFAULT_SECOND_SOURCE_INTERVAL else 0
     bar_latency_ms = int(payload.get("bar_latency_ms", default_latency_ms))
     if bar_latency_ms < 0:
@@ -839,7 +838,7 @@ def validate_hour_level_decision_grid(payload: dict[str, Any]) -> None:
     explicit_stride = payload.get("decision_stride_minutes", payload.get("decision_grid_minutes"))
     if explicit_stride is not None and int(explicit_stride) != DEFAULT_HOUR_DECISION_GRID_MINUTES:
         raise ValueError("Second-to-hour datasets must use an hourly decision grid with 60-minute rewards.")
-    source_interval = str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL))
+    source_interval = str(payload.get("source_bar_interval", DEFAULT_SECOND_SOURCE_INTERVAL))
     expected_bars = expected_context_bars_per_hour(source_interval)
     explicit_context_bars = payload.get("context_bars_per_hour", payload.get("seconds_per_hour"))
     if explicit_context_bars is not None and int(explicit_context_bars) != expected_bars:
@@ -984,7 +983,7 @@ def _build_split(
     action_feature_mean: torch.Tensor | None = None,
     action_feature_std: torch.Tensor | None = None,
     split_policy: dict[str, object] | None = None,
-) -> HourFromMinuteDataSplit:
+) -> HourFromSecondDataSplit:
     decisions = list(payload["decision_timestamps"])
     next_timestamps = list(payload["next_timestamps"])
     if not decisions:
@@ -1140,7 +1139,7 @@ def _build_split(
     valid_index_mask = torch.zeros(len(decision_subset), dtype=torch.bool)
     valid_index_mask[valid_start_indices] = True
 
-    return HourFromMinuteDataSplit(
+    return HourFromSecondDataSplit(
         name=name,
         decision_timestamps=decision_subset,
         next_timestamps=next_subset,
@@ -1163,7 +1162,7 @@ def _build_split(
         seconds_per_hour=int(payload.get("seconds_per_hour", raw_second.shape[2])),
         decision_grid_minutes=int(payload.get("decision_grid_minutes", payload.get("decision_stride_minutes", DEFAULT_HOUR_DECISION_GRID_MINUTES))),
         periods_per_year=float(payload.get("periods_per_year", 252.0 * 6.0)),
-        source_bar_interval=str(payload.get("source_bar_interval", DEFAULT_MINUTE_SOURCE_INTERVAL)),
+        source_bar_interval=str(payload.get("source_bar_interval", DEFAULT_SECOND_SOURCE_INTERVAL)),
         context_bars_per_hour=int(payload.get("context_bars_per_hour", payload.get("seconds_per_hour", raw_second.shape[2]))),
         dataset_reportable=dataset_reportable,
         dataset_reportability_errors=dataset_reportability_errors,
@@ -1191,7 +1190,7 @@ def _build_split(
     )
 
 
-def build_hour_from_minute_splits(
+def build_hour_from_second_splits(
     *,
     dataset_path,
     split_mode: str = "latest_holdout",
@@ -1209,7 +1208,7 @@ def build_hour_from_minute_splits(
     min_train_rows: int = 1,
     action_covariate_sidecar: str | bytes | PathLike[str] = "auto",
     news_llm_sidecar: str | bytes | PathLike[str] = "none",
-) -> tuple[HourFromMinuteDataSplit, HourFromMinuteDataSplit, HourFromMinuteDataSplit]:
+) -> tuple[HourFromSecondDataSplit, HourFromSecondDataSplit, HourFromSecondDataSplit]:
     payload = _load_payload(
         dataset_path,
         action_covariate_sidecar=action_covariate_sidecar,
@@ -1369,11 +1368,11 @@ def build_hour_from_minute_splits(
         )
     else:
         raise ValueError(f"Unsupported split_mode {split_mode!r}.")
-    assert_matching_hour_from_minute_schema(train, val, test)
+    assert_matching_hour_from_second_schema(train, val, test)
     return train, val, test
 
 
-def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) -> None:
+def assert_matching_hour_from_second_schema(*splits: HourFromSecondDataSplit) -> None:
     if not splits:
         return
     reference = splits[0]
@@ -1411,7 +1410,7 @@ def assert_matching_hour_from_minute_schema(*splits: HourFromMinuteDataSplit) ->
 
 
 def second_to_hour_missing_label_report(
-    split: HourFromMinuteDataSplit,
+    split: HourFromSecondDataSplit,
     *,
     row_indices: torch.Tensor | list[int] | None = None,
     requested_actions: torch.Tensor | list[int] | None = None,

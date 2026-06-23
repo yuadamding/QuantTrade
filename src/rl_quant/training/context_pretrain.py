@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit
+from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit
 from rl_quant.models.second_to_hour import SecondContextForwardHead, SecondToHourContextEncoder
 
 
@@ -58,7 +58,7 @@ def forward_market_targets(
 
 
 def train_second_context_encoder(
-    train_data: HourFromMinuteDataSplit,
+    train_data: HourFromSecondDataSplit,
     config: ContextPretrainConfig = ContextPretrainConfig(),
     *,
     device: torch.device | str = "cpu",
@@ -94,8 +94,11 @@ def train_second_context_encoder(
             )
             pred = head(encoder(second, mask, hour))
             loss = loss_fn(pred, target)
-            opt.zero_grad(); loss.backward(); opt.step()
-            epoch_loss += float(loss.detach()); n_batches += 1
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += float(loss.detach())
+            n_batches += 1
         mean_loss = epoch_loss / max(n_batches, 1)
         if epoch == 0:
             first = mean_loss
@@ -105,7 +108,7 @@ def train_second_context_encoder(
 
 @torch.no_grad()
 def encode_split(
-    encoder: SecondToHourContextEncoder, data: HourFromMinuteDataSplit, *, batch_size: int = 256,
+    encoder: SecondToHourContextEncoder, data: HourFromSecondDataSplit, *, batch_size: int = 256,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
     """Precompute the frozen hourly context embedding ``[D, d_model]`` for every decision row -- the compact

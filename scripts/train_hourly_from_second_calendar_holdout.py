@@ -5,9 +5,10 @@ import argparse
 import csv
 import gc
 import json
+import statistics
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -188,6 +189,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recency-half-life-days", type=float, default=120.0)
     parser.add_argument("--recency-min-weight", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent seeds to train for this window (seeds = base --seed, +1, +2, ...). "
+            ">1 trains an ensemble; the reported policy is the seed with the best VALIDATION return (never "
+            "test), and per-seed test dispersion is recorded under summary.seed_ensemble. Default 1 = the "
+            "prior single-seed behaviour (resume honoured)."
+        ),
+    )
     parser.add_argument(
         "--expected-action-count",
         type=int,
@@ -897,37 +909,104 @@ def main(argv: list[str] | None = None) -> int:
             min_weight=args.recency_min_weight,
         ),
     )
+    seed_list = [args.seed + offset for offset in range(max(1, int(args.seeds)))]
+    multi_seed = len(seed_list) > 1
     started = datetime.now(timezone.utc)
     try:
-        model, artifacts = train_second_to_hour_dqn(train_split, val_split, device=device, config=train_config)
-        train_result = evaluate_second_to_hour_policy(
-            train_split.to(device),
-            model,
-            device=device,
-            initial_action=initial_action,
-            constraints=constraints,
-            episode_length=args.episode_length,
-            cash_idle_penalty_bps=args.cash_idle_penalty_bps,
-        )
-        val_result = evaluate_second_to_hour_policy(
-            val_split.to(device),
-            model,
-            device=device,
-            initial_action=initial_action,
-            constraints=constraints,
-            episode_length=args.episode_length,
-            cash_idle_penalty_bps=args.cash_idle_penalty_bps,
-        )
-        test_result = evaluate_second_to_hour_policy(
-            test_split.to(device),
-            model,
-            device=device,
-            initial_action=initial_action,
-            constraints=constraints,
-            episode_length=args.episode_length,
-            cash_idle_penalty_bps=args.cash_idle_penalty_bps,
-            capture_rollout=True,
-        )
+        seed_runs: list[dict[str, Any]] = []
+        for seed in seed_list:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            # Per-seed config: when ensembling, give each seed its own checkpoint state file and disable
+            # cross-seed resume so the seeds stay independent (resume is a single long-run feature). With
+            # a single seed the original train_config (resume honoured) is used unchanged.
+            seed_config = train_config
+            if multi_seed:
+                seed_config = replace(
+                    train_config,
+                    resume_training_state=None,
+                    checkpoint_training_state=(
+                        run_dir / f"training_state_seed{seed}.pt" if args.checkpoint_every_steps > 0 else None
+                    ),
+                )
+            seed_model, seed_artifacts = train_second_to_hour_dqn(
+                train_split, val_split, device=device, config=seed_config
+            )
+            seed_train_result = evaluate_second_to_hour_policy(
+                train_split.to(device),
+                seed_model,
+                device=device,
+                initial_action=initial_action,
+                constraints=constraints,
+                episode_length=args.episode_length,
+                cash_idle_penalty_bps=args.cash_idle_penalty_bps,
+            )
+            seed_val_result = evaluate_second_to_hour_policy(
+                val_split.to(device),
+                seed_model,
+                device=device,
+                initial_action=initial_action,
+                constraints=constraints,
+                episode_length=args.episode_length,
+                cash_idle_penalty_bps=args.cash_idle_penalty_bps,
+            )
+            seed_test_result = evaluate_second_to_hour_policy(
+                test_split.to(device),
+                seed_model,
+                device=device,
+                initial_action=initial_action,
+                constraints=constraints,
+                episode_length=args.episode_length,
+                cash_idle_penalty_bps=args.cash_idle_penalty_bps,
+                capture_rollout=True,
+            )
+            seed_runs.append(
+                {
+                    "seed": seed,
+                    "model": seed_model,
+                    "artifacts": seed_artifacts,
+                    "train_result": seed_train_result,
+                    "val_result": seed_val_result,
+                    "test_result": seed_test_result,
+                }
+            )
+            if multi_seed:
+                print(
+                    f"  seed {seed}: val_total_return={seed_val_result.total_return:.6f} "
+                    f"test_total_return={seed_test_result.total_return:.6f}",
+                    flush=True,
+                )
+        # Select the reported policy by VALIDATION return only (never test), so the official test metrics
+        # below are reported off a checkpoint chosen without peeking at the held-out test window.
+        selected = max(seed_runs, key=lambda run: run["val_result"].total_return)
+        model = selected["model"]
+        artifacts = selected["artifacts"]
+        train_result = selected["train_result"]
+        val_result = selected["val_result"]
+        test_result = selected["test_result"]
+        seed_test_returns = [run["test_result"].total_return for run in seed_runs]
+        seed_ensemble = {
+            "seed_count": len(seed_list),
+            "seeds": seed_list,
+            "selected_seed": selected["seed"],
+            "selection_metric": "validation_total_return",
+            "test_used_for_selection": False,
+            "per_seed": [
+                {
+                    "seed": run["seed"],
+                    "val_total_return": run["val_result"].total_return,
+                    "test_total_return": run["test_result"].total_return,
+                    "test_annualized_sharpe": run["test_result"].annualized_sharpe,
+                    "test_order_legs": run["test_result"].market_order_legs,
+                }
+                for run in seed_runs
+            ],
+            "test_total_return_mean": statistics.fmean(seed_test_returns),
+            "test_total_return_stdev": statistics.stdev(seed_test_returns) if len(seed_test_returns) > 1 else 0.0,
+            "test_total_return_min": min(seed_test_returns),
+            "test_total_return_max": max(seed_test_returns),
+        }
         checkpoint_path = run_dir / "model.pt"
         torch.save(
             {
@@ -1005,6 +1084,7 @@ def main(argv: list[str] | None = None) -> int:
                 "action_names_tail": train_split.action_names[-20:],
             },
             "policy_diagnostics": policy_diagnostics,
+            "seed_ensemble": seed_ensemble,
             "checkpoint": str(checkpoint_path),
             "training_state_checkpoint": str(training_state_path),
             "split_windows": {
@@ -1034,6 +1114,8 @@ def main(argv: list[str] | None = None) -> int:
                 "test_switches": test_result.allocation_switches,
                 "test_order_legs": test_result.market_order_legs,
                 "checkpoint_selected_on": "validation",
+                "selected_seed": selected["seed"],
+                "seed_count": len(seed_list),
                 "test_used_for_selection": False,
                 "reportable": bool(test_result.evaluation_reportable),
                 "reportability_errors": list(test_result.reportability_errors),

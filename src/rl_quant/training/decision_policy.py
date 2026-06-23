@@ -20,6 +20,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from rl_quant.core import (
@@ -28,7 +29,7 @@ from rl_quant.core import (
     epsilon_by_step,
     safe_next_row_indices,
 )
-from rl_quant.datasets.hour_from_second import HourFromMinuteDataSplit
+from rl_quant.datasets.hour_from_second import HourFromSecondDataSplit
 from rl_quant.envs.second_to_hour import SecondToHourEnvConfig, VectorizedSecondToHourEnv
 from rl_quant.models.decision_policy import DecisionPolicyQNetwork
 from rl_quant.models.second_to_hour import SecondToHourContextEncoder
@@ -63,6 +64,7 @@ class DecisionPolicyConfig:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     target_update_interval: int = 150
+    eval_interval: int = 250  # val-eval cadence when a validation split is supplied (best-val selection)
 
 
 @contextmanager
@@ -87,8 +89,34 @@ def freeze_encoder(encoder: SecondToHourContextEncoder) -> SecondToHourContextEn
     return encoder
 
 
+class _StagePolicyEvalBridge(nn.Module):
+    """Eval-only composition of the FROZEN Stage-1 encoder and the LIVE Stage-2 policy, exposing the
+    end-to-end ``(second, mask, hour, prev, constraint, ...)`` forward + the passthrough attributes
+    ``evaluate_second_to_hour_policy`` reads. It holds REFERENCES (no copy), so evaluating it always
+    reflects the current policy weights -- used purely for best-validation checkpoint selection, the
+    same eval path the joint trainer uses, so the Stage-2 selection metric is apples-to-apples with it."""
+
+    def __init__(self, encoder: SecondToHourContextEncoder, policy: DecisionPolicyQNetwork) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.policy = policy
+        self.action_count = policy.action_count
+        self.action_feature_dim = policy.action_feature_dim
+        self.transition_feature_dim = policy.transition_feature_dim
+        self.dynamic_feature_dim = policy.dynamic_feature_dim
+        self.hours_lookback = encoder.hours_lookback
+        self.seconds_per_hour = encoder.seconds_per_hour
+        self.max_second_tokens = encoder.max_second_tokens
+
+    def forward(self, second_features, second_mask, hour_features, previous_actions, constraint_features,
+                action_features=None, dynamic_state=None):
+        context = self.encoder(second_features, second_mask, hour_features)
+        return self.policy(context, previous_actions, constraint_features,
+                           action_features=action_features, dynamic_state=dynamic_state)
+
+
 def precompute_context_embeddings(
-    encoder: SecondToHourContextEncoder, data: HourFromMinuteDataSplit, *, device: torch.device | str = "cpu"
+    encoder: SecondToHourContextEncoder, data: HourFromSecondDataSplit, *, device: torch.device | str = "cpu"
 ) -> torch.Tensor:
     """Frozen hourly embedding ``[D, d_model]`` per decision row -- the Stage-2 observation source."""
     embeddings = encode_split(freeze_encoder(encoder), data, device=device)
@@ -117,15 +145,24 @@ def build_decision_policy(
 
 def train_decision_policy_dqn(
     embeddings: torch.Tensor,
-    data: HourFromMinuteDataSplit,
+    data: HourFromSecondDataSplit,
     config: DecisionPolicyConfig = DecisionPolicyConfig(),
     *,
     device: torch.device | str = "cpu",
     transition_table: torch.Tensor | None = None,
+    encoder: SecondToHourContextEncoder | None = None,
+    val_data: HourFromSecondDataSplit | None = None,
+    initial_action: int = 0,
 ) -> tuple[DecisionPolicyQNetwork, dict]:
     """Double-DQN over the precomputed context ``embeddings [D, d_model]``. Reuses the second->hour env (state
     machine + reward + constraint masks) and the shared DQN helpers; the observation is ``embeddings[indices]``
-    and the model is a ``DecisionPolicyQNetwork`` (no transformer in the loop). Returns ``(policy, metrics)``."""
+    and the model is a ``DecisionPolicyQNetwork`` (no transformer in the loop). Returns ``(policy, metrics)``.
+
+    Best-validation checkpoint selection (review #4): pass BOTH ``encoder`` (the FROZEN Stage-1 encoder) and
+    ``val_data`` (a held-out split) to evaluate the policy every ``config.eval_interval`` steps on the SAME
+    eval path the joint trainer uses, keep the best-validation ``state_dict``, and return THAT checkpoint
+    (not the final, possibly-overfit one). With either omitted the function returns the final policy, exactly
+    as before -- so existing callers are unaffected."""
     device = torch.device(device)
     data = data.to(device)
     split_key = getattr(embeddings, "_qt_split_key", None)  # captured before .to() drops custom attrs
@@ -197,6 +234,36 @@ def train_decision_policy_dqn(
     def action_feats(indices):
         return data.action_feature_state(indices) if use_action_features else None
 
+    # Best-validation selection: enabled only when both the frozen encoder and a val split are supplied.
+    do_val_selection = encoder is not None and val_data is not None
+    eval_bridge = _StagePolicyEvalBridge(freeze_encoder(encoder), policy) if do_val_selection else None
+    best_val_return = -float("inf")
+    best_val_step: int | None = None
+    best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+    val_trace: list[dict] = []
+
+    def _maybe_select_on_val(step: int) -> None:
+        nonlocal best_val_return, best_val_step, best_state
+        if not do_val_selection:
+            return
+        if step % config.eval_interval != 0 and step != config.train_steps:
+            return
+        from rl_quant.training.second_to_hour import evaluate_second_to_hour_policy
+
+        was_training = policy.training
+        val_result = evaluate_second_to_hour_policy(
+            val_data, eval_bridge, device=device, initial_action=initial_action,
+            constraints=env.constraints, episode_length=config.episode_length, reward_scale=config.reward_scale,
+        )
+        if was_training:
+            policy.train()  # the evaluator put the shared policy in eval(); restore train() for grad steps
+        val_trace.append({"step": step, "val_return": val_result.total_return,
+                          "val_order_legs": val_result.market_order_legs})
+        if val_result.total_return > best_val_return:
+            best_val_return = val_result.total_return
+            best_val_step = step
+            best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+
     reward_trace: list[float] = []
     loss_trace: list[float] = []
     for step in range(1, config.train_steps + 1):
@@ -235,13 +302,25 @@ def train_decision_policy_dqn(
                 next_q = next_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
                 target_q = dqn_td_target(batch["rewards"], config.gamma, batch["terminated"], next_q)
             loss = F.smooth_l1_loss(chosen_q.float(), target_q.float())
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
             loss_trace.append(float(loss.detach()))
             if step % config.target_update_interval == 0:
                 target.load_state_dict(policy.state_dict())
+
+        _maybe_select_on_val(step)
+
+    # Return the best-VALIDATION checkpoint (not the final, possibly-overfit one) when val selection ran.
+    if do_val_selection:
+        policy.load_state_dict(best_state)
 
     return policy, {
         "train_steps": config.train_steps,
         "final_loss": loss_trace[-1] if loss_trace else None,
         "mean_reward_last_100": (sum(reward_trace[-100:]) / len(reward_trace[-100:])) if reward_trace else None,
+        "val_selected": do_val_selection,
+        "best_val_return": best_val_return if do_val_selection else None,
+        "best_val_step": best_val_step,
+        "val_trace": val_trace,
     }
