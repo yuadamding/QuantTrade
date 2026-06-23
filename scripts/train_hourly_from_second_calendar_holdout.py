@@ -757,6 +757,7 @@ def main(argv: list[str] | None = None) -> int:
         SecondToHourTrainingConfig,
         RecencyWeightConfig,
         action_index,
+        evaluate_second_to_hour_baselines,
         evaluate_second_to_hour_policy,
         train_second_to_hour_dqn,
     )
@@ -1007,6 +1008,33 @@ def main(argv: list[str] | None = None) -> int:
             "test_total_return_min": min(seed_test_returns),
             "test_total_return_max": max(seed_test_returns),
         }
+        # Cost-paid reference policies through the SAME eval path (review fix #6): CASH and per-stock
+        # buy-and-hold, so "does the policy make real money" is judged against honest, cost-charged
+        # baselines -- never the ad-hoc costless equal-weight basket used in earlier analyses. Model-
+        # independent, so computed ONCE per window (not per seed).
+        baseline_results = evaluate_second_to_hour_baselines(
+            test_split.to(device), device=device, constraints=constraints,
+            episode_length=args.episode_length, cash_idle_penalty_bps=args.cash_idle_penalty_bps,
+        )
+        cash_baseline_return = baseline_results["always_cash"].total_return
+        bh_returns = sorted(
+            result.total_return for key, result in baseline_results.items() if key.startswith("buy_and_hold:")
+        )
+        bh_mean = statistics.fmean(bh_returns) if bh_returns else None
+        bh_median = statistics.median(bh_returns) if bh_returns else None
+        test_baselines = {
+            "cost_paid": True,
+            "evaluated_through_same_eval_path": True,
+            "always_cash_total_return": cash_baseline_return,
+            "buy_and_hold_count": len(bh_returns),
+            "buy_and_hold_total_return_mean": bh_mean,
+            "buy_and_hold_total_return_median": bh_median,
+            "buy_and_hold_total_return_min": bh_returns[0] if bh_returns else None,
+            "buy_and_hold_total_return_max": bh_returns[-1] if bh_returns else None,
+            # Did the selected (best-val) policy beat the honest cost-paid baselines on this OOS window?
+            "policy_beats_cash": test_result.total_return > cash_baseline_return,
+            "policy_beats_buy_and_hold_mean": (bh_mean is not None and test_result.total_return > bh_mean),
+        }
         checkpoint_path = run_dir / "model.pt"
         torch.save(
             {
@@ -1085,6 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             "policy_diagnostics": policy_diagnostics,
             "seed_ensemble": seed_ensemble,
+            "test_baselines": test_baselines,
             "checkpoint": str(checkpoint_path),
             "training_state_checkpoint": str(training_state_path),
             "split_windows": {
@@ -1117,6 +1146,10 @@ def main(argv: list[str] | None = None) -> int:
                 "selected_seed": selected["seed"],
                 "seed_count": len(seed_list),
                 "test_used_for_selection": False,
+                "cost_paid_baseline_cash_return": cash_baseline_return,
+                "cost_paid_baseline_buy_and_hold_mean": bh_mean,
+                "policy_beats_cash": test_baselines["policy_beats_cash"],
+                "policy_beats_buy_and_hold_mean": test_baselines["policy_beats_buy_and_hold_mean"],
                 "reportable": bool(test_result.evaluation_reportable),
                 "reportability_errors": list(test_result.reportability_errors),
             },

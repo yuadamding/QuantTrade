@@ -120,8 +120,17 @@ class SecondToHourContextEncoder(nn.Module):
         seconds = x.shape[1]
         safe_padding_mask = ~flat_mask
         empty_rows = ~flat_mask.any(dim=1)
-        if bool(empty_rows.any().item()):
-            safe_padding_mask[empty_rows, 0] = False
+        # Causal + key-padding interaction: under the causal mask a query at position i attends only to
+        # keys 0..i. If that entire window is padding (the row's first VALID token is at position > i --
+        # e.g. an hour whose data starts late, so the leading compressed token is empty), the query
+        # attends to nothing -> softmax over all -inf -> NaN, which then propagates through every later
+        # position (including the last-valid token we read below) and poisons the embedding. The previous
+        # guard only un-masked position 0 for FULLY-empty rows; it missed rows that are merely empty at the
+        # front. Because key 0 lies in the causal window of EVERY query, guaranteeing key 0 is attendable
+        # for all rows removes all all-masked query rows at once (and subsumes the empty-row case). For
+        # rows already valid at position 0 this is a no-op; for the rest key 0 is a zero pad token (benign,
+        # finite) and the true last-valid position is still what feeds the hour token.
+        safe_padding_mask[:, 0] = False
         second_context = self.second_encoder(
             x, mask=self._causal_mask(seconds, x.device), src_key_padding_mask=safe_padding_mask
         )

@@ -41,6 +41,26 @@ class ContextPolicySplitTests(unittest.TestCase):
         ctx = enc(torch.randn(5, 2, 4, 3), torch.ones(5, 2, 4, dtype=torch.bool), torch.randn(5, 2, 2))
         self.assertEqual(tuple(ctx.shape), (5, 16))
 
+    def test_context_encoder_finite_with_leading_masked_seconds(self) -> None:
+        """Regression: an hour whose LEADING seconds are masked (data starts late) must not poison the
+        embedding with NaN. Under the causal mask, query positions before the first valid second would
+        attend to an all-padding window -> softmax over all -inf -> NaN, propagating to the read-out
+        token. The encoder must keep the embedding finite (guarantee key 0 is always attendable)."""
+        torch.manual_seed(0)
+        enc = SecondToHourContextEncoder(
+            second_feature_dim=3, hour_feature_dim=2, hours_lookback=2, seconds_per_hour=6,
+            d_model=16, n_heads=2, second_layers=2, hour_layers=1, feedforward_dim=16,
+            max_second_tokens=None,  # no compression: exercise the raw causal+padding interaction
+        )
+        enc.eval()
+        second = torch.randn(3, 2, 6, 3)
+        mask = torch.ones(3, 2, 6, dtype=torch.bool)
+        mask[1, 0, :4] = False   # row 1, hour 0: first 4 seconds masked, last 2 valid (leading padding)
+        mask[2, 1, :] = False    # row 2, hour 1: fully empty (the previously-handled case)
+        ctx = enc(second, mask, torch.randn(3, 2, 2))
+        self.assertEqual(tuple(ctx.shape), (3, 16))
+        self.assertTrue(bool(torch.isfinite(ctx).all()), "leading-masked seconds must not yield NaN context")
+
     def test_policy_scores_from_context_embedding(self) -> None:
         policy = DecisionPolicyQNetwork(d_model=16, action_count=4)
         q = policy(torch.randn(5, 16), torch.zeros(5, dtype=torch.long), torch.zeros(5, CONSTRAINT_FEATURE_DIM))
