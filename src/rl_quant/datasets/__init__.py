@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from rl_quant.datasets.raw_window import (
+    BAR_FEATS,
     BAR_FIELDS,
-    CHUNK_FEATS,
     COV_FIELDS,
-    NEWS_FEATS,
+    MAX_NEWS,
+    NEWS_RAW_DIM,
     RawWindowConfig,
     build_window,
     list_windows,
@@ -13,10 +14,11 @@ from rl_quant.datasets.raw_window import (
 )
 
 __all__ = [
+    "BAR_FEATS",
     "BAR_FIELDS",
-    "CHUNK_FEATS",
     "COV_FIELDS",
-    "NEWS_FEATS",
+    "MAX_NEWS",
+    "NEWS_RAW_DIM",
     "RawWindowConfig",
     "build_window",
     "list_windows",
