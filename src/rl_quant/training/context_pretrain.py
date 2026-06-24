@@ -1,14 +1,14 @@
-"""Stage-1 training: self-supervised CONTEXT LEARNING, then freeze + encode.
+"""Stage-1 training: self-supervised CONTEXT LEARNING over full sessions, then freeze + encode.
 
-The context encoder is trained on a pretext task (predict the next-interval equal-weight market return and
-realized vol from the market context) -- no policy, no action returns-as-reward. It is then FROZEN and used to
-ENCODE every window into cached context embeddings. Stage 2 trains the policy on those cached tensors, so the
-policy never holds a reference to the encoder and its gradients cannot reach it -- the split is literal, not
-merely a convention.
+The unit is a trading DAY (a full RTH session = nB blocks). The two-tier encoder turns each day into a context
+at EVERY block; the SSL pretext predicts, from each block's market context, that block's next-interval
+equal-weight market return + realized vol (per-block targets derived from the T+1 labels -- no extra inputs).
+The encoder is then FROZEN and used to ENCODE every day into per-block cached context embeddings; Stage 2 trains
+the policy on those (it never holds an encoder reference -> the split is literal).
 
-Resumability is delegated to the caller: pass ``start_step`` + an ``optimizer`` to resume, and an
-``on_checkpoint(step, optimizer)`` callback that persists state. RNG is the global torch RNG (the caller
-seeds it and saves/restores ``torch.get_rng_state()`` in the checkpoint), so a resumed run is bit-identical.
+Days stream from CPU-resident storage to ``device`` per micro-batch (full sessions are too big to hold all on
+GPU) and gradients are ACCUMULATED over ``accum_steps`` micro-batches. Resumability is delegated to the caller
+(start_step + optimizer + an on_checkpoint that persists model+opt+step+RNG); RNG is the global torch RNG.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from rl_quant.training._optim import apply_lr, lr_scale
 
 
 def ssl_targets(ret: torch.Tensor, ret_valid: torch.Tensor) -> torch.Tensor:
-    """Next-interval [equal-weight return, realized vol] over the valid non-CASH actions. -> [D,2]."""
+    """Per-block [equal-weight return, realized vol] over the valid non-CASH actions. ret/ret_valid [nB,A] -> [nB,2]."""
     r, v = ret[:, 1:], ret_valid[:, 1:]
     n = v.float().sum(1).clamp_min(1.0)
     ew = torch.where(v, r, torch.zeros_like(r)).sum(1) / n
@@ -30,48 +30,43 @@ def ssl_targets(ret: torch.Tensor, ret_valid: torch.Tensor) -> torch.Tensor:
 
 
 def train_context_encoder(
-    encoder, head, train_windows, *, device,
+    encoder, head, train_days, *, device,
     steps: int, lr: float = 3e-4, weight_decay: float = 1e-2, batch_size: int = 1, accum_steps: int = 1,
     warmup_steps: int = 0, schedule: str = "cosine", grad_clip: float = 0.0, amp: bool = False,
     start_step: int = 0, optimizer=None, checkpoint_every: int = 0,
     on_checkpoint: Callable[[int, object], None] | None = None,
 ):
-    """Fit the context encoder + SSL head on the pretext task. STREAMS each micro-batch of decision-rows from
-    CPU-resident windows to ``device`` (the raw-second tensors are far too big to hold all on GPU), and
-    GRADIENT-ACCUMULATES ``accum_steps`` micro-batches per optimizer step (so the SSL loss batch is
-    ``batch_size*accum_steps`` targets while peak VRAM stays at ``batch_size`` decision-rows = batch_size*A
-    raw-second sequences). warmup+cosine LR, grad clip, optional bf16 AMP. Returns the optimizer (for resume)."""
+    """Fit the encoder + per-block SSL head over full sessions. STREAMS ``batch_size`` days/micro-batch from CPU
+    to ``device`` and GRADIENT-ACCUMULATES ``accum_steps`` micro-batches per optimizer step. Returns the optimizer."""
     if optimizer is None:
         optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(head.parameters()),
                                       lr=lr, weight_decay=weight_decay)
     params = list(encoder.parameters()) + list(head.parameters())
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
-    # flat (window, decision) row index + per-window SSL targets (small, kept on CPU)
-    rows = [(wi, di) for wi, w in enumerate(train_windows) for di in range(w["decisions"])]
-    wi_arr = torch.tensor([r[0] for r in rows])
-    di_arr = torch.tensor([r[1] for r in rows])
-    tgt_w = [ssl_targets(w["ret"], w["ret_valid"]) for w in train_windows]
-    n = len(rows)
+    targets = [ssl_targets(d["ret"], d["ret_valid"]) for d in train_days]      # per day [nB,2]
+    valid = [d["ret_valid"][:, 1:].any(1) for d in train_days]                 # per day [nB] block has a target
+    n = len(train_days)
     encoder.train()
     head.train()
 
-    def micro_batch():
-        sel = torch.randint(0, n, (batch_size,))
-        ws, ds = wi_arr[sel].tolist(), di_arr[sel].tolist()
-        bars = torch.stack([train_windows[w]["bars"][d] for w, d in zip(ws, ds)]).to(device, non_blocking=True)
-        mask = torch.stack([train_windows[w]["bar_mask"][d] for w, d in zip(ws, ds)]).to(device, non_blocking=True)
-        cov = torch.stack([train_windows[w]["cov"][d] for w, d in zip(ws, ds)]).to(device, non_blocking=True)
-        tgt = torch.stack([tgt_w[w][d] for w, d in zip(ws, ds)]).to(device, non_blocking=True)
-        return bars, mask, cov, tgt
+    def micro():
+        idx = torch.randint(0, n, (batch_size,)).tolist()
+        bars = torch.stack([train_days[i]["bars"] for i in idx]).to(device, non_blocking=True)
+        mask = torch.stack([train_days[i]["bar_mask"] for i in idx]).to(device, non_blocking=True)
+        cov = torch.stack([train_days[i]["cov_blocks"] for i in idx]).to(device, non_blocking=True)
+        tgt = torch.stack([targets[i] for i in idx]).to(device, non_blocking=True)      # [b,nB,2]
+        vm = torch.stack([valid[i] for i in idx]).to(device, non_blocking=True)         # [b,nB]
+        return bars, mask, cov, tgt, vm
 
     for step in range(start_step, steps):
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
         optimizer.zero_grad()
         for _ in range(accum_steps):
-            bars, mask, cov, tgt = micro_batch()
+            bars, mask, cov, tgt, vm = micro()
             with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-                _, market = encoder(bars, mask, cov)
-                loss = F.smooth_l1_loss(head(market), tgt) / accum_steps
+                _, market = encoder(bars, mask, cov)                  # market [b,nB,d]
+                pred = head(market)                                   # [b,nB,2]
+                loss = F.smooth_l1_loss(pred[vm], tgt[vm]) / accum_steps if vm.any() else (pred.sum() * 0.0)
             loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(params, grad_clip)
@@ -88,48 +83,25 @@ def freeze_encoder(encoder) -> None:
 
 
 @torch.no_grad()
-def encode_windows(encoder, windows, device, max_decisions: int, batch: int = 2, amp: bool = False) -> list[dict]:
-    """Run the FROZEN encoder over each window -> cached context embeddings, decision-padded to ``max_decisions``
-    (so the policy stage can batch windows). Decisions are encoded in CHUNKS of ``batch`` (peak VRAM = batch * A
-    raw-second sequences) -- a whole window at once is D*A sequences and OOMs at long lookbacks. The returned
-    dicts carry NO raw seconds and NO encoder reference -- they are the Stage-2 inputs."""
+def encode_days(encoder, days, device, batch: int = 2, amp: bool = False) -> list[dict]:
+    """Run the FROZEN encoder over each day's full session -> per-block context embeddings, in chunks of ``batch``
+    days (peak VRAM = batch * A sequences). The returned per-day dicts carry NO raw seconds and NO encoder
+    reference -- they are the Stage-2 inputs (one entry per trading day, each with nB blocks)."""
     encoder.eval()
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     out = []
-    for w in windows:
-        bars, mask, cov = w["bars"], w["bar_mask"], w["cov"]
-        d = bars.shape[0]
-        ps_chunks, mk_chunks = [], []
-        for i in range(0, d, batch):
-            with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-                ps, mk = encoder(bars[i:i + batch].to(device), mask[i:i + batch].to(device),
-                                 cov[i:i + batch].to(device))
-            ps_chunks.append(ps.float().cpu())
-            mk_chunks.append(mk.float().cpu())
-        per_stock, market = torch.cat(ps_chunks, 0), torch.cat(mk_chunks, 0)
-        out.append({
-            "market": _pad(market, max_decisions),
-            "per_stock": _pad(per_stock, max_decisions),
-            "cov": _pad(w["cov"], max_decisions),
-            "news_raw": _pad(w["news_raw"], max_decisions),
-            "news_mask": _pad(w["news_mask"], max_decisions, dtype=torch.bool),
-            "ret": _pad(w["ret"], max_decisions),
-            "ret_valid": _pad(w["ret_valid"], max_decisions, dtype=torch.bool),
-            "decision_mask": _decision_mask(d, max_decisions),
-            "window": w.get("window"), "decisions": d,
-        })
+    for i in range(0, len(days), batch):
+        chunk = days[i:i + batch]
+        bars = torch.stack([d["bars"] for d in chunk]).to(device, non_blocking=True)
+        mask = torch.stack([d["bar_mask"] for d in chunk]).to(device, non_blocking=True)
+        cov = torch.stack([d["cov_blocks"] for d in chunk]).to(device, non_blocking=True)
+        with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
+            per_stock, market = encoder(bars, mask, cov)              # [b,nB,A,d], [b,nB,d]
+        per_stock, market = per_stock.float().cpu(), market.float().cpu()
+        for j, d in enumerate(chunk):
+            out.append({
+                "market": market[j], "per_stock": per_stock[j],
+                "news_raw": d["news_raw"], "news_mask": d["news_mask"],
+                "ret": d["ret"], "ret_valid": d["ret_valid"], "n_blocks": d["ret"].shape[0],
+            })
     return out
-
-
-def _pad(t: torch.Tensor, max_d: int, dtype=None) -> torch.Tensor:
-    d = t.shape[0]
-    if d >= max_d:
-        return t[:max_d]
-    pad = torch.zeros((max_d - d, *t.shape[1:]), dtype=dtype or t.dtype)
-    return torch.cat([t, pad], dim=0)
-
-
-def _decision_mask(d: int, max_d: int) -> torch.Tensor:
-    m = torch.zeros(max_d, dtype=torch.bool)
-    m[:min(d, max_d)] = True
-    return m

@@ -10,7 +10,7 @@ orchestration is the caller's (the driver's) job.
 from __future__ import annotations
 
 from rl_quant.training.context_pretrain import (
-    encode_windows,
+    encode_days,
     freeze_encoder,
     ssl_targets,
     train_context_encoder,
@@ -28,7 +28,7 @@ __all__ = [
     "Phase1Design",
     "SWEEP",
     "cost_paid_baselines",
-    "encode_windows",
+    "encode_days",
     "evaluate_policy",
     "freeze_encoder",
     "ssl_targets",

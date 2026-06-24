@@ -1,14 +1,18 @@
-"""Stage-1 CONTEXT LEARNING model: a causal-attention transformer over the RAW 1-second bars.
+"""Stage-1 CONTEXT LEARNING model: a TWO-TIER causal-attention transformer over the RAW 1-second bars.
 
 The encoder consumes the raw per-second bars DIRECTLY -- one token per second, the raw OHLCV values -- with NO
 pooling and NO hand-computed (scale-free) features. The only transform is the model's own input normalization
 (a BatchNorm layer over the raw bar fields, learned at train time) + a linear embedding: that is the model
-learning from the data, not precomputed feature engineering. Tokens are LEFT-aligned (the window's oldest bar at
-position 0, the most recent valid bar last) and attention is CAUSAL (is_causal), so the representation rolls
-forward in time and -- since padding sits after the valid tail -- a valid token never attends to padding.
+learning from the data, not precomputed feature engineering. A full RTH session is fed SESSION-ALIGNED (index s =
+second s after the 09:30 open) and attention is CAUSAL (is_causal), so a block's context depends only on the
+seconds up to that block -- no look-ahead, and padding (after a stock's valid tail) is never attended.
 
-This module is PURE market context: no action/policy concept (the enforced context/policy split). The per-stock
-embedding (its most-recent-valid token) is pooled cross-sectionally into a market-context vector.
+The encoder produces a context at EVERY `block_seconds` block of the session (the candidate/decision grid for the
+event-timed policy): tier-1 attends locally within each block, tier-2 attends causally across the block summaries.
+Full-session SSL is dominated by the tier-1 activations, so `grad_checkpoint` recomputes tier-1 in backward.
+
+This module is PURE market context: no action/policy concept (the enforced context/policy split). Per block, the
+per-stock contexts (bars fused with as-of covariates) are pooled cross-sectionally into a market-context vector.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
 
 
@@ -29,8 +34,9 @@ class ContextEncoderConfig:
     n_layers: int = 2                # split across the two tiers (tier1 = n_layers//2, tier2 = the rest)
     feedforward_dim: int = 256
     dropout: float = 0.0
-    max_seconds: int = 3600          # longest raw-second lookback per decision (rolls from the session open)
+    max_seconds: int = 3600          # full session length in seconds (rolls from the 09:30 open)
     block_seconds: int = 300         # tier-1 block length: seconds attended LOCALLY before the global tier-2
+    grad_checkpoint: bool = False    # recompute tier-1 blocks in backward (full-session SSL memory relief)
 
 
 def _sinusoidal(n: int, d: int) -> torch.Tensor:
@@ -90,6 +96,7 @@ class ContextEncoder(nn.Module):
         self.config = config
         d = config.d_model
         self.block_seconds = config.block_seconds
+        self.grad_checkpoint = config.grad_checkpoint
         t1 = max(1, config.n_layers // 2)
         t2 = max(1, config.n_layers - t1)
         self.bar_norm = nn.BatchNorm1d(config.bar_feature_dim)   # input normalization over RAW bar fields
@@ -109,18 +116,21 @@ class ContextEncoder(nn.Module):
         self.fuse = nn.LayerNorm(d)
         self.d_model = d
 
-    def forward(self, bars: torch.Tensor, bar_mask: torch.Tensor, covariates: torch.Tensor):
-        """bars [B,A,S,F] RAW (left-aligned), bar_mask [B,A,S], covariates [B,A,C]
-        -> per_stock [B,A,d], market [B,d]."""
+    def forward(self, bars: torch.Tensor, bar_mask: torch.Tensor, cov_blocks: torch.Tensor):
+        """Encode a full session per (batch) day -> a context at EVERY 5-min block (causal). The decision at
+        block b uses only blocks 0..b (no look-ahead). bars [B,A,S,F] RAW (session-aligned: index s = second s
+        after the 09:30 open), bar_mask [B,A,S], cov_blocks [B,nB,A,C] (as-of covariates at each block).
+        -> per_stock [B,nB,A,d], market [B,nB,d]."""
         B, A, S, F = bars.shape
         d = self.d_model
-        bl = min(self.block_seconds, S)
-        nB = (S + bl - 1) // bl
+        bl = self.block_seconds
+        nB = S // bl
         if nB * bl != S:                                         # pad the session up to a whole number of blocks
-            pad = nB * bl - S
+            pad = (nB + 1) * bl - S
             bars = torch.nn.functional.pad(bars, (0, 0, 0, pad))
             bar_mask = torch.nn.functional.pad(bar_mask, (0, pad))
-            S = nB * bl
+            S = bars.shape[2]
+            nB = S // bl
         # input normalization on the RAW valid bars (per-feature), then learned embedding
         flat = bars.reshape(-1, F)
         mv = bar_mask.reshape(-1)
@@ -128,26 +138,27 @@ class ContextEncoder(nn.Module):
         if mv.any():
             normed[mv] = self.bar_norm(flat[mv])
         x = self.input_proj(normed).reshape(B * A, nB, bl, d) + self.pos1[:bl].view(1, 1, bl, d)
-        # --- Tier 1: local causal attention within each block -> learned block summaries ---
+        # --- Tier 1: local causal attention within each block -> learned per-block summaries ---
         x = x.reshape(B * A * nB, bl, d)
         for blk in self.tier1:
-            x = blk(x)
+            x = (torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                 if self.grad_checkpoint and self.training else blk(x))
         x = self.norm1(x)
         cnt1 = bar_mask.reshape(B * A * nB, bl).sum(-1)          # valid seconds per block
         summ = _last_valid(x, cnt1).reshape(B * A, nB, d)        # each block's most-recent-valid token
-        block_has = (cnt1.reshape(B * A, nB) > 0)
+        block_has = (cnt1.reshape(B * A, nB) > 0)                # [B*A, nB]
         summ = summ * block_has.unsqueeze(-1).float()
-        # --- Tier 2: global causal attention over block summaries across the whole session ---
+        # --- Tier 2: global causal attention over block summaries -> a context at EVERY block ---
         h = summ + self.pos2[:nB].unsqueeze(0)
         for blk in self.tier2:
             h = blk(h)
-        h = self.norm2(h)
-        cnt2 = block_has.sum(-1)                                 # valid blocks per (stock, decision)
-        bar_ctx = _last_valid(h, cnt2).reshape(B, A, d)          # most-recent-valid block = session context
-        cov_ctx = self.cov_mlp(self.cov_norm(covariates.reshape(B * A, -1)).reshape(B, A, -1))
-        has = (cnt2.reshape(B, A) > 0).float().unsqueeze(-1)     # 0 for stocks absent at this decision
-        per_stock = self.fuse(bar_ctx + cov_ctx) * has           # fuse bars + covariates
-        market = per_stock.sum(dim=1) / has.sum(dim=1).clamp_min(1.0)
+        h = self.norm2(h)                                        # [B*A, nB, d] per-block tier-2 context
+        bar_blocks = h.reshape(B, A, nB, d).permute(0, 2, 1, 3)  # [B, nB, A, d]
+        has = block_has.reshape(B, A, nB).permute(0, 2, 1).unsqueeze(-1).float()   # [B, nB, A, 1]
+        cov_flat = self.cov_norm(cov_blocks[:, :nB].reshape(-1, cov_blocks.shape[-1]))  # [B*nB*A, C]
+        cov = self.cov_mlp(cov_flat).reshape(B, nB, A, d)        # learned C->d embedding, per block
+        per_stock = self.fuse(bar_blocks + cov) * has            # fuse bars + as-of covariates, per block
+        market = per_stock.sum(dim=2) / has.sum(dim=2).clamp_min(1.0)   # cross-sectional mean per block
         return per_stock, market
 
 

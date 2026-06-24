@@ -2,17 +2,21 @@
 
 Reads ONLY raw inputs from a dataset root: ``partitions/<S_to_E>/{bars.parquet, covariates.parquet, news.jsonl}``
 + ``universe.json``. NOTHING is precomputed/stored as features -- this module ORGANIZES the raw inputs into the
-tensors the learning framework consumes, all at train time:
+tensors the learning framework consumes, all at train time. The design is BLOCK-ALIGNED and EVENT-TIMED: one full
+RTH session per trading day is stored ONCE, SESSION-ALIGNED (index s = second s after the 09:30 open); the encoder
+turns it into a context at every ``block_seconds`` block, and the policy chooses WHEN to act over those blocks.
 
-  * context bars: the RAW 1-second OHLCV bars directly (one token per second), LEFT-aligned -- the most recent
-    ``max_seconds`` in ``[09:30 session open, decision)`` (no pooling, no hand-computed features; the encoder
-    normalizes + compresses them itself). Rolls from the session open.
-  * as-of covariates: the latest point-in-time covariate record available at the decision.
-  * news: the RAW per-article sentiment scores available at the decision (the model aggregates them at train
+  * context bars: the RAW 1-second OHLCV bars directly (one token per second), session-aligned over the whole
+    ``session_seconds`` RTH session (no pooling, no hand-computed features; the encoder normalizes + compresses
+    them itself, causally per block).
+  * as-of covariates: the latest point-in-time covariate record available at each block's end.
+  * news: the RAW per-article sentiment scores available by each block's end (the model aggregates them at train
     time -- no precomputed count/mean).
-  * forward-return labels: close@decision+latency -> close@next-decision+latency (the reward signal).
+  * T+1 forward-return labels per (day, block): decide at block b (context <= block-b end), EXECUTE at block
+    b+1's end, hold to block b+2's end -- close@(b+1 end)+latency -> close@(b+2 end)+latency (the reward signal).
 
-The decision grid is the 5 hourly RTH decisions/day, DST-aware (zoneinfo), built from the trading days.
+The block grid (78 blocks/day at 300s) is DST-aware (zoneinfo). Output tensors carry a leading n_days axis; the
+driver flattens windows to per-day units (the training unit).
 """
 from __future__ import annotations
 
@@ -38,9 +42,9 @@ MAX_NEWS = 32     # most-recent articles kept per (stock, decision); the model a
 
 @dataclass
 class RawWindowConfig:
-    max_seconds: int = 3600  # raw 1s bars per decision (most recent max_seconds in [session open, decision))
+    session_seconds: int = 23400  # full RTH session (09:30->16:00) stored once per day (session-aligned)
+    block_seconds: int = 300      # candidate/decision cadence = the encoder's tier-1 block (must match it)
     max_news: int = MAX_NEWS
-    decision_et_hhmm: tuple[tuple[int, int], ...] = ((10, 30), (11, 30), (12, 30), (13, 30), (14, 30))
     open_et_hhmm: tuple[int, int] = (9, 30)
     exec_latency_ms: int = 1000
     cache_version: int = 1
@@ -95,112 +99,110 @@ def _load_window_raw(root: Path, window: str, cfg: RawWindowConfig):
     return bars, cov, news
 
 
-def _decision_grid(date_exchange, cfg: RawWindowConfig):
-    """Sorted [(decision_ms, session_open_ms)] for the window's trading days (DST-aware ET->UTC)."""
-    pairs = []
-    for d in sorted(set(date_exchange)):
-        off = _et_offset_hours(d)
-        y, m, day = map(int, d.split("-"))
-        open_ms = int(dt.datetime(y, m, day, cfg.open_et_hhmm[0] - off, cfg.open_et_hhmm[1],
-                                  tzinfo=dt.timezone.utc).timestamp() * 1000)
-        for h, mm in cfg.decision_et_hhmm:
-            t = int(dt.datetime(y, m, day, h - off, mm, tzinfo=dt.timezone.utc).timestamp() * 1000)
-            pairs.append((t, open_ms))
-    return sorted(pairs)
+def _open_ms(date_iso: str, cfg: RawWindowConfig) -> int:
+    """UTC ms of the 09:30 ET session open on `date_iso` (DST-aware)."""
+    off = _et_offset_hours(date_iso)
+    y, m, day = map(int, date_iso.split("-"))
+    return int(dt.datetime(y, m, day, cfg.open_et_hhmm[0] - off, cfg.open_et_hhmm[1],
+                           tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 
 def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_actions: int,
                  cfg: RawWindowConfig) -> dict | None:
-    """Organize one raw time window: RAW per-second bars + as-of covariates + news + forward-return labels."""
+    """BLOCK-ALIGNED organizer. One full RTH session per trading day is stored session-aligned (index s = second
+    s after the 09:30 open); the encoder turns it into a context at every `block_seconds` block, and the policy
+    chooses WHEN to act over those blocks. Per (day, block) we also store as-of covariates, raw news, and the
+    T+1 forward-return label: decide at block b (context <= block-b end), EXECUTE at block b+1's end, hold to
+    block b+2's end. Returns per-window tensors with a leading n_days axis."""
     bars, cov, news = _load_window_raw(root, window, cfg)
-    grid = _decision_grid(bars["date_exchange"], cfg)
-    if len(grid) < 2:
+    days = sorted(set(bars["date_exchange"]))
+    if not days:
         return None
+    S, bl = cfg.session_seconds, cfg.block_seconds
+    nB = S // bl
+    Dd, A, F, M, NC = len(days), n_actions, len(cfg.bar_fields), cfg.max_news, len(cfg.cov_fields)
+    day_idx = {d: i for i, d in enumerate(days)}
+    open_ms = np.array([_open_ms(d, cfg) for d in days], dtype=np.int64)              # [Dd]
+    block_end = open_ms[:, None] + (np.arange(1, nB + 1) * bl * 1000)                 # [Dd,nB] block-b end (ms)
+    lat = cfg.exec_latency_ms
+
+    bars_t = np.zeros((Dd, A, S, F), dtype=np.float32)
+    bar_mask = np.zeros((Dd, A, S), dtype=bool)
+    covt = np.zeros((Dd, nB, A, NC), dtype=np.float32)
+    news_raw = np.zeros((Dd, nB, A, M, NEWS_RAW_DIM), dtype=np.float32)
+    news_mask = np.zeros((Dd, nB, A, M), dtype=bool)
+    ret = np.full((Dd, nB, A), np.nan, dtype=np.float32)
+    ret_valid = np.zeros((Dd, nB, A), dtype=bool)
+    ret[:, :, 0] = 0.0          # CASH return is identically 0 at every block
+    ret_valid[:, :, 0] = True
+
+    # --- bars: vectorized scatter of every bar into [day, stock, second-offset from the open] ---
     ts = bars["timestamp_ms"].astype(np.int64)
-    sym = np.array([stock_to_idx.get(s, -1) for s in bars["symbol"]], dtype=np.int64)
-    order = np.lexsort((ts, sym))
-    sym_s, ts_s = sym[order], ts[order]
-    ohlcv_s = np.stack([bars[f].astype(np.float32)[order] for f in cfg.bar_fields], axis=1)  # RAW [N,F]
-    close_s = ohlcv_s[:, 3].astype(np.float64)
-    dms_arr = np.array([g[0] for g in grid], dtype=np.int64)
-    open_arr = np.array([g[1] for g in grid], dtype=np.int64)
+    b_sym = np.array([stock_to_idx.get(s, -1) for s in bars["symbol"]], dtype=np.int64)
+    b_day = np.array([day_idx[d] for d in bars["date_exchange"]], dtype=np.int64)
+    b_soff = (ts - open_ms[b_day]) // 1000
+    ok = (b_sym >= 1) & (b_soff >= 0) & (b_soff < S)
+    ohlcv = np.stack([bars[f].astype(np.float32) for f in cfg.bar_fields], axis=1)    # [N,F]
+    bars_t[b_day[ok], b_sym[ok], b_soff[ok]] = ohlcv[ok]
+    bar_mask[b_day[ok], b_sym[ok], b_soff[ok]] = True
 
-    D, A, S, F = len(grid) - 1, n_actions, cfg.max_seconds, len(cfg.bar_fields)
-    bars_t = np.zeros((D, A, S, F), dtype=np.float32)        # RAW 1s bars, one token per second (left-aligned)
-    bar_mask = np.zeros((D, A, S), dtype=bool)
-    ret = np.full((D, A), np.nan, dtype=np.float32)
-    ret_valid = np.zeros((D, A), dtype=bool)
-    ret[:, 0] = 0.0          # CASH return is identically 0
-    ret_valid[:, 0] = True
-    for ai in range(1, A):
-        m = sym_s == ai
-        if not m.any():
-            continue
-        a_ts, a_ohlcv, a_close = ts_s[m], ohlcv_s[m], close_s[m]
-        for di in range(D):
-            dms, day_open = dms_arr[di], open_arr[di]
-            lo = np.searchsorted(a_ts, day_open, "left")     # bars in [session open, decision)
-            hi = np.searchsorted(a_ts, dms, "left")
-            win = a_ohlcv[lo:hi][-S:]                         # most recent S raw bars, oldest-first (left-aligned)
-            k = len(win)
-            if k:
-                bars_t[di, ai, :k] = win
-                bar_mask[di, ai, :k] = True
-            ei = np.searchsorted(a_ts, dms + cfg.exec_latency_ms, "left")
-            xi = np.searchsorted(a_ts, dms_arr[di + 1] + cfg.exec_latency_ms, "left")
-            if ei < len(a_close) and xi < len(a_close) and a_close[ei] > 0:
-                r = a_close[xi] / a_close[ei] - 1.0
-                if np.isfinite(r):
-                    ret[di, ai] = float(np.clip(r, -1.0, 1.0))
-                    ret_valid[di, ai] = True
-
-    covt = np.zeros((D, A, len(cfg.cov_fields)), dtype=np.float32)
+    # --- per-stock as-of covariates / raw news / T+1 labels at each (day, block) ---
+    order = np.lexsort((ts, b_sym))
+    sym_s, ts_s = b_sym[order], ts[order]
+    close_s = ohlcv[order][:, 3].astype(np.float64)
+    cs = cav = None
     if cov is not None and cov.get("symbol"):
         cs = np.array([stock_to_idx.get(s, -1) for s in cov["symbol"]])
         cav = np.array(cov["available_timestamp_ms"], dtype=np.int64)
-        for ai in range(1, A):
-            m = cs == ai
-            if not m.any():
-                continue
-            idxs = np.nonzero(m)[0]
-            o = np.argsort(cav[m])
-            av = cav[m][o]
-            idxs = idxs[o]
-            for di in range(D):
-                k = np.searchsorted(av, dms_arr[di], "right") - 1
-                if k >= 0:
-                    j = idxs[k]
-                    covt[di, ai] = [float(cov[f][j]) if isinstance(cov[f][j], (int, float)) else 0.0
-                                    for f in cfg.cov_fields]
-
-    # RAW news: the per-article qwen3 sentiment scores available as-of each decision (NO precomputed count/mean;
-    # the model aggregates them at train time). Most-recent cfg.max_news articles, chronological (oldest-first).
-    M = cfg.max_news
-    news_raw = np.zeros((D, A, M, NEWS_RAW_DIM), dtype=np.float32)
-    news_mask = np.zeros((D, A, M), dtype=bool)
     if news:
         nt = np.array([stock_to_idx.get(r.get("ticker"), -1) for r in news])
         nav = np.array([int(r.get("llm_feature_available_timestamp_ms", r.get("published_timestamp_ms", 0)))
                         for r in news], dtype=np.int64)
         nsent = np.array([float(r.get("sentiment_score", 0.0)) for r in news], dtype=np.float32)
-        for ai in range(1, A):
-            m = nt == ai
-            if not m.any():
-                continue
-            o = np.argsort(nav[m])                       # chronological
-            av, se = nav[m][o], nsent[m][o]
-            for di in range(D):
-                k = np.searchsorted(av, dms_arr[di], "right")     # articles available before the decision
-                if k > 0:
-                    take = se[max(0, k - M):k]                    # most recent M raw scores (oldest-first)
-                    kk = len(take)
-                    news_raw[di, ai, :kk, 0] = take
-                    news_mask[di, ai, :kk] = True
+    for ai in range(1, A):
+        m = sym_s == ai
+        a_ts, a_close = ts_s[m], close_s[m]
+        cav_a = cidx_a = None
+        if cs is not None:
+            cm = np.nonzero(cs == ai)[0]
+            if len(cm):
+                co = np.argsort(cav[cm])
+                cav_a, cidx_a = cav[cm][co], cm[co]
+        nav_a = nse_a = None
+        if news:
+            nm = np.nonzero(nt == ai)[0]
+            if len(nm):
+                no = np.argsort(nav[nm])
+                nav_a, nse_a = nav[nm][no], nsent[nm][no]
+        for d in range(Dd):
+            for b in range(nB):
+                te = int(block_end[d, b])
+                if cav_a is not None:                                # as-of covariates at block-b end
+                    k = np.searchsorted(cav_a, te, "right") - 1
+                    if k >= 0:
+                        j = cidx_a[k]
+                        covt[d, b, ai] = [float(cov[f][j]) if isinstance(cov[f][j], (int, float)) else 0.0
+                                          for f in cfg.cov_fields]
+                if nav_a is not None:                                # RAW news available by block-b end
+                    k = np.searchsorted(nav_a, te, "right")
+                    if k > 0:
+                        take = nse_a[max(0, k - M):k]
+                        kk = len(take)
+                        news_raw[d, b, ai, :kk, 0] = take
+                        news_mask[d, b, ai, :kk] = True
+                if b <= nB - 3 and len(a_close):                     # T+1 label: execute b+1 end -> b+2 end
+                    ei = np.searchsorted(a_ts, int(block_end[d, b + 1]) + lat, "left")
+                    xi = np.searchsorted(a_ts, int(block_end[d, b + 2]) + lat, "left")
+                    if ei < len(a_close) and xi < len(a_close) and a_close[ei] > 0:
+                        r = a_close[xi] / a_close[ei] - 1.0
+                        if np.isfinite(r):
+                            ret[d, b, ai] = float(np.clip(r, -1.0, 1.0))
+                            ret_valid[d, b, ai] = True
 
     return {
         "bars": torch.from_numpy(bars_t), "bar_mask": torch.from_numpy(bar_mask),
-        "cov": torch.from_numpy(covt), "news_raw": torch.from_numpy(news_raw),
+        "cov_blocks": torch.from_numpy(covt), "news_raw": torch.from_numpy(news_raw),
         "news_mask": torch.from_numpy(news_mask),
         "ret": torch.from_numpy(ret), "ret_valid": torch.from_numpy(ret_valid),
-        "window": window, "decisions": D,
+        "window": window, "n_days": Dd, "n_blocks": nB,
     }
