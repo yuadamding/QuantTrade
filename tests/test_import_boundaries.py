@@ -23,10 +23,13 @@ import unittest
 LAYER_ORDER = [
     "protocol",
     "data_sources",
+    "models",
+    "datasets",
     "execution",
     "features",
     "reportability",
     "evaluation",
+    "training",
     "workflows",
 ]
 
