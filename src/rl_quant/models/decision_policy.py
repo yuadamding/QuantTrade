@@ -24,8 +24,7 @@ from torch import nn
 
 @dataclass
 class DecisionPolicyConfig:
-    context_dim: int                 # d_model of the frozen context encoder
-    covariate_dim: int               # raw as-of covariate fields (normalized IN-model, not precomputed)
+    context_dim: int                 # d_model of the frozen context encoder (covariate-fused per-block context)
     news_raw_dim: int = 1            # raw fields per news article (the qwen3 sentiment_score)
     max_news: int = 32               # articles per (stock, decision) the model aggregates at train time
     news_embed_dim: int = 32
@@ -62,9 +61,8 @@ class DecisionPolicyHead(nn.Module):
     def __init__(self, config: DecisionPolicyConfig) -> None:
         super().__init__()
         self.config = config
-        self.cov_norm = nn.BatchNorm1d(config.covariate_dim)                  # normalize RAW covariates in-model
         self.news_agg = _NewsAggregator(config.news_raw_dim, config.news_embed_dim)
-        in_dim = config.context_dim * 2 + config.covariate_dim + config.news_embed_dim + 1  # +prev weight
+        in_dim = config.context_dim * 2 + config.news_embed_dim + 1  # market + per-stock ctx + news + prev weight
         self.token_proj = nn.Linear(in_dim, config.token_dim)
         self.cash_bias = nn.Parameter(torch.zeros(config.token_dim))  # marks the CASH token in the set
         layer = nn.TransformerEncoderLayer(
@@ -73,16 +71,16 @@ class DecisionPolicyHead(nn.Module):
         )
         self.attn = nn.TransformerEncoder(layer, num_layers=config.n_layers, enable_nested_tensor=False)
         self.score = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
+        self.gate_head = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))  # act/hold
         self.temperature = config.temperature
 
-    def forward(self, market, per_stock, covariates, news_scores, news_mask, prev_weights, available):
-        """market [B,d]; per_stock [B,A,d]; covariates [B,A,C]; news_scores [B,A,M,raw]; news_mask [B,A,M];
-        prev_weights/available [B,A]. -> weights [B,A] (rows sum to 1)."""
+    def forward(self, market, per_stock, news_scores, news_mask, prev_weights, available):
+        """market [B,d]; per_stock [B,A,d] (covariate-fused context); news_scores [B,A,M,raw]; news_mask [B,A,M];
+        prev_weights/available [B,A]. -> (target_weights [B,A] summing to 1, act_gate [B] in [0,1])."""
         B, A, d = per_stock.shape
         mkt = market.unsqueeze(1).expand(B, A, d)
-        cov = self.cov_norm(covariates.reshape(B * A, -1)).reshape(B, A, -1)  # in-model covariate normalization
         news = self.news_agg(news_scores, news_mask)                          # in-model raw-news aggregation
-        tok = self.token_proj(torch.cat([mkt, per_stock, cov, news, prev_weights.unsqueeze(-1)], dim=-1))
+        tok = self.token_proj(torch.cat([mkt, per_stock, news, prev_weights.unsqueeze(-1)], dim=-1))
         tok = tok + self.cash_bias * (torch.arange(A, device=tok.device) == 0).float().view(1, A, 1)  # CASH token
         kpm = ~available.bool()                                  # constraint mask: unavailable actions are dropped
         kpm = kpm.clone()
@@ -90,4 +88,6 @@ class DecisionPolicyHead(nn.Module):
         h = self.attn(tok, src_key_padding_mask=kpm)             # cross-sectional attention (no positional axis)
         scores = self.score(h).squeeze(-1) / self.temperature    # [B,A]; temperature shapes allocation sharpness
         scores = scores.masked_fill(kpm, float("-inf"))          # never allocate to unavailable actions
-        return torch.softmax(scores, dim=1)
+        weights = torch.softmax(scores, dim=1)
+        gate = torch.sigmoid(self.gate_head(h.mean(dim=1)).squeeze(-1))  # [B] trade (->target) vs hold (->prev)
+        return weights, gate

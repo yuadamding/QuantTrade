@@ -36,14 +36,17 @@ OHLCV; in‑model `BatchNorm` + linear embedding only — no pooling, no scale�
 
 - **Tier 1 (local):** causal attention *within* fixed `block_seconds` blocks of raw seconds; each block's
   most‑recent‑valid token is a **learned** summary (the model compresses raw seconds — nothing hand‑pooled).
-- **Tier 2 (global):** causal attention *over* the block summaries across the session; the most‑recent‑valid
-  block is the per‑stock session context. This makes the **full ~6.5 h RTH session** tractable at
-  O(S·block) + O(n_blocks²) instead of flat O(S²); context rolls from the 09:30 open with no look‑ahead.
+- **Tier 2 (global):** causal attention *over* the block summaries across the session, yielding a context at
+  **every** block. This makes the **full ~6.5 h RTH session** tractable at O(S·block) + O(n_blocks²) instead of
+  flat O(S²); each block's context rolls from the 09:30 open with no look‑ahead. The block grid (78 blocks/day at
+  300 s) **is** the candidate grid the event‑timed policy acts on — one full‑session encode yields every context,
+  so there is no separate per‑candidate storage. (`grad_checkpoint` recomputes tier‑1 in backward for full‑session SSL.)
 - The encoder **also learns from each stock's as‑of covariates** (fundamentals / market‑cap / news‑volume),
-  fused with the temporal context; the cross‑sectional mean over **all involved stocks** → a **pure market
-  context** (no policy state ever enters).
-- **Self‑supervised pretext:** predict the next interval's equal‑weight market return + realized vol. Then the
-  encoder is **frozen** and used to encode every decision into cached embeddings.
+  fused with the per‑block context; the cross‑sectional mean over **all involved stocks** → a **pure market
+  context** per block (no policy state ever enters).
+- **Self‑supervised pretext:** from each block's market context predict that block's next‑interval equal‑weight
+  market return + realized vol. Then the encoder is **frozen** and used to encode every day into per‑block cached
+  embeddings.
 
 ### Stage 2 — policy learning (`rl_quant.models.decision_policy`)
 
@@ -55,21 +58,29 @@ frozen context (it holds no encoder reference → its reward gradient cannot rea
   each action relative to the others; unavailable actions are masked.
 - Raw per‑article **news scores are aggregated in‑model** (a learned masked sum), and **covariates are
   normalized in‑model** — so the policy also uses **no precomputed features**.
-- A softmax (with **temperature**) over `{CASH, stocks}` yields **allocation weights**. CASH = abstain.
-- **Objective — differentiable portfolio:** roll each window forward carrying the previous weights and maximize
-  realized net return − turnover cost, with a downside‑variance penalty and an optional entropy bonus. Shared
-  weights ⇒ the same head scales from tens to ~2000 actions.
+- A softmax (with **temperature**) over `{CASH, stocks}` yields target **allocation weights**, and a per‑block
+  **act‑gate** `g∈[0,1]` decides *whether* to trade: the held position is `g·target + (1−g)·prev` (holding is
+  turnover‑free). CASH = abstain.
+- **Event‑timed:** the policy is not on a fixed clock — it chooses **when** to act over the blocks, under a
+  **soft per‑day budget** of ~`max_actions_per_day` trades (a penalty on the per‑day gate mass). Trades are
+  **T+1**: a position decided at block *b* executes at *b+1* and realizes over the next interval.
+- **Objective — differentiable portfolio:** roll each day forward over its blocks carrying the previous weights
+  and maximize realized net return − turnover cost, with a downside‑variance penalty, an optional entropy bonus,
+  and the budget penalty. Shared weights ⇒ the same head scales from tens to ~2000 actions.
 
 ### Training (`rl_quant.training`)
 
-- `context_pretrain.py` — Stage‑1 SSL trainer: **streams** raw‑second micro‑batches from CPU‑resident windows to
-  the GPU + **gradient accumulation** (effective batch ≫ peak VRAM); then `freeze_encoder` + `encode_windows`
-  (cached embeddings). `decision_policy.py` — Stage‑2 differentiable‑portfolio trainer + `evaluate_policy` +
-  cost‑paid baselines. `_optim.py` — step‑driven warmup+cosine/constant LR (resume‑exact, no scheduler state).
-- **Per‑stage training strategy** (LR / warmup / weight decay / grad clip; bf16 AMP + TF32; policy
-  cost / risk / entropy / temperature) is parameterized by `designs.py` — a series of `Phase1Design` presets
-  spanning both transformers' architecture *and* the training setup, keyed on the `max_seconds` lookback
-  (including a `full_session` design over the whole RTH session). `tiny` is the CPU smoke / CI design.
+- `context_pretrain.py` — Stage‑1 SSL trainer: **streams** full sessions (one day/micro‑batch) from CPU‑resident
+  windows to the GPU + **gradient accumulation** (effective batch ≫ peak VRAM); then `freeze_encoder` +
+  `encode_days` (per‑block cached embeddings). `decision_policy.py` — Stage‑2 event‑timed differentiable‑portfolio
+  trainer (gated day/block rollout, per‑day budget, T+1) + `evaluate_policy` + cost‑paid baselines. `_optim.py`
+  — step‑driven warmup+cosine/constant LR (resume‑exact, no scheduler state).
+- **Per‑stage training strategy** (LR / warmup / weight decay / grad clip; bf16 AMP + TF32 + `grad_checkpoint`;
+  policy cost / risk / entropy / temperature / `max_actions_per_day` / `budget_lambda`) is parameterized by
+  `designs.py` — a series of `Phase1Design` presets spanning both transformers' architecture *and* the training
+  setup. Every real design encodes the **full RTH session** (the two‑tier hierarchy reaches it by design); the
+  series varies *context arch × policy arch × block cadence × training strategy × trade budget*. `tiny` is the
+  CPU smoke / CI design.
 
 The actual **experiment driver lives outside this package**, in `../training/` (relative paths only): a thin
 `train_phase1.py` (multi‑seed, resumable, time split, verdict) and `sweep_phase1.py` (multi‑GPU sweep). See
@@ -104,8 +115,9 @@ Forward‑only layers (training code never parses raw vendor files when a valida
 - **Silver** — cleaned point‑in‑time tables (stock covariates; news‑LLM article scores).
 - **Raw decision windows** — what the framework consumes: `partitions/<S_to_E>/{bars.parquet,
   covariates.parquet, news.jsonl}` + `universe.json` (e.g. the TOP50 dataset at `../TOP50`). The organizer
-  builds, **at train time**, the raw per‑second bars, as‑of covariates, raw news, and forward‑return labels —
-  nothing precomputed. The decision grid is 5 hourly RTH decisions/day, DST‑correct via `zoneinfo`.
+  builds, **at train time**, the full‑session raw per‑second bars (stored once per day, session‑aligned), per‑block
+  as‑of covariates, raw news, and per‑(day, block) **T+1** forward‑return labels — nothing precomputed. The block
+  grid is 78 blocks/day at 300 s, DST‑correct via `zoneinfo`.
 
 **LLM news caveat:** the qwen3 news scores carry an anachronistic availability sentinel — fine as a model
 *input*, but **not point‑in‑time clean for a reportable backtest**. Bars + covariates + forward‑return labels
@@ -175,9 +187,10 @@ conda run -n quanttrade ruff check src tests
 ```
 
 `tests/test_phase1_framework.py` locks the design as executable assertions: the context/policy split (no policy
-gradient reaches the frozen encoder), multi‑block cross‑block causality, simplex allocation + constraint
-masking, the LR/temperature/AMP/entropy strategy knobs, and design‑series validity. `test_import_boundaries.py`
-locks the layering DAG; `test_scripts_are_wrappers.py` keeps `scripts/` thin.
+gradient reaches the frozen encoder), multi‑block cross‑block causality (a block is invariant to *later* blocks),
+simplex allocation + constraint masking + the act‑gate in `[0,1]`, the LR/temperature/AMP/entropy/budget strategy
+knobs, the per‑block SSL pretext, and design‑series validity. `test_import_boundaries.py` locks the layering DAG;
+`test_scripts_are_wrappers.py` keeps `scripts/` thin.
 
 ---
 
@@ -185,19 +198,23 @@ locks the layering DAG; `test_scripts_are_wrappers.py` keeps `scripts/` thin.
 
 - **No precomputed features** anywhere (context or policy) — enforced by design + tests.
 - **News is input‑only**, not reportable‑clean (anachronistic LLM availability). Bars/covariates/labels are clean.
-- **VRAM is GPU‑measured but verify on your hardware.** Raw‑second sequences are heavy: the SSL batch is
-  `ssl_batch × n_stocks` (the encoder runs every stock per decision), so `ssl_batch` is small and decoupled from
-  the statistical batch via gradient accumulation. The `full_session` design needs a big‑RAM box (~134 GB of raw
-  bars across windows) or lazy per‑window loading.
+- **VRAM is GPU‑measured but verify on your hardware.** Full‑session SSL is heavy (one day = `n_stocks ×
+  session_seconds` raw tokens); the SSL micro‑batch is in **days** (`ssl_batch_size` ≈ 1) and decoupled from the
+  effective batch via gradient accumulation, with `grad_checkpoint` (recompute tier‑1 in backward) + bf16 AMP
+  keeping one day within an 80 GB H100 up to ~`d512`. The full TOP50 needs a big‑RAM box (~tens of GB of raw bars
+  across windows, held CPU‑resident and streamed to the GPU).
 - Decision times are **DST‑correct** (`zoneinfo`); changing the build logic bumps the driver's cache version.
 
 ---
 
 ## Glossary
 
-- **Decision grid** — the 5 hourly RTH decision timestamps per trading day (DST‑aware).
-- **Context** — the frozen market‑state representation (Stage 1) the policy consumes.
+- **Block grid** — the per‑block candidate timestamps (78/day at 300 s, DST‑aware); the encoder emits a context
+  at each, and the event‑timed policy chooses which to act on.
+- **Act‑gate / trade budget** — the per‑block `g∈[0,1]` deciding whether to trade (`g·target+(1−g)·prev`), under
+  a soft per‑day cap of ~`max_actions_per_day`. Trades are **T+1** (decide at *b*, execute at *b+1*).
+- **Context** — the frozen per‑block market‑state representation (Stage 1) the policy consumes.
 - **Differentiable portfolio** — the Stage‑2 objective: maximize realized net return − turnover cost (with
-  downside/entropy terms) over softmax allocation weights.
+  downside/entropy/budget terms) over softmax allocation weights, rolled over each day's blocks.
 - **Reportable** — a result satisfying every point in *Safety & reportability*.
 - **CASH** — action 0; the abstention/risk‑free floor (return identically 0).

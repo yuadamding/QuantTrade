@@ -1,24 +1,30 @@
-"""A series of model + training-strategy DESIGNS for the Phase-1 two-stage framework.
+"""A series of model + training-strategy DESIGNS for the Phase-1 two-stage, EVENT-TIMED framework.
 
 Each design fully specifies BOTH transformers' architecture AND the training strategy/setup for BOTH stages:
 
   ARCHITECTURE
-    context (two-tier causal transformer over RAW seconds): max_seconds (causal lookback, rolls from open),
-      d_model / enc_layers / enc_heads (block_seconds is the tier-1 block length, set on the encoder config).
+    context (two-tier causal transformer over RAW seconds): session_seconds (full RTH session encoded once),
+      block_seconds (tier-1 block length = the candidate/decision cadence), d_model / enc_layers / enc_heads.
     policy (set-transformer): policy_token_dim / policy_layers / policy_heads.
   TRAINING STRATEGY / SETUP (per stage where it differs)
-    budget: ssl_steps, policy_steps, ssl_batch_size (effective SSL batch = ssl_batch_size x 51 actions),
-      batch_windows (windows per policy step).
+    budget: ssl_steps, policy_steps, ssl_batch_size (DAYS per SSL micro-batch), ssl_accum (grad-accum),
+      batch_days (days per policy step).
     optimization: ssl_lr / pol_lr, ssl_weight_decay / pol_weight_decay, ssl_warmup_frac / pol_warmup_frac,
-      schedule ('cosine' warmup->decay, or 'constant'), grad_clip, amp (bf16 autocast).
-    policy objective: cost (turnover), risk_lambda (downside penalty), entropy_coef (exploration),
-      temperature (allocation sharpness).
+      schedule ('cosine' warmup->decay, or 'constant'), grad_clip, amp (bf16 autocast), grad_checkpoint.
+    policy objective: cost (turnover), risk_lambda (downside), entropy_coef (exploration),
+      temperature (allocation sharpness), max_actions_per_day (soft trade budget) + budget_lambda (its penalty).
 
-The series is an ISO-VRAM SWEEP: every design targets ~75 GB on one 80 GB H100, but explores a DIFFERENT point
-in (context arch x policy arch x training strategy) space. `large` (~22 GB) is the smaller MINIMUM/floor. VRAM
-was sized from a calibrated measurement (method reproduces the real `large` ~= 22 GB); ssl_batch_size is the
-per-design knob that lands ~75 GB. The 2xH100 sweep runs two designs at once (one per GPU) -> ~150 GB in use.
-Verify with nvidia-smi and nudge ssl_batch_size +/-1 if a card's headroom differs.
+EVENT-TIMED: the policy is NOT on a fixed decision clock. The encoder turns each full session into a context at
+EVERY `block_seconds` block (78 blocks/day at 300s); the policy chooses WHEN to trade (a per-block act-gate) under
+a SOFT per-day budget of ~`max_actions_per_day` trades, and trades execute T+1. So the candidate grid is the
+encoder's blocks -- there is no separate per-candidate storage; one full-session encode yields every context.
+
+The series no longer varies "lookback": the two-tier hierarchy reaches the WHOLE session by design, so every real
+design encodes the full RTH session and instead varies (context arch x policy arch x block cadence x training
+strategy x trade budget). `large` is the smaller MINIMUM/floor. Full-session SSL is dominated by the tier-1
+activations; `grad_checkpoint` (recompute tier-1 in backward) + `amp` (bf16) keep ONE day/micro-batch within an
+80 GB H100 up to ~d512, and `ssl_accum` builds the effective target-batch at fixed peak VRAM. Verify with
+nvidia-smi and tune ssl_accum / ssl_batch_size. The 2xH100 sweep runs two designs at once (one per GPU).
 """
 from __future__ import annotations
 
@@ -30,7 +36,8 @@ class Phase1Design:
     name: str
     note: str
     # --- architecture ---
-    max_seconds: int                 # raw-second causal lookback (one token per second)
+    session_seconds: int             # full RTH session encoded once per day (one raw token/second)
+    block_seconds: int               # tier-1 block = candidate/decision cadence (300s -> 78 blocks/day)
     d_model: int
     enc_layers: int
     enc_heads: int
@@ -40,9 +47,9 @@ class Phase1Design:
     # --- training budget ---
     ssl_steps: int                   # SSL OPTIMIZER steps (each = ssl_accum micro-batches)
     policy_steps: int
-    ssl_batch_size: int              # decision-rows per micro-batch; peak VRAM = ssl_batch_size * 51 stocks
-    batch_windows: int
-    ssl_accum: int = 8               # grad-accum: effective SSL target-batch = ssl_batch_size * ssl_accum
+    ssl_batch_size: int              # DAYS per SSL micro-batch (a day = one full session)
+    batch_days: int                  # days per policy step
+    ssl_accum: int = 8               # grad-accum: effective SSL target-batch = ssl_batch_size * ssl_accum days
     # --- training strategy / setup (defaults; designs override to vary) ---
     dropout: float = 0.1
     ssl_lr: float = 2e-4
@@ -57,7 +64,10 @@ class Phase1Design:
     risk_lambda: float = 0.1
     entropy_coef: float = 0.0
     temperature: float = 1.0
+    max_actions_per_day: float = 5.0  # SOFT per-day trade budget (the policy gates WHEN to act)
+    budget_lambda: float = 0.1        # penalty on per-day act-gate mass exceeding max_actions_per_day
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
+    grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
 
     def __post_init__(self) -> None:
         if self.d_model % self.enc_heads:
@@ -69,60 +79,62 @@ class Phase1Design:
             raise ValueError(f"{self.name}: schedule must be 'cosine' or 'constant'")
         if self.temperature <= 0:
             raise ValueError(f"{self.name}: temperature must be > 0")
-        for f in ("max_seconds", "ssl_steps", "policy_steps", "ssl_batch_size", "ssl_accum", "batch_windows"):
+        if self.session_seconds % self.block_seconds:
+            raise ValueError(f"{self.name}: block_seconds {self.block_seconds} must divide "
+                             f"session_seconds {self.session_seconds}")
+        if self.max_actions_per_day <= 0 or self.budget_lambda < 0:
+            raise ValueError(f"{self.name}: need max_actions_per_day>0 and budget_lambda>=0")
+        for f in ("session_seconds", "block_seconds", "ssl_steps", "policy_steps", "ssl_batch_size",
+                  "ssl_accum", "batch_days"):
             if getattr(self, f) <= 0:
                 raise ValueError(f"{self.name}: {f} must be positive")
 
 
-# The context encoder reads RAW 1-second bars DIRECTLY (one token/second) + covariates; `max_seconds` is the
-# causal lookback in real seconds. Sizing is GPU-MEASURED (scratchpad raw-second probe): peak VRAM ~ ssl_batch_size
-# * 51 stocks * ~0.16 MB * max_seconds. On one 80 GB H100 that caps ssl_batch_size at ~2 (S=3600) / 1 (S>=5400);
-# 51 stocks * 10800s already ~87 GB so a 3h lookback is INFEASIBLE and was dropped. The tiny per-step batch is
-# compensated by GRADIENT ACCUMULATION (ssl_accum) -> a healthy SSL target-batch at fixed peak VRAM. SSL steps are
-# OPTIMIZER steps; each does ssl_accum micro-batches of (ssl_batch_size * 51) raw-second sequences, so they are far
-# costlier than the old chunk-token steps -> step counts are right-sized down accordingly. Verify with nvidia-smi
-# and tune ssl_batch_size / ssl_accum / max_seconds. The variety spans lookback x context arch x policy arch x
-# training strategy; `large` is the smaller minimum.
+FULL = 23400  # full RTH session (09:30->16:00) in seconds; 78 blocks at 300s
 _SERIES = [
-    # tiny: CPU smoke / CI only.
-    Phase1Design("tiny", "smoke/CI only", max_seconds=120, d_model=24, enc_layers=1, enc_heads=2,
-                 policy_token_dim=24, policy_layers=1, policy_heads=2, ssl_steps=40, policy_steps=60,
-                 ssl_batch_size=4, ssl_accum=1, batch_windows=4, dropout=0.0),
+    # tiny: CPU smoke / CI only (short session, 4 blocks of 30s).
+    Phase1Design("tiny", "smoke/CI only", session_seconds=120, block_seconds=30, d_model=24, enc_layers=1,
+                 enc_heads=2, policy_token_dim=24, policy_layers=1, policy_heads=2, ssl_steps=40, policy_steps=60,
+                 ssl_batch_size=2, ssl_accum=1, batch_days=4, dropout=0.0, max_actions_per_day=2.0),
 
-    # large: the MINIMUM -- short lookback, modest model (S=1800 allows a bigger ssl_batch).
-    Phase1Design("large", "MINIMUM: 1800s lookback, d256/4L", max_seconds=1800, d_model=256, enc_layers=4,
-                 enc_heads=8, policy_token_dim=256, policy_layers=4, policy_heads=8, ssl_steps=3000,
-                 policy_steps=8000, ssl_batch_size=4, ssl_accum=8, batch_windows=32),
+    # large: the MINIMUM -- full session, modest model, standard 300s blocks (78/day), budget ~5.
+    Phase1Design("large", "MINIMUM: full session, d256/4L, 300s blocks, budget 5", session_seconds=FULL,
+                 block_seconds=300, d_model=256, enc_layers=4, enc_heads=8, policy_token_dim=256, policy_layers=4,
+                 policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=8, batch_days=32,
+                 grad_checkpoint=True),
 
-    # ===== variety: vary lookback (max_seconds) x context arch x policy arch x training strategy =====
-    Phase1Design("wide", "WIDE d512/8L, 3600s lookback; standard cosine", max_seconds=3600, d_model=512,
-                 enc_layers=8, enc_heads=8, policy_token_dim=512, policy_layers=4, policy_heads=8,
-                 ssl_steps=3000, policy_steps=8000, ssl_batch_size=2, ssl_accum=8, batch_windows=48),
+    # ===== variety: context arch x policy arch x block cadence x training strategy x trade budget =====
+    Phase1Design("wide", "WIDE d512/8L, full session, 300s blocks, budget 5; bf16", session_seconds=FULL,
+                 block_seconds=300, d_model=512, enc_layers=8, enc_heads=8, policy_token_dim=512, policy_layers=4,
+                 policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=8, batch_days=48,
+                 amp=True, grad_checkpoint=True),
 
-    Phase1Design("deep", "DEEP-NARROW d384/16L, 3600s; warmup-heavy, clip 0.5, lr 1.5e-4", max_seconds=3600,
-                 d_model=384, enc_layers=16, enc_heads=8, policy_token_dim=384, policy_layers=6, policy_heads=8,
-                 ssl_steps=3500, policy_steps=8000, ssl_batch_size=1, ssl_accum=16, batch_windows=48,
-                 ssl_lr=1.5e-4, ssl_warmup_frac=0.10, pol_warmup_frac=0.10, grad_clip=0.5),
+    Phase1Design("deep", "DEEP-NARROW d384/16L, full session, budget 3; warmup-heavy, clip 0.5, lr 1.5e-4",
+                 session_seconds=FULL, block_seconds=300, d_model=384, enc_layers=16, enc_heads=8,
+                 policy_token_dim=384, policy_layers=6, policy_heads=8, ssl_steps=3500, policy_steps=8000,
+                 ssl_batch_size=1, ssl_accum=16, batch_days=48, ssl_lr=1.5e-4, ssl_warmup_frac=0.10,
+                 pol_warmup_frac=0.10, grad_clip=0.5, max_actions_per_day=3.0, amp=True, grad_checkpoint=True),
 
-    Phase1Design("balanced", "BALANCED d512/10L, 3600s; entropy 0.01, temp 1.5, cost 1e-3", max_seconds=3600,
-                 d_model=512, enc_layers=10, enc_heads=8, policy_token_dim=512, policy_layers=6, policy_heads=8,
-                 ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=16, batch_windows=64,
-                 entropy_coef=0.01, temperature=1.5, cost=1e-3),
+    Phase1Design("balanced", "BALANCED d512/10L, full session, budget 5; entropy 0.01, temp 1.5, cost 1e-3",
+                 session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=10, enc_heads=8,
+                 policy_token_dim=512, policy_layers=6, policy_heads=8, ssl_steps=3000, policy_steps=8000,
+                 ssl_batch_size=1, ssl_accum=16, batch_days=64, entropy_coef=0.01, temperature=1.5, cost=1e-3,
+                 amp=True, grad_checkpoint=True),
 
-    Phase1Design("long_ctx", "LONG 7200s lookback (24 blocks), d384/8L; constant lr, wd 5e-2, risk 0.2",
-                 max_seconds=7200, d_model=384, enc_layers=8, enc_heads=8, policy_token_dim=512, policy_layers=4,
-                 policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=8, batch_windows=48,
-                 schedule="constant", pol_weight_decay=5e-2, risk_lambda=0.2),
+    Phase1Design("coarse_blocks", "COARSE 600s blocks (39/day), d384/8L, full session; constant lr, risk 0.2",
+                 session_seconds=FULL, block_seconds=600, d_model=384, enc_layers=8, enc_heads=8,
+                 policy_token_dim=512, policy_layers=4, policy_heads=8, ssl_steps=3000, policy_steps=8000,
+                 ssl_batch_size=1, ssl_accum=8, batch_days=48, schedule="constant", pol_weight_decay=5e-2,
+                 risk_lambda=0.2, amp=True, grad_checkpoint=True),
 
-    # FULL SESSION: the two-tier hierarchy makes the whole ~6.5h RTH session tractable (78 blocks x 300s). bf16.
-    # NOTE: raw bars for the full session are ~134 GB across 374 windows -> needs a big-RAM box (or lazy loading).
-    Phase1Design("full_session", "FULL ~23400s session (78 blocks), d512/10L, bf16 AMP, entropy",
-                 max_seconds=23400, d_model=512, enc_layers=10, enc_heads=8, policy_token_dim=640, policy_layers=6,
-                 policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=16, batch_windows=64,
-                 amp=True, ssl_lr=2.5e-4, entropy_coef=0.02),
+    Phase1Design("active", "ACTIVE budget 8 (looser budget_lambda 0.05), d512/10L, full session; bf16, entropy",
+                 session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=10, enc_heads=8,
+                 policy_token_dim=640, policy_layers=6, policy_heads=8, ssl_steps=3000, policy_steps=8000,
+                 ssl_batch_size=1, ssl_accum=16, batch_days=64, amp=True, grad_checkpoint=True, ssl_lr=2.5e-4,
+                 entropy_coef=0.02, max_actions_per_day=8.0, budget_lambda=0.05),
 ]
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 
 DEFAULT_DESIGN = "wide"
 # Variety run on the 2xH100 box, with `large` as the smaller minimum. ('tiny' = CPU smoke only.)
-SWEEP = ["large", "wide", "deep", "balanced", "long_ctx", "full_session"]
+SWEEP = ["large", "wide", "deep", "balanced", "coarse_blocks", "active"]
