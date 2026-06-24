@@ -12,7 +12,6 @@ from rl_quant.research_protocol import (
     default_benchmark_registry,
     hash_string_sequence,
 )
-from _support import load_script
 
 
 class ResearchProtocolTests(unittest.TestCase):
@@ -139,32 +138,6 @@ class ResearchProtocolTests(unittest.TestCase):
 
         manifest_basis_fields = {f.name for f in dc_fields(DatasetManifest) if f.name.startswith("action_return_")}
         self.assertEqual(manifest_basis_fields, set(_RETURN_BASIS_FIELD_KEYS.values()))
-
-    def test_return_basis_canonical_home_is_protocol_with_back_compat_reexport(self) -> None:
-        # The action-return basis contract lives in the protocol layer; the datasets module re-exports the SAME
-        # objects for backward compatibility, and the protocol package surfaces them.
-        from rl_quant.datasets.hour_from_second import ReturnBasis as DatasetsReturnBasis
-        from rl_quant.datasets.hour_from_second import return_basis_agreement_errors as datasets_fn
-        from rl_quant.protocol import ReturnBasis as PackageReturnBasis
-        from rl_quant.protocol.action_return_basis import ReturnBasis as ProtocolReturnBasis
-        from rl_quant.protocol.action_return_basis import return_basis_agreement_errors as protocol_fn
-
-        self.assertIs(DatasetsReturnBasis, ProtocolReturnBasis)  # datasets re-export is the same object
-        self.assertIs(PackageReturnBasis, ProtocolReturnBasis)   # protocol package surfaces it
-        self.assertIs(datasets_fn, protocol_fn)
-
-    def test_universe_selection_date_resolver_uses_latest_universe_file_date(self) -> None:
-        module = load_script("build_hourly_transformer_dataset")
-        args = module.parse_args(
-            [
-                "--stock-universe",
-                "data/top_us_volume_stocks_2026-06-14.csv",
-                "--etf-universe",
-                "data/top_us_volume_etfs_2026-06-13.csv",
-            ]
-        )
-
-        self.assertEqual(module.resolve_universe_selection_date(args), "2026-06-14T00:00:00+00:00")
 
     def test_model_manifest_requires_baselines_and_stress_tests(self) -> None:
         protocol = EvaluationProtocol(

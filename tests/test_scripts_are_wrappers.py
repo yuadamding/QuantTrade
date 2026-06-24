@@ -28,8 +28,7 @@ _SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 # move its logic into rl_quant/ (workflows.commands / datasets.*/builder / reportability.gates / ...) and turn
 # the script into a thin wrapper, then DELETE it from this set. Do not ADD to this set without a strong reason.
 LEGACY_NON_WRAPPER_SCRIPTS = {
-    "build_hour_from_second_dataset.py",
-    "build_hourly_transformer_dataset.py",
+    # The per-second feature/model/trainer scripts were deleted (2026-06-23, "keep the LLM-generated part only").
     "build_news_article_table.py",
     "build_news_llm_aggregates.py",
     "build_news_llm_features.py",
@@ -40,10 +39,6 @@ LEGACY_NON_WRAPPER_SCRIPTS = {
     "fetch_top_us_market_cap_universe.py",
     "fetch_top_volume_universes.py",
     "generate_qwen_news_precomputed.py",
-    "integrate_stock_covariates_with_hour_partitions.py",
-    "train_hour_from_second_rl.py",
-    "train_hourly_from_second_calendar_holdout.py",
-    "train_hourly_from_second_protocol_partitions.py",
     # validate_research_protocol.py MIGRATED -> rl_quant.workflows.commands.validate (now a thin wrapper).
 }
 
