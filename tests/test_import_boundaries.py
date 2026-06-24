@@ -25,12 +25,8 @@ LAYER_ORDER = [
     "data_sources",
     "execution",
     "features",
-    "models",
     "reportability",
-    "datasets",
     "evaluation",
-    "envs",
-    "training",
     "workflows",
 ]
 

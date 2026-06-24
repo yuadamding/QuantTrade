@@ -18,19 +18,14 @@ import sys
 from rl_quant.paths import scripts_dir
 from rl_quant.presets import PRESETS, resolve_preset
 
-# (group, workflow) -> the single underlying entry-point script. Model 1 (second->hour) only.
+# (group, workflow) -> the single underlying entry-point script. The per-second train/build entry points
+# were removed with the precomputed-feature stack (2026-06-23, "keep the LLM-generated part only").
 _DISPATCH: dict[tuple[str, str], str] = {
-    ("train", "second"): "train_hour_from_second_rl.py",
-    ("train", "partitions"): "train_hourly_from_second_protocol_partitions.py",
-    ("build", "second"): "build_hour_from_second_dataset.py",
     ("validate", "protocol"): "validate_research_protocol.py",
 }
 
-# When no explicit --preset is given, the 1s source selector picks the default preset.
-_DEFAULT_PRESETS: dict[tuple[str, str, str], str] = {
-    ("train", "second", "1s"): "train.second",
-    ("build", "second", "1s"): "build.second",
-}
+# When no explicit --preset is given, the source selector picks the default preset. (Per-second presets removed.)
+_DEFAULT_PRESETS: dict[tuple[str, str, str], str] = {}
 
 
 def build_parser() -> argparse.ArgumentParser:
