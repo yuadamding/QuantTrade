@@ -88,19 +88,28 @@ def freeze_encoder(encoder) -> None:
 
 
 @torch.no_grad()
-def encode_windows(encoder, windows, device, max_decisions: int) -> list[dict]:
-    """Run the FROZEN encoder over each window once -> cached context embeddings, decision-padded to
-    ``max_decisions`` (so the policy stage can batch windows). The returned dicts carry NO raw seconds and NO
-    encoder reference -- they are the Stage-2 inputs."""
+def encode_windows(encoder, windows, device, max_decisions: int, batch: int = 2, amp: bool = False) -> list[dict]:
+    """Run the FROZEN encoder over each window -> cached context embeddings, decision-padded to ``max_decisions``
+    (so the policy stage can batch windows). Decisions are encoded in CHUNKS of ``batch`` (peak VRAM = batch * A
+    raw-second sequences) -- a whole window at once is D*A sequences and OOMs at long lookbacks. The returned
+    dicts carry NO raw seconds and NO encoder reference -- they are the Stage-2 inputs."""
     encoder.eval()
+    dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     out = []
     for w in windows:
-        per_stock, market = encoder(w["bars"].to(device), w["bar_mask"].to(device),
-                                    w["cov"].to(device))  # [D,A,d], [D,d]
-        d = per_stock.shape[0]
+        bars, mask, cov = w["bars"], w["bar_mask"], w["cov"]
+        d = bars.shape[0]
+        ps_chunks, mk_chunks = [], []
+        for i in range(0, d, batch):
+            with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
+                ps, mk = encoder(bars[i:i + batch].to(device), mask[i:i + batch].to(device),
+                                 cov[i:i + batch].to(device))
+            ps_chunks.append(ps.float().cpu())
+            mk_chunks.append(mk.float().cpu())
+        per_stock, market = torch.cat(ps_chunks, 0), torch.cat(mk_chunks, 0)
         out.append({
-            "market": _pad(market.detach().cpu(), max_decisions),
-            "per_stock": _pad(per_stock.detach().cpu(), max_decisions),
+            "market": _pad(market, max_decisions),
+            "per_stock": _pad(per_stock, max_decisions),
             "cov": _pad(w["cov"], max_decisions),
             "news_raw": _pad(w["news_raw"], max_decisions),
             "news_mask": _pad(w["news_mask"], max_decisions, dtype=torch.bool),
