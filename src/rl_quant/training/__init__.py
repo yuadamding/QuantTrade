@@ -20,8 +20,13 @@ from rl_quant.training.decision_policy import (
     evaluate_policy,
     train_decision_policy,
 )
+from rl_quant.training.designs import DEFAULT_DESIGN, DESIGNS, SWEEP, Phase1Design
 
 __all__ = [
+    "DEFAULT_DESIGN",
+    "DESIGNS",
+    "Phase1Design",
+    "SWEEP",
     "cost_paid_baselines",
     "encode_windows",
     "evaluate_policy",
