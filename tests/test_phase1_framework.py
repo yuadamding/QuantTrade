@@ -123,6 +123,33 @@ class PolicyIsAllocationOverActions(unittest.TestCase):
             self.assertAlmostEqual(float(w.sum()), 1.0, places=4)
 
 
+class DesignSeriesIsValid(unittest.TestCase):
+    def test_designs_load_and_are_internally_consistent(self):
+        from rl_quant.training import DEFAULT_DESIGN, DESIGNS, SWEEP
+        self.assertIn(DEFAULT_DESIGN, DESIGNS)
+        self.assertTrue(set(SWEEP).issubset(DESIGNS))
+        for name, d in DESIGNS.items():
+            self.assertEqual(d.d_model % d.enc_heads, 0, f"{name}: enc_heads must divide d_model")
+            self.assertEqual(d.policy_token_dim % d.policy_heads, 0, f"{name}: policy_heads must divide token_dim")
+            self.assertGreater(d.max_chunks * d.chunk_sec, 0)
+            self.assertGreater(min(d.ssl_steps, d.policy_steps, d.ssl_batch_size, d.batch_windows), 0)
+
+    def test_a_design_drives_the_models_at_its_settings(self):
+        from rl_quant.training import DESIGNS
+        d = DESIGNS["small"]
+        enc = ContextEncoder(ContextEncoderConfig(chunk_feature_dim=CHUNK_FEATS, d_model=d.d_model,
+                             n_heads=d.enc_heads, n_layers=d.enc_layers, feedforward_dim=d.d_model * 4,
+                             dropout=d.dropout, max_chunks=d.max_chunks))
+        per_stock, market = enc(torch.randn(1, A, 4, CHUNK_FEATS), torch.ones(1, A, 4, dtype=torch.bool))
+        self.assertEqual(market.shape, (1, d.d_model))
+        pol = DecisionPolicyHead(DecisionPolicyConfig(context_dim=d.d_model, covariate_dim=NC, news_dim=NN,
+                                 token_dim=d.policy_token_dim, n_heads=d.policy_heads, n_layers=d.policy_layers,
+                                 feedforward_dim=d.policy_token_dim * 2))
+        w = pol(market, per_stock, torch.randn(1, A, NC), torch.randn(1, A, NN),
+                torch.zeros(1, A), torch.ones(1, A, dtype=torch.bool))
+        self.assertAlmostEqual(float(w.sum()), 1.0, places=4)
+
+
 class EndToEndStagesRun(unittest.TestCase):
     def test_encode_then_policy_eval_produces_per_decision_returns(self):
         torch.manual_seed(0)
