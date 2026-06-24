@@ -17,7 +17,7 @@ import unittest
 
 import torch
 
-from rl_quant.datasets import CHUNK_FEATS, COV_FIELDS, NEWS_FEATS
+from rl_quant.datasets import BAR_FEATS, COV_FIELDS, NEWS_RAW_DIM
 from rl_quant.models import (
     ContextEncoder,
     ContextEncoderConfig,
@@ -26,35 +26,42 @@ from rl_quant.models import (
 )
 from rl_quant.training import encode_windows, evaluate_policy, freeze_encoder, train_decision_policy
 
-D, A, C = 3, 6, 5
-NC, NN = len(COV_FIELDS), NEWS_FEATS
+D, A, S, M = 3, 6, 8, 4  # decisions, actions, raw-second tokens, news articles
+NC, NRD = len(COV_FIELDS), NEWS_RAW_DIM
 
 
 def _encoder(d_model=16):
-    return ContextEncoder(ContextEncoderConfig(chunk_feature_dim=CHUNK_FEATS, d_model=d_model, n_heads=2,
-                                               n_layers=1, feedforward_dim=32, dropout=0.0, max_chunks=C))
+    return ContextEncoder(ContextEncoderConfig(bar_feature_dim=BAR_FEATS, covariate_dim=NC, d_model=d_model,
+                                               n_heads=2, n_layers=1, feedforward_dim=32, dropout=0.0,
+                                               max_seconds=S))
 
 
 def _policy(d_model=16):
-    return DecisionPolicyHead(DecisionPolicyConfig(context_dim=d_model, covariate_dim=NC, news_dim=NN,
-                                                   token_dim=16, n_heads=2, n_layers=1, feedforward_dim=32))
+    return DecisionPolicyHead(DecisionPolicyConfig(context_dim=d_model, covariate_dim=NC, news_raw_dim=NRD,
+                                                   max_news=M, token_dim=16, n_heads=2, n_layers=1,
+                                                   feedforward_dim=32))
 
 
-def _synthetic_window(seed=0, decisions=D, actions=A, chunks=C):
+def _news(b, actions, gen=None):  # raw per-article scores + mask (what the policy aggregates in-model)
+    return (torch.randn(b, actions, M, NRD, generator=gen), torch.ones(b, actions, M, dtype=torch.bool))
+
+
+def _synthetic_window(seed=0, decisions=D, actions=A, seconds=S):
     g = torch.Generator().manual_seed(seed)
-    chunk = torch.randn(decisions, actions, chunks, CHUNK_FEATS, generator=g)
-    mask = torch.zeros(decisions, actions, chunks, dtype=torch.bool)
+    bars = torch.randn(decisions, actions, seconds, BAR_FEATS, generator=g)  # RAW bars (one token/second)
+    mask = torch.zeros(decisions, actions, seconds, dtype=torch.bool)
     for di in range(decisions):
         for ai in range(1, actions):  # action 0 = CASH carries no stock context
-            k = 1 + (di + ai) % chunks  # left-aligned valid prefix of length k
+            k = 1 + (di + ai) % seconds  # left-aligned valid prefix of length k
             mask[di, ai, :k] = True
     ret = 0.01 * torch.randn(decisions, actions, generator=g)
     ret[:, 0] = 0.0
     valid = mask.any(-1)
     valid[:, 0] = True
-    return {"chunk": chunk, "chunk_mask": mask, "cov": torch.randn(decisions, actions, NC, generator=g),
-            "news": torch.randn(decisions, actions, NN, generator=g), "ret": ret, "ret_valid": valid,
-            "decisions": decisions}
+    return {"bars": bars, "bar_mask": mask, "cov": torch.randn(decisions, actions, NC, generator=g),
+            "news_raw": torch.randn(decisions, actions, M, NRD, generator=g),
+            "news_mask": torch.ones(decisions, actions, M, dtype=torch.bool),
+            "ret": ret, "ret_valid": valid, "decisions": decisions}
 
 
 class ContextIsPolicyFree(unittest.TestCase):
@@ -64,7 +71,9 @@ class ContextIsPolicyFree(unittest.TestCase):
         for banned in ("action", "policy", "previous", "constraint", "cash", "score"):
             self.assertFalse(any(banned in n.lower() for n, _ in enc.named_parameters()),
                              f"context encoder must not carry a '{banned}' parameter")
-        per_stock, market = enc(torch.randn(2, A, C, CHUNK_FEATS), torch.ones(2, A, C, dtype=torch.bool))
+        enc.eval()
+        per_stock, market = enc(torch.randn(2, A, S, BAR_FEATS), torch.ones(2, A, S, dtype=torch.bool),
+                                torch.randn(2, A, NC))
         self.assertEqual(per_stock.shape, (2, A, enc.d_model))
         self.assertEqual(market.shape, (2, enc.d_model))
 
@@ -86,16 +95,37 @@ class ContextIsCausal(unittest.TestCase):
         torch.manual_seed(0)
         enc = _encoder()
         enc.eval()
-        chunk = torch.randn(1, 1, C, CHUNK_FEATS)
-        mask = torch.zeros(1, 1, C, dtype=torch.bool)
-        mask[0, 0, :2] = True  # only the first two tokens are valid (left-aligned)
+        bars = torch.randn(1, 1, S, BAR_FEATS)
+        mask = torch.zeros(1, 1, S, dtype=torch.bool)
+        mask[0, 0, :2] = True  # only the first two seconds are valid (left-aligned)
+        cov = torch.randn(1, 1, NC)
         with torch.no_grad():
-            base, _ = enc(chunk, mask)
-            perturbed = chunk.clone()
-            perturbed[0, 0, 2:] += 5.0  # change ONLY the later/padded tokens
-            after, _ = enc(perturbed, mask)
+            base, _ = enc(bars, mask, cov)
+            perturbed = bars.clone()
+            perturbed[0, 0, 2:] += 5.0  # change ONLY the later/padded second-tokens
+            after, _ = enc(perturbed, mask, cov)
         self.assertTrue(torch.allclose(base, after, atol=1e-5),
                         "context changed when only future/padded tokens changed -> not causal")
+
+    def test_two_tier_multi_block_shapes_and_causality(self):
+        # block_seconds < max_seconds -> exercises the real hierarchy (tier-1 within blocks, tier-2 over blocks)
+        torch.manual_seed(0)
+        enc = ContextEncoder(ContextEncoderConfig(bar_feature_dim=BAR_FEATS, covariate_dim=NC, d_model=16,
+                             n_heads=2, n_layers=4, feedforward_dim=32, max_seconds=16, block_seconds=4))
+        enc.eval()
+        bars = torch.randn(1, A, 16, BAR_FEATS)            # 16 seconds = 4 blocks of 4
+        mask = torch.zeros(1, A, 16, dtype=torch.bool)
+        mask[0, :, :10] = True                             # 10 valid seconds (spans blocks 0..2, into block 2)
+        cov = torch.randn(1, A, NC)
+        with torch.no_grad():
+            ps, market = enc(bars, mask, cov)
+            self.assertEqual(ps.shape, (1, A, 16))
+            self.assertEqual(market.shape, (1, 16))
+            perturbed = bars.clone()
+            perturbed[0, :, 10:] += 9.0                    # change only future/padded seconds (across later blocks)
+            ps2, _ = enc(perturbed, mask, cov)
+        self.assertTrue(torch.allclose(ps, ps2, atol=1e-5),
+                        "two-tier context changed when only future tokens changed -> not causal across blocks")
 
 
 class PolicyIsAllocationOverActions(unittest.TestCase):
@@ -106,8 +136,9 @@ class PolicyIsAllocationOverActions(unittest.TestCase):
         avail[0, actions - 1] = False  # one unavailable action
         prev = torch.zeros(1, actions)
         prev[0, 0] = 1.0
+        ns, nm = _news(1, actions)
         return pol(torch.randn(1, 16), torch.randn(1, actions, 16), torch.randn(1, actions, NC),
-                   torch.randn(1, actions, NN), prev, avail)
+                   ns, nm, prev, avail)
 
     def test_weights_form_a_simplex_and_respect_constraints(self):
         w = self._weights(A)
@@ -131,23 +162,58 @@ class DesignSeriesIsValid(unittest.TestCase):
         for name, d in DESIGNS.items():
             self.assertEqual(d.d_model % d.enc_heads, 0, f"{name}: enc_heads must divide d_model")
             self.assertEqual(d.policy_token_dim % d.policy_heads, 0, f"{name}: policy_heads must divide token_dim")
-            self.assertGreater(d.max_chunks * d.chunk_sec, 0)
+            self.assertGreater(d.max_seconds, 0)
             self.assertGreater(min(d.ssl_steps, d.policy_steps, d.ssl_batch_size, d.batch_windows), 0)
 
     def test_a_design_drives_the_models_at_its_settings(self):
         from rl_quant.training import DESIGNS
-        d = DESIGNS["small"]
-        enc = ContextEncoder(ContextEncoderConfig(chunk_feature_dim=CHUNK_FEATS, d_model=d.d_model,
+        d = DESIGNS["wide"]
+        enc = ContextEncoder(ContextEncoderConfig(bar_feature_dim=BAR_FEATS, covariate_dim=NC, d_model=d.d_model,
                              n_heads=d.enc_heads, n_layers=d.enc_layers, feedforward_dim=d.d_model * 4,
-                             dropout=d.dropout, max_chunks=d.max_chunks))
-        per_stock, market = enc(torch.randn(1, A, 4, CHUNK_FEATS), torch.ones(1, A, 4, dtype=torch.bool))
+                             dropout=d.dropout, max_seconds=64))
+        enc.eval()
+        per_stock, market = enc(torch.randn(1, A, 16, BAR_FEATS), torch.ones(1, A, 16, dtype=torch.bool),
+                                torch.randn(1, A, NC))
         self.assertEqual(market.shape, (1, d.d_model))
-        pol = DecisionPolicyHead(DecisionPolicyConfig(context_dim=d.d_model, covariate_dim=NC, news_dim=NN,
-                                 token_dim=d.policy_token_dim, n_heads=d.policy_heads, n_layers=d.policy_layers,
-                                 feedforward_dim=d.policy_token_dim * 2))
-        w = pol(market, per_stock, torch.randn(1, A, NC), torch.randn(1, A, NN),
-                torch.zeros(1, A), torch.ones(1, A, dtype=torch.bool))
+        pol = DecisionPolicyHead(DecisionPolicyConfig(context_dim=d.d_model, covariate_dim=NC, news_raw_dim=NRD,
+                                 max_news=M, token_dim=d.policy_token_dim, n_heads=d.policy_heads,
+                                 n_layers=d.policy_layers, feedforward_dim=d.policy_token_dim * 2))
+        ns, nm = _news(1, A)
+        w = pol(market, per_stock, torch.randn(1, A, NC), ns, nm, torch.zeros(1, A), torch.ones(1, A, dtype=torch.bool))
         self.assertAlmostEqual(float(w.sum()), 1.0, places=4)
+
+
+class TrainingStrategyKnobs(unittest.TestCase):
+    def test_lr_schedule_warmup_then_decay(self):
+        from rl_quant.training._optim import lr_scale
+        self.assertAlmostEqual(lr_scale(0, 100, 10), 0.1, places=6)      # warmup start
+        self.assertAlmostEqual(lr_scale(9, 100, 10), 1.0, places=6)      # warmup end
+        self.assertLess(lr_scale(99, 100, 10), 0.05)                     # cosine ~ -> 0
+        self.assertEqual(lr_scale(50, 100, 10, "constant"), 1.0)         # constant = flat
+
+    def test_temperature_sharpens_or_diversifies_allocation(self):
+        torch.manual_seed(0)
+        ms, ps = torch.randn(1, 16), torch.randn(1, A, 16)
+        cov, prev, avail = torch.randn(1, A, NC), torch.zeros(1, A), torch.ones(1, A, dtype=torch.bool)
+        ns, nm = _news(1, A)
+        cfg = dict(context_dim=16, covariate_dim=NC, news_raw_dim=NRD, max_news=M, token_dim=16, n_heads=2,
+                   n_layers=1, feedforward_dim=32)
+        torch.manual_seed(1)
+        w_sharp = DecisionPolicyHead(DecisionPolicyConfig(**cfg, temperature=0.3))(ms, ps, cov, ns, nm, prev, avail)
+        torch.manual_seed(1)
+        w_diff = DecisionPolicyHead(DecisionPolicyConfig(**cfg, temperature=3.0))(ms, ps, cov, ns, nm, prev, avail)
+
+        def ent(w):
+            return float(-(w.clamp_min(1e-9) * w.clamp_min(1e-9).log()).sum())
+        self.assertLess(ent(w_sharp), ent(w_diff))   # low temp -> concentrated (lower entropy)
+
+    def test_amp_and_entropy_training_step_runs(self):
+        torch.manual_seed(0)
+        enc = _encoder()
+        freeze_encoder(enc)
+        emb = encode_windows(enc, [_synthetic_window(2), _synthetic_window(3)], torch.device("cpu"), max_decisions=D)
+        train_decision_policy(_policy(), emb, steps=2, eval_every=0, val_emb=emb, device=torch.device("cpu"),
+                              batch_windows=2, entropy_coef=0.02, grad_clip=0.5, warmup_steps=1, schedule="constant")
 
 
 class EndToEndStagesRun(unittest.TestCase):
