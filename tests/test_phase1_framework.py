@@ -372,6 +372,50 @@ class CrossDayDailyMode(unittest.TestCase):
         self.assertEqual(len(rows), 2 * 4)                                     # every day label-valid (opens>0)
         self.assertTrue(all(abs(r) < 1.0 for r in rows))
 
+    def test_truncated_bptt_enables_multiday_credit_assignment(self):
+        # Delayed-reward task: the winner is identifiable ONLY from the day-0 context; its payoff lands on the
+        # HELD days 1-2 (day-0 return ~0, later contexts uninformative). A myopic (1-step) policy can never
+        # connect the day-0 decision to the later payoff -> ~0; truncated BPTT credits the held position's
+        # multi-day returns to the day-0 decision -> it learns to buy & hold the winner. This is the mechanism
+        # behind learning long-range holds.
+        def _delayed(n_ep=8, L=4, actions=4, d=16, seed=0):
+            gg = torch.Generator().manual_seed(seed)
+            eps = []
+            for e in range(n_ep):
+                win = 1 + (e % (actions - 1))
+                ps = 0.1 * torch.randn(L, actions, d, generator=gg)     # later days: uninformative context
+                ps[0, :, 0] = -1.0
+                ps[0, win, 0] = 2.0                                     # day-0 signal ONLY identifies the winner
+                ret = torch.zeros(L, actions)
+                ret[1, win] = 0.03
+                ret[2, win] = 0.03                                      # payoff on the HELD days (not day 0)
+                ret[:, 1:] = ret[:, 1:] - ret[:, 1:].mean(1, keepdim=True)
+                valid = torch.zeros(L, actions, dtype=torch.bool)
+                valid[:, 0] = True
+                valid[:3, 1:] = True
+                eps.append({"market": ps.mean(1), "per_stock": ps,
+                            "news_raw": torch.zeros(L, actions, M, NRD),
+                            "news_mask": torch.zeros(L, actions, M, dtype=torch.bool),
+                            "ret": ret, "ret_valid": valid, "n_blocks": L})
+            return eps
+
+        dev = torch.device("cpu")
+
+        def train_eval(window):
+            torch.manual_seed(0)
+            pol = _policy()
+            train_decision_policy(pol, _delayed(seed=1), steps=400, lr=3e-3, batch_days=8, cost=1e-3,
+                                  risk_lambda=0.0, budget_lambda=0.0, gate_entropy_coef=0.0, friction_warmup_steps=0,
+                                  schedule="constant", eval_every=0, val_days=_delayed(seed=1), device=dev,
+                                  bptt_window=window)
+            r = evaluate_policy(pol, _delayed(seed=1), dev, cost=1e-3)
+            return sum(r) / len(r)
+
+        oos_myopic = train_eval(1)
+        oos_bptt = train_eval(4)
+        self.assertGreater(oos_bptt, oos_myopic, "BPTT did not improve multi-day credit over the myopic baseline")
+        self.assertGreater(oos_bptt, 0.0, "BPTT policy failed to capture the delayed (held) reward")
+
     def test_long_hold_overlapping_windows_and_short_split(self):
         # overlapping sliding windows -> many fixed-length episodes from a long sequence (LONG-HOLD training data)
         eps = build_daily_episodes(_daily_records(30), episode_len=10, stride=5)

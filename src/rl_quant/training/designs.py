@@ -74,8 +74,10 @@ class Phase1Design:
     friction_warmup_frac: float = 0.3 # ramp turnover cost + budget penalty 0->full over this frac of policy_steps
     ssl_perstock_coef: float = 1.0    # weight of the per-stock cross-sectional SSL pretext (relative-value signal)
     horizon_mode: str = "intraday"    # "intraday" (trade 5-min blocks within a day) | "daily" (hold ACROSS days)
-    episode_len: int = 21             # daily mode: days per episode (max hold; positions carry across the episode)
+    episode_len: int = 21             # daily mode: days per episode (the RANGE of ability -- max holdable span)
     episode_stride: int = 0           # daily mode: train sliding-window stride (0=non-overlap; small=>more samples)
+    bptt_window: int = 1              # truncated-BPTT span: credit a held position's returns to the decision that
+    #                                   set it over this many steps (1=myopic 1-step; >1 needed to LEARN long holds)
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
 
@@ -93,6 +95,8 @@ class Phase1Design:
             raise ValueError(f"{self.name}: episode_len must be > 1")
         if self.episode_stride < 0:
             raise ValueError(f"{self.name}: episode_stride must be >= 0")
+        if self.bptt_window < 1:
+            raise ValueError(f"{self.name}: bptt_window must be >= 1")
         if self.temperature <= 0:
             raise ValueError(f"{self.name}: temperature must be > 0")
         if self.session_seconds % self.block_seconds:
@@ -170,17 +174,18 @@ _SERIES = [
     Phase1Design("daily_xs", "DAILY cross-sectional, hold across days (21d episodes), d512/8L; bf16", session_seconds=FULL,
                  block_seconds=300, d_model=512, enc_layers=8, enc_heads=8, policy_token_dim=512, policy_layers=4,
                  policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=8, batch_days=16,
-                 horizon_mode="daily", episode_len=21, budget_lambda=0.0, ssl_perstock_coef=0.0,
+                 horizon_mode="daily", episode_len=21, bptt_window=21, budget_lambda=0.0, ssl_perstock_coef=0.0,
                  amp=True, grad_checkpoint=True),
 
-    # LONG-HOLD cross-sectional: 180-day episodes (positions carry the whole episode) + a SPARSE trade budget
-    # (~2 rebalances/episode) => the policy can profit from two trades >=180 days apart. Overlapping train windows
-    # (stride 20) keep enough samples despite the long episode; eval uses one long episode per (data-limited) split.
-    Phase1Design("daily_long", "LONG-HOLD daily: 180d episodes, ~2 trades/episode (>=180d apart), d512/8L; bf16",
+    # LONG-RANGE cross-sectional: 180-day episodes = the RANGE of ability (positions CAN persist up to 180 days,
+    # but the policy chooses each hold's length -- it is NOT forced to hold 180d). Turnover cost (not a sparse
+    # budget) regulates frequency; truncated BPTT (window 30) lets a held position's multi-day returns credit the
+    # decision that set it, so long holds are LEARNABLE. Overlapping train windows (stride 20) keep enough samples.
+    Phase1Design("daily_long", "LONG-RANGE daily: 180d episodes (range), free hold length, BPTT 30, d512/8L; bf16",
                  session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=8, enc_heads=8,
                  policy_token_dim=512, policy_layers=4, policy_heads=8, ssl_steps=3000, policy_steps=8000,
                  ssl_batch_size=1, ssl_accum=8, batch_days=8, horizon_mode="daily", episode_len=180,
-                 episode_stride=20, max_actions_per_day=2.0, budget_lambda=0.5, ssl_perstock_coef=0.0,
+                 episode_stride=20, bptt_window=30, budget_lambda=0.0, ssl_perstock_coef=0.0,
                  amp=True, grad_checkpoint=True),
 ]
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}

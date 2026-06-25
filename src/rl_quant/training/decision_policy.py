@@ -42,9 +42,14 @@ def _stack(days_emb: list[dict], idx, device):
     }
 
 
-def _rollout(policy, batch, cost: float):
-    """Roll the policy forward over a day's blocks, carrying the previous position (T+1, gated holding).
-    -> nets [B,nB], gates [B,nB], entropies [B,nB], cash_w [B,nB], turnover [B,nB]."""
+def _rollout(policy, batch, cost: float, bptt_window: int = 1):
+    """Roll the policy forward over the sequence (intraday blocks OR cross-day days), carrying the previous
+    position (T+1, gated holding). -> nets [B,T], gates [B,T], entropies [B,T], cash_w [B,T], turnover [B,T].
+
+    Credit assignment via TRUNCATED BPTT: the held position carries the autograd graph for `bptt_window` steps
+    before detaching, so a position's MULTI-step returns back-propagate to the allocation/gate that set it (needed
+    to learn long holds -- e.g. the 180-day range). `bptt_window=1` detaches every step (myopic 1-step credit, the
+    original behaviour). The policy's prev-weight INPUT is always detached (it reads its position as a feature)."""
     market, per_stock = batch["market"], batch["per_stock"]
     news_raw, news_mask, ret, avail = batch["news_raw"], batch["news_mask"], batch["ret"], batch["avail"]
     B, nB, A, _ = per_stock.shape
@@ -53,15 +58,15 @@ def _rollout(policy, batch, cost: float):
     nets, gates, ents, cash_w, turn = [], [], [], [], []
     for b in range(nB):
         w, g = policy(market[:, b], per_stock[:, b], news_raw[:, b], news_mask[:, b], prev_w.detach(), avail[:, b])
-        a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * prev_w.detach()   # gated, T+1 position
+        a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * prev_w   # carry WITH grad (truncated below) -> T+1
         realized = (a * ret[:, b]).sum(-1)
-        turnover = 0.5 * (a - prev_w.detach()).abs().sum(-1)
+        turnover = 0.5 * (a - prev_w).abs().sum(-1)
         nets.append(realized - cost * turnover)
         gates.append(g)
         ents.append(-(w * w.clamp_min(1e-9).log()).sum(-1))      # allocation entropy (masked actions contribute 0)
         cash_w.append(a[:, CASH_INDEX])
         turn.append(turnover)
-        prev_w = a
+        prev_w = a.detach() if (bptt_window <= 1 or (b + 1) % bptt_window == 0) else a   # truncation boundary
     st = lambda xs: torch.stack(xs, 1)  # noqa: E731
     return st(nets), st(gates), st(ents), st(cash_w), st(turn)
 
@@ -85,7 +90,7 @@ def train_decision_policy(
     policy, train_days, *, steps: int, lr: float = 3e-4, weight_decay: float = 3e-2,
     batch_days: int = 16, cost: float = 5e-4, risk_lambda: float = 0.1, entropy_coef: float = 0.0,
     max_actions: float = 5.0, budget_lambda: float = 0.1, gate_entropy_coef: float = 1e-3,
-    friction_warmup_steps: int = 0,
+    friction_warmup_steps: int = 0, bptt_window: int = 1,
     warmup_steps: int = 0, schedule: str = "cosine", grad_clip: float = 0.0, amp: bool = False,
     start_step: int = 0, optimizer=None, best_val: float = -1e9, best_state: dict | None = None,
     eval_every: int = 0, val_days: list[dict] | None = None, device=None,
@@ -105,7 +110,7 @@ def train_decision_policy(
         idx = torch.randint(0, n, (min(batch_days, n),)).tolist()
         batch = _stack(train_days, idx, device)
         with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-            nets, gates, ents, _, _ = _rollout(policy, batch, cost * friction)
+            nets, gates, ents, _, _ = _rollout(policy, batch, cost * friction, bptt_window=bptt_window)
             loss = _loss(nets, gates, ents, batch["label"], risk_lambda, entropy_coef,
                          max_actions, budget_lambda * friction, gate_entropy_coef)
         optimizer.zero_grad()
