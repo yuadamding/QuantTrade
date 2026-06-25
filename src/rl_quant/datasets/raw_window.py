@@ -199,10 +199,17 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
                             ret[d, b, ai] = float(np.clip(r, -1.0, 1.0))
                             ret_valid[d, b, ai] = True
 
+    # per-stock day-OPEN price (first valid bar's open) -- the cross-day (daily) execution price
+    fv = bar_mask.argmax(axis=2)                                  # [Dd,A] first valid second (0 if none)
+    has = bar_mask.any(axis=2)                                    # [Dd,A]
+    opens = np.take_along_axis(bars_t[:, :, :, 0], fv[:, :, None], axis=2)[:, :, 0]
+    day_open = np.where(has, opens, np.nan).astype(np.float32)    # [Dd,A] (NaN where the stock has no bars that day)
+
     return {
         "bars": torch.from_numpy(bars_t), "bar_mask": torch.from_numpy(bar_mask),
         "cov_blocks": torch.from_numpy(covt), "news_raw": torch.from_numpy(news_raw),
         "news_mask": torch.from_numpy(news_mask),
         "ret": torch.from_numpy(ret), "ret_valid": torch.from_numpy(ret_valid),
+        "day_open": torch.from_numpy(day_open), "dates": days,
         "window": window, "n_days": Dd, "n_blocks": nB,
     }

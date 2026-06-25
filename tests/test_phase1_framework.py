@@ -18,7 +18,7 @@ import unittest
 
 import torch
 
-from rl_quant.datasets import BAR_FEATS, COV_FIELDS, NEWS_RAW_DIM
+from rl_quant.datasets import BAR_FEATS, COV_FIELDS, NEWS_RAW_DIM, build_daily_episodes, cross_day_returns
 from rl_quant.models import (
     ContextEncoder,
     ContextEncoderConfig,
@@ -301,6 +301,21 @@ class PolicyLearnsAndTradesUnderFix(unittest.TestCase):
         self.assertGreater(oos, 0.0, "policy did not learn the planted cross-sectional signal")
         self.assertGreater(oos, before, "training did not improve OOS over the untrained policy")
 
+    def test_tight_budget_sparsifies_trading_for_long_holds(self):
+        # A tight per-episode trade budget must drive the gate SPARSE so positions are HELD across the episode
+        # (the mechanism behind "two trades >=180 days apart"): over a 20-step episode the gate starts ~0.88
+        # (>=17 trades) and must drop well below that under budget pressure.
+        torch.manual_seed(0)
+        days = _planted_days(n_days=6, nb=20)
+        pol = _policy()
+        dev = torch.device("cpu")
+        train_decision_policy(pol, days, steps=300, lr=3e-3, batch_days=6, cost=1e-4, risk_lambda=0.0,
+                              max_actions=2.0, budget_lambda=2.0, gate_entropy_coef=0.0, friction_warmup_steps=0,
+                              schedule="constant", eval_every=0, val_days=days, device=dev)
+        tele = policy_telemetry(pol, days, dev, cost=1e-4)
+        self.assertLess(tele["mean_gate"], 0.5, "tight budget did not sparsify the gate -> long holds not enabled")
+        self.assertLess(tele["trades_per_day"], 10.0, "still trading most days despite a 2-trade/episode budget")
+
 
 class SSLPerStockPretext(unittest.TestCase):
     def test_perstock_target_is_demeaned_and_cash_is_invalid(self):
@@ -321,6 +336,52 @@ class SSLPerStockPretext(unittest.TestCase):
                               steps=2, batch_size=2, accum_steps=1, warmup_steps=1, schedule="constant")
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in ps_head.parameters()),
                         "per-stock SSL head received no gradient -> the cross-sectional pretext is not wired")
+
+
+def _daily_records(n=12, actions=A, d=16, seed=0):
+    """A date-sorted sequence of per-day end-of-day-context records (what the daily assembler consumes)."""
+    g = torch.Generator().manual_seed(seed)
+    return [{"date": f"2022-02-{i + 1:02d}", "day_open": 1.0 + 0.5 * torch.rand(actions, generator=g),
+             "market": torch.randn(d, generator=g), "per_stock": torch.randn(actions, d, generator=g),
+             "news_raw": torch.zeros(actions, M, NRD), "news_mask": torch.zeros(actions, M, dtype=torch.bool)}
+            for i in range(n)]
+
+
+class CrossDayDailyMode(unittest.TestCase):
+    def test_cross_day_returns_are_open_to_open_T1(self):
+        # CASH col 0 (dummy), stock1 opens 1.0,1.1,1.21,..., stock2 2.0,2.2,2.42,...
+        op = torch.tensor([[1., 1.00, 2.00], [1., 1.10, 2.20], [1., 1.21, 2.42],
+                           [1., 1.00, 1.00], [1., 1.00, 1.00]])
+        ret, valid = cross_day_returns(op)
+        self.assertAlmostEqual(float(ret[0, 1]), 1.21 / 1.10 - 1.0, places=5)  # open[d+2]/open[d+1]-1
+        self.assertEqual(float(ret[0, 0]), 0.0)                                # CASH return 0
+        self.assertTrue(bool(valid[0, 0]) and bool(valid[0, 1]))
+        self.assertFalse(bool(valid[3, 1]) or bool(valid[4, 1]))               # last 2 days: no T+1 label
+
+    def test_build_daily_episodes_shape_and_trains(self):
+        recs = _daily_records(12)
+        eps = build_daily_episodes(recs, episode_len=4)
+        self.assertEqual(len(eps), 2)                                          # usable=10 -> floor over 4-day chunks
+        self.assertEqual(eps[0]["per_stock"].shape, (4, A, 16))
+        self.assertEqual(eps[0]["market"].shape, (4, 16))
+        self.assertEqual(eps[0]["ret"].shape, (4, A))
+        dev = torch.device("cpu")
+        train_decision_policy(_policy(), eps, steps=2, batch_days=2, val_days=eps, device=dev, eval_every=0,
+                              budget_lambda=0.0)
+        rows = evaluate_policy(_policy(), eps, dev, cost=1e-4)
+        self.assertEqual(len(rows), 2 * 4)                                     # every day label-valid (opens>0)
+        self.assertTrue(all(abs(r) < 1.0 for r in rows))
+
+    def test_long_hold_overlapping_windows_and_short_split(self):
+        # overlapping sliding windows -> many fixed-length episodes from a long sequence (LONG-HOLD training data)
+        eps = build_daily_episodes(_daily_records(30), episode_len=10, stride=5)
+        self.assertGreater(len(eps), 2)
+        self.assertTrue(all(e["per_stock"].shape[0] == 10 for e in eps))
+        # a held position (gate=0) carries across the WHOLE episode -> a 10-day hold here, >=180 at full scale
+        # short split (fewer days than episode_len) is NOT starved: one episode of the full usable length
+        short = build_daily_episodes(_daily_records(8), episode_len=180)
+        self.assertEqual(len(short), 1)
+        self.assertEqual(short[0]["per_stock"].shape[0], 6)                    # usable = 8 - 2 (T+1 tail)
 
 
 if __name__ == "__main__":
