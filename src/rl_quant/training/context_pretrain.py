@@ -127,7 +127,7 @@ def encode_days(encoder, days, device, batch: int = 2, amp: bool = False) -> lis
         for j, d in enumerate(chunk):
             out.append({
                 "market": market[j], "per_stock": per_stock[j],
-                "news_raw": d["news_raw"], "news_mask": d["news_mask"],
+                "news_raw": d["news_raw"], "news_mask": d["news_mask"], "avail": d["avail"],
                 "ret": d["ret"], "ret_valid": d["ret_valid"], "n_blocks": d["ret"].shape[0],
             })
     return out

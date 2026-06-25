@@ -37,7 +37,8 @@ def _stack(days_emb: list[dict], idx, device):
     return {
         "market": s("market"), "per_stock": s("per_stock"),
         "news_raw": s("news_raw"), "news_mask": s("news_mask"),
-        "ret": torch.nan_to_num(s("ret")), "avail": s("ret_valid"),
+        "ret": torch.nan_to_num(s("ret")),
+        "avail": s("avail"),                                     # as-of tradeability (NOT label existence -> no leak)
         "label": s("ret_valid")[:, :, 1:].any(-1),               # [B,nB] block has a non-CASH T+1 label
     }
 
