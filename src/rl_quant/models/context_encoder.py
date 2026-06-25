@@ -137,15 +137,22 @@ class ContextEncoder(nn.Module):
         normed = torch.zeros_like(flat)
         if mv.any():
             normed[mv] = self.bar_norm(flat[mv])
-        x = self.input_proj(normed).reshape(B * A, nB, bl, d) + self.pos1[:bl].view(1, 1, bl, d)
+        x = self.input_proj(normed).reshape(B * A, nB, bl, d)
+        # LEFT-PACK valid seconds within each block: bars are scattered at ABSOLUTE second-offsets, so a late start
+        # or interior gap leaves zeros between valid seconds. Move the valid seconds to the front (time order
+        # preserved) BEFORE adding positions, so causal attention never attends a gap/empty key and the per-block
+        # summary (_last_valid via count) is the true most-recent valid token. A fully-traded block is unchanged.
+        bm = bar_mask.reshape(B * A, nB, bl)
+        order = torch.argsort(bm.to(torch.int8), dim=-1, descending=True, stable=True)   # valid first, order-stable
+        x = torch.gather(x, 2, order.unsqueeze(-1).expand(-1, -1, -1, d))
+        x = x.reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
         # --- Tier 1: local causal attention within each block -> learned per-block summaries ---
-        x = x.reshape(B * A * nB, bl, d)
         for blk in self.tier1:
             x = (torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
                  if self.grad_checkpoint and self.training else blk(x))
         x = self.norm1(x)
-        cnt1 = bar_mask.reshape(B * A * nB, bl).sum(-1)          # valid seconds per block
-        summ = _last_valid(x, cnt1).reshape(B * A, nB, d)        # each block's most-recent-valid token
+        cnt1 = bm.reshape(B * A * nB, bl).sum(-1)                # valid seconds per block (packing-invariant)
+        summ = _last_valid(x, cnt1).reshape(B * A, nB, d)        # left-packed -> count-1 IS the last valid token
         block_has = (cnt1.reshape(B * A, nB) > 0)                # [B*A, nB]
         summ = summ * block_has.unsqueeze(-1).float()
         # --- Tier 2: global causal attention over block summaries -> a context at EVERY block ---
@@ -155,8 +162,12 @@ class ContextEncoder(nn.Module):
         h = self.norm2(h)                                        # [B*A, nB, d] per-block tier-2 context
         bar_blocks = h.reshape(B, A, nB, d).permute(0, 2, 1, 3)  # [B, nB, A, d]
         has = block_has.reshape(B, A, nB).permute(0, 2, 1).unsqueeze(-1).float()   # [B, nB, A, 1]
-        cov_flat = self.cov_norm(cov_blocks[:, :nB].reshape(-1, cov_blocks.shape[-1]))  # [B*nB*A, C]
-        cov = self.cov_mlp(cov_flat).reshape(B, nB, A, d)        # learned C->d embedding, per block
+        cf = cov_blocks[:, :nB].reshape(-1, cov_blocks.shape[-1])   # [B*nB*A, C]
+        cm = has.reshape(-1) > 0                                    # normalize only PRESENT-stock rows (mirror bars):
+        cov_flat = torch.zeros_like(cf)                            # absent-stock zero rows must not pollute BN stats
+        if cm.any():
+            cov_flat[cm] = self.cov_norm(cf[cm])
+        cov = self.cov_mlp(cov_flat).reshape(B, nB, A, d)          # learned C->d embedding, per block
         per_stock = self.fuse(bar_blocks + cov) * has            # fuse bars + as-of covariates, per block
         market = per_stock.sum(dim=2) / has.sum(dim=2).clamp_min(1.0)   # cross-sectional mean per block
         return per_stock, market

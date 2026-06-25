@@ -71,11 +71,12 @@ def _synthetic_day(seed=0, actions=A, seconds=S, block_seconds=BL):
     valid = torch.zeros(nb, actions, dtype=torch.bool)
     valid[:, 0] = True                                          # CASH valid (return 0) at every block
     valid[: max(0, nb - 2), 1:] = True                          # stocks: T+1 label for blocks 0..nb-3
+    avail = torch.ones(nb, actions, dtype=torch.bool)            # as-of tradeability (all present in this synthetic)
     return {"bars": bars, "bar_mask": mask,
             "cov_blocks": torch.randn(nb, actions, NC, generator=g),
             "news_raw": torch.randn(nb, actions, M, NRD, generator=g),
             "news_mask": torch.ones(nb, actions, M, dtype=torch.bool),
-            "ret": ret, "ret_valid": valid}
+            "avail": avail, "ret": ret, "ret_valid": valid}
 
 
 class ContextIsPolicyFree(unittest.TestCase):
@@ -269,6 +270,7 @@ def _planted_days(n_days=10, actions=A, nb=8, d=16, seed=0):
         valid[: nb - 2, 1:] = True                                   # last 2 blocks unlabeled (T+1)
         days.append({"market": per_stock.mean(1), "per_stock": per_stock,
                      "news_raw": torch.zeros(nb, actions, M, NRD), "news_mask": torch.zeros(nb, actions, M, dtype=torch.bool),
+                     "avail": torch.ones(nb, actions, dtype=torch.bool),
                      "ret": ret, "ret_valid": valid, "n_blocks": nb})
     return days
 
@@ -342,6 +344,7 @@ def _daily_records(n=12, actions=A, d=16, seed=0):
     """A date-sorted sequence of per-day end-of-day-context records (what the daily assembler consumes)."""
     g = torch.Generator().manual_seed(seed)
     return [{"date": f"2022-02-{i + 1:02d}", "day_open": 1.0 + 0.5 * torch.rand(actions, generator=g),
+             "avail": torch.ones(actions, dtype=torch.bool),
              "market": torch.randn(d, generator=g), "per_stock": torch.randn(actions, d, generator=g),
              "news_raw": torch.zeros(actions, M, NRD), "news_mask": torch.zeros(actions, M, dtype=torch.bool)}
             for i in range(n)]
@@ -396,6 +399,7 @@ class CrossDayDailyMode(unittest.TestCase):
                 eps.append({"market": ps.mean(1), "per_stock": ps,
                             "news_raw": torch.zeros(L, actions, M, NRD),
                             "news_mask": torch.zeros(L, actions, M, dtype=torch.bool),
+                            "avail": torch.ones(L, actions, dtype=torch.bool),
                             "ret": ret, "ret_valid": valid, "n_blocks": L})
             return eps
 
@@ -426,6 +430,88 @@ class CrossDayDailyMode(unittest.TestCase):
         short = build_daily_episodes(_daily_records(8), episode_len=180)
         self.assertEqual(len(short), 1)
         self.assertEqual(short[0]["per_stock"].shape[0], 6)                    # usable = 8 - 2 (T+1 tail)
+
+
+def _fake_window(dates, actions=3, nb=4, seconds=8):
+    """A minimal built-window dict (real shapes, zero content) for testing the leak-critical split logic."""
+    Dd = len(dates)
+    return {"bars": torch.zeros(Dd, actions, seconds, BAR_FEATS), "bar_mask": torch.zeros(Dd, actions, seconds, dtype=torch.bool),
+            "cov_blocks": torch.zeros(Dd, nb, actions, NC), "news_raw": torch.zeros(Dd, nb, actions, M, NRD),
+            "news_mask": torch.zeros(Dd, nb, actions, M, dtype=torch.bool), "avail": torch.ones(Dd, nb, actions, dtype=torch.bool),
+            "ret": torch.zeros(Dd, nb, actions), "ret_valid": torch.zeros(Dd, nb, actions, dtype=torch.bool),
+            "day_open": torch.ones(Dd, actions), "dates": list(dates), "n_days": Dd, "n_blocks": nb}
+
+
+class SplitsAreLeakFree(unittest.TestCase):
+    def test_daily_split_is_chronological_deduped_and_disjoint(self):
+        from rl_quant.datasets import day_sequence, split_days
+        b = [_fake_window(["2022-01-03", "2022-01-04", "2022-01-05"]),
+             _fake_window(["2022-01-05", "2022-01-06"])]                 # 01-05 duplicated across windows
+        self.assertEqual([d["date"] for d in day_sequence(b)],
+                         ["2022-01-03", "2022-01-04", "2022-01-05", "2022-01-06"])  # sorted + deduped (keep-first)
+        tr, va, te = split_days(b, "daily", 0.5, 0.25)
+        sets = [set(d["date"] for d in s) for s in (tr, va, te)]
+        self.assertEqual(sets[0] & sets[1], set())                       # NO date shared across splits (no leak)
+        self.assertEqual(sets[0] & sets[2], set())
+        self.assertEqual(sets[1] & sets[2], set())
+        self.assertEqual(len(tr) + len(va) + len(te), 4)                 # every unique day used exactly once
+
+    def test_intraday_split_is_window_level_and_disjoint(self):
+        from rl_quant.datasets import split_days
+        b = [_fake_window([f"2022-02-{i:02d}"]) for i in range(1, 9)]    # 8 disjoint 1-day windows
+        tr, va, te = split_days(b, "intraday", 0.75, 0.10)
+        sets = [set(d["date"] for d in s) for s in (tr, va, te)]
+        self.assertEqual(sets[0] & sets[2], set())                       # train/test disjoint
+        self.assertEqual(sets[0] & sets[1], set())
+        self.assertEqual(len(tr) + len(va) + len(te), 8)
+
+
+class StatisticalBatteryIsCorrect(unittest.TestCase):
+    """Pin the credibility layer (the verdict reads it) to closed-form / known behavior so it can't silently regress."""
+
+    def test_psr_half_at_benchmark_and_monotone(self):
+        from rl_quant.evaluation.statistical import probabilistic_sharpe_ratio as psr
+        self.assertAlmostEqual(psr(0.5, benchmark_sharpe=0.5, n_observations=100), 0.5, places=6)
+        self.assertGreater(psr(0.6, benchmark_sharpe=0.0, n_observations=100),
+                           psr(0.3, benchmark_sharpe=0.0, n_observations=100))   # monotone in observed Sharpe
+        self.assertGreater(psr(0.3, benchmark_sharpe=0.0, n_observations=400),
+                           psr(0.3, benchmark_sharpe=0.0, n_observations=100))   # monotone in n_observations
+
+    def test_dsr_single_trial_is_psr_vs_zero_and_decreases_with_trials(self):
+        from rl_quant.evaluation.statistical import deflated_sharpe_ratio as dsr
+        from rl_quant.evaluation.statistical import probabilistic_sharpe_ratio as psr
+        self.assertAlmostEqual(dsr(0.4, n_trials=1, n_observations=200),
+                               psr(0.4, benchmark_sharpe=0.0, n_observations=200), places=6)
+        self.assertGreater(dsr(0.4, n_trials=1, n_observations=200),
+                           dsr(0.4, n_trials=50, n_observations=200))            # more trials -> lower credibility
+
+    def test_effective_sample_size_drops_under_autocorrelation(self):
+        from rl_quant.evaluation.statistical import effective_sample_size as ess
+        g = torch.Generator().manual_seed(0)
+        iid = torch.randn(2000, generator=g).tolist()
+        rep = [v for v in torch.randn(200, generator=g).tolist() for _ in range(10)]  # block-repeated -> autocorr
+        self.assertGreater(ess(iid), ess(rep))
+        self.assertLess(ess(rep), len(rep))
+
+    def test_wrc_spa_reject_dominant_positive_accept_negative(self):
+        from rl_quant.evaluation.statistical import hansens_spa as spa
+        from rl_quant.evaluation.statistical import white_reality_check as wrc
+        g = torch.Generator().manual_seed(0)
+        pos = [[0.01 + 0.001 * float(torch.randn(1, generator=g))] for _ in range(200)]   # one clearly +EV model
+        g2 = torch.Generator().manual_seed(0)
+        neg = [[-0.01 + 0.001 * float(torch.randn(1, generator=g2))] for _ in range(200)]  # clearly -EV
+        self.assertLess(wrc(pos, n_bootstrap=400, seed=0), 0.2)          # low p -> edge survives snooping correction
+        self.assertGreater(wrc(neg, n_bootstrap=400, seed=0), 0.4)       # no real edge -> high p
+        self.assertLess(spa(pos, n_bootstrap=400, seed=0), 0.2)
+
+    def test_block_bootstrap_ci_brackets_the_sample_mean(self):
+        from rl_quant.evaluation.statistical import block_bootstrap_confidence_interval as ci
+        g = torch.Generator().manual_seed(0)
+        xs = (0.001 + 0.01 * torch.randn(500, generator=g)).tolist()
+        lo, hi = ci(xs, statistic="mean", confidence=0.95, n_bootstrap=400, seed=0)
+        m = sum(xs) / len(xs)
+        self.assertLess(lo, m)
+        self.assertGreater(hi, m)
 
 
 if __name__ == "__main__":

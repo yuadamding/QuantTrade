@@ -191,9 +191,13 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
                         news_raw[d, b, ai, :kk, 0] = take
                         news_mask[d, b, ai, :kk] = True
                 if b <= nB - 3 and len(a_close):                     # T+1 label: execute b+1 end -> b+2 end
-                    ei = np.searchsorted(a_ts, int(block_end[d, b + 1]) + lat, "left")
-                    xi = np.searchsorted(a_ts, int(block_end[d, b + 2]) + lat, "left")
-                    if ei < len(a_close) and xi < len(a_close) and a_close[ei] > 0:
+                    t_en, t_ex = int(block_end[d, b + 1]) + lat, int(block_end[d, b + 2]) + lat
+                    ei = np.searchsorted(a_ts, t_en, "left")
+                    xi = np.searchsorted(a_ts, t_ex, "left")
+                    day_close = int(open_ms[d]) + S * 1000           # nominal RTH end (reject post-close/AH bars)
+                    if (ei < len(a_close) and xi < len(a_close) and a_close[ei] > 0
+                            and a_ts[ei] < day_close and a_ts[xi] < day_close            # entry & exit IN that RTH
+                            and a_ts[ei] - t_en <= bl * 1000 and a_ts[xi] - t_ex <= bl * 1000):  # near the target
                         r = a_close[xi] / a_close[ei] - 1.0
                         if np.isfinite(r):
                             ret[d, b, ai] = float(np.clip(r, -1.0, 1.0))
@@ -205,10 +209,16 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     opens = np.take_along_axis(bars_t[:, :, :, 0], fv[:, :, None], axis=2)[:, :, 0]
     day_open = np.where(has, opens, np.nan).astype(np.float32)    # [Dd,A] (NaN where the stock has no bars that day)
 
+    # as-of AVAILABILITY (point-in-time): a stock is tradeable at block b iff it has ANY bar by block-b end --
+    # derived from bar presence, NOT from label existence (which would leak future-bar information).
+    block_present = bar_mask[:, :, :nB * bl].reshape(Dd, A, nB, bl).any(axis=3)   # [Dd,A,nB]
+    avail = np.ascontiguousarray(np.maximum.accumulate(block_present, axis=2).transpose(0, 2, 1))  # [Dd,nB,A]
+    avail[:, :, 0] = True                                                         # CASH always available
+
     return {
         "bars": torch.from_numpy(bars_t), "bar_mask": torch.from_numpy(bar_mask),
         "cov_blocks": torch.from_numpy(covt), "news_raw": torch.from_numpy(news_raw),
-        "news_mask": torch.from_numpy(news_mask),
+        "news_mask": torch.from_numpy(news_mask), "avail": torch.from_numpy(avail),
         "ret": torch.from_numpy(ret), "ret_valid": torch.from_numpy(ret_valid),
         "day_open": torch.from_numpy(day_open), "dates": days,
         "window": window, "n_days": Dd, "n_blocks": nB,
