@@ -6,8 +6,17 @@ absent here, so policy gradients cannot reach it -- the context/policy split is 
 The policy chooses WHEN to trade: at each 5-min block it emits an act-gate g in [0,1] (trade vs hold) and a
 target allocation w. The held position is a = g*w + (1-g)*prev (holding is free of turnover). Trades are T+1:
 the position decided at block b is realized over the label horizon AFTER block b (ret[b] is already the T+1
-forward return). A SOFT per-day budget penalizes sum_b g beyond `max_actions_per_day`. Objective per day:
-maximize realized net return - turnover cost, with downside-variance and entropy terms + the budget penalty.
+forward return).
+
+Escaping the CASH basin (why the naive objective collapses): CASH has return identically 0, so doing nothing is
+an exact zero-loss sink, and the act-gate can shut (g->0) before the allocation head ever learns an edge -- a
+self-reinforcing collapse (da/dw = g vanishes too). Three things prevent it: (1) the gate is initialized OPEN
+(gate_init_bias); (2) a FRICTION WARM-UP scales the turnover cost AND the budget penalty from 0 -> full over
+`friction_warmup_steps`, so early training trades freely and the allocation head discovers the cross-sectional
+signal before friction applies; (3) the budget penalty is a per-block RATE (mean gate over the day vs the target
+rate max_actions/nB), commensurate with the per-decision return term -- not an unnormalized sum that dwarfs it.
+A gate-entropy bonus adds mild exploration. Objective/day: maximize realized net return - turnover cost, with
+downside-variance, allocation- and gate-entropy bonuses, and the soft per-day trade budget.
 
 Resumability mirrors Stage 1 (start_step / optimizer / best_* + an on_eval checkpoint hook).
 """
@@ -35,13 +44,13 @@ def _stack(days_emb: list[dict], idx, device):
 
 def _rollout(policy, batch, cost: float):
     """Roll the policy forward over a day's blocks, carrying the previous position (T+1, gated holding).
-    -> nets [B,nB], gates [B,nB], entropies [B,nB]."""
+    -> nets [B,nB], gates [B,nB], entropies [B,nB], cash_w [B,nB], turnover [B,nB]."""
     market, per_stock = batch["market"], batch["per_stock"]
     news_raw, news_mask, ret, avail = batch["news_raw"], batch["news_mask"], batch["ret"], batch["avail"]
     B, nB, A, _ = per_stock.shape
     prev_w = torch.zeros(B, A, device=per_stock.device)
     prev_w[:, CASH_INDEX] = 1.0
-    nets, gates, ents = [], [], []
+    nets, gates, ents, cash_w, turn = [], [], [], [], []
     for b in range(nB):
         w, g = policy(market[:, b], per_stock[:, b], news_raw[:, b], news_mask[:, b], prev_w.detach(), avail[:, b])
         a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * prev_w.detach()   # gated, T+1 position
@@ -50,32 +59,41 @@ def _rollout(policy, batch, cost: float):
         nets.append(realized - cost * turnover)
         gates.append(g)
         ents.append(-(w * w.clamp_min(1e-9).log()).sum(-1))      # allocation entropy (masked actions contribute 0)
+        cash_w.append(a[:, CASH_INDEX])
+        turn.append(turnover)
         prev_w = a
-    return torch.stack(nets, 1), torch.stack(gates, 1), torch.stack(ents, 1)
+    st = lambda xs: torch.stack(xs, 1)  # noqa: E731
+    return st(nets), st(gates), st(ents), st(cash_w), st(turn)
 
 
-def _loss(nets, gates, ents, label, risk_lambda, entropy_coef, max_actions, budget_lambda):
+def _loss(nets, gates, ents, label, risk_lambda, entropy_coef, max_actions, budget_lambda, gate_entropy_coef):
     lm = label.float()
     denom = lm.sum(1).clamp_min(1.0)
     mean_net = (nets * lm).sum(1) / denom
     downside = (torch.clamp(nets, max=0.0) ** 2 * lm).sum(1) / denom
     mean_ent = (ents * lm).sum(1) / denom
-    budget_pen = torch.clamp(gates.sum(1) - max_actions, min=0.0)             # excess trades/day over the cap
+    target_rate = max_actions / gates.shape[1]                               # trades/day cap as a per-block RATE
+    budget_pen = torch.clamp(gates.mean(1) - target_rate, min=0.0)           # excess gate RATE over the cap, in [0,1]
+    g = gates.clamp(1e-6, 1 - 1e-6)
+    gate_ent = (-(g * g.log() + (1 - g) * (1 - g).log())).mean(1)            # Bernoulli gate entropy -> exploration
     return (-mean_net.mean() + risk_lambda * downside.mean()
-            - entropy_coef * mean_ent.mean() + budget_lambda * budget_pen.mean())
+            - entropy_coef * mean_ent.mean() - gate_entropy_coef * gate_ent.mean()
+            + budget_lambda * budget_pen.mean())
 
 
 def train_decision_policy(
     policy, train_days, *, steps: int, lr: float = 3e-4, weight_decay: float = 3e-2,
     batch_days: int = 16, cost: float = 5e-4, risk_lambda: float = 0.1, entropy_coef: float = 0.0,
-    max_actions: float = 5.0, budget_lambda: float = 0.1,
+    max_actions: float = 5.0, budget_lambda: float = 0.1, gate_entropy_coef: float = 1e-3,
+    friction_warmup_steps: int = 0,
     warmup_steps: int = 0, schedule: str = "cosine", grad_clip: float = 0.0, amp: bool = False,
     start_step: int = 0, optimizer=None, best_val: float = -1e9, best_state: dict | None = None,
     eval_every: int = 0, val_days: list[dict] | None = None, device=None,
     on_eval: Callable[[int, float, float, dict | None, object], None] | None = None,
 ):
-    """Train the event-timed differentiable-portfolio policy on frozen per-block embeddings.
-    Returns (optimizer, best_val, best_state)."""
+    """Train the event-timed differentiable-portfolio policy on frozen per-block embeddings. The turnover cost and
+    the budget penalty are warmed up from 0 -> full over `friction_warmup_steps` (curriculum: learn the edge first,
+    then constrain frequency). Returns (optimizer, best_val, best_state)."""
     if optimizer is None:
         optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
     dev_type = (device.type if hasattr(device, "type") else "cuda")
@@ -83,11 +101,13 @@ def train_decision_policy(
     for step in range(start_step, steps):
         policy.train()
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
+        friction = min(1.0, (step + 1) / friction_warmup_steps) if friction_warmup_steps > 0 else 1.0
         idx = torch.randint(0, n, (min(batch_days, n),)).tolist()
         batch = _stack(train_days, idx, device)
         with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-            nets, gates, ents = _rollout(policy, batch, cost)
-            loss = _loss(nets, gates, ents, batch["label"], risk_lambda, entropy_coef, max_actions, budget_lambda)
+            nets, gates, ents, _, _ = _rollout(policy, batch, cost * friction)
+            loss = _loss(nets, gates, ents, batch["label"], risk_lambda, entropy_coef,
+                         max_actions, budget_lambda * friction, gate_entropy_coef)
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
@@ -111,9 +131,28 @@ def evaluate_policy(policy, days_emb, device, cost: float, batch_days: int = 32)
     rows = []
     for i in range(0, len(days_emb), batch_days):
         batch = _stack(days_emb, list(range(i, min(i + batch_days, len(days_emb)))), device)
-        nets, _, _ = _rollout(policy, batch, cost)               # [B,nB]
+        nets, _, _, _, _ = _rollout(policy, batch, cost)         # [B,nB]
         rows += nets[batch["label"]].cpu().tolist()
     return rows
+
+
+@torch.no_grad()
+def policy_telemetry(policy, days_emb, device, cost: float, batch_days: int = 32) -> dict:
+    """Behaviour telemetry so an all-CASH collapse is visible, not mistaken for zero alpha:
+    mean act-gate, expected trades/day (sum of gates over the day), mean CASH weight, mean per-block turnover."""
+    policy.eval()
+    gates_all, cash_all, turn_all, trades = [], [], [], []
+    for i in range(0, len(days_emb), batch_days):
+        batch = _stack(days_emb, list(range(i, min(i + batch_days, len(days_emb)))), device)
+        _, gates, _, cw, tv = _rollout(policy, batch, cost)
+        gates_all.append(gates.flatten())
+        cash_all.append(cw.flatten())
+        turn_all.append(tv.flatten())
+        trades.append(gates.sum(1))                                  # [B] per-day trade count
+    if not gates_all:
+        return {"mean_gate": 0.0, "trades_per_day": 0.0, "mean_cash_weight": 1.0, "mean_turnover": 0.0}
+    return {"mean_gate": float(torch.cat(gates_all).mean()), "trades_per_day": float(torch.cat(trades).mean()),
+            "mean_cash_weight": float(torch.cat(cash_all).mean()), "mean_turnover": float(torch.cat(turn_all).mean())}
 
 
 def cost_paid_baselines(days_emb) -> tuple[float, float]:

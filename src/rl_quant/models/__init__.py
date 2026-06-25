@@ -10,7 +10,12 @@ context encoder. Training the policy on cached frozen embeddings (see rl_quant.t
 """
 from __future__ import annotations
 
-from rl_quant.models.context_encoder import ContextEncoder, ContextEncoderConfig, ContextForwardHead
+from rl_quant.models.context_encoder import (
+    ContextEncoder,
+    ContextEncoderConfig,
+    ContextForwardHead,
+    PerStockForwardHead,
+)
 from rl_quant.models.decision_policy import DecisionPolicyConfig, DecisionPolicyHead
 
 __all__ = [
@@ -19,4 +24,5 @@ __all__ = [
     "ContextForwardHead",
     "DecisionPolicyConfig",
     "DecisionPolicyHead",
+    "PerStockForwardHead",
 ]
