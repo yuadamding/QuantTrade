@@ -13,11 +13,13 @@ from rl_quant.training.context_pretrain import (
     encode_days,
     freeze_encoder,
     ssl_targets,
+    ssl_targets_perstock,
     train_context_encoder,
 )
 from rl_quant.training.decision_policy import (
     cost_paid_baselines,
     evaluate_policy,
+    policy_telemetry,
     train_decision_policy,
 )
 from rl_quant.training.designs import DEFAULT_DESIGN, DESIGNS, SWEEP, Phase1Design
@@ -31,7 +33,9 @@ __all__ = [
     "encode_days",
     "evaluate_policy",
     "freeze_encoder",
+    "policy_telemetry",
     "ssl_targets",
+    "ssl_targets_perstock",
     "train_context_encoder",
     "train_decision_policy",
 ]

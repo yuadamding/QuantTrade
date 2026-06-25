@@ -11,8 +11,11 @@ Each design fully specifies BOTH transformers' architecture AND the training str
       batch_days (days per policy step).
     optimization: ssl_lr / pol_lr, ssl_weight_decay / pol_weight_decay, ssl_warmup_frac / pol_warmup_frac,
       schedule ('cosine' warmup->decay, or 'constant'), grad_clip, amp (bf16 autocast), grad_checkpoint.
-    policy objective: cost (turnover), risk_lambda (downside), entropy_coef (exploration),
-      temperature (allocation sharpness), max_actions_per_day (soft trade budget) + budget_lambda (its penalty).
+    policy objective: cost (turnover), risk_lambda (downside), entropy_coef (allocation exploration),
+      temperature (allocation sharpness), max_actions_per_day (soft trade budget) + budget_lambda (its penalty),
+      and the CASH-basin escape knobs -- gate_init_bias (start trading), gate_entropy_coef (gate exploration),
+      friction_warmup_frac (ramp cost+budget 0->full so the edge is learned before friction bites), and
+      ssl_perstock_coef (Stage-1 cross-sectional pretext weight).
 
 EVENT-TIMED: the policy is NOT on a fixed decision clock. The encoder turns each full session into a context at
 EVERY `block_seconds` block (78 blocks/day at 300s); the policy chooses WHEN to trade (a per-block act-gate) under
@@ -65,7 +68,11 @@ class Phase1Design:
     entropy_coef: float = 0.0
     temperature: float = 1.0
     max_actions_per_day: float = 5.0  # SOFT per-day trade budget (the policy gates WHEN to act)
-    budget_lambda: float = 0.1        # penalty on per-day act-gate mass exceeding max_actions_per_day
+    budget_lambda: float = 0.1        # penalty on the per-day act-gate RATE exceeding max_actions_per_day/nB
+    gate_init_bias: float = 2.0       # initial act-gate logit (sigmoid(2)=0.88): start TRADING, not in CASH
+    gate_entropy_coef: float = 1e-3   # Bernoulli gate-entropy bonus -> exploration on WHEN to trade
+    friction_warmup_frac: float = 0.3 # ramp turnover cost + budget penalty 0->full over this frac of policy_steps
+    ssl_perstock_coef: float = 1.0    # weight of the per-stock cross-sectional SSL pretext (relative-value signal)
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
 

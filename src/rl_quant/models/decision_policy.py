@@ -8,11 +8,13 @@ here; the context encoder (rl_quant.models.context_encoder) stays pure market st
 Design (the chosen "differentiable portfolio"): each action becomes a token
 ``[ market context (broadcast) | that action's per-stock context | as-of covariates | news | prev weight ]``;
 a permutation-equivariant set-transformer attends ACROSS actions (relative cross-sectional valuation -- the
-core of equity alpha), unavailable actions are masked, and a softmax over {CASH, stocks} yields allocation
-WEIGHTS. CASH (action 0) is the abstention sink. Shared weights across actions => the same head scales from 51
-to ~2000 actions (swap full attention for inducing-point/ISAB attention at the large end). The training
-objective maximizes realized net return minus turnover cost (it is allocation/turnover aware via the prev
-weight), so this is genuine policy learning, not a return regression.
+core of equity alpha), unavailable actions are masked, and a softmax over {CASH, stocks} yields target allocation
+WEIGHTS. CASH (action 0) is the abstention sink. A separate per-block ACT-GATE g in [0,1] (read from the
+available-action summary) decides WHEN to trade: the held position is g*target + (1-g)*prev (holding is
+turnover-free), and the gate is initialized OPEN (gate_init_bias) so the policy trades from the start rather than
+sitting in the CASH basin. Shared weights across actions => the same head scales from 51 to ~2000 actions (swap
+full attention for inducing-point/ISAB attention at the large end). The training objective maximizes realized net
+return minus turnover cost (allocation/turnover aware via the prev weight), so this is genuine policy learning.
 """
 from __future__ import annotations
 
@@ -34,6 +36,7 @@ class DecisionPolicyConfig:
     feedforward_dim: int = 256
     dropout: float = 0.0
     temperature: float = 1.0         # softmax temperature on the allocation: <1 concentrates, >1 diversifies
+    gate_init_bias: float = 2.0      # initial act-gate logit -> sigmoid(2)=0.88: start TRADING (escape CASH basin)
 
 
 class _NewsAggregator(nn.Module):
@@ -72,6 +75,7 @@ class DecisionPolicyHead(nn.Module):
         self.attn = nn.TransformerEncoder(layer, num_layers=config.n_layers, enable_nested_tensor=False)
         self.score = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
         self.gate_head = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))  # act/hold
+        nn.init.constant_(self.gate_head[-1].bias, config.gate_init_bias)  # start with the gate OPEN (trade early)
         self.temperature = config.temperature
 
     def forward(self, market, per_stock, news_scores, news_mask, prev_weights, available):
@@ -89,5 +93,7 @@ class DecisionPolicyHead(nn.Module):
         scores = self.score(h).squeeze(-1) / self.temperature    # [B,A]; temperature shapes allocation sharpness
         scores = scores.masked_fill(kpm, float("-inf"))          # never allocate to unavailable actions
         weights = torch.softmax(scores, dim=1)
-        gate = torch.sigmoid(self.gate_head(h.mean(dim=1)).squeeze(-1))  # [B] trade (->target) vs hold (->prev)
+        avail = (~kpm).float().unsqueeze(-1)                     # gate reads only AVAILABLE actions (incl. CASH)
+        summary = (h * avail).sum(dim=1) / avail.sum(dim=1).clamp_min(1.0)  # masked mean (no padded-row dilution)
+        gate = torch.sigmoid(self.gate_head(summary).squeeze(-1))  # [B] trade (->target) vs hold (->prev)
         return weights, gate

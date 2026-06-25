@@ -172,3 +172,18 @@ class ContextForwardHead(nn.Module):
 
     def forward(self, market: torch.Tensor) -> torch.Tensor:
         return self.net(market)
+
+
+class PerStockForwardHead(nn.Module):
+    """Self-supervised CROSS-SECTIONAL pretext head: from each stock's per-block context predict that stock's
+    next-block CROSS-SECTIONALLY-DEMEANED return (r_i - equal-weight market). The market head alone trains only
+    the pooled mean, so per-stock embeddings get no gradient rewarding relative-value discrimination -- this head
+    puts a direct signal on each stock's embedding so the FROZEN context carries the which-stock-wins information
+    the policy needs. Trained jointly in Stage 1, then discarded."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
+
+    def forward(self, per_stock: torch.Tensor) -> torch.Tensor:
+        return self.net(per_stock).squeeze(-1)   # [B,nB,A,d] -> [B,nB,A]

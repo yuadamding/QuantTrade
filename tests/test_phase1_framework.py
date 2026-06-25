@@ -25,12 +25,15 @@ from rl_quant.models import (
     ContextForwardHead,
     DecisionPolicyConfig,
     DecisionPolicyHead,
+    PerStockForwardHead,
 )
 from rl_quant.training import (
     encode_days,
     evaluate_policy,
     freeze_encoder,
+    policy_telemetry,
     ssl_targets,
+    ssl_targets_perstock,
     train_context_encoder,
     train_decision_policy,
 )
@@ -248,6 +251,76 @@ class EndToEndStagesRun(unittest.TestCase):
         rows = evaluate_policy(_policy(), emb, torch.device("cpu"), cost=5e-4)
         self.assertEqual(len(rows), len(days) * (NB - 2))  # one net per label-valid block (last 2 blocks unlabeled)
         self.assertTrue(all(abs(r) < 1.0 for r in rows))
+
+
+def _planted_days(n_days=10, actions=A, nb=8, d=16, seed=0):
+    """Synthetic per-block embeddings where each stock's context LINEARLY encodes its next-block cross-sectionally
+    -demeaned return (a strong planted relative-value signal). A working policy must keep the gate OPEN and tilt
+    toward the high-signal stocks; the all-CASH collapse would score ~0. Bypasses the encoder to isolate Stage 2."""
+    g = torch.Generator().manual_seed(seed)
+    days = []
+    for _ in range(n_days):
+        per_stock = torch.randn(nb, actions, d, generator=g)
+        ret = torch.zeros(nb, actions)
+        ret[:, 1:] = 0.02 * torch.tanh(per_stock[:, 1:, 0])          # planted: context dim 0 -> next-block return
+        ret[:, 1:] = ret[:, 1:] - ret[:, 1:].mean(1, keepdim=True)   # cross-sectionally demeaned (pure relative)
+        valid = torch.zeros(nb, actions, dtype=torch.bool)
+        valid[:, 0] = True
+        valid[: nb - 2, 1:] = True                                   # last 2 blocks unlabeled (T+1)
+        days.append({"market": per_stock.mean(1), "per_stock": per_stock,
+                     "news_raw": torch.zeros(nb, actions, M, NRD), "news_mask": torch.zeros(nb, actions, M, dtype=torch.bool),
+                     "ret": ret, "ret_valid": valid, "n_blocks": nb})
+    return days
+
+
+class PolicyLearnsAndTradesUnderFix(unittest.TestCase):
+    """Locks the CASH-collapse fix: the gate starts open and the policy learns a planted cross-sectional signal
+    (it trades and is profitable) rather than abstaining to ~0 -- the failure mode of the unnormalized budget."""
+
+    def test_gate_initialized_open(self):
+        torch.manual_seed(0)
+        pol = _policy()                                              # gate_init_bias defaults to 2.0
+        _, gate = pol(torch.randn(4, 16), torch.randn(4, A, 16), *_news(4, A),
+                      torch.zeros(4, A), torch.ones(4, A, dtype=torch.bool))
+        self.assertGreater(float(gate.mean()), 0.5, "act-gate must START OPEN (trade), not closed")
+
+    def test_policy_learns_planted_signal_and_keeps_trading(self):
+        torch.manual_seed(0)
+        days = _planted_days()
+        pol = _policy()
+        dev = torch.device("cpu")
+        r0 = evaluate_policy(pol, days, dev, cost=1e-4)
+        before = sum(r0) / len(r0)
+        train_decision_policy(pol, days, steps=250, lr=3e-3, batch_days=10, cost=1e-4, risk_lambda=0.0,
+                              max_actions=5.0, budget_lambda=0.1, gate_entropy_coef=1e-3,
+                              friction_warmup_steps=60, schedule="constant", eval_every=0, val_days=days, device=dev)
+        rows = evaluate_policy(pol, days, dev, cost=1e-4)
+        oos = sum(rows) / len(rows)
+        tele = policy_telemetry(pol, days, dev, cost=1e-4)
+        self.assertGreater(tele["mean_gate"], 0.3, "gate COLLAPSED to ~hold -> the CASH-basin bug is back")
+        self.assertGreater(oos, 0.0, "policy did not learn the planted cross-sectional signal")
+        self.assertGreater(oos, before, "training did not improve OOS over the untrained policy")
+
+
+class SSLPerStockPretext(unittest.TestCase):
+    def test_perstock_target_is_demeaned_and_cash_is_invalid(self):
+        day = _synthetic_day(7)
+        tgt, mask = ssl_targets_perstock(day["ret"], day["ret_valid"])
+        self.assertEqual(tgt.shape, (NB, A))
+        self.assertFalse(bool(mask[:, 0].any()), "CASH must be an invalid per-stock target")
+        for b in range(NB):                                          # demeaned -> valid non-CASH targets sum ~0
+            m = mask[b]
+            if m.sum() >= 2:
+                self.assertAlmostEqual(float(tgt[b][m].sum()), 0.0, places=5)
+
+    def test_perstock_ssl_head_trains_and_receives_gradient(self):
+        torch.manual_seed(0)
+        enc, head, ps_head = _encoder(), ContextForwardHead(16), PerStockForwardHead(16)
+        days = [_synthetic_day(5), _synthetic_day(6)]
+        train_context_encoder(enc, head, days, device=torch.device("cpu"), perstock_head=ps_head, perstock_coef=1.0,
+                              steps=2, batch_size=2, accum_steps=1, warmup_steps=1, schedule="constant")
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in ps_head.parameters()),
+                        "per-stock SSL head received no gradient -> the cross-sectional pretext is not wired")
 
 
 if __name__ == "__main__":
