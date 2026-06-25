@@ -77,9 +77,12 @@ class _CausalBlock(nn.Module):
         return x
 
 
-def _last_valid(seq: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
-    """Gather the last VALID position of each sequence. seq [N,L,d], count [N] (#valid, left-aligned). -> [N,d]."""
-    idx = (count - 1).clamp_min(0).long()
+def _last_valid(seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Gather each sequence's LAST valid token by its boolean mask -- correct even when valid positions are NOT
+    contiguous (bars sit at absolute second-offsets). seq [N,L,d], mask [N,L] bool -> [N,d] (position 0 if none).
+    Cheap: gathers a single position per sequence (no full-length gather)."""
+    ar = torch.arange(seq.shape[1], device=seq.device)
+    idx = torch.where(mask, ar, torch.full_like(ar, -1)).amax(dim=1).clamp_min(0)
     return torch.gather(seq, 1, idx[:, None, None].expand(seq.shape[0], 1, seq.shape[2])).squeeze(1)
 
 
@@ -137,23 +140,23 @@ class ContextEncoder(nn.Module):
         normed = torch.zeros_like(flat)
         if mv.any():
             normed[mv] = self.bar_norm(flat[mv])
-        x = self.input_proj(normed).reshape(B * A, nB, bl, d)
-        # LEFT-PACK valid seconds within each block: bars are scattered at ABSOLUTE second-offsets, so a late start
-        # or interior gap leaves zeros between valid seconds. Move the valid seconds to the front (time order
-        # preserved) BEFORE adding positions, so causal attention never attends a gap/empty key and the per-block
-        # summary (_last_valid via count) is the true most-recent valid token. A fully-traded block is unchanged.
-        bm = bar_mask.reshape(B * A, nB, bl)
-        order = torch.argsort(bm.to(torch.int8), dim=-1, descending=True, stable=True)   # valid first, order-stable
-        x = torch.gather(x, 2, order.unsqueeze(-1).expand(-1, -1, -1, d))
-        x = x.reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
-        # --- Tier 1: local causal attention within each block -> learned per-block summaries ---
-        for blk in self.tier1:
-            x = (torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
-                 if self.grad_checkpoint and self.training else blk(x))
+        x = self.input_proj(normed).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
+        # --- Tier 1: local causal attention within each block -> learned per-block summaries. Checkpoint the WHOLE
+        # tier-1 stack as ONE segment (store only its input, recompute all layers in backward) to bound full-session
+        # VRAM -- far cheaper than per-layer checkpointing, which retains one [B*A*nB, bl, d] input per layer.
+        if self.grad_checkpoint and self.training:
+            def _tier1(y):
+                for blk in self.tier1:
+                    y = blk(y)
+                return y
+            x = torch.utils.checkpoint.checkpoint(_tier1, x, use_reentrant=False)
+        else:
+            for blk in self.tier1:
+                x = blk(x)
         x = self.norm1(x)
-        cnt1 = bm.reshape(B * A * nB, bl).sum(-1)                # valid seconds per block (packing-invariant)
-        summ = _last_valid(x, cnt1).reshape(B * A, nB, d)        # left-packed -> count-1 IS the last valid token
-        block_has = (cnt1.reshape(B * A, nB) > 0)                # [B*A, nB]
+        bm1 = bar_mask.reshape(B * A * nB, bl)                   # per-block validity (bars sit at absolute offsets)
+        summ = _last_valid(x, bm1).reshape(B * A, nB, d)         # TRUE last-valid second's token (gap-correct, cheap)
+        block_has = bm1.any(-1).reshape(B * A, nB)               # [B*A, nB]
         summ = summ * block_has.unsqueeze(-1).float()
         # --- Tier 2: global causal attention over block summaries -> a context at EVERY block ---
         h = summ + self.pos2[:nB].unsqueeze(0)
