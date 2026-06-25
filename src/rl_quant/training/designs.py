@@ -73,6 +73,9 @@ class Phase1Design:
     gate_entropy_coef: float = 1e-3   # Bernoulli gate-entropy bonus -> exploration on WHEN to trade
     friction_warmup_frac: float = 0.3 # ramp turnover cost + budget penalty 0->full over this frac of policy_steps
     ssl_perstock_coef: float = 1.0    # weight of the per-stock cross-sectional SSL pretext (relative-value signal)
+    horizon_mode: str = "intraday"    # "intraday" (trade 5-min blocks within a day) | "daily" (hold ACROSS days)
+    episode_len: int = 21             # daily mode: days per episode (max hold; positions carry across the episode)
+    episode_stride: int = 0           # daily mode: train sliding-window stride (0=non-overlap; small=>more samples)
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
 
@@ -84,6 +87,12 @@ class Phase1Design:
                              f"policy_token_dim {self.policy_token_dim}")
         if self.schedule not in ("cosine", "constant"):
             raise ValueError(f"{self.name}: schedule must be 'cosine' or 'constant'")
+        if self.horizon_mode not in ("intraday", "daily"):
+            raise ValueError(f"{self.name}: horizon_mode must be 'intraday' or 'daily'")
+        if self.episode_len <= 1:
+            raise ValueError(f"{self.name}: episode_len must be > 1")
+        if self.episode_stride < 0:
+            raise ValueError(f"{self.name}: episode_stride must be >= 0")
         if self.temperature <= 0:
             raise ValueError(f"{self.name}: temperature must be > 0")
         if self.session_seconds % self.block_seconds:
@@ -139,9 +148,45 @@ _SERIES = [
                  policy_token_dim=640, policy_layers=6, policy_heads=8, ssl_steps=3000, policy_steps=8000,
                  ssl_batch_size=1, ssl_accum=16, batch_days=64, amp=True, grad_checkpoint=True, ssl_lr=2.5e-4,
                  entropy_coef=0.02, max_actions_per_day=8.0, budget_lambda=0.05),
+
+    # ===== LONGER-HORIZON experiments (coarser blocks => decision cadence AND T+1 hold both lengthen) =====
+    # NB: the IC probe found price-based cross-sectional signal ~0 at ALL horizons (5min..daily) in TOP50, so
+    # these mainly test whether covariates/news carry edge at a longer hold; expect ~null on price alone.
+    Phase1Design("h30m", "30-MIN horizon: 1800s blocks (13/day), d384/8L, full session; budget 4", session_seconds=FULL,
+                 block_seconds=1800, d_model=384, enc_layers=8, enc_heads=8, policy_token_dim=384, policy_layers=4,
+                 policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=8, batch_days=48,
+                 max_actions_per_day=4.0, amp=True, grad_checkpoint=True),
+
+    Phase1Design("h65m", "65-MIN horizon: 3900s blocks (6/day), d384/8L, full session; budget 3", session_seconds=FULL,
+                 block_seconds=3900, d_model=384, enc_layers=8, enc_heads=8, policy_token_dim=384, policy_layers=4,
+                 policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=8, batch_days=48,
+                 max_actions_per_day=3.0, amp=True, grad_checkpoint=True),
+
+    # ===== CROSS-DAY (daily cross-sectional): hold positions ACROSS days, scored on open->open T+1 returns =====
+    # This is where documented cross-sectional equity predictability (daily reversal/momentum, fundamentals) lives.
+    # The encoder still summarizes each full session (300s blocks); the policy decides once/day from the END-OF-DAY
+    # context and carries positions across `episode_len`-day episodes. budget off (turnover cost regulates); the
+    # intraday per-stock SSL is off (intraday cross-section is dead) -- per_stock still fuses covariates/fundamentals.
+    Phase1Design("daily_xs", "DAILY cross-sectional, hold across days (21d episodes), d512/8L; bf16", session_seconds=FULL,
+                 block_seconds=300, d_model=512, enc_layers=8, enc_heads=8, policy_token_dim=512, policy_layers=4,
+                 policy_heads=8, ssl_steps=3000, policy_steps=8000, ssl_batch_size=1, ssl_accum=8, batch_days=16,
+                 horizon_mode="daily", episode_len=21, budget_lambda=0.0, ssl_perstock_coef=0.0,
+                 amp=True, grad_checkpoint=True),
+
+    # LONG-HOLD cross-sectional: 180-day episodes (positions carry the whole episode) + a SPARSE trade budget
+    # (~2 rebalances/episode) => the policy can profit from two trades >=180 days apart. Overlapping train windows
+    # (stride 20) keep enough samples despite the long episode; eval uses one long episode per (data-limited) split.
+    Phase1Design("daily_long", "LONG-HOLD daily: 180d episodes, ~2 trades/episode (>=180d apart), d512/8L; bf16",
+                 session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=8, enc_heads=8,
+                 policy_token_dim=512, policy_layers=4, policy_heads=8, ssl_steps=3000, policy_steps=8000,
+                 ssl_batch_size=1, ssl_accum=8, batch_days=8, horizon_mode="daily", episode_len=180,
+                 episode_stride=20, max_actions_per_day=2.0, budget_lambda=0.5, ssl_perstock_coef=0.0,
+                 amp=True, grad_checkpoint=True),
 ]
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 
 DEFAULT_DESIGN = "wide"
 # Variety run on the 2xH100 box, with `large` as the smaller minimum. ('tiny' = CPU smoke only.)
 SWEEP = ["large", "wide", "deep", "balanced", "coarse_blocks", "active"]
+# Longer-horizon probes (run explicitly with --design; not in the default sweep).
+HORIZON_SWEEP = ["h30m", "h65m"]
