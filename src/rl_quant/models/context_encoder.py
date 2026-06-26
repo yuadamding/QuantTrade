@@ -141,15 +141,14 @@ class ContextEncoder(nn.Module):
         if mv.any():
             normed[mv] = self.bar_norm(flat[mv])
         x = self.input_proj(normed).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
-        # --- Tier 1: local causal attention within each block -> learned per-block summaries. Checkpoint the WHOLE
-        # tier-1 stack as ONE segment (store only its input, recompute all layers in backward) to bound full-session
-        # VRAM -- far cheaper than per-layer checkpointing, which retains one [B*A*nB, bl, d] input per layer.
+        # --- Tier 1: local causal attention within each block -> learned per-block summaries.
+        # Per-block checkpointing: checkpoint each _CausalBlock independently. During forward, each block's
+        # input is saved (n_blocks × [B*A*nB, bl, d] ≈ 9.6 GB for d512/8L with B=1 day). During backward,
+        # only ONE block's intermediates are recomputed and held at a time (~12 GB peak), so the backward
+        # peak is ~24 GB instead of ~70+ GB from a one-segment recompute of all 8 blocks simultaneously.
         if self.grad_checkpoint and self.training:
-            def _tier1(y):
-                for blk in self.tier1:
-                    y = blk(y)
-                return y
-            x = torch.utils.checkpoint.checkpoint(_tier1, x, use_reentrant=False)
+            for blk in self.tier1:
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
         else:
             for blk in self.tier1:
                 x = blk(x)
