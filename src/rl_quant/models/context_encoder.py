@@ -49,8 +49,12 @@ def _sinusoidal(n: int, d: int) -> torch.Tensor:
 
 
 class _CausalBlock(nn.Module):
-    """Pre-norm transformer block whose self-attention is causal via scaled_dot_product_attention(is_causal=True)
-    -- no materialized [S,S] mask, so memory stays O(S) and long raw-second sequences are tractable."""
+    """Pre-norm transformer block with causal self-attention.
+
+    When no key padding is needed, SDPA's native causal path avoids a materialized [S,S] mask. If padding is
+    present, causal and key-valid constraints are combined into one boolean mask because SDPA rejects mixing a
+    custom mask with `is_causal=True` on some PyTorch versions.
+    """
 
     def __init__(self, d: int, n_heads: int, ff: int, dropout: float) -> None:
         super().__init__()
@@ -70,13 +74,17 @@ class _CausalBlock(nn.Module):
         qkv = self.qkv(h).reshape(N, S, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]                 # each [N, n_heads, S, head_dim]
         attn_mask = None
-        if key_padding_mask is not None:
+        is_causal = True
+        if key_padding_mask is not None and bool(key_padding_mask.any()):
             kpm = key_padding_mask.bool()
             if bool(kpm.all(dim=1).any()):
                 kpm = kpm.clone()
                 kpm[kpm.all(dim=1), 0] = False
-            attn_mask = (~kpm).view(N, 1, 1, S)          # bool mask: True keys may be attended
-        a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=True,
+            key_allowed = (~kpm).view(N, 1, 1, S)        # bool mask: True keys may be attended
+            causal_allowed = torch.ones(S, S, dtype=torch.bool, device=x.device).tril().view(1, 1, S, S)
+            attn_mask = causal_allowed & key_allowed
+            is_causal = False
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal,
                                            dropout_p=self.attn_dropout if self.training else 0.0)
         a = a.transpose(1, 2).reshape(N, S, d)
         x = x + self.drop(self.proj(a))

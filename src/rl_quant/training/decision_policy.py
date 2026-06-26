@@ -145,16 +145,47 @@ def train_decision_policy(
 
 
 @torch.no_grad()
-def evaluate_policy(policy, days_emb, device, cost: float, batch_days: int = 32,
-                    max_missing_label_weight: float = 1e-6) -> list[float]:
-    """Realized per-decision net return on label-valid/reportable blocks, chunked over days. Pooled list."""
+def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: int = 32,
+                             max_missing_label_weight: float = 1e-6) -> tuple[list[float], dict]:
+    """Realized per-decision net return plus coverage stats.
+
+    `reportable_fraction` is reportable blocks over all evaluated blocks; `label_reportable_fraction` uses only
+    blocks with at least one non-CASH label as the denominator.
+    """
     policy.eval()
     rows = []
+    total_blocks = 0
+    label_blocks = 0
+    reportable_blocks = 0
+    missing_values = []
     for i in range(0, len(days_emb), batch_days):
         batch = _stack(days_emb, list(range(i, min(i + batch_days, len(days_emb)))), device)
         nets, _, _, _, _, missing_w = _rollout(policy, batch, cost)         # [B,nB]
-        reportable = batch["label"] & (missing_w <= max_missing_label_weight)
+        label = batch["label"].bool()
+        reportable = label & (missing_w <= max_missing_label_weight)
+        total_blocks += int(label.numel())
+        label_blocks += int(label.sum().item())
+        reportable_blocks += int(reportable.sum().item())
+        if label.any():
+            missing_values.append(missing_w[label].detach().cpu())
         rows += nets[reportable].cpu().tolist()
+    mean_missing = float(torch.cat(missing_values).mean()) if missing_values else 0.0
+    stats = {
+        "total_blocks": total_blocks,
+        "label_blocks": label_blocks,
+        "reportable_blocks": reportable_blocks,
+        "reportable_fraction": reportable_blocks / total_blocks if total_blocks else 0.0,
+        "label_reportable_fraction": reportable_blocks / label_blocks if label_blocks else 0.0,
+        "mean_missing_label_weight": mean_missing,
+    }
+    return rows, stats
+
+
+@torch.no_grad()
+def evaluate_policy(policy, days_emb, device, cost: float, batch_days: int = 32,
+                    max_missing_label_weight: float = 1e-6) -> list[float]:
+    """Realized per-decision net return on label-valid/reportable blocks, chunked over days. Pooled list."""
+    rows, _ = evaluate_policy_detailed(policy, days_emb, device, cost, batch_days, max_missing_label_weight)
     return rows
 
 

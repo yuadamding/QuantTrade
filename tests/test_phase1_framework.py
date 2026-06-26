@@ -30,6 +30,7 @@ from rl_quant.models import (
 from rl_quant.training import (
     encode_days,
     evaluate_policy,
+    evaluate_policy_detailed,
     freeze_encoder,
     policy_telemetry,
     ssl_targets,
@@ -111,6 +112,22 @@ class ContextIsPolicyFree(unittest.TestCase):
 
 
 class ContextIsCausal(unittest.TestCase):
+    def test_context_encoder_runs_with_padding_mask(self):
+        torch.manual_seed(0)
+        enc = _encoder()
+        enc.eval()
+        bars = torch.randn(2, A, S, BAR_FEATS)
+        mask = torch.ones(2, A, S, dtype=torch.bool)
+        mask[:, 0, :] = False                                    # fully masked CASH row exercises the fallback
+        mask[:, 1:, -3:] = False                                 # partially padded stock rows exercise SDPA masks
+        cov = torch.randn(2, NB, A, NC)
+        with torch.no_grad():
+            per_stock, market = enc(bars, mask, cov)
+        self.assertEqual(per_stock.shape, (2, NB, A, enc.d_model))
+        self.assertEqual(market.shape, (2, NB, enc.d_model))
+        self.assertTrue(torch.isfinite(per_stock).all())
+        self.assertTrue(torch.isfinite(market).all())
+
     def test_single_block_context_invariant_to_future_and_padded_tokens(self):
         torch.manual_seed(0)
         enc = _encoder(block_seconds=S, max_seconds=S)            # one block -> tier-1 only
@@ -285,6 +302,14 @@ class MissingLabelsAreNotFlatReturns(unittest.TestCase):
                "ret": torch.tensor([[0.0, float("nan"), 0.05]]),
                "ret_valid": torch.tensor([[True, False, True]]), "n_blocks": 1}
         self.assertEqual(evaluate_policy(PickMissing(), [day], torch.device("cpu"), cost=0.0), [])
+        rows, stats = evaluate_policy_detailed(PickMissing(), [day], torch.device("cpu"), cost=0.0)
+        self.assertEqual(rows, [])
+        self.assertEqual(stats["total_blocks"], 1)
+        self.assertEqual(stats["label_blocks"], 1)
+        self.assertEqual(stats["reportable_blocks"], 0)
+        self.assertEqual(stats["reportable_fraction"], 0.0)
+        self.assertEqual(stats["label_reportable_fraction"], 0.0)
+        self.assertAlmostEqual(stats["mean_missing_label_weight"], 1.0, places=5)
         tele = policy_telemetry(PickMissing(), [day], torch.device("cpu"), cost=0.0)
         self.assertAlmostEqual(tele["mean_missing_label_weight"], 1.0, places=5)
 

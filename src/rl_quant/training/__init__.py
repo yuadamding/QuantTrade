@@ -20,6 +20,7 @@ from rl_quant.training.context_pretrain import (
 from rl_quant.training.decision_policy import (
     cost_paid_baselines,
     evaluate_policy,
+    evaluate_policy_detailed,
     policy_telemetry,
     train_decision_policy,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "cost_paid_baselines",
     "encode_days",
     "evaluate_policy",
+    "evaluate_policy_detailed",
     "freeze_encoder",
     "policy_telemetry",
     "ssl_targets",
