@@ -5,7 +5,8 @@ Each design fully specifies BOTH transformers' architecture AND the training str
   ARCHITECTURE
     context (two-tier causal transformer over RAW seconds): session_seconds (full RTH session encoded once),
       block_seconds (tier-1 block length = the candidate/decision cadence), d_model / enc_layers / enc_heads.
-    policy (set-transformer): policy_token_dim / policy_layers / policy_heads.
+    policy: raw-second policy encoder (raw_policy_dim / raw_policy_layers / raw_policy_heads) feeding the
+      set-transformer (policy_token_dim / policy_layers / policy_heads).
   TRAINING STRATEGY / SETUP (per stage where it differs)
     budget: ssl_steps, policy_steps, ssl_batch_size (DAYS per SSL micro-batch), ssl_accum (grad-accum),
       batch_days (days per policy step).
@@ -13,9 +14,9 @@ Each design fully specifies BOTH transformers' architecture AND the training str
       schedule ('cosine' warmup->decay, or 'constant'), grad_clip, amp (bf16 autocast), grad_checkpoint.
     policy objective: cost (turnover), risk_lambda (downside), entropy_coef (allocation exploration),
       temperature (allocation sharpness), max_actions_per_day (soft trade budget) + budget_lambda (its penalty),
-      and the CASH-basin escape knobs -- gate_init_bias (start trading), gate_entropy_coef (gate exploration),
-      friction_warmup_frac (ramp cost+budget 0->full so the edge is learned before friction bites), and
-      ssl_perstock_coef (Stage-1 cross-sectional pretext weight).
+      and the CASH-basin / label-accounting knobs -- gate_init_bias (start trading), gate_entropy_coef
+      (gate exploration), missing_label_penalty, friction_warmup_frac (ramp cost+budget 0->full so the edge is
+      learned before friction bites), and ssl_perstock_coef (Stage-1 cross-sectional pretext weight).
 
 EVENT-TIMED: the policy is NOT on a fixed decision clock. The encoder turns each full session into a context at
 EVERY `block_seconds` block (78 blocks/day at 300s); the policy chooses WHEN to trade (a per-block act-gate) under
@@ -23,8 +24,8 @@ a SOFT per-day budget of ~`max_actions_per_day` trades, and trades execute T+1. 
 encoder's blocks -- there is no separate per-candidate storage; one full-session encode yields every context.
 
 The series no longer varies "lookback": the two-tier hierarchy reaches the WHOLE session by design, so every real
-design encodes the full RTH session and instead varies (context arch x policy arch x block cadence x training
-strategy x trade budget). `large` is the smaller MINIMUM/floor. Full-session SSL is dominated by the tier-1
+design encodes the full RTH session and instead varies (context arch x policy raw/set arch x block cadence x
+training strategy x trade budget). `large` is the smaller MINIMUM/floor. Full-session SSL is dominated by the tier-1
 activations; `grad_checkpoint` (recompute tier-1 in backward) + `amp` (bf16) keep ONE day/micro-batch within an
 80 GB H100 up to ~d512, and `ssl_accum` builds the effective target-batch at fixed peak VRAM. Verify with
 nvidia-smi and tune ssl_accum / ssl_batch_size. The 2xH100 sweep runs two designs at once (one per GPU).
@@ -52,6 +53,9 @@ class Phase1Design:
     policy_steps: int
     ssl_batch_size: int              # DAYS per SSL micro-batch (a day = one full session)
     batch_days: int                  # days per policy step
+    raw_policy_dim: int = 64          # trainable Stage-2 raw-second encoder width (profit-gradient path)
+    raw_policy_layers: int = 1
+    raw_policy_heads: int = 4
     ssl_accum: int = 8               # grad-accum: effective SSL target-batch = ssl_batch_size * ssl_accum days
     # --- training strategy / setup (defaults; designs override to vary) ---
     dropout: float = 0.1
@@ -71,6 +75,7 @@ class Phase1Design:
     budget_lambda: float = 0.1        # penalty on the per-day act-gate RATE exceeding max_actions_per_day/nB
     gate_init_bias: float = 2.0       # initial act-gate logit (sigmoid(2)=0.88): start TRADING, not in CASH
     gate_entropy_coef: float = 1e-3   # Bernoulli gate-entropy bonus -> exploration on WHEN to trade
+    missing_label_penalty: float = 1.0 # loss penalty for allocating to actions whose future label is missing
     friction_warmup_frac: float = 0.3 # ramp turnover cost + budget penalty 0->full over this frac of policy_steps
     ssl_perstock_coef: float = 1.0    # weight of the per-stock cross-sectional SSL pretext (relative-value signal)
     horizon_mode: str = "intraday"    # "intraday" (trade 5-min blocks within a day) | "daily" (hold ACROSS days)
@@ -87,6 +92,9 @@ class Phase1Design:
         if self.policy_token_dim % self.policy_heads:
             raise ValueError(f"{self.name}: policy_heads {self.policy_heads} must divide "
                              f"policy_token_dim {self.policy_token_dim}")
+        if self.raw_policy_dim % self.raw_policy_heads:
+            raise ValueError(f"{self.name}: raw_policy_heads {self.raw_policy_heads} must divide "
+                             f"raw_policy_dim {self.raw_policy_dim}")
         if self.schedule not in ("cosine", "constant"):
             raise ValueError(f"{self.name}: schedule must be 'cosine' or 'constant'")
         if self.horizon_mode not in ("intraday", "daily"):
@@ -102,10 +110,10 @@ class Phase1Design:
         if self.session_seconds % self.block_seconds:
             raise ValueError(f"{self.name}: block_seconds {self.block_seconds} must divide "
                              f"session_seconds {self.session_seconds}")
-        if self.max_actions_per_day <= 0 or self.budget_lambda < 0:
-            raise ValueError(f"{self.name}: need max_actions_per_day>0 and budget_lambda>=0")
+        if self.max_actions_per_day <= 0 or self.budget_lambda < 0 or self.missing_label_penalty < 0:
+            raise ValueError(f"{self.name}: need max_actions_per_day>0, budget_lambda>=0, missing_label_penalty>=0")
         for f in ("session_seconds", "block_seconds", "ssl_steps", "policy_steps", "ssl_batch_size",
-                  "ssl_accum", "batch_days"):
+                  "ssl_accum", "batch_days", "raw_policy_dim", "raw_policy_layers", "raw_policy_heads"):
             if getattr(self, f) <= 0:
                 raise ValueError(f"{self.name}: {f} must be positive")
 
@@ -115,7 +123,8 @@ _SERIES = [
     # tiny: CPU smoke / CI only (short session, 4 blocks of 30s).
     Phase1Design("tiny", "smoke/CI only", session_seconds=120, block_seconds=30, d_model=24, enc_layers=1,
                  enc_heads=2, policy_token_dim=24, policy_layers=1, policy_heads=2, ssl_steps=40, policy_steps=60,
-                 ssl_batch_size=2, ssl_accum=1, batch_days=4, dropout=0.0, max_actions_per_day=2.0),
+                 raw_policy_dim=24, raw_policy_heads=2, ssl_batch_size=2, ssl_accum=1, batch_days=4, dropout=0.0,
+                 max_actions_per_day=2.0),
 
     # large: the MINIMUM -- full session, modest model, standard 300s blocks (78/day), budget ~5.
     Phase1Design("large", "MINIMUM: full session, d256/4L, 300s blocks, budget 5", session_seconds=FULL,

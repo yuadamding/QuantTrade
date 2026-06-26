@@ -1,8 +1,9 @@
 """Two-stage training for the learning framework, decoupled to enforce the context/policy split.
 
-  * context_pretrain -- Stage 1: self-supervised context learning, then freeze + encode windows to cached
-    embeddings.
-  * decision_policy  -- Stage 2: differentiable-portfolio policy learning on those FROZEN embeddings.
+  * context_pretrain -- Stage 1: self-supervised context learning, then freeze + encode windows to detached
+    context embeddings while carrying raw bars forward.
+  * decision_policy  -- Stage 2: differentiable-portfolio policy learning on detached context plus a trainable
+    raw-second policy encoder.
 
 Both expose resumable training routines (start_step + optimizer + checkpoint callback); persistence/resume
 orchestration is the caller's (the driver's) job.

@@ -3,7 +3,8 @@
 QuantTrade (`rl_quant`) is a compact, point‑in‑time‑correct research framework for learning trading policies
 from raw market data. Its current centerpiece is a **decoupled two‑stage learning framework**: a self‑supervised
 **context encoder** that learns market state from the raw 1‑second bars, and a **decision policy** that allocates
-capital on top of the frozen context. Around it sit the kept data/evaluation/reportability infrastructure.
+capital from the frozen context plus its own trainable raw‑second policy encoder. Around it sit the kept
+data/evaluation/reportability infrastructure.
 
 > **Status (2026‑06).** The earlier per‑second / subhour / second‑to‑hour transformer stack and its
 > precomputed‑feature datasets were removed. The framework below is raw‑input only: **no precomputed/engineered
@@ -20,8 +21,8 @@ capital on top of the frozen context. Around it sit the kept data/evaluation/rep
    and raw per‑article LLM news scores. All normalization / aggregation / representation is done **inside the
    models at train time** — nothing hand‑engineered is persisted.
 3. **Context ⟂ policy split.** "What is the market doing" (context) is learned separately from "what to do about
-   it" (policy). The context encoder is trained self‑supervised, then **frozen**; the policy trains on the
-   frozen context and can never backprop into it.
+   it" (policy). The context encoder is trained self‑supervised, then **frozen**; the policy trains on detached
+   context tensors plus a separate raw‑second policy encoder, so reward gradients never backprop into Stage 1.
 4. **Reportability.** A result is trustworthy only with realistic masks/latency/costs, matched train/val/test
    schemas, cost‑paid baselines, and a statistical battery (see *Safety & reportability*).
 
@@ -50,14 +51,15 @@ OHLCV; in‑model `BatchNorm` + linear embedding only — no pooling, no scale�
 
 ### Stage 2 — policy learning (`rl_quant.models.decision_policy`)
 
-A **permutation‑equivariant set‑transformer** over the action set `{CASH, stock₁ … stock_N}`, trained on the
-frozen context (it holds no encoder reference → its reward gradient cannot reach the context):
+A **permutation‑equivariant set‑transformer** over the action set `{CASH, stock₁ … stock_N}`, trained on frozen
+context plus a policy‑side raw‑second encoder (it holds no Stage‑1 encoder reference → its reward gradient cannot
+reach the context):
 
-- Each action becomes a token `[ broadcast market ctx | per‑stock ctx | in‑model‑normalized covariates |
-  in‑model‑aggregated raw news | previous weight ]` + a learned CASH token. Cross‑sectional attention values
-  each action relative to the others; unavailable actions are masked.
-- Raw per‑article **news scores are aggregated in‑model** (a learned masked sum), and **covariates are
-  normalized in‑model** — so the policy also uses **no precomputed features**.
+- Each action becomes a token `[ broadcast market ctx | per‑stock ctx | trainable raw‑second policy ctx |
+  in‑model‑aggregated raw news | previous weight ]` + a learned CASH token. Cross‑sectional attention values each
+  action relative to the others; unavailable actions are masked.
+- Raw per‑article **news scores are aggregated in‑model** (a learned masked sum), and raw OHLCV is encoded by the
+  policy path at train time — so the policy also uses **no precomputed features**.
 - A softmax (with **temperature**) over `{CASH, stocks}` yields target **allocation weights**, and a per‑block
   **act‑gate** `g∈[0,1]` decides *whether* to trade: the held position is `g·target + (1−g)·prev` (holding is
   turnover‑free). CASH = abstain.
@@ -72,8 +74,9 @@ frozen context (it holds no encoder reference → its reward gradient cannot rea
 
 - `context_pretrain.py` — Stage‑1 SSL trainer: **streams** full sessions (one day/micro‑batch) from CPU‑resident
   windows to the GPU + **gradient accumulation** (effective batch ≫ peak VRAM); then `freeze_encoder` +
-  `encode_days` (per‑block cached embeddings). `decision_policy.py` — Stage‑2 event‑timed differentiable‑portfolio
-  trainer (gated day/block rollout, per‑day budget, T+1) + `evaluate_policy` + cost‑paid baselines. `_optim.py`
+  `encode_days` (detached per‑block embeddings plus raw bars for Stage 2). `decision_policy.py` — Stage‑2
+  event‑timed differentiable‑portfolio trainer (gated day/block rollout, per‑day budget, T+1) + `evaluate_policy`
+  + cost‑paid baselines. `_optim.py`
   — step‑driven warmup+cosine/constant LR (resume‑exact, no scheduler state).
 - **Per‑stage training strategy** (LR / warmup / weight decay / grad clip; bf16 AMP + TF32 + `grad_checkpoint`;
   policy cost / risk / entropy / temperature / `max_actions_per_day` / `budget_lambda`) is parameterized by

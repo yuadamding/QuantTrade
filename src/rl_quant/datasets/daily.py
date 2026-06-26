@@ -38,7 +38,8 @@ def cross_day_returns(day_open: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
 
 def build_daily_episodes(records: list[dict], episode_len: int, stride: int | None = None) -> list[dict]:
     """records: a DATE-SORTED list of per-day dicts, each with the end-of-day context + day-open + availability:
-        {market [d], per_stock [A,d], news_raw [A,M,1], news_mask [A,M], day_open [A], avail [A]}.
+        {market [d], per_stock [A,d], bars [A,S,F], bar_mask [A,S], news_raw [A,M,1], news_mask [A,M],
+         day_open [A], avail [A]}.
     Returns equal-length episodes shaped like the intraday per-day dicts (sequence axis = DAYS), so Stage-2's
     rollout carries positions ACROSS days -- a policy that holds (gate=0) keeps a position for the WHOLE episode,
     which is how LONG holds (e.g. two trades >=180 days apart) are expressed. `episode_len` sets the max hold; a
@@ -55,12 +56,20 @@ def build_daily_episodes(records: list[dict], episode_len: int, stride: int | No
     per_stock = torch.stack([r["per_stock"] for r in records])   # [N,A,d]
     news_raw = torch.stack([r["news_raw"] for r in records])     # [N,A,M,1]
     news_mask = torch.stack([r["news_mask"] for r in records])   # [N,A,M]
+    bars = torch.stack([r["bars"] for r in records]) if "bars" in records[0] else None        # [N,A,S,F]
+    bar_mask = torch.stack([r["bar_mask"] for r in records]) if "bar_mask" in records[0] else None  # [N,A,S]
     avail = torch.stack([r["avail"] for r in records])           # [N,A] as-of tradeability (traded that day)
     usable = N - 2                                               # labelled days
     L = min(episode_len, usable)                                 # don't starve a short split: one full episode
     st = stride if (stride and stride > 0) else L
     starts = list(range(0, usable - L + 1, st)) or [0]
-    return [{"market": market[s:s + L], "per_stock": per_stock[s:s + L],
-             "news_raw": news_raw[s:s + L], "news_mask": news_mask[s:s + L], "avail": avail[s:s + L],
-             "ret": ret[s:s + L], "ret_valid": valid[s:s + L], "n_blocks": L}
-            for s in starts]
+    episodes = []
+    for s in starts:
+        episode = {"market": market[s:s + L], "per_stock": per_stock[s:s + L],
+                   "news_raw": news_raw[s:s + L], "news_mask": news_mask[s:s + L], "avail": avail[s:s + L],
+                   "ret": ret[s:s + L], "ret_valid": valid[s:s + L], "n_blocks": L}
+        if bars is not None and bar_mask is not None:
+            episode["bars"] = bars[s:s + L]
+            episode["bar_mask"] = bar_mask[s:s + L]
+        episodes.append(episode)
+    return episodes

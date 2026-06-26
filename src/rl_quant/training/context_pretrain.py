@@ -8,8 +8,9 @@ at EVERY block; the SSL pretext has TWO heads (both targets derived from the T+1
     DEMEANED return (r_i - equal-weight). The market head alone would train only the pooled mean, leaving the
     per-stock embeddings with no gradient rewarding which-stock-wins discrimination; this head makes the FROZEN
     context carry the relative-value signal the policy needs (without it the policy has nothing to select on).
-The encoder is then FROZEN and used to ENCODE every day into per-block cached context embeddings; Stage 2 trains
-the policy on those (it never holds an encoder reference -> the split is literal).
+The encoder is then FROZEN and used to ENCODE every day into detached per-block context embeddings while carrying
+the raw bars forward for Stage 2. The policy trains on those detached contexts plus its own trainable raw-second
+encoder (it never holds a Stage-1 encoder reference -> the split is literal).
 
 Days stream from CPU-resident storage to ``device`` per micro-batch (full sessions are too big to hold all on
 GPU) and gradients are ACCUMULATED over ``accum_steps`` micro-batches. Resumability is delegated to the caller
@@ -111,8 +112,8 @@ def freeze_encoder(encoder) -> None:
 @torch.no_grad()
 def encode_days(encoder, days, device, batch: int = 2, amp: bool = False) -> list[dict]:
     """Run the FROZEN encoder over each day's full session -> per-block context embeddings, in chunks of ``batch``
-    days (peak VRAM = batch * A sequences). The returned per-day dicts carry NO raw seconds and NO encoder
-    reference -- they are the Stage-2 inputs (one entry per trading day, each with nB blocks)."""
+    days (peak VRAM = batch * A sequences). The returned per-day dicts carry detached context plus the raw
+    seconds the policy-side raw encoder consumes; they carry NO encoder reference."""
     encoder.eval()
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     out = []
@@ -127,6 +128,7 @@ def encode_days(encoder, days, device, batch: int = 2, amp: bool = False) -> lis
         for j, d in enumerate(chunk):
             out.append({
                 "market": market[j], "per_stock": per_stock[j],
+                "bars": d["bars"], "bar_mask": d["bar_mask"],
                 "news_raw": d["news_raw"], "news_mask": d["news_mask"], "avail": d["avail"],
                 "ret": d["ret"], "ret_valid": d["ret_valid"], "n_blocks": d["ret"].shape[0],
             })

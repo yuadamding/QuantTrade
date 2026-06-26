@@ -50,7 +50,10 @@ def _encoder(d_model=16, max_seconds=S, block_seconds=BL, n_layers=2):
 
 
 def _policy(d_model=16, **kw):
-    return DecisionPolicyHead(DecisionPolicyConfig(context_dim=d_model, news_raw_dim=NRD, max_news=M, token_dim=16,
+    return DecisionPolicyHead(DecisionPolicyConfig(context_dim=d_model, bar_feature_dim=BAR_FEATS,
+                                                   raw_policy_dim=4, raw_block_seconds=BL,
+                                                   raw_policy_layers=0, raw_policy_heads=1,
+                                                   news_raw_dim=NRD, max_news=M, token_dim=16,
                                                    n_heads=2, n_layers=1, feedforward_dim=32, **kw))
 
 
@@ -98,10 +101,13 @@ class ContextIsPolicyFree(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in enc.parameters()))
         emb = encode_days(enc, [_synthetic_day(1)], torch.device("cpu"), batch=1)
         self.assertFalse(emb[0]["per_stock"].requires_grad, "cached context must be detached")
-        train_decision_policy(_policy(), emb, steps=1, eval_every=0, val_days=emb,
+        pol = _policy()
+        train_decision_policy(pol, emb, steps=1, eval_every=0, val_days=emb,
                               device=torch.device("cpu"), batch_days=1)
         self.assertTrue(all(p.grad is None for p in enc.parameters()),
                         "policy training put a gradient on the context encoder -> the split is broken")
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in pol.raw_encoder.parameters()),
+                        "policy raw-second encoder received no profit-gradient signal")
 
 
 class ContextIsCausal(unittest.TestCase):
@@ -148,7 +154,8 @@ class PolicyIsAllocationAndGate(unittest.TestCase):
         prev = torch.zeros(1, actions)
         prev[0, 0] = 1.0
         ns, nm = _news(1, actions)
-        return pol(torch.randn(1, 16), torch.randn(1, actions, 16), ns, nm, prev, avail)
+        raw = torch.randn(1, actions, 4)
+        return pol(torch.randn(1, 16), torch.randn(1, actions, 16), raw, ns, nm, prev, avail)
 
     def test_weights_form_a_simplex_and_respect_constraints(self):
         w, gate = self._forward(A)
@@ -190,11 +197,16 @@ class DesignSeriesIsValid(unittest.TestCase):
         per_stock, market = enc(torch.randn(1, A, S, BAR_FEATS), torch.ones(1, A, S, dtype=torch.bool),
                                 torch.randn(1, NB, A, NC))
         self.assertEqual(market.shape, (1, NB, d.d_model))
-        pol = DecisionPolicyHead(DecisionPolicyConfig(context_dim=d.d_model, news_raw_dim=NRD, max_news=M,
+        pol = DecisionPolicyHead(DecisionPolicyConfig(context_dim=d.d_model, bar_feature_dim=BAR_FEATS,
+                                 raw_policy_dim=d.raw_policy_dim, raw_block_seconds=BL,
+                                 raw_policy_layers=d.raw_policy_layers, raw_policy_heads=d.raw_policy_heads,
+                                 news_raw_dim=NRD, max_news=M,
                                  token_dim=d.policy_token_dim, n_heads=d.policy_heads, n_layers=d.policy_layers,
                                  feedforward_dim=d.policy_token_dim * 2))
         ns, nm = _news(1, A)
-        w, gate = pol(market[:, 0], per_stock[:, 0], ns, nm, torch.zeros(1, A), torch.ones(1, A, dtype=torch.bool))
+        raw = torch.randn(1, A, d.raw_policy_dim)
+        w, gate = pol(market[:, 0], per_stock[:, 0], raw, ns, nm, torch.zeros(1, A),
+                      torch.ones(1, A, dtype=torch.bool))
         self.assertAlmostEqual(float(w.sum()), 1.0, places=4)
         self.assertTrue(0.0 <= float(gate) <= 1.0)
 
@@ -212,10 +224,11 @@ class TrainingStrategyKnobs(unittest.TestCase):
         ms, ps = torch.randn(1, 16), torch.randn(1, A, 16)
         prev, avail = torch.zeros(1, A), torch.ones(1, A, dtype=torch.bool)
         ns, nm = _news(1, A)
+        raw = torch.randn(1, A, 4)
         torch.manual_seed(1)
-        w_sharp, _ = _policy(temperature=0.3)(ms, ps, ns, nm, prev, avail)
+        w_sharp, _ = _policy(temperature=0.3)(ms, ps, raw, ns, nm, prev, avail)
         torch.manual_seed(1)
-        w_diff, _ = _policy(temperature=3.0)(ms, ps, ns, nm, prev, avail)
+        w_diff, _ = _policy(temperature=3.0)(ms, ps, raw, ns, nm, prev, avail)
 
         def ent(w):
             return float(-(w.clamp_min(1e-9) * w.clamp_min(1e-9).log()).sum())
@@ -254,6 +267,28 @@ class EndToEndStagesRun(unittest.TestCase):
         self.assertTrue(all(abs(r) < 1.0 for r in rows))
 
 
+class MissingLabelsAreNotFlatReturns(unittest.TestCase):
+    def test_evaluation_excludes_allocations_to_missing_label_actions(self):
+        class PickMissing(torch.nn.Module):
+            def encode_raw_policy_step(self, bars, bar_mask, step):
+                return torch.zeros(bars.shape[0], bars.shape[1], 1)
+
+            def forward(self, market, per_stock, raw_policy_ctx, news_scores, news_mask, prev_weights, available):
+                w = torch.zeros_like(prev_weights)
+                w[:, 1] = 1.0
+                return w, torch.ones(prev_weights.shape[0])
+
+        day = {"market": torch.zeros(1, 1), "per_stock": torch.zeros(1, 3, 1),
+               "bars": torch.zeros(3, BL, BAR_FEATS), "bar_mask": torch.ones(3, BL, dtype=torch.bool),
+               "news_raw": torch.zeros(1, 3, M, NRD), "news_mask": torch.zeros(1, 3, M, dtype=torch.bool),
+               "avail": torch.ones(1, 3, dtype=torch.bool),
+               "ret": torch.tensor([[0.0, float("nan"), 0.05]]),
+               "ret_valid": torch.tensor([[True, False, True]]), "n_blocks": 1}
+        self.assertEqual(evaluate_policy(PickMissing(), [day], torch.device("cpu"), cost=0.0), [])
+        tele = policy_telemetry(PickMissing(), [day], torch.device("cpu"), cost=0.0)
+        self.assertAlmostEqual(tele["mean_missing_label_weight"], 1.0, places=5)
+
+
 def _planted_days(n_days=10, actions=A, nb=8, d=16, seed=0):
     """Synthetic per-block embeddings where each stock's context LINEARLY encodes its next-block cross-sectionally
     -demeaned return (a strong planted relative-value signal). A working policy must keep the gate OPEN and tilt
@@ -269,7 +304,10 @@ def _planted_days(n_days=10, actions=A, nb=8, d=16, seed=0):
         valid[:, 0] = True
         valid[: nb - 2, 1:] = True                                   # last 2 blocks unlabeled (T+1)
         days.append({"market": per_stock.mean(1), "per_stock": per_stock,
-                     "news_raw": torch.zeros(nb, actions, M, NRD), "news_mask": torch.zeros(nb, actions, M, dtype=torch.bool),
+                     "bars": torch.zeros(actions, nb * BL, BAR_FEATS),
+                     "bar_mask": torch.ones(actions, nb * BL, dtype=torch.bool),
+                     "news_raw": torch.zeros(nb, actions, M, NRD),
+                     "news_mask": torch.zeros(nb, actions, M, dtype=torch.bool),
                      "avail": torch.ones(nb, actions, dtype=torch.bool),
                      "ret": ret, "ret_valid": valid, "n_blocks": nb})
     return days
@@ -282,7 +320,7 @@ class PolicyLearnsAndTradesUnderFix(unittest.TestCase):
     def test_gate_initialized_open(self):
         torch.manual_seed(0)
         pol = _policy()                                              # gate_init_bias defaults to 2.0
-        _, gate = pol(torch.randn(4, 16), torch.randn(4, A, 16), *_news(4, A),
+        _, gate = pol(torch.randn(4, 16), torch.randn(4, A, 16), torch.randn(4, A, 4), *_news(4, A),
                       torch.zeros(4, A), torch.ones(4, A, dtype=torch.bool))
         self.assertGreater(float(gate.mean()), 0.5, "act-gate must START OPEN (trade), not closed")
 
@@ -293,9 +331,9 @@ class PolicyLearnsAndTradesUnderFix(unittest.TestCase):
         dev = torch.device("cpu")
         r0 = evaluate_policy(pol, days, dev, cost=1e-4)
         before = sum(r0) / len(r0)
-        train_decision_policy(pol, days, steps=250, lr=3e-3, batch_days=10, cost=1e-4, risk_lambda=0.0,
+        train_decision_policy(pol, days, steps=140, lr=5e-3, batch_days=10, cost=1e-4, risk_lambda=0.0,
                               max_actions=5.0, budget_lambda=0.1, gate_entropy_coef=1e-3,
-                              friction_warmup_steps=60, schedule="constant", eval_every=0, val_days=days, device=dev)
+                              friction_warmup_steps=30, schedule="constant", eval_every=0, val_days=days, device=dev)
         rows = evaluate_policy(pol, days, dev, cost=1e-4)
         oos = sum(rows) / len(rows)
         tele = policy_telemetry(pol, days, dev, cost=1e-4)
@@ -311,7 +349,7 @@ class PolicyLearnsAndTradesUnderFix(unittest.TestCase):
         days = _planted_days(n_days=6, nb=20)
         pol = _policy()
         dev = torch.device("cpu")
-        train_decision_policy(pol, days, steps=300, lr=3e-3, batch_days=6, cost=1e-4, risk_lambda=0.0,
+        train_decision_policy(pol, days, steps=140, lr=5e-3, batch_days=6, cost=1e-4, risk_lambda=0.0,
                               max_actions=2.0, budget_lambda=2.0, gate_entropy_coef=0.0, friction_warmup_steps=0,
                               schedule="constant", eval_every=0, val_days=days, device=dev)
         tele = policy_telemetry(pol, days, dev, cost=1e-4)
@@ -346,6 +384,7 @@ def _daily_records(n=12, actions=A, d=16, seed=0):
     return [{"date": f"2022-02-{i + 1:02d}", "day_open": 1.0 + 0.5 * torch.rand(actions, generator=g),
              "avail": torch.ones(actions, dtype=torch.bool),
              "market": torch.randn(d, generator=g), "per_stock": torch.randn(actions, d, generator=g),
+             "bars": torch.zeros(actions, S, BAR_FEATS), "bar_mask": torch.ones(actions, S, dtype=torch.bool),
              "news_raw": torch.zeros(actions, M, NRD), "news_mask": torch.zeros(actions, M, dtype=torch.bool)}
             for i in range(n)]
 
@@ -397,6 +436,8 @@ class CrossDayDailyMode(unittest.TestCase):
                 valid[:, 0] = True
                 valid[:3, 1:] = True
                 eps.append({"market": ps.mean(1), "per_stock": ps,
+                            "bars": torch.zeros(L, actions, S, BAR_FEATS),
+                            "bar_mask": torch.ones(L, actions, S, dtype=torch.bool),
                             "news_raw": torch.zeros(L, actions, M, NRD),
                             "news_mask": torch.zeros(L, actions, M, dtype=torch.bool),
                             "avail": torch.ones(L, actions, dtype=torch.bool),
@@ -408,7 +449,7 @@ class CrossDayDailyMode(unittest.TestCase):
         def train_eval(window):
             torch.manual_seed(0)
             pol = _policy()
-            train_decision_policy(pol, _delayed(seed=1), steps=400, lr=3e-3, batch_days=8, cost=1e-3,
+            train_decision_policy(pol, _delayed(seed=1), steps=180, lr=5e-3, batch_days=8, cost=1e-3,
                                   risk_lambda=0.0, budget_lambda=0.0, gate_entropy_coef=0.0, friction_warmup_steps=0,
                                   schedule="constant", eval_every=0, val_days=_delayed(seed=1), device=dev,
                                   bptt_window=window)

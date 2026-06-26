@@ -64,12 +64,19 @@ class _CausalBlock(nn.Module):
         self.ff = nn.Sequential(nn.Linear(d, ff), nn.GELU(), nn.Linear(ff, d))
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x [N, S, d]
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:  # x [N, S, d]
         N, S, d = x.shape
         h = self.ln1(x)
         qkv = self.qkv(h).reshape(N, S, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]                 # each [N, n_heads, S, head_dim]
-        a = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+        attn_mask = None
+        if key_padding_mask is not None:
+            kpm = key_padding_mask.bool()
+            if bool(kpm.all(dim=1).any()):
+                kpm = kpm.clone()
+                kpm[kpm.all(dim=1), 0] = False
+            attn_mask = (~kpm).view(N, 1, 1, S)          # bool mask: True keys may be attended
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=True,
                                            dropout_p=self.attn_dropout if self.training else 0.0)
         a = a.transpose(1, 2).reshape(N, S, d)
         x = x + self.drop(self.proj(a))
@@ -146,24 +153,29 @@ class ContextEncoder(nn.Module):
         # input is saved (n_blocks × [B*A*nB, bl, d] ≈ 9.6 GB for d512/8L with B=1 day). During backward,
         # only ONE block's intermediates are recomputed and held at a time (~12 GB peak), so the backward
         # peak is ~24 GB instead of ~70+ GB from a one-segment recompute of all 8 blocks simultaneously.
+        bm1 = bar_mask.reshape(B * A * nB, bl)                   # per-block validity (bars sit at absolute offsets)
+        kpm1 = ~bm1
         if self.grad_checkpoint and self.training:
             for blk in self.tier1:
-                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(blk, x, kpm1, use_reentrant=False)
         else:
             for blk in self.tier1:
-                x = blk(x)
+                x = blk(x, kpm1)
         x = self.norm1(x)
-        bm1 = bar_mask.reshape(B * A * nB, bl)                   # per-block validity (bars sit at absolute offsets)
         summ = _last_valid(x, bm1).reshape(B * A, nB, d)         # TRUE last-valid second's token (gap-correct, cheap)
         block_has = bm1.any(-1).reshape(B * A, nB)               # [B*A, nB]
         summ = summ * block_has.unsqueeze(-1).float()
         # --- Tier 2: global causal attention over block summaries -> a context at EVERY block ---
         h = summ + self.pos2[:nB].unsqueeze(0)
         for blk in self.tier2:
-            h = blk(h)
+            h = blk(h, ~block_has)
         h = self.norm2(h)                                        # [B*A, nB, d] per-block tier-2 context
         bar_blocks = h.reshape(B, A, nB, d).permute(0, 2, 1, 3)  # [B, nB, A, d]
-        has = block_has.reshape(B, A, nB).permute(0, 2, 1).unsqueeze(-1).float()   # [B, nB, A, 1]
+        # Once a stock has traded, later no-trade blocks still get the causal stale context emitted at that
+        # timestamp. Empty blocks are not attention keys above, so they cannot become synthetic history.
+        seen_blocks = block_has.to(torch.int8).cummax(dim=1).values.bool()
+        seen = seen_blocks.reshape(B, A, nB).permute(0, 2, 1).unsqueeze(-1).float()
+        has = seen                                                     # [B, nB, A, 1]
         cf = cov_blocks[:, :nB].reshape(-1, cov_blocks.shape[-1])   # [B*nB*A, C]
         cm = has.reshape(-1) > 0                                    # normalize only PRESENT-stock rows (mirror bars):
         cov_flat = torch.zeros_like(cf)                            # absent-stock zero rows must not pollute BN stats
