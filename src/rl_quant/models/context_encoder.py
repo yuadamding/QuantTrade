@@ -4,8 +4,9 @@ The encoder consumes the raw per-second bars DIRECTLY -- one token per second, t
 pooling and NO hand-computed (scale-free) features. The only transform is the model's own input normalization
 (a BatchNorm layer over the raw bar fields, learned at train time) + a linear embedding: that is the model
 learning from the data, not precomputed feature engineering. A full RTH session is fed SESSION-ALIGNED (index s =
-second s after the 09:30 open) and attention is CAUSAL (is_causal), so a block's context depends only on the
-seconds up to that block -- no look-ahead, and padding (after a stock's valid tail) is never attended.
+second s after the 09:30 open) and attention is CAUSAL: unpadded rows use SDPA's native causal path, while padded
+rows use one combined causal + key-valid mask. A block's context depends only on the seconds up to that block --
+no look-ahead, and padding (after a stock's valid tail) is never attended.
 
 The encoder produces a context at EVERY `block_seconds` block of the session (the candidate/decision grid for the
 event-timed policy): tier-1 attends locally within each block, tier-2 attends causally across the block summaries.
