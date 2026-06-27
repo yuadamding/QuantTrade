@@ -29,16 +29,14 @@ _SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 # the script into a thin wrapper, then DELETE it from this set. Do not ADD to this set without a strong reason.
 LEGACY_NON_WRAPPER_SCRIPTS = {
     # The per-second feature/model/trainer scripts were deleted (2026-06-23, "keep the LLM-generated part only").
-    "build_news_article_table.py",
-    "build_news_llm_aggregates.py",
-    "build_news_llm_features.py",
-    # build_stock_covariate_silver_features.py MIGRATED -> rl_quant.workflows.commands.* (now a thin wrapper).
+    # The engineered-feature build scripts (build_news_llm_aggregates/_features, build_news_article_table,
+    # generate_qwen_news_precomputed, build_stock_covariate_silver_features) were QUARANTINED to legacy/ for the
+    # no-feature-engineering audit (2026-06-26); they no longer live under scripts/.
     "convert_polygon_second_to_protocol.py",
     "download_daily_ohlcv.py",
     "download_hourly_ohlcv.py",
     "fetch_top_us_market_cap_universe.py",
     "fetch_top_volume_universes.py",
-    "generate_qwen_news_precomputed.py",
     # validate_research_protocol.py MIGRATED -> rl_quant.workflows.commands.validate (now a thin wrapper).
 }
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
+import torch.utils.checkpoint
 
 from rl_quant.training._optim import apply_lr, lr_scale
 
@@ -45,14 +46,21 @@ def _stack(days_emb: list[dict], idx, device):
     }
 
 
-def _rollout(policy, batch, cost: float, bptt_window: int = 1):
+def _rollout(policy, batch, cost: float, bptt_window: int = 1, grad_checkpoint: bool = False):
     """Roll the policy forward over the sequence (intraday blocks OR cross-day days), carrying the previous
     position (T+1, gated holding). -> nets [B,T], gates [B,T], entropies [B,T], cash_w [B,T], turnover [B,T].
 
     Credit assignment via TRUNCATED BPTT: the held position carries the autograd graph for `bptt_window` steps
     before detaching, so a position's MULTI-step returns back-propagate to the allocation/gate that set it (needed
     to learn long holds -- e.g. the 180-day range). `bptt_window=1` detaches every step (myopic 1-step credit, the
-    original behaviour). The policy's prev-weight INPUT is always detached (it reads its position as a feature)."""
+    original behaviour). The policy's prev-weight INPUT is always detached (it reads its position as a feature).
+
+    `grad_checkpoint` recomputes each block's raw-second policy encode in backward instead of retaining it: the
+    rollout re-encodes raw bars at EVERY block and accumulates all nB block losses before backward, so without
+    this the nB raw-encoder graphs (heavy: per-second attention over ~300s x A stocks x batch_days) pile up and
+    OOM a full-session run. Checkpointing frees those activations in forward and recomputes one block at a time;
+    the inputs (bars/bar_mask) are already resident so no copy is added, and RNG state is preserved so dropout --
+    hence the loss and gradients -- is bit-identical to the non-checkpointed path."""
     market, per_stock = batch["market"], batch["per_stock"]
     news_raw, news_mask, ret, ret_valid, avail = (
         batch["news_raw"], batch["news_mask"], batch["ret"], batch["ret_valid"], batch["avail"]
@@ -60,9 +68,14 @@ def _rollout(policy, batch, cost: float, bptt_window: int = 1):
     B, nB, A, _ = per_stock.shape
     prev_w = torch.zeros(B, A, device=per_stock.device)
     prev_w[:, CASH_INDEX] = 1.0
+    ckpt = grad_checkpoint and policy.training
     nets, gates, ents, cash_w, turn, missing_w = [], [], [], [], [], []
     for b in range(nB):
-        raw_ctx = policy.encode_raw_policy_step(batch["bars"], batch["bar_mask"], b)
+        if ckpt:
+            raw_ctx = torch.utils.checkpoint.checkpoint(
+                policy.encode_raw_policy_step, batch["bars"], batch["bar_mask"], b, use_reentrant=False)
+        else:
+            raw_ctx = policy.encode_raw_policy_step(batch["bars"], batch["bar_mask"], b)
         w, g = policy(market[:, b], per_stock[:, b], raw_ctx, news_raw[:, b], news_mask[:, b],
                       prev_w.detach(), avail[:, b])
         a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * prev_w   # carry WITH grad (truncated below) -> T+1
@@ -104,6 +117,7 @@ def train_decision_policy(
     batch_days: int = 16, cost: float = 5e-4, risk_lambda: float = 0.1, entropy_coef: float = 0.0,
     max_actions: float = 5.0, budget_lambda: float = 0.1, gate_entropy_coef: float = 1e-3,
     missing_label_penalty: float = 1.0, friction_warmup_steps: int = 0, bptt_window: int = 1,
+    grad_checkpoint: bool = False,
     warmup_steps: int = 0, schedule: str = "cosine", grad_clip: float = 0.0, amp: bool = False,
     start_step: int = 0, optimizer=None, best_val: float = -1e9, best_state: dict | None = None,
     eval_every: int = 0, val_days: list[dict] | None = None, device=None,
@@ -126,7 +140,7 @@ def train_decision_policy(
         batch = _stack(train_days, idx, device)
         with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
             nets, gates, ents, _, _, missing_w = _rollout(
-                policy, batch, cost * friction, bptt_window=bptt_window
+                policy, batch, cost * friction, bptt_window=bptt_window, grad_checkpoint=grad_checkpoint
             )
             loss = _loss(nets, gates, ents, missing_w, batch["label"], risk_lambda, entropy_coef,
                          max_actions, budget_lambda * friction, gate_entropy_coef, missing_label_penalty)

@@ -7,9 +7,14 @@ capital from the frozen context plus its own trainable raw‑second policy encod
 data/evaluation/reportability infrastructure.
 
 > **Status (2026‑06).** The earlier per‑second / subhour / second‑to‑hour transformer stack and its
-> precomputed‑feature datasets were removed. The framework below is raw‑input only: **no precomputed/engineered
-> features are stored or consumed** — the models organize and learn from raw seconds + covariates + news at
-> train time. (The expensive LLM news scoring is the one precomputed artifact that is kept, as a raw input.)
+> precomputed‑feature datasets were removed. The **audited training/evaluation path consumes only raw inputs** —
+> raw 1‑second OHLCV bars, raw as‑of fundamental covariates, and raw per‑article LLM news scores — which the
+> models normalize, organize, and learn from **at train time**; no engineered feature tables, covariate ratios,
+> or news aggregates are stored or consumed. The expensive LLM news *scoring* is the one model‑produced artifact,
+> kept as a per‑article raw input (see the **LLM news caveat** below). The offline feature‑producer modules under
+> `features/` and the `scripts/build_*` builders are **never imported by the audited path** — enforced by
+> `tests/test_no_feature_engineering.py` (it fails if training/eval imports `rl_quant.features` or references any
+> `action_covariates` / `action_features` / `feature_schema` / news‑aggregate / `*_sidecar` artifact).
 
 ---
 
@@ -99,7 +104,7 @@ The actual **experiment driver lives outside this package**, in `../training/` (
 | `datasets/` | `raw_window` — organizes a raw time window (bars/covariates/news) into train‑time tensors; no features stored |
 | `training/` | two‑stage trainers, LR/optim helpers, the `Phase1Design` series |
 | `evaluation/` | the statistical battery — `statistical.py` (block‑bootstrap CI, White Reality Check, Hansen SPA, deflated Sharpe), ranking, run registry, research protocol |
-| `features/` | `news_llm` (qwen3 news scoring), `stock_covariates`, `action_risk` — the **kept** feature producers |
+| `features/` | **offline feature producers** — `news_llm` (qwen3 news scoring), `stock_covariates`, `action_risk` (action‑universe/risk metadata). **Not part of the audited training/eval path**; `tests/test_no_feature_engineering.py` forbids importing them there. Kept for offline data provenance only |
 | `data_sources/` | polygon second aggregates + stock‑covariate readers, quote utils |
 | `protocol/`, `reportability/` | the reportability contract: action‑return basis, constraints, validators, decision log, baselines |
 | `execution/` | fills / legs / cost model |
@@ -122,9 +127,14 @@ Forward‑only layers (training code never parses raw vendor files when a valida
   as‑of covariates, raw news, and per‑(day, block) **T+1** forward‑return labels — nothing precomputed. The block
   grid is 78 blocks/day at 300 s, DST‑correct via `zoneinfo`.
 
-**LLM news caveat:** the qwen3 news scores carry an anachronistic availability sentinel — fine as a model
-*input*, but **not point‑in‑time clean for a reportable backtest**. Bars + covariates + forward‑return labels
-**are** point‑in‑time clean. Large generated assets stay under `data/`/`derived/`, never in `src/`.
+**LLM news caveat.** Article *timing* is point‑in‑time clean: a decision at block *b* sees only articles whose
+`llm_feature_available_timestamp_ms` (publication + scoring latency) is ≤ block‑*b* end, so no future article
+leaks in. The defect is the *scorer*, not the timing — every article carries `model_available_timestamp_ms =
+1000` (an epoch sentinel), i.e. the qwen3 model is claimed "available since epoch" when it in fact postdates the
+backtest window. So the scores are usable as a training **input**, but **news‑driven results are not
+point‑in‑time clean for a reportable backtest** until either the scores are regenerated with a period‑correct
+model or the reportability guard treats that sentinel as not‑yet‑available. Bars + covariates + forward‑return
+labels **are** point‑in‑time clean. Large generated assets stay under `data/`/`derived/`, never in `src/`.
 
 ---
 
@@ -146,9 +156,14 @@ PYTHON=… python ../training/sweep_phase1.py --designs sweep --devices 0,2,3 --
 ```
 
 The repo‑root `run.sh` is a convenience launcher for the sweep. The **verdict** reports pooled OOS
-mean/decision + a 95% block‑bootstrap CI, cost‑paid CASH / buy‑&‑hold baselines, and White Reality Check /
-Hansen SPA / deflated‑Sharpe vs the CASH floor. A trustworthy positive = beats cash **and** CI excludes 0
-**and** low WRC/SPA **and** deflated‑Sharpe credible.
+mean/decision + a 95% block‑bootstrap CI, cost‑paid CASH / buy‑&‑hold baselines computed over the **same
+decisions** the policy is scored on (in daily mode the baseline is truncated to the episode‑covered days, not all
+test days), and a **deflated Sharpe** on the best seed. The deflated Sharpe is deflated for the **whole search** —
+the sweep passes `--n-trials = designs × seeds`, so the reported winner is corrected for every (design, seed) it
+was selected from, not just the seeds of one design. A trustworthy positive = beats cash/buy‑&‑hold **and** CI
+excludes 0 **and** deflated‑Sharpe credible (>0.95). (White Reality Check / Hansen SPA over *seeds* were dropped:
+seeds are independent rollouts of one design, not distinct strategies on a common period axis, so the paired
+bootstrap across them was invalid; a valid WRC/SPA would compare *designs* on aligned per‑decision returns.)
 
 ---
 
