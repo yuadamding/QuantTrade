@@ -123,6 +123,7 @@ def train_decision_policy(
     eval_every: int = 0, val_days: list[dict] | None = None, device=None,
     min_val_label_reportable_fraction: float = 0.95,
     on_eval: Callable[[int, float, float, dict | None, object], None] | None = None,
+    grad_reduce: Callable[[list], None] | None = None, is_main: bool = True,
 ):
     """Train the event-timed differentiable-portfolio policy on detached context plus raw bars. The turnover cost
     and the budget penalty are warmed up from 0 -> full over `friction_warmup_steps` (curriculum: learn the edge
@@ -146,10 +147,12 @@ def train_decision_policy(
                          max_actions, budget_lambda * friction, gate_entropy_coef, missing_label_penalty)
         optimizer.zero_grad()
         loss.backward()
+        if grad_reduce is not None:                  # data-parallel: average grads across ranks before the step
+            grad_reduce(list(policy.parameters()))
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
         optimizer.step()
-        if (eval_every and (step + 1) % eval_every == 0) or step == steps - 1:
+        if ((eval_every and (step + 1) % eval_every == 0) or step == steps - 1) and is_main:
             if val_days:
                 vr, vstats = evaluate_policy_detailed(policy, val_days, device, cost)
                 ok_coverage = vstats["label_reportable_fraction"] >= min_val_label_reportable_fraction

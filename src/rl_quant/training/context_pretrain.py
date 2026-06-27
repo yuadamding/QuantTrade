@@ -47,17 +47,38 @@ def ssl_targets_perstock(ret: torch.Tensor, ret_valid: torch.Tensor):
     return torch.where(v, tgt, torch.zeros_like(tgt)), v
 
 
+def ssl_targets_daily(day_close: torch.Tensor, horizon: int, exec_delay: int = 1):
+    """DAILY per-stock SSL target: each day's next-H-day CROSS-SECTIONALLY-DEMEANED close-to-close return -- the
+    relative-value signal a DAILY cross-sectional policy actually needs (vs the intraday next-block target). Built
+    over a chronological day_close sequence [N,A]; PIT-clean (uses only the close series within the split, so the
+    last exec_delay+horizon days are invalid rather than peeking ahead). -> (tgt [N,A], mask [N,A]) (CASH invalid)."""
+    from rl_quant.datasets.daily import horizon_close_returns
+    ret, valid = horizon_close_returns(day_close, horizon, exec_delay)
+    valid = valid.clone()
+    valid[:, 0] = False                                                        # CASH carries no relative signal
+    n = valid[:, 1:].float().sum(1, keepdim=True).clamp_min(1.0)
+    ew = torch.where(valid[:, 1:], ret[:, 1:], torch.zeros_like(ret[:, 1:])).sum(1, keepdim=True) / n
+    tgt = torch.zeros_like(ret)
+    tgt[:, 1:] = ret[:, 1:] - ew
+    return torch.where(valid, tgt, torch.zeros_like(tgt)), valid
+
+
 def train_context_encoder(
     encoder, head, train_days, *, device, perstock_head=None, perstock_coef: float = 1.0,
+    daily_head=None, daily_targets=None, daily_coef: float = 1.0,
     steps: int, lr: float = 3e-4, weight_decay: float = 1e-2, batch_size: int = 1, accum_steps: int = 1,
     warmup_steps: int = 0, schedule: str = "cosine", grad_clip: float = 0.0, amp: bool = False,
     start_step: int = 0, optimizer=None, checkpoint_every: int = 0,
     on_checkpoint: Callable[[int, object], None] | None = None,
+    grad_reduce: Callable[[list], None] | None = None,
 ):
-    """Fit the encoder + the market SSL head (+ optional per-stock SSL head) over full sessions. STREAMS
-    ``batch_size`` days/micro-batch from CPU to ``device`` and GRADIENT-ACCUMULATES ``accum_steps`` micro-batches
-    per optimizer step. Returns the optimizer."""
-    heads = [head] + ([perstock_head] if perstock_head is not None else [])
+    """Fit the encoder + the market SSL head (+ optional per-stock and DAILY SSL heads) over full sessions.
+    ``daily_head`` + ``daily_targets`` (a list aligned with train_days of (tgt [A], mask [A]) = each day's next-H-day
+    cross-sectional return) add a DAILY relative-value pretext on the END-OF-DAY context -- the target a daily
+    cross-sectional policy needs (see ssl_targets_daily). STREAMS ``batch_size`` days/micro-batch and
+    GRADIENT-ACCUMULATES ``accum_steps`` micro-batches per step. Returns the optimizer."""
+    heads = [head] + ([perstock_head] if perstock_head is not None else []) + \
+            ([daily_head] if daily_head is not None else [])
     params = list(encoder.parameters()) + [p for h in heads for p in h.parameters()]
     if optimizer is None:
         optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
@@ -65,6 +86,7 @@ def train_context_encoder(
     targets = [ssl_targets(d["ret"], d["ret_valid"]) for d in train_days]      # per day [nB,2]
     valid = [d["ret_valid"][:, 1:].any(1) for d in train_days]                 # per day [nB] block has a target
     ps = [ssl_targets_perstock(d["ret"], d["ret_valid"]) for d in train_days]  # per day ([nB,A], [nB,A])
+    use_daily = daily_head is not None and daily_targets is not None
     n = len(train_days)
     encoder.train()
     for h in heads:
@@ -79,13 +101,17 @@ def train_context_encoder(
         tgt, vm = st(targets), st(valid)                                          # [b,nB,2], [b,nB]
         ps_tgt = torch.stack([ps[i][0] for i in idx]).to(device, non_blocking=True)   # [b,nB,A]
         ps_vm = torch.stack([ps[i][1] for i in idx]).to(device, non_blocking=True)    # [b,nB,A]
-        return bars, mask, cov, tgt, vm, ps_tgt, ps_vm
+        d_tgt = d_vm = None
+        if use_daily:
+            d_tgt = torch.stack([daily_targets[i][0] for i in idx]).to(device, non_blocking=True)  # [b,A]
+            d_vm = torch.stack([daily_targets[i][1] for i in idx]).to(device, non_blocking=True)   # [b,A]
+        return bars, mask, cov, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm
 
     for step in range(start_step, steps):
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
         optimizer.zero_grad()
         for _ in range(accum_steps):
-            bars, mask, cov, tgt, vm, ps_tgt, ps_vm = micro()
+            bars, mask, cov, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro()
             with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
                 per_stock, market = encoder(bars, mask, cov)          # [b,nB,A,d], [b,nB,d]
                 pred = head(market)                                   # [b,nB,2]
@@ -93,8 +119,13 @@ def train_context_encoder(
                 if perstock_head is not None and ps_vm.any():         # cross-sectional relative-value pretext
                     ps_pred = perstock_head(per_stock)                # [b,nB,A]
                     loss = loss + perstock_coef * F.smooth_l1_loss(ps_pred[ps_vm], ps_tgt[ps_vm])
+                if use_daily and d_vm.any():                          # DAILY next-H-day relative-value pretext
+                    d_pred = daily_head(per_stock[:, -1])             # end-of-day context -> [b,A]
+                    loss = loss + daily_coef * F.smooth_l1_loss(d_pred[d_vm], d_tgt[d_vm])
                 loss = loss / accum_steps
             loss.backward()
+        if grad_reduce is not None:                  # data-parallel: average grads across ranks before the step
+            grad_reduce(params)
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(params, grad_clip)
         optimizer.step()

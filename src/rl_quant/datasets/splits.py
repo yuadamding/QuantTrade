@@ -7,7 +7,8 @@ split. These helpers live in the package (not the driver) so the leak-critical l
 from __future__ import annotations
 
 # the per-day fields carried out of a built window (everything build_window stores with a leading n_days axis)
-_DAY_KEYS = ("bars", "bar_mask", "cov_blocks", "news_raw", "news_mask", "avail", "ret", "ret_valid", "day_open")
+_DAY_KEYS = ("bars", "bar_mask", "cov_blocks", "news_raw", "news_mask", "avail", "ret", "ret_valid",
+             "day_open", "day_close")
 
 
 def flatten_days(windows: list[dict]) -> list[dict]:
@@ -16,7 +17,7 @@ def flatten_days(windows: list[dict]) -> list[dict]:
     out = []
     for w in windows:
         for di in range(w["n_days"]):
-            d = {k: w[k][di] for k in _DAY_KEYS}
+            d = {k: w[k][di] for k in _DAY_KEYS if k in w}   # carry the fields present (e.g. day_close on real windows)
             d["date"] = w["dates"][di]
             out.append(d)
     return out
@@ -41,7 +42,7 @@ def day_sequence(built: list[dict]) -> list[dict]:
 def split_days(built: list[dict], mode: str, train_frac: float, val_frac: float):
     """Chronological train/val/test as lists of per-day sessions. intraday: split WINDOWS (time-ordered) then
     flatten. daily: build the continuous deduped day sequence then split it. No date is shared across splits."""
-    if mode == "daily":
+    if mode in ("daily", "daily_raw"):
         return time_split(day_sequence(built), train_frac, val_frac)
     tr, va, te = time_split(built, train_frac, val_frac)
     return flatten_days(tr), flatten_days(va), flatten_days(te)

@@ -203,11 +203,15 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
                             ret[d, b, ai] = float(np.clip(r, -1.0, 1.0))
                             ret_valid[d, b, ai] = True
 
-    # per-stock day-OPEN price (first valid bar's open) -- the cross-day (daily) execution price
+    # per-stock day-OPEN price (first valid bar's open) -- the cross-day (daily, open-to-open) execution price
     fv = bar_mask.argmax(axis=2)                                  # [Dd,A] first valid second (0 if none)
     has = bar_mask.any(axis=2)                                    # [Dd,A]
     opens = np.take_along_axis(bars_t[:, :, :, 0], fv[:, :, None], axis=2)[:, :, 0]
     day_open = np.where(has, opens, np.nan).astype(np.float32)    # [Dd,A] (NaN where the stock has no bars that day)
+    # per-stock day-CLOSE price (LAST valid bar's close) -- the close-to-close (daily_raw) execution price.
+    lv = (bar_mask.shape[2] - 1) - np.argmax(bar_mask[:, :, ::-1], axis=2)   # [Dd,A] last valid second (S-1 if none)
+    closes = np.take_along_axis(bars_t[:, :, :, 3], lv[:, :, None], axis=2)[:, :, 0]   # field 3 = close
+    day_close = np.where(has, closes, np.nan).astype(np.float32)  # [Dd,A] (NaN where the stock has no bars that day)
 
     # as-of AVAILABILITY (point-in-time): a stock is tradeable at block b iff it has ANY bar by block-b end --
     # derived from bar presence, NOT from label existence (which would leak future-bar information).
@@ -220,6 +224,6 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
         "cov_blocks": torch.from_numpy(covt), "news_raw": torch.from_numpy(news_raw),
         "news_mask": torch.from_numpy(news_mask), "avail": torch.from_numpy(avail),
         "ret": torch.from_numpy(ret), "ret_valid": torch.from_numpy(ret_valid),
-        "day_open": torch.from_numpy(day_open), "dates": days,
+        "day_open": torch.from_numpy(day_open), "day_close": torch.from_numpy(day_close), "dates": days,
         "window": window, "n_days": Dd, "n_blocks": nB,
     }

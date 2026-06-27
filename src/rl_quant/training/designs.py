@@ -83,8 +83,13 @@ class Phase1Design:
     episode_stride: int = 0           # daily mode: train sliding-window stride (0=non-overlap; small=>more samples)
     bptt_window: int = 1              # truncated-BPTT span: credit a held position's returns to the decision that
     #                                   set it over this many steps (1=myopic 1-step; >1 needed to LEARN long holds)
+    label_horizon_days: int = 21      # daily_raw: close-to-close forward-return horizon H (per-decision credit signal)
+    daily_lookback: int = 60          # daily_raw: cross-day memory window (bounds episode/eval span; soft, not a band)
+    exec_delay: int = 1               # daily_raw: execution delay in DAYS (decide EOD d, execute close d+exec_delay)
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
+    min_gpus: int = 1                 # GPUs to give this setting (data-parallel). Set 2 if peak VRAM > one card
+    #                                   (~80GB H100); the sweep then launches it via torchrun across that many GPUs.
 
     def __post_init__(self) -> None:
         if self.d_model % self.enc_heads:
@@ -97,8 +102,10 @@ class Phase1Design:
                              f"raw_policy_dim {self.raw_policy_dim}")
         if self.schedule not in ("cosine", "constant"):
             raise ValueError(f"{self.name}: schedule must be 'cosine' or 'constant'")
-        if self.horizon_mode not in ("intraday", "daily"):
-            raise ValueError(f"{self.name}: horizon_mode must be 'intraday' or 'daily'")
+        if self.horizon_mode not in ("intraday", "daily", "daily_raw"):
+            raise ValueError(f"{self.name}: horizon_mode must be 'intraday', 'daily', or 'daily_raw'")
+        if self.label_horizon_days < 1 or self.daily_lookback < 1 or self.exec_delay < 1:
+            raise ValueError(f"{self.name}: need label_horizon_days>=1, daily_lookback>=1, exec_delay>=1")
         if self.episode_len <= 1:
             raise ValueError(f"{self.name}: episode_len must be > 1")
         if self.episode_stride < 0:
@@ -112,6 +119,8 @@ class Phase1Design:
                              f"session_seconds {self.session_seconds}")
         if self.max_actions_per_day <= 0 or self.budget_lambda < 0 or self.missing_label_penalty < 0:
             raise ValueError(f"{self.name}: need max_actions_per_day>0, budget_lambda>=0, missing_label_penalty>=0")
+        if self.min_gpus < 1:
+            raise ValueError(f"{self.name}: min_gpus must be >= 1")
         for f in ("session_seconds", "block_seconds", "ssl_steps", "policy_steps", "ssl_batch_size",
                   "ssl_accum", "batch_days", "raw_policy_dim", "raw_policy_layers", "raw_policy_heads"):
             if getattr(self, f) <= 0:
@@ -196,6 +205,24 @@ _SERIES = [
                  ssl_batch_size=1, ssl_accum=8, batch_days=8, horizon_mode="daily", episode_len=180,
                  episode_stride=20, bptt_window=30, budget_lambda=0.0, ssl_perstock_coef=0.0,
                  amp=True, grad_checkpoint=True),
+
+    # ===== DAILY_RAW: the day-level redesign (learn a day strategy from the FULL raw second-bar day) =====
+    # Structural upgrades over `daily`: (1) a TRAINABLE full-day two-tier raw encoder (profit gradients shape the
+    # WHOLE session, not just the last block); (2) a CAUSAL cross-day temporal encoder -> learned multi-day memory
+    # (reversal/momentum/vol), which BPTT alone cannot provide; (3) a DAILY per-stock SSL target (next-H-day
+    # cross-sectional close-to-close return) instead of the intraday one; (4) CONTINUOUS chronological eval +
+    # terminal liquidation; (5) realistic cost from step 1 (friction_warmup=0). Long-only; label = close[d+1+H] /
+    # close[d+1] - 1 (H=label_horizon_days), PIT-clean (execute one day after the EOD decision). The gate + carry
+    # let positions HOLD up to daily_lookback days; episodes are kept moderate because the trainable full-day raw
+    # encode is ~episode_len full-session forwards/step (grad_checkpoint bounds the memory). Tune episode_len /
+    # batch_days / policy_steps to the compute budget.
+    Phase1Design("daily_raw", "DAILY_RAW: full-day trainable raw + cross-day memory, H=21 close-to-close; d384/6L",
+                 session_seconds=FULL, block_seconds=300, d_model=384, enc_layers=6, enc_heads=8,
+                 policy_token_dim=256, policy_layers=3, policy_heads=8, ssl_steps=3000, policy_steps=4000,
+                 ssl_batch_size=1, ssl_accum=8, batch_days=6, raw_policy_dim=128, raw_policy_layers=2,
+                 raw_policy_heads=8, horizon_mode="daily_raw", episode_len=42, episode_stride=5, bptt_window=42,
+                 label_horizon_days=21, daily_lookback=60, exec_delay=1, budget_lambda=0.0, ssl_perstock_coef=1.0,
+                 friction_warmup_frac=0.0, cost=5e-4, amp=True, grad_checkpoint=True),
 ]
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 

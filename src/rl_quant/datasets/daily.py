@@ -36,6 +36,70 @@ def cross_day_returns(day_open: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     return ret, valid
 
 
+def horizon_close_returns(day_close: torch.Tensor, horizon: int, exec_delay: int = 1
+                          ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Close-to-close H-day forward return, POINT-IN-TIME clean. Decide at END of day d (using context through
+    close d), EXECUTE at close[d+exec_delay], EXIT at close[d+exec_delay+horizon]:
+        ret_d = close[d+exec_delay+horizon] / close[d+exec_delay] - 1.
+    day_close [N,A] (NaN where a stock has no bars that day) -> (ret [N,A], valid [N,A]). CASH (action 0) = 0/valid.
+    `exec_delay>=1` removes the T+0 look-ahead (the decision never trades at the close it observed). The policy may
+    still CARRY a position far beyond `horizon` (gate=hold) -- `horizon` only sets the per-decision credit signal."""
+    N, A = day_close.shape
+    ret = torch.zeros(N, A)
+    valid = torch.zeros(N, A, dtype=torch.bool)
+    valid[:, CASH_INDEX] = True                                  # CASH tradeable every day, return 0
+    e, x = exec_delay, exec_delay + horizon
+    last = N - x                                                 # decisions d=0..last-1 have an in-range exit
+    if last >= 1:
+        entry, exit_ = day_close[e:e + last], day_close[x:x + last]
+        good = torch.isfinite(entry) & torch.isfinite(exit_) & (entry > 0)
+        safe = torch.where(entry > 0, entry, torch.ones_like(entry))
+        r = torch.where(good, exit_ / safe - 1.0, torch.zeros_like(entry))
+        ret[:last] = torch.where(good, r.clamp(-1.0, 1.0), torch.zeros_like(r))
+        valid[:last] = good
+        ret[:, CASH_INDEX] = 0.0
+        valid[:, CASH_INDEX] = True
+    return ret, valid
+
+
+def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int | None = None,
+                             horizon: int = 21, exec_delay: int = 1) -> list[dict]:
+    """daily_raw episodes: close-to-close H-day labels over the FULL split day-sequence, sliced into episodes that
+    carry the FROZEN end-of-day context + the FULL-day raw bars + news + avail for the cross-day policy.
+
+    records: a DATE-SORTED list of per-day dicts, each with
+        {market [dc], per_stock [A,dc], bars [A,S,F], bar_mask [A,S], news_raw [A,M,1], news_mask [A,M],
+         day_close [A], avail [A]}.
+    Labels are computed once over the whole split (so a day's H-day label is drawn from the global close series, not
+    limited to its episode). Episodes are [s:s+L]; for a CONTINUOUS evaluation rollout pass episode_len>=N (one
+    episode spanning the split, so every day has its full causal cross-day history)."""
+    N = len(records)
+    if N < exec_delay + horizon + 1:
+        return []
+    day_close = torch.stack([r["day_close"] for r in records])   # [N,A]
+    ret, valid = horizon_close_returns(day_close, horizon, exec_delay)
+    market = torch.stack([r["market"] for r in records])
+    per_stock = torch.stack([r["per_stock"] for r in records])
+    bars = torch.stack([r["bars"] for r in records])
+    bar_mask = torch.stack([r["bar_mask"] for r in records])
+    news_raw = torch.stack([r["news_raw"] for r in records])
+    news_mask = torch.stack([r["news_mask"] for r in records])
+    avail = torch.stack([r["avail"] for r in records])
+    usable = N - (exec_delay + horizon)                          # days d=0..usable-1 carry an in-range H-day label
+    L = min(episode_len, usable)
+    st = stride if (stride and stride > 0) else L
+    starts = list(range(0, usable - L + 1, st)) or [0]
+    episodes = []
+    for s in starts:
+        e = s + L
+        episodes.append({
+            "market": market[s:e], "per_stock": per_stock[s:e], "bars": bars[s:e], "bar_mask": bar_mask[s:e],
+            "news_raw": news_raw[s:e], "news_mask": news_mask[s:e], "avail": avail[s:e],
+            "ret": ret[s:e], "ret_valid": valid[s:e], "n_blocks": L,
+        })
+    return episodes
+
+
 def build_daily_episodes(records: list[dict], episode_len: int, stride: int | None = None) -> list[dict]:
     """records: a DATE-SORTED list of per-day dicts, each with the end-of-day context + day-open + availability:
         {market [d], per_stock [A,d], bars [A,S,F], bar_mask [A,S], news_raw [A,M,1], news_mask [A,M],
