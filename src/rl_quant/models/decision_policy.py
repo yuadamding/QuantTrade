@@ -104,7 +104,7 @@ class RawSecondPolicyEncoder(nn.Module):
         if bool(key_padding.all(dim=1).any()):
             key_padding = key_padding.clone()
             key_padding[key_padding.all(dim=1), 0] = False
-        causal = torch.triu(torch.full((bl, bl), float("-inf"), device=bars.device), diagonal=1)
+        causal = torch.triu(torch.ones((bl, bl), dtype=torch.bool, device=bars.device), diagonal=1)
         h = self.local(x, mask=causal, src_key_padding_mask=key_padding) if self.n_layers > 0 else self.local(x)
         h = self.out_norm(h)
         ar = torch.arange(bl, device=bars.device)

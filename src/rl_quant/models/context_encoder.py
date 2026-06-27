@@ -163,13 +163,34 @@ class ContextEncoder(nn.Module):
         # only ONE block's intermediates are recomputed and held at a time (~12 GB peak), so the backward
         # peak is ~24 GB instead of ~70+ GB from a one-segment recompute of all 8 blocks simultaneously.
         bm1 = bar_mask.reshape(B * A * nB, bl)                   # per-block validity (bars sit at absolute offsets)
-        kpm1 = ~bm1
-        if self.grad_checkpoint and self.training:
-            for blk in self.tier1:
-                x = torch.utils.checkpoint.checkpoint(blk, x, kpm1, use_reentrant=False)
-        else:
-            for blk in self.tier1:
-                x = blk(x, kpm1)
+
+        def run_tier1_rows(rows: torch.Tensor, kpm: torch.Tensor | None) -> torch.Tensor:
+            y = rows
+            if self.grad_checkpoint and self.training:
+                for blk in self.tier1:
+                    if kpm is None:
+                        y = torch.utils.checkpoint.checkpoint(lambda z, b=blk: b(z, None), y,
+                                                              use_reentrant=False)
+                    else:
+                        y = torch.utils.checkpoint.checkpoint(blk, y, kpm, use_reentrant=False)
+            else:
+                for blk in self.tier1:
+                    y = blk(y, kpm)
+            return y
+
+        # Avoid letting fully empty rows (notably CASH) force the materialized padded SDPA mask for every row.
+        # Dense stock/block rows use native causal SDPA; only rows with some missing seconds use the combined mask.
+        seq_has = bm1.any(-1)
+        x1 = torch.zeros_like(x)
+        if bool(seq_has.any()):
+            kpm1 = ~bm1
+            dense = seq_has & (~kpm1.any(-1))
+            padded = seq_has & (~dense)
+            if bool(dense.any()):
+                x1[dense] = run_tier1_rows(x[dense], None)
+            if bool(padded.any()):
+                x1[padded] = run_tier1_rows(x[padded], kpm1[padded])
+        x = x1
         x = self.norm1(x)
         summ = _last_valid(x, bm1).reshape(B * A, nB, d)         # TRUE last-valid second's token (gap-correct, cheap)
         block_has = bm1.any(-1).reshape(B * A, nB)               # [B*A, nB]

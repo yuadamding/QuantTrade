@@ -310,8 +310,38 @@ class MissingLabelsAreNotFlatReturns(unittest.TestCase):
         self.assertEqual(stats["reportable_fraction"], 0.0)
         self.assertEqual(stats["label_reportable_fraction"], 0.0)
         self.assertAlmostEqual(stats["mean_missing_label_weight"], 1.0, places=5)
+        for key in ("mean_gross_return", "mean_turnover_cost", "mean_net_return",
+                    "mean_turnover", "mean_cash_weight", "mean_gate"):
+            self.assertIn(key, stats)
         tele = policy_telemetry(PickMissing(), [day], torch.device("cpu"), cost=0.0)
         self.assertAlmostEqual(tele["mean_missing_label_weight"], 1.0, places=5)
+
+    def test_validation_selection_rejects_low_reportable_coverage(self):
+        class PickMissingTrainable(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_logit = torch.nn.Parameter(torch.tensor(2.0))
+
+            def encode_raw_policy_step(self, bars, bar_mask, step):
+                return torch.zeros(bars.shape[0], bars.shape[1], 1)
+
+            def forward(self, market, per_stock, raw_policy_ctx, news_scores, news_mask, prev_weights, available):
+                w = torch.zeros_like(prev_weights)
+                w[:, 1] = 1.0
+                return w, torch.sigmoid(self.gate_logit).expand(prev_weights.shape[0])
+
+        day = {"market": torch.zeros(1, 1), "per_stock": torch.zeros(1, 3, 1),
+               "bars": torch.zeros(3, BL, BAR_FEATS), "bar_mask": torch.ones(3, BL, dtype=torch.bool),
+               "news_raw": torch.zeros(1, 3, M, NRD), "news_mask": torch.zeros(1, 3, M, dtype=torch.bool),
+               "avail": torch.ones(1, 3, dtype=torch.bool),
+               "ret": torch.tensor([[0.0, float("nan"), 0.05]]),
+               "ret_valid": torch.tensor([[True, False, True]]), "n_blocks": 1}
+        _, best_val, best_state = train_decision_policy(
+            PickMissingTrainable(), [day], steps=1, eval_every=1, val_days=[day], device=torch.device("cpu"),
+            batch_days=1, cost=0.0, min_val_label_reportable_fraction=0.95,
+        )
+        self.assertEqual(best_val, -1e9)
+        self.assertIsNone(best_state)
 
 
 def _planted_days(n_days=10, actions=A, nb=8, d=16, seed=0):

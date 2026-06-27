@@ -107,11 +107,13 @@ def train_decision_policy(
     warmup_steps: int = 0, schedule: str = "cosine", grad_clip: float = 0.0, amp: bool = False,
     start_step: int = 0, optimizer=None, best_val: float = -1e9, best_state: dict | None = None,
     eval_every: int = 0, val_days: list[dict] | None = None, device=None,
+    min_val_label_reportable_fraction: float = 0.95,
     on_eval: Callable[[int, float, float, dict | None, object], None] | None = None,
 ):
     """Train the event-timed differentiable-portfolio policy on detached context plus raw bars. The turnover cost
     and the budget penalty are warmed up from 0 -> full over `friction_warmup_steps` (curriculum: learn the edge
-    first, then constrain frequency). Returns (optimizer, best_val, best_state)."""
+    first, then constrain frequency). Validation selection ignores checkpoints whose label-valid reportable
+    coverage is below `min_val_label_reportable_fraction`. Returns (optimizer, best_val, best_state)."""
     if optimizer is None:
         optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
     dev_type = (device.type if hasattr(device, "type") else "cuda")
@@ -134,8 +136,12 @@ def train_decision_policy(
             torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
         optimizer.step()
         if (eval_every and (step + 1) % eval_every == 0) or step == steps - 1:
-            vr = evaluate_policy(policy, val_days, device, cost) if val_days else []
-            vmean = (sum(vr) / len(vr)) if vr else -1e9
+            if val_days:
+                vr, vstats = evaluate_policy_detailed(policy, val_days, device, cost)
+                ok_coverage = vstats["label_reportable_fraction"] >= min_val_label_reportable_fraction
+                vmean = (sum(vr) / len(vr)) if (vr and ok_coverage) else -1e9
+            else:
+                vmean = -1e9
             if vmean > best_val:
                 best_val = vmean
                 best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
@@ -150,17 +156,18 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
     """Realized per-decision net return plus coverage stats.
 
     `reportable_fraction` is reportable blocks over all evaluated blocks; `label_reportable_fraction` uses only
-    blocks with at least one non-CASH label as the denominator.
+    blocks with at least one non-CASH label as the denominator. Mean gross return, turnover cost, net return,
+    turnover, CASH weight, and gate are computed on the reportable rows.
     """
     policy.eval()
     rows = []
     total_blocks = 0
     label_blocks = 0
     reportable_blocks = 0
-    missing_values = []
+    missing_values, gross_values, cost_values, turn_values, cash_values, gate_values = [], [], [], [], [], []
     for i in range(0, len(days_emb), batch_days):
         batch = _stack(days_emb, list(range(i, min(i + batch_days, len(days_emb)))), device)
-        nets, _, _, _, _, missing_w = _rollout(policy, batch, cost)         # [B,nB]
+        nets, gates, _, cash_w, turn, missing_w = _rollout(policy, batch, cost)         # [B,nB]
         label = batch["label"].bool()
         reportable = label & (missing_w <= max_missing_label_weight)
         total_blocks += int(label.numel())
@@ -168,7 +175,18 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
         reportable_blocks += int(reportable.sum().item())
         if label.any():
             missing_values.append(missing_w[label].detach().cpu())
+        if reportable.any():
+            turn_r = turn[reportable].detach().cpu()
+            net_r = nets[reportable].detach().cpu()
+            gross_values.append(net_r + cost * turn_r)
+            cost_values.append(cost * turn_r)
+            turn_values.append(turn_r)
+            cash_values.append(cash_w[reportable].detach().cpu())
+            gate_values.append(gates[reportable].detach().cpu())
         rows += nets[reportable].cpu().tolist()
+    def mean_or_zero(xs: list[torch.Tensor]) -> float:
+        return float(torch.cat(xs).mean()) if xs else 0.0
+
     mean_missing = float(torch.cat(missing_values).mean()) if missing_values else 0.0
     stats = {
         "total_blocks": total_blocks,
@@ -176,6 +194,12 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
         "reportable_blocks": reportable_blocks,
         "reportable_fraction": reportable_blocks / total_blocks if total_blocks else 0.0,
         "label_reportable_fraction": reportable_blocks / label_blocks if label_blocks else 0.0,
+        "mean_gross_return": mean_or_zero(gross_values),
+        "mean_turnover_cost": mean_or_zero(cost_values),
+        "mean_net_return": (sum(rows) / len(rows)) if rows else 0.0,
+        "mean_turnover": mean_or_zero(turn_values),
+        "mean_cash_weight": mean_or_zero(cash_values),
+        "mean_gate": mean_or_zero(gate_values),
         "mean_missing_label_weight": mean_missing,
     }
     return rows, stats
