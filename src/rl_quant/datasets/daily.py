@@ -80,11 +80,18 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
     ret, valid = horizon_close_returns(day_close, horizon, exec_delay)
     market = torch.stack([r["market"] for r in records])
     per_stock = torch.stack([r["per_stock"] for r in records])
-    bars = torch.stack([r["bars"] for r in records])
-    bar_mask = torch.stack([r["bar_mask"] for r in records])
     news_raw = torch.stack([r["news_raw"] for r in records])
     news_mask = torch.stack([r["news_mask"] for r in records])
     avail = torch.stack([r["avail"] for r in records])
+    # STREAMING: a record carries "_bars_day" (a lazy per-day handle exposing ["bars"]/["bar_mask"]) instead of a
+    # materialized "bars". DON'T stack full-day bars (a 171-day episode would be hundreds of GB) -- keep the per-day
+    # handles; the rollout loads day-t bars on demand. The small fields above are already in RAM (materialized at
+    # encode), so stacking them is cheap.
+    stream = "_bars_day" in records[0]
+    bars = bar_mask = None
+    if not stream:
+        bars = torch.stack([r["bars"] for r in records])
+        bar_mask = torch.stack([r["bar_mask"] for r in records])
     usable = N - (exec_delay + horizon)                          # days d=0..usable-1 carry an in-range H-day label
     L = min(episode_len, usable)
     st = stride if (stride and stride > 0) else L
@@ -92,11 +99,17 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
     episodes = []
     for s in starts:
         e = s + L
-        episodes.append({
-            "market": market[s:e], "per_stock": per_stock[s:e], "bars": bars[s:e], "bar_mask": bar_mask[s:e],
+        ep = {
+            "market": market[s:e], "per_stock": per_stock[s:e],
             "news_raw": news_raw[s:e], "news_mask": news_mask[s:e], "avail": avail[s:e],
             "ret": ret[s:e], "ret_valid": valid[s:e], "n_blocks": L,
-        })
+        }
+        if stream:
+            ep["bars_days"] = [r["_bars_day"] for r in records[s:e]]   # lazy per-day handles (load bars on demand)
+        else:
+            ep["bars"] = bars[s:e]
+            ep["bar_mask"] = bar_mask[s:e]
+        episodes.append(ep)
     return episodes
 
 

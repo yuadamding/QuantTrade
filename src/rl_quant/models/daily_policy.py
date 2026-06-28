@@ -191,21 +191,42 @@ class DailyCrossSectionPolicy(nn.Module):
         self.temperature = config.temperature
         self.token_dim = config.token_dim
 
-    def encode_episode(self, market, per_stock, bars, bar_mask, news_raw, news_mask, avail):
-        """Precompute the cross-day temporal state for a whole episode (once per rollout).
+    def _raw_day(self, day_bars_fn, t):
+        """Full-day raw embedding for day t across the batch: day_bars_fn(t) -> (bars [B,A,S,F], mask [B,A,S]).
+        The raw encoder is per-(stock,day) independent (instance-norm, no batch coupling), so encoding day-by-day
+        is bit-identical to encoding the [B*T] reshape at once."""
+        bars_t, mask_t = day_bars_fn(t)
+        return self.raw_encoder(bars_t, mask_t)                # [B,A,dr]
 
-        market [B,T,dc] (detached frozen), per_stock [B,T,A,dc] (detached frozen), bars [B,T,A,S,F],
-        bar_mask [B,T,A,S], news_raw [B,T,A,M,raw], news_mask [B,T,A,M], avail [B,T,A].
-        -> temporal_state [B,T,A,token_dim]."""
+    def _encode_episode_core(self, market, per_stock, day_bars_fn, news_raw, news_mask, avail, reload_ckpt):
+        """Shared episode encode. day_bars_fn(t) yields day-t bars/mask (a tensor slice in-RAM, or a lazy disk load
+        when streaming). When `reload_ckpt` and training, each day's raw encode is checkpointed so backward
+        RE-LOADS + recomputes that day instead of retaining all T days' bars -> bounded RAM for huge universes."""
         B, T, A, dc = per_stock.shape
-        raw = self.raw_encoder(bars.reshape(B * T, A, bars.shape[3], bars.shape[4]),
-                               bar_mask.reshape(B * T, A, bars.shape[3])).reshape(B, T, A, -1)  # [B,T,A,dr]
+        ckpt = reload_ckpt and self.training
+        raw_days = []
+        for t in range(T):
+            if ckpt:
+                raw_days.append(torch.utils.checkpoint.checkpoint(self._raw_day, day_bars_fn, t, use_reentrant=False))
+            else:
+                raw_days.append(self._raw_day(day_bars_fn, t))
+        raw = torch.stack(raw_days, dim=1)                     # [B,T,A,dr]
         news = self.news_agg(news_raw.reshape(B * T, A, news_raw.shape[3], news_raw.shape[4]),
                              news_mask.reshape(B * T, A, news_mask.shape[3])).reshape(B, T, A, -1)  # [B,T,A,ne]
         mkt = market.unsqueeze(2).expand(B, T, A, dc)
         tok = self.token_proj(torch.cat([mkt, per_stock, raw, news], dim=-1))   # [B,T,A,token_dim]
-        state = self.temporal(tok, day_valid=avail.bool())                      # causal cross-day memory
-        return state
+        return self.temporal(tok, day_valid=avail.bool())                       # causal cross-day memory
+
+    def encode_episode(self, market, per_stock, bars, bar_mask, news_raw, news_mask, avail):
+        """In-RAM encode: bars/bar_mask are pre-stacked [B,T,A,S,F]/[B,T,A,S]. -> temporal_state [B,T,A,token_dim]."""
+        return self._encode_episode_core(market, per_stock, lambda t: (bars[:, t], bar_mask[:, t]),
+                                         news_raw, news_mask, avail, reload_ckpt=False)
+
+    def encode_episode_streaming(self, market, per_stock, day_bars_fn, news_raw, news_mask, avail, n_days):
+        """Streaming encode: day_bars_fn(t) lazily loads day-t bars/mask [B,A,S,F]/[B,A,S] from disk; backward
+        reloads + recomputes per day (reload_ckpt) so the whole episode's bars are never resident."""
+        per_stock = per_stock if per_stock.shape[1] == n_days else per_stock      # T == n_days
+        return self._encode_episode_core(market, per_stock, day_bars_fn, news_raw, news_mask, avail, reload_ckpt=True)
 
     def step(self, state_t, prev_weights, available):
         """One day's cross-sectional allocation. state_t [B,A,token_dim], prev_weights/available [B,A]

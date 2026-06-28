@@ -23,8 +23,19 @@ CASH_INDEX = 0
 def _stack(episodes: list[dict], idx, device):
     g = [episodes[i] for i in idx]
     s = lambda key: torch.stack([w[key] for w in g]).to(device)  # noqa: E731
-    return {k: s(k) for k in ("market", "per_stock", "bars", "bar_mask", "news_raw", "news_mask",
-                              "avail", "ret", "ret_valid")} | {"label": s("ret_valid")[:, :, 1:].any(-1)}
+    small = ("market", "per_stock", "news_raw", "news_mask", "avail", "ret", "ret_valid")
+    batch = {k: s(k) for k in small} | {"label": s("ret_valid")[:, :, 1:].any(-1)}
+    if "bars_days" in g[0]:                                       # STREAMING: per-day bars loader (no pre-stack)
+        handles = [w["bars_days"] for w in g]                    # B episodes, each a list of L day handles
+        def bars_loader(t, _h=handles, _dev=device):             # -> (bars [B,A,S,F], mask [B,A,S]) for day t
+            b = torch.stack([h[t]["bars"] for h in _h]).to(_dev)
+            m = torch.stack([h[t]["bar_mask"] for h in _h]).to(_dev)
+            return b, m
+        batch["_bars_loader"] = bars_loader
+        batch["_n_days"] = g[0]["n_blocks"]
+    else:                                                        # in-RAM: pre-stacked bars
+        batch["bars"], batch["bar_mask"] = s("bars"), s("bar_mask")
+    return batch
 
 
 def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_liquidate: bool = True):
@@ -33,8 +44,12 @@ def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_li
     position with truncated BPTT. A terminal liquidation cost is folded into the last day's net."""
     market, per_stock = batch["market"], batch["per_stock"]
     avail, ret, ret_valid = batch["avail"], batch["ret"], batch["ret_valid"]
-    state = policy.encode_episode(market, per_stock, batch["bars"], batch["bar_mask"],
-                                  batch["news_raw"], batch["news_mask"], avail)        # [B,T,A,token_dim]
+    if "_bars_loader" in batch:                              # STREAMING: load day-t bars on demand (reload in backward)
+        state = policy.encode_episode_streaming(market, per_stock, batch["_bars_loader"],
+                                                batch["news_raw"], batch["news_mask"], avail, batch["_n_days"])
+    else:
+        state = policy.encode_episode(market, per_stock, batch["bars"], batch["bar_mask"],
+                                      batch["news_raw"], batch["news_mask"], avail)    # [B,T,A,token_dim]
     B, T, A, _ = per_stock.shape
     prev_w = torch.zeros(B, A, device=per_stock.device)
     prev_w[:, CASH_INDEX] = 1.0

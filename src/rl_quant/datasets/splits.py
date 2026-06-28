@@ -6,20 +6,26 @@ split. These helpers live in the package (not the driver) so the leak-critical l
 """
 from __future__ import annotations
 
+from rl_quant.datasets.streaming import LazyDay, LazyWindow
+
 # the per-day fields carried out of a built window (everything build_window stores with a leading n_days axis)
 _DAY_KEYS = ("bars", "bar_mask", "cov_blocks", "news_raw", "news_mask", "avail", "ret", "ret_valid",
              "day_open", "day_close")
 
 
-def flatten_days(windows: list[dict]) -> list[dict]:
-    """Expand built windows (leading n_days axis) into per-day session dicts. Indexing a window tensor returns a
-    view, so this is cheap -- the window tensors keep the storage alive. The per-day `date` is attached."""
+def flatten_days(windows: list) -> list:
+    """Expand built windows (leading n_days axis) into per-day session dicts. For an in-RAM window dict, indexing
+    returns a view (cheap; the window keeps the storage alive). For a LazyWindow (streaming), produce LazyDay
+    handles that load the window .pt on demand (LRU-bounded) -- so the whole dataset is never resident at once."""
     out = []
     for w in windows:
-        for di in range(w["n_days"]):
-            d = {k: w[k][di] for k in _DAY_KEYS if k in w}   # carry the fields present (e.g. day_close on real windows)
-            d["date"] = w["dates"][di]
-            out.append(d)
+        if isinstance(w, LazyWindow):
+            out.extend(LazyDay(w, di) for di in range(w.n_days))   # streaming: lazy per-day handles
+        else:
+            for di in range(w["n_days"]):
+                d = {k: w[k][di] for k in _DAY_KEYS if k in w}     # carry the fields present (e.g. day_close)
+                d["date"] = w["dates"][di]
+                out.append(d)
     return out
 
 

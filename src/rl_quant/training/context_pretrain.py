@@ -23,6 +23,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from rl_quant.datasets.streaming import LazyDay
 from rl_quant.training._optim import apply_lr, lr_scale
 
 
@@ -157,10 +158,20 @@ def encode_days(encoder, days, device, batch: int = 2, amp: bool = False) -> lis
             per_stock, market = encoder(bars, mask, cov)              # [b,nB,A,d], [b,nB,d]
         per_stock, market = per_stock.float().cpu(), market.float().cpu()
         for j, d in enumerate(chunk):
-            out.append({
-                "market": market[j], "per_stock": per_stock[j],
-                "bars": d["bars"], "bar_mask": d["bar_mask"],
-                "news_raw": d["news_raw"], "news_mask": d["news_mask"], "avail": d["avail"],
-                "ret": d["ret"], "ret_valid": d["ret_valid"], "n_blocks": d["ret"].shape[0],
-            })
+            if isinstance(d, LazyDay):
+                # STREAMING: attach the embeddings + materialize the SMALL per-day fields in RAM (the window is
+                # already resident here for the encode, so this is an LRU hit, not a reload). ONLY bars/bar_mask
+                # stay lazy -> downstream (episode build, rollout) never reloads a 1GB window for a label or mask.
+                out.append(d.with_overrides(
+                    market=market[j].clone(), per_stock=per_stock[j].clone(),
+                    avail=d["avail"].clone(), news_raw=d["news_raw"].clone(), news_mask=d["news_mask"].clone(),
+                    ret=d["ret"].clone(), ret_valid=d["ret_valid"].clone(),
+                    day_open=d["day_open"].clone(), day_close=d["day_close"].clone()))
+            else:
+                out.append({
+                    "market": market[j], "per_stock": per_stock[j],
+                    "bars": d["bars"], "bar_mask": d["bar_mask"],
+                    "news_raw": d["news_raw"], "news_mask": d["news_mask"], "avail": d["avail"],
+                    "ret": d["ret"], "ret_valid": d["ret_valid"], "n_blocks": d["ret"].shape[0],
+                })
     return out
