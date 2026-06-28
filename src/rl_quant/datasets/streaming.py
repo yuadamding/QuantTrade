@@ -33,7 +33,8 @@ class _WindowLRU:
         if hit is not None:
             self.od.move_to_end(p)
             return hit
-        d = torch.load(p, weights_only=False)
+        d = torch.load(p, weights_only=True)           # cache holds only tensors + dict/list/str/int -> safe load
+                                                       # (no arbitrary-code pickle path; see datasets cache format)
         self.od[p] = d
         while len(self.od) > self.maxn:
             self.od.popitem(last=False)

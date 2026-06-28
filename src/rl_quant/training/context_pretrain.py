@@ -173,5 +173,10 @@ def encode_days(encoder, days, device, batch: int = 2, amp: bool = False) -> lis
                     "bars": d["bars"], "bar_mask": d["bar_mask"],
                     "news_raw": d["news_raw"], "news_mask": d["news_mask"], "avail": d["avail"],
                     "ret": d["ret"], "ret_valid": d["ret_valid"], "n_blocks": d["ret"].shape[0],
+                    # carry the cross-day execution prices + date so the DAILY episode builders are self-contained
+                    # (no reliance on an external adapter to re-attach day_close); harmless for intraday.
+                    **({"day_open": d["day_open"]} if "day_open" in d else {}),
+                    **({"day_close": d["day_close"]} if "day_close" in d else {}),
+                    **({"date": d["date"]} if "date" in d else {}),
                 })
     return out

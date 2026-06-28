@@ -14,7 +14,34 @@ from __future__ import annotations
 
 import torch
 
+from rl_quant.datasets.streaming import LazyDay
+
 CASH_INDEX = 0
+
+
+def to_daily_raw_records(encoded: list) -> list[dict]:
+    """EOD adapter (the single, explicit place daily_raw assembles records). Each `encoded` day carries per-BLOCK
+    context ([nB, ...]) + raw bars + day_close (from encode_days). This selects the END-OF-DAY block ([last]) for
+    the daily decision and keeps raw bars LAZY when the day is a LazyDay (streaming) -- so the shape contract is
+    in-repo + unit-tested rather than living in an external driver.
+
+    encoded[i]: {market [nB,d], per_stock [nB,A,d], avail [nB,A], news_raw [nB,A,M,1], news_mask [nB,A,M],
+                 day_close [A], date, + bars/bar_mask (materialized) OR a lazy bars handle if a LazyDay}.
+    -> records consumable by build_daily_raw_episodes (each end-of-day; bars materialized or via "_bars_day")."""
+    if not encoded:
+        return []
+    last = encoded[0]["per_stock"].shape[0] - 1                  # end-of-day block (full session encoded causally)
+    recs = []
+    for e in encoded:
+        r = {"date": e["date"], "day_close": e["day_close"], "avail": e["avail"][last],
+             "market": e["market"][last], "per_stock": e["per_stock"][last],
+             "news_raw": e["news_raw"][last], "news_mask": e["news_mask"][last]}
+        if isinstance(e, LazyDay):                              # streaming: keep full-day bars lazy via the handle
+            r["_bars_day"] = e
+        else:
+            r["bars"], r["bar_mask"] = e["bars"], e["bar_mask"]
+        recs.append(r)
+    return recs
 
 
 def cross_day_returns(day_open: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -77,7 +104,8 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
     if N < exec_delay + horizon + 1:
         return []
     day_close = torch.stack([r["day_close"] for r in records])   # [N,A]
-    ret, valid = horizon_close_returns(day_close, horizon, exec_delay)
+    ret, valid = horizon_close_returns(day_close, horizon, exec_delay)            # H-day: TRAINING target/reward
+    real_ret, real_valid = horizon_close_returns(day_close, 1, exec_delay)        # 1-day mark: REALIZED/reported PnL
     market = torch.stack([r["market"] for r in records])
     per_stock = torch.stack([r["per_stock"] for r in records])
     news_raw = torch.stack([r["news_raw"] for r in records])
@@ -102,7 +130,9 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
         ep = {
             "market": market[s:e], "per_stock": per_stock[s:e],
             "news_raw": news_raw[s:e], "news_mask": news_mask[s:e], "avail": avail[s:e],
-            "ret": ret[s:e], "ret_valid": valid[s:e], "n_blocks": L,
+            "ret": ret[s:e], "ret_valid": valid[s:e],                  # H-day training target
+            "real_ret": real_ret[s:e], "real_ret_valid": real_valid[s:e],   # 1-day realized PnL (reported)
+            "n_blocks": L,
         }
         if stream:
             ep["bars_days"] = [r["_bars_day"] for r in records[s:e]]   # lazy per-day handles (load bars on demand)

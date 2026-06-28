@@ -48,6 +48,7 @@ class RawWindowConfig:
     open_et_hhmm: tuple[int, int] = (9, 30)
     exec_latency_ms: int = 1000
     cache_version: int = 1
+    use_news: bool = True         # False -> news masked out (reportable ablation; see news_is_reportable)
     bar_fields: tuple[str, ...] = field(default=BAR_FIELDS)
     cov_fields: tuple[str, ...] = field(default=COV_FIELDS)
 
@@ -55,6 +56,34 @@ class RawWindowConfig:
 def load_universe(root: Path) -> tuple[list[str], int]:
     u = json.loads((Path(root) / "universe.json").read_text())
     return list(u["actions"]), int(u["cash_index"])  # actions[0] == CASH
+
+
+def news_is_reportable(root: Path, n_windows: int = 4) -> tuple[bool, str]:
+    """Sample news.jsonl across a few windows and decide whether news is POINT-IN-TIME REPORTABLE. News is NOT
+    reportable if the LLM model-availability timestamp is anachronistic -- `model_available_timestamp_ms` at or
+    before `published_timestamp_ms` means the scorer is claimed available no later than the article itself
+    existed, i.e. the scores embed future-model knowledge (the qwen3 sentinel = 1000). Returns (ok, reason)."""
+    bad = total = 0
+    sample = None
+    for w in list_windows(root)[:max(1, n_windows)]:
+        nf = Path(root) / "partitions" / w / "news.jsonl"
+        if not nf.exists():
+            continue
+        for line in nf.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            ma, pub = r.get("model_available_timestamp_ms"), r.get("published_timestamp_ms")
+            total += 1
+            if ma is not None and pub is not None and int(ma) <= int(pub):
+                bad += 1
+                sample = (int(ma), int(pub))
+    if total == 0:
+        return True, "no news in sampled windows"
+    if bad:
+        return False, (f"anachronistic model availability in {bad}/{total} sampled articles "
+                       f"(model_available={sample[0]} <= published={sample[1]}) -- scores embed future-model knowledge")
+    return True, f"ok ({total} sampled articles have model availability after publication)"
 
 
 def list_windows(root: Path) -> list[str]:
@@ -115,6 +144,8 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     T+1 forward-return label: decide at block b (context <= block-b end), EXECUTE at block b+1's end, hold to
     block b+2's end. Returns per-window tensors with a leading n_days axis."""
     bars, cov, news = _load_window_raw(root, window, cfg)
+    if not cfg.use_news:
+        news = []                  # reportable ablation: leave news_raw zero / news_mask False (the model sees none)
     days = sorted(set(bars["date_exchange"]))
     if not days:
         return None
