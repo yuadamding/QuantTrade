@@ -24,7 +24,7 @@ from rl_quant.training import (
     ssl_targets_daily,
     train_daily_policy,
 )
-from rl_quant.training.daily_policy import _daily_rollout, _stack
+from rl_quant.training.daily_policy import _daily_rollout, _held_drift, _stack
 
 A, S, Fd, M, DC = 4, 24, 5, 3, 8        # 4 actions incl CASH; 24s session; 5 OHLCV fields; 3 news; ctx dim 8
 
@@ -301,6 +301,152 @@ class GradIsolationAndLearnability(unittest.TestCase):
         cash, _ = daily_cost_paid_baselines(test_eps)
         self.assertTrue(rows, "no reportable decisions")
         self.assertGreater(sum(rows) / len(rows), cash)      # learned the planted cross-sectional edge
+
+
+class RawNormLevel(unittest.TestCase):
+    """The 'level' raw norm preserves intraday RETURN magnitude (the cross-sectional signal) while staying causal,
+    per-(stock,day), and multiplicatively scale-invariant -- unlike the affine-invariant 'instance' norm."""
+
+    def _enc(self):
+        torch.manual_seed(0)
+        return FullDayRawEncoder(bar_feature_dim=Fd, d_model=8, n_heads=2, n_layers=2, feedforward_dim=16,
+                                 dropout=0.0, block_seconds=8, max_seconds=S, raw_norm="level").eval()
+
+    def _bars(self):
+        g = torch.Generator().manual_seed(1)
+        bars = torch.empty(2, A, S, Fd)
+        bars[..., :4] = 100.0 + torch.randn(2, A, S, 4, generator=g)        # positive prices around 100
+        bars[..., 4] = (1000.0 + 50.0 * torch.randn(2, A, S, generator=g)).clamp_min(1.0)   # volume
+        return bars, torch.ones(2, A, S, dtype=torch.bool)
+
+    def test_cross_sectional_independence(self) -> None:
+        enc = self._enc()
+        bars, mask = self._bars()
+        out = enc(bars, mask)
+        b2 = bars.clone()
+        b2[:, 2, : S // 2, :4] += 3.0                                       # perturb stock 2's price path
+        out2 = enc(b2, mask)
+        self.assertLess(float((out2[:, 1] - out[:, 1]).abs().max()), 1e-6)  # stock 1 untouched (per-stock norm)
+        self.assertGreater(float((out2[:, 2] - out[:, 2]).abs().max()), 1e-6)
+
+    def test_multiplicative_price_scale_invariance(self) -> None:
+        enc = self._enc()
+        bars, mask = self._bars()
+        out = enc(bars, mask)
+        b_scaled = bars.clone()
+        b_scaled[..., :4] *= 3.7                                            # scale ALL price fields (split-like)
+        self.assertLess(float((enc(b_scaled, mask) - out).abs().max()), 1e-5)  # price-LEVEL invariant
+
+    def test_intraday_magnitude_sensitivity(self) -> None:
+        enc = self._enc()
+        bars, mask = self._bars()
+        out = enc(bars, mask)
+        # amplify intraday price DEVIATIONS 2x about the day-mean close (anchor) -> level norm doubles its input,
+        # so the embedding MUST change (the instance norm would whiten this 2x away -> the signal we restored).
+        anchor = bars[..., 3].mean(dim=2, keepdim=True).unsqueeze(-1)        # [2,A,1,1] mean close per stock-day
+        b_amp = bars.clone()
+        b_amp[..., :4] = anchor + 2.0 * (bars[..., :4] - anchor)
+        self.assertGreater(float((enc(b_amp, mask) - out).abs().max()), 1e-4)
+
+
+class RewardScaleAndDrift(unittest.TestCase):
+    def _ep_batch(self):
+        N, H = 12, 3
+        g = torch.Generator().manual_seed(0)
+        recs = [dict(date=f"d{i}", day_close=torch.tensor([float("nan")] + [100.0 + i + ai for ai in range(1, A)]),
+                     market=torch.randn(DC, generator=g), per_stock=torch.randn(A, DC, generator=g),
+                     bars=torch.randn(A, S, Fd, generator=g), bar_mask=torch.ones(A, S, dtype=torch.bool),
+                     news_raw=torch.zeros(A, M, 1), news_mask=torch.ones(A, M, dtype=torch.bool),
+                     avail=torch.ones(A, dtype=torch.bool)) for i in range(N)]
+        eps = build_daily_raw_episodes(recs, episode_len=8, stride=8, horizon=H, exec_delay=1)
+        pol = DailyCrossSectionPolicy(_cfg(daily_lookback=8)).eval()
+        return pol, _stack(eps, [0], torch.device("cpu"))
+
+    def test_reward_scale_rescales_realized_net_only(self) -> None:
+        """reward_scale puts the H-day reward on a per-day-equivalent scale: with cost=0 the net is linear in it
+        (the allocation/turnover are identical, only the credited return is rescaled)."""
+        pol, batch = self._ep_batch()
+        n_full = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", reward_scale=1.0)[0]
+        n_half = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", reward_scale=0.5)[0]
+        self.assertTrue(torch.allclose(n_half, 0.5 * n_full, atol=1e-6))
+
+    def test_train_with_reward_scale_and_eval_window_runs(self) -> None:
+        """The exact driver call shape (per-day-equivalent reward_scale=1/H + a windowed continuous validation
+        episode) trains and selects a checkpoint without error."""
+        torch.manual_seed(0)
+        N, H = 60, 3
+        g = torch.Generator().manual_seed(3)
+        dc = torch.empty(N, A)
+        dc[:, 0] = float("nan")
+        dc[:, 1:] = 100 + (0.5 * torch.randn(N, A - 1, generator=g)).cumsum(0)
+        recs = [dict(date=f"d{i}", day_close=dc[i], market=torch.randn(DC, generator=g),
+                     per_stock=torch.randn(A, DC, generator=g), bars=torch.randn(A, S, Fd, generator=g),
+                     bar_mask=torch.ones(A, S, dtype=torch.bool), news_raw=torch.zeros(A, M, 1),
+                     news_mask=torch.ones(A, M, dtype=torch.bool), avail=torch.ones(A, dtype=torch.bool))
+                for i in range(N)]
+        train_eps = build_daily_raw_episodes(recs, episode_len=12, stride=6, horizon=H, exec_delay=1)
+        val_eps = build_daily_raw_episodes(recs, episode_len=N, stride=N, horizon=H, exec_delay=1)  # one continuous
+        pol = DailyCrossSectionPolicy(_cfg(daily_lookback=12))
+        dev = torch.device("cpu")
+        _, _, best_state = train_daily_policy(
+            pol, train_eps, steps=6, lr=3e-3, batch_days=3, cost=5e-4, risk_lambda=0.1, budget_lambda=0.0,
+            gate_entropy_coef=1e-3, bptt_window=12, reward_scale=1.0 / H, eval_window=12, eval_every=3,
+            val_eps=val_eps, device=dev, min_val_label_reportable_fraction=0.0)
+        self.assertIsNotNone(best_state)
+        rows, st = evaluate_daily_detailed(pol, val_eps, dev, cost=5e-4, batch_days=1, window=12)
+        self.assertTrue(rows)
+        self.assertGreaterEqual(st["reportable_fraction"], 0.0)
+
+    def test_held_drift_rides_and_stays_on_simplex(self) -> None:
+        prev = torch.tensor([[0.5, 0.5, 0.0, 0.0]])                         # CASH=0.5, stock@idx1=0.5
+        real = torch.tensor([[0.0, 1.0, 0.0, 0.0]])                         # stock@idx1 returns +100%
+        valid = torch.ones(1, A, dtype=torch.bool)
+        d = _held_drift(prev, real, valid)
+        self.assertAlmostEqual(float(d.sum()), 1.0, places=6)               # stays on the simplex
+        self.assertGreater(float(d[0, 1]), 0.5)                             # winner's weight rode up
+        self.assertLess(float(d[0, 0]), 0.5)                                # CASH (0 return) shrank relatively
+
+
+class EvalWindowHorizon(unittest.TestCase):
+    def test_windowed_state_ignores_days_before_the_window(self) -> None:
+        """A windowed eval decision at day t must depend only on days [t-W+1 .. t]; a day BEFORE the window cannot
+        move it (bounded memory = the trained horizon), while the FULL-context state at t still does (proof the
+        window genuinely bounds the memory rather than being a no-op)."""
+        pol = DailyCrossSectionPolicy(_cfg()).eval()
+        g = torch.Generator().manual_seed(1)
+        ep = _episode(1, 10, g)
+        tok = pol.encode_tokens(ep["market"], ep["per_stock"], ep["bars"], ep["bar_mask"],
+                                ep["news_raw"], ep["news_mask"])
+        avail, W, t = ep["avail"], 3, 8
+        lo = t - W + 1                                                      # window [6..8]
+        s_win = pol.temporal_state(tok[:, lo:t + 1], avail[:, lo:t + 1])[:, -1]
+        tok2 = tok.clone()
+        tok2[:, 2, :, ::2] += 5.0                                           # perturb day 2 (BEFORE the window;
+        #                                       a feature SUBSET so it survives the temporal block's LayerNorm)
+        s_win2 = pol.temporal_state(tok2[:, lo:t + 1], avail[:, lo:t + 1])[:, -1]
+        self.assertLess(float((s_win2 - s_win).abs().max()), 1e-6)         # outside window -> no effect
+        s_full = pol.temporal_state(tok, avail)[:, t]
+        s_full2 = pol.temporal_state(tok2, avail)[:, t]
+        self.assertGreater(float((s_full2 - s_full).abs().max()), 1e-6)    # full causal context DOES see day 2
+
+    def test_eval_window_changes_the_rollout_when_split_exceeds_window(self) -> None:
+        pol = DailyCrossSectionPolicy(_cfg()).eval()
+        g = torch.Generator().manual_seed(2)
+        N, H = 16, 3
+        dc = torch.empty(N, A)
+        dc[:, 0] = float("nan")
+        dc[:, 1:] = 100 + (0.5 * torch.randn(N, A - 1, generator=g)).cumsum(0)
+        recs = [dict(date=f"d{i}", day_close=dc[i], market=torch.randn(DC, generator=g),
+                     per_stock=torch.randn(A, DC, generator=g), bars=torch.randn(A, S, Fd, generator=g),
+                     bar_mask=torch.ones(A, S, dtype=torch.bool), news_raw=torch.zeros(A, M, 1),
+                     news_mask=torch.ones(A, M, dtype=torch.bool), avail=torch.ones(A, dtype=torch.bool))
+                for i in range(N)]
+        eps = build_daily_raw_episodes(recs, episode_len=N, stride=N, horizon=H, exec_delay=1)   # one long episode
+        batch = _stack(eps, [0], torch.device("cpu"))
+        n_full = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", window=0)[0]
+        n_win = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", window=3)[0]
+        self.assertEqual(n_full.shape, n_win.shape)
+        self.assertFalse(torch.allclose(n_full, n_win))                    # bounded memory changes later decisions
 
 
 if __name__ == "__main__":

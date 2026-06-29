@@ -39,13 +39,16 @@ class FullDayRawEncoder(nn.Module):
 
     def __init__(self, *, bar_feature_dim: int, d_model: int, n_heads: int, n_layers: int,
                  feedforward_dim: int, dropout: float, block_seconds: int, max_seconds: int,
-                 grad_checkpoint: bool = False) -> None:
+                 grad_checkpoint: bool = False, raw_norm: str = "instance") -> None:
         super().__init__()
         d = d_model
         if d % n_heads:
             raise ValueError(f"raw d_model {d} must be divisible by n_heads {n_heads}")
+        if raw_norm not in ("instance", "level"):
+            raise ValueError(f"raw_norm must be 'instance' or 'level', got {raw_norm!r}")
         self.block_seconds = int(block_seconds)
         self.grad_checkpoint = grad_checkpoint
+        self.raw_norm = raw_norm
         t1 = max(1, n_layers // 2)
         t2 = max(1, n_layers - t1)
         self.input_proj = nn.Linear(bar_feature_dim, d)
@@ -67,15 +70,29 @@ class FullDayRawEncoder(nn.Module):
             raise ValueError(f"FullDayRawEncoder needs at least one {bl}s block; got S={S}")
         bars = bars[:, :, :nB * bl]
         bar_mask = bar_mask[:, :, :nB * bl].bool()
-        # Per-(stock,day) per-FIELD instance normalization over that stock-day's valid seconds. NO coupling across
-        # the batch/day axis (so a future day cannot affect a past day's normalization -> strictly causal) and each
-        # field is standardized on its own scale (price vs volume), avoiding the LayerNorm-over-OHLCV units mix.
-        # Using the whole day's stats is PIT-clean for the END-OF-DAY embedding (all of day d is known at EOD d).
+        # Per-(stock,day) normalization over that stock-day's valid seconds. BOTH modes have NO coupling across the
+        # batch/day axis (a future day cannot affect a past day's normalization -> strictly causal) and use only
+        # day-d's own bars (PIT-clean for the END-OF-DAY embedding). They differ in what they preserve:
         m = bar_mask.unsqueeze(-1).to(bars.dtype)               # [B,A,Sd,1]
         cnt = m.sum(dim=2).clamp_min(1.0)                       # [B,A,1]
-        mean = (bars * m).sum(dim=2) / cnt                      # [B,A,F]
-        var = ((bars - mean.unsqueeze(2)) ** 2 * m).sum(dim=2) / cnt
-        normed = ((bars - mean.unsqueeze(2)) / (var.unsqueeze(2) + 1e-5).sqrt()) * m
+        if self.raw_norm == "instance":
+            # per-FIELD standardize: affine-invariant, so the day's intraday move MAGNITUDE is whitened away (only
+            # the vol-normalized SHAPE survives) -- bad for a cross-sectional RETURN policy, kept for back-compat.
+            mean = (bars * m).sum(dim=2) / cnt                  # [B,A,F]
+            var = ((bars - mean.unsqueeze(2)) ** 2 * m).sum(dim=2) / cnt
+            normed = ((bars - mean.unsqueeze(2)) / (var.unsqueeze(2) + 1e-5).sqrt()) * m
+        else:                                                   # "level": magnitude-preserving (the daily_raw default)
+            # Prices -> deviation from the day's mean CLOSE expressed in RETURN units (divide by the price level, do
+            # NOT divide by std): multiplicatively scale-INVARIANT (a $5 and a $500 name are comparable; splits don't
+            # matter) yet magnitude-SENSITIVE (a +5% day reads ~10x a +0.5% day -- the cross-sectional signal the
+            # instance norm destroyed). Volume -> centered log1p (relative intraday volume; absolute level isn't a
+            # return signal). This is INPUT NORMALIZATION of raw OHLCV, not an engineered feature column.
+            price, vol = bars[..., :4], bars[..., 4:]
+            anchor = ((bars[..., 3:4] * m).sum(dim=2) / cnt).clamp_min(1e-2)        # [B,A,1] mean close level
+            price_n = (price - anchor.unsqueeze(2)) / anchor.unsqueeze(2)           # ~ price/anchor - 1 (return units)
+            vlog = torch.log1p(vol.clamp_min(0.0))
+            vol_n = vlog - (vlog * m).sum(dim=2, keepdim=True) / cnt.unsqueeze(2)   # centered log-volume
+            normed = torch.cat([price_n, vol_n], dim=-1) * m
         x = self.input_proj(normed).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
         bm1 = bar_mask.reshape(B * A * nB, bl)
         kpm = ~bm1                                               # key-padding for missing seconds (SDPA-safe in block)
@@ -152,6 +169,7 @@ class DailyCrossSectionConfig:
     temperature: float = 1.0
     gate_init_bias: float = 2.0
     grad_checkpoint: bool = False
+    raw_norm: str = "level"          # full-day raw input norm: "level" (magnitude-preserving) | "instance" (whitened)
 
 
 class DailyCrossSectionPolicy(nn.Module):
@@ -170,7 +188,7 @@ class DailyCrossSectionPolicy(nn.Module):
             n_heads=config.raw_policy_heads, n_layers=config.raw_policy_layers,
             feedforward_dim=config.raw_policy_dim * 2, dropout=config.dropout,
             block_seconds=config.raw_block_seconds, max_seconds=config.session_seconds,
-            grad_checkpoint=config.grad_checkpoint)
+            grad_checkpoint=config.grad_checkpoint, raw_norm=config.raw_norm)
         self.news_agg = _NewsAggregator(config.news_raw_dim, config.news_embed_dim)
         # per-day per-stock token: [market | per-stock frozen ctx | full-day raw | news]
         tok_in = config.context_dim * 2 + config.raw_policy_dim + config.news_embed_dim
@@ -198,10 +216,11 @@ class DailyCrossSectionPolicy(nn.Module):
         bars_t, mask_t = day_bars_fn(t)
         return self.raw_encoder(bars_t, mask_t)                # [B,A,dr]
 
-    def _encode_episode_core(self, market, per_stock, day_bars_fn, news_raw, news_mask, avail, reload_ckpt):
-        """Shared episode encode. day_bars_fn(t) yields day-t bars/mask (a tensor slice in-RAM, or a lazy disk load
-        when streaming). When `reload_ckpt` and training, each day's raw encode is checkpointed so backward
-        RE-LOADS + recomputes that day instead of retaining all T days' bars -> bounded RAM for huge universes."""
+    def _episode_tokens(self, market, per_stock, day_bars_fn, news_raw, news_mask, reload_ckpt):
+        """Build the per-day per-stock TOKENS (everything BEFORE the cross-day temporal encoder): frozen context +
+        trainable full-day raw + news -> tok [B,T,A,token_dim]. day_bars_fn(t) yields day-t bars/mask (a tensor
+        slice in-RAM, or a lazy disk load when streaming). When `reload_ckpt` and training, each day's raw encode is
+        checkpointed so backward RE-LOADS + recomputes that day instead of retaining all T days' bars."""
         B, T, A, dc = per_stock.shape
         ckpt = reload_ckpt and self.training
         raw_days = []
@@ -214,19 +233,38 @@ class DailyCrossSectionPolicy(nn.Module):
         news = self.news_agg(news_raw.reshape(B * T, A, news_raw.shape[3], news_raw.shape[4]),
                              news_mask.reshape(B * T, A, news_mask.shape[3])).reshape(B, T, A, -1)  # [B,T,A,ne]
         mkt = market.unsqueeze(2).expand(B, T, A, dc)
-        tok = self.token_proj(torch.cat([mkt, per_stock, raw, news], dim=-1))   # [B,T,A,token_dim]
-        return self.temporal(tok, day_valid=avail.bool())                       # causal cross-day memory
+        return self.token_proj(torch.cat([mkt, per_stock, raw, news], dim=-1))  # [B,T,A,token_dim]
+
+    def temporal_state(self, tok, avail):
+        """Run the CAUSAL cross-day memory over a (possibly windowed) token slice. tok [B,W,A,token_dim],
+        avail [B,W,A] -> [B,W,A,token_dim]. For a rolling EVAL the caller slices the last `daily_lookback` days so
+        the memory horizon (and positional range) matches what TRAINING exercised (episode_len), not the full
+        split -- otherwise eval runs the temporal encoder at sequence positions/contexts it never saw in training."""
+        return self.temporal(tok, day_valid=avail.bool())
 
     def encode_episode(self, market, per_stock, bars, bar_mask, news_raw, news_mask, avail):
         """In-RAM encode: bars/bar_mask are pre-stacked [B,T,A,S,F]/[B,T,A,S]. -> temporal_state [B,T,A,token_dim]."""
-        return self._encode_episode_core(market, per_stock, lambda t: (bars[:, t], bar_mask[:, t]),
-                                         news_raw, news_mask, avail, reload_ckpt=False)
+        tok = self._episode_tokens(market, per_stock, lambda t: (bars[:, t], bar_mask[:, t]),
+                                   news_raw, news_mask, reload_ckpt=False)
+        return self.temporal_state(tok, avail)
 
     def encode_episode_streaming(self, market, per_stock, day_bars_fn, news_raw, news_mask, avail, n_days):
         """Streaming encode: day_bars_fn(t) lazily loads day-t bars/mask [B,A,S,F]/[B,A,S] from disk; backward
         reloads + recomputes per day (reload_ckpt) so the whole episode's bars are never resident."""
-        per_stock = per_stock if per_stock.shape[1] == n_days else per_stock      # T == n_days
-        return self._encode_episode_core(market, per_stock, day_bars_fn, news_raw, news_mask, avail, reload_ckpt=True)
+        tok = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask, reload_ckpt=True)
+        return self.temporal_state(tok, avail)
+
+    def encode_tokens(self, market, per_stock, bars, bar_mask, news_raw, news_mask):
+        """Pre-temporal tokens for a (continuous) eval episode, computed ONCE: the expensive full-day raw encode
+        runs per day here; the cheap temporal pass is then re-run per decision over a bounded window (see
+        rl_quant.training.daily_policy._daily_rollout windowing). In-RAM bars -> tok [B,T,A,token_dim]."""
+        return self._episode_tokens(market, per_stock, lambda t: (bars[:, t], bar_mask[:, t]),
+                                    news_raw, news_mask, reload_ckpt=False)
+
+    def encode_tokens_streaming(self, market, per_stock, day_bars_fn, news_raw, news_mask):
+        """Streaming variant of encode_tokens (eval is no_grad, so no reload-checkpoint needed): loads each day's
+        bars once to build the tokens, which stay resident (small) while the per-day bars are released."""
+        return self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask, reload_ckpt=False)
 
     def step(self, state_t, prev_weights, available):
         """One day's cross-sectional allocation. state_t [B,A,token_dim], prev_weights/available [B,A]

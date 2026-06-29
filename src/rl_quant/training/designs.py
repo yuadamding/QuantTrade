@@ -84,8 +84,13 @@ class Phase1Design:
     bptt_window: int = 1              # truncated-BPTT span: credit a held position's returns to the decision that
     #                                   set it over this many steps (1=myopic 1-step; >1 needed to LEARN long holds)
     label_horizon_days: int = 21      # daily_raw: close-to-close forward-return horizon H (per-decision credit signal)
-    daily_lookback: int = 60          # daily_raw: cross-day memory window (bounds episode/eval span; soft, not a band)
+    daily_lookback: int = 60          # daily_raw: learned cross-day MEMORY window. EFFECTIVE horizon = min(this,
+    #                                   episode_len): training episodes are episode_len long, and eval bounds its
+    #                                   rolling temporal window to episode_len to match (the position CARRY can still
+    #                                   hold longer -- continuous eval rides positions across windows).
     exec_delay: int = 1               # daily_raw: execution delay in DAYS (decide EOD d, execute close d+exec_delay)
+    raw_norm: str = "level"           # daily_raw full-day raw input norm: "level" preserves intraday RETURN
+    #                                   magnitude (the cross-sectional signal); "instance" whitens it away (legacy)
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
     min_gpus: int = 1                 # GPUs to give this setting (data-parallel). Set 2 if peak VRAM > one card
@@ -221,8 +226,9 @@ _SERIES = [
                  policy_token_dim=256, policy_layers=3, policy_heads=8, ssl_steps=3000, policy_steps=4000,
                  ssl_batch_size=1, ssl_accum=8, batch_days=6, raw_policy_dim=128, raw_policy_layers=2,
                  raw_policy_heads=8, horizon_mode="daily_raw", episode_len=42, episode_stride=5, bptt_window=42,
-                 label_horizon_days=21, daily_lookback=60, exec_delay=1, budget_lambda=0.0, ssl_perstock_coef=1.0,
-                 friction_warmup_frac=0.0, cost=5e-4, amp=True, grad_checkpoint=True),
+                 label_horizon_days=21, daily_lookback=42, exec_delay=1, budget_lambda=0.0, ssl_perstock_coef=1.0,
+                 friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
+                 grad_checkpoint=True),
 ]
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 

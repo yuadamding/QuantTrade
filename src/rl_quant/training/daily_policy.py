@@ -40,32 +40,34 @@ def _stack(episodes: list[dict], idx, device):
     return batch
 
 
-def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_liquidate: bool = True,
-                   ret_key: str = "ret"):
-    """Roll the long-only daily portfolio over the episode, realizing the return series `ret_key`:
-    "ret" (H-day, the TRAINING reward) or "real_ret" (the 1-day close-to-close mark, the REPORTED PnL). The
-    allocation/gate/turnover are identical either way -- only which return is credited differs, so training
-    optimizes the H-day forecast while eval reports the tradeable one-period PnL. -> nets/gates/ents/cash_w/turn/
-    missing_w [B,T]. encode_episode() runs ONCE (cross-day memory); the per-day step carries the position (BPTT)."""
-    market, per_stock = batch["market"], batch["per_stock"]
-    avail, ret, ret_valid = batch["avail"], batch[ret_key], batch[ret_key + "_valid"]
-    if "_bars_loader" in batch:                              # STREAMING: load day-t bars on demand (reload in backward)
-        state = policy.encode_episode_streaming(market, per_stock, batch["_bars_loader"],
-                                                batch["news_raw"], batch["news_mask"], avail, batch["_n_days"])
-    else:
-        state = policy.encode_episode(market, per_stock, batch["bars"], batch["bar_mask"],
-                                      batch["news_raw"], batch["news_mask"], avail)    # [B,T,A,token_dim]
-    B, T, A, _ = per_stock.shape
-    prev_w = torch.zeros(B, A, device=per_stock.device)
+def _held_drift(prev_a, real_ret_t, real_valid_t):
+    """Carry the held weights into the next day by the realized 1-DAY return (a true buy-and-hold RIDE). With this,
+    a gate=0 "hold" incurs ZERO turnover (you let the position ride), instead of the old behaviour that silently
+    re-balanced back to constant target weights every day for free -- which understated cost and overstated the
+    realism of "hold". CASH (return 0) and invalid names don't grow; renormalize onto the simplex."""
+    r1 = torch.where(real_valid_t.bool(), real_ret_t, torch.zeros_like(real_ret_t))
+    grown = prev_a * (1.0 + r1)
+    return grown / grown.sum(-1, keepdim=True).clamp_min(1e-12)
+
+
+def _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_valid, cost,
+                    reward_scale, bptt_window, terminal_liquidate):
+    """Shared per-day portfolio roll. state_fn(t) -> day-t policy state [B,A,token_dim]. The credited return is
+    `reward_scale * ret` (training passes reward_scale = 1/H so the H-day forecast reward is a PER-DAY-EQUIVALENT
+    rate, on the SAME scale as the per-day turnover cost and the per-day eval mark -- otherwise the H-day reward is
+    ~H x the cost it is charged against, so the policy systematically under-prices turnover). The held position
+    drifts by the realized 1-day return between days (a true ride)."""
+    B, A = avail.shape[0], avail.shape[2]
+    prev_w = torch.zeros(B, A, device=avail.device)
     prev_w[:, CASH_INDEX] = 1.0
     nets, gates, ents, cash_w, turn, missing_w = [], [], [], [], [], []
     last_a = prev_w
     for t in range(T):
-        w, g = policy.step(state[:, t], prev_w.detach(), avail[:, t])
+        w, g = policy.step(state_fn(t), prev_w.detach(), avail[:, t])
         a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * prev_w
         valid = ret_valid[:, t].bool()
         missing = (a * (~valid).to(a.dtype)).sum(-1)
-        realized = (a * torch.where(valid, ret[:, t], torch.zeros_like(ret[:, t]))).sum(-1)
+        realized = (a * torch.where(valid, ret[:, t], torch.zeros_like(ret[:, t]))).sum(-1) * reward_scale
         turnover = 0.5 * (a - prev_w).abs().sum(-1)
         nets.append(realized - cost * turnover)
         gates.append(g)
@@ -74,7 +76,8 @@ def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_li
         turn.append(turnover)
         missing_w.append(missing)
         last_a = a
-        prev_w = a.detach() if (bptt_window <= 1 or (t + 1) % bptt_window == 0) else a
+        nxt = _held_drift(a, real_ret[:, t], real_valid[:, t])       # ride the held book by the realized 1-day move
+        prev_w = nxt.detach() if (bptt_window <= 1 or (t + 1) % bptt_window == 0) else nxt
     if terminal_liquidate and nets:                                  # charge the exit of the final position to CASH
         cash_vec = torch.zeros_like(last_a)
         cash_vec[:, CASH_INDEX] = 1.0
@@ -83,6 +86,45 @@ def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_li
         turn[-1] = turn[-1] + term_turn
     st = lambda xs: torch.stack(xs, 1)  # noqa: E731
     return st(nets), st(gates), st(ents), st(cash_w), st(turn), st(missing_w)
+
+
+def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_liquidate: bool = True,
+                   ret_key: str = "ret", reward_scale: float = 1.0, window: int = 0):
+    """Roll the long-only daily portfolio over the episode, crediting the return series `ret_key` (scaled by
+    `reward_scale`): "ret" (H-day, the TRAINING reward) or "real_ret" (the 1-day close-to-close mark, the REPORTED
+    PnL). The held position always RIDES by the realized 1-day return (_held_drift). -> nets/gates/ents/cash_w/turn/
+    missing_w [B,T]. `window>0` (EVAL) bounds the cross-day memory to `window` days = the training episode_len: the
+    raw tokens are encoded ONCE, then the cheap temporal pass re-runs per decision over the trailing window so day t
+    sees <= window prior days (positions 0..window-1, exactly what training exercised) rather than the whole split.
+    `window<=0` (TRAIN / short eval) encodes the temporal memory over the full episode in one pass."""
+    market, per_stock = batch["market"], batch["per_stock"]
+    avail = batch["avail"]
+    ret, ret_valid = batch[ret_key], batch[ret_key + "_valid"]
+    real_ret, real_valid = batch["real_ret"], batch["real_ret_valid"]
+    T = per_stock.shape[1]
+    if window and 0 < window < T:                            # EVAL: bound the memory horizon to the trained window
+        if "_bars_loader" in batch:
+            tok = policy.encode_tokens_streaming(market, per_stock, batch["_bars_loader"],
+                                                 batch["news_raw"], batch["news_mask"])
+        else:
+            tok = policy.encode_tokens(market, per_stock, batch["bars"], batch["bar_mask"],
+                                       batch["news_raw"], batch["news_mask"])
+
+        def state_fn(t, _tok=tok, _av=avail, _w=window):
+            lo = max(0, t - _w + 1)
+            return policy.temporal_state(_tok[:, lo:t + 1], _av[:, lo:t + 1])[:, -1]
+    else:                                                    # TRAIN / short eval: one temporal pass over the episode
+        if "_bars_loader" in batch:                          # STREAMING: load day-t bars on demand (reload in backward)
+            state = policy.encode_episode_streaming(market, per_stock, batch["_bars_loader"],
+                                                    batch["news_raw"], batch["news_mask"], avail, batch["_n_days"])
+        else:
+            state = policy.encode_episode(market, per_stock, batch["bars"], batch["bar_mask"],
+                                          batch["news_raw"], batch["news_mask"], avail)    # [B,T,A,token_dim]
+
+        def state_fn(t, _s=state):
+            return _s[:, t]
+    return _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_valid, cost,
+                           reward_scale, bptt_window, terminal_liquidate)
 
 
 def _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef, max_actions, budget_lambda,
@@ -110,13 +152,16 @@ def train_daily_policy(
     bptt_window: int = 1, terminal_liquidate: bool = True, warmup_steps: int = 0, schedule: str = "cosine",
     grad_clip: float = 0.0, amp: bool = False, start_step: int = 0, optimizer=None, best_val: float = -1e9,
     best_state: dict | None = None, eval_every: int = 0, val_eps: list[dict] | None = None, device=None,
-    min_val_label_reportable_fraction: float = 0.95,
+    min_val_label_reportable_fraction: float = 0.95, reward_scale: float = 1.0, eval_window: int = 0,
     on_eval: Callable[[int, float, float, dict | None, object], None] | None = None,
     grad_reduce: Callable[[list], None] | None = None, is_main: bool = True,
 ):
-    """Train the daily cross-sectional policy. Cost is full from step 1 (no friction warm-up). Returns
-    (optimizer, best_val, best_state). Validation uses the CONTINUOUS rollout and selects on mean net return only
-    when label-reportable coverage is adequate."""
+    """Train the daily cross-sectional policy. Cost is full from step 1 (no friction warm-up). `reward_scale`
+    rescales the credited (H-day) training reward to a per-day-equivalent rate (pass 1/H) so it shares the scale of
+    the per-day turnover cost and the per-day realized eval mark. `eval_window` bounds the validation rollout's
+    cross-day memory to the trained episode span (0 = whole split). Returns (optimizer, best_val, best_state).
+    Validation uses the CONTINUOUS rollout (1-day realized mark) and selects on mean net return only when
+    label-reportable coverage is adequate."""
     if optimizer is None:
         optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
     dev_type = (device.type if hasattr(device, "type") else "cuda")
@@ -128,7 +173,8 @@ def train_daily_policy(
         batch = _stack(train_eps, idx, device)
         with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
             nets, gates, ents, _, _, missing_w = _daily_rollout(policy, batch, cost, bptt_window=bptt_window,
-                                                                terminal_liquidate=terminal_liquidate, ret_key="ret")
+                                                                terminal_liquidate=terminal_liquidate, ret_key="ret",
+                                                                reward_scale=reward_scale)
             label = batch["ret_valid"][:, :, 1:].any(-1)         # train on the H-day target
             loss = _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef,
                                max_actions, budget_lambda, gate_entropy_coef, missing_label_penalty)
@@ -141,7 +187,7 @@ def train_daily_policy(
         optimizer.step()
         if ((eval_every and (step + 1) % eval_every == 0) or step == steps - 1) and is_main:
             if val_eps:
-                vr, vstats = evaluate_daily_detailed(policy, val_eps, device, cost)
+                vr, vstats = evaluate_daily_detailed(policy, val_eps, device, cost, window=eval_window)
                 ok = vstats["label_reportable_fraction"] >= min_val_label_reportable_fraction
                 vmean = (sum(vr) / len(vr)) if (vr and ok) else -1e9
             else:
@@ -156,16 +202,19 @@ def train_daily_policy(
 
 @torch.no_grad()
 def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_days: int = 4,
-                            max_missing_label_weight: float = 1e-6) -> tuple[list[float], dict]:
+                            max_missing_label_weight: float = 1e-6, window: int = 0) -> tuple[list[float], dict]:
     """Per-decision net return + coverage over the (continuous) evaluation episode(s). Pass a single full-split
-    episode for a continuous chronological rollout (no mid-stream CASH reset)."""
+    episode for a continuous chronological rollout (no mid-stream CASH reset). `window>0` bounds the cross-day
+    memory to the trained episode span (= episode_len) so the temporal encoder runs at the positions/contexts it
+    saw in training rather than extrapolating across the whole split. Reports the 1-day realized mark (real_ret)."""
     policy.eval()
     rows: list[float] = []
     total = lab = rep = 0
     gross, costs, turns, cash, gate, miss = [], [], [], [], [], []
     for i in range(0, len(eps), batch_days):
         batch = _stack(eps, list(range(i, min(i + batch_days, len(eps)))), device)
-        nets, gates, _, cash_w, turn, missing_w = _daily_rollout(policy, batch, cost, ret_key="real_ret")
+        nets, gates, _, cash_w, turn, missing_w = _daily_rollout(policy, batch, cost, ret_key="real_ret",
+                                                                 window=window)
         label = batch["real_ret_valid"][:, :, 1:].any(-1).bool()   # report the 1-day realized PnL
         reportable = label & (missing_w <= max_missing_label_weight)
         total += int(label.numel())
@@ -193,12 +242,13 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
 
 
 @torch.no_grad()
-def daily_policy_telemetry(policy, eps: list[dict], device, cost: float, batch_days: int = 4) -> dict:
+def daily_policy_telemetry(policy, eps: list[dict], device, cost: float, batch_days: int = 4,
+                           window: int = 0) -> dict:
     policy.eval()
     gates_all, cash_all, turn_all, miss_all, trades = [], [], [], [], []
     for i in range(0, len(eps), batch_days):
         batch = _stack(eps, list(range(i, min(i + batch_days, len(eps)))), device)
-        _, gates, _, cw, tv, mw = _daily_rollout(policy, batch, cost, ret_key="real_ret")
+        _, gates, _, cw, tv, mw = _daily_rollout(policy, batch, cost, ret_key="real_ret", window=window)
         gates_all.append(gates.flatten())
         cash_all.append(cw.flatten())
         turn_all.append(tv.flatten())
