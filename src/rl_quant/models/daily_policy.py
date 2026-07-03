@@ -39,7 +39,7 @@ class FullDayRawEncoder(nn.Module):
 
     def __init__(self, *, bar_feature_dim: int, d_model: int, n_heads: int, n_layers: int,
                  feedforward_dim: int, dropout: float, block_seconds: int, max_seconds: int,
-                 grad_checkpoint: bool = False, raw_norm: str = "instance") -> None:
+                 grad_checkpoint: bool = False, raw_norm: str = "instance", stock_chunk: int = 0) -> None:
         super().__init__()
         d = d_model
         if d % n_heads:
@@ -49,6 +49,8 @@ class FullDayRawEncoder(nn.Module):
         self.block_seconds = int(block_seconds)
         self.grad_checkpoint = grad_checkpoint
         self.raw_norm = raw_norm
+        self.stock_chunk = int(stock_chunk)   # >0: encode the stock axis in chunks (bit-identical: every norm here
+        #                                       is per-(stock,day); huge universes need it for activation memory)
         t1 = max(1, n_layers // 2)
         t2 = max(1, n_layers - t1)
         self.input_proj = nn.Linear(bar_feature_dim, d)
@@ -61,7 +63,23 @@ class FullDayRawEncoder(nn.Module):
         self.d_model = d
 
     def forward(self, bars: torch.Tensor, bar_mask: torch.Tensor) -> torch.Tensor:
-        """bars [B,A,S,F] raw OHLCV (session-aligned), bar_mask [B,A,S] -> [B,A,d] end-of-day per-stock embedding."""
+        """bars [B,A,S,F] raw OHLCV (session-aligned), bar_mask [B,A,S] -> [B,A,d] end-of-day per-stock embedding.
+        `stock_chunk>0` encodes the (weight-shared, per-stock-normalized) stock axis in chunks -- bit-identical,
+        bounded activation memory; with grad_checkpoint each chunk is checkpointed (backward recomputes one chunk)."""
+        A = bars.shape[1]
+        ck = self.stock_chunk if self.stock_chunk and 0 < self.stock_chunk < A else A
+        if ck >= A:
+            return self._encode_stocks(bars, bar_mask)
+        outs = []
+        for lo in range(0, A, ck):
+            bc, mc = bars[:, lo:lo + ck], bar_mask[:, lo:lo + ck]
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                outs.append(torch.utils.checkpoint.checkpoint(self._encode_stocks, bc, mc, use_reentrant=False))
+            else:
+                outs.append(self._encode_stocks(bc, mc))
+        return torch.cat(outs, dim=1)                            # [B,A,d]
+
+    def _encode_stocks(self, bars: torch.Tensor, bar_mask: torch.Tensor) -> torch.Tensor:
         B, A, S, Fdim = bars.shape
         d = self.d_model
         bl = self.block_seconds
@@ -170,6 +188,14 @@ class DailyCrossSectionConfig:
     gate_init_bias: float = 2.0
     grad_checkpoint: bool = False
     raw_norm: str = "level"          # full-day raw input norm: "level" (magnitude-preserving) | "instance" (whitened)
+    raw_recent_days: int = 0         # TWO-SPEED tokens: >0 -> only the LAST this-many days of an episode/eval
+    #                                  window get the (expensive, trainable) full-day raw encode; older days'
+    #                                  tokens carry frozen ctx + news + the past-return channel only (has_raw=0).
+    #                                  Extends the cross-day memory to e.g. 252d at ~the 42d raw compute.
+    #                                  0 = every day raw (the original behavior).
+    raw_stock_chunk: int = 0         # >0: the full-day raw encoder processes the stock axis in chunks of this
+    #                                  many stocks (bit-identical -- all its norms are per-(stock,day)); REQUIRED
+    #                                  for huge universes (TOP2000: ~512/chunk on an 80GB H100). 0 = single pass.
 
 
 class DailyCrossSectionPolicy(nn.Module):
@@ -188,10 +214,14 @@ class DailyCrossSectionPolicy(nn.Module):
             n_heads=config.raw_policy_heads, n_layers=config.raw_policy_layers,
             feedforward_dim=config.raw_policy_dim * 2, dropout=config.dropout,
             block_seconds=config.raw_block_seconds, max_seconds=config.session_seconds,
-            grad_checkpoint=config.grad_checkpoint, raw_norm=config.raw_norm)
+            grad_checkpoint=config.grad_checkpoint, raw_norm=config.raw_norm,
+            stock_chunk=config.raw_stock_chunk)
         self.news_agg = _NewsAggregator(config.news_raw_dim, config.news_embed_dim)
-        # per-day per-stock token: [market | per-stock frozen ctx | full-day raw | news]
-        tok_in = config.context_dim * 2 + config.raw_policy_dim + config.news_embed_dim
+        # per-day per-stock token: [market | per-stock frozen ctx | full-day raw | news | past_ret | past_valid |
+        # has_raw]. past_ret = the stock's OWN 1-day close-to-close return for that day (PIT: known at EOD) -- the
+        # raw close series under a scale-invariant normalization, so the cross-day temporal encoder can compute
+        # momentum/reversal over its window; has_raw flags whether the raw component is real or a two-speed zero.
+        tok_in = config.context_dim * 2 + config.raw_policy_dim + config.news_embed_dim + 3
         self.token_proj = nn.Linear(tok_in, config.token_dim)
         self.temporal = CrossDayTemporalEncoder(
             d_model=config.token_dim, n_heads=config.temporal_heads, n_layers=config.temporal_layers,
@@ -216,16 +246,28 @@ class DailyCrossSectionPolicy(nn.Module):
         bars_t, mask_t = day_bars_fn(t)
         return self.raw_encoder(bars_t, mask_t)                # [B,A,dr]
 
-    def _episode_tokens(self, market, per_stock, day_bars_fn, news_raw, news_mask, reload_ckpt):
+    def _raw_day_mask(self, T: int) -> list[bool]:
+        """Two-speed assignment for a length-T episode: the last `raw_recent_days` days get the trainable raw
+        encode (all days if raw_recent_days<=0)."""
+        r = self.config.raw_recent_days
+        return [True] * T if r <= 0 else [t >= T - r for t in range(T)]
+
+    def _episode_tokens(self, market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid,
+                        raw_day_mask, reload_ckpt):
         """Build the per-day per-stock TOKENS (everything BEFORE the cross-day temporal encoder): frozen context +
-        trainable full-day raw + news -> tok [B,T,A,token_dim]. day_bars_fn(t) yields day-t bars/mask (a tensor
-        slice in-RAM, or a lazy disk load when streaming). When `reload_ckpt` and training, each day's raw encode is
-        checkpointed so backward RE-LOADS + recomputes that day instead of retaining all T days' bars."""
+        (two-speed) trainable full-day raw + news + the past-return channel -> tok [B,T,A,token_dim].
+        day_bars_fn(t) yields day-t bars/mask (a tensor slice in-RAM, or a lazy disk load when streaming);
+        raw_day_mask[t] selects which days get the raw encode (False -> zeros + has_raw=0: the day contributes
+        frozen ctx/news/past-return only -- and its bars are NEVER loaded, the two-speed compute saving). When
+        `reload_ckpt` and training, each raw day's encode is checkpointed so backward RE-LOADS + recomputes it."""
         B, T, A, dc = per_stock.shape
         ckpt = reload_ckpt and self.training
+        dr = self.config.raw_policy_dim
         raw_days = []
         for t in range(T):
-            if ckpt:
+            if not raw_day_mask[t]:
+                raw_days.append(torch.zeros(B, A, dr, device=per_stock.device, dtype=per_stock.dtype))
+            elif ckpt:
                 raw_days.append(torch.utils.checkpoint.checkpoint(self._raw_day, day_bars_fn, t, use_reentrant=False))
             else:
                 raw_days.append(self._raw_day(day_bars_fn, t))
@@ -233,7 +275,11 @@ class DailyCrossSectionPolicy(nn.Module):
         news = self.news_agg(news_raw.reshape(B * T, A, news_raw.shape[3], news_raw.shape[4]),
                              news_mask.reshape(B * T, A, news_mask.shape[3])).reshape(B, T, A, -1)  # [B,T,A,ne]
         mkt = market.unsqueeze(2).expand(B, T, A, dc)
-        return self.token_proj(torch.cat([mkt, per_stock, raw, news], dim=-1))  # [B,T,A,token_dim]
+        flag = torch.tensor(raw_day_mask, device=per_stock.device, dtype=per_stock.dtype)
+        flag = flag.view(1, T, 1, 1).expand(B, T, A, 1)
+        pr = past_ret.unsqueeze(-1).to(per_stock.dtype)
+        pv = past_ret_valid.unsqueeze(-1).to(per_stock.dtype)
+        return self.token_proj(torch.cat([mkt, per_stock, raw, news, pr, pv, flag], dim=-1))  # [B,T,A,token_dim]
 
     def temporal_state(self, tok, avail):
         """Run the CAUSAL cross-day memory over a (possibly windowed) token slice. tok [B,W,A,token_dim],
@@ -242,29 +288,38 @@ class DailyCrossSectionPolicy(nn.Module):
         split -- otherwise eval runs the temporal encoder at sequence positions/contexts it never saw in training."""
         return self.temporal(tok, day_valid=avail.bool())
 
-    def encode_episode(self, market, per_stock, bars, bar_mask, news_raw, news_mask, avail):
-        """In-RAM encode: bars/bar_mask are pre-stacked [B,T,A,S,F]/[B,T,A,S]. -> temporal_state [B,T,A,token_dim]."""
+    def encode_episode(self, market, per_stock, bars, bar_mask, news_raw, news_mask, avail,
+                       past_ret, past_ret_valid):
+        """In-RAM encode: bars/bar_mask are pre-stacked [B,T,A,S,F]/[B,T,A,S]. -> temporal_state [B,T,A,token_dim].
+        Two-speed: only the last `raw_recent_days` days are raw-encoded (all, if 0)."""
+        T = per_stock.shape[1]
         tok = self._episode_tokens(market, per_stock, lambda t: (bars[:, t], bar_mask[:, t]),
-                                   news_raw, news_mask, reload_ckpt=False)
+                                   news_raw, news_mask, past_ret, past_ret_valid,
+                                   self._raw_day_mask(T), reload_ckpt=False)
         return self.temporal_state(tok, avail)
 
-    def encode_episode_streaming(self, market, per_stock, day_bars_fn, news_raw, news_mask, avail, n_days):
+    def encode_episode_streaming(self, market, per_stock, day_bars_fn, news_raw, news_mask, avail, n_days,
+                                 past_ret, past_ret_valid):
         """Streaming encode: day_bars_fn(t) lazily loads day-t bars/mask [B,A,S,F]/[B,A,S] from disk; backward
-        reloads + recomputes per day (reload_ckpt) so the whole episode's bars are never resident."""
-        tok = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask, reload_ckpt=True)
+        reloads + recomputes per day (reload_ckpt) so the whole episode's bars are never resident. Two-speed days
+        outside `raw_recent_days` never load their bars at all."""
+        tok = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid,
+                                   self._raw_day_mask(n_days), reload_ckpt=True)
         return self.temporal_state(tok, avail)
 
-    def encode_tokens(self, market, per_stock, bars, bar_mask, news_raw, news_mask):
-        """Pre-temporal tokens for a (continuous) eval episode, computed ONCE: the expensive full-day raw encode
-        runs per day here; the cheap temporal pass is then re-run per decision over a bounded window (see
-        rl_quant.training.daily_policy._daily_rollout windowing). In-RAM bars -> tok [B,T,A,token_dim]."""
-        return self._episode_tokens(market, per_stock, lambda t: (bars[:, t], bar_mask[:, t]),
-                                    news_raw, news_mask, reload_ckpt=False)
-
-    def encode_tokens_streaming(self, market, per_stock, day_bars_fn, news_raw, news_mask):
-        """Streaming variant of encode_tokens (eval is no_grad, so no reload-checkpoint needed): loads each day's
-        bars once to build the tokens, which stay resident (small) while the per-day bars are released."""
-        return self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask, reload_ckpt=False)
+    def encode_tokens_dual(self, market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid):
+        """EVAL: BOTH token variants for every day, computed ONCE -- (tok_raw [B,T,A,D], tok_noraw [B,T,A,D]).
+        The expensive full-day raw encode runs once per day (for tok_raw); tok_noraw re-projects the same
+        ctx/news/past-return with a zero raw component + has_raw=0. The rolling-window rollout then assembles each
+        decision's slice PER-DECISION (raw variant for its most recent `raw_recent_days`, no-raw before), matching
+        the two-speed geometry training saw. day_bars_fn(t) -> (bars [B,A,S,F], mask [B,A,S]); works for in-RAM
+        slices and streaming loaders alike (eval is no_grad, so no reload-checkpoint is needed)."""
+        T = per_stock.shape[1]
+        tok_raw = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask,
+                                       past_ret, past_ret_valid, [True] * T, reload_ckpt=False)
+        tok_noraw = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask,
+                                         past_ret, past_ret_valid, [False] * T, reload_ckpt=False)
+        return tok_raw, tok_noraw
 
     def step(self, state_t, prev_weights, available):
         """One day's cross-sectional allocation. state_t [B,A,token_dim], prev_weights/available [B,A]

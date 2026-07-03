@@ -38,6 +38,13 @@ class ContextEncoderConfig:
     max_seconds: int = 3600          # full session length in seconds (rolls from the 09:30 open)
     block_seconds: int = 300         # tier-1 block length: seconds attended LOCALLY before the global tier-2
     grad_checkpoint: bool = False    # recompute tier-1 blocks in backward (full-session SSL memory relief)
+    stock_chunk: int = 0             # >0: process the stock axis in chunks of this many stocks (REQUIRED for huge
+    #                                  universes -- one un-chunked TOP2000 day is a ~0.5TB tier-1 activation).
+    #                                  BIT-IDENTICAL to un-chunked in BOTH modes: the encoder is per-stock
+    #                                  weight-shared and the bar BatchNorm runs over the FULL cross-section
+    #                                  BEFORE the chunk loop (same batch stats, one running-stat update). With
+    #                                  grad_checkpoint, each chunk is also checkpointed (backward recomputes one
+    #                                  chunk at a time). 0 = single pass (small universes).
 
 
 def _sinusoidal(n: int, d: int) -> torch.Tensor:
@@ -116,6 +123,7 @@ class ContextEncoder(nn.Module):
         d = config.d_model
         self.block_seconds = config.block_seconds
         self.grad_checkpoint = config.grad_checkpoint
+        self.stock_chunk = config.stock_chunk
         t1 = max(1, config.n_layers // 2)
         t2 = max(1, config.n_layers - t1)
         self.bar_norm = nn.BatchNorm1d(config.bar_feature_dim)   # input normalization over RAW bar fields
@@ -139,9 +147,9 @@ class ContextEncoder(nn.Module):
         """Encode a full session per (batch) day -> a context at EVERY 5-min block (causal). The decision at
         block b uses only blocks 0..b (no look-ahead). bars [B,A,S,F] RAW (session-aligned: index s = second s
         after the 09:30 open), bar_mask [B,A,S], cov_blocks [B,nB,A,C] (as-of covariates at each block).
-        -> per_stock [B,nB,A,d], market [B,nB,d]."""
+        -> per_stock [B,nB,A,d], market [B,nB,d]. `stock_chunk>0` processes the (weight-shared) stock axis in
+        chunks -- bit-identical, bounded activation memory (huge universes)."""
         B, A, S, F = bars.shape
-        d = self.d_model
         bl = self.block_seconds
         nB = S // bl
         if nB * bl != S:                                         # pad the session up to a whole number of blocks
@@ -150,13 +158,40 @@ class ContextEncoder(nn.Module):
             bar_mask = torch.nn.functional.pad(bar_mask, (0, pad))
             S = bars.shape[2]
             nB = S // bl
-        # input normalization on the RAW valid bars (per-feature), then learned embedding
+        # Input normalization on the RAW valid bars (per-feature) over the FULL cross-section, BEFORE the stock
+        # chunk loop: train-mode BatchNorm batch statistics (and the single running-stat update) are then IDENTICAL
+        # with or without chunking -> chunked == un-chunked bit-for-bit in both modes.
         flat = bars.reshape(-1, F)
         mv = bar_mask.reshape(-1)
-        normed = torch.zeros_like(flat)
+        normed_flat = torch.zeros_like(flat)
         if mv.any():
-            normed[mv] = self.bar_norm(flat[mv])
-        x = self.input_proj(normed).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
+            normed_flat[mv] = self.bar_norm(flat[mv])
+        normed = normed_flat.reshape(B, A, S, F)
+        ck = self.stock_chunk if self.stock_chunk and 0 < self.stock_chunk < A else A
+        outs, seens = [], []
+        for lo in range(0, A, ck):                               # per-stock weight-shared -> chunk the stock axis
+            nc, mc = normed[:, lo:lo + ck], bar_mask[:, lo:lo + ck]
+            if ck < A and self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                # chunk-level checkpoint: backward recomputes ONE chunk's tier-1/tier-2 at a time; only the small
+                # normalized-bars slice is saved (the inner per-block checkpoints engage during the recompute).
+                bb, sn = torch.utils.checkpoint.checkpoint(self._stock_blocks, nc, mc, use_reentrant=False)
+            else:
+                bb, sn = self._stock_blocks(nc, mc)
+            outs.append(bb)
+            seens.append(sn)
+        bar_blocks = torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]      # [B, nB, A, d]
+        seen = torch.cat(seens, dim=2) if len(seens) > 1 else seens[0]         # [B, nB, A, 1]
+        return self._fuse_market(bar_blocks, seen, cov_blocks, nB)
+
+    def _stock_blocks(self, normed: torch.Tensor, bar_mask: torch.Tensor):
+        """Per-stock bars path for one stock chunk: embed + tier-1 + tier-2. normed [B,Ac,S,F] (ALREADY
+        bar-normalized -- BN stays outside so its stats/updates are chunk-invariant), bar_mask [B,Ac,S] ->
+        (bar_blocks [B,nB,Ac,d], seen [B,nB,Ac,1])."""
+        B, A, S, F = normed.shape
+        d = self.d_model
+        bl = self.block_seconds
+        nB = S // bl
+        x = self.input_proj(normed.reshape(-1, F)).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
         # --- Tier 1: local causal attention within each block -> learned per-block summaries.
         # Per-block checkpointing: checkpoint each _CausalBlock independently. During forward, each block's
         # input is saved (n_blocks × [B*A*nB, bl, d] ≈ 9.6 GB for d512/8L with B=1 day). During backward,
@@ -205,6 +240,13 @@ class ContextEncoder(nn.Module):
         # timestamp. Empty blocks are not attention keys above, so they cannot become synthetic history.
         seen_blocks = block_has.to(torch.int8).cummax(dim=1).values.bool()
         seen = seen_blocks.reshape(B, A, nB).permute(0, 2, 1).unsqueeze(-1).float()
+        return bar_blocks, seen
+
+    def _fuse_market(self, bar_blocks: torch.Tensor, seen: torch.Tensor, cov_blocks: torch.Tensor, nB: int):
+        """Fuse the (full cross-section) bar contexts with as-of covariates and pool the market context. Runs on
+        the FULL stock axis (cheap: [B*nB*A, C] rows), so the cov BatchNorm stats and the cross-sectional mean are
+        chunk-invariant. bar_blocks [B,nB,A,d], seen [B,nB,A,1], cov_blocks [B,>=nB,A,C]."""
+        B, _, A, d = bar_blocks.shape
         has = seen                                                     # [B, nB, A, 1]
         cf = cov_blocks[:, :nB].reshape(-1, cov_blocks.shape[-1])   # [B*nB*A, C]
         cm = has.reshape(-1) > 0                                    # normalize only PRESENT-stock rows (mirror bars):

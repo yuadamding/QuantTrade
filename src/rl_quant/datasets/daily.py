@@ -106,6 +106,21 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
     day_close = torch.stack([r["day_close"] for r in records])   # [N,A]
     ret, valid = horizon_close_returns(day_close, horizon, exec_delay)            # H-day: TRAINING target/reward
     real_ret, real_valid = horizon_close_returns(day_close, 1, exec_delay)        # 1-day mark: REALIZED/reported PnL
+    # PAST-return INPUT channel (PIT-clean): day d carries its OWN 1-day close-to-close return close_d/close_{d-1}-1,
+    # fully known at the EOD-d decision. This is the raw close series under a scale-invariant normalization (the
+    # 'level'-norm spirit) -- it lets the cross-day temporal encoder compute momentum/reversal over ITS OWN window
+    # (e.g. ~12-month momentum at 252d reach) instead of asking a within-day encoder to reconstruct price history.
+    past_ret = torch.zeros_like(day_close).nan_to_num(0.0)
+    past_valid = torch.zeros(day_close.shape, dtype=torch.bool)
+    past_valid[:, CASH_INDEX] = True
+    if N >= 2:
+        c0, c1 = day_close[:-1], day_close[1:]
+        good = torch.isfinite(c0) & torch.isfinite(c1) & (c0 > 0)
+        pr = torch.where(good, c1 / torch.where(c0 > 0, c0, torch.ones_like(c0)) - 1.0, torch.zeros_like(c0))
+        past_ret[1:] = torch.where(good, pr.clamp(-1.0, 1.0), torch.zeros_like(pr))
+        past_valid[1:] = good
+        past_ret[:, CASH_INDEX] = 0.0
+        past_valid[:, CASH_INDEX] = True
     market = torch.stack([r["market"] for r in records])
     per_stock = torch.stack([r["per_stock"] for r in records])
     news_raw = torch.stack([r["news_raw"] for r in records])
@@ -132,6 +147,7 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
             "news_raw": news_raw[s:e], "news_mask": news_mask[s:e], "avail": avail[s:e],
             "ret": ret[s:e], "ret_valid": valid[s:e],                  # H-day training target
             "real_ret": real_ret[s:e], "real_ret_valid": real_valid[s:e],   # 1-day realized PnL (reported)
+            "past_ret": past_ret[s:e], "past_ret_valid": past_valid[s:e],   # PIT input: own 1-day past return
             "n_blocks": L,
         }
         if stream:

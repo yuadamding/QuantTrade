@@ -43,7 +43,8 @@ def _episode(B, T, gen):
         market=torch.randn(B, T, DC, generator=gen), per_stock=torch.randn(B, T, A, DC, generator=gen),
         bars=torch.randn(B, T, A, S, Fd, generator=gen), bar_mask=torch.ones(B, T, A, S, dtype=torch.bool),
         news_raw=torch.randn(B, T, A, M, 1, generator=gen), news_mask=torch.ones(B, T, A, M, dtype=torch.bool),
-        avail=torch.ones(B, T, A, dtype=torch.bool))
+        avail=torch.ones(B, T, A, dtype=torch.bool),
+        past_ret=0.01 * torch.randn(B, T, A, generator=gen), past_ret_valid=torch.ones(B, T, A, dtype=torch.bool))
 
 
 class HorizonCloseReturns(unittest.TestCase):
@@ -104,7 +105,8 @@ class CrossDayCausality(unittest.TestCase):
         g = torch.Generator().manual_seed(1)
         ep = _episode(2, 6, g)
         state = pol.encode_episode(ep["market"], ep["per_stock"], ep["bars"], ep["bar_mask"],
-                                   ep["news_raw"], ep["news_mask"], ep["avail"])
+                                   ep["news_raw"], ep["news_mask"], ep["avail"],
+                                   ep["past_ret"], ep["past_ret_valid"])
         self.assertEqual(state.shape, (2, 6, A, 16))
         prev = torch.zeros(2, A)
         prev[:, 0] = 1.0
@@ -116,7 +118,8 @@ class CrossDayCausality(unittest.TestCase):
         b2 = ep["bars"].clone()
         b2[:, 5, :, : S // 2] += 5.0
         state2 = pol.encode_episode(ep["market"], ep["per_stock"], b2, ep["bar_mask"],
-                                    ep["news_raw"], ep["news_mask"], ep["avail"])
+                                    ep["news_raw"], ep["news_mask"], ep["avail"],
+                                    ep["past_ret"], ep["past_ret_valid"])
         self.assertLess(float((state2[:, :5] - state[:, :5]).abs().max()), 1e-6)
 
 
@@ -271,6 +274,45 @@ class GradIsolationAndLearnability(unittest.TestCase):
         self.assertTrue(any("raw_encoder" in n for n in names))
         self.assertTrue(any("temporal" in n for n in names))
 
+    def test_planted_edge_survives_production_loss_weights(self) -> None:
+        """PRODUCTION-GEOMETRY guard (2026-06-29 audit): a planted cross-sectional edge ~10x cost must survive the
+        DEFAULT objective coefficients (budget/gate-entropy/missing at their production values, full cost from
+        step 1, reward_scale=1/H) and beat CASH on the reported 1-day mark. The audit showed the OLD weights made
+        this impossible (the loss was penalty-dominated by 2-4 orders of magnitude); this test fails if the
+        objective ever again stops a real edge from being expressed."""
+        torch.manual_seed(0)
+        N, H = 70, 3
+        g = torch.Generator().manual_seed(2)
+        dc = torch.empty(N, A)
+        dc[:, 0] = float("nan")
+        dc[:, 1:] = 100 + (0.5 * torch.randn(N, A - 1, generator=g)).cumsum(0)   # ~0.5%/day moves >> 5e-4 cost
+        recs = [dict(date=f"d{i}", day_close=dc[i], market=torch.randn(DC, generator=g),
+                     per_stock=torch.randn(A, DC, generator=g), bars=torch.randn(A, S, Fd, generator=g),
+                     bar_mask=torch.ones(A, S, dtype=torch.bool), news_raw=torch.zeros(A, M, 1),
+                     news_mask=torch.ones(A, M, dtype=torch.bool), avail=torch.ones(A, dtype=torch.bool))
+                for i in range(N)]
+        eps = build_daily_raw_episodes(recs, episode_len=18, stride=4, horizon=H, exec_delay=1)
+        for e in eps:                                        # PLANT: leak the label into frozen-ctx channel 0
+            e["per_stock"] = e["per_stock"].clone()
+            e["per_stock"][:, :, 0] = e["ret"]
+        ntr = int(len(eps) * 0.7)
+        train_eps, test_eps = eps[:ntr], eps[ntr:]
+        pol = DailyCrossSectionPolicy(_cfg(daily_lookback=18))
+        dev = torch.device("cpu")
+        cost = 5e-4
+        # NOTE: budget_lambda / gate_entropy_coef / missing_label_penalty deliberately NOT passed -> production
+        # defaults; full cost from step 1; per-day-equivalent training reward (reward_scale=1/H).
+        _, _, best_state = train_daily_policy(
+            pol, train_eps, steps=120, lr=3e-3, batch_days=4, cost=cost, bptt_window=18,
+            reward_scale=1.0 / H, eval_every=60, val_eps=test_eps, device=dev,
+            min_val_label_reportable_fraction=0.0)
+        if best_state:
+            pol.load_state_dict(best_state)
+        rows, _ = evaluate_daily_detailed(pol, test_eps, dev, cost=cost)
+        cash, _ = daily_cost_paid_baselines(test_eps)
+        self.assertTrue(rows, "no reportable decisions")
+        self.assertGreater(sum(rows) / len(rows), cash)      # the edge survived the production objective
+
     def test_learns_planted_cross_sectional_signal_and_beats_cash(self) -> None:
         torch.manual_seed(0)
         N, H = 70, 3
@@ -407,6 +449,80 @@ class RewardScaleAndDrift(unittest.TestCase):
         self.assertLess(float(d[0, 0]), 0.5)                                # CASH (0 return) shrank relatively
 
 
+class TwoSpeedTokens(unittest.TestCase):
+    """252d-reach mechanics: with raw_recent_days=R only the LAST R days of an episode get the trainable raw
+    encode; older days contribute frozen ctx + news + the past-return channel (has_raw=0) -- so long histories
+    are visible to the cross-day memory at ~the R-day raw compute."""
+
+    def test_old_days_bars_ignored_but_past_ret_channel_lives(self) -> None:
+        pol = DailyCrossSectionPolicy(_cfg(raw_recent_days=2)).eval()
+        g = torch.Generator().manual_seed(3)
+        ep = _episode(1, 6, g)
+        args = (ep["market"], ep["per_stock"], ep["bars"], ep["bar_mask"], ep["news_raw"], ep["news_mask"],
+                ep["avail"], ep["past_ret"], ep["past_ret_valid"])
+        state = pol.encode_episode(*args)
+        # perturbing an OLD day's BARS (t=1 < T-R=4) has NO effect anywhere: its raw encode never runs
+        b2 = ep["bars"].clone()
+        b2[:, 1, :, : S // 2] += 5.0
+        s2 = pol.encode_episode(ep["market"], ep["per_stock"], b2, ep["bar_mask"], ep["news_raw"],
+                                ep["news_mask"], ep["avail"], ep["past_ret"], ep["past_ret_valid"])
+        self.assertLess(float((s2 - state).abs().max()), 1e-6)
+        # ... but its PAST-RETURN channel still reaches later days' memory (old days stay informative)
+        pr2 = ep["past_ret"].clone()
+        pr2[:, 1, 2] += 0.5
+        s3 = pol.encode_episode(ep["market"], ep["per_stock"], ep["bars"], ep["bar_mask"], ep["news_raw"],
+                                ep["news_mask"], ep["avail"], pr2, ep["past_ret_valid"])
+        self.assertGreater(float((s3[:, 1:] - state[:, 1:]).abs().max()), 1e-6)
+        self.assertLess(float((s3[:, 0] - state[:, 0]).abs().max()), 1e-6)      # causal: day 0 unaffected
+        # a RECENT day's bars (t=5 >= T-R) still matter (the raw encode runs there)
+        b3 = ep["bars"].clone()
+        b3[:, 5, :, : S // 2] += 5.0
+        s4 = pol.encode_episode(ep["market"], ep["per_stock"], b3, ep["bar_mask"], ep["news_raw"],
+                                ep["news_mask"], ep["avail"], ep["past_ret"], ep["past_ret_valid"])
+        self.assertGreater(float((s4[:, 5] - state[:, 5]).abs().max()), 1e-6)
+
+    def test_windowed_rollout_assembles_two_speed_slices(self) -> None:
+        """The rolling-window eval must run under raw_recent_days>0 (dual tokens, per-decision assembly) and
+        bound the memory exactly like the plain windowed path."""
+        pol = DailyCrossSectionPolicy(_cfg(raw_recent_days=2)).eval()
+        g = torch.Generator().manual_seed(4)
+        N, H = 16, 3
+        dc = torch.empty(N, A)
+        dc[:, 0] = float("nan")
+        dc[:, 1:] = 100 + (0.5 * torch.randn(N, A - 1, generator=g)).cumsum(0)
+        recs = [dict(date=f"d{i}", day_close=dc[i], market=torch.randn(DC, generator=g),
+                     per_stock=torch.randn(A, DC, generator=g), bars=torch.randn(A, S, Fd, generator=g),
+                     bar_mask=torch.ones(A, S, dtype=torch.bool), news_raw=torch.zeros(A, M, 1),
+                     news_mask=torch.ones(A, M, dtype=torch.bool), avail=torch.ones(A, dtype=torch.bool))
+                for i in range(N)]
+        eps = build_daily_raw_episodes(recs, episode_len=N, stride=N, horizon=H, exec_delay=1)
+        batch = _stack(eps, [0], torch.device("cpu"))
+        n_win = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", window=5)[0]
+        n_full = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", window=0)[0]
+        self.assertEqual(n_win.shape, n_full.shape)
+        self.assertTrue(torch.isfinite(n_win).all())
+        self.assertFalse(torch.allclose(n_win, n_full))       # bounded memory changes decisions
+
+    def test_past_ret_is_pit_and_matches_closes(self) -> None:
+        N, H = 8, 2
+        g = torch.Generator().manual_seed(5)
+        dc = torch.empty(N, A)
+        dc[:, 0] = float("nan")
+        dc[:, 1:] = 100 + torch.arange(N).float().unsqueeze(1) * torch.arange(1, A).float()  # deterministic ramps
+        recs = [dict(date=f"d{i}", day_close=dc[i], market=torch.randn(DC, generator=g),
+                     per_stock=torch.randn(A, DC, generator=g), bars=torch.randn(A, S, Fd, generator=g),
+                     bar_mask=torch.ones(A, S, dtype=torch.bool), news_raw=torch.zeros(A, M, 1),
+                     news_mask=torch.ones(A, M, dtype=torch.bool), avail=torch.ones(A, dtype=torch.bool))
+                for i in range(N)]
+        eps = build_daily_raw_episodes(recs, episode_len=N, stride=N, horizon=H, exec_delay=1)
+        ep = eps[0]
+        self.assertFalse(bool(ep["past_ret_valid"][0, 1:].any()))            # first day: no prior close
+        for t in range(1, ep["past_ret"].shape[0]):
+            for ai in range(1, A):
+                self.assertAlmostEqual(float(ep["past_ret"][t, ai]),
+                                       float(dc[t, ai] / dc[t - 1, ai] - 1.0), places=6)
+
+
 class EvalWindowHorizon(unittest.TestCase):
     def test_windowed_state_ignores_days_before_the_window(self) -> None:
         """A windowed eval decision at day t must depend only on days [t-W+1 .. t]; a day BEFORE the window cannot
@@ -415,8 +531,9 @@ class EvalWindowHorizon(unittest.TestCase):
         pol = DailyCrossSectionPolicy(_cfg()).eval()
         g = torch.Generator().manual_seed(1)
         ep = _episode(1, 10, g)
-        tok = pol.encode_tokens(ep["market"], ep["per_stock"], ep["bars"], ep["bar_mask"],
-                                ep["news_raw"], ep["news_mask"])
+        tok, _ = pol.encode_tokens_dual(ep["market"], ep["per_stock"],
+                                        lambda t: (ep["bars"][:, t], ep["bar_mask"][:, t]),
+                                        ep["news_raw"], ep["news_mask"], ep["past_ret"], ep["past_ret_valid"])
         avail, W, t = ep["avail"], 3, 8
         lo = t - W + 1                                                      # window [6..8]
         s_win = pol.temporal_state(tok[:, lo:t + 1], avail[:, lo:t + 1])[:, -1]

@@ -71,11 +71,22 @@ class Phase1Design:
     risk_lambda: float = 0.1
     entropy_coef: float = 0.0
     temperature: float = 1.0
+    # -- objective-shaping penalties are calibrated in RETURN UNITS (the per-step net-return scale ~1e-4..1e-3).
+    #    The 2026-06-29 loss-scale audit showed the old values (budget 0.1, gate_ent 1e-3, missing 1.0) were
+    #    2-4 ORDERS OF MAGNITUDE above the return term: optimizing the loss with ZERO edge reproduced the trained
+    #    run exactly (gate pinned at max_actions/nB, cash 0.9+) and no achievable signal (even IC=1) could move it.
+    #    Rule of thumb: a penalty's marginal per-trade hurdle should sit near the trading cost, not 1000x above it.
     max_actions_per_day: float = 5.0  # SOFT per-day trade budget (the policy gates WHEN to act)
-    budget_lambda: float = 0.1        # penalty on the per-day act-gate RATE exceeding max_actions_per_day/nB
+    budget_lambda: float = 1e-3       # rate penalty: marginal trade beyond budget must expect ~budget_lambda
+    #                                   (~10bp/trade = 2x the 5bp cost) -- a soft budget, not a hard clamp (was 0.1
+    #                                   = a 9.5%-per-5-min hurdle no signal can clear)
     gate_init_bias: float = 2.0       # initial act-gate logit (sigmoid(2)=0.88): start TRADING, not in CASH
-    gate_entropy_coef: float = 1e-3   # Bernoulli gate-entropy bonus -> exploration on WHEN to trade
-    missing_label_penalty: float = 1.0 # loss penalty for allocating to actions whose future label is missing
+    gate_entropy_coef: float = 1e-5   # Bernoulli gate-entropy bonus: keeps the gate off exactly 0 (the only
+    #                                   gradient path out of the CASH basin) but subordinate to returns (was 1e-3
+    #                                   = ~100x the return term at equilibrium, positioning the gate by itself)
+    missing_label_penalty: float = 1e-3 # steers off chronically label-missing names without dominating allocation
+    #                                   learning (was 1.0 = ~90x any realistic return gradient -> the alloc head
+    #                                   trained as a missing-label classifier)
     friction_warmup_frac: float = 0.3 # ramp turnover cost + budget penalty 0->full over this frac of policy_steps
     ssl_perstock_coef: float = 1.0    # weight of the per-stock cross-sectional SSL pretext (relative-value signal)
     horizon_mode: str = "intraday"    # "intraday" (trade 5-min blocks within a day) | "daily" (hold ACROSS days)
@@ -91,6 +102,19 @@ class Phase1Design:
     exec_delay: int = 1               # daily_raw: execution delay in DAYS (decide EOD d, execute close d+exec_delay)
     raw_norm: str = "level"           # daily_raw full-day raw input norm: "level" preserves intraday RETURN
     #                                   magnitude (the cross-sectional signal); "instance" whitens it away (legacy)
+    raw_recent_days: int = 0          # daily_raw TWO-SPEED tokens: >0 -> only the last this-many days of an
+    #                                   episode/eval window get the trainable full-day raw encode; older days feed
+    #                                   the cross-day memory as frozen ctx + news + past-return channel. Extends
+    #                                   reach (e.g. 252d, enough to COMPUTE 12-month momentum) at ~this-many days'
+    #                                   raw compute. 0 = every day raw.
+    ssl_daily_coef: float = 1.0       # daily_raw: weight of the DAILY next-H-day SSL pretext (decoupled from
+    #                                   ssl_perstock_coef so the noisy intraday next-block pretext can be zeroed
+    #                                   while keeping the daily relative-value target)
+    enc_stock_chunk: int = 0          # Stage-1 encoder stock-axis chunk (BIT-IDENTICAL; bounded activations).
+    #                                   REQUIRED for huge universes: one un-chunked TOP2000 day is a ~0.5TB tier-1
+    #                                   activation. ~100/chunk fits d512/8L on an 80GB H100. 0 = single pass.
+    raw_stock_chunk: int = 0          # Stage-2 full-day raw encoder stock chunk (bit-identical). TOP2000:
+    #                                   ~512/chunk at raw128/2L. 0 = single pass.
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
     min_gpus: int = 1                 # GPUs to give this setting (data-parallel). Set 2 if peak VRAM > one card
@@ -113,6 +137,12 @@ class Phase1Design:
             raise ValueError(f"{self.name}: need label_horizon_days>=1, daily_lookback>=1, exec_delay>=1")
         if self.episode_len <= 1:
             raise ValueError(f"{self.name}: episode_len must be > 1")
+        if self.raw_recent_days < 0 or self.raw_recent_days > self.episode_len:
+            raise ValueError(f"{self.name}: raw_recent_days must be in [0, episode_len]")
+        if self.ssl_daily_coef < 0:
+            raise ValueError(f"{self.name}: ssl_daily_coef must be >= 0")
+        if self.enc_stock_chunk < 0 or self.raw_stock_chunk < 0:
+            raise ValueError(f"{self.name}: stock chunks must be >= 0 (0 = single pass)")
         if self.episode_stride < 0:
             raise ValueError(f"{self.name}: episode_stride must be >= 0")
         if self.bptt_window < 1:
@@ -170,11 +200,11 @@ _SERIES = [
                  ssl_batch_size=1, ssl_accum=8, batch_days=48, schedule="constant", pol_weight_decay=5e-2,
                  risk_lambda=0.2, amp=True, grad_checkpoint=True),
 
-    Phase1Design("active", "ACTIVE budget 8 (looser budget_lambda 0.05), d512/10L, full session; bf16, entropy",
+    Phase1Design("active", "ACTIVE budget 8 (looser budget_lambda 5e-4), d512/10L, full session; bf16, entropy",
                  session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=10, enc_heads=8,
                  policy_token_dim=640, policy_layers=6, policy_heads=8, ssl_steps=3000, policy_steps=8000,
                  ssl_batch_size=1, ssl_accum=16, batch_days=64, amp=True, grad_checkpoint=True, ssl_lr=2.5e-4,
-                 entropy_coef=0.02, max_actions_per_day=8.0, budget_lambda=0.05),
+                 entropy_coef=0.02, max_actions_per_day=8.0, budget_lambda=5e-4),
 
     # ===== LONGER-HORIZON experiments (coarser blocks => decision cadence AND T+1 hold both lengthen) =====
     # NB: the IC probe found price-based cross-sectional signal ~0 at ALL horizons (5min..daily) in TOP50, so
@@ -229,6 +259,43 @@ _SERIES = [
                  label_horizon_days=21, daily_lookback=42, exec_delay=1, budget_lambda=0.0, ssl_perstock_coef=1.0,
                  friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
                  grad_checkpoint=True),
+
+    # 252-day reach: the ONLY signal that survived the IC probes (12-month momentum, needs ~252d of history) is
+    # invisible to a 42d memory. Two-speed tokens keep the raw compute at ~42 days while the cross-day memory +
+    # the past-return channel span a full year; the noisy intraday per-stock SSL pretext is OFF (its demeaned
+    # next-block target has IC~0 -- pure gradient noise), the DAILY relative-value pretext stays on.
+    Phase1Design("daily_raw_252", "DAILY_RAW 252d reach: two-speed tokens (raw last 42d), H=21; d384/6L",
+                 session_seconds=FULL, block_seconds=300, d_model=384, enc_layers=6, enc_heads=8,
+                 policy_token_dim=256, policy_layers=3, policy_heads=8, ssl_steps=3000, policy_steps=4000,
+                 ssl_batch_size=1, ssl_accum=8, batch_days=2, raw_policy_dim=128, raw_policy_layers=2,
+                 raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=15, bptt_window=42,
+                 label_horizon_days=21, daily_lookback=252, exec_delay=1, raw_recent_days=42,
+                 budget_lambda=0.0, ssl_perstock_coef=0.0, ssl_daily_coef=1.0,
+                 friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
+                 grad_checkpoint=True),
+
+    # ===== TOP2000, 4x H100 JOINTLY (one torchrun data-parallel job; the sweep's GPU pool grants all 4 cards).
+    # Sizing rationale (2026-07 workflow, probe-grounded): the two stages have OPPOSITE binding constraints.
+    #   Stage-1 is DATA-RICH (~1.5M train stock-days, params A-independent) and compute-bound -> scale UP to
+    #   d512/8L (~25.5M params, ~60:1 sample:param) and buy throughput with 4-way day-parallelism; activations are
+    #   bounded by stock-chunking (~100 stocks/chunk ~ 46GB/chunk at d512, ~20 chunks/day) -- NOT by shrinking d.
+    #   Stage-2 is OVERFITTING-BOUND (effective samples = ~840 train DAYS regardless of A; H=21 overlap deflates to
+    #   eff_n ~ 40) -> decision core stays SMALL (tok96/2L ~ 0.3M) + heavy decoupled weight decay; per-stock raw
+    #   encoder stays raw128/2L (stock-day-rich, A-independent) with ~512-stock chunks (~40GB during a day's
+    #   backward-recompute). batch_days=4 / ssl_batch_size=4 shard to 1 day per rank on 4 cards.
+    # NB: at 1-SECOND bars TOP2000 is ~39x TOP50 compute (SSL ~ a week+ on 4 cards); the 1-minute-resample
+    # decision can cut that ~30x and is still open with the user. This design is memory-correct at either
+    # resolution -- resolution changes wall-clock, not the setting.
+    Phase1Design("daily_raw_top2000", "TOP2000 4xH100: d512/8L ctx (chunked 100), tok96/2L policy, 252d two-speed",
+                 session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=8, enc_heads=8,
+                 policy_token_dim=96, policy_layers=2, policy_heads=6, ssl_steps=2000, policy_steps=4000,
+                 ssl_batch_size=4, ssl_accum=8, batch_days=4, raw_policy_dim=128, raw_policy_layers=2,
+                 raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=15, bptt_window=42,
+                 label_horizon_days=21, daily_lookback=252, exec_delay=1, raw_recent_days=42,
+                 enc_stock_chunk=100, raw_stock_chunk=512,
+                 budget_lambda=0.0, ssl_perstock_coef=0.0, ssl_daily_coef=1.0, pol_weight_decay=0.3,
+                 friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
+                 grad_checkpoint=True, min_gpus=4),
 ]
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 

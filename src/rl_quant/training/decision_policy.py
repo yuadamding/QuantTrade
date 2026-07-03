@@ -115,8 +115,8 @@ def _loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef, max_ac
 def train_decision_policy(
     policy, train_days, *, steps: int, lr: float = 3e-4, weight_decay: float = 3e-2,
     batch_days: int = 16, cost: float = 5e-4, risk_lambda: float = 0.1, entropy_coef: float = 0.0,
-    max_actions: float = 5.0, budget_lambda: float = 0.1, gate_entropy_coef: float = 1e-3,
-    missing_label_penalty: float = 1.0, friction_warmup_steps: int = 0, bptt_window: int = 1,
+    max_actions: float = 5.0, budget_lambda: float = 1e-3, gate_entropy_coef: float = 1e-5,
+    missing_label_penalty: float = 1e-3, friction_warmup_steps: int = 0, bptt_window: int = 1,
     grad_checkpoint: bool = False,
     warmup_steps: int = 0, schedule: str = "cosine", grad_clip: float = 0.0, amp: bool = False,
     start_step: int = 0, optimizer=None, best_val: float = -1e9, best_state: dict | None = None,

@@ -49,6 +49,10 @@ class RawWindowConfig:
     exec_latency_ms: int = 1000
     cache_version: int = 1
     use_news: bool = True         # False -> news masked out (reportable ablation; see news_is_reportable)
+    cov_carry_days: int = 400     # as-of covariates CARRY from prior windows up to this many calendar days back
+    #                               (fundamentals publish ~quarterly into event-time partitions; without the carry
+    #                               a window only sees records published INSIDE its ~3 days -> the model saw
+    #                               market_cap on ~10% of stock-days and financials on ~2.5%. 0 disables carry.)
     bar_fields: tuple[str, ...] = field(default=BAR_FIELDS)
     cov_fields: tuple[str, ...] = field(default=COV_FIELDS)
 
@@ -110,16 +114,43 @@ def _et_offset_hours(date_iso: str) -> int:
     return -4 if 3 <= m <= 11 else -5
 
 
+def _window_start_date(window: str) -> str:
+    return window.split("_to_")[0]
+
+
+def _cov_source_windows(root: Path, window: str, cfg: RawWindowConfig) -> list[str]:
+    """Windows whose covariate records can be as-of visible in `window`: the window itself plus PRIOR windows back
+    to `cov_carry_days` calendar days before its start. Fundamentals are event-sparse (quarterly filings, monthly
+    snapshots) and partitions are event-time, so the LAST-KNOWN record usually lives in an EARLIER partition;
+    point-in-time safety is unchanged because visibility is still gated per record on available_timestamp_ms."""
+    wins = list_windows(root)
+    if window not in wins or cfg.cov_carry_days <= 0:
+        return [window]
+    y, m, d = (int(x) for x in _window_start_date(window).split("-"))
+    horizon = (dt.date(y, m, d) - dt.timedelta(days=cfg.cov_carry_days)).isoformat()
+    i = wins.index(window)
+    return [w for w in wins[:i] if _window_start_date(w) >= horizon] + [window]
+
+
 def _load_window_raw(root: Path, window: str, cfg: RawWindowConfig):
     base = Path(root) / "partitions" / window
     bt = pq.read_table(base / "bars.parquet",
                        columns=["symbol", "timestamp_ms", "date_exchange", *cfg.bar_fields])
     bars = {c: (bt.column(c).to_numpy() if c not in ("symbol", "date_exchange") else bt.column(c).to_pylist())
             for c in bt.column_names}
+    # covariates: concat this window's records with prior windows' (the as-of carry); availability stays
+    # per-record point-in-time (available_timestamp_ms), so older records add reach, never look-ahead.
+    cov_cols = ("symbol", "available_timestamp_ms", *cfg.cov_fields)
+    cov_parts = []
+    for w in _cov_source_windows(root, window, cfg):
+        f = Path(root) / "partitions" / w / "covariates.parquet"
+        if f.exists():
+            ct = pq.read_table(f, columns=[c for c in cov_cols if c in pq.read_schema(f).names])
+            cov_parts.append({c: ct.column(c).to_pylist() for c in ct.column_names})
     cov = None
-    if (base / "covariates.parquet").exists():
-        ct = pq.read_table(base / "covariates.parquet")
-        cov = {c: ct.column(c).to_pylist() for c in ct.column_names}
+    if cov_parts:
+        cov = {c: [v for p in cov_parts for v in p.get(c, [None] * len(p["symbol"]))] for c in cov_cols
+               if any(c in p for p in cov_parts)}
     news = []
     if (base / "news.jsonl").exists():
         for line in (base / "news.jsonl").read_text().splitlines():
@@ -181,10 +212,16 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     order = np.lexsort((ts, b_sym))
     sym_s, ts_s = b_sym[order], ts[order]
     close_s = ohlcv[order][:, 3].astype(np.float64)
-    cs = cav = None
+    cs = cav = cvals = None
     if cov is not None and cov.get("symbol"):
         cs = np.array([stock_to_idx.get(s, -1) for s in cov["symbol"]])
-        cav = np.array(cov["available_timestamp_ms"], dtype=np.int64)
+        cav = np.array([int(v) if v is not None else -1 for v in cov["available_timestamp_ms"]], dtype=np.int64)
+        cs = np.where(cav >= 0, cs, -1)              # a record without an availability timestamp is never PIT-usable
+        # raw per-record field values, NaN where null: records are event-sparse and PARTIAL (a monthly market-cap
+        # snapshot has null financials), so the as-of state must FORWARD-FILL per FIELD -- taking the latest row
+        # wholesale would erase previously published fields with 0s.
+        cvals = np.stack([np.array([float(v) if isinstance(v, (int, float)) else np.nan for v in cov[f]],
+                                   dtype=np.float64) for f in cfg.cov_fields], axis=1)   # [n_rows, NC]
     if news:
         nt = np.array([stock_to_idx.get(r.get("ticker"), -1) for r in news])
         nav = np.array([int(r.get("llm_feature_available_timestamp_ms", r.get("published_timestamp_ms", 0)))
@@ -193,12 +230,16 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     for ai in range(1, A):
         m = sym_s == ai
         a_ts, a_close = ts_s[m], close_s[m]
-        cav_a = cidx_a = None
+        cav_a = cfill_a = None
         if cs is not None:
             cm = np.nonzero(cs == ai)[0]
             if len(cm):
-                co = np.argsort(cav[cm])
-                cav_a, cidx_a = cav[cm][co], cm[co]
+                co = np.argsort(cav[cm], kind="stable")
+                cav_a = cav[cm][co]
+                vals_a = cvals[cm][co]                               # [n_a, NC] in availability order, NaN=null
+                fi = np.where(~np.isnan(vals_a), np.arange(len(cav_a))[:, None], 0)
+                np.maximum.accumulate(fi, axis=0, out=fi)            # per-FIELD index of the last non-null so far
+                cfill_a = np.nan_to_num(np.take_along_axis(vals_a, fi, axis=0)).astype(np.float32)
         nav_a = nse_a = None
         if news:
             nm = np.nonzero(nt == ai)[0]
@@ -208,12 +249,10 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
         for d in range(Dd):
             for b in range(nB):
                 te = int(block_end[d, b])
-                if cav_a is not None:                                # as-of covariates at block-b end
+                if cav_a is not None:                                # as-of covariates: per-field last-known state
                     k = np.searchsorted(cav_a, te, "right") - 1
                     if k >= 0:
-                        j = cidx_a[k]
-                        covt[d, b, ai] = [float(cov[f][j]) if isinstance(cov[f][j], (int, float)) else 0.0
-                                          for f in cfg.cov_fields]
+                        covt[d, b, ai] = cfill_a[k]
                 if nav_a is not None:                                # RAW news available by block-b end
                     k = np.searchsorted(nav_a, te, "right")
                     if k > 0:
