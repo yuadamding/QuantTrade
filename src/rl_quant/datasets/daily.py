@@ -110,7 +110,7 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
     # fully known at the EOD-d decision. This is the raw close series under a scale-invariant normalization (the
     # 'level'-norm spirit) -- it lets the cross-day temporal encoder compute momentum/reversal over ITS OWN window
     # (e.g. ~12-month momentum at 252d reach) instead of asking a within-day encoder to reconstruct price history.
-    past_ret = torch.zeros_like(day_close).nan_to_num(0.0)
+    past_ret = torch.zeros(day_close.shape)
     past_valid = torch.zeros(day_close.shape, dtype=torch.bool)
     past_valid[:, CASH_INDEX] = True
     if N >= 2:

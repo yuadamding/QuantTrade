@@ -277,7 +277,10 @@ class DailyCrossSectionPolicy(nn.Module):
         mkt = market.unsqueeze(2).expand(B, T, A, dc)
         flag = torch.tensor(raw_day_mask, device=per_stock.device, dtype=per_stock.dtype)
         flag = flag.view(1, T, 1, 1).expand(B, T, A, 1)
-        pr = past_ret.unsqueeze(-1).to(per_stock.dtype)
+        # Fixed input scaling to ~unit variance (daily moves are ~2%, the other token channels are ~unit scale;
+        # unscaled, the momentum channel would start ~100x under-weighted into token_proj). A constant, applied
+        # identically everywhere -- input normalization, not a learned/engineered feature.
+        pr = (past_ret * 50.0).unsqueeze(-1).to(per_stock.dtype)
         pv = past_ret_valid.unsqueeze(-1).to(per_stock.dtype)
         return self.token_proj(torch.cat([mkt, per_stock, raw, news, pr, pv, flag], dim=-1))  # [B,T,A,token_dim]
 

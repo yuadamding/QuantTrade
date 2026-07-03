@@ -169,7 +169,7 @@ def train_decision_policy(
 
 @torch.no_grad()
 def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: int = 32,
-                             max_missing_label_weight: float = 1e-6) -> tuple[list[float], dict]:
+                             max_missing_label_weight: float = 0.05) -> tuple[list[float], dict]:
     """Realized per-decision net return plus coverage stats.
 
     `reportable_fraction` is reportable blocks over all evaluated blocks; `label_reportable_fraction` uses only
@@ -224,7 +224,7 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
 
 @torch.no_grad()
 def evaluate_policy(policy, days_emb, device, cost: float, batch_days: int = 32,
-                    max_missing_label_weight: float = 1e-6) -> list[float]:
+                    max_missing_label_weight: float = 0.05) -> list[float]:
     """Realized per-decision net return on label-valid/reportable blocks, chunked over days. Pooled list."""
     rows, _ = evaluate_policy_detailed(policy, days_emb, device, cost, batch_days, max_missing_label_weight)
     return rows

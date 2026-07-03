@@ -110,11 +110,14 @@ class Phase1Design:
     ssl_daily_coef: float = 1.0       # daily_raw: weight of the DAILY next-H-day SSL pretext (decoupled from
     #                                   ssl_perstock_coef so the noisy intraday next-block pretext can be zeroed
     #                                   while keeping the daily relative-value target)
-    enc_stock_chunk: int = 0          # Stage-1 encoder stock-axis chunk (BIT-IDENTICAL; bounded activations).
-    #                                   REQUIRED for huge universes: one un-chunked TOP2000 day is a ~0.5TB tier-1
-    #                                   activation. ~100/chunk fits d512/8L on an 80GB H100. 0 = single pass.
-    raw_stock_chunk: int = 0          # Stage-2 full-day raw encoder stock chunk (bit-identical). TOP2000:
-    #                                   ~512/chunk at raw128/2L. 0 = single pass.
+    enc_stock_chunk: int = 0          # Stage-1 encoder stock-axis chunk (numerically identical: exact at eval /
+    #                                   dropout=0; with dropout>0 the RNG is consumed per-chunk, so train-mode is
+    #                                   statistically -- not bit -- equivalent; the chunk value is part of the
+    #                                   context identity). REQUIRED for huge universes: one un-chunked TOP2000 day
+    #                                   is a ~0.5TB tier-1 activation. ~64/chunk fits d512/8L on an 80GB H100
+    #                                   (measured ~0.70 GB/stock backward peak). 0 = single pass.
+    raw_stock_chunk: int = 0          # Stage-2 full-day raw encoder stock chunk (same equivalence caveat).
+    #                                   TOP2000: ~384/chunk at raw128/2L (~0.14 GB/stock measured). 0 = single pass.
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
     min_gpus: int = 1                 # GPUs to give this setting (data-parallel). Set 2 if peak VRAM > one card
@@ -278,11 +281,13 @@ _SERIES = [
     # Sizing rationale (2026-07 workflow, probe-grounded): the two stages have OPPOSITE binding constraints.
     #   Stage-1 is DATA-RICH (~1.5M train stock-days, params A-independent) and compute-bound -> scale UP to
     #   d512/8L (~25.5M params, ~60:1 sample:param) and buy throughput with 4-way day-parallelism; activations are
-    #   bounded by stock-chunking (~100 stocks/chunk ~ 46GB/chunk at d512, ~20 chunks/day) -- NOT by shrinking d.
+    #   bounded by stock-chunking -- NOT by shrinking d. Chunk sizes follow the MEASURED backward peak (~0.70
+    #   GB/stock at d512/8L/bl300, ~0.14 GB/stock at raw128/2L; bf16 + per-block ckpt): enc chunk 64 ~ 45GB +
+    #   ~6GB full-A bases, raw chunk 384 ~ 54GB -- headroom on an 80GB card (100/512 measured at/over budget).
     #   Stage-2 is OVERFITTING-BOUND (effective samples = ~840 train DAYS regardless of A; H=21 overlap deflates to
     #   eff_n ~ 40) -> decision core stays SMALL (tok96/2L ~ 0.3M) + heavy decoupled weight decay; per-stock raw
-    #   encoder stays raw128/2L (stock-day-rich, A-independent) with ~512-stock chunks (~40GB during a day's
-    #   backward-recompute). batch_days=4 / ssl_batch_size=4 shard to 1 day per rank on 4 cards.
+    #   encoder stays raw128/2L (stock-day-rich, A-independent). batch_days=4 / ssl_batch_size=4 shard to 1 day
+    #   per rank on 4 cards; the driver REFUSES to run a min_gpus=4 design at world<4 (it would be ~4x VRAM/rank).
     # NB: at 1-SECOND bars TOP2000 is ~39x TOP50 compute (SSL ~ a week+ on 4 cards); the 1-minute-resample
     # decision can cut that ~30x and is still open with the user. This design is memory-correct at either
     # resolution -- resolution changes wall-clock, not the setting.
@@ -292,7 +297,7 @@ _SERIES = [
                  ssl_batch_size=4, ssl_accum=8, batch_days=4, raw_policy_dim=128, raw_policy_layers=2,
                  raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=15, bptt_window=42,
                  label_horizon_days=21, daily_lookback=252, exec_delay=1, raw_recent_days=42,
-                 enc_stock_chunk=100, raw_stock_chunk=512,
+                 enc_stock_chunk=64, raw_stock_chunk=384,
                  budget_lambda=0.0, ssl_perstock_coef=0.0, ssl_daily_coef=1.0, pol_weight_decay=0.3,
                  friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
                  grad_checkpoint=True, min_gpus=4),

@@ -523,6 +523,95 @@ class TwoSpeedTokens(unittest.TestCase):
                                        float(dc[t, ai] / dc[t - 1, ai] - 1.0), places=6)
 
 
+class RealizedICDiagnostic(unittest.TestCase):
+    """The gross realized-IC skill readout: computed on the policy's RAW allocation view (never the drift-carried
+    held book), sign-correct, and degenerate days are skipped rather than scored 0."""
+
+    def _mk(self, T=20, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        rr = torch.zeros(1, T, A)
+        rr[:, :, 1:] = 0.02 * torch.randn(1, T, A - 1, generator=g)
+        rv = torch.ones(1, T, A, dtype=torch.bool)
+        label = torch.ones(1, T, dtype=torch.bool)
+        return rr, rv, label
+
+    def test_sign_convention_and_magnitude(self) -> None:
+        from rl_quant.training.daily_policy import _cross_sectional_ic
+        rr, rv, label = self._mk()
+        w_fore = torch.zeros(1, rr.shape[1], A)
+        w_fore[:, :, 1:] = torch.softmax(50.0 * rr[:, :, 1:], dim=-1)       # perfect foresight -> IC ~ +1-ish
+        ics = _cross_sectional_ic(w_fore, rr, rv, label)
+        self.assertEqual(len(ics), rr.shape[1])
+        self.assertGreater(sum(ics) / len(ics), 0.5)
+        w_anti = torch.zeros_like(w_fore)
+        w_anti[:, :, 1:] = torch.softmax(-50.0 * rr[:, :, 1:], dim=-1)      # anti-aligned -> strongly negative
+        self.assertLess(sum(_cross_sectional_ic(w_anti, rr, rv, label)) / rr.shape[1], -0.5)
+
+    def test_uniform_view_is_skipped_not_zero(self) -> None:
+        from rl_quant.training.daily_policy import _cross_sectional_ic
+        rr, rv, label = self._mk()
+        w_uni = torch.full((1, rr.shape[1], A), 1.0 / A)                    # no tilt -> no measurable view
+        self.assertEqual(_cross_sectional_ic(w_uni, rr, rv, label), [])
+
+    def test_drift_leak_scenario_scores_zero_on_raw_view(self) -> None:
+        """The failure the audit caught: a gate~0 book passively RIDING persistent returns scored IC~1 when the
+        held book was used. On the RAW view (a fixed uniform bet, no information) the IC must be ~0 even under
+        strongly autocorrelated returns."""
+        from rl_quant.training.daily_policy import _cross_sectional_ic, _held_drift
+        T = 40
+        g = torch.Generator().manual_seed(1)
+        base = 0.02 * torch.randn(1, A - 1, generator=g)                    # persistent cross-section (rho ~ 1)
+        rr = torch.zeros(1, T, A)
+        rr[:, :, 1:] = base.unsqueeze(1) + 0.002 * torch.randn(1, T, A - 1, generator=g)
+        rv = torch.ones(1, T, A, dtype=torch.bool)
+        label = torch.ones(1, T, dtype=torch.bool)
+        w_view = torch.zeros(1, T, A)
+        w_view[:, :, 1:] = 1.0 / (A - 1)                                    # the policy's VIEW: uniform, zero skill
+        self.assertEqual(_cross_sectional_ic(w_view, rr, rv, label), [])    # skipped: no tilt
+        # meanwhile the drift-carried BOOK becomes return-aligned -- exactly why it must NOT be the IC input
+        book = torch.zeros(1, A)
+        book[:, 1:] = 1.0 / (A - 1)
+        for t in range(T):
+            book = _held_drift(book, rr[:, t], rv[:, t])
+        held = book.unsqueeze(1).expand(1, T, A)
+        held_ics = _cross_sectional_ic(held, rr, rv, label)
+        self.assertGreater(sum(held_ics) / len(held_ics), 0.5)             # the spurious 'skill' the fix removes
+
+
+class ReportableGate(unittest.TestCase):
+    def test_hole_name_does_not_disqualify_diffuse_book(self) -> None:
+        """The recalibrated missing_label_penalty (1e-3) no longer forces the softmax book out of chronically
+        unlabeled names; the eval WEIGHT tolerance must therefore admit a diffuse book (~1/A per name) holding one
+        hole name -- the old 1e-6 tolerance disqualified nearly every day and val selection returned -1e9."""
+        N, H = 30, 3
+        g = torch.Generator().manual_seed(0)
+        dc = torch.empty(N, A)
+        dc[:, 0] = float("nan")
+        dc[:, 1:] = 100 + (0.5 * torch.randn(N, A - 1, generator=g)).cumsum(0)
+        dc[:, 1] = float("nan")                                             # action 1: a permanent hole name
+        recs = [dict(date=f"d{i}", day_close=dc[i], market=torch.randn(DC, generator=g),
+                     per_stock=torch.randn(A, DC, generator=g), bars=torch.randn(A, S, Fd, generator=g),
+                     bar_mask=torch.ones(A, S, dtype=torch.bool), news_raw=torch.zeros(A, M, 1),
+                     news_mask=torch.ones(A, M, dtype=torch.bool), avail=torch.ones(A, dtype=torch.bool))
+                for i in range(N)]
+        eps = build_daily_raw_episodes(recs, episode_len=N, stride=N, horizon=H, exec_delay=1)
+        pol = DailyCrossSectionPolicy(_cfg()).eval()                        # untrained -> near-uniform softmax book
+        dev = torch.device("cpu")
+        # this toy universe has A-1=3 names, so one hole name carries ~1/3 of the book; scale the tolerance to
+        # ~1.5/A for the same "one diffuse hole name tolerated" semantics the 0.05 default gives real universes
+        tol = 1.5 / A
+        _, st = evaluate_daily_detailed(pol, eps, dev, cost=0.0, max_missing_label_weight=tol)
+        self.assertGreaterEqual(st["label_reportable_fraction"], 0.95,
+                                "a ~1/A hole-name weight must be tolerated at a ~1/A-scaled gate")
+        _, st_old = evaluate_daily_detailed(pol, eps, dev, cost=0.0, max_missing_label_weight=1e-6)
+        self.assertLess(st_old["label_reportable_fraction"], 0.5)           # the old tolerance rejected everything
+        # PRODUCTION calibration guard: the default must tolerate >=2 diffuse hole names on the SMALLEST real
+        # universe (TOP50: 1/51 each) -- the audit's failure was the default sitting ~4 orders below that.
+        import inspect
+        default = inspect.signature(evaluate_daily_detailed).parameters["max_missing_label_weight"].default
+        self.assertGreaterEqual(default, 2 / 51)
+
+
 class EvalWindowHorizon(unittest.TestCase):
     def test_windowed_state_ignores_days_before_the_window(self) -> None:
         """A windowed eval decision at day t must depend only on days [t-W+1 .. t]; a day BEFORE the window cannot

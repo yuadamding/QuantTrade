@@ -40,11 +40,14 @@ class ContextEncoderConfig:
     grad_checkpoint: bool = False    # recompute tier-1 blocks in backward (full-session SSL memory relief)
     stock_chunk: int = 0             # >0: process the stock axis in chunks of this many stocks (REQUIRED for huge
     #                                  universes -- one un-chunked TOP2000 day is a ~0.5TB tier-1 activation).
-    #                                  BIT-IDENTICAL to un-chunked in BOTH modes: the encoder is per-stock
-    #                                  weight-shared and the bar BatchNorm runs over the FULL cross-section
+    #                                  NUMERICALLY IDENTICAL to un-chunked (exact at eval / dropout=0): per-stock
+    #                                  weight-shared, and the bar BatchNorm runs over the FULL cross-section
     #                                  BEFORE the chunk loop (same batch stats, one running-stat update). With
-    #                                  grad_checkpoint, each chunk is also checkpointed (backward recomputes one
-    #                                  chunk at a time). 0 = single pass (small universes).
+    #                                  dropout>0 the RNG is consumed per-chunk, so train-mode is statistically --
+    #                                  not bit -- equivalent (the chunk value is part of the config identity).
+    #                                  With grad_checkpoint, each chunk is also checkpointed (backward recomputes
+    #                                  one chunk at a time; the checkpoint keeps the normalized-bars base alive,
+    #                                  which the BN backward needs anyway). 0 = single pass (small universes).
 
 
 def _sinusoidal(n: int, d: int) -> torch.Tensor:

@@ -69,6 +69,15 @@ class DefaultConsistency(unittest.TestCase):
         self.assertLessEqual(d.missing_label_penalty, 1e-2)
         self.assertGreater(d.gate_entropy_coef, 0.0)                # keep >0: the path out of the CASH basin
 
+    def test_every_design_stays_return_unit_calibrated(self) -> None:
+        """No per-design OVERRIDE may reintroduce the old penalty scales -- the dataclass-default bounds alone
+        would miss a design that sets e.g. budget_lambda=0.1 explicitly."""
+        from rl_quant.training.designs import DESIGNS
+        for name, d in DESIGNS.items():
+            self.assertLessEqual(d.budget_lambda, 2e-3, name)
+            self.assertLessEqual(d.gate_entropy_coef, 1e-4, name)
+            self.assertLessEqual(d.missing_label_penalty, 1e-2, name)
+
     def test_trainer_defaults_match_design_defaults(self) -> None:
         """The trainer function defaults and Phase1Design defaults must not drift apart."""
         import inspect
