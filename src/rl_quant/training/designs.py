@@ -110,6 +110,12 @@ class Phase1Design:
     ssl_daily_coef: float = 1.0       # daily_raw: weight of the DAILY next-H-day SSL pretext (decoupled from
     #                                   ssl_perstock_coef so the noisy intraday next-block pretext can be zeroed
     #                                   while keeping the daily relative-value target)
+    bar_seconds: int = 1              # bar GRID resolution: 1 = raw 1-second tokens; >1 = the loader RESAMPLES to
+    #                                   bar_seconds-OHLCV (open=first/high=max/low=min/close=last/volume=sum per
+    #                                   slot -- the same raw fields on a coarser grid, computed at load time).
+    #                                   T+1 labels / day open+close / PIT joins stay on raw 1-second timestamps.
+    #                                   60 cuts per-day encode tokens ~60x: the lever that fits TOP2000 training
+    #                                   inside ONE DAY on 4xH100. Must divide block_seconds.
     enc_stock_chunk: int = 0          # Stage-1 encoder stock-axis chunk (numerically identical: exact at eval /
     #                                   dropout=0; with dropout>0 the RNG is consumed per-chunk, so train-mode is
     #                                   statistically -- not bit -- equivalent; the chunk value is part of the
@@ -155,6 +161,9 @@ class Phase1Design:
         if self.session_seconds % self.block_seconds:
             raise ValueError(f"{self.name}: block_seconds {self.block_seconds} must divide "
                              f"session_seconds {self.session_seconds}")
+        if self.bar_seconds < 1 or self.block_seconds % self.bar_seconds:
+            raise ValueError(f"{self.name}: bar_seconds {self.bar_seconds} must be >=1 and divide "
+                             f"block_seconds {self.block_seconds}")
         if self.max_actions_per_day <= 0 or self.budget_lambda < 0 or self.missing_label_penalty < 0:
             raise ValueError(f"{self.name}: need max_actions_per_day>0, budget_lambda>=0, missing_label_penalty>=0")
         if self.min_gpus < 1:
@@ -267,8 +276,12 @@ _SERIES = [
     # invisible to a 42d memory. Two-speed tokens keep the raw compute at ~42 days while the cross-day memory +
     # the past-return channel span a full year; the noisy intraday per-stock SSL pretext is OFF (its demeaned
     # next-block target has IC~0 -- pure gradient noise), the DAILY relative-value pretext stays on.
-    Phase1Design("daily_raw_252", "DAILY_RAW 252d reach: two-speed tokens (raw last 42d), H=21; d384/6L",
-                 session_seconds=FULL, block_seconds=300, d_model=384, enc_layers=6, enc_heads=8,
+    # 1-MINUTE bars (bar_seconds=60): same raw OHLCV fields on a coarser grid, resampled at load time; labels and
+    # PIT joins stay 1s-accurate. Cuts the day-encode ~60x -> this design completes in HOURS on one H100 (the
+    # 1-second variant needed ~31 GPU-h for SSL alone). The daily thesis lives at 21d horizons -- intra-5-minute
+    # microstructure carried ~no signal in the IC probes, so the coarser grid costs little information.
+    Phase1Design("daily_raw_252", "DAILY_RAW 252d reach: two-speed tokens (raw last 42d), H=21; d384/6L; 1-min bars",
+                 session_seconds=FULL, block_seconds=300, bar_seconds=60, d_model=384, enc_layers=6, enc_heads=8,
                  policy_token_dim=256, policy_layers=3, policy_heads=8, ssl_steps=3000, policy_steps=4000,
                  ssl_batch_size=1, ssl_accum=8, batch_days=2, raw_policy_dim=128, raw_policy_layers=2,
                  raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=15, bptt_window=42,
@@ -277,27 +290,26 @@ _SERIES = [
                  friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
                  grad_checkpoint=True),
 
-    # ===== TOP2000, 4x H100 JOINTLY (one torchrun data-parallel job; the sweep's GPU pool grants all 4 cards).
+    # ===== TOP2000, 4x H100 JOINTLY, sized to FINISH IN ONE DAY (one torchrun data-parallel job).
     # Sizing rationale (2026-07 workflow, probe-grounded): the two stages have OPPOSITE binding constraints.
-    #   Stage-1 is DATA-RICH (~1.5M train stock-days, params A-independent) and compute-bound -> scale UP to
-    #   d512/8L (~25.5M params, ~60:1 sample:param) and buy throughput with 4-way day-parallelism; activations are
-    #   bounded by stock-chunking -- NOT by shrinking d. Chunk sizes follow the MEASURED backward peak (~0.70
-    #   GB/stock at d512/8L/bl300, ~0.14 GB/stock at raw128/2L; bf16 + per-block ckpt): enc chunk 64 ~ 45GB +
-    #   ~6GB full-A bases, raw chunk 384 ~ 54GB -- headroom on an 80GB card (100/512 measured at/over budget).
-    #   Stage-2 is OVERFITTING-BOUND (effective samples = ~840 train DAYS regardless of A; H=21 overlap deflates to
-    #   eff_n ~ 40) -> decision core stays SMALL (tok96/2L ~ 0.3M) + heavy decoupled weight decay; per-stock raw
-    #   encoder stays raw128/2L (stock-day-rich, A-independent). batch_days=4 / ssl_batch_size=4 shard to 1 day
-    #   per rank on 4 cards; the driver REFUSES to run a min_gpus=4 design at world<4 (it would be ~4x VRAM/rank).
-    # NB: at 1-SECOND bars TOP2000 is ~39x TOP50 compute (SSL ~ a week+ on 4 cards); the 1-minute-resample
-    # decision can cut that ~30x and is still open with the user. This design is memory-correct at either
-    # resolution -- resolution changes wall-clock, not the setting.
-    Phase1Design("daily_raw_top2000", "TOP2000 4xH100: d512/8L ctx (chunked 100), tok96/2L policy, 252d two-speed",
-                 session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=8, enc_heads=8,
-                 policy_token_dim=96, policy_layers=2, policy_heads=6, ssl_steps=2000, policy_steps=4000,
+    #   Stage-1 is DATA-RICH (~1.5M train stock-days, params A-independent) -> d512/8L (~25.5M params, ~60:1
+    #   sample:param). Stage-2 is OVERFITTING-BOUND (effective samples = ~840 train DAYS regardless of A; H=21
+    #   overlap deflates to eff_n ~ 40) -> decision core SMALL (tok96/2L ~ 0.3M) + heavy decoupled weight decay;
+    #   per-stock raw encoder raw128/2L (stock-day-rich, A-independent).
+    # ONE-DAY WALL-CLOCK BUDGET at bar_seconds=60 (1-min bars; tokens/day-encode = 2000 x 390 = 780k ~ 0.67x a
+    # TOP50-at-1s day): d512/8L day-encode ~ 7s fwd+bwd -> SSL 1000 steps x 8 accum x 1 day/rank ~ 15.5h; frozen
+    # encode of 1121 days ~ 45min; policy 2000 steps (42-day two-speed raw at raw128 ~ seconds/step) ~ 1-2h;
+    # evals + verdict < 1h  =>  ~18h total. (At 1-SECOND bars the same design needs ~a week for SSL alone --
+    # bar_seconds is the lever, not step-count tuning.) 1-min activations are ~60x smaller, so NO stock-chunking
+    # is needed (full-A tier-1 backward ~ 23GB at d512; chunking machinery remains for any 1s config).
+    # batch_days=4 / ssl_batch_size=4 shard to 1 day per rank on 4 cards; the driver REFUSES to run a min_gpus=4
+    # design at world<4 (it would be ~4x VRAM/rank).
+    Phase1Design("daily_raw_top2000", "TOP2000 4xH100 ~18h: 1-min bars, d512/8L ctx, tok96/2L policy, 252d two-speed",
+                 session_seconds=FULL, block_seconds=300, bar_seconds=60, d_model=512, enc_layers=8, enc_heads=8,
+                 policy_token_dim=96, policy_layers=2, policy_heads=6, ssl_steps=1000, policy_steps=2000,
                  ssl_batch_size=4, ssl_accum=8, batch_days=4, raw_policy_dim=128, raw_policy_layers=2,
                  raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=15, bptt_window=42,
                  label_horizon_days=21, daily_lookback=252, exec_delay=1, raw_recent_days=42,
-                 enc_stock_chunk=64, raw_stock_chunk=384,
                  budget_lambda=0.0, ssl_perstock_coef=0.0, ssl_daily_coef=1.0, pol_weight_decay=0.3,
                  friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
                  grad_checkpoint=True, min_gpus=4),

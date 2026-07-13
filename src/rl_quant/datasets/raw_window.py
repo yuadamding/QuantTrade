@@ -44,6 +44,13 @@ MAX_NEWS = 32     # most-recent articles kept per (stock, decision); the model a
 class RawWindowConfig:
     session_seconds: int = 23400  # full RTH session (09:30->16:00) stored once per day (session-aligned)
     block_seconds: int = 300      # candidate/decision cadence = the encoder's tier-1 block (must match it)
+    bar_seconds: int = 1          # bar GRID resolution: 1 = raw 1-second rows scattered as-is; >1 = the raw rows
+    #                               are RESAMPLED to bar_seconds-OHLCV at load time (open=first, high=max, low=min,
+    #                               close=last, volume=sum per slot). Same raw fields on a coarser grid -- input
+    #                               organization, NOT a stored/engineered feature. T+1 LABELS, day open/close, and
+    #                               all PIT joins keep using the raw 1-second rows' real timestamps (unchanged
+    #                               accuracy); only the model's bar tokens coarsen. 60 makes TOP2000 ~40x cheaper
+    #                               (the lever that fits training in a day). Must divide block_seconds.
     max_news: int = MAX_NEWS
     open_et_hhmm: tuple[int, int] = (9, 30)
     exec_latency_ms: int = 1000
@@ -180,12 +187,16 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     days = sorted(set(bars["date_exchange"]))
     if not days:
         return None
-    S, bl = cfg.session_seconds, cfg.block_seconds
-    nB = S // bl
+    gs = max(1, int(cfg.bar_seconds))                        # bar-grid resolution (1 = raw seconds)
+    if cfg.block_seconds % gs:
+        raise ValueError(f"bar_seconds {gs} must divide block_seconds {cfg.block_seconds}")
+    S = cfg.session_seconds // gs                            # bar SLOTS per session (tokens the encoder sees)
+    bl = cfg.block_seconds // gs                             # bar slots per tier-1 block
+    nB = cfg.session_seconds // cfg.block_seconds
     Dd, A, F, M, NC = len(days), n_actions, len(cfg.bar_fields), cfg.max_news, len(cfg.cov_fields)
     day_idx = {d: i for i, d in enumerate(days)}
     open_ms = np.array([_open_ms(d, cfg) for d in days], dtype=np.int64)              # [Dd]
-    block_end = open_ms[:, None] + (np.arange(1, nB + 1) * bl * 1000)                 # [Dd,nB] block-b end (ms)
+    block_end = open_ms[:, None] + (np.arange(1, nB + 1) * cfg.block_seconds * 1000)  # [Dd,nB] block-b end (ms)
     lat = cfg.exec_latency_ms
 
     bars_t = np.zeros((Dd, A, S, F), dtype=np.float32)
@@ -198,15 +209,43 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     ret[:, :, 0] = 0.0          # CASH return is identically 0 at every block
     ret_valid[:, :, 0] = True
 
-    # --- bars: vectorized scatter of every bar into [day, stock, second-offset from the open] ---
+    # --- bars: vectorized scatter of every raw row into [day, stock, grid-slot offset from the open]. At gs=1
+    # the slot IS the second (at most one raw row per slot -> plain scatter). At gs>1 the rows in a slot are
+    # RESAMPLED to one OHLCV bar: open = first row's open, high = max, low = min, close = last row's close,
+    # volume = sum -- the standard aggregation of the same raw fields, computed here at load time. ---
     ts = bars["timestamp_ms"].astype(np.int64)
     b_sym = np.array([stock_to_idx.get(s, -1) for s in bars["symbol"]], dtype=np.int64)
     b_day = np.array([day_idx[d] for d in bars["date_exchange"]], dtype=np.int64)
-    b_soff = (ts - open_ms[b_day]) // 1000
+    b_soff = (ts - open_ms[b_day]) // (1000 * gs)
     ok = (b_sym >= 1) & (b_soff >= 0) & (b_soff < S)
     ohlcv = np.stack([bars[f].astype(np.float32) for f in cfg.bar_fields], axis=1)    # [N,F]
-    bars_t[b_day[ok], b_sym[ok], b_soff[ok]] = ohlcv[ok]
-    bar_mask[b_day[ok], b_sym[ok], b_soff[ok]] = True
+    if gs == 1:
+        bars_t[b_day[ok], b_sym[ok], b_soff[ok]] = ohlcv[ok]
+        bar_mask[b_day[ok], b_sym[ok], b_soff[ok]] = True
+    else:
+        oi = np.nonzero(ok)[0]
+        slot_key = (b_day[oi] * A + b_sym[oi]) * S + b_soff[oi]                      # unique (day,stock,slot) id
+        so = oi[np.lexsort((ts[oi], slot_key))]                                      # slot-major, time-ascending
+        k_sorted = (b_day[so] * A + b_sym[so]) * S + b_soff[so]
+        uniq, first_pos, counts = np.unique(k_sorted, return_index=True, return_counts=True)
+        first_row = so[first_pos]                                                    # earliest raw row per slot
+        last_row = so[first_pos + counts - 1]                                        # latest raw row per slot
+        d_u, s_u, o_u = b_day[first_row], b_sym[first_row], b_soff[first_row]
+        fields = {f: i for i, f in enumerate(cfg.bar_fields)}
+        bars_t[d_u, s_u, o_u, fields["open"]] = ohlcv[first_row, fields["open"]]
+        bars_t[d_u, s_u, o_u, fields["close"]] = ohlcv[last_row, fields["close"]]
+        # high/low/volume reduce over ALL rows in the slot (order-independent)
+        hi = np.full(len(uniq), -np.inf, dtype=np.float64)
+        lo_ = np.full(len(uniq), np.inf, dtype=np.float64)
+        vol = np.zeros(len(uniq), dtype=np.float64)
+        pos = np.searchsorted(uniq, k_sorted)                                        # row -> slot group
+        np.maximum.at(hi, pos, ohlcv[so, fields["high"]].astype(np.float64))
+        np.minimum.at(lo_, pos, ohlcv[so, fields["low"]].astype(np.float64))
+        np.add.at(vol, pos, ohlcv[so, fields["volume"]].astype(np.float64))
+        bars_t[d_u, s_u, o_u, fields["high"]] = hi.astype(np.float32)
+        bars_t[d_u, s_u, o_u, fields["low"]] = lo_.astype(np.float32)
+        bars_t[d_u, s_u, o_u, fields["volume"]] = vol.astype(np.float32)
+        bar_mask[d_u, s_u, o_u] = True
 
     # --- per-stock as-of covariates / raw news / T+1 labels at each (day, block) ---
     order = np.lexsort((ts, b_sym))
@@ -264,10 +303,11 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
                     t_en, t_ex = int(block_end[d, b + 1]) + lat, int(block_end[d, b + 2]) + lat
                     ei = np.searchsorted(a_ts, t_en, "left")
                     xi = np.searchsorted(a_ts, t_ex, "left")
-                    day_close = int(open_ms[d]) + S * 1000           # nominal RTH end (reject post-close/AH bars)
+                    day_close = int(open_ms[d]) + cfg.session_seconds * 1000   # nominal RTH end (reject AH bars)
                     if (ei < len(a_close) and xi < len(a_close) and a_close[ei] > 0
                             and a_ts[ei] < day_close and a_ts[xi] < day_close            # entry & exit IN that RTH
-                            and a_ts[ei] - t_en <= bl * 1000 and a_ts[xi] - t_ex <= bl * 1000):  # near the target
+                            and a_ts[ei] - t_en <= cfg.block_seconds * 1000            # near the target (real time,
+                            and a_ts[xi] - t_ex <= cfg.block_seconds * 1000):         # NOT grid slots)
                         r = a_close[xi] / a_close[ei] - 1.0
                         if np.isfinite(r):
                             ret[d, b, ai] = float(np.clip(r, -1.0, 1.0))
