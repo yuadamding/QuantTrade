@@ -4,10 +4,11 @@ Operates on cached FROZEN context embeddings plus raw 1-second OHLCV carried thr
 policy owns a separate trainable raw-second encoder, so profit gradients can learn a raw-bar policy representation
 without reaching the frozen context encoder -- the context/policy split remains structural.
 
-The policy chooses WHEN to trade: at each 5-min block it emits an act-gate g in [0,1] (trade vs hold) and a
-target allocation w. The held position is a = g*w + (1-g)*prev (holding is free of turnover). Trades are T+1:
-the position decided at block b is realized over the label horizon AFTER block b (ret[b] is already the T+1
-forward return).
+The policy chooses WHEN to trade: at each 5-min block it emits an act-gate g in [0,1] (rebalance intensity) and a
+target allocation w. Trades are T+1. The policy observes only the previously submitted allocation that has
+executed by its decision timestamp; when the new instruction executes one interval later, its gate interpolates
+against the then-current drifted book. That future pre-trade book is used only for execution/turnover accounting
+and never enters the current policy observation. ``ret[b]`` is the return after block b's delayed execution.
 
 Escaping the CASH basin (why the naive objective collapses): CASH has return identically 0, so doing nothing is
 an exact zero-loss sink, and the act-gate can shut (g->0) before the allocation head ever learns an edge -- a
@@ -29,7 +30,7 @@ import torch
 import torch.utils.checkpoint
 
 from rl_quant.execution import drift_weights, force_unavailable_to_cash, one_way_turnover
-from rl_quant.training._optim import apply_lr, lr_scale
+from rl_quant.training._optim import apply_lr, lr_scale, make_adamw
 
 CASH_INDEX = 0
 
@@ -87,8 +88,15 @@ def _rollout(
         batch["news_raw"], batch["news_mask"], batch["ret"], batch["ret_valid"], batch["avail"]
     )
     B, nB, A, _ = per_stock.shape
-    prev_w = torch.zeros(B, A, device=per_stock.device)
-    prev_w[:, CASH_INDEX] = 1.0
+    # Delayed labels require two books.  ``decision_weights`` has just
+    # executed at the current decision and is observable.  The previous
+    # action's post-return ``execution_pretrade`` is the book one interval
+    # later, when today's instruction executes; it may determine turnover and
+    # the gate's execution result, but feeding it to today's policy leaks the
+    # next price.  The old single ``prev_w`` mixed those timestamps.
+    decision_weights = torch.zeros(B, A, device=per_stock.device)
+    decision_weights[:, CASH_INDEX] = 1.0
+    execution_pretrade = decision_weights
     ckpt = grad_checkpoint and policy.training
     # Evaluation has no activation-retention constraint, so encode all policy raw steps in one vectorized call.
     # DecisionPolicyHead's batched path is algebraically identical to encode_raw_policy_step for both intraday
@@ -97,7 +105,6 @@ def _rollout(
     if not policy.training and hasattr(policy, "encode_raw_policy_context"):
         raw_sequence = policy.encode_raw_policy_context(batch["bars"], batch["bar_mask"], nB)
     nets, gates, ents, cash_w, turn, missing_w, post_weights = [], [], [], [], [], [], []
-    final_weights = prev_w
     for b in range(nB):
         if raw_sequence is not None:
             raw_ctx = raw_sequence[:, b]
@@ -106,11 +113,16 @@ def _rollout(
                 policy.encode_raw_policy_step, batch["bars"], batch["bar_mask"], b, use_reentrant=False)
         else:
             raw_ctx = policy.encode_raw_policy_step(batch["bars"], batch["bar_mask"], b)
-        before_trade = prev_w
-        feasible_prev = force_unavailable_to_cash(before_trade, avail[:, b], cash_index=CASH_INDEX)
+        decision_visible = force_unavailable_to_cash(
+            decision_weights, avail[:, b], cash_index=CASH_INDEX
+        )
         w, g = policy(market[:, b], per_stock[:, b], raw_ctx, news_raw[:, b], news_mask[:, b],
-                      feasible_prev.detach(), avail[:, b])
-        a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * feasible_prev  # carry WITH grad -> T+1
+                      decision_visible.detach(), avail[:, b])
+        before_trade = execution_pretrade
+        feasible_pretrade = force_unavailable_to_cash(before_trade, avail[:, b], cash_index=CASH_INDEX)
+        # Apply the submitted rebalance intensity at the delayed execution
+        # timestamp.  gate=0 leaves the then-current drifted book untouched.
+        a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * feasible_pretrade
         valid = ret_valid[:, b].bool()
         missing = (a * (~valid).to(a.dtype)).sum(-1)
         realized = (a * torch.where(valid, ret[:, b], torch.zeros_like(ret[:, b]))).sum(-1)
@@ -127,8 +139,9 @@ def _rollout(
         # rebalances back to ``a`` for free and understates subsequent turnover.
         final_weights = _held_drift(a, ret[:, b], valid)
         post_weights.append(final_weights)
-        prev_w = (final_weights.detach()
-                  if (bptt_window <= 1 or (b + 1) % bptt_window == 0) else final_weights)  # truncation boundary
+        detach = bptt_window <= 1 or (b + 1) % bptt_window == 0
+        decision_weights = a.detach() if detach else a
+        execution_pretrade = final_weights.detach() if detach else final_weights
     st = lambda xs: torch.stack(xs, 1)  # noqa: E731
     nets_t, turn_t = st(nets), st(turn)
     if terminal_liquidate and nets:
@@ -179,13 +192,18 @@ def train_decision_policy(
     min_val_label_reportable_fraction: float = 0.95,
     on_eval: Callable[[int, float, float, dict | None, object], None] | None = None,
     grad_reduce: Callable[[list], None] | None = None, is_main: bool = True,
+    prepare_checkpoint: Callable[[], None] | None = None,
+    sync_after_eval: Callable[[], None] | None = None,
 ):
     """Train the event-timed differentiable-portfolio policy on detached context plus raw bars. The turnover cost
     and the budget penalty are warmed up from 0 -> full over `friction_warmup_steps` (curriculum: learn the edge
     first, then constrain frequency). Validation selection ignores checkpoints whose label-valid reportable
-    coverage is below `min_val_label_reportable_fraction`. Returns (optimizer, best_val, best_state)."""
+    coverage is below `min_val_label_reportable_fraction`. Distributed callers
+    may provide ``prepare_checkpoint`` for an all-rank snapshot after
+    validation, then ``sync_after_eval`` to rendezvous after rank-0 checkpoint
+    I/O. Returns (optimizer, best_val, best_state)."""
     if optimizer is None:
-        optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = make_adamw(policy.parameters(), lr=lr, weight_decay=weight_decay)
     dev_type = (device.type if hasattr(device, "type") else "cuda")
     n = len(train_days)
     for step in range(start_step, steps):
@@ -200,25 +218,32 @@ def train_decision_policy(
             )
             loss = _loss(nets, gates, ents, missing_w, batch["label"], risk_lambda, entropy_coef,
                          max_actions, budget_lambda * friction, gate_entropy_coef, missing_label_penalty)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_reduce is not None:                  # data-parallel: average grads across ranks before the step
             grad_reduce(list(policy.parameters()))
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
         optimizer.step()
-        if ((eval_every and (step + 1) % eval_every == 0) or step == steps - 1) and is_main:
-            if val_days:
-                vr, vstats = evaluate_policy_detailed(policy, val_days, device, cost)
-                ok_coverage = vstats["label_reportable_fraction"] >= min_val_label_reportable_fraction
-                vmean = (sum(vr) / len(vr)) if (vr and ok_coverage) else -1e9
-            else:
-                vmean = -1e9
-            if vmean > best_val:
-                best_val = vmean
-                best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
-            if on_eval:
-                on_eval(step + 1, vmean, best_val, best_state, optimizer)
+        should_eval = bool((eval_every and (step + 1) % eval_every == 0) or step == steps - 1)
+        if should_eval:
+            if is_main:
+                if val_days:
+                    vr, vstats = evaluate_policy_detailed(policy, val_days, device, cost)
+                    ok_coverage = vstats["label_reportable_fraction"] >= min_val_label_reportable_fraction
+                    vmean = (sum(vr) / len(vr)) if (vr and ok_coverage) else -1e9
+                else:
+                    vmean = -1e9
+                if vmean > best_val:
+                    best_val = vmean
+                    best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+            if prepare_checkpoint is not None:
+                prepare_checkpoint()
+            if is_main:
+                if on_eval:
+                    on_eval(step + 1, vmean, best_val, best_state, optimizer)
+            if sync_after_eval is not None:
+                sync_after_eval()
     return optimizer, best_val, best_state
 
 

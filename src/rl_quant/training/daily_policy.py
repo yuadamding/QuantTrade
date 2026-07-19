@@ -3,11 +3,14 @@
 Operates on FROZEN end-of-day context (detached) + full-day raw bars + raw news, assembled into day-sequence
 episodes (rl_quant.datasets.build_daily_raw_episodes). Per optimizer step: encode the episode ONCE (cross-day
 temporal state, with the full-day raw encoder under grad), then roll the long-only portfolio forward day by day --
-held position a = g*w + (1-g)*prev (turnover-free holding), T+1 close-to-close credit -- carrying the position
-across the WHOLE episode (truncated BPTT). A terminal liquidation cost charges the final exit to CASH so a
-buy-and-hold can't dodge its exit. Cost is applied from step 1 (no friction warm-up) -- for a daily strategy the
-cost defines whether the edge exists. Evaluation is a CONTINUOUS chronological rollout over the whole split (one
-episode), never resetting to CASH mid-stream.
+at decision t the policy sees the submitted book that has just executed, while its new T+1 instruction is applied
+against the future drifted pre-trade book only inside execution accounting. This two-book timeline prevents the
+next close from entering the policy observation. Overlapping prefixes are observation-only burn-in: they warm the
+temporal state, but the allocator is not called and the book remains in CASH until the unique scored tail begins.
+The first scored allocation therefore pays its entry turnover rather than inheriting a free policy-controlled
+position. Sampled windows are rollout truncations rather than artificial liquidation events. Cost is applied from
+the first scored step (no friction warm-up). Evaluation is one continuous chronological rollout over the scored
+split and charges a single final liquidation.
 """
 from __future__ import annotations
 
@@ -16,22 +19,90 @@ from typing import Any, Callable
 import torch
 
 from rl_quant.execution import drift_weights, force_unavailable_to_cash, one_way_turnover
-from rl_quant.training._optim import apply_lr, lr_scale
+from rl_quant.training._optim import apply_lr, lr_scale, make_adamw
 
 CASH_INDEX = 0
 
 
+def _score_starts(score_mask: torch.Tensor) -> torch.Tensor:
+    """Return the first scored step per row and require one contiguous suffix."""
+
+    if score_mask.ndim != 2:
+        raise ValueError(f"score_mask must be [B,T], got {tuple(score_mask.shape)}")
+    mask = score_mask.detach().to(device="cpu", dtype=torch.bool)
+    starts = torch.full((mask.shape[0],), mask.shape[1], dtype=torch.long)
+    for row_index, row in enumerate(mask):
+        scored = torch.where(row)[0]
+        if scored.numel() == 0:
+            continue
+        start = int(scored[0])
+        if not bool(row[start:].all()):
+            raise ValueError("score_mask must be a contiguous suffix for observation-only burn-in")
+        starts[row_index] = start
+    return starts
+
+
+def _eval_raw_start(score_starts: torch.Tensor | None, T: int, window: int, raw_recent_days: int) -> int:
+    """Earliest raw day used by any scored rolling-window decision."""
+
+    if score_starts is None:
+        return 0
+    starts = torch.as_tensor(score_starts, dtype=torch.long, device="cpu")
+    if starts.ndim != 1 or starts.numel() == 0:
+        raise ValueError("score_starts must be a non-empty one-dimensional tensor")
+    first_scored = int(starts.min())
+    if first_scored >= T:
+        return T
+    raw_reach = raw_recent_days if raw_recent_days > 0 else window
+    if raw_reach <= 0:
+        return 0
+    return max(0, first_scored - raw_reach + 1)
+
+
 def _stack(episodes: list[dict], idx, device):
     g = [episodes[i] for i in idx]
-    s = lambda key: torch.stack([w[key] for w in g]).to(device)  # noqa: E731
+    def s(key):
+        values = [w[key] for w in g]
+        first = values[0]
+        if key in ("news_raw", "news_mask"):
+            # The default TOP2000 no-news tensors are logical expanded zeros backed by one scalar. Preserve that
+            # representation for every local batch size and create the scalar directly on the destination;
+            # torch.stack or a cross-device `.to()` of the expanded view would materialize the full article grid.
+            scalar_zeros = all(
+                value.shape == first.shape
+                and value.dtype == first.dtype
+                and value.device == first.device
+                and value.numel() > 1
+                and value.untyped_storage().nbytes() == value.element_size()
+                and not bool(value[(0,) * value.ndim])
+                for value in values
+            )
+            if scalar_zeros:
+                return torch.zeros((), dtype=first.dtype, device=device).expand(len(g), *first.shape)
+        # Evaluation and some configurations use one episode at a time. In
+        # that case, unsqueeze is a view of the shared chronological host
+        # backing; multi-episode batches require one dense stack by definition.
+        host_value = first.unsqueeze(0) if len(g) == 1 else torch.stack(values)
+        # Preserve the frozen-context storage dtype on device. TOP2000's BF16
+        # context then stays BF16 through the autocast token assembly instead
+        # of creating a ~2x FP32 context allocation and FP32 concatenation.
+        # FP32 designs remain unchanged because ``to`` preserves their dtype.
+        return host_value.to(device)
+
     # ret and real_ret share the canonical one-step MDP basis. H-day forecasting labels, when present, are
     # auxiliary-only. score_mask keeps causal burn-in observations in state while excluding them from objectives.
     small = ("market", "per_stock", "news_raw", "news_mask", "avail",
              "ret", "ret_valid", "real_ret", "real_ret_valid", "past_ret", "past_ret_valid")
     batch: dict[str, Any] = {k: s(k) for k in small}
-    batch["score_mask"] = s("score_mask").bool() if "score_mask" in g[0] else torch.ones_like(
-        batch["ret_valid"][..., 0], dtype=torch.bool
+    score_mask = (
+        torch.stack([w["score_mask"] for w in g]).bool()
+        if "score_mask" in g[0]
+        else torch.ones((len(g), g[0]["ret_valid"].shape[0]), dtype=torch.bool)
     )
+    batch["score_mask"] = score_mask.to(device)
+    # Keep this tiny control tensor on CPU. The rollout uses it to select only
+    # active rows without synchronizing the accelerator at every burn-in day.
+    batch["_score_starts"] = _score_starts(score_mask)
     if "aux_ret" in g[0]:
         batch["aux_ret"], batch["aux_ret_valid"] = s("aux_ret"), s("aux_ret_valid")
     if "bars_days" in g[0]:                                       # STREAMING: per-day bars loader (no pre-stack)
@@ -56,21 +127,67 @@ def _held_drift(prev_a, real_ret_t, real_valid_t):
 
 
 def _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_valid, cost,
-                    reward_scale, bptt_window, terminal_liquidate):
+                    reward_scale, bptt_window, terminal_liquidate, score_starts=None):
     """Shared per-day portfolio roll. state_fn(t) -> day-t policy state [B,A,token_dim]. The credited return is
     ``reward_scale * ret``. The canonical environment passes one-step ``ret`` with ``reward_scale=1``; the scale
     argument remains only for explicit reward-ablation experiments. The held position drifts by the same realized
     one-day transition between days (a true ride)."""
     B, A = avail.shape[0], avail.shape[2]
-    prev_w = torch.zeros(B, A, device=avail.device)
-    prev_w[:, CASH_INDEX] = 1.0
+    if score_starts is not None:
+        score_starts = torch.as_tensor(score_starts, dtype=torch.long, device="cpu")
+        if tuple(score_starts.shape) != (B,) or bool(((score_starts < 0) | (score_starts > T)).any()):
+            raise ValueError(f"score_starts must contain one value in [0, {T}] per batch row")
+    # There are two distinct books under delayed execution:
+    #
+    # * ``decision_weights`` is the allocation that has just executed at the
+    #   current decision timestamp and is therefore observable by the policy.
+    # * ``execution_pretrade`` is that allocation after the following realized
+    #   return, immediately before today's instruction executes one period
+    #   later.  It is valid for execution accounting, but must never be fed to
+    #   today's policy because it contains the next close.
+    #
+    # The previous implementation used one ``prev_w`` for both roles.  Since
+    # ``ret[t-1]`` spans close[t] -> close[t+1], policy step t consequently saw
+    # weights containing close[t+1], a one-period future leak.
+    cash_book = torch.zeros(B, A, device=avail.device)
+    cash_book[:, CASH_INDEX] = 1.0
+    decision_weights = cash_book
+    execution_pretrade = decision_weights
     nets, gates, ents, cash_w, turn, missing_w, views = [], [], [], [], [], [], []
-    last_a = prev_w
+    post_weights = []
     for t in range(T):
-        before_trade = prev_w
-        feasible_prev = force_unavailable_to_cash(before_trade, avail[:, t], cash_index=CASH_INDEX)
-        w, g = policy.step(state_fn(t), feasible_prev.detach(), avail[:, t])
-        a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * feasible_prev
+        active_rows = (
+            torch.arange(B, device=avail.device)
+            if score_starts is None
+            else torch.where(score_starts <= t)[0].to(device=avail.device)
+        )
+        w = cash_book.clone()
+        g = torch.zeros(B, dtype=ret.dtype, device=avail.device)
+        a = cash_book.clone()
+        before_trade = cash_book.clone()
+        if active_rows.numel():
+            active_avail = avail[:, t].index_select(0, active_rows)
+            decision_visible = force_unavailable_to_cash(
+                decision_weights.index_select(0, active_rows), active_avail, cash_index=CASH_INDEX
+            )
+            active_w, active_g = policy.step(
+                state_fn(t).index_select(0, active_rows), decision_visible.detach(), active_avail
+            )
+            active_pretrade = execution_pretrade.index_select(0, active_rows)
+            feasible_pretrade = force_unavailable_to_cash(
+                active_pretrade, active_avail, cash_index=CASH_INDEX
+            )
+            # The instruction is a target plus a rebalance intensity. At its
+            # delayed execution timestamp, gate=0 means leave the then-current
+            # drifted book untouched; gate=1 reaches the submitted target.
+            active_a = active_g.unsqueeze(-1) * active_w + (1.0 - active_g.unsqueeze(-1)) * feasible_pretrade
+            w = w.index_copy(0, active_rows, active_w)
+            # CUDA autocast emits a BF16 gate, while rollout/accounting tensors intentionally remain FP32.
+            # index_copy requires an exact dtype match (ordinary arithmetic would promote implicitly).
+            active_g = active_g.to(dtype=g.dtype)
+            g = g.index_copy(0, active_rows, active_g)
+            a = a.index_copy(0, active_rows, active_a)
+            before_trade = before_trade.index_copy(0, active_rows, active_pretrade)
         valid = ret_valid[:, t].bool()
         missing = (a * (~valid).to(a.dtype)).sum(-1)
         realized = (a * torch.where(valid, ret[:, t], torch.zeros_like(ret[:, t]))).sum(-1) * reward_scale
@@ -86,13 +203,27 @@ def _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_v
         views.append(w)     # the policy's RAW allocation (its fresh cross-sectional VIEW) -- the skill readout.
         # NOT the post-gate held book: the carried book RIDES realized returns (_held_drift), so under return
         # autocorrelation a zero-skill gate=0 book scores spuriously high IC (probe: persistent returns -> IC~1).
-        last_a = a
         nxt = _held_drift(a, real_ret[:, t], real_valid[:, t])       # ride the held book by the realized 1-day move
-        prev_w = nxt.detach() if (bptt_window <= 1 or (t + 1) % bptt_window == 0) else nxt
+        post_weights.append(nxt)
+        if bptt_window <= 1:
+            decision_weights, execution_pretrade = a.detach(), nxt.detach()
+        elif score_starts is None:
+            detach = (t + 1) % bptt_window == 0
+            decision_weights = a.detach() if detach else a
+            execution_pretrade = nxt.detach() if detach else nxt
+        else:
+            # Anchor truncated credit to each row's first active decision, not
+            # to the start of a 237-day observation prefix. Rows can have
+            # different final-tail lengths in the same sampled batch.
+            detach_rows = (score_starts <= t) & ((t - score_starts + 1) % bptt_window == 0)
+            detach_mask = detach_rows.to(device=avail.device).unsqueeze(-1)
+            decision_weights = torch.where(detach_mask, a.detach(), a)
+            execution_pretrade = torch.where(detach_mask, nxt.detach(), nxt)
     if terminal_liquidate and nets:                                  # charge the exit of the final position to CASH
-        cash_vec = torch.zeros_like(last_a)
+        final_book = post_weights[-1]
+        cash_vec = torch.zeros_like(final_book)
         cash_vec[:, CASH_INDEX] = 1.0
-        term_turn = one_way_turnover(last_a, cash_vec)
+        term_turn = one_way_turnover(final_book, cash_vec)
         nets[-1] = nets[-1] - cost * term_turn
         turn[-1] = turn[-1] + term_turn
     st = lambda xs: torch.stack(xs, 1)  # noqa: E731
@@ -115,6 +246,9 @@ def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_li
     real_ret, real_valid = batch["real_ret"], batch["real_ret_valid"]
     past_ret, past_valid = batch["past_ret"], batch["past_ret_valid"]
     T = per_stock.shape[1]
+    score_starts = batch.get("_score_starts")
+    if score_starts is None and "score_mask" in batch:
+        score_starts = _score_starts(batch["score_mask"])
     two_speed = getattr(policy.config, "raw_recent_days", 0) > 0
     # EVAL takes the per-decision path when the memory window binds (window < T) OR the policy is TWO-SPEED: a
     # two-speed policy must give EVERY decision the raw variant on its own most recent raw_recent_days (matching
@@ -123,8 +257,17 @@ def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_li
     if window and (0 < window < T or two_speed):
         bars_fn = batch["_bars_loader"] if "_bars_loader" in batch else (
             lambda t: (batch["bars"][:, t], batch["bar_mask"][:, t]))
-        tok_raw, tok_noraw = policy.encode_tokens_dual(market, per_stock, bars_fn, batch["news_raw"],
-                                                       batch["news_mask"], past_ret, past_valid)
+        raw_start = _eval_raw_start(score_starts, T, window, int(policy.config.raw_recent_days))
+        tok_raw, tok_noraw = policy.encode_tokens_dual(
+            market,
+            per_stock,
+            bars_fn,
+            batch["news_raw"],
+            batch["news_mask"],
+            past_ret,
+            past_valid,
+            raw_start=raw_start,
+        )
         R = policy.config.raw_recent_days
 
         def windowed_state_fn(t, _tr=tok_raw, _tn=tok_noraw, _av=avail, _w=window, _r=R):
@@ -152,7 +295,7 @@ def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_li
 
         state_fn = full_state_fn
     return _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_valid, cost,
-                           reward_scale, bptt_window, terminal_liquidate)
+                           reward_scale, bptt_window, terminal_liquidate, score_starts=score_starts)
 
 
 def _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef, max_actions, budget_lambda,
@@ -164,67 +307,107 @@ def _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef, 
     mean_ent = (ents * lm).sum(1) / denom
     missing_pen = (missing_w * lm).sum(1) / denom
     target_rate = max_actions / gates.shape[1]
-    budget_pen = torch.clamp(gates.mean(1) - target_rate, min=0.0)
+    scored_gate_rate = (gates * lm).sum(1) / denom
+    budget_pen = torch.clamp(scored_gate_rate - target_rate, min=0.0)
     g = gates.clamp(1e-6, 1 - 1e-6)
-    gate_ent = (-(g * g.log() + (1 - g) * (1 - g).log())).mean(1)
+    gate_entropy = -(g * g.log() + (1 - g) * (1 - g).log())
+    gate_ent = (gate_entropy * lm).sum(1) / denom
     return (-mean_net.mean() + risk_lambda * downside.mean()
             - entropy_coef * mean_ent.mean() - gate_entropy_coef * gate_ent.mean()
             + missing_label_penalty * missing_pen.mean()
             + budget_lambda * budget_pen.mean())
 
 
+def _sample_episode_indices(n_episodes: int, batch_size: int) -> list[int]:
+    """Sample one optimizer batch without replacement.
+
+    Overlapping long-history datasets can contain only a few dozen episodes;
+    ``randint`` needlessly duplicated an episode inside the same batch.  A
+    random permutation preserves stochastic sampling across steps while using
+    every slot for a distinct episode.
+    """
+
+    if n_episodes <= 0 or batch_size <= 0:
+        raise ValueError("n_episodes and batch_size must be positive")
+    return torch.randperm(n_episodes)[: min(batch_size, n_episodes)].tolist()
+
+
 def train_daily_policy(
     policy, train_eps, *, steps: int, lr: float = 3e-4, weight_decay: float = 3e-2, batch_days: int = 6,
     cost: float = 5e-4, risk_lambda: float = 0.1, entropy_coef: float = 0.0, max_actions: float = 5.0,
     budget_lambda: float = 1e-3, gate_entropy_coef: float = 1e-5, missing_label_penalty: float = 1e-3,
-    bptt_window: int = 1, terminal_liquidate: bool = True, warmup_steps: int = 0, schedule: str = "cosine",
+    bptt_window: int = 1, terminal_liquidate: bool = False, warmup_steps: int = 0, schedule: str = "cosine",
     grad_clip: float = 0.0, amp: bool = False, start_step: int = 0, optimizer=None, best_val: float = -1e9,
     best_state: dict | None = None, eval_every: int = 0, val_eps: list[dict] | None = None, device=None,
     min_val_label_reportable_fraction: float = 0.95, reward_scale: float = 1.0, eval_window: int = 0,
     on_eval: Callable[[int, float, float, dict | None, object], None] | None = None,
+    episode_sampler: Callable[[int, int], list[int]] | None = None,
     grad_reduce: Callable[[list], None] | None = None, is_main: bool = True,
+    prepare_checkpoint: Callable[[], None] | None = None,
+    sync_after_eval: Callable[[], None] | None = None,
 ):
     """Train the daily cross-sectional policy on canonical one-step realized wealth changes. ``reward_scale`` is
     retained for controlled ablations and should be 1 for the canonical environment. ``eval_window`` bounds the
     validation rollout's
     cross-day memory to the trained episode span (0 = whole split). Returns (optimizer, best_val, best_state).
     Validation uses the CONTINUOUS rollout (1-day realized mark) and selects on mean net return only when
-    label-reportable coverage is adequate."""
+    label-reportable coverage is adequate. Distributed callers may provide
+    ``prepare_checkpoint`` for an all-rank snapshot after validation, then
+    ``sync_after_eval`` so non-main ranks cannot enter the next training
+    collective while rank 0 is still writing its checkpoint."""
     if optimizer is None:
-        optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = make_adamw(policy.parameters(), lr=lr, weight_decay=weight_decay)
     dev_type = (device.type if hasattr(device, "type") else "cuda")
     n = len(train_eps)
     for step in range(start_step, steps):
         policy.train()
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
-        idx = torch.randint(0, n, (min(batch_days, n),)).tolist()
+        idx = (episode_sampler or _sample_episode_indices)(n, batch_days)
+        expected_batch = min(batch_days, n)
+        if len(idx) != expected_batch or len(set(idx)) != len(idx) or any(i < 0 or i >= n for i in idx):
+            raise RuntimeError(
+                f"episode sampler must return {expected_batch} distinct indices in [0, {n}), got {idx}"
+            )
         batch = _stack(train_eps, idx, device)
         with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
             nets, gates, ents, _, _, missing_w, _ = _daily_rollout(policy, batch, cost, bptt_window=bptt_window,
+                                                                   # Sampled overlapping windows are normally
+                                                                   # rollout truncations, not economic terminals;
+                                                                   # the default therefore does not duplicate an
+                                                                   # exit charge at every stride boundary.
                                                                    terminal_liquidate=terminal_liquidate,
                                                                    ret_key="ret", reward_scale=reward_scale)
             label = batch["ret_valid"][:, :, 1:].any(-1) & batch["score_mask"]
             loss = _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef,
                                max_actions, budget_lambda, gate_entropy_coef, missing_label_penalty)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_reduce is not None:                  # data-parallel: average grads across ranks before the step
             grad_reduce(list(policy.parameters()))
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
         optimizer.step()
-        if ((eval_every and (step + 1) % eval_every == 0) or step == steps - 1) and is_main:
-            if val_eps:
-                vr, vstats = evaluate_daily_detailed(policy, val_eps, device, cost, window=eval_window)
-                ok = vstats["label_reportable_fraction"] >= min_val_label_reportable_fraction
-                vmean = (sum(vr) / len(vr)) if (vr and ok) else -1e9
-            else:
-                vmean = -1e9
-            if vmean > best_val:
-                best_val = vmean
-                best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
-            if on_eval:
-                on_eval(step + 1, vmean, best_val, best_state, optimizer)
+        should_eval = bool((eval_every and (step + 1) % eval_every == 0) or step == steps - 1)
+        if should_eval:
+            if is_main:
+                if val_eps:
+                    vr, vstats = evaluate_daily_detailed(
+                        policy, val_eps, device, cost, window=eval_window, amp=amp
+                    )
+                    ok = vstats["label_reportable_fraction"] >= min_val_label_reportable_fraction
+                    vmean = (sum(vr) / len(vr)) if (vr and ok) else -1e9
+                else:
+                    vmean = -1e9
+                if vmean > best_val:
+                    best_val = vmean
+                    best_state = {k: v.detach().cpu().clone() for k, v in policy.state_dict().items()}
+            if prepare_checkpoint is not None:
+                prepare_checkpoint()
+            if is_main:
+                if on_eval:
+                    on_eval(step + 1, vmean, best_val, best_state, optimizer)
+            if sync_after_eval is not None:
+                sync_after_eval()
     return optimizer, best_val, best_state
 
 
@@ -235,31 +418,88 @@ def _cross_sectional_ic(view_w: torch.Tensor, real_ret: torch.Tensor, real_valid
     the drift-carried held book: the carried book RIDES realized returns, so under return autocorrelation a
     zero-skill gate~0 book would score spuriously high IC. Days with <3 valid names or a ~uniform/degenerate view
     (no tilt variance) are SKIPPED, not scored 0. view_w/real_ret/real_valid [B,T,A], label [B,T] -> per-day ICs."""
-    ics: list[float] = []
-    B, T = label.shape
-    for bi in range(B):
-        for t in range(T):
-            if not bool(label[bi, t]):
-                continue
-            v = real_valid[bi, t, 1:].bool()
-            if int(v.sum()) < 3:
-                continue
-            wv = view_w[bi, t, 1:][v]
-            r = real_ret[bi, t, 1:][v]
-            wt, rt = wv - wv.mean(), r - r.mean()
-            sw, sr = float(wt.norm()), float(rt.norm())
-            if sw > 1e-9 and sr > 1e-9:
-                ics.append(float((wt @ rt) / (sw * sr)))
-    return ics
+    # BF16 is appropriate for policy inference, not for small cross-sectional
+    # correlation reductions. Restore FP32 reporting precision explicitly.
+    view_w, real_ret = view_w.float(), real_ret.float()
+    valid = real_valid[..., 1:].bool() & label.unsqueeze(-1)
+    count = valid.sum(dim=-1)
+    denom = count.clamp_min(1).to(view_w.dtype)
+    weights = torch.where(valid, view_w[..., 1:], torch.zeros_like(view_w[..., 1:]))
+    returns = torch.where(valid, real_ret[..., 1:], torch.zeros_like(real_ret[..., 1:]))
+    weight_mean = weights.sum(dim=-1) / denom
+    return_mean = returns.sum(dim=-1) / denom
+    centered_weights = torch.where(valid, weights - weight_mean.unsqueeze(-1), torch.zeros_like(weights))
+    centered_returns = torch.where(valid, returns - return_mean.unsqueeze(-1), torch.zeros_like(returns))
+    numerator = (centered_weights * centered_returns).sum(dim=-1)
+    weight_norm = centered_weights.square().sum(dim=-1).sqrt()
+    return_norm = centered_returns.square().sum(dim=-1).sqrt()
+    good = (count >= 3) & (weight_norm > 1e-9) & (return_norm > 1e-9)
+    correlations = numerator / (weight_norm * return_norm).clamp_min(1e-18)
+    return correlations[good].detach().cpu().tolist()
+
+
+def _summarize_daily_telemetry(
+    gates_all: list[torch.Tensor],
+    cash_all: list[torch.Tensor],
+    turn_all: list[torch.Tensor],
+    miss_all: list[torch.Tensor],
+    trades: list[torch.Tensor],
+    largest_stock_all: list[torch.Tensor],
+    stock_hhi_all: list[torch.Tensor],
+    effective_stocks_all: list[torch.Tensor],
+) -> dict[str, float]:
+    """Reduce rollout tensors into the stable daily telemetry schema."""
+    if not gates_all:
+        return {"mean_gate": 0.0, "trades_per_episode": 0.0, "mean_cash_weight": 1.0, "mean_turnover": 0.0,
+                "mean_missing_label_weight": 0.0, "mean_largest_stock_weight": 0.0,
+                "max_stock_weight_observed": 0.0, "mean_stock_hhi": 0.0, "mean_effective_stock_count": 0.0}
+    return {"mean_gate": float(torch.cat(gates_all).mean()), "trades_per_episode": float(torch.cat(trades).mean()),
+            "mean_cash_weight": float(torch.cat(cash_all).mean()), "mean_turnover": float(torch.cat(turn_all).mean()),
+            "mean_missing_label_weight": float(torch.cat(miss_all).mean()),
+            "mean_largest_stock_weight": float(torch.cat(largest_stock_all).mean()),
+            "max_stock_weight_observed": float(torch.cat(largest_stock_all).max()),
+            "mean_stock_hhi": float(torch.cat(stock_hhi_all).mean()),
+            "mean_effective_stock_count": float(torch.cat(effective_stocks_all).mean())}
+
+
+def _append_daily_telemetry(
+    gates: torch.Tensor,
+    cash_weights: torch.Tensor,
+    turnover: torch.Tensor,
+    missing_weights: torch.Tensor,
+    views: torch.Tensor,
+    score: torch.Tensor,
+    stores: tuple[list[torch.Tensor], ...],
+) -> None:
+    """Accumulate telemetry from a rollout already performed for evaluation."""
+    if not score.any():
+        return
+    (gates_all, cash_all, turn_all, miss_all, trades,
+     largest_stock_all, stock_hhi_all, effective_stocks_all) = stores
+    gates_all.append(gates[score].float().cpu())
+    cash_all.append(cash_weights[score].float().cpu())
+    turn_all.append(turnover[score].float().cpu())
+    miss_all.append(missing_weights[score].float().cpu())
+    trades.append((gates.float() * score).sum(1).cpu())
+    risky = views[score][:, 1:].float()
+    risky_mass = risky.sum(dim=-1, keepdim=True)
+    conditional = torch.where(risky_mass > 0, risky / risky_mass.clamp_min(1e-12), torch.zeros_like(risky))
+    hhi = conditional.square().sum(dim=-1)
+    largest_stock_all.append(risky.max(dim=-1).values.cpu())
+    stock_hhi_all.append(hhi.cpu())
+    effective_stocks_all.append(torch.where(hhi > 0, hhi.reciprocal(), torch.zeros_like(hhi)).cpu())
 
 
 @torch.no_grad()
 def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_days: int = 4,
-                            max_missing_label_weight: float = 0.05, window: int = 0) -> tuple[list[float], dict]:
+                            max_missing_label_weight: float = 0.05, window: int = 0,
+                            amp: bool = False) -> tuple[list[float], dict]:
     """Per-decision net return + coverage over the (continuous) evaluation episode(s). Pass a single full-split
     episode for a continuous chronological rollout (no mid-stream CASH reset). `window>0` bounds the cross-day
     memory to the trained episode span (= episode_len) so the temporal encoder runs at the positions/contexts it
-    saw in training rather than extrapolating across the whole split. Reports the 1-day realized mark (real_ret).
+    saw in training rather than extrapolating across the whole split. ``amp=True`` keeps a BF16 frozen context and
+    token assembly in BF16 during inference; PnL, IC, and telemetry reductions are explicitly restored to FP32.
+    Reports the 1-day realized mark (real_ret).
 
     `max_missing_label_weight` is the WEIGHT tolerance for names whose forward label is missing: the softmax
     allocator gives every available name nonzero weight (~1/A each when diffuse), so a couple of chronically
@@ -268,31 +508,37 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
     unlabeled names; their return is credited as ZERO while their turnover is still charged, so the reported PnL
     is CONSERVATIVE (never inflated) on tolerated days."""
     policy.eval()
+    dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     rows: list[float] = []
     decision_ids: list[str] = []
     total = lab = rep = 0
     gross, costs, turns, cash, gate, miss, ics = [], [], [], [], [], [], []
+    telemetry_stores: tuple[list[torch.Tensor], ...] = tuple([] for _ in range(8))
     for i in range(0, len(eps), batch_days):
         batch = _stack(eps, list(range(i, min(i + batch_days, len(eps)))), device)
-        nets, gates, _, cash_w, turn, missing_w, views = _daily_rollout(policy, batch, cost, ret_key="real_ret",
-                                                                        window=window)
+        with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
+            nets, gates, _, cash_w, turn, missing_w, views = _daily_rollout(
+                policy, batch, cost, ret_key="real_ret", window=window
+            )
         score = batch["score_mask"].bool()
+        _append_daily_telemetry(gates, cash_w, turn, missing_w, views, score, telemetry_stores)
         label = batch["real_ret_valid"][:, :, 1:].any(-1).bool() & score
-        reportable = label & (missing_w <= max_missing_label_weight)
+        missing_report = missing_w.float()
+        reportable = label & (missing_report <= max_missing_label_weight)
         total += int(score.sum())
         lab += int(label.sum())
         rep += int(reportable.sum())
         if reportable.any():
-            tr = turn[reportable].cpu()
-            nr = nets[reportable].cpu()
+            tr = turn[reportable].float().cpu()
+            nr = nets[reportable].float().cpu()
             gross.append(nr + cost * tr)
             costs.append(cost * tr)
             turns.append(tr)
-            cash.append(cash_w[reportable].cpu())
-            gate.append(gates[reportable].cpu())
+            cash.append(cash_w[reportable].float().cpu())
+            gate.append(gates[reportable].float().cpu())
         if label.any():
-            miss.append(missing_w[label].cpu())
-        rows += nets[reportable].cpu().tolist()
+            miss.append(missing_report[label].cpu())
+        rows += nets[reportable].float().cpu().tolist()
         reportable_cpu = reportable.detach().cpu()
         for local_index, episode in enumerate(eps[i:i + reportable.shape[0]]):
             identifiers = episode.get("decision_ids")
@@ -314,6 +560,7 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
     ic_n = len(ics)
     ic_mean = (sum(ics) / ic_n) if ic_n else 0.0
     ic_se = (float(torch.tensor(ics).std(unbiased=True)) / (ic_n ** 0.5)) if ic_n > 1 else 0.0
+    telemetry = _summarize_daily_telemetry(*telemetry_stores)
     stats = {"total_blocks": total, "label_blocks": lab, "reportable_blocks": rep,
              "reportable_fraction": rep / total if total else 0.0,
              "label_reportable_fraction": rep / lab if lab else 0.0,
@@ -321,31 +568,34 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
              "mean_net_return": (sum(rows) / len(rows)) if rows else 0.0, "mean_turnover": mean(turns),
              "mean_cash_weight": mean(cash), "mean_gate": mean(gate), "mean_missing_label_weight": mean(miss),
              "realized_ic_mean": ic_mean, "realized_ic_se": ic_se, "realized_ic_days": ic_n,
-             "decision_ids": decision_ids}
+             "decision_ids": decision_ids, "policy_telemetry": telemetry}
     return rows, stats
 
 
 @torch.no_grad()
 def daily_policy_telemetry(policy, eps: list[dict], device, cost: float, batch_days: int = 4,
-                           window: int = 0) -> dict:
+                           window: int = 0, amp: bool = False) -> dict:
     policy.eval()
-    gates_all, cash_all, turn_all, miss_all, trades = [], [], [], [], []
+    dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
+    gates_all: list[torch.Tensor] = []
+    cash_all: list[torch.Tensor] = []
+    turn_all: list[torch.Tensor] = []
+    miss_all: list[torch.Tensor] = []
+    trades: list[torch.Tensor] = []
+    largest_stock_all: list[torch.Tensor] = []
+    stock_hhi_all: list[torch.Tensor] = []
+    effective_stocks_all: list[torch.Tensor] = []
+    stores = (gates_all, cash_all, turn_all, miss_all, trades,
+              largest_stock_all, stock_hhi_all, effective_stocks_all)
     for i in range(0, len(eps), batch_days):
         batch = _stack(eps, list(range(i, min(i + batch_days, len(eps)))), device)
-        _, gates, _, cw, tv, mw, _ = _daily_rollout(policy, batch, cost, ret_key="real_ret", window=window)
+        with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
+            _, gates, _, cw, tv, mw, views = _daily_rollout(
+                policy, batch, cost, ret_key="real_ret", window=window
+            )
         score = batch["score_mask"].bool()
-        if score.any():
-            gates_all.append(gates[score])
-            cash_all.append(cw[score])
-            turn_all.append(tv[score])
-            miss_all.append(mw[score])
-            trades.append((gates * score).sum(1))
-    if not gates_all:
-        return {"mean_gate": 0.0, "trades_per_episode": 0.0, "mean_cash_weight": 1.0, "mean_turnover": 0.0,
-                "mean_missing_label_weight": 0.0}
-    return {"mean_gate": float(torch.cat(gates_all).mean()), "trades_per_episode": float(torch.cat(trades).mean()),
-            "mean_cash_weight": float(torch.cat(cash_all).mean()), "mean_turnover": float(torch.cat(turn_all).mean()),
-            "mean_missing_label_weight": float(torch.cat(miss_all).mean())}
+        _append_daily_telemetry(gates, cw, tv, mw, views, score, stores)
+    return _summarize_daily_telemetry(*stores)
 
 
 def daily_cost_paid_baselines(eps: list[dict]) -> tuple[float, float]:

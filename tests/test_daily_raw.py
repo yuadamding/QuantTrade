@@ -24,7 +24,15 @@ from rl_quant.training import (
     ssl_targets_daily,
     train_daily_policy,
 )
-from rl_quant.training.daily_policy import _daily_rollout, _held_drift, _stack
+from rl_quant.training.daily_policy import (
+    _daily_loss,
+    _daily_rollout,
+    _eval_raw_start,
+    _held_drift,
+    _roll_positions,
+    _sample_episode_indices,
+    _stack,
+)
 
 A, S, Fd, M, DC = 4, 24, 5, 3, 8        # 4 actions incl CASH; 24s session; 5 OHLCV fields; 3 news; ctx dim 8
 
@@ -174,6 +182,170 @@ class Episodes(unittest.TestCase):
         self.assertTrue(torch.allclose(n_one, n_r))
         self.assertFalse(torch.allclose(n_aux, n_r))
 
+    def test_bfloat16_context_stays_bfloat16_through_amp_token_assembly(self) -> None:
+        """TOP2000 evaluation must not recreate the giant context/token input in FP32."""
+        torch.manual_seed(8)
+        T = 6
+        episode = _episode(1, T, torch.Generator().manual_seed(9))
+        realized = torch.zeros(1, T, A)
+        realized[:, :, 1:] = 0.01 * torch.randn(1, T, A - 1, generator=torch.Generator().manual_seed(10))
+        packed = {
+            key: value[0]
+            for key, value in episode.items()
+        }
+        packed.update({
+            "market": packed["market"].bfloat16(),
+            "per_stock": packed["per_stock"].bfloat16(),
+            # Production TOP2000 runs with the declared no-news ablation.  Exercise the scalar-backed logical
+            # article grid so this test covers both its allocation-free aggregation and the downstream dtype path.
+            "news_raw": torch.zeros((), dtype=torch.float32).expand(T, A, M, 1),
+            "news_mask": torch.zeros((), dtype=torch.bool).expand(T, A, M),
+            "ret": realized[0],
+            "ret_valid": torch.ones(T, A, dtype=torch.bool),
+            "real_ret": realized[0],
+            "real_ret_valid": torch.ones(T, A, dtype=torch.bool),
+            "score_mask": torch.ones(T, dtype=torch.bool),
+            "decision_ids": tuple(f"d{index}" for index in range(T)),
+            "n_blocks": T,
+        })
+        policy = DailyCrossSectionPolicy(_cfg(daily_lookback=T, raw_recent_days=2)).eval()
+        token_input_dtypes: list[torch.dtype] = []
+        raw_output_dtypes: list[torch.dtype] = []
+        temporal_input_dtypes: list[torch.dtype] = []
+        temporal_output_dtypes: list[torch.dtype] = []
+        allocator_input_dtypes: list[torch.dtype] = []
+        attention_input_dtypes: list[torch.dtype] = []
+
+        def capture_token_input(_module, args) -> None:
+            token_input_dtypes.append(args[0].dtype)
+
+        def capture_raw_output(_module, _args, output) -> None:
+            raw_output_dtypes.append(output.dtype)
+
+        def capture_temporal_input(_module, args) -> None:
+            temporal_input_dtypes.append(args[0].dtype)
+
+        def capture_temporal_output(_module, _args, output) -> None:
+            temporal_output_dtypes.append(output.dtype)
+
+        def capture_allocator_input(_module, args) -> None:
+            allocator_input_dtypes.append(args[0].dtype)
+
+        def capture_attention_input(_module, args) -> None:
+            attention_input_dtypes.append(args[0].dtype)
+
+        hooks = [
+            policy.token_proj.register_forward_pre_hook(capture_token_input),
+            policy.raw_encoder.register_forward_hook(capture_raw_output),
+            policy.temporal.register_forward_pre_hook(capture_temporal_input),
+            policy.temporal.register_forward_hook(capture_temporal_output),
+            policy.alloc_in.register_forward_pre_hook(capture_allocator_input),
+            policy.attn.register_forward_pre_hook(capture_attention_input),
+        ]
+        try:
+            rows, stats = evaluate_daily_detailed(
+                policy, [packed], torch.device("cpu"), cost=5e-4, batch_days=1, window=T, amp=True
+            )
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        self.assertTrue(rows)
+        self.assertEqual(stats["decision_ids"], list(packed["decision_ids"]))
+        self.assertTrue(token_input_dtypes)
+        self.assertEqual(set(token_input_dtypes), {torch.bfloat16})
+        self.assertTrue(raw_output_dtypes)
+        self.assertEqual(set(raw_output_dtypes), {torch.bfloat16})
+        self.assertTrue(temporal_input_dtypes)
+        self.assertEqual(set(temporal_input_dtypes), {torch.bfloat16})
+        self.assertTrue(temporal_output_dtypes)
+        self.assertEqual(set(temporal_output_dtypes), {torch.bfloat16})
+        self.assertTrue(allocator_input_dtypes)
+        self.assertEqual(set(allocator_input_dtypes), {torch.bfloat16})
+        self.assertTrue(attention_input_dtypes)
+        self.assertEqual(set(attention_input_dtypes), {torch.bfloat16})
+        reported = [
+            *rows,
+            stats["mean_net_return"],
+            stats["realized_ic_mean"],
+            *stats["policy_telemetry"].values(),
+        ]
+        self.assertTrue(all(isinstance(value, float) for value in reported))
+        self.assertTrue(bool(torch.isfinite(torch.tensor(reported, dtype=torch.float32)).all()))
+
+        # Explicit AMP-off remains a supported fallback: assembly promotes
+        # locally for FP32 weights rather than requiring `_stack` to retain a
+        # second full-size FP32 context batch.
+        fallback_rows, fallback_stats = evaluate_daily_detailed(
+            policy, [packed], torch.device("cpu"), cost=5e-4, batch_days=1, window=T, amp=False
+        )
+        self.assertEqual(len(fallback_rows), len(rows))
+        self.assertEqual(fallback_stats["decision_ids"], stats["decision_ids"])
+        self.assertTrue(bool(torch.isfinite(torch.tensor(fallback_rows)).all()))
+
+        policy.train()
+        train_batch = _stack([packed], [0], torch.device("cpu"))
+        policy.zero_grad(set_to_none=True)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            train_nets = _daily_rollout(
+                policy, train_batch, cost=5e-4, terminal_liquidate=False, ret_key="ret"
+            )[0]
+            train_loss = -train_nets.mean()
+        self.assertEqual(train_nets.dtype, torch.float32)
+        train_loss.backward()
+        grads = [parameter.grad for parameter in policy.parameters() if parameter.grad is not None]
+        self.assertTrue(grads)
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in grads))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA autocast dtype contract")
+    def test_cuda_amp_daily_policy_state_and_allocator_stay_bfloat16(self) -> None:
+        """CUDA's FP32 LayerNorm policy must not widen raw, temporal, or allocator-wide activations."""
+        torch.manual_seed(12)
+        T = 3
+        episode = {
+            key: value.cuda()
+            for key, value in _episode(1, T, torch.Generator().manual_seed(13)).items()
+        }
+        episode["market"] = episode["market"].bfloat16()
+        episode["per_stock"] = episode["per_stock"].bfloat16()
+        episode["news_raw"] = torch.zeros((), device="cuda").expand(1, T, A, M, 1)
+        episode["news_mask"] = torch.zeros((), dtype=torch.bool, device="cuda").expand(1, T, A, M)
+        policy = DailyCrossSectionPolicy(_cfg(daily_lookback=T, raw_recent_days=2)).cuda().train()
+        previous = torch.zeros(1, A, device="cuda")
+        previous[:, 0] = 1.0
+        realized = torch.zeros(1, T, A, device="cuda")
+        rollout_batch = {
+            **episode,
+            "ret": realized,
+            "ret_valid": torch.ones_like(realized, dtype=torch.bool),
+            "real_ret": realized,
+            "real_ret_valid": torch.ones_like(realized, dtype=torch.bool),
+            "score_mask": torch.ones(1, T, dtype=torch.bool, device="cuda"),
+        }
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            state = policy.encode_episode(
+                episode["market"], episode["per_stock"], episode["bars"], episode["bar_mask"],
+                episode["news_raw"], episode["news_mask"], episode["avail"],
+                episode["past_ret"], episode["past_ret_valid"],
+            )
+            weights, gate = policy.step(state[:, -1], previous, episode["avail"][:, -1])
+            nets = _daily_rollout(policy, rollout_batch, cost=5e-4, terminal_liquidate=False)[0]
+            loss = (
+                state.float().square().mean()
+                + weights.float().square().mean()
+                + gate.float().square().mean()
+                + nets.square().mean()
+            )
+        self.assertEqual(state.dtype, torch.bfloat16)
+        # CUDA softmax intentionally returns FP32 for stable simplex/accounting; only the wide model state is BF16.
+        self.assertEqual(weights.dtype, torch.float32)
+        self.assertEqual(gate.dtype, torch.bfloat16)
+        self.assertEqual(nets.dtype, torch.float32)
+        loss.backward()
+        gradients = [parameter.grad for parameter in policy.parameters() if parameter.grad is not None]
+        self.assertTrue(gradients)
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
+
 
 class EODAdapter(unittest.TestCase):
     def test_eod_selection_inram(self) -> None:
@@ -216,6 +388,8 @@ class EODAdapter(unittest.TestCase):
             for di, r in enumerate(recs):
                 self.assertNotIn("bars", r)                  # NOT materialized
                 self.assertIn("_bars_day", r)
+                self.assertIsNot(r["_bars_day"], enc[di])     # raw handle drops context overrides/storage
+                self.assertEqual(r["_bars_day"]._ov, {})      # noqa: SLF001 - memory-retention regression
                 self.assertEqual(r["_bars_day"]["bars"].shape, (A, S, Fd))     # handle yields the full-day bars
                 self.assertTrue(torch.equal(r["_bars_day"]["bars"], w["bars"][di]))
                 self.assertEqual(r["per_stock"].shape, (A, DC))
@@ -576,6 +750,8 @@ class RewardScaleAndDrift(unittest.TestCase):
         rows, st = evaluate_daily_detailed(pol, val_eps, dev, cost=5e-4, batch_days=1, window=12)
         self.assertTrue(rows)
         self.assertGreaterEqual(st["reportable_fraction"], 0.0)
+        self.assertIn("policy_telemetry", st)
+        self.assertIn("mean_effective_stock_count", st["policy_telemetry"])
 
     def test_held_drift_rides_and_stays_on_simplex(self) -> None:
         prev = torch.tensor([[0.5, 0.5, 0.0, 0.0]])                         # CASH=0.5, stock@idx1=0.5
@@ -585,6 +761,150 @@ class RewardScaleAndDrift(unittest.TestCase):
         self.assertAlmostEqual(float(d.sum()), 1.0, places=6)               # stays on the simplex
         self.assertGreater(float(d[0, 1]), 0.5)                             # winner's weight rode up
         self.assertLess(float(d[0, 0]), 0.5)                                # CASH (0 return) shrank relatively
+
+    def test_delayed_execution_never_exposes_future_drift_to_policy(self) -> None:
+        """At decision t+1 the policy may see action t, but not its close[t+2]-dependent drift."""
+
+        class RecordingPolicy:
+            def __init__(self) -> None:
+                self.previous: list[torch.Tensor] = []
+
+            def step(self, state, previous, available):
+                del state, available
+                self.previous.append(previous.detach().clone())
+                target = torch.zeros_like(previous)
+                target[:, :2] = 0.5
+                # Enter on the first decision, then hold at delayed execution.
+                gate = torch.ones(previous.shape[0], dtype=previous.dtype, device=previous.device)
+                if len(self.previous) > 1:
+                    gate.zero_()
+                return target, gate
+
+        policy = RecordingPolicy()
+        available = torch.ones(1, 2, A, dtype=torch.bool)
+        realized = torch.tensor([[[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]])
+        valid = torch.ones_like(realized, dtype=torch.bool)
+        result = _roll_positions(
+            policy,
+            lambda _t: torch.zeros(1, A, 1),
+            2,
+            available,
+            realized,
+            valid,
+            realized,
+            valid,
+            0.1,
+            1.0,
+            1,
+            False,
+        )
+        nets, _, _, cash_weight, turnover, _, _ = result
+
+        torch.testing.assert_close(policy.previous[0], torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+        # The +100% return belongs to the future of decision 1.  The observable
+        # submitted book is still 50/50, while delayed execution correctly
+        # accounts against the future pre-trade book (1/3 CASH, 2/3 stock).
+        torch.testing.assert_close(policy.previous[1], torch.tensor([[0.5, 0.5, 0.0, 0.0]]))
+        torch.testing.assert_close(cash_weight[0], torch.tensor([0.5, 1.0 / 3.0]))
+        torch.testing.assert_close(turnover[0], torch.tensor([0.5, 0.0]))
+        torch.testing.assert_close(nets[0], torch.tensor([0.45, 0.0]))
+
+    def test_terminal_liquidation_uses_final_post_return_book(self) -> None:
+        class EnterPolicy:
+            @staticmethod
+            def step(state, previous, available):
+                del state, available
+                target = torch.zeros_like(previous)
+                target[:, :2] = 0.5
+                return target, torch.ones(previous.shape[0], dtype=previous.dtype)
+
+        available = torch.ones(1, 1, A, dtype=torch.bool)
+        realized = torch.tensor([[[0.0, 1.0, 0.0, 0.0]]])
+        valid = torch.ones_like(realized, dtype=torch.bool)
+        nets, _, _, _, turnover, _, _ = _roll_positions(
+            EnterPolicy(),
+            lambda _t: torch.zeros(1, A, 1),
+            1,
+            available,
+            realized,
+            valid,
+            realized,
+            valid,
+            0.1,
+            1.0,
+            1,
+            True,
+        )
+        # Entry is 0.5 turnover.  After the stock doubles, liquidation from
+        # the 1/3--2/3 final book costs another 2/3 turnover.
+        torch.testing.assert_close(turnover[0], torch.tensor([0.5 + 2.0 / 3.0]))
+        torch.testing.assert_close(nets[0], torch.tensor([0.5 - 0.1 * (0.5 + 2.0 / 3.0)]))
+
+    def test_observation_burn_in_stays_cash_and_first_scored_trade_pays_entry(self) -> None:
+        class EnterPolicy:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def step(self, state, previous, available):
+                del state, available
+                self.calls += 1
+                target = torch.zeros_like(previous)
+                target[:, 1] = 1.0
+                return target, torch.ones(previous.shape[0], dtype=previous.dtype)
+
+        policy = EnterPolicy()
+        available = torch.ones(1, 3, A, dtype=torch.bool)
+        realized = torch.zeros(1, 3, A)
+        realized[:, 2, 1] = 0.1
+        valid = torch.ones_like(realized, dtype=torch.bool)
+        nets, gates, _, cash_weight, turnover, _, _ = _roll_positions(
+            policy,
+            lambda _t: torch.zeros(1, A, 1),
+            3,
+            available,
+            realized,
+            valid,
+            realized,
+            valid,
+            0.01,
+            1.0,
+            1,
+            False,
+            score_starts=torch.tensor([2]),
+        )
+
+        self.assertEqual(policy.calls, 1)
+        torch.testing.assert_close(gates[0], torch.tensor([0.0, 0.0, 1.0]))
+        torch.testing.assert_close(cash_weight[0], torch.tensor([1.0, 1.0, 0.0]))
+        torch.testing.assert_close(turnover[0], torch.tensor([0.0, 0.0, 1.0]))
+        torch.testing.assert_close(nets[0], torch.tensor([0.0, 0.0, 0.09]))
+
+    def test_episode_batch_sampling_is_unique_and_seeded(self) -> None:
+        torch.manual_seed(17)
+        first = _sample_episode_indices(8, 6)
+        torch.manual_seed(17)
+        second = _sample_episode_indices(8, 6)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 6)
+        self.assertEqual(len(set(first)), 6)
+        self.assertEqual(sorted(_sample_episode_indices(3, 20)), [0, 1, 2])
+
+    def test_burn_in_gates_do_not_shape_scored_policy_penalties(self) -> None:
+        common = dict(
+            nets=torch.zeros(1, 2),
+            ents=torch.zeros(1, 2),
+            missing_w=torch.zeros(1, 2),
+            label=torch.tensor([[False, True]]),
+            risk_lambda=0.0,
+            entropy_coef=0.0,
+            max_actions=0.1,
+            budget_lambda=1.0,
+            gate_entropy_coef=1.0,
+            missing_label_penalty=0.0,
+        )
+        low_burn = _daily_loss(gates=torch.tensor([[0.001, 0.2]]), **common)
+        high_burn = _daily_loss(gates=torch.tensor([[0.999, 0.2]]), **common)
+        torch.testing.assert_close(low_burn, high_burn)
 
 
 class TwoSpeedTokens(unittest.TestCase):
@@ -619,6 +939,54 @@ class TwoSpeedTokens(unittest.TestCase):
                                 ep["news_mask"], ep["avail"], ep["past_ret"], ep["past_ret_valid"])
         self.assertGreater(float((s4[:, 5] - state[:, 5]).abs().max()), 1e-6)
 
+    def test_eval_raw_encode_covers_only_the_union_of_scored_windows(self) -> None:
+        pol = DailyCrossSectionPolicy(_cfg(raw_recent_days=2)).eval()
+        g = torch.Generator().manual_seed(7)
+        ep = _episode(1, 6, g)
+        calls: list[int] = []
+
+        def loader(t: int):
+            calls.append(t)
+            return ep["bars"][:, t], ep["bar_mask"][:, t]
+
+        optimized_raw, optimized_noraw = pol.encode_tokens_dual(
+            ep["market"], ep["per_stock"], loader, ep["news_raw"], ep["news_mask"],
+            ep["past_ret"], ep["past_ret_valid"], raw_start=3,
+        )
+        self.assertEqual(calls, [3, 4, 5])
+
+        full_raw, full_noraw = pol.encode_tokens_dual(
+            ep["market"], ep["per_stock"],
+            lambda t: (ep["bars"][:, t], ep["bar_mask"][:, t]),
+            ep["news_raw"], ep["news_mask"], ep["past_ret"], ep["past_ret_valid"],
+        )
+        # The first scored decision is t=4 with a two-day raw reach. Its
+        # union with t=5 needs raw days 3..5 and no earlier raw encode.
+        self.assertEqual(_eval_raw_start(torch.tensor([4]), T=6, window=5, raw_recent_days=2), 3)
+        for t in (4, 5):
+            lo = max(0, t - 5 + 1)
+            optimized = torch.cat([optimized_noraw[:, lo:t - 1], optimized_raw[:, t - 1:t + 1]], dim=1)
+            full = torch.cat([full_noraw[:, lo:t - 1], full_raw[:, t - 1:t + 1]], dim=1)
+            torch.testing.assert_close(optimized, full)
+            torch.testing.assert_close(
+                pol.temporal_state(optimized, ep["avail"][:, lo:t + 1])[:, -1],
+                pol.temporal_state(full, ep["avail"][:, lo:t + 1])[:, -1],
+            )
+
+        calls.clear()
+        realized = torch.zeros(1, 6, A)
+        rollout_batch = {
+            **ep,
+            "ret": realized,
+            "ret_valid": torch.ones_like(realized, dtype=torch.bool),
+            "real_ret": realized,
+            "real_ret_valid": torch.ones_like(realized, dtype=torch.bool),
+            "score_mask": torch.tensor([[False, False, False, False, True, True]]),
+            "_bars_loader": loader,
+            "_n_days": 6,
+        }
+        _daily_rollout(pol, rollout_batch, cost=0.0, terminal_liquidate=False, window=5)
+        self.assertEqual(calls, [3, 4, 5])
     def test_windowed_rollout_assembles_two_speed_slices(self) -> None:
         """The rolling-window eval must run under raw_recent_days>0 (dual tokens, per-decision assembly) and
         bound the memory exactly like the plain windowed path."""

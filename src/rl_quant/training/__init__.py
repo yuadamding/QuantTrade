@@ -31,13 +31,26 @@ from rl_quant.training.decision_policy import (
     policy_telemetry,
     train_decision_policy,
 )
-from rl_quant.training.designs import DEFAULT_DESIGN, DESIGNS, SWEEP, Phase1Design
+from rl_quant.training.designs import (
+    DEFAULT_DESIGN,
+    DESIGNS,
+    SWEEP,
+    TOP2000_H100_CORE_SWEEP,
+    TOP2000_H100_WIDE_SWEEP,
+    TOP50_H100_CORE_SWEEP,
+    TOP50_H100_WIDE_SWEEP,
+    Phase1Design,
+)
 
 __all__ = [
     "DEFAULT_DESIGN",
     "DESIGNS",
     "Phase1Design",
     "SWEEP",
+    "TOP2000_H100_CORE_SWEEP",
+    "TOP2000_H100_WIDE_SWEEP",
+    "TOP50_H100_CORE_SWEEP",
+    "TOP50_H100_WIDE_SWEEP",
     "cost_paid_baselines",
     "daily_cost_paid_baselines",
     "daily_policy_telemetry",

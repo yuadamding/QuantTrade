@@ -9,8 +9,9 @@ from torch import nn
 
 from rl_quant.datasets.daily import build_daily_episodes, build_daily_raw_episodes, to_daily_raw_records
 from rl_quant.datasets.streaming import LazyDay, LazyWindow
-from rl_quant.models.decision_policy import DecisionPolicyConfig, DecisionPolicyHead
+from rl_quant.models.decision_policy import DecisionPolicyConfig, DecisionPolicyHead, _NewsAggregator
 from rl_quant.training.context_pretrain import encode_days
+from rl_quant.training.daily_policy import _stack as _stack_daily
 from rl_quant.training.decision_policy import _rollout
 
 
@@ -154,6 +155,174 @@ def test_daily_raw_uses_one_step_reward_aux_horizon_and_prefix_score_mask() -> N
     assert aux_limited[0]["n_blocks"] == 4
 
 
+def test_daily_raw_overlap_scores_each_warmed_decision_once_in_recent_tail() -> None:
+    records = [_daily_record(i) for i in range(300)]
+    episodes = build_daily_raw_episodes(
+        records,
+        episode_len=252,
+        stride=15,
+        horizon=21,
+        exec_delay=1,
+        score_tail=15,
+    )
+
+    scored_ids: list[str] = []
+    for episode in episodes:
+        local_scored = torch.where(episode["score_mask"])[0]
+        assert bool((local_scored >= 252 - 15).all())
+        scored_ids.extend(
+            decision_id
+            for decision_id, scored in zip(episode["decision_ids"], episode["score_mask"].tolist(), strict=True)
+            if scored
+        )
+
+    # N - (exec_delay + one-step reward horizon) = 298 usable decisions.
+    # The first 237 are causal history; all remaining decisions are covered,
+    # including the one-row stride remainder at the data boundary.
+    assert scored_ids == [f"d{i}" for i in range(237, 298)]
+    assert len(scored_ids) == len(set(scored_ids))
+
+
+def test_daily_raw_overlapping_episodes_share_one_chronological_backing() -> None:
+    records = [_daily_record(i, actions=7) for i in range(80)]
+    episodes = build_daily_raw_episodes(records, episode_len=30, stride=3, horizon=5)
+    assert len(episodes) > 10
+
+    # Logical episode volume is highly overlapping, but every tensor field has exactly one backing allocation.
+    # data_ptr() differs by slice offset, so compare the storage allocation pointer rather than the view pointer.
+    shared_fields = (
+        "market", "per_stock", "news_raw", "news_mask", "avail", "ret", "ret_valid",
+        "real_ret", "real_ret_valid", "aux_ret", "aux_ret_valid", "past_ret", "past_ret_valid",
+        "bars", "bar_mask",
+    )
+    for key in shared_fields:
+        storage_ptrs = {episode[key].untyped_storage().data_ptr() for episode in episodes}
+        assert len(storage_ptrs) == 1, f"{key} was copied per overlapping episode"
+        logical_bytes = sum(episode[key].numel() * episode[key].element_size() for episode in episodes)
+        assert episodes[0][key].untyped_storage().nbytes() < logical_bytes
+
+    # Compatibility aliases share the same reward storage too.
+    assert episodes[0]["ret"].untyped_storage().data_ptr() == episodes[0]["real_ret"].untyped_storage().data_ptr()
+    assert episodes[0]["ret_valid"].untyped_storage().data_ptr() == episodes[0]["real_ret_valid"].untyped_storage().data_ptr()
+
+
+def test_daily_adapter_reuses_compact_eod_but_copies_oversized_block_view() -> None:
+    encoded = _encoded_day(blocks=5, actions=4)
+    compact_market = torch.randn(3)
+    compact_per_stock = torch.randn(4, 3)
+    encoded["market"] = compact_market
+    encoded["per_stock"] = compact_per_stock
+
+    record = to_daily_raw_records([encoded])[0]
+    assert record["market"].untyped_storage().data_ptr() == compact_market.untyped_storage().data_ptr()
+    assert record["per_stock"].untyped_storage().data_ptr() == compact_per_stock.untyped_storage().data_ptr()
+
+    full_blocks = torch.randn(5, 4, 3)
+    encoded["per_stock"] = full_blocks
+    copied = to_daily_raw_records([encoded])[0]["per_stock"]
+    assert copied.untyped_storage().data_ptr() != full_blocks.untyped_storage().data_ptr()
+    _assert_compact(copied)
+    torch.testing.assert_close(copied, full_blocks[-1])
+
+    # Distributed TOP2000 overlays each EOD row as a view of one full date
+    # timeline.  Keep that view until the episode builder performs the single
+    # chronological stack; cloning here would create a redundant full copy
+    # one day at a time before stacking it again.
+    chronology = torch.randn(9, 4, 3)
+    encoded["per_stock"] = chronology[4]
+    shared = to_daily_raw_records([encoded])[0]["per_stock"]
+    assert shared.untyped_storage().data_ptr() == chronology.untyped_storage().data_ptr()
+
+
+def test_disabled_news_stays_scalar_backed_through_daily_episode_assembly() -> None:
+    days = []
+    for index in range(15):
+        day = _encoded_day(blocks=4, actions=3)
+        day["date"] = f"2022-01-{index + 3:02d}"
+        day["day_close"] = torch.arange(3, dtype=torch.float32) + 10.0 + index
+        day["news_raw"] = torch.zeros((), dtype=torch.float32).expand(4, 3, 32, 1)
+        day["news_mask"] = torch.zeros((), dtype=torch.bool).expand(4, 3, 32)
+        days.append(day)
+
+    encoded = encode_days(_ToyEncoder(), days, torch.device("cpu"), batch=2, last_only=True)
+    for day in encoded:
+        assert day["news_raw"].untyped_storage().nbytes() == day["news_raw"].element_size()
+        assert day["news_mask"].untyped_storage().nbytes() == day["news_mask"].element_size()
+
+    records = to_daily_raw_records(encoded)
+    episodes = build_daily_raw_episodes(records, episode_len=6, stride=6, horizon=2)
+    assert len(episodes) == 2
+    episode = episodes[0]
+    assert episode["news_raw"].shape == (6, 3, 32, 1)
+    assert episode["news_mask"].shape == (6, 3, 32)
+    assert episode["news_raw"].untyped_storage().nbytes() == episode["news_raw"].element_size()
+    assert episode["news_mask"].untyped_storage().nbytes() == episode["news_mask"].element_size()
+    assert not bool(episode["news_raw"].any())
+    assert not bool(episode["news_mask"].any())
+
+    # TOP2000 uses two episodes per rank. Create one scalar directly on the destination instead of densifying via
+    # either torch.stack or a cross-device copy.
+    batch = _stack_daily(episodes, [0, 1], torch.device("cpu"))
+    assert batch["news_raw"].shape == (2, 6, 3, 32, 1)
+    assert batch["news_mask"].shape == (2, 6, 3, 32)
+    assert batch["news_raw"].untyped_storage().nbytes() == batch["news_raw"].element_size()
+    assert batch["news_mask"].untyped_storage().nbytes() == batch["news_mask"].element_size()
+
+
+def test_all_masked_news_aggregator_skips_article_projection_with_exact_norm_semantics() -> None:
+    aggregator = _NewsAggregator(raw_dim=1, out_dim=5)
+    with torch.no_grad():
+        aggregator.norm.bias.copy_(torch.tensor([0.4, -0.3, 0.2, 0.1, -0.5]))
+        aggregator.norm.weight.copy_(torch.tensor([0.7, 1.2, 0.8, 1.1, 0.9]))
+
+    projection_calls = 0
+
+    def count_projection(_module, _inputs, _output) -> None:
+        nonlocal projection_calls
+        projection_calls += 1
+
+    handle = aggregator.proj.register_forward_hook(count_projection)
+    scores = torch.zeros((), dtype=torch.float32).expand(12, 7, 32, 1)
+    mask = torch.zeros((), dtype=torch.bool).expand(12, 7, 32)
+    output = aggregator(scores, mask)
+    handle.remove()
+
+    assert projection_calls == 0
+    assert output.shape == (12, 7, 5)
+    torch.testing.assert_close(output, aggregator.norm.bias.view(1, 1, 5).expand_as(output))
+
+    output.sum().backward()
+    torch.testing.assert_close(aggregator.norm.bias.grad, torch.full((5,), 12 * 7.0))
+    torch.testing.assert_close(aggregator.norm.weight.grad, torch.zeros(5))
+    for parameter in aggregator.proj.parameters():
+        assert parameter.grad is not None
+        torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter))
+
+
+def test_daily_single_episode_stack_avoids_host_copy() -> None:
+    episodes = build_daily_raw_episodes([_daily_record(i) for i in range(8)], episode_len=6, horizon=2)
+    batch = _stack_daily(episodes, [0], torch.device("cpu"))
+
+    assert batch["ret"].shape == (1, *episodes[0]["ret"].shape)
+    assert batch["ret"].untyped_storage().data_ptr() == episodes[0]["ret"].untyped_storage().data_ptr()
+    torch.testing.assert_close(batch["ret"][0], episodes[0]["ret"])
+
+
+def test_daily_batch_preserves_compact_bfloat16_context_on_device() -> None:
+    records = [_daily_record(i) for i in range(8)]
+    episodes = build_daily_raw_episodes(records, episode_len=6, stride=6, horizon=2)
+    episodes[0]["market"] = episodes[0]["market"].bfloat16()
+    episodes[0]["per_stock"] = episodes[0]["per_stock"].bfloat16()
+
+    batch = _stack_daily(episodes, [0], torch.device("cpu"))
+
+    assert episodes[0]["market"].dtype == torch.bfloat16
+    assert episodes[0]["per_stock"].dtype == torch.bfloat16
+    assert batch["market"].dtype == torch.bfloat16
+    assert batch["per_stock"].dtype == torch.bfloat16
+    assert batch["per_stock"].element_size() * 2 == torch.empty((), dtype=torch.float32).element_size()
+
+
 def test_generic_daily_builder_stacks_only_final_raw_block() -> None:
     records = [_daily_record(i) for i in range(5)]
     episode = build_daily_episodes(records, episode_len=5, raw_block_steps=2)[0]
@@ -251,12 +420,17 @@ def test_evaluation_batches_raw_encoding_without_changing_rollout() -> None:
 
 
 class _DriftPolicy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_previous: list[torch.Tensor] = []
+
     def encode_raw_policy_step(self, bars, bar_mask, step):
         del bar_mask, step
         return torch.zeros(bars.shape[0], bars.shape[1], 1)
 
     def forward(self, market, per_stock, raw_policy_ctx, news, news_mask, prev_weights, available):
         del market, per_stock, raw_policy_ctx, news, news_mask, available
+        self.seen_previous.append(prev_weights.detach().clone())
         weights = torch.full_like(prev_weights, 0.5)
         gate = (prev_weights[:, 0] > 0.9).to(prev_weights.dtype)
         return weights, gate
@@ -277,6 +451,10 @@ def test_rollout_drifts_held_weights_and_charges_terminal_liquidation() -> None:
     policy = _DriftPolicy().eval()
 
     nets, _, _, cash_weight, turnover, _ = _rollout(policy, batch, cost=0.1)
+    # ret[0] contains close information after decision 1.  It belongs in
+    # execution accounting, not in the policy's decision-1 observation.
+    torch.testing.assert_close(policy.seen_previous[0], torch.tensor([[1.0, 0.0]]))
+    torch.testing.assert_close(policy.seen_previous[1], torch.tensor([[0.5, 0.5]]))
     torch.testing.assert_close(cash_weight[0], torch.tensor([0.5, 1.0 / 3.0]))
     torch.testing.assert_close(turnover[0], torch.tensor([0.5, 2.0 / 3.0]))
     torch.testing.assert_close(nets[0], torch.tensor([0.45, -0.1 * 2.0 / 3.0]))

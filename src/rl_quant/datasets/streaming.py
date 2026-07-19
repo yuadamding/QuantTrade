@@ -34,8 +34,11 @@ class _WindowLRU:
         if hit is not None:
             self.od.move_to_end(p)
             return hit
-        d = torch.load(p, weights_only=True)           # cache holds only tensors + dict/list/str/int -> safe load
-                                                       # (no arbitrary-code pickle path; see datasets cache format)
+        # Map tensor storages instead of eagerly deserializing the entire file.
+        # A default TOP2000/60s window is ~148 MiB and many callers need only a
+        # small day_close/availability slice; mmap lets the OS fault in touched
+        # pages while the LRU still bounds live mappings and tensor views.
+        d = torch.load(p, weights_only=True, mmap=True)  # tensors + dict/list/str/int only; safe cache format
         self.od[p] = d
         while len(self.od) > self.maxn:
             self.od.popitem(last=False)
@@ -113,3 +116,13 @@ class LazyDay:
         o = dict(self._ov)
         o.update(kw)
         return LazyDay(self._win, self._di, o)
+
+    def raw_handle(self) -> "LazyDay":
+        """Return the same lazy source day without materialized overrides.
+
+        Episode bar loaders need only ``bars``/``bar_mask``. Keeping encoded
+        context overrides on that handle can pin an otherwise disposable full
+        chronological context tensor through every episode.
+        """
+
+        return LazyDay(self._win, self._di)

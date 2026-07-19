@@ -125,14 +125,18 @@ from its submitted session, and train/eval normalization is identical.
 ### Stage 2: direct differentiable allocation
 
 The legacy decision policies combine frozen context with policy-side raw-market encoding and optional raw news.
-They produce a target allocation and a continuous gate
-`held = gate * target + (1 - gate) * previous`. The gate is interpolation/rebalance intensity, **not** a sampled
-trade probability or literal order count. The trainer directly differentiates net portfolio return; it has no
-critic, behavior log probability, PPO ratio, or Bellman update.
+They produce a target allocation and a continuous gate. The gate is interpolation/rebalance intensity, **not** a
+sampled trade probability or literal order count. Under delayed execution, the policy observes the previously
+submitted allocation at the current decision timestamp; its new target is later interpolated against the drifted
+pre-trade book inside execution accounting. Future-drifted weights are never policy inputs. The trainer directly
+differentiates net portfolio return; it has no critic, behavior log probability, PPO ratio, or Bellman update.
 
 The repaired daily-raw path trains and reports on the same one-day close-to-close reward. Longer-horizon returns
 are auxiliary forecasting/SSL targets, and validation/test can carry an input-only causal history prefix that is
-excluded from scoring. Legacy rollouts now share portfolio helpers for availability, turnover, holdings drift,
+excluded from control and scoring. Overlapping training windows likewise use observation-only prefixes to warm
+temporal state while keeping the book in cash, score each warmed date once, and charge entry turnover on the first
+scored allocation. They do not liquidate at arbitrary sampling boundaries; continuous evaluation liquidates once
+at the true split end. Legacy rollouts now share portfolio helpers for availability, turnover, holdings drift,
 and terminal liquidation, but they still do not call `VectorPortfolioEnv`.
 
 Keep this path as a named direct-optimization baseline while the [migration](docs/architecture_migration_plan.md)
@@ -221,9 +225,13 @@ conda run -n quanttrade python ../training/train_phase1.py --smoke --allow-unrep
 conda run -n quanttrade python ../training/train_phase1.py \
   --design daily_raw --data-root "$DATA_ROOT" --device cuda:0 --seeds 5
 
-# Multi-GPU sweep
+# Explicit TOP50 wide screen: one paired seed, four independent one-GPU jobs
 conda run -n quanttrade python ../training/sweep_phase1.py \
-  --designs sweep --devices 0,1,2,3 --seeds 5
+  --designs top50-wide --devices 0,1,2,3 --vram-ceiling-gib 75 --seeds 1
+
+# Serious TOP2000 wide study: sequential four-rank settings, one seed each
+conda run -n quanttrade python ../training/sweep_phase1.py \
+  --designs top2000-wide --devices 0,1,2,3 --gpus-per-job 4 --seeds 1
 ```
 
 Use `--stream` for large datasets. Large-universe execution should wait until provenance passes and the smaller

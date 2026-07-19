@@ -1,8 +1,118 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
+
+
+def project_capped_risky_simplex(
+    weights: torch.Tensor,
+    available: torch.Tensor,
+    *,
+    max_risky_weight: float,
+    cash_index: int = 0,
+) -> torch.Tensor:
+    """Project a long-only allocation onto a per-risky-asset capped simplex.
+
+    CASH is the unrestricted residual/abstention asset.  Excess from a capped
+    risky name is redistributed proportionally across still-uncapped available
+    risky names; when total risky capacity is insufficient, the remainder goes
+    to CASH.  Unlike ``clamp(...); normalize()``, this construction cannot
+    re-inflate a risky weight above the configured cap in working precision
+    (the returned low-precision dtype rounds to its nearest representable value).
+
+    The operation is piecewise differentiable and implements batched
+    water-filling with one sort and tensor-only prefix/suffix operations, so it
+    is safe inside a policy forward without an asset-count Python loop.
+    """
+
+    if weights.ndim < 2 or weights.shape != available.shape:
+        raise ValueError("weights and available must have identical [..., asset] shapes")
+    if not weights.is_floating_point() or available.dtype != torch.bool:
+        raise ValueError("weights must be floating and available must be bool")
+    if not 0 <= cash_index < weights.shape[-1]:
+        raise ValueError("cash_index is outside the action axis")
+    cap = float(max_risky_weight)
+    if not math.isfinite(cap) or not 0 < cap <= 1:
+        raise ValueError("max_risky_weight must lie in (0, 1]")
+    if cap >= 1.0:
+        # Preserve the cheap uncapped path, but do not bypass the availability
+        # contract: any unavailable risky mass belongs in the CASH residual.
+        risky_mask = available.clone()
+        risky_mask[..., cash_index] = False
+        risky = torch.where(risky_mask, weights, torch.zeros_like(weights))
+        out = risky.clone()
+        out[..., cash_index] = 1.0 - risky.sum(dim=-1)
+        return out
+
+    original_dtype = weights.dtype
+    work = weights.float() if weights.dtype in (torch.float16, torch.bfloat16) else weights
+    risky_mask = available.clone()
+    risky_mask[..., cash_index] = False
+    risky = torch.where(risky_mask, work, torch.zeros_like(work))
+    active_count = risky_mask.sum(dim=-1, keepdim=True).to(work.dtype)
+    target_mass = torch.minimum(risky.sum(dim=-1, keepdim=True), active_count * cap)
+
+    # Exact batched water filling.  Sorting identifies how many largest names
+    # are fixed at the cap; the remainder shares the residual proportionally.
+    # This replaces the former O(A) Python loop (1,998 GPU kernel rounds at
+    # TOP2000 on every decision) with one O(A log A) tensor pass.
+    action_count = weights.shape[-1]
+    shape = (1,) * (weights.ndim - 1) + (action_count,)
+    position = torch.arange(action_count, device=work.device).view(shape)
+    active_count_long = risky_mask.sum(dim=-1, keepdim=True)
+
+    # Active zero-weight names must sort ahead of CASH/unavailable zeros so the
+    # uniform fallback never assigns capital to an infeasible action.
+    sort_key = torch.where(risky_mask, risky, torch.full_like(risky, -1.0))
+    _, order = torch.sort(sort_key, dim=-1, descending=True)
+    sorted_risky = torch.gather(risky, -1, order)
+    suffix_mass = torch.flip(torch.cumsum(torch.flip(sorted_risky, dims=(-1,)), dim=-1), dims=(-1,))
+
+    raw_remaining = target_mass - position.to(work.dtype) * cap
+    remaining_mass = raw_remaining.clamp_min(0.0)
+    remaining_count = (active_count_long - position).clamp_min(0)
+    proportional_max = remaining_mass * sorted_risky / suffix_mass.clamp_min(1e-20)
+    uniform_each = remaining_mass / remaining_count.clamp_min(1).to(work.dtype)
+    candidate_max = torch.where(suffix_mass > 0, proportional_max, uniform_each)
+    tolerance = 16 * torch.finfo(work.dtype).eps
+    candidate = (
+        (position <= active_count_long)
+        & (raw_remaining >= -tolerance)
+        & (candidate_max <= cap + tolerance)
+    )
+    # A feasible capped simplex always supplies at least one candidate.  The
+    # first is the unique proportional water-fill active set (ties are benign).
+    capped_count = candidate.to(torch.int64).argmax(dim=-1, keepdim=True)
+    selected_suffix = torch.gather(suffix_mass, -1, capped_count)
+    selected_remaining = (target_mass - capped_count.to(work.dtype) * cap).clamp_min(0.0)
+    selected_count = (active_count_long - capped_count).clamp_min(0)
+    scale = selected_remaining / selected_suffix.clamp_min(1e-20)
+    fill = torch.where(
+        selected_suffix > 0,
+        sorted_risky * scale,
+        selected_remaining / selected_count.clamp_min(1).to(work.dtype),
+    )
+    sorted_projected = torch.where(
+        position < capped_count,
+        torch.full_like(sorted_risky, cap),
+        torch.where(
+            (position >= capped_count) & (position < active_count_long),
+            fill,
+            torch.zeros_like(fill),
+        ),
+    )
+    projected = torch.zeros_like(work).scatter(-1, order, sorted_projected)
+    projected = torch.where(risky_mask, projected.clamp_max(cap), torch.zeros_like(projected))
+
+    # Numerical guard: only scale down (never up), so the risky cap remains
+    # inviolate in working precision. CASH receives every residual unit of capital.
+    risky_total = projected.sum(dim=-1, keepdim=True)
+    projected = projected * torch.where(risky_total > 1, risky_total.reciprocal(), torch.ones_like(risky_total))
+    out = projected.clone()
+    out[..., cash_index] = 1.0 - projected.sum(dim=-1)
+    return out.to(original_dtype)
 
 
 @dataclass

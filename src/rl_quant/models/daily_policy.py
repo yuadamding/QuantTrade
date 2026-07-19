@@ -26,6 +26,8 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
+from rl_quant.protocol.constraints import project_capped_risky_simplex
+
 from rl_quant.models.context_encoder import _CausalBlock, _sinusoidal
 from rl_quant.models.decision_policy import _NewsAggregator
 
@@ -114,7 +116,11 @@ class FullDayRawEncoder(nn.Module):
             vlog = torch.log1p(vol.clamp_min(0.0))
             vol_n = vlog - (vlog * m).sum(dim=2, keepdim=True) / cnt.unsqueeze(2)   # centered log-volume
             normed = torch.cat([price_n, vol_n], dim=-1) * m
-        x = self.input_proj(normed).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
+        x = self.input_proj(normed).reshape(B * A * nB, bl, d)
+        # Keep autocast's BF16 projection in BF16.  Adding the persistent FP32 positional buffer directly would
+        # promote the full raw-session activation, all transformer residuals, and the returned day embedding to
+        # FP32.  The small positional slice is the value that should follow the compute dtype.
+        x = x + self.pos1[:bl].to(dtype=x.dtype).view(1, bl, d)
         bm1 = bar_mask.reshape(B * A * nB, bl)
 
         def packed_last(rows: torch.Tensor, valid: torch.Tensor, blocks: nn.ModuleList,
@@ -149,17 +155,18 @@ class FullDayRawEncoder(nn.Module):
                         )
                     else:
                         packed = block(packed, None)
-                result[selected] = norm(packed[:, -1])
+                # CUDA autocast LayerNorm returns FP32; indexed assignment requires an explicit compute-dtype cast.
+                result[selected] = norm(packed[:, -1]).to(dtype=result.dtype)
             return result
 
         summ = packed_last(x, bm1, self.tier1, self.norm1).reshape(B * A, nB, d)
         block_has = bm1.any(-1).reshape(B * A, nB)
-        summ = summ * block_has.unsqueeze(-1).float()
-        h = summ + self.pos2[:nB].unsqueeze(0)
+        summ = summ * block_has.unsqueeze(-1).to(dtype=summ.dtype)
+        h = summ + self.pos2[:nB].to(dtype=summ.dtype).unsqueeze(0)
         # Only the final day state is consumed, so tier 2 can use the same ragged-last path and avoid retaining a
         # padded full-session output. Missing blocks still keep their absolute ``pos2`` timestamp.
         day = packed_last(h, block_has, self.tier2, self.norm2).reshape(B, A, d)
-        return day * block_has.any(-1).reshape(B, A, 1).float()  # zero for stocks absent all day
+        return day * block_has.any(-1).reshape(B, A, 1).to(dtype=day.dtype)  # zero for stocks absent all day
 
 
 class CrossDayTemporalEncoder(nn.Module):
@@ -188,11 +195,14 @@ class CrossDayTemporalEncoder(nn.Module):
         B, T, A, d = seq.shape
         if T > self.pos.shape[0]:
             raise ValueError(f"episode/eval length {T} exceeds temporal max_days {self.pos.shape[0]}")
-        x = seq.permute(0, 2, 1, 3).reshape(B * A, T, d) + self.pos[:T].unsqueeze(0)  # [B*A, T, d]
+        x = seq.permute(0, 2, 1, 3).reshape(B * A, T, d)
+        x = x + self.pos[:T].to(dtype=x.dtype).unsqueeze(0)       # [B*A, T, d], no BF16 -> FP32 promotion
         kpm = (~day_valid.bool()).permute(0, 2, 1).reshape(B * A, T) if day_valid is not None else None
         for blk in self.blocks:
             x = blk(x, kpm)
-        x = self.norm(x)
+        # Standalone CUDA LayerNorm returns FP32 under autocast.  Keep its FP32 internal reduction, then restore
+        # the BF16 residual dtype so the full [B,T,A,d] state and allocator input do not double in size.
+        x = self.norm(x).to(dtype=x.dtype)
         return x.reshape(B, A, T, d).permute(0, 2, 1, 3)         # [B,T,A,d]
 
 
@@ -218,6 +228,7 @@ class DailyCrossSectionConfig:
     feedforward_dim: int = 512
     dropout: float = 0.0
     temperature: float = 1.0
+    max_stock_weight: float = 1.0     # hard cap on each non-CASH target weight; CASH is unrestricted
     gate_init_bias: float = 2.0
     grad_checkpoint: bool = False
     raw_norm: str = "level"          # full-day raw input norm: "level" (magnitude-preserving) | "instance" (whitened)
@@ -241,6 +252,8 @@ class DailyCrossSectionPolicy(nn.Module):
 
     def __init__(self, config: DailyCrossSectionConfig) -> None:
         super().__init__()
+        if not 0 < float(config.max_stock_weight) <= 1:
+            raise ValueError("max_stock_weight must lie in (0, 1]")
         self.config = config
         self.raw_encoder = FullDayRawEncoder(
             bar_feature_dim=config.bar_feature_dim, d_model=config.raw_policy_dim,
@@ -296,25 +309,42 @@ class DailyCrossSectionPolicy(nn.Module):
         B, T, A, dc = per_stock.shape
         ckpt = reload_ckpt and self.training
         dr = self.config.raw_policy_dim
+        # A BF16 frozen context is already quantized to BF16. Under BF16
+        # autocast, keep every token component in that dtype before the giant
+        # concatenation; Linear would cast the FP32 concatenation back to BF16
+        # anyway. Outside autocast, promote locally to FP32 so BF16 context
+        # remains a valid explicit-AMP-off fallback with FP32 module weights.
+        low_precision_context = per_stock.dtype in (torch.float16, torch.bfloat16)
+        assembly_dtype = (
+            per_stock.dtype
+            if low_precision_context and torch.is_autocast_enabled(per_stock.device.type)
+            else torch.float32
+        )
         raw_days = []
         for t in range(T):
             if not raw_day_mask[t]:
-                raw_days.append(torch.zeros(B, A, dr, device=per_stock.device, dtype=per_stock.dtype))
+                raw_days.append(torch.zeros(B, A, dr, device=per_stock.device, dtype=assembly_dtype))
             elif ckpt:
-                raw_days.append(torch.utils.checkpoint.checkpoint(self._raw_day, day_bars_fn, t, use_reentrant=False))
+                raw_days.append(
+                    torch.utils.checkpoint.checkpoint(
+                        self._raw_day, day_bars_fn, t, use_reentrant=False
+                    ).to(assembly_dtype)
+                )
             else:
-                raw_days.append(self._raw_day(day_bars_fn, t))
+                raw_days.append(self._raw_day(day_bars_fn, t).to(assembly_dtype))
         raw = torch.stack(raw_days, dim=1)                     # [B,T,A,dr]
         news = self.news_agg(news_raw.reshape(B * T, A, news_raw.shape[3], news_raw.shape[4]),
-                             news_mask.reshape(B * T, A, news_mask.shape[3])).reshape(B, T, A, -1)  # [B,T,A,ne]
-        mkt = market.unsqueeze(2).expand(B, T, A, dc)
-        flag = torch.tensor(raw_day_mask, device=per_stock.device, dtype=per_stock.dtype)
+                             news_mask.reshape(B * T, A, news_mask.shape[3])).reshape(B, T, A, -1)
+        news = news.to(assembly_dtype)                          # [B,T,A,ne]
+        mkt = market.to(assembly_dtype).unsqueeze(2).expand(B, T, A, dc)
+        per_stock = per_stock.to(assembly_dtype)
+        flag = torch.tensor(raw_day_mask, device=per_stock.device, dtype=assembly_dtype)
         flag = flag.view(1, T, 1, 1).expand(B, T, A, 1)
         # Fixed input scaling to ~unit variance (daily moves are ~2%, the other token channels are ~unit scale;
         # unscaled, the momentum channel would start ~100x under-weighted into token_proj). A constant, applied
         # identically everywhere -- input normalization, not a learned/engineered feature.
-        pr = (past_ret * 50.0).unsqueeze(-1).to(per_stock.dtype)
-        pv = past_ret_valid.unsqueeze(-1).to(per_stock.dtype)
+        pr = (past_ret * 50.0).unsqueeze(-1).to(assembly_dtype)
+        pv = past_ret_valid.unsqueeze(-1).to(assembly_dtype)
         return self.token_proj(torch.cat([mkt, per_stock, raw, news, pr, pv, flag], dim=-1))  # [B,T,A,token_dim]
 
     def temporal_state(self, tok, avail):
@@ -343,16 +373,23 @@ class DailyCrossSectionPolicy(nn.Module):
                                    self._raw_day_mask(n_days), reload_ckpt=True)
         return self.temporal_state(tok, avail)
 
-    def encode_tokens_dual(self, market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid):
-        """EVAL: BOTH token variants for every day, computed ONCE -- (tok_raw [B,T,A,D], tok_noraw [B,T,A,D]).
-        The expensive full-day raw encode runs once per day (for tok_raw); tok_noraw re-projects the same
-        ctx/news/past-return with a zero raw component + has_raw=0. The rolling-window rollout then assembles each
-        decision's slice PER-DECISION (raw variant for its most recent `raw_recent_days`, no-raw before), matching
-        the two-speed geometry training saw. day_bars_fn(t) -> (bars [B,A,S,F], mask [B,A,S]); works for in-RAM
-        slices and streaming loaders alike (eval is no_grad, so no reload-checkpoint is needed)."""
+    def encode_tokens_dual(self, market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid,
+                           *, raw_start: int = 0):
+        """EVAL token variants for a rolling scored suffix.
+
+        ``tok_noraw`` is built for every day. ``tok_raw`` runs the expensive
+        full-day raw encoder only on ``[raw_start, T)``; callers must choose a
+        start covering the union of every scored decision's raw window. Earlier
+        ``tok_raw`` rows equal the no-raw variant and are never selected. This
+        preserves scored outputs while avoiding raw encoding of long input-only
+        burn-in prefixes. ``raw_start=0`` retains the full legacy behavior.
+        """
         T = per_stock.shape[1]
+        if isinstance(raw_start, bool) or not isinstance(raw_start, int) or not 0 <= raw_start <= T:
+            raise ValueError(f"raw_start must be an integer in [0, {T}], got {raw_start!r}")
         tok_raw = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask,
-                                       past_ret, past_ret_valid, [True] * T, reload_ckpt=False)
+                                       past_ret, past_ret_valid,
+                                       [t >= raw_start for t in range(T)], reload_ckpt=False)
         tok_noraw = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask,
                                          past_ret, past_ret_valid, [False] * T, reload_ckpt=False)
         return tok_raw, tok_noraw
@@ -361,17 +398,31 @@ class DailyCrossSectionPolicy(nn.Module):
         """One day's cross-sectional allocation. state_t [B,A,token_dim], prev_weights/available [B,A]
         -> (weights [B,A] long-only over {CASH,stocks}, gate [B])."""
         B, A, _ = state_t.shape
-        tok = self.alloc_in(torch.cat([state_t, prev_weights.unsqueeze(-1)], dim=-1))
-        tok = tok + self.cash_bias * (torch.arange(A, device=tok.device) == 0).float().view(1, A, 1)
+        # Portfolio accounting remains FP32, but the previous-weight feature is immediately consumed by an
+        # autocast Linear.  Cast that one column before concatenation so it cannot promote the much wider BF16
+        # temporal state to FP32 merely to be cast back inside alloc_in.
+        prev_feature = prev_weights.unsqueeze(-1).to(dtype=state_t.dtype)
+        tok = self.alloc_in(torch.cat([state_t, prev_feature], dim=-1))
+        cash_marker = (torch.arange(A, device=tok.device) == 0).to(dtype=tok.dtype).view(1, A, 1)
+        tok = tok + self.cash_bias.to(dtype=tok.dtype) * cash_marker
         kpm = ~available.bool()
         kpm = kpm.clone()
         kpm[:, 0] = False                                        # CASH always available
         h = self.attn(tok, src_key_padding_mask=kpm)
         scores = self.score(h).squeeze(-1) / self.temperature
         scores = scores.masked_fill(kpm, float("-inf"))
-        weights = torch.softmax(scores, dim=1)                   # long-only, sums to 1
-        avail = (~kpm).float().unsqueeze(-1)
-        summary = (h * avail).sum(dim=1) / avail.sum(dim=1).clamp_min(1.0)
+        weights = torch.softmax(scores, dim=1)                   # requested long-only simplex
+        weights = project_capped_risky_simplex(
+            weights,
+            ~kpm,
+            max_risky_weight=self.config.max_stock_weight,
+            cash_index=0,
+        )
+        avail = (~kpm).to(dtype=h.dtype).unsqueeze(-1)
+        summary = (
+            (h * avail).sum(dim=1, dtype=torch.float32)
+            / avail.sum(dim=1, dtype=torch.float32).clamp_min(1.0)
+        )                                                         # stable wide reduction; only [B,d] stays FP32
         gate = torch.sigmoid(self.gate_head(summary).squeeze(-1))
         return weights, gate
 

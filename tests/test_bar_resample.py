@@ -98,6 +98,19 @@ class ResampleAggregation(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _build(root, gs=7)                                   # 30 % 7 != 0
 
+    def test_disabled_news_uses_scalar_backed_zero_views(self) -> None:
+        """No-news caches keep the full tensor contract without persisting dense zero storage."""
+        with tempfile.TemporaryDirectory() as tmp:
+            window = _build(_write_root(Path(tmp), self.ROWS), gs=GRID)
+            news_raw, news_mask = window["news_raw"], window["news_mask"]
+
+            self.assertEqual(news_raw.shape, (1, SESSION // BLOCK, 2, 32, 1))
+            self.assertEqual(news_mask.shape, (1, SESSION // BLOCK, 2, 32))
+            self.assertFalse(bool(news_raw.any()))
+            self.assertFalse(bool(news_mask.any()))
+            self.assertEqual(news_raw.untyped_storage().nbytes(), news_raw.element_size())
+            self.assertEqual(news_mask.untyped_storage().nbytes(), news_mask.element_size())
+
 
 class DesignValidation(unittest.TestCase):
     def test_bar_seconds_validated_and_top2000_is_one_day_sized(self) -> None:

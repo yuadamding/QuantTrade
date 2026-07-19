@@ -18,6 +18,8 @@ import math
 import torch
 from torch import nn
 
+from rl_quant.protocol.constraints import project_capped_risky_simplex
+
 
 @dataclass
 class DecisionPolicyConfig:
@@ -37,6 +39,7 @@ class DecisionPolicyConfig:
     feedforward_dim: int = 256
     dropout: float = 0.0
     temperature: float = 1.0         # softmax temperature on the allocation: <1 concentrates, >1 diversifies
+    max_stock_weight: float = 1.0    # hard cap on each non-CASH target; CASH remains the residual sink
     gate_init_bias: float = 2.0      # initial act-gate logit -> sigmoid(2)=0.88: start TRADING (escape CASH basin)
 
 
@@ -130,7 +133,10 @@ class RawSecondPolicyEncoder(nn.Module):
             raise ValueError(f"raw policy encoder needs at least one {bl}s block; got S={S}")
         bars = bars[:, :, : nB * bl].reshape(B * A * nB, bl, F)
         bm = bar_mask[:, :, : nB * bl].bool().reshape(B * A * nB, bl)
-        x = self.input_proj(self._normalize_ohlcv(bars, bm)) + self.pos[:bl].view(1, bl, self.d_model)
+        x = self.input_proj(self._normalize_ohlcv(bars, bm))
+        # Autocast Linear emits BF16, while the persistent positional table is FP32.  Cast the tiny table slice
+        # instead of promoting the full raw-token grid and all following attention residuals to FP32.
+        x = x + self.pos[:bl].to(dtype=x.dtype).view(1, bl, self.d_model)
 
         # We consume only the last valid token from each block. Pack rows by valid length so attention never sees
         # padding and needs only one shared ``[L,L]`` causal mask, instead of an expanded per-row causal+padding
@@ -158,7 +164,8 @@ class RawSecondPolicyEncoder(nn.Module):
                 packed = self.local(packed, mask=causal)
             else:
                 packed = self.local(packed)
-            summary[selected] = self.out_norm(packed[:, -1])
+            # CUDA autocast LayerNorm returns FP32; indexed assignment requires an explicit compute-dtype cast.
+            summary[selected] = self.out_norm(packed[:, -1]).to(dtype=summary.dtype)
         return summary.reshape(B, A, nB, self.d_model).permute(0, 2, 1, 3)
 
 
@@ -171,10 +178,31 @@ class _NewsAggregator(nn.Module):
         super().__init__()
         self.proj = nn.Sequential(nn.Linear(raw_dim, out_dim), nn.GELU())
         self.norm = nn.LayerNorm(out_dim)
+        self.out_dim = int(out_dim)
 
     def forward(self, scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # scores [B,A,M,raw_dim], mask [B,A,M] -> [B,A,out_dim]
-        e = self.proj(scores) * mask.unsqueeze(-1).to(scores.dtype)
+        if mask.numel() == 0:
+            all_masked = True
+        elif mask.untyped_storage().nbytes() == mask.element_size():
+            # Expanded scalar is the default no-news representation. Inspect one value instead of reducing its
+            # potentially multi-million-element logical view.
+            all_masked = not bool(mask[(0,) * mask.ndim])
+        else:
+            all_masked = not bool(mask.any())
+        if all_masked:
+            # Exact semantics are LayerNorm(sum(0 * projection)) = LayerNorm(0). Evaluate that once and expand it
+            # over [B,A], retaining a learned LayerNorm bias from a news-enabled checkpoint without allocating the
+            # [B,A,M,out_dim] article activation. Zero dependencies keep skipped projection gradients (and thus
+            # AdamW decay behavior) equivalent to the ordinary all-masked path: zero tensors rather than None.
+            zero = scores.new_zeros(1, 1, self.out_dim)
+            for parameter in self.proj.parameters():
+                zero = zero + (parameter.sum() * 0.0).to(dtype=zero.dtype)
+            return self.norm(zero).expand(*scores.shape[:2], self.out_dim)
+        e = self.proj(scores)
+        # ``scores`` is commonly an FP32 input even under autocast.  Following its dtype here would widen the
+        # dense [B,A,M,out] projected article activation immediately after Linear produced BF16.
+        e = e * mask.unsqueeze(-1).to(dtype=e.dtype)
         return self.norm(e.sum(dim=2))
 
 
@@ -187,6 +215,8 @@ class DecisionPolicyHead(nn.Module):
 
     def __init__(self, config: DecisionPolicyConfig) -> None:
         super().__init__()
+        if not 0 < float(config.max_stock_weight) <= 1:
+            raise ValueError("max_stock_weight must lie in (0, 1]")
         self.config = config
         raw_dim = config.raw_policy_dim or config.context_dim
         raw_heads = config.raw_policy_heads or config.n_heads
@@ -257,10 +287,20 @@ class DecisionPolicyHead(nn.Module):
         news_mask [B,A,M]; prev_weights/available [B,A].
         """
         B, A, d = per_stock.shape
-        mkt = market.unsqueeze(1).expand(B, A, d)
-        news = self.news_agg(news_scores, news_mask)                          # in-model raw-news aggregation
-        tok = self.token_proj(torch.cat([mkt, per_stock, raw_policy_ctx, news, prev_weights.unsqueeze(-1)], dim=-1))
-        tok = tok + self.cash_bias * (torch.arange(A, device=tok.device) == 0).float().view(1, A, 1)  # CASH token
+        low_precision_context = per_stock.dtype in (torch.float16, torch.bfloat16)
+        assembly_dtype = (
+            per_stock.dtype
+            if low_precision_context and torch.is_autocast_enabled(per_stock.device.type)
+            else torch.float32
+        )
+        mkt = market.to(dtype=assembly_dtype).unsqueeze(1).expand(B, A, d)
+        per_stock = per_stock.to(dtype=assembly_dtype)
+        raw_policy_ctx = raw_policy_ctx.to(dtype=assembly_dtype)
+        news = self.news_agg(news_scores, news_mask).to(dtype=assembly_dtype)  # in-model raw-news aggregation
+        prev_feature = prev_weights.unsqueeze(-1).to(dtype=assembly_dtype)
+        tok = self.token_proj(torch.cat([mkt, per_stock, raw_policy_ctx, news, prev_feature], dim=-1))
+        cash_marker = (torch.arange(A, device=tok.device) == 0).to(dtype=tok.dtype).view(1, A, 1)
+        tok = tok + self.cash_bias.to(dtype=tok.dtype) * cash_marker           # CASH token
         kpm = ~available.bool()                                  # constraint mask: unavailable actions are dropped
         kpm = kpm.clone()
         kpm[:, 0] = False                                        # CASH is always available (abstention sink)
@@ -268,7 +308,16 @@ class DecisionPolicyHead(nn.Module):
         scores = self.score(h).squeeze(-1) / self.temperature    # [B,A]; temperature shapes allocation sharpness
         scores = scores.masked_fill(kpm, float("-inf"))          # never allocate to unavailable actions
         weights = torch.softmax(scores, dim=1)
-        avail = (~kpm).float().unsqueeze(-1)                     # gate reads only AVAILABLE actions (incl. CASH)
-        summary = (h * avail).sum(dim=1) / avail.sum(dim=1).clamp_min(1.0)  # masked mean (no padded-row dilution)
+        weights = project_capped_risky_simplex(
+            weights,
+            ~kpm,
+            max_risky_weight=self.config.max_stock_weight,
+            cash_index=0,
+        )
+        avail = (~kpm).to(dtype=h.dtype).unsqueeze(-1)            # gate reads only AVAILABLE actions (incl. CASH)
+        summary = (
+            (h * avail).sum(dim=1, dtype=torch.float32)
+            / avail.sum(dim=1, dtype=torch.float32).clamp_min(1.0)
+        )                                                         # stable masked mean; only [B,d] is FP32
         gate = torch.sigmoid(self.gate_head(summary).squeeze(-1))  # [B] trade (->target) vs hold (->prev)
         return weights, gate

@@ -19,24 +19,76 @@ from rl_quant.datasets.streaming import LazyDay
 CASH_INDEX = 0
 
 
+def _compact_detached(value: torch.Tensor) -> torch.Tensor:
+    """Detach ``value`` without copying unless its view pins a larger backing allocation.
+
+    ``encode_days(last_only=True)`` already returns compact, detached EOD tensors.  Cloning those again in the
+    daily adapter briefly doubled TOP2000's largest host allocation before the chronological backing was built.
+    Conversely, an EOD slice of a full block tensor *must* be copied or it retains all intraday blocks.  Storage
+    size, rather than contiguity alone, distinguishes those cases and also lets broadcast zero/news tensors keep
+    their intentionally tiny backing until the builder stacks the timeline once.
+    """
+
+    value = value.detach()
+    logical_nbytes = value.numel() * value.element_size()
+    if value.untyped_storage().nbytes() <= logical_nbytes:
+        return value
+    return value.clone(memory_format=torch.contiguous_format)
+
+
 def _owned_eod(value: torch.Tensor, full_ndim: int, key: str) -> torch.Tensor:
-    """Accept a full ``[n_blocks, ...]`` field or an already-EOD field and return compact owned storage."""
+    """Accept a full ``[n_blocks, ...]`` field or an already-EOD field.
+
+    A full block tensor must be compacted immediately.  An already-EOD tensor
+    may intentionally be a day view into the distributed chronological cache;
+    retain that view until :func:`build_daily_raw_episodes` creates the one
+    owned timeline, instead of allocating one copy per day and then stacking a
+    second copy of the same chronology.
+    """
     if value.ndim == full_ndim:
-        value = value[-1]
+        return value[-1].detach().contiguous().clone()
     elif value.ndim != full_ndim - 1:
         raise ValueError(
             f"daily field {key!r} must have {full_ndim} dims (per-block) or {full_ndim - 1} dims (EOD); "
             f"got shape {tuple(value.shape)}"
         )
-    return value.detach().contiguous().clone()
+    return value.detach()
+
+
+def _timeline_view(value: torch.Tensor, start: int, stop: int) -> torch.Tensor:
+    """Return an episode view into a single chronological backing (never a per-episode copy)."""
+
+    return value.narrow(0, start, stop - start)
+
+
+def _stack_news_timeline(records: list[dict], key: str) -> torch.Tensor:
+    """Stack enabled news, but keep the disabled-news chronology backed by one zero scalar."""
+
+    values = [record[key] for record in records]
+    first = values[0]
+
+    def scalar_backed_zero(value: torch.Tensor) -> bool:
+        if (
+            value.shape != first.shape
+            or value.dtype != first.dtype
+            or value.device != first.device
+            or value.numel() <= 1
+            or value.untyped_storage().nbytes() != value.element_size()
+        ):
+            return False
+        return not bool(value[(0,) * value.ndim])
+
+    if all(scalar_backed_zero(value) for value in values):
+        return torch.zeros((), dtype=first.dtype, device=first.device).expand(len(values), *first.shape)
+    return torch.stack(values)
 
 
 def to_daily_raw_records(encoded: list) -> list[dict]:
     """EOD adapter (the single, explicit place daily_raw assembles records). Each `encoded` day carries per-BLOCK
     context ([nB, ...]) OR already-selected EOD context + raw bars + day_close (from encode_days). This selects or
-    accepts the END-OF-DAY fields for the daily decision and gives each one compact owned storage. Raw bars stay
-    LAZY when the day is a LazyDay (streaming) -- so the shape contract is in-repo + unit-tested rather than living
-    in an external driver.
+    accepts the END-OF-DAY fields for the daily decision. Full-block slices are compacted immediately; existing
+    EOD chronology views are stacked once by the episode builder. Raw bars stay LAZY when the day is a LazyDay
+    (streaming) -- so the shape contract is in-repo + unit-tested rather than living in an external driver.
 
     encoded[i]: {market [nB,d], per_stock [nB,A,d], avail [nB,A], news_raw [nB,A,M,1], news_mask [nB,A,M],
                  day_close [A], date, + bars/bar_mask (materialized) OR a lazy bars handle if a LazyDay}.
@@ -47,7 +99,7 @@ def to_daily_raw_records(encoded: list) -> list[dict]:
     for e in encoded:
         r = {
             "date": e["date"],
-            "day_close": e["day_close"].detach().contiguous().clone(),
+            "day_close": _compact_detached(e["day_close"]),
             "avail": _owned_eod(e["avail"], 2, "avail"),
             "market": _owned_eod(e["market"], 2, "market"),
             "per_stock": _owned_eod(e["per_stock"], 3, "per_stock"),
@@ -55,7 +107,7 @@ def to_daily_raw_records(encoded: list) -> list[dict]:
             "news_mask": _owned_eod(e["news_mask"], 3, "news_mask"),
         }
         if isinstance(e, LazyDay):                              # streaming: keep full-day bars lazy via the handle
-            r["_bars_day"] = e
+            r["_bars_day"] = e.raw_handle()                     # context overrides must not pin full storage
         else:
             r["bars"], r["bar_mask"] = e["bars"], e["bar_mask"]
         recs.append(r)
@@ -116,6 +168,7 @@ def build_daily_raw_episodes(
     *,
     require_aux_labels: bool = False,
     score_start: int = 0,
+    score_tail: int | None = None,
 ) -> list[dict]:
     """Build daily_raw episodes with a canonical one-step transition reward and optional burn-in prefix.
 
@@ -126,9 +179,16 @@ def build_daily_raw_episodes(
     tail to decisions having an H-day auxiliary label, which is useful for an explicitly auxiliary-only training
     experiment but should not be used for continuous validation/test coverage.
 
-    ``score_start`` is a record index: earlier records remain in the episode as causal input/portfolio burn-in but
-    have ``score_mask=False``. Consumers should AND this mask with their loss/reporting label while still using
-    the prefix transitions to build temporal state and drift the held portfolio.
+    ``score_start`` is a record index: earlier records remain in the episode as causal observation burn-in but
+    have ``score_mask=False``. Consumers should AND this mask with their loss/reporting label, keep the burn-in
+    book in CASH, and use the prefix only to build temporal state.
+
+    ``score_tail`` is the training-window mode.  When set, only a non-overlapping tail of at most this many
+    decisions is scored in each overlapping episode; the earlier rows are causal observation-only burn-in.  A
+    final offset window covers any stride remainder without scoring a date twice.  This makes a length-252,
+    stride-15 episode train on decisions with 238--252 days of history instead of counting every short prefix,
+    and keeps the scored current day inside a two-speed policy's recent-raw tail.  Leave it ``None`` for the
+    continuous validation/test behavior.
 
     Episodes carry the FROZEN end-of-day context + FULL-day raw bars + news + availability for the cross-day
     policy. ``records`` is a DATE-SORTED list of per-day dicts, each with
@@ -146,6 +206,10 @@ def build_daily_raw_episodes(
         raise ValueError(f"episode_len must be positive, got {episode_len}")
     if not 0 <= score_start <= N:
         raise ValueError(f"score_start must be in [0, {N}], got {score_start}")
+    if score_tail is not None and (
+        isinstance(score_tail, bool) or not isinstance(score_tail, int) or score_tail <= 0
+    ):
+        raise ValueError(f"score_tail must be a positive integer or None, got {score_tail!r}")
     if N < exec_delay + 2:
         return []
     day_close = torch.stack([r["day_close"] for r in records])   # [N,A]
@@ -168,8 +232,11 @@ def build_daily_raw_episodes(
         past_valid[:, CASH_INDEX] = True
     market = torch.stack([r["market"] for r in records])
     per_stock = torch.stack([r["per_stock"] for r in records])
-    news_raw = torch.stack([r["news_raw"] for r in records])
-    news_mask = torch.stack([r["news_mask"] for r in records])
+    # Disabled news arrives as scalar-backed broadcast zeros. Preserve that representation across the date axis;
+    # a normal torch.stack would silently turn it into ~0.25 GiB of TOP2000 host storage per rank. Enabled news
+    # remains dense and follows the ordinary stack path.
+    news_raw = _stack_news_timeline(records, "news_raw")
+    news_mask = _stack_news_timeline(records, "news_mask")
     avail = torch.stack([r["avail"] for r in records])
     # STREAMING: a record carries "_bars_day" (a lazy per-day handle exposing ["bars"]/["bar_mask"]) instead of a
     # materialized "bars". DON'T stack full-day bars (a 171-day episode would be hundreds of GB) -- keep the per-day
@@ -185,19 +252,45 @@ def build_daily_raw_episodes(
     if usable <= 0:
         return []
     L = min(episode_len, usable)
+    if score_tail is not None and score_tail > L:
+        raise ValueError(f"score_tail {score_tail} exceeds the usable episode length {L}")
     st = stride if (stride and stride > 0) else L
     starts = list(range(0, usable - L + 1, st)) or [0]
+    if score_tail is not None:
+        # A regular stride can leave a short tail.  End one final window at the
+        # data boundary; ``next_score_index`` below admits only the remainder,
+        # so already-scored dates are not duplicated.
+        final_start = usable - L
+        if starts[-1] != final_start:
+            starts.append(final_start)
     episodes = []
+    next_score_index = max(score_start, L - score_tail) if score_tail is not None else score_start
     for s in starts:
         e = s + L
+        indices = torch.arange(s, e)
+        if score_tail is None:
+            score_mask = indices >= score_start
+        else:
+            score_from = max(s, score_start, e - score_tail, next_score_index)
+            score_mask = indices >= score_from
+            next_score_index = max(next_score_index, e)
         ep = {
-            "market": market[s:e], "per_stock": per_stock[s:e],
-            "news_raw": news_raw[s:e], "news_mask": news_mask[s:e], "avail": avail[s:e],
-            "ret": ret[s:e], "ret_valid": valid[s:e],                       # canonical 1-day train reward
-            "real_ret": ret[s:e], "real_ret_valid": valid[s:e],             # same basis, compatibility alias
-            "aux_ret": aux_ret[s:e], "aux_ret_valid": aux_valid[s:e],       # H-day auxiliary forecast label
-            "past_ret": past_ret[s:e], "past_ret_valid": past_valid[s:e],   # PIT input: own 1-day past return
-            "score_mask": torch.arange(s, e) >= score_start,                  # input-only prefix is not scored
+            # Every large field is a view of one date-sorted backing. With TOP2000/252d/stride15 this is the
+            # difference between one chronology per rank and roughly forty overlapping episode copies.
+            "market": _timeline_view(market, s, e),
+            "per_stock": _timeline_view(per_stock, s, e),
+            "news_raw": _timeline_view(news_raw, s, e),
+            "news_mask": _timeline_view(news_mask, s, e),
+            "avail": _timeline_view(avail, s, e),
+            "ret": _timeline_view(ret, s, e),
+            "ret_valid": _timeline_view(valid, s, e),                       # canonical 1-day train reward
+            "real_ret": _timeline_view(ret, s, e),
+            "real_ret_valid": _timeline_view(valid, s, e),                  # same basis, compatibility alias
+            "aux_ret": _timeline_view(aux_ret, s, e),
+            "aux_ret_valid": _timeline_view(aux_valid, s, e),               # H-day auxiliary forecast label
+            "past_ret": _timeline_view(past_ret, s, e),
+            "past_ret_valid": _timeline_view(past_valid, s, e),             # PIT input: own 1-day past return
+            "score_mask": score_mask,                                        # input-only prefix is not scored
             "decision_ids": tuple(str(records[index].get("date", index)) for index in range(s, e)),
             "n_blocks": L,
         }
@@ -205,8 +298,8 @@ def build_daily_raw_episodes(
             ep["bars_days"] = [r["_bars_day"] for r in records[s:e]]   # lazy per-day handles (load bars on demand)
         else:
             assert bars is not None and bar_mask is not None
-            ep["bars"] = bars[s:e]
-            ep["bar_mask"] = bar_mask[s:e]
+            ep["bars"] = _timeline_view(bars, s, e)
+            ep["bar_mask"] = _timeline_view(bar_mask, s, e)
         episodes.append(ep)
     return episodes
 

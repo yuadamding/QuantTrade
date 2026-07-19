@@ -15,6 +15,7 @@ assertions:
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -190,6 +191,113 @@ class PolicyIsAllocationAndGate(unittest.TestCase):
             self.assertAlmostEqual(float(w.sum()), 1.0, places=4)
             self.assertTrue(0.0 <= float(gate) <= 1.0)
 
+    def test_hard_stock_cap_keeps_cash_as_the_residual(self):
+        torch.manual_seed(0)
+        pol = _policy(max_stock_weight=0.10)
+        actions = 8
+        available = torch.ones(1, actions, dtype=torch.bool)
+        previous = torch.zeros(1, actions)
+        previous[:, 0] = 1.0
+        news_scores, news_mask = _news(1, actions)
+        weights, _ = pol(
+            torch.randn(1, 16),
+            torch.randn(1, actions, 16),
+            torch.randn(1, actions, 4),
+            news_scores,
+            news_mask,
+            previous,
+            available,
+        )
+
+        self.assertAlmostEqual(float(weights.sum()), 1.0, places=5)
+        self.assertLessEqual(float(weights[:, 1:].max()), 0.10 + 1e-6)
+        self.assertGreaterEqual(float(weights[:, 0]), 0.30 - 1e-6)
+
+    def test_amp_keeps_generic_policy_hot_path_bfloat16(self):
+        """Frozen BF16 context must not be widened by FP32 news/book/position constants before policy Linear ops."""
+        torch.manual_seed(4)
+        policy = _policy().train()
+        market = torch.randn(2, 16).bfloat16()
+        per_stock = torch.randn(2, A, 16).bfloat16()
+        bars = torch.randn(2, A, BL, BAR_FEATS)
+        bar_mask = torch.ones(2, A, BL, dtype=torch.bool)
+        news_scores = torch.zeros((), dtype=torch.float32).expand(2, A, M, NRD)
+        news_mask = torch.zeros((), dtype=torch.bool).expand(2, A, M)
+        previous = torch.zeros(2, A)
+        previous[:, 0] = 1.0
+        available = torch.ones(2, A, dtype=torch.bool)
+        raw_dtypes: list[torch.dtype] = []
+        token_dtypes: list[torch.dtype] = []
+        attention_dtypes: list[torch.dtype] = []
+
+        handles = [
+            policy.raw_encoder.register_forward_hook(
+                lambda _module, _args, output: raw_dtypes.append(output.dtype)
+            ),
+            policy.token_proj.register_forward_pre_hook(
+                lambda _module, args: token_dtypes.append(args[0].dtype)
+            ),
+            policy.attn.register_forward_pre_hook(
+                lambda _module, args: attention_dtypes.append(args[0].dtype)
+            ),
+        ]
+        try:
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                raw = policy.encode_raw_policy_step(bars, bar_mask, 0)
+                weights, gate = policy(
+                    market, per_stock, raw, news_scores, news_mask, previous, available
+                )
+                loss = weights.float().square().mean() + gate.float().square().mean()
+            loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertEqual(set(raw_dtypes), {torch.bfloat16})
+        self.assertEqual(set(token_dtypes), {torch.bfloat16})
+        self.assertEqual(set(attention_dtypes), {torch.bfloat16})
+        gradients = [parameter.grad for parameter in policy.parameters() if parameter.grad is not None]
+        self.assertTrue(gradients)
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
+
+        policy.eval()
+        with torch.no_grad():
+            raw_fp32 = policy.encode_raw_policy_step(bars, bar_mask, 0)
+            weights_fp32, gate_fp32 = policy(
+                market, per_stock, raw_fp32, news_scores, news_mask, previous, available
+            )
+        self.assertEqual(raw_fp32.dtype, torch.float32)
+        self.assertEqual(weights_fp32.dtype, torch.float32)
+        self.assertEqual(gate_fp32.dtype, torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA autocast dtype contract")
+    def test_cuda_amp_generic_policy_is_bfloat16_and_differentiable(self):
+        torch.manual_seed(5)
+        policy = _policy().cuda().train()
+        market = torch.randn(2, 16, device="cuda").bfloat16()
+        per_stock = torch.randn(2, A, 16, device="cuda").bfloat16()
+        bars = torch.randn(2, A, BL, BAR_FEATS, device="cuda")
+        bar_mask = torch.ones(2, A, BL, dtype=torch.bool, device="cuda")
+        news_scores = torch.zeros((), device="cuda").expand(2, A, M, NRD)
+        news_mask = torch.zeros((), dtype=torch.bool, device="cuda").expand(2, A, M)
+        previous = torch.zeros(2, A, device="cuda")
+        previous[:, 0] = 1.0
+        available = torch.ones(2, A, dtype=torch.bool, device="cuda")
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            raw = policy.encode_raw_policy_step(bars, bar_mask, 0)
+            weights, gate = policy(
+                market, per_stock, raw, news_scores, news_mask, previous, available
+            )
+            loss = weights.float().square().mean() + gate.float().square().mean()
+        self.assertEqual(raw.dtype, torch.bfloat16)
+        # CUDA softmax intentionally returns FP32 for stable simplex/accounting; only the wide model state is BF16.
+        self.assertEqual(weights.dtype, torch.float32)
+        self.assertEqual(gate.dtype, torch.bfloat16)
+        loss.backward()
+        gradients = [parameter.grad for parameter in policy.parameters() if parameter.grad is not None]
+        self.assertTrue(gradients)
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
+
 
 class DesignSeriesIsValid(unittest.TestCase):
     def test_designs_load_and_are_internally_consistent(self):
@@ -258,6 +366,61 @@ class TrainingStrategyKnobs(unittest.TestCase):
         self.assertEqual(ssl_targets(days[0]["ret"], days[0]["ret_valid"]).shape, (NB, 2))
         train_context_encoder(enc, head, days, device=torch.device("cpu"), steps=2, batch_size=2, accum_steps=1,
                               warmup_steps=1, schedule="constant")
+
+    def test_ssl_microbatch_samples_distinct_days(self):
+        enc, head = _encoder(), ContextForwardHead(16)
+        days = [_synthetic_day(i) for i in range(3)]
+        for marker, day in enumerate(days, start=10):
+            day["bars"][1, 0, 0] = marker
+        sampled = []
+
+        def record_batch(_module, args):
+            sampled.extend(args[0][:, 1, 0, 0].tolist())
+
+        handle = enc.register_forward_pre_hook(record_batch)
+        try:
+            # Under this seed the former randint path drew [2, 0, 2].
+            torch.manual_seed(0)
+            train_context_encoder(enc, head, days, device=torch.device("cpu"), steps=1,
+                                  batch_size=3, accum_steps=1, schedule="constant")
+        finally:
+            handle.remove()
+        self.assertEqual(sorted(sampled), [10.0, 11.0, 12.0])
+
+    def test_zero_weight_ssl_auxiliary_heads_do_not_build_targets_or_run(self):
+        class DisabledHead(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(()))
+
+            def forward(self, _value):
+                raise AssertionError("a zero-weight SSL auxiliary head must not run")
+
+        enc, head = _encoder(), ContextForwardHead(16)
+        perstock_head, daily_head = DisabledHead(), DisabledHead()
+        days = [_synthetic_day(5), _synthetic_day(6)]
+        daily_targets = [(torch.zeros(A), torch.ones(A, dtype=torch.bool)) for _ in days]
+        with mock.patch(
+            "rl_quant.training.context_pretrain.ssl_targets_perstock",
+            side_effect=AssertionError("zero-weight per-stock targets must not be materialized"),
+        ):
+            train_context_encoder(
+                enc,
+                head,
+                days,
+                device=torch.device("cpu"),
+                perstock_head=perstock_head,
+                perstock_coef=0.0,
+                daily_head=daily_head,
+                daily_targets=daily_targets,
+                daily_coef=0.0,
+                steps=1,
+                batch_size=2,
+                accum_steps=1,
+                schedule="constant",
+            )
+        self.assertTrue(all(p.grad is None for p in perstock_head.parameters()))
+        self.assertTrue(all(p.grad is None for p in daily_head.parameters()))
 
     def test_amp_entropy_and_budget_training_step_runs(self):
         torch.manual_seed(0)

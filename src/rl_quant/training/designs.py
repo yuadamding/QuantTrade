@@ -32,7 +32,7 @@ nvidia-smi and tune ssl_accum / ssl_batch_size. The 2xH100 sweep runs two design
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -71,12 +71,13 @@ class Phase1Design:
     risk_lambda: float = 0.1
     entropy_coef: float = 0.0
     temperature: float = 1.0
+    max_stock_weight: float = 1.0    # hard cap per non-CASH target weight; CASH remains unrestricted
     # -- objective-shaping penalties are calibrated in RETURN UNITS (the per-step net-return scale ~1e-4..1e-3).
     #    The 2026-06-29 loss-scale audit showed the old values (budget 0.1, gate_ent 1e-3, missing 1.0) were
     #    2-4 ORDERS OF MAGNITUDE above the return term: optimizing the loss with ZERO edge reproduced the trained
     #    run exactly (gate pinned at max_actions/nB, cash 0.9+) and no achievable signal (even IC=1) could move it.
     #    Rule of thumb: a penalty's marginal per-trade hurdle should sit near the trading cost, not 1000x above it.
-    max_actions_per_day: float = 5.0  # SOFT per-day trade budget (the policy gates WHEN to act)
+    max_actions_per_day: float = 5.0  # SOFT action budget per rollout: intraday rollout=day; daily_raw=episode
     budget_lambda: float = 1e-3       # rate penalty: marginal trade beyond budget must expect ~budget_lambda
     #                                   (~10bp/trade = 2x the 5bp cost) -- a soft budget, not a hard clamp (was 0.1
     #                                   = a 9.5%-per-5-min hurdle no signal can clear)
@@ -102,6 +103,8 @@ class Phase1Design:
     exec_delay: int = 1               # daily_raw: execution delay in DAYS (decide EOD d, execute close d+exec_delay)
     raw_norm: str = "level"           # daily_raw full-day raw input norm: "level" preserves intraday RETURN
     #                                   magnitude (the cross-sectional signal); "instance" whitens it away (legacy)
+    context_storage_dtype: str = "float32"  # frozen EOD context kept between stages; bfloat16 is an explicit
+    #                                   large-universe storage/communication + AMP token-assembly choice
     raw_recent_days: int = 0          # daily_raw TWO-SPEED tokens: >0 -> only the last this-many days of an
     #                                   episode/eval window get the trainable full-day raw encode; older days feed
     #                                   the cross-day memory as frozen ctx + news + past-return channel. Extends
@@ -120,10 +123,12 @@ class Phase1Design:
     #                                   dropout=0; with dropout>0 the RNG is consumed per-chunk, so train-mode is
     #                                   statistically -- not bit -- equivalent; the chunk value is part of the
     #                                   context identity). REQUIRED for huge universes: one un-chunked TOP2000 day
-    #                                   is a ~0.5TB tier-1 activation. ~64/chunk fits d512/8L on an 80GB H100
-    #                                   (measured ~0.70 GB/stock backward peak). 0 = single pass.
+    #                                   is a ~0.5TB tier-1 activation at the raw 1-second grid. The safe chunk also
+    #                                   depends on grid, width, and LOCAL micro-batch; measure the exact geometry.
+    #                                   0 = single pass.
     raw_stock_chunk: int = 0          # Stage-2 full-day raw encoder stock chunk (same equivalence caveat).
-    #                                   TOP2000: ~384/chunk at raw128/2L (~0.14 GB/stock measured). 0 = single pass.
+    #                                   Its safe value also depends on grid, width, and local episode batch.
+    #                                   0 = single pass.
     amp: bool = False                 # bf16 autocast (frees ~44% activation -> bigger batch at same VRAM)
     grad_checkpoint: bool = False     # recompute tier-1 in backward (needed for full-session SSL at d>=384)
     min_gpus: int = 1                 # GPUs to give this setting (data-parallel). Set 2 if peak VRAM > one card
@@ -142,6 +147,8 @@ class Phase1Design:
             raise ValueError(f"{self.name}: schedule must be 'cosine' or 'constant'")
         if self.horizon_mode not in ("intraday", "daily", "daily_raw"):
             raise ValueError(f"{self.name}: horizon_mode must be 'intraday', 'daily', or 'daily_raw'")
+        if self.context_storage_dtype not in ("float32", "bfloat16"):
+            raise ValueError(f"{self.name}: context_storage_dtype must be 'float32' or 'bfloat16'")
         if self.label_horizon_days < 1 or self.daily_lookback < 1 or self.exec_delay < 1:
             raise ValueError(f"{self.name}: need label_horizon_days>=1, daily_lookback>=1, exec_delay>=1")
         if self.episode_len <= 1:
@@ -158,6 +165,8 @@ class Phase1Design:
             raise ValueError(f"{self.name}: bptt_window must be >= 1")
         if self.temperature <= 0:
             raise ValueError(f"{self.name}: temperature must be > 0")
+        if not 0 < self.max_stock_weight <= 1:
+            raise ValueError(f"{self.name}: max_stock_weight must lie in (0, 1]")
         if self.session_seconds % self.block_seconds:
             raise ValueError(f"{self.name}: block_seconds {self.block_seconds} must divide "
                              f"session_seconds {self.session_seconds}")
@@ -296,29 +305,424 @@ _SERIES = [
     #   sample:param). Stage-2 is OVERFITTING-BOUND (effective samples = ~840 train DAYS regardless of A; H=21
     #   overlap deflates to eff_n ~ 40) -> decision core SMALL (tok96/2L ~ 0.3M) + heavy decoupled weight decay;
     #   per-stock raw encoder raw128/2L (stock-day-rich, A-independent).
-    # ONE-DAY WALL-CLOCK BUDGET at bar_seconds=60 (1-min bars; tokens/day-encode = 2000 x 390 = 780k ~ 0.67x a
-    # TOP50-at-1s day): d512/8L day-encode ~ 7s fwd+bwd -> SSL 1000 steps x 8 accum x 1 day/rank ~ 15.5h; frozen
-    # encode of 1121 days ~ 45min; policy 2000 steps (42-day two-speed raw at raw128 ~ seconds/step) ~ 1-2h;
-    # evals + verdict < 1h  =>  ~18h total. (At 1-SECOND bars the same design needs ~a week for SSL alone --
-    # bar_seconds is the lever, not step-count tuning.) 1-min activations are ~60x smaller, so NO stock-chunking
-    # is needed (full-A tier-1 backward ~ 23GB at d512; chunking machinery remains for any 1s config).
-    # batch_days=4 / ssl_batch_size=4 shard to 1 day per rank on 4 cards; the driver REFUSES to run a min_gpus=4
-    # design at world<4 (it would be ~4x VRAM/rank).
-    Phase1Design("daily_raw_top2000", "TOP2000 4xH100 ~18h: 1-min bars, d512/8L ctx, tok96/2L policy, 252d two-speed",
+    # H100 MEMORY/THROUGHPUT: an RTX 3080 BF16+checkpoint slope probe at the configured LOCAL SSL batch of three
+    # grew by ~0.080 GiB allocated / ~0.103 GiB reserved per unchunked stock. Extrapolating an all-at-once
+    # 2001-action pass is therefore far above the launcher's 75 GiB ceiling. A 640-stock chunk bounds the dominant
+    # recompute near 52/66 GiB plus the small full-axis outputs while retaining large tensor-core work units. The
+    # largest Stage-2 variant projected near 70 GiB reserved unchunked; a 1024-stock raw chunk gives two large,
+    # balanced passes and ample backward headroom. Runtime telemetry remains authoritative across CUDA builds.
+    # A 12-day global micro-batch assigns three days/rank; three accumulation passes give an effective global batch
+    # of 36 (close to the former 32). Stage 2 uses two episodes/rank and 716 optimizer steps, preserving about 120k
+    # monthly scored-tail exposures.
+    # Every TOP2000 setting is one synchronous four-rank job; Stage 1 may shard dates, but Stage 2 must construct
+    # episodes from the complete chronological training history on every rank and distribute episode samples.
+    Phase1Design("daily_raw_top2000", "TOP2000 H100 primary: 1m bars, d512/8L context, 252d memory, monthly budget",
                  session_seconds=FULL, block_seconds=300, bar_seconds=60, d_model=512, enc_layers=8, enc_heads=8,
-                 policy_token_dim=96, policy_layers=2, policy_heads=6, ssl_steps=1000, policy_steps=2000,
-                 ssl_batch_size=4, ssl_accum=8, batch_days=4, raw_policy_dim=128, raw_policy_layers=2,
-                 raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=15, bptt_window=42,
+                 policy_token_dim=96, policy_layers=2, policy_heads=6, ssl_steps=1000, policy_steps=716,
+                 ssl_batch_size=12, ssl_accum=3, batch_days=8, raw_policy_dim=128, raw_policy_layers=2,
+                 raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=21, bptt_window=21,
                  label_horizon_days=21, daily_lookback=252, exec_delay=1, raw_recent_days=42,
-                 budget_lambda=0.0, ssl_perstock_coef=0.0, ssl_daily_coef=1.0, pol_weight_decay=0.3,
-                 friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
-                 grad_checkpoint=True, min_gpus=4),
+                 budget_lambda=1e-3, ssl_perstock_coef=0.0, ssl_daily_coef=1.0, pol_weight_decay=0.3,
+                 max_actions_per_day=12.0, friction_warmup_frac=0.0, cost=1e-3, temperature=0.5,
+                 max_stock_weight=0.01, raw_norm="level", context_storage_dtype="bfloat16", amp=True,
+                 grad_checkpoint=True, enc_stock_chunk=640, raw_stock_chunk=1024, min_gpus=4),
 ]
+
+# ===== TOP50 / 4xH100 one-seed screening =====================================
+#
+# TOP50 has only ~840 training dates.  Four-way data parallelism would give a
+# rank only ~210 contiguous dates and silently destroy a 252-day episode.
+# These settings therefore remain ONE-GPU jobs; the pool runs four independent
+# settings concurrently.  The paired seed makes one-factor comparisons less
+# noisy, while the sweep-level multiple-testing correction still counts every
+# setting searched.
+#
+# For the 60-second designs, 8-day SSL micro-batches x 1 accumulation preserve
+# the original effective batch of eight while replacing eight small forwards
+# with one tensor-core-friendly forward.  The policy budgets keep approximately
+# 120k newly-scored-date draws per run after score-tail de-duplication:
+#   42d: 8 * stride5  * 3000 = 120k
+#  126d: 8 * stride10 * 1500 = 120k
+#  252d: 8 * stride15 * 1000 = 120k
+# Activation checkpointing is retained as a safety rail until the H100 peak
+# telemetry proves a setting has enough headroom to disable it.  Model width is
+# varied in explicit ablations only; unused VRAM is not evidence for a larger
+# hypothesis class.
+_daily_252 = next(d for d in _SERIES if d.name == "daily_raw_252")
+_top50_h100_base = replace(
+    _daily_252,
+    name="top50_h100_252",
+    note="TOP50 H100 primary: 60s grid, 252d memory, equal-exposure B8 screening",
+    ssl_batch_size=8,
+    ssl_accum=1,
+    batch_days=8,
+    policy_steps=1000,
+    max_stock_weight=0.10,
+)
+
+_TOP50_H100_SERIES = [
+    # Core causal grid/memory dose-response.  These four are the primary,
+    # interpretable comparison and are ordered first so the scheduler can fill
+    # four H100s immediately after cache construction.
+    replace(
+        _top50_h100_base,
+        name="top50_h100_42_1s",
+        note="TOP50 H100 grid control: 1s grid, 42d memory/raw, equal-exposure B8",
+        bar_seconds=1,
+        episode_len=42,
+        episode_stride=5,
+        bptt_window=42,
+        daily_lookback=42,
+        raw_recent_days=0,
+        ssl_batch_size=2,
+        ssl_accum=4,
+        policy_steps=3000,
+        ssl_perstock_coef=0.0,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_42_60s",
+        note="TOP50 H100 fast control: 60s grid, 42d memory/raw, equal-exposure B8",
+        episode_len=42,
+        episode_stride=5,
+        bptt_window=42,
+        daily_lookback=42,
+        raw_recent_days=0,
+        policy_steps=3000,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_126",
+        note="TOP50 H100 memory dose: 60s grid, 126d memory, raw recent 42d",
+        episode_len=126,
+        episode_stride=10,
+        bptt_window=42,
+        daily_lookback=126,
+        raw_recent_days=42,
+        policy_steps=1500,
+    ),
+    _top50_h100_base,
+
+    # Representation/capacity ablations.  Only these settings alter the model
+    # size, keeping the primary memory comparison at the audited base capacity.
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_small",
+        note="TOP50 capacity ablation: d256/4L, raw64/1L, token128/2L",
+        d_model=256,
+        enc_layers=4,
+        enc_heads=8,
+        raw_policy_dim=64,
+        raw_policy_layers=1,
+        raw_policy_heads=4,
+        policy_token_dim=128,
+        policy_layers=2,
+        policy_heads=8,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_large",
+        note="TOP50 capacity ablation: d512/8L, raw192/3L, token384/4L",
+        d_model=512,
+        enc_layers=8,
+        enc_heads=8,
+        raw_policy_dim=192,
+        raw_policy_layers=3,
+        raw_policy_heads=8,
+        policy_token_dim=384,
+        policy_layers=4,
+        policy_heads=8,
+    ),
+
+    # Sampling-resolution ablations around the 60-second primary.  The 15s
+    # variant tests whether sub-minute shape helps; 300s removes within-block
+    # detail while preserving the same 78 daily context blocks.
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_15s",
+        note="TOP50 resolution ablation: 15s grid, 252d memory",
+        bar_seconds=15,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_300s",
+        note="TOP50 resolution ablation: one bar per 5m block, 252d memory",
+        bar_seconds=300,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_block1m",
+        note="TOP50 context-cadence ablation: 1m blocks on a 1m grid",
+        block_seconds=60,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_block15m",
+        note="TOP50 context-cadence ablation: 15m blocks on a 1m grid",
+        block_seconds=900,
+    ),
+
+    # Auxiliary-label and economic sensitivity.  The policy reward remains the
+    # canonical one-day transition; H changes only Stage-1's forward target.
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_h5",
+        note="TOP50 auxiliary-horizon ablation: H=5d",
+        label_horizon_days=5,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_h63",
+        note="TOP50 auxiliary-horizon ablation: H=63d",
+        label_horizon_days=63,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_risk0",
+        note="TOP50 objective sensitivity: no downside penalty",
+        risk_lambda=0.0,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_risk25",
+        note="TOP50 objective sensitivity: downside penalty 0.25",
+        risk_lambda=0.25,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_cost2bp",
+        note="TOP50 friction sensitivity: 2bp per one-way turnover",
+        cost=2e-4,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_cost10bp",
+        note="TOP50 friction sensitivity: 10bp per one-way turnover",
+        cost=1e-3,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_temp1",
+        note="TOP50 concentration sensitivity: allocation temperature 1.0",
+        temperature=1.0,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_cap20",
+        note="TOP50 concentration sensitivity: 20% risky-name cap",
+        max_stock_weight=0.20,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_uncapped",
+        note="TOP50 signal-only concentration control: risky-name cap disabled",
+        max_stock_weight=1.0,
+    ),
+    replace(
+        _top50_h100_base,
+        name="top50_h100_252_raw21",
+        note="TOP50 raw-history sensitivity: trainable raw recent 21d",
+        raw_recent_days=21,
+    ),
+]
+_SERIES.extend(_TOP50_H100_SERIES)
+
+# ===== TOP2000 / 4xH100 one-seed screening ==================================
+#
+# Unlike TOP50, one TOP2000 setting consumes all four H100s jointly.  All
+# settings retain the full 252-day episode and differ by one declared factor.
+# The first ten form the core policy/optimizer/trading screen and share one
+# expensive Stage-1 context exactly.  Wide-only bar/block/label ablations are
+# intentionally last because each requires a distinct cache and/or SSL run.
+#
+# `max_actions_per_day` is legacy terminology.  In daily_raw, the loss divides
+# it by episode length, so it is the target number of reallocations per 252-day
+# training episode.  The primary value 12 is monthly-ish; 5 and 52 are explicit
+# slow/weekly sensitivities.  Cost settings are robustness studies and must not
+# be ranked against each other on their differently costed net-return metric.
+_top2000_h100_base = next(d for d in _SERIES if d.name == "daily_raw_top2000")
+_TOP2000_H100_VARIANTS = [
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_policy_small",
+        note="TOP2000 policy-capacity ablation: raw64/1L and token64/1L",
+        raw_policy_dim=64,
+        raw_policy_layers=1,
+        raw_policy_heads=4,
+        policy_token_dim=64,
+        policy_layers=1,
+        policy_heads=4,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_policy_large",
+        note="TOP2000 policy-capacity ablation: raw192/3L and token192/3L",
+        raw_policy_dim=192,
+        raw_policy_layers=3,
+        raw_policy_heads=8,
+        policy_token_dim=192,
+        policy_layers=3,
+        policy_heads=8,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_lr1e4",
+        note="TOP2000 policy learning-rate ablation: 1e-4",
+        pol_lr=1e-4,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_lr6e4",
+        note="TOP2000 policy learning-rate ablation: 6e-4",
+        pol_lr=6e-4,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_bptt5",
+        note="TOP2000 credit-horizon ablation: five-day truncated BPTT within the 21d scored tail",
+        bptt_window=5,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_actions26",
+        note="TOP2000 turnover-budget ablation: 26 target reallocations per 252d episode",
+        max_actions_per_day=26.0,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_actions5",
+        note="TOP2000 turnover-budget ablation: five target reallocations per 252d episode",
+        max_actions_per_day=5.0,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_actions52",
+        note="TOP2000 turnover-budget ablation: 52 target reallocations per 252d episode",
+        max_actions_per_day=52.0,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_cap005",
+        note="TOP2000 concentration ablation: 0.5% hard risky-name cap",
+        max_stock_weight=0.005,
+    ),
+
+    # Wide policy/objective sensitivities.  These still reuse the primary
+    # frozen context; only Stage 2 is rerun.
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_raw21",
+        note="TOP2000 raw-history ablation: trainable raw encoder on recent 21d",
+        raw_recent_days=21,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_raw84",
+        note="TOP2000 raw-history ablation: trainable raw encoder on recent 84d",
+        raw_recent_days=84,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_cap02",
+        note="TOP2000 concentration ablation: 2% hard risky-name cap",
+        max_stock_weight=0.02,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_uncapped",
+        note="TOP2000 signal-only concentration control: risky-name cap disabled",
+        max_stock_weight=1.0,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_risk0",
+        note="TOP2000 downside-objective ablation: no downside penalty",
+        risk_lambda=0.0,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_risk25",
+        note="TOP2000 downside-objective ablation: downside penalty 0.25",
+        risk_lambda=0.25,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_cost5bp",
+        note="TOP2000 friction sensitivity: 5bp per one-way turnover",
+        cost=5e-4,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_cost20bp",
+        note="TOP2000 friction sensitivity: 20bp per one-way turnover",
+        cost=2e-3,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_temp1",
+        note="TOP2000 allocation-temperature ablation: temperature 1.0",
+        temperature=1.0,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_entropy1e5",
+        note="TOP2000 allocation-entropy ablation: coefficient 1e-5",
+        entropy_coef=1e-5,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_wd10",
+        note="TOP2000 policy regularization ablation: AdamW decay 0.10",
+        pol_weight_decay=0.10,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_wd60",
+        note="TOP2000 policy regularization ablation: AdamW decay 0.60",
+        pol_weight_decay=0.60,
+    ),
+
+    # Expensive representation/target sensitivities.  These alter Stage 1 and
+    # therefore intentionally form separate context-cache groups.
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_bar300",
+        note="TOP2000 resolution ablation: one 5-minute bar per context block",
+        bar_seconds=300,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_block15m",
+        note="TOP2000 context-cadence ablation: 15-minute blocks on the 1-minute grid",
+        block_seconds=900,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_h5",
+        note="TOP2000 auxiliary-target ablation: five-day relative return",
+        label_horizon_days=5,
+    ),
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_h63",
+        note="TOP2000 auxiliary-target ablation: 63-day relative return",
+        label_horizon_days=63,
+    ),
+]
+_TOP2000_H100_SERIES = [_top2000_h100_base, *_TOP2000_H100_VARIANTS]
+_SERIES.extend(_TOP2000_H100_VARIANTS)
+
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 
 DEFAULT_DESIGN = "daily_raw"
-# The old intraday TOP50 sweep is a documented null regime. Default experiments now compare daily raw baselines;
-# intraday architecture ablations remain explicitly addressable by name.
-SWEEP = ["daily_raw", "daily_raw_252"]
+# The old intraday TOP50 sweep is a documented null regime.  The current default
+# is a broad, ONE-SEED screening study intended for four independent H100 jobs.
+# It is exploratory: promote no winner until a fresh point-in-time universe,
+# walk-forward selection, and multi-seed confirmation have succeeded.
+TOP50_H100_CORE_SWEEP = [d.name for d in _TOP50_H100_SERIES[:4]]
+TOP50_H100_WIDE_SWEEP = [d.name for d in _TOP50_H100_SERIES]
+TOP2000_H100_CORE_SWEEP = [d.name for d in _TOP2000_H100_SERIES[:10]]
+TOP2000_H100_WIDE_SWEEP = [d.name for d in _TOP2000_H100_SERIES]
+SWEEP = TOP2000_H100_WIDE_SWEEP
 # Longer-horizon probes (run explicitly with --design; not in the default sweep).
 HORIZON_SWEEP = ["h30m", "h65m"]

@@ -388,7 +388,12 @@ class ContextEncoder(nn.Module):
         d = self.d_model
         bl = self.block_seconds
         nB = S // bl
-        x = self.input_proj(normed.reshape(-1, F)).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
+        x = self.input_proj(normed.reshape(-1, F)).reshape(B * A * nB, bl, d)
+        # Positional buffers are stored in FP32 for checkpoint-independent accuracy.  A plain add would promote
+        # the BF16 projection produced by autocast back to FP32, after which every residual in both transformer
+        # tiers (and the full [B,nB,A,d] output) would stay FP32.  Cast only the tiny positional slice to the
+        # activation dtype; explicit FP32/non-AMP execution is unchanged.
+        x = x + self.pos1[:bl].to(dtype=x.dtype).view(1, bl, d)
         # --- Tier 1: local causal attention within each block -> learned per-block summaries.
         # Per-block checkpointing: checkpoint each _CausalBlock independently. During forward, each block's
         # input is saved (n_blocks × [B*A*nB, bl, d] ≈ 9.6 GB for d512/8L with B=1 day). During backward,
@@ -430,20 +435,23 @@ class ContextEncoder(nn.Module):
                 positions = positions.reshape(row_x.shape[0], length)
                 packed = torch.gather(row_x, 1, positions.unsqueeze(-1).expand(-1, -1, d))
             encoded = run_tier1_rows(packed, None)
-            summaries[rows] = self.norm1(encoded[:, -1])
+            # CUDA autocast LayerNorm returns FP32; indexed assignment does not implicitly narrow its source.
+            summaries[rows] = self.norm1(encoded[:, -1]).to(dtype=summaries.dtype)
         summ = summaries.reshape(B * A, nB, d)                    # true last-valid, gap-position-aware token
         block_has = bm1.any(-1).reshape(B * A, nB)               # [B*A, nB]
-        summ = summ * block_has.unsqueeze(-1).float()
+        summ = summ * block_has.unsqueeze(-1).to(dtype=summ.dtype)
         # --- Tier 2: global causal attention over block summaries -> a context at EVERY block ---
-        h = summ + self.pos2[:nB].unsqueeze(0)
+        h = summ + self.pos2[:nB].to(dtype=summ.dtype).unsqueeze(0)
         for blk in self.tier2:
             h = blk(h, ~block_has)
-        h = self.norm2(h)                                        # [B*A, nB, d] per-block tier-2 context
+        # CUDA autocast executes standalone LayerNorm in FP32.  Its accuracy is useful, but retaining that output
+        # would widen the full stock/block context; quantize the normalized result back to the residual dtype.
+        h = self.norm2(h).to(dtype=h.dtype)                       # [B*A, nB, d] per-block tier-2 context
         bar_blocks = h.reshape(B, A, nB, d).permute(0, 2, 1, 3)  # [B, nB, A, d]
         # Once a stock has traded, later no-trade blocks still get the causal stale context emitted at that
         # timestamp. Empty blocks are not attention keys above, so they cannot become synthetic history.
         seen_blocks = block_has.to(torch.int8).cummax(dim=1).values.bool()
-        seen = seen_blocks.reshape(B, A, nB).permute(0, 2, 1).unsqueeze(-1).float()
+        seen = seen_blocks.reshape(B, A, nB).permute(0, 2, 1).unsqueeze(-1).to(dtype=bar_blocks.dtype)
         return bar_blocks, seen
 
     def _fuse_market(
@@ -478,8 +486,15 @@ class ContextEncoder(nn.Module):
             cov_flat[cm] = torch.where(cv[cm], normalized, torch.zeros_like(normalized))
         cov_embed = self.cov_mlp(cov_flat) + self.cov_valid_proj(cv.to(cov_flat.dtype))
         cov = cov_embed.reshape(B, nB, A, d)                         # values + explicit validity, per block
-        per_stock = self.fuse(bar_blocks + cov) * has            # fuse bars + as-of covariates, per block
-        market = per_stock.sum(dim=2) / has.sum(dim=2).clamp_min(1.0)   # cross-sectional mean per block
+        fused = self.fuse(bar_blocks + cov).to(dtype=bar_blocks.dtype)
+        per_stock = fused * has                                  # fuse bars + as-of covariates, per block
+        # Accumulate the wide TOP2000 cross-section in FP32 without materializing an FP32 copy of per_stock, then
+        # return to the activation dtype.  This preserves BF16 storage/throughput while avoiding a low-precision
+        # cancellation-prone reduction over ~2,000 names.
+        market = (
+            per_stock.sum(dim=2, dtype=torch.float32)
+            / has.sum(dim=2, dtype=torch.float32).clamp_min(1.0)
+        ).to(dtype=per_stock.dtype)
         return per_stock, market
 
 

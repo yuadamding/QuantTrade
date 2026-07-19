@@ -502,8 +502,12 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     bar_mask = np.zeros((Dd, A, S), dtype=bool)
     covt = np.zeros((Dd, nB, A, NC), dtype=np.float32)
     cov_valid = np.zeros((Dd, nB, A, NC), dtype=bool)
-    news_raw = np.zeros((Dd, nB, A, M, NEWS_RAW_DIM), dtype=np.float32)
-    news_mask = np.zeros((Dd, nB, A, M), dtype=bool)
+    # The default reportable path disables news.  Keep those tensors logical
+    # but do not allocate/write ~71 MiB of zeros per TOP2000 window: an
+    # expanded scalar has identical values/shapes and torch.save persists only
+    # its one-element storage.  The opt-in news path remains dense and mutable.
+    news_raw = np.zeros((Dd, nB, A, M, NEWS_RAW_DIM), dtype=np.float32) if cfg.use_news else None
+    news_mask = np.zeros((Dd, nB, A, M), dtype=bool) if cfg.use_news else None
     ret = np.full((Dd, nB, A), np.nan, dtype=np.float32)
     ret_valid = np.zeros((Dd, nB, A), dtype=bool)
     ret[:, :, 0] = 0.0          # CASH return is identically 0 at every block
@@ -652,6 +656,8 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
                     if k > 0:
                         take = nse_a[max(0, k - M):k]
                         kk = len(take)
+                        if news_raw is None or news_mask is None:  # guarded by ``if news``; defensive invariant
+                            raise RuntimeError("news records require dense news tensors")
                         news_raw[d, b, ai, :kk, 0] = take
                         news_mask[d, b, ai, :kk] = True
 
@@ -691,10 +697,17 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     avail &= member
     avail[:, :, 0] = True                                                         # CASH always available
 
+    if news_raw is None or news_mask is None:
+        news_raw_t = torch.zeros((), dtype=torch.float32).expand(Dd, nB, A, M, NEWS_RAW_DIM)
+        news_mask_t = torch.zeros((), dtype=torch.bool).expand(Dd, nB, A, M)
+    else:
+        news_raw_t = torch.from_numpy(news_raw)
+        news_mask_t = torch.from_numpy(news_mask)
+
     return {
         "bars": torch.from_numpy(bars_t), "bar_mask": torch.from_numpy(bar_mask),
         "cov_blocks": torch.from_numpy(covt), "cov_valid_blocks": torch.from_numpy(cov_valid),
-        "news_raw": torch.from_numpy(news_raw), "news_mask": torch.from_numpy(news_mask),
+        "news_raw": news_raw_t, "news_mask": news_mask_t,
         "avail": torch.from_numpy(avail),
         "universe_member": torch.from_numpy(member),
         "ret": torch.from_numpy(ret), "ret_valid": torch.from_numpy(ret_valid),

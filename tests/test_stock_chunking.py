@@ -65,6 +65,59 @@ class ContextEncoderChunking(unittest.TestCase):
         self._compare(train=True, gc=False)
         self._compare(train=True, gc=True)                       # chunk-level checkpoint path
 
+    def test_amp_keeps_projected_context_hot_path_bfloat16(self) -> None:
+        """FP32 position/mask constants must not widen TOP2000 transformer activations under autocast."""
+        bars, mask, cov = _inputs()
+        encoder = _ctx_encoder(3, False).train()
+        hot_path_dtypes: list[torch.dtype] = []
+
+        def capture_input(_module, args) -> None:
+            hot_path_dtypes.append(args[0].dtype)
+
+        handles = [
+            encoder.tier1[0].register_forward_pre_hook(capture_input),
+            encoder.tier2[0].register_forward_pre_hook(capture_input),
+            encoder.fuse.register_forward_pre_hook(capture_input),
+        ]
+        try:
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                per_stock, market = encoder(bars, mask, cov)
+                loss = per_stock.float().square().mean() + market.float().square().mean()
+            loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertEqual(per_stock.dtype, torch.bfloat16)
+        self.assertEqual(market.dtype, torch.bfloat16)
+        self.assertTrue(hot_path_dtypes)
+        self.assertEqual(set(hot_path_dtypes), {torch.bfloat16})
+        gradients = [parameter.grad for parameter in encoder.parameters() if parameter.grad is not None]
+        self.assertTrue(gradients)
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
+
+        # The dtype-following casts are no-ops for the explicit non-AMP path.
+        encoder.eval()
+        with torch.no_grad():
+            per_stock_fp32, market_fp32 = encoder(bars, mask, cov)
+        self.assertEqual(per_stock_fp32.dtype, torch.float32)
+        self.assertEqual(market_fp32.dtype, torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA autocast dtype contract")
+    def test_cuda_amp_context_output_is_bfloat16_and_differentiable(self) -> None:
+        """CUDA LayerNorm returns FP32, so every final/indexed boundary must explicitly restore BF16."""
+        bars, mask, cov = (value.cuda() for value in _inputs())
+        encoder = _ctx_encoder(3, False).cuda().train()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            per_stock, market = encoder(bars, mask, cov)
+            loss = per_stock.float().square().mean() + market.float().square().mean()
+        self.assertEqual(per_stock.dtype, torch.bfloat16)
+        self.assertEqual(market.dtype, torch.bfloat16)
+        loss.backward()
+        gradients = [parameter.grad for parameter in encoder.parameters() if parameter.grad is not None]
+        self.assertTrue(gradients)
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
+
 
 class FullDayRawEncoderChunking(unittest.TestCase):
     def _enc(self, chunk: int, gc: bool, raw_norm: str) -> FullDayRawEncoder:
@@ -108,6 +161,21 @@ class FullDayRawEncoderChunking(unittest.TestCase):
         e0.eval(), e1.eval()
         self.assertEqual(e1(bars, mask).shape, (B, A, 8))
         self.assertLess(float((e0(bars, mask) - e1(bars, mask)).abs().max()), 1e-5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA autocast dtype contract")
+    def test_cuda_amp_raw_output_is_bfloat16_and_differentiable(self) -> None:
+        generator = torch.Generator().manual_seed(5)
+        bars = (100.0 + torch.randn(B, A, S, Fd, generator=generator)).cuda()
+        mask = torch.ones(B, A, S, dtype=torch.bool, device="cuda")
+        encoder = self._enc(3, True, "level").cuda().train()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            output = encoder(bars, mask)
+            loss = output.float().square().mean()
+        self.assertEqual(output.dtype, torch.bfloat16)
+        loss.backward()
+        gradients = [parameter.grad for parameter in encoder.parameters() if parameter.grad is not None]
+        self.assertTrue(gradients)
+        self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
 
 
 if __name__ == "__main__":

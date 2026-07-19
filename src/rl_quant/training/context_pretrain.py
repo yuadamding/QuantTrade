@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from rl_quant.datasets.streaming import LazyDay
-from rl_quant.training._optim import apply_lr, lr_scale
+from rl_quant.training._optim import apply_lr, lr_scale, make_adamw
 
 
 def ssl_targets(ret: torch.Tensor, ret_valid: torch.Tensor) -> torch.Tensor:
@@ -72,29 +72,50 @@ def train_context_encoder(
     start_step: int = 0, optimizer=None, checkpoint_every: int = 0,
     on_checkpoint: Callable[[int, object], None] | None = None,
     grad_reduce: Callable[[list], None] | None = None,
+    prepare_checkpoint: Callable[[], None] | None = None,
+    sync_after_checkpoint: Callable[[], None] | None = None,
 ):
     """Fit the encoder + the market SSL head (+ optional per-stock and DAILY SSL heads) over full sessions.
     ``daily_head`` + ``daily_targets`` (a list aligned with train_days of (tgt [A], mask [A]) = each day's next-H-day
     cross-sectional return) add a DAILY relative-value pretext on the END-OF-DAY context -- the target a daily
     cross-sectional policy needs (see ssl_targets_daily). STREAMS ``batch_size`` days/micro-batch and
-    GRADIENT-ACCUMULATES ``accum_steps`` micro-batches per step. Returns the optimizer."""
+    GRADIENT-ACCUMULATES ``accum_steps`` micro-batches per step. Distributed
+    callers may provide ``prepare_checkpoint`` for an all-rank snapshot (for
+    example per-rank RNG gathering), then ``sync_after_checkpoint`` so all
+    ranks wait for rank-0 checkpoint I/O before starting the next collective.
+    Returns the optimizer."""
+    # A zero-weight auxiliary objective is disabled, not merely multiplied by
+    # zero after its dense head has run.  This matters at TOP2000 scale: the
+    # per-stock head's hidden activation has shape [B,nB,A,d].  Keep disabled
+    # heads in ``heads``/``params`` so existing optimizer and checkpoint layouts
+    # remain compatible; their gradients stay None on every rank and the
+    # distributed reducer already skips parameters unused globally.
+    use_perstock = perstock_head is not None and perstock_coef != 0.0
+    use_daily = daily_head is not None and daily_targets is not None and daily_coef != 0.0
     heads = [head] + ([perstock_head] if perstock_head is not None else []) + \
             ([daily_head] if daily_head is not None else [])
     params = list(encoder.parameters()) + [p for h in heads for p in h.parameters()]
     if optimizer is None:
-        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        optimizer = make_adamw(params, lr=lr, weight_decay=weight_decay)
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     targets = [ssl_targets(d["ret"], d["ret_valid"]) for d in train_days]      # per day [nB,2]
     valid = [d["ret_valid"][:, 1:].any(1) for d in train_days]                 # per day [nB] block has a target
-    ps = [ssl_targets_perstock(d["ret"], d["ret_valid"]) for d in train_days]  # per day ([nB,A], [nB,A])
-    use_daily = daily_head is not None and daily_targets is not None
+    ps = (
+        [ssl_targets_perstock(d["ret"], d["ret_valid"]) for d in train_days]
+        if use_perstock else None
+    )                                                                          # per day ([nB,A], [nB,A])
     n = len(train_days)
+    if not 0 < batch_size <= n:
+        raise ValueError(f"batch_size must be in [1, {n}], got {batch_size}")
     encoder.train()
     for h in heads:
         h.train()
 
     def micro():
-        idx = torch.randint(0, n, (batch_size,)).tolist()
+        # A local micro-batch should spend every slot on a distinct trading
+        # day.  Rank date shards are disjoint, so this also avoids cross-rank
+        # duplicates without adding a distributed sampling collective.
+        idx = torch.randperm(n)[:batch_size].tolist()
         st = lambda src: torch.stack([src[i] for i in idx]).to(device, non_blocking=True)  # noqa: E731
         bars = torch.stack([train_days[i]["bars"] for i in idx]).to(device, non_blocking=True)
         mask = torch.stack([train_days[i]["bar_mask"] for i in idx]).to(device, non_blocking=True)
@@ -105,8 +126,11 @@ def train_context_encoder(
                 device, non_blocking=True
             )
         tgt, vm = st(targets), st(valid)                                          # [b,nB,2], [b,nB]
-        ps_tgt = torch.stack([ps[i][0] for i in idx]).to(device, non_blocking=True)   # [b,nB,A]
-        ps_vm = torch.stack([ps[i][1] for i in idx]).to(device, non_blocking=True)    # [b,nB,A]
+        ps_tgt = ps_vm = None
+        if use_perstock:
+            assert ps is not None
+            ps_tgt = torch.stack([ps[i][0] for i in idx]).to(device, non_blocking=True)   # [b,nB,A]
+            ps_vm = torch.stack([ps[i][1] for i in idx]).to(device, non_blocking=True)    # [b,nB,A]
         d_tgt = d_vm = None
         if use_daily:
             d_tgt = torch.stack([daily_targets[i][0] for i in idx]).to(device, non_blocking=True)  # [b,A]
@@ -115,7 +139,7 @@ def train_context_encoder(
 
     for step in range(start_step, steps):
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         for _ in range(accum_steps):
             bars, mask, cov, cov_valid, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro()
             with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
@@ -123,7 +147,7 @@ def train_context_encoder(
                 per_stock, market = encoded                          # [b,nB,A,d], [b,nB,d]
                 pred = head(market)                                   # [b,nB,2]
                 loss = F.smooth_l1_loss(pred[vm], tgt[vm]) if vm.any() else (pred.sum() * 0.0)
-                if perstock_head is not None and ps_vm.any():         # cross-sectional relative-value pretext
+                if use_perstock and ps_vm is not None and ps_tgt is not None and ps_vm.any():
                     ps_pred = perstock_head(per_stock)                # [b,nB,A]
                     loss = loss + perstock_coef * F.smooth_l1_loss(ps_pred[ps_vm], ps_tgt[ps_vm])
                 if use_daily and d_vm.any():                          # DAILY next-H-day relative-value pretext
@@ -136,8 +160,14 @@ def train_context_encoder(
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(params, grad_clip)
         optimizer.step()
-        if checkpoint_every and on_checkpoint and (step + 1) % checkpoint_every == 0:
-            on_checkpoint(step + 1, optimizer)
+        checkpoint_due = bool(checkpoint_every and (step + 1) % checkpoint_every == 0)
+        if checkpoint_due:
+            if prepare_checkpoint is not None:
+                prepare_checkpoint()
+            if on_checkpoint is not None:
+                on_checkpoint(step + 1, optimizer)
+            if sync_after_checkpoint is not None:
+                sync_after_checkpoint()
     return optimizer
 
 
@@ -162,10 +192,11 @@ def encode_days(
 
     By default, return every block for intraday policies. ``last_only=True`` is the daily-policy storage path: the
     full session is still encoded causally, but only the end-of-day market/per-stock context and matching
-    availability/news fields leave the encode chunk. Every selected tensor is cloned after slicing so it owns a
-    compact storage allocation instead of pinning a full ``[n_blocks, ...]`` backing tensor (especially important
-    for :class:`LazyDay` overrides). ``output_dtype`` controls only the cached context embedding dtype; raw inputs,
-    masks, labels, and prices retain their source dtypes.
+    availability/news fields leave the encode chunk. Dense selected tensors are cloned after slicing so they own
+    a compact storage allocation instead of pinning a full ``[n_blocks, ...]`` backing tensor (especially
+    important for :class:`LazyDay` overrides). Disabled-news tensors are scalar-backed broadcast-zero views and
+    retain that compact representation. ``output_dtype`` controls only the cached context embedding dtype; raw
+    inputs, masks, labels, and prices retain their source dtypes.
 
     Returned records carry no encoder reference. Raw bars remain materialized for in-memory days and lazy for
     ``LazyDay`` inputs; the daily adapters decide whether a policy needs a full session or only its final raw block.
@@ -180,7 +211,16 @@ def encode_days(
         return t.detach().to(device="cpu", dtype=dtype or t.dtype).contiguous().clone()
 
     def eod_field(day, key: str) -> torch.Tensor:
-        return owned_cpu(day[key][-1])
+        selected = day[key][-1]
+        # The reportable no-news cache represents the full logical tensor as an expanded zero scalar. Cloning its
+        # EOD view would materialize [A,max_news,...] once per day before the episode builder stacks it again. Keep
+        # the broadcast representation; dense fields still take the compact owned-copy path below.
+        scalar_backed = selected.numel() > 1 and selected.untyped_storage().nbytes() == selected.element_size()
+        if key in ("news_raw", "news_mask") and scalar_backed:
+            origin = selected[(0,) * selected.ndim]
+            if not bool(origin):
+                return torch.zeros((), dtype=selected.dtype, device="cpu").expand(selected.shape)
+        return owned_cpu(selected)
 
     encoder.eval()
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
