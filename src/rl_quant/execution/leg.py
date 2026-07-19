@@ -203,7 +203,9 @@ def _make_leg(symbol: str, prev_w: float, tgt_w: float, quote: SymbolQuote, conf
     if config.real_executable_fill_model:
         try:
             fill_price = _fill_price(quote._market(), buying=side == LegSide.BUY, config=config)
-            spread_bps = abs(float(fill_price) - quote.mid) / quote.mid * 1e4
+            if fill_price is None:
+                raise RuntimeError("A real-executable fill model returned no fill price.")
+            spread_bps = abs(fill_price - quote.mid) / quote.mid * 1e4
         except ValueError:
             status = FillStatus.MISSING_QUOTE
             spread_bps = 0.0

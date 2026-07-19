@@ -35,6 +35,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import cast
 
 # BASE tier: protocol-required fields a causal backtest must log (docs/decision_tensor_protocol.md). The
 # real fill prices (entry_price/exit_price) are intentionally STRICT-tier, not base.
@@ -100,7 +101,7 @@ def _is_finite_number(value: object) -> bool:
 
 
 def _is_positive_finite_number(value: object) -> bool:
-    return _is_finite_number(value) and float(value) > 0.0
+    return _is_finite_number(value) and float(cast(int | float, value)) > 0.0
 
 
 def _parse_timestamp(value: object) -> float | None:
@@ -132,7 +133,11 @@ def _is_traded_row(row: Mapping) -> bool:
     notional = row.get("traded_notional")
     if (legs is not None and not _is_finite_number(legs)) or (notional is not None and not _is_finite_number(notional)):
         return True
-    return (_is_finite_number(legs) and float(legs) > 0.0) or (_is_finite_number(notional) and abs(float(notional)) > 0.0)
+    return (
+        _is_finite_number(legs) and float(cast(int | float, legs)) > 0.0
+    ) or (
+        _is_finite_number(notional) and abs(float(cast(int | float, notional))) > 0.0
+    )
 
 
 def evaluate_decision_log_reportability(
@@ -168,10 +173,10 @@ def evaluate_decision_log_reportability(
                 base_issues.append(ReportabilityIssue(i, field, "malformed", f"row {i}: {field} is not a finite number ({value!r})"))
         for field in _NONNEGATIVE_FIELDS:
             value = row.get(field)
-            if _is_finite_number(value) and float(value) < 0.0:
+            if _is_finite_number(value) and float(cast(int | float, value)) < 0.0:
                 base_issues.append(ReportabilityIssue(i, field, "negative", f"row {i}: {field} is negative ({value!r})"))
         equity = row.get("equity_after")
-        if _is_finite_number(equity) and float(equity) <= 0.0:
+        if _is_finite_number(equity) and float(cast(int | float, equity)) <= 0.0:
             base_issues.append(ReportabilityIssue(i, "equity_after", "nonpositive_equity", f"row {i}: equity_after must be > 0 ({equity!r})"))
 
         # Point-in-time causality: parse the timestamp chain (numeric / ISO / datetime) and require it
@@ -234,11 +239,12 @@ def evaluate_decision_log_reportability(
         eq_prev, eq_cur, net = prev.get("equity_after"), cur.get("equity_after"), cur.get("net_return")
         if not (_is_finite_number(eq_prev) and _is_finite_number(eq_cur) and _is_finite_number(net)):
             continue  # missing/malformed numerics are already base issues
-        expected = float(eq_prev) * (1.0 + float(net))
-        if abs(expected - float(eq_cur)) > 1e-6 * max(1.0, abs(float(eq_cur))):
+        expected = float(cast(int | float, eq_prev)) * (1.0 + float(cast(int | float, net)))
+        equity_value = float(cast(int | float, eq_cur))
+        if abs(expected - equity_value) > 1e-6 * max(1.0, abs(equity_value)):
             ledger_issues.append(ReportabilityIssue(
                 i, "equity_after", "ledger",
-                f"row {i}: equity_after {float(eq_cur)!r} != equity_after[{i - 1}]*(1+net_return) = {expected!r}",
+                f"row {i}: equity_after {equity_value!r} != equity_after[{i - 1}]*(1+net_return) = {expected!r}",
             ))
 
     base_reportable = not base_issues

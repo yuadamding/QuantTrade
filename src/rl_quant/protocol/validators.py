@@ -9,7 +9,8 @@ only; changes no data, number, or training behavior."""
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, cast
 
 
 def validate_model_input_label_split(
@@ -109,7 +110,10 @@ def assert_invalid_returns_are_nan(action_returns: object, valid_mask: object) -
 
 def _to_list(value: object) -> list[object]:
     """Coerce a 1-D tensor (anything with .tolist()) or a sequence to a list, keeping the layer torch-free."""
-    return list(value.tolist() if hasattr(value, "tolist") else value)  # type: ignore[union-attr]
+    converted = value.tolist() if hasattr(value, "tolist") else value  # type: ignore[union-attr]
+    if not isinstance(converted, Iterable) or isinstance(converted, (str, bytes)):
+        raise TypeError("Expected a tensor-like or iterable value.")
+    return list(converted)
 
 
 def validate_causal_timestamp_chain(
@@ -140,7 +144,7 @@ def validate_causal_timestamp_chain(
             lo, hi = arrays[i][row], arrays[i + 1][row]
             if not _finite(lo) or not _finite(hi):
                 issues.append(f"row {row}: non-finite timestamp ({stage[i]}={lo!r}, {stage[i + 1]}={hi!r})")
-            elif float(lo) > float(hi):
+            elif float(cast(Any, lo)) > float(cast(Any, hi)):
                 issues.append(f"row {row}: {stage[i]} ({lo!r}) > {stage[i + 1]} ({hi!r}) -- look-ahead")
         if len(issues) > max_issues:
             issues = issues[:max_issues]
@@ -235,7 +239,7 @@ def validate_decision_tensor_shapes(
     action_counts: dict[str, int] = {}
     issues: list[str] = []
     for name, arr in named_arrays.items():
-        rows = list(arr.tolist() if hasattr(arr, "tolist") else arr)  # type: ignore[union-attr]
+        rows = _to_list(arr)
         row_counts[name] = len(rows)
         widths = {len(r) for r in rows if isinstance(r, (list, tuple))}
         if len(widths) > 1:

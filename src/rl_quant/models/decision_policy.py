@@ -53,8 +53,13 @@ class RawSecondPolicyEncoder(nn.Module):
     """Trainable policy-side encoder over raw 1-second OHLCV bars.
 
     This is not the frozen context encoder. Profit gradients update it. Inputs are raw bars plus the raw-bar
-    validity mask only; missing seconds are masked as attention keys rather than converted to engineered inputs.
+    validity mask only; missing seconds are omitted from attention rather than converted to engineered inputs.
+    Price fields are expressed relative to the first valid close in each decision block, while remaining fields
+    receive a signed-log magnitude transform. Both transforms are token/block local: they do not mix OHLCV fields,
+    batch peers, later blocks, or future decisions.
     """
+
+    pos: torch.Tensor
 
     def __init__(
         self,
@@ -73,7 +78,7 @@ class RawSecondPolicyEncoder(nn.Module):
         if block_seconds <= 0:
             raise ValueError("raw policy block_seconds must be positive")
         self.block_seconds = int(block_seconds)
-        self.input_norm = nn.LayerNorm(bar_feature_dim)
+        self.bar_feature_dim = int(bar_feature_dim)
         self.input_proj = nn.Linear(bar_feature_dim, d_model)
         self.register_buffer("pos", _sinusoidal(self.block_seconds, d_model), persistent=False)
         self.n_layers = int(n_layers)
@@ -82,11 +87,39 @@ class RawSecondPolicyEncoder(nn.Module):
                 d_model=d_model, nhead=n_heads, dim_feedforward=feedforward_dim,
                 dropout=dropout, batch_first=True, norm_first=True, activation="gelu",
             )
-            self.local = nn.TransformerEncoder(layer, num_layers=self.n_layers, enable_nested_tensor=False)
+            self.local: nn.Module = nn.TransformerEncoder(
+                layer, num_layers=self.n_layers, enable_nested_tensor=False
+            )
         else:
             self.local = nn.Identity()
         self.out_norm = nn.LayerNorm(d_model)
         self.d_model = d_model
+
+    @staticmethod
+    def _normalize_ohlcv(bars: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """Causally scale block-local raw fields without cross-field LayerNorm.
+
+        ``bars`` is ``[N, L, F]`` after block partitioning. Standardizing the feature axis of each raw token makes
+        a large volume observation determine the apparent scale of all four price fields. Instead, OHLC (when
+        present) is represented in return units relative to the block's first valid close and volume/extra raw
+        fields use a signed ``log1p``. The anchor is the earliest observation, so the transform is point-in-time
+        and invariant to later or peer samples. Invalid/non-finite values become the neutral zero input.
+        """
+        finite_valid = valid.unsqueeze(-1) & torch.isfinite(bars)
+        clean = torch.where(finite_valid, bars, torch.zeros_like(bars))
+        if bars.shape[-1] < 4:
+            transformed = torch.sign(clean) * torch.log1p(clean.abs())
+            return transformed * valid.unsqueeze(-1).to(bars.dtype)
+
+        first_index = valid.to(torch.int64).argmax(dim=1)
+        rows = torch.arange(bars.shape[0], device=bars.device)
+        anchor = clean[rows, first_index, 3:4]
+        denominator = anchor.abs().clamp_min(1e-4)
+        prices = (clean[..., :4] - anchor.unsqueeze(1)) / denominator.unsqueeze(1)
+        other = clean[..., 4:]
+        other = torch.sign(other) * torch.log1p(other.abs())
+        transformed = torch.cat((prices, other), dim=-1)
+        return transformed * valid.unsqueeze(-1).to(bars.dtype)
 
     def forward(self, bars: torch.Tensor, bar_mask: torch.Tensor) -> torch.Tensor:
         """bars [B,A,S,F], bar_mask [B,A,S] -> [B,nB,A,d_model] raw policy context."""
@@ -95,22 +128,37 @@ class RawSecondPolicyEncoder(nn.Module):
         nB = S // bl
         if nB <= 0:
             raise ValueError(f"raw policy encoder needs at least one {bl}s block; got S={S}")
-        bars = bars[:, :, : nB * bl]
-        bar_mask = bar_mask[:, :, : nB * bl].bool()
-        x = self.input_proj(self.input_norm(bars)).reshape(B * A * nB, bl, self.d_model)
-        x = x + self.pos[:bl].view(1, bl, self.d_model)
-        bm = bar_mask.reshape(B * A * nB, bl)
-        key_padding = ~bm
-        if bool(key_padding.all(dim=1).any()):
-            key_padding = key_padding.clone()
-            key_padding[key_padding.all(dim=1), 0] = False
-        causal = torch.triu(torch.ones((bl, bl), dtype=torch.bool, device=bars.device), diagonal=1)
-        h = self.local(x, mask=causal, src_key_padding_mask=key_padding) if self.n_layers > 0 else self.local(x)
-        h = self.out_norm(h)
-        ar = torch.arange(bl, device=bars.device)
-        idx = torch.where(bm, ar.view(1, bl), torch.full((1, bl), -1, device=bars.device)).amax(dim=1).clamp_min(0)
-        rows = torch.arange(h.shape[0], device=bars.device)
-        summary = h[rows, idx] * bm.any(dim=1, keepdim=True).to(h.dtype)
+        bars = bars[:, :, : nB * bl].reshape(B * A * nB, bl, F)
+        bm = bar_mask[:, :, : nB * bl].bool().reshape(B * A * nB, bl)
+        x = self.input_proj(self._normalize_ohlcv(bars, bm)) + self.pos[:bl].view(1, bl, self.d_model)
+
+        # We consume only the last valid token from each block. Pack rows by valid length so attention never sees
+        # padding and needs only one shared ``[L,L]`` causal mask, instead of an expanded per-row causal+padding
+        # mask. Absolute positions remain in ``x`` before compaction, preserving the timestamp of gaps.
+        counts = bm.sum(-1)
+        summary = torch.zeros(x.shape[0], self.d_model, dtype=x.dtype, device=x.device)
+        for length_value in counts.unique(sorted=True).tolist():
+            length = int(length_value)
+            if length <= 0:
+                continue
+            selected = counts == length
+            selected_x, selected_mask = x[selected], bm[selected]
+            if length == bl:
+                packed = selected_x
+            else:
+                positions = torch.arange(bl, device=x.device).expand(selected_x.shape[0], bl)[selected_mask]
+                positions = positions.reshape(selected_x.shape[0], length)
+                packed = torch.gather(
+                    selected_x, 1, positions.unsqueeze(-1).expand(-1, -1, self.d_model)
+                )
+            if self.n_layers > 0:
+                causal = torch.triu(
+                    torch.ones((length, length), dtype=torch.bool, device=x.device), diagonal=1
+                )
+                packed = self.local(packed, mask=causal)
+            else:
+                packed = self.local(packed)
+            summary[selected] = self.out_norm(packed[:, -1])
         return summary.reshape(B, A, nB, self.d_model).permute(0, 2, 1, 3)
 
 

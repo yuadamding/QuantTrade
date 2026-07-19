@@ -154,7 +154,9 @@ def _base_cost_per_share(snapshot: MarketSnapshot, *, buying: bool, config: Exec
         spread_cost = config.spread_multiplier * snapshot.half_spread
     else:
         fill_px = _fill_price(snapshot, buying=buying, config=config)
-        spread_cost = abs(float(fill_px) - snapshot.mid)
+        if fill_px is None:
+            raise RuntimeError("A quote-side execution level returned no fill price.")
+        spread_cost = abs(fill_px - snapshot.mid)
     return spread_cost + config.extra_cost_per_share + config.commission_per_share
 
 

@@ -226,6 +226,11 @@ A backtest using `stock_news_llm_v1` is reportable only if:
 - Prompt hash, schema hash, and model id are recorded.
 - The model training cutoff is recorded, or the extractor is the deterministic
   non-trained baseline.
+- Every article has a non-empty ticker, an exact integer feature-availability
+  timestamp, and a finite numeric `sentiment_score` in `[-1, 1]`; missing or
+  malformed values are never filled with neutral sentiment.
+- The ticker maps to a declared non-CASH action, and model/prompt/schema
+  identifiers are canonical non-empty strings.
 - Source coverage is explicit, so missing news files are not confused with
   known zero news.
 

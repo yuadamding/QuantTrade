@@ -99,6 +99,11 @@ def train_context_encoder(
         bars = torch.stack([train_days[i]["bars"] for i in idx]).to(device, non_blocking=True)
         mask = torch.stack([train_days[i]["bar_mask"] for i in idx]).to(device, non_blocking=True)
         cov = torch.stack([train_days[i]["cov_blocks"] for i in idx]).to(device, non_blocking=True)
+        cov_valid = None
+        if all("cov_valid_blocks" in train_days[i] for i in idx):
+            cov_valid = torch.stack([train_days[i]["cov_valid_blocks"] for i in idx]).to(
+                device, non_blocking=True
+            )
         tgt, vm = st(targets), st(valid)                                          # [b,nB,2], [b,nB]
         ps_tgt = torch.stack([ps[i][0] for i in idx]).to(device, non_blocking=True)   # [b,nB,A]
         ps_vm = torch.stack([ps[i][1] for i in idx]).to(device, non_blocking=True)    # [b,nB,A]
@@ -106,15 +111,16 @@ def train_context_encoder(
         if use_daily:
             d_tgt = torch.stack([daily_targets[i][0] for i in idx]).to(device, non_blocking=True)  # [b,A]
             d_vm = torch.stack([daily_targets[i][1] for i in idx]).to(device, non_blocking=True)   # [b,A]
-        return bars, mask, cov, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm
+        return bars, mask, cov, cov_valid, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm
 
     for step in range(start_step, steps):
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
         optimizer.zero_grad()
         for _ in range(accum_steps):
-            bars, mask, cov, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro()
+            bars, mask, cov, cov_valid, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro()
             with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-                per_stock, market = encoder(bars, mask, cov)          # [b,nB,A,d], [b,nB,d]
+                encoded = encoder(bars, mask, cov, cov_valid) if cov_valid is not None else encoder(bars, mask, cov)
+                per_stock, market = encoded                          # [b,nB,A,d], [b,nB,d]
                 pred = head(market)                                   # [b,nB,2]
                 loss = F.smooth_l1_loss(pred[vm], tgt[vm]) if vm.any() else (pred.sum() * 0.0)
                 if perstock_head is not None and ps_vm.any():         # cross-sectional relative-value pretext
@@ -142,22 +148,93 @@ def freeze_encoder(encoder) -> None:
 
 
 @torch.no_grad()
-def encode_days(encoder, days, device, batch: int = 2, amp: bool = False) -> list[dict]:
-    """Run the FROZEN encoder over each day's full session -> per-block context embeddings, in chunks of ``batch``
-    days (peak VRAM = batch * A sequences). The returned per-day dicts carry detached context plus the raw
-    seconds the policy-side raw encoder consumes; they carry NO encoder reference."""
+def encode_days(
+    encoder,
+    days,
+    device,
+    batch: int = 2,
+    amp: bool = False,
+    *,
+    last_only: bool = False,
+    output_dtype: torch.dtype = torch.float32,
+) -> list[dict | LazyDay]:
+    """Encode frozen context in bounded day chunks.
+
+    By default, return every block for intraday policies. ``last_only=True`` is the daily-policy storage path: the
+    full session is still encoded causally, but only the end-of-day market/per-stock context and matching
+    availability/news fields leave the encode chunk. Every selected tensor is cloned after slicing so it owns a
+    compact storage allocation instead of pinning a full ``[n_blocks, ...]`` backing tensor (especially important
+    for :class:`LazyDay` overrides). ``output_dtype`` controls only the cached context embedding dtype; raw inputs,
+    masks, labels, and prices retain their source dtypes.
+
+    Returned records carry no encoder reference. Raw bars remain materialized for in-memory days and lazy for
+    ``LazyDay`` inputs; the daily adapters decide whether a policy needs a full session or only its final raw block.
+    """
+    if batch <= 0:
+        raise ValueError(f"encode batch must be positive, got {batch}")
+    if not isinstance(output_dtype, torch.dtype) or not output_dtype.is_floating_point:
+        raise TypeError(f"output_dtype must be a floating torch.dtype, got {output_dtype!r}")
+
+    def owned_cpu(t: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Detach and give a (possibly sliced) tensor its own compact CPU storage."""
+        return t.detach().to(device="cpu", dtype=dtype or t.dtype).contiguous().clone()
+
+    def eod_field(day, key: str) -> torch.Tensor:
+        return owned_cpu(day[key][-1])
+
     encoder.eval()
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
-    out = []
+    out: list[dict | LazyDay] = []
     for i in range(0, len(days), batch):
         chunk = days[i:i + batch]
         bars = torch.stack([d["bars"] for d in chunk]).to(device, non_blocking=True)
         mask = torch.stack([d["bar_mask"] for d in chunk]).to(device, non_blocking=True)
         cov = torch.stack([d["cov_blocks"] for d in chunk]).to(device, non_blocking=True)
+        cov_valid = None
+        if all("cov_valid_blocks" in d for d in chunk):
+            cov_valid = torch.stack([d["cov_valid_blocks"] for d in chunk]).to(device, non_blocking=True)
         with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-            per_stock, market = encoder(bars, mask, cov)              # [b,nB,A,d], [b,nB,d]
-        per_stock, market = per_stock.float().cpu(), market.float().cpu()
+            encoded = encoder(bars, mask, cov, cov_valid) if cov_valid is not None else encoder(bars, mask, cov)
+            per_stock, market = encoded                              # [b,nB,A,d], [b,nB,d]
+        if last_only:
+            # Slice on the accelerator before the device transfer. ``owned_cpu`` also clones CPU encodes, where a
+            # same-device ``to`` would otherwise preserve the full output storage behind this one-block view.
+            per_stock = owned_cpu(per_stock[:, -1], dtype=output_dtype)   # [b,A,d]
+            market = owned_cpu(market[:, -1], dtype=output_dtype)         # [b,d]
+        else:
+            per_stock = owned_cpu(per_stock, dtype=output_dtype)          # [b,nB,A,d]
+            market = owned_cpu(market, dtype=output_dtype)                # [b,nB,d]
         for j, d in enumerate(chunk):
+            if last_only:
+                small = {
+                    "market": owned_cpu(market[j]),
+                    "per_stock": owned_cpu(per_stock[j]),
+                    "avail": eod_field(d, "avail"),
+                    "news_raw": eod_field(d, "news_raw"),
+                    "news_mask": eod_field(d, "news_mask"),
+                }
+                # DAILY rewards are rebuilt causally from the cross-day price sequence. Keep only the EOD copies
+                # of the intraday labels for dict compatibility; do not retain a full-block label backing tensor.
+                if "ret" in d:
+                    small["ret"] = eod_field(d, "ret")
+                if "ret_valid" in d:
+                    small["ret_valid"] = eod_field(d, "ret_valid")
+                for key in ("day_open", "day_close"):
+                    if key in d:
+                        small[key] = owned_cpu(d[key])
+                if isinstance(d, LazyDay):
+                    # The lazy window remains solely as the raw-bar handle. All frequently accessed small fields
+                    # are owned overrides and therefore cannot keep an evicted full-window tensor alive as views.
+                    out.append(d.with_overrides(**small))
+                else:
+                    out.append({
+                        **small,
+                        "bars": d["bars"],
+                        "bar_mask": d["bar_mask"],
+                        "n_blocks": 1,
+                        **({"date": d["date"]} if "date" in d else {}),
+                    })
+                continue
             if isinstance(d, LazyDay):
                 # STREAMING: attach the embeddings + materialize the SMALL per-day fields in RAM (the window is
                 # already resident here for the encode, so this is an LRU hit, not a reload). ONLY bars/bar_mask

@@ -1,4 +1,11 @@
-# Wiring the execution engine into reward — shipped PR-3 contract + PR-4 plan (no number-moving code)
+# Historical execution-wiring memo (superseded active-stack plan)
+
+> **Archive notice (2026-07).** This memo describes the removed minute-to-hour/DQN stack and its historical
+> shadow flags. Those modules are not the active QuantTrade architecture. The current implementation is
+> `rl_quant.envs.VectorPortfolioEnv` plus the shared `rl_quant.execution` tensor accounting; current migration
+> status is in [general_rl_architecture.md](general_rl_architecture.md) and
+> [architecture_migration_plan.md](architecture_migration_plan.md). The details below are retained only as design
+> history and must not be used to claim current behavior.
 
 Companion to the 2026-06-17 target memo and [architecture_migration_plan.md](architecture_migration_plan.md).
 This records the **shipped** PR-3 shadow-mode contract (§3) and the remaining PR-4 promotion plan (§4); the

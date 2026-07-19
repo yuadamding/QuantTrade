@@ -19,23 +19,41 @@ from rl_quant.datasets.streaming import LazyDay
 CASH_INDEX = 0
 
 
+def _owned_eod(value: torch.Tensor, full_ndim: int, key: str) -> torch.Tensor:
+    """Accept a full ``[n_blocks, ...]`` field or an already-EOD field and return compact owned storage."""
+    if value.ndim == full_ndim:
+        value = value[-1]
+    elif value.ndim != full_ndim - 1:
+        raise ValueError(
+            f"daily field {key!r} must have {full_ndim} dims (per-block) or {full_ndim - 1} dims (EOD); "
+            f"got shape {tuple(value.shape)}"
+        )
+    return value.detach().contiguous().clone()
+
+
 def to_daily_raw_records(encoded: list) -> list[dict]:
     """EOD adapter (the single, explicit place daily_raw assembles records). Each `encoded` day carries per-BLOCK
-    context ([nB, ...]) + raw bars + day_close (from encode_days). This selects the END-OF-DAY block ([last]) for
-    the daily decision and keeps raw bars LAZY when the day is a LazyDay (streaming) -- so the shape contract is
-    in-repo + unit-tested rather than living in an external driver.
+    context ([nB, ...]) OR already-selected EOD context + raw bars + day_close (from encode_days). This selects or
+    accepts the END-OF-DAY fields for the daily decision and gives each one compact owned storage. Raw bars stay
+    LAZY when the day is a LazyDay (streaming) -- so the shape contract is in-repo + unit-tested rather than living
+    in an external driver.
 
     encoded[i]: {market [nB,d], per_stock [nB,A,d], avail [nB,A], news_raw [nB,A,M,1], news_mask [nB,A,M],
                  day_close [A], date, + bars/bar_mask (materialized) OR a lazy bars handle if a LazyDay}.
     -> records consumable by build_daily_raw_episodes (each end-of-day; bars materialized or via "_bars_day")."""
     if not encoded:
         return []
-    last = encoded[0]["per_stock"].shape[0] - 1                  # end-of-day block (full session encoded causally)
     recs = []
     for e in encoded:
-        r = {"date": e["date"], "day_close": e["day_close"], "avail": e["avail"][last],
-             "market": e["market"][last], "per_stock": e["per_stock"][last],
-             "news_raw": e["news_raw"][last], "news_mask": e["news_mask"][last]}
+        r = {
+            "date": e["date"],
+            "day_close": e["day_close"].detach().contiguous().clone(),
+            "avail": _owned_eod(e["avail"], 2, "avail"),
+            "market": _owned_eod(e["market"], 2, "market"),
+            "per_stock": _owned_eod(e["per_stock"], 3, "per_stock"),
+            "news_raw": _owned_eod(e["news_raw"], 4, "news_raw"),
+            "news_mask": _owned_eod(e["news_mask"], 3, "news_mask"),
+        }
         if isinstance(e, LazyDay):                              # streaming: keep full-day bars lazy via the handle
             r["_bars_day"] = e
         else:
@@ -89,23 +107,50 @@ def horizon_close_returns(day_close: torch.Tensor, horizon: int, exec_delay: int
     return ret, valid
 
 
-def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int | None = None,
-                             horizon: int = 21, exec_delay: int = 1) -> list[dict]:
-    """daily_raw episodes: close-to-close H-day labels over the FULL split day-sequence, sliced into episodes that
-    carry the FROZEN end-of-day context + the FULL-day raw bars + news + avail for the cross-day policy.
+def build_daily_raw_episodes(
+    records: list[dict],
+    episode_len: int,
+    stride: int | None = None,
+    horizon: int = 21,
+    exec_delay: int = 1,
+    *,
+    require_aux_labels: bool = False,
+    score_start: int = 0,
+) -> list[dict]:
+    """Build daily_raw episodes with a canonical one-step transition reward and optional burn-in prefix.
 
-    records: a DATE-SORTED list of per-day dicts, each with
+    ``ret``/``ret_valid`` and ``real_ret``/``real_ret_valid`` are both the next one-day realized wealth-change
+    basis used by policy training and evaluation. The H-day forecasting target is retained separately as
+    ``aux_ret``/``aux_ret_valid``; it must not silently redefine the environment reward. By default episode
+    eligibility therefore retains every one-step-valid decision. ``require_aux_labels=True`` limits the usable
+    tail to decisions having an H-day auxiliary label, which is useful for an explicitly auxiliary-only training
+    experiment but should not be used for continuous validation/test coverage.
+
+    ``score_start`` is a record index: earlier records remain in the episode as causal input/portfolio burn-in but
+    have ``score_mask=False``. Consumers should AND this mask with their loss/reporting label while still using
+    the prefix transitions to build temporal state and drift the held portfolio.
+
+    Episodes carry the FROZEN end-of-day context + FULL-day raw bars + news + availability for the cross-day
+    policy. ``records`` is a DATE-SORTED list of per-day dicts, each with
         {market [dc], per_stock [A,dc], bars [A,S,F], bar_mask [A,S], news_raw [A,M,1], news_mask [A,M],
          day_close [A], avail [A]}.
-    Labels are computed once over the whole split (so a day's H-day label is drawn from the global close series, not
-    limited to its episode). Episodes are [s:s+L]; for a CONTINUOUS evaluation rollout pass episode_len>=N (one
-    episode spanning the split, so every day has its full causal cross-day history)."""
+    Labels are computed once over the whole record sequence (so a target is never limited to its episode). Episodes
+    are [s:s+L]; for a CONTINUOUS evaluation rollout pass episode_len>=N (one episode spanning the usable sequence,
+    so every scored day has its full causal cross-day history)."""
     N = len(records)
-    if N < exec_delay + horizon + 1:
+    if horizon <= 0:
+        raise ValueError(f"horizon must be positive, got {horizon}")
+    if exec_delay < 1:
+        raise ValueError(f"exec_delay must be at least one for PIT-clean execution, got {exec_delay}")
+    if episode_len <= 0:
+        raise ValueError(f"episode_len must be positive, got {episode_len}")
+    if not 0 <= score_start <= N:
+        raise ValueError(f"score_start must be in [0, {N}], got {score_start}")
+    if N < exec_delay + 2:
         return []
     day_close = torch.stack([r["day_close"] for r in records])   # [N,A]
-    ret, valid = horizon_close_returns(day_close, horizon, exec_delay)            # H-day: TRAINING target/reward
-    real_ret, real_valid = horizon_close_returns(day_close, 1, exec_delay)        # 1-day mark: REALIZED/reported PnL
+    aux_ret, aux_valid = horizon_close_returns(day_close, horizon, exec_delay)     # optional H-day forecast target
+    ret, valid = horizon_close_returns(day_close, 1, exec_delay)                   # canonical 1-day MDP transition
     # PAST-return INPUT channel (PIT-clean): day d carries its OWN 1-day close-to-close return close_d/close_{d-1}-1,
     # fully known at the EOD-d decision. This is the raw close series under a scale-invariant normalization (the
     # 'level'-norm spirit) -- it lets the cross-day temporal encoder compute momentum/reversal over ITS OWN window
@@ -135,7 +180,10 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
     if not stream:
         bars = torch.stack([r["bars"] for r in records])
         bar_mask = torch.stack([r["bar_mask"] for r in records])
-    usable = N - (exec_delay + horizon)                          # days d=0..usable-1 carry an in-range H-day label
+    required_horizon = horizon if require_aux_labels else 1
+    usable = N - (exec_delay + required_horizon)                 # eligible decisions on the selected label basis
+    if usable <= 0:
+        return []
     L = min(episode_len, usable)
     st = stride if (stride and stride > 0) else L
     starts = list(range(0, usable - L + 1, st)) or [0]
@@ -145,24 +193,39 @@ def build_daily_raw_episodes(records: list[dict], episode_len: int, stride: int 
         ep = {
             "market": market[s:e], "per_stock": per_stock[s:e],
             "news_raw": news_raw[s:e], "news_mask": news_mask[s:e], "avail": avail[s:e],
-            "ret": ret[s:e], "ret_valid": valid[s:e],                  # H-day training target
-            "real_ret": real_ret[s:e], "real_ret_valid": real_valid[s:e],   # 1-day realized PnL (reported)
+            "ret": ret[s:e], "ret_valid": valid[s:e],                       # canonical 1-day train reward
+            "real_ret": ret[s:e], "real_ret_valid": valid[s:e],             # same basis, compatibility alias
+            "aux_ret": aux_ret[s:e], "aux_ret_valid": aux_valid[s:e],       # H-day auxiliary forecast label
             "past_ret": past_ret[s:e], "past_ret_valid": past_valid[s:e],   # PIT input: own 1-day past return
+            "score_mask": torch.arange(s, e) >= score_start,                  # input-only prefix is not scored
+            "decision_ids": tuple(str(records[index].get("date", index)) for index in range(s, e)),
             "n_blocks": L,
         }
         if stream:
             ep["bars_days"] = [r["_bars_day"] for r in records[s:e]]   # lazy per-day handles (load bars on demand)
         else:
+            assert bars is not None and bar_mask is not None
             ep["bars"] = bars[s:e]
             ep["bar_mask"] = bar_mask[s:e]
         episodes.append(ep)
     return episodes
 
 
-def build_daily_episodes(records: list[dict], episode_len: int, stride: int | None = None) -> list[dict]:
+def build_daily_episodes(
+    records: list[dict],
+    episode_len: int,
+    stride: int | None = None,
+    *,
+    raw_block_steps: int | None = None,
+) -> list[dict]:
     """records: a DATE-SORTED list of per-day dicts, each with the end-of-day context + day-open + availability:
         {market [d], per_stock [A,d], bars [A,S,F], bar_mask [A,S], news_raw [A,M,1], news_mask [A,M],
          day_open [A], avail [A]}.
+    ``raw_block_steps`` compacts each day's raw input to its final block *before* stacking. This is semantically
+    exact for the generic daily DecisionPolicy, whose daily raw step consumes only that block, and avoids copying
+    an otherwise unused full session into every episode. Pass the configured block length in bar slots; already
+    compact inputs are accepted unchanged.
+
     Returns equal-length episodes shaped like the intraday per-day dicts (sequence axis = DAYS), so Stage-2's
     rollout carries positions ACROSS days -- a policy that holds (gate=0) keeps a position for the WHOLE episode,
     which is how LONG holds (e.g. two trades >=180 days apart) are expressed. `episode_len` sets the max hold; a
@@ -179,8 +242,21 @@ def build_daily_episodes(records: list[dict], episode_len: int, stride: int | No
     per_stock = torch.stack([r["per_stock"] for r in records])   # [N,A,d]
     news_raw = torch.stack([r["news_raw"] for r in records])     # [N,A,M,1]
     news_mask = torch.stack([r["news_mask"] for r in records])   # [N,A,M]
-    bars = torch.stack([r["bars"] for r in records]) if "bars" in records[0] else None        # [N,A,S,F]
-    bar_mask = torch.stack([r["bar_mask"] for r in records]) if "bar_mask" in records[0] else None  # [N,A,S]
+    if raw_block_steps is not None and raw_block_steps <= 0:
+        raise ValueError(f"raw_block_steps must be positive, got {raw_block_steps}")
+    bars = bar_mask = None
+    if "bars" in records[0] and "bar_mask" in records[0]:
+        if raw_block_steps is None:
+            bars = torch.stack([r["bars"] for r in records])                  # [N,A,S,F]
+            bar_mask = torch.stack([r["bar_mask"] for r in records])          # [N,A,S]
+        else:
+            if any(r["bars"].shape[-2] < raw_block_steps for r in records):
+                shortest = min(r["bars"].shape[-2] for r in records)
+                raise ValueError(f"raw daily input has only {shortest} bar slots, need {raw_block_steps}")
+            # Slice before stack: torch.stack creates the compact owned episode storage, so no tail view pins a
+            # full-session backing allocation after the input records are released.
+            bars = torch.stack([r["bars"][..., -raw_block_steps:, :] for r in records])
+            bar_mask = torch.stack([r["bar_mask"][..., -raw_block_steps:] for r in records])
     avail = torch.stack([r["avail"] for r in records])           # [N,A] as-of tradeability (traded that day)
     usable = N - 2                                               # labelled days
     L = min(episode_len, usable)                                 # don't starve a short split: one full episode
@@ -190,7 +266,11 @@ def build_daily_episodes(records: list[dict], episode_len: int, stride: int | No
     for s in starts:
         episode = {"market": market[s:s + L], "per_stock": per_stock[s:s + L],
                    "news_raw": news_raw[s:s + L], "news_mask": news_mask[s:s + L], "avail": avail[s:s + L],
-                   "ret": ret[s:s + L], "ret_valid": valid[s:s + L], "n_blocks": L}
+                   "ret": ret[s:s + L], "ret_valid": valid[s:s + L],
+                   "decision_ids": tuple(
+                       str(records[index].get("date", index)) for index in range(s, s + L)
+                   ),
+                   "n_blocks": L}
         if bars is not None and bar_mask is not None:
             episode["bars"] = bars[s:s + L]
             episode["bar_mask"] = bar_mask[s:s + L]

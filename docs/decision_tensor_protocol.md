@@ -1,5 +1,12 @@
 # Decision Tensor Protocol v1
 
+> **Status (2026-07): compatibility/reportability protocol, not the active RL batch format.** The former
+> `stock_second_context_decision_v3` builder is no longer present. The new general RL path exchanges
+> `ObservationBatch` / `TransitionBatch`, while the active Phase-1 path organizes raw windows directly. The
+> timestamp, mask, split, normalization-fit, requested/executed-action, and artifact rules below remain the
+> standard for any future persisted gold decision tensor. See
+> [general_rl_architecture.md](general_rl_architecture.md) for current runtime interfaces.
+
 This protocol defines the compact model-input format for QuantTrade decision
 models. It is designed for second-level, minute-level, and future higher
 resolution data while keeping the model interface stable.
@@ -707,10 +714,11 @@ cache identity matches the requested source manifest, universe, conversion
 config, converter identity, and action schema when reusing an existing artifact
 ```
 
-## Current Implementation And Next Migrations
+## Historical implementation and reuse requirements
 
-The current `stock_second_context_decision_v3` payload implements the v1
-contract for the second-context action-scorer path:
+The removed `stock_second_context_decision_v3` payload previously implemented the following v1 fields for the
+second-context action-scorer path. This list is historical compatibility information, not a claim that an active
+builder currently emits the artifact:
 
 ```text
 protocol_version="decision_tensor_v1"
@@ -724,7 +732,7 @@ action_metadata.json and split_manifest.json sidecars
 model_input_keys, label_keys, and forbidden_model_input_keys leakage guards
 ```
 
-Remaining migrations should be additive:
+If a compact gold decision-tensor store is reintroduced, additions should remain compatible:
 
 ```text
 write normalization_manifest.json when learned normalizers are persisted

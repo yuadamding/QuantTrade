@@ -499,7 +499,8 @@ def validate_reportable_summary(summary: dict[str, Any], *, strict: bool = False
     and value VALIDITY only (a contradiction, an invalid weight semantics, or a corrupt clip), so a legacy /
     partially-declared basis stays reportable."""
     errors: list[str] = []
-    declared_manifest = summary.get("dataset_manifest") if isinstance(summary.get("dataset_manifest"), dict) else {}
+    manifest_value = summary.get("dataset_manifest")
+    declared_manifest: dict[str, Any] = manifest_value if isinstance(manifest_value, dict) else {}
     # Structural artifact sections (unchanged). The baseline/stress requirements moved OUT of this list to the
     # canonical protocol contract below (the legacy baselines.CASH / cost_stress.* path checks are replaced).
     required_paths = [
@@ -575,7 +576,10 @@ def validate_reportable_summary(summary: dict[str, Any], *, strict: bool = False
 
     concentration = summary.get("action_concentration", {})
     if isinstance(concentration, dict):
-        if float(concentration.get("max_risky_group_share", concentration.get("max_group_share", 0.0))) > 0.75:
+        max_group_share = concentration.get(
+            "max_risky_group_share", concentration.get("max_group_share", 0.0)
+        )
+        if float(0.0 if max_group_share is None else max_group_share) > 0.75:
             errors.append("max_group_share_exceeds_limit")
         if float(concentration.get("leveraged_action_share", 0.0)) > 0.50:
             errors.append("leveraged_action_share_exceeds_limit")
@@ -598,7 +602,8 @@ def classify_reportability(summary: dict[str, Any]) -> dict[str, Any]:
     is pure (depends only on the summary) and testable without a training run. summary["reportability"] is read
     for the upstream reportability_flags verdict/reasons (a False flag or any flag reason forces non_reportable).
     """
-    flags = summary.get("reportability") if isinstance(summary.get("reportability"), dict) else {}
+    flags_value = summary.get("reportability")
+    flags: dict[str, Any] = flags_value if isinstance(flags_value, dict) else {}
     # The flag channel is permissive by default: an ABSENT / non-dict reportability section (or a missing
     # "reportable" key) defaults to True, so it never alone fails a run -- the base and strict CONTRACTS below
     # still gate everything. A flag that is explicitly False, or carries any reason, does force non_reportable.

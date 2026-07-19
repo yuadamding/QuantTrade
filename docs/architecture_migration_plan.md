@@ -1,113 +1,190 @@
-# QuantTrade architecture migration — protocol-first, env-first, artifact-reportable (PHASED)
+# Deep-RL migration ledger
 
-Executes the 2026-06-17 architectural review **safely and incrementally**. A package-wide reorg of a
-300+-test codebase must be phased and gate-verified, never big-bang — and the review agrees (Phase 1 = *no
-behavior change*; the monolith splits + env-owns-reward are explicitly Phases 3–6). This doc is the tracked
-plan; each phase keeps the full gate green and old import paths working via shims.
+This ledger tracks the move from the market-specific Phase-1 direct optimizer to a general deep-RL framework.
+It describes current repository state as of 2026-07; it is not a promise that pending items already exist. The
+stable architecture contracts are documented in [general_rl_architecture.md](general_rl_architecture.md).
 
-## Status (2026-06-17)
+## Non-negotiable boundary
 
-All layer packages now exist and are populated; the flat top-level holds only back-compat shims,
-cross-cutting infra (`cli`/`config`/`core`/`paths`), and the not-yet-split workflow monoliths.
+> For the general RL path, only the environment/execution layer may mutate domain state, execute/project an
+> action, or compute reward.
 
-```
-protocol/      constraints (the contract), partition, validators            DONE
-data_sources/  polygon_second_aggs, polygon_stock_covariates, quote_utils    DONE
-features/      stock_second_context, stock_covariates, news_llm, action_risk DONE
-datasets/      intraday, strategy                                            DONE
-models/        minute_to_hour, hourly, second_context, intraday, strategy   DONE (Phase 4)
-evaluation/    statistical, confidence, research_protocol, decision_framework, second_context  DONE
-reportability/ decision_log                                                  DONE
-workflows/     presets, cli, config                                          DONE
-envs/          strategy, intraday, hourly, minute_to_hour                    DONE (Phase 4)
-training/      strategy, intraday, hourly, minute_to_hour                    DONE (Phase 4)
-```
+Algorithms consume observations and transitions. Data adapters establish causal observations. Evaluators replay
+the same environment semantics and persist artifacts. A trainer must not carry a private copy of portfolio P&L,
+turnover, drift, or liquidation logic.
 
-**Phase 4 complete (verified CLEAN, commit 610e190):** all 5 transformer/dqn monoliths decomposed into
-datasets/models/envs/training/evaluation, each move byte-for-byte verbatim (adversarially verified: 125
-top-level blocks, 0 altered), old import paths preserved via shims, gate green (303), ruff clean, no import
-cycles. The flat top level now holds only back-compat shims + the foundation (core/execution/paths).
-Remaining (not yet done): Phase 3 (env-owns-reward behind a flag -- result-moving, needs sign-off + A/B) and
-the optional further-split of eval out of training/minute_to_hour into evaluation/.
+The legacy Phase-1 trainer predates this boundary and still owns its differentiable rollout. It now shares pure
+accounting primitives with the environment, but it is not yet evidence that the migration is complete.
 
-Every relocation was behavior-preserving: git-mv + a re-export shim at the old path, verified gate-green
-(303 tests) and import-cycle-free, with identity checks where it mattered (the contract; the extracted model).
+## Current status
 
-## The one rule the architecture must enforce
+| Workstream | Status | Evidence / boundary |
+|---|---|---|
+| Domain-neutral specs and typed batches | Implemented | `rl_quant.rl.specs`, `rl_quant.rl.types`; fail-closed unit tests. |
+| Algorithm/environment protocols | Implemented | `rl_quant.rl.algorithm`, `rl_quant.rl.environment`. |
+| Recurrent on-policy trajectories and GAE | Implemented | Correct termination/truncation bootstrapping, burn-in, padding, and reward-component storage. |
+| Recurrent PPO reference | Implemented | Masked categorical, diagonal-Normal, and masked-Dirichlet policies; recurrent minibatches, checkpointed minibatch RNG, and portfolio integration tests. |
+| On-policy rollout coordinator | Implemented as a library primitive | Preserves pre-observation recurrent state, terminal/truncation bootstrap, mid-episode continuation, GAE, and episode metrics; no production CLI. |
+| Typed replay and offline coordinators | Implemented | Schema-locked requested/executed transition replay including episode boundaries, behavior collection, checkpointed deterministic replay sampling, trusted sample fast path, and optional exact int64 decision alignment. |
+| Twin-critic IQL | Implemented | Executed-action economics by default, expectile value, validated sparse-simplex likelihood smoothing, critic disagreement/penalty, row-identity-preserving lower-envelope targets, and checkpoints for IQL-owned model/optimizer/configuration state. Replay and global action RNG remain external. |
+| Regime mixture and uncertainty helpers | Implemented | Learned same-support expert router, exact categorical marginal MAP, coherent highest-router continuous/simplex action, balance/entropy terms, critic-disagreement output, and deterministic fallback abstention. Calibration/live adaptation are not supplied. |
+| Historical portfolio environment | Implemented | Long-only simplex projection, separate target-weight execution-cost authority, risk-state observations, maximum-drawdown CASH halt, chronological reward, drift, and sequentially scaled terminal liquidation. |
+| Market robust transforms | Implemented | Explicit trend/return reversal and liquidity/cost stresses compose into named lower-envelope IQL scenarios. |
+| Dataset universe provenance | Implemented mechanically | Future-selected universes fail; rolling/PIT membership is supported. Existing ranked datasets still need rebuilding. |
+| Causal Stage-1 normalization | Implemented and integrated | Fixed training-only moments; forward is immutable and train/eval identical. |
+| Legacy daily reward/accounting repairs | Implemented | One-step daily-raw reward, auxiliary H-day target, burn-in score mask, drift and liquidation helpers. |
+| Walk-forward splitter | Implemented as a library primitive | Tested purge/embargo geometry, expanding/rolling windows, and fold identities bound to caller-supplied horizon/axis identity. The API cannot infer effective lookahead or verify dataset-snapshot authenticity; launcher/evaluator integration remains in progress. |
+| General RL experiment CLI | **Pending** | Implemented collectors, algorithms, and environment still need configuration, checkpoint/RNG/provenance bundling, and command orchestration. |
+| Phase-1 encoder-to-RL observation adapter | **Pending** | Frozen/raw market encoders are not connected to `ObservationBatch` for PPO. |
+| Legacy trainer/evaluator routed through environment | **Pending** | Direct differentiable rollouts remain separate, although accounting primitives are shared. |
+| Artifact-driven RL evaluation/reportability | **Pending** | Identity hooks exist, but the RL core does not yet write the complete decision log, manifest, baselines, stresses, and selection history. |
+| Other algorithms | **Pending** | SAC, modern DQN/QR-DQN, CQL, prioritized replay, and n-step replay are not implemented. |
 
-> **Only the environment/execution layer may change portfolio state and compute trading reward.**
+## Migration sequence
 
-Datasets prepare causal observations + labels; models score valid candidate actions; trainers optimize via
-the env/dataset interface; **env/execution** applies the action, computes fill/cost/reward, updates state;
-evaluation runs the policy through the env and collects logs; reportability judges artifact completeness +
-claim validity; the statistical layer judges credibility. If this rule holds, many model families plug in;
-if it doesn't, every workflow grows private execution semantics and reportability becomes untrustworthy.
+### 1. Establish trustworthy data — in progress
 
-## Target layers
+- Rebuild TOP50/TOP2000 from a universe selected no later than the training start, or provide an event-time
+  `universe_membership.parquet` with delistings and availability timestamps.
+- Keep `--require-reportable` and `--no-news` as defaults.
+- Persist universe method/date/hash, membership mode, raw-source hashes, and known coverage gaps.
+- Run-resume and shared Stage-1 context identities now bind provenance-manifest content, canonical raw-source
+  signatures, ordered actions, and driver/package/distributed-helper source content in addition to configuration.
+- Reserve a new future lockbox because the existing test period has already informed model design.
 
-```
-protocol/      decision-tensor schema, mask semantics, validators, manifests  (the contract)
-data_sources/  vendor ingestion only (OHLCV second-aggs, NBBO, news)          [exists]
-features/      point-in-time feature construction                             [exists]
-datasets/      gold dataset builders/loaders (compact tensors, manifests)
-execution/     pure transition + cost semantics (scalar-$ vs weight-bps)      [execution.py today]
-envs/          AUTHORITATIVE owner of state/transition/reward/next-mask/logs
-models/         neural networks only (consume typed tensors -> scores/Q)
-training/      DQN/replay loops (consume env+dataset+model; no raw data/reward)
-evaluation/    sequential eval, baselines, statistical credibility            [partial: evaluation/]
-reportability/ mechanical + execution + claim gates over PERSISTED artifacts  [partial: reportability/]
-workflows/     versioned WorkflowSpecs + presets + CLI
-```
+Exit condition: the provenance gate passes without override, and delisting/missing-return behavior is tested.
 
-## Migration discipline (every phase)
+### 2. Complete the portfolio action adapter — library primitive implemented
 
-- Default flags reproduce current numbers **byte-for-byte** (regression test); result-moving behavior is
-  opt-in, manifest-recorded, A/B-gated, one-flag rollback (the established promotion gate, §2.1 of the wiring
-  design). Old import paths stay working via shims until the transition completes.
-- **Bounded / non-reward-changing** phases I can land directly; **result-moving** phases (env owns reward,
-  dynamic model inputs) need explicit sign-off + a latest-period A/B (test block untouched).
+Delivered:
 
-## Phases
+- `MaskedDirichlet` samples and scores the active simplex directly, with masked coordinates exactly zero;
+- `RecurrentActorCritic(action_kind="dirichlet")` carries action masks into both acting and recurrent PPO update;
+- tests cover masked recurrent PPO updates and acceptance of the sampled action unchanged by the portfolio
+  action contract;
+- projection distance remains available from the environment.
 
-### Phase 1 — pure/shared layers + shims — DONE (this commit), no behavior change
-- `reportability.py` → `reportability/` package (`reportability/decision_log.py` + `__init__` re-export). Old
-  `from rl_quant.reportability import ...` unchanged.
-- `statistical_credibility.py` → `evaluation/statistical.py` (+ `evaluation/__init__` re-export); old path kept
-  as a shim. Establishes the **evaluation** and **reportability** layers.
-- Verified: old + new import paths both resolve; full gate green (302 tests), ruff clean.
+Remaining integration work: choose/configure this actor in the future RL CLI and monitor projection distance in
+the artifact evaluator. Sparse top-k allocation is not silently introduced; if added, its probability semantics
+must be explicit.
 
-### Phase 2 — protocol layer + enforced validation (bounded, additive)
-- `protocol/` package: a real `DecisionTensorPayload.load()/validate()` wrapping the decision-tensor schema +
-  the model-input / label / forbidden-key split (today documented in `decision_tensor_protocol.md` and
-  `features/stock_second_context.py`), so trainers consume a *validated* payload, not a raw dict. Re-export
-  the mask/transition/constraint contract from `trading_constraints` (16 importers -> keep the module, add the
-  namespace). Add architecture tests: model never consumes forbidden/label keys; `selected_action` valid under
-  the decision mask; `context_available_until <= decision_ts`. Label-only / additive.
+### 3. Add one reusable rollout coordinator — library primitive implemented
 
-### Phase 3 — env layer owns reward (RESULT-MOVING -> flag + A/B)
-- `envs/` with a `TradingEnv` protocol (`reset/observe/valid_action_mask/step/decision_log_row`). Wrap the
-  existing minute_to_hour env first (byte-identical), then add an opt-in `use_execution_env_reward` flag that
-  makes the env (via the `execution.py` engine) the reward authority — the step the leg-level engine was built
-  for. Gated, default-off byte-identical, A/B before any default flip. (Builds directly on PR-D D0–D3b.)
+Delivered:
 
-### Phase 4 — split the monoliths (bounded, behavior-preserving)
-- Decompose `minute_to_hour_transformer.py` -> `datasets/hour_from_subhour.py`, `models/minute_to_hour.py`,
-  `envs/hour_allocator_env.py`, `training/minute_to_hour_dqn.py`, `evaluation/hour_allocator.py`; same for
-  `second_context_transformer.py`. Move the transition-feature builders into a shared module
-  (static [A,A,F] vs dynamic per-env), keeping `execution.py`'s scalar-$ vs weight-bps split. Each move keeps a
-  shim at the old import path; gate green per move. No logic change.
+- `OnPolicyRolloutCoordinator` owns reset/step collection, pre-observation recurrent state, next-value estimation,
+  GAE, synchronous episode resets, continuation across fixed rollout windows, and low-cardinality metrics;
+- true terminals zero bootstrap, truncations may bootstrap from the real next observation;
+- tests cover toy-environment collection through a real recurrent PPO update; portfolio distribution compatibility
+  is covered separately.
 
-### Phase 5 — artifact-driven reportability (bounded)
-- Reportability evaluates **persisted** `decision_log.jsonl` + `run_manifest.json`, not in-memory `metrics`,
-  so a run can't be made (un)reportable by toggling whether logs are returned. Emit
-  `mechanical_reportability.json` / `execution_reportability.json` / `statistical_credibility.json` +
-  `reportability_issues.jsonl`.
+Remaining integration work: the CLI must checkpoint model, optimizer, RNG, normalization, rollout position, and
+provenance identity together. The coordinator deliberately rejects partial-vector completion until an environment
+defines subset-reset semantics.
 
-### Phase 6 — statistical-credibility expansion + stress grid (bounded)
-- Extend `evaluation/` (PSR/DSR already landed) with block-bootstrap CIs, walk-forward, PBO/CSCV, reality-check
-  + the latency/cost/spread/impact stress grid and the baseline panel as a promotion gate.
+### 4. Adapt Phase-1 observations without coupling the RL core — pending
 
-## What I will NOT do without sign-off
-Flip any flag from default, make the env the reward authority (Phase 3), or merge a phase whose gate-off path
-isn't proven byte-identical. Phases 3 (result-moving) and the larger Phase-4 splits proceed one reviewable,
-gate-green step at a time on your go-ahead — not as a single big-bang reorg.
+- Wrap causal raw/context encoders in a `PortfolioObservationAdapter` or portfolio actor; do not import market
+  models into `rl_quant.rl`.
+- Calibrate fixed normalization on training data only and include its buffers in checkpoints.
+- Use causal input-only prefixes for recurrent validation/test warm-up while excluding prefixes from scores.
+- Keep longer-horizon forecasting and SSL targets auxiliary to the environment's one-step reward.
+
+Exit condition: PPO and the direct baseline consume the same point-in-time observations and scored date range.
+
+### 5. Make environment accounting universal — pending
+
+- Compare the legacy direct rollout with `VectorPortfolioEnv` on deterministic action traces.
+- Resolve parity for availability, missing/delisting returns, turnover convention, costs, holdings drift, and
+  terminal liquidation.
+- Route sequential evaluation through the environment first.
+- Retain the differentiable legacy rollout only as an explicitly named baseline if training cannot use the
+  non-differentiable environment.
+
+Exit condition: evaluator rewards come from the environment, and any direct-baseline differences are declared
+and regression-tested rather than accidental.
+
+### 6. Persist evaluation artifacts before scaling — pending
+
+- Use optional `HistoricalMarketData.decision_ids` so transitions/replay have globally unique int64 identities;
+  exact replay alignment must fail closed when IDs are missing, duplicated, or mismatched.
+- Write a dated decision log with observations/provenance IDs, masks, requested/executed actions, reward
+  components, holdings, equity, constraints, and terminal flags.
+- Write a run manifest containing split boundaries, seeds, selection rules, configs, code/data identities,
+  normalization state identity, and runtime/GPU-hour measurements.
+- Evaluate cash, equal weight, aligned buy-and-hold, random-same-turnover, and simple linear/momentum baselines.
+- Run paired multi-seed comparisons and 1x/2x/4x cost and capacity stresses.
+
+The legacy Phase-1 result payload now persists per-decision identifiers and joins seeds by identity. That repair
+does not supply the requested/executed action ledger or make the legacy artifact a complete RL evaluation record.
+Its provenance gate now keeps `positive=false` for `--allow-unreportable` runs even when the separate
+`statistically_positive` diagnostics pass.
+
+Exit condition: reportability is derived from persisted artifacts, not a console summary or in-memory metric.
+
+### 7. Integrate purged walk-forward selection — library primitive implemented
+
+Delivered:
+
+- `generate_walk_forward_folds(...)` has explicit decision-count geometry, accepts a caller-supplied effective
+  `label_horizon`, and enforces `purge_size >= label_horizon`;
+- configurable embargo and expanding or bounded rolling training windows;
+- immutable stable fold identities over decision positions/dates and a required caller-supplied decision-axis ID;
+- fail-closed validation and adversarial tests.
+
+The caller must calculate `label_horizon` from execution/settlement delay plus the maximum target, selection, or
+reporting horizon; the splitter cannot discover those dependencies. It binds `decision_axis_id` into each fold
+digest but cannot prove that the supplied string is an immutable/content-addressed dataset snapshot.
+
+Remaining integration work:
+
+- Wire immutable fold identities and boundaries into the future RL run manifest.
+- Fit normalization and select checkpoints/hyperparameters inside each permitted training fold only.
+- Keep the final lockbox outside fold construction and selection.
+
+Exit condition: the audited splitter is exercised through the launcher and evaluator, and every reported result
+can identify the exact folds used. Until then, the Phase-1 launcher retains its single chronological split.
+
+### 8. Extend replay-based algorithms behind the common contracts — partly implemented
+
+Delivered:
+
+- schema-locked `ReplayBatch` / `TransitionReplayBuffer` with requested and executed actions;
+- `ReplayRolloutCollector` and `OfflineTrainer` with checkpointable seeded replay sampling (algorithm/backend
+  stochasticity remains separate);
+- twin-critic `ImplicitQLearning`, masked-Dirichlet behavior policy, regime-mixture actor, uncertainty diagnostics,
+  and lower-envelope robust transition targets.
+
+Remaining:
+
+- categorical QR-DQN/Double-DQN for truly discrete actions;
+- SAC for a validated continuous allocation distribution;
+- constrained/Lagrangian or distributional risk objectives;
+- n-step and prioritized replay;
+- CQL or other alternatives only where their logged-action assumptions are documented.
+
+Each algorithm must use the same environment, observation cutoff, execution semantics, compute budget, baselines,
+and evaluation periods. IQL's presence in the library does not by itself establish that an existing market log is
+causally complete or that counterfactual execution is identifiable.
+
+## Scaling gate
+
+Do not promote a TOP2000/H100 run merely because it completes. Scale only after:
+
+1. the dataset provenance gate passes;
+2. the planted-signal and accounting tests pass;
+3. the direct baseline and PPO are compared on PIT TOP50 with paired seeds;
+4. performance telemetry shows the job is not dominated by host RAM, padded attention, or repeated encoding;
+5. a complete run artifact can be audited and replayed.
+
+The current compact EOD context storage, vectorized raw-window joins, batched evaluation encoding, and streaming
+cache changes reduce known bottlenecks. They do not substitute for the correctness and artifact gates above.
+
+## Compatibility policy
+
+- Keep the Phase-1 command available during migration and label its optimizer accurately.
+- Do not make `rl_quant.rl` depend on markets, datasets, or Phase-1 models.
+- Prefer adapters over parallel copies of trajectory, reward, or execution logic.
+- A result-moving semantic change requires a new manifest/config identity and a fresh comparison; cached artifacts
+  must never silently cross that boundary.
+- Remove legacy paths only after a reportable replacement exists and parity differences are understood.

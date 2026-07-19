@@ -12,14 +12,16 @@ contributor changes one path and silently leaves another stale.
 ## Decision
 
 Implementation lives in the `src/rl_quant` package, organized into layers that form a strict dependency DAG. A
-package may import only *lower* (more foundational) layers, never a higher one. The canonical order:
+package may import only *lower* (more foundational) layers, never a higher one. The canonical runtime order
+(lowest first) is:
 
 ```
-protocol < data_sources < execution < features < models < reportability < datasets < evaluation < envs < training < workflows
+protocol < rl < data_sources < models < datasets < execution < envs < features < reportability < evaluation < training < workflows
 ```
 
-`protocol/` is the lowest layer and is stdlib-only (no torch): it owns reusable contracts (decision-tensor
-masks, the action-return basis, the reportability grid). A new subpackage must be placed in the order.
+`protocol/` owns the lowest shared research contracts (decision-tensor masks, action-return basis, constraints,
+and the reportability grid). `rl/` owns domain-neutral torch contracts and algorithms; it may not import market
+models, datasets, execution, or environments. A new subpackage must be placed deliberately in this order.
 
 `TYPE_CHECKING`-only imports are exempt (they create no runtime coupling).
 

@@ -21,13 +21,21 @@ driver flattens windows to per-day units (the training unit).
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import torch
+
+from rl_quant.datasets.provenance import (
+    declared_universe_actions,
+    point_in_time_membership,
+    source_symbol_to_action_index,
+)
 
 BAR_FIELDS = ("open", "high", "low", "close", "volume")
 BAR_FEATS = len(BAR_FIELDS)  # the encoder consumes the RAW bar fields directly (one token per second)
@@ -38,6 +46,14 @@ COV_FIELDS = (
 )
 NEWS_RAW_DIM = 1  # raw fields kept per news article (the qwen3 sentiment_score) -- NO precomputed aggregate
 MAX_NEWS = 32     # most-recent articles kept per (stock, decision); the model aggregates them at train time
+NEWS_SENTIMENT_RANGE = (-1.0, 1.0)
+
+# One canonical version for the raw-window payload and cache identity.  Bump
+# whenever tensor semantics or the cache dependency contract changes.  Version
+# 10 preserves the v9 dependency contract and adds fail-closed validation for
+# every model-facing news row, so caches built with silent neutral defaults are
+# never reused.
+RAW_WINDOW_CACHE_VERSION = 10
 
 
 @dataclass
@@ -54,8 +70,8 @@ class RawWindowConfig:
     max_news: int = MAX_NEWS
     open_et_hhmm: tuple[int, int] = (9, 30)
     exec_latency_ms: int = 1000
-    cache_version: int = 1
-    use_news: bool = True         # False -> news masked out (reportable ablation; see news_is_reportable)
+    cache_version: int = RAW_WINDOW_CACHE_VERSION
+    use_news: bool = False        # opt-in research input; current scored-news artifacts are not PIT reportable
     cov_carry_days: int = 400     # as-of covariates CARRY from prior windows up to this many calendar days back
     #                               (fundamentals publish ~quarterly into event-time partitions; without the carry
     #                               a window only sees records published INSIDE its ~3 days -> the model saw
@@ -63,38 +79,305 @@ class RawWindowConfig:
     bar_fields: tuple[str, ...] = field(default=BAR_FIELDS)
     cov_fields: tuple[str, ...] = field(default=COV_FIELDS)
 
+    def __post_init__(self) -> None:
+        if isinstance(self.cache_version, bool) or not isinstance(self.cache_version, int) or self.cache_version <= 0:
+            raise ValueError("cache_version must be a positive integer")
+
+
+def raw_window_dependency_paths(root: str | Path, window: str, cfg: RawWindowConfig) -> tuple[Path, ...]:
+    """Return every upstream file whose state can affect ``build_window``.
+
+    Missing paths are deliberately retained: creating a previously absent
+    carried covariate, membership, or news file must change the signature just
+    as modifying an existing file does.  Prior-window *bars contents* are not a
+    dependency; their filenames/existence only select covariate partitions, and
+    that selection is represented by the returned covariate paths themselves.
+    """
+
+    root = Path(root)
+    base = root / "partitions" / window
+    paths: list[Path] = [
+        root / "universe.json",
+        root / "universe_membership.parquet",
+        base / "bars.parquet",
+    ]
+    paths.extend(
+        root / "partitions" / source_window / "covariates.parquet"
+        for source_window in _cov_source_windows(root, window, cfg)
+    )
+    if cfg.use_news:
+        paths.append(base / "news.jsonl")
+    # Preserve dependency order while removing the current covariate path if a
+    # defensive caller supplied a duplicate source window.
+    return tuple(dict.fromkeys(paths))
+
+
+def _metadata_signature_record(root: Path, path: Path) -> tuple[object, ...]:
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError:
+        relative = str(path.resolve())
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (relative, "missing")
+    # ctime + inode catch atomic replacements and same-size rewrites whose mtime
+    # is restored. No file content is read on cache lookup.
+    return (
+        relative,
+        "present",
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_mode),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def raw_window_source_signature(root: str | Path, window: str, cfg: RawWindowConfig) -> str:
+    """Metadata digest of all active file dependencies for one raw window.
+
+    The digest covers current bars, every covariate partition eligible for
+    as-of carry (including missing sentinels), dynamic universe membership, the
+    universe declaration, and news only when enabled.  It uses filesystem
+    metadata rather than reading/hashing multi-GB parquet contents on each load.
+    """
+
+    root = Path(root)
+    records: list[tuple[object, ...]] = [("signature_schema", 2)]
+    records.extend(
+        _metadata_signature_record(root, path)
+        for path in raw_window_dependency_paths(root, window, cfg)
+    )
+    payload = json.dumps(records, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _cache_config_signature(cfg: RawWindowConfig) -> str:
+    payload = {
+        "session_seconds": cfg.session_seconds,
+        "block_seconds": cfg.block_seconds,
+        "bar_seconds": cfg.bar_seconds,
+        "max_news": cfg.max_news,
+        "open_et_hhmm": cfg.open_et_hhmm,
+        "exec_latency_ms": cfg.exec_latency_ms,
+        "use_news": cfg.use_news,
+        "cov_carry_days": cfg.cov_carry_days,
+        "bar_fields": cfg.bar_fields,
+        "cov_fields": cfg.cov_fields,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def raw_window_cache_key(
+    root: str | Path,
+    window: str,
+    cfg: RawWindowConfig,
+    *,
+    universe_signature: str = "",
+) -> str:
+    """Canonical cache filename for one raw-window build.
+
+    ``universe_signature`` identifies the caller's ordered action mapping; the
+    source signature independently covers the on-disk universe declaration and
+    point-in-time membership events.
+    """
+
+    universe_digest = hashlib.sha256(universe_signature.encode()).hexdigest()[:12]
+    source_digest = raw_window_source_signature(root, window, cfg)
+    return (
+        f"{window}__S{cfg.session_seconds}b{cfg.block_seconds}g{cfg.bar_seconds}"
+        f"_v{cfg.cache_version}_{_cache_config_signature(cfg)}_{universe_digest}_{source_digest}.pt"
+    )
+
 
 def load_universe(root: Path) -> tuple[list[str], int]:
-    u = json.loads((Path(root) / "universe.json").read_text())
-    return list(u["actions"]), int(u["cash_index"])  # actions[0] == CASH
+    return declared_universe_actions(root), 0
 
 
-def news_is_reportable(root: Path, n_windows: int = 4) -> tuple[bool, str]:
-    """Sample news.jsonl across a few windows and decide whether news is POINT-IN-TIME REPORTABLE. News is NOT
-    reportable if the LLM model-availability timestamp is anachronistic -- `model_available_timestamp_ms` at or
-    before `published_timestamp_ms` means the scorer is claimed available no later than the article itself
-    existed, i.e. the scores embed future-model knowledge (the qwen3 sentinel = 1000). Returns (ok, reason)."""
-    bad = total = 0
-    sample = None
-    for w in list_windows(root)[:max(1, n_windows)]:
-        nf = Path(root) / "partitions" / w / "news.jsonl"
-        if not nf.exists():
-            continue
-        for line in nf.read_text().splitlines():
-            if not line.strip():
-                continue
-            r = json.loads(line)
-            ma, pub = r.get("model_available_timestamp_ms"), r.get("published_timestamp_ms")
-            total += 1
-            if ma is not None and pub is not None and int(ma) <= int(pub):
-                bad += 1
-                sample = (int(ma), int(pub))
-    if total == 0:
-        return True, "no news in sampled windows"
-    if bad:
-        return False, (f"anachronistic model availability in {bad}/{total} sampled articles "
-                       f"(model_available={sample[0]} <= published={sample[1]}) -- scores embed future-model knowledge")
-    return True, f"ok ({total} sampled articles have model availability after publication)"
+def _minimum_parquet_int(path: Path, column: str) -> int:
+    parquet = pq.ParquetFile(path)
+    try:
+        column_index = parquet.schema_arrow.names.index(column)
+    except ValueError as exc:
+        raise ValueError(f"{path} is missing required column {column!r}") from exc
+    minima: list[int] = []
+    for row_group in range(parquet.metadata.num_row_groups):
+        statistics = parquet.metadata.row_group(row_group).column(column_index).statistics
+        if statistics is not None and statistics.has_min_max:
+            minima.append(int(statistics.min))
+    if minima:
+        return min(minima)
+    values = pq.read_table(path, columns=[column]).column(column).to_numpy()
+    if values.size == 0:
+        raise ValueError(f"{path} contains no rows")
+    return int(np.min(values))
+
+
+def _utc_timestamp_ms(value: str) -> int:
+    normalized = value.strip().replace("Z", "+00:00")
+    parsed = dt.datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def _validated_news_sentiment(article: object, *, location: str) -> float:
+    """Return the sole model-facing news value, rejecting missing/corrupt rows.
+
+    A missing score is not neutral sentiment: silently substituting zero would
+    make malformed inputs observationally indistinguishable from an extractor
+    that actually emitted a neutral score.
+    """
+
+    if not isinstance(article, dict):
+        raise ValueError(f"{location} must contain a JSON object")
+    ticker = article.get("ticker")
+    if not isinstance(ticker, str) or not ticker or ticker != ticker.strip():
+        raise ValueError(f"{location} lacks a canonical non-empty ticker")
+    value = article.get("sentiment_score")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{location} lacks a numeric sentiment_score")
+    score = float(value)
+    lower, upper = NEWS_SENTIMENT_RANGE
+    if not np.isfinite(score) or not lower <= score <= upper:
+        raise ValueError(
+            f"{location} sentiment_score must be finite and in [{lower:g}, {upper:g}]"
+        )
+    return score
+
+
+def _validated_news_timestamp(article: object, name: str, *, location: str) -> int:
+    if not isinstance(article, dict):
+        raise ValueError(f"{location} must contain a JSON object")
+    value = article.get(name)
+    if value is None:
+        raise ValueError(f"{location} lacks required integer {name}")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= np.iinfo(np.int64).max
+    ):
+        raise ValueError(f"{location} has invalid integer {name}")
+    return value
+
+
+def news_is_reportable(
+    root: Path,
+    windows: Sequence[str] | None = None,
+) -> tuple[bool, str]:
+    """Fail-closed chronology/provenance audit for every active news article.
+
+    A reportable extractor must already exist by the first market decision and
+    by article publication, while its scored feature can become available only
+    after both. Required deterministic-extraction metadata must be explicit;
+    missing news files are not silently treated as known-zero coverage.
+    """
+
+    root = Path(root)
+    active_windows = list(list_windows(root) if windows is None else windows)
+    if not active_windows:
+        return False, "no active bars windows are available for the news chronology audit"
+    try:
+        known_tickers = set(source_symbol_to_action_index(root))
+    except (OSError, ValueError) as exc:
+        return False, f"cannot establish declared ticker universe for news audit: {exc}"
+    try:
+        first_decision_ms = min(
+            _minimum_parquet_int(root / "partitions" / window / "bars.parquet", "timestamp_ms")
+            for window in active_windows
+        )
+    except (OSError, ValueError) as exc:
+        return False, f"cannot establish first market decision for news audit: {exc}"
+
+    modern_model_floor_ms = 946_684_800_000  # 2000-01-01; rejects epoch/sentinel availability values.
+    total = 0
+    for window in active_windows:
+        news_path = root / "partitions" / window / "news.jsonl"
+        if not news_path.exists():
+            return False, f"active window {window} is missing news.jsonl (coverage is unknown, not zero)"
+        with news_path.open() as source:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    article = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    return False, f"{window}/news.jsonl:{line_number} is invalid JSON: {exc}"
+                location = f"{window}/news.jsonl:{line_number}"
+                try:
+                    _validated_news_sentiment(article, location=location)
+                except ValueError as exc:
+                    return False, str(exc)
+                if article["ticker"] not in known_tickers:
+                    return False, f"{location} ticker {article['ticker']!r} is not a declared non-CASH action"
+                required_timestamps = (
+                    "published_timestamp_ms",
+                    "llm_feature_available_timestamp_ms",
+                    "model_available_timestamp_ms",
+                )
+                try:
+                    published, feature_available, model_available = (
+                        _validated_news_timestamp(article, name, location=location)
+                        for name in required_timestamps
+                    )
+                except ValueError as exc:
+                    return False, str(exc)
+                if model_available < modern_model_floor_ms:
+                    return False, (
+                        f"{window}/news.jsonl:{line_number} has an implausible/sentinel model availability "
+                        f"timestamp {model_available}"
+                    )
+                if model_available > first_decision_ms or model_available > published:
+                    return False, (
+                        f"{window}/news.jsonl:{line_number} uses a model unavailable by the first decision/article"
+                    )
+                if feature_available < max(model_available, published):
+                    return False, (
+                        f"{window}/news.jsonl:{line_number} exposes the feature before its model/article exists"
+                    )
+                temperature = article.get("extractor_temperature")
+                if (
+                    isinstance(temperature, bool)
+                    or not isinstance(temperature, (int, float))
+                    or not np.isfinite(float(temperature))
+                    or float(temperature) != 0.0
+                ):
+                    return False, f"{window}/news.jsonl:{line_number} lacks deterministic temperature=0"
+                if article.get("extractor_no_retrieval") is not True:
+                    return False, f"{window}/news.jsonl:{line_number} does not certify no external retrieval"
+                for name in ("llm_model_id", "llm_prompt_hash", "llm_schema_hash"):
+                    value = article.get(name)
+                    if not isinstance(value, str) or not value or value != value.strip():
+                        return False, f"{window}/news.jsonl:{line_number} lacks {name}"
+                provider_value = article.get("extractor_provider")
+                if (
+                    not isinstance(provider_value, str)
+                    or not provider_value
+                    or provider_value != provider_value.strip()
+                ):
+                    return False, f"{window}/news.jsonl:{line_number} lacks extractor_provider"
+                provider = provider_value
+                cutoff_value = article.get("model_training_cutoff_utc")
+                if cutoff_value is not None and not isinstance(cutoff_value, str):
+                    return False, f"{window}/news.jsonl:{line_number} has a non-string model training cutoff"
+                cutoff = "" if cutoff_value is None else cutoff_value.strip()
+                deterministic_baseline = provider.startswith("deterministic")
+                if not deterministic_baseline and (not cutoff or cutoff.lower().startswith("unknown")):
+                    return False, f"{window}/news.jsonl:{line_number} lacks a known model training cutoff"
+                if not deterministic_baseline:
+                    try:
+                        cutoff_ms = _utc_timestamp_ms(cutoff)
+                    except (OSError, OverflowError, ValueError):
+                        return False, f"{window}/news.jsonl:{line_number} has an invalid model training cutoff"
+                    if cutoff_ms > model_available:
+                        return False, (
+                            f"{window}/news.jsonl:{line_number} has a training cutoff after model availability"
+                        )
+                total += 1
+    return True, f"ok ({total} articles across {len(active_windows)} active windows passed chronology/provenance)"
 
 
 def list_windows(root: Path) -> list[str]:
@@ -102,6 +385,7 @@ def list_windows(root: Path) -> list[str]:
     return sorted(p.name for p in parts.iterdir() if (p / "bars.parquet").exists())
 
 
+_ET: dt.tzinfo | None
 try:
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
@@ -158,11 +442,26 @@ def _load_window_raw(root: Path, window: str, cfg: RawWindowConfig):
     if cov_parts:
         cov = {c: [v for p in cov_parts for v in p.get(c, [None] * len(p["symbol"]))] for c in cov_cols
                if any(c in p for p in cov_parts)}
+    # News is disabled by default for reportable runs.  Do not parse a potentially
+    # multi-GB side input only to discard it in ``build_window``; this also keeps a
+    # no-news cache build independent of the availability of the research-only
+    # news file.
     news = []
-    if (base / "news.jsonl").exists():
-        for line in (base / "news.jsonl").read_text().splitlines():
-            if line.strip():
-                news.append(json.loads(line))
+    if cfg.use_news and (base / "news.jsonl").exists():
+        with (base / "news.jsonl").open() as source:
+            for line_number, line in enumerate(source, start=1):
+                if line.strip():
+                    article = json.loads(line)
+                    _validated_news_sentiment(
+                        article,
+                        location=f"{window}/news.jsonl:{line_number}",
+                    )
+                    _validated_news_timestamp(
+                        article,
+                        "llm_feature_available_timestamp_ms",
+                        location=f"{window}/news.jsonl:{line_number}",
+                    )
+                    news.append(article)
     return bars, cov, news
 
 
@@ -202,6 +501,7 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     bars_t = np.zeros((Dd, A, S, F), dtype=np.float32)
     bar_mask = np.zeros((Dd, A, S), dtype=bool)
     covt = np.zeros((Dd, nB, A, NC), dtype=np.float32)
+    cov_valid = np.zeros((Dd, nB, A, NC), dtype=bool)
     news_raw = np.zeros((Dd, nB, A, M, NEWS_RAW_DIM), dtype=np.float32)
     news_mask = np.zeros((Dd, nB, A, M), dtype=bool)
     ret = np.full((Dd, nB, A), np.nan, dtype=np.float32)
@@ -261,57 +561,99 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
         # wholesale would erase previously published fields with 0s.
         cvals = np.stack([np.array([float(v) if isinstance(v, (int, float)) else np.nan for v in cov[f]],
                                    dtype=np.float64) for f in cfg.cov_fields], axis=1)   # [n_rows, NC]
+        co = np.lexsort((cav, cs))
+        cs, cav, cvals = cs[co], cav[co], cvals[co]
     if news:
+        unknown_news_tickers = sorted({
+            r["ticker"] for r in news
+            if r["ticker"] not in stock_to_idx or stock_to_idx[r["ticker"]] <= 0
+        })
+        if unknown_news_tickers:
+            raise ValueError(
+                f"{window} news contains tickers outside the non-CASH action universe: "
+                + ", ".join(unknown_news_tickers)
+            )
         nt = np.array([stock_to_idx.get(r.get("ticker"), -1) for r in news])
-        nav = np.array([int(r.get("llm_feature_available_timestamp_ms", r.get("published_timestamp_ms", 0)))
-                        for r in news], dtype=np.int64)
-        nsent = np.array([float(r.get("sentiment_score", 0.0)) for r in news], dtype=np.float32)
+        nav = np.array([
+            _validated_news_timestamp(
+                r,
+                "llm_feature_available_timestamp_ms",
+                location=f"{window}/news article {index}",
+            )
+            for index, r in enumerate(news, start=1)
+        ], dtype=np.int64)
+        nsent = np.array([
+            _validated_news_sentiment(r, location=f"{window}/news article {index}")
+            for index, r in enumerate(news, start=1)
+        ], dtype=np.float32)
+        no = np.lexsort((nav, nt))
+        nt, nav, nsent = nt[no], nav[no], nsent[no]
+    flat_block_end = block_end.reshape(-1)
     for ai in range(1, A):
-        m = sym_s == ai
-        a_ts, a_close = ts_s[m], close_s[m]
-        cav_a = cfill_a = None
-        if cs is not None:
-            cm = np.nonzero(cs == ai)[0]
-            if len(cm):
-                co = np.argsort(cav[cm], kind="stable")
-                cav_a = cav[cm][co]
-                vals_a = cvals[cm][co]                               # [n_a, NC] in availability order, NaN=null
+        # ``sym_s`` is symbol-major.  Binary-searching its contiguous slice
+        # avoids scanning every raw row once per action (the old O(A * rows)
+        # path is prohibitive for ~2,000 names).
+        blo = np.searchsorted(sym_s, ai, side="left")
+        bhi = np.searchsorted(sym_s, ai, side="right")
+        a_ts, a_close = ts_s[blo:bhi], close_s[blo:bhi]
+        cav_a = cfill_a = cvalid_a = None
+        if cs is not None and cav is not None and cvals is not None:
+            clo = np.searchsorted(cs, ai, side="left")
+            chi = np.searchsorted(cs, ai, side="right")
+            if chi > clo:
+                cav_a = cav[clo:chi]
+                vals_a = cvals[clo:chi]                              # [n_a, NC] in availability order, NaN=null
                 fi = np.where(~np.isnan(vals_a), np.arange(len(cav_a))[:, None], 0)
                 np.maximum.accumulate(fi, axis=0, out=fi)            # per-FIELD index of the last non-null so far
                 cfill_a = np.nan_to_num(np.take_along_axis(vals_a, fi, axis=0)).astype(np.float32)
+                cvalid_a = np.maximum.accumulate(~np.isnan(vals_a), axis=0)
         nav_a = nse_a = None
         if news:
-            nm = np.nonzero(nt == ai)[0]
-            if len(nm):
-                no = np.argsort(nav[nm])
-                nav_a, nse_a = nav[nm][no], nsent[nm][no]
+            nlo = np.searchsorted(nt, ai, side="left")
+            nhi = np.searchsorted(nt, ai, side="right")
+            if nhi > nlo:
+                nav_a, nse_a = nav[nlo:nhi], nsent[nlo:nhi]
+
+        if cav_a is not None and cfill_a is not None and cvalid_a is not None:  # vectorized block-grid as-of join
+            ck = np.searchsorted(cav_a, flat_block_end, side="right") - 1
+            good = ck >= 0
+            cov_flat = covt[:, :, ai].reshape(-1, NC)
+            valid_flat = cov_valid[:, :, ai].reshape(-1, NC)
+            cov_flat[good] = cfill_a[ck[good]]
+            valid_flat[good] = cvalid_a[ck[good]]
+
+        # T+1 labels are independent across days and blocks; vectorize the
+        # timestamp searches and validity checks rather than repeating Python
+        # search calls for every block.
+        if len(a_close) and nB >= 3:
+            entry_target = block_end[:, 1:nB - 1] + lat
+            exit_target = block_end[:, 2:nB] + lat
+            ei = np.searchsorted(a_ts, entry_target)
+            xi = np.searchsorted(a_ts, exit_target)
+            in_bounds = (ei < len(a_ts)) & (xi < len(a_ts))
+            ei_safe = np.minimum(ei, len(a_ts) - 1)
+            xi_safe = np.minimum(xi, len(a_ts) - 1)
+            entry_px, exit_px = a_close[ei_safe], a_close[xi_safe]
+            day_end = open_ms[:, None] + cfg.session_seconds * 1000
+            good = (in_bounds & (entry_px > 0)
+                    & (a_ts[ei_safe] < day_end) & (a_ts[xi_safe] < day_end)
+                    & (a_ts[ei_safe] - entry_target <= cfg.block_seconds * 1000)
+                    & (a_ts[xi_safe] - exit_target <= cfg.block_seconds * 1000))
+            ratio = np.divide(exit_px, entry_px, out=np.zeros_like(exit_px), where=entry_px > 0) - 1.0
+            good &= np.isfinite(ratio)
+            ret[:, :nB - 2, ai] = np.where(good, np.clip(ratio, -1.0, 1.0), np.nan).astype(np.float32)
+            ret_valid[:, :nB - 2, ai] = good
+
         for d in range(Dd):
             for b in range(nB):
                 te = int(block_end[d, b])
-                if cav_a is not None:                                # as-of covariates: per-field last-known state
-                    k = np.searchsorted(cav_a, te, "right") - 1
-                    if k >= 0:
-                        covt[d, b, ai] = cfill_a[k]
-                if nav_a is not None:                                # RAW news available by block-b end
-                    k = np.searchsorted(nav_a, te, "right")
+                if nav_a is not None and nse_a is not None:          # RAW news available by block-b end
+                    k = int(np.searchsorted(nav_a, te, "right"))
                     if k > 0:
                         take = nse_a[max(0, k - M):k]
                         kk = len(take)
                         news_raw[d, b, ai, :kk, 0] = take
                         news_mask[d, b, ai, :kk] = True
-                if b <= nB - 3 and len(a_close):                     # T+1 label: execute b+1 end -> b+2 end
-                    t_en, t_ex = int(block_end[d, b + 1]) + lat, int(block_end[d, b + 2]) + lat
-                    ei = np.searchsorted(a_ts, t_en, "left")
-                    xi = np.searchsorted(a_ts, t_ex, "left")
-                    day_close = int(open_ms[d]) + cfg.session_seconds * 1000   # nominal RTH end (reject AH bars)
-                    if (ei < len(a_close) and xi < len(a_close) and a_close[ei] > 0
-                            and a_ts[ei] < day_close and a_ts[xi] < day_close            # entry & exit IN that RTH
-                            and a_ts[ei] - t_en <= cfg.block_seconds * 1000            # near the target (real time,
-                            and a_ts[xi] - t_ex <= cfg.block_seconds * 1000):         # NOT grid slots)
-                        r = a_close[xi] / a_close[ei] - 1.0
-                        if np.isfinite(r):
-                            ret[d, b, ai] = float(np.clip(r, -1.0, 1.0))
-                            ret_valid[d, b, ai] = True
 
     # per-stock day-OPEN price (first valid bar's open) -- the cross-day (daily, open-to-open) execution price
     fv = bar_mask.argmax(axis=2)                                  # [Dd,A] first valid second (0 if none)
@@ -323,16 +665,38 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     closes = np.take_along_axis(bars_t[:, :, :, 3], lv[:, :, None], axis=2)[:, :, 0]   # field 3 = close
     day_close = np.where(has, closes, np.nan).astype(np.float32)  # [Dd,A] (NaN where the stock has no bars that day)
 
-    # as-of AVAILABILITY (point-in-time): a stock is tradeable at block b iff it has ANY bar by block-b end --
-    # derived from bar presence, NOT from label existence (which would leak future-bar information).
+    # As-of AVAILABILITY: a stock must both have traded by the block end and belong to the universe according to
+    # an event that was available by that time.  Datasets without a membership event table retain the historical
+    # static-list behavior, but the provenance validator marks them development-only.
     block_present = bar_mask[:, :, :nB * bl].reshape(Dd, A, nB, bl).any(axis=3)   # [Dd,A,nB]
     avail = np.ascontiguousarray(np.maximum.accumulate(block_present, axis=2).transpose(0, 2, 1))  # [Dd,nB,A]
+    if (root / "universe.json").exists():
+        actions = declared_universe_actions(root)
+        expected_mapping = source_symbol_to_action_index(root)
+        if len(actions) != A or stock_to_idx != expected_mapping:
+            raise ValueError("raw source-symbol mapping does not match the ordered universe declaration")
+    else:
+        actions = [""] * A
+        for symbol, idx in stock_to_idx.items():
+            if 0 <= idx < A:
+                actions[idx] = symbol
+        if actions:
+            actions[0] = "CASH"
+    member = point_in_time_membership(
+        root,
+        [date for date in days for _ in range(nB)],
+        actions,
+        block_end.reshape(-1),
+    ).reshape(Dd, nB, A)
+    avail &= member
     avail[:, :, 0] = True                                                         # CASH always available
 
     return {
         "bars": torch.from_numpy(bars_t), "bar_mask": torch.from_numpy(bar_mask),
-        "cov_blocks": torch.from_numpy(covt), "news_raw": torch.from_numpy(news_raw),
-        "news_mask": torch.from_numpy(news_mask), "avail": torch.from_numpy(avail),
+        "cov_blocks": torch.from_numpy(covt), "cov_valid_blocks": torch.from_numpy(cov_valid),
+        "news_raw": torch.from_numpy(news_raw), "news_mask": torch.from_numpy(news_mask),
+        "avail": torch.from_numpy(avail),
+        "universe_member": torch.from_numpy(member),
         "ret": torch.from_numpy(ret), "ret_valid": torch.from_numpy(ret_valid),
         "day_open": torch.from_numpy(day_open), "day_close": torch.from_numpy(day_close), "dates": days,
         "window": window, "n_days": Dd, "n_blocks": nB,

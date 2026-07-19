@@ -9,6 +9,7 @@ public aliases at the bottom exist so callers outside this package can do likewi
 from __future__ import annotations
 
 import math
+from typing import Any, cast
 
 
 def _coerce_float(name: str, value: object) -> float:
@@ -18,7 +19,7 @@ def _coerce_float(name: str, value: object) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be numeric, not bool; got {value!r}.")
     try:
-        return float(value)
+        return float(cast(Any, value))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be numeric; got {value!r}.") from exc
 
@@ -56,7 +57,7 @@ def _require_nonnegative_int(name: str, value: object) -> int:
         if not math.isfinite(value) or not value.is_integer():
             raise ValueError(f"{name} must be integer-like; got {value!r}.")
     try:
-        coerced = int(value)
+        coerced = int(cast(Any, value))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be integer-like; got {value!r}.") from exc
     if coerced < 0:
@@ -79,7 +80,7 @@ def _require_int_allow_negative(name: str, value: object) -> int:
         if not math.isfinite(value) or not value.is_integer():
             raise ValueError(f"{name} must be integer-like; got {value!r}.")
     try:
-        return int(value)
+        return int(cast(Any, value))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be integer-like; got {value!r}.") from exc
 

@@ -1,6 +1,6 @@
 # ADR-0004: Only the env/execution layer mutates portfolio state and computes reward
 
-**Status:** Partial (agreed direction; staged, not fully realized)
+**Status:** Partial (implemented for the new RL environment; legacy Phase-1 migration remains)
 
 ## Context
 
@@ -16,13 +16,16 @@ reward math.
 
 ## Status / Consequences
 
-- **Direction accepted; not fully realized.** Today some evaluation still recomputes ledger logic outside the
-  env, and full execution-reward training is staged behind result-moving flags (`use_execution_env_reward`,
-  with `execution_env_reward_shadow` for shadow logging). These flags are result-moving and default off.
-- **Recommended path to "Accepted":** (1) extract pure `execution.reward` / `execution.ledger` primitives;
-  (2) add parity tests against the current evaluator/trainer reward outputs; (3) run shadow logging; (4) wire
-  evaluation through the shared primitive; (5) only then flip training reward behind `use_execution_env_reward`.
-  Do it staged, not as a big-bang — the flag is result-moving (affects reward, P&L, TD targets), so promotion
-  must be gated by parity evidence.
-- Until then, treat reward computed outside the env as a migration liability to be removed, not a pattern to
-  extend.
+- `rl_quant.envs.VectorPortfolioEnv` now satisfies this decision for the new RL path: it projects requested
+  actions, owns state/equity, delegates cost primitives to `execution`, realizes one chronological return,
+  drifts holdings, decomposes reward, and liquidates at a true terminal.
+- `rl_quant.training.decision_policy` and `daily_policy` still run differentiable portfolio loops. They share
+  pure accounting primitives (`drift_weights`, `one_way_turnover`, forced-unavailability handling), but they do
+  not step the environment. Their existence keeps this ADR Partial.
+- Evaluation for the general RL path is not yet artifact-driven. Before this ADR becomes fully Accepted, route
+  sequential scoring through the environment, add deterministic action-trace parity tests against the direct
+  baseline, and persist the environment's requested/executed actions and reward ledger.
+- Reward-changing migration requires a new run/config identity and fresh paired evaluation. A compatibility flag
+  cannot turn an old result into evidence for new semantics.
+- Until migration completes, reward computed outside the environment is a named legacy baseline or a liability
+  to remove, not a pattern for new algorithms.

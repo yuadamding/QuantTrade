@@ -5,8 +5,8 @@ profit-trained raw-second representation saw just the last block of each day, an
 memory across days (only the carried portfolio weight). Here:
 
   * FullDayRawEncoder -- a TRAINABLE two-tier causal transformer over the WHOLE RTH session of raw 1s bars (not
-    the last block) -> a per-stock end-of-day embedding. Profit gradients shape it. Per-FIELD BatchNorm (not a
-    LayerNorm across OHLCV) so price and volume normalize on their own scales.
+    the last block) -> a per-stock end-of-day embedding. Profit gradients shape it. Stock-day-local, per-field
+    normalization keeps price and volume on meaningful independent scales without batch/future-day coupling.
   * CrossDayTemporalEncoder -- a CAUSAL transformer over the DAY axis (per stock, shared weights), windowed to a
     `lookback` of prior days, so the policy can compute multi-day patterns (reversal/momentum/vol) from the
     sequence of daily embeddings. This is the learned cross-day memory BPTT alone cannot provide.
@@ -26,7 +26,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 
-from rl_quant.models.context_encoder import _CausalBlock, _last_valid, _sinusoidal
+from rl_quant.models.context_encoder import _CausalBlock, _sinusoidal
 from rl_quant.models.decision_policy import _NewsAggregator
 
 
@@ -35,7 +35,10 @@ class FullDayRawEncoder(nn.Module):
 
     Tier-1 attends locally within `block_seconds` blocks; tier-2 attends causally over the block summaries; the
     last valid block's context is the day embedding. Unlike the frozen Stage-1 context encoder, profit gradients
-    update this. Per-field BatchNorm normalizes each raw bar field on its own scale (price vs volume)."""
+    update this. Its normalization never couples separate stocks or days."""
+
+    pos1: torch.Tensor
+    pos2: torch.Tensor
 
     def __init__(self, *, bar_feature_dim: int, d_model: int, n_heads: int, n_layers: int,
                  feedforward_dim: int, dropout: float, block_seconds: int, max_seconds: int,
@@ -113,21 +116,49 @@ class FullDayRawEncoder(nn.Module):
             normed = torch.cat([price_n, vol_n], dim=-1) * m
         x = self.input_proj(normed).reshape(B * A * nB, bl, d) + self.pos1[:bl].view(1, bl, d)
         bm1 = bar_mask.reshape(B * A * nB, bl)
-        kpm = ~bm1                                               # key-padding for missing seconds (SDPA-safe in block)
-        for blk in self.tier1:                                  # tier-1: local causal within each block
-            if self.grad_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(blk, x, kpm, use_reentrant=False)
-            else:
-                x = blk(x, kpm)
-        x = self.norm1(x)
-        summ = _last_valid(x, bm1).reshape(B * A, nB, d)        # last valid second per block -> block summary
+
+        def packed_last(rows: torch.Tensor, valid: torch.Tensor, blocks: nn.ModuleList,
+                        norm: nn.Module) -> torch.Tensor:
+            """Encode ragged causal rows and retain only their last valid state.
+
+            Grouping by valid length lets SDPA use its native causal kernel. In contrast, combining a key-padding
+            mask with causality materializes an ``[N, heads, S, S]`` mask; at full-session universe sizes that mask
+            alone can consume multiple GiB. Positional embeddings are already attached before compaction, so a
+            gap's absolute time remains represented even though invalid query/key slots are not carried through
+            attention. Empty rows remain exactly zero.
+            """
+            counts = valid.sum(-1)
+            result = torch.zeros(rows.shape[0], d, dtype=rows.dtype, device=rows.device)
+            for length_value in counts.unique(sorted=True).tolist():
+                length = int(length_value)
+                if length <= 0:
+                    continue
+                selected = counts == length
+                selected_rows, selected_valid = rows[selected], valid[selected]
+                if length == rows.shape[1]:
+                    packed = selected_rows
+                else:
+                    positions = torch.arange(rows.shape[1], device=rows.device).expand(
+                        selected_rows.shape[0], -1
+                    )[selected_valid].reshape(selected_rows.shape[0], length)
+                    packed = torch.gather(selected_rows, 1, positions.unsqueeze(-1).expand(-1, -1, d))
+                for block in blocks:
+                    if self.grad_checkpoint and self.training:
+                        packed = torch.utils.checkpoint.checkpoint(
+                            lambda value, layer=block: layer(value, None), packed, use_reentrant=False
+                        )
+                    else:
+                        packed = block(packed, None)
+                result[selected] = norm(packed[:, -1])
+            return result
+
+        summ = packed_last(x, bm1, self.tier1, self.norm1).reshape(B * A, nB, d)
         block_has = bm1.any(-1).reshape(B * A, nB)
         summ = summ * block_has.unsqueeze(-1).float()
         h = summ + self.pos2[:nB].unsqueeze(0)
-        for blk in self.tier2:                                  # tier-2: causal over block summaries
-            h = blk(h, ~block_has)
-        h = self.norm2(h)
-        day = _last_valid(h, block_has).reshape(B, A, d)        # last valid BLOCK = end-of-day per-stock embedding
+        # Only the final day state is consumed, so tier 2 can use the same ragged-last path and avoid retaining a
+        # padded full-session output. Missing blocks still keep their absolute ``pos2`` timestamp.
+        day = packed_last(h, block_has, self.tier2, self.norm2).reshape(B, A, d)
         return day * block_has.any(-1).reshape(B, A, 1).float()  # zero for stocks absent all day
 
 
@@ -139,6 +170,8 @@ class CrossDayTemporalEncoder(nn.Module):
     the action axis. The effective memory horizon is bounded by the training episode length / eval window
     (`daily_lookback`), not by a hard attention band -- attending to all in-window prior days is correct and lets
     the model weight recent vs distant days itself."""
+
+    pos: torch.Tensor
 
     def __init__(self, *, d_model: int, n_heads: int, n_layers: int, feedforward_dim: int,
                  dropout: float, max_days: int) -> None:

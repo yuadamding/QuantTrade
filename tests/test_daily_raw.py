@@ -140,12 +140,12 @@ class Episodes(unittest.TestCase):
         # continuous single episode spanning the usable range
         one = build_daily_raw_episodes(recs, episode_len=N, stride=N, horizon=H, exec_delay=1)
         self.assertEqual(len(one), 1)
-        usable = N - (1 + H)                                  # labelled days
+        usable = N - (1 + 1)                                  # canonical one-step transition days
         self.assertEqual(one[0]["ret"].shape[0], usable)
+        self.assertEqual(one[0]["aux_ret"].shape, one[0]["ret"].shape)
 
     def test_reported_pnl_uses_one_period_not_horizon_label(self) -> None:
-        """REPORTED PnL + baseline must use the 1-DAY realized return (real_ret), with the H-day label (ret) only
-        the training target -- otherwise daily PnL double-counts overlapping multi-day returns."""
+        """Control and reported PnL use one-day transitions; H-day labels remain auxiliary only."""
         N, H = 12, 3
         g = torch.Generator().manual_seed(0)
         # linear ramp per stock -> the 3-day return is ~3x the 1-day return (genuinely different bases)
@@ -158,18 +158,21 @@ class Episodes(unittest.TestCase):
         self.assertTrue(eps)
         ep = eps[0]
         self.assertIn("real_ret", ep)
-        self.assertFalse(torch.allclose(ep["ret"], ep["real_ret"]))   # H-day and 1-day genuinely differ here
+        self.assertTrue(torch.allclose(ep["ret"], ep["real_ret"]))
+        self.assertFalse(torch.allclose(ep["aux_ret"], ep["real_ret"]))
         # baseline buy&hold uses the 1-day (real_ret) basis, not the H-day label
         rr, rv = ep["real_ret"], ep["real_ret_valid"]
         cols = [rr[:, ai][rv[:, ai]].mean() for ai in range(1, A) if rv[:, ai].any()]
         _, bh = daily_cost_paid_baselines([ep])
         self.assertAlmostEqual(bh, float(torch.stack(cols).mean()), places=5)
-        # the rollout realizes the SELECTED basis: nets differ between the H-day target and the 1-day mark
+        # canonical aliases produce identical wealth transitions; the explicit auxiliary target is distinct
         pol = DailyCrossSectionPolicy(_cfg(daily_lookback=6)).eval()
         batch = _stack([ep], [0], torch.device("cpu"))
-        n_h = _daily_rollout(pol, batch, 0.0, ret_key="ret")[0]
+        n_one = _daily_rollout(pol, batch, 0.0, ret_key="ret")[0]
         n_r = _daily_rollout(pol, batch, 0.0, ret_key="real_ret")[0]
-        self.assertFalse(torch.allclose(n_h, n_r))
+        n_aux = _daily_rollout(pol, batch, 0.0, ret_key="aux_ret")[0]
+        self.assertTrue(torch.allclose(n_one, n_r))
+        self.assertFalse(torch.allclose(n_aux, n_r))
 
 
 class EODAdapter(unittest.TestCase):
@@ -219,7 +222,26 @@ class EODAdapter(unittest.TestCase):
 
 
 class NewsReportability(unittest.TestCase):
-    """news_is_reportable flags the anachronistic-model sentinel (model availability <= publication)."""
+    """news_is_reportable checks every active article fail-closed."""
+
+    @staticmethod
+    def _article(**updates):
+        article = {
+            "ticker": "A",
+            "published_timestamp_ms": 1_650_000_000_000,
+            "llm_feature_available_timestamp_ms": 1_650_000_001_000,
+            "model_available_timestamp_ms": 1_600_000_000_000,
+            "extractor_temperature": 0,
+            "extractor_no_retrieval": True,
+            "extractor_provider": "local_model",
+            "llm_model_id": "period-correct-model",
+            "llm_prompt_hash": "prompt",
+            "llm_schema_hash": "schema",
+            "model_training_cutoff_utc": "2020-01-01",
+            "sentiment_score": 0.1,
+        }
+        article.update(updates)
+        return article
 
     def _root(self, tmp, articles):
         import json
@@ -227,7 +249,13 @@ class NewsReportability(unittest.TestCase):
         import pyarrow.parquet as pq
         root = Path(tmp)
         (root / "partitions" / "w0").mkdir(parents=True)
-        pq.write_table(pa.table({"symbol": ["A"], "timestamp_ms": [1], "date_exchange": ["2022-01-03"],
+        (root / "universe.json").write_text(json.dumps({
+            "cash_index": 0,
+            "action_count": 2,
+            "actions": ["CASH", "A"],
+        }))
+        pq.write_table(pa.table({"symbol": ["A"], "timestamp_ms": [1_700_000_000_000],
+                                 "date_exchange": ["2023-11-14"],
                                  "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]}),
                        root / "partitions" / "w0" / "bars.parquet")
         (root / "partitions" / "w0" / "news.jsonl").write_text("\n".join(json.dumps(a) for a in articles))
@@ -236,19 +264,131 @@ class NewsReportability(unittest.TestCase):
     def test_sentinel_is_not_reportable(self) -> None:
         from rl_quant.datasets import news_is_reportable
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._root(tmp, [{"ticker": "A", "model_available_timestamp_ms": 1000,
-                                     "published_timestamp_ms": 1_642_423_403_000, "sentiment_score": 0.1}])
+            root = self._root(tmp, [self._article(model_available_timestamp_ms=1000)])
             ok, reason = news_is_reportable(root)
             self.assertFalse(ok)
-            self.assertIn("anachronistic", reason)
+            self.assertIn("sentinel", reason)
 
     def test_period_correct_is_reportable(self) -> None:
         from rl_quant.datasets import news_is_reportable
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._root(tmp, [{"ticker": "A", "published_timestamp_ms": 1_642_423_403_000,
-                                     "model_available_timestamp_ms": 1_700_000_000_000, "sentiment_score": 0.1}])
+            root = self._root(tmp, [self._article()])
             ok, _ = news_is_reportable(root)
             self.assertTrue(ok)
+
+    def test_reserved_cash_equity_ticker_maps_through_explicit_alias(self) -> None:
+        import json
+        from rl_quant.datasets import news_is_reportable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, [self._article(ticker="CASH")])
+            (root / "universe.json").write_text(json.dumps({
+                "cash_index": 0,
+                "action_count": 2,
+                "actions": ["CASH", "EQUITY:CASH"],
+                "source_symbol_aliases": {"EQUITY:CASH": "CASH"},
+            }))
+            ok, _ = news_is_reportable(root)
+            self.assertTrue(ok)
+
+    def test_missing_nonfinite_or_out_of_range_sentiment_is_not_reportable(self) -> None:
+        from rl_quant.datasets import news_is_reportable
+
+        cases = (
+            (None, "lacks a numeric"),
+            (float("nan"), "must be finite"),
+            (1.01, "must be finite"),
+            (False, "lacks a numeric"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                article = self._article(sentiment_score=value)
+                if value is None:
+                    del article["sentiment_score"]
+                root = self._root(tmp, [article])
+                ok, reason = news_is_reportable(root)
+                self.assertFalse(ok)
+                self.assertIn(expected, reason)
+
+    def test_missing_ticker_or_non_integer_feature_time_is_not_reportable(self) -> None:
+        from rl_quant.datasets import news_is_reportable
+
+        for updates, expected in (
+            ({"ticker": ""}, "non-empty ticker"),
+            ({"ticker": " ZZZ "}, "canonical non-empty ticker"),
+            ({"ticker": "ZZZ"}, "not a declared non-CASH action"),
+            ({"llm_feature_available_timestamp_ms": 1_650_000_001_000.5}, "invalid integer"),
+            ({"extractor_temperature": False}, "temperature=0"),
+        ):
+            with self.subTest(updates=updates), tempfile.TemporaryDirectory() as tmp:
+                root = self._root(tmp, [self._article(**updates)])
+                ok, reason = news_is_reportable(root)
+                self.assertFalse(ok)
+                self.assertIn(expected, reason)
+
+    def test_non_string_extractor_identity_is_not_reportable(self) -> None:
+        from rl_quant.datasets import news_is_reportable
+
+        for field, value in (
+            ("llm_model_id", {}),
+            ("llm_prompt_hash", 123),
+            ("llm_schema_hash", []),
+            ("extractor_provider", 123),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = self._root(tmp, [self._article(**{field: value})])
+                ok, reason = news_is_reportable(root)
+                self.assertFalse(ok)
+                self.assertIn(field, reason)
+
+    def test_future_or_missing_model_chronology_is_not_reportable(self) -> None:
+        from rl_quant.datasets import news_is_reportable
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(
+                tmp,
+                [self._article(model_available_timestamp_ms=1_660_000_000_000)],
+            )
+            ok, reason = news_is_reportable(root)
+            self.assertFalse(ok)
+            self.assertIn("unavailable", reason)
+        with tempfile.TemporaryDirectory() as tmp:
+            article = self._article()
+            del article["model_available_timestamp_ms"]
+            root = self._root(tmp, [article])
+            ok, reason = news_is_reportable(root)
+            self.assertFalse(ok)
+            self.assertIn("lacks required", reason)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(
+                tmp,
+                [self._article(model_training_cutoff_utc="2030-01-01")],
+            )
+            ok, reason = news_is_reportable(root)
+            self.assertFalse(ok)
+            self.assertIn("training cutoff after", reason)
+
+    def test_news_gate_scans_every_active_window(self) -> None:
+        import json
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from rl_quant.datasets import news_is_reportable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, [self._article()])
+            for index in range(1, 5):
+                partition = root / "partitions" / f"w{index}"
+                partition.mkdir()
+                pq.write_table(
+                    pa.table({"timestamp_ms": [1_700_000_000_000 + index]}),
+                    partition / "bars.parquet",
+                )
+                if index < 4:
+                    (partition / "news.jsonl").write_text(json.dumps(self._article()))
+
+            ok, reason = news_is_reportable(root)
+
+            self.assertFalse(ok)
+            self.assertIn("w4 is missing news.jsonl", reason)
 
 
 class DailySSL(unittest.TestCase):
@@ -277,7 +417,7 @@ class GradIsolationAndLearnability(unittest.TestCase):
     def test_planted_edge_survives_production_loss_weights(self) -> None:
         """PRODUCTION-GEOMETRY guard (2026-06-29 audit): a planted cross-sectional edge ~10x cost must survive the
         DEFAULT objective coefficients (budget/gate-entropy/missing at their production values, full cost from
-        step 1, reward_scale=1/H) and beat CASH on the reported 1-day mark. The audit showed the OLD weights made
+        step 1, canonical reward_scale=1) and beat CASH on the reported 1-day mark. The audit showed the OLD weights made
         this impossible (the loss was penalty-dominated by 2-4 orders of magnitude); this test fails if the
         objective ever again stops a real edge from being expressed."""
         torch.manual_seed(0)
@@ -301,10 +441,10 @@ class GradIsolationAndLearnability(unittest.TestCase):
         dev = torch.device("cpu")
         cost = 5e-4
         # NOTE: budget_lambda / gate_entropy_coef / missing_label_penalty deliberately NOT passed -> production
-        # defaults; full cost from step 1; per-day-equivalent training reward (reward_scale=1/H).
+        # defaults; full cost from step 1; canonical one-day training reward.
         _, _, best_state = train_daily_policy(
             pol, train_eps, steps=120, lr=3e-3, batch_days=4, cost=cost, bptt_window=18,
-            reward_scale=1.0 / H, eval_every=60, val_eps=test_eps, device=dev,
+            reward_scale=1.0, eval_every=60, val_eps=test_eps, device=dev,
             min_val_label_reportable_fraction=0.0)
         if best_state:
             pol.load_state_dict(best_state)
@@ -405,16 +545,14 @@ class RewardScaleAndDrift(unittest.TestCase):
         return pol, _stack(eps, [0], torch.device("cpu"))
 
     def test_reward_scale_rescales_realized_net_only(self) -> None:
-        """reward_scale puts the H-day reward on a per-day-equivalent scale: with cost=0 the net is linear in it
-        (the allocation/turnover are identical, only the credited return is rescaled)."""
+        """The optional reward-ablation scale is linear at zero cost; production leaves it at one."""
         pol, batch = self._ep_batch()
         n_full = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", reward_scale=1.0)[0]
         n_half = _daily_rollout(pol, batch, 0.0, ret_key="real_ret", reward_scale=0.5)[0]
         self.assertTrue(torch.allclose(n_half, 0.5 * n_full, atol=1e-6))
 
     def test_train_with_reward_scale_and_eval_window_runs(self) -> None:
-        """The exact driver call shape (per-day-equivalent reward_scale=1/H + a windowed continuous validation
-        episode) trains and selects a checkpoint without error."""
+        """The exact driver shape (canonical reward scale + windowed validation) selects a checkpoint."""
         torch.manual_seed(0)
         N, H = 60, 3
         g = torch.Generator().manual_seed(3)
@@ -432,7 +570,7 @@ class RewardScaleAndDrift(unittest.TestCase):
         dev = torch.device("cpu")
         _, _, best_state = train_daily_policy(
             pol, train_eps, steps=6, lr=3e-3, batch_days=3, cost=5e-4, risk_lambda=0.1, budget_lambda=0.0,
-            gate_entropy_coef=1e-3, bptt_window=12, reward_scale=1.0 / H, eval_window=12, eval_every=3,
+            gate_entropy_coef=1e-3, bptt_window=12, reward_scale=1.0, eval_window=12, eval_every=3,
             val_eps=val_eps, device=dev, min_val_label_reportable_fraction=0.0)
         self.assertIsNotNone(best_state)
         rows, st = evaluate_daily_detailed(pol, val_eps, dev, cost=5e-4, batch_days=1, window=12)

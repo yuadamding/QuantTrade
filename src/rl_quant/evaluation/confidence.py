@@ -558,5 +558,5 @@ def save_action_confidence_npz(
         "ood_score": confidence.ood_score.numpy().astype("float32"),
         "manifest_json": np.asarray(json.dumps(manifest, sort_keys=True), dtype=str),
     }
-    np.savez_compressed(target, **arrays)
+    np.savez_compressed(target, **arrays)  # type: ignore[arg-type]
     target.with_suffix(".json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

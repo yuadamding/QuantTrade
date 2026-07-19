@@ -22,10 +22,12 @@ import unittest
 # Layer order, lowest (most foundational) first. Verified to make the current runtime import graph a clean DAG.
 LAYER_ORDER = [
     "protocol",
+    "rl",
     "data_sources",
     "models",
     "datasets",
     "execution",
+    "envs",
     "features",
     "reportability",
     "evaluation",

@@ -146,17 +146,17 @@ def main(argv: list[str] | None = None) -> int:
 
     for path in args.model_manifest:
         try:
-            manifest = load_model_manifest(json.loads(path.read_text()))
-            manifest.validate_reportable(strict=not args.allow_legacy_selection)
+            model_manifest = load_model_manifest(json.loads(path.read_text()))
+            model_manifest.validate_reportable(strict=not args.allow_legacy_selection)
             selection_mode = "legacy" if args.allow_legacy_selection else "strict"
-            print(f"OK model manifest ({selection_mode}): {path} ({manifest.model_id})")
+            print(f"OK model manifest ({selection_mode}): {path} ({model_manifest.model_id})")
             if registry:
                 registry.append(
                     {
                         "record_type": "model_manifest_validation",
                         "validated_at_utc": utc_now_iso(),
                         "path": str(path),
-                        "model_id": manifest.model_id,
+                        "model_id": model_manifest.model_id,
                         "selection_validation_mode": selection_mode,
                         "status": "ok",
                     }

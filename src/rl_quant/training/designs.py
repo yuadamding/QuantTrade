@@ -200,10 +200,10 @@ _SERIES = [
                  ssl_batch_size=1, ssl_accum=16, batch_days=48, ssl_lr=1.5e-4, ssl_warmup_frac=0.10,
                  pol_warmup_frac=0.10, grad_clip=0.5, max_actions_per_day=3.0, amp=True, grad_checkpoint=True),
 
-    Phase1Design("balanced", "BALANCED d512/10L, full session, budget 5; entropy 0.01, temp 1.5, cost 1e-3",
+    Phase1Design("balanced", "BALANCED d512/10L, full session, budget 5; calibrated entropy, temp 1.5, cost 1e-3",
                  session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=10, enc_heads=8,
                  policy_token_dim=512, policy_layers=6, policy_heads=8, ssl_steps=3000, policy_steps=8000,
-                 ssl_batch_size=1, ssl_accum=16, batch_days=64, entropy_coef=0.01, temperature=1.5, cost=1e-3,
+                 ssl_batch_size=1, ssl_accum=16, batch_days=64, entropy_coef=1e-5, temperature=1.5, cost=1e-3,
                  amp=True, grad_checkpoint=True),
 
     Phase1Design("coarse_blocks", "COARSE 600s blocks (39/day), d384/8L, full session; constant lr, risk 0.2",
@@ -216,7 +216,7 @@ _SERIES = [
                  session_seconds=FULL, block_seconds=300, d_model=512, enc_layers=10, enc_heads=8,
                  policy_token_dim=640, policy_layers=6, policy_heads=8, ssl_steps=3000, policy_steps=8000,
                  ssl_batch_size=1, ssl_accum=16, batch_days=64, amp=True, grad_checkpoint=True, ssl_lr=2.5e-4,
-                 entropy_coef=0.02, max_actions_per_day=8.0, budget_lambda=5e-4),
+                 entropy_coef=2e-5, max_actions_per_day=8.0, budget_lambda=5e-4),
 
     # ===== LONGER-HORIZON experiments (coarser blocks => decision cadence AND T+1 hold both lengthen) =====
     # NB: the IC probe found price-based cross-sectional signal ~0 at ALL horizons (5min..daily) in TOP50, so
@@ -316,8 +316,9 @@ _SERIES = [
 ]
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 
-DEFAULT_DESIGN = "wide"
-# Variety run on the 2xH100 box, with `large` as the smaller minimum. ('tiny' = CPU smoke only.)
-SWEEP = ["large", "wide", "deep", "balanced", "coarse_blocks", "active"]
+DEFAULT_DESIGN = "daily_raw"
+# The old intraday TOP50 sweep is a documented null regime. Default experiments now compare daily raw baselines;
+# intraday architecture ablations remain explicitly addressable by name.
+SWEEP = ["daily_raw", "daily_raw_252"]
 # Longer-horizon probes (run explicitly with --design; not in the default sweep).
 HORIZON_SWEEP = ["h30m", "h65m"]

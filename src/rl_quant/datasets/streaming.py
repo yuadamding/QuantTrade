@@ -17,7 +17,8 @@ import torch
 # the per-day tensor fields a window cache carries (leading n_days axis); everything else is light meta
 TENSOR_KEYS = ("bars", "bar_mask", "cov_blocks", "news_raw", "news_mask",
                "avail", "ret", "ret_valid", "day_open", "day_close")
-META_KEYS = ("n_days", "n_blocks", "dates", "window")
+OPTIONAL_TENSOR_KEYS = ("cov_valid_blocks", "universe_member")
+META_KEYS = ("n_days", "n_blocks", "dates", "window", "tensor_keys")
 
 
 class _WindowLRU:
@@ -62,7 +63,12 @@ class LazyWindow:
         self._meta = {k: meta[k] for k in META_KEYS if k in meta}
 
     def __contains__(self, k) -> bool:
-        return k in self._meta or k in TENSOR_KEYS
+        if k in self._meta or k in TENSOR_KEYS:
+            return True
+        if k in OPTIONAL_TENSOR_KEYS:
+            known = self._meta.get("tensor_keys")
+            return k in known if known is not None else k in _LRU.load(self._path)
+        return False
 
     def __getitem__(self, k):
         if k in self._meta:
@@ -88,7 +94,7 @@ class LazyDay:
         self._ov = dict(overrides or {})
 
     def __contains__(self, k) -> bool:
-        return k in self._ov or k in ("date", "n_blocks") or k in TENSOR_KEYS
+        return k in self._ov or k in ("date", "n_blocks") or k in self._win
 
     def __getitem__(self, k):
         if k in self._ov:

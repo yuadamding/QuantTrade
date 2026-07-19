@@ -13,5 +13,5 @@ named so a reader can see the policy is not just aspirational.
 | [0001](0001-protocol-first-package-ownership.md) | Protocol-first layered package; the package owns logic, layers form a DAG | Accepted | `tests/test_import_boundaries.py` |
 | [0002](0002-strict-reportability-default.md) | `reportable: true` requires the strict tier (`reportable_tier`) | Accepted | `tests/test_decision_framework.py::...classify_reportability...` |
 | [0003](0003-return-basis-content-hash.md) | A canonical `ReturnBasis` + content hash is the return-economics contract | Accepted | `tests/test_golden_artifacts.py`, `test_research_protocol.py` |
-| [0004](0004-env-execution-owns-reward.md) | Only the env/execution layer may mutate portfolio state and compute reward | Partial | (staged behind `use_execution_env_reward`) |
+| [0004](0004-env-execution-owns-reward.md) | Only the env/execution layer may mutate portfolio state and compute reward | Partial | `tests/test_portfolio_env.py`; legacy gaps in `tests/test_daily_runtime_accounting.py` |
 | [0005](0005-scripts-to-package-migration.md) | `scripts/` are thin wrappers; the package owns implementation | Accepted | `tests/test_scripts_are_wrappers.py` |

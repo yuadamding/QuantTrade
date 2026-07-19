@@ -1,202 +1,235 @@
 # QuantTrade
 
-QuantTrade (`rl_quant`) is a compact, point‑in‑time‑correct research framework for learning trading policies
-from raw market data. Its current centerpiece is a **decoupled two‑stage learning framework**: a self‑supervised
-**context encoder** that learns market state from the raw 1‑second bars, and a **decision policy** that allocates
-capital from the frozen context plus its own trainable raw‑second policy encoder. Around it sit the kept
-data/evaluation/reportability infrastructure.
+QuantTrade (`rl_quant`) is a torch-native **general deep-reinforcement-learning library** with a historical
+portfolio environment and market-research components. Its RL contracts are domain-neutral: observations,
+actions, transitions, trajectories, and algorithms do not import market code. Portfolio allocation is the first
+application, not the definition of the framework.
 
-> **Status (2026‑06).** The earlier per‑second / subhour / second‑to‑hour transformer stack and its
-> precomputed‑feature datasets were removed. The **audited training/evaluation path consumes only raw inputs** —
-> raw 1‑second OHLCV bars, raw as‑of fundamental covariates, and raw per‑article LLM news scores — which the
-> models normalize, organize, and learn from **at train time**; no engineered feature tables, covariate ratios,
-> or news aggregates are stored or consumed. The expensive LLM news *scoring* is the one model‑produced artifact,
-> kept as a per‑article raw input (see the **LLM news caveat** below). The offline feature‑producer modules under
-> `features/` and the `scripts/build_*` builders are **never imported by the audited path** — enforced by
-> `tests/test_no_feature_engineering.py` (it fails if training/eval imports `rl_quant.features` or references any
-> `action_covariates` / `action_features` / `feature_schema` / news‑aggregate / `*_sidecar` artifact).
+The repository also retains the older two-stage **Phase-1 direct portfolio optimizer**. That workflow is useful
+as a baseline, but it is not PPO and is not yet wired through the new environment/trajectory interfaces.
 
----
+> **Current status (2026-07).** The tested library now includes recurrent PPO with masked simplex actions,
+> on-policy and replay rollout coordinators, schema-locked replay, offline training, twin-critic IQL, regime
+> mixtures, uncertainty abstention, market stress transforms, a purged/embargoed walk-forward splitter, and the
+> vectorized portfolio environment. These are library primitives, not a production trading runner: the
+> Phase-1-to-RL encoder adapter/CLI, walk-forward runtime integration, and complete artifact-driven evaluator are
+> still pending. Existing TOP50/TOP2000 universes were ranked after their backtest start and remain development-only
+> until rebuilt point-in-time.
 
-## Design principles
+See [General RL architecture](docs/general_rl_architecture.md) for the exact interfaces and limitations, and the
+[migration ledger](docs/architecture_migration_plan.md) for implemented versus pending work.
 
-1. **Point‑in‑time causality.** A bar, covariate, news item, constraint, or cost may be a model input only if it
-   is available **at or before** the decision timestamp. Forward returns are used only as the training *label*.
-2. **No precomputed features.** The dataset stores raw 1‑second OHLCV bars, raw point‑in‑time covariate records,
-   and raw per‑article LLM news scores. All normalization / aggregation / representation is done **inside the
-   models at train time** — nothing hand‑engineered is persisted.
-3. **Context ⟂ policy split.** "What is the market doing" (context) is learned separately from "what to do about
-   it" (policy). The context encoder is trained self‑supervised, then **frozen**; the policy trains on detached
-   context tensors plus a separate raw‑second policy encoder, so reward gradients never backprop into Stage 1.
-4. **Reportability.** A result is trustworthy only with realistic masks/latency/costs, matched train/val/test
-   schemas, cost‑paid baselines, and a statistical battery (see *Safety & reportability*).
+## Architecture
 
----
-
-## The two‑stage learning framework
-
-### Stage 1 — context learning (`rl_quant.models.context_encoder`)
-
-A **two‑tier causal transformer** that reads the **raw 1‑second bars directly** (one token per second, raw
-OHLCV; in‑model `BatchNorm` + linear embedding only — no pooling, no scale‑free features):
-
-- **Tier 1 (local):** causal attention *within* fixed `block_seconds` blocks of raw seconds; each block's
-  most‑recent‑valid token is a **learned** summary (the model compresses raw seconds — nothing hand‑pooled).
-- **Tier 2 (global):** causal attention *over* the block summaries across the session, yielding a context at
-  **every** block. This makes the **full ~6.5 h RTH session** tractable at O(S·block) + O(n_blocks²) instead of
-  flat O(S²); each block's context rolls from the 09:30 open with no look‑ahead. The block grid (78 blocks/day at
-  300 s) **is** the candidate grid the event‑timed policy acts on — one full‑session encode yields every context,
-  so there is no separate per‑candidate storage. (`grad_checkpoint` recomputes tier‑1 in backward for full‑session SSL.)
-- The encoder **also learns from each stock's as‑of covariates** (fundamentals / market‑cap / news‑volume),
-  fused with the per‑block context; the cross‑sectional mean over **all involved stocks** → a **pure market
-  context** per block (no policy state ever enters).
-- **Self‑supervised pretext:** from each block's market context predict that block's next‑interval equal‑weight
-  market return + realized vol. Then the encoder is **frozen** and used to encode every day into per‑block cached
-  embeddings.
-
-### Stage 2 — policy learning (`rl_quant.models.decision_policy`)
-
-A **permutation‑equivariant set‑transformer** over the action set `{CASH, stock₁ … stock_N}`, trained on frozen
-context plus a policy‑side raw‑second encoder (it holds no Stage‑1 encoder reference → its reward gradient cannot
-reach the context):
-
-- Each action becomes a token `[ broadcast market ctx | per‑stock ctx | trainable raw‑second policy ctx |
-  in‑model‑aggregated raw news | previous weight ]` + a learned CASH token. Cross‑sectional attention values each
-  action relative to the others; unavailable actions are masked.
-- Raw per‑article **news scores are aggregated in‑model** (a learned masked sum), and raw OHLCV is encoded by the
-  policy path at train time — so the policy also uses **no precomputed features**.
-- A softmax (with **temperature**) over `{CASH, stocks}` yields target **allocation weights**, and a per‑block
-  **act‑gate** `g∈[0,1]` decides *whether* to trade: the held position is `g·target + (1−g)·prev` (holding is
-  turnover‑free). CASH = abstain.
-- **Event‑timed:** the policy is not on a fixed clock — it chooses **when** to act over the blocks, under a
-  **soft per‑day budget** of ~`max_actions_per_day` trades (a penalty on the per‑day gate mass). Trades are
-  **T+1**: a position decided at block *b* executes at *b+1* and realizes over the next interval.
-- **Objective — differentiable portfolio:** roll each day forward over its blocks carrying the previous weights
-  and maximize realized net return − turnover cost, with a downside‑variance penalty, an optional entropy bonus,
-  and the budget penalty. Shared weights ⇒ the same head scales from tens to ~2000 actions.
-
-### Training (`rl_quant.training`)
-
-- `context_pretrain.py` — Stage‑1 SSL trainer: **streams** full sessions (one day/micro‑batch) from CPU‑resident
-  windows to the GPU + **gradient accumulation** (effective batch ≫ peak VRAM); then `freeze_encoder` +
-  `encode_days` (detached per‑block embeddings plus raw bars for Stage 2). `decision_policy.py` — Stage‑2
-  event‑timed differentiable‑portfolio trainer (gated day/block rollout, per‑day budget, T+1) + `evaluate_policy`
-  + cost‑paid baselines. `_optim.py`
-  — step‑driven warmup+cosine/constant LR (resume‑exact, no scheduler state).
-- **Per‑stage training strategy** (LR / warmup / weight decay / grad clip; bf16 AMP + TF32 + `grad_checkpoint`;
-  policy cost / risk / entropy / temperature / `max_actions_per_day` / `budget_lambda`) is parameterized by
-  `designs.py` — a series of `Phase1Design` presets spanning both transformers' architecture *and* the training
-  setup. Every real design encodes the **full RTH session** (the two‑tier hierarchy reaches it by design); the
-  series varies *context arch × policy arch × block cadence × training strategy × trade budget*. `tiny` is the
-  CPU smoke / CI design.
-
-The actual **experiment driver lives outside this package**, in `../training/` (relative paths only): a thin
-`train_phase1.py` (multi‑seed, resumable, time split, verdict) and `sweep_phase1.py` (multi‑GPU sweep). See
-*Running*. The split is CI‑enforced (`tests/test_phase1_framework.py`).
-
----
-
-## Package layout (`src/rl_quant`)
-
-| subpackage / module | role |
-|---|---|
-| `models/` | `context_encoder` (Stage 1, two‑tier causal), `decision_policy` (Stage 2, set‑transformer) |
-| `datasets/` | `raw_window` — organizes a raw time window (bars/covariates/news) into train‑time tensors; no features stored |
-| `training/` | two‑stage trainers, LR/optim helpers, the `Phase1Design` series |
-| `evaluation/` | the statistical battery — `statistical.py` (block‑bootstrap CI, White Reality Check, Hansen SPA, deflated Sharpe), ranking, run registry, research protocol |
-| `features/` | **offline feature producers** — `news_llm` (qwen3 news scoring), `stock_covariates`, `action_risk` (action‑universe/risk metadata). **Not part of the audited training/eval path**; `tests/test_no_feature_engineering.py` forbids importing them there. Kept for offline data provenance only |
-| `data_sources/` | polygon second aggregates + stock‑covariate readers, quote utils |
-| `protocol/`, `reportability/` | the reportability contract: action‑return basis, constraints, validators, decision log, baselines |
-| `execution/` | fills / legs / cost model |
-| core modules | `core`, `config`, `paths`, `decision_framework`, `trading_constraints`, `research_protocol`, `statistical_credibility`, `confidence`, `partition_protocol` |
-
-Layering is enforced as a runtime DAG by `tests/test_import_boundaries.py`.
-
----
-
-## Data
-
-Forward‑only layers (training code never parses raw vendor files when a validated builder exists):
-
-- **Bronze** — raw/minimally‑normalized vendor files (Polygon 1‑second aggregate Parquet
-  `…/SYMBOL/YYYY/MM/YYYY-MM-DD.parquet` with a `manifest.csv` source‑of‑truth; Yahoo OHLCV; raw quotes).
-- **Silver** — cleaned point‑in‑time tables (stock covariates; news‑LLM article scores).
-- **Raw decision windows** — what the framework consumes: `partitions/<S_to_E>/{bars.parquet,
-  covariates.parquet, news.jsonl}` + `universe.json` (e.g. the TOP50 dataset at `../TOP50`). The organizer
-  builds, **at train time**, the full‑session raw per‑second bars (stored once per day, session‑aligned), per‑block
-  as‑of covariates, raw news, and per‑(day, block) **T+1** forward‑return labels — nothing precomputed. The block
-  grid is 78 blocks/day at 300 s, DST‑correct via `zoneinfo`.
-
-**LLM news caveat.** Article *timing* is point‑in‑time clean: a decision at block *b* sees only articles whose
-`llm_feature_available_timestamp_ms` (publication + scoring latency) is ≤ block‑*b* end, so no future article
-leaks in. The defect is the *scorer*, not the timing — every article carries `model_available_timestamp_ms =
-1000` (an epoch sentinel), i.e. the qwen3 model is claimed "available since epoch" when it in fact postdates the
-backtest window. So the scores are usable as a training **input**, but **news‑driven results are not
-point‑in‑time clean for a reportable backtest** until either the scores are regenerated with a period‑correct
-model or the reportability guard treats that sentinel as not‑yet‑available. Bars + covariates + forward‑return
-labels **are** point‑in‑time clean. Large generated assets stay under `data/`/`derived/`, never in `src/`.
-
----
-
-## Running
-
-The package is the library; the runnable Phase‑1 experiment driver is in `../training/` (DATA read only from a
-raw dataset root such as `../TOP50`; all paths relative to the script). Set `PYTHON` to the `quanttrade`
-interpreter.
-
-```bash
-# correctness smoke (CPU ok, ~30 s): design=tiny
-PYTHON=…/quanttrade/bin/python python ../training/train_phase1.py --smoke
-
-# one design on one GPU (resumable, multi-seed)
-PYTHON=… python ../training/train_phase1.py --design wide --device cuda:0 --seeds 3
-
-# multi-GPU sweep over the design series (one (design,seed) job per GPU; resumable)
-PYTHON=… python ../training/sweep_phase1.py --designs sweep --devices 0,2,3 --cpu-workers-per-gpu 8 --seeds 3
+```mermaid
+flowchart LR
+    D[Domain data adapter] --> O[ObservationBatch]
+    O --> A[Algorithm / actor-critic]
+    A --> R[Requested ActionBatch]
+    R --> E[VectorEnvironment]
+    E --> T[Executed action + TransitionBatch]
+    T --> B[Trajectory or replay representation]
+    B --> A
+    T --> V[Domain evaluator + artifacts]
 ```
 
-The repo‑root `run.sh` is a convenience launcher for the sweep. The **verdict** reports pooled OOS
-mean/decision + a 95% block‑bootstrap CI, cost‑paid CASH / buy‑&‑hold baselines computed over the **same
-decisions** the policy is scored on (in daily mode the baseline is truncated to the episode‑covered days, not all
-test days), and a **deflated Sharpe** on the best seed. The deflated Sharpe is deflated for the **whole search** —
-the sweep passes `--n-trials = designs × seeds`, so the reported winner is corrected for every (design, seed) it
-was selected from, not just the seeds of one design. A trustworthy positive = beats cash/buy‑&‑hold **and** CI
-excludes 0 **and** deflated‑Sharpe credible (>0.95). (White Reality Check / Hansen SPA over *seeds* were dropped:
-seeds are independent rollouts of one design, not distinct strategies on a common period axis, so the paired
-bootstrap across them was invalid; a valid WRC/SPA would compare *designs* on aligned per‑decision returns.)
+The domain-neutral layer is `rl_quant.rl`. A domain supplies an observation adapter and an environment; an
+algorithm supplies action selection and updates. Requested and executed actions remain distinct, and reward is a
+decomposed ledger rather than an opaque scalar.
 
----
+The governing rules are:
 
-## Safety & reportability
+1. **Environment ownership.** New RL algorithms do not mutate portfolio/domain state or compute reward. The
+   environment executes the request and returns the authoritative transition.
+2. **Point-in-time observations.** Every input and mask must have been available by its decision timestamp.
+   Labels and future returns never enter an observation.
+3. **Explicit missingness and feasibility.** Floating observations are finite; missingness and valid actions use
+   explicit masks/channels.
+4. **Terminal precision.** True termination and rollout truncation are different. Only true termination forces
+   zero bootstrap discount.
+5. **Reportability from artifacts.** A passing training loss is not evidence of a tradable result. Provenance,
+   aligned decisions, baselines, costs, stresses, and selection history must be persisted.
 
-Research code. A result is **not** reportable unless: every input is available ≤ the decision timestamp;
-rewards realize inside the evaluated split; train/val/test schemas match; fit windows end before val/test use;
-trading constraints apply in both training and eval; costs are leg/action‑aware; terminal positions are
-liquidated‑with‑cost or reported open; registered baselines + cost/frequency stress are included; source
-completeness/limitations are declared; invalid action returns are stored as `NaN`, never silently zero.
+## General deep-RL substrate
 
-No secrets in the repo (`.env.example` documents variable names only). Do not commit API/broker/S3 credentials,
-large raw datasets, checkpoints, or run directories.
+`rl_quant.rl` currently provides:
 
----
+| Component | Implemented behavior |
+|---|---|
+| `TensorSpec`, `ActionSpec` | Shape/dtype/bounds validation; continuous, discrete, or hybrid descriptors; optional simplex and CASH semantics. |
+| `ObservationBatch`, `ActionBatch` | Validated vectorized observations, masks, episode starts, requested actions, behavior log probabilities, entropy, and recurrent state. |
+| `RewardComponents`, `TransitionBatch` | Gross return, explicit cost/penalty terms, requested/executed actions, next state, termination/truncation, discount, and diagnostics. |
+| `VectorEnvironment` | Domain-neutral synchronous `reset()` / `step()` protocol. |
+| `Actor`, `Critic`, `ActionValueCritic`, `Algorithm` | Small interfaces for acting, updating, checkpointing, and train/eval state. |
+| `OnPolicyTrajectoryBuffer` | Time-major recurrent rollouts, GAE, correct truncation bootstrap, episode boundaries, burn-in, padding, and sequence minibatches. |
+| `TransitionReplayBuffer`, `ReplayBatch` | Schema-locked circular replay preserving requested/executed actions, masks, behavior likelihoods, reward components, terminal semantics, and optional exact decision identity. |
+| Rollout/training coordinators | `OnPolicyRolloutCoordinator` preserves recurrent continuation and GAE boundaries; `ReplayRolloutCollector` and `OfflineTrainer` collect and optimize replay batches. |
+| `RecurrentPPO` | Clipped recurrent PPO with categorical, diagonal-Normal, or masked-Dirichlet actions, recurrent updates, checkpoints, and diagnostics. |
+| `ImplicitQLearning` | Replay-based twin-critic IQL with expectile value learning, advantage-weighted behavior cloning, executed-action semantics, uncertainty penalties, and conservative transformed targets. |
+| Mixture and robustness helpers | Same-support regime experts/router, critic-disagreement diagnostics, deterministic uncertainty abstention, and generic/market-specific transition stresses. |
 
-## Environment
+`MaskedDirichlet` keeps masked dimensions exactly zero and samples the active simplex, so the reference
+`RecurrentActorCritic(action_kind="dirichlet")` can train against `VectorPortfolioEnv`. The diagonal Normal remains
+invalid for simplex allocation, and `ActionSpec(kind="hybrid")` still has no hybrid PPO distribution. Replay and
+offline IQL are implemented; SAC, modern DQN, prioritized/n-step replay, and CQL are not.
 
-Use the `quanttrade` conda env (Python 3.11):
+## Portfolio environment
+
+`rl_quant.envs.VectorPortfolioEnv` applies the general contracts to batched historical allocation. It accepts a
+requested long-only simplex allocation including CASH and then:
+
+- applies availability, per-risky-asset weight, and gross-exposure constraints;
+- caps discretionary one-way turnover, while allowing hard feasibility changes to exceed that cap and reporting
+  the forced excess;
+- treats optional maximum drawdown as a post-return breach threshold that latches a CASH halt, not as a guarantee
+  that an intra-step loss cannot overshoot the threshold;
+- reports the request-to-execution projection distance and forced turnover;
+- delegates authoritative costs for the approved target to a separate `TargetWeightExecutionModel`;
+- realizes exactly one chronological asset-return vector;
+- drifts holdings through realized returns instead of silently rebalancing;
+- exposes equity peak, drawdown, recent turnover, gross exposure, limits, and risk-halt state to the policy;
+- latches a drawdown breach, forces an immediate cost-paid CASH fallback, and keeps later actions CASH-only;
+- emits decomposed reward components and equity/turnover diagnostics;
+- liquidates to CASH, with cost, at a true data terminal but not a rollout truncation.
+
+`HistoricalMarketData` requires point-in-time feature states and availability for `horizon + 1` states and one
+asset-return vector for each of the `horizon` transitions. `TensorPortfolioObservationAdapter` adds current
+weights, equity, time index, action mask, and episode-start state; the environment adds its own risk state without
+changing that adapter signature. Optional globally unique int64 decision IDs flow into transition metadata and
+can be used for exact replay alignment. Domain-specific learned encoders can implement the same adapter boundary.
+
+The default immediate target-weight model charges configured spread/fee and optional linear-impact sensitivities;
+it explicitly does not model market fills. The simulator has no partial fills, queue position, market-by-order
+data, venue latency, volume/capacity calibration, empirical nonlinear impact, borrow model, built-in CASH yield,
+live adaptation, or asynchronous execution. Do not describe its returns as executable-trading evidence.
+
+## Legacy Phase-1 baseline
+
+The runnable workflow in `../training/` predates the general RL layer.
+
+### Stage 1: causal market context
+
+`rl_quant.models.context_encoder.ContextEncoder` reads raw or load-time-resampled OHLCV tokens with as-of stock
+covariates:
+
+- tier 1 performs causal attention inside each fixed block;
+- tier 2 performs causal attention over block summaries;
+- self-supervised market and per-stock heads learn next-interval context;
+- the trained encoder is frozen and cached for Stage 2.
+
+Bar and covariate standardization uses fixed persistent moments. The driver calls
+`calibrate_normalization(...)` on a deterministic **training-only** sample before optimization, excluding masked
+and non-finite values, then broadcasts the buffers across ranks. `forward()` never derives or updates statistics
+from its submitted session, and train/eval normalization is identical.
+
+### Stage 2: direct differentiable allocation
+
+The legacy decision policies combine frozen context with policy-side raw-market encoding and optional raw news.
+They produce a target allocation and a continuous gate
+`held = gate * target + (1 - gate) * previous`. The gate is interpolation/rebalance intensity, **not** a sampled
+trade probability or literal order count. The trainer directly differentiates net portfolio return; it has no
+critic, behavior log probability, PPO ratio, or Bellman update.
+
+The repaired daily-raw path trains and reports on the same one-day close-to-close reward. Longer-horizon returns
+are auxiliary forecasting/SSL targets, and validation/test can carry an input-only causal history prefix that is
+excluded from scoring. Legacy rollouts now share portfolio helpers for availability, turnover, holdings drift,
+and terminal liquidation, but they still do not call `VectorPortfolioEnv`.
+
+Keep this path as a named direct-optimization baseline while the [migration](docs/architecture_migration_plan.md)
+proceeds.
+
+## Causal data and provenance
+
+The Phase-1 raw dataset layout is:
+
+```text
+DATA_ROOT/
+  manifest.json
+  universe.json
+  universe_membership.parquet       # required for point_in_time/rolling mode
+  partitions/
+    <start>_to_<end>/
+      bars.parquet
+      covariates.parquet
+      news.jsonl                    # optional, research-only with current scorer metadata
+```
+
+`universe.json` stores unique policy action IDs. Optional `source_symbol_aliases` maps an action ID to the raw
+market ticker when a source symbol collides with a reserved action; for example, `EQUITY:CASH -> CASH` keeps the
+listed equity distinct from synthetic portfolio cash across bars, covariates, news, and membership events.
+
+The organizer creates session-aligned OHLCV, as-of covariates with per-field validity, raw per-article scores,
+availability/membership masks, and forward labels. A coarser `bar_seconds` grid performs standard OHLCV
+resampling at load time; it does not persist a technical-feature table.
+
+`inspect_dataset_provenance()` checks `manifest.json` and `universe.json` before training. Reportability fails
+when universe selection metadata is absent/invalid, when selection postdates the sample start, or when rolling/PIT
+membership lacks a non-empty event table. Dynamic membership must match the declared action universe and contain
+at least one positive event for every non-CASH action. The declared coverage start must also match the earliest
+actual date inside the bars files. Membership events apply only after both their effective date and availability
+timestamp. A prior-selected static universe can pass the mechanical gate but keeps a delisting/survivorship warning.
+
+The current ranked TOP50/TOP2000 assets were selected using 2026 information for a sample beginning in 2022.
+Use `--allow-unreportable` only for an explicitly development-only diagnostic; it is not a promotion path.
+
+News is disabled by default. The stored article timestamps can be filtered causally, but the existing scorer's
+model-availability metadata is anachronistic for the historical sample. Enable `--news` only as research input;
+the fail-closed audit checks every active news window, and a reportable run requires period-correct scores plus
+complete deterministic-extractor provenance. Each model-facing row must also have a ticker, an exact integer
+availability timestamp, and a finite numeric sentiment score in `[-1, 1]`; malformed rows are rejected rather
+than converted to neutral sentiment. Tickers must map to a declared non-CASH action, and model/prompt/schema
+identifiers must be canonical non-empty strings, so audited articles cannot disappear during tensorization.
+
+## Package layout
+
+| Path | Role |
+|---|---|
+| `src/rl_quant/rl/` | Domain-neutral contracts, trajectories/replay, rollout coordination, PPO, IQL, regime mixtures, and robustness helpers. |
+| `src/rl_quant/envs/` | Historical market container, observation adapter, portfolio environment, and market-specific robust transforms. |
+| `src/rl_quant/execution/` | Target-weight execution/cost authority and pure portfolio accounting helpers. |
+| `src/rl_quant/models/` | Legacy market context and allocation models. |
+| `src/rl_quant/datasets/` | Raw-window organization, provenance/membership, chronological and tested purged/embargoed walk-forward splits, daily episodes, and streaming. |
+| `src/rl_quant/training/` | Legacy two-stage direct trainers and experiment designs. |
+| `src/rl_quant/evaluation/` | Statistical/reportability utilities; not yet an end-to-end evaluator for the new RL path. |
+| `src/rl_quant/protocol/`, `reportability/` | Research contracts, validators, baselines, and decision-log utilities. |
+| `src/rl_quant/features/` | Offline/legacy artifact-producer namespace; not imported by the audited raw Phase-1 training path. |
+| `training/` (repository parent) | Resumable Phase-1 experiment and sweep drivers. |
+
+Import layering is enforced by `tests/test_import_boundaries.py`.
+
+## Install
+
+Use the `quanttrade` conda environment (Python 3.11):
 
 ```bash
 cd QuantTrade
-conda run -n quanttrade python -m pip install -e ".[dev,data]"   # + ".[llm]" for offline news scoring
+conda run -n quanttrade python -m pip install -e ".[dev,data]"
 ```
 
-Core deps are intentionally small: `torch>=2.6,<3`, `numpy>=2.2,<3`; optional `pandas`/`pyarrow` (data) and
-`transformers`/`accelerate` (LLM); `pytest`/`ruff`/`mypy` (dev). The kept news‑LLM stack scores articles offline
-(primary `Qwen/Qwen3‑1.7B`) and writes frozen tables; **training never calls an LLM** — it consumes only frozen
-scores. Verify CUDA/AMP: `python -c "import torch;print(torch.cuda.is_available(), torch.cuda.is_bf16_supported())"`.
+Core dependencies are intentionally small (`torch`, `numpy`). Parquet/data tooling and offline language-model
+scoring are optional extras. Training consumes frozen news scores; it never invokes an LLM.
 
----
+## Run the legacy Phase-1 experiment
 
-## Testing & quality
+There is not yet a production RL rollout command. The following commands run the **legacy direct baseline**:
+
+```bash
+# CPU correctness smoke
+conda run -n quanttrade python ../training/train_phase1.py --smoke --allow-unreportable
+
+# One design; fail-closed provenance and news-off are defaults
+conda run -n quanttrade python ../training/train_phase1.py \
+  --design daily_raw --data-root "$DATA_ROOT" --device cuda:0 --seeds 5
+
+# Multi-GPU sweep
+conda run -n quanttrade python ../training/sweep_phase1.py \
+  --designs sweep --devices 0,1,2,3 --seeds 5
+```
+
+Use `--stream` for large datasets. Large-universe execution should wait until provenance passes and the smaller
+PIT universe has cleared correctness, baseline, and artifact gates.
+
+## Testing and quality
 
 ```bash
 cd QuantTrade
@@ -204,35 +237,44 @@ PYTHONPATH=src conda run -n quanttrade python -m pytest tests/ -q
 conda run -n quanttrade ruff check src tests
 ```
 
-`tests/test_phase1_framework.py` locks the design as executable assertions: the context/policy split (no policy
-gradient reaches the frozen encoder), multi‑block cross‑block causality (a block is invariant to *later* blocks),
-simplex allocation + constraint masking + the act‑gate in `[0,1]`, the LR/temperature/AMP/entropy/budget strategy
-knobs, the per‑block SSL pretext, and design‑series validity. `test_import_boundaries.py` locks the layering DAG;
-`test_scripts_are_wrappers.py` keeps `scripts/` thin.
+The most relevant contract suites are:
 
----
+- `test_rl_core.py`: typed batches, reward ledger, GAE, terminals, recurrent burn-in;
+- `test_ppo.py`: categorical/Normal/Dirichlet distributions, PPO updates/checkpoints, planted-signal learning;
+- `test_replay.py`, `test_offline.py`, `test_iql.py`: replay integrity, collectors/trainers, and executed-action IQL;
+- `test_mixture.py`, `test_market_robust_transforms.py`: regime routing and conservative scenario transforms;
+- `test_rollout.py`: recurrent continuation, terminal/truncation bootstrapping, and collect-to-update integration;
+- `test_portfolio_env.py`: execution authority, risk state/halt, identity, costs, constraints, drift, and liquidation;
+- `test_context_normalization.py`: causal fixed statistics and serialization;
+- `test_dataset_provenance.py`: future-universe rejection and event-time membership;
+- `test_walk_forward.py`: purge/embargo geometry, expanding/rolling folds, stable identities, and fail-closed validation;
+- `test_daily_runtime_accounting.py`: compact daily storage and legacy accounting.
 
-## Caveats / correctness contract
+## Reportability
 
-- **No precomputed features** anywhere (context or policy) — enforced by design + tests.
-- **News is input‑only**, not reportable‑clean (anachronistic LLM availability). Bars/covariates/labels are clean.
-- **VRAM is GPU‑measured but verify on your hardware.** Full‑session SSL is heavy (one day = `n_stocks ×
-  session_seconds` raw tokens); the SSL micro‑batch is in **days** (`ssl_batch_size` ≈ 1) and decoupled from the
-  effective batch via gradient accumulation, with `grad_checkpoint` (recompute tier‑1 in backward) + bf16 AMP
-  keeping one day within an 80 GB H100 up to ~`d512`. The full TOP50 needs a big‑RAM box (~tens of GB of raw bars
-  across windows, held CPU‑resident and streamed to the GPU).
-- Decision times are **DST‑correct** (`zoneinfo`); changing the build logic bumps the driver's cache version.
+A result is not reportable merely because the driver completes. At minimum:
 
----
+- every observation, universe event, and model-produced input is available by its decision time;
+- train/validation/test periods and normalization fit windows are disjoint and persisted;
+- evaluation uses the same action feasibility, execution, costs, holdings drift, and liquidation semantics as
+  training;
+- requested/executed actions, masks, reward components, equity, decisions, seeds, and selection history are
+  persisted;
+- baselines are aligned to identical dates and pay comparable costs;
+- uncertainty, multiple testing, and cost/capacity stresses are reported;
+- the test split is not used to choose a seed, checkpoint, architecture, or hyperparameter.
 
-## Glossary
+The new RL core exposes the necessary transition data but does not yet write this complete artifact. Until that
+runner exists, RL unit tests demonstrate software behavior—not investment performance.
 
-- **Block grid** — the per‑block candidate timestamps (78/day at 300 s, DST‑aware); the encoder emits a context
-  at each, and the event‑timed policy chooses which to act on.
-- **Act‑gate / trade budget** — the per‑block `g∈[0,1]` deciding whether to trade (`g·target+(1−g)·prev`), under
-  a soft per‑day cap of ~`max_actions_per_day`. Trades are **T+1** (decide at *b*, execute at *b+1*).
-- **Context** — the frozen per‑block market‑state representation (Stage 1) the policy consumes.
-- **Differentiable portfolio** — the Stage‑2 objective: maximize realized net return − turnover cost (with
-  downside/entropy/budget terms) over softmax allocation weights, rolled over each day's blocks.
-- **Reportable** — a result satisfying every point in *Safety & reportability*.
-- **CASH** — action 0; the abstention/risk‑free floor (return identically 0).
+The legacy Phase-1 verdict reports split-level `statistically_positive` diagnostics separately from its promotion
+gate. Dataset/news provenance now participates in `positive`, so a run admitted with `--allow-unreportable` is
+forced non-positive and remains development-only.
+
+## Documentation
+
+- [General RL architecture and exact current limitations](docs/general_rl_architecture.md)
+- [Deep-RL migration ledger](docs/architecture_migration_plan.md)
+- [Decision tensor and reportability protocol](docs/decision_tensor_protocol.md)
+- [Architecture decision records](docs/adr/README.md)
+- [News-model provenance protocol](docs/news_llm_covariate_protocol.md)

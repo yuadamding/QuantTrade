@@ -125,7 +125,12 @@ def strict_latest_partition_violations(
     # --skip-existing builds) makes "the latest period" ambiguous by date order alone and risks
     # train/test leakage. Fail closed. (Adjacent windows share at most a boundary, end_i <= start_{i+1},
     # so they pass.) The diagnostic names both the overlapping window and the container it overlaps.
-    spans = sorted(((label_span(label), label) for label in distinct_labels), key=lambda item: item[0])
+    parsed_spans: list[tuple[tuple[datetime, datetime], str]] = []
+    for label in distinct_labels:
+        span = label_span(label)
+        assert span is not None  # invalid labels returned above
+        parsed_spans.append((span, label))
+    spans = sorted(parsed_spans, key=lambda item: item[0])
     running_max_end: datetime | None = None
     active_label: str | None = None
     overlapping: list[str] = []
@@ -177,9 +182,9 @@ class PartitionWindow:
 class PartitionSplit:
     """A reportable train/validation/test split expressed as contiguous partition blocks."""
 
-    train: list[PartitionWindow]
-    val: list[PartitionWindow]
-    test: list[PartitionWindow]
+    train: tuple[PartitionWindow, ...]
+    val: tuple[PartitionWindow, ...]
+    test: tuple[PartitionWindow, ...]
 
 
 def partition_windows_from_labels(labels: list[str], *, complete: bool = True) -> list[PartitionWindow]:
@@ -235,4 +240,4 @@ def derive_reportable_partition_split(
     train = ordered[: -(test_count + val_count)]
     if train_window_count is not None:
         train = train[-train_window_count:]
-    return PartitionSplit(train=train, val=val, test=test)
+    return PartitionSplit(train=tuple(train), val=tuple(val), test=tuple(test))

@@ -28,6 +28,7 @@ from typing import Callable
 import torch
 import torch.utils.checkpoint
 
+from rl_quant.execution import drift_weights, force_unavailable_to_cash, one_way_turnover
 from rl_quant.training._optim import apply_lr, lr_scale
 
 CASH_INDEX = 0
@@ -46,9 +47,29 @@ def _stack(days_emb: list[dict], idx, device):
     }
 
 
-def _rollout(policy, batch, cost: float, bptt_window: int = 1, grad_checkpoint: bool = False):
+def _held_drift(weights: torch.Tensor, realized_ret: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Advance simplex weights through the realized return before the next decision.
+
+    Holding a portfolio means letting its constituents drift; carrying the pre-return target unchanged would be a
+    free rebalance at every step. Missing returns grow by zero rather than entering the denominator as NaN.
+    """
+    return drift_weights(weights, realized_ret, valid)
+
+
+def _rollout(
+    policy,
+    batch,
+    cost: float,
+    bptt_window: int = 1,
+    grad_checkpoint: bool = False,
+    terminal_liquidate: bool = True,
+):
     """Roll the policy forward over the sequence (intraday blocks OR cross-day days), carrying the previous
     position (T+1, gated holding). -> nets [B,T], gates [B,T], entropies [B,T], cash_w [B,T], turnover [B,T].
+
+    Between decisions the held allocation is marked through the realized return and renormalized, so gate=hold is
+    a true buy-and-hold ride rather than a free rebalance. By default the post-return final book is liquidated to
+    CASH and its exit turnover is charged on the final row.
 
     Credit assignment via TRUNCATED BPTT: the held position carries the autograd graph for `bptt_window` steps
     before detaching, so a position's MULTI-step returns back-propagate to the allocation/gate that set it (needed
@@ -69,29 +90,63 @@ def _rollout(policy, batch, cost: float, bptt_window: int = 1, grad_checkpoint: 
     prev_w = torch.zeros(B, A, device=per_stock.device)
     prev_w[:, CASH_INDEX] = 1.0
     ckpt = grad_checkpoint and policy.training
-    nets, gates, ents, cash_w, turn, missing_w = [], [], [], [], [], []
+    # Evaluation has no activation-retention constraint, so encode all policy raw steps in one vectorized call.
+    # DecisionPolicyHead's batched path is algebraically identical to encode_raw_policy_step for both intraday
+    # [B,A,S,F] inputs and daily [B,T,A,S,F] inputs. Lightweight test policies without that API keep the fallback.
+    raw_sequence = None
+    if not policy.training and hasattr(policy, "encode_raw_policy_context"):
+        raw_sequence = policy.encode_raw_policy_context(batch["bars"], batch["bar_mask"], nB)
+    nets, gates, ents, cash_w, turn, missing_w, post_weights = [], [], [], [], [], [], []
+    final_weights = prev_w
     for b in range(nB):
-        if ckpt:
+        if raw_sequence is not None:
+            raw_ctx = raw_sequence[:, b]
+        elif ckpt:
             raw_ctx = torch.utils.checkpoint.checkpoint(
                 policy.encode_raw_policy_step, batch["bars"], batch["bar_mask"], b, use_reentrant=False)
         else:
             raw_ctx = policy.encode_raw_policy_step(batch["bars"], batch["bar_mask"], b)
+        before_trade = prev_w
+        feasible_prev = force_unavailable_to_cash(before_trade, avail[:, b], cash_index=CASH_INDEX)
         w, g = policy(market[:, b], per_stock[:, b], raw_ctx, news_raw[:, b], news_mask[:, b],
-                      prev_w.detach(), avail[:, b])
-        a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * prev_w   # carry WITH grad (truncated below) -> T+1
+                      feasible_prev.detach(), avail[:, b])
+        a = g.unsqueeze(-1) * w + (1.0 - g.unsqueeze(-1)) * feasible_prev  # carry WITH grad -> T+1
         valid = ret_valid[:, b].bool()
         missing = (a * (~valid).to(a.dtype)).sum(-1)
         realized = (a * torch.where(valid, ret[:, b], torch.zeros_like(ret[:, b]))).sum(-1)
-        turnover = 0.5 * (a - prev_w).abs().sum(-1)
+        turnover = one_way_turnover(a, before_trade)
         nets.append(realized - cost * turnover)
         gates.append(g)
-        ents.append(-(w * w.clamp_min(1e-9).log()).sum(-1))      # allocation entropy (masked actions contribute 0)
+        entropy = -(w * w.clamp_min(1e-9).log()).sum(-1)
+        entropy_scale = avail[:, b].sum(-1).clamp_min(2).to(w.dtype).log()
+        ents.append(entropy / entropy_scale)                    # normalized [0,1], invariant to universe width
         cash_w.append(a[:, CASH_INDEX])
         turn.append(turnover)
         missing_w.append(missing)
-        prev_w = a.detach() if (bptt_window <= 1 or (b + 1) % bptt_window == 0) else a   # truncation boundary
+        # The next decision sees the post-return book. Without this mark-to-market drift, gate=hold silently
+        # rebalances back to ``a`` for free and understates subsequent turnover.
+        final_weights = _held_drift(a, ret[:, b], valid)
+        post_weights.append(final_weights)
+        prev_w = (final_weights.detach()
+                  if (bptt_window <= 1 or (b + 1) % bptt_window == 0) else final_weights)  # truncation boundary
     st = lambda xs: torch.stack(xs, 1)  # noqa: E731
-    return st(nets), st(gates), st(ents), st(cash_w), st(turn), st(missing_w)
+    nets_t, turn_t = st(nets), st(turn)
+    if terminal_liquidate and nets:
+        # Intraday caches can contain an unlabeled tail after their final executable return. Liquidate the book
+        # immediately after each sample's last non-CASH label, then place that charge on the same scored row.
+        label = ret_valid[:, :, 1:].bool().any(-1)
+        has_label = label.any(-1)
+        steps = torch.arange(nB, device=label.device).view(1, nB)
+        last_index = torch.where(label, steps, torch.full_like(steps, -1)).amax(-1)
+        post = st(post_weights)
+        selected = post[torch.arange(B, device=post.device), last_index.clamp_min(0)]
+        cash = torch.zeros_like(selected)
+        cash[:, CASH_INDEX] = 1.0
+        liquidation_turnover = one_way_turnover(selected, cash) * has_label.to(selected.dtype)
+        charge_row = (steps == last_index.unsqueeze(1)).to(selected.dtype) * liquidation_turnover.unsqueeze(1)
+        nets_t = nets_t - cost * charge_row
+        turn_t = turn_t + charge_row
+    return nets_t, st(gates), st(ents), st(cash_w), turn_t, st(missing_w)
 
 
 def _loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef, max_actions, budget_lambda,
@@ -99,7 +154,7 @@ def _loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef, max_ac
     lm = label.float()
     denom = lm.sum(1).clamp_min(1.0)
     mean_net = (nets * lm).sum(1) / denom
-    downside = (torch.clamp(nets, max=0.0) ** 2 * lm).sum(1) / denom
+    downside = (((torch.clamp(nets, max=0.0) ** 2 * lm).sum(1) / denom).clamp_min(0.0) + 1e-12).sqrt()
     mean_ent = (ents * lm).sum(1) / denom
     missing_pen = (missing_w * lm).sum(1) / denom
     target_rate = max_actions / gates.shape[1]                               # trades/day cap as a per-block RATE
@@ -178,6 +233,7 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
     """
     policy.eval()
     rows = []
+    decision_ids: list[str] = []
     total_blocks = 0
     label_blocks = 0
     reportable_blocks = 0
@@ -201,6 +257,14 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
             cash_values.append(cash_w[reportable].detach().cpu())
             gate_values.append(gates[reportable].detach().cpu())
         rows += nets[reportable].cpu().tolist()
+        reportable_cpu = reportable.detach().cpu()
+        group = days_emb[i:min(i + batch_days, len(days_emb))]
+        for local_index, day in enumerate(group):
+            date = str(day.get("date", f"day_{i + local_index}"))
+            decision_ids.extend(
+                f"{date}:step_{step}" for step in range(reportable.shape[1])
+                if bool(reportable_cpu[local_index, step])
+            )
     def mean_or_zero(xs: list[torch.Tensor]) -> float:
         return float(torch.cat(xs).mean()) if xs else 0.0
 
@@ -218,6 +282,7 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
         "mean_cash_weight": mean_or_zero(cash_values),
         "mean_gate": mean_or_zero(gate_values),
         "mean_missing_label_weight": mean_missing,
+        "decision_ids": decision_ids,
     }
     return rows, stats
 

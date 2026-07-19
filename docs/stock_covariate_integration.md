@@ -1,5 +1,12 @@
 # Stock Covariate Data And Framework Integration
 
+> **Archive notice (2026-07).** This document was written for the removed second-context/hourly stack and contains
+> historical paths and migration proposals. The active raw Phase-1 organizer now performs per-field point-in-time
+> covariate carry in `rl_quant.datasets.raw_window`, emits `cov_valid_blocks`, and calibrates masked fixed
+> normalization on training data only. The current architecture and remaining gaps are documented in
+> [general_rl_architecture.md](general_rl_architecture.md). Treat the details below as source-data history, not a
+> description of the active model interface.
+
 This document describes the newly downloaded Polygon stock-specific covariates,
 their time structure, and the work required before they can be used safely by
 the QuantTrade RL framework.
