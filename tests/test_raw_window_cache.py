@@ -4,6 +4,7 @@ from dataclasses import replace
 import os
 from pathlib import Path
 
+import rl_quant.datasets.raw_window as raw_window_module
 from rl_quant.datasets.raw_window import (
     RAW_WINDOW_CACHE_VERSION,
     RawWindowConfig,
@@ -146,10 +147,10 @@ def test_atomic_same_size_replacement_is_detected_without_content_hashing(
     assert after != before
 
 
-def test_cache_key_covers_version_config_universe_and_source(tmp_path: Path) -> None:
+def test_cache_key_covers_version_config_universe_schedule_and_source(tmp_path: Path, monkeypatch) -> None:
     _dataset(tmp_path)
     cfg = RawWindowConfig()
-    assert cfg.cache_version == RAW_WINDOW_CACHE_VERSION == 10
+    assert cfg.cache_version == RAW_WINDOW_CACHE_VERSION == 11
     base = raw_window_cache_key(tmp_path, W2, cfg, universe_signature="CASH|AAA")
     assert f"_v{RAW_WINDOW_CACHE_VERSION}_" in base
 
@@ -166,6 +167,14 @@ def test_cache_key_covers_version_config_universe_and_source(tmp_path: Path) -> 
         replace(cfg, cache_version=RAW_WINDOW_CACHE_VERSION + 1),
         universe_signature="CASH|AAA",
     ) != base
+    audited_schedule = raw_window_module.XNYS_EARLY_CLOSE_DATES_2022_2026
+    monkeypatch.setattr(
+        raw_window_module,
+        "XNYS_EARLY_CLOSE_DATES_2022_2026",
+        (*audited_schedule, "2027-11-26"),
+    )
+    assert raw_window_cache_key(tmp_path, W2, cfg, universe_signature="CASH|AAA") != base
+    monkeypatch.setattr(raw_window_module, "XNYS_EARLY_CLOSE_DATES_2022_2026", audited_schedule)
 
     (tmp_path / "universe_membership.parquet").write_bytes(b"new-membership-events")
     assert raw_window_cache_key(tmp_path, W2, cfg, universe_signature="CASH|AAA") != base

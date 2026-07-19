@@ -100,7 +100,8 @@ class Phase1Design:
     #                                   episode_len): training episodes are episode_len long, and eval bounds its
     #                                   rolling temporal window to episode_len to match (the position CARRY can still
     #                                   hold longer -- continuous eval rides positions across windows).
-    exec_delay: int = 1               # daily_raw: execution delay in DAYS (decide EOD d, execute close d+exec_delay)
+    exec_delay: int = 1               # daily_raw: exactly one day. Its two-book rollout models one pending target
+    #                                   (decide EOD d, execute close d+1); longer delays need an explicit order queue.
     raw_norm: str = "level"           # daily_raw full-day raw input norm: "level" preserves intraday RETURN
     #                                   magnitude (the cross-sectional signal); "instance" whitens it away (legacy)
     context_storage_dtype: str = "float32"  # frozen EOD context kept between stages; bfloat16 is an explicit
@@ -151,6 +152,10 @@ class Phase1Design:
             raise ValueError(f"{self.name}: context_storage_dtype must be 'float32' or 'bfloat16'")
         if self.label_horizon_days < 1 or self.daily_lookback < 1 or self.exec_delay < 1:
             raise ValueError(f"{self.name}: need label_horizon_days>=1, daily_lookback>=1, exec_delay>=1")
+        if self.horizon_mode == "daily_raw" and self.exec_delay != 1:
+            raise ValueError(
+                f"{self.name}: daily_raw supports exec_delay=1 only; longer delays require a pending-order queue"
+            )
         if self.episode_len <= 1:
             raise ValueError(f"{self.name}: episode_len must be > 1")
         if self.raw_recent_days < 0 or self.raw_recent_days > self.episode_len:
@@ -599,6 +604,15 @@ _TOP2000_H100_VARIANTS = [
         name="top2000_h100_actions52",
         note="TOP2000 turnover-budget ablation: 52 target reallocations per 252d episode",
         max_actions_per_day=52.0,
+    ),
+    # Net return already charges one-way turnover. Put the cost-only control in
+    # the core screen so the scheduler tests the objective-aligned alternative
+    # before secondary concentration sensitivities.
+    replace(
+        _top2000_h100_base,
+        name="top2000_h100_budget0",
+        note="TOP2000 turnover-control ablation: transaction cost only (no soft gate-rate penalty)",
+        budget_lambda=0.0,
     ),
     replace(
         _top2000_h100_base,

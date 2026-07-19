@@ -48,12 +48,34 @@ NEWS_RAW_DIM = 1  # raw fields kept per news article (the qwen3 sentiment_score)
 MAX_NEWS = 32     # most-recent articles kept per (stock, decision); the model aggregates them at train time
 NEWS_SENTIMENT_RANGE = (-1.0, 1.0)
 
+# Audited XNYS 13:00 ET closes inside the checked-in TOP50/TOP2000 sample
+# (2022-01-03 through 2026-06-23), plus the already-published remainder of
+# 2026.  Keep this table explicit: an approximate weekday/holiday algorithm is
+# not an acceptable source of execution timestamps.  A future data extension
+# must append dates from the venue calendar before it can claim the same
+# session-close contract.
+XNYS_EARLY_CLOSE_DATES_2022_2026 = (
+    "2022-11-25",
+    "2023-07-03",
+    "2023-11-24",
+    "2024-07-03",
+    "2024-11-29",
+    "2024-12-24",
+    "2025-07-03",
+    "2025-11-28",
+    "2025-12-24",
+    "2026-11-27",
+    "2026-12-24",
+)
+XNYS_AUDITED_CALENDAR_START = "2022-01-01"
+XNYS_AUDITED_CALENDAR_END = "2026-12-31"
+
 # One canonical version for the raw-window payload and cache identity.  Bump
 # whenever tensor semantics or the cache dependency contract changes.  Version
-# 10 preserves the v9 dependency contract and adds fail-closed validation for
-# every model-facing news row, so caches built with silent neutral defaults are
-# never reused.
-RAW_WINDOW_CACHE_VERSION = 10
+# 11 makes the session end calendar-aware, removes post-close bars/features,
+# and requires a fresh completed regular-session aggregate. Older caches can
+# therefore never retain a stale daily mark or half-day extended-hours data.
+RAW_WINDOW_CACHE_VERSION = 11
 
 
 @dataclass
@@ -70,6 +92,7 @@ class RawWindowConfig:
     max_news: int = MAX_NEWS
     open_et_hhmm: tuple[int, int] = (9, 30)
     exec_latency_ms: int = 1000
+    close_recency_seconds: int = 300  # EOD proxy must print in the final five minutes before the session boundary
     cache_version: int = RAW_WINDOW_CACHE_VERSION
     use_news: bool = False        # opt-in research input; current scored-news artifacts are not PIT reportable
     cov_carry_days: int = 400     # as-of covariates CARRY from prior windows up to this many calendar days back
@@ -82,6 +105,12 @@ class RawWindowConfig:
     def __post_init__(self) -> None:
         if isinstance(self.cache_version, bool) or not isinstance(self.cache_version, int) or self.cache_version <= 0:
             raise ValueError("cache_version must be a positive integer")
+        if (
+            isinstance(self.close_recency_seconds, bool)
+            or not isinstance(self.close_recency_seconds, int)
+            or self.close_recency_seconds <= 0
+        ):
+            raise ValueError("close_recency_seconds must be a positive integer")
 
 
 def raw_window_dependency_paths(root: str | Path, window: str, cfg: RawWindowConfig) -> tuple[Path, ...]:
@@ -162,6 +191,12 @@ def _cache_config_signature(cfg: RawWindowConfig) -> str:
         "max_news": cfg.max_news,
         "open_et_hhmm": cfg.open_et_hhmm,
         "exec_latency_ms": cfg.exec_latency_ms,
+        "close_recency_seconds": cfg.close_recency_seconds,
+        # Treat the audited venue schedule as part of tensor semantics, so
+        # extending/correcting the table invalidates affected cache identities
+        # even if a maintainer forgets to bump the coarse cache version.
+        "xnys_early_close_dates": XNYS_EARLY_CLOSE_DATES_2022_2026,
+        "xnys_audited_calendar_bounds": (XNYS_AUDITED_CALENDAR_START, XNYS_AUDITED_CALENDAR_END),
         "use_news": cfg.use_news,
         "cov_carry_days": cfg.cov_carry_days,
         "bar_fields": cfg.bar_fields,
@@ -473,6 +508,32 @@ def _open_ms(date_iso: str, cfg: RawWindowConfig) -> int:
                            tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 
+def _session_end_ms(date_iso: str, cfg: RawWindowConfig) -> int:
+    """Official session end for the audited XNYS sample, in UTC milliseconds.
+
+    ``session_seconds`` remains the tensor/grid capacity.  On an audited
+    13:00-ET half day the effective session is shorter; ``min`` preserves
+    intentionally short synthetic/custom grids without extending them.
+    """
+
+    open_ms = _open_ms(date_iso, cfg)
+    if not XNYS_AUDITED_CALENDAR_START <= date_iso <= XNYS_AUDITED_CALENDAR_END:
+        raise ValueError(
+            "audited XNYS calendar covers only "
+            f"{XNYS_AUDITED_CALENDAR_START} through {XNYS_AUDITED_CALENDAR_END}; got {date_iso}. "
+            "Extend the versioned venue schedule before building this date."
+        )
+    nominal_end = open_ms + cfg.session_seconds * 1000
+    if date_iso not in XNYS_EARLY_CLOSE_DATES_2022_2026:
+        return nominal_end
+    off = _et_offset_hours(date_iso)
+    year, month, day = map(int, date_iso.split("-"))
+    early_end = int(
+        dt.datetime(year, month, day, 13 - off, 0, tzinfo=dt.timezone.utc).timestamp() * 1000
+    )
+    return min(nominal_end, early_end)
+
+
 def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_actions: int,
                  cfg: RawWindowConfig) -> dict | None:
     """BLOCK-ALIGNED organizer. One full RTH session per trading day is stored session-aligned (index s = second
@@ -495,7 +556,13 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     Dd, A, F, M, NC = len(days), n_actions, len(cfg.bar_fields), cfg.max_news, len(cfg.cov_fields)
     day_idx = {d: i for i, d in enumerate(days)}
     open_ms = np.array([_open_ms(d, cfg) for d in days], dtype=np.int64)              # [Dd]
+    session_end = np.array([_session_end_ms(d, cfg) for d in days], dtype=np.int64)   # [Dd], early-close aware
     block_end = open_ms[:, None] + (np.arange(1, nB + 1) * cfg.block_seconds * 1000)  # [Dd,nB] block-b end (ms)
+    # Cap every PIT join at the official session boundary. The fixed-size tensor remains
+    # 78 blocks on a half day, but its post-close suffix can neither reveal
+    # news/covariates/membership events nor introduce extended-hours bars.
+    effective_block_end = np.minimum(block_end, session_end[:, None])
+    session_close_block = ((session_end - open_ms - 1) // (cfg.block_seconds * 1000)).astype(np.int64)
     lat = cfg.exec_latency_ms
 
     bars_t = np.zeros((Dd, A, S, F), dtype=np.float32)
@@ -521,7 +588,7 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     b_sym = np.array([stock_to_idx.get(s, -1) for s in bars["symbol"]], dtype=np.int64)
     b_day = np.array([day_idx[d] for d in bars["date_exchange"]], dtype=np.int64)
     b_soff = (ts - open_ms[b_day]) // (1000 * gs)
-    ok = (b_sym >= 1) & (b_soff >= 0) & (b_soff < S)
+    ok = (b_sym >= 1) & (b_soff >= 0) & (b_soff < S) & (ts < session_end[b_day])
     ohlcv = np.stack([bars[f].astype(np.float32) for f in cfg.bar_fields], axis=1)    # [N,F]
     if gs == 1:
         bars_t[b_day[ok], b_sym[ok], b_soff[ok]] = ohlcv[ok]
@@ -592,7 +659,7 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
         ], dtype=np.float32)
         no = np.lexsort((nav, nt))
         nt, nav, nsent = nt[no], nav[no], nsent[no]
-    flat_block_end = block_end.reshape(-1)
+    flat_block_end = effective_block_end.reshape(-1)
     for ai in range(1, A):
         # ``sym_s`` is symbol-major.  Binary-searching its contiguous slice
         # avoids scanning every raw row once per action (the old O(A * rows)
@@ -638,9 +705,8 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
             ei_safe = np.minimum(ei, len(a_ts) - 1)
             xi_safe = np.minimum(xi, len(a_ts) - 1)
             entry_px, exit_px = a_close[ei_safe], a_close[xi_safe]
-            day_end = open_ms[:, None] + cfg.session_seconds * 1000
             good = (in_bounds & (entry_px > 0)
-                    & (a_ts[ei_safe] < day_end) & (a_ts[xi_safe] < day_end)
+                    & (a_ts[ei_safe] < session_end[:, None]) & (a_ts[xi_safe] < session_end[:, None])
                     & (a_ts[ei_safe] - entry_target <= cfg.block_seconds * 1000)
                     & (a_ts[xi_safe] - exit_target <= cfg.block_seconds * 1000))
             ratio = np.divide(exit_px, entry_px, out=np.zeros_like(exit_px), where=entry_px > 0) - 1.0
@@ -650,7 +716,7 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
 
         for d in range(Dd):
             for b in range(nB):
-                te = int(block_end[d, b])
+                te = int(effective_block_end[d, b])
                 if nav_a is not None and nse_a is not None:          # RAW news available by block-b end
                     k = int(np.searchsorted(nav_a, te, "right"))
                     if k > 0:
@@ -661,6 +727,20 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
                         news_raw[d, b, ai, :kk, 0] = take
                         news_mask[d, b, ai, :kk] = True
 
+    block_number = np.arange(nB, dtype=np.int64)[None, :]
+    close_block = block_number == session_close_block[:, None]
+    post_close = block_number > session_close_block[:, None]
+    # The fixed 78-block shape is retained for batching, but a half-day's
+    # padded suffix is not a sequence of repeated 13:00 observations.  Keeping
+    # those repeats would overweight half-day covariates in normalization and
+    # expose synthetic policy steps. The declared session-close block itself remains.
+    covt[post_close] = 0.0
+    cov_valid[post_close] = False
+    ret_valid[post_close] = False
+    if news_raw is not None and news_mask is not None:
+        news_raw[post_close] = 0.0
+        news_mask[post_close] = False
+
     # per-stock day-OPEN price (first valid bar's open) -- the cross-day (daily, open-to-open) execution price
     fv = bar_mask.argmax(axis=2)                                  # [Dd,A] first valid second (0 if none)
     has = bar_mask.any(axis=2)                                    # [Dd,A]
@@ -669,7 +749,22 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
     # per-stock day-CLOSE price (LAST valid bar's close) -- the close-to-close (daily_raw) execution price.
     lv = (bar_mask.shape[2] - 1) - np.argmax(bar_mask[:, :, ::-1], axis=2)   # [Dd,A] last valid second (S-1 if none)
     closes = np.take_along_axis(bars_t[:, :, :, 3], lv[:, :, None], axis=2)[:, :, 0]   # field 3 = close
-    day_close = np.where(has, closes, np.nan).astype(np.float32)  # [Dd,A] (NaN where the stock has no bars that day)
+    # A daily close proxy is usable only when its final COMPLETED regular-session
+    # aggregate is fresh relative to the official session boundary. Polygon
+    # aggregate timestamps denote window starts, so the source's RTH contract is
+    # half-open and a row exactly at 16:00/13:00 remains excluded. This proxy is
+    # not a condition-qualified official auction close. Merely trading once in
+    # the morning is not enough, and a half-day post-boundary row cannot rescue
+    # a stale mark because those rows were excluded by ``ok``.
+    last_trade_ms = np.full((Dd, A), -1, dtype=np.int64)
+    np.maximum.at(last_trade_ms, (b_day[ok], b_sym[ok]), ts[ok])
+    close_valid = (
+        has
+        & (last_trade_ms >= session_end[:, None] - cfg.close_recency_seconds * 1000)
+        & np.isfinite(closes)
+        & (closes > 0)
+    )
+    day_close = np.where(close_valid, closes, np.nan).astype(np.float32)
 
     # As-of AVAILABILITY: a stock must both have traded by the block end and belong to the universe according to
     # an event that was available by that time.  Datasets without a membership event table retain the historical
@@ -692,9 +787,20 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
         root,
         [date for date in days for _ in range(nB)],
         actions,
-        block_end.reshape(-1),
+        effective_block_end.reshape(-1),
     ).reshape(Dd, nB, A)
     avail &= member
+    # At the close (and in the fixed-grid suffix after an early close), policy
+    # tradeability additionally requires a fresh pre-boundary close proxy. This
+    # keeps ``avail`` aligned with daily label validity instead of advertising
+    # an asset whose last price may be hours old.
+    close_eligible = close_valid[:, None, :] & member
+    avail = np.where(
+        close_block[:, :, None],
+        close_eligible,
+        avail,
+    )
+    avail = np.where(post_close[:, :, None], False, avail)
     avail[:, :, 0] = True                                                         # CASH always available
 
     if news_raw is None or news_mask is None:
@@ -711,6 +817,8 @@ def build_window(root: Path, window: str, stock_to_idx: dict[str, int], n_action
         "avail": torch.from_numpy(avail),
         "universe_member": torch.from_numpy(member),
         "ret": torch.from_numpy(ret), "ret_valid": torch.from_numpy(ret_valid),
-        "day_open": torch.from_numpy(day_open), "day_close": torch.from_numpy(day_close), "dates": days,
+        "day_open": torch.from_numpy(day_open), "day_close": torch.from_numpy(day_close),
+        "day_close_valid": torch.from_numpy(close_valid),
+        "session_close_block": torch.from_numpy(session_close_block), "dates": days,
         "window": window, "n_days": Dd, "n_blocks": nB,
     }

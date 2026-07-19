@@ -36,7 +36,7 @@ def _compact_detached(value: torch.Tensor) -> torch.Tensor:
     return value.clone(memory_format=torch.contiguous_format)
 
 
-def _owned_eod(value: torch.Tensor, full_ndim: int, key: str) -> torch.Tensor:
+def _owned_eod(value: torch.Tensor, full_ndim: int, key: str, block_index: int = -1) -> torch.Tensor:
     """Accept a full ``[n_blocks, ...]`` field or an already-EOD field.
 
     A full block tensor must be compacted immediately.  An already-EOD tensor
@@ -46,7 +46,11 @@ def _owned_eod(value: torch.Tensor, full_ndim: int, key: str) -> torch.Tensor:
     second copy of the same chronology.
     """
     if value.ndim == full_ndim:
-        return value[-1].detach().contiguous().clone()
+        if not -value.shape[0] <= block_index < value.shape[0]:
+            raise ValueError(
+                f"daily field {key!r} close block {block_index} is outside {value.shape[0]} blocks"
+            )
+        return value[block_index].detach().contiguous().clone()
     elif value.ndim != full_ndim - 1:
         raise ValueError(
             f"daily field {key!r} must have {full_ndim} dims (per-block) or {full_ndim - 1} dims (EOD); "
@@ -97,15 +101,18 @@ def to_daily_raw_records(encoded: list) -> list[dict]:
         return []
     recs = []
     for e in encoded:
+        close_block = int(e["session_close_block"]) if "session_close_block" in e else -1
         r = {
             "date": e["date"],
             "day_close": _compact_detached(e["day_close"]),
-            "avail": _owned_eod(e["avail"], 2, "avail"),
-            "market": _owned_eod(e["market"], 2, "market"),
-            "per_stock": _owned_eod(e["per_stock"], 3, "per_stock"),
-            "news_raw": _owned_eod(e["news_raw"], 4, "news_raw"),
-            "news_mask": _owned_eod(e["news_mask"], 3, "news_mask"),
+            "avail": _owned_eod(e["avail"], 2, "avail", close_block),
+            "market": _owned_eod(e["market"], 2, "market", close_block),
+            "per_stock": _owned_eod(e["per_stock"], 3, "per_stock", close_block),
+            "news_raw": _owned_eod(e["news_raw"], 4, "news_raw", close_block),
+            "news_mask": _owned_eod(e["news_mask"], 3, "news_mask", close_block),
         }
+        if "day_close_valid" in e:
+            r["day_close_valid"] = _compact_detached(e["day_close_valid"])
         if isinstance(e, LazyDay):                              # streaming: keep full-day bars lazy via the handle
             r["_bars_day"] = e.raw_handle()                     # context overrides must not pin full storage
         else:
@@ -213,6 +220,16 @@ def build_daily_raw_episodes(
     if N < exec_delay + 2:
         return []
     day_close = torch.stack([r["day_close"] for r in records])   # [N,A]
+    have_close_valid = ["day_close_valid" in record for record in records]
+    if any(have_close_valid) and not all(have_close_valid):
+        raise ValueError("daily records cannot mix explicit and implicit day_close_valid semantics")
+    if all(have_close_valid):
+        day_close_valid = torch.stack([r["day_close_valid"] for r in records]).bool()
+        if day_close_valid.shape != day_close.shape:
+            raise ValueError(
+                f"day_close_valid shape {tuple(day_close_valid.shape)} must match day_close {tuple(day_close.shape)}"
+            )
+        day_close = day_close.masked_fill(~day_close_valid, float("nan"))
     aux_ret, aux_valid = horizon_close_returns(day_close, horizon, exec_delay)     # optional H-day forecast target
     ret, valid = horizon_close_returns(day_close, 1, exec_delay)                   # canonical 1-day MDP transition
     # PAST-return INPUT channel (PIT-clean): day d carries its OWN 1-day close-to-close return close_d/close_{d-1}-1,

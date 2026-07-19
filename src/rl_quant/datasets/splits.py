@@ -15,7 +15,7 @@ from rl_quant.datasets.streaming import LazyDay, LazyWindow
 # the per-day fields carried out of a built window (everything build_window stores with a leading n_days axis)
 _DAY_KEYS = ("bars", "bar_mask", "cov_blocks", "cov_valid_blocks", "news_raw", "news_mask", "avail",
              "universe_member", "ret", "ret_valid",
-             "day_open", "day_close")
+             "day_open", "day_close", "day_close_valid", "session_close_block")
 
 
 def flatten_days(windows: list) -> list[Any]:

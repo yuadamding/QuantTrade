@@ -58,6 +58,8 @@ def _encoded_day(*, days: int = 1, blocks: int = 4, actions: int = 3, steps: int
         "ret_valid": torch.ones(blocks, actions, dtype=torch.bool),
         "day_open": torch.ones(actions),
         "day_close": torch.arange(actions, dtype=torch.float32) + 10.0,
+        "day_close_valid": torch.ones(actions, dtype=torch.bool),
+        "session_close_block": torch.tensor(blocks - 1),
     }
 
 

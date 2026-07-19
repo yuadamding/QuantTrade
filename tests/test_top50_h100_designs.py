@@ -1,7 +1,9 @@
 """Exact contracts for the exploratory TOP50/TOP2000 H100 screening matrices."""
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
+
+import pytest
 
 from rl_quant.training import (
     DESIGNS,
@@ -47,9 +49,10 @@ TOP2000_CORE = (
     "top2000_h100_actions26",
     "top2000_h100_actions5",
     "top2000_h100_actions52",
-    "top2000_h100_cap005",
+    "top2000_h100_budget0",
 )
 TOP2000_WIDE = TOP2000_CORE + (
+    "top2000_h100_cap005",
     "top2000_h100_raw21",
     "top2000_h100_raw84",
     "top2000_h100_cap02",
@@ -216,7 +219,7 @@ def test_top2000_membership_order_and_base_geometry_are_exact() -> None:
     assert tuple(TOP2000_H100_CORE_SWEEP) == TOP2000_CORE
     assert tuple(TOP2000_H100_WIDE_SWEEP) == TOP2000_WIDE
     assert tuple(SWEEP) == TOP2000_WIDE
-    assert len(TOP2000_WIDE) == len(set(TOP2000_WIDE)) == 26
+    assert len(TOP2000_WIDE) == len(set(TOP2000_WIDE)) == 27
 
     design = DESIGNS["daily_raw_top2000"]
 
@@ -233,6 +236,11 @@ def test_top2000_membership_order_and_base_geometry_are_exact() -> None:
     assert design.context_storage_dtype == "bfloat16"
     assert (design.enc_stock_chunk, design.raw_stock_chunk) == (640, 1024)
     assert design.min_gpus == 4
+
+
+def test_daily_raw_rejects_delays_without_a_pending_order_queue() -> None:
+    with pytest.raises(ValueError, match=r"daily_raw supports exec_delay=1 only"):
+        replace(DESIGNS["daily_raw_top2000"], name="unsupported_delay", exec_delay=2)
 
 
 def test_top2000_wide_ablations_change_only_declared_fields() -> None:
@@ -260,6 +268,7 @@ def test_top2000_wide_ablations_change_only_declared_fields() -> None:
         "top2000_h100_actions5": {"max_actions_per_day": 5.0},
         "top2000_h100_actions52": {"max_actions_per_day": 52.0},
         "top2000_h100_cap005": {"max_stock_weight": 0.005},
+        "top2000_h100_budget0": {"budget_lambda": 0.0},
         "top2000_h100_raw21": {"raw_recent_days": 21},
         "top2000_h100_raw84": {"raw_recent_days": 84},
         "top2000_h100_cap02": {"max_stock_weight": 0.02},

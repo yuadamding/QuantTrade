@@ -241,6 +241,7 @@ class ContextEncoder(nn.Module):
 
     pos1: torch.Tensor
     pos2: torch.Tensor
+    supports_last_only = True
 
     def __init__(self, config: ContextEncoderConfig) -> None:
         super().__init__()
@@ -341,12 +342,18 @@ class ContextEncoder(nn.Module):
         bar_mask: torch.Tensor,
         cov_blocks: torch.Tensor,
         cov_valid: torch.Tensor | None = None,
+        *,
+        last_only: bool = False,
+        last_block_index: torch.Tensor | None = None,
     ):
         """Encode a full session per (batch) day -> a context at EVERY 5-min block (causal). The decision at
         block b uses only blocks 0..b (no look-ahead). bars [B,A,S,F] RAW (session-aligned: index s = second s
         after the 09:30 open), bar_mask [B,A,S], cov_blocks [B,nB,A,C] (as-of covariates at each block).
         -> per_stock [B,nB,A,d], market [B,nB,d]. `stock_chunk>0` processes the (weight-shared) stock axis in
-        chunks -- bit-identical, bounded activation memory (huge universes)."""
+        chunks -- bit-identical, bounded activation memory (huge universes). ``last_only=True`` returns one selected
+        context per day with a length-one block axis while avoiding retained/fused outputs for other blocks;
+        ``last_block_index`` selects the declared session-close block (and defaults to the final grid block). This is the
+        frozen daily EOD encode path, not the full-sequence Stage-1 training path."""
         B, A, S, F = bars.shape
         bl = self.block_seconds
         nB = S // bl
@@ -356,6 +363,16 @@ class ContextEncoder(nn.Module):
             bar_mask = torch.nn.functional.pad(bar_mask, (0, pad))
             S = bars.shape[2]
             nB = S // bl
+        if last_block_index is not None and not last_only:
+            raise ValueError("last_block_index is only valid with last_only=True")
+        if last_block_index is None:
+            selected_blocks = torch.full((B,), nB - 1, dtype=torch.long, device=bars.device)
+        else:
+            if last_block_index.ndim != 1 or last_block_index.shape[0] != B:
+                raise ValueError(f"last_block_index must have shape [{B}], got {tuple(last_block_index.shape)}")
+            selected_blocks = last_block_index.to(device=bars.device, dtype=torch.long)
+            if bool(((selected_blocks < 0) | (selected_blocks >= nB)).any()):
+                raise ValueError(f"last_block_index values must be in [0, {nB - 1}]")
         # Fixed-stat normalization on RAW valid bars. Statistics come only from explicit TRAINING calibration;
         # this read-only transform is identical in train/eval and independent of future/session-peer observations.
         flat = bars.reshape(-1, F)
@@ -371,19 +388,47 @@ class ContextEncoder(nn.Module):
             if ck < A and self.grad_checkpoint and self.training and torch.is_grad_enabled():
                 # chunk-level checkpoint: backward recomputes ONE chunk's tier-1/tier-2 at a time; only the small
                 # normalized-bars slice is saved (the inner per-block checkpoints engage during the recompute).
-                bb, sn = torch.utils.checkpoint.checkpoint(self._stock_blocks, nc, mc, use_reentrant=False)
+                stock_path = (
+                    self._stock_blocks
+                    if not last_only
+                    else lambda values, valid: self._stock_blocks(
+                        values, valid, last_only=True, last_block_index=selected_blocks
+                    )
+                )
+                bb, sn = torch.utils.checkpoint.checkpoint(stock_path, nc, mc, use_reentrant=False)
             else:
-                bb, sn = self._stock_blocks(nc, mc)
+                bb, sn = self._stock_blocks(
+                    nc,
+                    mc,
+                    last_only=last_only,
+                    last_block_index=selected_blocks if last_only else None,
+                )
             outs.append(bb)
             seens.append(sn)
         bar_blocks = torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]      # [B, nB, A, d]
         seen = torch.cat(seens, dim=2) if len(seens) > 1 else seens[0]         # [B, nB, A, 1]
-        return self._fuse_market(bar_blocks, seen, cov_blocks, nB, cov_valid)
+        if last_only:
+            cov_index = selected_blocks[:, None, None, None].expand(-1, 1, cov_blocks.shape[2], cov_blocks.shape[3])
+            cov_blocks = torch.gather(cov_blocks[:, :nB], 1, cov_index)
+            if cov_valid is not None:
+                valid_index = selected_blocks.reshape(B, 1, *([1] * (cov_valid.ndim - 2))).expand(
+                    -1, 1, *cov_valid.shape[2:]
+                )
+                cov_valid = torch.gather(cov_valid[:, :nB], 1, valid_index)
+        return self._fuse_market(bar_blocks, seen, cov_blocks, bar_blocks.shape[1], cov_valid)
 
-    def _stock_blocks(self, normed: torch.Tensor, bar_mask: torch.Tensor):
+    def _stock_blocks(
+        self,
+        normed: torch.Tensor,
+        bar_mask: torch.Tensor,
+        *,
+        last_only: bool = False,
+        last_block_index: torch.Tensor | None = None,
+    ):
         """Per-stock bars path for one stock chunk: embed + tier-1 + tier-2. normed [B,Ac,S,F] (ALREADY
         bar-normalized -- fixed normalization stays outside the chunk loop), bar_mask [B,Ac,S] ->
-        (bar_blocks [B,nB,Ac,d], seen [B,nB,Ac,1])."""
+        (bar_blocks [B,nB,Ac,d], seen [B,nB,Ac,1]). With ``last_only``, the returned block axis has length one and
+        owns compact storage rather than retaining the full tier-2 output behind an EOD view."""
         B, A, S, F = normed.shape
         d = self.d_model
         bl = self.block_seconds
@@ -444,6 +489,24 @@ class ContextEncoder(nn.Module):
         h = summ + self.pos2[:nB].to(dtype=summ.dtype).unsqueeze(0)
         for blk in self.tier2:
             h = blk(h, ~block_has)
+        if last_only:
+            # LayerNorm is token-local, so normalizing only the consumed final
+            # token is exactly equivalent to slicing the full normalized
+            # output. Reshape/copy it into compact EOD storage before the next
+            # stock chunk is processed.
+            selected = (
+                torch.full((B,), nB - 1, dtype=torch.long, device=h.device)
+                if last_block_index is None
+                else last_block_index.to(device=h.device, dtype=torch.long)
+            )
+            flat_selected = selected[:, None].expand(B, A).reshape(-1)
+            rows = torch.arange(B * A, device=h.device)
+            final = self.norm2(h[rows, flat_selected]).to(dtype=h.dtype)
+            bar_blocks = final.reshape(B, A, d).unsqueeze(1).contiguous()
+            seen_blocks = block_has.to(torch.int8).cummax(dim=1).values.bool()
+            seen = seen_blocks[rows, flat_selected].reshape(B, A).unsqueeze(1).unsqueeze(-1)
+            seen = seen.to(dtype=bar_blocks.dtype)
+            return bar_blocks, seen
         # CUDA autocast executes standalone LayerNorm in FP32.  Its accuracy is useful, but retaining that output
         # would widen the full stock/block context; quantize the normalized result back to the residual dtype.
         h = self.norm2(h).to(dtype=h.dtype)                       # [B*A, nB, d] per-block tier-2 context

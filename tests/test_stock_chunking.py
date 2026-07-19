@@ -61,6 +61,40 @@ class ContextEncoderChunking(unittest.TestCase):
         self._compare(train=False, gc=False)
         self._compare(train=False, gc=True)
 
+    def test_last_only_matches_full_eod_for_chunked_and_unchunked_encoders(self) -> None:
+        bars, mask, cov = _inputs()
+        cov_valid = torch.rand_like(cov) > 0.25
+        for chunk in (0, 3):
+            encoder = _ctx_encoder(chunk, False).eval()
+            with torch.no_grad():
+                per_stock, market = encoder(bars, mask, cov, cov_valid)
+                eod_stock, eod_market = encoder(bars, mask, cov, cov_valid, last_only=True)
+            self.assertEqual(eod_stock.shape, per_stock[:, -1:].shape)
+            self.assertEqual(eod_market.shape, market[:, -1:].shape)
+            self.assertTrue(torch.allclose(eod_stock, per_stock[:, -1:], atol=1e-6, rtol=1e-6))
+            self.assertTrue(torch.allclose(eod_market, market[:, -1:], atol=1e-6, rtol=1e-6))
+            self.assertLess(eod_stock.untyped_storage().nbytes(), per_stock.untyped_storage().nbytes())
+
+    def test_last_only_selects_each_days_official_close_with_3d_or_4d_cov_valid(self) -> None:
+        bars, mask, cov = _inputs()
+        selected = torch.tensor([0, 1])
+        rows = torch.arange(B)
+        for chunk in (0, 3):
+            for cov_valid in (torch.rand(B, NB, A) > 0.25, torch.rand_like(cov) > 0.25):
+                encoder = _ctx_encoder(chunk, False).eval()
+                with torch.no_grad():
+                    per_stock, market = encoder(bars, mask, cov, cov_valid)
+                    close_stock, close_market = encoder(
+                        bars,
+                        mask,
+                        cov,
+                        cov_valid,
+                        last_only=True,
+                        last_block_index=selected,
+                    )
+                self.assertTrue(torch.allclose(close_stock[:, 0], per_stock[rows, selected], atol=1e-6, rtol=1e-6))
+                self.assertTrue(torch.allclose(close_market[:, 0], market[rows, selected], atol=1e-6, rtol=1e-6))
+
     def test_train_equivalence_with_grads_and_bn(self) -> None:
         self._compare(train=True, gc=False)
         self._compare(train=True, gc=True)                       # chunk-level checkpoint path

@@ -17,7 +17,7 @@ import torch
 # the per-day tensor fields a window cache carries (leading n_days axis); everything else is light meta
 TENSOR_KEYS = ("bars", "bar_mask", "cov_blocks", "news_raw", "news_mask",
                "avail", "ret", "ret_valid", "day_open", "day_close")
-OPTIONAL_TENSOR_KEYS = ("cov_valid_blocks", "universe_member")
+OPTIONAL_TENSOR_KEYS = ("cov_valid_blocks", "universe_member", "day_close_valid", "session_close_block")
 META_KEYS = ("n_days", "n_blocks", "dates", "window", "tensor_keys")
 
 

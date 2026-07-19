@@ -56,7 +56,7 @@ def test_seed_returns_are_paired_by_decision_not_pooled() -> None:
     assert paired == [2.0, 2.0, 6.0]
     assert [result["seed"] for result in normalized] == [7, 11]
     assert certified
-    assert note == "complete aligned coverage"
+    assert note == "complete aligned fixed-label coverage"
 
     paired, _, certified, note = driver._paired_seed_returns(
         {1: _result(1, [1.0, 2.0]), 2: _result(2, [1.0])}
@@ -73,7 +73,7 @@ def test_seed_returns_are_paired_by_decision_not_pooled() -> None:
     )
     assert paired == [2.0, 3.0]
     assert certified
-    assert note == "complete aligned coverage"
+    assert note == "complete aligned fixed-label coverage"
 
     paired, _, certified, note = driver._paired_seed_returns(
         {
@@ -93,20 +93,92 @@ def test_incomplete_or_legacy_alignment_cannot_be_certified() -> None:
 
     assert paired == pytest.approx([0.15, 0.15, 0.35])
     assert not certified
-    assert "reportable" in note and "legacy" in note
+    assert "legacy" in note
+
+
+def test_low_reportable_fraction_is_a_verdict_gate_not_an_alignment_filter(monkeypatch) -> None:
+    results = {
+        1: _result(1, [0.010, 0.020, 0.015], reportable=2),
+        2: _result(2, [0.012, 0.018, 0.014], reportable=2),
+    }
+    paired, _, certified, _ = driver._paired_seed_returns(results)
+    assert len(paired) == 3
+    assert certified
+
+    baseline = [{"ret": torch.zeros(3, 2), "ret_valid": torch.ones(3, 2, dtype=torch.bool),
+                 "availability": torch.ones(3, 2, dtype=torch.bool)}]
+    monkeypatch.setattr(driver, "block_bootstrap_confidence_interval", lambda *args, **kwargs: (0.001, 0.02))
+    monkeypatch.setattr(driver, "effective_sample_size", lambda values: float(len(values)))
+    monkeypatch.setattr(driver, "deflated_sharpe_ratio", lambda *args, **kwargs: 0.99)
+
+    summary = driver.verdict("low-coverage", results, baseline, n_seeds=2, n_trials=2, cost=0.0)
+
+    assert summary["alignment_certified"]
+    assert not summary["test_coverage_eligible"]
+    assert not summary["statistically_positive"]
 
 
 def test_buy_and_hold_baseline_pays_each_round_trip() -> None:
     item = {
         "ret": torch.tensor([[0.0, 0.10], [0.0, 0.10], [0.0, 0.10]]),
         "ret_valid": torch.tensor([[True, True], [True, False], [True, True]]),
+        "availability": torch.ones(3, 2, dtype=torch.bool),
     }
 
     cash, buy_hold = driver.round_trip_cost_paid_baselines([item], cost=0.01)
 
-    # Two one-row valid holding intervals: gross .20 - two entries/exits * .02, divided by two marks.
+    # One continuously held portfolio: gross .20 minus one .01 entry and one .01 exit, over two labeled marks.
     assert cash == 0.0
-    assert abs(buy_hold - 0.08) < 1e-7
+    assert abs(buy_hold - 0.09) < 1e-7
+
+
+def test_buy_and_hold_baseline_is_one_fixed_date_portfolio_not_per_asset_means() -> None:
+    item = {
+        "ret": torch.tensor([[0.0, 0.20, -0.10], [0.0, 0.00, 0.10]]),
+        "ret_valid": torch.tensor([[True, True, True], [True, False, True]]),
+        "availability": torch.ones(2, 3, dtype=torch.bool),
+    }
+
+    _, buy_hold = driver.round_trip_cost_paid_baselines([item], cost=0.0)
+
+    # Equal 50/50 entry earns .05, then drifts to 4/7 and 3/7. The missing
+    # stock receives zero credit on date two while the surviving stock earns
+    # .10, so both policy-aligned labeled dates remain in the denominator.
+    assert buy_hold == pytest.approx((0.05 + 3.0 / 7.0 * 0.10) / 2.0)
+
+
+def test_daily_raw_baseline_requires_decision_time_eod_availability() -> None:
+    # Stock 1 has a +100% forward price move for decision d0, but it is not in
+    # the feasible EOD action set until d1.  A future finite price must not make
+    # the pre-IPO/unavailable d0 observation a benchmark candidate.
+    closes = torch.tensor([
+        [float("nan"), 1.0, 1.0],
+        [float("nan"), 1.0, 1.0],
+        [float("nan"), 2.0, 1.0],
+        [float("nan"), 2.0, 1.0],
+    ])
+    days = []
+    for index in range(len(closes)):
+        eod = torch.tensor([True, index >= 1, True])
+        days.append({
+            "day_close": closes[index],
+            # Exercise a half-day-like padded suffix: the session-close block is
+            # block 0 and the post-close row is all unavailable.  Baseline
+            # feasibility must select the declared close, not tensor[-1].
+            "avail": torch.stack((eod, torch.zeros(3, dtype=torch.bool))),
+            "session_close_block": torch.tensor(0),
+        })
+
+    items = driver.baseline_items(days, "daily_raw", episode_len=252, horizon=21, exec_delay=1)
+    valid = items[0]["ret_valid"]
+    availability = items[0]["availability"]
+
+    assert valid.shape == (2, 3)
+    assert bool(valid[0, 1])
+    assert bool(valid[1, 1])
+    assert not bool(availability[0, 1])
+    _, buy_hold = driver.round_trip_cost_paid_baselines(items, cost=0.0)
+    assert buy_hold == 0.0
 
 
 def test_verdict_uses_paired_series_and_never_selects_test_seed(monkeypatch, capsys) -> None:
@@ -114,7 +186,8 @@ def test_verdict_uses_paired_series_and_never_selects_test_seed(monkeypatch, cap
         1: _result(1, [0.010, -0.005, 0.020, 0.001]),
         2: _result(2, [0.020, -0.001, 0.010, 0.005]),
     }
-    baseline = [{"ret": torch.zeros(4, 2), "ret_valid": torch.ones(4, 2, dtype=torch.bool)}]
+    baseline = [{"ret": torch.zeros(4, 2), "ret_valid": torch.ones(4, 2, dtype=torch.bool),
+                 "availability": torch.ones(4, 2, dtype=torch.bool)}]
     monkeypatch.setattr(driver, "block_bootstrap_confidence_interval", lambda *args, **kwargs: (0.001, 0.02))
     monkeypatch.setattr(driver, "effective_sample_size", lambda values: float(len(values)))
     monkeypatch.setattr(driver, "deflated_sharpe_ratio", lambda *args, **kwargs: 0.99)
@@ -134,7 +207,8 @@ def test_missing_requested_seed_replication_cannot_be_promoted(monkeypatch) -> N
         17: _result(17, [0.010, 0.020, 0.015, 0.012]),
         18: _result(18, [0.012, 0.018, 0.014, 0.011]),
     }
-    baseline = [{"ret": torch.zeros(4, 2), "ret_valid": torch.ones(4, 2, dtype=torch.bool)}]
+    baseline = [{"ret": torch.zeros(4, 2), "ret_valid": torch.ones(4, 2, dtype=torch.bool),
+                 "availability": torch.ones(4, 2, dtype=torch.bool)}]
     monkeypatch.setattr(driver, "block_bootstrap_confidence_interval", lambda *args, **kwargs: (0.001, 0.02))
     monkeypatch.setattr(driver, "effective_sample_size", lambda values: float(len(values)))
     monkeypatch.setattr(driver, "deflated_sharpe_ratio", lambda *args, **kwargs: 0.99)
@@ -152,7 +226,8 @@ def test_statistical_success_cannot_override_failed_data_provenance(monkeypatch,
         1: _result(1, [0.010, 0.020, 0.015, 0.012]),
         2: _result(2, [0.012, 0.018, 0.014, 0.011]),
     }
-    baseline = [{"ret": torch.zeros(4, 2), "ret_valid": torch.ones(4, 2, dtype=torch.bool)}]
+    baseline = [{"ret": torch.zeros(4, 2), "ret_valid": torch.ones(4, 2, dtype=torch.bool),
+                 "availability": torch.ones(4, 2, dtype=torch.bool)}]
     monkeypatch.setattr(driver, "block_bootstrap_confidence_interval", lambda *args, **kwargs: (0.001, 0.02))
     monkeypatch.setattr(driver, "effective_sample_size", lambda values: float(len(values)))
     monkeypatch.setattr(driver, "deflated_sharpe_ratio", lambda *args, **kwargs: 0.99)
@@ -309,6 +384,122 @@ def test_manifest_jsonl_and_final_policy_are_durable(tmp_path, monkeypatch) -> N
     assert set(saved["policy_state_dict"]) == set(policy.state_dict())
 
 
+def test_daily_raw_without_eligible_validation_checkpoint_never_publishes_or_tests(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FakePolicy:
+        def __init__(self, _config) -> None:
+            pass
+
+        def to(self, _device):
+            return self
+
+    def fake_build(_records, episode_len, **_kwargs):
+        return [{"n_blocks": episode_len}]
+
+    calls = {"publish": 0, "test": 0}
+
+    def forbidden_publish(*_args, **_kwargs):
+        calls["publish"] += 1
+        raise AssertionError("invalid policy weights were published")
+
+    def forbidden_test(*_args, **_kwargs):
+        calls["test"] += 1
+        raise AssertionError("test split was opened without a validation checkpoint")
+
+    monkeypatch.setattr(driver, "to_daily_raw_records", lambda values: list(values))
+    monkeypatch.setattr(driver, "build_daily_raw_episodes", fake_build)
+    monkeypatch.setattr(driver, "DailyCrossSectionPolicy", FakePolicy)
+    monkeypatch.setattr(driver, "train_daily_policy", lambda *_args, **_kwargs: (None, -1e9, None))
+    monkeypatch.setattr(driver, "_begin_stage_runtime", lambda _device: 0.0)
+    monkeypatch.setattr(driver, "_finish_stage_runtime", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(driver, "_save_final_policy", forbidden_publish)
+    monkeypatch.setattr(driver, "evaluate_daily_detailed", forbidden_test)
+    monkeypatch.setattr(driver, "_is_main", lambda: True)
+
+    args = SimpleNamespace(
+        label_horizon_days=1,
+        exec_delay=1,
+        episode_stride=2,
+        episode_len=2,
+        batch_days=1,
+        d_model=8,
+        raw_policy_dim=8,
+        raw_policy_layers=1,
+        raw_policy_heads=2,
+        block_seconds=2,
+        bar_seconds=1,
+        session_seconds=4,
+        policy_token_dim=8,
+        policy_layers=1,
+        policy_heads=2,
+        daily_lookback=2,
+        dropout=0.0,
+        temperature=1.0,
+        max_stock_weight=1.0,
+        gate_init_bias=0.0,
+        grad_checkpoint=False,
+        raw_norm="level",
+        raw_recent_days=0,
+        raw_stock_chunk=0,
+        pol_lr=1e-3,
+        pol_weight_decay=0.0,
+        policy_steps=1,
+        cost=0.0,
+        risk_lambda=0.0,
+        entropy_coef=0.0,
+        max_actions_per_day=1.0,
+        budget_lambda=0.0,
+        gate_entropy_coef=0.0,
+        missing_label_penalty=0.0,
+        bptt_window=1,
+        pol_warmup_frac=0.0,
+        schedule="constant",
+        grad_clip=0.0,
+        amp=False,
+        vram_ceiling_gib=0.0,
+    )
+    values = [{"date": "d0"}, {"date": "d1"}, {"date": "d2"}]
+
+    with pytest.raises(SystemExit, match=r"no validation checkpoint.*refusing to publish weights or evaluate"):
+        driver._run_daily_raw(
+            values,
+            values,
+            values,
+            values,
+            values,
+            values,
+            args,
+            torch.device("cpu"),
+            17,
+            None,
+            {"cfg": "test"},
+            tmp_path / "state.pt",
+        )
+
+    assert calls == {"publish": 0, "test": 0}
+
+
+def test_daily_raw_validation_checkpoint_abort_is_broadcast_to_every_rank(monkeypatch) -> None:
+    calls: list[tuple[bool, str, int]] = []
+
+    monkeypatch.setitem(driver._DIST, "is_dist", True)
+    monkeypatch.setattr(driver, "_is_main", lambda: False)
+
+    def fake_broadcast(value: bool, device: torch.device, src: int = 0) -> bool:
+        calls.append((value, device.type, src))
+        return False
+
+    monkeypatch.setattr(driver, "broadcast_bool", fake_broadcast)
+
+    with pytest.raises(SystemExit, match=r"no validation checkpoint.*refusing to publish weights or evaluate"):
+        driver._require_validation_checkpoint(None, torch.device("cpu"), seed=17, mode="daily_raw")
+
+    # A non-main rank contributes a placeholder; rank 0's broadcast verdict
+    # controls whether all ranks continue or abort together.
+    assert calls == [(False, "cpu", 0)]
+
+
 def test_vram_ceiling_is_validated_and_applied_as_an_allocator_fraction(monkeypatch) -> None:
     calls: list[tuple[float, torch.device]] = []
     monkeypatch.setattr(
@@ -430,8 +621,8 @@ def test_top2000_wide_has_one_shared_and_four_distinct_context_groups() -> None:
         groups.setdefault(key, []).append(name)
 
     sizes = sorted(len(names) for names in groups.values())
-    assert sizes == [1, 1, 1, 1, 22]
-    shared = next(names for names in groups.values() if len(names) == 22)
+    assert sizes == [1, 1, 1, 1, 23]
+    shared = next(names for names in groups.values() if len(names) == 23)
     assert list(sweep.TOP2000_H100_CORE_SWEEP) == shared[:10]
 
 
@@ -482,7 +673,7 @@ def test_sweep_runtime_controls_fail_before_launch(field: str, value: object, me
     controls = {
         "cache_windows": 4,
         "cpu_workers_per_gpu": 8,
-        "build_workers": 4,
+        "build_workers": 28,
         "max_windows": 0,
         "poll_sec": 2.0,
         "distributed_timeout_minutes": 120.0,
@@ -665,6 +856,7 @@ def test_top2000_launcher_passes_guarded_four_h100_protocol_without_implicit_ack
         "--vram-ceiling-gib": "75",
         "--cache-windows": "4",
         "--cpu-workers-per-gpu": "8",
+        "--build-workers": "28",
         "--distributed-timeout-minutes": "120",
         "--seeds": "1",
         "--seed-base": "17",
@@ -679,6 +871,85 @@ def test_top2000_launcher_passes_guarded_four_h100_protocol_without_implicit_ack
     subprocess.run(["bash", str(TOP2000_LAUNCHER)], env=env, check=True, timeout=5)
     inherited_args = capture.read_text(encoding="utf-8").splitlines()
     assert inherited_args[inherited_args.index("--devices") + 1] == "4,5,6,7"
+
+
+def test_cache_build_defaults_use_28_single_threaded_workers(monkeypatch) -> None:
+    assert driver.DEFAULT_CACHE_BUILD_WORKERS == 28
+    assert sweep.DEFAULT_CACHE_BUILD_WORKERS == 28
+    assert "--build-workers 28" in ROOT_LAUNCHER.read_text(encoding="utf-8")
+
+    thread_calls: list[tuple[str, int]] = []
+    fake_arrow = SimpleNamespace(
+        set_cpu_count=lambda count: thread_calls.append(("arrow-cpu", count)),
+        set_io_thread_count=lambda count: thread_calls.append(("arrow-io", count)),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "pyarrow", fake_arrow)
+    monkeypatch.setattr(driver.os, "environ", {})
+    monkeypatch.setattr(driver.torch, "set_num_threads", lambda count: thread_calls.append(("torch", count)))
+    monkeypatch.setattr(
+        driver.torch,
+        "set_num_interop_threads",
+        lambda count: thread_calls.append(("torch-interop", count)),
+    )
+
+    driver._configure_cache_worker()
+
+    assert set(driver.os.environ.values()) == {"1"}
+    assert thread_calls == [("torch", 1), ("torch-interop", 1), ("arrow-cpu", 1), ("arrow-io", 1)]
+
+
+def test_cache_build_pool_caps_28_worker_default_to_uncached_work(monkeypatch, tmp_path) -> None:
+    pool_config: dict[str, object] = {}
+    inherited_thread_env: dict[str, str | None] = {}
+
+    class FakePool:
+        def __init__(self, **kwargs) -> None:
+            pool_config.update(kwargs)
+            inherited_thread_env.update(
+                {name: driver.os.environ.get(name) for name in driver.CACHE_WORKER_THREAD_ENV_VARS}
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        @staticmethod
+        def map(_fn, args):
+            return [item[1] for item in args]
+
+    monkeypatch.setattr(driver, "_resolve_root", lambda _root: tmp_path)
+    monkeypatch.setattr(driver, "load_universe", lambda _root: (["CASH", "AAA"], 0))
+    monkeypatch.setattr(driver, "source_symbol_to_action_index", lambda _root: {"AAA": 1})
+    monkeypatch.setattr(driver, "list_windows", lambda _root: ["w0", "w1"])
+    monkeypatch.setattr(driver, "_window_key", lambda _root, window, _cfg, _sig: f"{window}.pt")
+    monkeypatch.setattr(driver, "ProcessPoolExecutor", FakePool)
+    monkeypatch.setattr(driver, "_ensure_complete_window_cache", lambda *args: args[1])
+    original_thread_env = {
+        name: f"original-{index}" for index, name in enumerate(driver.CACHE_WORKER_THREAD_ENV_VARS)
+    }
+    for name, value in original_thread_env.items():
+        monkeypatch.setenv(name, value)
+    args = SimpleNamespace(
+        data_root="TOP2000",
+        session_seconds=300,
+        block_seconds=300,
+        bar_seconds=60,
+        no_news=True,
+        max_windows=0,
+        build_workers=driver.DEFAULT_CACHE_BUILD_WORKERS,
+        build_only=True,
+        stream=True,
+    )
+
+    _, windows = driver.build_windows(args, tmp_path / "cache")
+
+    assert windows == ["w0", "w1"]
+    assert pool_config["max_workers"] == 2
+    assert pool_config["initializer"] is driver._configure_cache_worker
+    assert set(inherited_thread_env.values()) == {"1"}
+    assert {name: driver.os.environ.get(name) for name in driver.CACHE_WORKER_THREAD_ENV_VARS} == original_thread_env
 
 
 def test_root_launcher_stops_tailing_and_propagates_sweep_failure(tmp_path) -> None:

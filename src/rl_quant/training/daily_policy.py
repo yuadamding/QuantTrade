@@ -127,7 +127,7 @@ def _held_drift(prev_a, real_ret_t, real_valid_t):
 
 
 def _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_valid, cost,
-                    reward_scale, bptt_window, terminal_liquidate, score_starts=None):
+                    reward_scale, bptt_window, terminal_liquidate, score_starts=None, score_mask=None):
     """Shared per-day portfolio roll. state_fn(t) -> day-t policy state [B,A,token_dim]. The credited return is
     ``reward_scale * ret``. The canonical environment passes one-step ``ret`` with ``reward_scale=1``; the scale
     argument remains only for explicit reward-ablation experiments. The held position drifts by the same realized
@@ -219,13 +219,31 @@ def _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_v
             detach_mask = detach_rows.to(device=avail.device).unsqueeze(-1)
             decision_weights = torch.where(detach_mask, a.detach(), a)
             execution_pretrade = torch.where(detach_mask, nxt.detach(), nxt)
-    if terminal_liquidate and nets:                                  # charge the exit of the final position to CASH
-        final_book = post_weights[-1]
-        cash_vec = torch.zeros_like(final_book)
+    if terminal_liquidate and nets:
+        # Evaluation can carry observation burn-in and a trailing date whose
+        # non-CASH labels are all missing. Charge each row's liquidation on its
+        # last SCORED realized label, not blindly on tensor[-1] where fixed-date
+        # reporting might discard it. This mirrors the generic policy rollout.
+        label = real_valid[:, :, 1:].bool().any(-1)
+        if score_mask is not None:
+            if score_mask.shape != label.shape:
+                raise ValueError(f"score_mask must match [B,T]={tuple(label.shape)}, got {tuple(score_mask.shape)}")
+            label = label & score_mask.to(device=label.device, dtype=torch.bool)
+        elif score_starts is not None:
+            starts = torch.as_tensor(score_starts, dtype=torch.long, device=label.device)
+            steps = torch.arange(T, device=label.device).view(1, T)
+            label = label & (steps >= starts.to(device=label.device).unsqueeze(1))
+        has_label = label.any(-1)
+        steps = torch.arange(T, device=label.device).view(1, T)
+        last_index = torch.where(label, steps, torch.full_like(steps, -1)).amax(-1)
+        post = torch.stack(post_weights, 1)
+        selected = post[torch.arange(B, device=post.device), last_index.clamp_min(0)]
+        cash_vec = torch.zeros_like(selected)
         cash_vec[:, CASH_INDEX] = 1.0
-        term_turn = one_way_turnover(final_book, cash_vec)
-        nets[-1] = nets[-1] - cost * term_turn
-        turn[-1] = turn[-1] + term_turn
+        term_turn = one_way_turnover(selected, cash_vec) * has_label.to(selected.dtype)
+        charge_row = (steps == last_index.unsqueeze(1)).to(selected.dtype) * term_turn.unsqueeze(1)
+        nets = [value - cost * charge_row[:, index] for index, value in enumerate(nets)]
+        turn = [value + charge_row[:, index] for index, value in enumerate(turn)]
     st = lambda xs: torch.stack(xs, 1)  # noqa: E731
     return st(nets), st(gates), st(ents), st(cash_w), st(turn), st(missing_w), st(views)
 
@@ -295,7 +313,8 @@ def _daily_rollout(policy, batch, cost: float, bptt_window: int = 1, terminal_li
 
         state_fn = full_state_fn
     return _roll_positions(policy, state_fn, T, avail, ret, ret_valid, real_ret, real_valid, cost,
-                           reward_scale, bptt_window, terminal_liquidate, score_starts=score_starts)
+                           reward_scale, bptt_window, terminal_liquidate, score_starts=score_starts,
+                           score_mask=batch.get("score_mask"))
 
 
 def _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef, max_actions, budget_lambda,
@@ -350,8 +369,10 @@ def train_daily_policy(
     retained for controlled ablations and should be 1 for the canonical environment. ``eval_window`` bounds the
     validation rollout's
     cross-day memory to the trained episode span (0 = whole split). Returns (optimizer, best_val, best_state).
-    Validation uses the CONTINUOUS rollout (1-day realized mark) and selects on mean net return only when
-    label-reportable coverage is adequate. Distributed callers may provide
+    Validation uses the CONTINUOUS rollout (1-day realized mark) and selects on mean net return over the fixed,
+    policy-independent set of labeled dates, only when label-reportable coverage is adequate. Missing-label
+    allocations receive zero return credit and still pay turnover cost; the coverage threshold is an eligibility
+    gate, never a row filter. Distributed callers may provide
     ``prepare_checkpoint`` for an all-rank snapshot after validation, then
     ``sync_after_eval`` so non-main ranks cannot enter the next training
     collective while rank 0 is still writing its checkpoint."""
@@ -505,8 +526,10 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
     allocator gives every available name nonzero weight (~1/A each when diffuse), so a couple of chronically
     unlabeled names breach a ~0 tolerance on MOST days and would silently disqualify validation selection (the old
     1e-6 tolerance + the recalibrated 1e-3 penalty did exactly that). At 0.05, up to 5% of the book may sit in
-    unlabeled names; their return is credited as ZERO while their turnover is still charged, so the reported PnL
-    is CONSERVATIVE (never inflated) on tolerated days."""
+    unlabeled names. Every ex-ante labeled date remains in ``rows`` and in the return/cost summaries regardless of
+    this tolerance: missing returns receive ZERO credit while turnover is still charged. ``reportable`` is kept
+    solely as a separate checkpoint/promotion eligibility gate. This fixed date set prevents a policy from
+    improving its validation score by making an unfavorable date non-reportable."""
     policy.eval()
     dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
     rows: list[float] = []
@@ -528,18 +551,22 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
         total += int(score.sum())
         lab += int(label.sum())
         rep += int(reportable.sum())
-        if reportable.any():
-            tr = turn[reportable].float().cpu()
-            nr = nets[reportable].float().cpu()
+        # Rank every checkpoint on the same ex-ante set of labeled dates.  The
+        # rollout has already assigned zero return to invalid holdings and has
+        # charged their turnover, so retaining these rows is conservative and
+        # preserves the full accounting transition.  ``reportable`` remains a
+        # policy-dependent coverage diagnostic/eligibility gate only.
+        if label.any():
+            tr = turn[label].float().cpu()
+            nr = nets[label].float().cpu()
             gross.append(nr + cost * tr)
             costs.append(cost * tr)
             turns.append(tr)
-            cash.append(cash_w[reportable].float().cpu())
-            gate.append(gates[reportable].float().cpu())
-        if label.any():
+            cash.append(cash_w[label].float().cpu())
+            gate.append(gates[label].float().cpu())
             miss.append(missing_report[label].cpu())
-        rows += nets[reportable].float().cpu().tolist()
-        reportable_cpu = reportable.detach().cpu()
+        rows += nets[label].float().cpu().tolist()
+        label_cpu = label.detach().cpu()
         for local_index, episode in enumerate(eps[i:i + reportable.shape[0]]):
             identifiers = episode.get("decision_ids")
             if identifiers is None:
@@ -548,7 +575,7 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
                 raise ValueError("daily episode decision_ids must match its sequence length")
             decision_ids.extend(
                 str(identifiers[step]) for step in range(reportable.shape[1])
-                if bool(reportable_cpu[local_index, step])
+                if bool(label_cpu[local_index, step])
             )
         # GROSS realized-IC diagnostic: the diluted portfolio-mean net cannot statistically detect a small true
         # edge on a ~171-day span (min detectable ~ annSR 2+); the cross-sectional IC of the policy's RAW view
@@ -568,7 +595,11 @@ def evaluate_daily_detailed(policy, eps: list[dict], device, cost: float, batch_
              "mean_net_return": (sum(rows) / len(rows)) if rows else 0.0, "mean_turnover": mean(turns),
              "mean_cash_weight": mean(cash), "mean_gate": mean(gate), "mean_missing_label_weight": mean(miss),
              "realized_ic_mean": ic_mean, "realized_ic_se": ic_se, "realized_ic_days": ic_n,
-             "decision_ids": decision_ids, "policy_telemetry": telemetry}
+             "decision_ids": decision_ids,
+             "return_date_basis": "fixed_labeled_dates",
+             "missing_label_accounting": "zero_return_credit_cost_charged",
+             "coverage_role": "eligibility_gate_only",
+             "policy_telemetry": telemetry}
     return rows, stats
 
 

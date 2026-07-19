@@ -349,22 +349,23 @@ class Episodes(unittest.TestCase):
 
 class EODAdapter(unittest.TestCase):
     def test_eod_selection_inram(self) -> None:
-        """to_daily_raw_records selects the END-OF-DAY block ([last]) and materializes bars for in-RAM days."""
+        """The adapter selects each session's declared close block, including an early-close day."""
         nB, d = 3, DC
         g = torch.Generator().manual_seed(0)
         enc = [dict(market=torch.randn(nB, d, generator=g), per_stock=torch.randn(nB, A, d, generator=g),
                     bars=torch.randn(A, S, Fd, generator=g), bar_mask=torch.ones(A, S, dtype=torch.bool),
                     news_raw=torch.randn(nB, A, M, 1, generator=g), news_mask=torch.ones(nB, A, M, dtype=torch.bool),
                     avail=torch.ones(nB, A, dtype=torch.bool), day_close=100 + torch.randn(A, generator=g),
+                    session_close_block=torch.tensor(1),
                     date=f"d{i}") for i in range(4)]
         recs = to_daily_raw_records(enc)
         self.assertEqual(len(recs), 4)
         for e, r in zip(enc, recs):
             self.assertEqual(r["date"], e["date"])
-            self.assertTrue(torch.equal(r["market"], e["market"][nB - 1]))      # end-of-day block
-            self.assertTrue(torch.equal(r["per_stock"], e["per_stock"][nB - 1]))
-            self.assertTrue(torch.equal(r["avail"], e["avail"][nB - 1]))
-            self.assertTrue(torch.equal(r["news_raw"], e["news_raw"][nB - 1]))
+            self.assertTrue(torch.equal(r["market"], e["market"][1]))
+            self.assertTrue(torch.equal(r["per_stock"], e["per_stock"][1]))
+            self.assertTrue(torch.equal(r["avail"], e["avail"][1]))
+            self.assertTrue(torch.equal(r["news_raw"], e["news_raw"][1]))
             self.assertEqual(r["per_stock"].shape, (A, DC))
             self.assertTrue(torch.equal(r["bars"], e["bars"]))                  # in-RAM: bars materialized
             self.assertNotIn("_bars_day", r)
@@ -840,6 +841,48 @@ class RewardScaleAndDrift(unittest.TestCase):
         torch.testing.assert_close(turnover[0], torch.tensor([0.5 + 2.0 / 3.0]))
         torch.testing.assert_close(nets[0], torch.tensor([0.5 - 0.1 * (0.5 + 2.0 / 3.0)]))
 
+    def test_terminal_liquidation_is_charged_on_last_scored_label_not_invalid_tail(self) -> None:
+        class EnterThenCashPolicy:
+            def __init__(self) -> None:
+                self.step_index = 0
+
+            def step(self, state, previous, available):
+                del state, previous
+                target = torch.zeros_like(available, dtype=torch.float32)
+                if self.step_index == 0:
+                    target[:, 1] = 1.0
+                else:
+                    target[:, 0] = 1.0
+                self.step_index += 1
+                return target, torch.ones(available.shape[0])
+
+        available = torch.ones(1, 2, A, dtype=torch.bool)
+        realized = torch.zeros(1, 2, A)
+        valid = torch.ones_like(realized, dtype=torch.bool)
+        valid[:, 1, 1:] = False  # final tensor row has no scored non-CASH label
+        score_mask = torch.ones(1, 2, dtype=torch.bool)
+
+        nets, _, _, _, turnover, _, _ = _roll_positions(
+            EnterThenCashPolicy(),
+            lambda _t: torch.zeros(1, A, 1),
+            2,
+            available,
+            realized,
+            valid,
+            realized,
+            valid,
+            0.01,
+            1.0,
+            1,
+            True,
+            score_mask=score_mask,
+        )
+
+        # Entry and terminal exit are both attached to the only fixed labeled
+        # date. The trailing invalid row cannot hide the exit charge.
+        torch.testing.assert_close(turnover[0, 0], torch.tensor(2.0))
+        torch.testing.assert_close(nets[0, 0], torch.tensor(-0.02))
+
     def test_observation_burn_in_stays_cash_and_first_scored_trade_pays_entry(self) -> None:
         class EnterPolicy:
             def __init__(self) -> None:
@@ -1085,6 +1128,126 @@ class RealizedICDiagnostic(unittest.TestCase):
 
 
 class ReportableGate(unittest.TestCase):
+    @staticmethod
+    def _fixed_label_episode() -> dict:
+        """Two labeled dates; the policy's chosen stock lacks a label only on date zero."""
+
+        T = 2
+        realized = torch.tensor([
+            [0.0, 0.00, 0.03, -0.01],
+            [0.0, 0.02, 0.03, -0.01],
+        ])
+        valid = torch.tensor([
+            [True, False, True, True],
+            [True, True, True, True],
+        ])
+        return {
+            "market": torch.zeros(T, DC),
+            "per_stock": torch.zeros(T, A, DC),
+            "bars": torch.zeros(T, A, S, Fd),
+            "bar_mask": torch.ones(T, A, S, dtype=torch.bool),
+            "news_raw": torch.zeros(T, A, M, 1),
+            "news_mask": torch.zeros(T, A, M, dtype=torch.bool),
+            "avail": torch.ones(T, A, dtype=torch.bool),
+            "ret": realized,
+            "ret_valid": valid,
+            "real_ret": realized,
+            "real_ret_valid": valid,
+            "past_ret": torch.zeros(T, A),
+            "past_ret_valid": torch.ones(T, A, dtype=torch.bool),
+            "score_mask": torch.ones(T, dtype=torch.bool),
+            "decision_ids": ("d0", "d1"),
+            "n_blocks": T,
+        }
+
+    class _PickFirstStock(torch.nn.Module):
+        class _Config:
+            raw_recent_days = 0
+
+        config = _Config()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.logit = torch.nn.Parameter(torch.tensor(8.0))
+
+        def encode_episode(self, market, per_stock, bars, bar_mask, news_raw, news_mask, avail,
+                           past_ret, past_valid):
+            del bars, bar_mask, news_raw, news_mask, avail, past_ret, past_valid
+            return torch.zeros(
+                market.shape[0], market.shape[1], per_stock.shape[2], 1,
+                dtype=market.dtype, device=market.device,
+            )
+
+        def step(self, state, previous, available):
+            del state, available
+            risky = torch.sigmoid(self.logit).expand(previous.shape[0])
+            zero = torch.zeros_like(risky)
+            target = torch.stack((1.0 - risky, risky, zero, zero), dim=-1)
+            return target, torch.ones_like(risky)
+
+    def test_policy_dependent_coverage_never_filters_validation_return_dates(self) -> None:
+        policy = self._PickFirstStock()
+        rows, stats = evaluate_daily_detailed(
+            policy,
+            [self._fixed_label_episode()],
+            torch.device("cpu"),
+            cost=0.01,
+            batch_days=1,
+            max_missing_label_weight=0.05,
+        )
+
+        # d0 is not coverage-eligible because virtually the whole book is in
+        # an unlabeled name.  It nevertheless stays in the fixed ex-ante date
+        # set, receives zero gross credit, and pays its entry cost.  d1 pays
+        # the terminal exit cost as well.
+        self.assertEqual(stats["label_blocks"], 2)
+        self.assertEqual(stats["reportable_blocks"], 1)
+        self.assertEqual(stats["decision_ids"], ["d0", "d1"])
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(rows[0], -0.01, places=4)
+        self.assertAlmostEqual(stats["mean_gross_return"], 0.01, places=4)
+        self.assertAlmostEqual(stats["mean_turnover_cost"], 0.01, places=4)
+        self.assertAlmostEqual(stats["mean_net_return"], sum(rows) / len(rows), places=7)
+        self.assertEqual(stats["return_date_basis"], "fixed_labeled_dates")
+        self.assertEqual(stats["coverage_role"], "eligibility_gate_only")
+
+    def test_trainer_ranks_fixed_dates_but_keeps_coverage_as_eligibility_gate(self) -> None:
+        episode = self._fixed_label_episode()
+        policy = self._PickFirstStock()
+        _, best_val, best_state = train_daily_policy(
+            policy,
+            [episode],
+            steps=1,
+            lr=0.0,
+            batch_days=1,
+            cost=0.01,
+            eval_every=1,
+            val_eps=[episode],
+            device=torch.device("cpu"),
+            min_val_label_reportable_fraction=0.5,
+        )
+        rows, stats = evaluate_daily_detailed(policy, [episode], torch.device("cpu"), cost=0.01)
+        self.assertEqual(stats["label_reportable_fraction"], 0.5)
+        self.assertEqual(len(rows), 2)
+        self.assertAlmostEqual(best_val, sum(rows) / len(rows), places=7)
+        self.assertIsNotNone(best_state)
+
+        rejected = self._PickFirstStock()
+        _, rejected_val, rejected_state = train_daily_policy(
+            rejected,
+            [episode],
+            steps=1,
+            lr=0.0,
+            batch_days=1,
+            cost=0.01,
+            eval_every=1,
+            val_eps=[episode],
+            device=torch.device("cpu"),
+            min_val_label_reportable_fraction=0.51,
+        )
+        self.assertEqual(rejected_val, -1e9)
+        self.assertIsNone(rejected_state)
+
     def test_hole_name_does_not_disqualify_diffuse_book(self) -> None:
         """The recalibrated missing_label_penalty (1e-3) no longer forces the softmax book out of chronically
         unlabeled names; the eval WEIGHT tolerance must therefore admit a diffuse book (~1/A per name) holding one

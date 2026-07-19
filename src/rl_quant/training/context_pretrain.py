@@ -125,6 +125,16 @@ def train_context_encoder(
             cov_valid = torch.stack([train_days[i]["cov_valid_blocks"] for i in idx]).to(
                 device, non_blocking=True
             )
+        close_blocks = torch.tensor(
+            [
+                int(train_days[i]["session_close_block"])
+                if "session_close_block" in train_days[i]
+                else int(train_days[i]["ret"].shape[0]) - 1
+                for i in idx
+            ],
+            dtype=torch.long,
+            device=device,
+        )
         tgt, vm = st(targets), st(valid)                                          # [b,nB,2], [b,nB]
         ps_tgt = ps_vm = None
         if use_perstock:
@@ -135,13 +145,13 @@ def train_context_encoder(
         if use_daily:
             d_tgt = torch.stack([daily_targets[i][0] for i in idx]).to(device, non_blocking=True)  # [b,A]
             d_vm = torch.stack([daily_targets[i][1] for i in idx]).to(device, non_blocking=True)   # [b,A]
-        return bars, mask, cov, cov_valid, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm
+        return bars, mask, cov, cov_valid, close_blocks, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm
 
     for step in range(start_step, steps):
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
         optimizer.zero_grad(set_to_none=True)
         for _ in range(accum_steps):
-            bars, mask, cov, cov_valid, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro()
+            bars, mask, cov, cov_valid, close_blocks, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro()
             with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
                 encoded = encoder(bars, mask, cov, cov_valid) if cov_valid is not None else encoder(bars, mask, cov)
                 per_stock, market = encoded                          # [b,nB,A,d], [b,nB,d]
@@ -151,7 +161,8 @@ def train_context_encoder(
                     ps_pred = perstock_head(per_stock)                # [b,nB,A]
                     loss = loss + perstock_coef * F.smooth_l1_loss(ps_pred[ps_vm], ps_tgt[ps_vm])
                 if use_daily and d_vm.any():                          # DAILY next-H-day relative-value pretext
-                    d_pred = daily_head(per_stock[:, -1])             # end-of-day context -> [b,A]
+                    rows = torch.arange(per_stock.shape[0], device=per_stock.device)
+                    d_pred = daily_head(per_stock[rows, close_blocks])  # session-boundary context -> [b,A]
                     loss = loss + daily_coef * F.smooth_l1_loss(d_pred[d_vm], d_tgt[d_vm])
                 loss = loss / accum_steps
             loss.backward()
@@ -191,12 +202,13 @@ def encode_days(
     """Encode frozen context in bounded day chunks.
 
     By default, return every block for intraday policies. ``last_only=True`` is the daily-policy storage path: the
-    full session is still encoded causally, but only the end-of-day market/per-stock context and matching
-    availability/news fields leave the encode chunk. Dense selected tensors are cloned after slicing so they own
-    a compact storage allocation instead of pinning a full ``[n_blocks, ...]`` backing tensor (especially
-    important for :class:`LazyDay` overrides). Disabled-news tensors are scalar-backed broadcast-zero views and
-    retain that compact representation. ``output_dtype`` controls only the cached context embedding dtype; raw
-    inputs, masks, labels, and prices retain their source dtypes.
+    full session is still encoded causally, but encoders advertising ``supports_last_only`` avoid retaining and
+    fusing unused earlier-block outputs. Only the end-of-day market/per-stock context and matching availability/news
+    fields leave the encode chunk. Dense selected tensors are cloned after slicing so they own a compact storage
+    allocation instead of pinning a full ``[n_blocks, ...]`` backing tensor (especially important for
+    :class:`LazyDay` overrides). Disabled-news tensors are scalar-backed broadcast-zero views and retain that compact
+    representation. ``output_dtype`` controls only the cached context embedding dtype; raw inputs, masks, labels,
+    and prices retain their source dtypes.
 
     Returned records carry no encoder reference. Raw bars remain materialized for in-memory days and lazy for
     ``LazyDay`` inputs; the daily adapters decide whether a policy needs a full session or only its final raw block.
@@ -211,7 +223,8 @@ def encode_days(
         return t.detach().to(device="cpu", dtype=dtype or t.dtype).contiguous().clone()
 
     def eod_field(day, key: str) -> torch.Tensor:
-        selected = day[key][-1]
+        block = int(day["session_close_block"]) if "session_close_block" in day else -1
+        selected = day[key][block]
         # The reportable no-news cache represents the full logical tensor as an expanded zero scalar. Cloning its
         # EOD view would materialize [A,max_news,...] once per day before the episode builder stacks it again. Keep
         # the broadcast representation; dense fields still take the compact owned-copy path below.
@@ -233,14 +246,49 @@ def encode_days(
         cov_valid = None
         if all("cov_valid_blocks" in d for d in chunk):
             cov_valid = torch.stack([d["cov_valid_blocks"] for d in chunk]).to(device, non_blocking=True)
+        close_blocks = None
+        if last_only:
+            have_close_blocks = ["session_close_block" in d for d in chunk]
+            if any(have_close_blocks) and not all(have_close_blocks):
+                raise ValueError("a daily encode chunk cannot mix days with and without session_close_block")
+            if all(have_close_blocks):
+                close_blocks = torch.stack([d["session_close_block"] for d in chunk]).to(
+                    device=device, dtype=torch.long, non_blocking=True
+                )
         with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-            encoded = encoder(bars, mask, cov, cov_valid) if cov_valid is not None else encoder(bars, mask, cov)
+            supports_fast_last = bool(getattr(encoder, "supports_last_only", False))
+            if cov_valid is not None and supports_fast_last:
+                encoded = encoder(
+                    bars,
+                    mask,
+                    cov,
+                    cov_valid,
+                    last_only=last_only,
+                    last_block_index=close_blocks,
+                )
+            elif cov_valid is not None:
+                encoded = encoder(bars, mask, cov, cov_valid)
+            elif supports_fast_last:
+                encoded = encoder(
+                    bars,
+                    mask,
+                    cov,
+                    last_only=last_only,
+                    last_block_index=close_blocks,
+                )
+            else:
+                encoded = encoder(bars, mask, cov)
             per_stock, market = encoded                              # [b,nB,A,d], [b,nB,d]
         if last_only:
             # Slice on the accelerator before the device transfer. ``owned_cpu`` also clones CPU encodes, where a
             # same-device ``to`` would otherwise preserve the full output storage behind this one-block view.
-            per_stock = owned_cpu(per_stock[:, -1], dtype=output_dtype)   # [b,A,d]
-            market = owned_cpu(market[:, -1], dtype=output_dtype)         # [b,d]
+            if supports_fast_last or close_blocks is None:
+                per_stock = owned_cpu(per_stock[:, -1], dtype=output_dtype)   # [b,A,d]
+                market = owned_cpu(market[:, -1], dtype=output_dtype)         # [b,d]
+            else:
+                rows = torch.arange(len(chunk), device=per_stock.device)
+                per_stock = owned_cpu(per_stock[rows, close_blocks], dtype=output_dtype)
+                market = owned_cpu(market[rows, close_blocks], dtype=output_dtype)
         else:
             per_stock = owned_cpu(per_stock, dtype=output_dtype)          # [b,nB,A,d]
             market = owned_cpu(market, dtype=output_dtype)                # [b,nB,d]
@@ -259,7 +307,7 @@ def encode_days(
                     small["ret"] = eod_field(d, "ret")
                 if "ret_valid" in d:
                     small["ret_valid"] = eod_field(d, "ret_valid")
-                for key in ("day_open", "day_close"):
+                for key in ("day_open", "day_close", "day_close_valid", "session_close_block"):
                     if key in d:
                         small[key] = owned_cpu(d[key])
                 if isinstance(d, LazyDay):
@@ -283,7 +331,10 @@ def encode_days(
                     market=market[j].clone(), per_stock=per_stock[j].clone(),
                     avail=d["avail"].clone(), news_raw=d["news_raw"].clone(), news_mask=d["news_mask"].clone(),
                     ret=d["ret"].clone(), ret_valid=d["ret_valid"].clone(),
-                    day_open=d["day_open"].clone(), day_close=d["day_close"].clone()))
+                    day_open=d["day_open"].clone(), day_close=d["day_close"].clone(),
+                    **({"day_close_valid": d["day_close_valid"].clone()} if "day_close_valid" in d else {}),
+                    **({"session_close_block": d["session_close_block"].clone()}
+                       if "session_close_block" in d else {})))
             else:
                 out.append({
                     "market": market[j], "per_stock": per_stock[j],
@@ -294,6 +345,8 @@ def encode_days(
                     # (no reliance on an external adapter to re-attach day_close); harmless for intraday.
                     **({"day_open": d["day_open"]} if "day_open" in d else {}),
                     **({"day_close": d["day_close"]} if "day_close" in d else {}),
+                    **({"day_close_valid": d["day_close_valid"]} if "day_close_valid" in d else {}),
+                    **({"session_close_block": d["session_close_block"]} if "session_close_block" in d else {}),
                     **({"date": d["date"]} if "date" in d else {}),
                 })
     return out

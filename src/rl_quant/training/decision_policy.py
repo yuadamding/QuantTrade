@@ -197,8 +197,10 @@ def train_decision_policy(
 ):
     """Train the event-timed differentiable-portfolio policy on detached context plus raw bars. The turnover cost
     and the budget penalty are warmed up from 0 -> full over `friction_warmup_steps` (curriculum: learn the edge
-    first, then constrain frequency). Validation selection ignores checkpoints whose label-valid reportable
-    coverage is below `min_val_label_reportable_fraction`. Distributed callers
+    first, then constrain frequency). Validation ranks checkpoints on the fixed, policy-independent set of
+    label-valid blocks and ignores checkpoints whose label-valid reportable coverage is below
+    `min_val_label_reportable_fraction`. Missing-label allocations receive zero return credit and still pay
+    turnover cost; coverage is an eligibility gate, never a score-row filter. Distributed callers
     may provide ``prepare_checkpoint`` for an all-rank snapshot after
     validation, then ``sync_after_eval`` to rendezvous after rank-0 checkpoint
     I/O. Returns (optimizer, best_val, best_state)."""
@@ -253,8 +255,10 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
     """Realized per-decision net return plus coverage stats.
 
     `reportable_fraction` is reportable blocks over all evaluated blocks; `label_reportable_fraction` uses only
-    blocks with at least one non-CASH label as the denominator. Mean gross return, turnover cost, net return,
-    turnover, CASH weight, and gate are computed on the reportable rows.
+    blocks with at least one non-CASH label as the denominator. Every label-valid block remains in the returned
+    score and accounting summaries. Invalid held names receive zero return credit while their turnover cost is
+    retained; reportable coverage is a separate eligibility diagnostic so a policy cannot improve its score by
+    making an unfavorable block non-reportable.
     """
     policy.eval()
     rows = []
@@ -273,22 +277,22 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
         reportable_blocks += int(reportable.sum().item())
         if label.any():
             missing_values.append(missing_w[label].detach().cpu())
-        if reportable.any():
-            turn_r = turn[reportable].detach().cpu()
-            net_r = nets[reportable].detach().cpu()
+        if label.any():
+            turn_r = turn[label].detach().cpu()
+            net_r = nets[label].detach().cpu()
             gross_values.append(net_r + cost * turn_r)
             cost_values.append(cost * turn_r)
             turn_values.append(turn_r)
-            cash_values.append(cash_w[reportable].detach().cpu())
-            gate_values.append(gates[reportable].detach().cpu())
-        rows += nets[reportable].cpu().tolist()
-        reportable_cpu = reportable.detach().cpu()
+            cash_values.append(cash_w[label].detach().cpu())
+            gate_values.append(gates[label].detach().cpu())
+        rows += nets[label].cpu().tolist()
+        label_cpu = label.detach().cpu()
         group = days_emb[i:min(i + batch_days, len(days_emb))]
         for local_index, day in enumerate(group):
             date = str(day.get("date", f"day_{i + local_index}"))
             decision_ids.extend(
                 f"{date}:step_{step}" for step in range(reportable.shape[1])
-                if bool(reportable_cpu[local_index, step])
+                if bool(label_cpu[local_index, step])
             )
     def mean_or_zero(xs: list[torch.Tensor]) -> float:
         return float(torch.cat(xs).mean()) if xs else 0.0
@@ -308,6 +312,9 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
         "mean_gate": mean_or_zero(gate_values),
         "mean_missing_label_weight": mean_missing,
         "decision_ids": decision_ids,
+        "return_date_basis": "fixed_labeled_blocks",
+        "missing_label_accounting": "zero_return_credit_cost_charged",
+        "coverage_role": "eligibility_gate_only",
     }
     return rows, stats
 
@@ -315,7 +322,7 @@ def evaluate_policy_detailed(policy, days_emb, device, cost: float, batch_days: 
 @torch.no_grad()
 def evaluate_policy(policy, days_emb, device, cost: float, batch_days: int = 32,
                     max_missing_label_weight: float = 0.05) -> list[float]:
-    """Realized per-decision net return on label-valid/reportable blocks, chunked over days. Pooled list."""
+    """Realized per-decision net return on the fixed label-valid block set, chunked over days. Pooled list."""
     rows, _ = evaluate_policy_detailed(policy, days_emb, device, cost, batch_days, max_missing_label_weight)
     return rows
 

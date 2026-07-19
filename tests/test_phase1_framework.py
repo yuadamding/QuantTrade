@@ -387,6 +387,48 @@ class TrainingStrategyKnobs(unittest.TestCase):
             handle.remove()
         self.assertEqual(sorted(sampled), [10.0, 11.0, 12.0])
 
+    def test_daily_ssl_uses_each_days_official_close_block(self):
+        class BlockIndexEncoder(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.ones(()))
+
+            def forward(self, bars, _mask, cov, _cov_valid=None):
+                batch, actions = bars.shape[:2]
+                blocks = cov.shape[1]
+                values = torch.arange(blocks, dtype=bars.dtype, device=bars.device)
+                per_stock = values.view(1, blocks, 1, 1).expand(batch, blocks, actions, 1) * self.scale
+                return per_stock, per_stock.mean(dim=2)
+
+        class CaptureDailyHead(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(()))
+                self.inputs: list[torch.Tensor] = []
+
+            def forward(self, value):
+                self.inputs.append(value.detach().clone())
+                return value[..., 0] * self.weight
+
+        days = [_synthetic_day(5), _synthetic_day(6)]
+        days[0]["session_close_block"] = torch.tensor(1)
+        days[1]["session_close_block"] = torch.tensor(3)
+        daily_head = CaptureDailyHead()
+        train_context_encoder(
+            BlockIndexEncoder(),
+            torch.nn.Linear(1, 2),
+            days,
+            device=torch.device("cpu"),
+            daily_head=daily_head,
+            daily_targets=[(torch.zeros(A), torch.ones(A, dtype=torch.bool)) for _ in days],
+            steps=1,
+            batch_size=2,
+            accum_steps=1,
+            schedule="constant",
+        )
+        selected = sorted(float(value) for value in daily_head.inputs[0][:, 0, 0])
+        self.assertEqual(selected, [1.0, 3.0])
+
     def test_zero_weight_ssl_auxiliary_heads_do_not_build_targets_or_run(self):
         class DisabledHead(torch.nn.Module):
             def __init__(self):
@@ -464,15 +506,18 @@ class MissingLabelsAreNotFlatReturns(unittest.TestCase):
                "avail": torch.ones(1, 3, dtype=torch.bool),
                "ret": torch.tensor([[0.0, float("nan"), 0.05]]),
                "ret_valid": torch.tensor([[True, False, True]]), "n_blocks": 1}
-        self.assertEqual(evaluate_policy(PickMissing(), [day], torch.device("cpu"), cost=0.0), [])
+        self.assertEqual(evaluate_policy(PickMissing(), [day], torch.device("cpu"), cost=0.0), [0.0])
         rows, stats = evaluate_policy_detailed(PickMissing(), [day], torch.device("cpu"), cost=0.0)
-        self.assertEqual(rows, [])
+        self.assertEqual(rows, [0.0])
         self.assertEqual(stats["total_blocks"], 1)
         self.assertEqual(stats["label_blocks"], 1)
         self.assertEqual(stats["reportable_blocks"], 0)
         self.assertEqual(stats["reportable_fraction"], 0.0)
         self.assertEqual(stats["label_reportable_fraction"], 0.0)
         self.assertAlmostEqual(stats["mean_missing_label_weight"], 1.0, places=5)
+        self.assertEqual(stats["return_date_basis"], "fixed_labeled_blocks")
+        self.assertEqual(stats["missing_label_accounting"], "zero_return_credit_cost_charged")
+        self.assertEqual(stats["coverage_role"], "eligibility_gate_only")
         for key in ("mean_gross_return", "mean_turnover_cost", "mean_net_return",
                     "mean_turnover", "mean_cash_weight", "mean_gate"):
             self.assertIn(key, stats)

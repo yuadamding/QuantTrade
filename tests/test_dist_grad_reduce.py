@@ -22,6 +22,29 @@ dist_utils = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dist_utils)
 
 
+def test_broadcast_bool_uses_one_backend_tensor_and_obeys_source(monkeypatch) -> None:
+    calls: list[tuple[torch.dtype, str, int]] = []
+    monkeypatch.setattr(dist_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist_utils.dist, "is_initialized", lambda: True)
+
+    def fake_broadcast(signal: torch.Tensor, src: int) -> None:
+        calls.append((signal.dtype, signal.device.type, src))
+        signal.fill_(1)
+
+    monkeypatch.setattr(dist_utils.dist, "broadcast", fake_broadcast)
+
+    assert dist_utils.broadcast_bool(False, torch.device("cpu"), src=0)
+    assert calls == [(torch.uint8, "cpu", 0)]
+
+
+def test_broadcast_bool_requires_initialized_group(monkeypatch) -> None:
+    monkeypatch.setattr(dist_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist_utils.dist, "is_initialized", lambda: False)
+
+    with pytest.raises(RuntimeError, match="initialized process group"):
+        dist_utils.broadcast_bool(True, torch.device("cpu"))
+
+
 class _ScalarPolicy(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()

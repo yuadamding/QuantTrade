@@ -32,6 +32,8 @@ def _synthetic_window(Dd=6, seed=0):
         "news_mask": torch.ones(Dd, nB, A, M, dtype=torch.bool), "avail": torch.ones(Dd, nB, A, dtype=torch.bool),
         "ret": ret, "ret_valid": torch.ones(Dd, nB, A, dtype=torch.bool),
         "day_open": 100 + torch.randn(Dd, A, generator=g), "day_close": 100 + torch.randn(Dd, A, generator=g),
+        "day_close_valid": torch.ones(Dd, A, dtype=torch.bool),
+        "session_close_block": torch.full((Dd,), nB - 1, dtype=torch.long),
         "dates": [f"2022-01-{i+3:02d}" for i in range(Dd)], "window": "w0", "n_days": Dd, "n_blocks": nB,
     }
     return w

@@ -14,8 +14,16 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
 
-from rl_quant.datasets.raw_window import RawWindowConfig, build_window
+from rl_quant.datasets.raw_window import (
+    XNYS_AUDITED_CALENDAR_END,
+    XNYS_AUDITED_CALENDAR_START,
+    XNYS_EARLY_CLOSE_DATES_2022_2026,
+    RawWindowConfig,
+    _session_end_ms,
+    build_window,
+)
 
 SESSION, BLOCK, GRID = 120, 30, 15                 # 120s session, 4 blocks, 15s slots (8 slots, 2 per block)
 SYM = "AAA"
@@ -27,15 +35,20 @@ def _open_ms(date_iso: str) -> int:
     return om(date_iso, RawWindowConfig(session_seconds=SESSION, block_seconds=BLOCK))
 
 
-def _write_root(tmp: Path, rows: list[tuple[int, float, float, float, float, float]]) -> Path:
+def _write_root(
+    tmp: Path,
+    rows: list[tuple[int, float, float, float, float, float]],
+    *,
+    day: str = DAY,
+) -> Path:
     """rows: (second_offset, open, high, low, close, volume) raw 1s rows for SYM on DAY."""
-    o = _open_ms(DAY)
+    o = _open_ms(day)
     cols = {"symbol": [], "timestamp_ms": [], "date_exchange": [],
             "open": [], "high": [], "low": [], "close": [], "volume": []}
     for s_off, op, hi, lo, cl, vol in rows:
         cols["symbol"].append(SYM)
         cols["timestamp_ms"].append(o + s_off * 1000)
-        cols["date_exchange"].append(DAY)
+        cols["date_exchange"].append(day)
         for k, v in (("open", op), ("high", hi), ("low", lo), ("close", cl), ("volume", vol)):
             cols[k].append(v)
     (tmp / "partitions" / WIN).mkdir(parents=True, exist_ok=True)
@@ -110,6 +123,82 @@ class ResampleAggregation(unittest.TestCase):
             self.assertFalse(bool(news_mask.any()))
             self.assertEqual(news_raw.untyped_storage().nbytes(), news_raw.element_size())
             self.assertEqual(news_mask.untyped_storage().nbytes(), news_mask.element_size())
+
+
+class SessionCloseIntegrity(unittest.TestCase):
+    def test_checked_in_sample_uses_explicit_audited_early_close_dates(self) -> None:
+        self.assertEqual(XNYS_AUDITED_CALENDAR_START, "2022-01-01")
+        self.assertEqual(XNYS_AUDITED_CALENDAR_END, "2026-12-31")
+        self.assertEqual(
+            set(XNYS_EARLY_CLOSE_DATES_2022_2026),
+            {
+                "2022-11-25",
+                "2023-07-03", "2023-11-24",
+                "2024-07-03", "2024-11-29", "2024-12-24",
+                "2025-07-03", "2025-11-28", "2025-12-24",
+                "2026-11-27", "2026-12-24",
+            },
+        )
+
+    def test_session_calendar_fails_closed_outside_audited_range(self) -> None:
+        with self.assertRaisesRegex(ValueError, "audited XNYS calendar covers only"):
+            _session_end_ms("2027-01-04", RawWindowConfig())
+
+    def test_audited_half_day_excludes_post_close_rows_and_selects_close_block(self) -> None:
+        half_day = "2024-07-03"
+        rows = [
+            (0, 10.0, 10.0, 10.0, 10.0, 1.0),
+            (12_599, 11.0, 11.0, 11.0, 11.0, 1.0),       # final completed regular-session second aggregate
+            (12_600, 88.0, 88.0, 88.0, 88.0, 1.0),       # 13:00 bucket STARTS at boundary: exclude fail-closed
+            (12_610, 99.0, 99.0, 99.0, 99.0, 1.0),       # after 13:00: must not enter context/close
+            (23_399, 199.0, 199.0, 199.0, 199.0, 1.0),   # extended-hours row near the nominal 16:00 grid end
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _write_root(Path(tmp), rows, day=half_day)
+            cfg = RawWindowConfig(session_seconds=23_400, block_seconds=300, bar_seconds=60)
+            window = build_window(root, WIN, {SYM: 1}, 2, cfg)
+
+        self.assertEqual(int(window["session_close_block"][0]), 41)  # block ending 13:00 ET
+        self.assertFalse(bool(window["bar_mask"][0, 1, 210:].any()))
+        self.assertAlmostEqual(float(window["day_close"][0, 1]), 11.0)
+        self.assertTrue(bool(window["day_close_valid"][0, 1]))
+        self.assertTrue(bool(window["avail"][0, 41, 1]))
+        self.assertFalse(bool(window["avail"][0, 42:, 1].any()))
+        self.assertFalse(bool(window["cov_valid_blocks"][0, 42:].any()))
+        self.assertFalse(bool(window["ret_valid"][0, 42:].any()))
+
+    def test_post_close_print_cannot_rescue_a_stale_half_day_mark(self) -> None:
+        half_day = "2024-07-03"
+        rows = [
+            (0, 10.0, 10.0, 10.0, 10.0, 1.0),
+            (12_000, 11.0, 11.0, 11.0, 11.0, 1.0),       # 12:50:00: stale by ten minutes
+            (12_601, 50.0, 50.0, 50.0, 50.0, 1.0),      # post-close print must be excluded
+            (23_399, 99.0, 99.0, 99.0, 99.0, 1.0),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _write_root(Path(tmp), rows, day=half_day)
+            cfg = RawWindowConfig(session_seconds=23_400, block_seconds=300, bar_seconds=60)
+            window = build_window(root, WIN, {SYM: 1}, 2, cfg)
+
+        self.assertTrue(torch.isnan(window["day_close"][0, 1]))
+        self.assertFalse(bool(window["day_close_valid"][0, 1]))
+        self.assertFalse(bool(window["avail"][0, 41, 1]))
+
+    def test_morning_only_print_is_not_an_executable_normal_session_close(self) -> None:
+        normal_day = "2024-07-02"
+        rows = [
+            (0, 10.0, 10.0, 10.0, 10.0, 1.0),
+            (180, 11.0, 11.0, 11.0, 11.0, 1.0),  # 09:33 ET, hours stale by the 16:00 close
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _write_root(Path(tmp), rows, day=normal_day)
+            cfg = RawWindowConfig(session_seconds=23_400, block_seconds=300, bar_seconds=60)
+            window = build_window(root, WIN, {SYM: 1}, 2, cfg)
+
+        self.assertEqual(int(window["session_close_block"][0]), 77)
+        self.assertTrue(torch.isnan(window["day_close"][0, 1]))
+        self.assertFalse(bool(window["day_close_valid"][0, 1]))
+        self.assertFalse(bool(window["avail"][0, 77, 1]))
 
 
 class DesignValidation(unittest.TestCase):
