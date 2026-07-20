@@ -28,11 +28,13 @@ from torch import nn
 
 
 # PyTorch 2.6's fused CUDA SDPA kernels map the leading batch dimension directly
-# to a CUDA grid dimension, whose portable limit is 65,535.  TOP2000 legitimately
-# exceeds it after flattening day x stock x block (for example 3 x 640 x 78 =
-# 149,760).  Split only the independent attention rows; keeping QKV/projection/FF
-# work whole preserves the large H100 tensor-core work units and model semantics.
-_SDPA_CUDA_BATCH_LIMIT = 65_535
+# to a CUDA grid dimension, whose portable limit is 65,535.  Running at that
+# literal boundary is not robust in FlashAttention backward, and its padded FP32
+# dQ workspace is also very large for our short, wide TOP2000 geometry.  A 16K
+# tile stays far from the launch limit, materially lowers the transient, and
+# still exposes 131K independent batch-head rows to an eight-head H100 kernel.
+# Split only attention rows: QKV/projection/FF remain full-sized tensor-core work.
+_SDPA_CUDA_BATCH_LIMIT = 16_384
 
 
 def _sdpa_batch_limit(q: torch.Tensor) -> int:
@@ -50,7 +52,7 @@ def _bounded_scaled_dot_product_attention(
     is_causal: bool,
     dropout_p: float,
 ) -> torch.Tensor:
-    """Run SDPA without exceeding the fused CUDA kernel's batch-grid limit.
+    """Run SDPA in fused-CUDA-safe, backward-memory-bounded row tiles.
 
     Rows in SDPA's leading dimension are independent, so slicing and
     concatenating that dimension is mathematically identical when dropout is

@@ -39,6 +39,9 @@ def _inputs():
 
 
 class ContextEncoderChunking(unittest.TestCase):
+    def test_sdpa_cuda_tile_keeps_backward_headroom(self) -> None:
+        self.assertEqual(context_encoder_module._SDPA_CUDA_BATCH_LIMIT, 16_384)
+
     def test_sdpa_grid_guard_preserves_outputs_masks_and_gradients(self) -> None:
         generator = torch.Generator().manual_seed(11)
         for use_mask in (False, True):
@@ -103,8 +106,62 @@ class ContextEncoderChunking(unittest.TestCase):
             direct.square().sum().backward()
 
             torch.manual_seed(23)
-            checkpointed = torch.utils.checkpoint.checkpoint(attend, checkpoint_input, use_reentrant=False)
+            def inner_checkpoint(value: torch.Tensor) -> torch.Tensor:
+                return torch.utils.checkpoint.checkpoint(attend, value, use_reentrant=False)
+
+            # ContextEncoder uses an outer stock-chunk checkpoint around inner
+            # per-layer checkpoints.  Exercise that exact nesting so dropout
+            # must replay the same tiled SDPA call order at both levels.
+            checkpointed = torch.utils.checkpoint.checkpoint(
+                inner_checkpoint,
+                checkpoint_input,
+                use_reentrant=False,
+            )
             checkpointed.square().sum().backward()
+
+        self.assertTrue(torch.equal(direct, checkpointed))
+        self.assertIsNotNone(direct_input.grad)
+        self.assertIsNotNone(checkpoint_input.grad)
+        self.assertTrue(torch.equal(direct_input.grad, checkpoint_input.grad))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA fused-SDPA checkpoint contract")
+    def test_cuda_fused_sdpa_replays_nested_checkpoint_dropout(self) -> None:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        base = torch.randn(5, 2, 3, 8, device="cuda", dtype=torch.bfloat16)
+
+        def attend(value: torch.Tensor) -> torch.Tensor:
+            return context_encoder_module._bounded_scaled_dot_product_attention(
+                value,
+                value,
+                value,
+                attn_mask=None,
+                is_causal=True,
+                dropout_p=0.2,
+            )
+
+        direct_input = base.clone().requires_grad_()
+        checkpoint_input = base.clone().requires_grad_()
+        with (
+            patch.object(context_encoder_module, "_sdpa_batch_limit", lambda _query: 2),
+            sdpa_kernel(SDPBackend.FLASH_ATTENTION),
+        ):
+            torch.manual_seed(29)
+            direct = attend(direct_input)
+            direct.float().square().sum().backward()
+            torch.cuda.synchronize()
+
+            def inner_checkpoint(value: torch.Tensor) -> torch.Tensor:
+                return torch.utils.checkpoint.checkpoint(attend, value, use_reentrant=False)
+
+            torch.manual_seed(29)
+            checkpointed = torch.utils.checkpoint.checkpoint(
+                inner_checkpoint,
+                checkpoint_input,
+                use_reentrant=False,
+            )
+            checkpointed.float().square().sum().backward()
+            torch.cuda.synchronize()
 
         self.assertTrue(torch.equal(direct, checkpointed))
         self.assertIsNotNone(direct_input.grad)
