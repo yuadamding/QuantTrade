@@ -27,6 +27,73 @@ import torch.utils.checkpoint
 from torch import nn
 
 
+# PyTorch 2.6's fused CUDA SDPA kernels map the leading batch dimension directly
+# to a CUDA grid dimension, whose portable limit is 65,535.  TOP2000 legitimately
+# exceeds it after flattening day x stock x block (for example 3 x 640 x 78 =
+# 149,760).  Split only the independent attention rows; keeping QKV/projection/FF
+# work whole preserves the large H100 tensor-core work units and model semantics.
+_SDPA_CUDA_BATCH_LIMIT = 65_535
+
+
+def _sdpa_batch_limit(q: torch.Tensor) -> int:
+    """Return the safe leading-dimension size for the active SDPA backend."""
+
+    return _SDPA_CUDA_BATCH_LIMIT if q.device.type == "cuda" else max(1, q.shape[0])
+
+
+def _bounded_scaled_dot_product_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    attn_mask: torch.Tensor | None,
+    is_causal: bool,
+    dropout_p: float,
+) -> torch.Tensor:
+    """Run SDPA without exceeding the fused CUDA kernel's batch-grid limit.
+
+    Rows in SDPA's leading dimension are independent, so slicing and
+    concatenating that dimension is mathematically identical when dropout is
+    disabled and statistically equivalent when it is enabled.  Separate calls
+    own separate Philox offsets; activation checkpointing restores the RNG
+    state and replays the same fixed call order during recomputation.
+
+    The generated padding mask is ``[N, 1, S, S]`` and must be sliced with the
+    rows.  Lower-dimensional or singleton-leading masks remain broadcastable
+    and are reused unchanged.
+    """
+
+    batch = q.shape[0]
+    batch_limit = _sdpa_batch_limit(q)
+    if batch <= batch_limit:
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+            dropout_p=dropout_p,
+        )
+
+    outputs: list[torch.Tensor] = []
+    for start in range(0, batch, batch_limit):
+        end = min(start + batch_limit, batch)
+        chunk_mask = attn_mask
+        if attn_mask is not None and attn_mask.ndim >= 3 and attn_mask.shape[0] == batch:
+            chunk_mask = attn_mask[start:end]
+        outputs.append(
+            F.scaled_dot_product_attention(
+                q[start:end],
+                k[start:end],
+                v[start:end],
+                attn_mask=chunk_mask,
+                is_causal=is_causal,
+                dropout_p=dropout_p,
+            )
+        )
+    return torch.cat(outputs, dim=0)
+
+
 @dataclass
 class ContextEncoderConfig:
     bar_feature_dim: int             # number of RAW bar fields per second (e.g. OHLCV = 5)
@@ -95,8 +162,14 @@ class _CausalBlock(nn.Module):
             causal_allowed = torch.ones(S, S, dtype=torch.bool, device=x.device).tril().view(1, 1, S, S)
             attn_mask = causal_allowed & key_allowed
             is_causal = False
-        a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal,
-                                           dropout_p=self.attn_dropout if self.training else 0.0)
+        a = _bounded_scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
         a = a.transpose(1, 2).reshape(N, S, d)
         x = x + self.drop(self.proj(a))
         x = x + self.drop(self.ff(self.ln2(x)))

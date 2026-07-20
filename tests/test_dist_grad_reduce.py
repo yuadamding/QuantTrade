@@ -395,6 +395,39 @@ def test_init_distributed_uses_long_configurable_collective_timeout(monkeypatch)
     assert calls[-1]["timeout"] == explicit
 
 
+def test_init_distributed_selects_cuda_device_before_nccl_initialization(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: calls.append(("device", device)))
+    monkeypatch.setattr(
+        dist_utils.dist,
+        "init_process_group",
+        lambda **kwargs: calls.append(("process_group", kwargs)),
+    )
+
+    assert dist_utils.init_distributed() == (2, 4, 2, True)
+    assert calls[0] == ("device", 2)
+    assert calls[1][0] == "process_group"
+    assert calls[1][1]["backend"] == "nccl"
+
+
+def test_barrier_declares_rank_local_device_for_nccl(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(dist_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist_utils.dist, "get_backend", lambda: "nccl")
+    monkeypatch.setattr(dist_utils.dist, "barrier", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    dist_utils.barrier()
+
+    assert calls == [{"device_ids": [3]}]
+
+
 def _gloo_rank0_work_sync_worker(
     rank: int,
     world: int,

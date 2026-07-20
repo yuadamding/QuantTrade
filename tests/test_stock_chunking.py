@@ -9,9 +9,13 @@ epsilon in BOTH train and eval, gradients included, with BN running stats update
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
 
+import rl_quant.models.context_encoder as context_encoder_module
 from rl_quant.models.context_encoder import ContextEncoder, ContextEncoderConfig
 from rl_quant.models.daily_policy import FullDayRawEncoder
 
@@ -35,6 +39,78 @@ def _inputs():
 
 
 class ContextEncoderChunking(unittest.TestCase):
+    def test_sdpa_grid_guard_preserves_outputs_masks_and_gradients(self) -> None:
+        generator = torch.Generator().manual_seed(11)
+        for use_mask in (False, True):
+            base = [torch.randn(5, 2, 3, 4, generator=generator) for _ in range(3)]
+            reference_inputs = [value.clone().requires_grad_() for value in base]
+            chunked_inputs = [value.clone().requires_grad_() for value in base]
+            mask = None
+            if use_mask:
+                mask = torch.ones(5, 1, 3, 3, dtype=torch.bool).tril()
+                mask[::2, :, :, -1] = False
+
+            reference = F.scaled_dot_product_attention(
+                *reference_inputs,
+                attn_mask=mask,
+                is_causal=not use_mask,
+                dropout_p=0.0,
+            )
+            reference_gradients = torch.autograd.grad(reference.square().sum(), reference_inputs)
+
+            calls: list[int] = []
+            original_sdpa = F.scaled_dot_product_attention
+
+            def recording_sdpa(*args, **kwargs):
+                calls.append(args[0].shape[0])
+                return original_sdpa(*args, **kwargs)
+
+            with (
+                patch.object(context_encoder_module, "_sdpa_batch_limit", lambda _query: 2),
+                patch.object(context_encoder_module.F, "scaled_dot_product_attention", recording_sdpa),
+            ):
+                chunked = context_encoder_module._bounded_scaled_dot_product_attention(
+                    *chunked_inputs,
+                    attn_mask=mask,
+                    is_causal=not use_mask,
+                    dropout_p=0.0,
+                )
+            chunked_gradients = torch.autograd.grad(chunked.square().sum(), chunked_inputs)
+
+            self.assertEqual(calls, [2, 2, 1])
+            self.assertTrue(torch.allclose(reference, chunked, atol=1e-6, rtol=1e-6))
+            for reference_gradient, chunked_gradient in zip(reference_gradients, chunked_gradients):
+                self.assertTrue(torch.allclose(reference_gradient, chunked_gradient, atol=1e-6, rtol=1e-6))
+
+    def test_sdpa_grid_guard_replays_dropout_under_checkpointing(self) -> None:
+        base = torch.randn(5, 2, 3, 4, generator=torch.Generator().manual_seed(19))
+
+        def attend(value: torch.Tensor) -> torch.Tensor:
+            return context_encoder_module._bounded_scaled_dot_product_attention(
+                value,
+                value,
+                value,
+                attn_mask=None,
+                is_causal=True,
+                dropout_p=0.2,
+            )
+
+        direct_input = base.clone().requires_grad_()
+        checkpoint_input = base.clone().requires_grad_()
+        with patch.object(context_encoder_module, "_sdpa_batch_limit", lambda _query: 2):
+            torch.manual_seed(23)
+            direct = attend(direct_input)
+            direct.square().sum().backward()
+
+            torch.manual_seed(23)
+            checkpointed = torch.utils.checkpoint.checkpoint(attend, checkpoint_input, use_reentrant=False)
+            checkpointed.square().sum().backward()
+
+        self.assertTrue(torch.equal(direct, checkpointed))
+        self.assertIsNotNone(direct_input.grad)
+        self.assertIsNotNone(checkpoint_input.grad)
+        self.assertTrue(torch.equal(direct_input.grad, checkpoint_input.grad))
+
     def _compare(self, train: bool, gc: bool) -> None:
         bars, mask, cov = _inputs()
         e0, e1 = _ctx_encoder(0, gc), _ctx_encoder(3, gc)
