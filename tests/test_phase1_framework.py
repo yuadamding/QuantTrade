@@ -51,6 +51,21 @@ def _encoder(d_model=16, max_seconds=S, block_seconds=BL, n_layers=2):
                                                max_seconds=max_seconds, block_seconds=block_seconds))
 
 
+class _TinySamplingEncoder(torch.nn.Module):
+    """Cheap differentiable encoder for tests concerned only with sampled day indices."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.value = torch.nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, bars, _mask, cov, _cov_valid=None):
+        batch, actions = bars.shape[:2]
+        blocks = cov.shape[1]
+        per_stock = self.value.expand(batch, blocks, actions, 1)
+        market = self.value.expand(batch, blocks, 1)
+        return per_stock, market
+
+
 def _policy(d_model=16, **kw):
     return DecisionPolicyHead(DecisionPolicyConfig(context_dim=d_model, bar_feature_dim=BAR_FEATS,
                                                    raw_policy_dim=4, raw_block_seconds=BL,
@@ -386,6 +401,81 @@ class TrainingStrategyKnobs(unittest.TestCase):
         finally:
             handle.remove()
         self.assertEqual(sorted(sampled), [10.0, 11.0, 12.0])
+
+    def test_ssl_accumulation_partitions_one_distinct_effective_batch(self):
+        enc, head = _TinySamplingEncoder(), ContextForwardHead(1)
+        days = [_synthetic_day(i) for i in range(36)]
+        for marker, day in enumerate(days, start=100):
+            day["bars"][1, 0, 0] = marker
+        sampled_batches = []
+
+        def record_batch(_module, args):
+            sampled_batches.append(tuple(args[0][:, 1, 0, 0].tolist()))
+
+        handle = enc.register_forward_pre_hook(record_batch)
+        try:
+            torch.manual_seed(7)
+            train_context_encoder(
+                enc,
+                head,
+                days,
+                device=torch.device("cpu"),
+                steps=1,
+                batch_size=3,
+                accum_steps=12,
+                schedule="constant",
+            )
+        finally:
+            handle.remove()
+
+        sampled = [marker for batch in sampled_batches for marker in batch]
+        self.assertEqual(len(sampled_batches), 12)
+        self.assertTrue(all(len(batch) == 3 for batch in sampled_batches))
+        self.assertEqual(sorted(sampled), [float(marker) for marker in range(100, 136)])
+
+    def test_ssl_accumulation_small_split_keeps_each_microbatch_distinct(self):
+        enc, head = _TinySamplingEncoder(), ContextForwardHead(1)
+        days = [_synthetic_day(i) for i in range(3)]
+        for marker, day in enumerate(days, start=20):
+            day["bars"][1, 0, 0] = marker
+        sampled_batches = []
+
+        def record_batch(_module, args):
+            sampled_batches.append(tuple(args[0][:, 1, 0, 0].tolist()))
+
+        handle = enc.register_forward_pre_hook(record_batch)
+        try:
+            torch.manual_seed(11)
+            train_context_encoder(
+                enc,
+                head,
+                days,
+                device=torch.device("cpu"),
+                steps=1,
+                batch_size=2,
+                accum_steps=3,
+                schedule="constant",
+            )
+        finally:
+            handle.remove()
+
+        self.assertEqual(len(sampled_batches), 3)
+        self.assertTrue(all(len(batch) == len(set(batch)) == 2 for batch in sampled_batches))
+
+    def test_ssl_accumulation_must_be_a_positive_integer(self):
+        days = [_synthetic_day(0)]
+        for accum_steps in (0, -1, False, 1.5):
+            with self.subTest(accum_steps=accum_steps):
+                with self.assertRaisesRegex(ValueError, "accum_steps must be a positive integer"):
+                    train_context_encoder(
+                        _TinySamplingEncoder(),
+                        ContextForwardHead(1),
+                        days,
+                        device=torch.device("cpu"),
+                        steps=0,
+                        batch_size=1,
+                        accum_steps=accum_steps,
+                    )
 
     def test_daily_ssl_uses_each_days_official_close_block(self):
         class BlockIndexEncoder(torch.nn.Module):

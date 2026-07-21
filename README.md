@@ -229,9 +229,9 @@ conda run -n quanttrade python ../training/train_phase1.py \
 conda run -n quanttrade python ../training/sweep_phase1.py \
   --designs top50-wide --devices 0,1,2,3 --vram-ceiling-gib 75 --seeds 1
 
-# Serious TOP2000 wide study: sequential four-rank settings, one seed each
+# Serious TOP2000 wide study: four independent one-GPU settings at a time, one seed each
 conda run -n quanttrade python ../training/sweep_phase1.py \
-  --designs top2000-wide --devices 0,1,2,3 --gpus-per-job 4 --seeds 1
+  --designs top2000-wide --devices 0,1,2,3 --gpus-per-job 1 --seeds 1
 ```
 
 Use `--stream` for large datasets. Large-universe execution should wait until provenance passes and the smaller

@@ -228,19 +228,27 @@ def test_top2000_membership_order_and_base_geometry_are_exact() -> None:
     assert (design.raw_recent_days, design.bptt_window) == (42, 21)
     assert (design.d_model, design.enc_layers, design.enc_heads) == (512, 8, 8)
     assert (design.policy_token_dim, design.policy_layers, design.policy_heads) == (96, 2, 6)
-    assert (design.ssl_batch_size, design.ssl_accum, design.ssl_steps) == (12, 3, 1000)
-    assert (design.batch_days, design.policy_steps) == (8, 716)
-    assert design.batch_days * design.episode_stride * design.policy_steps == 120_288
+    assert (design.ssl_batch_size, design.ssl_accum, design.ssl_steps) == (3, 12, 1000)
+    assert (design.batch_days, design.policy_accum, design.policy_steps) == (2, 4, 716)
+    assert design.batch_days * design.policy_accum * design.episode_stride * design.policy_steps == 120_288
     assert (design.max_actions_per_day, design.budget_lambda) == (12.0, 1e-3)
     assert (design.cost, design.max_stock_weight) == (1e-3, 0.01)
     assert design.context_storage_dtype == "bfloat16"
     assert (design.enc_stock_chunk, design.raw_stock_chunk) == (640, 1024)
-    assert design.min_gpus == 4
+    assert design.min_gpus == 1
 
 
 def test_daily_raw_rejects_delays_without_a_pending_order_queue() -> None:
     with pytest.raises(ValueError, match=r"daily_raw supports exec_delay=1 only"):
         replace(DESIGNS["daily_raw_top2000"], name="unsupported_delay", exec_delay=2)
+
+
+def test_design_rejects_nonpositive_policy_accumulation() -> None:
+    with pytest.raises(ValueError, match=r"policy_accum must be positive"):
+        replace(DESIGNS["daily_raw_top2000"], name="bad_policy_accum", policy_accum=0)
+
+    with pytest.raises(ValueError, match=r"policy_accum is supported by daily_raw training only"):
+        replace(DESIGNS["large"], name="ignored_policy_accum", policy_accum=2)
 
 
 def test_top2000_wide_ablations_change_only_declared_fields() -> None:
@@ -298,6 +306,7 @@ def test_top2000_wide_ablations_change_only_declared_fields() -> None:
         assert actual == expected_overrides[name]
         assert candidate["horizon_mode"] == "daily_raw"
         assert candidate["episode_len"] == candidate["daily_lookback"] == 252
-        assert candidate["ssl_batch_size"] % 4 == candidate["batch_days"] % 4 == 0
+        assert candidate["ssl_batch_size"] * candidate["ssl_accum"] == 36
+        assert candidate["batch_days"] * candidate["policy_accum"] == 8
         assert (candidate["enc_stock_chunk"], candidate["raw_stock_chunk"]) == (640, 1024)
-        assert candidate["min_gpus"] == 4
+        assert candidate["min_gpus"] == 1

@@ -9,7 +9,7 @@ Each design fully specifies BOTH transformers' architecture AND the training str
       set-transformer (policy_token_dim / policy_layers / policy_heads).
   TRAINING STRATEGY / SETUP (per stage where it differs)
     budget: ssl_steps, policy_steps, ssl_batch_size (DAYS per SSL micro-batch), ssl_accum (grad-accum),
-      batch_days (days per policy step).
+      batch_days (episodes per policy micro-batch), policy_accum (policy grad-accum).
     optimization: ssl_lr / pol_lr, ssl_weight_decay / pol_weight_decay, ssl_warmup_frac / pol_warmup_frac,
       schedule ('cosine' warmup->decay, or 'constant'), grad_clip, amp (bf16 autocast), grad_checkpoint.
     policy objective: cost (turnover), risk_lambda (downside), entropy_coef (allocation exploration),
@@ -57,6 +57,7 @@ class Phase1Design:
     raw_policy_layers: int = 1
     raw_policy_heads: int = 4
     ssl_accum: int = 8               # grad-accum: effective SSL target-batch = ssl_batch_size * ssl_accum days
+    policy_accum: int = 1            # grad-accum: effective policy batch = batch_days * policy_accum episodes
     # --- training strategy / setup (defaults; designs override to vary) ---
     dropout: float = 0.1
     ssl_lr: float = 2e-4
@@ -156,6 +157,8 @@ class Phase1Design:
             raise ValueError(
                 f"{self.name}: daily_raw supports exec_delay=1 only; longer delays require a pending-order queue"
             )
+        if self.horizon_mode != "daily_raw" and self.policy_accum != 1:
+            raise ValueError(f"{self.name}: policy_accum is supported by daily_raw training only")
         if self.episode_len <= 1:
             raise ValueError(f"{self.name}: episode_len must be > 1")
         if self.raw_recent_days < 0 or self.raw_recent_days > self.episode_len:
@@ -183,7 +186,8 @@ class Phase1Design:
         if self.min_gpus < 1:
             raise ValueError(f"{self.name}: min_gpus must be >= 1")
         for f in ("session_seconds", "block_seconds", "ssl_steps", "policy_steps", "ssl_batch_size",
-                  "ssl_accum", "batch_days", "raw_policy_dim", "raw_policy_layers", "raw_policy_heads"):
+                  "ssl_accum", "batch_days", "policy_accum", "raw_policy_dim", "raw_policy_layers",
+                  "raw_policy_heads"):
             if getattr(self, f) <= 0:
                 raise ValueError(f"{self.name}: {f} must be positive")
 
@@ -304,7 +308,7 @@ _SERIES = [
                  friction_warmup_frac=0.0, cost=5e-4, temperature=0.5, raw_norm="level", amp=True,
                  grad_checkpoint=True),
 
-    # ===== TOP2000, 4x H100 JOINTLY, sized to FINISH IN ONE DAY (one torchrun data-parallel job).
+    # ===== TOP2000, one H100 per setting (four-setting pool), with optimizer budgets preserved by accumulation.
     # Sizing rationale (2026-07 workflow, probe-grounded): the two stages have OPPOSITE binding constraints.
     #   Stage-1 is DATA-RICH (~1.5M train stock-days, params A-independent) -> d512/8L (~25.5M params, ~60:1
     #   sample:param). Stage-2 is OVERFITTING-BOUND (effective samples = ~840 train DAYS regardless of A; H=21
@@ -316,21 +320,22 @@ _SERIES = [
     # recompute near 52/66 GiB plus the small full-axis outputs while retaining large tensor-core work units. The
     # largest Stage-2 variant projected near 70 GiB reserved unchunked; a 1024-stock raw chunk gives two large,
     # balanced passes and ample backward headroom. Runtime telemetry remains authoritative across CUDA builds.
-    # A 12-day global micro-batch assigns three days/rank; three accumulation passes give an effective global batch
-    # of 36 (close to the former 32). Stage 2 uses two episodes/rank and 716 optimizer steps, preserving about 120k
-    # monthly scored-tail exposures.
-    # Every TOP2000 setting is one synchronous four-rank job; Stage 1 may shard dates, but Stage 2 must construct
-    # episodes from the complete chronological training history on every rank and distribute episode samples.
+    # One distinct 36-day SSL draw is partitioned into twelve three-day accumulation passes, preserving the former
+    # four-rank effective batch without multiplying one H100's peak activation. Stage 2 likewise accumulates four
+    # disjoint two-episode micro-batches before one optimizer step, preserving the former global batch of eight,
+    # 716 optimizer updates,
+    # and about 120k monthly scored-tail exposures. Four H100s run independent settings concurrently.
     Phase1Design("daily_raw_top2000", "TOP2000 H100 primary: 1m bars, d512/8L context, 252d memory, monthly budget",
                  session_seconds=FULL, block_seconds=300, bar_seconds=60, d_model=512, enc_layers=8, enc_heads=8,
                  policy_token_dim=96, policy_layers=2, policy_heads=6, ssl_steps=1000, policy_steps=716,
-                 ssl_batch_size=12, ssl_accum=3, batch_days=8, raw_policy_dim=128, raw_policy_layers=2,
+                 ssl_batch_size=3, ssl_accum=12, batch_days=2, policy_accum=4,
+                 raw_policy_dim=128, raw_policy_layers=2,
                  raw_policy_heads=8, horizon_mode="daily_raw", episode_len=252, episode_stride=21, bptt_window=21,
                  label_horizon_days=21, daily_lookback=252, exec_delay=1, raw_recent_days=42,
                  budget_lambda=1e-3, ssl_perstock_coef=0.0, ssl_daily_coef=1.0, pol_weight_decay=0.3,
                  max_actions_per_day=12.0, friction_warmup_frac=0.0, cost=1e-3, temperature=0.5,
                  max_stock_weight=0.01, raw_norm="level", context_storage_dtype="bfloat16", amp=True,
-                 grad_checkpoint=True, enc_stock_chunk=640, raw_stock_chunk=1024, min_gpus=4),
+                 grad_checkpoint=True, enc_stock_chunk=640, raw_stock_chunk=1024, min_gpus=1),
 ]
 
 # ===== TOP50 / 4xH100 one-seed screening =====================================
@@ -532,10 +537,10 @@ _TOP50_H100_SERIES = [
 ]
 _SERIES.extend(_TOP50_H100_SERIES)
 
-# ===== TOP2000 / 4xH100 one-seed screening ==================================
+# ===== TOP2000 / four independent H100s, one seed per setting ===============
 #
-# Unlike TOP50, one TOP2000 setting consumes all four H100s jointly.  All
-# settings retain the full 252-day episode and differ by one declared factor.
+# Each TOP2000 setting uses one H100; the pool runs up to four settings at once.
+# All settings retain the full 252-day episode and differ by one declared factor.
 # The first ten form the core policy/optimizer/trading screen and share one
 # expensive Stage-1 context exactly.  Wide-only bar/block/label ablations are
 # intentionally last because each requires a distinct cache and/or SSL run.

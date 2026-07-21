@@ -353,6 +353,7 @@ def _sample_episode_indices(n_episodes: int, batch_size: int) -> list[int]:
 
 def train_daily_policy(
     policy, train_eps, *, steps: int, lr: float = 3e-4, weight_decay: float = 3e-2, batch_days: int = 6,
+    accum_steps: int = 1,
     cost: float = 5e-4, risk_lambda: float = 0.1, entropy_coef: float = 0.0, max_actions: float = 5.0,
     budget_lambda: float = 1e-3, gate_entropy_coef: float = 1e-5, missing_label_penalty: float = 1e-3,
     bptt_window: int = 1, terminal_liquidate: bool = False, warmup_steps: int = 0, schedule: str = "cosine",
@@ -372,37 +373,53 @@ def train_daily_policy(
     Validation uses the CONTINUOUS rollout (1-day realized mark) and selects on mean net return over the fixed,
     policy-independent set of labeled dates, only when label-reportable coverage is adequate. Missing-label
     allocations receive zero return credit and still pay turnover cost; the coverage threshold is an eligibility
-    gate, never a row filter. Distributed callers may provide
+    gate, never a row filter. ``batch_days`` is the peak-memory micro-batch and ``accum_steps`` disjoint
+    micro-batches form one effective optimizer batch. Distributed callers may provide
     ``prepare_checkpoint`` for an all-rank snapshot after validation, then
     ``sync_after_eval`` so non-main ranks cannot enter the next training
     collective while rank 0 is still writing its checkpoint."""
+    if isinstance(accum_steps, bool) or not isinstance(accum_steps, int) or accum_steps < 1:
+        raise ValueError(f"accum_steps must be a positive integer, got {accum_steps!r}")
     if optimizer is None:
         optimizer = make_adamw(policy.parameters(), lr=lr, weight_decay=weight_decay)
     dev_type = (device.type if hasattr(device, "type") else "cuda")
     n = len(train_eps)
+    if n <= 0:
+        raise ValueError("train_eps must contain at least one episode")
+    if isinstance(batch_days, bool) or not isinstance(batch_days, int) or batch_days < 1:
+        raise ValueError(f"batch_days must be a positive integer, got {batch_days!r}")
     for step in range(start_step, steps):
         policy.train()
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
-        idx = (episode_sampler or _sample_episode_indices)(n, batch_days)
-        expected_batch = min(batch_days, n)
+        requested_batch = batch_days * accum_steps
+        idx = (episode_sampler or _sample_episode_indices)(n, requested_batch)
+        expected_batch = min(requested_batch, n)
         if len(idx) != expected_batch or len(set(idx)) != len(idx) or any(i < 0 or i >= n for i in idx):
             raise RuntimeError(
                 f"episode sampler must return {expected_batch} distinct indices in [0, {n}), got {idx}"
             )
-        batch = _stack(train_eps, idx, device)
-        with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
-            nets, gates, ents, _, _, missing_w, _ = _daily_rollout(policy, batch, cost, bptt_window=bptt_window,
-                                                                   # Sampled overlapping windows are normally
-                                                                   # rollout truncations, not economic terminals;
-                                                                   # the default therefore does not duplicate an
-                                                                   # exit charge at every stride boundary.
-                                                                   terminal_liquidate=terminal_liquidate,
-                                                                   ret_key="ret", reward_scale=reward_scale)
-            label = batch["ret_valid"][:, :, 1:].any(-1) & batch["score_mask"]
-            loss = _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef,
-                               max_actions, budget_lambda, gate_entropy_coef, missing_label_penalty)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        for offset in range(0, len(idx), batch_days):
+            micro_idx = idx[offset:offset + batch_days]
+            batch = _stack(train_eps, micro_idx, device)
+            with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
+                nets, gates, ents, cash_w, turn, missing_w, views = _daily_rollout(
+                    policy, batch, cost, bptt_window=bptt_window,
+                    # Sampled overlapping windows are normally rollout truncations, not economic terminals;
+                    # the default therefore does not duplicate an exit charge at every stride boundary.
+                    terminal_liquidate=terminal_liquidate,
+                    ret_key="ret", reward_scale=reward_scale,
+                )
+                label = batch["ret_valid"][:, :, 1:].any(-1) & batch["score_mask"]
+                loss = _daily_loss(nets, gates, ents, missing_w, label, risk_lambda, entropy_coef,
+                                   max_actions, budget_lambda, gate_entropy_coef, missing_label_penalty)
+                # `_daily_loss` is a mean over episodes. Weight by this micro-batch's share of the one disjoint
+                # effective batch, including the legacy n < batch_days case where the only micro-batch is short.
+                loss = loss * (len(micro_idx) / len(idx))
+            loss.backward()
+            # Release graph endpoints before `_stack` constructs the next large-universe micro-batch. Otherwise
+            # Python keeps the previous batch alive while evaluating the right-hand side of the next assignment.
+            del batch, nets, gates, ents, cash_w, turn, missing_w, views, label, loss
         if grad_reduce is not None:                  # data-parallel: average grads across ranks before the step
             grad_reduce(list(policy.parameters()))
         if grad_clip > 0:

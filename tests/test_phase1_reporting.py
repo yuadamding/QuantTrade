@@ -376,11 +376,17 @@ def test_manifest_jsonl_and_final_policy_are_durable(tmp_path, monkeypatch) -> N
     policy = torch.nn.Linear(2, 1)
     state = {"cfg": "abc"}
     checkpoint = driver._save_final_policy(
-        tmp_path / "state.pt", policy, seed=9, best_val=0.25, state=state, mode="daily"
+        tmp_path / "state.pt", policy, seed=9, best_val=0.25, state=state, mode="daily",
+        context_hash="ctx-hash", context_artifact_id="generation-a", context_path=tmp_path / "ctx.pt",
     )
     saved = torch.load(checkpoint, weights_only=True)
     assert saved["seed"] == 9
     assert saved["selection_source"] == "validation_mean_net_return"
+    assert saved["context"] == {
+        "hash": "ctx-hash",
+        "artifact_id": "generation-a",
+        "encoder_path": str(driver._context_generation_path(tmp_path / "ctx.pt", "generation-a")),
+    }
     assert set(saved["policy_state_dict"]) == set(policy.state_dict())
 
 
@@ -423,6 +429,7 @@ def test_daily_raw_without_eligible_validation_checkpoint_never_publishes_or_tes
         episode_stride=2,
         episode_len=2,
         batch_days=1,
+        policy_accum=1,
         d_model=8,
         raw_policy_dim=8,
         raw_policy_layers=1,
@@ -595,7 +602,7 @@ def test_named_top50_sweep_aliases_are_one_seed_one_gpu_protocols() -> None:
         sweep.validate_screening_request("top50-core", seeds=1, gpus_per_job=2)
 
 
-def test_named_top2000_study_is_one_seed_per_four_rank_setting() -> None:
+def test_named_top2000_study_is_one_seed_per_independent_gpu_setting() -> None:
     expected = list(sweep.TOP2000_H100_WIDE_SWEEP)
     core = list(sweep.TOP2000_H100_CORE_SWEEP)
     assert expected
@@ -604,13 +611,42 @@ def test_named_top2000_study_is_one_seed_per_four_rank_setting() -> None:
     assert sweep.resolve_designs("top2000-wide") == expected
     assert sweep.resolve_designs("top2000") == expected
     assert sweep.resolve_designs("sweep") == expected
+    assert all(sweep.DESIGNS[name].min_gpus == 1 for name in expected)
     sweep.validate_screening_request("top2000-wide", seeds=1, gpus_per_job=0)
-    sweep.validate_screening_request("sweep", seeds=1, gpus_per_job=4)
-    sweep.validate_screening_request("top2000-wide", seeds=1, gpus_per_job=4)
+    sweep.validate_screening_request("sweep", seeds=1, gpus_per_job=1)
+    sweep.validate_screening_request("top2000-wide", seeds=1, gpus_per_job=1)
     with pytest.raises(ValueError, match="one-seed-per-setting"):
-        sweep.validate_screening_request("top2000-wide", seeds=2, gpus_per_job=4)
-    with pytest.raises(ValueError, match="one four-rank job per setting"):
+        sweep.validate_screening_request("top2000-wide", seeds=2, gpus_per_job=1)
+    with pytest.raises(ValueError, match="one GPU per independent setting"):
         sweep.validate_screening_request("top2000-wide", seeds=1, gpus_per_job=2)
+
+
+@pytest.mark.parametrize(
+    ("trailing_override", "message"),
+    [
+        (["--designs", "daily_raw_top2000"], "requires --designs"),
+        (["--gpus-per-job", "4"], "one GPU per independent setting"),
+        (["--seeds", "2"], "one-seed-per-setting"),
+    ],
+)
+def test_sticky_top2000_protocol_rejects_trailing_launcher_overrides(
+    trailing_override: list[str], message: str
+) -> None:
+    argv = [
+        "--independent-top2000-protocol",
+        "--designs", "top2000-wide",
+        "--gpus-per-job", "1",
+        "--seeds", "1",
+        *trailing_override,
+    ]
+
+    with pytest.raises(SystemExit, match=message):
+        sweep.main(argv)
+
+
+def test_explicit_sweep_rejects_duplicate_design_settings() -> None:
+    with pytest.raises(ValueError, match="duplicate settings"):
+        sweep.resolve_designs("daily_raw_top2000,daily_raw_top2000")
 
 
 def test_top2000_wide_has_one_shared_and_four_distinct_context_groups() -> None:
@@ -631,19 +667,110 @@ def test_unpublished_context_blocks_dependants_only_for_current_invocation(tmp_p
     groups = {context_path: [0, 1, 2, 3]}
     launched = {0, 3}
 
-    blocked = sweep.block_unpublished_context_dependants(context_path, 0, groups, launched)
+    blocked = sweep.block_unpublished_context_dependants(
+        context_path, 0, groups, launched, artifacts_ready=False
+    )
 
     assert blocked == [1, 2]
     assert launched == {0, 1, 2, 3}
 
-    # Atomic publication before producer exit leaves all policy dependants
-    # runnable. A new process invocation also reconstructs its own launched
-    # set, so nothing durable marks dependants skipped across resumable runs.
-    context_path.parent.mkdir(parents=True)
-    context_path.write_bytes(b"published")
+    # Validated publication before producer exit leaves all policy dependants
+    # runnable. A new process invocation also reconstructs its own launched set,
+    # so nothing durable marks dependants skipped across resumable runs.
     relaunched = {0}
-    assert sweep.block_unpublished_context_dependants(context_path, 0, groups, relaunched) == []
+    assert sweep.block_unpublished_context_dependants(
+        context_path, 0, groups, relaunched, artifacts_ready=True
+    ) == []
     assert relaunched == {0}
+
+
+def test_context_artifact_readiness_validates_identity_and_rechecks_atomic_replacement(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "ctx-expected.pt"
+    wrong_state = {"weight": torch.ones(1)}
+    torch.save({
+        "schema_version": 1,
+        "ctx": "wrong",
+        "artifact_id": "generation-wrong",
+        "state_schema_sha256": driver._context_state_schema_sha256(wrong_state),
+        "enc": wrong_state,
+    }, path)
+    cache: sweep.ArtifactReadinessCache = {}
+    real_load = sweep.torch.load
+    loads: list[Path] = []
+
+    def tracked_load(candidate, *args, **kwargs):
+        loads.append(Path(candidate))
+        return real_load(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(sweep.torch, "load", tracked_load)
+    assert not sweep.context_encoder_artifact_ready(path, cache)
+    assert not sweep.context_encoder_artifact_ready(path, cache)
+    assert loads == [path]
+
+    replacement = tmp_path / "replacement.pt"
+    replacement_state = {"weight": torch.ones(1)}
+    torch.save({
+        "schema_version": 1,
+        "ctx": path.stem,
+        "artifact_id": "generation-correct",
+        "state_schema_sha256": driver._context_state_schema_sha256(replacement_state),
+        "enc": replacement_state,
+    }, replacement)
+    os.replace(replacement, path)
+    assert sweep.context_encoder_artifact_ready(path, cache)
+    assert loads == [path, path]
+
+
+def test_daily_eod_artifact_readiness_validates_payload_and_hash(tmp_path) -> None:
+    context_hash = "ctx-eod"
+    storage_dtype = "bfloat16"
+    path = tmp_path / f"{context_hash}.daily_eod.{storage_dtype}.pt"
+    fields = {
+        "market": torch.zeros(1, 2, dtype=torch.bfloat16),
+        "per_stock": torch.zeros(1, 3, 2, dtype=torch.bfloat16),
+        "avail": torch.ones(1, 3, dtype=torch.bool),
+        "news_raw": torch.zeros(1, 3, driver.MAX_NEWS, driver.NEWS_RAW_DIM),
+        "news_mask": torch.zeros(1, 3, driver.MAX_NEWS, dtype=torch.bool),
+        "day_close": torch.ones(1, 3),
+    }
+    torch.save({
+        "schema_version": 1,
+        "context_hash": context_hash,
+        "context_artifact_id": "encoder-generation",
+        "storage_dtype": storage_dtype,
+        "dates": ["2024-01-02"],
+        "fields": fields,
+    }, path)
+    cache: sweep.ArtifactReadinessCache = {}
+
+    assert sweep.daily_eod_artifact_ready(
+        path,
+        context_hash=context_hash,
+        context_artifact_id="encoder-generation",
+        context_dim=2,
+        storage_dtype=storage_dtype,
+        cache=cache,
+    )
+    # The file itself is unchanged, but a new encoder generation must force
+    # revalidation instead of reusing the memoized True verdict.
+    assert not sweep.daily_eod_artifact_ready(
+        path,
+        context_hash=context_hash,
+        context_artifact_id="new-encoder-generation",
+        context_dim=2,
+        storage_dtype=storage_dtype,
+        cache=cache,
+    )
+    assert not sweep.daily_eod_artifact_ready(
+        path,
+        context_hash="other",
+        context_artifact_id="encoder-generation",
+        context_dim=2,
+        storage_dtype=storage_dtype,
+        cache={},
+    )
 
 
 def test_sweep_device_parser_canonicalizes_and_rejects_ambiguous_pools() -> None:
@@ -762,7 +889,14 @@ def test_guarded_top2000_rechecks_claim_immediately_before_launch(tmp_path, monk
     monkeypatch.setattr(sweep, "seed_done", lambda *_args, **_kwargs: False)
     context_path = tmp_path / "cache" / "contexts" / "shared.pt"
     context_path.parent.mkdir(parents=True)
-    context_path.write_bytes(b"published")
+    shared_state = {"weight": torch.ones(1)}
+    torch.save({
+        "schema_version": 1,
+        "ctx": context_path.stem,
+        "artifact_id": "shared-generation",
+        "state_schema_sha256": driver._context_state_schema_sha256(shared_state),
+        "enc": shared_state,
+    }, context_path)
     monkeypatch.setattr(sweep, "_context_cache_path", lambda *_args, **_kwargs: context_path)
     monkeypatch.setattr(sweep, "design_cfg_hash", lambda *_args, **_kwargs: "cfg")
     monkeypatch.setattr(
@@ -797,11 +931,126 @@ def test_guarded_top2000_rechecks_claim_immediately_before_launch(tmp_path, monk
     # the cards, directly adjacent to Popen.
     assert preflight_calls == [
         (("0", "1", "2", "3"), 75.0, True),
-        (("0", "1", "2", "3"), 75.0, True),
+        (("0",), 75.0, True),
     ]
     assert len(launched_commands) == 1
     command = launched_commands[0]
     assert command[command.index("--distributed-timeout-minutes") + 1] == "37.5"
+    assert "torch.distributed.run" not in command
+    assert command[command.index("--device") + 1] == "cuda:0"
+
+
+def test_named_top2000_scheduler_replenishes_four_direct_gpus_across_all_settings(
+    tmp_path, monkeypatch
+) -> None:
+    designs = list(sweep.TOP2000_H100_WIDE_SWEEP)
+    assert len(designs) == 27
+    monkeypatch.setattr(sweep, "seed_done", lambda *_args, **_kwargs: False)
+
+    context_paths_by_key: dict[tuple[object, ...], Path] = {}
+    context_paths_by_design: dict[str, Path] = {}
+    for name in designs:
+        design = sweep.DESIGNS[name]
+        key = tuple(getattr(design, field) for field in driver.CONTEXT_FIELDS)
+        if key not in context_paths_by_key:
+            context_paths_by_key[key] = tmp_path / "cache" / "contexts" / f"group-{len(context_paths_by_key)}.pt"
+        context_paths_by_design[name] = context_paths_by_key[key]
+
+    monkeypatch.setattr(
+        sweep,
+        "_context_cache_path",
+        lambda design_name, _seed, **_kwargs: context_paths_by_design[design_name],
+    )
+    ready_contexts: set[Path] = set()
+
+    def ready_context(path, _cache, artifact_ids):
+        if path not in ready_contexts:
+            artifact_ids.pop(path, None)
+            return False
+        artifact_ids[path] = f"generation-{path.stem}"
+        return True
+
+    monkeypatch.setattr(sweep, "context_encoder_artifact_ready", ready_context)
+    monkeypatch.setattr(sweep, "daily_eod_artifact_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(sweep, "design_cfg_hash", lambda *_args, **_kwargs: "cfg")
+    for key in sweep.TORCH_DISTRIBUTED_ENV_VARS:
+        monkeypatch.setenv(key, "hostile-parent-value")
+
+    preflight_claims: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        sweep,
+        "gpu_preflight",
+        lambda devices, *_args, **_kwargs: preflight_claims.append(tuple(devices)),
+    )
+    direct_run_envs: list[dict[str, str]] = []
+
+    def finished_run(*_args, **kwargs):
+        if kwargs.get("env") is not None:
+            direct_run_envs.append(dict(kwargs["env"]))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(sweep.subprocess, "run", finished_run)
+    monkeypatch.setattr(sweep.time, "sleep", lambda _seconds: None)
+
+    counters = {"active": 0, "peak": 0}
+    launches: list[tuple[list[str], str, dict[str, str]]] = []
+
+    class FinishedProcess:
+        def __init__(self, context_path: Path) -> None:
+            self.finished = False
+            self.context_path = context_path
+
+        def poll(self) -> int:
+            if not self.finished:
+                self.finished = True
+                counters["active"] -= 1
+                ready_contexts.add(self.context_path)
+            return 0
+
+    def finished_popen(command, *_args, **kwargs):
+        design_name = command[command.index("--design") + 1]
+        counters["active"] += 1
+        counters["peak"] = max(counters["peak"], counters["active"])
+        launches.append((list(command), kwargs["env"]["CUDA_VISIBLE_DEVICES"], dict(kwargs["env"])))
+        return FinishedProcess(context_paths_by_design[design_name])
+
+    monkeypatch.setattr(sweep.subprocess, "Popen", finished_popen)
+
+    assert sweep.main([
+        "--independent-top2000-protocol",
+        "--designs", "top2000-wide",
+        "--data-root", "TOP2000",
+        "--devices", "0,1,2,3",
+        "--runs-root", str(tmp_path),
+        "--python", "python",
+    ]) == 0
+
+    assert counters["peak"] == 4
+    assert len(launches) == 27
+    launched_designs = [command[command.index("--design") + 1] for command, _visible, _env in launches]
+    assert len(set(launched_designs)) == 27
+    assert set(launched_designs) == set(designs)
+    assert len({context_paths_by_design[name] for name in launched_designs[:4]}) == 4
+    visible_devices = [visible for _command, visible, _env in launches]
+    assert visible_devices[:4] == ["0", "1", "2", "3"]
+    assert sorted(visible_devices.count(device) for device in ("0", "1", "2", "3")) == [6, 7, 7, 7]
+    assert preflight_claims[0] == ("0", "1", "2", "3")
+    assert len(preflight_claims) == 28
+    assert all(len(claim) == 1 for claim in preflight_claims[1:])
+    for command, visible, env in launches:
+        assert command[:2] == ["python", str(sweep.DRIVER)]
+        assert "torch.distributed.run" not in command
+        assert command[command.index("--device") + 1] == "cuda:0"
+        assert command[command.index("--seeds") + 1] == "1"
+        assert command[command.index("--seed-base") + 1] == "17"
+        assert env["CUDA_VISIBLE_DEVICES"] == visible
+        assert all(key not in env for key in sweep.TORCH_DISTRIBUTED_ENV_VARS)
+    assert direct_run_envs
+    assert all(
+        key not in env
+        for env in direct_run_envs
+        for key in sweep.TORCH_DISTRIBUTED_ENV_VARS
+    )
 
 
 @pytest.mark.parametrize(("build_only", "stream"), [(True, True), (False, True), (False, False)])
@@ -852,7 +1101,7 @@ def test_top2000_launcher_passes_guarded_four_h100_protocol_without_implicit_ack
         "--designs": "top2000-wide",
         "--data-root": "TOP2000",
         "--devices": "0,1,2,3",
-        "--gpus-per-job": "4",
+        "--gpus-per-job": "1",
         "--vram-ceiling-gib": "75",
         "--cache-windows": "4",
         "--cpu-workers-per-gpu": "8",
@@ -864,6 +1113,7 @@ def test_top2000_launcher_passes_guarded_four_h100_protocol_without_implicit_ack
     }
     for flag, expected in expected_values.items():
         assert args[args.index(flag) + 1] == expected
+    assert args.count("--independent-top2000-protocol") == 1
     assert args.count("--stream") == 1
     assert "--allow-unreportable" not in args
 
@@ -871,6 +1121,24 @@ def test_top2000_launcher_passes_guarded_four_h100_protocol_without_implicit_ack
     subprocess.run(["bash", str(TOP2000_LAUNCHER)], env=env, check=True, timeout=5)
     inherited_args = capture.read_text(encoding="utf-8").splitlines()
     assert inherited_args[inherited_args.index("--devices") + 1] == "4,5,6,7"
+
+    subprocess.run(
+        [
+            "bash", str(TOP2000_LAUNCHER),
+            "--designs", "daily_raw_top2000",
+            "--gpus-per-job", "4",
+            "--seeds", "2",
+        ],
+        env=env,
+        check=True,
+        timeout=5,
+    )
+    hostile_args = capture.read_text(encoding="utf-8").splitlines()
+    assert hostile_args.count("--independent-top2000-protocol") == 1
+    with pytest.raises(SystemExit, match="requires --designs"):
+        sweep.main(hostile_args[1:])
+
+    assert "--independent-top2000-protocol" in ROOT_LAUNCHER.read_text(encoding="utf-8")
 
 
 def test_cache_build_defaults_use_28_single_threaded_workers(monkeypatch) -> None:

@@ -79,7 +79,8 @@ def train_context_encoder(
     ``daily_head`` + ``daily_targets`` (a list aligned with train_days of (tgt [A], mask [A]) = each day's next-H-day
     cross-sectional return) add a DAILY relative-value pretext on the END-OF-DAY context -- the target a daily
     cross-sectional policy needs (see ssl_targets_daily). STREAMS ``batch_size`` days/micro-batch and
-    GRADIENT-ACCUMULATES ``accum_steps`` micro-batches per step. Distributed
+    GRADIENT-ACCUMULATES ``accum_steps`` micro-batches per step. When the effective batch fits the training split,
+    its days are sampled once without replacement and partitioned into micro-batches. Distributed
     callers may provide ``prepare_checkpoint`` for an all-rank snapshot (for
     example per-rank RNG gathering), then ``sync_after_checkpoint`` so all
     ranks wait for rank-0 checkpoint I/O before starting the next collective.
@@ -107,15 +108,31 @@ def train_context_encoder(
     n = len(train_days)
     if not 0 < batch_size <= n:
         raise ValueError(f"batch_size must be in [1, {n}], got {batch_size}")
+    if isinstance(accum_steps, bool) or not isinstance(accum_steps, int) or accum_steps < 1:
+        raise ValueError(f"accum_steps must be a positive integer, got {accum_steps!r}")
     encoder.train()
     for h in heads:
         h.train()
 
-    def micro():
-        # A local micro-batch should spend every slot on a distinct trading
-        # day.  Rank date shards are disjoint, so this also avoids cross-rank
-        # duplicates without adding a distributed sampling collective.
-        idx = torch.randperm(n)[:batch_size].tolist()
+    def effective_indices() -> list[int]:
+        """Draw one optimizer batch, retaining the legacy small-split fallback.
+
+        TOP2000 has enough dates for the whole effective batch, so one
+        permutation makes every accumulated sample distinct. Some smoke and
+        unit-test datasets are smaller than ``batch_size * accum_steps``. For
+        those, repeats are unavoidable; independent permutations keep each
+        individual micro-batch distinct and preserve the former behavior.
+        """
+
+        effective_batch = batch_size * accum_steps
+        if effective_batch <= n:
+            return torch.randperm(n)[:effective_batch].tolist()
+        selected: list[int] = []
+        for _ in range(accum_steps):
+            selected.extend(torch.randperm(n)[:batch_size].tolist())
+        return selected
+
+    def micro(idx: list[int]):
         st = lambda src: torch.stack([src[i] for i in idx]).to(device, non_blocking=True)  # noqa: E731
         bars = torch.stack([train_days[i]["bars"] for i in idx]).to(device, non_blocking=True)
         mask = torch.stack([train_days[i]["bar_mask"] for i in idx]).to(device, non_blocking=True)
@@ -150,8 +167,10 @@ def train_context_encoder(
     for step in range(start_step, steps):
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
         optimizer.zero_grad(set_to_none=True)
-        for _ in range(accum_steps):
-            bars, mask, cov, cov_valid, close_blocks, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro()
+        selected = effective_indices()
+        for offset in range(0, len(selected), batch_size):
+            idx = selected[offset:offset + batch_size]
+            bars, mask, cov, cov_valid, close_blocks, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro(idx)
             with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
                 encoded = encoder(bars, mask, cov, cov_valid) if cov_valid is not None else encoder(bars, mask, cov)
                 per_stock, market = encoded                          # [b,nB,A,d], [b,nB,d]
