@@ -15,3 +15,4 @@ named so a reader can see the policy is not just aspirational.
 | [0003](0003-return-basis-content-hash.md) | A canonical `ReturnBasis` + content hash is the return-economics contract | Accepted | `tests/test_golden_artifacts.py`, `test_research_protocol.py` |
 | [0004](0004-env-execution-owns-reward.md) | Only the env/execution layer may mutate portfolio state and compute reward | Partial | `tests/test_portfolio_env.py`; legacy gaps in `tests/test_daily_runtime_accounting.py` |
 | [0005](0005-scripts-to-package-migration.md) | `scripts/` are thin wrappers; the package owns implementation | Accepted | `tests/test_scripts_are_wrappers.py` |
+| [0006](0006-daily-decision-soft-30-session-holding.md) | One daily decision, carried positions, soft 30-session holding target | Partial | Not yet; planned Hold-30 accounting, carry, and mechanism tests |

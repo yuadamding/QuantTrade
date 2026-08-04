@@ -1,8 +1,22 @@
 # Deep-RL migration ledger
 
 This ledger tracks the move from the market-specific Phase-1 direct optimizer to a general deep-RL framework.
-It describes current repository state as of 2026-07; it is not a promise that pending items already exist. The
-stable architecture contracts are documented in [general_rl_architecture.md](general_rl_architecture.md).
+Its implementation-status table is a 2026-07 snapshot; the documentation was
+updated on 2026-08-04. Pending items are not promises that the implementation
+already exists. The stable architecture contracts are documented in
+[general_rl_architecture.md](general_rl_architecture.md).
+
+The scientifically negative S0–S7 evaluation motivates a proposed next
+generation rather than a wider search over the old grid. The strategy mandate
+is recorded in [ADR-0006](adr/0006-daily-decision-soft-30-session-holding.md):
+one portfolio decision per trading session, continuously carried positions,
+and a soft target holding duration of roughly 30 sessions. The
+[Hold-30 redesign RFC](daily_hold30_policy_rfc.md) and
+[H0–H3 pre-lockbox experiment](prelockbox_hold30_h0_h3_experiment.md) are the
+only active proposed implementation and experiment protocol. The earlier
+A0–A5 draft was superseded before execution because it tested a materially
+different holding mechanism. This ledger continues to describe implemented
+behavior until the RFC code and blocking tests land.
 
 ## Non-negotiable boundary
 
@@ -33,6 +47,7 @@ accounting primitives with the environment, but it is not yet evidence that the 
 | Dataset universe provenance | Implemented mechanically | Future-selected universes fail; rolling/PIT membership is supported. Existing ranked datasets still need rebuilding. |
 | Causal Stage-1 normalization | Implemented and integrated | Fixed training-only moments; forward is immutable and train/eval identical. |
 | Legacy daily reward/accounting repairs | Implemented | One-step daily-raw reward, auxiliary H-day target, burn-in score mask, drift and liquidation helpers. |
+| Hold-30 state/action/accounting contract | **Pending** | ADR-0006 is agreed, but canonical state carry, origin-indexed credit replay, fill-time age/cohort state, per-stock hazards, sleeves, and duration evidence are not implemented. |
 | Walk-forward splitter | Implemented as a library primitive | Tested purge/embargo geometry, expanding/rolling windows, and fold identities bound to caller-supplied horizon/axis identity. The API cannot infer effective lookahead or verify dataset-snapshot authenticity; launcher/evaluator integration remains in progress. |
 | General RL experiment CLI | **Pending** | Implemented collectors, algorithms, and environment still need configuration, checkpoint/RNG/provenance bundling, and command orchestration. |
 | Phase-1 encoder-to-RL observation adapter | **Pending** | Frozen/raw market encoders are not connected to `ObservationBatch` for PPO. |
@@ -54,7 +69,7 @@ accounting primitives with the environment, but it is not yet evidence that the 
 
 Exit condition: the provenance gate passes without override, and delisting/missing-return behavior is tested.
 
-### 2. Complete the portfolio action adapter — library primitive implemented
+### 2. Complete the portfolio action adapters — simplex primitive implemented; Hold-30 pending
 
 Delivered:
 
@@ -64,9 +79,14 @@ Delivered:
   action contract;
 - projection distance remains available from the environment.
 
-Remaining integration work: choose/configure this actor in the future RL CLI and monitor projection distance in
-the artifact evaluator. Sparse top-k allocation is not silently introduced; if added, its probability semantics
-must be explicit.
+The simplex adapter remains valid as a generic PPO/reference compatibility
+primitive. H0 instead uses the experiment's deterministic
+target-softmax/scalar adapter under direct optimization. Neither is the target
+Hold-30 action. Remaining work is to add a typed entry-score,
+per-stock-hazard, and risky-exposure intent adapter with environment-owned age
+state, then monitor projection distance and action causes in the artifact
+evaluator. Sparse top-k allocation is not silently introduced; if added, its
+probability semantics must be explicit.
 
 ### 3. Add one reusable rollout coordinator — library primitive implemented
 
@@ -90,7 +110,10 @@ defines subset-reset semantics.
 - Use causal input-only prefixes for recurrent validation/test warm-up while excluding prefixes from scores.
 - Keep longer-horizon forecasting and SSL targets auxiliary to the environment's one-step reward.
 
-Exit condition: PPO and the direct baseline consume the same point-in-time observations and scored date range.
+Exit condition: H0–H3 consume the same point-in-time observations, scored date
+range, causal age summaries, availability masks, and censor masks under the
+direct optimizer. A later registered PPO comparison must reuse that frozen
+observation and Hold-30 state/action contract.
 
 ### 5. Make environment accounting universal — pending
 
@@ -101,15 +124,20 @@ Exit condition: PPO and the direct baseline consume the same point-in-time obser
 - Retain the differentiable legacy rollout only as an explicitly named baseline if training cannot use the
   non-differentiable environment.
 
-Exit condition: evaluator rewards come from the environment, and any direct-baseline differences are declared
+Exit condition: evaluator rewards come from the environment; portfolio,
+age/cohort, pending-intent, and model state cross intra-sweep boundaries without
+an economic reset; turnover is cause-typed; continuing and separately
+liquidated wealth reconcile; and any direct-baseline differences are declared
 and regression-tested rather than accidental.
 
 ### 6. Persist evaluation artifacts before scaling — pending
 
 - Use optional `HistoricalMarketData.decision_ids` so transitions/replay have globally unique int64 identities;
   exact replay alignment must fail closed when IDs are missing, duplicated, or mismatched.
-- Write a dated decision log with observations/provenance IDs, masks, requested/executed actions, reward
-  components, holdings, equity, constraints, and terminal flags.
+- Write a dated decision log with observations/provenance IDs, masks, raw/
+  constructed/filled action stages, pending intents, reward components,
+  holdings, age/cohort or sleeve state, cause-typed turnover, equity,
+  constraints, censoring, continuation, and terminal flags.
 - Write a run manifest containing split boundaries, seeds, selection rules, configs, code/data identities,
   normalization state identity, and runtime/GPU-hour measurements.
 - Evaluate cash, equal weight, aligned buy-and-hold, random-same-turnover, and simple linear/momentum baselines.
@@ -172,10 +200,12 @@ causally complete or that counterfactual execution is identifiable.
 Do not promote a TOP2000/H100 run merely because it completes. Scale only after:
 
 1. the dataset provenance gate passes;
-2. the planted-signal and accounting tests pass;
-3. the direct baseline and PPO are compared on PIT TOP50 with paired seeds;
+2. the Hold-30 planted-signal, age/cohort, state-carry, and accounting tests pass;
+3. H2 qualifies under the frozen PIT-300 pre-lockbox protocol;
 4. performance telemetry shows the job is not dominated by host RAM, padded attention, or repeated encoding;
-5. a complete run artifact can be audited and replayed.
+5. a complete run artifact can be audited and replayed; and
+6. any direct-versus-PPO comparison is registered as a later orthogonal
+   ablation using the already-qualified Hold-30 mechanism.
 
 The current compact EOD context storage, vectorized raw-window joins, batched evaluation encoding, and streaming
 cache changes reduce known bottlenecks. They do not substitute for the correctness and artifact gates above.

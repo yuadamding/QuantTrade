@@ -8,7 +8,7 @@ application, not the definition of the framework.
 The repository also retains the older two-stage **Phase-1 direct portfolio optimizer**. That workflow is useful
 as a baseline, but it is not PPO and is not yet wired through the new environment/trajectory interfaces.
 
-> **Current status (2026-07).** The tested library now includes recurrent PPO with masked simplex actions,
+> **Implementation snapshot (2026-07; documentation updated 2026-08-04).** The tested library now includes recurrent PPO with masked simplex actions,
 > on-policy and replay rollout coordinators, schema-locked replay, offline training, twin-critic IQL, regime
 > mixtures, uncertainty abstention, market stress transforms, a purged/embargoed walk-forward splitter, and the
 > vectorized portfolio environment. These are library primitives, not a production trading runner: the
@@ -281,6 +281,10 @@ forced non-positive and remains development-only.
 
 ## Documentation
 
+- [ADR-0006: one daily decision with a soft 30-session holding target](docs/adr/0006-daily-decision-soft-30-session-holding.md)
+- [Proposed Hold-30 policy redesign RFC](docs/daily_hold30_policy_rfc.md)
+- [Launch-blocked pre-lockbox Hold-30 H0–H3 experiment specification](docs/prelockbox_hold30_h0_h3_experiment.md)
+- [Seadragon training-source lineage](docs/SEADRAGON_TRAINING_SOURCE.md)
 - [General RL architecture and exact current limitations](docs/general_rl_architecture.md)
 - [Deep-RL migration ledger](docs/architecture_migration_plan.md)
 - [Decision tensor and reportability protocol](docs/decision_tensor_protocol.md)
