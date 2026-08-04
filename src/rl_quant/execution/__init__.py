@@ -27,6 +27,7 @@ from rl_quant.execution.leg import (
     simulate_action_transition,
 )
 from rl_quant.execution.portfolio import (
+    FixedTurnoverTargetWeightExecution,
     ImmediateTargetWeightExecution,
     TargetWeightExecutionModel,
     TargetWeightExecutionResult,
@@ -66,6 +67,7 @@ __all__ = [
     "ExecutionLeg",
     "FillLevel",
     "FillStatus",
+    "FixedTurnoverTargetWeightExecution",
     "Holdings",
     "ImpactModel",
     "ImmediateTargetWeightExecution",

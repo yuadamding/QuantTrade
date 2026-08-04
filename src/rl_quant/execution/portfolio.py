@@ -13,7 +13,7 @@ from typing import ClassVar, Mapping, Protocol, runtime_checkable
 import torch
 
 from rl_quant.execution.types import WeightExecutionCostConfig, weight_transition_cost_bps
-from rl_quant.execution.validation import coerce_finite_nonnegative
+from rl_quant.execution.validation import coerce_finite_nonnegative, require_nonnegative_int
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,63 @@ class TargetWeightExecutionModel(Protocol):
         *,
         cash_index: int,
     ) -> TargetWeightExecutionResult: ...
+
+
+@dataclass(frozen=True)
+class FixedTurnoverTargetWeightExecution:
+    """Charge a fixed number of basis points on canonical one-way turnover.
+
+    Turnover is half the L1 distance between the *full* current and target
+    portfolios, including CASH.  This is the same cost basis used by the legacy
+    differentiable-portfolio trainers and deliberately differs from summing both
+    risky legs of an asset-to-asset switch.
+
+    The result is expressed in return units for the environment's additive
+    reward ledger.  This deterministic accounting model does not claim to model
+    market fills or impact.
+    """
+
+    cost_bps: float = 0.0
+    models_market_fills: ClassVar[bool] = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cost_bps", coerce_finite_nonnegative("cost_bps", self.cost_bps))
+
+    def execute(
+        self,
+        current_weights: torch.Tensor,
+        target_weights: torch.Tensor,
+        *,
+        cash_index: int,
+    ) -> TargetWeightExecutionResult:
+        if current_weights.shape != target_weights.shape or current_weights.ndim < 2:
+            raise ValueError("current_weights and target_weights need identical [..., asset] shapes.")
+        if (
+            not current_weights.is_floating_point()
+            or target_weights.dtype != current_weights.dtype
+            or target_weights.device != current_weights.device
+        ):
+            raise ValueError("Current and target weights must share one floating dtype and device.")
+        checked_cash_index = require_nonnegative_int("cash_index", cash_index)
+        if checked_cash_index >= current_weights.shape[-1]:
+            raise ValueError("cash_index is outside the target-weight action axis.")
+        if not bool(torch.isfinite(current_weights).all().item()) or not bool(
+            torch.isfinite(target_weights).all().item()
+        ):
+            raise ValueError("Current and target weights must be finite.")
+
+        turnover = one_way_turnover(target_weights, current_weights)
+        execution_cost = turnover * torch.as_tensor(
+            self.cost_bps / 10_000.0,
+            dtype=current_weights.dtype,
+            device=current_weights.device,
+        )
+        return TargetWeightExecutionResult(
+            execution_cost=execution_cost,
+            modeled_impact_cost=torch.zeros_like(turnover),
+            traded_notional=turnover,
+            diagnostics={"one_way_turnover": turnover},
+        )
 
 
 @dataclass(frozen=True)

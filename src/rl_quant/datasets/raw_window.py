@@ -130,10 +130,14 @@ def raw_window_dependency_paths(root: str | Path, window: str, cfg: RawWindowCon
         root / "universe_membership.parquet",
         base / "bars.parquet",
     ]
-    paths.extend(
-        root / "partitions" / source_window / "covariates.parquet"
-        for source_window in _cov_source_windows(root, window, cfg)
-    )
+    # A bars-only consumer can set ``cov_fields=()``.  In that mode covariate
+    # files are neither inputs nor cache dependencies; keeping them here would
+    # make a purported bars-only cache change when unrelated fundamentals do.
+    if cfg.cov_fields:
+        paths.extend(
+            root / "partitions" / source_window / "covariates.parquet"
+            for source_window in _cov_source_windows(root, window, cfg)
+        )
     if cfg.use_news:
         paths.append(base / "news.jsonl")
     # Preserve dependency order while removing the current covariate path if a
@@ -468,11 +472,12 @@ def _load_window_raw(root: Path, window: str, cfg: RawWindowConfig):
     # per-record point-in-time (available_timestamp_ms), so older records add reach, never look-ahead.
     cov_cols = ("symbol", "available_timestamp_ms", *cfg.cov_fields)
     cov_parts = []
-    for w in _cov_source_windows(root, window, cfg):
-        f = Path(root) / "partitions" / w / "covariates.parquet"
-        if f.exists():
-            ct = pq.read_table(f, columns=[c for c in cov_cols if c in pq.read_schema(f).names])
-            cov_parts.append({c: ct.column(c).to_pylist() for c in ct.column_names})
+    if cfg.cov_fields:
+        for w in _cov_source_windows(root, window, cfg):
+            f = Path(root) / "partitions" / w / "covariates.parquet"
+            if f.exists():
+                ct = pq.read_table(f, columns=[c for c in cov_cols if c in pq.read_schema(f).names])
+                cov_parts.append({c: ct.column(c).to_pylist() for c in ct.column_names})
     cov = None
     if cov_parts:
         cov = {c: [v for p in cov_parts for v in p.get(c, [None] * len(p["symbol"]))] for c in cov_cols

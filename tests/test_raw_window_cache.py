@@ -110,6 +110,24 @@ def test_news_only_invalidates_news_enabled_cache(tmp_path: Path) -> None:
     assert enabled_after != enabled_before
 
 
+def test_bars_only_config_has_no_covariate_dependency(tmp_path: Path) -> None:
+    _dataset(tmp_path)
+    cfg = RawWindowConfig(cov_fields=(), use_news=False)
+    dependencies = {
+        path.relative_to(tmp_path).as_posix()
+        for path in raw_window_dependency_paths(tmp_path, W2, cfg)
+    }
+
+    assert dependencies == {
+        "universe.json",
+        "universe_membership.parquet",
+        f"partitions/{W2}/bars.parquet",
+    }
+    before = raw_window_source_signature(tmp_path, W2, cfg)
+    (tmp_path / f"partitions/{W1}/covariates.parquet").write_bytes(b"unrelated change")
+    assert raw_window_source_signature(tmp_path, W2, cfg) == before
+
+
 def test_universe_declaration_and_membership_events_invalidate_cache(tmp_path: Path) -> None:
     _dataset(tmp_path)
     cfg = RawWindowConfig()

@@ -19,6 +19,8 @@ dependencies = [
 [project.scripts]
 qt = "rl_quant.cli:main"
 quanttrade = "rl_quant.cli:main"
+quanttrade-top2000-ppo = "rl_quant.workflows.top2000_ppo:main"
+quanttrade-top2000-pipeline = "rl_quant.workflows.top2000_pipeline:main"
 
 [project.optional-dependencies]
 data = [
