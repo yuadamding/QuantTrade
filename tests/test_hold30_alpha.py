@@ -174,7 +174,42 @@ def test_evaluator_data_is_content_bound_and_never_actor_visible() -> None:
     assert "beta-objective" in panel.provenance.market_usage
     assert "a06-a07-total-sharpe-objective" in panel.provenance.risk_free_usage
     assert "checkpoint-ranking" in panel.provenance.risk_free_usage
-    assert receipt.receipt_id == receipt.receipt_id
+    repeated = bind_hold30_alpha_evaluation_panel(sequence, panel)
+    assert receipt.receipt_id == repeated.receipt_id
+
+    binding_mutations = (
+        {"source_axis_id": _digest("another-axis")},
+        {"c1_trace_sha256": _digest("another-c1-trace")},
+        {"cash_returns_sha256": _digest("another-cash-series")},
+        {"evaluation_panel_id": _digest("another-evaluation-panel")},
+        {"evaluation_provenance_id": _digest("another-provenance")},
+        {"global_path_ids": (1,)},
+    )
+    mutated_binding_ids = {
+        replace(receipt, **mutation).receipt_id for mutation in binding_mutations
+    }
+    assert receipt.receipt_id not in mutated_binding_ids
+    assert len(mutated_binding_ids) == len(binding_mutations)
+
+    provenance = panel.provenance
+    assert provenance.receipt_id == replace(provenance).receipt_id
+    provenance_mutations = (
+        {"risk_free_id": "pit-cash-total-return-v2"},
+        {"market_benchmark_id": "pit-cap-weight-market-v2"},
+        {"factor_model_id": "declared-market-size-model-v2"},
+        {"factor_names": ("MKT2", "SIZE")},
+        {"factor_return_conventions": ("total-return", "zero-investment")},
+        {"risk_free_artifact_sha256": _digest("another-risk-free-artifact")},
+        {"market_artifact_sha256": _digest("another-market-artifact")},
+        {"factor_artifact_sha256": _digest("another-factor-artifact")},
+        {"factor_plan_sha256": _digest("another-factor-plan")},
+    )
+    mutated_provenance_ids = {
+        replace(provenance, **mutation).receipt_id
+        for mutation in provenance_mutations
+    }
+    assert provenance.receipt_id not in mutated_provenance_ids
+    assert len(mutated_provenance_ids) == len(provenance_mutations)
 
     changed_cash = panel.risk_free_returns.clone()
     changed_cash[0, 0] += 1e-12

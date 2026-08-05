@@ -98,10 +98,13 @@ def _clone_intent(intent: Hold30Intent, *, detach: bool) -> Hold30Intent:
         target_logits=copy(intent.target_logits),
         gate=copy(intent.gate),
         hazard_residual=copy(intent.hazard_residual),
+        raw_hazard_residual=copy(intent.raw_hazard_residual),
+        exact_hold_probability=copy(intent.exact_hold_probability),
         exposure_residual=copy(intent.exposure_residual),
         alpha_mean_30d=copy(intent.alpha_mean_30d),
         alpha_downside_30d=copy(intent.alpha_downside_30d),
         active_risk_scale=copy(intent.active_risk_scale),
+        signal_confidence=copy(intent.signal_confidence),
         total_risk_overlay=copy(intent.total_risk_overlay),
         auxiliary_alpha_mean=copy(intent.auxiliary_alpha_mean),
     )
@@ -115,10 +118,13 @@ def _intent_tensors(intent: Hold30Intent) -> tuple[tuple[str, torch.Tensor], ...
             "target_logits",
             "gate",
             "hazard_residual",
+            "raw_hazard_residual",
+            "exact_hold_probability",
             "exposure_residual",
             "alpha_mean_30d",
             "alpha_downside_30d",
             "active_risk_scale",
+            "signal_confidence",
             "total_risk_overlay",
             "auxiliary_alpha_mean",
         )
@@ -1137,6 +1143,7 @@ class Hold30ChronologicalRuntime:
                     trade_mask,
                     risk_asset_caps,
                     risk_gross_max,
+                    exact_hold_probability=intent.exact_hold_probability,
                     total_risk_overlay=intent.total_risk_overlay,
                     total_risk_step=self.alpha_total_risk_step,
                     cash_index=repaired_ledger.cash_index,
@@ -1152,6 +1159,7 @@ class Hold30ChronologicalRuntime:
                     trade_mask,
                     risk_asset_caps,
                     risk_gross_max,
+                    exact_hold_probability=intent.exact_hold_probability,
                     cash_index=repaired_ledger.cash_index,
                 )
         else:  # guarded by __init__
@@ -1166,7 +1174,13 @@ class Hold30ChronologicalRuntime:
         prohibited: tuple[str, ...]
         if self.mechanism in {"H0", "H1"}:
             required = {"target_logits": matrix_shape, "gate": vector_shape}
-            prohibited = ("entry_scores", "hazard_residual", "exposure_residual")
+            prohibited = (
+                "entry_scores",
+                "hazard_residual",
+                "raw_hazard_residual",
+                "exact_hold_probability",
+                "exposure_residual",
+            )
         elif self.mechanism == "H2":
             required = {
                 "entry_scores": matrix_shape,
@@ -1176,7 +1190,14 @@ class Hold30ChronologicalRuntime:
             prohibited = ("target_logits", "gate")
         else:
             required = {"entry_scores": matrix_shape}
-            prohibited = ("target_logits", "gate", "hazard_residual", "exposure_residual")
+            prohibited = (
+                "target_logits",
+                "gate",
+                "hazard_residual",
+                "raw_hazard_residual",
+                "exact_hold_probability",
+                "exposure_residual",
+            )
         for name, shape in required.items():
             value = getattr(intent, name)
             if value is None or tuple(value.shape) != shape:
@@ -1184,10 +1205,25 @@ class Hold30ChronologicalRuntime:
         for name in prohibited:
             if getattr(intent, name) is not None:
                 raise ValueError(f"{self.mechanism} intent must not populate {name}")
+        if self.mechanism == "H2":
+            for name in ("raw_hazard_residual", "exact_hold_probability"):
+                value = getattr(intent, name)
+                if value is not None and tuple(value.shape) != matrix_shape:
+                    raise ValueError(
+                        f"H2 intent field {name} must have shape {matrix_shape} when present"
+                    )
+            if intent.exact_hold_probability is not None and bool(
+                (
+                    (intent.exact_hold_probability < 0)
+                    | (intent.exact_hold_probability > 1)
+                ).any()
+            ):
+                raise ValueError("exact_hold_probability must lie in [0,1]")
         alpha_fields = (
             "alpha_mean_30d",
             "alpha_downside_30d",
             "active_risk_scale",
+            "signal_confidence",
             "total_risk_overlay",
             "auxiliary_alpha_mean",
         )
@@ -1211,6 +1247,13 @@ class Hold30ChronologicalRuntime:
             )
         if tuple(intent.active_risk_scale.shape) != vector_shape:
             raise ValueError("v3 active_risk_scale must have shape [batch]")
+        if intent.signal_confidence is not None:
+            if tuple(intent.signal_confidence.shape) != vector_shape:
+                raise ValueError("M03R signal_confidence must have shape [batch]")
+            if bool(
+                ((intent.signal_confidence < 0) | (intent.signal_confidence > 1)).any()
+            ):
+                raise ValueError("M03R signal_confidence must lie in [0,1]")
         if intent.total_risk_overlay is not None and tuple(
             intent.total_risk_overlay.shape
         ) != vector_shape:

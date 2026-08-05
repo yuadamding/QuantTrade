@@ -273,25 +273,24 @@ A result is not reportable merely because the driver completes. At minimum:
 - the test split is not used to choose a seed, checkpoint, architecture, or hyperparameter.
 
 The Hold-30 path now has package-owned chronological training, checkpoint/resume,
-cohort telemetry, and receipt primitives. Alpha mechanism-8 v3 is the current
-protocol; v2 was superseded before launch. Its protocol/data/model/action,
-objective, checkpoint, and evaluator components are locally CPU
-integration-qualified. A non-authorizing synthetic driver now closes one
-optimizer update and an append-only checkpoint graph for all eight
-qualification-only routes, including A06's core-intact three-stream update and
-parent-linked optimizer-state receipts.
-The content-addressed pilot profile now freezes A06's total-Sharpe variance
-floor at `1e-6`, the same 10-bp daily-volatility floor as A07. This prelaunch
-choice is negligible at normal equity volatility and stabilizes near-zero
-denominators; it was not selected from outcomes. There is still no production
-240-trial real-data driver. Full-policy CPU two-rank distinct-shard parity is
-qualified only for the frozen one-path-per-rank geometry, and exact all-eight
-two-update restart/resume parity is qualified. V3 remains launch-blocked by
-typed real-data and global-path bindings, an immutable image, GPU/H100 parity
-and capacity, and executable approval gates.
-No v3 training or performance result exists.
-Synthetic software qualification is not
-investment-performance evidence.
+cohort telemetry, and receipt primitives. The current scientific design is the
+new immutable `prelockbox-hold30-active-alpha-m03r-v4` generation. It removes
+the compulsory tracking-error floor, targets active rather than total market
+beta, separates 30 post-fill economic returns from the 63-session rollout,
+restores a 252-session slow context beside the 42-session fast path, and ranks
+eligible checkpoints by a block-bootstrap lower confidence bound. V3 remains
+unchanged as a prelaunch audit generation; v2 was superseded before launch.
+
+M03R currently has typed protocol, objective, selection, hazard, telemetry, and
+evaluation qualification components, but its production trainer and governed
+all-setting execution path are not yet connected. It is still launch-blocked:
+verified confidence calibration and ensemble/execution receipts, numerical
+factor/sector exposure bands, the complete inferential family, point-in-time
+real-data/global-path bindings, evaluator-derived checkpoint evidence,
+empirical execution, an immutable image, single-/two-rank CUDA parity, and an
+H100 capacity receipt remain required.
+There is no M03R real-data training or performance result. Synthetic software
+qualification is not investment-performance evidence.
 
 The legacy Phase-1 verdict reports split-level `statistically_positive` diagnostics separately from its promotion
 gate. Dataset/news provenance now participates in `positive`, so a run admitted with `--allow-unreportable` is
@@ -303,7 +302,8 @@ forced non-positive and remains development-only.
 - [ADR-0007: benchmark-relative alpha is the Hold-30 promotion objective](docs/adr/0007-benchmark-relative-hold30-alpha-objective.md)
 - [Hold-30 policy redesign RFC](docs/daily_hold30_policy_rfc.md)
 - [Normative pre-lockbox Hold-30 H0–H3 base specification](docs/prelockbox_hold30_h0_h3_experiment.md)
-- [Current launch-blocked Hold-30 alpha mechanism-8 v3 specification](docs/prelockbox_hold30_alpha_mech8_v3.md)
+- [Current launch-blocked M03R active-alpha Hold-30 specification](docs/prelockbox_hold30_active_alpha_m03r_v4.md)
+- [Superseded-before-launch Hold-30 alpha mechanism-8 v3 audit specification](docs/prelockbox_hold30_alpha_mech8_v3.md)
 - [Hold-30 alpha v3 sealed-evaluation contract](docs/prelockbox_hold30_alpha_evaluation_v3.md)
 - [Superseded-before-launch mechanism-8 v2 audit record](docs/prelockbox_hold30_mech8_v2.md)
 - [Seadragon training-source lineage](docs/SEADRAGON_TRAINING_SOURCE.md)

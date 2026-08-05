@@ -661,6 +661,23 @@ _daily_raw_pit300_hold30 = replace(
     min_gpus=2,
 )
 
+# M03R is a new protocol generation, not a mutation of the frozen v2/v3
+# designs above.  Its economic holding support remains 30 post-fill returns,
+# while the recurrent optimizer and validation windows remain 63 sessions.
+# The slow branch restores a full 252-session learned context; only the most
+# recent 42 sessions take the expensive raw-day path.
+_daily_raw_pit300_hold30_m03r = replace(
+    _daily_raw_pit300_hold30,
+    name="daily_raw_pit300_hold30_m03r",
+    note=(
+        "M03R active-alpha Hold-30: 42-session fast raw branch, 252-session "
+        "slow context, 63-session rollout, and 30 post-fill economic returns"
+    ),
+    daily_lookback=252,
+    raw_recent_days=42,
+    auxiliary_horizons=(5, 21, 30, 63),
+)
+
 _TOP2000_H100_VARIANTS = [
     replace(
         _top2000_h100_base,
@@ -841,6 +858,7 @@ _TOP2000_H100_VARIANTS = [
 _TOP2000_H100_SERIES = [_top2000_h100_base, *_TOP2000_H100_VARIANTS]
 _SERIES.extend(_TOP2000_H100_VARIANTS)
 _SERIES.append(_daily_raw_pit300_hold30)
+_SERIES.append(_daily_raw_pit300_hold30_m03r)
 
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 
@@ -854,6 +872,7 @@ TOP50_H100_WIDE_SWEEP = [d.name for d in _TOP50_H100_SERIES]
 TOP2000_H100_CORE_SWEEP = [d.name for d in _TOP2000_H100_SERIES[:10]]
 TOP2000_H100_WIDE_SWEEP = [d.name for d in _TOP2000_H100_SERIES]
 HOLD30_BASE_DESIGN = _daily_raw_pit300_hold30.name
+HOLD30_M03R_BASE_DESIGN = _daily_raw_pit300_hold30_m03r.name
 SWEEP = TOP2000_H100_WIDE_SWEEP
 # Longer-horizon probes (run explicitly with --design; not in the default sweep).
 HORIZON_SWEEP = ["h30m", "h65m"]

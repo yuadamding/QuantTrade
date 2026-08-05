@@ -52,6 +52,8 @@ def _reject_extra_fields(intents: Sequence[Hold30Intent], allowed: set[str]) -> 
         "target_logits",
         "gate",
         "hazard_residual",
+        "raw_hazard_residual",
+        "exact_hold_probability",
         "exposure_residual",
         "alpha_mean_30d",
         "alpha_downside_30d",
@@ -119,13 +121,53 @@ def aggregate_hold30_intents(
         )
     _reject_extra_fields(
         intents,
-        {"entry_scores", "hazard_residual", "exposure_residual"},
+        {
+            "entry_scores",
+            "hazard_residual",
+            "raw_hazard_residual",
+            "exact_hold_probability",
+            "exposure_residual",
+        },
     )
     hazards = _stack_required(intents, "hazard_residual", matrix_shape)
     exposures = _stack_required(intents, "exposure_residual", (batch,))
+    raw_values = [intent.raw_hazard_residual for intent in intents]
+    if any(value is not None for value in raw_values) and any(
+        value is None for value in raw_values
+    ):
+        raise ValueError(
+            "raw_hazard_residual must be populated by every member or none"
+        )
+    raw_hazard = (
+        None
+        if all(value is None for value in raw_values)
+        else _stack_required(
+            intents,
+            "raw_hazard_residual",
+            matrix_shape,
+        ).median(dim=0).values
+    )
+    hold_values = [intent.exact_hold_probability for intent in intents]
+    if any(value is not None for value in hold_values) and any(
+        value is None for value in hold_values
+    ):
+        raise ValueError(
+            "exact_hold_probability must be populated by every member or none"
+        )
+    exact_hold = (
+        None
+        if all(value is None for value in hold_values)
+        else _stack_required(
+            intents,
+            "exact_hold_probability",
+            matrix_shape,
+        ).median(dim=0).values.clamp(0.0, 1.0)
+    )
     return Hold30Intent(
         entry_scores=entry,
         hazard_residual=hazards.median(dim=0).values.clamp(-12.0, 12.0),
+        raw_hazard_residual=raw_hazard,
+        exact_hold_probability=exact_hold,
         exposure_residual=exposures.median(dim=0).values,
     )
 

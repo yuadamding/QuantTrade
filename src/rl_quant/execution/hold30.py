@@ -229,6 +229,7 @@ def build_h2_hold30_action(
     risk_asset_caps: torch.Tensor,
     risk_gross_max: torch.Tensor,
     *,
+    exact_hold_probability: torch.Tensor | None = None,
     cash_index: int = 0,
     max_turnover: float = HOLD30_MAX_DISCRETIONARY_TURNOVER,
     exposure_step: float = HOLD30_EXPOSURE_STEP,
@@ -264,10 +265,36 @@ def build_h2_hold30_action(
     risky = torch.ones_like(repaired_weights, dtype=torch.bool)
     risky[:, cash_index] = False
     ages = torch.arange(61, device=age_notional.device, dtype=age_notional.dtype)
-    hazards = hold30_release_hazard(ages, hazard_residual.unsqueeze(-1).to(age_notional.dtype))
+    if exact_hold_probability is not None:
+        exact_hold_probability = _require_matrix(
+            "exact_hold_probability",
+            exact_hold_probability,
+            repaired_weights,
+        )
+        if bool(
+            ((exact_hold_probability < 0) | (exact_hold_probability > 1)).any()
+        ):
+            raise ValueError("exact_hold_probability must lie in [0,1]")
+    hazards = hold30_release_hazard(
+        ages,
+        hazard_residual.unsqueeze(-1).to(age_notional.dtype),
+        exact_hold_probability=(
+            None
+            if exact_hold_probability is None
+            else exact_hold_probability.unsqueeze(-1).to(age_notional.dtype)
+        ),
+    )
     release_by_age = age_notional * hazards
     release_by_age = torch.where(risky.unsqueeze(-1), release_by_age, torch.zeros_like(release_by_age))
-    proposed_release = hold30_proposed_release(age_notional, hazard_residual.to(age_notional.dtype))
+    proposed_release = hold30_proposed_release(
+        age_notional,
+        hazard_residual.to(age_notional.dtype),
+        exact_hold_probability=(
+            None
+            if exact_hold_probability is None
+            else exact_hold_probability.to(age_notional.dtype)
+        ),
+    )
     proposed_release = torch.where(risky, proposed_release, torch.zeros_like(proposed_release))
     proposed_release = torch.minimum(proposed_release, repaired_weights.clamp_min(0.0))
     retained = torch.where(risky, repaired_weights - proposed_release, torch.zeros_like(repaired_weights)).clamp_min(0.0)
@@ -327,6 +354,7 @@ def build_alpha_hold30_action(
     risk_asset_caps: torch.Tensor,
     risk_gross_max: torch.Tensor,
     *,
+    exact_hold_probability: torch.Tensor | None = None,
     total_risk_overlay: torch.Tensor | None = None,
     total_risk_step: float | None = None,
     te_target: float = HOLD30_ALPHA_TE_TARGET_ANNUAL,
@@ -349,8 +377,8 @@ def build_alpha_hold30_action(
     active_risk_scale = _require_vector(
         "active_risk_scale", active_risk_scale, batch, repaired_weights
     )
-    if bool((active_risk_scale <= 0).any()):
-        raise ValueError("active_risk_scale must be strictly positive")
+    if bool((active_risk_scale < 0).any()):
+        raise ValueError("active_risk_scale must be nonnegative")
     if not 0 < float(te_target) < 1:
         raise ValueError("te_target must lie in (0,1)")
     scaled_score = risk_adjusted_score * (
@@ -382,6 +410,7 @@ def build_alpha_hold30_action(
         trade_mask,
         risk_asset_caps,
         risk_gross_max,
+        exact_hold_probability=exact_hold_probability,
         cash_index=cash_index,
         max_turnover=max_turnover,
         exposure_step=exposure_step,

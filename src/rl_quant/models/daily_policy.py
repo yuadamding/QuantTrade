@@ -20,6 +20,7 @@ split holds). Only this module's parameters are trained by the PnL objective.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -33,18 +34,29 @@ from rl_quant.models.hold30_alpha import (
     Hold30AlphaHead,
     Hold30AlphaHeadConfig,
 )
+from rl_quant.models.hold30_hazard import (
+    HOLD30_HAZARD_BOUND_MODES,
+    HOLD30_HAZARD_MAX,
+    HOLD30_HAZARD_MIN,
+    Hold30HazardBoundMode,
+    bound_hold30_hazard_residual,
+    clip_hold30_hazard_residual,
+    straight_through_exact_hold_decision,
+)
 from rl_quant.protocol.constraints import project_capped_risky_simplex
 from rl_quant.protocol.hold30 import (
     HOLD30_MECH8_SETTINGS,
     resolve_hold30_setting,
+)
+from rl_quant.protocol.hold30_alpha_m03r import (
+    M03R_SETTING_IDS,
+    resolve_m03r_setting,
 )
 from rl_quant.protocol.hold30_alpha_v3 import (
     HOLD30_ALPHA_MECH8_SETTINGS,
     resolve_hold30_alpha_setting,
 )
 
-HOLD30_HAZARD_MIN = -12.0
-HOLD30_HAZARD_MAX = 12.0
 HOLD30_AGE_CAP = 60
 HOLD30_AGE_SUMMARY_DIM = 5
 
@@ -100,10 +112,31 @@ _HOLD30_MODEL_SWITCHES.update(
         for setting in HOLD30_ALPHA_MECH8_SETTINGS
     }
 )
+_HOLD30_MODEL_SWITCHES.update(
+    {
+        setting_id: Hold30ModelSwitches(
+            setting_id=setting_id,
+            mechanism="H2",
+            use_age_input=setting.age_aware_holding,
+            use_exposure_timing=False,
+            use_early_exit_penalty=setting.age_aware_holding,
+            use_turnover_penalty=setting.age_aware_holding,
+            use_alpha_head=setting.residual_alpha_heads,
+            use_uncertainty=setting.uncertainty_scaled_sizing,
+            use_total_risk_overlay=(
+                setting.sharpe_mode == "separate-total-risk-overlay"
+            ),
+            use_direct_sharpe=(setting.sharpe_mode == "direct-two-pass-gradient"),
+        )
+        for setting_id in M03R_SETTING_IDS
+        for setting in (resolve_m03r_setting(setting_id),)
+    }
+)
 HOLD30_V2_MODEL_SETTING_IDS = tuple(setting.setting_id for setting in HOLD30_MECH8_SETTINGS)
 HOLD30_ALPHA_MODEL_SETTING_IDS = tuple(
     setting.setting_id for setting in HOLD30_ALPHA_MECH8_SETTINGS
 )
+HOLD30_M03R_MODEL_SETTING_IDS = M03R_SETTING_IDS
 # Backward-compatible V2 public inventory; V3 has a disjoint explicit export.
 HOLD30_MODEL_SETTING_IDS = HOLD30_V2_MODEL_SETTING_IDS
 
@@ -115,6 +148,9 @@ def resolve_hold30_model_switches(setting_id: str) -> Hold30ModelSwitches:
     # shares one alias-rejection/error contract.
     if setting_id in _HOLD30_MODEL_SWITCHES and setting_id.startswith("hold30a-"):
         registered = resolve_hold30_alpha_setting(setting_id)
+        return _HOLD30_MODEL_SWITCHES[registered.setting_id]
+    if setting_id in M03R_SETTING_IDS:
+        registered = resolve_m03r_setting(setting_id)
         return _HOLD30_MODEL_SWITCHES[registered.setting_id]
     registered = resolve_hold30_setting(setting_id)
     return _HOLD30_MODEL_SWITCHES[registered.setting_id]
@@ -134,28 +170,23 @@ class Hold30Intent:
     target_logits: torch.Tensor | None = None
     gate: torch.Tensor | None = None
     hazard_residual: torch.Tensor | None = None
+    raw_hazard_residual: torch.Tensor | None = None
+    exact_hold_probability: torch.Tensor | None = None
     exposure_residual: torch.Tensor | None = None
     alpha_mean_30d: torch.Tensor | None = None
     alpha_downside_30d: torch.Tensor | None = None
     active_risk_scale: torch.Tensor | None = None
+    signal_confidence: torch.Tensor | None = None
     total_risk_overlay: torch.Tensor | None = None
     auxiliary_alpha_mean: torch.Tensor | None = None
 
 
-def _clip_with_zero_boundary_gradient(value: torch.Tensor, lower: float, upper: float) -> torch.Tensor:
-    """Closed-interval clip whose derivative is zero at and beyond each endpoint."""
+def _clip_with_zero_boundary_gradient(value: torch.Tensor, lower: float, upper: float,) -> torch.Tensor:
+    """Frozen endpoint-gradient behavior used by the v2/v3 release clock."""
 
     lo = value.new_tensor(lower)
     hi = value.new_tensor(upper)
     return torch.where(value <= lo, lo, torch.where(value >= hi, hi, value))
-
-
-def clip_hold30_hazard_residual(raw_hazard: torch.Tensor) -> torch.Tensor:
-    """Deploy the finite Hold-30 hazard residual in ``[-12, 12]``."""
-
-    if not raw_hazard.is_floating_point():
-        raise TypeError("raw_hazard must be a floating-point tensor")
-    return _clip_with_zero_boundary_gradient(raw_hazard, HOLD30_HAZARD_MIN, HOLD30_HAZARD_MAX)
 
 
 def hold30_age_prior_logit(age: torch.Tensor) -> torch.Tensor:
@@ -166,12 +197,17 @@ def hold30_age_prior_logit(age: torch.Tensor) -> torch.Tensor:
     return -2.0 + (age.clamp(min=0.0, max=float(HOLD30_AGE_CAP)) - 30.0) / 4.0
 
 
-def hold30_release_hazard(age: torch.Tensor, hazard_residual: torch.Tensor) -> torch.Tensor:
+def hold30_release_hazard(age: torch.Tensor, hazard_residual: torch.Tensor,
+    *,
+    exact_hold_probability: torch.Tensor | None = None,) -> torch.Tensor:
     """Normalized cohort-release hazard from the RFC.
 
     ``age`` and ``hazard_residual`` follow ordinary PyTorch broadcasting.
     ``hazard_residual=-12`` returns exact zero for every age; zero residual
-    follows the approximately 30-session reference release clock.
+    follows the approximately 30-session reference release clock.  A later
+    research generation may also provide an exact-hold mixture probability.
+    The expected release is then multiplied by ``1-p_hold``; ``p_hold=1`` is a
+    separate exact hold atom rather than hazard-logit saturation.
     """
 
     if not hazard_residual.is_floating_point():
@@ -180,10 +216,30 @@ def hold30_release_hazard(age: torch.Tensor, hazard_residual: torch.Tensor) -> t
     bounded = clip_hold30_hazard_residual(hazard_residual)
     p_min = torch.sigmoid(_clip_with_zero_boundary_gradient(beta + HOLD30_HAZARD_MIN, -20.0, 20.0))
     release = torch.sigmoid(_clip_with_zero_boundary_gradient(beta + bounded, -20.0, 20.0))
-    return (release - p_min) / (1.0 - p_min)
+    normalized = (release - p_min) / (1.0 - p_min)
+    if exact_hold_probability is None:
+        return normalized
+    if (
+        not exact_hold_probability.is_floating_point()
+        or not bool(torch.isfinite(exact_hold_probability).all())
+        or bool(((exact_hold_probability < 0) | (exact_hold_probability > 1)).any())
+    ):
+        raise ValueError("exact_hold_probability must be finite and lie in [0,1]")
+    probability = exact_hold_probability.to(
+        device=normalized.device,
+        dtype=normalized.dtype,
+    )
+    try:
+        return normalized * (1.0 - probability)
+    except RuntimeError as error:
+        raise ValueError(
+            "exact_hold_probability must broadcast with the release hazard"
+        ) from error
 
 
-def hold30_proposed_release(age_notional: torch.Tensor, hazard_residual: torch.Tensor) -> torch.Tensor:
+def hold30_proposed_release(age_notional: torch.Tensor, hazard_residual: torch.Tensor,
+    *,
+    exact_hold_probability: torch.Tensor | None = None,) -> torch.Tensor:
     """Return gross proposed release by asset from ``[..., asset, 61]`` cohort notionals."""
 
     if age_notional.ndim < 2 or age_notional.shape[-1] != HOLD30_AGE_CAP + 1:
@@ -195,8 +251,25 @@ def hold30_proposed_release(age_notional: torch.Tensor, hazard_residual: torch.T
             "hazard_residual must match age_notional without its age-bin axis; "
             f"got {tuple(hazard_residual.shape)} and {tuple(age_notional.shape)}"
         )
+    if (
+        exact_hold_probability is not None
+        and exact_hold_probability.shape != hazard_residual.shape
+    ):
+        raise ValueError(
+            "exact_hold_probability must match hazard_residual; "
+            f"got {tuple(exact_hold_probability.shape)} and "
+            f"{tuple(hazard_residual.shape)}"
+        )
     ages = torch.arange(HOLD30_AGE_CAP + 1, device=age_notional.device, dtype=age_notional.dtype)
-    hazards = hold30_release_hazard(ages, hazard_residual.unsqueeze(-1).to(dtype=age_notional.dtype))
+    hazards = hold30_release_hazard(
+        ages,
+        hazard_residual.unsqueeze(-1).to(dtype=age_notional.dtype),
+        exact_hold_probability=(
+            None
+            if exact_hold_probability is None
+            else exact_hold_probability.unsqueeze(-1).to(dtype=age_notional.dtype)
+        ),
+    )
     return (age_notional * hazards).sum(dim=-1)
 
 
@@ -212,6 +285,8 @@ def exact_hold30_intent(reference: torch.Tensor) -> Hold30Intent:
     return Hold30Intent(
         entry_scores=torch.zeros_like(reference),
         hazard_residual=torch.full_like(reference, HOLD30_HAZARD_MIN),
+        raw_hazard_residual=torch.full_like(reference, HOLD30_HAZARD_MIN),
+        exact_hold_probability=torch.ones_like(reference),
         exposure_residual=torch.zeros(reference.shape[:-1], device=reference.device, dtype=reference.dtype),
     )
 
@@ -390,6 +465,54 @@ class CrossDayTemporalEncoder(nn.Module):
         return x.reshape(B, A, T, d).permute(0, 2, 1, 3)         # [B,T,A,d]
 
 
+@dataclass(frozen=True, slots=True)
+class Hold30TwoSpeedContextContract:
+    """Explicit fast/slow session contract for later Hold-30 generations.
+
+    Existing v2/v3 configurations do not populate this contract and retain
+    their exact semantics.  M03R-like generations can bind the human meaning
+    of the historical ``raw_recent_days`` and ``daily_lookback`` fields without
+    introducing a second, contradictory source of truth.
+    """
+
+    fast_raw_context_sessions: int
+    slow_context_sessions: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("fast_raw_context_sessions", self.fast_raw_context_sessions),
+            ("slow_context_sessions", self.slow_context_sessions),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.fast_raw_context_sessions > self.slow_context_sessions:
+            raise ValueError(
+                "fast_raw_context_sessions cannot exceed slow_context_sessions"
+            )
+
+    def validate_model_geometry(
+        self,
+        *,
+        raw_recent_days: int,
+        daily_lookback: int,
+        max_days: int,
+    ) -> None:
+        if raw_recent_days != self.fast_raw_context_sessions:
+            raise ValueError(
+                "raw_recent_days must equal fast_raw_context_sessions under the "
+                "explicit Hold-30 context contract"
+            )
+        if daily_lookback != self.slow_context_sessions:
+            raise ValueError(
+                "daily_lookback must equal slow_context_sessions under the "
+                "explicit Hold-30 context contract"
+            )
+        if max_days < self.slow_context_sessions:
+            raise ValueError(
+                "max_days must cover the complete slow_context_sessions window"
+            )
+
+
 @dataclass
 class DailyCrossSectionConfig:
     context_dim: int                 # frozen Stage-1 per-stock/market context width (d_model)
@@ -412,19 +535,19 @@ class DailyCrossSectionConfig:
     feedforward_dim: int = 512
     dropout: float = 0.0
     temperature: float = 1.0
-    max_stock_weight: float = 1.0     # hard cap on each non-CASH target weight; CASH is unrestricted
+    max_stock_weight: float = 1.0
     gate_init_bias: float = 2.0
     grad_checkpoint: bool = False
     raw_norm: str = "level"          # full-day raw input norm: "level" (magnitude-preserving) | "instance" (whitened)
-    raw_recent_days: int = 0         # TWO-SPEED tokens: >0 -> only the LAST this-many days of an episode/eval
+    raw_recent_days: int = 0
     #                                  window get the (expensive, trainable) full-day raw encode; older days'
     #                                  tokens carry frozen ctx + news + the past-return channel only (has_raw=0).
     #                                  Extends the cross-day memory to e.g. 252d at ~the 42d raw compute.
     #                                  0 = every day raw (the original behavior).
-    raw_stock_chunk: int = 0         # >0: the full-day raw encoder processes the stock axis in chunks of this
+    raw_stock_chunk: int = 0
     #                                  many stocks (bit-identical -- all its norms are per-(stock,day)); REQUIRED
     #                                  for huge universes (TOP2000: ~512/chunk on an 80GB H100). 0 = single pass.
-    hold30_setting: str | None = None # None preserves the legacy model/state-dict contract; otherwise one of the
+    hold30_setting: str | None = None
     #                                  frozen V2 IDs in HOLD30_MODEL_SETTING_IDS or V3 IDs in
     #                                  HOLD30_ALPHA_MODEL_SETTING_IDS.
     age_summary_dim: int = HOLD30_AGE_SUMMARY_DIM
@@ -433,6 +556,15 @@ class DailyCrossSectionConfig:
     alpha_downside_penalty_kappa: float | None = None
     alpha_active_log_scale_bounds: tuple[float, float] | None = None
     alpha_uncertainty_log_scale_bounds: tuple[float, float] | None = None
+    # Opt-in post-v3 contracts. Defaults preserve every frozen v2/v3 model.
+    hold30_mechanism_generation: Literal["v2-v3-frozen", "m03r-v1"] = "v2-v3-frozen"
+    hold30_fast_raw_context_sessions: int | None = None
+    hold30_slow_context_sessions: int | None = None
+    hold30_hazard_bound_mode: Hold30HazardBoundMode = "hard_clip"
+    hold30_exact_hold_mixture: bool = False
+    hold30_exact_hold_logit_bias: float | None = None
+    hold30_fixed_hazard_residual: float | None = None
+    alpha_confidence_calibration_manifest_sha256: str | None = None
 
 
 class DailyCrossSectionPolicy(nn.Module):
@@ -449,10 +581,122 @@ class DailyCrossSectionPolicy(nn.Module):
             raise ValueError("max_stock_weight must lie in (0, 1]")
         if isinstance(config.age_summary_dim, bool) or int(config.age_summary_dim) <= 0:
             raise ValueError("age_summary_dim must be a positive integer")
+        if config.hold30_hazard_bound_mode not in HOLD30_HAZARD_BOUND_MODES:
+            raise ValueError(
+                "hold30_hazard_bound_mode must be 'hard_clip' or 'smooth_tanh'"
+            )
+        if config.hold30_mechanism_generation not in {
+            "v2-v3-frozen",
+            "m03r-v1",
+        }:
+            raise ValueError(
+                "hold30_mechanism_generation must be 'v2-v3-frozen' or 'm03r-v1'"
+            )
+        if not isinstance(config.hold30_exact_hold_mixture, bool):
+            raise TypeError("hold30_exact_hold_mixture must be boolean")
+        if config.hold30_exact_hold_mixture:
+            if (
+                config.hold30_exact_hold_logit_bias is None
+                or isinstance(config.hold30_exact_hold_logit_bias, bool)
+                or not math.isfinite(float(config.hold30_exact_hold_logit_bias))
+            ):
+                raise ValueError(
+                    "an exact-hold mixture requires a finite "
+                    "hold30_exact_hold_logit_bias"
+                )
+        elif config.hold30_exact_hold_logit_bias is not None:
+            raise ValueError(
+                "hold30_exact_hold_logit_bias is forbidden when the exact-hold "
+                "mixture is disabled"
+            )
+        if config.hold30_fixed_hazard_residual is not None:
+            fixed = config.hold30_fixed_hazard_residual
+            if (
+                isinstance(fixed, bool)
+                or not math.isfinite(float(fixed))
+                or not HOLD30_HAZARD_MIN <= float(fixed) <= HOLD30_HAZARD_MAX
+            ):
+                raise ValueError(
+                    "hold30_fixed_hazard_residual must be finite and lie in [-12,12]"
+                )
+            if config.hold30_exact_hold_mixture:
+                raise ValueError(
+                    "fixed-hazard comparator cannot also learn an exact-hold mixture"
+                )
+        context_values = (
+            config.hold30_fast_raw_context_sessions,
+            config.hold30_slow_context_sessions,
+        )
+        if (context_values[0] is None) != (context_values[1] is None):
+            raise ValueError(
+                "hold30 fast and slow context session fields must be supplied together"
+            )
+        if config.hold30_mechanism_generation == "v2-v3-frozen":
+            if (
+                context_values[0] is not None
+                or config.hold30_hazard_bound_mode != "hard_clip"
+                or config.hold30_exact_hold_mixture
+                or config.hold30_fixed_hazard_residual is not None
+            ):
+                raise ValueError(
+                    "post-v3 context or hazard options require the explicit "
+                    "m03r-v1 mechanism generation"
+                )
+        else:
+            if context_values[0] is None:
+                raise ValueError(
+                    "m03r-v1 requires explicit fast and slow context sessions"
+                )
+            if config.hold30_hazard_bound_mode != "smooth_tanh":
+                raise ValueError("m03r-v1 requires the smooth_tanh hazard bound")
+        self.hold30_context_contract: Hold30TwoSpeedContextContract | None = None
+        if context_values[0] is not None:
+            assert context_values[1] is not None
+            self.hold30_context_contract = Hold30TwoSpeedContextContract(
+                int(context_values[0]),
+                int(context_values[1]),
+            )
+            self.hold30_context_contract.validate_model_geometry(
+                raw_recent_days=int(config.raw_recent_days),
+                daily_lookback=int(config.daily_lookback),
+                max_days=int(config.max_days),
+            )
         self.config = config
         self.hold30_switches = (
             resolve_hold30_model_switches(config.hold30_setting)
             if config.hold30_setting is not None else None
+        )
+        is_m03r_setting = config.hold30_setting in M03R_SETTING_IDS
+        if config.hold30_mechanism_generation == "m03r-v1" and not is_m03r_setting:
+            raise ValueError(
+                "m03r-v1 requires an exact M03R setting identity; V2/V3 relabeling "
+                "is forbidden"
+            )
+        if is_m03r_setting and config.hold30_mechanism_generation != "m03r-v1":
+            raise ValueError(
+                "an M03R setting identity requires hold30_mechanism_generation='m03r-v1'"
+            )
+        if is_m03r_setting:
+            assert config.hold30_setting is not None
+            m03r_setting = resolve_m03r_setting(config.hold30_setting)
+            expected_slow = int(m03r_setting.slow_context_trading_sessions)
+            if config.hold30_slow_context_sessions != expected_slow:
+                raise ValueError(
+                    "M03R slow context must match its exact registered setting"
+                )
+            fixed_expected = m03r_setting.exit_hazard_mode == "fixed-hold30-prior"
+            if not fixed_expected and not config.hold30_exact_hold_mixture:
+                raise ValueError(
+                    "learned M03R exit settings require the hard exact-hold "
+                    "branch and an explicit initialization bias"
+                )
+            if fixed_expected and config.hold30_fixed_hazard_residual != 0.0:
+                raise ValueError(
+                    "A08-fixed-exit-hazard requires fixed residual 0.0 (the "
+                    "30-session structural prior)"
+                )
+            if not fixed_expected and config.hold30_fixed_hazard_residual is not None:
+                raise ValueError("fixed hazard is exclusive to A08-fixed-exit-hazard"
         )
         self.raw_encoder = FullDayRawEncoder(
             bar_feature_dim=config.bar_feature_dim, d_model=config.raw_policy_dim,
@@ -494,6 +738,7 @@ class DailyCrossSectionPolicy(nn.Module):
         self.entry_head: nn.Module | None = None
         self.hazard_features: nn.Module | None = None
         self.hazard_head: nn.Linear | None = None
+        self.exact_hold_head: nn.Linear | None = None
         self.exposure_head: nn.Module | None = None
         self.alpha_head: Hold30AlphaHead | None = None
         if self.hold30_switches is not None:
@@ -508,6 +753,18 @@ class DailyCrossSectionPolicy(nn.Module):
                         active_log_scale_bounds=config.alpha_active_log_scale_bounds,
                         uncertainty_log_scale_bounds=(
                             config.alpha_uncertainty_log_scale_bounds
+                        ),
+                        hazard_bound_mode=config.hold30_hazard_bound_mode,
+                        exact_hold_mixture=config.hold30_exact_hold_mixture,
+                        exact_hold_logit_bias=config.hold30_exact_hold_logit_bias,
+                        fixed_hazard_residual=config.hold30_fixed_hazard_residual,
+                        confidence_calibration_manifest_sha256=(
+                            config.alpha_confidence_calibration_manifest_sha256
+                        ),
+                        mechanism_generation=(
+                            "v3-frozen"
+                            if config.hold30_mechanism_generation == "v2-v3-frozen"
+                            else "m03r-v1"
                         ),
                     )
                 )
@@ -529,8 +786,17 @@ class DailyCrossSectionPolicy(nn.Module):
                     nn.GELU(),
                     nn.LayerNorm(config.token_dim),
                 )
-                self.hazard_head = nn.Linear(config.token_dim, 1)
-                self._init_hold30_output(self.hazard_head)
+                if config.hold30_fixed_hazard_residual is None:
+                    self.hazard_head = nn.Linear(config.token_dim, 1)
+                    self._init_hold30_output(self.hazard_head)
+                if config.hold30_exact_hold_mixture:
+                    self.exact_hold_head = nn.Linear(config.token_dim, 1)
+                    self._init_hold30_output(self.exact_hold_head)
+                    assert config.hold30_exact_hold_logit_bias is not None
+                    nn.init.constant_(
+                        self.exact_hold_head.bias,
+                        float(config.hold30_exact_hold_logit_bias),
+                    )
                 if self.hold30_switches.use_exposure_timing:
                     self.exposure_head = nn.Sequential(
                         nn.LayerNorm(config.token_dim),
@@ -760,10 +1026,13 @@ class DailyCrossSectionPolicy(nn.Module):
             return Hold30Intent(
                 entry_scores=output.risk_adjusted_score,
                 hazard_residual=output.hazard_residual,
+                raw_hazard_residual=output.raw_hazard_residual,
+                exact_hold_probability=output.exact_hold_probability,
                 exposure_residual=torch.zeros_like(output.active_risk_scale),
                 alpha_mean_30d=output.mean_30d,
                 alpha_downside_30d=output.downside_30d,
                 active_risk_scale=output.active_risk_scale,
+                signal_confidence=output.signal_confidence,
                 total_risk_overlay=output.total_risk_overlay,
                 auxiliary_alpha_mean=output.auxiliary_mean,
             )
@@ -777,8 +1046,8 @@ class DailyCrossSectionPolicy(nn.Module):
         if switches.mechanism == "H3":
             return Hold30Intent(entry_scores=entry)
 
-        if self.hazard_features is None or self.hazard_head is None:
-            raise RuntimeError("registered H2 setting is missing its hazard head")
+        if self.hazard_features is None:
+            raise RuntimeError("registered H2 setting is missing its hazard features")
         hazard_parts = [market_hidden, prev_weights.to(dtype=market_hidden.dtype).unsqueeze(-1)]
         if switches.use_age_input:
             expected_age = (B, A, int(self.config.age_summary_dim))
@@ -787,8 +1056,35 @@ class DailyCrossSectionPolicy(nn.Module):
                 raise ValueError(f"age_summaries must have shape {expected_age}; got {actual}")
             hazard_parts.append(age_summaries.to(device=state_t.device, dtype=market_hidden.dtype))
         hazard_hidden = self.hazard_features(torch.cat(hazard_parts, dim=-1))
-        raw_hazard = self.hazard_head(hazard_hidden).squeeze(-1)
-        hazard = clip_hold30_hazard_residual(raw_hazard)
+        if self.config.hold30_fixed_hazard_residual is None:
+            if self.hazard_head is None:
+                raise RuntimeError("registered H2 setting is missing its hazard head")
+            raw_hazard = self.hazard_head(hazard_hidden).squeeze(-1)
+            hazard = bound_hold30_hazard_residual(
+                raw_hazard,
+                mode=self.config.hold30_hazard_bound_mode,
+            )
+        else:
+            raw_hazard = torch.full_like(
+                entry,
+                float(self.config.hold30_fixed_hazard_residual),
+            )
+            hazard = raw_hazard
+        exact_hold: torch.Tensor | None = None
+        if self.exact_hold_head is not None:
+            exact_hold = straight_through_exact_hold_decision(
+                self.exact_hold_head(hazard_hidden).squeeze(-1)
+            )
+            exact_hold = torch.where(
+                risky_available,
+                exact_hold,
+                torch.ones_like(exact_hold),
+            ).float()
+        raw_hazard = torch.where(
+            risky_available,
+            raw_hazard,
+            torch.zeros_like(raw_hazard),
+        ).float()
         hazard = torch.where(
             risky_available,
             hazard,
@@ -809,6 +1105,8 @@ class DailyCrossSectionPolicy(nn.Module):
         return Hold30Intent(
             entry_scores=entry,
             hazard_residual=hazard,
+            raw_hazard_residual=raw_hazard,
+            exact_hold_probability=exact_hold,
             exposure_residual=exposure,
         )
 
