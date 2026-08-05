@@ -98,6 +98,62 @@ V3_COMPONENT_TESTS = (
     "tests/test_hold30_alpha_workflow.py",
 )
 
+# Later immutable generations deliberately share the broad ``hold30_alpha``
+# filename family.  They are integration history for a v3 qualification, not
+# v3-owned components.  Keeping this mapping explicit preserves the original
+# v3 ownership boundary while still making every later source and blocking
+# test part of the content-addressed integration inventory below.
+V3_LATER_GENERATION_SOURCE_TESTS = (
+    (
+        "src/rl_quant/evaluation/hold30_alpha_m03r.py",
+        "tests/test_hold30_alpha_m03r_evaluation.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r.py",
+        "tests/test_hold30_alpha_m03r_protocol.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r.py",
+        "tests/test_hold30_alpha_m03r.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_selection.py",
+        "tests/test_hold30_alpha_m03r_selection.py",
+    ),
+    (
+        "src/rl_quant/evaluation/hold30_alpha_m03r_v5.py",
+        "tests/test_hold30_alpha_m03r_v5_evaluation.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v5.py",
+        "tests/test_hold30_alpha_m03r_v5_protocol.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v5.py",
+        "tests/test_hold30_m03r_v5_model_semantics.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v5_routes.py",
+        "tests/test_hold30_alpha_m03r_v5_routes.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v5_selection.py",
+        "tests/test_hold30_alpha_m03r_v5_selection.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v6.py",
+        "tests/test_hold30_alpha_m03r_v6_protocol.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v6.py",
+        "tests/test_hold30_alpha_m03r_v6_objective.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v6_selection.py",
+        "tests/test_hold30_alpha_m03r_v6_selection.py",
+    ),
+)
+
 V3_REUSED_NON_HOLD30_SOURCES = (
     "src/rl_quant/models/context_encoder.py",
     "src/rl_quant/models/daily_policy.py",
@@ -125,6 +181,7 @@ V3_EVIDENCE_FILES = (
     "docs/prelockbox_hold30_mech8_v2.md",
     "docs/prelockbox_hold30_alpha_mech8_v3.md",
     "docs/prelockbox_hold30_alpha_evaluation_v3.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v6.md",
     "pyproject.toml",
 )
 
@@ -181,6 +238,9 @@ def resolve_hold30_alpha_qualification_inventory(
 
     root = Path(repo).resolve()
     registered = {source: test for source, test in V3_COMPONENT_SOURCE_TESTS}
+    later_generation = {
+        source: test for source, test in V3_LATER_GENERATION_SOURCE_TESTS
+    }
     source_root = root / "src" / "rl_quant"
     if not source_root.is_dir():
         raise Hold30AlphaQualificationError("src/rl_quant is absent")
@@ -188,7 +248,9 @@ def resolve_hold30_alpha_qualification_inventory(
         candidate.relative_to(root).as_posix()
         for candidate in sorted(source_root.rglob("*hold30*alpha*.py"))
     )
-    missing_registration = sorted(set(discovered) - set(registered))
+    missing_registration = sorted(
+        set(discovered) - set(registered) - set(later_generation)
+    )
     if missing_registration:
         raise Hold30AlphaQualificationError(
             "unregistered v3 source requires an explicit blocking test: "
@@ -199,6 +261,12 @@ def resolve_hold30_alpha_qualification_inventory(
         raise Hold30AlphaQualificationError(
             "registered v3 sources are absent: " + ", ".join(stale_registration)
         )
+    stale_later_generation = sorted(set(later_generation) - set(discovered))
+    if stale_later_generation:
+        raise Hold30AlphaQualificationError(
+            "registered later-generation alpha sources are absent: "
+            + ", ".join(stale_later_generation)
+        )
 
     test_root = root / "tests"
     discovered_tests = tuple(
@@ -206,8 +274,11 @@ def resolve_hold30_alpha_qualification_inventory(
         for candidate in sorted(test_root.glob("test_hold30_alpha*.py"))
     )
     expected_tests = _ordered_unique((*V3_COMPONENT_TESTS, *registered.values()))
-    if set(discovered_tests) != set(expected_tests):
-        missing = sorted(set(discovered_tests) - set(expected_tests))
+    allowed_later_tests = set(later_generation.values())
+    if (set(discovered_tests) - allowed_later_tests) != set(expected_tests):
+        missing = sorted(
+            set(discovered_tests) - set(expected_tests) - allowed_later_tests
+        )
         stale = sorted(set(expected_tests) - set(discovered_tests))
         raise Hold30AlphaQualificationError(
             f"v3 test inventory mismatch; unregistered={missing}, absent={stale}"

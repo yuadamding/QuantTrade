@@ -678,6 +678,33 @@ _daily_raw_pit300_hold30_m03r = replace(
     auxiliary_horizons=(5, 21, 30, 63),
 )
 
+# M03R v5 is result-moving and therefore receives a new immutable registry
+# identity. The numeric tensor geometry is intentionally unchanged from v4;
+# v5 corrects the scientific semantics, evidence binding, confidence
+# calibration, and execution contract without relabeling the frozen v4 row.
+_daily_raw_pit300_hold30_m03r_v5 = replace(
+    _daily_raw_pit300_hold30_m03r,
+    name="daily_raw_pit300_hold30_m03r_v5",
+    note=(
+        "M03R v5 active-alpha Hold-30: 42-session trainable raw branch, "
+        "252-session learned temporal context, 63-session rollout, and "
+        "30 post-fill economic returns"
+    ),
+)
+
+# V6 keeps the qualified v5 tensor geometry but changes the result-moving
+# persistence contract: 30 sessions is a weak one-sided prior, never a
+# minimum hold, sell mask, forced expiry, or checkpoint-promotion gate.
+_daily_raw_pit300_hold30_m03r_v6 = replace(
+    _daily_raw_pit300_hold30_m03r_v5,
+    name="daily_raw_pit300_hold30_m03r_v6",
+    note=(
+        "M03R v6 soft-persistence active-alpha Hold-30: freely revisable "
+        "positions, optional exact-hold action, one-sided early-exit cost, "
+        "252-session learned context, and 63-session rollout"
+    ),
+)
+
 _TOP2000_H100_VARIANTS = [
     replace(
         _top2000_h100_base,
@@ -859,6 +886,8 @@ _TOP2000_H100_SERIES = [_top2000_h100_base, *_TOP2000_H100_VARIANTS]
 _SERIES.extend(_TOP2000_H100_VARIANTS)
 _SERIES.append(_daily_raw_pit300_hold30)
 _SERIES.append(_daily_raw_pit300_hold30_m03r)
+_SERIES.append(_daily_raw_pit300_hold30_m03r_v5)
+_SERIES.append(_daily_raw_pit300_hold30_m03r_v6)
 
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 
@@ -873,6 +902,8 @@ TOP2000_H100_CORE_SWEEP = [d.name for d in _TOP2000_H100_SERIES[:10]]
 TOP2000_H100_WIDE_SWEEP = [d.name for d in _TOP2000_H100_SERIES]
 HOLD30_BASE_DESIGN = _daily_raw_pit300_hold30.name
 HOLD30_M03R_BASE_DESIGN = _daily_raw_pit300_hold30_m03r.name
+HOLD30_M03R_V5_BASE_DESIGN = _daily_raw_pit300_hold30_m03r_v5.name
+HOLD30_M03R_V6_BASE_DESIGN = _daily_raw_pit300_hold30_m03r_v6.name
 SWEEP = TOP2000_H100_WIDE_SWEEP
 # Longer-horizon probes (run explicitly with --design; not in the default sweep).
 HORIZON_SWEEP = ["h30m", "h65m"]

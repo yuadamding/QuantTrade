@@ -7,15 +7,16 @@ separate approved Seadragon launcher must verify before allocating GPUs.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
 
 from rl_quant.protocol.hold30 import HOLD30_MECH8_IDS, HOLD30_PROTOCOL_GENERATION
 from rl_quant.protocol.hold30_freeze import (
@@ -29,7 +30,6 @@ from rl_quant.training.hold30_experiment import (
     build_hold30_policy_config,
     hold30_parameter_counts,
 )
-
 
 SOFTWARE_GATE_FILES = (
     "tests/test_hold30_accounting.py",
@@ -93,11 +93,31 @@ HOLD30_COMPONENT_TESTS = (
         "src/rl_quant/evaluation/hold30_alpha_evaluation.py",
         "tests/test_hold30_alpha_evaluation.py",
     ),
+    (
+        "src/rl_quant/evaluation/hold30_alpha_m03r.py",
+        "tests/test_hold30_alpha_m03r_evaluation.py",
+    ),
+    (
+        "src/rl_quant/evaluation/hold30_alpha_m03r_v5.py",
+        "tests/test_hold30_alpha_m03r_v5_evaluation.py",
+    ),
     ("src/rl_quant/evaluation/hold30_endpoints.py", "tests/test_hold30_endpoints.py"),
     ("src/rl_quant/evaluation/hold30_inference.py", "tests/test_hold30_inference.py"),
     ("src/rl_quant/evaluation/hold30_metrics.py", "tests/test_hold30_metrics.py"),
     ("src/rl_quant/models/hold30_ensemble.py", "tests/test_hold30_ensemble.py"),
     ("src/rl_quant/models/hold30_alpha.py", "tests/test_hold30_alpha.py"),
+    (
+        "src/rl_quant/models/hold30_hazard.py",
+        "tests/test_hold30_m03r_mechanism.py",
+    ),
+    (
+        "src/rl_quant/models/hold30_m03r_ensemble.py",
+        "tests/test_hold30_m03r_projection.py",
+    ),
+    (
+        "src/rl_quant/models/hold30_m03r_ensemble_v5.py",
+        "tests/test_hold30_m03r_v5_projection.py",
+    ),
     ("src/rl_quant/protocol/hold30.py", "tests/test_hold30_designs.py"),
     (
         "src/rl_quant/protocol/hold30_alpha_v3.py",
@@ -107,9 +127,53 @@ HOLD30_COMPONENT_TESTS = (
         "src/rl_quant/protocol/hold30_alpha_v3_freeze.py",
         "tests/test_hold30_alpha_v3_protocol.py",
     ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r.py",
+        "tests/test_hold30_alpha_m03r_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v5.py",
+        "tests/test_hold30_alpha_m03r_v5_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_m03r_confidence.py",
+        "tests/test_hold30_m03r_v5_model_semantics.py",
+    ),
     ("src/rl_quant/protocol/hold30_freeze.py", "tests/test_hold30_freeze.py"),
     ("src/rl_quant/training/hold30.py", "tests/test_hold30_training.py"),
     ("src/rl_quant/training/hold30_alpha.py", "tests/test_hold30_alpha.py"),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r.py",
+        "tests/test_hold30_alpha_m03r.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_selection.py",
+        "tests/test_hold30_alpha_m03r_selection.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v5.py",
+        "tests/test_hold30_m03r_v5_model_semantics.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v5_routes.py",
+        "tests/test_hold30_alpha_m03r_v5_routes.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v5_selection.py",
+        "tests/test_hold30_alpha_m03r_v5_selection.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v6.py",
+        "tests/test_hold30_alpha_m03r_v6_protocol.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v6.py",
+        "tests/test_hold30_alpha_m03r_v6_objective.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v6_selection.py",
+        "tests/test_hold30_alpha_m03r_v6_selection.py",
+    ),
     (
         "src/rl_quant/training/hold30_alpha_plan.py",
         "tests/test_hold30_alpha_v3_protocol.py",
@@ -122,6 +186,14 @@ HOLD30_COMPONENT_TESTS = (
     ("src/rl_quant/training/hold30_experiment.py", "tests/test_hold30_designs.py"),
     ("src/rl_quant/training/hold30_runtime.py", "tests/test_hold30_runtime.py"),
     ("src/rl_quant/training/hold30_state.py", "tests/test_hold30_state.py"),
+    (
+        "src/rl_quant/execution/hold30_m03r_projection_v5.py",
+        "tests/test_hold30_m03r_v5_projection.py",
+    ),
+    (
+        "src/rl_quant/execution/hold30_m03r_soft_persistence_v6.py",
+        "tests/test_hold30_m03r_v6_behavior.py",
+    ),
     ("src/rl_quant/workflows/hold30_prelockbox.py", "tests/test_hold30_workflow.py"),
     (
         "src/rl_quant/workflows/hold30_alpha_prelockbox.py",
@@ -142,6 +214,9 @@ HOLD30_EVIDENCE_FILES = (
     "docs/adr/0006-daily-decision-soft-30-session-holding.md",
     "docs/adr/0007-benchmark-relative-hold30-alpha-objective.md",
     "docs/daily_hold30_policy_rfc.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v4.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v5.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v6.md",
     "docs/prelockbox_hold30_alpha_evaluation_v3.md",
     "docs/prelockbox_hold30_alpha_mech8_v3.md",
     "docs/prelockbox_hold30_h0_h3_experiment.md",
@@ -387,8 +462,7 @@ def _git_value(repo: Path, *arguments: str) -> str:
     result = subprocess.run(
         ("git", *arguments),
         cwd=repo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if result.returncode:
@@ -436,8 +510,7 @@ def qualify_hold30_software(
     diff = subprocess.run(
         ("git", "diff", "--binary", "HEAD", "--", *inventory.qualified_files),
         cwd=root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if diff.returncode:

@@ -100,11 +100,18 @@ def _clone_intent(intent: Hold30Intent, *, detach: bool) -> Hold30Intent:
         hazard_residual=copy(intent.hazard_residual),
         raw_hazard_residual=copy(intent.raw_hazard_residual),
         exact_hold_probability=copy(intent.exact_hold_probability),
+        exact_hold_logit=copy(intent.exact_hold_logit),
+        exact_hold_soft_probability=copy(intent.exact_hold_soft_probability),
+        exact_hold_decision_st=copy(intent.exact_hold_decision_st),
         exposure_residual=copy(intent.exposure_residual),
         alpha_mean_30d=copy(intent.alpha_mean_30d),
         alpha_downside_30d=copy(intent.alpha_downside_30d),
         active_risk_scale=copy(intent.active_risk_scale),
         signal_confidence=copy(intent.signal_confidence),
+        uncalibrated_signal_confidence_logit=copy(
+            intent.uncalibrated_signal_confidence_logit
+        ),
+        benchmark_derisk_request=copy(intent.benchmark_derisk_request),
         total_risk_overlay=copy(intent.total_risk_overlay),
         auxiliary_alpha_mean=copy(intent.auxiliary_alpha_mean),
     )
@@ -120,11 +127,16 @@ def _intent_tensors(intent: Hold30Intent) -> tuple[tuple[str, torch.Tensor], ...
             "hazard_residual",
             "raw_hazard_residual",
             "exact_hold_probability",
+            "exact_hold_logit",
+            "exact_hold_soft_probability",
+            "exact_hold_decision_st",
             "exposure_residual",
             "alpha_mean_30d",
             "alpha_downside_30d",
             "active_risk_scale",
             "signal_confidence",
+            "uncalibrated_signal_confidence_logit",
+            "benchmark_derisk_request",
             "total_risk_overlay",
             "auxiliary_alpha_mean",
         )
@@ -1143,7 +1155,13 @@ class Hold30ChronologicalRuntime:
                     trade_mask,
                     risk_asset_caps,
                     risk_gross_max,
-                    exact_hold_probability=intent.exact_hold_probability,
+                    # V5 exposes the hard straight-through branch explicitly;
+                    # legacy generations keep the original field name.
+                    exact_hold_probability=(
+                        intent.exact_hold_decision_st
+                        if intent.exact_hold_decision_st is not None
+                        else intent.exact_hold_probability
+                    ),
                     total_risk_overlay=intent.total_risk_overlay,
                     total_risk_step=self.alpha_total_risk_step,
                     cash_index=repaired_ledger.cash_index,
@@ -1179,6 +1197,9 @@ class Hold30ChronologicalRuntime:
                 "hazard_residual",
                 "raw_hazard_residual",
                 "exact_hold_probability",
+                "exact_hold_logit",
+                "exact_hold_soft_probability",
+                "exact_hold_decision_st",
                 "exposure_residual",
             )
         elif self.mechanism == "H2":
@@ -1196,6 +1217,9 @@ class Hold30ChronologicalRuntime:
                 "hazard_residual",
                 "raw_hazard_residual",
                 "exact_hold_probability",
+                "exact_hold_logit",
+                "exact_hold_soft_probability",
+                "exact_hold_decision_st",
                 "exposure_residual",
             )
         for name, shape in required.items():
@@ -1206,7 +1230,13 @@ class Hold30ChronologicalRuntime:
             if getattr(intent, name) is not None:
                 raise ValueError(f"{self.mechanism} intent must not populate {name}")
         if self.mechanism == "H2":
-            for name in ("raw_hazard_residual", "exact_hold_probability"):
+            for name in (
+                "raw_hazard_residual",
+                "exact_hold_probability",
+                "exact_hold_logit",
+                "exact_hold_soft_probability",
+                "exact_hold_decision_st",
+            ):
                 value = getattr(intent, name)
                 if value is not None and tuple(value.shape) != matrix_shape:
                     raise ValueError(
@@ -1219,11 +1249,33 @@ class Hold30ChronologicalRuntime:
                 ).any()
             ):
                 raise ValueError("exact_hold_probability must lie in [0,1]")
+            if intent.exact_hold_soft_probability is not None and bool(
+                (intent.exact_hold_soft_probability < 0).any()
+                or (intent.exact_hold_soft_probability > 1).any()
+            ):
+                raise ValueError("exact_hold_soft_probability must lie in [0,1]")
+            if intent.exact_hold_decision_st is not None and bool(
+                ((intent.exact_hold_decision_st != 0) & (intent.exact_hold_decision_st != 1)).any()
+            ):
+                raise ValueError("exact_hold_decision_st must be hard binary")
+            if intent.exact_hold_probability is not None and any(
+                value is not None
+                for value in (
+                    intent.exact_hold_logit,
+                    intent.exact_hold_soft_probability,
+                    intent.exact_hold_decision_st,
+                )
+            ):
+                raise ValueError(
+                    "legacy exact_hold_probability and explicit v5 exact-hold fields are mutually exclusive"
+                )
         alpha_fields = (
             "alpha_mean_30d",
             "alpha_downside_30d",
             "active_risk_scale",
             "signal_confidence",
+            "uncalibrated_signal_confidence_logit",
+            "benchmark_derisk_request",
             "total_risk_overlay",
             "auxiliary_alpha_mean",
         )
@@ -1254,6 +1306,22 @@ class Hold30ChronologicalRuntime:
                 ((intent.signal_confidence < 0) | (intent.signal_confidence > 1)).any()
             ):
                 raise ValueError("M03R signal_confidence must lie in [0,1]")
+        if intent.uncalibrated_signal_confidence_logit is not None and tuple(
+            intent.uncalibrated_signal_confidence_logit.shape
+        ) != vector_shape:
+            raise ValueError(
+                "M03R uncalibrated_signal_confidence_logit must have shape [batch]"
+            )
+        if intent.benchmark_derisk_request is not None:
+            if tuple(intent.benchmark_derisk_request.shape) != vector_shape:
+                raise ValueError(
+                    "M03R benchmark_derisk_request must have shape [batch]"
+                )
+            if bool(
+                (intent.benchmark_derisk_request < 0).any()
+                or (intent.benchmark_derisk_request > 1).any()
+            ):
+                raise ValueError("M03R benchmark_derisk_request must lie in [0,1]")
         if intent.total_risk_overlay is not None and tuple(
             intent.total_risk_overlay.shape
         ) != vector_shape:

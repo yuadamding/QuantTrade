@@ -1736,11 +1736,20 @@ class _CpuA06SelectiveDetachPolicy:
             hazard_residual=detached(intent.hazard_residual),
             raw_hazard_residual=detached(intent.raw_hazard_residual),
             exact_hold_probability=detached(intent.exact_hold_probability),
+            exact_hold_logit=detached(intent.exact_hold_logit),
+            exact_hold_soft_probability=detached(
+                intent.exact_hold_soft_probability
+            ),
+            exact_hold_decision_st=detached(intent.exact_hold_decision_st),
             exposure_residual=detached(intent.exposure_residual),
             alpha_mean_30d=detached(intent.alpha_mean_30d),
             alpha_downside_30d=detached(intent.alpha_downside_30d),
             active_risk_scale=detached(intent.active_risk_scale),
             signal_confidence=detached(intent.signal_confidence),
+            uncalibrated_signal_confidence_logit=detached(
+                intent.uncalibrated_signal_confidence_logit
+            ),
+            benchmark_derisk_request=detached(intent.benchmark_derisk_request),
             total_risk_overlay=intent.total_risk_overlay,
             auxiliary_alpha_mean=detached(intent.auxiliary_alpha_mean),
         )

@@ -18,6 +18,7 @@ memory across days (only the carried portfolio weight). Here:
 The frozen context enters as plain detached tensors -- no gradient reaches the Stage-1 encoder (the context/policy
 split holds). Only this module's parameters are trained by the PnL objective.
 """
+
 from __future__ import annotations
 
 import math
@@ -49,12 +50,23 @@ from rl_quant.protocol.hold30 import (
     resolve_hold30_setting,
 )
 from rl_quant.protocol.hold30_alpha_m03r import (
-    M03R_SETTING_IDS,
-    resolve_m03r_setting,
+    M03R_SETTING_IDS as M03R_V4_SETTING_IDS,
+)
+from rl_quant.protocol.hold30_alpha_m03r import (
+    resolve_m03r_setting as resolve_m03r_v4_setting,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_SETTING_IDS as M03R_V5_SETTING_IDS,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    resolve_m03r_v5_setting,
 )
 from rl_quant.protocol.hold30_alpha_v3 import (
     HOLD30_ALPHA_MECH8_SETTINGS,
     resolve_hold30_alpha_setting,
+)
+from rl_quant.protocol.hold30_m03r_confidence import (
+    M03RConfidenceCalibrationManifest,
 )
 
 HOLD30_AGE_CAP = 60
@@ -105,8 +117,7 @@ _HOLD30_MODEL_SWITCHES.update(
             setting.age_aware,
             use_alpha_head=setting.supervised_residual_alpha_heads,
             use_uncertainty=setting.uncertainty_downside_heads,
-            use_total_risk_overlay=setting.sharpe_mode
-            == "separate-total-risk-overlay",
+            use_total_risk_overlay=setting.sharpe_mode == "separate-total-risk-overlay",
             use_direct_sharpe=setting.sharpe_mode == "direct-two-pass-gradient",
         )
         for setting in HOLD30_ALPHA_MECH8_SETTINGS
@@ -128,32 +139,64 @@ _HOLD30_MODEL_SWITCHES.update(
             ),
             use_direct_sharpe=(setting.sharpe_mode == "direct-two-pass-gradient"),
         )
-        for setting_id in M03R_SETTING_IDS
-        for setting in (resolve_m03r_setting(setting_id),)
+        for setting_id in M03R_V4_SETTING_IDS
+        for setting in (resolve_m03r_v4_setting(setting_id),)
     }
 )
-HOLD30_V2_MODEL_SETTING_IDS = tuple(setting.setting_id for setting in HOLD30_MECH8_SETTINGS)
+_HOLD30_M03R_V5_MODEL_SWITCHES = {
+    setting_id: Hold30ModelSwitches(
+        setting_id=setting_id,
+        mechanism="H2",
+        use_age_input=setting.age_aware_holding,
+        use_exposure_timing=False,
+        use_early_exit_penalty=setting.age_aware_holding,
+        use_turnover_penalty=setting.age_aware_holding,
+        use_alpha_head=setting.residual_alpha_heads,
+        use_uncertainty=setting.use_downside_adjusted_stock_score,
+        use_total_risk_overlay=(setting.sharpe_mode == "separate-total-risk-overlay"),
+        use_direct_sharpe=(setting.sharpe_mode == "direct-two-pass-gradient"),
+    )
+    for setting_id in M03R_V5_SETTING_IDS
+    for setting in (resolve_m03r_v5_setting(setting_id),)
+}
+HOLD30_V2_MODEL_SETTING_IDS = tuple(
+    setting.setting_id for setting in HOLD30_MECH8_SETTINGS
+)
 HOLD30_ALPHA_MODEL_SETTING_IDS = tuple(
     setting.setting_id for setting in HOLD30_ALPHA_MECH8_SETTINGS
 )
-HOLD30_M03R_MODEL_SETTING_IDS = M03R_SETTING_IDS
+HOLD30_M03R_MODEL_SETTING_IDS = M03R_V4_SETTING_IDS
+HOLD30_M03R_V4_MODEL_SETTING_IDS = M03R_V4_SETTING_IDS
+HOLD30_M03R_V5_MODEL_SETTING_IDS = M03R_V5_SETTING_IDS
 # Backward-compatible V2 public inventory; V3 has a disjoint explicit export.
 HOLD30_MODEL_SETTING_IDS = HOLD30_V2_MODEL_SETTING_IDS
 
 
 def resolve_hold30_model_switches(setting_id: str) -> Hold30ModelSwitches:
-    """Return the immutable model contract for a registered Hold-30 setting."""
+    """Return the legacy/V3 model contract for a registered setting.
+
+    Shared M03R IDs resolve to the frozen v4 contract here solely for backward
+    compatibility. New M03R v5 callers must use the generation-qualified
+    :func:`resolve_hold30_m03r_v5_model_switches` resolver.
+    """
 
     # Resolve through the protocol first so every artifact-producing surface
     # shares one alias-rejection/error contract.
     if setting_id in _HOLD30_MODEL_SWITCHES and setting_id.startswith("hold30a-"):
         registered = resolve_hold30_alpha_setting(setting_id)
         return _HOLD30_MODEL_SWITCHES[registered.setting_id]
-    if setting_id in M03R_SETTING_IDS:
-        registered = resolve_m03r_setting(setting_id)
+    if setting_id in M03R_V4_SETTING_IDS:
+        registered = resolve_m03r_v4_setting(setting_id)
         return _HOLD30_MODEL_SWITCHES[registered.setting_id]
     registered = resolve_hold30_setting(setting_id)
     return _HOLD30_MODEL_SWITCHES[registered.setting_id]
+
+
+def resolve_hold30_m03r_v5_model_switches(setting_id: str) -> Hold30ModelSwitches:
+    """Return only the exact generation-qualified M03R v5 model contract."""
+
+    registered = resolve_m03r_v5_setting(setting_id)
+    return _HOLD30_M03R_V5_MODEL_SWITCHES[registered.setting_id]
 
 
 @dataclass(frozen=True)
@@ -172,16 +215,25 @@ class Hold30Intent:
     hazard_residual: torch.Tensor | None = None
     raw_hazard_residual: torch.Tensor | None = None
     exact_hold_probability: torch.Tensor | None = None
+    exact_hold_logit: torch.Tensor | None = None
+    exact_hold_soft_probability: torch.Tensor | None = None
+    exact_hold_decision_st: torch.Tensor | None = None
     exposure_residual: torch.Tensor | None = None
     alpha_mean_30d: torch.Tensor | None = None
     alpha_downside_30d: torch.Tensor | None = None
     active_risk_scale: torch.Tensor | None = None
     signal_confidence: torch.Tensor | None = None
+    uncalibrated_signal_confidence_logit: torch.Tensor | None = None
+    benchmark_derisk_request: torch.Tensor | None = None
     total_risk_overlay: torch.Tensor | None = None
     auxiliary_alpha_mean: torch.Tensor | None = None
 
 
-def _clip_with_zero_boundary_gradient(value: torch.Tensor, lower: float, upper: float,) -> torch.Tensor:
+def _clip_with_zero_boundary_gradient(
+    value: torch.Tensor,
+    lower: float,
+    upper: float,
+) -> torch.Tensor:
     """Frozen endpoint-gradient behavior used by the v2/v3 release clock."""
 
     lo = value.new_tensor(lower)
@@ -197,9 +249,12 @@ def hold30_age_prior_logit(age: torch.Tensor) -> torch.Tensor:
     return -2.0 + (age.clamp(min=0.0, max=float(HOLD30_AGE_CAP)) - 30.0) / 4.0
 
 
-def hold30_release_hazard(age: torch.Tensor, hazard_residual: torch.Tensor,
+def hold30_release_hazard(
+    age: torch.Tensor,
+    hazard_residual: torch.Tensor,
     *,
-    exact_hold_probability: torch.Tensor | None = None,) -> torch.Tensor:
+    exact_hold_probability: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Normalized cohort-release hazard from the RFC.
 
     ``age`` and ``hazard_residual`` follow ordinary PyTorch broadcasting.
@@ -212,10 +267,16 @@ def hold30_release_hazard(age: torch.Tensor, hazard_residual: torch.Tensor,
 
     if not hazard_residual.is_floating_point():
         raise TypeError("hazard_residual must be a floating-point tensor")
-    beta = hold30_age_prior_logit(age.to(device=hazard_residual.device, dtype=hazard_residual.dtype))
+    beta = hold30_age_prior_logit(
+        age.to(device=hazard_residual.device, dtype=hazard_residual.dtype)
+    )
     bounded = clip_hold30_hazard_residual(hazard_residual)
-    p_min = torch.sigmoid(_clip_with_zero_boundary_gradient(beta + HOLD30_HAZARD_MIN, -20.0, 20.0))
-    release = torch.sigmoid(_clip_with_zero_boundary_gradient(beta + bounded, -20.0, 20.0))
+    p_min = torch.sigmoid(
+        _clip_with_zero_boundary_gradient(beta + HOLD30_HAZARD_MIN, -20.0, 20.0)
+    )
+    release = torch.sigmoid(
+        _clip_with_zero_boundary_gradient(beta + bounded, -20.0, 20.0)
+    )
     normalized = (release - p_min) / (1.0 - p_min)
     if exact_hold_probability is None:
         return normalized
@@ -237,9 +298,12 @@ def hold30_release_hazard(age: torch.Tensor, hazard_residual: torch.Tensor,
         ) from error
 
 
-def hold30_proposed_release(age_notional: torch.Tensor, hazard_residual: torch.Tensor,
+def hold30_proposed_release(
+    age_notional: torch.Tensor,
+    hazard_residual: torch.Tensor,
     *,
-    exact_hold_probability: torch.Tensor | None = None,) -> torch.Tensor:
+    exact_hold_probability: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Return gross proposed release by asset from ``[..., asset, 61]`` cohort notionals."""
 
     if age_notional.ndim < 2 or age_notional.shape[-1] != HOLD30_AGE_CAP + 1:
@@ -260,7 +324,9 @@ def hold30_proposed_release(age_notional: torch.Tensor, hazard_residual: torch.T
             f"got {tuple(exact_hold_probability.shape)} and "
             f"{tuple(hazard_residual.shape)}"
         )
-    ages = torch.arange(HOLD30_AGE_CAP + 1, device=age_notional.device, dtype=age_notional.dtype)
+    ages = torch.arange(
+        HOLD30_AGE_CAP + 1, device=age_notional.device, dtype=age_notional.dtype
+    )
     hazards = hold30_release_hazard(
         ages,
         hazard_residual.unsqueeze(-1).to(dtype=age_notional.dtype),
@@ -287,7 +353,9 @@ def exact_hold30_intent(reference: torch.Tensor) -> Hold30Intent:
         hazard_residual=torch.full_like(reference, HOLD30_HAZARD_MIN),
         raw_hazard_residual=torch.full_like(reference, HOLD30_HAZARD_MIN),
         exact_hold_probability=torch.ones_like(reference),
-        exposure_residual=torch.zeros(reference.shape[:-1], device=reference.device, dtype=reference.dtype),
+        exposure_residual=torch.zeros(
+            reference.shape[:-1], device=reference.device, dtype=reference.dtype
+        ),
     )
 
 
@@ -301,27 +369,53 @@ class FullDayRawEncoder(nn.Module):
     pos1: torch.Tensor
     pos2: torch.Tensor
 
-    def __init__(self, *, bar_feature_dim: int, d_model: int, n_heads: int, n_layers: int,
-                 feedforward_dim: int, dropout: float, block_seconds: int, max_seconds: int,
-                 grad_checkpoint: bool = False, raw_norm: str = "instance", stock_chunk: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        bar_feature_dim: int,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        feedforward_dim: int,
+        dropout: float,
+        block_seconds: int,
+        max_seconds: int,
+        grad_checkpoint: bool = False,
+        raw_norm: str = "instance",
+        stock_chunk: int = 0,
+    ) -> None:
         super().__init__()
         d = d_model
         if d % n_heads:
             raise ValueError(f"raw d_model {d} must be divisible by n_heads {n_heads}")
         if raw_norm not in ("instance", "level"):
-            raise ValueError(f"raw_norm must be 'instance' or 'level', got {raw_norm!r}")
+            raise ValueError(
+                f"raw_norm must be 'instance' or 'level', got {raw_norm!r}"
+            )
         self.block_seconds = int(block_seconds)
         self.grad_checkpoint = grad_checkpoint
         self.raw_norm = raw_norm
-        self.stock_chunk = int(stock_chunk)   # >0: encode the stock axis in chunks (bit-identical: every norm here
+        self.stock_chunk = int(
+            stock_chunk
+        )  # >0: encode the stock axis in chunks (bit-identical: every norm here
         #                                       is per-(stock,day); huge universes need it for activation memory)
         t1 = max(1, n_layers // 2)
         t2 = max(1, n_layers - t1)
         self.input_proj = nn.Linear(bar_feature_dim, d)
-        self.register_buffer("pos1", _sinusoidal(self.block_seconds, d), persistent=False)
-        self.register_buffer("pos2", _sinusoidal(max_seconds // max(1, self.block_seconds) + 2, d), persistent=False)
-        self.tier1 = nn.ModuleList([_CausalBlock(d, n_heads, feedforward_dim, dropout) for _ in range(t1)])
-        self.tier2 = nn.ModuleList([_CausalBlock(d, n_heads, feedforward_dim, dropout) for _ in range(t2)])
+        self.register_buffer(
+            "pos1", _sinusoidal(self.block_seconds, d), persistent=False
+        )
+        self.register_buffer(
+            "pos2",
+            _sinusoidal(max_seconds // max(1, self.block_seconds) + 2, d),
+            persistent=False,
+        )
+        self.tier1 = nn.ModuleList(
+            [_CausalBlock(d, n_heads, feedforward_dim, dropout) for _ in range(t1)]
+        )
+        self.tier2 = nn.ModuleList(
+            [_CausalBlock(d, n_heads, feedforward_dim, dropout) for _ in range(t2)]
+        )
         self.norm1 = nn.LayerNorm(d)
         self.norm2 = nn.LayerNorm(d)
         self.d_model = d
@@ -336,44 +430,58 @@ class FullDayRawEncoder(nn.Module):
             return self._encode_stocks(bars, bar_mask)
         outs = []
         for lo in range(0, A, ck):
-            bc, mc = bars[:, lo:lo + ck], bar_mask[:, lo:lo + ck]
+            bc, mc = bars[:, lo : lo + ck], bar_mask[:, lo : lo + ck]
             if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-                outs.append(torch.utils.checkpoint.checkpoint(self._encode_stocks, bc, mc, use_reentrant=False))
+                outs.append(
+                    torch.utils.checkpoint.checkpoint(
+                        self._encode_stocks, bc, mc, use_reentrant=False
+                    )
+                )
             else:
                 outs.append(self._encode_stocks(bc, mc))
-        return torch.cat(outs, dim=1)                            # [B,A,d]
+        return torch.cat(outs, dim=1)  # [B,A,d]
 
-    def _encode_stocks(self, bars: torch.Tensor, bar_mask: torch.Tensor) -> torch.Tensor:
+    def _encode_stocks(
+        self, bars: torch.Tensor, bar_mask: torch.Tensor
+    ) -> torch.Tensor:
         B, A, S, _feature_dim = bars.shape
         d = self.d_model
         bl = self.block_seconds
         nB = S // bl
         if nB <= 0:
-            raise ValueError(f"FullDayRawEncoder needs at least one {bl}s block; got S={S}")
-        bars = bars[:, :, :nB * bl]
-        bar_mask = bar_mask[:, :, :nB * bl].bool()
+            raise ValueError(
+                f"FullDayRawEncoder needs at least one {bl}s block; got S={S}"
+            )
+        bars = bars[:, :, : nB * bl]
+        bar_mask = bar_mask[:, :, : nB * bl].bool()
         # Per-(stock,day) normalization over that stock-day's valid seconds. BOTH modes have NO coupling across the
         # batch/day axis (a future day cannot affect a past day's normalization -> strictly causal) and use only
         # day-d's own bars (PIT-clean for the END-OF-DAY embedding). They differ in what they preserve:
-        m = bar_mask.unsqueeze(-1).to(bars.dtype)               # [B,A,Sd,1]
-        cnt = m.sum(dim=2).clamp_min(1.0)                       # [B,A,1]
+        m = bar_mask.unsqueeze(-1).to(bars.dtype)  # [B,A,Sd,1]
+        cnt = m.sum(dim=2).clamp_min(1.0)  # [B,A,1]
         if self.raw_norm == "instance":
             # per-FIELD standardize: affine-invariant, so the day's intraday move MAGNITUDE is whitened away (only
             # the vol-normalized SHAPE survives) -- bad for a cross-sectional RETURN policy, kept for back-compat.
-            mean = (bars * m).sum(dim=2) / cnt                  # [B,A,F]
+            mean = (bars * m).sum(dim=2) / cnt  # [B,A,F]
             var = ((bars - mean.unsqueeze(2)) ** 2 * m).sum(dim=2) / cnt
             normed = ((bars - mean.unsqueeze(2)) / (var.unsqueeze(2) + 1e-5).sqrt()) * m
-        else:                                                   # "level": magnitude-preserving (the daily_raw default)
+        else:  # "level": magnitude-preserving (the daily_raw default)
             # Prices -> deviation from the day's mean CLOSE expressed in RETURN units (divide by the price level, do
             # NOT divide by std): multiplicatively scale-INVARIANT (a $5 and a $500 name are comparable; splits don't
             # matter) yet magnitude-SENSITIVE (a +5% day reads ~10x a +0.5% day -- the cross-sectional signal the
             # instance norm destroyed). Volume -> centered log1p (relative intraday volume; absolute level isn't a
             # return signal). This is INPUT NORMALIZATION of raw OHLCV, not an engineered feature column.
             price, vol = bars[..., :4], bars[..., 4:]
-            anchor = ((bars[..., 3:4] * m).sum(dim=2) / cnt).clamp_min(1e-2)        # [B,A,1] mean close level
-            price_n = (price - anchor.unsqueeze(2)) / anchor.unsqueeze(2)           # ~ price/anchor - 1 (return units)
+            anchor = ((bars[..., 3:4] * m).sum(dim=2) / cnt).clamp_min(
+                1e-2
+            )  # [B,A,1] mean close level
+            price_n = (price - anchor.unsqueeze(2)) / anchor.unsqueeze(
+                2
+            )  # ~ price/anchor - 1 (return units)
             vlog = torch.log1p(vol.clamp_min(0.0))
-            vol_n = vlog - (vlog * m).sum(dim=2, keepdim=True) / cnt.unsqueeze(2)   # centered log-volume
+            vol_n = vlog - (vlog * m).sum(dim=2, keepdim=True) / cnt.unsqueeze(
+                2
+            )  # centered log-volume
             normed = torch.cat([price_n, vol_n], dim=-1) * m
         x = self.input_proj(normed).reshape(B * A * nB, bl, d)
         # Keep autocast's BF16 projection in BF16.  Adding the persistent FP32 positional buffer directly would
@@ -382,8 +490,12 @@ class FullDayRawEncoder(nn.Module):
         x = x + self.pos1[:bl].to(dtype=x.dtype).view(1, bl, d)
         bm1 = bar_mask.reshape(B * A * nB, bl)
 
-        def packed_last(rows: torch.Tensor, valid: torch.Tensor, blocks: nn.ModuleList,
-                        norm: nn.Module) -> torch.Tensor:
+        def packed_last(
+            rows: torch.Tensor,
+            valid: torch.Tensor,
+            blocks: nn.ModuleList,
+            norm: nn.Module,
+        ) -> torch.Tensor:
             """Encode ragged causal rows and retain only their last valid state.
 
             Grouping by valid length lets SDPA use its native causal kernel. In contrast, combining a key-padding
@@ -403,14 +515,20 @@ class FullDayRawEncoder(nn.Module):
                 if length == rows.shape[1]:
                     packed = selected_rows
                 else:
-                    positions = torch.arange(rows.shape[1], device=rows.device).expand(
-                        selected_rows.shape[0], -1
-                    )[selected_valid].reshape(selected_rows.shape[0], length)
-                    packed = torch.gather(selected_rows, 1, positions.unsqueeze(-1).expand(-1, -1, d))
+                    positions = (
+                        torch.arange(rows.shape[1], device=rows.device)
+                        .expand(selected_rows.shape[0], -1)[selected_valid]
+                        .reshape(selected_rows.shape[0], length)
+                    )
+                    packed = torch.gather(
+                        selected_rows, 1, positions.unsqueeze(-1).expand(-1, -1, d)
+                    )
                 for block in blocks:
                     if self.grad_checkpoint and self.training:
                         packed = torch.utils.checkpoint.checkpoint(
-                            lambda value, layer=block: layer(value, None), packed, use_reentrant=False
+                            lambda value, layer=block: layer(value, None),
+                            packed,
+                            use_reentrant=False,
                         )
                     else:
                         packed = block(packed, None)
@@ -425,7 +543,9 @@ class FullDayRawEncoder(nn.Module):
         # Only the final day state is consumed, so tier 2 can use the same ragged-last path and avoid retaining a
         # padded full-session output. Missing blocks still keep their absolute ``pos2`` timestamp.
         day = packed_last(h, block_has, self.tier2, self.norm2).reshape(B, A, d)
-        return day * block_has.any(-1).reshape(B, A, 1).to(dtype=day.dtype)  # zero for stocks absent all day
+        return day * block_has.any(-1).reshape(B, A, 1).to(
+            dtype=day.dtype
+        )  # zero for stocks absent all day
 
 
 class CrossDayTemporalEncoder(nn.Module):
@@ -439,30 +559,54 @@ class CrossDayTemporalEncoder(nn.Module):
 
     pos: torch.Tensor
 
-    def __init__(self, *, d_model: int, n_heads: int, n_layers: int, feedforward_dim: int,
-                 dropout: float, max_days: int) -> None:
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        feedforward_dim: int,
+        dropout: float,
+        max_days: int,
+    ) -> None:
         super().__init__()
-        self.register_buffer("pos", _sinusoidal(max_days + 2, d_model), persistent=False)
-        self.blocks = nn.ModuleList([_CausalBlock(d_model, n_heads, feedforward_dim, dropout)
-                                     for _ in range(max(1, n_layers))])
+        self.register_buffer(
+            "pos", _sinusoidal(max_days + 2, d_model), persistent=False
+        )
+        self.blocks = nn.ModuleList(
+            [
+                _CausalBlock(d_model, n_heads, feedforward_dim, dropout)
+                for _ in range(max(1, n_layers))
+            ]
+        )
         self.norm = nn.LayerNorm(d_model)
         self.d_model = d_model
 
-    def forward(self, seq: torch.Tensor, day_valid: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, seq: torch.Tensor, day_valid: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """seq [B,T,A,d] -> [B,T,A,d]. day_valid [B,T,A] (a stock has a real embedding that day) -> absent days are
         masked as attention KEYS (a not-yet-listed stock never feeds the memory); the causal order is in _CausalBlock."""
         B, T, A, d = seq.shape
         if T > self.pos.shape[0]:
-            raise ValueError(f"episode/eval length {T} exceeds temporal max_days {self.pos.shape[0]}")
+            raise ValueError(
+                f"episode/eval length {T} exceeds temporal max_days {self.pos.shape[0]}"
+            )
         x = seq.permute(0, 2, 1, 3).reshape(B * A, T, d)
-        x = x + self.pos[:T].to(dtype=x.dtype).unsqueeze(0)       # [B*A, T, d], no BF16 -> FP32 promotion
-        kpm = (~day_valid.bool()).permute(0, 2, 1).reshape(B * A, T) if day_valid is not None else None
+        x = x + self.pos[:T].to(dtype=x.dtype).unsqueeze(
+            0
+        )  # [B*A, T, d], no BF16 -> FP32 promotion
+        kpm = (
+            (~day_valid.bool()).permute(0, 2, 1).reshape(B * A, T)
+            if day_valid is not None
+            else None
+        )
         for blk in self.blocks:
             x = blk(x, kpm)
         # Standalone CUDA LayerNorm returns FP32 under autocast.  Keep its FP32 internal reduction, then restore
         # the BF16 residual dtype so the full [B,T,A,d] state and allocator input do not double in size.
         x = self.norm(x).to(dtype=x.dtype)
-        return x.reshape(B, A, T, d).permute(0, 2, 1, 3)         # [B,T,A,d]
+        return x.reshape(B, A, T, d).permute(0, 2, 1, 3)  # [B,T,A,d]
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,9 +659,9 @@ class Hold30TwoSpeedContextContract:
 
 @dataclass
 class DailyCrossSectionConfig:
-    context_dim: int                 # frozen Stage-1 per-stock/market context width (d_model)
+    context_dim: int  # frozen Stage-1 per-stock/market context width (d_model)
     bar_feature_dim: int = 5
-    raw_policy_dim: int = 128        # trainable full-day raw encoder width
+    raw_policy_dim: int = 128  # trainable full-day raw encoder width
     raw_policy_layers: int = 2
     raw_policy_heads: int = 4
     raw_block_seconds: int = 300
@@ -525,7 +669,7 @@ class DailyCrossSectionConfig:
     news_raw_dim: int = 1
     max_news: int = 32
     news_embed_dim: int = 32
-    token_dim: int = 256             # per-day per-stock token + temporal/allocator width
+    token_dim: int = 256  # per-day per-stock token + temporal/allocator width
     temporal_layers: int = 2
     temporal_heads: int = 4
     daily_lookback: int = 60
@@ -538,7 +682,7 @@ class DailyCrossSectionConfig:
     max_stock_weight: float = 1.0
     gate_init_bias: float = 2.0
     grad_checkpoint: bool = False
-    raw_norm: str = "level"          # full-day raw input norm: "level" (magnitude-preserving) | "instance" (whitened)
+    raw_norm: str = "level"  # full-day raw input norm: "level" (magnitude-preserving) | "instance" (whitened)
     raw_recent_days: int = 0
     #                                  window get the (expensive, trainable) full-day raw encode; older days'
     #                                  tokens carry frozen ctx + news + the past-return channel only (has_raw=0).
@@ -557,7 +701,9 @@ class DailyCrossSectionConfig:
     alpha_active_log_scale_bounds: tuple[float, float] | None = None
     alpha_uncertainty_log_scale_bounds: tuple[float, float] | None = None
     # Opt-in post-v3 contracts. Defaults preserve every frozen v2/v3 model.
-    hold30_mechanism_generation: Literal["v2-v3-frozen", "m03r-v1"] = "v2-v3-frozen"
+    hold30_mechanism_generation: Literal["v2-v3-frozen", "m03r-v1", "m03r-v2"] = (
+        "v2-v3-frozen"
+    )
     hold30_fast_raw_context_sessions: int | None = None
     hold30_slow_context_sessions: int | None = None
     hold30_hazard_bound_mode: Hold30HazardBoundMode = "hard_clip"
@@ -565,6 +711,14 @@ class DailyCrossSectionConfig:
     hold30_exact_hold_logit_bias: float | None = None
     hold30_fixed_hazard_residual: float | None = None
     alpha_confidence_calibration_manifest_sha256: str | None = None
+    alpha_confidence_calibration_manifest: M03RConfidenceCalibrationManifest | None = (
+        None
+    )
+    alpha_confidence_calibration_seed: int | None = None
+    alpha_confidence_calibration_checkpoint_sha256: str | None = None
+    alpha_confidence_calibration_model_state_sha256: str | None = None
+    alpha_confidence_calibration_source_score_array_sha256: str | None = None
+    alpha_confidence_calibration_source_target_array_sha256: str | None = None
 
 
 class DailyCrossSectionPolicy(nn.Module):
@@ -588,9 +742,10 @@ class DailyCrossSectionPolicy(nn.Module):
         if config.hold30_mechanism_generation not in {
             "v2-v3-frozen",
             "m03r-v1",
+            "m03r-v2",
         }:
             raise ValueError(
-                "hold30_mechanism_generation must be 'v2-v3-frozen' or 'm03r-v1'"
+                "hold30_mechanism_generation must be v2-v3-frozen, m03r-v1, or m03r-v2"
             )
         if not isinstance(config.hold30_exact_hold_mixture, bool):
             raise TypeError("hold30_exact_hold_mixture must be boolean")
@@ -662,23 +817,43 @@ class DailyCrossSectionPolicy(nn.Module):
                 max_days=int(config.max_days),
             )
         self.config = config
-        self.hold30_switches = (
-            resolve_hold30_model_switches(config.hold30_setting)
-            if config.hold30_setting is not None else None
-        )
-        is_m03r_setting = config.hold30_setting in M03R_SETTING_IDS
-        if config.hold30_mechanism_generation == "m03r-v1" and not is_m03r_setting:
-            raise ValueError(
-                "m03r-v1 requires an exact M03R setting identity; V2/V3 relabeling "
-                "is forbidden"
+        is_m03r_v4 = config.hold30_mechanism_generation == "m03r-v1"
+        is_m03r_v5 = config.hold30_mechanism_generation == "m03r-v2"
+        if is_m03r_v5:
+            if config.hold30_setting is None:
+                raise ValueError("m03r-v2 requires an exact M03R v5 setting identity")
+            self.hold30_switches = _HOLD30_M03R_V5_MODEL_SWITCHES.get(
+                config.hold30_setting
             )
-        if is_m03r_setting and config.hold30_mechanism_generation != "m03r-v1":
-            raise ValueError(
-                "an M03R setting identity requires hold30_mechanism_generation='m03r-v1'"
+            if self.hold30_switches is None:
+                resolve_m03r_v5_setting(config.hold30_setting)
+                raise AssertionError("unreachable M03R v5 setting resolution")
+        else:
+            self.hold30_switches = (
+                resolve_hold30_model_switches(config.hold30_setting)
+                if config.hold30_setting is not None
+                else None
             )
-        if is_m03r_setting:
+        if is_m03r_v4:
+            if config.hold30_setting not in M03R_V4_SETTING_IDS:
+                raise ValueError(
+                    "m03r-v1 requires an exact M03R setting identity from v4"
+                )
             assert config.hold30_setting is not None
-            m03r_setting = resolve_m03r_setting(config.hold30_setting)
+            resolve_m03r_v4_setting(config.hold30_setting)
+        if not (is_m03r_v4 or is_m03r_v5) and config.hold30_setting in (
+            set(M03R_V4_SETTING_IDS) | set(M03R_V5_SETTING_IDS)
+        ):
+            raise ValueError(
+                "an M03R setting identity requires its explicit M03R mechanism generation"
+            )
+        if is_m03r_v4 or is_m03r_v5:
+            assert config.hold30_setting is not None
+            m03r_setting = (
+                resolve_m03r_v4_setting(config.hold30_setting)
+                if is_m03r_v4
+                else resolve_m03r_v5_setting(config.hold30_setting)
+            )
             expected_slow = int(m03r_setting.slow_context_trading_sessions)
             if config.hold30_slow_context_sessions != expected_slow:
                 raise ValueError(
@@ -696,34 +871,58 @@ class DailyCrossSectionPolicy(nn.Module):
                     "30-session structural prior)"
                 )
             if not fixed_expected and config.hold30_fixed_hazard_residual is not None:
-                raise ValueError("fixed hazard is exclusive to A08-fixed-exit-hazard"
-        )
+                raise ValueError("fixed hazard is exclusive to A08-fixed-exit-hazard")
         self.raw_encoder = FullDayRawEncoder(
-            bar_feature_dim=config.bar_feature_dim, d_model=config.raw_policy_dim,
-            n_heads=config.raw_policy_heads, n_layers=config.raw_policy_layers,
-            feedforward_dim=config.raw_policy_dim * 2, dropout=config.dropout,
-            block_seconds=config.raw_block_seconds, max_seconds=config.session_seconds,
-            grad_checkpoint=config.grad_checkpoint, raw_norm=config.raw_norm,
-            stock_chunk=config.raw_stock_chunk)
+            bar_feature_dim=config.bar_feature_dim,
+            d_model=config.raw_policy_dim,
+            n_heads=config.raw_policy_heads,
+            n_layers=config.raw_policy_layers,
+            feedforward_dim=config.raw_policy_dim * 2,
+            dropout=config.dropout,
+            block_seconds=config.raw_block_seconds,
+            max_seconds=config.session_seconds,
+            grad_checkpoint=config.grad_checkpoint,
+            raw_norm=config.raw_norm,
+            stock_chunk=config.raw_stock_chunk,
+        )
         self.news_agg = _NewsAggregator(config.news_raw_dim, config.news_embed_dim)
         # per-day per-stock token: [market | per-stock frozen ctx | full-day raw | news | past_ret | past_valid |
         # has_raw]. past_ret = the stock's OWN 1-day close-to-close return for that day (PIT: known at EOD) -- the
         # raw close series under a scale-invariant normalization, so the cross-day temporal encoder can compute
         # momentum/reversal over its window; has_raw flags whether the raw component is real or a two-speed zero.
-        tok_in = config.context_dim * 2 + config.raw_policy_dim + config.news_embed_dim + 3
+        tok_in = (
+            config.context_dim * 2 + config.raw_policy_dim + config.news_embed_dim + 3
+        )
         self.token_proj = nn.Linear(tok_in, config.token_dim)
         self.temporal = CrossDayTemporalEncoder(
-            d_model=config.token_dim, n_heads=config.temporal_heads, n_layers=config.temporal_layers,
-            feedforward_dim=config.feedforward_dim, dropout=config.dropout, max_days=config.max_days)
+            d_model=config.token_dim,
+            n_heads=config.temporal_heads,
+            n_layers=config.temporal_layers,
+            feedforward_dim=config.feedforward_dim,
+            dropout=config.dropout,
+            max_days=config.max_days,
+        )
         # allocator: cross-sectional set-transformer over [temporal state | prev weight] per day
         self.alloc_in = nn.Linear(config.token_dim + 1, config.token_dim)
         self.cash_bias = nn.Parameter(torch.zeros(config.token_dim))
         layer = nn.TransformerEncoderLayer(
-            d_model=config.token_dim, nhead=config.alloc_heads, dim_feedforward=config.feedforward_dim,
-            dropout=config.dropout, batch_first=True, norm_first=True, activation="gelu")
-        self.attn = nn.TransformerEncoder(layer, num_layers=config.alloc_layers, enable_nested_tensor=False)
-        self.score = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
-        self.gate_head = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
+            d_model=config.token_dim,
+            nhead=config.alloc_heads,
+            dim_feedforward=config.feedforward_dim,
+            dropout=config.dropout,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.attn = nn.TransformerEncoder(
+            layer, num_layers=config.alloc_layers, enable_nested_tensor=False
+        )
+        self.score = nn.Sequential(
+            nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1)
+        )
+        self.gate_head = nn.Sequential(
+            nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1)
+        )
         gate_bias = config.gate_init_bias
         if self.hold30_switches is not None:
             if self.hold30_switches.mechanism == "H0":
@@ -761,10 +960,28 @@ class DailyCrossSectionPolicy(nn.Module):
                         confidence_calibration_manifest_sha256=(
                             config.alpha_confidence_calibration_manifest_sha256
                         ),
+                        confidence_calibration_manifest=(
+                            config.alpha_confidence_calibration_manifest
+                        ),
+                        confidence_calibration_seed=(
+                            config.alpha_confidence_calibration_seed
+                        ),
+                        confidence_calibration_checkpoint_sha256=(
+                            config.alpha_confidence_calibration_checkpoint_sha256
+                        ),
+                        confidence_calibration_model_state_sha256=(
+                            config.alpha_confidence_calibration_model_state_sha256
+                        ),
+                        confidence_calibration_source_score_array_sha256=(
+                            config.alpha_confidence_calibration_source_score_array_sha256
+                        ),
+                        confidence_calibration_source_target_array_sha256=(
+                            config.alpha_confidence_calibration_source_target_array_sha256
+                        ),
                         mechanism_generation=(
                             "v3-frozen"
                             if config.hold30_mechanism_generation == "v2-v3-frozen"
-                            else "m03r-v1"
+                            else config.hold30_mechanism_generation
                         ),
                     )
                 )
@@ -772,7 +989,9 @@ class DailyCrossSectionPolicy(nn.Module):
                 self._init_hold30_output(self.score[-1])
                 nn.init.orthogonal_(self.gate_head[-1].weight, gain=1e-3)
             else:
-                self.entry_head = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
+                self.entry_head = nn.Sequential(
+                    nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1)
+                )
                 self._init_hold30_output(self.entry_head[-1])
             if (
                 self.hold30_switches.mechanism == "H2"
@@ -818,7 +1037,7 @@ class DailyCrossSectionPolicy(nn.Module):
         The raw encoder is per-(stock,day) independent (instance-norm, no batch coupling), so encoding day-by-day
         is bit-identical to encoding the [B*T] reshape at once."""
         bars_t, mask_t = day_bars_fn(t)
-        return self.raw_encoder(bars_t, mask_t)                # [B,A,dr]
+        return self.raw_encoder(bars_t, mask_t)  # [B,A,dr]
 
     def _raw_day_mask(self, T: int) -> list[bool]:
         """Two-speed assignment for a length-T episode: the last `raw_recent_days` days get the trainable raw
@@ -826,8 +1045,18 @@ class DailyCrossSectionPolicy(nn.Module):
         r = self.config.raw_recent_days
         return [True] * T if r <= 0 else [t >= T - r for t in range(T)]
 
-    def _episode_tokens(self, market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid,
-                        raw_day_mask, reload_ckpt):
+    def _episode_tokens(
+        self,
+        market,
+        per_stock,
+        day_bars_fn,
+        news_raw,
+        news_mask,
+        past_ret,
+        past_ret_valid,
+        raw_day_mask,
+        reload_ckpt,
+    ):
         """Build the per-day per-stock TOKENS (everything BEFORE the cross-day temporal encoder): frozen context +
         (two-speed) trainable full-day raw + news + the past-return channel -> tok [B,T,A,token_dim].
         day_bars_fn(t) yields day-t bars/mask (a tensor slice in-RAM, or a lazy disk load when streaming);
@@ -845,13 +1074,16 @@ class DailyCrossSectionPolicy(nn.Module):
         low_precision_context = per_stock.dtype in (torch.float16, torch.bfloat16)
         assembly_dtype = (
             per_stock.dtype
-            if low_precision_context and torch.is_autocast_enabled(per_stock.device.type)
+            if low_precision_context
+            and torch.is_autocast_enabled(per_stock.device.type)
             else torch.float32
         )
         raw_days = []
         for t in range(T):
             if not raw_day_mask[t]:
-                raw_days.append(torch.zeros(B, A, dr, device=per_stock.device, dtype=assembly_dtype))
+                raw_days.append(
+                    torch.zeros(B, A, dr, device=per_stock.device, dtype=assembly_dtype)
+                )
             elif ckpt:
                 raw_days.append(
                     torch.utils.checkpoint.checkpoint(
@@ -860,10 +1092,12 @@ class DailyCrossSectionPolicy(nn.Module):
                 )
             else:
                 raw_days.append(self._raw_day(day_bars_fn, t).to(assembly_dtype))
-        raw = torch.stack(raw_days, dim=1)                     # [B,T,A,dr]
-        news = self.news_agg(news_raw.reshape(B * T, A, news_raw.shape[3], news_raw.shape[4]),
-                             news_mask.reshape(B * T, A, news_mask.shape[3])).reshape(B, T, A, -1)
-        news = news.to(assembly_dtype)                          # [B,T,A,ne]
+        raw = torch.stack(raw_days, dim=1)  # [B,T,A,dr]
+        news = self.news_agg(
+            news_raw.reshape(B * T, A, news_raw.shape[3], news_raw.shape[4]),
+            news_mask.reshape(B * T, A, news_mask.shape[3]),
+        ).reshape(B, T, A, -1)
+        news = news.to(assembly_dtype)  # [B,T,A,ne]
         mkt = market.to(assembly_dtype).unsqueeze(2).expand(B, T, A, dc)
         per_stock = per_stock.to(assembly_dtype)
         flag = torch.tensor(raw_day_mask, device=per_stock.device, dtype=assembly_dtype)
@@ -873,7 +1107,9 @@ class DailyCrossSectionPolicy(nn.Module):
         # identically everywhere -- input normalization, not a learned/engineered feature.
         pr = (past_ret * 50.0).unsqueeze(-1).to(assembly_dtype)
         pv = past_ret_valid.unsqueeze(-1).to(assembly_dtype)
-        return self.token_proj(torch.cat([mkt, per_stock, raw, news, pr, pv, flag], dim=-1))  # [B,T,A,token_dim]
+        return self.token_proj(
+            torch.cat([mkt, per_stock, raw, news, pr, pv, flag], dim=-1)
+        )  # [B,T,A,token_dim]
 
     def temporal_state(self, tok, avail):
         """Run the CAUSAL cross-day memory over a (possibly windowed) token slice. tok [B,W,A,token_dim],
@@ -882,27 +1118,74 @@ class DailyCrossSectionPolicy(nn.Module):
         split -- otherwise eval runs the temporal encoder at sequence positions/contexts it never saw in training."""
         return self.temporal(tok, day_valid=avail.bool())
 
-    def encode_episode(self, market, per_stock, bars, bar_mask, news_raw, news_mask, avail,
-                       past_ret, past_ret_valid):
+    def encode_episode(
+        self,
+        market,
+        per_stock,
+        bars,
+        bar_mask,
+        news_raw,
+        news_mask,
+        avail,
+        past_ret,
+        past_ret_valid,
+    ):
         """In-RAM encode: bars/bar_mask are pre-stacked [B,T,A,S,F]/[B,T,A,S]. -> temporal_state [B,T,A,token_dim].
         Two-speed: only the last `raw_recent_days` days are raw-encoded (all, if 0)."""
         T = per_stock.shape[1]
-        tok = self._episode_tokens(market, per_stock, lambda t: (bars[:, t], bar_mask[:, t]),
-                                   news_raw, news_mask, past_ret, past_ret_valid,
-                                   self._raw_day_mask(T), reload_ckpt=False)
+        tok = self._episode_tokens(
+            market,
+            per_stock,
+            lambda t: (bars[:, t], bar_mask[:, t]),
+            news_raw,
+            news_mask,
+            past_ret,
+            past_ret_valid,
+            self._raw_day_mask(T),
+            reload_ckpt=False,
+        )
         return self.temporal_state(tok, avail)
 
-    def encode_episode_streaming(self, market, per_stock, day_bars_fn, news_raw, news_mask, avail, n_days,
-                                 past_ret, past_ret_valid):
+    def encode_episode_streaming(
+        self,
+        market,
+        per_stock,
+        day_bars_fn,
+        news_raw,
+        news_mask,
+        avail,
+        n_days,
+        past_ret,
+        past_ret_valid,
+    ):
         """Streaming encode: day_bars_fn(t) lazily loads day-t bars/mask [B,A,S,F]/[B,A,S] from disk; backward
         reloads + recomputes per day (reload_ckpt) so the whole episode's bars are never resident. Two-speed days
         outside `raw_recent_days` never load their bars at all."""
-        tok = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid,
-                                   self._raw_day_mask(n_days), reload_ckpt=True)
+        tok = self._episode_tokens(
+            market,
+            per_stock,
+            day_bars_fn,
+            news_raw,
+            news_mask,
+            past_ret,
+            past_ret_valid,
+            self._raw_day_mask(n_days),
+            reload_ckpt=True,
+        )
         return self.temporal_state(tok, avail)
 
-    def encode_tokens_dual(self, market, per_stock, day_bars_fn, news_raw, news_mask, past_ret, past_ret_valid,
-                           *, raw_start: int = 0):
+    def encode_tokens_dual(
+        self,
+        market,
+        per_stock,
+        day_bars_fn,
+        news_raw,
+        news_mask,
+        past_ret,
+        past_ret_valid,
+        *,
+        raw_start: int = 0,
+    ):
         """EVAL token variants for a rolling scored suffix.
 
         ``tok_noraw`` is built for every day. ``tok_raw`` runs the expensive
@@ -913,13 +1196,36 @@ class DailyCrossSectionPolicy(nn.Module):
         burn-in prefixes. ``raw_start=0`` retains the full legacy behavior.
         """
         T = per_stock.shape[1]
-        if isinstance(raw_start, bool) or not isinstance(raw_start, int) or not 0 <= raw_start <= T:
-            raise ValueError(f"raw_start must be an integer in [0, {T}], got {raw_start!r}")
-        tok_raw = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask,
-                                       past_ret, past_ret_valid,
-                                       [t >= raw_start for t in range(T)], reload_ckpt=False)
-        tok_noraw = self._episode_tokens(market, per_stock, day_bars_fn, news_raw, news_mask,
-                                         past_ret, past_ret_valid, [False] * T, reload_ckpt=False)
+        if (
+            isinstance(raw_start, bool)
+            or not isinstance(raw_start, int)
+            or not 0 <= raw_start <= T
+        ):
+            raise ValueError(
+                f"raw_start must be an integer in [0, {T}], got {raw_start!r}"
+            )
+        tok_raw = self._episode_tokens(
+            market,
+            per_stock,
+            day_bars_fn,
+            news_raw,
+            news_mask,
+            past_ret,
+            past_ret_valid,
+            [t >= raw_start for t in range(T)],
+            reload_ckpt=False,
+        )
+        tok_noraw = self._episode_tokens(
+            market,
+            per_stock,
+            day_bars_fn,
+            news_raw,
+            news_mask,
+            past_ret,
+            past_ret_valid,
+            [False] * T,
+            reload_ckpt=False,
+        )
         return tok_raw, tok_noraw
 
     def _allocator_hidden(self, state_t, prev_weights, available):
@@ -931,11 +1237,13 @@ class DailyCrossSectionPolicy(nn.Module):
         # temporal state to FP32 merely to be cast back inside alloc_in.
         prev_feature = prev_weights.unsqueeze(-1).to(dtype=state_t.dtype)
         tok = self.alloc_in(torch.cat([state_t, prev_feature], dim=-1))
-        cash_marker = (torch.arange(A, device=tok.device) == 0).to(dtype=tok.dtype).view(1, A, 1)
+        cash_marker = (
+            (torch.arange(A, device=tok.device) == 0).to(dtype=tok.dtype).view(1, A, 1)
+        )
         tok = tok + self.cash_bias.to(dtype=tok.dtype) * cash_marker
         kpm = ~available.bool()
         kpm = kpm.clone()
-        kpm[:, 0] = False                                        # CASH always available
+        kpm[:, 0] = False  # CASH always available
         h = self.attn(tok, src_key_padding_mask=kpm)
         return h, kpm
 
@@ -943,10 +1251,9 @@ class DailyCrossSectionPolicy(nn.Module):
         """Portfolio-wide gate from an allocator state, with stable wide reductions."""
 
         avail = (~kpm).to(dtype=h.dtype).unsqueeze(-1)
-        summary = (
-            (h * avail).sum(dim=1, dtype=torch.float32)
-            / avail.sum(dim=1, dtype=torch.float32).clamp_min(1.0)
-        )                                                         # stable wide reduction; only [B,d] stays FP32
+        summary = (h * avail).sum(dim=1, dtype=torch.float32) / avail.sum(
+            dim=1, dtype=torch.float32
+        ).clamp_min(1.0)  # stable wide reduction; only [B,d] stays FP32
         return torch.sigmoid(self.gate_head(summary).squeeze(-1))
 
     def step(self, state_t, prev_weights, available):
@@ -960,7 +1267,7 @@ class DailyCrossSectionPolicy(nn.Module):
         h, kpm = self._allocator_hidden(state_t, prev_weights, available)
         scores = self.score(h).squeeze(-1) / self.temperature
         scores = scores.masked_fill(kpm, float("-inf"))
-        weights = torch.softmax(scores, dim=1)                   # requested long-only simplex
+        weights = torch.softmax(scores, dim=1)  # requested long-only simplex
         weights = project_capped_risky_simplex(
             weights,
             ~kpm,
@@ -969,7 +1276,9 @@ class DailyCrossSectionPolicy(nn.Module):
         )
         return weights, self._gate(h, kpm)
 
-    def hold30_intent(self, state_t, prev_weights, available, age_summaries=None) -> Hold30Intent:
+    def hold30_intent(
+        self, state_t, prev_weights, available, age_summaries=None
+    ) -> Hold30Intent:
         """Emit one registered Hold-30 decision-time raw intent.
 
         ``age_summaries`` has shape ``[B,A,5]`` and order
@@ -982,7 +1291,9 @@ class DailyCrossSectionPolicy(nn.Module):
 
         switches = self.hold30_switches
         if switches is None:
-            raise RuntimeError("hold30_intent requires DailyCrossSectionConfig.hold30_setting")
+            raise RuntimeError(
+                "hold30_intent requires DailyCrossSectionConfig.hold30_setting"
+            )
         if state_t.ndim != 3 or state_t.shape[-1] != self.token_dim:
             raise ValueError(
                 f"state_t must have shape [B,A,{self.token_dim}]; got {tuple(state_t.shape)}"
@@ -995,7 +1306,9 @@ class DailyCrossSectionPolicy(nn.Module):
                 f"got {tuple(prev_weights.shape)} and {tuple(available.shape)}"
             )
         if A < 1:
-            raise ValueError("Hold-30 intent requires a CASH coordinate at asset index 0")
+            raise ValueError(
+                "Hold-30 intent requires a CASH coordinate at asset index 0"
+            )
 
         if switches.mechanism in ("H0", "H1"):
             hidden, kpm = self._allocator_hidden(state_t, prev_weights, available)
@@ -1007,7 +1320,9 @@ class DailyCrossSectionPolicy(nn.Module):
         # H2 entry and H3 sleeve scores are market-only by construction: the
         # previous-weight feature is exactly zero, and age never enters this
         # cross-sectional path.
-        market_hidden, kpm = self._allocator_hidden(state_t, torch.zeros_like(prev_weights), available)
+        market_hidden, kpm = self._allocator_hidden(
+            state_t, torch.zeros_like(prev_weights), available
+        )
         if switches.use_alpha_head:
             if self.alpha_head is None:
                 raise RuntimeError("registered v3 alpha setting is missing its head")
@@ -1028,11 +1343,18 @@ class DailyCrossSectionPolicy(nn.Module):
                 hazard_residual=output.hazard_residual,
                 raw_hazard_residual=output.raw_hazard_residual,
                 exact_hold_probability=output.exact_hold_probability,
+                exact_hold_logit=output.exact_hold_logit,
+                exact_hold_soft_probability=output.exact_hold_soft_probability,
+                exact_hold_decision_st=output.exact_hold_decision_st,
                 exposure_residual=torch.zeros_like(output.active_risk_scale),
                 alpha_mean_30d=output.mean_30d,
                 alpha_downside_30d=output.downside_30d,
                 active_risk_scale=output.active_risk_scale,
                 signal_confidence=output.signal_confidence,
+                uncalibrated_signal_confidence_logit=(
+                    output.uncalibrated_signal_confidence_logit
+                ),
+                benchmark_derisk_request=output.benchmark_derisk_request,
                 total_risk_overlay=output.total_risk_overlay,
                 auxiliary_alpha_mean=output.auxiliary_mean,
             )
@@ -1048,13 +1370,20 @@ class DailyCrossSectionPolicy(nn.Module):
 
         if self.hazard_features is None:
             raise RuntimeError("registered H2 setting is missing its hazard features")
-        hazard_parts = [market_hidden, prev_weights.to(dtype=market_hidden.dtype).unsqueeze(-1)]
+        hazard_parts = [
+            market_hidden,
+            prev_weights.to(dtype=market_hidden.dtype).unsqueeze(-1),
+        ]
         if switches.use_age_input:
             expected_age = (B, A, int(self.config.age_summary_dim))
             if age_summaries is None or tuple(age_summaries.shape) != expected_age:
                 actual = None if age_summaries is None else tuple(age_summaries.shape)
-                raise ValueError(f"age_summaries must have shape {expected_age}; got {actual}")
-            hazard_parts.append(age_summaries.to(device=state_t.device, dtype=market_hidden.dtype))
+                raise ValueError(
+                    f"age_summaries must have shape {expected_age}; got {actual}"
+                )
+            hazard_parts.append(
+                age_summaries.to(device=state_t.device, dtype=market_hidden.dtype)
+            )
         hazard_hidden = self.hazard_features(torch.cat(hazard_parts, dim=-1))
         if self.config.hold30_fixed_hazard_residual is None:
             if self.hazard_head is None:
@@ -1071,10 +1400,22 @@ class DailyCrossSectionPolicy(nn.Module):
             )
             hazard = raw_hazard
         exact_hold: torch.Tensor | None = None
+        exact_hold_logit: torch.Tensor | None = None
+        exact_hold_soft_probability: torch.Tensor | None = None
         if self.exact_hold_head is not None:
-            exact_hold = straight_through_exact_hold_decision(
-                self.exact_hold_head(hazard_hidden).squeeze(-1)
-            )
+            exact_hold_logit = self.exact_hold_head(hazard_hidden).squeeze(-1)
+            exact_hold_soft_probability = torch.sigmoid(exact_hold_logit)
+            exact_hold = straight_through_exact_hold_decision(exact_hold_logit)
+            exact_hold_logit = torch.where(
+                risky_available,
+                exact_hold_logit,
+                torch.zeros_like(exact_hold_logit),
+            ).float()
+            exact_hold_soft_probability = torch.where(
+                risky_available,
+                exact_hold_soft_probability,
+                torch.ones_like(exact_hold_soft_probability),
+            ).float()
             exact_hold = torch.where(
                 risky_available,
                 exact_hold,
@@ -1095,10 +1436,9 @@ class DailyCrossSectionPolicy(nn.Module):
             if self.exposure_head is None:
                 raise RuntimeError("registered H2 setting is missing its exposure head")
             mask = risky_available.to(dtype=hazard_hidden.dtype).unsqueeze(-1)
-            pooled = (
-                (hazard_hidden * mask).sum(dim=1, dtype=torch.float32)
-                / mask.sum(dim=1, dtype=torch.float32).clamp_min(1.0)
-            )
+            pooled = (hazard_hidden * mask).sum(dim=1, dtype=torch.float32) / mask.sum(
+                dim=1, dtype=torch.float32
+            ).clamp_min(1.0)
             exposure = self.exposure_head(pooled).squeeze(-1).float()
         else:
             exposure = torch.zeros(B, device=state_t.device, dtype=torch.float32)
@@ -1106,7 +1446,26 @@ class DailyCrossSectionPolicy(nn.Module):
             entry_scores=entry,
             hazard_residual=hazard,
             raw_hazard_residual=raw_hazard,
-            exact_hold_probability=exact_hold,
+            exact_hold_probability=(
+                None
+                if self.config.hold30_mechanism_generation == "m03r-v2"
+                else exact_hold
+            ),
+            exact_hold_logit=(
+                exact_hold_logit
+                if self.config.hold30_mechanism_generation == "m03r-v2"
+                else None
+            ),
+            exact_hold_soft_probability=(
+                exact_hold_soft_probability
+                if self.config.hold30_mechanism_generation == "m03r-v2"
+                else None
+            ),
+            exact_hold_decision_st=(
+                exact_hold
+                if self.config.hold30_mechanism_generation == "m03r-v2"
+                else None
+            ),
             exposure_residual=exposure,
         )
 
@@ -1117,7 +1476,9 @@ class DailyForwardHead(nn.Module):
 
     def __init__(self, d_model: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1)
+        )
 
     def forward(self, per_stock: torch.Tensor) -> torch.Tensor:
         return self.net(per_stock).squeeze(-1)

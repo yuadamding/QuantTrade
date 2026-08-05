@@ -24,10 +24,25 @@ from rl_quant.models.hold30_hazard import (
     straight_through_exact_hold_decision,
 )
 from rl_quant.protocol.hold30_alpha_m03r import (
-    M03R_ALPHA_HORIZONS_TRADING_SESSIONS,
-    M03R_DESIGN,
-    M03R_SETTING_IDS,
-    resolve_m03r_setting,
+    M03R_ALPHA_HORIZONS_TRADING_SESSIONS as M03R_V4_ALPHA_HORIZONS,
+)
+from rl_quant.protocol.hold30_alpha_m03r import (
+    M03R_SETTING_IDS as M03R_V4_SETTING_IDS,
+)
+from rl_quant.protocol.hold30_alpha_m03r import (
+    resolve_m03r_setting as resolve_m03r_v4_setting,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_ALPHA_HORIZONS_TRADING_SESSIONS as M03R_V5_ALPHA_HORIZONS,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_DESIGN as M03R_V5_DESIGN,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_SETTING_IDS as M03R_V5_SETTING_IDS,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    resolve_m03r_v5_setting,
 )
 from rl_quant.protocol.hold30_alpha_v3 import (
     HOLD30_ALPHA_HORIZONS,
@@ -35,29 +50,47 @@ from rl_quant.protocol.hold30_alpha_v3 import (
     HOLD30_ALPHA_TE_TARGET_ANNUAL,
     resolve_hold30_alpha_setting,
 )
+from rl_quant.protocol.hold30_m03r_confidence import (
+    M03RConfidenceCalibrationError,
+    M03RConfidenceCalibrationManifest,
+    apply_m03r_confidence_calibration,
+    validate_m03r_confidence_calibration_manifest,
+)
 
 HOLD30_ALPHA_HEAD_PARAMETER_CAP: Final[int] = 1_000_000
-_DIGEST_CHARS = frozenset("0123456789abcdef")
 
 
 class Hold30AlphaModelError(ValueError):
-    """A v3 alpha-head input or setting violates the frozen interface."""
+    """An alpha-head input violates its exact v3, M03R v4, or M03R v5 contract."""
 
 
-def _alpha_setting_flags(setting_id: str) -> tuple[bool, bool, str]:
+def _alpha_setting_flags(
+    setting_id: str,
+    mechanism_generation: Literal["v3-frozen", "m03r-v1", "m03r-v2"],
+) -> tuple[bool, bool, bool, str]:
     """Resolve exact V3 or M03R identity without cross-generation aliases."""
 
-    if setting_id in M03R_SETTING_IDS:
-        setting = resolve_m03r_setting(setting_id)
+    if mechanism_generation == "m03r-v2":
+        setting = resolve_m03r_v5_setting(setting_id)
+        return (
+            setting.residual_alpha_heads,
+            setting.use_downside_adjusted_stock_score,
+            setting.use_confidence_scaled_active_risk_budget,
+            setting.sharpe_mode,
+        )
+    if mechanism_generation == "m03r-v1":
+        setting = resolve_m03r_v4_setting(setting_id)
         return (
             setting.residual_alpha_heads,
             setting.uncertainty_scaled_sizing,
+            True,
             setting.sharpe_mode,
         )
     setting = resolve_hold30_alpha_setting(setting_id)
     return (
         setting.supervised_residual_alpha_heads,
         setting.uncertainty_downside_heads,
+        False,
         setting.sharpe_mode,
     )
 
@@ -73,8 +106,13 @@ class Hold30AlphaOutput:
     hazard_residual: torch.Tensor
     raw_hazard_residual: torch.Tensor
     exact_hold_probability: torch.Tensor | None
+    exact_hold_logit: torch.Tensor | None
+    exact_hold_soft_probability: torch.Tensor | None
+    exact_hold_decision_st: torch.Tensor | None
     active_risk_scale: torch.Tensor
     signal_confidence: torch.Tensor | None
+    uncalibrated_signal_confidence_logit: torch.Tensor | None
+    benchmark_derisk_request: torch.Tensor | None
     total_risk_overlay: torch.Tensor | None
     auxiliary_horizons_trading_sessions: tuple[int, ...] = HOLD30_ALPHA_HORIZONS
 
@@ -99,6 +137,14 @@ class Hold30AlphaOutput:
             raise Hold30AlphaModelError(
                 f"exact_hold_probability must have shape {matrix}"
             )
+        for name in (
+            "exact_hold_logit",
+            "exact_hold_soft_probability",
+            "exact_hold_decision_st",
+        ):
+            value = getattr(self, name)
+            if value is not None and tuple(value.shape) != matrix:
+                raise Hold30AlphaModelError(f"{name} must have shape {matrix}")
         if tuple(self.auxiliary_mean.shape) != (
             *matrix,
             len(self.auxiliary_horizons_trading_sessions),
@@ -112,6 +158,16 @@ class Hold30AlphaOutput:
             self.signal_confidence.shape
         ) != (matrix[0],):
             raise Hold30AlphaModelError("signal_confidence must be [batch]")
+        if self.uncalibrated_signal_confidence_logit is not None and tuple(
+            self.uncalibrated_signal_confidence_logit.shape
+        ) != (matrix[0],):
+            raise Hold30AlphaModelError(
+                "uncalibrated_signal_confidence_logit must be [batch]"
+            )
+        if self.benchmark_derisk_request is not None and tuple(
+            self.benchmark_derisk_request.shape
+        ) != (matrix[0],):
+            raise Hold30AlphaModelError("benchmark_derisk_request must be [batch]")
         if self.total_risk_overlay is not None and tuple(
             self.total_risk_overlay.shape
         ) != (matrix[0],):
@@ -126,17 +182,30 @@ class Hold30AlphaOutput:
         )
         if self.exact_hold_probability is not None:
             values = (*values, self.exact_hold_probability)
+        for value in (
+            self.exact_hold_logit,
+            self.exact_hold_soft_probability,
+            self.exact_hold_decision_st,
+        ):
+            if value is not None:
+                values = (*values, value)
         if self.signal_confidence is not None:
             values = (*values, self.signal_confidence)
+        if self.uncalibrated_signal_confidence_logit is not None:
+            values = (*values, self.uncalibrated_signal_confidence_logit)
+        if self.benchmark_derisk_request is not None:
+            values = (*values, self.benchmark_derisk_request)
         if self.total_risk_overlay is not None:
             values = (*values, self.total_risk_overlay)
         if self.downside_30d is not None:
             values = (*values, self.downside_30d)
-        if not all(value.is_floating_point() and bool(torch.isfinite(value).all()) for value in values):
+        if not all(
+            value.is_floating_point() and bool(torch.isfinite(value).all())
+            for value in values
+        ):
             raise Hold30AlphaModelError("alpha output contains non-finite values")
         if (
-            self.downside_30d is not None
-            and bool((self.downside_30d < 0).any())
+            self.downside_30d is not None and bool((self.downside_30d < 0).any())
         ) or bool((self.active_risk_scale < 0).any()):
             raise Hold30AlphaModelError(
                 "downside and active-risk scale must be nonnegative"
@@ -147,10 +216,32 @@ class Hold30AlphaOutput:
             ).any()
         ):
             raise Hold30AlphaModelError("exact_hold_probability must lie in [0,1]")
+        if self.exact_hold_soft_probability is not None and bool(
+            (
+                (self.exact_hold_soft_probability < 0)
+                | (self.exact_hold_soft_probability > 1)
+            ).any()
+        ):
+            raise Hold30AlphaModelError("exact_hold_soft_probability must lie in [0,1]")
+        if self.exact_hold_decision_st is not None and bool(
+            (
+                (self.exact_hold_decision_st != 0) & (self.exact_hold_decision_st != 1)
+            ).any()
+        ):
+            raise Hold30AlphaModelError(
+                "exact_hold_decision_st must be hard binary in the forward pass"
+            )
         if self.signal_confidence is not None and bool(
             ((self.signal_confidence < 0) | (self.signal_confidence > 1)).any()
         ):
             raise Hold30AlphaModelError("signal_confidence must lie in [0,1]")
+        if self.benchmark_derisk_request is not None and bool(
+            (
+                (self.benchmark_derisk_request < 0)
+                | (self.benchmark_derisk_request > 1)
+            ).any()
+        ):
+            raise Hold30AlphaModelError("benchmark_derisk_request must lie in [0,1]")
         if bool(
             (self.hazard_residual < HOLD30_HAZARD_MIN).any()
             or (self.hazard_residual > HOLD30_HAZARD_MAX).any()
@@ -170,21 +261,39 @@ class Hold30AlphaHeadConfig:
     parameter_cap: int = HOLD30_ALPHA_HEAD_PARAMETER_CAP
     # Explicitly opt-in for post-v3 generations. These defaults are the frozen
     # v3 behavior and therefore do not change existing checkpoint identities.
-    mechanism_generation: Literal["v3-frozen", "m03r-v1"] = "v3-frozen"
+    mechanism_generation: Literal["v3-frozen", "m03r-v1", "m03r-v2"] = "v3-frozen"
     hazard_bound_mode: Hold30HazardBoundMode = "hard_clip"
     exact_hold_mixture: bool = False
     exact_hold_logit_bias: float | None = None
     fixed_hazard_residual: float | None = None
     confidence_calibration_manifest_sha256: str | None = None
+    confidence_calibration_manifest: M03RConfidenceCalibrationManifest | None = None
+    confidence_calibration_seed: int | None = None
+    confidence_calibration_checkpoint_sha256: str | None = None
+    confidence_calibration_model_state_sha256: str | None = None
+    confidence_calibration_source_score_array_sha256: str | None = None
+    confidence_calibration_source_target_array_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        use_alpha, use_uncertainty, _sharpe_mode = _alpha_setting_flags(self.setting_id)
-        is_m03r = self.setting_id in M03R_SETTING_IDS
-        m03r_setting = resolve_m03r_setting(self.setting_id) if is_m03r else None
-        if is_m03r != (self.mechanism_generation == "m03r-v1"):
+        use_alpha, use_downside, use_confidence_budget, _sharpe_mode = (
+            _alpha_setting_flags(self.setting_id, self.mechanism_generation)
+        )
+        is_m03r_v4 = self.mechanism_generation == "m03r-v1"
+        is_m03r_v5 = self.mechanism_generation == "m03r-v2"
+        is_m03r = is_m03r_v4 or is_m03r_v5
+        m03r_setting = (
+            resolve_m03r_v4_setting(self.setting_id)
+            if is_m03r_v4
+            else resolve_m03r_v5_setting(self.setting_id)
+            if is_m03r_v5
+            else None
+        )
+        if self.mechanism_generation == "v3-frozen" and (
+            self.setting_id in M03R_V4_SETTING_IDS
+            or self.setting_id in M03R_V5_SETTING_IDS
+        ):
             raise Hold30AlphaModelError(
-                "M03R head options require an exact M03R setting identity and "
-                "V3 heads require mechanism_generation='v3-frozen'"
+                "M03R head options require an explicit M03R mechanism generation"
             )
         if not use_alpha:
             raise Hold30AlphaModelError(
@@ -206,7 +315,7 @@ class Hold30AlphaHeadConfig:
         if not 0 < float(self.te_target) < 1:
             raise Hold30AlphaModelError("te_target must lie in (0,1)")
         expected_risk_reference = (
-            M03R_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
+            M03R_V5_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
             if is_m03r
             else HOLD30_ALPHA_TE_TARGET_ANNUAL
         )
@@ -214,7 +323,7 @@ class Hold30AlphaHeadConfig:
             raise Hold30AlphaModelError(
                 "te_target must match the exact protocol generation risk reference"
             )
-        if use_uncertainty:
+        if use_downside:
             if self.downside_penalty_kappa is None:
                 raise Hold30AlphaModelError(
                     "downside_penalty_kappa is an unresolved result-moving "
@@ -256,16 +365,91 @@ class Hold30AlphaHeadConfig:
                     "bounds are forbidden"
                 )
             digest = self.confidence_calibration_manifest_sha256
-            if (
-                not isinstance(digest, str)
-                or len(digest) != 64
-                or any(character not in _DIGEST_CHARS for character in digest)
+            manifest = self.confidence_calibration_manifest
+            calibration_identity = (
+                self.confidence_calibration_seed,
+                self.confidence_calibration_checkpoint_sha256,
+                self.confidence_calibration_model_state_sha256,
+                self.confidence_calibration_source_score_array_sha256,
+                self.confidence_calibration_source_target_array_sha256,
+            )
+            if is_m03r_v5 and use_confidence_budget:
+                if (
+                    not isinstance(digest, str)
+                    or manifest is None
+                    or any(value is None for value in calibration_identity)
+                ):
+                    raise Hold30AlphaModelError(
+                        "M03R confidence sizing requires a typed, content-bound "
+                        "confidence calibration manifest and exact seed/checkpoint identity"
+                    )
+                assert self.confidence_calibration_seed is not None
+                assert self.confidence_calibration_checkpoint_sha256 is not None
+                assert self.confidence_calibration_model_state_sha256 is not None
+                assert self.confidence_calibration_source_score_array_sha256 is not None
+                assert (
+                    self.confidence_calibration_source_target_array_sha256 is not None
+                )
+                try:
+                    validate_m03r_confidence_calibration_manifest(
+                        manifest,
+                        expected_manifest_sha256=digest,
+                        expected_setting_id=self.setting_id,
+                        expected_seed=self.confidence_calibration_seed,
+                        expected_checkpoint_sha256=(
+                            self.confidence_calibration_checkpoint_sha256
+                        ),
+                        expected_model_state_sha256=(
+                            self.confidence_calibration_model_state_sha256
+                        ),
+                        expected_source_score_array_sha256=(
+                            self.confidence_calibration_source_score_array_sha256
+                        ),
+                        expected_source_target_array_sha256=(
+                            self.confidence_calibration_source_target_array_sha256
+                        ),
+                    )
+                except M03RConfidenceCalibrationError as error:
+                    raise Hold30AlphaModelError(
+                        f"invalid M03R confidence calibration: {error}"
+                    ) from error
+            elif is_m03r_v5 and (
+                digest is not None
+                or manifest is not None
+                or any(value is not None for value in calibration_identity)
             ):
                 raise Hold30AlphaModelError(
-                    "M03R requires a content-bound confidence calibration manifest"
+                    "a setting without confidence-sized risk cannot bind a calibrator"
                 )
+            elif is_m03r_v4:
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or manifest is not None
+                ):
+                    raise Hold30AlphaModelError(
+                        "M03R v4 requires its frozen digest-only confidence calibration binding"
+                    )
+                if any(value is not None for value in calibration_identity):
+                    raise Hold30AlphaModelError(
+                        "checkpoint-specific confidence identity is exclusive to M03R v5"
+                    )
         else:
-            if self.confidence_calibration_manifest_sha256 is not None:
+            if (
+                self.confidence_calibration_manifest_sha256 is not None
+                or self.confidence_calibration_manifest is not None
+                or any(
+                    value is not None
+                    for value in (
+                        self.confidence_calibration_seed,
+                        self.confidence_calibration_checkpoint_sha256,
+                        self.confidence_calibration_model_state_sha256,
+                        self.confidence_calibration_source_score_array_sha256,
+                        self.confidence_calibration_source_target_array_sha256,
+                    )
+                )
+            ):
                 raise Hold30AlphaModelError(
                     "V3 heads cannot bind an M03R confidence calibration manifest"
                 )
@@ -292,9 +476,9 @@ class Hold30AlphaHeadConfig:
             raise Hold30AlphaModelError(
                 "hazard_bound_mode must be 'hard_clip' or 'smooth_tanh'"
             )
-        if self.mechanism_generation not in {"v3-frozen", "m03r-v1"}:
+        if self.mechanism_generation not in {"v3-frozen", "m03r-v1", "m03r-v2"}:
             raise Hold30AlphaModelError(
-                "mechanism_generation must be 'v3-frozen' or 'm03r-v1'"
+                "mechanism_generation must be v3-frozen, m03r-v1, or m03r-v2"
             )
         if not isinstance(self.exact_hold_mixture, bool):
             raise Hold30AlphaModelError("exact_hold_mixture must be boolean")
@@ -343,25 +527,32 @@ class Hold30AlphaHeadConfig:
                     "post-v3 hazard options require mechanism_generation='m03r-v1'"
                 )
         elif self.hazard_bound_mode != "smooth_tanh":
-            raise Hold30AlphaModelError("m03r-v1 requires the smooth_tanh hazard bound")
+            raise Hold30AlphaModelError(
+                "M03R v4/v5 requires the smooth_tanh hazard bound"
+            )
 
     @property
     def use_uncertainty(self) -> bool:
-        return _alpha_setting_flags(self.setting_id)[1]
+        return _alpha_setting_flags(self.setting_id, self.mechanism_generation)[1]
 
     @property
     def use_total_risk_overlay(self) -> bool:
-        return _alpha_setting_flags(self.setting_id)[2] == "separate-total-risk-overlay"
+        return (
+            _alpha_setting_flags(self.setting_id, self.mechanism_generation)[3]
+            == "separate-total-risk-overlay"
+        )
 
     @property
     def use_confidence_scaled_risk(self) -> bool:
-        return self.setting_id in M03R_SETTING_IDS
+        return _alpha_setting_flags(self.setting_id, self.mechanism_generation)[2]
 
     @property
     def auxiliary_horizons(self) -> tuple[int, ...]:
         return (
-            M03R_ALPHA_HORIZONS_TRADING_SESSIONS
-            if self.setting_id in M03R_SETTING_IDS
+            M03R_V5_ALPHA_HORIZONS
+            if self.mechanism_generation == "m03r-v2"
+            else M03R_V4_ALPHA_HORIZONS
+            if self.mechanism_generation == "m03r-v1"
             else HOLD30_ALPHA_HORIZONS
         )
 
@@ -382,9 +573,7 @@ class Hold30AlphaHead(nn.Module):
         width = config.hidden_dim
         self.downside_head: nn.Module | None = None
         if config.use_uncertainty:
-            self.downside_head = nn.Sequential(
-                nn.LayerNorm(width), nn.Linear(width, 1)
-            )
+            self.downside_head = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 1))
         self.auxiliary_head = nn.Sequential(
             nn.LayerNorm(width), nn.Linear(width, len(self.auxiliary_horizons))
         )
@@ -479,8 +668,7 @@ class Hold30AlphaHead(nn.Module):
             lower, upper = self.config.uncertainty_log_scale_bounds
             downside = torch.exp(raw_downside.clamp(float(lower), float(upper)))
         score = (
-            mean
-            - float(self.config.downside_penalty_kappa) * downside
+            mean - float(self.config.downside_penalty_kappa) * downside
             if downside is not None
             else mean
         )
@@ -489,7 +677,9 @@ class Hold30AlphaHead(nn.Module):
         if downside is not None:
             downside = torch.where(risky, downside, zero)
         score = torch.where(risky, score, zero)
-        auxiliary = torch.where(risky.unsqueeze(-1), auxiliary, torch.zeros_like(auxiliary))
+        auxiliary = torch.where(
+            risky.unsqueeze(-1), auxiliary, torch.zeros_like(auxiliary)
+        )
 
         hazard_input = torch.cat(
             (
@@ -514,9 +704,21 @@ class Hold30AlphaHead(nn.Module):
             )
             hazard = raw_hazard
         exact_hold: torch.Tensor | None = None
+        exact_hold_logit: torch.Tensor | None = None
+        exact_hold_soft_probability: torch.Tensor | None = None
         if self.exact_hold_head is not None:
-            exact_hold = straight_through_exact_hold_decision(
-                self.exact_hold_head(hazard_hidden).squeeze(-1)
+            exact_hold_logit = self.exact_hold_head(hazard_hidden).squeeze(-1)
+            exact_hold_soft_probability = torch.sigmoid(exact_hold_logit)
+            exact_hold = straight_through_exact_hold_decision(exact_hold_logit)
+            exact_hold_logit = torch.where(
+                risky,
+                exact_hold_logit,
+                torch.zeros_like(exact_hold_logit),
+            )
+            exact_hold_soft_probability = torch.where(
+                risky,
+                exact_hold_soft_probability,
+                torch.ones_like(exact_hold_soft_probability),
             )
             exact_hold = torch.where(
                 risky,
@@ -537,14 +739,61 @@ class Hold30AlphaHead(nn.Module):
             dim=1, dtype=torch.float32
         ).clamp_min(1.0)
         signal_confidence: torch.Tensor | None = None
+        uncalibrated_confidence_logit: torch.Tensor | None = None
+        benchmark_derisk_request: torch.Tensor | None = None
         if self.confidence_head is not None:
-            signal_confidence = torch.sigmoid(self.confidence_head(pooled).squeeze(-1))
+            uncalibrated_confidence_logit = self.confidence_head(pooled).squeeze(-1)
+            if self.config.mechanism_generation == "m03r-v2":
+                assert self.config.confidence_calibration_manifest is not None
+                assert self.config.confidence_calibration_manifest_sha256 is not None
+                assert self.config.confidence_calibration_seed is not None
+                assert self.config.confidence_calibration_checkpoint_sha256 is not None
+                assert self.config.confidence_calibration_model_state_sha256 is not None
+                assert (
+                    self.config.confidence_calibration_source_score_array_sha256
+                    is not None
+                )
+                assert (
+                    self.config.confidence_calibration_source_target_array_sha256
+                    is not None
+                )
+                signal_confidence = apply_m03r_confidence_calibration(
+                    uncalibrated_confidence_logit,
+                    self.config.confidence_calibration_manifest,
+                    expected_manifest_sha256=(
+                        self.config.confidence_calibration_manifest_sha256
+                    ),
+                    expected_setting_id=self.config.setting_id,
+                    expected_seed=self.config.confidence_calibration_seed,
+                    expected_checkpoint_sha256=(
+                        self.config.confidence_calibration_checkpoint_sha256
+                    ),
+                    expected_model_state_sha256=(
+                        self.config.confidence_calibration_model_state_sha256
+                    ),
+                    expected_source_score_array_sha256=(
+                        self.config.confidence_calibration_source_score_array_sha256
+                    ),
+                    expected_source_target_array_sha256=(
+                        self.config.confidence_calibration_source_target_array_sha256
+                    ),
+                )
+            else:
+                # Frozen M03R v4 behavior: the digest was syntactic only and
+                # the raw sigmoid was treated as confidence.
+                signal_confidence = torch.sigmoid(uncalibrated_confidence_logit)
             active_risk = (
                 float(
-                    M03R_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
+                    M03R_V5_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
                 )
                 * signal_confidence
             )
+            # Confidence governs only capacity for new or enlarged active risk.
+            # It is never an implicit instruction to liquidate the carried book
+            # toward C1. Canonical v5 has no learned de-risk head; the explicit
+            # request is frozen off and risk-forced repair remains separate.
+            if self.config.mechanism_generation == "m03r-v2":
+                benchmark_derisk_request = torch.zeros_like(signal_confidence)
         else:
             assert self.active_risk_head is not None
             assert self.config.active_log_scale_bounds is not None
@@ -572,10 +821,42 @@ class Hold30AlphaHead(nn.Module):
             auxiliary_mean=auxiliary.float(),
             hazard_residual=hazard.float(),
             raw_hazard_residual=raw_hazard.float(),
-            exact_hold_probability=(None if exact_hold is None else exact_hold.float()),
+            exact_hold_probability=(
+                None
+                if exact_hold is None or self.config.mechanism_generation == "m03r-v2"
+                else exact_hold.float()
+            ),
+            exact_hold_logit=(
+                None
+                if exact_hold_logit is None
+                or self.config.mechanism_generation != "m03r-v2"
+                else exact_hold_logit.float()
+            ),
+            exact_hold_soft_probability=(
+                None
+                if exact_hold_soft_probability is None
+                or self.config.mechanism_generation != "m03r-v2"
+                else exact_hold_soft_probability.float()
+            ),
+            exact_hold_decision_st=(
+                None
+                if exact_hold is None or self.config.mechanism_generation != "m03r-v2"
+                else exact_hold.float()
+            ),
             active_risk_scale=active_risk.float(),
             signal_confidence=(
                 None if signal_confidence is None else signal_confidence.float()
+            ),
+            uncalibrated_signal_confidence_logit=(
+                None
+                if uncalibrated_confidence_logit is None
+                or self.config.mechanism_generation != "m03r-v2"
+                else uncalibrated_confidence_logit.float()
+            ),
+            benchmark_derisk_request=(
+                None
+                if benchmark_derisk_request is None
+                else benchmark_derisk_request.float()
             ),
             total_risk_overlay=(
                 None if total_overlay is None else total_overlay.float()

@@ -274,21 +274,21 @@ A result is not reportable merely because the driver completes. At minimum:
 
 The Hold-30 path now has package-owned chronological training, checkpoint/resume,
 cohort telemetry, and receipt primitives. The current scientific design is the
-new immutable `prelockbox-hold30-active-alpha-m03r-v4` generation. It removes
-the compulsory tracking-error floor, targets active rather than total market
-beta, separates 30 post-fill economic returns from the 63-session rollout,
-restores a 252-session slow context beside the 42-session fast path, and ranks
-eligible checkpoints by a block-bootstrap lower confidence bound. V3 remains
-unchanged as a prelaunch audit generation; v2 was superseded before launch.
+immutable `prelockbox-hold30-active-alpha-m03r-v6` generation. It treats 30
+sessions as a weak one-sided persistence prior—not a minimum hold, sell mask,
+expiry, or promotion gate—while retaining v5's active-beta, confidence-budget,
+30-return/63-session separation, and 252-session learned-context corrections.
+V5, v4, and v3 remain unchanged prelaunch audit generations; v2 was superseded
+before launch.
 
-M03R currently has typed protocol, objective, selection, hazard, telemetry, and
-evaluation qualification components, but its production trainer and governed
-all-setting execution path are not yet connected. It is still launch-blocked:
-verified confidence calibration and ensemble/execution receipts, numerical
-factor/sector exposure bands, the complete inferential family, point-in-time
-real-data/global-path bindings, evaluator-derived checkpoint evidence,
-empirical execution, an immutable image, single-/two-rank CUDA parity, and an
-H100 capacity receipt remain required.
+M03R v6 currently has typed protocol, soft early-exit objective, cause-typed
+cohort-release qualification, and duration-free checkpoint-gate/ranking
+qualification. Its production trainer and governed 12-setting execution path
+are not yet connected. It remains launch-blocked pending verified calibration
+and ensemble/execution receipts, numerical factor/sector bounds, the complete
+inferential family, point-in-time real-data/global-path bindings,
+evaluator-derived checkpoint evidence, empirical execution, an immutable
+image, single-/two-rank CUDA parity, and an H100 capacity receipt.
 There is no M03R real-data training or performance result. Synthetic software
 qualification is not investment-performance evidence.
 
@@ -302,7 +302,9 @@ forced non-positive and remains development-only.
 - [ADR-0007: benchmark-relative alpha is the Hold-30 promotion objective](docs/adr/0007-benchmark-relative-hold30-alpha-objective.md)
 - [Hold-30 policy redesign RFC](docs/daily_hold30_policy_rfc.md)
 - [Normative pre-lockbox Hold-30 H0–H3 base specification](docs/prelockbox_hold30_h0_h3_experiment.md)
-- [Current launch-blocked M03R active-alpha Hold-30 specification](docs/prelockbox_hold30_active_alpha_m03r_v4.md)
+- [Current launch-blocked M03R v6 soft-persistence specification](docs/prelockbox_hold30_active_alpha_m03r_v6.md)
+- [Immutable M03R v5 active-alpha Hold-30 specification](docs/prelockbox_hold30_active_alpha_m03r_v5.md)
+- [Frozen M03R v4 specification](docs/prelockbox_hold30_active_alpha_m03r_v4.md)
 - [Superseded-before-launch Hold-30 alpha mechanism-8 v3 audit specification](docs/prelockbox_hold30_alpha_mech8_v3.md)
 - [Hold-30 alpha v3 sealed-evaluation contract](docs/prelockbox_hold30_alpha_evaluation_v3.md)
 - [Superseded-before-launch mechanism-8 v2 audit record](docs/prelockbox_hold30_mech8_v2.md)
