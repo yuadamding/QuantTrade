@@ -18,7 +18,7 @@ GPU) and gradients are ACCUMULATED over ``accum_steps`` micro-batches. Resumabil
 """
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -74,6 +74,11 @@ def train_context_encoder(
     grad_reduce: Callable[[list], None] | None = None,
     prepare_checkpoint: Callable[[], None] | None = None,
     sync_after_checkpoint: Callable[[], None] | None = None,
+    effective_index_schedule: Sequence[Sequence[int]] | None = None,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+    global_valid_normalization: bool = False,
+    grad_reduce_mode: str | None = None,
 ):
     """Fit the encoder + the market SSL head (+ optional per-stock and DAILY SSL heads) over full sessions.
     ``daily_head`` + ``daily_targets`` (a list aligned with train_days of (tgt [A], mask [A]) = each day's next-H-day
@@ -84,7 +89,18 @@ def train_context_encoder(
     callers may provide ``prepare_checkpoint`` for an all-rank snapshot (for
     example per-rank RNG gathering), then ``sync_after_checkpoint`` so all
     ranks wait for rank-0 checkpoint I/O before starting the next collective.
-    Returns the optimizer."""
+    ``effective_index_schedule`` is the receipt-bound/replay path: row ``s``
+    supplies the complete ordered effective batch for optimizer step ``s``.
+    Supplying it removes date sampling from mutable RNG state while preserving
+    the exact micro-batch partition and optimizer math.  With
+    ``distributed_world_size=2``, each global three-day micro-batch is split
+    2/1 on even micro-batches and 1/2 on odd micro-batches.  The two ranks each
+    process 18 of a 36-day update. ``global_valid_normalization`` changes each
+    enabled objective from local means to local sums divided by the full
+    effective batch's valid-target count; ``grad_reduce`` must then SUM (not
+    average) gradients across ranks and declare ``grad_reduce_mode='sum'``.
+    Returns the optimizer.
+    """
     # A zero-weight auxiliary objective is disabled, not merely multiplied by
     # zero after its dense head has run.  This matters at TOP2000 scale: the
     # per-stock head's hidden activation has shape [B,nB,A,d].  Keep disabled
@@ -110,6 +126,51 @@ def train_context_encoder(
         raise ValueError(f"batch_size must be in [1, {n}], got {batch_size}")
     if isinstance(accum_steps, bool) or not isinstance(accum_steps, int) or accum_steps < 1:
         raise ValueError(f"accum_steps must be a positive integer, got {accum_steps!r}")
+    if distributed_world_size not in (1, 2):
+        raise ValueError("context pretraining supports distributed_world_size 1 or 2")
+    if distributed_rank not in range(distributed_world_size):
+        raise ValueError("distributed_rank is outside distributed_world_size")
+    if distributed_world_size == 2:
+        if batch_size != 3 or accum_steps != 12:
+            raise ValueError(
+                "two-rank Stage-1 requires global batch_size=3 and accum_steps=12"
+            )
+        if effective_index_schedule is None:
+            raise ValueError("two-rank Stage-1 requires an explicit global date schedule")
+        if grad_reduce is None:
+            raise ValueError("two-rank Stage-1 requires SUM gradient reduction")
+        if grad_reduce_mode != "sum":
+            raise ValueError("two-rank Stage-1 grad_reduce_mode must be 'sum'")
+        if not global_valid_normalization:
+            raise ValueError("two-rank Stage-1 requires global valid-target normalization")
+    effective_batch = batch_size * accum_steps
+    if effective_index_schedule is not None:
+        if len(effective_index_schedule) != steps:
+            raise ValueError(
+                "effective_index_schedule must contain exactly one row per optimizer step"
+            )
+        for schedule_step, row in enumerate(effective_index_schedule):
+            if len(row) != effective_batch:
+                raise ValueError(
+                    f"effective_index_schedule[{schedule_step}] must contain "
+                    f"{effective_batch} day indexes"
+                )
+            if any(isinstance(index, bool) or not isinstance(index, int) for index in row):
+                raise ValueError("effective_index_schedule indexes must be integers")
+            if any(index < 0 or index >= n for index in row):
+                raise ValueError(
+                    f"effective_index_schedule[{schedule_step}] contains an out-of-range day index"
+                )
+            if effective_batch <= n and len(set(row)) != effective_batch:
+                raise ValueError(
+                    f"effective_index_schedule[{schedule_step}] must use distinct days"
+                )
+            if effective_batch > n:
+                for offset in range(0, effective_batch, batch_size):
+                    if len(set(row[offset:offset + batch_size])) != batch_size:
+                        raise ValueError(
+                            f"effective_index_schedule[{schedule_step}] repeats a day within a micro-batch"
+                        )
     encoder.train()
     for h in heads:
         h.train()
@@ -124,7 +185,6 @@ def train_context_encoder(
         individual micro-batch distinct and preserve the former behavior.
         """
 
-        effective_batch = batch_size * accum_steps
         if effective_batch <= n:
             return torch.randperm(n)[:effective_batch].tolist()
         selected: list[int] = []
@@ -133,7 +193,9 @@ def train_context_encoder(
         return selected
 
     def micro(idx: list[int]):
-        st = lambda src: torch.stack([src[i] for i in idx]).to(device, non_blocking=True)  # noqa: E731
+        def stack_selected(src):
+            return torch.stack([src[i] for i in idx]).to(device, non_blocking=True)
+
         bars = torch.stack([train_days[i]["bars"] for i in idx]).to(device, non_blocking=True)
         mask = torch.stack([train_days[i]["bar_mask"] for i in idx]).to(device, non_blocking=True)
         cov = torch.stack([train_days[i]["cov_blocks"] for i in idx]).to(device, non_blocking=True)
@@ -152,7 +214,7 @@ def train_context_encoder(
             dtype=torch.long,
             device=device,
         )
-        tgt, vm = st(targets), st(valid)                                          # [b,nB,2], [b,nB]
+        tgt, vm = stack_selected(targets), stack_selected(valid)                  # [b,nB,2], [b,nB]
         ps_tgt = ps_vm = None
         if use_perstock:
             assert ps is not None
@@ -164,28 +226,86 @@ def train_context_encoder(
             d_vm = torch.stack([daily_targets[i][1] for i in idx]).to(device, non_blocking=True)   # [b,A]
         return bars, mask, cov, cov_valid, close_blocks, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm
 
+    def local_microbatches(selected: list[int]) -> list[list[int]]:
+        global_batches = [
+            selected[offset:offset + batch_size]
+            for offset in range(0, len(selected), batch_size)
+        ]
+        if distributed_world_size == 1:
+            return global_batches
+        local: list[list[int]] = []
+        for microbatch_index, global_batch in enumerate(global_batches):
+            if len(global_batch) != 3:
+                raise ValueError("two-rank Stage-1 received an incomplete global micro-batch")
+            split = 2 if microbatch_index % 2 == 0 else 1
+            local.append(
+                global_batch[:split]
+                if distributed_rank == 0
+                else global_batch[split:]
+            )
+        if sum(map(len, local)) != 18:
+            raise AssertionError("two-rank Stage-1 partition must assign 18 dates per rank")
+        return local
+
+    def global_denominators(selected: list[int]) -> tuple[int, int, int]:
+        market = sum(int(valid[index].sum()) * 2 for index in selected)
+        perstock = 0
+        if use_perstock:
+            assert ps is not None
+            perstock = sum(int(ps[index][1].sum()) for index in selected)
+        daily = 0
+        if use_daily:
+            daily = sum(int(daily_targets[index][1].sum()) for index in selected)
+        return market, perstock, daily
+
     for step in range(start_step, steps):
         apply_lr(optimizer, lr, lr_scale(step, steps, warmup_steps, schedule))
         optimizer.zero_grad(set_to_none=True)
-        selected = effective_indices()
-        for offset in range(0, len(selected), batch_size):
-            idx = selected[offset:offset + batch_size]
+        selected = (
+            list(effective_index_schedule[step])
+            if effective_index_schedule is not None
+            else effective_indices()
+        )
+        market_den, perstock_den, daily_den = global_denominators(selected)
+        for idx in local_microbatches(selected):
             bars, mask, cov, cov_valid, close_blocks, tgt, vm, ps_tgt, ps_vm, d_tgt, d_vm = micro(idx)
             with torch.autocast(device_type=dev_type, dtype=torch.bfloat16, enabled=amp):
                 encoded = encoder(bars, mask, cov, cov_valid) if cov_valid is not None else encoder(bars, mask, cov)
                 per_stock, market = encoded                          # [b,nB,A,d], [b,nB,d]
                 pred = head(market)                                   # [b,nB,2]
-                loss = F.smooth_l1_loss(pred[vm], tgt[vm]) if vm.any() else (pred.sum() * 0.0)
+                if global_valid_normalization:
+                    loss = (
+                        F.smooth_l1_loss(pred[vm], tgt[vm], reduction="sum") / market_den
+                        if market_den and vm.any()
+                        else (pred.sum() * 0.0)
+                    )
+                else:
+                    loss = F.smooth_l1_loss(pred[vm], tgt[vm]) if vm.any() else (pred.sum() * 0.0)
                 if use_perstock and ps_vm is not None and ps_tgt is not None and ps_vm.any():
                     ps_pred = perstock_head(per_stock)                # [b,nB,A]
-                    loss = loss + perstock_coef * F.smooth_l1_loss(ps_pred[ps_vm], ps_tgt[ps_vm])
+                    ps_loss = F.smooth_l1_loss(
+                        ps_pred[ps_vm],
+                        ps_tgt[ps_vm],
+                        reduction="sum" if global_valid_normalization else "mean",
+                    )
+                    if global_valid_normalization:
+                        ps_loss = ps_loss / perstock_den
+                    loss = loss + perstock_coef * ps_loss
                 if use_daily and d_vm.any():                          # DAILY next-H-day relative-value pretext
                     rows = torch.arange(per_stock.shape[0], device=per_stock.device)
                     d_pred = daily_head(per_stock[rows, close_blocks])  # session-boundary context -> [b,A]
-                    loss = loss + daily_coef * F.smooth_l1_loss(d_pred[d_vm], d_tgt[d_vm])
-                loss = loss / accum_steps
+                    daily_loss = F.smooth_l1_loss(
+                        d_pred[d_vm],
+                        d_tgt[d_vm],
+                        reduction="sum" if global_valid_normalization else "mean",
+                    )
+                    if global_valid_normalization:
+                        daily_loss = daily_loss / daily_den
+                    loss = loss + daily_coef * daily_loss
+                if not global_valid_normalization:
+                    loss = loss / accum_steps
             loss.backward()
-        if grad_reduce is not None:                  # data-parallel: average grads across ranks before the step
+        if grad_reduce is not None:                  # caller-declared SUM/mean reduction before the optimizer step
             grad_reduce(params)
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(params, grad_clip)

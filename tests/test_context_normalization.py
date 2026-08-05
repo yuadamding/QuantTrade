@@ -146,3 +146,32 @@ def test_calibrated_statistics_and_outputs_round_trip_through_state_dict() -> No
     torch.testing.assert_close(restored.cov_norm.sample_count, encoder.cov_norm.sample_count)
     for expected_tensor, actual_tensor in zip(expected, actual):
         torch.testing.assert_close(actual_tensor, expected_tensor, atol=0.0, rtol=0.0)
+
+
+def test_raw_bars_only_context_has_no_synthetic_covariate_parameters() -> None:
+    encoder = ContextEncoder(
+        ContextEncoderConfig(
+            bar_feature_dim=F,
+            covariate_dim=0,
+            d_model=8,
+            n_heads=2,
+            n_layers=2,
+            feedforward_dim=16,
+            dropout=0.0,
+            max_seconds=S,
+            block_seconds=BL,
+        )
+    )
+    bars, mask, _cov = _inputs(6)
+    cov = torch.empty(B, NB, A, 0)
+
+    encoder.calibrate_normalization(bars, mask, cov)
+    per_stock, market = encoder(bars.requires_grad_(), mask, cov)
+    (per_stock.square().mean() + market.square().mean()).backward()
+
+    assert encoder.cov_norm is None
+    assert encoder.cov_mlp is None
+    assert encoder.cov_valid_proj is None
+    assert encoder.normalization_calibrated
+    assert bars.grad is not None
+    assert bool(torch.isfinite(bars.grad).all())

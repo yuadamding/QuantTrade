@@ -97,6 +97,15 @@ class Phase1Design:
     bptt_window: int = 1              # truncated-BPTT span: credit a held position's returns to the decision that
     #                                   set it over this many steps (1=myopic 1-step; >1 needed to LEARN long holds)
     label_horizon_days: int = 21      # daily_raw: close-to-close forward-return horizon H (per-decision credit signal)
+    auxiliary_horizons: tuple[int, ...] = ()  # daily_raw: ordered auxiliary label horizons. Empty retains the
+    #                                   legacy single-label contract at ``label_horizon_days``.
+    scored_tail_days: int | None = None  # daily_raw: controlled/scored suffix length. ``None`` retains the
+    #                                   legacy caller-supplied score-tail behavior.
+    target_holding_days: int | None = None  # daily_raw: soft notional holding-duration target; ``None`` means the
+    #                                   legacy design has no explicit holding-duration mandate.
+    target_discretionary_turnover: float | None = None  # target mean one-way discretionary turnover per decision.
+    terminal_liquidate: bool = True   # report/run liquidation at a real terminal boundary. Hold-30 uses continuing
+    #                                   wealth and records optional liquidation separately.
     daily_lookback: int = 60          # daily_raw: learned cross-day MEMORY window. EFFECTIVE horizon = min(this,
     #                                   episode_len): training episodes are episode_len long, and eval bounds its
     #                                   rolling temporal window to episode_len to match (the position CARRY can still
@@ -153,6 +162,58 @@ class Phase1Design:
             raise ValueError(f"{self.name}: context_storage_dtype must be 'float32' or 'bfloat16'")
         if self.label_horizon_days < 1 or self.daily_lookback < 1 or self.exec_delay < 1:
             raise ValueError(f"{self.name}: need label_horizon_days>=1, daily_lookback>=1, exec_delay>=1")
+        if not isinstance(self.terminal_liquidate, bool):
+            raise TypeError(f"{self.name}: terminal_liquidate must be a bool")
+        if any(
+            isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1
+            for horizon in self.auxiliary_horizons
+        ):
+            raise ValueError(f"{self.name}: auxiliary_horizons must contain positive integers")
+        if tuple(sorted(set(self.auxiliary_horizons))) != self.auxiliary_horizons:
+            raise ValueError(f"{self.name}: auxiliary_horizons must be strictly increasing and unique")
+        if self.auxiliary_horizons and self.label_horizon_days not in self.auxiliary_horizons:
+            raise ValueError(f"{self.name}: auxiliary_horizons must include label_horizon_days")
+        if self.scored_tail_days is not None and (
+            isinstance(self.scored_tail_days, bool)
+            or not isinstance(self.scored_tail_days, int)
+            or not 1 <= self.scored_tail_days <= self.episode_len
+        ):
+            raise ValueError(f"{self.name}: scored_tail_days must be in [1, episode_len] or None")
+        if self.target_holding_days is not None and (
+            isinstance(self.target_holding_days, bool)
+            or not isinstance(self.target_holding_days, int)
+            or self.target_holding_days < 1
+        ):
+            raise ValueError(f"{self.name}: target_holding_days must be a positive integer or None")
+        if self.target_discretionary_turnover is not None and (
+            isinstance(self.target_discretionary_turnover, bool)
+            or not 0.0 < self.target_discretionary_turnover <= 1.0
+        ):
+            raise ValueError(f"{self.name}: target_discretionary_turnover must lie in (0, 1] or be None")
+        holding_fields = (
+            self.scored_tail_days,
+            self.target_holding_days,
+            self.target_discretionary_turnover,
+        )
+        if any(value is not None for value in holding_fields):
+            if self.horizon_mode != "daily_raw":
+                raise ValueError(f"{self.name}: explicit holding fields require horizon_mode='daily_raw'")
+            if any(value is None for value in holding_fields):
+                raise ValueError(
+                    f"{self.name}: scored_tail_days, target_holding_days, and "
+                    "target_discretionary_turnover must be configured together"
+                )
+            assert self.scored_tail_days is not None and self.target_holding_days is not None
+            if self.scored_tail_days < self.target_holding_days + self.exec_delay:
+                raise ValueError(
+                    f"{self.name}: scored_tail_days must cover target_holding_days plus exec_delay"
+                )
+            if self.bptt_window < self.target_holding_days:
+                raise ValueError(f"{self.name}: bptt_window must be >= target_holding_days")
+            if self.label_horizon_days != self.target_holding_days:
+                raise ValueError(f"{self.name}: label_horizon_days must equal target_holding_days")
+            if self.terminal_liquidate:
+                raise ValueError(f"{self.name}: explicit holding designs require terminal_liquidate=False")
         if self.horizon_mode == "daily_raw" and self.exec_delay != 1:
             raise ValueError(
                 f"{self.name}: daily_raw supports exec_delay=1 only; longer delays require a pending-order queue"
@@ -551,6 +612,55 @@ _SERIES.extend(_TOP50_H100_SERIES)
 # slow/weekly sensitivities.  Cost settings are robustness studies and must not
 # be ranked against each other on their differently costed net-return metric.
 _top2000_h100_base = next(d for d in _SERIES if d.name == "daily_raw_top2000")
+
+# Hold-30 is deliberately registered outside the future-selected TOP2000
+# sweeps.  The v2 workflow must bind a monthly point-in-time active-300 axis;
+# this design borrows only the already-proven compact H100 tensor geometry.  Its
+# stateful chronological runtime consumes ``scored_tail_days`` and the explicit
+# holding contract; feeding this design to the legacy cash-reset sweep would
+# violate that contract.  Two H100s are the declared per-setting allocation.
+_daily_raw_pit300_hold30 = replace(
+    _top2000_h100_base,
+    name="daily_raw_pit300_hold30",
+    note="PIT-300 Hold-30 v2: 63d controlled credit, explicit 30-session soft holding contract",
+    # This is a mechanism screen over fewer than two thousand independent
+    # pre-lockbox dates, not a capacity sweep.  Do not inherit TOP2000's
+    # d512/8L Stage-1 encoder: the v1 specification freezes width-128 causal
+    # context blocks, two layers, four heads, and a width-256 feed-forward
+    # sublayer for every mechanism.
+    d_model=128,
+    enc_layers=2,
+    enc_heads=4,
+    dropout=0.0,
+    policy_steps=128,
+    pol_lr=1e-4,
+    pol_weight_decay=1e-4,
+    schedule="constant",
+    grad_clip=0.5,
+    cost=2e-3,
+    raw_policy_dim=64,
+    raw_policy_layers=2,
+    raw_policy_heads=4,
+    policy_token_dim=128,
+    policy_layers=2,
+    policy_heads=4,
+    episode_stride=0,
+    bptt_window=63,
+    label_horizon_days=30,
+    # V1/v2 has one 30-session representation target.  Multi-horizon heads
+    # remain a later registered ablation and cannot enter this mechanism screen.
+    auxiliary_horizons=(),
+    scored_tail_days=63,
+    target_holding_days=30,
+    target_discretionary_turnover=1.0 / 30.0,
+    daily_lookback=63,
+    terminal_liquidate=False,
+    budget_lambda=0.0,
+    gate_init_bias=-3.3844844191,
+    gate_entropy_coef=0.0,
+    min_gpus=2,
+)
+
 _TOP2000_H100_VARIANTS = [
     replace(
         _top2000_h100_base,
@@ -730,6 +840,7 @@ _TOP2000_H100_VARIANTS = [
 ]
 _TOP2000_H100_SERIES = [_top2000_h100_base, *_TOP2000_H100_VARIANTS]
 _SERIES.extend(_TOP2000_H100_VARIANTS)
+_SERIES.append(_daily_raw_pit300_hold30)
 
 DESIGNS: dict[str, Phase1Design] = {d.name: d for d in _SERIES}
 
@@ -742,6 +853,7 @@ TOP50_H100_CORE_SWEEP = [d.name for d in _TOP50_H100_SERIES[:4]]
 TOP50_H100_WIDE_SWEEP = [d.name for d in _TOP50_H100_SERIES]
 TOP2000_H100_CORE_SWEEP = [d.name for d in _TOP2000_H100_SERIES[:10]]
 TOP2000_H100_WIDE_SWEEP = [d.name for d in _TOP2000_H100_SERIES]
+HOLD30_BASE_DESIGN = _daily_raw_pit300_hold30.name
 SWEEP = TOP2000_H100_WIDE_SWEEP
 # Longer-horizon probes (run explicitly with --design; not in the default sweep).
 HORIZON_SWEEP = ["h30m", "h65m"]

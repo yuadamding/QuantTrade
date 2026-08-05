@@ -21,15 +21,199 @@ split holds). Only this module's parameters are trained by the PnL objective.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.utils.checkpoint
 from torch import nn
 
-from rl_quant.protocol.constraints import project_capped_risky_simplex
-
 from rl_quant.models.context_encoder import _CausalBlock, _sinusoidal
 from rl_quant.models.decision_policy import _NewsAggregator
+from rl_quant.models.hold30_alpha import (
+    Hold30AlphaHead,
+    Hold30AlphaHeadConfig,
+)
+from rl_quant.protocol.constraints import project_capped_risky_simplex
+from rl_quant.protocol.hold30 import (
+    HOLD30_MECH8_SETTINGS,
+    resolve_hold30_setting,
+)
+from rl_quant.protocol.hold30_alpha_v3 import (
+    HOLD30_ALPHA_MECH8_SETTINGS,
+    resolve_hold30_alpha_setting,
+)
+
+HOLD30_HAZARD_MIN = -12.0
+HOLD30_HAZARD_MAX = 12.0
+HOLD30_AGE_CAP = 60
+HOLD30_AGE_SUMMARY_DIM = 5
+
+
+@dataclass(frozen=True)
+class Hold30ModelSwitches:
+    """Model-facing switches for the frozen eight-setting Hold-30 screen.
+
+    Loss-only switches are retained here so a checkpoint can bind the complete
+    setting identity even though the model consumes only ``use_age_input`` and
+    ``use_exposure_timing``.  The training registry remains authoritative for
+    optimizer/loss construction.
+    """
+
+    setting_id: str
+    mechanism: Literal["H0", "H1", "H2", "H3"]
+    use_age_input: bool
+    use_exposure_timing: bool
+    use_early_exit_penalty: bool
+    use_turnover_penalty: bool
+    use_alpha_head: bool = False
+    use_uncertainty: bool = False
+    use_total_risk_overlay: bool = False
+    use_direct_sharpe: bool = False
+
+
+_HOLD30_MODEL_SWITCHES = {
+    setting.setting_id: Hold30ModelSwitches(
+        setting.setting_id,
+        setting.mechanism,  # type: ignore[arg-type]
+        setting.use_position_age,
+        setting.use_exposure_timing,
+        setting.use_early_exit_penalty,
+        setting.use_turnover_penalty,
+    )
+    for setting in HOLD30_MECH8_SETTINGS
+}
+_HOLD30_MODEL_SWITCHES.update(
+    {
+        setting.setting_id: Hold30ModelSwitches(
+            setting.setting_id,
+            "H0" if setting.mechanism == "legacy-scalar-gate" else "H2",
+            setting.age_aware,
+            False,
+            setting.age_aware,
+            setting.age_aware,
+            use_alpha_head=setting.supervised_residual_alpha_heads,
+            use_uncertainty=setting.uncertainty_downside_heads,
+            use_total_risk_overlay=setting.sharpe_mode
+            == "separate-total-risk-overlay",
+            use_direct_sharpe=setting.sharpe_mode == "direct-two-pass-gradient",
+        )
+        for setting in HOLD30_ALPHA_MECH8_SETTINGS
+    }
+)
+HOLD30_V2_MODEL_SETTING_IDS = tuple(setting.setting_id for setting in HOLD30_MECH8_SETTINGS)
+HOLD30_ALPHA_MODEL_SETTING_IDS = tuple(
+    setting.setting_id for setting in HOLD30_ALPHA_MECH8_SETTINGS
+)
+# Backward-compatible V2 public inventory; V3 has a disjoint explicit export.
+HOLD30_MODEL_SETTING_IDS = HOLD30_V2_MODEL_SETTING_IDS
+
+
+def resolve_hold30_model_switches(setting_id: str) -> Hold30ModelSwitches:
+    """Return the immutable model contract for a registered Hold-30 setting."""
+
+    # Resolve through the protocol first so every artifact-producing surface
+    # shares one alias-rejection/error contract.
+    if setting_id in _HOLD30_MODEL_SWITCHES and setting_id.startswith("hold30a-"):
+        registered = resolve_hold30_alpha_setting(setting_id)
+        return _HOLD30_MODEL_SWITCHES[registered.setting_id]
+    registered = resolve_hold30_setting(setting_id)
+    return _HOLD30_MODEL_SWITCHES[registered.setting_id]
+
+
+@dataclass(frozen=True)
+class Hold30Intent:
+    """Raw decision-time intent; the execution adapter owns portfolio construction.
+
+    H0/H1 populate ``target_logits`` and ``gate``. H2 populates entry,
+    hazard, and exposure outputs. H3 populates only ``entry_scores``. Keeping
+    the raw intent separate prevents fill-time masks or repaired holdings from
+    leaking into the actor.
+    """
+
+    entry_scores: torch.Tensor | None = None
+    target_logits: torch.Tensor | None = None
+    gate: torch.Tensor | None = None
+    hazard_residual: torch.Tensor | None = None
+    exposure_residual: torch.Tensor | None = None
+    alpha_mean_30d: torch.Tensor | None = None
+    alpha_downside_30d: torch.Tensor | None = None
+    active_risk_scale: torch.Tensor | None = None
+    total_risk_overlay: torch.Tensor | None = None
+    auxiliary_alpha_mean: torch.Tensor | None = None
+
+
+def _clip_with_zero_boundary_gradient(value: torch.Tensor, lower: float, upper: float) -> torch.Tensor:
+    """Closed-interval clip whose derivative is zero at and beyond each endpoint."""
+
+    lo = value.new_tensor(lower)
+    hi = value.new_tensor(upper)
+    return torch.where(value <= lo, lo, torch.where(value >= hi, hi, value))
+
+
+def clip_hold30_hazard_residual(raw_hazard: torch.Tensor) -> torch.Tensor:
+    """Deploy the finite Hold-30 hazard residual in ``[-12, 12]``."""
+
+    if not raw_hazard.is_floating_point():
+        raise TypeError("raw_hazard must be a floating-point tensor")
+    return _clip_with_zero_boundary_gradient(raw_hazard, HOLD30_HAZARD_MIN, HOLD30_HAZARD_MAX)
+
+
+def hold30_age_prior_logit(age: torch.Tensor) -> torch.Tensor:
+    """Reference age clock ``beta(a)`` for post-return fill-time ages."""
+
+    if not age.is_floating_point():
+        age = age.to(dtype=torch.float32)
+    return -2.0 + (age.clamp(min=0.0, max=float(HOLD30_AGE_CAP)) - 30.0) / 4.0
+
+
+def hold30_release_hazard(age: torch.Tensor, hazard_residual: torch.Tensor) -> torch.Tensor:
+    """Normalized cohort-release hazard from the RFC.
+
+    ``age`` and ``hazard_residual`` follow ordinary PyTorch broadcasting.
+    ``hazard_residual=-12`` returns exact zero for every age; zero residual
+    follows the approximately 30-session reference release clock.
+    """
+
+    if not hazard_residual.is_floating_point():
+        raise TypeError("hazard_residual must be a floating-point tensor")
+    beta = hold30_age_prior_logit(age.to(device=hazard_residual.device, dtype=hazard_residual.dtype))
+    bounded = clip_hold30_hazard_residual(hazard_residual)
+    p_min = torch.sigmoid(_clip_with_zero_boundary_gradient(beta + HOLD30_HAZARD_MIN, -20.0, 20.0))
+    release = torch.sigmoid(_clip_with_zero_boundary_gradient(beta + bounded, -20.0, 20.0))
+    return (release - p_min) / (1.0 - p_min)
+
+
+def hold30_proposed_release(age_notional: torch.Tensor, hazard_residual: torch.Tensor) -> torch.Tensor:
+    """Return gross proposed release by asset from ``[..., asset, 61]`` cohort notionals."""
+
+    if age_notional.ndim < 2 or age_notional.shape[-1] != HOLD30_AGE_CAP + 1:
+        raise ValueError(
+            f"age_notional must end in {HOLD30_AGE_CAP + 1} age bins; got {tuple(age_notional.shape)}"
+        )
+    if hazard_residual.shape != age_notional.shape[:-1]:
+        raise ValueError(
+            "hazard_residual must match age_notional without its age-bin axis; "
+            f"got {tuple(hazard_residual.shape)} and {tuple(age_notional.shape)}"
+        )
+    ages = torch.arange(HOLD30_AGE_CAP + 1, device=age_notional.device, dtype=age_notional.dtype)
+    hazards = hold30_release_hazard(ages, hazard_residual.unsqueeze(-1).to(dtype=age_notional.dtype))
+    return (age_notional * hazards).sum(dim=-1)
+
+
+def exact_hold30_intent(reference: torch.Tensor) -> Hold30Intent:
+    """Construct the finite H2 neutral action for a ``[..., asset]`` reference.
+
+    Entry scores are intentionally zero: when release is exactly zero and
+    risky exposure is unchanged they are irrelevant to the executed delta.
+    """
+
+    if reference.ndim < 2 or not reference.is_floating_point():
+        raise ValueError("reference must be a floating-point [..., asset] tensor")
+    return Hold30Intent(
+        entry_scores=torch.zeros_like(reference),
+        hazard_residual=torch.full_like(reference, HOLD30_HAZARD_MIN),
+        exposure_residual=torch.zeros(reference.shape[:-1], device=reference.device, dtype=reference.dtype),
+    )
 
 
 class FullDayRawEncoder(nn.Module):
@@ -85,7 +269,7 @@ class FullDayRawEncoder(nn.Module):
         return torch.cat(outs, dim=1)                            # [B,A,d]
 
     def _encode_stocks(self, bars: torch.Tensor, bar_mask: torch.Tensor) -> torch.Tensor:
-        B, A, S, Fdim = bars.shape
+        B, A, S, _feature_dim = bars.shape
         d = self.d_model
         bl = self.block_seconds
         nB = S // bl
@@ -240,6 +424,15 @@ class DailyCrossSectionConfig:
     raw_stock_chunk: int = 0         # >0: the full-day raw encoder processes the stock axis in chunks of this
     #                                  many stocks (bit-identical -- all its norms are per-(stock,day)); REQUIRED
     #                                  for huge universes (TOP2000: ~512/chunk on an 80GB H100). 0 = single pass.
+    hold30_setting: str | None = None # None preserves the legacy model/state-dict contract; otherwise one of the
+    #                                  frozen V2 IDs in HOLD30_MODEL_SETTING_IDS or V3 IDs in
+    #                                  HOLD30_ALPHA_MODEL_SETTING_IDS.
+    age_summary_dim: int = HOLD30_AGE_SUMMARY_DIM
+    # Result-moving V3 score coefficient. It deliberately has no default;
+    # uncertainty settings fail closed until the manifest supplies it.
+    alpha_downside_penalty_kappa: float | None = None
+    alpha_active_log_scale_bounds: tuple[float, float] | None = None
+    alpha_uncertainty_log_scale_bounds: tuple[float, float] | None = None
 
 
 class DailyCrossSectionPolicy(nn.Module):
@@ -254,7 +447,13 @@ class DailyCrossSectionPolicy(nn.Module):
         super().__init__()
         if not 0 < float(config.max_stock_weight) <= 1:
             raise ValueError("max_stock_weight must lie in (0, 1]")
+        if isinstance(config.age_summary_dim, bool) or int(config.age_summary_dim) <= 0:
+            raise ValueError("age_summary_dim must be a positive integer")
         self.config = config
+        self.hold30_switches = (
+            resolve_hold30_model_switches(config.hold30_setting)
+            if config.hold30_setting is not None else None
+        )
         self.raw_encoder = FullDayRawEncoder(
             bar_feature_dim=config.bar_feature_dim, d_model=config.raw_policy_dim,
             n_heads=config.raw_policy_heads, n_layers=config.raw_policy_layers,
@@ -281,9 +480,72 @@ class DailyCrossSectionPolicy(nn.Module):
         self.attn = nn.TransformerEncoder(layer, num_layers=config.alloc_layers, enable_nested_tensor=False)
         self.score = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
         self.gate_head = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
-        nn.init.constant_(self.gate_head[-1].bias, config.gate_init_bias)
+        gate_bias = config.gate_init_bias
+        if self.hold30_switches is not None:
+            if self.hold30_switches.mechanism == "H0":
+                gate_bias = 2.0
+            elif self.hold30_switches.mechanism == "H1":
+                gate_bias = -3.3844844191
+        nn.init.constant_(self.gate_head[-1].bias, gate_bias)
+
+        # Hold-30 heads are created only for a registered Hold-30 setting. The
+        # legacy/default module therefore retains its exact parameter names,
+        # shapes, initialization order, and ``step`` behavior.
+        self.entry_head: nn.Module | None = None
+        self.hazard_features: nn.Module | None = None
+        self.hazard_head: nn.Linear | None = None
+        self.exposure_head: nn.Module | None = None
+        self.alpha_head: Hold30AlphaHead | None = None
+        if self.hold30_switches is not None:
+            if self.hold30_switches.use_alpha_head:
+                assert config.hold30_setting is not None
+                self.alpha_head = Hold30AlphaHead(
+                    Hold30AlphaHeadConfig(
+                        setting_id=config.hold30_setting,
+                        hidden_dim=config.token_dim,
+                        age_summary_dim=int(config.age_summary_dim),
+                        downside_penalty_kappa=config.alpha_downside_penalty_kappa,
+                        active_log_scale_bounds=config.alpha_active_log_scale_bounds,
+                        uncertainty_log_scale_bounds=(
+                            config.alpha_uncertainty_log_scale_bounds
+                        ),
+                    )
+                )
+            elif self.hold30_switches.mechanism in ("H0", "H1"):
+                self._init_hold30_output(self.score[-1])
+                nn.init.orthogonal_(self.gate_head[-1].weight, gain=1e-3)
+            else:
+                self.entry_head = nn.Sequential(nn.LayerNorm(config.token_dim), nn.Linear(config.token_dim, 1))
+                self._init_hold30_output(self.entry_head[-1])
+            if (
+                self.hold30_switches.mechanism == "H2"
+                and not self.hold30_switches.use_alpha_head
+            ):
+                hazard_input_dim = config.token_dim + 1
+                if self.hold30_switches.use_age_input:
+                    hazard_input_dim += int(config.age_summary_dim)
+                self.hazard_features = nn.Sequential(
+                    nn.Linear(hazard_input_dim, config.token_dim),
+                    nn.GELU(),
+                    nn.LayerNorm(config.token_dim),
+                )
+                self.hazard_head = nn.Linear(config.token_dim, 1)
+                self._init_hold30_output(self.hazard_head)
+                if self.hold30_switches.use_exposure_timing:
+                    self.exposure_head = nn.Sequential(
+                        nn.LayerNorm(config.token_dim),
+                        nn.Linear(config.token_dim, 1),
+                    )
+                    self._init_hold30_output(self.exposure_head[-1])
         self.temperature = config.temperature
         self.token_dim = config.token_dim
+
+    @staticmethod
+    def _init_hold30_output(linear: nn.Linear) -> None:
+        """Frozen small-output initialization for every Hold-30 raw intent head."""
+
+        nn.init.orthogonal_(linear.weight, gain=1e-3)
+        nn.init.zeros_(linear.bias)
 
     def _raw_day(self, day_bars_fn, t):
         """Full-day raw embedding for day t across the batch: day_bars_fn(t) -> (bars [B,A,S,F], mask [B,A,S]).
@@ -394,10 +656,10 @@ class DailyCrossSectionPolicy(nn.Module):
                                          past_ret, past_ret_valid, [False] * T, reload_ckpt=False)
         return tok_raw, tok_noraw
 
-    def step(self, state_t, prev_weights, available):
-        """One day's cross-sectional allocation. state_t [B,A,token_dim], prev_weights/available [B,A]
-        -> (weights [B,A] long-only over {CASH,stocks}, gate [B])."""
-        B, A, _ = state_t.shape
+    def _allocator_hidden(self, state_t, prev_weights, available):
+        """Shared cross-sectional allocator state and normalized availability mask."""
+
+        _batch, A, _ = state_t.shape
         # Portfolio accounting remains FP32, but the previous-weight feature is immediately consumed by an
         # autocast Linear.  Cast that one column before concatenation so it cannot promote the much wider BF16
         # temporal state to FP32 merely to be cast back inside alloc_in.
@@ -409,6 +671,27 @@ class DailyCrossSectionPolicy(nn.Module):
         kpm = kpm.clone()
         kpm[:, 0] = False                                        # CASH always available
         h = self.attn(tok, src_key_padding_mask=kpm)
+        return h, kpm
+
+    def _gate(self, h, kpm):
+        """Portfolio-wide gate from an allocator state, with stable wide reductions."""
+
+        avail = (~kpm).to(dtype=h.dtype).unsqueeze(-1)
+        summary = (
+            (h * avail).sum(dim=1, dtype=torch.float32)
+            / avail.sum(dim=1, dtype=torch.float32).clamp_min(1.0)
+        )                                                         # stable wide reduction; only [B,d] stays FP32
+        return torch.sigmoid(self.gate_head(summary).squeeze(-1))
+
+    def step(self, state_t, prev_weights, available):
+        """Legacy one-day absolute allocation API, retained without Hold-30 semantics.
+
+        ``state_t`` is ``[B,A,token_dim]`` and ``prev_weights`` / ``available``
+        are ``[B,A]``. Returns requested long-only simplex weights and one
+        portfolio-wide gate. New Hold-30 runtimes use :meth:`hold30_intent`.
+        """
+
+        h, kpm = self._allocator_hidden(state_t, prev_weights, available)
         scores = self.score(h).squeeze(-1) / self.temperature
         scores = scores.masked_fill(kpm, float("-inf"))
         weights = torch.softmax(scores, dim=1)                   # requested long-only simplex
@@ -418,13 +701,116 @@ class DailyCrossSectionPolicy(nn.Module):
             max_risky_weight=self.config.max_stock_weight,
             cash_index=0,
         )
-        avail = (~kpm).to(dtype=h.dtype).unsqueeze(-1)
-        summary = (
-            (h * avail).sum(dim=1, dtype=torch.float32)
-            / avail.sum(dim=1, dtype=torch.float32).clamp_min(1.0)
-        )                                                         # stable wide reduction; only [B,d] stays FP32
-        gate = torch.sigmoid(self.gate_head(summary).squeeze(-1))
-        return weights, gate
+        return weights, self._gate(h, kpm)
+
+    def hold30_intent(self, state_t, prev_weights, available, age_summaries=None) -> Hold30Intent:
+        """Emit one registered Hold-30 decision-time raw intent.
+
+        ``age_summaries`` has shape ``[B,A,5]`` and order
+        ``(mean_age/60, frac_lt10, frac_lt20, frac_lt30, frac_ge30)``.
+        Only H2 settings whose switch enables age consume it. Entry scores are
+        computed from market state with a zero previous-weight feature, making
+        them exactly invariant to holdings and age. Portfolio construction,
+        fill-time remasking, and cohort release remain execution-layer work.
+        """
+
+        switches = self.hold30_switches
+        if switches is None:
+            raise RuntimeError("hold30_intent requires DailyCrossSectionConfig.hold30_setting")
+        if state_t.ndim != 3 or state_t.shape[-1] != self.token_dim:
+            raise ValueError(
+                f"state_t must have shape [B,A,{self.token_dim}]; got {tuple(state_t.shape)}"
+            )
+        B, A, _ = state_t.shape
+        expected = (B, A)
+        if tuple(prev_weights.shape) != expected or tuple(available.shape) != expected:
+            raise ValueError(
+                f"prev_weights and available must both have shape {expected}; "
+                f"got {tuple(prev_weights.shape)} and {tuple(available.shape)}"
+            )
+        if A < 1:
+            raise ValueError("Hold-30 intent requires a CASH coordinate at asset index 0")
+
+        if switches.mechanism in ("H0", "H1"):
+            hidden, kpm = self._allocator_hidden(state_t, prev_weights, available)
+            return Hold30Intent(
+                target_logits=self.score(hidden).squeeze(-1).float(),
+                gate=self._gate(hidden, kpm).float(),
+            )
+
+        # H2 entry and H3 sleeve scores are market-only by construction: the
+        # previous-weight feature is exactly zero, and age never enters this
+        # cross-sectional path.
+        market_hidden, kpm = self._allocator_hidden(state_t, torch.zeros_like(prev_weights), available)
+        if switches.use_alpha_head:
+            if self.alpha_head is None:
+                raise RuntimeError("registered v3 alpha setting is missing its head")
+            expected_age = (B, A, int(self.config.age_summary_dim))
+            if age_summaries is None or tuple(age_summaries.shape) != expected_age:
+                actual = None if age_summaries is None else tuple(age_summaries.shape)
+                raise ValueError(
+                    f"age_summaries must have shape {expected_age}; got {actual}"
+                )
+            output = self.alpha_head(
+                market_hidden,
+                prev_weights,
+                age_summaries,
+                available.bool(),
+            )
+            return Hold30Intent(
+                entry_scores=output.risk_adjusted_score,
+                hazard_residual=output.hazard_residual,
+                exposure_residual=torch.zeros_like(output.active_risk_scale),
+                alpha_mean_30d=output.mean_30d,
+                alpha_downside_30d=output.downside_30d,
+                active_risk_scale=output.active_risk_scale,
+                total_risk_overlay=output.total_risk_overlay,
+                auxiliary_alpha_mean=output.auxiliary_mean,
+            )
+        if self.entry_head is None:
+            raise RuntimeError("registered H2/H3 setting is missing its entry head")
+        risky_available = ~kpm
+        risky_available = risky_available.clone()
+        risky_available[:, 0] = False
+        entry = self.entry_head(market_hidden).squeeze(-1)
+        entry = torch.where(risky_available, entry, torch.zeros_like(entry)).float()
+        if switches.mechanism == "H3":
+            return Hold30Intent(entry_scores=entry)
+
+        if self.hazard_features is None or self.hazard_head is None:
+            raise RuntimeError("registered H2 setting is missing its hazard head")
+        hazard_parts = [market_hidden, prev_weights.to(dtype=market_hidden.dtype).unsqueeze(-1)]
+        if switches.use_age_input:
+            expected_age = (B, A, int(self.config.age_summary_dim))
+            if age_summaries is None or tuple(age_summaries.shape) != expected_age:
+                actual = None if age_summaries is None else tuple(age_summaries.shape)
+                raise ValueError(f"age_summaries must have shape {expected_age}; got {actual}")
+            hazard_parts.append(age_summaries.to(device=state_t.device, dtype=market_hidden.dtype))
+        hazard_hidden = self.hazard_features(torch.cat(hazard_parts, dim=-1))
+        raw_hazard = self.hazard_head(hazard_hidden).squeeze(-1)
+        hazard = clip_hold30_hazard_residual(raw_hazard)
+        hazard = torch.where(
+            risky_available,
+            hazard,
+            torch.full_like(hazard, HOLD30_HAZARD_MIN),
+        ).float()
+
+        if switches.use_exposure_timing:
+            if self.exposure_head is None:
+                raise RuntimeError("registered H2 setting is missing its exposure head")
+            mask = risky_available.to(dtype=hazard_hidden.dtype).unsqueeze(-1)
+            pooled = (
+                (hazard_hidden * mask).sum(dim=1, dtype=torch.float32)
+                / mask.sum(dim=1, dtype=torch.float32).clamp_min(1.0)
+            )
+            exposure = self.exposure_head(pooled).squeeze(-1).float()
+        else:
+            exposure = torch.zeros(B, device=state_t.device, dtype=torch.float32)
+        return Hold30Intent(
+            entry_scores=entry,
+            hazard_residual=hazard,
+            exposure_residual=exposure,
+        )
 
 
 class DailyForwardHead(nn.Module):

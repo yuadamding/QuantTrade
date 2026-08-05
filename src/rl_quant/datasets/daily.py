@@ -173,6 +173,8 @@ def build_daily_raw_episodes(
     horizon: int = 21,
     exec_delay: int = 1,
     *,
+    auxiliary_horizons: tuple[int, ...] | None = None,
+    entry_credit_horizon_days: int | None = None,
     require_aux_labels: bool = False,
     score_start: int = 0,
     score_tail: int | None = None,
@@ -197,6 +199,12 @@ def build_daily_raw_episodes(
     and keeps the scored current day inside a two-speed policy's recent-raw tail.  Leave it ``None`` for the
     continuous validation/test behavior.
 
+    ``auxiliary_horizons`` optionally materializes an ordered multi-horizon label tensor under
+    ``aux_ret_multi``/``aux_ret_valid_multi`` while retaining ``aux_ret`` as the compatibility alias for
+    ``horizon``. ``entry_credit_horizon_days`` emits scored ``entry_credit_mask`` and ``entry_censored_mask``
+    fields.  A decision is creditable only when its delayed fill and the complete requested holding lifecycle fit
+    inside the episode; this prevents a right boundary from being misreported as an intentionally short hold.
+
     Episodes carry the FROZEN end-of-day context + FULL-day raw bars + news + availability for the cross-day
     policy. ``records`` is a DATE-SORTED list of per-day dicts, each with
         {market [dc], per_stock [A,dc], bars [A,S,F], bar_mask [A,S], news_raw [A,M,1], news_mask [A,M],
@@ -207,6 +215,25 @@ def build_daily_raw_episodes(
     N = len(records)
     if horizon <= 0:
         raise ValueError(f"horizon must be positive, got {horizon}")
+    if auxiliary_horizons is None:
+        materialized_horizons = (horizon,)
+    else:
+        materialized_horizons = tuple(auxiliary_horizons)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in materialized_horizons
+        ):
+            raise ValueError("auxiliary_horizons must contain positive integers")
+        if tuple(sorted(set(materialized_horizons))) != materialized_horizons:
+            raise ValueError("auxiliary_horizons must be strictly increasing and unique")
+        if horizon not in materialized_horizons:
+            raise ValueError("auxiliary_horizons must include horizon")
+    if entry_credit_horizon_days is not None and (
+        isinstance(entry_credit_horizon_days, bool)
+        or not isinstance(entry_credit_horizon_days, int)
+        or entry_credit_horizon_days <= 0
+    ):
+        raise ValueError("entry_credit_horizon_days must be a positive integer or None")
     if exec_delay < 1:
         raise ValueError(f"exec_delay must be at least one for PIT-clean execution, got {exec_delay}")
     if episode_len <= 0:
@@ -230,7 +257,15 @@ def build_daily_raw_episodes(
                 f"day_close_valid shape {tuple(day_close_valid.shape)} must match day_close {tuple(day_close.shape)}"
             )
         day_close = day_close.masked_fill(~day_close_valid, float("nan"))
-    aux_ret, aux_valid = horizon_close_returns(day_close, horizon, exec_delay)     # optional H-day forecast target
+    auxiliary = {
+        label_horizon: horizon_close_returns(day_close, label_horizon, exec_delay)
+        for label_horizon in materialized_horizons
+    }
+    aux_ret, aux_valid = auxiliary[horizon]                    # compatibility alias for the primary H-day target
+    aux_ret_multi = aux_valid_multi = None
+    if auxiliary_horizons is not None:
+        aux_ret_multi = torch.stack([auxiliary[value][0] for value in materialized_horizons], dim=1)
+        aux_valid_multi = torch.stack([auxiliary[value][1] for value in materialized_horizons], dim=1)
     ret, valid = horizon_close_returns(day_close, 1, exec_delay)                   # canonical 1-day MDP transition
     # PAST-return INPUT channel (PIT-clean): day d carries its OWN 1-day close-to-close return close_d/close_{d-1}-1,
     # fully known at the EOD-d decision. This is the raw close series under a scale-invariant normalization (the
@@ -264,7 +299,7 @@ def build_daily_raw_episodes(
     if not stream:
         bars = torch.stack([r["bars"] for r in records])
         bar_mask = torch.stack([r["bar_mask"] for r in records])
-    required_horizon = horizon if require_aux_labels else 1
+    required_horizon = max(materialized_horizons) if require_aux_labels else 1
     usable = N - (exec_delay + required_horizon)                 # eligible decisions on the selected label basis
     if usable <= 0:
         return []
@@ -311,6 +346,19 @@ def build_daily_raw_episodes(
             "decision_ids": tuple(str(records[index].get("date", index)) for index in range(s, e)),
             "n_blocks": L,
         }
+        if auxiliary_horizons is not None:
+            assert aux_ret_multi is not None and aux_valid_multi is not None
+            ep["auxiliary_horizons"] = materialized_horizons
+            ep["aux_ret_multi"] = _timeline_view(aux_ret_multi, s, e)
+            ep["aux_ret_valid_multi"] = _timeline_view(aux_valid_multi, s, e)
+        if entry_credit_horizon_days is not None:
+            # Decision i fills after ``exec_delay`` states and needs a terminal
+            # state after the requested number of holding transitions.  The
+            # strict comparison is equivalent to i + delay + horizon <= e - 1.
+            lifecycle_fits = indices + exec_delay + entry_credit_horizon_days < e
+            ep["entry_credit_horizon_days"] = entry_credit_horizon_days
+            ep["entry_credit_mask"] = score_mask & lifecycle_fits
+            ep["entry_censored_mask"] = score_mask & ~lifecycle_fits
         if stream:
             ep["bars_days"] = [r["_bars_day"] for r in records[s:e]]   # lazy per-day handles (load bars on demand)
         else:

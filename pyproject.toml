@@ -21,6 +21,8 @@ qt = "rl_quant.cli:main"
 quanttrade = "rl_quant.cli:main"
 quanttrade-top2000-ppo = "rl_quant.workflows.top2000_ppo:main"
 quanttrade-top2000-pipeline = "rl_quant.workflows.top2000_pipeline:main"
+quanttrade-hold30-prelockbox = "rl_quant.workflows.hold30_prelockbox:main"
+quanttrade-hold30-alpha-prelockbox = "rl_quant.workflows.hold30_alpha_prelockbox:main"
 
 [project.optional-dependencies]
 data = [

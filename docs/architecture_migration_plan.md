@@ -6,17 +6,75 @@ updated on 2026-08-04. Pending items are not promises that the implementation
 already exists. The stable architecture contracts are documented in
 [general_rl_architecture.md](general_rl_architecture.md).
 
-The scientifically negative S0–S7 evaluation motivates a proposed next
+The scientifically negative S0–S7 evaluation motivates a next
 generation rather than a wider search over the old grid. The strategy mandate
 is recorded in [ADR-0006](adr/0006-daily-decision-soft-30-session-holding.md):
 one portfolio decision per trading session, continuously carried positions,
 and a soft target holding duration of roughly 30 sessions. The
 [Hold-30 redesign RFC](daily_hold30_policy_rfc.md) and
-[H0–H3 pre-lockbox experiment](prelockbox_hold30_h0_h3_experiment.md) are the
-only active proposed implementation and experiment protocol. The earlier
-A0–A5 draft was superseded before execution because it tested a materially
-different holding mechanism. This ledger continues to describe implemented
-behavior until the RFC code and blocking tests land.
+[Hold-30 alpha mechanism-8 v3](prelockbox_hold30_alpha_mech8_v3.md) are the
+active implementation and experiment protocol. H0–H3 remains the mechanics
+base. Mechanism-8 v2 and the earlier A0–A5 draft were superseded before launch
+because they tested materially different scientific questions.
+
+## Hold-30 alpha v3 protocol status (2026-08-04)
+
+The version-controlled v3 tranche freezes:
+
+- a disjoint generation and exact eight-setting inventory, with canonical m03
+  as the sole promotion candidate;
+- alpha horizons 5/21/30/63, a 30-session primary horizon, C1 as the training
+  benchmark, 20-bp training, and 10/20/40-bp validation;
+- a 2%/4%/6% annual tracking-error floor/target/ceiling, beta 1.0 +/- 0.1,
+  objective modes, and an eligibility-first lexicographic checkpoint contract;
+  and
+- mandatory PIT risk-free/CASH and cap-market inputs with narrow
+  objective/checkpoint/accounting/evaluation roles, plus evaluator-only
+  declared factors; all deny policy-feature access and have no fake/default
+  path.
+
+V3 artifact schemas reject the v2 generation and all v2 setting IDs. The
+canonical protocol template deliberately leaves result-moving fields unset so
+it remains a non-authorizing software-qualification baseline. A separate
+content-addressed pilot profile resolves every applicable objective field, the
+active/uncertainty action bounds, the 1% projection-distance maximum, and the
+10% forced-turnover-fraction maximum; registered ablation-inapplicable fields
+remain exact nulls. Its scientific-profile receipt is
+`7cb98970c93bc4e8cd59c49cc09b1b7883025ff700acec3783453585c7084752`.
+A hash-only plan still cannot close the gate: executable preflight requires the
+exact typed pilot plan, A06's immutable optimizer-spec receipt and disjoint
+routing, and all external receipts. Real-data qualification, distributed H100
+parity, capacity, and scientific execution remain blocked.
+
+## Hold-30 v2 reusable implementation history (superseded before launch)
+
+The package now implements the local mechanism core described by ADR-0006:
+
+- the exact eight-setting registry and six-fold/five-seed freeze geometry;
+- compact H0/H1 scalar-gate controls, H2 entry/hazard/exposure actions, and H3
+  30-sleeve actions;
+- delayed fill-time execution, continuing holdings, cause-typed turnover,
+  61-bin economic ages, return-neutral entry units, forced-exit competing
+  risks, and continuing rather than forced-liquidated terminal state;
+- one canonical economic pass plus origin-indexed 31-row credit replays,
+  package-owned differentiable actor-state recomputation, and calendar-row
+  objective telemetry kept distinct from the replay surrogate;
+- exact two-rank origin sharding with global normalization, SUM-reduced
+  gradients, per-rank RNG receipts, and CPU/Gloo single-versus-two-rank resume
+  equivalence;
+- exact five-member output-space evaluation, shared-book checkpoint selection,
+  holding telemetry, deterministic outcome-null transforms, and downstream C1
+  and C5-label rebuilding; and
+- append-only source/model/checkpoint receipts, receipt-complete synchronized
+  five-seed early-stop finalization, and a launch-incapable local qualification
+  workflow.
+
+V2 did not launch and cannot identify new artifacts. This is not a scientific
+or GPU qualification. The real pre-2026 point-in-time
+active-300 dataset with at least 1,811 positions is absent from the current
+workspace. H100 numeric/capacity parity, the complete C0-C8/statistical sealed
+evaluator, the immutable container/source bundle, and an executable manifest
+remain blocking. The future-selected TOP2000 data is prohibited as a fallback.
 
 ## Non-negotiable boundary
 
@@ -47,7 +105,7 @@ accounting primitives with the environment, but it is not yet evidence that the 
 | Dataset universe provenance | Implemented mechanically | Future-selected universes fail; rolling/PIT membership is supported. Existing ranked datasets still need rebuilding. |
 | Causal Stage-1 normalization | Implemented and integrated | Fixed training-only moments; forward is immutable and train/eval identical. |
 | Legacy daily reward/accounting repairs | Implemented | One-step daily-raw reward, auxiliary H-day target, burn-in score mask, drift and liquidation helpers. |
-| Hold-30 state/action/accounting contract | **Pending** | ADR-0006 is agreed, but canonical state carry, origin-indexed credit replay, fill-time age/cohort state, per-stock hazards, sleeves, and duration evidence are not implemented. |
+| Hold-30 state/action/accounting contract | Implemented locally; launch blocked | Canonical state carry, origin-indexed credit replay, fill-time age/cohort state, per-stock hazards, sleeves, duration telemetry, output-space ensemble, and deterministic null mechanisms have blocking CPU tests. Real PIT data and H100 qualification remain absent. |
 | Walk-forward splitter | Implemented as a library primitive | Tested purge/embargo geometry, expanding/rolling windows, and fold identities bound to caller-supplied horizon/axis identity. The API cannot infer effective lookahead or verify dataset-snapshot authenticity; launcher/evaluator integration remains in progress. |
 | General RL experiment CLI | **Pending** | Implemented collectors, algorithms, and environment still need configuration, checkpoint/RNG/provenance bundling, and command orchestration. |
 | Phase-1 encoder-to-RL observation adapter | **Pending** | Frozen/raw market encoders are not connected to `ObservationBatch` for PPO. |
@@ -69,7 +127,7 @@ accounting primitives with the environment, but it is not yet evidence that the 
 
 Exit condition: the provenance gate passes without override, and delisting/missing-return behavior is tested.
 
-### 2. Complete the portfolio action adapters — simplex primitive implemented; Hold-30 pending
+### 2. Complete the portfolio action adapters — Hold-30 direct path implemented locally
 
 Delivered:
 
@@ -80,13 +138,13 @@ Delivered:
 - projection distance remains available from the environment.
 
 The simplex adapter remains valid as a generic PPO/reference compatibility
-primitive. H0 instead uses the experiment's deterministic
-target-softmax/scalar adapter under direct optimization. Neither is the target
-Hold-30 action. Remaining work is to add a typed entry-score,
-per-stock-hazard, and risky-exposure intent adapter with environment-owned age
-state, then monitor projection distance and action causes in the artifact
-evaluator. Sparse top-k allocation is not silently introduced; if added, its
-probability semantics must be explicit.
+primitive. H0/H1 use deterministic target-softmax/scalar adapters under direct
+optimization. H2 now uses typed entry-score, per-stock-hazard, and
+risky-exposure intent with environment-owned age state; H3 uses the structural
+30-sleeve comparator. Projection distance and action causes are persisted by
+the Hold-30 runtime/telemetry path, but still need the complete sealed outer
+evaluator and real PIT dataset. Sparse top-k allocation is not silently
+introduced; if added, its probability semantics must be explicit.
 
 ### 3. Add one reusable rollout coordinator — library primitive implemented
 

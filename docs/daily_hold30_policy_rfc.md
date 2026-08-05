@@ -1,12 +1,15 @@
 # RFC: Daily-decision policy with a soft 30-session holding target
 
-**Status:** Proposed; no production or large-GPU launch is authorized by this document
+**Status:** Implementation in progress; no production or large-GPU launch is authorized by this document
 
 **Date:** 2026-08-04
 
 **Mandate:** [ADR-0006](adr/0006-daily-decision-soft-30-session-holding.md)
 
-**Experiment:** [Pre-lockbox Hold-30 H0–H3 mechanism ablation](prelockbox_hold30_h0_h3_experiment.md)
+**Experiment:** [Pre-lockbox Hold-30 alpha mechanism-8 v3](prelockbox_hold30_alpha_mech8_v3.md)
+
+**Superseded implementation generation:**
+[mechanism-8 v2](prelockbox_hold30_mech8_v2.md), retained as audit history
 
 ## Summary
 
@@ -30,6 +33,15 @@ The redesign has five coupled parts:
 
 The target is a soft duration distribution, not a hard 30-session lock. A
 planted adverse reversal must still be able to trigger a prompt early exit.
+
+V3 adds the scientific objective contract without changing these economic
+mechanics: C1 is the training benchmark, canonical m03 learns 30-session alpha
+mean and downside uncertainty under a 2%/4%/6% annual tracking-error band and
+beta 1.0 +/- 0.1, and only m03 may promote. C1 anchors actions and active
+training; PIT market data is restricted to beta objective/checkpoint/evaluation;
+PIT risk-free/CASH is restricted to accounting, a06/a07 total-excess-Sharpe,
+and evaluation; declared factors are evaluator-only. Every one of these
+artifacts has `policy_feature_access=false`.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** in this RFC are
 normative.

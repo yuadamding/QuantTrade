@@ -13,12 +13,13 @@ Its source manifest is pinned by SHA-256:
 17745275eb47e3458d9452759a05a1c9d98fff0061a42e352ef0d8dd1a2e556c
 ```
 
-The same manifest is retained locally at
-`/home/yding1995/qt-a100x4-pilot-f49680fb/parent_metadata/QuantTrade.SHA256SUMS`.
-Run the following from the repository root to verify the relationship:
+A controller-side copy of the manifest must be retained outside the repository.
+Set `QT_TRAINING_MANIFEST` to that verified file, confirm its own digest equals
+the value above, and then run the content check from the repository root:
 
 ```bash
-sha256sum -c /home/yding1995/qt-a100x4-pilot-f49680fb/parent_metadata/QuantTrade.SHA256SUMS
+sha256sum "$QT_TRAINING_MANIFEST"
+sha256sum -c "$QT_TRAINING_MANIFEST"
 ```
 
 The command is intentionally expected to report any local divergence. At the
@@ -42,11 +43,10 @@ without first recording a new source manifest and its reason for divergence.
 
 ## Safe refresh procedure
 
-1. Run `/home/yding1995/.local/bin/codex-chain-linux verify`.
+1. Run `codex-chain-linux verify` from the enrolled controller.
 2. Inspect the exact bundle path and manifest on Seadragon through the chain.
 3. Compare the manifest against this checkout before changing files.
 4. Preserve unrelated local edits; stage any source refresh as a reviewable
    patch and re-run the focused test suite.
 5. Record the new manifest hash and source delta here before using the code for
    another GPU run.
-

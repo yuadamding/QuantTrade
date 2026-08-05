@@ -832,6 +832,10 @@ substitute for the signal-destruction retraining branches below.
 Before any run, separate ordinary risky return from cash return and mandatory
 corporate-action/delisting adjustment. Mandatory events, membership,
 availability, cash, costs, and observation tensors remain at their legal dates.
+The transform input therefore carries explicit, disjoint
+`ordinary_return_valid` and `mandatory_return_mask` tensors. For each outbound
+row, `ordinary_return_valid` is exactly the fill-active, risky, nonmandatory
+set. Neither transform reads, reorders, or replaces actor state.
 For fold `k`, materialize exactly three disjoint outbound-return row domains:
 
 ```text
@@ -858,6 +862,15 @@ transformed datasets independently inside each of these three domains:
   assignment. Coordinates with mandatory delisting/corporate-action outcomes
   stay fixed; fewer than two permutable coordinates fails the transform.
 
+`transform_seed`, destination, source, date, and batch indices use unsigned
+64-bit big-endian encodings before concatenation. `N_time` visits destinations
+in ascending row order, uses the hash bytes and then source row as its stable
+adjacency ordering, and admits no edge across a materialized domain. `N_xs`
+uses `SHA256(transform_seed || date || batch)` to choose a shift in
+`[1, n_eligible-1]` over stable asset-axis order, so its cyclic map is never
+the identity. CASH, mandatory outcomes, and inactive coordinates are copied
+bitwise from the source dataset.
+
 Recompute C1, labels, portfolio drift, actions, costs, and every endpoint on the
 transformed market. Retrain H1/H2 from initialization with the paired seed and
 unchanged budget. Transform seeds, the three materialized domains, source row
@@ -865,6 +878,14 @@ maps, terminal masks, and output hashes are frozen in the manifest. No
 transformed outer result is exposed early, and no source/destination edge
 crosses a domain. These are the null/shuffle branches referenced by the
 falsification gates.
+
+Each transform receipt binds the source axis, seed, ordered domain triples,
+input ordinary outcomes, ordinary-valid mask, mandatory mask, active mask,
+complete mapping, and transformed output by SHA-256. A transformed outcome view
+is not a runtime actor-state override. The dataset runtime adapter rejects that
+shortcut; a downstream builder must explicitly regenerate C1, all auxiliary
+labels, drifted books, and the transformed-data provenance receipt before the
+branch can run.
 
 ## Primary and secondary endpoints
 

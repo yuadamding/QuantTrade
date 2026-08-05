@@ -340,23 +340,37 @@ class ContextEncoder(nn.Module):
                                     for _ in range(t2)])
         self.norm1 = nn.LayerNorm(d)
         self.norm2 = nn.LayerNorm(d)
-        # covariate path: the encoder also learns from each stock's as-of covariates
-        self.cov_norm = _FixedFeatureNormalizer(config.covariate_dim)
-        self.cov_mlp = nn.Sequential(nn.Linear(config.covariate_dim, d), nn.GELU(), nn.Linear(d, d))
-        self.cov_valid_proj = nn.Linear(config.covariate_dim, d, bias=False)
+        if config.covariate_dim < 0:
+            raise ValueError("covariate_dim cannot be negative")
+        # A zero-width covariate axis is an explicit raw-bars-only contract,
+        # not a synthetic constant feature.  This keeps the Hold-30 model graph
+        # faithful to its frozen OHLCV-only specification.
+        if config.covariate_dim:
+            self.cov_norm: _FixedFeatureNormalizer | None = _FixedFeatureNormalizer(config.covariate_dim)
+            self.cov_mlp: nn.Module | None = nn.Sequential(
+                nn.Linear(config.covariate_dim, d), nn.GELU(), nn.Linear(d, d)
+            )
+            self.cov_valid_proj: nn.Module | None = nn.Linear(config.covariate_dim, d, bias=False)
+        else:
+            self.cov_norm = None
+            self.cov_mlp = None
+            self.cov_valid_proj = None
         self.fuse = nn.LayerNorm(d)
         self.d_model = d
 
     @property
     def normalization_calibrated(self) -> bool:
         """Whether every bar and covariate field has fixed training-set statistics."""
-        return self.bar_norm.calibrated and self.cov_norm.calibrated
+        return self.bar_norm.calibrated and (
+            self.cov_norm is None or self.cov_norm.calibrated
+        )
 
     @torch.no_grad()
     def reset_normalization(self) -> None:
         """Reset bar and covariate normalization to the safe identity default."""
         self.bar_norm.reset()
-        self.cov_norm.reset()
+        if self.cov_norm is not None:
+            self.cov_norm.reset()
 
     @torch.no_grad()
     def calibrate_normalization(
@@ -382,6 +396,10 @@ class ContextEncoder(nn.Module):
         if cov_blocks.ndim != 4 or cov_blocks.shape[0] != B or cov_blocks.shape[2] != A:
             raise ValueError(
                 f"expected cov_blocks [B,nB,A,C] matching B={B}, A={A}, got {tuple(cov_blocks.shape)}"
+            )
+        if cov_blocks.shape[-1] != self.config.covariate_dim:
+            raise ValueError(
+                f"cov_blocks has {cov_blocks.shape[-1]} features, expected {self.config.covariate_dim}"
             )
         bl = self.block_seconds
         nB = (S + bl - 1) // bl
@@ -409,7 +427,8 @@ class ContextEncoder(nn.Module):
                     "cov_mask must have shape [B,nB,A] or [B,nB,A,C]; "
                     f"got {tuple(cov_mask.shape)} for covariates {tuple(cov_values.shape)}"
                 )
-        self.cov_norm.update(cov_values, effective_mask)
+        if self.cov_norm is not None:
+            self.cov_norm.update(cov_values, effective_mask)
 
     def forward(
         self,
@@ -605,6 +624,23 @@ class ContextEncoder(nn.Module):
         bar_blocks [B,nB,A,d], seen [B,nB,A,1], cov_blocks [B,>=nB,A,C]."""
         B, _, A, d = bar_blocks.shape
         has = seen                                                     # [B, nB, A, 1]
+        if cov_blocks.shape[-1] != self.config.covariate_dim:
+            raise ValueError(
+                f"cov_blocks has {cov_blocks.shape[-1]} features, expected {self.config.covariate_dim}"
+            )
+        if self.config.covariate_dim == 0:
+            if cov_valid is not None and cov_valid.numel() != 0:
+                raise ValueError("cov_valid must be empty for a raw-bars-only encoder")
+            per_stock = self.fuse(bar_blocks).to(dtype=bar_blocks.dtype) * has
+            market = (
+                per_stock.sum(dim=2, dtype=torch.float32)
+                / has.sum(dim=2, dtype=torch.float32).clamp_min(1.0)
+            ).to(dtype=per_stock.dtype)
+            return per_stock, market
+
+        assert self.cov_norm is not None
+        assert self.cov_mlp is not None
+        assert self.cov_valid_proj is not None
         cf = cov_blocks[:, :nB].reshape(-1, cov_blocks.shape[-1])   # [B*nB*A, C]
         cm = has.reshape(-1) > 0                                # normalize only PRESENT-stock rows (mirror bars)
         cov_flat = torch.zeros_like(cf)                         # keep absent-stock rows at the neutral zero input

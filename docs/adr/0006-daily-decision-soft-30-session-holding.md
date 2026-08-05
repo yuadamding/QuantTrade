@@ -1,6 +1,6 @@
 # ADR-0006: One daily decision with a soft 30-session holding target
 
-**Status:** Partial (strategy mandate accepted; implementation and qualification pending)
+**Status:** Accepted; mechanism-8 v2 implementation/qualification in progress and launch blocked
 
 **Date:** 2026-08-04
 
@@ -105,8 +105,11 @@ then face a separately registered untouched or prospective lockbox.
 - The [Hold-30 RFC](../daily_hold30_policy_rfc.md) is the proposed
   implementation contract.
 - The [H0–H3 experiment specification](../prelockbox_hold30_h0_h3_experiment.md)
-  is the only active proposed pre-lockbox mechanism experiment and remains
-  launch-blocked.
+  remains the normative mechanics base. The
+  [alpha mechanism-8 v3 specification](../prelockbox_hold30_alpha_mech8_v3.md)
+  is the current pre-lockbox generation. The
+  [mechanism-8 v2 delta](../prelockbox_hold30_mech8_v2.md) was superseded
+  before launch and remains implementation-history evidence only.
 - H1's scalar gate is an ineligible transitional mechanism control. Only H2
   implements the target learned action contract and may qualify for scale-up.
 - The earlier A0–A5 draft is superseded before execution. Its optimizer and
