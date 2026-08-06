@@ -75,6 +75,55 @@ def test_a06_uses_disjoint_optimizer_states_and_stop_gradient_routes() -> None:
     assert any(value.grad is not None for value in overlay_parameters)
 
 
+def test_bfloat16_encoder_state_reenters_autocast_for_full_alpha_head() -> None:
+    policy = Top2000M03RV7DevelopmentPolicy(
+        "M03R-soft-persistence-active-alpha-hold30-top2000-dev-v1",
+        token_dim=16,
+        raw_stock_chunk=32,
+    ).eval()
+    state = torch.randn((2, 121, policy.token_dim), dtype=torch.bfloat16)
+    state.requires_grad_(True)
+    previous = torch.full((2, 121), 1.0 / 120.0)
+    previous[:, 0] = 0.0
+    available = torch.ones((2, 121), dtype=torch.bool)
+    ages = torch.zeros((2, 121, 5))
+    assert policy.core.alpha_head is not None
+    allocator_dtypes: list[torch.dtype] = []
+    alpha_dtypes: list[torch.dtype] = []
+    allocator_hook = policy.core.alloc_in.register_forward_hook(
+        lambda _module, _inputs, output: allocator_dtypes.append(output.dtype)
+    )
+    alpha_hook = policy.core.alpha_head.auxiliary_head[-1].register_forward_hook(
+        lambda _module, _inputs, output: alpha_dtypes.append(output.dtype)
+    )
+
+    try:
+        intent = policy.hold30_intent(state, previous, available, ages)
+    finally:
+        allocator_hook.remove()
+        alpha_hook.remove()
+    assert intent.entry_scores is not None
+    assert intent.hazard_residual is not None
+    assert intent.active_risk_scale is not None
+    assert allocator_dtypes == [torch.bfloat16]
+    assert alpha_dtypes == [torch.bfloat16]
+    # Public intent tensors return to FP32 deliberately for stable execution
+    # and accounting; only the large learned activation path stays BF16.
+    assert intent.entry_scores.dtype == torch.float32
+    assert intent.hazard_residual.dtype == torch.float32
+    assert torch.isfinite(intent.entry_scores).all()
+    assert torch.isfinite(intent.hazard_residual).all()
+    assert torch.isfinite(intent.active_risk_scale).all()
+    loss = (
+        intent.entry_scores.sum()
+        + intent.hazard_residual.sum()
+        + intent.active_risk_scale.sum()
+    )
+    loss.backward()  # type: ignore[no-untyped-call]
+    assert state.grad is not None
+    assert torch.isfinite(state.grad).all()
+
+
 def test_a07_two_pass_coefficients_are_total_excess_return_sharpe_gradient() -> None:
     active = torch.tensor(
         [0.0010, -0.0004, 0.0007, 0.0002, -0.0001, 0.0009],

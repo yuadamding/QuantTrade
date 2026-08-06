@@ -877,12 +877,25 @@ class Top2000M03RV7DevelopmentPolicy(nn.Module):
         available: torch.Tensor,
         age_summaries: torch.Tensor | None = None,
     ) -> Hold30Intent:
-        intent = self.core.hold30_intent(
-            state_t,
-            prev_weights,
-            available,
-            age_summaries,
+        # Episode encoding runs under BF16 autocast, but the chronological
+        # runtime invokes this decision head after the encoder scope closes.
+        # Re-enter autocast for the complete allocator/alpha-head path so its
+        # BF16 state can be consumed by FP32 parameters without promoting the
+        # large per-decision activation surface to FP32.
+        use_bfloat16_autocast = (
+            state_t.device.type == "cuda" or state_t.dtype == torch.bfloat16
         )
+        with torch.autocast(
+            device_type=state_t.device.type,
+            dtype=torch.bfloat16,
+            enabled=use_bfloat16_autocast,
+        ):
+            intent = self.core.hold30_intent(
+                state_t,
+                prev_weights,
+                available,
+                age_summaries,
+            )
         if intent.entry_scores is None:
             raise Top2000M03RV7DevelopmentError(
                 "TOP2000 v7 development rows require H2 entry scores"
