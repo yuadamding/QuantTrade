@@ -393,6 +393,9 @@ def test_unqualified_plan_renders_suspended_single_and_all_setting_pilots() -> N
     assert "backoffLimitPerIndex" not in single.manifest["spec"]
     assert "maxFailedIndexes" not in single.manifest["spec"]
     single_args = single.manifest["spec"]["template"]["spec"]["containers"][0]["args"]
+    single_environment = single.manifest["spec"]["template"]["spec"][
+        "containers"
+    ][0]["env"]
     assert single_args[-6:] == [
         "--completion-index",
         "10",
@@ -401,6 +404,9 @@ def test_unqualified_plan_renders_suspended_single_and_all_setting_pilots() -> N
         "4",
         "--qualification-restart-after-step1",
     ]
+    assert single_environment.count(
+        {"name": "JOB_COMPLETION_INDEX", "value": "10"}
+    ) == 1
 
     batch = render_m03r_v7_top2000_suspended_qualification_batch_job(
         plan=plan,
@@ -451,6 +457,9 @@ def test_extended_sentinel_crosses_the_reproduced_failure_boundary() -> None:
     args = sentinel.manifest["spec"]["template"]["spec"]["containers"][0][
         "args"
     ]
+    environment = sentinel.manifest["spec"]["template"]["spec"]["containers"][
+        0
+    ]["env"]
     assert args[-5:] == [
         "--completion-index",
         str(M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX),
@@ -461,6 +470,12 @@ def test_extended_sentinel_crosses_the_reproduced_failure_boundary() -> None:
     assert "--qualification-restart-after-step1" not in args
     assert "--max-restarts=0" in args
     assert "--max-restarts=1" not in args
+    assert environment.count(
+        {
+            "name": "JOB_COMPLETION_INDEX",
+            "value": str(M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX),
+        }
+    ) == 1
     assert (
         sentinel.manifest["metadata"]["annotations"][
             "rl-quant/intentional-restart-after-step"

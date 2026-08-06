@@ -603,6 +603,11 @@ class M03RV7RenderedQualificationPilotJob:
         requests = _mapping(resources.get("requests"), "pilot requests")
         limits = _mapping(resources.get("limits"), "pilot limits")
         args = container.get("args")
+        environment = container.get("env")
+        expected_completion_environment = {
+            "name": "JOB_COMPLETION_INDEX",
+            "value": str(self.completion_index),
+        }
         required_suffix = [
             "--package-plan",
             "/mnt/package/package-plan.json",
@@ -650,6 +655,8 @@ class M03RV7RenderedQualificationPilotJob:
             or container.get("command") != [worker_argv_prefix[0]]
             or args
             != worker_argv_prefix[1:] + required_suffix
+            or not isinstance(environment, list)
+            or environment.count(expected_completion_environment) != 1
             or requests.get("nvidia.com/gpu") != "2"
             or limits.get("nvidia.com/gpu") != "2"
         ):
@@ -967,6 +974,10 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
                             "command": [argv[0]],
                             "args": argv[1:],
                             "env": [
+                                {
+                                    "name": "JOB_COMPLETION_INDEX",
+                                    "value": str(completion_index),
+                                },
                                 {"name": "NCCL_ASYNC_ERROR_HANDLING", "value": "1"},
                                 {
                                     "name": "TORCH_NCCL_ASYNC_ERROR_HANDLING",
@@ -1109,6 +1120,9 @@ def render_m03r_v7_top2000_suspended_qualification_batch_job(
     marker = args.index("--completion-index")
     del args[marker : marker + 2]
     environment = cast(list[dict[str, Any]], container["env"])
+    environment[:] = [
+        row for row in environment if row.get("name") != "JOB_COMPLETION_INDEX"
+    ]
     environment.insert(
         0,
         {
