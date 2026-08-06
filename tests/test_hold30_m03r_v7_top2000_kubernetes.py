@@ -40,6 +40,7 @@ from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
     render_m03r_v7_top2000_suspended_qualification_pilot_job,
 )
 from rl_quant.training.hold30_alpha_m03r_v7_package import (
+    M03R_TOP2000_QUALIFICATION_EVIDENCE_SCHEMA,
     M03RV7Top2000ArtifactBindings,
     M03RV7Top2000PackageError,
     M03RV7Top2000QualifiedPackage,
@@ -78,8 +79,7 @@ def _qualified_package(
         plan_artifact_path="/mnt/package/package-plan.json",
     )
     qualifications = tuple(
-        _qualification(plan, completion_index)
-        for completion_index in range(12)
+        _qualification(plan, completion_index) for completion_index in range(12)
     )
     worker = build_m03r_v7_top2000_worker_receipt_from_qualifications(
         plan=plan,
@@ -122,9 +122,7 @@ def _qualification(
         "cell_receipt_sha256": _digest(f"cell-{completion_index}"),
         "execution_plan_binding_sha256": _digest(f"binding-{completion_index}"),
         "rank_model_state_sha256": (_digest(f"model-{completion_index}"),) * 2,
-        "rank_alpha_optimizer_state_sha256": (
-            _digest(f"optimizer-{completion_index}"),
-        )
+        "rank_alpha_optimizer_state_sha256": (_digest(f"optimizer-{completion_index}"),)
         * 2,
         "rank_overlay_optimizer_state_sha256": overlay,
         "rank_peak_allocated_bytes": (64 * 1024**3, 65 * 1024**3),
@@ -135,7 +133,7 @@ def _qualification(
         "compute_capabilities": ((9, 0), (9, 0)),
         "runtime_identity_sha256": _digest(f"runtime-{completion_index}"),
         "qualification_steps": 4,
-        "schema": "rl-quant.m03r-v7-top2000-verified-qualification-v1",
+        "schema": M03R_TOP2000_QUALIFICATION_EVIDENCE_SCHEMA,
     }
     unsigned = M03RV7Top2000VerifiedQualificationArtifact.__new__(
         M03RV7Top2000VerifiedQualificationArtifact
@@ -150,6 +148,8 @@ def _qualification(
         **fields,
         evidence_sha256=evidence,
     )
+
+
 def _rbac(**overrides: bool) -> M03RV7KubernetesRBACEvidence:
     values = {
         "jobs_get": True,
@@ -214,9 +214,7 @@ def _admitted_reads(
     second_resource_version: str = "1002",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     first = deepcopy(rendered.manifest)
-    first["metadata"].update(
-        {"uid": uid, "resourceVersion": first_resource_version}
-    )
+    first["metadata"].update({"uid": uid, "resourceVersion": first_resource_version})
     first["spec"]["selector"] = {
         "matchLabels": {"batch.kubernetes.io/controller-uid": uid}
     }
@@ -272,7 +270,9 @@ def test_package_separates_artifacts_and_maps_all_twelve_indices() -> None:
         "image_digest_sha256",
     }
     assert tuple(value.completion_index for value in plan.indices) == tuple(range(12))
-    assert tuple(value.setting_index for value in plan.indices) == M03R_V7_ADMISSION_ORDER
+    assert (
+        tuple(value.setting_index for value in plan.indices) == M03R_V7_ADMISSION_ORDER
+    )
     assert all(value.fold_seed_cell_count == 30 for value in plan.indices)
     assert plan.runtime_profile == M03RV7Top2000RuntimeProfile()
     assert plan.source_pythonpath == "/mnt/package/source/src"
@@ -314,7 +314,9 @@ def test_runtime_profile_is_content_bound_and_rejects_unqualified_shapes() -> No
         M03RV7Top2000RuntimeProfile(activation_checkpointing=0)  # type: ignore[arg-type]
 
 
-def test_package_fails_closed_without_worker_and_capacity_and_rejects_stale_surface() -> None:
+def test_package_fails_closed_without_worker_and_capacity_and_rejects_stale_surface() -> (
+    None
+):
     plan = build_m03r_v7_top2000_package_plan(
         artifacts=_artifacts(),
         plan_artifact_path="/mnt/package/package-plan.json",
@@ -348,7 +350,9 @@ def test_parallelism_is_authorized_cap_derived_and_never_exceeds_eight(
     free: int,
     expected: int,
 ) -> None:
-    assert _live_evidence(protected=protected, free=free).allowed_parallelism == expected
+    assert (
+        _live_evidence(protected=protected, free=free).allowed_parallelism == expected
+    )
 
     incomplete = _live_evidence(rbac=_rbac(jobs_patch=False))
     assert incomplete.allowed_parallelism == 0
@@ -386,9 +390,7 @@ def test_unqualified_plan_renders_suspended_single_and_all_setting_pilots() -> N
     assert single.manifest["spec"]["activeDeadlineSeconds"] == 86400
     assert "backoffLimitPerIndex" not in single.manifest["spec"]
     assert "maxFailedIndexes" not in single.manifest["spec"]
-    single_args = single.manifest["spec"]["template"]["spec"]["containers"][0][
-        "args"
-    ]
+    single_args = single.manifest["spec"]["template"]["spec"]["containers"][0]["args"]
     assert single_args[-6:] == [
         "--completion-index",
         "10",
@@ -598,9 +600,7 @@ def test_admitted_binding_rejects_unknown_metadata_and_pool_mutations() -> None:
     wrong_pool_first = deepcopy(first)
     wrong_pool_second = deepcopy(second)
     for value in (wrong_pool_first, wrong_pool_second):
-        value["spec"]["template"]["spec"]["nodeSelector"] = {
-            "gpu-type": "A100"
-        }
+        value["spec"]["template"]["spec"]["nodeSelector"] = {"gpu-type": "A100"}
     with pytest.raises(M03RV7Top2000KubernetesError, match="Pod field"):
         bind_m03r_v7_top2000_admitted_suspended_job(
             rendered=rendered,
@@ -802,8 +802,43 @@ def test_capacity_receipt_rejects_legacy_or_underfilled_hbm_profile() -> None:
             measurement_artifact_sha256=_digest("legacy-small-profile"),
         )  # type: ignore[call-arg]
     assert package.capacity_receipt is not None
+    capacity = package.capacity_receipt
+    assert capacity.rank_maximum_peak_allocated_gib == (64.0, 65.0)
+    assert capacity.rank_maximum_peak_allocator_reserved_hbm_gib == (
+        70.0,
+        71.0,
+    )
+    assert capacity.minimum_rank_allocated_to_reserved_ratio == pytest.approx(
+        64.0 / 70.0
+    )
+    assert capacity.minimum_rank_allocator_unreserved_capacity_gib == 9.0
+    assert capacity.setting_aggregate_peak_allocator_reserved_hbm_gib == (141.0,) * 12
+    payload = capacity.canonical_payload()
+    assert "rank_peak_hbm_gib" not in payload
+    assert "aggregate_peak_hbm_gib" not in payload
+    for field_name, invalid_value in (
+        ("rank_maximum_peak_allocated_gib", (float("nan"), 65.0)),
+        (
+            "rank_maximum_peak_allocator_reserved_hbm_gib",
+            (70.0, float("inf")),
+        ),
+        ("minimum_rank_allocated_to_reserved_ratio", float("nan")),
+        (
+            "minimum_rank_allocator_unreserved_capacity_gib",
+            float("inf"),
+        ),
+        (
+            "setting_aggregate_peak_allocator_reserved_hbm_gib",
+            (141.0,) * 11 + (float("nan"),),
+        ),
+    ):
+        with pytest.raises(
+            M03RV7Top2000PackageError,
+            match="aggregate allocator-reserved HBM",
+        ):
+            replace(capacity, **{field_name: invalid_value})
     with pytest.raises(M03RV7Top2000PackageError, match="hash mismatch"):
         replace(
-            package.capacity_receipt,
+            capacity,
             execution_surface_sha256=_digest("legacy-surface"),
         )

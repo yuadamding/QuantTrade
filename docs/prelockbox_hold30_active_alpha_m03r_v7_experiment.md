@@ -67,7 +67,8 @@ so each rank performs one useful episode-encoder pass per gradient route rather
 than two.  A06 deliberately has a second route for its isolated overlay.
 Retaining forward activations uses H100 memory for real trajectory work and
 removes activation-recompute overhead; its qualification receipt must still
-satisfy the frozen memory and headroom gates before the TOP2000 panel can
+satisfy the frozen memory and allocator-unreserved-capacity gates before the
+TOP2000 panel can
 launch.
 
 The two devices provide 160 GB of aggregate device capacity, not one 160-GB
@@ -307,9 +308,10 @@ world size and rank set                 2 and {0, 1}
 physical accelerator                   NVIDIA H100 80GB HBM3
 measured optimizer updates              4
 intentional torchrun restart count       1
-peak allocated memory per rank       60--75 GiB
-peak reserved memory per rank        allocated--75 GiB
-minimum physical headroom per rank       5 GiB
+peak allocator-reserved HBM per rank 60--75 GiB
+useful peak allocated tensors/rank   at least 48 GiB
+allocated/reserved ratio per rank    at least 0.70
+allocator-unreserved capacity/rank   at least 5 GiB
 allocator OOM/retry counters             0 / 0
 final model and optimizer rank parity    exact
 ```
@@ -321,7 +323,11 @@ exact package execution surface:
 1. executable worker qualification derived from all twelve artifacts,
    including two-rank parity and exact restart evidence;
 2. an all-setting capacity receipt showing 120--150 GiB aggregate peak
-   allocated HBM for every setting.
+   allocator-reserved HBM for every setting, with at least 48 GiB of useful
+   peak allocated tensors per rank and an allocated/reserved ratio of at
+   least 0.70 so allocator padding cannot qualify the run. The 5-GiB guard is
+   `total device capacity - peak PyTorch allocator-reserved bytes`; it is not
+   a measurement of instantaneous free or physically unused HBM.
 
 The manifest uses `completionMode: Indexed`, `completions: 12`, two H100s in
 one container per completion, and Job-level `backoffLimit: 0`. The installed
@@ -351,9 +357,10 @@ termination grace period, and container termination-message defaults. The
 final Job deadline is at most 216000 seconds; the bounded qualification Job is
 at most 86400 seconds. If node-list RBAC is denied, qualification does not
 claim that the product label was observed; actual runtime device name,
-physical memory, and compute capability provide the artifact-backed hardware
-proof required by the final launch. Node names, hostname selectors, host
-paths, private-key copying, and service-account token automounting are
+reported total device capacity, and compute capability provide the
+artifact-backed hardware proof required by the final launch. Node names,
+hostname selectors, host paths, private-key copying, and service-account token
+automounting are
 prohibited.
 
 The proven namespace topology uses the `yding4-gpu-home` PVC, `default`

@@ -38,20 +38,22 @@ M03R_TOP2000_WORKER_RECEIPT_SCHEMA = (
     "rl-quant.m03r-v7-top2000-worker-qualification-v1"
 )
 M03R_TOP2000_CAPACITY_RECEIPT_SCHEMA = (
-    "rl-quant.m03r-v7-top2000-two-h100-capacity-v2"
+    "rl-quant.m03r-v7-top2000-two-h100-capacity-v3"
 )
 M03R_TOP2000_PACKAGE_SOURCE_PYTHONPATH = "/mnt/package/source/src"
 M03R_TOP2000_QUALIFICATION_ARTIFACT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v7-bounded-qualification-v1"
 )
 M03R_TOP2000_QUALIFICATION_EVIDENCE_SCHEMA = (
-    "rl-quant.m03r-v7-top2000-verified-qualification-v1"
+    "rl-quant.m03r-v7-top2000-verified-qualification-v2"
 )
 M03R_TOP2000_QUALIFICATION_STEPS = 4
 M03R_TOP2000_GPU_NAME = "NVIDIA H100 80GB HBM3"
-M03R_TOP2000_MIN_ALLOCATED_GIB = 60.0
-M03R_TOP2000_MAX_ALLOCATED_GIB = 75.0
-M03R_TOP2000_MIN_RESERVED_HEADROOM_GIB = 5.0
+M03R_TOP2000_MIN_USEFUL_ALLOCATED_GIB = 48.0
+M03R_TOP2000_MIN_ALLOCATED_TO_RESERVED_RATIO = 0.70
+M03R_TOP2000_MIN_RESERVED_HBM_GIB = 60.0
+M03R_TOP2000_MAX_RESERVED_HBM_GIB = 75.0
+M03R_TOP2000_MIN_ALLOCATOR_UNRESERVED_CAPACITY_GIB = 5.0
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_RE = re.compile(r"^[^@\s]+@sha256:([0-9a-f]{64})$")
@@ -651,12 +653,15 @@ class M03RV7Top2000VerifiedQualificationArtifact:
             )
         gib = float(1024**3)
         if not all(
-            M03R_TOP2000_MIN_ALLOCATED_GIB
-            <= allocated / gib
-            <= M03R_TOP2000_MAX_ALLOCATED_GIB
+            allocated / gib >= M03R_TOP2000_MIN_USEFUL_ALLOCATED_GIB
+            and M03R_TOP2000_MIN_RESERVED_HBM_GIB
+            <= reserved / gib
+            <= M03R_TOP2000_MAX_RESERVED_HBM_GIB
             and allocated <= reserved <= total
+            and allocated / reserved
+            >= M03R_TOP2000_MIN_ALLOCATED_TO_RESERVED_RATIO
             and (total - reserved) / gib
-            >= M03R_TOP2000_MIN_RESERVED_HEADROOM_GIB
+            >= M03R_TOP2000_MIN_ALLOCATOR_UNRESERVED_CAPACITY_GIB
             for allocated, reserved, total in zip(
                 self.rank_peak_allocated_bytes,
                 self.rank_peak_reserved_bytes,
@@ -665,8 +670,10 @@ class M03RV7Top2000VerifiedQualificationArtifact:
             )
         ):
             raise M03RV7Top2000PackageError(
-                "qualification must measure 60-75 GiB allocated per rank with "
-                "at least 5 GiB reserved-memory headroom"
+                "qualification must measure 60-75 GiB allocator-reserved HBM "
+                "per rank, at least 48 GiB useful allocated tensors, an "
+                "allocated/reserved ratio of at least 0.70, and at least "
+                "5 GiB allocator-unreserved device capacity"
             )
         if (
             self.gpu_names != (M03R_TOP2000_GPU_NAME, M03R_TOP2000_GPU_NAME)
@@ -1075,16 +1082,17 @@ def build_m03r_v7_top2000_worker_receipt_from_qualifications(
 
 @dataclass(frozen=True, slots=True)
 class M03RV7Top2000CapacityReceipt:
-    """Two-H100 memory/throughput evidence for this exact execution surface."""
+    """Two-H100 allocator-residency evidence for this execution surface."""
 
     execution_surface_sha256: str
     image_digest_sha256: str
     gpu_product: Literal["NVIDIA-H100-80GB-HBM3"]
     gpu_count: Literal[2]
-    rank_peak_hbm_gib: tuple[float, float]
-    rank_peak_reserved_hbm_gib: tuple[float, float]
-    minimum_rank_reserved_headroom_gib: float
-    aggregate_peak_hbm_gib: float
+    rank_maximum_peak_allocated_gib: tuple[float, float]
+    rank_maximum_peak_allocator_reserved_hbm_gib: tuple[float, float]
+    minimum_rank_allocated_to_reserved_ratio: float
+    minimum_rank_allocator_unreserved_capacity_gib: float
+    setting_aggregate_peak_allocator_reserved_hbm_gib: tuple[float, ...]
     qualified_setting_ids: tuple[str, ...]
     qualification_artifact_sha256s: tuple[str, ...]
     two_rank_ddp_completed: bool
@@ -1101,14 +1109,21 @@ class M03RV7Top2000CapacityReceipt:
             "image_digest_sha256": self.image_digest_sha256,
             "gpu_product": self.gpu_product,
             "gpu_count": self.gpu_count,
-            "rank_peak_hbm_gib": list(self.rank_peak_hbm_gib),
-            "rank_peak_reserved_hbm_gib": list(
-                self.rank_peak_reserved_hbm_gib
+            "rank_maximum_peak_allocated_gib": list(
+                self.rank_maximum_peak_allocated_gib
             ),
-            "minimum_rank_reserved_headroom_gib": (
-                self.minimum_rank_reserved_headroom_gib
+            "rank_maximum_peak_allocator_reserved_hbm_gib": list(
+                self.rank_maximum_peak_allocator_reserved_hbm_gib
             ),
-            "aggregate_peak_hbm_gib": self.aggregate_peak_hbm_gib,
+            "minimum_rank_allocated_to_reserved_ratio": (
+                self.minimum_rank_allocated_to_reserved_ratio
+            ),
+            "minimum_rank_allocator_unreserved_capacity_gib": (
+                self.minimum_rank_allocator_unreserved_capacity_gib
+            ),
+            "setting_aggregate_peak_allocator_reserved_hbm_gib": list(
+                self.setting_aggregate_peak_allocator_reserved_hbm_gib
+            ),
             "qualified_setting_ids": list(self.qualified_setting_ids),
             "qualification_artifact_sha256s": list(
                 self.qualification_artifact_sha256s
@@ -1131,30 +1146,53 @@ class M03RV7Top2000CapacityReceipt:
             _require_sha256(name, getattr(self, name))
         if self.gpu_product != "NVIDIA-H100-80GB-HBM3" or self.gpu_count != 2:
             raise M03RV7Top2000PackageError("capacity receipt must use two H100 80GB")
+        capacity_floats = (
+            *self.rank_maximum_peak_allocated_gib,
+            *self.rank_maximum_peak_allocator_reserved_hbm_gib,
+            self.minimum_rank_allocated_to_reserved_ratio,
+            self.minimum_rank_allocator_unreserved_capacity_gib,
+            *self.setting_aggregate_peak_allocator_reserved_hbm_gib,
+        )
         if (
-            len(self.rank_peak_hbm_gib) != 2
-            or len(self.rank_peak_reserved_hbm_gib) != 2
+            not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                for value in capacity_floats
+            )
+            or len(self.rank_maximum_peak_allocated_gib) != 2
+            or len(self.rank_maximum_peak_allocator_reserved_hbm_gib) != 2
             or any(
-                not M03R_TOP2000_MIN_ALLOCATED_GIB
-                <= value
-                <= M03R_TOP2000_MAX_ALLOCATED_GIB
-                for value in self.rank_peak_hbm_gib
+                value < M03R_TOP2000_MIN_USEFUL_ALLOCATED_GIB
+                for value in self.rank_maximum_peak_allocated_gib
             )
             or any(
-                reserved < allocated or reserved > 75.0
+                not M03R_TOP2000_MIN_RESERVED_HBM_GIB
+                <= reserved
+                <= M03R_TOP2000_MAX_RESERVED_HBM_GIB
+                or allocated > reserved
                 for allocated, reserved in zip(
-                    self.rank_peak_hbm_gib,
-                    self.rank_peak_reserved_hbm_gib,
+                    self.rank_maximum_peak_allocated_gib,
+                    self.rank_maximum_peak_allocator_reserved_hbm_gib,
                     strict=True,
                 )
             )
-            or self.minimum_rank_reserved_headroom_gib
-            < M03R_TOP2000_MIN_RESERVED_HEADROOM_GIB
-            or abs(sum(self.rank_peak_hbm_gib) - self.aggregate_peak_hbm_gib) > 1e-6
-            or not 120.0 <= self.aggregate_peak_hbm_gib <= 150.0
+            or self.minimum_rank_allocated_to_reserved_ratio
+            < M03R_TOP2000_MIN_ALLOCATED_TO_RESERVED_RATIO
+            or self.minimum_rank_allocated_to_reserved_ratio > 1.0
+            or self.minimum_rank_allocator_unreserved_capacity_gib
+            < M03R_TOP2000_MIN_ALLOCATOR_UNRESERVED_CAPACITY_GIB
+            or len(self.setting_aggregate_peak_allocator_reserved_hbm_gib)
+            != len(M03R_TOP2000_DEV_SETTING_IDS)
+            or any(
+                not 120.0 <= value <= 150.0
+                for value in self.setting_aggregate_peak_allocator_reserved_hbm_gib
+            )
         ):
             raise M03RV7Top2000PackageError(
-                "capacity qualification must demonstrate 120-150 GiB aggregate HBM"
+                "capacity qualification must demonstrate 120-150 GiB "
+                "aggregate allocator-reserved HBM for every setting without "
+                "padding out useful tensors"
             )
         if (
             self.qualified_setting_ids != M03R_TOP2000_DEV_SETTING_IDS
@@ -1211,15 +1249,24 @@ def build_m03r_v7_top2000_capacity_receipt(
         qualifications=ordered,
     )
     gib = float(1024**3)
-    rank_peak_hbm_gib = tuple(
+    rank_maximum_peak_allocated_gib = tuple(
         max(value.rank_peak_allocated_bytes[rank] for value in ordered) / gib
         for rank in range(2)
     )
-    rank_peak_reserved_hbm_gib = tuple(
+    rank_maximum_peak_allocator_reserved_hbm_gib = tuple(
         max(value.rank_peak_reserved_bytes[rank] for value in ordered) / gib
         for rank in range(2)
     )
-    minimum_headroom = min(
+    minimum_allocated_to_reserved_ratio = min(
+        allocated / reserved
+        for value in ordered
+        for allocated, reserved in zip(
+            value.rank_peak_allocated_bytes,
+            value.rank_peak_reserved_bytes,
+            strict=True,
+        )
+    )
+    minimum_allocator_unreserved_capacity = min(
         (total - reserved) / gib
         for value in ordered
         for reserved, total in zip(
@@ -1228,15 +1275,27 @@ def build_m03r_v7_top2000_capacity_receipt(
             strict=True,
         )
     )
+    setting_aggregate_peak_allocator_reserved_hbm_gib = tuple(
+        sum(value.rank_peak_reserved_bytes) / gib for value in ordered
+    )
     fields: dict[str, Any] = {
         "execution_surface_sha256": worker.execution_surface_sha256,
         "image_digest_sha256": plan.artifacts.image_digest_sha256,
         "gpu_product": M03R_V7_H100_TOPOLOGY.gpu_product,
         "gpu_count": 2,
-        "rank_peak_hbm_gib": rank_peak_hbm_gib,
-        "rank_peak_reserved_hbm_gib": rank_peak_reserved_hbm_gib,
-        "minimum_rank_reserved_headroom_gib": minimum_headroom,
-        "aggregate_peak_hbm_gib": sum(rank_peak_hbm_gib),
+        "rank_maximum_peak_allocated_gib": rank_maximum_peak_allocated_gib,
+        "rank_maximum_peak_allocator_reserved_hbm_gib": (
+            rank_maximum_peak_allocator_reserved_hbm_gib
+        ),
+        "minimum_rank_allocated_to_reserved_ratio": (
+            minimum_allocated_to_reserved_ratio
+        ),
+        "minimum_rank_allocator_unreserved_capacity_gib": (
+            minimum_allocator_unreserved_capacity
+        ),
+        "setting_aggregate_peak_allocator_reserved_hbm_gib": (
+            setting_aggregate_peak_allocator_reserved_hbm_gib
+        ),
         "qualified_setting_ids": M03R_TOP2000_DEV_SETTING_IDS,
         "qualification_artifact_sha256s": qualification_artifact_sha256s,
         "two_rank_ddp_completed": True,

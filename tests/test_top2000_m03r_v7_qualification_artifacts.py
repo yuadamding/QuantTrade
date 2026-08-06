@@ -51,15 +51,27 @@ def _plan() -> Any:
     )
 
 
-def _rank(rank: int, *, allocated_gib: int = 64) -> dict[str, Any]:
+def _rank(
+    rank: int,
+    *,
+    allocated_gib: float = 50.0,
+    reserved_gib: float = 65.0,
+    measured_bytes: tuple[int, int, int] | None = None,
+) -> dict[str, Any]:
+    if measured_bytes is None:
+        allocated_bytes = int((allocated_gib + rank * 0.25) * 1024**3)
+        reserved_bytes = int((reserved_gib + rank * 0.25) * 1024**3)
+        total_memory_bytes = 80 * 1024**3
+    else:
+        allocated_bytes, reserved_bytes, total_memory_bytes = measured_bytes
     return {
         "rank": rank,
         "device": f"cuda:{rank}",
         "gpu_name": "NVIDIA H100 80GB HBM3",
-        "gpu_total_memory_bytes": 80 * 1024**3,
+        "gpu_total_memory_bytes": total_memory_bytes,
         "compute_capability": [9, 0],
-        "peak_allocated_bytes": (allocated_gib + rank) * 1024**3,
-        "peak_reserved_bytes": (70 + rank) * 1024**3,
+        "peak_allocated_bytes": allocated_bytes,
+        "peak_reserved_bytes": reserved_bytes,
         "allocator_oom_count": 0,
         "allocator_retry_count": 0,
         "torchrun_restart_count": 1,
@@ -74,7 +86,10 @@ def _rank(rank: int, *, allocated_gib: int = 64) -> dict[str, Any]:
 def _qualification_tree(
     tmp_path: Path,
     *,
-    allocated_gib: int = 64,
+    allocated_gib: float = 50.0,
+    reserved_gib: float = 65.0,
+    measured_rank_bytes: tuple[tuple[int, int, int], tuple[int, int, int]]
+    | None = None,
     binding_activation_checkpointing: bool | None = None,
 ) -> tuple[Any, Path, str, Path]:
     plan = _plan()
@@ -118,7 +133,17 @@ def _qualification_tree(
         model_path.parent.mkdir(parents=True, exist_ok=True)
         model_path.write_bytes(f"model-{rank}".encode())
         model_file_hashes.append(hashlib.sha256(model_path.read_bytes()).hexdigest())
-    peaks = [_rank(0, allocated_gib=allocated_gib), _rank(1, allocated_gib=allocated_gib)]
+    peaks = [
+        _rank(
+            rank,
+            allocated_gib=allocated_gib,
+            reserved_gib=reserved_gib,
+            measured_bytes=(
+                None if measured_rank_bytes is None else measured_rank_bytes[rank]
+            ),
+        )
+        for rank in range(2)
+    ]
     cell = {
         "schema": "rl-quant.top2000-dev.m03r-v7-cell-receipt-v2",
         "mode": "qualification",
@@ -178,7 +203,9 @@ def _qualification_tree(
     return plan, terminal_path, terminal_sha, cell_path
 
 
-def test_verifier_derives_real_two_rank_memory_parity_and_restart(tmp_path: Path) -> None:
+def test_verifier_derives_real_two_rank_memory_parity_and_restart(
+    tmp_path: Path,
+) -> None:
     plan, receipt, receipt_sha, _ = _qualification_tree(tmp_path)
     verified = verify_m03r_v7_top2000_qualification_artifact(
         plan=plan,
@@ -186,9 +213,36 @@ def test_verifier_derives_real_two_rank_memory_parity_and_restart(tmp_path: Path
         qualification_receipt_path=receipt,
         expected_qualification_receipt_sha256=receipt_sha,
     )
-    assert verified.rank_peak_allocated_bytes == (64 * 1024**3, 65 * 1024**3)
+    assert verified.rank_peak_allocated_bytes == (
+        50 * 1024**3,
+        int(50.25 * 1024**3),
+    )
+    assert verified.rank_peak_reserved_bytes == (
+        65 * 1024**3,
+        int(65.25 * 1024**3),
+    )
     assert len(set(verified.rank_model_state_sha256)) == 1
     assert verified.qualification_steps == 4
+
+
+def test_verifier_accepts_exact_a9_allocator_residency_bytes(tmp_path: Path) -> None:
+    measured = (
+        (53_888_892_928, 69_986_156_544, 85_028_372_480),
+        (53_628_473_344, 69_736_595_456, 85_028_372_480),
+    )
+    plan, receipt, receipt_sha, _ = _qualification_tree(
+        tmp_path,
+        measured_rank_bytes=measured,
+    )
+    verified = verify_m03r_v7_top2000_qualification_artifact(
+        plan=plan,
+        completion_index=0,
+        qualification_receipt_path=receipt,
+        expected_qualification_receipt_sha256=receipt_sha,
+    )
+    assert verified.rank_peak_allocated_bytes == tuple(value[0] for value in measured)
+    assert verified.rank_peak_reserved_bytes == tuple(value[1] for value in measured)
+    assert verified.rank_total_memory_bytes == tuple(value[2] for value in measured)
 
 
 def test_verifier_rejects_tampered_cell_and_underfilled_memory(tmp_path: Path) -> None:
@@ -221,7 +275,33 @@ def test_verifier_rejects_tampered_cell_and_underfilled_memory(tmp_path: Path) -
         tmp_path / "small",
         allocated_gib=20,
     )
-    with pytest.raises(M03RV7Top2000PackageError, match="60-75 GiB"):
+    with pytest.raises(M03RV7Top2000PackageError, match="useful allocated"):
+        verify_m03r_v7_top2000_qualification_artifact(
+            plan=plan,
+            completion_index=0,
+            qualification_receipt_path=receipt,
+            expected_qualification_receipt_sha256=receipt_sha,
+        )
+
+    plan, receipt, receipt_sha, _ = _qualification_tree(
+        tmp_path / "allocator-padding",
+        allocated_gib=48,
+        reserved_gib=70,
+    )
+    with pytest.raises(M03RV7Top2000PackageError, match="ratio of at least 0.70"):
+        verify_m03r_v7_top2000_qualification_artifact(
+            plan=plan,
+            completion_index=0,
+            qualification_receipt_path=receipt,
+            expected_qualification_receipt_sha256=receipt_sha,
+        )
+
+    plan, receipt, receipt_sha, _ = _qualification_tree(
+        tmp_path / "under-resident",
+        allocated_gib=48,
+        reserved_gib=59,
+    )
+    with pytest.raises(M03RV7Top2000PackageError, match="allocator-reserved HBM"):
         verify_m03r_v7_top2000_qualification_artifact(
             plan=plan,
             completion_index=0,
