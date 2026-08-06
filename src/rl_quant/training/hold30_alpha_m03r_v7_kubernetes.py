@@ -695,6 +695,7 @@ class M03RV7RenderedQualificationBatchJob:
             "name": "JOB_COMPLETION_INDEX",
             "valueFrom": {
                 "fieldRef": {
+                    "apiVersion": "v1",
                     "fieldPath": (
                         "metadata.annotations['batch.kubernetes.io/"
                         "job-completion-index']"
@@ -1068,6 +1069,7 @@ def render_m03r_v7_top2000_suspended_qualification_batch_job(
             "name": "JOB_COMPLETION_INDEX",
             "valueFrom": {
                 "fieldRef": {
+                    "apiVersion": "v1",
                     "fieldPath": (
                         "metadata.annotations['batch.kubernetes.io/"
                         "job-completion-index']"
@@ -1219,6 +1221,7 @@ def render_m03r_v7_top2000_suspended_indexed_job(
                                     "name": "JOB_COMPLETION_INDEX",
                                     "valueFrom": {
                                         "fieldRef": {
+                                            "apiVersion": "v1",
                                             "fieldPath": (
                                                 "metadata.annotations['batch.kubernetes.io/"
                                                 "job-completion-index']"
