@@ -32,6 +32,12 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed import (  # type: ignore[attr-defined]
+    PrefixStore as _TorchPrefixStore,
+)
+from torch.distributed import (  # type: ignore[attr-defined]
+    rendezvous as _torch_distributed_rendezvous,
+)
 
 from rl_quant.envs.hold30 import CohortLedger
 from rl_quant.evaluation.top2000_m03r_v7_dev import (
@@ -103,6 +109,7 @@ _INTENTIONAL_RESTART_MARKER_ROOT = Path(
 _INTENTIONAL_RESTART_RENDEZVOUS_TIMEOUT_SECONDS = 30.0
 _INTENTIONAL_RESTART_POLL_SECONDS = 0.05
 _INTENTIONAL_RESTART_SOCKET_SETTLE_SECONDS = 5.0
+_PROCESS_GROUP_STORE_PREFIX_ROOT = "rl-quant.top2000-m03r-v7"
 
 
 class Top2000M03RV7WorkerError(RuntimeError):
@@ -628,7 +635,18 @@ def _distributed_context(*, qualification_only: bool) -> _DistributedContext:
         if not torch.cuda.is_available():
             raise Top2000M03RV7WorkerError("two-rank execution requires CUDA")
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        store, rendezvous_rank, rendezvous_world_size = (
+            _generation_scoped_env_rendezvous(
+                expected_rank=rank,
+                expected_world_size=world_size,
+            )
+        )
+        dist.init_process_group(
+            backend="nccl",
+            store=store,
+            rank=rendezvous_rank,
+            world_size=rendezvous_world_size,
+        )
         owns = True
     if world_size == 2:
         if not dist.is_initialized() or dist.get_world_size() != world_size:
@@ -669,9 +687,38 @@ def _torchrun_restart_count() -> int:
         ) from exc
     if value not in {0, 1}:
         raise Top2000M03RV7WorkerError(
-            "intentional qualification permits exactly one torchrun restart"
+            "TOP2000 M03R-v7 permits exactly one torchrun restart"
         )
     return value
+
+
+def _process_group_store_prefix(restart_count: int) -> str:
+    if restart_count not in {0, 1}:
+        raise Top2000M03RV7WorkerError(
+            "process-group store restart generation must be zero or one"
+        )
+    return f"{_PROCESS_GROUP_STORE_PREFIX_ROOT}/restart-generation-{restart_count}"
+
+
+def _generation_scoped_env_rendezvous(
+    *,
+    expected_rank: int,
+    expected_world_size: int,
+) -> tuple[Any, int, int]:
+    restart_count = _torchrun_restart_count()
+    rendezvous = _torch_distributed_rendezvous("env://")
+    try:
+        base_store, rank, world_size = next(rendezvous)
+    except StopIteration as exc:
+        raise Top2000M03RV7WorkerError(
+            "env:// rendezvous returned no process-group store"
+        ) from exc
+    if rank != expected_rank or world_size != expected_world_size:
+        raise Top2000M03RV7WorkerError(
+            "env:// rendezvous rank/world geometry drifted"
+        )
+    prefix = _process_group_store_prefix(restart_count)
+    return _TorchPrefixStore(prefix, base_store), rank, world_size
 
 
 def _intentional_restart_rendezvous_path(

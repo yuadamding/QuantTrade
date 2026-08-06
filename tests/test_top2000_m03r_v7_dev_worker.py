@@ -166,6 +166,135 @@ def test_episode_schedule_is_paired_across_settings_and_run_paths(
             assert left_starts == right_starts
 
 
+def test_process_group_store_prefix_is_exact_shared_and_restart_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_store = object()
+    rendezvous_rows = [
+        (base_store, 0, 2),
+        (base_store, 1, 2),
+        (base_store, 0, 2),
+        (base_store, 1, 2),
+    ]
+    prefixes: list[str] = []
+    monkeypatch.setattr(
+        worker,
+        "_torch_distributed_rendezvous",
+        lambda url: iter([rendezvous_rows.pop(0)]) if url == "env://" else iter(()),
+    )
+
+    def prefix_store(prefix: str, store: object) -> object:
+        assert store is base_store
+        prefixes.append(prefix)
+        return object()
+
+    monkeypatch.setattr(worker, "_TorchPrefixStore", prefix_store)
+    for restart_count in (0, 1):
+        monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", str(restart_count))
+        for rank in (0, 1):
+            _, resolved_rank, world_size = (
+                worker._generation_scoped_env_rendezvous(
+                    expected_rank=rank,
+                    expected_world_size=2,
+                )
+            )
+            assert resolved_rank == rank
+            assert world_size == 2
+
+    assert prefixes == [
+        "rl-quant.top2000-m03r-v7/restart-generation-0",
+        "rl-quant.top2000-m03r-v7/restart-generation-0",
+        "rl-quant.top2000-m03r-v7/restart-generation-1",
+        "rl-quant.top2000-m03r-v7/restart-generation-1",
+    ]
+
+
+def test_process_group_store_prefix_rejects_invalid_restart_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: list[str] = []
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "2")
+
+    def rendezvous(url: str) -> Any:
+        called.append(url)
+        return iter(())
+
+    monkeypatch.setattr(worker, "_torch_distributed_rendezvous", rendezvous)
+    with pytest.raises(worker.Top2000M03RV7WorkerError, match="exactly one"):
+        worker._generation_scoped_env_rendezvous(
+            expected_rank=0,
+            expected_world_size=2,
+        )
+    assert called == []
+
+
+@pytest.mark.parametrize("qualification_only", (True, False))
+def test_generation_scoped_store_preserves_two_rank_context_geometry(
+    qualification_only: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("TORCHELASTIC_RESTART_COUNT", "1")
+    base_store = object()
+    prefixed_store = object()
+    initialized = [False]
+    init_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(dist, "is_initialized", lambda: initialized[0])
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(
+        worker,
+        "_torch_distributed_rendezvous",
+        lambda url: iter([(base_store, 1, 2)]) if url == "env://" else iter(()),
+    )
+
+    def prefix_store(prefix: str, store: object) -> object:
+        assert prefix == "rl-quant.top2000-m03r-v7/restart-generation-1"
+        assert store is base_store
+        return prefixed_store
+
+    def init_process_group(**kwargs: Any) -> None:
+        init_calls.append(kwargs)
+        initialized[0] = True
+
+    monkeypatch.setattr(worker, "_TorchPrefixStore", prefix_store)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _device: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_name",
+        lambda _device: "NVIDIA H100 80GB HBM3",
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            total_memory=80 * 1024**3,
+            major=9,
+            minor=0,
+        ),
+    )
+
+    context = worker._distributed_context(qualification_only=qualification_only)
+    assert context == worker._DistributedContext(
+        rank=1,
+        local_rank=1,
+        world_size=2,
+        device=torch.device("cuda", 1),
+        owns_process_group=True,
+    )
+    assert init_calls == [
+        {
+            "backend": "nccl",
+            "store": prefixed_store,
+            "rank": 1,
+            "world_size": 2,
+        }
+    ]
+
+
 def test_intentional_restart_handshake_orders_teardown_before_rendezvous(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
