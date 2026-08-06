@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from rl_quant.models.daily_policy import (
+    CrossDayTemporalEncoder,
     HOLD30_AGE_CAP,
     HOLD30_ALPHA_MODEL_SETTING_IDS,
     HOLD30_MODEL_SETTING_IDS,
@@ -19,6 +20,30 @@ from rl_quant.models.daily_policy import (
     hold30_release_hazard,
     resolve_hold30_model_switches,
 )
+
+
+def test_explicit_temporal_attention_lookback_blocks_older_rows() -> None:
+    torch.manual_seed(13)
+    encoder = CrossDayTemporalEncoder(
+        d_model=8,
+        n_heads=1,
+        n_layers=1,
+        feedforward_dim=16,
+        dropout=0.0,
+        max_days=8,
+        attention_lookback=2,
+    ).eval()
+    first = torch.randn(1, 5, 2, 8)
+    second = first.clone()
+    second[:, 0] = second[:, 0] + 100.0
+    available = torch.ones(1, 5, 2, dtype=torch.bool)
+
+    with torch.no_grad():
+        first_state = encoder(first, available)
+        second_state = encoder(second, available)
+
+    torch.testing.assert_close(first_state[:, 2:], second_state[:, 2:])
+    assert not torch.equal(first_state[:, 0], second_state[:, 0])
 
 
 def _config(setting_id: str | None = None) -> DailyCrossSectionConfig:

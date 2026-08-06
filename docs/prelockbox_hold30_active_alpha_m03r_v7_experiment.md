@@ -3,7 +3,7 @@
 **Protocol:** `prelockbox-hold30-active-alpha-m03r-v7`  
 **Design:** `daily_raw_pit300_hold30_m03r_v7`  
 **Canonical:** `M03R-soft-persistence-active-alpha-hold30-v7`  
-**Status:** launch-blocked experiment plan  
+**Status:** implementation-qualified locally; real two-H100 qualification required before launch
 **Normative RFC:** [M03R v7 active-alpha Hold-30 RFC](prelockbox_hold30_active_alpha_m03r_v7.md)
 
 This document specifies the paired experiment, GPU topology, admission order,
@@ -247,3 +247,116 @@ ownership-scoped cleanup and exact-UID recovery procedure
 The currently implemented v6 primitives do not satisfy this v7 checklist by
 themselves. No Kubernetes Job should be rendered or submitted from this
 document alone.
+
+## Development-only TOP2000 Kubernetes lifecycle
+
+The future-selected TOP2000 compatibility experiment has a disjoint,
+nonreportable identity. Its immutable package and lifecycle schemas live in:
+
+```text
+src/rl_quant/training/hold30_alpha_m03r_v7_package.py
+src/rl_quant/training/hold30_alpha_m03r_v7_kubernetes.py
+```
+
+The package binds separate source-archive, source-manifest, dependency-lock,
+cache-artifact, cache-manifest, data-manifest, execution-model, image-digest,
+and package-plan hashes. No aggregate hash substitutes for any of them. Each
+Indexed-Job completion maps by the frozen admission order to one development
+setting and owns its exact six-fold by five-seed inventory.
+
+The current cache binding is the existing pre-2026 TOP2000 artifact:
+
+```text
+host: /rsrch8/home/bcb/yding4/quant/training/caches/pre2026-bars-f08931bae1d0.pt
+sha256: 0ba73414c3adea7712f7a68b1e76d934a17694a27671f35b8aa191bcc6aa1ee0
+shape: [1001, 1999, 5] daily OHLCV, including CASH on the action axis
+dates: 2022-01-03 through 2025-12-29
+role: future-selected TOP2000 development-only, nonreportable
+```
+
+Every training replay has 378 state rows: 251 observation-only warmup
+decisions, 63 loss-bearing origins, and enough detached support for the full
+63-return auxiliary label. Each origin still owns exactly 30 post-fill
+economic returns. Validation scores exactly 63 chronological transitions and
+uses one five-seed output-space ensemble path per fold.
+
+The Kubernetes module has no cluster client or hidden mutation path. It first
+emits a suspended, all-twelve `batch/v1` qualification Job from the unqualified
+immutable package. That Job runs the exact final worker command for four real
+optimizer updates per setting, deliberately interrupts after the first
+checkpoint under `torchrun --max-restarts=1`, and must resume the same
+checkpoint before producing evidence. The verifier replays each terminal,
+cell, and execution-plan receipt from bytes; caller-authored peak-memory or
+parity claims cannot qualify a package.
+
+Every one of the twelve settings must independently prove:
+
+```text
+world size and rank set                 2 and {0, 1}
+physical accelerator                   NVIDIA H100 80GB HBM3
+measured optimizer updates              4
+intentional torchrun restart count       1
+peak allocated memory per rank       60--75 GiB
+peak reserved memory per rank        allocated--75 GiB
+minimum physical headroom per rank       5 GiB
+allocator OOM/retry counters             0 / 0
+final model and optimizer rank parity    exact
+```
+
+Only after all twelve verified artifacts exist may the package emit the final
+suspended Job. That final renderer requires both receipts below to match the
+exact package execution surface:
+
+1. executable worker qualification derived from all twelve artifacts,
+   including two-rank parity and exact restart evidence;
+2. an all-setting capacity receipt showing 120--150 GiB aggregate peak
+   allocated HBM for every setting.
+
+The manifest uses `completionMode: Indexed`, `completions: 12`, two H100s in
+one container per completion, `backoffLimitPerIndex: 0`, and
+`maxFailedIndexes: 0`. Parallelism is recomputed from a fresh live RBAC/cap
+receipt and is always:
+
+```text
+min(8, floor((16 - protected_H100) / 2))
+```
+
+Both qualification and final manifests request two GPUs per completion. The
+qualification batch uses the same twelve-entry admission map and at most eight
+concurrent completions, so it tests every causal route while respecting the
+same 16-H100 ceiling. Live free capacity is observational rather than an
+entitlement gate. Capacity
+that is not immediately available remains scheduler-Pending for automatic
+backfill; zero instantaneous free GPUs is not misreported as a failed Job.
+
+The API server must pass a fresh server-side dry run for the indexed-backoff
+fields before create. Product scheduling is restricted to the approved
+`nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3` selector. If node-list RBAC is
+denied, qualification does not claim that the label was observed; the actual
+runtime device name, physical memory, and compute capability provide the
+artifact-backed product proof required by the final launch. Node names,
+hostname selectors, host paths, private-key copying, and service-account token
+automounting are prohibited.
+
+The proven namespace topology uses the `yding4-gpu-home` PVC, `default`
+service account, `kai-scheduler`, queue
+`yding4-yn-gpu-workload-queue`, and PVC subpaths below
+`quant/training/{packages,runs}`. The package subtree is mounted read-only and
+the exact run subtree is the only writable research output mount.
+
+Attachment is receipt-gated: read each newly admitted suspended Job twice,
+verify stable UID and execution-bearing spec, verify zero UID-owned Pods, and
+bind the admitted `template.spec` and selector hashes. Activation may only use
+a full JSON Patch whose `test` operations bind the fresh UID, resourceVersion,
+run-ID annotation, suspension state, parallelism, selector, template metadata,
+and complete Pod spec before its sole mutation changes `suspend` to `false`.
+Every successful final completion must later publish one receipt containing all
+thirty fold/seed receipts; complete batch evidence requires exact indices
+0--11.
+
+Cleanup is also non-mutating in the package. Immediately before deletion it
+must re-read the exact Job and render foreground `DeleteOptions` with that
+fresh UID and `resourceVersion` as preconditions. A cleanup
+receipt is complete only after two observations show that the exact Job and
+all Pods owned by that UID are absent. Broad name-prefix or label-only deletion
+is not an acceptable recovery method.

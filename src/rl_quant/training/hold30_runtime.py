@@ -1114,6 +1114,16 @@ class Hold30ChronologicalRuntime:
                     early_sale_mass=origin_transition.discretionary_accounting.early_exit_notional.mean(),
                     gate=origin_gate,
                     gate_entropy=origin_entropy,
+                    discretionary_sold_value_by_age=(
+                        origin_transition.discretionary_accounting
+                        .sold_value_by_age.sum(dim=1).mean(dim=0)
+                    ),
+                    auxiliary_alpha_mean=(
+                        origin_transition.raw_intent.auxiliary_alpha_mean
+                    ),
+                    alpha_downside_30d=(
+                        origin_transition.raw_intent.alpha_downside_30d
+                    ),
                 )
             )
         return tuple(result)

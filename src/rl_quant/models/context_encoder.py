@@ -26,7 +26,6 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 
-
 # PyTorch 2.6's fused CUDA SDPA kernels map the leading batch dimension directly
 # to a CUDA grid dimension, whose portable limit is 65,535.  Running at that
 # literal boundary is not robust in FlashAttention backward, and its padded FP32
@@ -148,20 +147,47 @@ class _CausalBlock(nn.Module):
         self.ff = nn.Sequential(nn.Linear(d, ff), nn.GELU(), nn.Linear(ff, d))
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:  # x [N, S, d]
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        *,
+        causal_lookback: int | None = None,
+    ) -> torch.Tensor:  # x [N, S, d]
         N, S, d = x.shape
+        if causal_lookback is not None and (
+            isinstance(causal_lookback, bool)
+            or not isinstance(causal_lookback, int)
+            or causal_lookback <= 0
+        ):
+            raise ValueError("causal_lookback must be a positive integer or None")
         h = self.ln1(x)
         qkv = self.qkv(h).reshape(N, S, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]                 # each [N, n_heads, S, head_dim]
         attn_mask = None
         is_causal = True
-        if key_padding_mask is not None and bool(key_padding_mask.any()):
-            kpm = key_padding_mask.bool()
+        use_bounded_lookback = (
+            causal_lookback is not None and causal_lookback < S
+        )
+        if (
+            key_padding_mask is not None and bool(key_padding_mask.any())
+        ) or use_bounded_lookback:
+            kpm = (
+                torch.zeros((N, S), dtype=torch.bool, device=x.device)
+                if key_padding_mask is None
+                else key_padding_mask.bool()
+            )
             if bool(kpm.all(dim=1).any()):
                 kpm = kpm.clone()
                 kpm[kpm.all(dim=1), 0] = False
             key_allowed = (~kpm).view(N, 1, 1, S)        # bool mask: True keys may be attended
             causal_allowed = torch.ones(S, S, dtype=torch.bool, device=x.device).tril().view(1, 1, S, S)
+            if use_bounded_lookback:
+                positions = torch.arange(S, device=x.device)
+                distance = positions.view(S, 1) - positions.view(1, S)
+                causal_allowed = causal_allowed & (
+                    distance < int(causal_lookback)
+                ).view(1, 1, S, S)
             attn_mask = causal_allowed & key_allowed
             is_causal = False
         a = _bounded_scaled_dot_product_attention(

@@ -372,6 +372,9 @@ def test_canonical_replay_matches_and_credits_exactly_thirty_post_fill_returns()
     assert len(trace.pending_intents) == 94
     assert replay.origin == 63
     assert replay.utility_rows.numel() == 31
+    assert replay.discretionary_sold_value_by_age is not None
+    assert replay.discretionary_sold_value_by_age.shape == (61,)
+    assert replay.discretionary_sold_value_by_age.sum() >= 0
     assert policy.call_count == canonical_calls + 1  # support intents were reused, not reevaluated
     first_grad = torch.autograd.grad(
         replay.utility_rows[0], policy.encoder_scale, retain_graph=True

@@ -621,6 +621,7 @@ class CrossDayTemporalEncoder(nn.Module):
         feedforward_dim: int,
         dropout: float,
         max_days: int,
+        attention_lookback: int | None = None,
     ) -> None:
         super().__init__()
         self.register_buffer(
@@ -634,6 +635,13 @@ class CrossDayTemporalEncoder(nn.Module):
         )
         self.norm = nn.LayerNorm(d_model)
         self.d_model = d_model
+        if attention_lookback is not None and (
+            isinstance(attention_lookback, bool)
+            or not isinstance(attention_lookback, int)
+            or attention_lookback <= 0
+        ):
+            raise ValueError("attention_lookback must be a positive integer or None")
+        self.attention_lookback = attention_lookback
 
     def forward(
         self, seq: torch.Tensor, day_valid: torch.Tensor | None = None
@@ -655,7 +663,7 @@ class CrossDayTemporalEncoder(nn.Module):
             else None
         )
         for blk in self.blocks:
-            x = blk(x, kpm)
+            x = blk(x, kpm, causal_lookback=self.attention_lookback)
         # Standalone CUDA LayerNorm returns FP32 under autocast.  Keep its FP32 internal reduction, then restore
         # the BF16 residual dtype so the full [B,T,A,d] state and allocator input do not double in size.
         x = self.norm(x).to(dtype=x.dtype)
@@ -726,6 +734,11 @@ class DailyCrossSectionConfig:
     temporal_layers: int = 2
     temporal_heads: int = 4
     daily_lookback: int = 60
+    # Optional model-enforced rolling attention window.  ``None`` preserves
+    # every legacy caller, which already supplies externally windowed input.
+    # Development adapters that feed a longer chronology must bind this
+    # explicitly to prevent a short-context ablation from seeing older rows.
+    temporal_attention_lookback: int | None = None
     max_days: int = 256
     alloc_layers: int = 2
     alloc_heads: int = 4
@@ -741,6 +754,11 @@ class DailyCrossSectionConfig:
     #                                  tokens carry frozen ctx + news + the past-return channel only (has_raw=0).
     #                                  Extends the cross-day memory to e.g. 252d at ~the 42d raw compute.
     #                                  0 = every day raw (the original behavior).
+    # Development-only daily-aggregate adapters can opt into a lightweight
+    # raw-day token at every context row while retaining the distinct 42-day
+    # full-intraday contract in their outer protocol.  Legacy and canonical
+    # raw-bar routes remain byte-for-byte unchanged by the default.
+    encode_aggregated_daily_ohlcv_all_days: bool = False
     raw_stock_chunk: int = 0
     #                                  many stocks (bit-identical -- all its norms are per-(stock,day)); REQUIRED
     #                                  for huge universes (TOP2000: ~512/chunk on an 80GB H100). 0 = single pass.
@@ -1016,6 +1034,7 @@ class DailyCrossSectionPolicy(nn.Module):
             feedforward_dim=config.feedforward_dim,
             dropout=config.dropout,
             max_days=config.max_days,
+            attention_lookback=config.temporal_attention_lookback,
         )
         # allocator: cross-sectional set-transformer over [temporal state | prev weight] per day
         self.alloc_in = nn.Linear(config.token_dim + 1, config.token_dim)
@@ -1212,6 +1231,8 @@ class DailyCrossSectionPolicy(nn.Module):
     def _raw_day_mask(self, T: int) -> list[bool]:
         """Two-speed assignment for a length-T episode: the last `raw_recent_days` days get the trainable raw
         encode (all days if raw_recent_days<=0)."""
+        if self.config.encode_aggregated_daily_ohlcv_all_days:
+            return [True] * T
         r = self.config.raw_recent_days
         return [True] * T if r <= 0 else [t >= T - r for t in range(T)]
 

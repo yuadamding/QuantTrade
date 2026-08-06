@@ -15,14 +15,14 @@ wealth.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
 
 from rl_quant.protocol.hold30 import resolve_hold30_setting
-
 
 HOLD30_WARMUP_DECISIONS = 63
 HOLD30_CREDIT_RETURNS = 30
@@ -44,6 +44,10 @@ class Hold30ReplayGeometry:
     warmup_decisions: int = HOLD30_WARMUP_DECISIONS
     credit_returns: int = HOLD30_CREDIT_RETURNS
     support_decisions: int = HOLD30_SUPPORT_DECISIONS
+    # Optional detached label-only tail.  It never extends the economic
+    # return credit or origin replay; it only keeps longer auxiliary labels
+    # inside the training chronology.  Legacy callers retain 30.
+    label_support_decisions: int = HOLD30_SUPPORT_DECISIONS
     max_origin_batch: int = HOLD30_MAX_ORIGIN_BATCH
 
     def __post_init__(self) -> None:
@@ -51,6 +55,7 @@ class Hold30ReplayGeometry:
             self.warmup_decisions,
             self.credit_returns,
             self.support_decisions,
+            self.label_support_decisions,
             self.max_origin_batch,
         )
         if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in values):
@@ -61,9 +66,13 @@ class Hold30ReplayGeometry:
     @property
     def minimum_positions(self) -> int:
         # At least one anchor, its thirty support decisions, and terminal state.
-        return self.warmup_decisions + self.support_decisions + 2
+        return (
+            self.warmup_decisions
+            + max(self.support_decisions, self.label_support_decisions)
+            + 2
+        )
 
-    def roles(self, n_positions: int) -> "Hold30CreditRoles":
+    def roles(self, n_positions: int) -> Hold30CreditRoles:
         if isinstance(n_positions, bool) or not isinstance(n_positions, int):
             raise TypeError("n_positions must be an integer")
         if n_positions < self.minimum_positions:
@@ -71,9 +80,20 @@ class Hold30ReplayGeometry:
                 f"Hold-30 block needs at least {self.minimum_positions} positions, got {n_positions}"
             )
         terminal = n_positions - 1
-        support_start = terminal - self.support_decisions
-        anchors = torch.arange(self.warmup_decisions, support_start, dtype=torch.long)
-        support = torch.arange(support_start, terminal, dtype=torch.long)
+        label_support_start = terminal - max(
+            self.support_decisions,
+            self.label_support_decisions,
+        )
+        anchors = torch.arange(
+            self.warmup_decisions,
+            label_support_start,
+            dtype=torch.long,
+        )
+        support = torch.arange(
+            terminal - self.support_decisions,
+            terminal,
+            dtype=torch.long,
+        )
         if anchors.numel() == 0:
             raise ValueError("Hold-30 block contains no loss-bearing anchors")
         offsets = torch.arange(self.credit_returns + 1, dtype=torch.long)
@@ -196,7 +216,7 @@ class Hold30LossContract:
                 raise ValueError(f"{name} must be finite")
 
     @classmethod
-    def for_setting(cls, setting_id: str) -> "Hold30LossContract":
+    def for_setting(cls, setting_id: str) -> Hold30LossContract:
         setting = resolve_hold30_setting(setting_id)
         return cls(
             setting.mechanism,
@@ -216,6 +236,15 @@ class Hold30OriginReplay:
     early_sale_mass: torch.Tensor
     gate: torch.Tensor
     gate_entropy: torch.Tensor
+    # Optional generation-qualified accounting used by the proportional v7
+    # persistence objective.  Legacy Hold-30 routes intentionally leave this
+    # unset and retain their frozen scalar ``early_sale_mass`` semantics.
+    discretionary_sold_value_by_age: torch.Tensor | None = None
+    # Optional origin-time residual-alpha heads.  Generation-qualified
+    # trainers own the corresponding future-label construction; the runtime
+    # only preserves the differentiable prediction emitted at the decision.
+    auxiliary_alpha_mean: torch.Tensor | None = None
+    alpha_downside_30d: torch.Tensor | None = None
 
     def validate(self, *, credit_returns: int = HOLD30_CREDIT_RETURNS) -> None:
         if isinstance(self.origin, bool) or not isinstance(self.origin, int) or self.origin < 0:
@@ -226,12 +255,56 @@ class Hold30OriginReplay:
             value = getattr(self, name)
             if not isinstance(value, torch.Tensor) or value.numel() != 1:
                 raise ValueError(f"{name} must be a scalar tensor")
+        sold_by_age = self.discretionary_sold_value_by_age
+        if sold_by_age is not None and (
+            not isinstance(sold_by_age, torch.Tensor)
+            or sold_by_age.ndim != 1
+            or sold_by_age.numel() != 61
+            or not sold_by_age.is_floating_point()
+            or bool((sold_by_age < 0).any())
+            or not bool(torch.isfinite(sold_by_age).all())
+        ):
+            raise ValueError(
+                "discretionary_sold_value_by_age must be finite nonnegative "
+                "floating notional in exactly 61 age bins"
+            )
+        auxiliary = self.auxiliary_alpha_mean
+        downside = self.alpha_downside_30d
+        if auxiliary is not None and (
+            not isinstance(auxiliary, torch.Tensor)
+            or auxiliary.ndim != 3
+            or auxiliary.shape[-1] != 4
+            or not auxiliary.is_floating_point()
+            or not bool(torch.isfinite(auxiliary).all())
+        ):
+            raise ValueError(
+                "auxiliary_alpha_mean must be finite floating "
+                "[batch,asset,4] when present"
+            )
+        if downside is not None and (
+            auxiliary is None
+            or not isinstance(downside, torch.Tensor)
+            or tuple(downside.shape) != tuple(auxiliary.shape[:-1])
+            or not downside.is_floating_point()
+            # CASH and unavailable coordinates are allowed to carry zero;
+            # qualified alpha losses mask them before clamping valid risky
+            # scales to a strictly positive numerical floor.
+            or bool((downside < 0).any())
+            or not bool(torch.isfinite(downside).all())
+        ):
+            raise ValueError(
+                "alpha_downside_30d must be finite nonnegative [batch,asset] "
+                "and requires auxiliary_alpha_mean"
+            )
         tensors = (
             self.utility_rows,
             self.discretionary_turnover,
             self.early_sale_mass,
             self.gate,
             self.gate_entropy,
+            *(() if sold_by_age is None else (sold_by_age,)),
+            *(() if auxiliary is None else (auxiliary,)),
+            *(() if downside is None else (downside,)),
         )
         if not all(bool(torch.isfinite(value).all()) for value in tensors):
             raise ValueError("origin replay contains non-finite values")
@@ -528,8 +601,8 @@ __all__ = [
     "HOLD30_MAX_ORIGIN_BATCH",
     "HOLD30_SUPPORT_DECISIONS",
     "HOLD30_WARMUP_DECISIONS",
-    "Hold30CanonicalRow",
     "Hold30CalendarDiagnostic",
+    "Hold30CanonicalRow",
     "Hold30CreditRoles",
     "Hold30LossContract",
     "Hold30OriginReplay",
