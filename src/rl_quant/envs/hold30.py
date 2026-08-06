@@ -24,6 +24,185 @@ import torch
 MAX_EXACT_AGE = 60
 AGE_BIN_COUNT = MAX_EXACT_AGE + 1
 TARGET_HOLDING_DAYS = 30
+SIMPLEX_RECONCILIATION_ATOL = 1e-6
+SIMPLEX_ROUNDOFF_GUARD_ULPS = 8
+
+
+def _close_cash_simplex_roundoff_unchecked(
+    weights: torch.Tensor,
+    *,
+    cash_index: int,
+    gross_limit: torch.Tensor,
+) -> torch.Tensor:
+    """Tensor-only closure for already validated internal economic books."""
+
+    risky_mask = torch.ones_like(weights, dtype=torch.bool)
+    risky_mask[:, cash_index] = False
+    risky = torch.where(risky_mask, weights, torch.zeros_like(weights))
+    gross = risky.sum(dim=-1)
+    guard = SIMPLEX_ROUNDOFF_GUARD_ULPS * torch.finfo(weights.dtype).eps
+    repair = gross > gross_limit
+    scale = torch.where(
+        repair,
+        gross_limit
+        * (1.0 - guard)
+        / gross.clamp_min(torch.finfo(weights.dtype).tiny),
+        torch.ones_like(gross),
+    )
+    risky = risky * scale.unsqueeze(-1)
+    repaired_gross = risky.sum(dim=-1)
+    reconciled = risky.clone()
+    reconciled[:, cash_index] = (1.0 - repaired_gross).clamp_min(0.0)
+    return reconciled
+
+
+def reconcile_cash_simplex_roundoff(
+    weights: torch.Tensor,
+    *,
+    cash_index: int,
+    risky_gross_limit: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Close a long-only FP32/FP64 book without admitting negative CASH.
+
+    A reduction over hundreds or thousands of individually valid FP32 risky
+    weights can round one ULP above its gross limit.  CASH is implicit in the
+    cohort ledger, so a raw ``1 - risky.sum()`` would then manufacture a
+    negative holding.  This helper repairs only a sub-tolerance overshoot by
+    shrinking the risky book radially into the feasible set, then recomputes
+    CASH.  Material infeasibility still fails closed.
+
+    The repair is accounting-only numerical reconciliation.  Callers must
+    apply it before turnover is measured so it is never classified as a
+    trade.  Economic books deliberately remain FP32 or FP64 even when neural
+    encoders run under mixed precision.
+    """
+
+    if weights.ndim != 2:
+        raise ValueError(
+            "weights must have shape [batch, asset] for simplex reconciliation"
+        )
+    if weights.dtype not in (torch.float32, torch.float64):
+        raise TypeError("economic portfolio weights must use float32 or float64")
+    if not 0 <= cash_index < weights.shape[1]:
+        raise ValueError("cash_index is outside the asset axis")
+    if not bool(torch.isfinite(weights).all().item()):
+        raise ValueError("weights must be finite for simplex reconciliation")
+
+    risky_mask = torch.ones_like(weights, dtype=torch.bool)
+    risky_mask[:, cash_index] = False
+    risky = torch.where(risky_mask, weights, torch.zeros_like(weights))
+    if bool((risky < 0).any().item()):
+        raise ValueError("risky weights must be nonnegative before reconciliation")
+    cash_input = weights[:, cash_index]
+    if bool((cash_input < -SIMPLEX_RECONCILIATION_ATOL).any().item()):
+        raise ValueError("cash is materially negative before simplex reconciliation")
+    input_totals = weights.sum(dim=-1)
+    if not bool(
+        torch.allclose(
+            input_totals,
+            torch.ones_like(input_totals),
+            atol=SIMPLEX_RECONCILIATION_ATOL,
+            rtol=SIMPLEX_RECONCILIATION_ATOL,
+        )
+    ):
+        raise ValueError("weights are not a simplex within reconciliation tolerance")
+
+    batch = weights.shape[0]
+    if risky_gross_limit is None:
+        gross_limit = torch.ones(batch, dtype=weights.dtype, device=weights.device)
+    else:
+        gross_limit = torch.as_tensor(
+            risky_gross_limit,
+            dtype=weights.dtype,
+            device=weights.device,
+        )
+        if tuple(gross_limit.shape) != (batch,):
+            raise ValueError("risky_gross_limit must have shape [batch]")
+        if not bool(torch.isfinite(gross_limit).all().item()) or bool(
+            ((gross_limit < 0) | (gross_limit > 1)).any().item()
+        ):
+            raise ValueError("risky_gross_limit must be finite and lie in [0,1]")
+
+    gross = risky.sum(dim=-1)
+    excess = gross - gross_limit
+    if bool((excess > SIMPLEX_RECONCILIATION_ATOL).any().item()):
+        maximum = float(excess.detach().max().item())
+        raise ValueError(
+            "risky gross exceeds its limit beyond numerical roundoff "
+            f"(maximum excess {maximum:g})"
+        )
+
+    # Enter the feasible set by several output-dtype ULPs only on rows whose
+    # reduction rounded above the limit.  The package-private tensor-only path
+    # is also used for frequently-read, already validated ledger weights.
+    reconciled = _close_cash_simplex_roundoff_unchecked(
+        weights,
+        cash_index=cash_index,
+        gross_limit=gross_limit,
+    )
+    repaired_gross = torch.where(
+        risky_mask,
+        reconciled,
+        torch.zeros_like(reconciled),
+    ).sum(dim=-1)
+    post_excess = repaired_gross - gross_limit
+    if bool((post_excess > SIMPLEX_RECONCILIATION_ATOL).any().item()):
+        maximum = float(post_excess.detach().max().item())
+        raise ValueError(
+            "simplex roundoff repair did not restore the risky-gross limit "
+            f"(maximum excess {maximum:g})"
+        )
+
+    cash = reconciled[:, cash_index]
+    if bool((cash < -SIMPLEX_RECONCILIATION_ATOL).any().item()):
+        minimum = float(cash.detach().min().item())
+        raise ValueError(
+            "simplex roundoff repair produced material negative cash "
+            f"(minimum {minimum:g})"
+        )
+    totals = reconciled.sum(dim=-1)
+    if bool((reconciled < 0).any().item()) or not bool(
+        torch.allclose(
+            totals,
+            torch.ones_like(totals),
+            atol=SIMPLEX_RECONCILIATION_ATOL,
+            rtol=SIMPLEX_RECONCILIATION_ATOL,
+        )
+    ):
+        raise ValueError("simplex roundoff repair failed its strict postconditions")
+    return reconciled
+
+
+def _reconcile_cohort_economic_roundoff(
+    economic_value: torch.Tensor,
+    *,
+    cash_index: int,
+) -> torch.Tensor:
+    """Canonicalize the stored risky cohort mass, not merely its public view."""
+
+    # Match the public ``weights`` reduction order exactly: age first, then
+    # assets.  FP32 reductions over a staggered 61-bin ledger can otherwise
+    # disagree by more than the reconciliation budget even when a direct
+    # two-axis reduction appears feasible.
+    gross = economic_value.sum(dim=-1).sum(dim=-1)
+    excess = gross - 1.0
+    if bool((excess > SIMPLEX_RECONCILIATION_ATOL).any().item()):
+        maximum = float(excess.detach().max().item())
+        raise ValueError(
+            "cohort economic gross exceeds one beyond numerical roundoff "
+            f"(maximum excess {maximum:g})"
+        )
+    guard = SIMPLEX_ROUNDOFF_GUARD_ULPS * torch.finfo(economic_value.dtype).eps
+    repair = gross > 1.0
+    scale = torch.where(
+        repair,
+        (1.0 - guard) / gross.clamp_min(torch.finfo(economic_value.dtype).tiny),
+        torch.ones_like(gross),
+    )
+    reconciled = economic_value * scale[:, None, None]
+    reconciled = reconciled.clone()
+    reconciled[:, cash_index] = 0.0
+    return reconciled
 
 
 class TurnoverCause(str, Enum):
@@ -61,12 +240,16 @@ def _validate_weight_tensor(weights: torch.Tensor, *, name: str) -> None:
         raise ValueError(
             f"{name} must have shape [batch, asset]; got {tuple(weights.shape)}."
         )
-    if not weights.is_floating_point():
-        raise TypeError(f"{name} must use a floating dtype; got {weights.dtype}.")
+    if weights.dtype not in (torch.float32, torch.float64):
+        raise TypeError(
+            f"{name} must use float32 or float64 economic accounting; "
+            f"got {weights.dtype}."
+        )
     if not bool(torch.isfinite(weights).all().item()):
         raise ValueError(f"{name} must contain only finite values.")
-    if bool((weights < -1e-7).any().item()):
-        raise ValueError(f"{name} must be nonnegative.")
+    if bool((weights < 0).any().item()):
+        minimum = float(weights.detach().min().item())
+        raise ValueError(f"{name} must be nonnegative; minimum={minimum:g}.")
     totals = weights.sum(dim=-1)
     if not bool(torch.allclose(totals, torch.ones_like(totals), atol=1e-6, rtol=1e-6)):
         raise ValueError(f"{name} must sum to one along the asset dimension.")
@@ -148,20 +331,32 @@ class CohortLedger:
             or self.retention_units.device != self.economic_value.device
         ):
             raise ValueError("Both cohort ledgers must share dtype and device.")
+        if self.economic_value.dtype not in (torch.float32, torch.float64):
+            raise TypeError(
+                "cohort economic accounting must use float32 or float64"
+            )
         if not 0 <= self.cash_index < self.economic_value.shape[1]:
             raise ValueError("cash_index is outside the asset axis.")
         if not bool(torch.isfinite(self.economic_value).all()) or not bool(
             torch.isfinite(self.retention_units).all()
         ):
             raise ValueError("cohort ledgers must contain only finite values.")
-        if bool((self.economic_value < -1e-7).any()) or bool(
-            (self.retention_units < -1e-7).any()
+        if bool((self.economic_value < 0).any()) or bool(
+            (self.retention_units < 0).any()
         ):
             raise ValueError("cohort ledgers cannot contain negative mass.")
         if bool((self.economic_value[:, self.cash_index] != 0).any()) or bool(
             (self.retention_units[:, self.cash_index] != 0).any()
         ):
             raise ValueError("CASH cannot carry economic or retention age cohorts.")
+        object.__setattr__(
+            self,
+            "economic_value",
+            _reconcile_cohort_economic_roundoff(
+                self.economic_value,
+                cash_index=self.cash_index,
+            ),
+        )
 
     @classmethod
     def from_weights(
@@ -220,7 +415,7 @@ class CohortLedger:
             raise ValueError("cash_index is outside the asset axis.")
         for name, value in (("youngest_age", youngest_age), ("oldest_age", oldest_age)):
             if isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(f"{name} must be an integer in [0, {MAX_EXACT_AGE}].")
+                raise TypeError(f"{name} must be an integer in [0, {MAX_EXACT_AGE}].")
             if not 0 <= value <= MAX_EXACT_AGE:
                 raise ValueError(f"{name} must be an integer in [0, {MAX_EXACT_AGE}].")
         if youngest_age > oldest_age:
@@ -244,10 +439,17 @@ class CohortLedger:
     @property
     def weights(self) -> torch.Tensor:
         risky = self.economic_value.sum(dim=-1)
-        cash = 1.0 - risky.sum(dim=-1)
         full = risky.clone()
-        full[:, self.cash_index] = cash
-        return full
+        full[:, self.cash_index] = 1.0 - risky.sum(dim=-1)
+        return _close_cash_simplex_roundoff_unchecked(
+            full,
+            cash_index=self.cash_index,
+            gross_limit=torch.ones(
+                self.batch_size,
+                dtype=full.dtype,
+                device=full.device,
+            ),
+        )
 
     def clone(self) -> CohortLedger:
         return CohortLedger(

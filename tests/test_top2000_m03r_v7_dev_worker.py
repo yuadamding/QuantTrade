@@ -71,6 +71,25 @@ def test_plan_round_trip_is_content_pinned(tmp_path: Path) -> None:
         )
 
 
+def test_extended_qualification_is_restricted_to_exact_a08_geometry(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(worker.Top2000M03RV7WorkerError, match="restricted to"):
+        worker.run_worker(
+            _plan(tmp_path, optimizer_steps=64, setting_index=0),
+            plan_file_sha256="b" * 64,
+            qualification_only=True,
+            qualification_steps=20,
+        )
+    with pytest.raises(worker.Top2000M03RV7WorkerError, match="must lie"):
+        worker.run_worker(
+            _plan(tmp_path, optimizer_steps=64, setting_index=3),
+            plan_file_sha256="b" * 64,
+            qualification_only=True,
+            qualification_steps=19,
+        )
+
+
 def test_new_cell_applies_content_bound_activation_checkpointing(
     tmp_path: Path,
 ) -> None:

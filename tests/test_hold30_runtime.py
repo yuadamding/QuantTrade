@@ -5,7 +5,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from rl_quant.envs.hold30 import CohortLedger, TurnoverCause
+from rl_quant.envs.hold30 import (
+    CohortLedger,
+    TurnoverCause,
+    reconcile_cash_simplex_roundoff,
+)
 from rl_quant.execution.hold30 import Hold30BuiltAction, build_alpha_hold30_action
 from rl_quant.models.daily_policy import (
     HOLD30_HAZARD_MIN,
@@ -19,6 +23,7 @@ from rl_quant.models.hold30_exit_action_v6 import (
     M03RV6ExitAction,
     straight_through_m03r_v6_exit_action,
 )
+from rl_quant.training import hold30_runtime
 from rl_quant.training.hold30 import (
     Hold30LossContract,
     Hold30ReplayGeometry,
@@ -31,6 +36,145 @@ from rl_quant.training.hold30_runtime import (
     Hold30SafetyProjectionError,
     Hold30Sequence,
 )
+
+
+def test_top2000_fp32_simplex_roundoff_is_repaired_before_accounting() -> None:
+    """Regression for the failed 2xH100 TOP2000 training boundary."""
+
+    risky_assets = 334
+    weights = torch.zeros((1, risky_assets + 1), dtype=torch.float32)
+    weights[:, 1:] = 1.0 / risky_assets
+    # This exact reduction order generated the production failure.
+    assert float(1.0 - weights[:, 1:].sum()) == pytest.approx(
+        -1.1920928955078125e-07,
+        abs=0.0,
+    )
+
+    projected = hold30_runtime._risk_project(
+        weights,
+        torch.full_like(weights, 0.01),
+        torch.ones(1, dtype=torch.float32),
+        0,
+    )
+    assert bool((projected >= 0).all())
+    torch.testing.assert_close(
+        projected.sum(-1),
+        torch.ones(1, dtype=torch.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert float(projected[:, 1:].sum()) <= 1.0
+
+    ledger = CohortLedger.from_weights(projected, cash_index=0)
+    unchanged, accounting = ledger.trade_to(
+        ledger.weights,
+        cause=TurnoverCause.RISK_FORCED,
+    )
+    assert float(accounting.turnover.item()) == 0.0
+    assert bool((unchanged.weights >= 0).all())
+    torch.testing.assert_close(
+        unchanged.weights.sum(-1),
+        torch.ones(1, dtype=torch.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    small_sale_target = ledger.weights.clone()
+    small_sale_target[:, 1] -= 1.0e-4
+    small_sale_target[:, 0] += 1.0e-4
+    after_sale, sale_accounting = ledger.trade_to(
+        small_sale_target,
+        cause=TurnoverCause.DISCRETIONARY,
+    )
+    after_sale.assert_reconciles(small_sale_target)
+    assert sale_accounting.turnover.item() == pytest.approx(1.0e-4)
+
+
+def test_top2000_current_shape_survives_drift_and_zero_change_trade() -> None:
+    risky_assets = 1_998
+    weights = torch.zeros((1, risky_assets + 1), dtype=torch.float32)
+    weights[:, 1:] = 1.0 / risky_assets
+    ledger = CohortLedger.from_weights(weights, cash_index=0)
+    generator = torch.Generator().manual_seed(3)
+    returns = torch.zeros_like(weights)
+    returns[:, 1:] = 0.001 * torch.randn(
+        (1, risky_assets),
+        generator=generator,
+    )
+
+    drifted = ledger.age_and_drift(returns)
+    assert bool((drifted.weights >= 0).all())
+    unchanged, accounting = drifted.trade_to(
+        drifted.weights,
+        cause=TurnoverCause.DISCRETIONARY,
+    )
+    assert float(accounting.turnover.item()) == 0.0
+    assert bool((unchanged.weights >= 0).all())
+
+
+@pytest.mark.parametrize("risky_assets", [1_602, 1_626, 1_654, 1_700, 1_750])
+def test_staggered_top2000_ledger_reconciles_after_normal_sale(
+    risky_assets: int,
+) -> None:
+    weights = torch.zeros((1, 1_999), dtype=torch.float32)
+    weights[:, 1 : risky_assets + 1] = 1.0 / risky_assets
+    ledger = CohortLedger.from_staggered_endowment(
+        weights,
+        cash_index=0,
+        youngest_age=0,
+        oldest_age=29,
+    )
+    target = ledger.weights.clone()
+    target[:, 1] -= 1.0e-4
+    target[:, 0] += 1.0e-4
+
+    after_sale, accounting = ledger.trade_to(
+        target,
+        cause=TurnoverCause.DISCRETIONARY,
+    )
+    after_sale.assert_reconciles(target)
+    assert accounting.turnover.item() == pytest.approx(1.0e-4)
+
+
+def test_simplex_reconciliation_rejects_material_overshoot_and_low_precision() -> None:
+    with pytest.raises(ValueError, match="simplex|beyond numerical roundoff"):
+        hold30_runtime._force_mask_to_cash(
+            torch.tensor([[0.0, 0.55, 0.46]], dtype=torch.float32),
+            torch.ones((1, 3), dtype=torch.bool),
+            0,
+        )
+    with pytest.raises(TypeError, match="float32 or float64"):
+        CohortLedger.from_weights(
+            torch.tensor([[0.5, 0.5]], dtype=torch.bfloat16),
+            cash_index=0,
+        )
+    for malformed in (
+        torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        torch.tensor([[-0.5, 1.0]], dtype=torch.float32),
+        torch.tensor([[0.5, 0.1]], dtype=torch.float32),
+    ):
+        with pytest.raises(ValueError):
+            reconcile_cash_simplex_roundoff(malformed, cash_index=0)
+
+
+@pytest.mark.parametrize(
+    "risky_assets",
+    [100, 121, 300, 334, 1_000, 1_985, 1_994, 1_998],
+)
+def test_simplex_reconciliation_covers_top2000_asset_counts(
+    risky_assets: int,
+) -> None:
+    weights = torch.zeros((1, risky_assets + 1), dtype=torch.float32)
+    weights[:, 1:] = 1.0 / risky_assets
+    reconciled = reconcile_cash_simplex_roundoff(weights, cash_index=0)
+
+    assert bool((reconciled >= 0).all())
+    torch.testing.assert_close(
+        reconciled.sum(-1),
+        torch.ones(1, dtype=torch.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def _sequence(

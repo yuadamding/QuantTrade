@@ -99,6 +99,7 @@ COMPLETION_RECEIPT_SCHEMA = "rl-quant.top2000-dev.m03r-v7-completion-receipt-v1"
 QUALIFICATION_RECEIPT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v7-bounded-qualification-v1"
 )
+MAX_EXTENDED_QUALIFICATION_STEPS = 20
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _INTENTIONAL_RESTART_MARKER_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v7-intentional-restart-marker-v1"
@@ -2198,8 +2199,25 @@ def run_worker(
     """Run one setting, returning the rank-zero terminal receipt."""
 
     run_started = time.perf_counter()
-    if isinstance(qualification_steps, bool) or not 1 <= qualification_steps <= 4:
-        raise Top2000M03RV7WorkerError("qualification_steps must lie in [1, 4]")
+    if isinstance(qualification_steps, bool) or not (
+        1 <= qualification_steps <= 4
+        or qualification_steps == MAX_EXTENDED_QUALIFICATION_STEPS
+    ):
+        raise Top2000M03RV7WorkerError(
+            "qualification_steps must lie in [1, 4] or equal the approved "
+            f"extended sentinel length {MAX_EXTENDED_QUALIFICATION_STEPS}"
+        )
+    extended_sentinel = qualification_steps == MAX_EXTENDED_QUALIFICATION_STEPS
+    if extended_sentinel and (
+        not qualification_only
+        or qualification_restart_after_step1
+        or plan.setting_index != 3
+        or plan.setting_id != M03R_TOP2000_DEV_SETTING_IDS[3]
+    ):
+        raise Top2000M03RV7WorkerError(
+            "the 20-update sentinel is restricted to qualification-only A08 "
+            "without intentional restart"
+        )
     if qualification_restart_after_step1 and (
         not qualification_only or qualification_steps != 4
     ):
@@ -2210,7 +2228,13 @@ def run_worker(
         _torchrun_restart_count() if qualification_restart_after_step1 else 0
     )
     context = _distributed_context(qualification_only=qualification_only)
-    mode = "qualification" if qualification_only else "full"
+    mode = (
+        "qualification-extended-a08-20"
+        if extended_sentinel
+        else "qualification"
+        if qualification_only
+        else "full"
+    )
     try:
         if not qualification_only and context.world_size != plan.expected_world_size:
             raise Top2000M03RV7WorkerError(

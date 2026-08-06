@@ -38,6 +38,7 @@ from rl_quant.envs.hold30 import (
     CohortLedger,
     CohortTradeAccounting,
     TurnoverCause,
+    reconcile_cash_simplex_roundoff,
 )
 from rl_quant.execution.hold30 import (
     HOLD30_MAX_STOCK_WEIGHT,
@@ -248,7 +249,7 @@ class Hold30Sequence:
         if bool((self.risk_asset_caps < 0).any()) or bool((self.risk_gross_max < 0).any()):
             raise ValueError("risk caps cannot be negative")
         benchmark_totals = self.benchmark_weights.sum(-1)
-        if bool((self.benchmark_weights < -HOLD30_RECONCILIATION_TOLERANCE).any()) or not bool(
+        if bool((self.benchmark_weights < 0).any()) or not bool(
             torch.allclose(benchmark_totals, torch.ones_like(benchmark_totals), atol=1e-6, rtol=1e-6)
         ):
             raise ValueError("benchmark_weights must be nonnegative simplexes")
@@ -552,12 +553,18 @@ def _zero_accounting(ledger: CohortLedger, cause: TurnoverCause) -> CohortTradeA
 
 
 def _force_mask_to_cash(weights: torch.Tensor, allowed: torch.Tensor, cash_index: int) -> torch.Tensor:
-    target = torch.where(allowed, weights, torch.zeros_like(weights))
-    target = target.clone()
+    canonical = reconcile_cash_simplex_roundoff(weights, cash_index=cash_index)
+    target = torch.where(allowed, canonical, torch.zeros_like(canonical))
     risky = torch.ones_like(target, dtype=torch.bool)
     risky[:, cash_index] = False
-    target[:, cash_index] = 1.0 - torch.where(risky, target, torch.zeros_like(target)).sum(-1)
-    return target
+    released = torch.where(
+        risky & ~allowed,
+        canonical,
+        torch.zeros_like(canonical),
+    ).sum(-1)
+    target = target.clone()
+    target[:, cash_index] = canonical[:, cash_index] + released
+    return reconcile_cash_simplex_roundoff(target, cash_index=cash_index)
 
 
 def _risk_project(
@@ -584,7 +591,11 @@ def _risk_project(
     held = held * scale.unsqueeze(-1)
     target = held.clone()
     target[:, cash_index] = 1.0 - held.sum(-1)
-    return target
+    return reconcile_cash_simplex_roundoff(
+        target,
+        cash_index=cash_index,
+        risky_gross_limit=hard_gross,
+    )
 
 
 def _one_way(new: torch.Tensor, old: torch.Tensor) -> torch.Tensor:

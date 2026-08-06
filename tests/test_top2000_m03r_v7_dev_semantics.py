@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from rl_quant.envs.hold30 import CohortLedger
+from rl_quant.envs.hold30 import CohortLedger, reconcile_cash_simplex_roundoff
 from rl_quant.models.daily_policy import Hold30Intent
+from rl_quant.training import hold30_runtime
 from rl_quant.training.top2000_m03r_v7_dev import (
     Top2000M03RV7ActionBuilder,
     Top2000M03RV7DevelopmentPolicy,
@@ -215,6 +217,77 @@ def test_factor_neutrality_is_applied_to_executed_active_weights_with_gradient()
         gross,
     )
     assert torch.allclose(projected, shifted, atol=2.0e-6, rtol=2.0e-6)
+
+
+@pytest.mark.parametrize(
+    ("assets", "risky_assets"),
+    [(335, 334), (1_999, 1_602), (1_999, 1_700), (1_999, 1_750)],
+)
+def test_factor_projection_emits_strict_fp32_top2000_execution_book(
+    assets: int,
+    risky_assets: int,
+) -> None:
+    torch.manual_seed(0)
+    benchmark = torch.zeros((1, assets), dtype=torch.float32)
+    benchmark[:, 1 : risky_assets + 1] = 1.0 / risky_assets
+    requested = torch.zeros_like(benchmark)
+    requested[:, 1 : risky_assets + 1] = torch.softmax(
+        0.1 * torch.randn((1, risky_assets), dtype=torch.float32),
+        dim=-1,
+    )
+    requested.requires_grad_(True)
+    loadings = torch.randn((assets, 4), dtype=torch.float32)
+    loadings[0] = 0.0
+    trade_mask = torch.zeros((1, assets), dtype=torch.bool)
+    trade_mask[:, : risky_assets + 1] = True
+    caps = torch.full((1, assets), 0.01, dtype=torch.float32)
+    caps[:, 0] = 0.0
+    caps[:, risky_assets + 1 :] = 0.0
+    gross = torch.ones(1, dtype=torch.float32)
+
+    projected = top2000_m03r_v7_factor_neutral_executed_weights(
+        requested,
+        benchmark,
+        loadings,
+        trade_mask,
+        caps,
+        gross,
+    )
+    canonical_benchmark = reconcile_cash_simplex_roundoff(
+        benchmark,
+        cash_index=0,
+        risky_gross_limit=gross,
+    )
+    active = projected - canonical_benchmark
+    assert bool((projected >= 0).all())
+    assert bool((projected[:, 1:] <= caps[:, 1:] + 2.0e-6).all())
+    assert float(projected[:, 1:].sum()) <= 1.0 + 2.0e-6
+    torch.testing.assert_close(
+        projected.sum(-1),
+        torch.ones(1, dtype=torch.float32),
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+    assert float((active @ loadings).detach().abs().max()) <= 2.0e-4
+    assert float(active.detach().abs().sum()) > 0.0
+
+    filled = hold30_runtime._risk_project(
+        hold30_runtime._force_mask_to_cash(projected, trade_mask, 0),
+        caps,
+        gross,
+        0,
+    )
+    one_way_distance = 0.5 * (filled - projected).abs().sum(-1)
+    assert float(one_way_distance.detach().max()) <= 1.0e-6
+    assert bool((filled >= 0).all())
+    assert float(
+        ((filled - canonical_benchmark) @ loadings).detach().abs().max()
+    ) <= 2.0e-4
+
+    projected.square().sum().backward()  # type: ignore[no-untyped-call]
+    assert requested.grad is not None
+    assert bool(torch.isfinite(requested.grad).all())
+    assert float(requested.grad.abs().sum()) > 0.0
 
 
 def test_factor_projection_stays_active_inside_fill_tradable_subspace() -> None:

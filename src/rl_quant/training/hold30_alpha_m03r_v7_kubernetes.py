@@ -47,6 +47,9 @@ M03R_TOP2000_MULTI_GPU_TOLERATION = {
 M03R_TOP2000_PRIORITY_CLASS_NAME = "high-nonpreempting"
 M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS = 216000
 M03R_TOP2000_PILOT_MAX_ACTIVE_DEADLINE_SECONDS = 86400
+M03R_TOP2000_STANDARD_QUALIFICATION_STEPS = 4
+M03R_TOP2000_EXTENDED_SENTINEL_STEPS = 20
+M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX = 3
 M03R_TOP2000_TERMINATION_MESSAGE_PATH = "/dev/termination-log"
 M03R_TOP2000_TERMINATION_MESSAGE_POLICY = "File"
 M03R_TOP2000_DYNAMIC_TEMPLATE_LABEL_KEYS = (
@@ -558,7 +561,8 @@ class M03RV7RenderedQualificationPilotJob:
     package_plan_sha256: str
     live_evidence_receipt_sha256: str
     completion_index: int
-    qualification_steps: Literal[4] = 4
+    qualification_steps: int = M03R_TOP2000_STANDARD_QUALIFICATION_STEPS
+    qualification_restart_after_step1: bool = True
     activation_authorized: bool = False
     schema: str = M03R_TOP2000_PILOT_JOB_SCHEMA
 
@@ -610,9 +614,25 @@ class M03RV7RenderedQualificationPilotJob:
             str(self.completion_index),
             "--qualification-only",
             "--qualification-steps",
-            "4",
-            "--qualification-restart-after-step1",
+            str(self.qualification_steps),
         ]
+        if self.qualification_restart_after_step1:
+            required_suffix.append("--qualification-restart-after-step1")
+        standard_qualification = (
+            self.qualification_steps == M03R_TOP2000_STANDARD_QUALIFICATION_STEPS
+            and self.qualification_restart_after_step1
+        )
+        extended_sentinel = (
+            self.qualification_steps == M03R_TOP2000_EXTENDED_SENTINEL_STEPS
+            and not self.qualification_restart_after_step1
+            and self.completion_index
+            == M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX
+        )
+        worker_argv_prefix = list(M03R_TOP2000_WORKER_ARGV_PREFIX)
+        if extended_sentinel:
+            worker_argv_prefix[worker_argv_prefix.index("--max-restarts=1")] = (
+                "--max-restarts=0"
+            )
         if (
             manifest.get("apiVersion") != "batch/v1"
             or manifest.get("kind") != "Job"
@@ -626,15 +646,16 @@ class M03RV7RenderedQualificationPilotJob:
             or spec.get("suspend") is not True
             or self.activation_authorized
             or not 0 <= self.completion_index < 12
-            or self.qualification_steps != 4
-            or container.get("command") != [M03R_TOP2000_WORKER_ARGV_PREFIX[0]]
+            or not (standard_qualification or extended_sentinel)
+            or container.get("command") != [worker_argv_prefix[0]]
             or args
-            != list(M03R_TOP2000_WORKER_ARGV_PREFIX[1:]) + required_suffix
+            != worker_argv_prefix[1:] + required_suffix
             or requests.get("nvidia.com/gpu") != "2"
             or limits.get("nvidia.com/gpu") != "2"
         ):
             raise M03RV7Top2000KubernetesError(
-                "pilot must stay suspended, single-completion, two-H100, and four-update"
+                "pilot must stay suspended, single-completion, two-H100, and use "
+                "an approved qualification geometry"
             )
         _require_proven_h100_pod_profile(
             pod_spec,
@@ -792,6 +813,8 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
     live_evidence: M03RV7LiveAdmissionEvidence,
     template: M03RV7KubernetesTemplateConfig,
     now_utc: datetime,
+    qualification_steps: int = M03R_TOP2000_STANDARD_QUALIFICATION_STEPS,
+    qualification_restart_after_step1: bool = True,
 ) -> M03RV7RenderedQualificationPilotJob:
     """Render a pure suspended pilot from an unqualified immutable plan."""
 
@@ -806,6 +829,19 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
     if not 0 <= completion_index < len(plan.indices):
         raise M03RV7Top2000KubernetesError(
             "pilot completion index is outside the package plan"
+        )
+    standard_qualification = (
+        qualification_steps == M03R_TOP2000_STANDARD_QUALIFICATION_STEPS
+        and qualification_restart_after_step1
+    )
+    extended_sentinel = (
+        qualification_steps == M03R_TOP2000_EXTENDED_SENTINEL_STEPS
+        and not qualification_restart_after_step1
+        and completion_index == M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX
+    )
+    if not (standard_qualification or extended_sentinel):
+        raise M03RV7Top2000KubernetesError(
+            "pilot qualification geometry is not approved"
         )
     if not plan.plan_artifact_path.startswith(
         template.package_mount_path.rstrip("/") + "/"
@@ -832,11 +868,18 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
         "rl-quant/qualification-completion-index": str(completion_index),
         "rl-quant/qualification-setting-index": str(row.setting_index),
         "rl-quant/qualification-setting-id": row.development_setting_id,
-        "rl-quant/qualification-steps": "4",
-        "rl-quant/intentional-restart-after-step": "1",
+        "rl-quant/qualification-steps": str(qualification_steps),
+        "rl-quant/intentional-restart-after-step": (
+            "1" if qualification_restart_after_step1 else "none"
+        ),
         "rl-quant/data-role": "development-only-nonreportable",
     }
-    argv = list(M03R_TOP2000_WORKER_ARGV_PREFIX) + [
+    worker_argv_prefix = list(M03R_TOP2000_WORKER_ARGV_PREFIX)
+    if extended_sentinel:
+        worker_argv_prefix[worker_argv_prefix.index("--max-restarts=1")] = (
+            "--max-restarts=0"
+        )
+    argv = worker_argv_prefix + [
         "--package-plan",
         plan.plan_artifact_path,
         "--package-plan-sha256",
@@ -847,9 +890,10 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
         str(completion_index),
         "--qualification-only",
         "--qualification-steps",
-        "4",
-        "--qualification-restart-after-step1",
+        str(qualification_steps),
     ]
+    if qualification_restart_after_step1:
+        argv.append("--qualification-restart-after-step1")
     manifest: dict[str, Any] = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1013,6 +1057,8 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
         package_plan_sha256=plan.package_plan_sha256,
         live_evidence_receipt_sha256=live_evidence.receipt_sha256,
         completion_index=completion_index,
+        qualification_steps=qualification_steps,
+        qualification_restart_after_step1=qualification_restart_after_step1,
     )
 
 

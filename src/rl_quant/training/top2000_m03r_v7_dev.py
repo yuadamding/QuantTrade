@@ -24,7 +24,11 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from rl_quant.envs.hold30 import CohortLedger
+from rl_quant.envs.hold30 import (
+    SIMPLEX_RECONCILIATION_ATOL,
+    CohortLedger,
+    reconcile_cash_simplex_roundoff,
+)
 from rl_quant.execution.hold30 import (
     Hold30BuiltAction,
     build_alpha_hold30_action,
@@ -446,11 +450,11 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
     if (
         not isinstance(requested_weights, torch.Tensor)
         or requested_weights.ndim != 2
-        or not requested_weights.is_floating_point()
+        or requested_weights.dtype not in (torch.float32, torch.float64)
         or not bool(torch.isfinite(requested_weights).all())
     ):
         raise Top2000M03RV7DevelopmentError(
-            "requested_weights must be finite floating [batch,asset]"
+            "requested_weights must be finite float32/float64 [batch,asset]"
         )
     batch, assets = requested_weights.shape
     expected = (batch, assets)
@@ -461,7 +465,7 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
         if (
             not isinstance(value, torch.Tensor)
             or tuple(value.shape) != expected
-            or not value.is_floating_point()
+            or value.dtype not in (torch.float32, torch.float64)
             or not bool(torch.isfinite(value).all())
         ):
             raise Top2000M03RV7DevelopmentError(
@@ -493,7 +497,12 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
         else torch.float32
     )
     requested = requested_weights.to(dtype=work_dtype)
-    benchmark = benchmark_weights.to(dtype=work_dtype)
+    canonical_benchmark_weights = reconcile_cash_simplex_roundoff(
+        benchmark_weights,
+        cash_index=cash_index,
+        risky_gross_limit=risk_gross_max,
+    )
+    benchmark = canonical_benchmark_weights.to(dtype=work_dtype)
     loadings = factor_loadings.to(
         device=requested.device,
         dtype=work_dtype,
@@ -511,24 +520,17 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
         ],
         dim=1,
     )
-    # The calibration tensors are detached; pinv is consequently a constant
-    # linear map for autograd while remaining robust to redundant controls.
-    if factor_constraint_pinv is None:
-        constraint_pinv = torch.linalg.pinv(constraints)
-    else:
-        if (
-            tuple(factor_constraint_pinv.shape)
-            != (constraints.shape[1], assets)
-            or factor_constraint_pinv.requires_grad
-            or not factor_constraint_pinv.is_floating_point()
-            or not bool(torch.isfinite(factor_constraint_pinv).all())
-        ):
-            raise Top2000M03RV7DevelopmentError(
-                "cached factor-constraint pseudoinverse is invalid"
-            )
-        constraint_pinv = factor_constraint_pinv.to(
-            device=requested.device,
-            dtype=work_dtype,
+    # The cached full-universe pseudoinverse remains identity-bound input, but
+    # CASH preservation and per-row masks require the small risky-only Gram
+    # solve below rather than applying that global map directly.
+    if factor_constraint_pinv is not None and (
+        tuple(factor_constraint_pinv.shape) != (constraints.shape[1], assets)
+        or factor_constraint_pinv.requires_grad
+        or not factor_constraint_pinv.is_floating_point()
+        or not bool(torch.isfinite(factor_constraint_pinv).all())
+    ):
+        raise Top2000M03RV7DevelopmentError(
+            "cached factor-constraint pseudoinverse is invalid"
         )
     risky = torch.ones(expected, dtype=torch.bool, device=requested.device)
     risky[:, cash_index] = False
@@ -553,37 +555,48 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
             "the fill-time benchmark exceeds the gross-risk ceiling"
         )
 
-    # Project only in the fill-tradable subspace.  A global pseudoinverse can
-    # introduce active weights on a masked name even when both the requested
-    # and benchmark books are zero there; the subsequent radial feasibility
-    # repair would then scale the entire active book to zero.  The small
-    # per-row Gram system keeps unavailable coordinates fixed while enforcing
-    # the simplex and factor equalities on the executable coordinates.
-    active = torch.where(available, requested - benchmark, torch.zeros_like(requested))
-    if bool(available.all()):
-        neutral_active = active - (active @ constraints) @ constraint_pinv
-    else:
-        masked_constraints = constraints.unsqueeze(0) * available.to(
-            dtype=work_dtype
-        ).unsqueeze(-1)
-        moments = torch.einsum("ba,bak->bk", active, masked_constraints)
-        gram = torch.einsum(
-            "bak,bal->bkl",
-            masked_constraints,
-            masked_constraints,
-        )
-        gram_pinv = torch.linalg.pinv(gram, hermitian=True)
-        coefficients = torch.bmm(moments.unsqueeze(1), gram_pinv).squeeze(1)
-        correction = torch.einsum(
-            "bk,bak->ba",
-            coefficients,
-            masked_constraints,
-        )
-        neutral_active = torch.where(
-            available,
-            active - correction,
-            torch.zeros_like(active),
-        )
+    # Project only risky, fill-tradable coordinates.  CASH has zero factor
+    # loadings but must not participate in the least-squares correction: when
+    # a fully invested benchmark has zero CASH, even a sub-ULP negative CASH
+    # correction makes the long-only radial scale collapse to zero.  Preserve
+    # the requested CASH deviation and solve the risky affine target that
+    # keeps total active mass at zero while neutralizing every factor.
+    projection_available = available & risky
+    active = requested - benchmark
+    risky_active = torch.where(
+        projection_available,
+        active,
+        torch.zeros_like(active),
+    )
+    masked_constraints = constraints.unsqueeze(0) * projection_available.to(
+        dtype=work_dtype
+    ).unsqueeze(-1)
+    moments = torch.einsum("ba,bak->bk", risky_active, masked_constraints)
+    target_moments = torch.zeros_like(moments)
+    target_moments[:, 0] = -active[:, cash_index]
+    residual_moments = moments - target_moments
+    gram = torch.einsum(
+        "bak,bal->bkl",
+        masked_constraints,
+        masked_constraints,
+    )
+    gram_pinv = torch.linalg.pinv(gram, hermitian=True)
+    coefficients = torch.bmm(
+        residual_moments.unsqueeze(1),
+        gram_pinv,
+    ).squeeze(1)
+    correction = torch.einsum(
+        "bk,bak->ba",
+        coefficients,
+        masked_constraints,
+    )
+    neutral_active = torch.where(
+        projection_available,
+        risky_active - correction,
+        torch.zeros_like(active),
+    )
+    neutral_active = neutral_active.clone()
+    neutral_active[:, cash_index] = active[:, cash_index]
 
     positive_ratio = torch.where(
         neutral_active > 0,
@@ -604,20 +617,65 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
         torch.zeros_like(neutral_active),
     ).sum(-1)
     gross_ratio = torch.where(
-        active_gross_delta > 0,
+        active_gross_delta > SIMPLEX_RECONCILIATION_ATOL,
         (risk_gross_max.to(work_dtype) - benchmark_gross).clamp_min(0.0)
         / active_gross_delta.clamp_min(torch.finfo(work_dtype).tiny),
         torch.full_like(active_gross_delta, torch.inf),
     )
     scale = torch.minimum(scale, gross_ratio).clamp(0.0, 1.0)
+    # Keep a factor-neutral active book several output-dtype ULPs inside the
+    # radial feasibility boundary.  Casting an exact boundary solution to
+    # FP32 can otherwise create a tiny negative coordinate that a later
+    # generic clamp would alter without preserving factor neutrality.
+    output_guard = 8 * torch.finfo(requested_weights.dtype).eps
+    scale = torch.where(
+        scale > 0,
+        scale * (1.0 - output_guard),
+        scale,
+    )
     projected = benchmark + scale.unsqueeze(-1) * neutral_active
     projected = projected.to(dtype=requested_weights.dtype)
+    projected = reconcile_cash_simplex_roundoff(
+        projected,
+        cash_index=cash_index,
+        risky_gross_limit=risk_gross_max,
+    )
+    projected_upper = upper.to(dtype=projected.dtype)
+    projected_available = available.to(device=projected.device)
+    projected_risky = risky.to(device=projected.device)
+    projected_gross = torch.where(
+        projected_risky,
+        projected,
+        torch.zeros_like(projected),
+    ).sum(-1)
     exposure = (
-        (projected - benchmark_weights)
+        (projected - canonical_benchmark_weights)
         @ factor_loadings.to(device=projected.device, dtype=projected.dtype)
     )
     if (
-        not bool(
+        bool((projected < 0).any())
+        or bool((projected - projected_upper > 2.0e-6).any())
+        or bool(
+            (
+                torch.where(
+                    projected_available,
+                    torch.zeros_like(projected),
+                    projected - benchmark_weights,
+                ).abs()
+                > 2.0e-6
+            ).any()
+        )
+        or bool(
+            (
+                projected_gross
+                - risk_gross_max.to(
+                    device=projected.device,
+                    dtype=projected.dtype,
+                )
+                > 2.0e-6
+            ).any()
+        )
+        or not bool(
             torch.allclose(
                 projected.sum(-1),
                 torch.ones(batch, device=projected.device, dtype=projected.dtype),
@@ -628,9 +686,9 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
         or float(exposure.detach().abs().max()) > 2.0e-4
     ):
         raise Top2000M03RV7DevelopmentError(
-            "executed active-weight factor projection failed reconciliation"
+            "executed active-weight factor projection failed feasibility or reconciliation"
         )
-    return cast(torch.Tensor, projected)
+    return projected
 
 
 class Top2000M03RV7ActionPolicy(Protocol):

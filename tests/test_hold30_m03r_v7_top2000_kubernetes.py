@@ -15,6 +15,8 @@ from rl_quant.protocol.hold30_alpha_m03r_v7_schedule import (
     M03R_V7_ADMISSION_ORDER,
 )
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
+    M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX,
+    M03R_TOP2000_EXTENDED_SENTINEL_STEPS,
     M03R_TOP2000_H100_POOL_NODE_SELECTOR,
     M03R_TOP2000_H100_PRODUCT_LABEL_KEY,
     M03R_TOP2000_H100_PRODUCT_LABEL_VALUES,
@@ -430,6 +432,52 @@ def test_unqualified_plan_renders_suspended_single_and_all_setting_pilots() -> N
         attached_owned_pod_uids=(),
     )
     assert binding.suspended
+
+
+def test_extended_sentinel_crosses_the_reproduced_failure_boundary() -> None:
+    plan = build_m03r_v7_top2000_package_plan(
+        artifacts=_artifacts(),
+        plan_artifact_path="/mnt/package/package-plan.json",
+    )
+    sentinel = render_m03r_v7_top2000_suspended_qualification_pilot_job(
+        plan=plan,
+        completion_index=M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX,
+        live_evidence=_live_evidence(),
+        template=_template(),
+        now_utc=datetime(2026, 8, 5, 12, 1, tzinfo=UTC),
+        qualification_steps=M03R_TOP2000_EXTENDED_SENTINEL_STEPS,
+        qualification_restart_after_step1=False,
+    )
+    args = sentinel.manifest["spec"]["template"]["spec"]["containers"][0][
+        "args"
+    ]
+    assert args[-5:] == [
+        "--completion-index",
+        str(M03R_TOP2000_EXTENDED_SENTINEL_COMPLETION_INDEX),
+        "--qualification-only",
+        "--qualification-steps",
+        str(M03R_TOP2000_EXTENDED_SENTINEL_STEPS),
+    ]
+    assert "--qualification-restart-after-step1" not in args
+    assert "--max-restarts=0" in args
+    assert "--max-restarts=1" not in args
+    assert (
+        sentinel.manifest["metadata"]["annotations"][
+            "rl-quant/intentional-restart-after-step"
+        ]
+        == "none"
+    )
+
+    with pytest.raises(M03RV7Top2000KubernetesError, match="not approved"):
+        render_m03r_v7_top2000_suspended_qualification_pilot_job(
+            plan=plan,
+            completion_index=0,
+            live_evidence=_live_evidence(),
+            template=_template(),
+            now_utc=datetime(2026, 8, 5, 12, 1, tzinfo=UTC),
+            qualification_steps=M03R_TOP2000_EXTENDED_SENTINEL_STEPS,
+            qualification_restart_after_step1=False,
+        )
 
 
 def test_qualification_batch_binds_explicit_downward_api_default() -> None:
