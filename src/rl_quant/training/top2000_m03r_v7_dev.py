@@ -530,9 +530,6 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
             device=requested.device,
             dtype=work_dtype,
         )
-    active = requested - benchmark
-    neutral_active = active - (active @ constraints) @ constraint_pinv
-
     risky = torch.ones(expected, dtype=torch.bool, device=requested.device)
     risky[:, cash_index] = False
     available = trade_mask.to(device=requested.device).clone()
@@ -554,6 +551,38 @@ def top2000_m03r_v7_factor_neutral_executed_weights(
     if bool((benchmark_gross - risk_gross_max.to(work_dtype) > tolerance).any()):
         raise Top2000M03RV7DevelopmentError(
             "the fill-time benchmark exceeds the gross-risk ceiling"
+        )
+
+    # Project only in the fill-tradable subspace.  A global pseudoinverse can
+    # introduce active weights on a masked name even when both the requested
+    # and benchmark books are zero there; the subsequent radial feasibility
+    # repair would then scale the entire active book to zero.  The small
+    # per-row Gram system keeps unavailable coordinates fixed while enforcing
+    # the simplex and factor equalities on the executable coordinates.
+    active = torch.where(available, requested - benchmark, torch.zeros_like(requested))
+    if bool(available.all()):
+        neutral_active = active - (active @ constraints) @ constraint_pinv
+    else:
+        masked_constraints = constraints.unsqueeze(0) * available.to(
+            dtype=work_dtype
+        ).unsqueeze(-1)
+        moments = torch.einsum("ba,bak->bk", active, masked_constraints)
+        gram = torch.einsum(
+            "bak,bal->bkl",
+            masked_constraints,
+            masked_constraints,
+        )
+        gram_pinv = torch.linalg.pinv(gram, hermitian=True)
+        coefficients = torch.bmm(moments.unsqueeze(1), gram_pinv).squeeze(1)
+        correction = torch.einsum(
+            "bk,bak->ba",
+            coefficients,
+            masked_constraints,
+        )
+        neutral_active = torch.where(
+            available,
+            active - correction,
+            torch.zeros_like(active),
         )
 
     positive_ratio = torch.where(

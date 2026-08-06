@@ -182,6 +182,28 @@ def test_monthly_equal_weight_buy_and_drift_charges_all_turnover_by_cause(
     )
 
 
+def test_monthly_rebalance_cannot_buy_a_name_first_visible_at_fill(
+    tmp_path: Path,
+) -> None:
+    path, digest = _write_cache(tmp_path)
+    payload = torch.load(path, weights_only=True)
+    # February 1 is state 30 in this fixture.  A1 first becomes visible at the
+    # fill, so the January 31 benchmark decision must not buy it.
+    payload["availability"][29, 1] = False
+    payload["availability"][30, 1] = True
+    torch.save(payload, path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    adapted = _adapt(path, digest)
+    february_first = 30
+    assert adapted.exchange_dates[february_first] == "2024-02-01"
+    assert adapted.benchmark.weights[february_first, 1] == 0.0
+    assert torch.allclose(
+        adapted.benchmark.weights[february_first],
+        torch.tensor([0.0, 0.0, 0.5, 0.5], dtype=torch.float64),
+    )
+
+
 def test_future_row_changes_return_but_not_preceding_decision_state(
     tmp_path: Path,
 ) -> None:

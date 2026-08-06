@@ -418,9 +418,11 @@ class Top2000MonthlyEqualWeightBuyAndDriftTrace:
     The first book is an uncharged equal-weight endowment over risky names
     available at the first state.  Thereafter it earns the next close-to-close
     return, performs availability-forced sales into CASH, and re-establishes
-    equal weight over the point-in-time available risky set at the first state
-    of each new calendar month.  Both forced and rebalance turnover pay the
-    same one-way linear cost as the policy.
+    equal weight at the first state of each new calendar month over names that
+    were visible at the preceding decision and remain tradable at the fill.
+    This gives the deterministic benchmark the same one-session causal
+    availability contract as the policy.  Both forced and rebalance turnover
+    pay the same one-way linear cost as the policy.
     """
 
     weights: torch.Tensor
@@ -526,7 +528,8 @@ class Top2000Hold30DevelopmentIdentity:
         "common-c1-endowment-staggered-untracked-ages-0-through-29"
     )
     benchmark_rebalance_rule: str = (
-        "first-state-of-calendar-month-equal-weight-over-point-in-time-available-risky;"
+        "first-state-of-calendar-month-equal-weight-over-prior-decision-visible-and-"
+        "fill-available-risky;"
         "availability-forced-sales-to-cash"
     )
     availability_semantics: str = (
@@ -704,8 +707,14 @@ def _monthly_equal_weight_buy_and_drift(
             parsed_dates[index + 1].year,
             parsed_dates[index + 1].month,
         ):
+            # The benchmark order is decided at ``index`` and fills at
+            # ``index + 1``, exactly like a policy order.  A name that first
+            # appears at the fill was not decision-visible and cannot enter
+            # either book until a later decision.  Intersecting the two masks
+            # is execution feasibility, not future-information leakage.
+            causal_fill_availability = availability[index] & availability[index + 1]
             target = _equal_weight_target(
-                availability[index + 1],
+                causal_fill_availability,
                 cash_index=cash_index,
                 dtype=asset_returns.dtype,
             )

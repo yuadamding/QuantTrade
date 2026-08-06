@@ -217,6 +217,46 @@ def test_factor_neutrality_is_applied_to_executed_active_weights_with_gradient()
     assert torch.allclose(projected, shifted, atol=2.0e-6, rtol=2.0e-6)
 
 
+def test_factor_projection_stays_active_inside_fill_tradable_subspace() -> None:
+    torch.manual_seed(91)
+    assets = 131
+    benchmark = torch.zeros((1, assets), dtype=torch.float64)
+    benchmark[:, 1:111] = 1.0 / 110.0
+    requested = benchmark.clone()
+    requested[:, 1] += 3.0e-4
+    requested[:, 2] -= 3.0e-4
+    requested.requires_grad_(True)
+    loadings = torch.randn((assets, 4), dtype=torch.float64)
+    loadings[0] = 0.0
+    trade_mask = torch.ones((1, assets), dtype=torch.bool)
+    trade_mask[:, 111:] = False
+    caps = torch.full((1, assets), 0.01, dtype=torch.float64)
+    caps[:, 0] = 1.0
+    caps[:, 111:] = 0.0
+    gross = torch.ones(1, dtype=torch.float64)
+
+    projected = top2000_m03r_v7_factor_neutral_executed_weights(
+        requested,
+        benchmark,
+        loadings,
+        trade_mask,
+        caps,
+        gross,
+    )
+    active = projected - benchmark
+    assert torch.all(projected[:, 111:] == 0.0)
+    assert torch.allclose(projected.sum(-1), torch.ones(1, dtype=torch.float64))
+    assert float((active @ loadings).abs().max()) < 1.0e-9
+    # Regression: the former global nullspace correction leaked into masked
+    # assets, forcing radial scale zero and silently returning the benchmark.
+    assert float(active.abs().sum()) > 1.0e-5
+
+    objective = (projected * torch.linspace(0.0, 1.0, assets)).sum()
+    objective.backward()  # type: ignore[no-untyped-call]
+    assert requested.grad is not None
+    assert float(requested.grad.abs().sum()) > 0.0
+
+
 def test_action_builder_applies_projection_except_for_a10() -> None:
     torch.manual_seed(19)
     assets = 121
