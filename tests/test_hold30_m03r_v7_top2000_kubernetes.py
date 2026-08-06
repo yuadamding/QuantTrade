@@ -15,8 +15,12 @@ from rl_quant.protocol.hold30_alpha_m03r_v7_schedule import (
     M03R_V7_ADMISSION_ORDER,
 )
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
+    M03R_TOP2000_H100_POOL_NODE_SELECTOR,
     M03R_TOP2000_H100_PRODUCT_LABEL_KEY,
     M03R_TOP2000_H100_PRODUCT_LABEL_VALUES,
+    M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS,
+    M03R_TOP2000_MULTI_GPU_TOLERATION,
+    M03R_TOP2000_PRIORITY_CLASS_NAME,
     M03RV7AdmittedJobBinding,
     M03RV7FoldSeedReceiptRef,
     M03RV7KubernetesRBACEvidence,
@@ -178,7 +182,7 @@ def _live_evidence(
         gpu_product_label_values=M03R_TOP2000_H100_PRODUCT_LABEL_VALUES,
         live_h100_cap_verified=True,
         gpu_selector_observed_live=selector_proven,
-        indexed_backoff_server_dry_run_passed=True,
+        indexed_job_server_dry_run_passed=True,
     )
 
 
@@ -203,17 +207,31 @@ def _rendered() -> M03RV7RenderedSuspendedJob:
 
 
 def _admitted_reads(
-    rendered: M03RV7RenderedSuspendedJob,
+    rendered: Any,
+    *,
+    uid: str = "uid-m03r-v7-001",
+    first_resource_version: str = "1001",
+    second_resource_version: str = "1002",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     first = deepcopy(rendered.manifest)
     first["metadata"].update(
-        {"uid": "uid-m03r-v7-001", "resourceVersion": "1001"}
+        {"uid": uid, "resourceVersion": first_resource_version}
     )
     first["spec"]["selector"] = {
-        "matchLabels": {"batch.kubernetes.io/controller-uid": "uid-m03r-v7-001"}
+        "matchLabels": {"batch.kubernetes.io/controller-uid": uid}
     }
+    template_metadata = first["spec"]["template"]["metadata"]
+    template_metadata["creationTimestamp"] = None
+    template_metadata["labels"].update(
+        {
+            "batch.kubernetes.io/controller-uid": uid,
+            "batch.kubernetes.io/job-name": first["metadata"]["name"],
+            "controller-uid": uid,
+            "job-name": first["metadata"]["name"],
+        }
+    )
     second = deepcopy(first)
-    second["metadata"]["resourceVersion"] = "1002"
+    second["metadata"]["resourceVersion"] = second_resource_version
     return first, second
 
 
@@ -348,6 +366,9 @@ def test_unqualified_plan_renders_suspended_single_and_all_setting_pilots() -> N
     )
     assert single.manifest["spec"]["suspend"] is True
     assert single.manifest["spec"]["completions"] == 1
+    assert single.manifest["spec"]["activeDeadlineSeconds"] == 86400
+    assert "backoffLimitPerIndex" not in single.manifest["spec"]
+    assert "maxFailedIndexes" not in single.manifest["spec"]
     single_args = single.manifest["spec"]["template"]["spec"]["containers"][0][
         "args"
     ]
@@ -369,22 +390,20 @@ def test_unqualified_plan_renders_suspended_single_and_all_setting_pilots() -> N
     batch_spec = batch.manifest["spec"]
     assert batch_spec["completions"] == 12
     assert batch_spec["parallelism"] == 8
+    assert batch_spec["activeDeadlineSeconds"] == 86400
+    assert "backoffLimitPerIndex" not in batch_spec
+    assert "maxFailedIndexes" not in batch_spec
     assert batch.parallelism * 2 == 16
     container = batch_spec["template"]["spec"]["containers"][0]
     assert "--completion-index" not in container["args"]
     assert any(row["name"] == "JOB_COMPLETION_INDEX" for row in container["env"])
 
-    first = deepcopy(batch.manifest)
-    first["metadata"].update(
-        {"uid": "uid-m03r-v7-pilot", "resourceVersion": "2001"}
+    first, second = _admitted_reads(
+        batch,
+        uid="uid-m03r-v7-pilot",
+        first_resource_version="2001",
+        second_resource_version="2002",
     )
-    first["spec"]["selector"] = {
-        "matchLabels": {
-            "batch.kubernetes.io/controller-uid": "uid-m03r-v7-pilot"
-        }
-    }
-    second = deepcopy(first)
-    second["metadata"]["resourceVersion"] = "2002"
     binding = bind_m03r_v7_top2000_admitted_suspended_job(
         rendered=batch,
         first_read=first,
@@ -423,7 +442,7 @@ def test_pilot_can_establish_runtime_selector_proof_but_final_requires_it() -> N
         )
 
 
-def test_suspended_indexed_manifest_is_two_h100_fail_fast_and_node_agnostic() -> None:
+def test_suspended_indexed_manifest_uses_proven_two_h100_pool_profile() -> None:
     rendered = _rendered()
     manifest = rendered.manifest
     spec = manifest["spec"]
@@ -436,9 +455,10 @@ def test_suspended_indexed_manifest_is_two_h100_fail_fast_and_node_agnostic() ->
         "completions": 12,
         "parallelism": 8,
         "backoffLimit": 0,
-        "backoffLimitPerIndex": 0,
-        "maxFailedIndexes": 0,
     }
+    assert "backoffLimitPerIndex" not in spec
+    assert "maxFailedIndexes" not in spec
+    assert spec["activeDeadlineSeconds"] == M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS
     assert container["resources"]["requests"]["nvidia.com/gpu"] == "2"
     assert container["resources"]["limits"]["nvidia.com/gpu"] == "2"
     match = pod_spec["affinity"]["nodeAffinity"][
@@ -449,12 +469,17 @@ def test_suspended_indexed_manifest_is_two_h100_fail_fast_and_node_agnostic() ->
         "operator": "In",
         "values": list(M03R_TOP2000_H100_PRODUCT_LABEL_VALUES),
     }
-    assert "nodeSelector" not in pod_spec
+    assert pod_spec["nodeSelector"] == M03R_TOP2000_H100_POOL_NODE_SELECTOR
+    assert pod_spec["priorityClassName"] == M03R_TOP2000_PRIORITY_CLASS_NAME
+    assert pod_spec["tolerations"] == [M03R_TOP2000_MULTI_GPU_TOLERATION]
+    assert pod_spec["dnsPolicy"] == "ClusterFirst"
+    assert pod_spec["terminationGracePeriodSeconds"] == 60
     assert not any("$(JOB_COMPLETION_INDEX)" in arg for arg in container["args"])
     assert any(item["name"] == "JOB_COMPLETION_INDEX" for item in container["env"])
     environment = {item["name"]: item.get("value") for item in container["env"]}
     assert environment["PYTHONPATH"] == "/mnt/package/source/src"
     assert pod_spec["automountServiceAccountToken"] is False
+    assert pod_spec["serviceAccount"] == "default"
     assert pod_spec["serviceAccountName"] == "default"
     assert pod_spec["schedulerName"] == "kai-scheduler"
     assert pod_spec["securityContext"] == {
@@ -472,6 +497,8 @@ def test_suspended_indexed_manifest_is_two_h100_fail_fast_and_node_agnostic() ->
         "readOnlyRootFilesystem": True,
         "capabilities": {"drop": ["ALL"]},
     }
+    assert container["terminationMessagePath"] == "/dev/termination-log"
+    assert container["terminationMessagePolicy"] == "File"
     mounts = {row["name"]: row for row in container["volumeMounts"]}
     assert mounts["research-data"]["subPath"] == (
         "quant/training/runs/m03r-v7-top2000-dev-001"
@@ -514,6 +541,44 @@ def test_admitted_binding_requires_two_stable_suspended_reads_and_zero_pods() ->
             second_read=changed,
             attached_owned_pod_uids=(),
         )
+
+
+def test_admitted_binding_rejects_unknown_metadata_and_pool_mutations() -> None:
+    rendered = _rendered()
+    first, second = _admitted_reads(rendered)
+
+    extra_label_first = deepcopy(first)
+    extra_label_second = deepcopy(second)
+    for value in (extra_label_first, extra_label_second):
+        value["spec"]["template"]["metadata"]["labels"]["unknown"] = "value"
+    with pytest.raises(M03RV7Top2000KubernetesError, match="unknown mutation"):
+        bind_m03r_v7_top2000_admitted_suspended_job(
+            rendered=rendered,
+            first_read=extra_label_first,
+            second_read=extra_label_second,
+            attached_owned_pod_uids=(),
+        )
+
+    wrong_pool_first = deepcopy(first)
+    wrong_pool_second = deepcopy(second)
+    for value in (wrong_pool_first, wrong_pool_second):
+        value["spec"]["template"]["spec"]["nodeSelector"] = {
+            "gpu-type": "A100"
+        }
+    with pytest.raises(M03RV7Top2000KubernetesError, match="Pod field"):
+        bind_m03r_v7_top2000_admitted_suspended_job(
+            rendered=rendered,
+            first_read=wrong_pool_first,
+            second_read=wrong_pool_second,
+            attached_owned_pod_uids=(),
+        )
+
+
+def test_template_rejects_unproven_deadline_or_service_account() -> None:
+    with pytest.raises(M03RV7Top2000KubernetesError, match="proven bounded"):
+        replace(_template(), active_deadline_seconds=216001)
+    with pytest.raises(M03RV7Top2000KubernetesError, match="service account default"):
+        replace(_template(), service_account_name="other")
 
 
 def test_activation_request_is_full_content_bound_json_patch() -> None:

@@ -37,6 +37,24 @@ M03R_TOP2000_H100_PRODUCT_LABEL_KEY = "nvidia.com/gpu.product"
 M03R_TOP2000_H100_PRODUCT_LABEL_VALUES = (
     "NVIDIA-H100-80GB-HBM3",
 )
+M03R_TOP2000_H100_POOL_NODE_SELECTOR = {"gpu-type": "H100"}
+M03R_TOP2000_MULTI_GPU_TOLERATION = {
+    "effect": "NoSchedule",
+    "key": "multi-gpu",
+    "operator": "Equal",
+    "value": "true",
+}
+M03R_TOP2000_PRIORITY_CLASS_NAME = "high-nonpreempting"
+M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS = 216000
+M03R_TOP2000_PILOT_MAX_ACTIVE_DEADLINE_SECONDS = 86400
+M03R_TOP2000_TERMINATION_MESSAGE_PATH = "/dev/termination-log"
+M03R_TOP2000_TERMINATION_MESSAGE_POLICY = "File"
+M03R_TOP2000_DYNAMIC_TEMPLATE_LABEL_KEYS = (
+    "batch.kubernetes.io/controller-uid",
+    "batch.kubernetes.io/job-name",
+    "controller-uid",
+    "job-name",
+)
 M03R_TOP2000_LIVE_EVIDENCE_SCHEMA = (
     "rl-quant.m03r-v7-top2000-live-kubernetes-evidence-v1"
 )
@@ -167,7 +185,7 @@ class M03RV7LiveAdmissionEvidence:
     gpu_product_label_values: tuple[str, ...]
     live_h100_cap_verified: bool
     gpu_selector_observed_live: bool
-    indexed_backoff_server_dry_run_passed: bool
+    indexed_job_server_dry_run_passed: bool
     receipt_sha256: str
     context: str = M03R_TOP2000_KUBERNETES_CONTEXT
     namespace: str = M03R_TOP2000_KUBERNETES_NAMESPACE
@@ -193,8 +211,8 @@ class M03RV7LiveAdmissionEvidence:
             "gpu_product_label_values": list(self.gpu_product_label_values),
             "live_h100_cap_verified": self.live_h100_cap_verified,
             "gpu_selector_observed_live": self.gpu_selector_observed_live,
-            "indexed_backoff_server_dry_run_passed": (
-                self.indexed_backoff_server_dry_run_passed
+            "indexed_job_server_dry_run_passed": (
+                self.indexed_job_server_dry_run_passed
             ),
             "evidence_source": self.evidence_source,
             "rbac": asdict(self.rbac),
@@ -238,10 +256,10 @@ class M03RV7LiveAdmissionEvidence:
             )
         if not (
             self.live_h100_cap_verified
-            and self.indexed_backoff_server_dry_run_passed
+            and self.indexed_job_server_dry_run_passed
         ):
             raise M03RV7Top2000KubernetesError(
-                "live cap and backoffLimitPerIndex API support are required"
+                "live cap and exact Indexed Job server dry run are required"
             )
         _require_sha256("live evidence receipt_sha256", self.receipt_sha256)
         if self.receipt_sha256 != _sha256(self.canonical_payload()):
@@ -297,7 +315,7 @@ def build_m03r_v7_live_admission_evidence(
     gpu_product_label_values: tuple[str, ...],
     live_h100_cap_verified: bool,
     gpu_selector_observed_live: bool,
-    indexed_backoff_server_dry_run_passed: bool,
+    indexed_job_server_dry_run_passed: bool,
 ) -> M03RV7LiveAdmissionEvidence:
     """Bind externally collected live evidence without querying a cluster."""
 
@@ -312,8 +330,8 @@ def build_m03r_v7_live_admission_evidence(
         "gpu_product_label_values": gpu_product_label_values,
         "live_h100_cap_verified": live_h100_cap_verified,
         "gpu_selector_observed_live": gpu_selector_observed_live,
-        "indexed_backoff_server_dry_run_passed": (
-            indexed_backoff_server_dry_run_passed
+        "indexed_job_server_dry_run_passed": (
+            indexed_job_server_dry_run_passed
         ),
         "context": M03R_TOP2000_KUBERNETES_CONTEXT,
         "namespace": M03R_TOP2000_KUBERNETES_NAMESPACE,
@@ -350,7 +368,7 @@ class M03RV7KubernetesTemplateConfig:
     memory_limit: str = "400Gi"
     ephemeral_storage_request: str = "20Gi"
     ephemeral_storage_limit: str = "100Gi"
-    active_deadline_seconds: int = 604800
+    active_deadline_seconds: int = M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS
     ttl_seconds_after_finished: int = 86400
 
     def __post_init__(self) -> None:
@@ -382,16 +400,22 @@ class M03RV7KubernetesTemplateConfig:
             raise M03RV7Top2000KubernetesError(
                 "PVC training subpath must be one scoped relative path"
             )
+        if self.service_account_name != "default":
+            raise M03RV7Top2000KubernetesError(
+                "the qualified Seadragon execution profile uses service account default"
+            )
         if self.run_as_user <= 0 or self.run_as_group <= 0:
             raise M03RV7Top2000KubernetesError(
                 "research Pod UID/GID must be positive"
             )
         if (
             self.active_deadline_seconds <= 0
+            or self.active_deadline_seconds
+            > M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS
             or self.ttl_seconds_after_finished <= 0
         ):
             raise M03RV7Top2000KubernetesError(
-                "Job deadline and terminal TTL must be positive"
+                "Job deadline must use the proven bounded profile and TTL must be positive"
             )
 
 
@@ -406,6 +430,53 @@ def _assert_no_node_identity(value: Any) -> None:
     elif isinstance(value, list):
         for child in value:
             _assert_no_node_identity(child)
+
+
+def _require_proven_h100_pod_profile(
+    pod_spec: Mapping[str, Any],
+    *,
+    service_account_name: str,
+) -> None:
+    """Validate the explicit, previously admitted Seadragon two-H100 profile."""
+
+    if (
+        pod_spec.get("nodeSelector") != M03R_TOP2000_H100_POOL_NODE_SELECTOR
+        or pod_spec.get("priorityClassName")
+        != M03R_TOP2000_PRIORITY_CLASS_NAME
+        or pod_spec.get("tolerations") != [M03R_TOP2000_MULTI_GPU_TOLERATION]
+        or pod_spec.get("terminationGracePeriodSeconds") != 60
+        or pod_spec.get("dnsPolicy") != "ClusterFirst"
+        or pod_spec.get("serviceAccount") != service_account_name
+        or pod_spec.get("serviceAccountName") != service_account_name
+    ):
+        raise M03RV7Top2000KubernetesError(
+            "Pod spec does not match the proven Seadragon H100 pool profile"
+        )
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list) or len(containers) != 1:
+        raise M03RV7Top2000KubernetesError(
+            "two-H100 execution requires one exact worker container"
+        )
+    container = _mapping(containers[0], "H100 worker container")
+    if (
+        container.get("terminationMessagePath")
+        != M03R_TOP2000_TERMINATION_MESSAGE_PATH
+        or container.get("terminationMessagePolicy")
+        != M03R_TOP2000_TERMINATION_MESSAGE_POLICY
+    ):
+        raise M03RV7Top2000KubernetesError(
+            "worker termination-message defaults must be explicit and bound"
+        )
+
+
+def _require_supported_indexed_job_spec(spec: Mapping[str, Any]) -> None:
+    """Reject API fields stripped by this Seadragon Kubernetes version."""
+
+    unsupported = {"backoffLimitPerIndex", "maxFailedIndexes"}.intersection(spec)
+    if unsupported:
+        raise M03RV7Top2000KubernetesError(
+            "per-index backoff fields are unsupported by the admitted API profile"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +512,8 @@ class M03RV7RenderedSuspendedJob:
         ):
             _require_sha256(name, getattr(self, name))
         spec = _mapping(manifest.get("spec"), "manifest.spec")
+        _require_supported_indexed_job_spec(spec)
+        deadline = spec.get("activeDeadlineSeconds")
         if (
             manifest.get("apiVersion") != "batch/v1"
             or manifest.get("kind") != "Job"
@@ -448,8 +521,9 @@ class M03RV7RenderedSuspendedJob:
             or spec.get("completions") != 12
             or spec.get("parallelism") != self.parallelism
             or spec.get("backoffLimit") != 0
-            or spec.get("backoffLimitPerIndex") != 0
-            or spec.get("maxFailedIndexes") != 0
+            or isinstance(deadline, bool)
+            or not isinstance(deadline, int)
+            or not 1 <= deadline <= M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS
             or spec.get("suspend") is not True
             or self.activation_authorized
             or not 1 <= self.parallelism <= 8
@@ -459,6 +533,10 @@ class M03RV7RenderedSuspendedJob:
             )
         template = _mapping(spec.get("template"), "manifest.spec.template")
         pod_spec = _mapping(template.get("spec"), "manifest.spec.template.spec")
+        _require_proven_h100_pod_profile(
+            pod_spec,
+            service_account_name="default",
+        )
         if self.manifest_sha256 != _sha256(manifest):
             raise M03RV7Top2000KubernetesError("rendered manifest hash mismatch")
         if self.pod_template_sha256 != _canonical_pod_spec_sha256(pod_spec):
@@ -507,6 +585,8 @@ class M03RV7RenderedQualificationPilotJob:
         ):
             _require_sha256(name, getattr(self, name))
         spec = _mapping(manifest.get("spec"), "pilot.spec")
+        _require_supported_indexed_job_spec(spec)
+        deadline = spec.get("activeDeadlineSeconds")
         template = _mapping(spec.get("template"), "pilot.spec.template")
         pod_spec = _mapping(template.get("spec"), "pilot.spec.template.spec")
         containers = pod_spec.get("containers")
@@ -540,8 +620,9 @@ class M03RV7RenderedQualificationPilotJob:
             or spec.get("completions") != 1
             or spec.get("parallelism") != 1
             or spec.get("backoffLimit") != 0
-            or spec.get("backoffLimitPerIndex") != 0
-            or spec.get("maxFailedIndexes") != 0
+            or isinstance(deadline, bool)
+            or not isinstance(deadline, int)
+            or not 1 <= deadline <= M03R_TOP2000_PILOT_MAX_ACTIVE_DEADLINE_SECONDS
             or spec.get("suspend") is not True
             or self.activation_authorized
             or not 0 <= self.completion_index < 12
@@ -555,6 +636,10 @@ class M03RV7RenderedQualificationPilotJob:
             raise M03RV7Top2000KubernetesError(
                 "pilot must stay suspended, single-completion, two-H100, and four-update"
             )
+        _require_proven_h100_pod_profile(
+            pod_spec,
+            service_account_name="default",
+        )
         if self.manifest_sha256 != _sha256(manifest):
             raise M03RV7Top2000KubernetesError("pilot manifest hash mismatch")
         if self.pod_spec_sha256 != _canonical_pod_spec_sha256(pod_spec):
@@ -594,6 +679,8 @@ class M03RV7RenderedQualificationBatchJob:
                 "qualification batch manifest must be canonical JSON"
             )
         spec = _mapping(manifest.get("spec"), "qualification batch spec")
+        _require_supported_indexed_job_spec(spec)
+        deadline = spec.get("activeDeadlineSeconds")
         template = _mapping(spec.get("template"), "qualification batch template")
         pod_spec = _mapping(template.get("spec"), "qualification batch Pod spec")
         containers = pod_spec.get("containers")
@@ -628,8 +715,9 @@ class M03RV7RenderedQualificationBatchJob:
             or self.parallelism * 2 > 16
             or spec.get("suspend") is not True
             or spec.get("backoffLimit") != 0
-            or spec.get("backoffLimitPerIndex") != 0
-            or spec.get("maxFailedIndexes") != 0
+            or isinstance(deadline, bool)
+            or not isinstance(deadline, int)
+            or not 1 <= deadline <= M03R_TOP2000_PILOT_MAX_ACTIVE_DEADLINE_SECONDS
             or self.activation_authorized
             or self.qualification_steps != 4
             or not isinstance(args, list)
@@ -649,6 +737,10 @@ class M03RV7RenderedQualificationBatchJob:
             raise M03RV7Top2000KubernetesError(
                 "qualification batch geometry, cap, index map, or restart gate drifted"
             )
+        _require_proven_h100_pod_profile(
+            pod_spec,
+            service_account_name="default",
+        )
         for name in (
             "manifest_sha256",
             "pod_spec_sha256",
@@ -724,6 +816,7 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
     labels = {
         "app.kubernetes.io/name": "quanttrade-m03r-v7-capacity-pilot",
         "app.kubernetes.io/managed-by": "receipt-gated-research",
+        "k8s-user": "yding4",
         "rl-quant/run-id": template.run_id,
         "rl-quant/owner": "yding4",
         "runai/queue": template.runai_queue,
@@ -771,22 +864,25 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
             "completions": 1,
             "parallelism": 1,
             "backoffLimit": 0,
-            "backoffLimitPerIndex": 0,
-            "maxFailedIndexes": 0,
             "activeDeadlineSeconds": min(
                 template.active_deadline_seconds,
-                86400,
+                M03R_TOP2000_PILOT_MAX_ACTIVE_DEADLINE_SECONDS,
             ),
             "ttlSecondsAfterFinished": template.ttl_seconds_after_finished,
             "template": {
                 "metadata": {"labels": labels, "annotations": annotations},
                 "spec": {
                     "restartPolicy": "Never",
+                    "serviceAccount": template.service_account_name,
                     "serviceAccountName": template.service_account_name,
                     "schedulerName": template.scheduler_name,
                     "automountServiceAccountToken": False,
                     "enableServiceLinks": False,
+                    "dnsPolicy": "ClusterFirst",
+                    "nodeSelector": dict(M03R_TOP2000_H100_POOL_NODE_SELECTOR),
+                    "priorityClassName": M03R_TOP2000_PRIORITY_CLASS_NAME,
                     "terminationGracePeriodSeconds": 60,
+                    "tolerations": [dict(M03R_TOP2000_MULTI_GPU_TOLERATION)],
                     "affinity": {
                         "nodeAffinity": {
                             "requiredDuringSchedulingIgnoredDuringExecution": {
@@ -817,6 +913,12 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
                             "name": "trainer",
                             "image": plan.artifacts.image_reference,
                             "imagePullPolicy": "IfNotPresent",
+                            "terminationMessagePath": (
+                                M03R_TOP2000_TERMINATION_MESSAGE_PATH
+                            ),
+                            "terminationMessagePolicy": (
+                                M03R_TOP2000_TERMINATION_MESSAGE_POLICY
+                            ),
                             "command": [argv[0]],
                             "args": argv[1:],
                             "env": [
@@ -1012,6 +1114,7 @@ def render_m03r_v7_top2000_suspended_indexed_job(
     labels = {
         "app.kubernetes.io/name": "quanttrade-m03r-v7-dev",
         "app.kubernetes.io/managed-by": "receipt-gated-research",
+        "k8s-user": "yding4",
         "rl-quant/run-id": template.run_id,
         "rl-quant/owner": "yding4",
         "runai/queue": template.runai_queue,
@@ -1056,19 +1159,22 @@ def render_m03r_v7_top2000_suspended_indexed_job(
             "completions": M03R_TOP2000_INDEXED_COMPLETIONS,
             "parallelism": live_evidence.allowed_parallelism,
             "backoffLimit": 0,
-            "backoffLimitPerIndex": 0,
-            "maxFailedIndexes": 0,
             "activeDeadlineSeconds": template.active_deadline_seconds,
             "ttlSecondsAfterFinished": template.ttl_seconds_after_finished,
             "template": {
                 "metadata": {"labels": labels, "annotations": annotations},
                 "spec": {
                     "restartPolicy": "Never",
+                    "serviceAccount": template.service_account_name,
                     "serviceAccountName": template.service_account_name,
                     "schedulerName": template.scheduler_name,
                     "automountServiceAccountToken": False,
                     "enableServiceLinks": False,
+                    "dnsPolicy": "ClusterFirst",
+                    "nodeSelector": dict(M03R_TOP2000_H100_POOL_NODE_SELECTOR),
+                    "priorityClassName": M03R_TOP2000_PRIORITY_CLASS_NAME,
                     "terminationGracePeriodSeconds": 60,
+                    "tolerations": [dict(M03R_TOP2000_MULTI_GPU_TOLERATION)],
                     "affinity": {
                         "nodeAffinity": {
                             "requiredDuringSchedulingIgnoredDuringExecution": {
@@ -1101,6 +1207,12 @@ def render_m03r_v7_top2000_suspended_indexed_job(
                             "name": "trainer",
                             "image": package.plan.artifacts.image_reference,
                             "imagePullPolicy": "IfNotPresent",
+                            "terminationMessagePath": (
+                                M03R_TOP2000_TERMINATION_MESSAGE_PATH
+                            ),
+                            "terminationMessagePolicy": (
+                                M03R_TOP2000_TERMINATION_MESSAGE_POLICY
+                            ),
                             "command": [argv[0]],
                             "args": argv[1:],
                             "env": [
@@ -1306,6 +1418,84 @@ def _admitted_identity(job: Mapping[str, Any]) -> tuple[str, str, str, str]:
     return cast(str, name), cast(str, namespace), cast(str, uid), cast(str, resource_version)
 
 
+def _require_exact_admitted_metadata(
+    *,
+    desired_job_metadata: Mapping[str, Any],
+    admitted_job_metadata: Mapping[str, Any],
+    desired_template_metadata: Mapping[str, Any],
+    admitted_template_metadata: Mapping[str, Any],
+    job_name: str,
+    job_uid: str,
+) -> None:
+    """Allow only the Job-controller labels and the known null timestamp."""
+
+    desired_job_labels = dict(
+        _mapping(desired_job_metadata.get("labels"), "desired Job labels")
+    )
+    desired_job_annotations = dict(
+        _mapping(desired_job_metadata.get("annotations"), "desired Job annotations")
+    )
+    admitted_job_labels = dict(
+        _mapping(admitted_job_metadata.get("labels"), "admitted Job labels")
+    )
+    admitted_job_annotations = dict(
+        _mapping(admitted_job_metadata.get("annotations"), "admitted Job annotations")
+    )
+    if (
+        admitted_job_labels != desired_job_labels
+        or admitted_job_annotations != desired_job_annotations
+    ):
+        raise M03RV7Top2000KubernetesError(
+            "admission changed or injected an unbound Job label or annotation"
+        )
+
+    desired_template_labels = dict(
+        _mapping(
+            desired_template_metadata.get("labels"),
+            "desired Pod-template labels",
+        )
+    )
+    dynamic_template_label_values = (job_uid, job_name, job_uid, job_name)
+    expected_template_labels = {
+        **desired_template_labels,
+        **dict(
+            zip(
+                M03R_TOP2000_DYNAMIC_TEMPLATE_LABEL_KEYS,
+                dynamic_template_label_values,
+                strict=True,
+            )
+        ),
+    }
+    admitted_template_labels = dict(
+        _mapping(
+            admitted_template_metadata.get("labels"),
+            "admitted Pod-template labels",
+        )
+    )
+    desired_template_annotations = dict(
+        _mapping(
+            desired_template_metadata.get("annotations"),
+            "desired Pod-template annotations",
+        )
+    )
+    admitted_template_annotations = dict(
+        _mapping(
+            admitted_template_metadata.get("annotations"),
+            "admitted Pod-template annotations",
+        )
+    )
+    allowed_metadata_keys = {"labels", "annotations", "creationTimestamp"}
+    if (
+        admitted_template_labels != expected_template_labels
+        or admitted_template_annotations != desired_template_annotations
+        or set(admitted_template_metadata) != allowed_metadata_keys
+        or admitted_template_metadata.get("creationTimestamp") is not None
+    ):
+        raise M03RV7Top2000KubernetesError(
+            "admitted Pod-template metadata contains an unknown mutation"
+        )
+
+
 def bind_m03r_v7_top2000_admitted_suspended_job(
     *,
     rendered: (
@@ -1337,6 +1527,8 @@ def bind_m03r_v7_top2000_admitted_suspended_job(
         )
     first_spec = _mapping(first_read.get("spec"), "first.spec")
     second_spec = _mapping(second_read.get("spec"), "second.spec")
+    _require_supported_indexed_job_spec(first_spec)
+    _require_supported_indexed_job_spec(second_spec)
     if _sha256(first_spec) != _sha256(second_spec):
         raise M03RV7Top2000KubernetesError(
             "admitted Job spec changed between clean attachment reads"
@@ -1354,6 +1546,7 @@ def bind_m03r_v7_top2000_admitted_suspended_job(
     )
     desired_pod_spec = _mapping(desired_template.get("spec"), "desired pod spec")
     admitted_pod_spec = _mapping(second_template.get("spec"), "admitted pod spec")
+    _require_supported_indexed_job_spec(desired_spec)
     required_equal = tuple(
         (name, desired_spec.get(name))
         for name in (
@@ -1361,36 +1554,41 @@ def bind_m03r_v7_top2000_admitted_suspended_job(
             "completions",
             "parallelism",
             "backoffLimit",
-            "backoffLimitPerIndex",
-            "maxFailedIndexes",
+            "activeDeadlineSeconds",
+            "ttlSecondsAfterFinished",
             "suspend",
         )
     )
     if any(second_spec.get(name) != expected for name, expected in required_equal):
         raise M03RV7Top2000KubernetesError("admitted Indexed Job geometry drifted")
-    for name in ("containers", "affinity", "volumes", "serviceAccountName"):
-        if admitted_pod_spec.get(name) != desired_pod_spec.get(name):
-            raise M03RV7Top2000KubernetesError(
-                f"admission changed execution-bearing Pod field {name}"
-            )
-    for scope, desired, admitted in (
-        ("Job", desired_metadata, admitted_metadata),
-        ("Pod template", desired_template_metadata, admitted_template_metadata),
-    ):
-        for field in ("labels", "annotations"):
-            desired_values = _mapping(
-                desired.get(field), f"desired {scope} {field}"
-            )
-            admitted_values = _mapping(
-                admitted.get(field), f"admitted {scope} {field}"
-            )
-            if any(
-                admitted_values.get(key) != value
-                for key, value in desired_values.items()
-            ):
-                raise M03RV7Top2000KubernetesError(
-                    f"admission removed or changed bound {scope} {field}"
-                )
+    allowed_spec_keys = set(desired_spec) | {"selector"}
+    if set(second_spec) != allowed_spec_keys:
+        raise M03RV7Top2000KubernetesError(
+            "admitted Job spec contains an unknown injected field"
+        )
+    expected_selector = {
+        "matchLabels": {"batch.kubernetes.io/controller-uid": job_uid}
+    }
+    if dict(second_selector) != expected_selector:
+        raise M03RV7Top2000KubernetesError(
+            "admitted Job selector does not bind the exact controller UID"
+        )
+    if dict(admitted_pod_spec) != dict(desired_pod_spec):
+        raise M03RV7Top2000KubernetesError(
+            "admission changed an execution-bearing Pod field"
+        )
+    _require_proven_h100_pod_profile(
+        admitted_pod_spec,
+        service_account_name="default",
+    )
+    _require_exact_admitted_metadata(
+        desired_job_metadata=desired_metadata,
+        admitted_job_metadata=admitted_metadata,
+        desired_template_metadata=desired_template_metadata,
+        admitted_template_metadata=admitted_template_metadata,
+        job_name=job_name,
+        job_uid=job_uid,
+    )
     desired_annotations = _mapping(
         desired_metadata.get("annotations"), "desired Job annotations"
     )
@@ -2158,13 +2356,17 @@ def build_m03r_v7_indexed_batch_receipt(
 __all__ = [
     "M03R_TOP2000_ACTIVATION_REQUEST_SCHEMA",
     "M03R_TOP2000_GPUS_PER_COMPLETION",
+    "M03R_TOP2000_H100_POOL_NODE_SELECTOR",
     "M03R_TOP2000_H100_PRODUCT_LABEL_KEY",
     "M03R_TOP2000_H100_PRODUCT_LABEL_VALUES",
     "M03R_TOP2000_INDEXED_COMPLETIONS",
     "M03R_TOP2000_JSON_PATCH_CONTENT_TYPE",
     "M03R_TOP2000_KUBERNETES_CONTEXT",
     "M03R_TOP2000_KUBERNETES_NAMESPACE",
+    "M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS",
+    "M03R_TOP2000_MULTI_GPU_TOLERATION",
     "M03R_TOP2000_PARALLELISM_HARD_CAP",
+    "M03R_TOP2000_PRIORITY_CLASS_NAME",
     "M03RV7AdmittedJobBinding",
     "M03RV7ExactCleanupReceipt",
     "M03RV7ExactJobActivationRequest",

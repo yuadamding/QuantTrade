@@ -313,9 +313,10 @@ exact package execution surface:
    allocated HBM for every setting.
 
 The manifest uses `completionMode: Indexed`, `completions: 12`, two H100s in
-one container per completion, `backoffLimitPerIndex: 0`, and
-`maxFailedIndexes: 0`. Parallelism is recomputed from a fresh live RBAC/cap
-receipt and is always:
+one container per completion, and Job-level `backoffLimit: 0`. The installed
+Seadragon API strips the newer `backoffLimitPerIndex` and `maxFailedIndexes`
+fields, so this generation neither renders nor binds them. Parallelism is
+recomputed from a fresh live RBAC/cap receipt and is always:
 
 ```text
 min(8, floor((16 - protected_H100) / 2))
@@ -329,14 +330,20 @@ entitlement gate. Capacity
 that is not immediately available remains scheduler-Pending for automatic
 backfill; zero instantaneous free GPUs is not misreported as a failed Job.
 
-The API server must pass a fresh server-side dry run for the indexed-backoff
-fields before create. Product scheduling is restricted to the approved
-`nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3` selector. If node-list RBAC is
-denied, qualification does not claim that the label was observed; the actual
-runtime device name, physical memory, and compute capability provide the
-artifact-backed product proof required by the final launch. Node names,
-hostname selectors, host paths, private-key copying, and service-account token
-automounting are prohibited.
+The API server must pass a fresh server-side dry run for the exact compatible
+Indexed Job before create. Placement binds both the proven H100 resource pool
+selector `gpu-type=H100` and product affinity
+`nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3`. It also renders the admitted
+`multi-gpu=true:NoSchedule` toleration, `high-nonpreempting` priority class,
+`ClusterFirst` DNS policy, `default` service-account fields, 60-second
+termination grace period, and container termination-message defaults. The
+final Job deadline is at most 216000 seconds; the bounded qualification Job is
+at most 86400 seconds. If node-list RBAC is denied, qualification does not
+claim that the product label was observed; actual runtime device name,
+physical memory, and compute capability provide the artifact-backed hardware
+proof required by the final launch. Node names, hostname selectors, host
+paths, private-key copying, and service-account token automounting are
+prohibited.
 
 The proven namespace topology uses the `yding4-gpu-home` PVC, `default`
 service account, `kai-scheduler`, queue
@@ -346,7 +353,10 @@ the exact run subtree is the only writable research output mount.
 
 Attachment is receipt-gated: read each newly admitted suspended Job twice,
 verify stable UID and execution-bearing spec, verify zero UID-owned Pods, and
-bind the admitted `template.spec` and selector hashes. Activation may only use
+bind the admitted `template.spec` and selector hashes. The binding allows only
+the Job controller's exact UID/name labels plus the known null template
+creation timestamp; any other metadata or Pod-spec injection fails closed.
+Activation may only use
 a full JSON Patch whose `test` operations bind the fresh UID, resourceVersion,
 run-ID annotation, suspension state, parallelism, selector, template metadata,
 and complete Pod spec before its sole mutation changes `suspend` to `false`.
