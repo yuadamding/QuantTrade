@@ -980,7 +980,6 @@ def render_m03r_v7_top2000_suspended_qualification_pilot_job(
                                         + "/runs/"
                                         + template.run_id
                                     ),
-                                    "readOnly": False,
                                 },
                                 {"name": "tmp", "mountPath": "/tmp"},
                                 {"name": "dshm", "mountPath": "/dev/shm"},
@@ -1286,7 +1285,6 @@ def render_m03r_v7_top2000_suspended_indexed_job(
                                         + "/runs/"
                                         + template.run_id
                                     ),
-                                    "readOnly": False,
                                 },
                                 {
                                     "name": "tmp",

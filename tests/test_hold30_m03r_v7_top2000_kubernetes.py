@@ -413,6 +413,25 @@ def test_unqualified_plan_renders_suspended_single_and_all_setting_pilots() -> N
     assert binding.suspended
 
 
+def test_package_mount_is_read_only_and_output_mount_omits_read_only() -> None:
+    plan = build_m03r_v7_top2000_package_plan(
+        artifacts=_artifacts(),
+        plan_artifact_path="/mnt/package/package-plan.json",
+    )
+    pilot = render_m03r_v7_top2000_suspended_qualification_pilot_job(
+        plan=plan,
+        completion_index=0,
+        live_evidence=_live_evidence(),
+        template=_template(),
+        now_utc=datetime(2026, 8, 5, 12, 1, tzinfo=UTC),
+    )
+    for rendered in (pilot, _rendered()):
+        container = rendered.manifest["spec"]["template"]["spec"]["containers"][0]
+        mounts = {row["mountPath"]: row for row in container["volumeMounts"]}
+        assert mounts["/mnt/package"]["readOnly"] is True
+        assert "readOnly" not in mounts["/mnt/output"]
+
+
 def test_pilot_can_establish_runtime_selector_proof_but_final_requires_it() -> None:
     plan = build_m03r_v7_top2000_package_plan(
         artifacts=_artifacts(),
