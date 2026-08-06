@@ -66,7 +66,11 @@ class M03RV7Top2000RuntimeProfile:
     """Content-bound optimizer and memory geometry shared by all settings."""
 
     optimizer_steps_per_fold_seed: int = 64
-    max_origin_batch: int = 16
+    # The original 16-origin profile measured only 47.50 GiB allocated per
+    # H100 on the exact TOP2000 path.  Twenty-two origins is the next bounded
+    # useful-work geometry; it still must pass the 60--75 GiB/rank receipt
+    # gate before a full Job can be rendered.
+    max_origin_batch: int = 22
     learning_rate: float = 1.0e-4
     weight_decay: float = 1.0e-4
     grad_clip: float = 1.0
@@ -79,7 +83,7 @@ class M03RV7Top2000RuntimeProfile:
     def __post_init__(self) -> None:
         if (
             self.optimizer_steps_per_fold_seed <= 0
-            or self.max_origin_batch not in {4, 8, 16, 32}
+            or self.max_origin_batch not in {4, 8, 16, 22, 32}
             or self.learning_rate <= 0.0
             or self.weight_decay < 0.0
             or self.grad_clip <= 0.0

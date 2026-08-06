@@ -278,6 +278,7 @@ def test_package_separates_artifacts_and_maps_all_twelve_indices() -> None:
     assert plan.source_pythonpath == "/mnt/package/source/src"
     assert payload["source_pythonpath"] == plan.source_pythonpath
     assert payload["runtime_profile"]["token_dim"] == 512
+    assert payload["runtime_profile"]["max_origin_batch"] == 22
     assert not plan.promotion_eligible
     assert not plan.outer_evaluation_authorized
 
@@ -293,8 +294,11 @@ def test_runtime_profile_is_content_bound_and_rejects_unqualified_shapes() -> No
         runtime_profile=M03RV7Top2000RuntimeProfile(token_dim=448),
     )
     assert base.package_plan_sha256 != smaller.package_plan_sha256
+    assert M03RV7Top2000RuntimeProfile(max_origin_batch=22).max_origin_batch == 22
     with pytest.raises(M03RV7Top2000PackageError, match="runtime profile"):
         M03RV7Top2000RuntimeProfile(token_dim=513)
+    with pytest.raises(M03RV7Top2000PackageError, match="runtime profile"):
+        M03RV7Top2000RuntimeProfile(max_origin_batch=21)
 
 
 def test_package_fails_closed_without_worker_and_capacity_and_rejects_stale_surface() -> None:
