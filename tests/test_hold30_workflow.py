@@ -70,9 +70,38 @@ def test_inventory_contains_every_landed_hold30_component_and_test() -> None:
 
     assert "src/rl_quant/datasets/hold30.py" in inventory.component_sources
     assert "src/rl_quant/models/hold30_ensemble.py" in inventory.component_sources
+    assert "src/rl_quant/models/hold30_confidence_v6.py" in inventory.component_sources
+    assert (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7.py" in inventory.component_sources
+    )
+    assert (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_schedule.py"
+        in inventory.component_sources
+    )
+    assert (
+        "src/rl_quant/training/hold30_alpha_m03r_v7.py" in inventory.component_sources
+    )
+    assert (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_routes.py"
+        in inventory.component_sources
+    )
+    assert (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_schedule.py"
+        in inventory.component_sources
+    )
     assert "src/rl_quant/training/hold30_runtime.py" in inventory.component_sources
     assert "tests/test_hold30_dataset.py" in inventory.hold30_tests
     assert "tests/test_hold30_ensemble.py" in inventory.hold30_tests
+    assert "tests/test_hold30_confidence_v6.py" in inventory.hold30_tests
+    assert "tests/test_hold30_alpha_m03r_v7_protocol.py" in inventory.hold30_tests
+    assert "tests/test_hold30_alpha_m03r_v7_objective.py" in inventory.hold30_tests
+    assert "tests/test_hold30_alpha_m03r_v7_routes.py" in inventory.hold30_tests
+    assert "tests/test_hold30_alpha_m03r_v7_schedule.py" in inventory.hold30_tests
+    assert "docs/prelockbox_hold30_active_alpha_m03r_v7.md" in HOLD30_EVIDENCE_FILES
+    assert (
+        "docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md"
+        in HOLD30_EVIDENCE_FILES
+    )
     assert "tests/test_hold30_mechanisms.py" in inventory.hold30_tests
     assert "tests/test_hold30_workflow.py" in inventory.hold30_tests
     assert set(inventory.component_sources) == {
@@ -85,16 +114,22 @@ def test_inventory_fails_closed_when_a_required_test_is_missing(tmp_path: Path) 
     missing = "tests/test_hold30_dataset.py"
     _materialize_inventory_tree(tmp_path, omit={missing})
 
-    with pytest.raises(Hold30QualificationError, match="required qualification files are absent"):
+    with pytest.raises(
+        Hold30QualificationError, match="required qualification files are absent"
+    ):
         _resolve_qualification_inventory(tmp_path)
 
 
-def test_future_hold30_driver_requires_and_binds_its_conventional_test(tmp_path: Path) -> None:
+def test_future_hold30_driver_requires_and_binds_its_conventional_test(
+    tmp_path: Path,
+) -> None:
     _materialize_inventory_tree(tmp_path)
     driver = tmp_path / "src/rl_quant/training/hold30_aux_driver.py"
     driver.write_text("# package-owned driver\n", encoding="utf-8")
 
-    with pytest.raises(Hold30QualificationError, match="requires tests/test_hold30_aux_driver.py"):
+    with pytest.raises(
+        Hold30QualificationError, match="requires tests/test_hold30_aux_driver.py"
+    ):
         _resolve_qualification_inventory(tmp_path)
 
     driver_test = tmp_path / "tests/test_hold30_aux_driver.py"
@@ -102,10 +137,14 @@ def test_future_hold30_driver_requires_and_binds_its_conventional_test(tmp_path:
     inventory = _resolve_qualification_inventory(tmp_path)
     assert "src/rl_quant/training/hold30_aux_driver.py" in inventory.component_sources
     assert "tests/test_hold30_aux_driver.py" in inventory.hold30_tests
-    assert "src/rl_quant/training/hold30_aux_driver.py" in inventory.static_hygiene_files
+    assert (
+        "src/rl_quant/training/hold30_aux_driver.py" in inventory.static_hygiene_files
+    )
 
 
-def test_bad_compact_parameter_counts_block_qualification(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bad_compact_parameter_counts_block_qualification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         workflow,
         "hold30_parameter_counts",

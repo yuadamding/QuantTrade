@@ -15,6 +15,10 @@ from typing import Final, Literal
 import torch
 from torch import nn
 
+from rl_quant.models.hold30_exit_action_v6 import (
+    M03RV6ExitAction,
+    M03RV6ExitActionHead,
+)
 from rl_quant.models.hold30_hazard import (
     HOLD30_HAZARD_BOUND_MODES,
     HOLD30_HAZARD_MAX,
@@ -39,10 +43,34 @@ from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     M03R_DESIGN as M03R_V5_DESIGN,
 )
 from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_DESIGN_ID as M03R_V5_DESIGN_ID,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_PROTOCOL_GENERATION as M03R_V5_PROTOCOL_GENERATION,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     M03R_SETTING_IDS as M03R_V5_SETTING_IDS,
 )
 from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     resolve_m03r_v5_setting,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_ALPHA_HORIZONS_TRADING_SESSIONS as M03R_V6_ALPHA_HORIZONS,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_DESIGN as M03R_V6_DESIGN,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_DESIGN_ID as M03R_V6_DESIGN_ID,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_PROTOCOL_GENERATION as M03R_V6_PROTOCOL_GENERATION,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_SETTING_IDS as M03R_V6_SETTING_IDS,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    resolve_m03r_v6_setting,
 )
 from rl_quant.protocol.hold30_alpha_v3 import (
     HOLD30_ALPHA_HORIZONS,
@@ -58,6 +86,14 @@ from rl_quant.protocol.hold30_m03r_confidence import (
 )
 
 HOLD30_ALPHA_HEAD_PARAMETER_CAP: Final[int] = 1_000_000
+M03R_V6_CONFIDENCE_LIFECYCLE_STAGES: Final[tuple[str, str]] = (
+    "v6-training-uncalibrated",
+    "v6-post-freeze-calibrated",
+)
+M03RV6ConfidenceLifecycleStage = Literal[
+    "v6-training-uncalibrated",
+    "v6-post-freeze-calibrated",
+]
 
 
 class Hold30AlphaModelError(ValueError):
@@ -66,32 +102,42 @@ class Hold30AlphaModelError(ValueError):
 
 def _alpha_setting_flags(
     setting_id: str,
-    mechanism_generation: Literal["v3-frozen", "m03r-v1", "m03r-v2"],
+    mechanism_generation: Literal[
+        "v3-frozen", "m03r-v1", "m03r-v2", "m03r-v3"
+    ],
 ) -> tuple[bool, bool, bool, str]:
     """Resolve exact V3 or M03R identity without cross-generation aliases."""
 
-    if mechanism_generation == "m03r-v2":
-        setting = resolve_m03r_v5_setting(setting_id)
+    if mechanism_generation == "m03r-v3":
+        v6_setting = resolve_m03r_v6_setting(setting_id)
         return (
-            setting.residual_alpha_heads,
-            setting.use_downside_adjusted_stock_score,
-            setting.use_confidence_scaled_active_risk_budget,
-            setting.sharpe_mode,
+            v6_setting.residual_alpha_heads,
+            v6_setting.use_downside_adjusted_stock_score,
+            v6_setting.use_confidence_scaled_active_risk_budget,
+            v6_setting.sharpe_mode,
+        )
+    if mechanism_generation == "m03r-v2":
+        v5_setting = resolve_m03r_v5_setting(setting_id)
+        return (
+            v5_setting.residual_alpha_heads,
+            v5_setting.use_downside_adjusted_stock_score,
+            v5_setting.use_confidence_scaled_active_risk_budget,
+            v5_setting.sharpe_mode,
         )
     if mechanism_generation == "m03r-v1":
-        setting = resolve_m03r_v4_setting(setting_id)
+        v4_setting = resolve_m03r_v4_setting(setting_id)
         return (
-            setting.residual_alpha_heads,
-            setting.uncertainty_scaled_sizing,
+            v4_setting.residual_alpha_heads,
+            v4_setting.uncertainty_scaled_sizing,
             True,
-            setting.sharpe_mode,
+            v4_setting.sharpe_mode,
         )
-    setting = resolve_hold30_alpha_setting(setting_id)
+    v3_setting = resolve_hold30_alpha_setting(setting_id)
     return (
-        setting.supervised_residual_alpha_heads,
-        setting.uncertainty_downside_heads,
+        v3_setting.supervised_residual_alpha_heads,
+        v3_setting.uncertainty_downside_heads,
         False,
-        setting.sharpe_mode,
+        v3_setting.sharpe_mode,
     )
 
 
@@ -115,6 +161,7 @@ class Hold30AlphaOutput:
     benchmark_derisk_request: torch.Tensor | None
     total_risk_overlay: torch.Tensor | None
     auxiliary_horizons_trading_sessions: tuple[int, ...] = HOLD30_ALPHA_HORIZONS
+    exit_action_v6: M03RV6ExitAction | None = None
 
     def validate(self) -> None:
         if self.mean_30d.ndim != 2:
@@ -172,7 +219,7 @@ class Hold30AlphaOutput:
             self.total_risk_overlay.shape
         ) != (matrix[0],):
             raise Hold30AlphaModelError("total_risk_overlay must be [batch]")
-        values = (
+        values: tuple[torch.Tensor, ...] = (
             self.mean_30d,
             self.risk_adjusted_score,
             self.auxiliary_mean,
@@ -189,6 +236,12 @@ class Hold30AlphaOutput:
         ):
             if value is not None:
                 values = (*values, value)
+        if self.exit_action_v6 is not None:
+            self.exit_action_v6.validate()
+            if tuple(self.exit_action_v6.risky_available.shape) != matrix:
+                raise Hold30AlphaModelError(
+                    "exit_action_v6 asset axes must align with alpha outputs"
+                )
         if self.signal_confidence is not None:
             values = (*values, self.signal_confidence)
         if self.uncalibrated_signal_confidence_logit is not None:
@@ -261,7 +314,9 @@ class Hold30AlphaHeadConfig:
     parameter_cap: int = HOLD30_ALPHA_HEAD_PARAMETER_CAP
     # Explicitly opt-in for post-v3 generations. These defaults are the frozen
     # v3 behavior and therefore do not change existing checkpoint identities.
-    mechanism_generation: Literal["v3-frozen", "m03r-v1", "m03r-v2"] = "v3-frozen"
+    mechanism_generation: Literal[
+        "v3-frozen", "m03r-v1", "m03r-v2", "m03r-v3"
+    ] = "v3-frozen"
     hazard_bound_mode: Hold30HazardBoundMode = "hard_clip"
     exact_hold_mixture: bool = False
     exact_hold_logit_bias: float | None = None
@@ -273,6 +328,10 @@ class Hold30AlphaHeadConfig:
     confidence_calibration_model_state_sha256: str | None = None
     confidence_calibration_source_score_array_sha256: str | None = None
     confidence_calibration_source_target_array_sha256: str | None = None
+    m03r_v6_confidence_stage: M03RV6ConfidenceLifecycleStage | None = None
+    # Kept as ``object`` here to avoid a models -> training package import
+    # cycle. Post-freeze validation requires the exact typed governed class.
+    confidence_calibration_fit_evidence: object | None = None
 
     def __post_init__(self) -> None:
         use_alpha, use_downside, use_confidence_budget, _sharpe_mode = (
@@ -280,17 +339,21 @@ class Hold30AlphaHeadConfig:
         )
         is_m03r_v4 = self.mechanism_generation == "m03r-v1"
         is_m03r_v5 = self.mechanism_generation == "m03r-v2"
-        is_m03r = is_m03r_v4 or is_m03r_v5
+        is_m03r_v6 = self.mechanism_generation == "m03r-v3"
+        is_m03r = is_m03r_v4 or is_m03r_v5 or is_m03r_v6
         m03r_setting = (
             resolve_m03r_v4_setting(self.setting_id)
             if is_m03r_v4
             else resolve_m03r_v5_setting(self.setting_id)
             if is_m03r_v5
+            else resolve_m03r_v6_setting(self.setting_id)
+            if is_m03r_v6
             else None
         )
         if self.mechanism_generation == "v3-frozen" and (
             self.setting_id in M03R_V4_SETTING_IDS
             or self.setting_id in M03R_V5_SETTING_IDS
+            or self.setting_id in M03R_V6_SETTING_IDS
         ):
             raise Hold30AlphaModelError(
                 "M03R head options require an explicit M03R mechanism generation"
@@ -315,7 +378,9 @@ class Hold30AlphaHeadConfig:
         if not 0 < float(self.te_target) < 1:
             raise Hold30AlphaModelError("te_target must lie in (0,1)")
         expected_risk_reference = (
-            M03R_V5_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
+            M03R_V6_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
+            if is_m03r_v6
+            else M03R_V5_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
             if is_m03r
             else HOLD30_ALPHA_TE_TARGET_ANNUAL
         )
@@ -373,6 +438,78 @@ class Hold30AlphaHeadConfig:
                 self.confidence_calibration_source_score_array_sha256,
                 self.confidence_calibration_source_target_array_sha256,
             )
+            calibration_bound = (
+                digest is not None
+                or manifest is not None
+                or any(value is not None for value in calibration_identity)
+            )
+            stage = self.m03r_v6_confidence_stage
+            fit_evidence = self.confidence_calibration_fit_evidence
+            if is_m03r_v6 and use_confidence_budget:
+                if stage not in M03R_V6_CONFIDENCE_LIFECYCLE_STAGES:
+                    raise Hold30AlphaModelError(
+                        "M03R v6 confidence sizing requires an explicit "
+                        "v6-training-uncalibrated or v6-post-freeze-calibrated stage"
+                    )
+                if stage == "v6-training-uncalibrated":
+                    if calibration_bound or fit_evidence is not None:
+                        raise Hold30AlphaModelError(
+                            "v6 uncalibrated training forbids calibration manifests, "
+                            "checkpoint identity, and fit evidence"
+                        )
+                else:
+                    if (
+                        not isinstance(digest, str)
+                        or manifest is None
+                        or any(value is None for value in calibration_identity)
+                        or fit_evidence is None
+                    ):
+                        raise Hold30AlphaModelError(
+                            "v6 post-freeze execution requires typed calibration-fit "
+                            "evidence and its exact manifest/checkpoint identity"
+                        )
+                    from rl_quant.training.hold30_m03r_confidence_fit import (
+                        M03RConfidenceCalibrationFitEvidence,
+                        M03RConfidenceFitError,
+                        validate_m03r_confidence_calibration_fit_evidence,
+                    )
+
+                    if not isinstance(
+                        fit_evidence, M03RConfidenceCalibrationFitEvidence
+                    ):
+                        raise Hold30AlphaModelError(
+                            "v6 confidence-fit evidence must use the typed governed artifact"
+                        )
+                    try:
+                        validate_m03r_confidence_calibration_fit_evidence(fit_evidence)
+                    except M03RConfidenceFitError as error:
+                        raise Hold30AlphaModelError(
+                            f"invalid M03R v6 confidence-fit evidence: {error}"
+                        ) from error
+                    if fit_evidence.calibration_manifest != manifest:
+                        raise Hold30AlphaModelError(
+                            "v6 confidence-fit evidence manifest does not match config"
+                        )
+                    if (
+                        fit_evidence.target_construction_contract.protocol_generation
+                        != M03R_V6_PROTOCOL_GENERATION
+                        or fit_evidence.target_construction_contract.design_id
+                        != M03R_V6_DESIGN_ID
+                    ):
+                        raise Hold30AlphaModelError(
+                            "v6 confidence-fit evidence belongs to another generation"
+                        )
+            elif is_m03r_v6 and (
+                stage is not None or fit_evidence is not None or calibration_bound
+            ):
+                raise Hold30AlphaModelError(
+                    "a v6 setting without confidence-sized risk cannot bind a "
+                    "confidence lifecycle or calibrator"
+                )
+            elif not is_m03r_v6 and (stage is not None or fit_evidence is not None):
+                raise Hold30AlphaModelError(
+                    "the v6 confidence lifecycle and fit evidence are exclusive to M03R v6"
+                )
             if is_m03r_v5 and use_confidence_budget:
                 if (
                     not isinstance(digest, str)
@@ -408,19 +545,56 @@ class Hold30AlphaHeadConfig:
                         expected_source_target_array_sha256=(
                             self.confidence_calibration_source_target_array_sha256
                         ),
+                        expected_protocol_generation=M03R_V5_PROTOCOL_GENERATION,
+                        expected_design_id=M03R_V5_DESIGN_ID,
                     )
                 except M03RConfidenceCalibrationError as error:
                     raise Hold30AlphaModelError(
                         f"invalid M03R confidence calibration: {error}"
                     ) from error
-            elif is_m03r_v5 and (
-                digest is not None
-                or manifest is not None
-                or any(value is not None for value in calibration_identity)
-            ):
+            elif is_m03r_v5 and calibration_bound:
                 raise Hold30AlphaModelError(
                     "a setting without confidence-sized risk cannot bind a calibrator"
                 )
+            if (
+                is_m03r_v6
+                and stage == "v6-post-freeze-calibrated"
+                and use_confidence_budget
+            ):
+                assert isinstance(digest, str)
+                assert manifest is not None
+                assert self.confidence_calibration_seed is not None
+                assert self.confidence_calibration_checkpoint_sha256 is not None
+                assert self.confidence_calibration_model_state_sha256 is not None
+                assert self.confidence_calibration_source_score_array_sha256 is not None
+                assert (
+                    self.confidence_calibration_source_target_array_sha256 is not None
+                )
+                try:
+                    validate_m03r_confidence_calibration_manifest(
+                        manifest,
+                        expected_manifest_sha256=digest,
+                        expected_setting_id=self.setting_id,
+                        expected_seed=self.confidence_calibration_seed,
+                        expected_checkpoint_sha256=(
+                            self.confidence_calibration_checkpoint_sha256
+                        ),
+                        expected_model_state_sha256=(
+                            self.confidence_calibration_model_state_sha256
+                        ),
+                        expected_source_score_array_sha256=(
+                            self.confidence_calibration_source_score_array_sha256
+                        ),
+                        expected_source_target_array_sha256=(
+                            self.confidence_calibration_source_target_array_sha256
+                        ),
+                        expected_protocol_generation=M03R_V6_PROTOCOL_GENERATION,
+                        expected_design_id=M03R_V6_DESIGN_ID,
+                    )
+                except M03RConfidenceCalibrationError as error:
+                    raise Hold30AlphaModelError(
+                        f"invalid M03R v6 confidence calibration: {error}"
+                    ) from error
             elif is_m03r_v4:
                 if (
                     not isinstance(digest, str)
@@ -449,6 +623,8 @@ class Hold30AlphaHeadConfig:
                         self.confidence_calibration_source_target_array_sha256,
                     )
                 )
+                or self.m03r_v6_confidence_stage is not None
+                or self.confidence_calibration_fit_evidence is not None
             ):
                 raise Hold30AlphaModelError(
                     "V3 heads cannot bind an M03R confidence calibration manifest"
@@ -476,9 +652,15 @@ class Hold30AlphaHeadConfig:
             raise Hold30AlphaModelError(
                 "hazard_bound_mode must be 'hard_clip' or 'smooth_tanh'"
             )
-        if self.mechanism_generation not in {"v3-frozen", "m03r-v1", "m03r-v2"}:
+        if self.mechanism_generation not in {
+            "v3-frozen",
+            "m03r-v1",
+            "m03r-v2",
+            "m03r-v3",
+        }:
             raise Hold30AlphaModelError(
-                "mechanism_generation must be v3-frozen, m03r-v1, or m03r-v2"
+                "mechanism_generation must be v3-frozen, m03r-v1, m03r-v2, or "
+                "m03r-v3"
             )
         if not isinstance(self.exact_hold_mixture, bool):
             raise Hold30AlphaModelError("exact_hold_mixture must be boolean")
@@ -512,11 +694,28 @@ class Hold30AlphaHeadConfig:
         if (
             m03r_setting is not None
             and m03r_setting.exit_hazard_mode == "learned-age-aware"
+            and not is_m03r_v6
             and not self.exact_hold_mixture
         ):
             raise Hold30AlphaModelError(
                 "learned M03R exit settings require the hard exact-hold branch"
             )
+        if is_m03r_v6 and self.exact_hold_mixture:
+            raise Hold30AlphaModelError(
+                "M03R v6 uses its mutually exclusive three-way action head; "
+                "the frozen v4/v5 exact-hold mixture must remain disabled"
+            )
+        if is_m03r_v6:
+            assert m03r_setting is not None
+            fixed_expected = m03r_setting.exit_hazard_mode == "fixed-hold30-prior"
+            if fixed_expected and self.fixed_hazard_residual != 0.0:
+                raise Hold30AlphaModelError(
+                    "A08-fixed-exit-hazard-v6 requires fixed residual 0.0"
+                )
+            if not fixed_expected and self.fixed_hazard_residual is not None:
+                raise Hold30AlphaModelError(
+                    "fixed hazard is exclusive to A08-fixed-exit-hazard-v6"
+                )
         if self.mechanism_generation == "v3-frozen":
             if (
                 self.hazard_bound_mode != "hard_clip"
@@ -528,7 +727,7 @@ class Hold30AlphaHeadConfig:
                 )
         elif self.hazard_bound_mode != "smooth_tanh":
             raise Hold30AlphaModelError(
-                "M03R v4/v5 requires the smooth_tanh hazard bound"
+                "M03R generations require the smooth_tanh hazard bound"
             )
 
     @property
@@ -549,12 +748,31 @@ class Hold30AlphaHeadConfig:
     @property
     def auxiliary_horizons(self) -> tuple[int, ...]:
         return (
-            M03R_V5_ALPHA_HORIZONS
+            M03R_V6_ALPHA_HORIZONS
+            if self.mechanism_generation == "m03r-v3"
+            else M03R_V5_ALPHA_HORIZONS
             if self.mechanism_generation == "m03r-v2"
             else M03R_V4_ALPHA_HORIZONS
             if self.mechanism_generation == "m03r-v1"
             else HOLD30_ALPHA_HORIZONS
         )
+
+    @property
+    def use_three_way_exit_action(self) -> bool:
+        if self.mechanism_generation != "m03r-v3":
+            return False
+        return (
+            resolve_m03r_v6_setting(self.setting_id).exit_hazard_mode
+            == "learned-age-aware"
+        )
+
+    @property
+    def allow_exact_hold_atom(self) -> bool:
+        if not self.use_three_way_exit_action:
+            return False
+        return resolve_m03r_v6_setting(
+            self.setting_id
+        ).exact_hold_action_supported
 
 
 class Hold30AlphaHead(nn.Module):
@@ -569,6 +787,7 @@ class Hold30AlphaHead(nn.Module):
     def __init__(self, config: Hold30AlphaHeadConfig) -> None:
         super().__init__()
         self.config = config
+        self._post_freeze_confidence_state_bound = False
         self.auxiliary_horizons = config.auxiliary_horizons
         width = config.hidden_dim
         self.downside_head: nn.Module | None = None
@@ -586,6 +805,12 @@ class Hold30AlphaHead(nn.Module):
         self.exact_hold_head: nn.Linear | None = None
         if config.exact_hold_mixture:
             self.exact_hold_head = nn.Linear(width, 1)
+        self.exit_action_head_v6: M03RV6ExitActionHead | None = None
+        if config.use_three_way_exit_action:
+            self.exit_action_head_v6 = M03RV6ExitActionHead(
+                width,
+                allow_exact_hold_atom=config.allow_exact_hold_atom,
+            )
         self.active_risk_head: nn.Module | None = None
         self.confidence_head: nn.Module | None = None
         if config.use_confidence_scaled_risk:
@@ -612,6 +837,8 @@ class Hold30AlphaHead(nn.Module):
         ):
             if module is None:
                 continue
+            if not isinstance(module, nn.Linear):
+                raise TypeError("alpha output initialization requires Linear heads")
             nn.init.orthogonal_(module.weight, gain=1e-3)
             nn.init.zeros_(module.bias)
         if self.exact_hold_head is not None:
@@ -630,6 +857,71 @@ class Hold30AlphaHead(nn.Module):
                 f"{config.parameter_cap:,}"
             )
 
+    def _bind_m03r_v6_post_freeze_confidence_state(
+        self,
+        *,
+        loaded_checkpoint_sha256: str,
+        loaded_policy_state_sha256: str,
+    ) -> tuple[str, str]:
+        if (
+            self.config.mechanism_generation != "m03r-v3"
+            or self.config.m03r_v6_confidence_stage
+            != "v6-post-freeze-calibrated"
+            or self.confidence_head is None
+        ):
+            raise Hold30AlphaModelError(
+                "only calibrated post-freeze M03R v6 alpha heads may bind policy state"
+            )
+        if loaded_checkpoint_sha256 != (
+            self.config.confidence_calibration_checkpoint_sha256
+        ):
+            raise Hold30AlphaModelError(
+                "loaded checkpoint does not match confidence-fit evidence"
+            )
+        if loaded_policy_state_sha256 != (
+            self.config.confidence_calibration_model_state_sha256
+        ):
+            raise Hold30AlphaModelError(
+                "loaded policy state does not match confidence-fit evidence"
+            )
+        from rl_quant.training.hold30_m03r_confidence_fit import (
+            M03RConfidenceCalibrationFitEvidence,
+        )
+
+        evidence = self.config.confidence_calibration_fit_evidence
+        if not isinstance(evidence, M03RConfidenceCalibrationFitEvidence):
+            raise Hold30AlphaModelError(
+                "post-freeze confidence-fit evidence is no longer typed"
+            )
+        manifest = self.config.confidence_calibration_manifest
+        if manifest is None:
+            raise Hold30AlphaModelError(
+                "post-freeze confidence calibration manifest is missing"
+            )
+        return manifest.manifest_sha256, evidence.evidence_sha256
+
+    def _activate_m03r_v6_post_freeze_confidence_state(self) -> None:
+        if (
+            self.config.mechanism_generation != "m03r-v3"
+            or self.config.m03r_v6_confidence_stage
+            != "v6-post-freeze-calibrated"
+            or self.confidence_head is None
+        ):
+            raise Hold30AlphaModelError(
+                "training alpha heads cannot enter post-freeze confidence execution"
+            )
+        self.confidence_head.eval()
+        self._post_freeze_confidence_state_bound = True
+
+    def train(self, mode: bool = True) -> Hold30AlphaHead:
+        super().train(mode)
+        if (
+            self._post_freeze_confidence_state_bound
+            and self.confidence_head is not None
+        ):
+            self.confidence_head.eval()
+        return self
+
     @property
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
@@ -641,6 +933,16 @@ class Hold30AlphaHead(nn.Module):
         age_summaries: torch.Tensor,
         available: torch.Tensor,
     ) -> Hold30AlphaOutput:
+        if (
+            self.config.mechanism_generation == "m03r-v3"
+            and self.config.m03r_v6_confidence_stage
+            == "v6-post-freeze-calibrated"
+            and not self._post_freeze_confidence_state_bound
+        ):
+            raise Hold30AlphaModelError(
+                "post-freeze confidence forward requires package-owned full-policy "
+                "state binding after checkpoint load"
+            )
         if market_hidden.ndim != 3:
             raise Hold30AlphaModelError("market_hidden must be [batch,asset,hidden]")
         batch, assets, width = market_hidden.shape
@@ -667,11 +969,12 @@ class Hold30AlphaHead(nn.Module):
             assert self.config.uncertainty_log_scale_bounds is not None
             lower, upper = self.config.uncertainty_log_scale_bounds
             downside = torch.exp(raw_downside.clamp(float(lower), float(upper)))
-        score = (
-            mean - float(self.config.downside_penalty_kappa) * downside
-            if downside is not None
-            else mean
-        )
+        downside_penalty_kappa = self.config.downside_penalty_kappa
+        if downside is not None:
+            assert downside_penalty_kappa is not None
+            score = mean - float(downside_penalty_kappa) * downside
+        else:
+            score = mean
         zero = torch.zeros_like(mean)
         mean = torch.where(risky, mean, zero)
         if downside is not None:
@@ -725,6 +1028,15 @@ class Hold30AlphaHead(nn.Module):
                 exact_hold,
                 torch.ones_like(exact_hold),
             )
+        exit_action_v6 = (
+            None
+            if self.exit_action_head_v6 is None
+            else self.exit_action_head_v6(
+                hazard_hidden,
+                available,
+                cash_index=0,
+            )
+        )
         # Deliberate CASH/unavailable sentinels are kept out of raw-hazard
         # saturation telemetry by the separate availability mask.
         raw_hazard = torch.where(risky, raw_hazard, torch.zeros_like(raw_hazard))
@@ -742,8 +1054,24 @@ class Hold30AlphaHead(nn.Module):
         uncalibrated_confidence_logit: torch.Tensor | None = None
         benchmark_derisk_request: torch.Tensor | None = None
         if self.confidence_head is not None:
-            uncalibrated_confidence_logit = self.confidence_head(pooled).squeeze(-1)
-            if self.config.mechanism_generation == "m03r-v2":
+            confidence_input = (
+                pooled.detach()
+                if self.config.mechanism_generation == "m03r-v3"
+                else pooled
+            )
+            uncalibrated_confidence_logit = self.confidence_head(
+                confidence_input
+            ).squeeze(-1)
+            if (
+                self.config.mechanism_generation == "m03r-v3"
+                and self.config.m03r_v6_confidence_stage
+                == "v6-training-uncalibrated"
+            ):
+                # The governed confidence target is generated from the frozen
+                # standardized unit-risk proposal. Confidence therefore cannot
+                # size its own training path before that checkpoint exists.
+                signal_confidence = None
+            elif self.config.mechanism_generation in {"m03r-v2", "m03r-v3"}:
                 assert self.config.confidence_calibration_manifest is not None
                 assert self.config.confidence_calibration_manifest_sha256 is not None
                 assert self.config.confidence_calibration_seed is not None
@@ -777,23 +1105,46 @@ class Hold30AlphaHead(nn.Module):
                     expected_source_target_array_sha256=(
                         self.config.confidence_calibration_source_target_array_sha256
                     ),
+                    expected_protocol_generation=(
+                        M03R_V6_PROTOCOL_GENERATION
+                        if self.config.mechanism_generation == "m03r-v3"
+                        else M03R_V5_PROTOCOL_GENERATION
+                    ),
+                    expected_design_id=(
+                        M03R_V6_DESIGN_ID
+                        if self.config.mechanism_generation == "m03r-v3"
+                        else M03R_V5_DESIGN_ID
+                    ),
                 )
             else:
                 # Frozen M03R v4 behavior: the digest was syntactic only and
                 # the raw sigmoid was treated as confidence.
                 signal_confidence = torch.sigmoid(uncalibrated_confidence_logit)
+            risk_design = (
+                M03R_V6_DESIGN
+                if self.config.mechanism_generation == "m03r-v3"
+                else M03R_V5_DESIGN
+            )
+            active_risk_maximum = float(
+                risk_design.active_risk.confidence_preferred_annual_tracking_error_maximum
+            )
             active_risk = (
-                float(
-                    M03R_V5_DESIGN.active_risk.confidence_preferred_annual_tracking_error_maximum
+                torch.full(
+                    (batch,),
+                    active_risk_maximum,
+                    device=pooled.device,
+                    dtype=pooled.dtype,
                 )
-                * signal_confidence
+                if signal_confidence is None
+                else active_risk_maximum * signal_confidence
             )
             # Confidence governs only capacity for new or enlarged active risk.
             # It is never an implicit instruction to liquidate the carried book
-            # toward C1. Canonical v5 has no learned de-risk head; the explicit
-            # request is frozen off and risk-forced repair remains separate.
-            if self.config.mechanism_generation == "m03r-v2":
-                benchmark_derisk_request = torch.zeros_like(signal_confidence)
+            # toward C1. Canonical v5/v6 has no learned de-risk head; the
+            # explicit request is frozen off and risk-forced repair remains
+            # separate.
+            if self.config.mechanism_generation in {"m03r-v2", "m03r-v3"}:
+                benchmark_derisk_request = torch.zeros_like(active_risk)
         else:
             assert self.active_risk_head is not None
             assert self.config.active_log_scale_bounds is not None
@@ -843,6 +1194,7 @@ class Hold30AlphaHead(nn.Module):
                 if exact_hold is None or self.config.mechanism_generation != "m03r-v2"
                 else exact_hold.float()
             ),
+            exit_action_v6=exit_action_v6,
             active_risk_scale=active_risk.float(),
             signal_confidence=(
                 None if signal_confidence is None else signal_confidence.float()
@@ -850,7 +1202,8 @@ class Hold30AlphaHead(nn.Module):
             uncalibrated_signal_confidence_logit=(
                 None
                 if uncalibrated_confidence_logit is None
-                or self.config.mechanism_generation != "m03r-v2"
+                or self.config.mechanism_generation
+                not in {"m03r-v2", "m03r-v3"}
                 else uncalibrated_confidence_logit.float()
             ),
             benchmark_derisk_request=(
@@ -871,8 +1224,10 @@ __all__ = [
     "HOLD30_ALPHA_HEAD_PARAMETER_CAP",
     "HOLD30_ALPHA_HORIZONS",
     "HOLD30_ALPHA_MECH8_IDS",
+    "M03R_V6_CONFIDENCE_LIFECYCLE_STAGES",
     "Hold30AlphaHead",
     "Hold30AlphaHeadConfig",
     "Hold30AlphaModelError",
     "Hold30AlphaOutput",
+    "M03RV6ConfidenceLifecycleStage",
 ]

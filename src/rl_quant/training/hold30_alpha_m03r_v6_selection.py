@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, NoReturn
 
 from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_AGE_LEDGER_BIN_COUNT,
+    M03R_CANONICAL_SETTING_ID,
     M03R_DESIGN,
     M03R_DESIGN_ID,
     M03R_PROTOCOL_GENERATION,
@@ -29,13 +31,16 @@ from rl_quant.protocol.hold30_alpha_m03r_v6 import (
 )
 
 M03R_V6_SELECTION_CONTRACT_SCHEMA = (
-    "rl-quant.m03r-v6-soft-persistence-checkpoint-selection-contract-v1"
+    "rl-quant.m03r-v6-soft-persistence-checkpoint-selection-contract-v2"
 )
 M03R_V6_VALIDATION_METRICS_SCHEMA = (
     "rl-quant.m03r-v6-soft-persistence-validation-metrics-v1"
 )
 M03R_V6_SELECTION_ADAPTER_SCHEMA = (
     "rl-quant.m03r-v6-authoritative-ledger-selection-adapter-v1"
+)
+M03R_V6_CANDIDATE_EVALUATOR_IDENTITY_SCHEMA = (
+    "rl-quant.m03r-v6-candidate-evaluator-identity-v1"
 )
 M03R_V6_SELECTION_ADAPTER_AVAILABLE = False
 M03R_V6_SELECTION_ADAPTER_BLOCKERS = (
@@ -44,7 +49,7 @@ M03R_V6_SELECTION_ADAPTER_BLOCKERS = (
     "cause_typed_turnover_cost_and_projection_metrics_not_reproduced",
 )
 M03R_V6_HOLDING_PREFERENCE_FLOOR_TRADING_SESSIONS = 25.0
-M03R_V6_EXIT_AGE_BIN_COUNT = 61
+M03R_V6_EXIT_AGE_BIN_COUNT = M03R_AGE_LEDGER_BIN_COUNT
 
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -325,7 +330,7 @@ class M03RV6CheckpointSelectionContract:
     inference_contract_sha256: str
     common_evaluator_inputs_sha256: str
     evaluator_implementation_sha256: str
-    maximum_fold_censored_notional_fraction: float
+    require_exact_age_ledger_content_binding: bool
     maximum_requested_executed_projection_distance: float
     maximum_forced_turnover_fraction: float
     protocol_generation: str = M03R_PROTOCOL_GENERATION
@@ -352,18 +357,19 @@ class M03RV6CheckpointSelectionContract:
             raise M03RV6SelectionError(
                 "v6 checkpoint selection requires exactly 95% bootstrap confidence"
             )
+        if self.require_exact_age_ledger_content_binding is not True:
+            raise M03RV6SelectionError(
+                "v6 selection requires exact age-ledger validity and content binding"
+            )
         for name in (
-            "maximum_fold_censored_notional_fraction",
             "maximum_requested_executed_projection_distance",
             "maximum_forced_turnover_fraction",
         ):
             _nonnegative_float(name, getattr(self, name))
-        for name in (
-            "maximum_fold_censored_notional_fraction",
-            "maximum_forced_turnover_fraction",
-        ):
-            if float(getattr(self, name)) > 1.0:
-                raise M03RV6SelectionError(f"{name} must lie in [0,1]")
+        if self.maximum_forced_turnover_fraction > 1.0:
+            raise M03RV6SelectionError(
+                "maximum_forced_turnover_fraction must lie in [0,1]"
+            )
 
     def metrics_satisfy_hard_gates(self, row: M03RV6ValidationMetrics) -> bool:
         """Apply economic/risk/data-quality gates; never gate holding duration."""
@@ -379,8 +385,8 @@ class M03RV6CheckpointSelectionContract:
             and row.annual_tracking_error <= active_risk.annual_tracking_error_ceiling
             and row.active_beta_equivalence_upper_bound
             <= active_risk.absolute_active_market_beta_maximum
-            and row.fold_censored_notional_fraction
-            <= self.maximum_fold_censored_notional_fraction
+            and len(row.discretionary_exit_notional_by_age)
+            == M03R_V6_EXIT_AGE_BIN_COUNT
             and row.requested_executed_projection_distance
             <= self.maximum_requested_executed_projection_distance
             and row.forced_turnover_fraction <= self.maximum_forced_turnover_fraction
@@ -410,8 +416,9 @@ class M03RV6CheckpointSelectionContract:
                 "active_beta_equivalence_upper_bound": (
                     M03R_DESIGN.active_risk.absolute_active_market_beta_maximum
                 ),
-                "maximum_fold_censored_notional_fraction": (
-                    self.maximum_fold_censored_notional_fraction
+                "exact_age_ledger_bin_count": M03R_V6_EXIT_AGE_BIN_COUNT,
+                "exact_age_ledger_content_binding_required": (
+                    self.require_exact_age_ledger_content_binding
                 ),
                 "maximum_requested_executed_projection_distance": (
                     self.maximum_requested_executed_projection_distance
@@ -421,6 +428,12 @@ class M03RV6CheckpointSelectionContract:
                 ),
                 "holding_duration_requirement": None,
             },
+            "bound_non_gating_telemetry": [
+                "fold_censored_notional_fraction",
+                "notional_survival_at_20_sessions",
+                "notional_survival_at_30_sessions",
+                "restricted_mean_holding_time_through_60_sessions",
+            ],
             "rank_order": [
                 "block_bootstrap_lcb95_net_active_return_20bp:descending",
                 "information_ratio_20bp:descending",
@@ -457,6 +470,101 @@ class M03RV6CheckpointSelectionContract:
             "M03R v6 authoritative chronological-ledger selection adapter is "
             "unavailable: " + ", ".join(M03R_V6_SELECTION_ADAPTER_BLOCKERS)
         )
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV6CandidateEvaluatorIdentity:
+    """Bind one checkpoint path and receipt to frozen common evaluator inputs.
+
+    This identity is deliberately separate from validation metrics.  It lets
+    multiple checkpoints share one candidate-independent market-side panel
+    without allowing a policy-return path or its evaluator receipt to be
+    reused across candidates.  It does not make the unavailable authoritative
+    chronological-ledger selection adapter available.
+    """
+
+    update: int
+    common_evaluator_inputs_sha256: str
+    candidate_policy_returns_sha256: str
+    candidate_evaluator_receipt_sha256: str
+    inference_contract_sha256: str
+    evaluator_implementation_sha256: str
+    protocol_generation: str = M03R_PROTOCOL_GENERATION
+    design_id: str = M03R_DESIGN_ID
+    setting_id: str = M03R_CANONICAL_SETTING_ID
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.update, bool)
+            or not isinstance(self.update, int)
+            or self.update <= 0
+        ):
+            raise M03RV6SelectionError("candidate update must be a positive integer")
+        try:
+            validate_m03r_v6_artifact_identity(
+                protocol_generation=self.protocol_generation,
+                design_id=self.design_id,
+                setting_id=self.setting_id,
+            )
+        except ValueError as exc:
+            raise M03RV6SelectionError(str(exc)) from exc
+        for name in (
+            "common_evaluator_inputs_sha256",
+            "candidate_policy_returns_sha256",
+            "candidate_evaluator_receipt_sha256",
+            "inference_contract_sha256",
+            "evaluator_implementation_sha256",
+        ):
+            _require_digest(name, getattr(self, name))
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "schema": M03R_V6_CANDIDATE_EVALUATOR_IDENTITY_SCHEMA,
+            "protocol_generation": self.protocol_generation,
+            "design_id": self.design_id,
+            "setting_id": self.setting_id,
+            "update": self.update,
+            "inference_contract_sha256": self.inference_contract_sha256,
+            "common_evaluator_inputs_sha256": self.common_evaluator_inputs_sha256,
+            "candidate_policy_returns_sha256": (
+                self.candidate_policy_returns_sha256
+            ),
+            "candidate_evaluator_receipt_sha256": (
+                self.candidate_evaluator_receipt_sha256
+            ),
+            "evaluator_implementation_sha256": (
+                self.evaluator_implementation_sha256
+            ),
+        }
+
+    @property
+    def receipt_sha256(self) -> str:
+        return _payload_sha256(self.canonical_payload())
+
+    def validate_against(self, contract: M03RV6CheckpointSelectionContract) -> None:
+        """Reject candidate evidence that does not use the contract's common panel."""
+
+        if not isinstance(contract, M03RV6CheckpointSelectionContract):
+            raise M03RV6SelectionError(
+                "candidate evidence requires a typed v6 selection contract"
+            )
+        mismatches = tuple(
+            name
+            for name in (
+                "protocol_generation",
+                "design_id",
+                "setting_id",
+                "inference_contract_sha256",
+                "common_evaluator_inputs_sha256",
+                "evaluator_implementation_sha256",
+            )
+            if getattr(self, name) != getattr(contract, name)
+        )
+        if mismatches:
+            raise M03RV6SelectionError(
+                "candidate evaluator identity does not match selection contract: "
+                + ", ".join(mismatches)
+            )
 
 
 def order_m03r_v6_metrics_for_qualification(
@@ -506,6 +614,7 @@ def select_m03r_v6_checkpoint(
 
 
 __all__ = [
+    "M03R_V6_CANDIDATE_EVALUATOR_IDENTITY_SCHEMA",
     "M03R_V6_EXIT_AGE_BIN_COUNT",
     "M03R_V6_HOLDING_PREFERENCE_FLOOR_TRADING_SESSIONS",
     "M03R_V6_SELECTION_ADAPTER_AVAILABLE",
@@ -513,6 +622,7 @@ __all__ = [
     "M03R_V6_SELECTION_ADAPTER_SCHEMA",
     "M03R_V6_SELECTION_CONTRACT_SCHEMA",
     "M03R_V6_VALIDATION_METRICS_SCHEMA",
+    "M03RV6CandidateEvaluatorIdentity",
     "M03RV6CheckpointSelectionContract",
     "M03RV6FoldSeed",
     "M03RV6SelectionError",

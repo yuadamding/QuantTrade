@@ -31,6 +31,11 @@ def test_v3_inventory_binds_every_alpha_source_test_and_document() -> None:
     assert "docs/prelockbox_hold30_alpha_evaluation_v3.md" in inventory.evidence_files
     assert "docs/daily_hold30_policy_rfc.md" in inventory.evidence_files
     assert "docs/prelockbox_hold30_mech8_v2.md" in inventory.evidence_files
+    assert "docs/prelockbox_hold30_active_alpha_m03r_v7.md" in inventory.evidence_files
+    assert (
+        "docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md"
+        in inventory.evidence_files
+    )
     discovered_runtime = {
         path.relative_to(root).as_posix()
         for path in (root / "src" / "rl_quant").rglob("*hold30*.py")
@@ -39,12 +44,37 @@ def test_v3_inventory_binds_every_alpha_source_test_and_document() -> None:
         inventory.integration_sources
     ) - set(workflow.V3_REUSED_NON_HOLD30_SOURCES)
     assert set(inventory.component_tests) | set(inventory.integration_tests) == {
-        path.relative_to(root).as_posix() for path in (root / "tests").glob("test_hold30*.py")
+        path.relative_to(root).as_posix()
+        for path in (root / "tests").glob("test_hold30*.py")
     }
     assert inventory.excluded_runtime_history == (
         "src/rl_quant/workflows/hold30_prelockbox.py",
     )
     assert set(inventory.qualified_files) >= set(inventory.component_sources)
+    assert {
+        "src/rl_quant/models/hold30_confidence_v6.py",
+        "src/rl_quant/models/hold30_exit_action_v6.py",
+        "src/rl_quant/execution/hold30_exit_v6.py",
+        "src/rl_quant/protocol/hold30_m03r_confidence.py",
+        "src/rl_quant/training/hold30_m03r_confidence_fit.py",
+        "src/rl_quant/training/hold30_m03r_confidence_objective_v6.py",
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7.py",
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_schedule.py",
+        "src/rl_quant/training/hold30_alpha_m03r_v7.py",
+        "src/rl_quant/training/hold30_alpha_m03r_v7_routes.py",
+        "src/rl_quant/training/hold30_alpha_m03r_v7_schedule.py",
+    } <= set(inventory.integration_sources)
+    assert {
+        "tests/test_hold30_confidence_v6.py",
+        "tests/test_hold30_m03r_v6_exit_action.py",
+        "tests/test_hold30_m03r_v6_model_integration.py",
+        "tests/test_hold30_m03r_confidence_fit.py",
+        "tests/test_hold30_m03r_confidence_objective_v6.py",
+        "tests/test_hold30_alpha_m03r_v7_protocol.py",
+        "tests/test_hold30_alpha_m03r_v7_objective.py",
+        "tests/test_hold30_alpha_m03r_v7_routes.py",
+        "tests/test_hold30_alpha_m03r_v7_schedule.py",
+    } <= set(inventory.integration_tests)
 
 
 def test_v3_software_receipt_is_disjoint_non_authorizing_and_self_hashed(
@@ -85,7 +115,9 @@ def test_v3_software_receipt_is_disjoint_non_authorizing_and_self_hashed(
         receipt["model_contract"]["typed_training_plan_resolved_for_executable"]
         is False
     )
-    assert receipt["model_contract"]["A06_overlay_coefficient_and_routing_frozen"] is False
+    assert (
+        receipt["model_contract"]["A06_overlay_coefficient_and_routing_frozen"] is False
+    )
     assert receipt["model_contract"]["unresolved_objective_settings"] == list(
         HOLD30_ALPHA_MECH8_IDS[2:]
     )
@@ -112,8 +144,10 @@ def test_v3_cli_exposes_only_local_software_qualification() -> None:
     assert choices == ("qualify-software",)
     with pytest.raises(SystemExit):
         parser.parse_args(["render-manifest", "--output", "ignored.json"])
-    pyproject = Path(__file__).resolve().parents[1].joinpath("pyproject.toml").read_text()
+    pyproject = (
+        Path(__file__).resolve().parents[1].joinpath("pyproject.toml").read_text()
+    )
     assert (
-        'quanttrade-hold30-alpha-prelockbox = '
+        "quanttrade-hold30-alpha-prelockbox = "
         '"rl_quant.workflows.hold30_alpha_prelockbox:main"'
     ) in pyproject

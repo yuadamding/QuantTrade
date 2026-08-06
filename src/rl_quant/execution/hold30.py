@@ -12,7 +12,9 @@ from dataclasses import dataclass
 
 import torch
 
+from rl_quant.execution.hold30_exit_v6 import build_m03r_v6_exit_release
 from rl_quant.models.daily_policy import hold30_proposed_release, hold30_release_hazard
+from rl_quant.models.hold30_exit_action_v6 import M03RV6ExitAction
 from rl_quant.protocol.hold30_alpha_v3 import HOLD30_ALPHA_TE_TARGET_ANNUAL
 
 HOLD30_MAX_STOCK_WEIGHT = 0.01
@@ -230,6 +232,7 @@ def build_h2_hold30_action(
     risk_gross_max: torch.Tensor,
     *,
     exact_hold_probability: torch.Tensor | None = None,
+    exit_action_v6: M03RV6ExitAction | None = None,
     cash_index: int = 0,
     max_turnover: float = HOLD30_MAX_DISCRETIONARY_TURNOVER,
     exposure_step: float = HOLD30_EXPOSURE_STEP,
@@ -256,10 +259,33 @@ def build_h2_hold30_action(
         risk_gross_max,
         cash_index=cash_index,
     )
+    if exit_action_v6 is not None:
+        if exact_hold_probability is not None:
+            raise ValueError(
+                "v6 three-way exit action and legacy exact-hold probability "
+                "are mutually exclusive"
+            )
+        exit_action_v6.validate()
+        if tuple(exit_action_v6.risky_available.shape) != tuple(repaired_weights.shape):
+            raise ValueError(
+                "exit_action_v6 asset axes must match repaired_weights"
+            )
+        if exit_action_v6.logits.device != repaired_weights.device:
+            raise ValueError(
+                "exit_action_v6 must share the repaired portfolio device"
+            )
+        # Exact HOLD and EXIT are complete per-name decisions for this fill.
+        # Neither name may be bought back by the entry allocator in the same
+        # action; CONTINUOUS remains eligible for ordinary resizing.
+        entry_trade_mask = trade_mask & (
+            exit_action_v6.continuous_decision_st.detach() == 1.0
+        )
+    else:
+        entry_trade_mask = trade_mask
     direction = centered_benchmark_tilt(
         entry_scores,
         benchmark_weights,
-        trade_mask,
+        entry_trade_mask,
         cash_index=cash_index,
     )
     risky = torch.ones_like(repaired_weights, dtype=torch.bool)
@@ -275,26 +301,39 @@ def build_h2_hold30_action(
             ((exact_hold_probability < 0) | (exact_hold_probability > 1)).any()
         ):
             raise ValueError("exact_hold_probability must lie in [0,1]")
-    hazards = hold30_release_hazard(
-        ages,
-        hazard_residual.unsqueeze(-1).to(age_notional.dtype),
-        exact_hold_probability=(
-            None
-            if exact_hold_probability is None
-            else exact_hold_probability.unsqueeze(-1).to(age_notional.dtype)
-        ),
-    )
-    release_by_age = age_notional * hazards
-    release_by_age = torch.where(risky.unsqueeze(-1), release_by_age, torch.zeros_like(release_by_age))
-    proposed_release = hold30_proposed_release(
-        age_notional,
-        hazard_residual.to(age_notional.dtype),
-        exact_hold_probability=(
-            None
-            if exact_hold_probability is None
-            else exact_hold_probability.to(age_notional.dtype)
-        ),
-    )
+    if exit_action_v6 is None:
+        hazards = hold30_release_hazard(
+            ages,
+            hazard_residual.unsqueeze(-1).to(age_notional.dtype),
+            exact_hold_probability=(
+                None
+                if exact_hold_probability is None
+                else exact_hold_probability.unsqueeze(-1).to(age_notional.dtype)
+            ),
+        )
+        release_by_age = age_notional * hazards
+        release_by_age = torch.where(
+            risky.unsqueeze(-1),
+            release_by_age,
+            torch.zeros_like(release_by_age),
+        )
+        proposed_release = hold30_proposed_release(
+            age_notional,
+            hazard_residual.to(age_notional.dtype),
+            exact_hold_probability=(
+                None
+                if exact_hold_probability is None
+                else exact_hold_probability.to(age_notional.dtype)
+            ),
+        )
+    else:
+        release = build_m03r_v6_exit_release(
+            age_notional,
+            hazard_residual,
+            exit_action_v6,
+        )
+        release_by_age = release.discretionary_release_by_age
+        proposed_release = release.discretionary_release
     proposed_release = torch.where(risky, proposed_release, torch.zeros_like(proposed_release))
     proposed_release = torch.minimum(proposed_release, repaired_weights.clamp_min(0.0))
     retained = torch.where(risky, repaired_weights - proposed_release, torch.zeros_like(repaired_weights)).clamp_min(0.0)
@@ -317,10 +356,24 @@ def build_h2_hold30_action(
     buys, effective = capped_waterfill(buy_mass, direction, capacity)
     buy_case = desired_gross >= retained_gross
     sell_mass = (retained_gross - desired_gross).clamp_min(0.0)
+    sellable = (
+        retained
+        if exit_action_v6 is None
+        else retained
+        * exit_action_v6.continuous_decision_st.to(dtype=retained.dtype)
+    )
+    protected = (retained - sellable).clamp_min(0.0)
+    sellable_gross = sellable.sum(-1)
+    effective_sell_mass = torch.minimum(sell_mass, sellable_gross)
     proportional = torch.where(
-        retained_gross.unsqueeze(-1) > 0,
-        retained * (1.0 - sell_mass / retained_gross.clamp_min(1e-18)).unsqueeze(-1),
-        torch.zeros_like(retained),
+        sellable_gross.unsqueeze(-1) > 0,
+        protected
+        + sellable
+        * (
+            1.0
+            - effective_sell_mass / sellable_gross.clamp_min(1e-18)
+        ).unsqueeze(-1),
+        protected,
     )
     desired_risky = torch.where(buy_case.unsqueeze(-1), retained + buys, proportional)
     desired_risky = torch.where(risky, desired_risky, torch.zeros_like(desired_risky))
@@ -355,6 +408,7 @@ def build_alpha_hold30_action(
     risk_gross_max: torch.Tensor,
     *,
     exact_hold_probability: torch.Tensor | None = None,
+    exit_action_v6: M03RV6ExitAction | None = None,
     total_risk_overlay: torch.Tensor | None = None,
     total_risk_step: float | None = None,
     te_target: float = HOLD30_ALPHA_TE_TARGET_ANNUAL,
@@ -411,6 +465,7 @@ def build_alpha_hold30_action(
         risk_asset_caps,
         risk_gross_max,
         exact_hold_probability=exact_hold_probability,
+        exit_action_v6=exit_action_v6,
         cash_index=cash_index,
         max_turnover=max_turnover,
         exposure_step=exposure_step,

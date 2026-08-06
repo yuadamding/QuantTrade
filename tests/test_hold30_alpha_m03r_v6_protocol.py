@@ -8,10 +8,17 @@ import pytest
 
 from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     M03R_DESIGN_ID as M03R_V5_DESIGN_ID,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     M03R_PROTOCOL_GENERATION as M03R_V5_PROTOCOL_GENERATION,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     M03R_SETTING_IDS as M03R_V5_SETTING_IDS,
 )
 from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_AGE_LEDGER_BIN_COUNT,
+    M03R_AGE_LEDGER_MAXIMUM_AGE_SESSIONS,
+    M03R_AGE_LEDGER_MINIMUM_AGE_SESSIONS,
     M03R_CANONICAL_SETTING_ID,
     M03R_DESIGN,
     M03R_DESIGN_ID,
@@ -58,6 +65,10 @@ def test_30_sessions_is_only_a_soft_inductive_bias() -> None:
     assert not contract.holding_duration_is_promotion_gate
     assert not contract.turnover_target_is_holding_duration_proxy
     assert not contract.turnover_is_hard_holding_constraint
+    assert not contract.soft_turnover_reference_is_promotion_gate
+    assert contract.soft_daily_one_way_discretionary_turnover_reference == (
+        pytest.approx(1.0 / 30.0)
+    )
     assert contract.early_exit_always_allowed
 
     with pytest.raises(M03RProtocolError, match="minimum holding period"):
@@ -70,17 +81,37 @@ def test_30_sessions_is_only_a_soft_inductive_bias() -> None:
         replace(contract, holding_duration_is_promotion_gate=True)
 
 
+def test_v6_age_ledger_has_exactly_61_explicit_age_bins() -> None:
+    contract = M03R_SOFT_PERSISTENCE
+    assert M03R_AGE_LEDGER_BIN_COUNT == 61
+    assert M03R_AGE_LEDGER_MINIMUM_AGE_SESSIONS == 0
+    assert M03R_AGE_LEDGER_MAXIMUM_AGE_SESSIONS == 60
+    assert contract.age_ledger_bin_count == 61
+    assert contract.age_ledger_minimum_age_sessions == 0
+    assert contract.age_ledger_maximum_age_sessions == 60
+    assert contract.age_ledger_maximum_bin_accumulates_older_notional
+    assert (
+        contract.age_ledger_maximum_age_sessions
+        - contract.age_ledger_minimum_age_sessions
+        + 1
+        == contract.age_ledger_bin_count
+    )
+
+    with pytest.raises(M03RProtocolError, match="exactly 61 bins"):
+        replace(contract, age_ledger_bin_count=60)
+
+
 def test_soft_penalty_and_warmup_are_content_bound() -> None:
     contract = M03R_SOFT_PERSISTENCE
     assert contract.early_exit_penalty_shape == "quadratic-one-sided"
     assert contract.early_exit_penalty_bp_per_unit_at_age_zero == pytest.approx(5.0)
     assert (
         contract.early_exit_penalty_inner_development_grid_bp_per_unit_at_age_zero
-        == (2.0, 5.0, 10.0)
+        == (5.0,)
     )
+    assert contract.alternative_early_exit_penalty_requires_new_protocol_generation
     assert contract.early_exit_penalty_warmup_shape == "linear-from-zero"
     assert contract.early_exit_penalty_linear_warmup_fraction == pytest.approx(0.10)
-    assert contract.early_exit_sold_notional_epsilon == pytest.approx(1e-12)
     assert contract.holding_to_economic_gradient_norm_ratio_diagnostic_band == (
         0.05,
         0.15,
@@ -100,6 +131,16 @@ def test_soft_penalty_and_warmup_are_content_bound() -> None:
         replace(contract, early_exit_penalty_shape="linear")
     with pytest.raises(M03RProtocolError, match="10% linear warmup"):
         replace(contract, early_exit_penalty_linear_warmup_fraction=0.20)
+    with pytest.raises(M03RProtocolError, match="only canonical 5 bp"):
+        replace(
+            contract,
+            early_exit_penalty_bp_per_unit_at_age_zero=2.0,
+            early_exit_penalty_inner_development_grid_bp_per_unit_at_age_zero=(
+                2.0,
+                5.0,
+                10.0,
+            ),
+        )
 
 
 def test_exact_hold_is_available_but_never_required() -> None:
@@ -107,11 +148,21 @@ def test_exact_hold_is_available_but_never_required() -> None:
     model = M03R_DESIGN.model
     assert persistence.exact_hold_action_supported
     assert not persistence.exact_hold_action_required
+    assert persistence.exact_exit_action_supported
+    assert persistence.exact_exit_action_required_for_learned_hazard_settings
+    assert not persistence.continuous_hazard_upper_endpoint_is_exact_exit
     assert model.exact_hold_action_supported
     assert not model.exact_hold_action_required
+    assert model.exact_exit_action_supported
+    assert model.exact_exit_action_required_for_learned_hazard_settings
 
     with pytest.raises(M03RProtocolError, match="supports but never requires"):
         replace(persistence, exact_hold_action_required=True)
+    with pytest.raises(M03RProtocolError, match="reachable exact EXIT"):
+        replace(
+            persistence,
+            exact_exit_action_required_for_learned_hazard_settings=False,
+        )
 
 
 def test_temporal_credit_is_not_a_holding_rule() -> None:
@@ -121,6 +172,32 @@ def test_temporal_credit_is_not_a_holding_rule() -> None:
     assert temporal["learned_temporal_context_trading_sessions"] == 252
     assert "target_holding_trading_sessions" not in temporal
     assert "minimum_holding_period_sessions" not in temporal
+
+
+def test_confidence_target_is_standardized_unit_risk_not_its_own_sized_path() -> None:
+    assert M03R_DESIGN.model.confidence_target_definition == (
+        "probability-standardized-unit-risk-30-session-net-active-log-return-"
+        "versus-C1-is-positive"
+    )
+    assert "confidence-sized" not in M03R_DESIGN.model.confidence_target_definition
+
+
+def test_v6_registry_rejects_inherited_target_holding_semantics() -> None:
+    design = DESIGNS[M03R_DESIGN_ID]
+    assert design.scored_tail_days == 63
+    assert design.target_holding_days is None
+    assert design.target_discretionary_turnover is None
+    assert design.holding_preference_horizon_sessions == 30
+    assert design.soft_daily_one_way_discretionary_turnover_reference == (
+        pytest.approx(1.0 / 30.0)
+    )
+
+    with pytest.raises(ValueError, match="cannot inherit target_holding_days"):
+        replace(
+            design,
+            target_holding_days=30,
+            target_discretionary_turnover=1.0 / 30.0,
+        )
 
 
 def test_v6_inventory_has_12_settings_and_preserves_fixed_prior() -> None:

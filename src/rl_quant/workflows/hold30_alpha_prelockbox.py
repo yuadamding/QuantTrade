@@ -105,6 +105,10 @@ V3_COMPONENT_TESTS = (
 # test part of the content-addressed integration inventory below.
 V3_LATER_GENERATION_SOURCE_TESTS = (
     (
+        "src/rl_quant/models/hold30_confidence_v6.py",
+        "tests/test_hold30_confidence_v6.py",
+    ),
+    (
         "src/rl_quant/evaluation/hold30_alpha_m03r.py",
         "tests/test_hold30_alpha_m03r_evaluation.py",
     ),
@@ -149,8 +153,40 @@ V3_LATER_GENERATION_SOURCE_TESTS = (
         "tests/test_hold30_alpha_m03r_v6_objective.py",
     ),
     (
+        "src/rl_quant/training/hold30_alpha_m03r_v6_ledger.py",
+        "tests/test_hold30_alpha_m03r_v6_ledger.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v6_routes.py",
+        "tests/test_hold30_alpha_m03r_v6_routes.py",
+    ),
+    (
         "src/rl_quant/training/hold30_alpha_m03r_v6_selection.py",
         "tests/test_hold30_alpha_m03r_v6_selection.py",
+    ),
+    (
+        "src/rl_quant/evaluation/hold30_alpha_m03r_v6.py",
+        "tests/test_hold30_alpha_m03r_v6_evaluation.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7.py",
+        "tests/test_hold30_alpha_m03r_v7_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_schedule.py",
+        "tests/test_hold30_alpha_m03r_v7_schedule.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7.py",
+        "tests/test_hold30_alpha_m03r_v7_objective.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_routes.py",
+        "tests/test_hold30_alpha_m03r_v7_routes.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_schedule.py",
+        "tests/test_hold30_alpha_m03r_v7_schedule.py",
     ),
 )
 
@@ -178,10 +214,13 @@ V3_EVIDENCE_FILES = (
     "docs/adr/0006-daily-decision-soft-30-session-holding.md",
     "docs/adr/0007-benchmark-relative-hold30-alpha-objective.md",
     "docs/daily_hold30_policy_rfc.md",
+    "docs/m03r_confidence_calibration_protocol.md",
     "docs/prelockbox_hold30_mech8_v2.md",
     "docs/prelockbox_hold30_alpha_mech8_v3.md",
     "docs/prelockbox_hold30_alpha_evaluation_v3.md",
     "docs/prelockbox_hold30_active_alpha_m03r_v6.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v7.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md",
     "pyproject.toml",
 )
 
@@ -245,8 +284,13 @@ def resolve_hold30_alpha_qualification_inventory(
     if not source_root.is_dir():
         raise Hold30AlphaQualificationError("src/rl_quant is absent")
     discovered = tuple(
-        candidate.relative_to(root).as_posix()
-        for candidate in sorted(source_root.rglob("*hold30*alpha*.py"))
+        sorted(
+            {
+                candidate.relative_to(root).as_posix()
+                for candidate in source_root.rglob("*hold30*alpha*.py")
+            }
+            | {source for source in later_generation if (root / source).is_file()}
+        )
     )
     missing_registration = sorted(
         set(discovered) - set(registered) - set(later_generation)
@@ -448,7 +492,9 @@ def _model_evidence() -> dict[str, Any]:
         if setting.sharpe_mode == "separate-total-risk-overlay"
     ]
     if overlay_rows != ["hold30a-a06-sharpe-overlay"]:
-        raise Hold30AlphaQualificationError("only A06 may contain the separate Sharpe overlay")
+        raise Hold30AlphaQualificationError(
+            "only A06 may contain the separate Sharpe overlay"
+        )
     payload: dict[str, Any] = {
         "schema": "rl-quant.hold30-alpha-v3.model-contract-v1",
         "protocol_generation": HOLD30_ALPHA_PROTOCOL_GENERATION,
@@ -501,7 +547,8 @@ def qualify_hold30_alpha_software(
         for gate_id, argv in commands
     )
     qualified_hashes = {
-        name: _sha256_bytes((root / name).read_bytes()) for name in inventory.qualified_files
+        name: _sha256_bytes((root / name).read_bytes())
+        for name in inventory.qualified_files
     }
     payload: dict[str, Any] = {
         "schema": HOLD30_ALPHA_SOFTWARE_SCHEMA,
@@ -573,7 +620,9 @@ def verify_hold30_alpha_software_receipt(receipt: Mapping[str, Any]) -> None:
         "qualification_sha256",
     }
     if not isinstance(receipt, Mapping) or set(receipt) != required:
-        raise Hold30AlphaQualificationError("v3 software receipt has partial or unknown fields")
+        raise Hold30AlphaQualificationError(
+            "v3 software receipt has partial or unknown fields"
+        )
     if (
         receipt["schema"] != HOLD30_ALPHA_SOFTWARE_SCHEMA
         or receipt["schema_version"] != 1
@@ -589,7 +638,9 @@ def verify_hold30_alpha_software_receipt(receipt: Mapping[str, Any]) -> None:
         or receipt["end_to_end_v3_training_driver_qualified"] is not False
         or receipt["passed"] is not True
     ):
-        raise Hold30AlphaQualificationError("v3 software receipt identity/authority is invalid")
+        raise Hold30AlphaQualificationError(
+            "v3 software receipt identity/authority is invalid"
+        )
     if receipt["capabilities"] != {
         "reads_scientific_data": False,
         "performs_remote_access": False,
@@ -597,24 +648,34 @@ def verify_hold30_alpha_software_receipt(receipt: Mapping[str, Any]) -> None:
         "renders_executable_manifest": False,
         "launches_jobs": False,
     }:
-        raise Hold30AlphaQualificationError("v3 software receipt claims forbidden capability")
+        raise Hold30AlphaQualificationError(
+            "v3 software receipt claims forbidden capability"
+        )
     if receipt["protocol_contract"] != {
         "setting_ids": list(HOLD30_ALPHA_MECH8_IDS),
         "promotion_candidate": HOLD30_ALPHA_V3_CANONICAL_ID,
         "trial_inventory": {"settings": 8, "folds": 6, "seeds": 5, "trials": 240},
     }:
-        raise Hold30AlphaQualificationError("v3 software receipt protocol contract drifted")
-    if not isinstance(receipt["gates"], list) or [row.get("gate_id") for row in receipt["gates"]] != [
-        "v3_components",
-        "hold30_integration",
-        "compatibility_regressions",
-        "static_hygiene",
-    ] or any(row.get("passed") is not True for row in receipt["gates"]):
+        raise Hold30AlphaQualificationError(
+            "v3 software receipt protocol contract drifted"
+        )
+    if (
+        not isinstance(receipt["gates"], list)
+        or [row.get("gate_id") for row in receipt["gates"]]
+        != [
+            "v3_components",
+            "hold30_integration",
+            "compatibility_regressions",
+            "static_hygiene",
+        ]
+        or any(row.get("passed") is not True for row in receipt["gates"])
+    ):
         raise Hold30AlphaQualificationError("v3 software gate evidence is incomplete")
     qualified = receipt["qualified_file_sha256s"]
-    if not isinstance(qualified, Mapping) or sha256_payload(qualified) != receipt[
-        "qualified_content_sha256"
-    ]:
+    if (
+        not isinstance(qualified, Mapping)
+        or sha256_payload(qualified) != receipt["qualified_content_sha256"]
+    ):
         raise Hold30AlphaQualificationError("v3 qualified file digest map is invalid")
     claimed = receipt["qualification_sha256"]
     if not isinstance(claimed, str) or len(claimed) != 64:

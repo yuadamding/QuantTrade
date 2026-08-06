@@ -6,8 +6,19 @@ import pytest
 import torch
 
 from rl_quant.envs.hold30 import CohortLedger, TurnoverCause
-from rl_quant.execution.hold30 import Hold30BuiltAction
-from rl_quant.models.daily_policy import HOLD30_HAZARD_MIN, Hold30Intent, exact_hold30_intent
+from rl_quant.execution.hold30 import Hold30BuiltAction, build_alpha_hold30_action
+from rl_quant.models.daily_policy import (
+    HOLD30_HAZARD_MIN,
+    Hold30Intent,
+    exact_hold30_intent,
+)
+from rl_quant.models.hold30_exit_action_v6 import (
+    M03R_V6_EXIT_ACTION_COUNT,
+    M03R_V6_EXIT_ACTION_INDEX,
+    M03R_V6_HOLD_ACTION_INDEX,
+    M03RV6ExitAction,
+    straight_through_m03r_v6_exit_action,
+)
 from rl_quant.training.hold30 import (
     Hold30LossContract,
     Hold30ReplayGeometry,
@@ -79,6 +90,136 @@ class _ExactHoldPolicy(torch.nn.Module):
             )
         )
         return exact_hold30_intent(prev_weights)
+
+
+class _V6ExactActionPolicy(torch.nn.Module):
+    def __init__(self, action_index: int, hazard_residual: float) -> None:
+        super().__init__()
+        self.action_index = action_index
+        self.hazard_residual = hazard_residual
+        self.action_logits = torch.nn.Parameter(
+            torch.tensor([0.0, -1.0, -1.0], dtype=torch.float64)
+        )
+
+    def hold30_intent(self, state_t, prev_weights, available, age_summaries=None):
+        del state_t, age_summaries
+        batch, assets = prev_weights.shape
+        logits = self.action_logits.view(1, 1, M03R_V6_EXIT_ACTION_COUNT).expand(
+            batch, assets, -1
+        )
+        selected = logits.clone()
+        selected[:, 1, self.action_index] = 2.0
+        risky = available.bool().clone()
+        risky[:, 0] = False
+        soft, decision = straight_through_m03r_v6_exit_action(selected)
+        hold = torch.zeros_like(soft)
+        hold[..., M03R_V6_HOLD_ACTION_INDEX] = 1.0
+        soft = torch.where(risky.unsqueeze(-1), soft, hold)
+        decision = torch.where(risky.unsqueeze(-1), decision, hold)
+        action = M03RV6ExitAction(
+            logits=selected,
+            soft_probabilities=soft,
+            decision_st=decision,
+            risky_available=risky,
+            exact_hold_atom_enabled=True,
+        )
+        return Hold30Intent(
+            entry_scores=torch.zeros_like(prev_weights),
+            hazard_residual=torch.full_like(prev_weights, self.hazard_residual),
+            exposure_residual=torch.zeros(
+                batch,
+                dtype=prev_weights.dtype,
+                device=prev_weights.device,
+            ),
+            exit_action_v6=action,
+        )
+
+
+@pytest.mark.parametrize(
+    ("action_index", "hazard_residual", "expected_weight"),
+    (
+        (M03R_V6_HOLD_ACTION_INDEX, 12.0, 0.01),
+        (M03R_V6_EXIT_ACTION_INDEX, -12.0, 0.0),
+    ),
+)
+def test_v6_exact_action_survives_delayed_state_and_executes_at_fill(
+    action_index: int,
+    hazard_residual: float,
+    expected_weight: float,
+) -> None:
+    initial = torch.tensor([[0.99, 0.01, 0.0, 0.0]], dtype=torch.float64)
+    sequence = _sequence(2, initial_weights=initial)
+    runtime = Hold30ChronologicalRuntime("H2")
+    policy = _V6ExactActionPolicy(action_index, hazard_residual)
+
+    pending = runtime.decide(policy, sequence, runtime.initial_state(sequence))
+    assert pending.pending_intent is not None
+    live_action = pending.pending_intent.intent.exit_action_v6
+    assert live_action is not None
+    assert live_action.decision_st[0, 1, action_index].item() == 1.0
+
+    restored = pending.detach()
+    assert restored.pending_intent is not None
+    restored_action = restored.pending_intent.intent.exit_action_v6
+    assert restored_action is not None
+    assert restored_action.logits.data_ptr() != live_action.logits.data_ptr()
+    assert not restored_action.logits.requires_grad
+
+    next_state, transition = runtime.advance(sequence, restored)
+    assert next_state.ledger.weights[0, 1].item() == pytest.approx(expected_weight)
+    expected_sale = 0.01 - expected_weight
+    assert transition.discretionary_accounting.net_sells[0, 1].item() == pytest.approx(
+        expected_sale
+    )
+
+
+def test_v6_exact_exit_gradient_survives_pending_intent_until_fill() -> None:
+    initial = torch.tensor([[0.99, 0.01, 0.0, 0.0]], dtype=torch.float64)
+    sequence = _sequence(2, initial_weights=initial)
+    runtime = Hold30ChronologicalRuntime("H2")
+    policy = _V6ExactActionPolicy(M03R_V6_EXIT_ACTION_INDEX, -12.0)
+
+    pending = runtime.decide(policy, sequence, runtime.initial_state(sequence))
+    _next_state, transition = runtime.advance(sequence, pending)
+    transition.pre_cost_weights[0, 1].backward()
+
+    gradient = policy.action_logits.grad
+    assert gradient is not None
+    assert bool(torch.isfinite(gradient).all())
+    assert bool((gradient != 0.0).any())
+
+
+def test_v6_exact_hold_is_not_overridden_by_discretionary_risk_overlay() -> None:
+    weights = torch.tensor([[0.99, 0.01, 0.0, 0.0]], dtype=torch.float64)
+    age_notional = torch.zeros((1, 4, 61), dtype=torch.float64)
+    age_notional[0, 0, 5] = 0.99
+    age_notional[0, 1, 5] = 0.01
+    available = torch.ones_like(weights, dtype=torch.bool)
+    policy = _V6ExactActionPolicy(M03R_V6_HOLD_ACTION_INDEX, 12.0)
+    intent = policy.hold30_intent(
+        torch.zeros((1, 4, 1), dtype=torch.float64),
+        weights,
+        available,
+    )
+    assert intent.exit_action_v6 is not None
+
+    built = build_alpha_hold30_action(
+        weights,
+        age_notional,
+        torch.zeros_like(weights),
+        torch.full_like(weights, 12.0),
+        torch.tensor([0.04], dtype=torch.float64),
+        weights,
+        available,
+        torch.ones_like(weights),
+        torch.ones(1, dtype=torch.float64),
+        exit_action_v6=intent.exit_action_v6,
+        total_risk_overlay=torch.tensor([-10.0], dtype=torch.float64),
+        total_risk_step=0.10,
+    )
+
+    assert built.proposed_release[0, 1].item() == 0.0
+    assert built.target_weights[0, 1].item() == pytest.approx(0.01)
 
 
 def test_actor_cannot_see_future_return_or_fill_repair_and_new_fill_does_not_earn_old_return() -> None:

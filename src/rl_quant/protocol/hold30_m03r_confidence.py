@@ -1,4 +1,4 @@
-"""Typed, content-verified confidence calibration for M03R v5.
+"""Typed, content-verified confidence calibration for M03R v5 and v6.
 
 The actor emits an unconstrained scalar logit.  This module is the only
 authorized route from that logit to the confidence used by the new-active-risk
@@ -18,15 +18,35 @@ from datetime import date
 import torch
 
 from rl_quant.protocol.hold30_alpha_m03r_v5 import (
-    M03R_DESIGN,
-    M03R_DESIGN_ID,
-    M03R_PROTOCOL_GENERATION,
+    M03R_DESIGN as M03R_V5_DESIGN,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_DESIGN_ID as M03R_V5_DESIGN_ID,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_PROTOCOL_GENERATION as M03R_V5_PROTOCOL_GENERATION,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     resolve_m03r_v5_setting,
 )
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_DESIGN as M03R_V6_DESIGN,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_DESIGN_ID as M03R_V6_DESIGN_ID,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_PROTOCOL_GENERATION as M03R_V6_PROTOCOL_GENERATION,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    resolve_m03r_v6_setting,
+)
 
-M03R_CONFIDENCE_CALIBRATION_SCHEMA = M03R_DESIGN.model.confidence_calibration_schema
-M03R_CONFIDENCE_CALIBRATION_METHOD = M03R_DESIGN.model.confidence_calibration_method
-M03R_CONFIDENCE_TARGET_DEFINITION = M03R_DESIGN.model.confidence_target_definition
+# Preserve the existing exported defaults for immutable v5 callers. V6 callers
+# opt in explicitly through the generation/design keyword arguments below.
+M03R_CONFIDENCE_CALIBRATION_SCHEMA = M03R_V5_DESIGN.model.confidence_calibration_schema
+M03R_CONFIDENCE_CALIBRATION_METHOD = M03R_V5_DESIGN.model.confidence_calibration_method
+M03R_CONFIDENCE_TARGET_DEFINITION = M03R_V5_DESIGN.model.confidence_target_definition
 M03R_UNCALIBRATED_CONFIDENCE_SCORE_DEFINITION = "m03r-confidence-head-logit-v1"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
@@ -63,6 +83,68 @@ class M03RConfidenceCalibrationManifest:
     expected_calibration_error: float
     observed_target_rate: float
     manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _M03RConfidenceGenerationContract:
+    schema: str
+    calibration_method: str
+    target_definition: str
+
+
+def _resolve_generation_contract(
+    *,
+    protocol_generation: str,
+    design_id: str,
+    setting_id: str,
+) -> _M03RConfidenceGenerationContract:
+    if protocol_generation == M03R_V5_PROTOCOL_GENERATION:
+        if design_id != M03R_V5_DESIGN_ID:
+            raise M03RConfidenceCalibrationError(
+                "v5 confidence calibration requires the immutable v5 design ID"
+            )
+        try:
+            v5_setting = resolve_m03r_v5_setting(setting_id)
+        except ValueError as exc:
+            raise M03RConfidenceCalibrationError(
+                "confidence calibration setting does not belong to v5"
+            ) from exc
+        uses_confidence_scaled_active_risk_budget = (
+            v5_setting.use_confidence_scaled_active_risk_budget
+        )
+        schema = M03R_V5_DESIGN.model.confidence_calibration_schema
+        calibration_method = M03R_V5_DESIGN.model.confidence_calibration_method
+        target_definition = M03R_V5_DESIGN.model.confidence_target_definition
+    elif protocol_generation == M03R_V6_PROTOCOL_GENERATION:
+        if design_id != M03R_V6_DESIGN_ID:
+            raise M03RConfidenceCalibrationError(
+                "v6 confidence calibration requires the immutable v6 design ID"
+            )
+        try:
+            v6_setting = resolve_m03r_v6_setting(setting_id)
+        except ValueError as exc:
+            raise M03RConfidenceCalibrationError(
+                "confidence calibration setting does not belong to v6"
+            ) from exc
+        uses_confidence_scaled_active_risk_budget = (
+            v6_setting.use_confidence_scaled_active_risk_budget
+        )
+        schema = M03R_V6_DESIGN.model.confidence_calibration_schema
+        calibration_method = M03R_V6_DESIGN.model.confidence_calibration_method
+        target_definition = M03R_V6_DESIGN.model.confidence_target_definition
+    else:
+        raise M03RConfidenceCalibrationError(
+            "confidence calibration protocol generation is unsupported"
+        )
+    if not uses_confidence_scaled_active_risk_budget:
+        raise M03RConfidenceCalibrationError(
+            "the selected setting does not use a confidence-scaled active-risk budget"
+        )
+    return _M03RConfidenceGenerationContract(
+        schema=schema,
+        calibration_method=calibration_method,
+        target_definition=target_definition,
+    )
 
 
 def m03r_confidence_calibration_payload(
@@ -131,21 +213,23 @@ def validate_m03r_confidence_calibration_manifest(
     expected_model_state_sha256: str,
     expected_source_score_array_sha256: str,
     expected_source_target_array_sha256: str,
+    expected_protocol_generation: str = M03R_V5_PROTOCOL_GENERATION,
+    expected_design_id: str = M03R_V5_DESIGN_ID,
 ) -> None:
     """Fail closed unless identity, lineage, evidence, and content all agree."""
 
-    setting = resolve_m03r_v5_setting(expected_setting_id)
-    if not setting.use_confidence_scaled_active_risk_budget:
-        raise M03RConfidenceCalibrationError(
-            "the selected setting does not use a confidence-scaled active-risk budget"
-        )
+    contract = _resolve_generation_contract(
+        protocol_generation=expected_protocol_generation,
+        design_id=expected_design_id,
+        setting_id=expected_setting_id,
+    )
     exact = {
-        "schema": M03R_CONFIDENCE_CALIBRATION_SCHEMA,
-        "protocol_generation": M03R_PROTOCOL_GENERATION,
-        "design_id": M03R_DESIGN_ID,
+        "schema": contract.schema,
+        "protocol_generation": expected_protocol_generation,
+        "design_id": expected_design_id,
         "setting_id": expected_setting_id,
-        "calibration_method": M03R_CONFIDENCE_CALIBRATION_METHOD,
-        "target_definition": M03R_CONFIDENCE_TARGET_DEFINITION,
+        "calibration_method": contract.calibration_method,
+        "target_definition": contract.target_definition,
         "uncalibrated_score_definition": (
             M03R_UNCALIBRATED_CONFIDENCE_SCORE_DEFINITION
         ),
@@ -258,21 +342,34 @@ def bind_m03r_confidence_calibration(
     brier_score: float,
     expected_calibration_error: float,
     observed_target_rate: float,
+    protocol_generation: str = M03R_V5_PROTOCOL_GENERATION,
+    design_id: str = M03R_V5_DESIGN_ID,
 ) -> M03RConfidenceCalibrationManifest:
-    """Build, hash, and validate one complete inner-validation calibrator."""
+    """Build and hash a low-level calibration manifest.
 
+    This constructor remains for historical fixtures and replay internals. It
+    accepts caller-computed values and is therefore not governed fit evidence.
+    New governed fits must use the package-owned deterministic fitter in
+    :mod:`rl_quant.training.hold30_m03r_confidence_fit`.
+    """
+
+    contract = _resolve_generation_contract(
+        protocol_generation=protocol_generation,
+        design_id=design_id,
+        setting_id=setting_id,
+    )
     unbound = M03RConfidenceCalibrationManifest(
-        schema=M03R_CONFIDENCE_CALIBRATION_SCHEMA,
-        protocol_generation=M03R_PROTOCOL_GENERATION,
-        design_id=M03R_DESIGN_ID,
+        schema=contract.schema,
+        protocol_generation=protocol_generation,
+        design_id=design_id,
         setting_id=setting_id,
         seed=seed,
         checkpoint_sha256=checkpoint_sha256,
         model_state_sha256=model_state_sha256,
         source_score_array_sha256=source_score_array_sha256,
         source_target_array_sha256=source_target_array_sha256,
-        calibration_method=M03R_CONFIDENCE_CALIBRATION_METHOD,
-        target_definition=M03R_CONFIDENCE_TARGET_DEFINITION,
+        calibration_method=contract.calibration_method,
+        target_definition=contract.target_definition,
         uncalibrated_score_definition=M03R_UNCALIBRATED_CONFIDENCE_SCORE_DEFINITION,
         fit_data_role="inner-validation-only",
         fit_fold_ids=fit_fold_ids,
@@ -300,6 +397,8 @@ def bind_m03r_confidence_calibration(
         expected_model_state_sha256=model_state_sha256,
         expected_source_score_array_sha256=source_score_array_sha256,
         expected_source_target_array_sha256=source_target_array_sha256,
+        expected_protocol_generation=protocol_generation,
+        expected_design_id=design_id,
     )
     return bound
 
@@ -315,6 +414,8 @@ def apply_m03r_confidence_calibration(
     expected_model_state_sha256: str,
     expected_source_score_array_sha256: str,
     expected_source_target_array_sha256: str,
+    expected_protocol_generation: str = M03R_V5_PROTOCOL_GENERATION,
+    expected_design_id: str = M03R_V5_DESIGN_ID,
 ) -> torch.Tensor:
     """Apply the bound differentiable temperature transform to actor logits."""
 
@@ -327,6 +428,8 @@ def apply_m03r_confidence_calibration(
         expected_model_state_sha256=expected_model_state_sha256,
         expected_source_score_array_sha256=expected_source_score_array_sha256,
         expected_source_target_array_sha256=expected_source_target_array_sha256,
+        expected_protocol_generation=expected_protocol_generation,
+        expected_design_id=expected_design_id,
     )
     if (
         not isinstance(raw_logit, torch.Tensor)

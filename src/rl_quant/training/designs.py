@@ -101,9 +101,12 @@ class Phase1Design:
     #                                   legacy single-label contract at ``label_horizon_days``.
     scored_tail_days: int | None = None  # daily_raw: controlled/scored suffix length. ``None`` retains the
     #                                   legacy caller-supplied score-tail behavior.
-    target_holding_days: int | None = None  # daily_raw: soft notional holding-duration target; ``None`` means the
-    #                                   legacy design has no explicit holding-duration mandate.
-    target_discretionary_turnover: float | None = None  # target mean one-way discretionary turnover per decision.
+    target_holding_days: int | None = None  # legacy daily_raw compatibility field; v6 rejects it because its name
+    #                                   can be misread as an enforced duration.
+    target_discretionary_turnover: float | None = None  # legacy paired field for target_holding_days.
+    holding_preference_horizon_sessions: int | None = None  # v6 soft age scale; never a minimum hold or expiry.
+    soft_daily_one_way_discretionary_turnover_reference: float | None = None  # descriptive v6 reference only;
+    #                                   never a hard constraint, duration proxy, or promotion gate.
     terminal_liquidate: bool = True   # report/run liquidation at a real terminal boundary. Hold-30 uses continuing
     #                                   wealth and records optional liquidation separately.
     daily_lookback: int = 60          # daily_raw: learned cross-day MEMORY window. EFFECTIVE horizon = min(this,
@@ -190,15 +193,32 @@ class Phase1Design:
             or not 0.0 < self.target_discretionary_turnover <= 1.0
         ):
             raise ValueError(f"{self.name}: target_discretionary_turnover must lie in (0, 1] or be None")
-        holding_fields = (
-            self.scored_tail_days,
+        if self.holding_preference_horizon_sessions is not None and (
+            isinstance(self.holding_preference_horizon_sessions, bool)
+            or not isinstance(self.holding_preference_horizon_sessions, int)
+            or self.holding_preference_horizon_sessions < 1
+        ):
+            raise ValueError(
+                f"{self.name}: holding_preference_horizon_sessions must be a positive integer or None"
+            )
+        if self.soft_daily_one_way_discretionary_turnover_reference is not None and (
+            isinstance(self.soft_daily_one_way_discretionary_turnover_reference, bool)
+            or not 0.0 < self.soft_daily_one_way_discretionary_turnover_reference <= 1.0
+        ):
+            raise ValueError(
+                f"{self.name}: soft_daily_one_way_discretionary_turnover_reference "
+                "must lie in (0, 1] or be None"
+            )
+        legacy_holding_fields = (
             self.target_holding_days,
             self.target_discretionary_turnover,
         )
-        if any(value is not None for value in holding_fields):
+        if any(value is not None for value in legacy_holding_fields):
             if self.horizon_mode != "daily_raw":
                 raise ValueError(f"{self.name}: explicit holding fields require horizon_mode='daily_raw'")
-            if any(value is None for value in holding_fields):
+            if self.scored_tail_days is None or any(
+                value is None for value in legacy_holding_fields
+            ):
                 raise ValueError(
                     f"{self.name}: scored_tail_days, target_holding_days, and "
                     "target_discretionary_turnover must be configured together"
@@ -214,6 +234,32 @@ class Phase1Design:
                 raise ValueError(f"{self.name}: label_horizon_days must equal target_holding_days")
             if self.terminal_liquidate:
                 raise ValueError(f"{self.name}: explicit holding designs require terminal_liquidate=False")
+        soft_persistence_fields = (
+            self.holding_preference_horizon_sessions,
+            self.soft_daily_one_way_discretionary_turnover_reference,
+        )
+        if any(value is not None for value in soft_persistence_fields):
+            if self.horizon_mode != "daily_raw":
+                raise ValueError(
+                    f"{self.name}: soft persistence fields require horizon_mode='daily_raw'"
+                )
+            if self.scored_tail_days is None or any(
+                value is None for value in soft_persistence_fields
+            ):
+                raise ValueError(
+                    f"{self.name}: scored_tail_days, holding_preference_horizon_sessions, "
+                    "and soft_daily_one_way_discretionary_turnover_reference must be "
+                    "configured together"
+                )
+            if any(value is not None for value in legacy_holding_fields):
+                raise ValueError(
+                    f"{self.name}: v6 soft persistence cannot inherit "
+                    "target_holding_days or target_discretionary_turnover"
+                )
+            if self.terminal_liquidate:
+                raise ValueError(
+                    f"{self.name}: soft-persistence designs require terminal_liquidate=False"
+                )
         if self.horizon_mode == "daily_raw" and self.exec_delay != 1:
             raise ValueError(
                 f"{self.name}: daily_raw supports exec_delay=1 only; longer delays require a pending-order queue"
@@ -703,6 +749,10 @@ _daily_raw_pit300_hold30_m03r_v6 = replace(
         "positions, optional exact-hold action, one-sided early-exit cost, "
         "252-session learned context, and 63-session rollout"
     ),
+    target_holding_days=None,
+    target_discretionary_turnover=None,
+    holding_preference_horizon_sessions=30,
+    soft_daily_one_way_discretionary_turnover_reference=1.0 / 30.0,
 )
 
 _TOP2000_H100_VARIANTS = [

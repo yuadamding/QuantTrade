@@ -4,6 +4,7 @@ This command is intentionally unable to launch Kubernetes Jobs.  It produces
 local software evidence and deterministic split/manifest artifacts that a
 separate approved Seadragon launcher must verify before allocating GPUs.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -101,6 +102,10 @@ HOLD30_COMPONENT_TESTS = (
         "src/rl_quant/evaluation/hold30_alpha_m03r_v5.py",
         "tests/test_hold30_alpha_m03r_v5_evaluation.py",
     ),
+    (
+        "src/rl_quant/evaluation/hold30_alpha_m03r_v6.py",
+        "tests/test_hold30_alpha_m03r_v6_evaluation.py",
+    ),
     ("src/rl_quant/evaluation/hold30_endpoints.py", "tests/test_hold30_endpoints.py"),
     ("src/rl_quant/evaluation/hold30_inference.py", "tests/test_hold30_inference.py"),
     ("src/rl_quant/evaluation/hold30_metrics.py", "tests/test_hold30_metrics.py"),
@@ -109,6 +114,14 @@ HOLD30_COMPONENT_TESTS = (
     (
         "src/rl_quant/models/hold30_hazard.py",
         "tests/test_hold30_m03r_mechanism.py",
+    ),
+    (
+        "src/rl_quant/models/hold30_exit_action_v6.py",
+        "tests/test_hold30_m03r_v6_exit_action.py",
+    ),
+    (
+        "src/rl_quant/models/hold30_confidence_v6.py",
+        "tests/test_hold30_confidence_v6.py",
     ),
     (
         "src/rl_quant/models/hold30_m03r_ensemble.py",
@@ -171,8 +184,44 @@ HOLD30_COMPONENT_TESTS = (
         "tests/test_hold30_alpha_m03r_v6_objective.py",
     ),
     (
+        "src/rl_quant/training/hold30_alpha_m03r_v6_ledger.py",
+        "tests/test_hold30_alpha_m03r_v6_ledger.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v6_routes.py",
+        "tests/test_hold30_alpha_m03r_v6_routes.py",
+    ),
+    (
         "src/rl_quant/training/hold30_alpha_m03r_v6_selection.py",
         "tests/test_hold30_alpha_m03r_v6_selection.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7.py",
+        "tests/test_hold30_alpha_m03r_v7_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_schedule.py",
+        "tests/test_hold30_alpha_m03r_v7_schedule.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7.py",
+        "tests/test_hold30_alpha_m03r_v7_objective.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_routes.py",
+        "tests/test_hold30_alpha_m03r_v7_routes.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_schedule.py",
+        "tests/test_hold30_alpha_m03r_v7_schedule.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_m03r_confidence_fit.py",
+        "tests/test_hold30_m03r_confidence_fit.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_m03r_confidence_objective_v6.py",
+        "tests/test_hold30_m03r_confidence_objective_v6.py",
     ),
     (
         "src/rl_quant/training/hold30_alpha_plan.py",
@@ -194,6 +243,10 @@ HOLD30_COMPONENT_TESTS = (
         "src/rl_quant/execution/hold30_m03r_soft_persistence_v6.py",
         "tests/test_hold30_m03r_v6_behavior.py",
     ),
+    (
+        "src/rl_quant/execution/hold30_exit_v6.py",
+        "tests/test_hold30_m03r_v6_exit_action.py",
+    ),
     ("src/rl_quant/workflows/hold30_prelockbox.py", "tests/test_hold30_workflow.py"),
     (
         "src/rl_quant/workflows/hold30_alpha_prelockbox.py",
@@ -214,9 +267,12 @@ HOLD30_EVIDENCE_FILES = (
     "docs/adr/0006-daily-decision-soft-30-session-holding.md",
     "docs/adr/0007-benchmark-relative-hold30-alpha-objective.md",
     "docs/daily_hold30_policy_rfc.md",
+    "docs/m03r_confidence_calibration_protocol.md",
     "docs/prelockbox_hold30_active_alpha_m03r_v4.md",
     "docs/prelockbox_hold30_active_alpha_m03r_v5.md",
     "docs/prelockbox_hold30_active_alpha_m03r_v6.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v7.md",
+    "docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md",
     "docs/prelockbox_hold30_alpha_evaluation_v3.md",
     "docs/prelockbox_hold30_alpha_mech8_v3.md",
     "docs/prelockbox_hold30_h0_h3_experiment.md",
@@ -269,7 +325,8 @@ def _require_regular_files(root: Path, paths: Sequence[str]) -> None:
         )
     if unsafe:
         raise Hold30QualificationError(
-            "qualification files must be regular in-repository files: " + ", ".join(unsafe)
+            "qualification files must be regular in-repository files: "
+            + ", ".join(unsafe)
         )
 
 
@@ -282,7 +339,9 @@ def _resolve_qualification_inventory(root: Path) -> Hold30QualificationInventory
 
     source_root = root / "src" / "rl_quant"
     if not source_root.is_dir():
-        raise Hold30QualificationError("src/rl_quant is absent from the qualification root")
+        raise Hold30QualificationError(
+            "src/rl_quant is absent from the qualification root"
+        )
     for candidate in sorted(source_root.rglob("*hold30*.py")):
         relative = candidate.relative_to(root).as_posix()
         if relative in registered:
@@ -374,7 +433,10 @@ def _hold30_model_evidence() -> dict[str, Any]:
             )
         counts = hold30_parameter_counts(setting_id)
         values = (counts.context_encoder, counts.actor_path, counts.total_unique)
-        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in values):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in values
+        ):
             raise Hold30QualificationError(
                 f"Hold-30 parameter counts must be positive integers for {setting_id}: {values}"
             )
@@ -390,7 +452,9 @@ def _hold30_model_evidence() -> dict[str, Any]:
             )
         if not (
             counts.context_encoder < HOLD30_CONTEXT_PARAMETER_MAX
-            and HOLD30_ACTOR_PARAMETER_MIN <= counts.actor_path <= HOLD30_ACTOR_PARAMETER_MAX
+            and HOLD30_ACTOR_PARAMETER_MIN
+            <= counts.actor_path
+            <= HOLD30_ACTOR_PARAMETER_MAX
             and counts.total_unique <= HOLD30_TOTAL_PARAMETER_MAX
         ):
             raise Hold30QualificationError(
@@ -545,8 +609,12 @@ def qualify_hold30_software(
 
 def _read_axis(path: Path) -> tuple[str, ...]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list) or not all(isinstance(value, str) for value in payload):
-        raise Hold30QualificationError("decision-axis JSON must be an array of timestamps")
+    if not isinstance(payload, list) or not all(
+        isinstance(value, str) for value in payload
+    ):
+        raise Hold30QualificationError(
+            "decision-axis JSON must be an array of timestamps"
+        )
     return tuple(payload)
 
 
@@ -590,7 +658,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "qualify-software":
-        receipt = qualify_hold30_software(args.repo, timeout_seconds=args.timeout_seconds)
+        receipt = qualify_hold30_software(
+            args.repo, timeout_seconds=args.timeout_seconds
+        )
         _write_new_json(args.output, receipt)
         print(receipt["qualification_sha256"])
         return 0

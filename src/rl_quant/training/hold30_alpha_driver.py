@@ -1752,6 +1752,11 @@ class _CpuA06SelectiveDetachPolicy:
             benchmark_derisk_request=detached(intent.benchmark_derisk_request),
             total_risk_overlay=intent.total_risk_overlay,
             auxiliary_alpha_mean=detached(intent.auxiliary_alpha_mean),
+            exit_action_v6=(
+                None
+                if intent.exit_action_v6 is None
+                else intent.exit_action_v6.clone(detach=True)
+            ),
         )
 
 

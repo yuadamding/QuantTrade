@@ -10,6 +10,27 @@
 This protocol is for non-PHI scientific research and software qualification;
 it is not a business-production, investment-advice, or deployment contract.
 
+Confidence calibration targets whether a frozen, standardized unit-risk
+30-session active proposal earns positive net active log return versus C1. It
+must never target the final confidence-sized policy path, because that would
+make confidence define its own calibration outcome.
+
+Policy training and deployment calibration are separate stages. While policy
+parameters remain trainable, the raw confidence head receives package-owned
+binary-log-loss supervision from the standardized unit-risk outcome, consumes
+a detached market representation, and cannot size the economic trading path.
+After checkpoint freeze, deterministic inner-validation fitting binds the
+calibrator; calibrated confidence may then size new or expanded active risk,
+and no subsequent policy update is permitted.
+
+Ordinary exits use the bounded continuous age-aware hazard. Exact full exit is
+not attributed to the unreachable open endpoint of the tanh bound; it is a
+separate learnable EXIT atom in a mutually exclusive HOLD / CONTINUOUS / EXIT
+straight-through action. Exact HOLD remains optional and A11 removes only that
+atom. Exact EXIT remains available at every position age.
+This requirement applies to learned-hazard settings; A08 intentionally removes
+the learned action head as the fixed-prior comparator.
+
 This document and
 `src/rl_quant/protocol/hold30_alpha_m03r_v6.py` define the v6 contract.
 V6 changes the interpretation of Hold-30: 30 trading sessions is a soft
@@ -36,11 +57,13 @@ The optional exact-hold action remains an efficient atom for representing no
 trade. It is supported by canonical M03R, but never required. A11 removes that
 atom to measure its causal value.
 
-The bounded learned hazard retains `-12` as exact zero release and v6 assigns
-`+12` the symmetric meaning of exact full discretionary exit. Thus a severe
-reversal can close even a young cohort, while a favorable position may remain
-open indefinitely. Hard risk and availability repairs execute before the
-discretionary hazard and ignore both the persistence cost and exact-hold atom.
+The bounded learned hazard retains `-12` as exact zero release, while `+12`
+remains an ordinary continuous partial-release endpoint. A separate learnable
+EXIT atom provides reachable exact full discretionary exit at every age in
+learned-hazard settings. Thus
+a severe reversal can close even a young cohort, while a favorable position
+may remain open indefinitely. Hard risk and availability repairs execute
+before the discretionary action and ignore the persistence cost and HOLD atom.
 
 ## Temporal and economic semantics
 
@@ -51,6 +74,8 @@ discretionary hazard and ignore both the persistence cost and exact-hold atom.
 | Controlled rollout | 63 sessions | Optimization geometry |
 | Economic origin | 30 post-fill returns | Return support for the economic objective, not a holding rule |
 | Persistence preference | 30 sessions | Age scale in the soft early-exit penalty only |
+| Age ledger | 61 bins, indexed 0–60 | Exact protocol-owned shape; bin 60 accumulates notional aged 60 sessions or more |
+| Soft turnover reference | 1/30 one-way per session | Descriptive regularization reference, not a duration proxy, hard constraint, or promotion gate |
 | Auxiliary horizons | 5, 21, 30, 63 | Residual-alpha representation targets |
 | Evaluation warm-up / score | 63 / 63 sessions | Continuous-book evaluation geometry |
 
@@ -60,18 +85,25 @@ minimum holding duration.
 
 ## Soft-persistence objective
 
-For discretionary learned sales of notional `x_a` at age `a`, v6 freezes the
+For policy-discretionary sales of notional `x_a` at age `a`, v6 freezes the
 one-sided quadratic age weight
 
 \[
 q(a)=\max(0,1-a/30)^2.
 \]
 
-The normalized early-exit fraction is
+Let `N_valid` be the exact count of valid scored decision sessions represented
+by the aggregated sale-age ledger. The NAV- and session-normalized early-exit
+notional is
 
 \[
-E=\frac{\sum_a x_a q(a)}{\sum_a x_a + 10^{-12}}.
+E_{NAV/session}=\frac{1}{N_{valid}}\sum_a x_a q(a).
 \]
+
+There is deliberately no denominator involving total sold notional. A 1% NAV
+young sale pays 1% of the full-NAV penalty, while adding mature sales has
+exactly zero value and zero gradient in this term; mature sales cannot dilute
+the cost of young exits.
 
 For training completion fraction `u`, the 10% linear warmup is
 
@@ -79,20 +111,39 @@ For training completion fraction `u`, the 10% linear warmup is
 m(u)=\min(1,u/0.10).
 \]
 
+The total optimizer-step count that defines `u` is carried by a typed,
+content-addressed v6 training-plan receipt. It cannot be changed as a free
+runtime argument under the same plan identity. The valid decision-session
+count is owned by the same typed cause inventory as the aggregated age ledger,
+is derived by the sequence adapter, and must be positive; it cannot be supplied
+independently to the objective.
+
 The canonical loss contribution is
 
 \[
-L_{persist}=5\times 10^{-4}\,m(u)E,
+L_{persist}=5\times 10^{-4}\,m(u)E_{NAV/session},
 \]
 
-corresponding to 5 bp per unit at age zero. Only learned discretionary exits
-enter this loss. Forced, unavailable, risk-repair, corporate-action, and
-terminal sales remain cause-typed telemetry and are excluded.
+corresponding to 5 bp per unit at age zero. Learned-hazard, explicit policy
+de-risk, and policy-induced projection sales enter this loss. Pretrade
+unavailability, current-book risk repair, corporate-action, other forced, and
+terminal sales remain cause-typed telemetry and are excluded. The adapter
+requires the cause tensors to be disjoint and to sum exactly to total executed
+sales, so a policy cannot route a young exit through projection to avoid the
+penalty.
 
-The coefficient is selected only inside development from the frozen grid
-`(2, 5, 10)` bp. The selected value and all input identities must be sealed
-before any governed outer evaluation. Holding-duration outcomes remain
-diagnostics, not promotion gates.
+Five basis points is the sole v6 coefficient identity. A 2-bp or 10-bp
+coefficient is not a v6 inner-grid choice and cannot share a v6 receipt. Those
+sensitivities are deferred to a new immutable generation (v7 or later), where
+each must receive a separate non-promotable setting ID. Holding-duration
+outcomes remain diagnostics, not promotion gates.
+
+The generic design registry likewise carries no v6 `target_holding_days` or
+`target_discretionary_turnover`. It binds
+`holding_preference_horizon_sessions = 30` and
+`soft_daily_one_way_discretionary_turnover_reference = 1/30` instead. The
+63-session score tail is rollout geometry and is not coupled to an enforced
+holding target.
 
 The holding/economic gradient-norm ratio is reported separately with an
 initial diagnostic target band of 5%–15%. It never rescales the loss or gates
@@ -104,9 +155,51 @@ the holding penalty.
 
 Hard eligibility is limited to complete evidence, positive 20-bp active
 return, nonnegative 40-bp active return, the annual tracking-error ceiling,
-the active-beta equivalence bound, and frozen censoring/projection/forced-
-turnover quality limits. Survival at 20 or 30 sessions and RMST60 cannot make a
-checkpoint eligible or ineligible.
+the active-beta equivalence bound, exact 61-bin age-ledger validity/content
+binding, and frozen projection/forced-turnover quality limits. Raw fold-censored
+notional fraction remains content-bound telemetry; it is not an eligibility
+threshold. Survival at 20 or 30 sessions, RMST60, and the precision implied by
+their censoring pattern cannot make a checkpoint eligible or ineligible. A
+profitable, otherwise valid RMST45 candidate remains eligible even when most
+open notional is right-censored at a fold boundary.
+
+This correction is bound by checkpoint-selection schema
+`rl-quant.m03r-v6-soft-persistence-checkpoint-selection-contract-v2`; a v1
+selection receipt containing a censoring threshold cannot identify this gate
+contract.
+
+## Generation-qualified numerical evaluator
+
+`src/rl_quant/evaluation/hold30_alpha_m03r_v6.py` is the v6 public numerical
+surface for already-produced chronological return arrays. It validates the
+exact v6 protocol, design, and setting at entry and receipt boundaries. It is
+not a data loader, production evaluator driver, checkpoint selector, or launch
+authorization path.
+
+Evaluation fails closed without both typed, content-addressed manifests:
+
+- a point-in-time factor manifest whose factor set was defined without outer
+  data; and
+- an inference manifest bound to that exact factor manifest, bootstrap seed,
+  replicate count, primary 21-session moving block, 10/30-session sensitivity
+  blocks, 30-session primary HAC lag, and one-sided 5% tail.
+
+The evaluator reports three separate fold-fixed-effect multifactor
+regressions:
+
+```text
+portfolio excess return versus market and declared factors
+C1 benchmark excess return versus market and declared factors
+policy-minus-C1 active return versus market and declared factors
+```
+
+The primary uncertainty output is the 21-session within-fold circular
+moving-block lower confidence bound of the **active** multifactor intercept;
+10 and 30 sessions remain sensitivity blocks. The receipt binds chronology,
+fold IDs, every numerical return array, both manifests, all regression output,
+and bootstrap results. Its promotion flag remains false while the public
+production evaluator driver, multiplicity-adjusted factor family, and outer
+data-access receipts are unavailable.
 
 Eligible checkpoints rank by 20-bp active-return bootstrap lower bound,
 information ratio, total Sharpe, drawdown, discretionary turnover, cost, then
@@ -139,6 +232,35 @@ causal field. A08 remains distinct from A11: A08 freezes the age-shaped exit
 prior, while A11 removes the exact no-trade atom and leaves the learned hazard
 intact.
 
+### Generation-qualified route inventory
+
+`src/rl_quant/training/hold30_alpha_m03r_v6_routes.py` binds every setting, in
+protocol order, to its exact v6 objective, model, five-seed ensemble,
+execution, and evaluator route IDs. No v5 route ID or artifact is accepted.
+
+Every v6 route binds the sole persistence objective
+`m03r-v6-persistence/proportional-nav-session-quadratic-one-sided-5bp/v2`.
+The legacy generic early-exit term is explicitly inapplicable to all 12 v6
+settings; it cannot be combined with, substituted for, or added to the v6
+proportional persistence objective.
+
+The route inventory is declarative and fail-closed. Each setting explicitly
+reports these missing public production components:
+
+```text
+public all-setting training driver
+public isolated confidence-head training step
+public five-seed ensemble driver
+public cause-typed execution adapter
+public chronological evaluator adapter
+public route receipt writer
+```
+
+Consequently, the aggregate route status always has
+`launch_authorized = false` until a later generation-qualified implementation
+and evidence path replaces those missing-component declarations. Unit-tested
+lower-level primitives cannot self-attest a public production route.
+
 The primary holding-mechanism contrast is canonical M03R minus A08. It reports
 20/40-bp net active return, information ratio, total Sharpe, drawdown, RMST60,
 survival at 10/20/30 sessions, discretionary early-exit mass and cost, plus
@@ -155,7 +277,7 @@ Every v6 artifact must bind at least:
 protocol generation and schema
 design and exact v6 setting ID
 soft-persistence contract SHA-256
-selected inner-development coefficient and selection receipt
+canonical 5-bp soft-persistence coefficient
 source archive and container image
 PIT data, universe, benchmark, factor and sector manifests
 seed/checkpoint ensemble manifest

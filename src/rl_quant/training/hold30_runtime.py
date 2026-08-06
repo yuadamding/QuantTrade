@@ -53,6 +53,7 @@ from rl_quant.execution.hold30_sleeves import (
     Hold30SleeveState,
 )
 from rl_quant.models.daily_policy import Hold30Intent
+from rl_quant.models.hold30_exit_action_v6 import M03RV6ExitAction
 from rl_quant.protocol.hold30_alpha_v3 import HOLD30_ALPHA_HORIZONS
 from rl_quant.training.hold30 import (
     Hold30CanonicalRow,
@@ -114,11 +115,16 @@ def _clone_intent(intent: Hold30Intent, *, detach: bool) -> Hold30Intent:
         benchmark_derisk_request=copy(intent.benchmark_derisk_request),
         total_risk_overlay=copy(intent.total_risk_overlay),
         auxiliary_alpha_mean=copy(intent.auxiliary_alpha_mean),
+        exit_action_v6=(
+            None
+            if intent.exit_action_v6 is None
+            else intent.exit_action_v6.clone(detach=detach)
+        ),
     )
 
 
 def _intent_tensors(intent: Hold30Intent) -> tuple[tuple[str, torch.Tensor], ...]:
-    return tuple(
+    direct = tuple(
         (name, value)
         for name in (
             "entry_scores",
@@ -141,6 +147,16 @@ def _intent_tensors(intent: Hold30Intent) -> tuple[tuple[str, torch.Tensor], ...
             "auxiliary_alpha_mean",
         )
         if (value := getattr(intent, name)) is not None
+    )
+    if intent.exit_action_v6 is None:
+        return direct
+    action = intent.exit_action_v6
+    action.validate()
+    return (
+        *direct,
+        ("exit_action_v6.logits", action.logits),
+        ("exit_action_v6.soft_probabilities", action.soft_probabilities),
+        ("exit_action_v6.decision_st", action.decision_st),
     )
 
 
@@ -704,6 +720,11 @@ class Hold30ChronologicalRuntime:
         )
         intent = _clone_intent(intent, detach=False)
         self._validate_intent(intent, sequence.batch_size, sequence.num_assets)
+        self._validate_v6_exit_action_binding(
+            intent,
+            sequence.decision_available[t],
+            cash_index=sequence.cash_index,
+        )
         pending = PendingHold30Intent(
             intent=intent,
             decision_index=t,
@@ -731,6 +752,11 @@ class Hold30ChronologicalRuntime:
         if not torch.equal(pending.decision_available, sequence.decision_available[state.position_index]):
             raise ValueError("pending intent decision mask does not match the bound sequence")
         self._validate_intent(pending.intent, sequence.batch_size, sequence.num_assets)
+        self._validate_v6_exit_action_binding(
+            pending.intent,
+            pending.decision_available,
+            cash_index=sequence.cash_index,
+        )
         return replace(state, pending_intent=pending)
 
     def advance(
@@ -747,6 +773,11 @@ class Hold30ChronologicalRuntime:
         t = state.position_index
         if pending.axis_id != sequence.axis_id or pending.decision_index != t or pending.fill_index != t + 1:
             raise ValueError("pending-intent receipt does not match this transition")
+        self._validate_v6_exit_action_binding(
+            pending.intent,
+            pending.decision_available,
+            cash_index=sequence.cash_index,
+        )
 
         decision_ledger = state.ledger
         decision_weights = decision_ledger.weights
@@ -1162,6 +1193,7 @@ class Hold30ChronologicalRuntime:
                         if intent.exact_hold_decision_st is not None
                         else intent.exact_hold_probability
                     ),
+                    exit_action_v6=intent.exit_action_v6,
                     total_risk_overlay=intent.total_risk_overlay,
                     total_risk_step=self.alpha_total_risk_step,
                     cash_index=repaired_ledger.cash_index,
@@ -1178,6 +1210,7 @@ class Hold30ChronologicalRuntime:
                     risk_asset_caps,
                     risk_gross_max,
                     exact_hold_probability=intent.exact_hold_probability,
+                    exit_action_v6=intent.exit_action_v6,
                     cash_index=repaired_ledger.cash_index,
                 )
         else:  # guarded by __init__
@@ -1201,6 +1234,7 @@ class Hold30ChronologicalRuntime:
                 "exact_hold_soft_probability",
                 "exact_hold_decision_st",
                 "exposure_residual",
+                "exit_action_v6",
             )
         elif self.mechanism == "H2":
             required = {
@@ -1221,6 +1255,7 @@ class Hold30ChronologicalRuntime:
                 "exact_hold_soft_probability",
                 "exact_hold_decision_st",
                 "exposure_residual",
+                "exit_action_v6",
             )
         for name, shape in required.items():
             value = getattr(intent, name)
@@ -1269,6 +1304,32 @@ class Hold30ChronologicalRuntime:
                 raise ValueError(
                     "legacy exact_hold_probability and explicit v5 exact-hold fields are mutually exclusive"
                 )
+            if intent.exit_action_v6 is not None:
+                if not isinstance(intent.exit_action_v6, M03RV6ExitAction):
+                    raise ValueError("exit_action_v6 must use the typed v6 action")
+                assert intent.hazard_residual is not None
+                intent.exit_action_v6.validate()
+                if tuple(intent.exit_action_v6.risky_available.shape) != matrix_shape:
+                    raise ValueError(
+                        "exit_action_v6 asset axes must match the H2 intent"
+                    )
+                if intent.exit_action_v6.logits.device != intent.hazard_residual.device:
+                    raise ValueError(
+                        "exit_action_v6 must share the H2 intent device"
+                    )
+                if any(
+                    value is not None
+                    for value in (
+                        intent.exact_hold_probability,
+                        intent.exact_hold_logit,
+                        intent.exact_hold_soft_probability,
+                        intent.exact_hold_decision_st,
+                    )
+                ):
+                    raise ValueError(
+                        "v6 three-way exit action and legacy exact-hold fields "
+                        "are mutually exclusive"
+                    )
         alpha_fields = (
             "alpha_mean_30d",
             "alpha_downside_30d",
@@ -1285,18 +1346,39 @@ class Hold30ChronologicalRuntime:
             return
         if self.mechanism != "H2":
             raise ValueError("v3 alpha intent requires the age-aware H2 runtime")
-        if intent.alpha_mean_30d is None or tuple(
-            intent.alpha_mean_30d.shape
-        ) != matrix_shape:
-            raise ValueError(
-                f"v3 alpha intent field alpha_mean_30d must have shape {matrix_shape}"
-            )
-        if intent.alpha_downside_30d is not None and tuple(
-            intent.alpha_downside_30d.shape
-        ) != matrix_shape:
-            raise ValueError(
-                f"v3 alpha_downside_30d must have shape {matrix_shape} when present"
-            )
+        # M02 v6 deliberately keeps confidence-sized active risk while removing
+        # the residual-alpha head bundle.  Its standalone confidence head emits
+        # the raw confidence logit and risk budget, but no alpha mean/downside or
+        # auxiliary-alpha tensors.  Keep that schema explicit so an arbitrary
+        # partial alpha intent cannot be mistaken for the registered M02 path.
+        confidence_only = (
+            intent.alpha_mean_30d is None
+            and intent.alpha_downside_30d is None
+            and intent.auxiliary_alpha_mean is None
+            and intent.total_risk_overlay is None
+            and intent.uncalibrated_signal_confidence_logit is not None
+            and intent.benchmark_derisk_request is not None
+        )
+        if confidence_only:
+            benchmark_derisk = intent.benchmark_derisk_request
+            assert benchmark_derisk is not None
+            if not torch.equal(benchmark_derisk, torch.zeros_like(benchmark_derisk)):
+                raise ValueError(
+                    "standalone confidence intent must not request benchmark de-risking"
+                )
+        else:
+            if intent.alpha_mean_30d is None or tuple(
+                intent.alpha_mean_30d.shape
+            ) != matrix_shape:
+                raise ValueError(
+                    f"v3 alpha intent field alpha_mean_30d must have shape {matrix_shape}"
+                )
+            if intent.alpha_downside_30d is not None and tuple(
+                intent.alpha_downside_30d.shape
+            ) != matrix_shape:
+                raise ValueError(
+                    f"v3 alpha_downside_30d must have shape {matrix_shape} when present"
+                )
         if tuple(intent.active_risk_scale.shape) != vector_shape:
             raise ValueError("v3 active_risk_scale must have shape [batch]")
         if intent.signal_confidence is not None:
@@ -1326,12 +1408,34 @@ class Hold30ChronologicalRuntime:
             intent.total_risk_overlay.shape
         ) != vector_shape:
             raise ValueError("v3 total_risk_overlay must have shape [batch]")
-        if intent.auxiliary_alpha_mean is None or tuple(
-            intent.auxiliary_alpha_mean.shape
-        ) != (*matrix_shape, len(HOLD30_ALPHA_HORIZONS)):
+        if not confidence_only and (
+            intent.auxiliary_alpha_mean is None
+            or tuple(intent.auxiliary_alpha_mean.shape)
+            != (*matrix_shape, len(HOLD30_ALPHA_HORIZONS))
+        ):
             raise ValueError(
                 "v3 auxiliary_alpha_mean must have shape "
                 f"[batch,asset,{len(HOLD30_ALPHA_HORIZONS)}]"
+            )
+
+    @staticmethod
+    def _validate_v6_exit_action_binding(
+        intent: Hold30Intent,
+        decision_available: torch.Tensor,
+        *,
+        cash_index: int,
+    ) -> None:
+        """Bind the delayed exact action to the mask visible at decision time."""
+
+        action = intent.exit_action_v6
+        if action is None:
+            return
+        action.validate()
+        expected = decision_available.bool().clone()
+        expected[:, cash_index] = False
+        if not torch.equal(action.risky_available, expected):
+            raise ValueError(
+                "exit_action_v6 risky_available does not match the decision-time mask"
             )
 
     def _validate_state(self, sequence: Hold30Sequence, state: Hold30RuntimeState) -> None:
@@ -1510,6 +1614,23 @@ class Hold30ChronologicalRuntime:
             raise RuntimeError("canonical/replay raw-intent field mismatch")
         for name, value in actual_intent.items():
             self._assert_close(f"intent.{name}", value, expected_intent[name])
+        actual_exit = actual.raw_intent.exit_action_v6
+        expected_exit = expected.raw_intent.exit_action_v6
+        if (actual_exit is None) != (expected_exit is None):
+            raise RuntimeError("canonical/replay v6 exit-action presence mismatch")
+        if (
+            actual_exit is not None
+            and expected_exit is not None
+            and (
+                actual_exit.exact_hold_atom_enabled
+                != expected_exit.exact_hold_atom_enabled
+                or not torch.equal(
+                    actual_exit.risky_available,
+                    expected_exit.risky_available,
+                )
+            )
+        ):
+            raise RuntimeError("canonical/replay v6 exit-action metadata mismatch")
         for cause in TURNOVER_CAUSES:
             self._assert_close(
                 f"turnover.{cause.value}",

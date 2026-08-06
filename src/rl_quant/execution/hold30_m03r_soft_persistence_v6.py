@@ -56,10 +56,10 @@ def m03r_v6_release_cohorts(
 ) -> M03RV6CohortReleaseResult:
     """Release held cohorts without an age mask or a day-30 expiry.
 
-    ``hazard_residual`` is the already bounded learned residual.  Its upper
-    endpoint is an exact full discretionary exit, symmetrically with the
-    lower endpoint's exact zero release.  The optional exact-hold atom can
-    suppress ordinary release, but cannot suppress a forced repair.
+    ``hazard_residual`` is the already bounded learned residual. Its upper
+    endpoint remains a continuous partial release; exact full exit belongs to
+    the separate v6 EXIT action. The optional exact-hold atom can suppress
+    ordinary release, but cannot suppress a forced repair.
     """
 
     _finite_float_tensor("age_notional", age_notional)
@@ -115,13 +115,6 @@ def m03r_v6_release_cohorts(
             else exact_hold_decision_st.to(dtype=age_notional.dtype).unsqueeze(-1)
         ),
     )
-    # The historical normalized sigmoid makes -12 exactly zero but leaves the
-    # +12 endpoint infinitesimally below one.  V6 makes the opposite endpoint
-    # economically exact so an adverse signal can close even a young cohort.
-    full_exit = hazard_residual >= maximum
-    if exact_hold_decision_st is not None:
-        full_exit = full_exit & (exact_hold_decision_st == 0.0)
-    hazard = torch.where(full_exit.unsqueeze(-1), torch.ones_like(hazard), hazard)
     discretionary = after_forced * hazard
     remaining = after_forced - discretionary
     if not bool(

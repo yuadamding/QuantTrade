@@ -123,6 +123,16 @@ Brier score, expected calibration error, and observed target rate
 manifest SHA-256
 ```
 
+Governed construction follows the frozen two-stage protocol in
+[`m03r_confidence_calibration_protocol.md`](m03r_confidence_calibration_protocol.md):
+the policy checkpoint is trained and frozen first; the package-owned fitter
+then derives the calibrator from actual detached inner-validation logits and
+targets; the calibrator is frozen before validation or deployment; and no
+policy update may follow calibration. The replay receipt content-binds the
+row-level folds/dates, deterministic optimizer, calibrated probabilities, and
+fixed ten-bin ECE evidence. Caller-authored temperatures, intercepts, Brier
+scores, or ECE values are not governed fit evidence.
+
 The model recomputes the manifest digest and applies its transform in the
 forward path. A digest-shaped placeholder, a mismatched setting, altered
 parameter, checkpoint/seed mismatch, source-array mismatch, missing typed

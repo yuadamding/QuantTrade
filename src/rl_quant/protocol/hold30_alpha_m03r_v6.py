@@ -15,12 +15,14 @@ from typing import Any
 from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     M03R_ALPHA_HORIZONS_TRADING_SESSIONS,
     M03R_PRIMARY_BENCHMARK_ID,
-    M03R_PROTOCOL_GENERATION as M03R_V5_PROTOCOL_GENERATION,
     M03R_TRAINING_ONE_WAY_COST_BASIS_POINTS,
     M03R_VALIDATION_ONE_WAY_COSTS_BASIS_POINTS,
     M03RActiveRiskContract,
     M03REnsembleExecutionContract,
     M03RFactorSectorProjectionContract,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v5 import (
+    M03R_PROTOCOL_GENERATION as M03R_V5_PROTOCOL_GENERATION,
 )
 
 M03R_PROTOCOL_GENERATION = "prelockbox-hold30-active-alpha-m03r-v6"
@@ -29,6 +31,9 @@ M03R_V6_SCHEMA_VERSION = 6
 M03R_SUPERSEDED_PROTOCOL_GENERATION = M03R_V5_PROTOCOL_GENERATION
 M03R_DESIGN_ID = "daily_raw_pit300_hold30_m03r_v6"
 M03R_CANONICAL_SETTING_ID = "M03R-soft-persistence-active-alpha-hold30"
+M03R_AGE_LEDGER_BIN_COUNT = 61
+M03R_AGE_LEDGER_MINIMUM_AGE_SESSIONS = 0
+M03R_AGE_LEDGER_MAXIMUM_AGE_SESSIONS = 60
 
 
 class M03RProtocolError(ValueError):
@@ -87,22 +92,33 @@ class M03RSoftPersistenceContract:
     sell_mask_before_preference_horizon: bool = False
     forced_expiry_at_preference_horizon: bool = False
     holding_duration_is_promotion_gate: bool = False
+    age_ledger_bin_count: int = M03R_AGE_LEDGER_BIN_COUNT
+    age_ledger_minimum_age_sessions: int = M03R_AGE_LEDGER_MINIMUM_AGE_SESSIONS
+    age_ledger_maximum_age_sessions: int = M03R_AGE_LEDGER_MAXIMUM_AGE_SESSIONS
+    age_ledger_maximum_bin_accumulates_older_notional: bool = True
+    soft_daily_one_way_discretionary_turnover_reference: float = 1.0 / 30.0
     turnover_target_is_holding_duration_proxy: bool = False
     turnover_is_hard_holding_constraint: bool = False
+    soft_turnover_reference_is_promotion_gate: bool = False
     early_exit_always_allowed: bool = True
     exact_hold_action_supported: bool = True
     exact_hold_action_required: bool = False
+    exact_exit_action_supported: bool = True
+    exact_exit_action_required_for_learned_hazard_settings: bool = True
+    exit_action_parameterization: str = (
+        "mutually-exclusive-straight-through-hold-continuous-exit-v1"
+    )
     bounded_hazard_residual_minimum: float = -12.0
     bounded_hazard_residual_maximum: float = 12.0
-    maximum_hazard_endpoint_means_full_discretionary_exit: bool = True
+    continuous_hazard_upper_endpoint_is_exact_exit: bool = False
     early_exit_penalty_shape: str = "quadratic-one-sided"
     early_exit_penalty_bp_per_unit_at_age_zero: float = 5.0
     early_exit_penalty_inner_development_grid_bp_per_unit_at_age_zero: tuple[
         float, ...
-    ] = (2.0, 5.0, 10.0)
+    ] = (5.0,)
+    alternative_early_exit_penalty_requires_new_protocol_generation: bool = True
     early_exit_penalty_warmup_shape: str = "linear-from-zero"
     early_exit_penalty_linear_warmup_fraction: float = 0.10
-    early_exit_sold_notional_epsilon: float = 1e-12
     age_weight_formula: str = "max(0,1-age/30)^2"
     holding_to_economic_gradient_norm_ratio_diagnostic_band: tuple[float, float] = (
         0.05,
@@ -120,11 +136,31 @@ class M03RSoftPersistenceContract:
         if self.minimum_holding_period_sessions is not None:
             raise M03RProtocolError("M03R v6 cannot impose a minimum holding period")
         if (
+            self.age_ledger_bin_count != M03R_AGE_LEDGER_BIN_COUNT
+            or self.age_ledger_minimum_age_sessions
+            != M03R_AGE_LEDGER_MINIMUM_AGE_SESSIONS
+            or self.age_ledger_maximum_age_sessions
+            != M03R_AGE_LEDGER_MAXIMUM_AGE_SESSIONS
+            or self.age_ledger_bin_count
+            != self.age_ledger_maximum_age_sessions
+            - self.age_ledger_minimum_age_sessions
+            + 1
+            or not self.age_ledger_maximum_bin_accumulates_older_notional
+        ):
+            raise M03RProtocolError(
+                "M03R v6 age ledger must have exactly 61 bins for ages 0 through 60"
+            )
+        if self.soft_daily_one_way_discretionary_turnover_reference != 1.0 / 30.0:
+            raise M03RProtocolError(
+                "M03R v6 soft turnover reference must be exactly 1/30"
+            )
+        if (
             self.sell_mask_before_preference_horizon
             or self.forced_expiry_at_preference_horizon
             or self.holding_duration_is_promotion_gate
             or self.turnover_target_is_holding_duration_proxy
             or self.turnover_is_hard_holding_constraint
+            or self.soft_turnover_reference_is_promotion_gate
             or not self.early_exit_always_allowed
         ):
             raise M03RProtocolError(
@@ -136,36 +172,41 @@ class M03RSoftPersistenceContract:
                 "canonical v6 supports but never requires the exact-hold action"
             )
         if (
-            self.bounded_hazard_residual_minimum != -12.0
-            or self.bounded_hazard_residual_maximum != 12.0
-            or not self.maximum_hazard_endpoint_means_full_discretionary_exit
+            not self.exact_exit_action_supported
+            or not self.exact_exit_action_required_for_learned_hazard_settings
+            or self.exit_action_parameterization
+            != "mutually-exclusive-straight-through-hold-continuous-exit-v1"
         ):
             raise M03RProtocolError(
-                "v6 hazard endpoints must permit exact hold and full discretionary exit"
+                "canonical v6 requires the reachable exact EXIT action"
+            )
+        if (
+            self.bounded_hazard_residual_minimum != -12.0
+            or self.bounded_hazard_residual_maximum != 12.0
+            or self.continuous_hazard_upper_endpoint_is_exact_exit
+        ):
+            raise M03RProtocolError(
+                "v6 continuous hazard must remain bounded and cannot claim exact exit"
             )
         if self.early_exit_penalty_shape != "quadratic-one-sided":
             raise M03RProtocolError("M03R v6 early-exit penalty shape drifted")
         if self.early_exit_penalty_bp_per_unit_at_age_zero != 5.0:
             raise M03RProtocolError(
-                "canonical age-zero early-exit penalty must be 5 bp"
+                "M03R v6 permits only canonical 5 bp; alternatives need a new generation"
             )
-        if self.early_exit_penalty_inner_development_grid_bp_per_unit_at_age_zero != (
-            2.0,
-            5.0,
-            10.0,
+        if (
+            self.early_exit_penalty_inner_development_grid_bp_per_unit_at_age_zero
+            != (5.0,)
+            or not self.alternative_early_exit_penalty_requires_new_protocol_generation
         ):
-            raise M03RProtocolError("M03R v6 inner-development penalty grid drifted")
+            raise M03RProtocolError(
+                "M03R v6 permits only canonical 5 bp; alternatives need a new generation"
+            )
         if (
             self.early_exit_penalty_warmup_shape != "linear-from-zero"
             or self.early_exit_penalty_linear_warmup_fraction != 0.10
         ):
             raise M03RProtocolError("M03R v6 requires a frozen 10% linear warmup")
-        if (
-            not math.isfinite(self.early_exit_sold_notional_epsilon)
-            or self.early_exit_sold_notional_epsilon <= 0.0
-            or self.early_exit_sold_notional_epsilon != 1e-12
-        ):
-            raise M03RProtocolError("M03R v6 sold-notional epsilon must be 1e-12")
         if self.age_weight_formula != "max(0,1-age/30)^2":
             raise M03RProtocolError("M03R v6 age-weight formula drifted")
         if (
@@ -225,11 +266,14 @@ class M03RModelContract:
     exit_hazard_head_required: bool = True
     exact_hold_action_supported: bool = True
     exact_hold_action_required: bool = False
+    exact_exit_action_supported: bool = True
+    exact_exit_action_required_for_learned_hazard_settings: bool = True
     uncertainty_head_required: bool = True
     confidence_calibration_manifest_sha256_required: bool = True
     confidence_calibration_schema: str = "rl-quant.m03r-confidence-calibration-v2"
     confidence_target_definition: str = (
-        "probability-30-session-net-active-log-return-versus-C1-is-positive"
+        "probability-standardized-unit-risk-30-session-net-active-log-return-"
+        "versus-C1-is-positive"
     )
     confidence_calibration_method: str = "temperature-sigmoid-v1"
     separate_sharpe_overlay_in_canonical: bool = False
@@ -266,10 +310,18 @@ class M03RModelContract:
         if not self.exact_hold_action_supported or self.exact_hold_action_required:
             raise M03RProtocolError("M03R v6 exact hold must be available but optional")
         if (
+            not self.exact_exit_action_supported
+            or not self.exact_exit_action_required_for_learned_hazard_settings
+        ):
+            raise M03RProtocolError(
+                "M03R v6 learned-hazard settings require a reachable exact EXIT action"
+            )
+        if (
             self.confidence_calibration_schema
             != "rl-quant.m03r-confidence-calibration-v2"
             or self.confidence_target_definition
-            != "probability-30-session-net-active-log-return-versus-C1-is-positive"
+            != "probability-standardized-unit-risk-30-session-net-active-log-return-"
+            "versus-C1-is-positive"
             or self.confidence_calibration_method != "temperature-sigmoid-v1"
         ):
             raise M03RProtocolError("M03R v6 confidence contract drifted")
@@ -660,7 +712,8 @@ def m03r_v6_design_payload() -> dict[str, Any]:
         "launch_authorized": False,
         "launch_blockers": (
             "governed-v6-all-setting-production-driver-not-implemented",
-            "authoritative-cause-typed-chronological-ledger-adapter-not-implemented",
+            "isolated-confidence-head-training-and-two-stage-calibration-not-receipted",
+            "cause-typed-ledger-adapter-not-connected-to-production-driver",
             "v6-seed-ensemble-and-risk-projection-receipts-not-implemented",
             "point-in-time-real-data-and-inference-family-not-sealed",
             "cuda-two-rank-restart-and-h100-capacity-not-qualified",
@@ -683,6 +736,9 @@ def m03r_v6_design_payload() -> dict[str, Any]:
 
 
 __all__ = [
+    "M03R_AGE_LEDGER_BIN_COUNT",
+    "M03R_AGE_LEDGER_MAXIMUM_AGE_SESSIONS",
+    "M03R_AGE_LEDGER_MINIMUM_AGE_SESSIONS",
     "M03R_ALPHA_HORIZONS_TRADING_SESSIONS",
     "M03R_CANONICAL_SETTING_ID",
     "M03R_DESIGN",

@@ -8,52 +8,72 @@ economic gradients can be inspected independently.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_AGE_LEDGER_BIN_COUNT,
+    M03R_CANONICAL_SETTING_ID,
     M03R_DESIGN_ID,
     M03R_PROTOCOL_GENERATION,
     M03R_SOFT_PERSISTENCE,
+    validate_m03r_v6_artifact_identity,
 )
 
 M03R_V6_SOFT_PERSISTENCE_OBJECTIVE_SCHEMA = (
-    "rl-quant.hold30.m03r-v6-soft-persistence-objective-v1"
+    "rl-quant.hold30.m03r-v6-soft-persistence-objective-v2"
 )
+M03R_V6_TRAINING_PLAN_SCHEMA = "rl-quant.hold30.m03r-v6-training-plan-v1"
 _BASIS_POINT_AS_RETURN = 1.0e-4
+_GRADIENT_NORM_EPSILON = 1.0e-12
 
 
 class M03RV6ObjectiveError(ValueError):
     """The v6 soft-persistence objective is unbound or malformed."""
 
 
+def _payload_sha256(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _require_nonnegative_notional(name: str, value: torch.Tensor) -> None:
     if (
         not isinstance(value, torch.Tensor)
         or value.ndim != 1
-        or value.numel() <= M03R_SOFT_PERSISTENCE.holding_preference_horizon_sessions
+        or value.numel() != M03R_AGE_LEDGER_BIN_COUNT
         or not value.is_floating_point()
         or not bool(torch.isfinite(value).all())
         or bool((value < 0.0).any())
     ):
         raise M03RV6ObjectiveError(
-            f"{name} must be finite nonnegative floating notional indexed by age"
+            f"{name} must be finite nonnegative floating notional in exactly "
+            f"{M03R_AGE_LEDGER_BIN_COUNT} age bins"
         )
 
 
 @dataclass(frozen=True, slots=True)
 class M03RV6ExitNotionalByAge:
-    """Cause-typed sold notional; only the learned field enters the loss."""
+    """Cause-typed sold notional; only policy-discretionary exits enter the loss."""
 
-    discretionary_learned: torch.Tensor
-    forced: torch.Tensor
+    discretionary_policy: torch.Tensor
+    other_forced: torch.Tensor
     unavailable: torch.Tensor
     risk_repair: torch.Tensor
     corporate_action: torch.Tensor
     terminal: torch.Tensor
+    valid_decision_session_count: int
 
     def __post_init__(self) -> None:
         self.validate()
@@ -62,8 +82,8 @@ class M03RV6ExitNotionalByAge:
         """Revalidate mutable tensor contents before every objective call."""
 
         values = (
-            ("discretionary_learned", self.discretionary_learned),
-            ("forced", self.forced),
+            ("discretionary_policy", self.discretionary_policy),
+            ("other_forced", self.other_forced),
             ("unavailable", self.unavailable),
             ("risk_repair", self.risk_repair),
             ("corporate_action", self.corporate_action),
@@ -71,7 +91,16 @@ class M03RV6ExitNotionalByAge:
         )
         for name, value in values:
             _require_nonnegative_notional(name, value)
-        reference = self.discretionary_learned
+        if (
+            isinstance(self.valid_decision_session_count, bool)
+            or not isinstance(self.valid_decision_session_count, int)
+            or self.valid_decision_session_count <= 0
+        ):
+            raise M03RV6ObjectiveError(
+                "valid_decision_session_count must be a positive integer bound "
+                "to the cause-typed exit inventory"
+            )
+        reference = self.discretionary_policy
         for name, value in values[1:]:
             if (
                 tuple(value.shape) != tuple(reference.shape)
@@ -79,29 +108,82 @@ class M03RV6ExitNotionalByAge:
                 or value.device != reference.device
             ):
                 raise M03RV6ObjectiveError(
-                    f"{name} must align exactly with discretionary_learned"
+                    f"{name} must align exactly with discretionary_policy"
                 )
 
 
 @dataclass(frozen=True, slots=True)
-class M03RV6TrainingProgress:
-    """Completed optimizer steps for the frozen 10% linear warmup."""
+class M03RV6TrainingPlan:
+    """Content-addressed denominator for the frozen warm-up schedule."""
 
-    completed_optimizer_steps: int
     total_optimizer_steps: int
+    setting_id: str = M03R_CANONICAL_SETTING_ID
+    protocol_generation: str = M03R_PROTOCOL_GENERATION
+    design_id: str = M03R_DESIGN_ID
+    schema: str = M03R_V6_TRAINING_PLAN_SCHEMA
 
     def __post_init__(self) -> None:
+        try:
+            validate_m03r_v6_artifact_identity(
+                protocol_generation=self.protocol_generation,
+                design_id=self.design_id,
+                setting_id=self.setting_id,
+            )
+        except ValueError as exc:
+            raise M03RV6ObjectiveError(str(exc)) from exc
         if (
             isinstance(self.total_optimizer_steps, bool)
             or not isinstance(self.total_optimizer_steps, int)
             or self.total_optimizer_steps <= 0
-            or isinstance(self.completed_optimizer_steps, bool)
-            or not isinstance(self.completed_optimizer_steps, int)
-            or not 0 <= self.completed_optimizer_steps <= self.total_optimizer_steps
+            or self.schema != M03R_V6_TRAINING_PLAN_SCHEMA
         ):
             raise M03RV6ObjectiveError(
-                "optimizer progress must satisfy 0 <= completed <= positive total"
+                "v6 training plan needs a positive total optimizer-step count"
             )
+
+    def canonical_payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "protocol_generation": self.protocol_generation,
+            "design_id": self.design_id,
+            "setting_id": self.setting_id,
+            "total_optimizer_steps": self.total_optimizer_steps,
+            "early_exit_penalty_linear_warmup_fraction": (
+                M03R_SOFT_PERSISTENCE.early_exit_penalty_linear_warmup_fraction
+            ),
+            "soft_persistence_objective_schema": (
+                M03R_V6_SOFT_PERSISTENCE_OBJECTIVE_SCHEMA
+            ),
+        }
+
+    @property
+    def receipt_sha256(self) -> str:
+        return _payload_sha256(self.canonical_payload())
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV6TrainingProgress:
+    """Completed optimizer steps bound to one immutable v6 training plan."""
+
+    completed_optimizer_steps: int
+    training_plan: M03RV6TrainingPlan
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.training_plan, M03RV6TrainingPlan)
+            or isinstance(self.completed_optimizer_steps, bool)
+            or not isinstance(self.completed_optimizer_steps, int)
+            or not 0
+            <= self.completed_optimizer_steps
+            <= self.training_plan.total_optimizer_steps
+        ):
+            raise M03RV6ObjectiveError(
+                "optimizer progress must bind one plan and satisfy 0 <= completed <= total"
+            )
+
+    @property
+    def total_optimizer_steps(self) -> int:
+        return self.training_plan.total_optimizer_steps
 
     @property
     def early_exit_penalty_warmup_multiplier(self) -> float:
@@ -117,7 +199,7 @@ class M03RV6TrainingProgress:
 
 @dataclass(frozen=True, slots=True)
 class M03RV6SoftPersistenceConfig:
-    """Identity-bound v6 coefficient selected from the frozen inner grid."""
+    """Identity-bound v6 coefficient selected by the frozen protocol."""
 
     protocol_generation: str = M03R_PROTOCOL_GENERATION
     design_id: str = M03R_DESIGN_ID
@@ -127,9 +209,6 @@ class M03RV6SoftPersistenceConfig:
     )
     early_exit_penalty_linear_warmup_fraction: float = (
         M03R_SOFT_PERSISTENCE.early_exit_penalty_linear_warmup_fraction
-    )
-    sold_notional_epsilon: float = (
-        M03R_SOFT_PERSISTENCE.early_exit_sold_notional_epsilon
     )
 
     def __post_init__(self) -> None:
@@ -145,19 +224,16 @@ class M03RV6SoftPersistenceConfig:
             or not isinstance(coefficient, (int, float))
             or not math.isfinite(float(coefficient))
             or float(coefficient)
-            not in M03R_SOFT_PERSISTENCE.early_exit_penalty_inner_development_grid_bp_per_unit_at_age_zero
+            != M03R_SOFT_PERSISTENCE.early_exit_penalty_bp_per_unit_at_age_zero
         ):
             raise M03RV6ObjectiveError(
-                "early-exit coefficient must be one frozen v6 inner-grid value"
+                "canonical v6 early-exit coefficient must be exactly 5 bp; "
+                "alternatives require a new protocol generation"
             )
         if self.early_exit_penalty_linear_warmup_fraction != (
             M03R_SOFT_PERSISTENCE.early_exit_penalty_linear_warmup_fraction
         ):
             raise M03RV6ObjectiveError("v6 early-exit warmup fraction drifted")
-        if self.sold_notional_epsilon != (
-            M03R_SOFT_PERSISTENCE.early_exit_sold_notional_epsilon
-        ):
-            raise M03RV6ObjectiveError("v6 sold-notional epsilon drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,8 +242,10 @@ class M03RV6SoftPersistenceDiagnostics:
 
     early_exit_penalty_paid: torch.Tensor
     discretionary_exit_notional_by_age: torch.Tensor
-    weighted_early_exit_fraction: torch.Tensor
+    weighted_early_exit_notional: torch.Tensor
+    weighted_early_exit_notional_per_valid_session: torch.Tensor
     total_discretionary_exit_notional: torch.Tensor
+    valid_decision_session_count: int
     warmup_multiplier: float
     coefficient_bp_per_unit_at_age_zero: float
 
@@ -185,7 +263,7 @@ class M03RV6GradientNormTelemetry:
 
         return self.hold_gradient_l2_norm / max(
             self.economic_gradient_l2_norm,
-            M03R_SOFT_PERSISTENCE.early_exit_sold_notional_epsilon,
+            _GRADIENT_NORM_EPSILON,
         )
 
 
@@ -208,7 +286,16 @@ def m03r_v6_soft_persistence_objective(
     progress: M03RV6TrainingProgress,
     config: M03RV6SoftPersistenceConfig | None = None,
 ) -> tuple[torch.Tensor, M03RV6SoftPersistenceDiagnostics]:
-    """Return the differentiable soft penalty and detached cause-safe telemetry."""
+    """Return the proportional young-sale penalty and cause-safe telemetry.
+
+    ``discretionary_policy`` is an age histogram of policy-originated sold
+    notional expressed as fractions of portfolio NAV and aggregated across the
+    scored decisions. The authoritative adapter includes learned-hazard,
+    explicit policy de-risk, and policy-induced projection sales. The loss is
+    normalized only by the exact count of valid decisions. It is deliberately
+    *not* normalized by total sold notional: mature sales must have zero value
+    and zero gradient in this persistence term, and cannot dilute young sales.
+    """
 
     if not isinstance(exits, M03RV6ExitNotionalByAge):
         raise M03RV6ObjectiveError("exits must use the typed v6 cause inventory")
@@ -218,25 +305,34 @@ def m03r_v6_soft_persistence_objective(
         config = M03RV6SoftPersistenceConfig()
     elif not isinstance(config, M03RV6SoftPersistenceConfig):
         raise M03RV6ObjectiveError("config must use the immutable v6 objective type")
-
     # Revalidate because tensor contents remain mutable after dataclass creation.
     exits.validate()
-    sold = exits.discretionary_learned
+    valid_decision_session_count = exits.valid_decision_session_count
+    sold = exits.discretionary_policy
     horizon = M03R_SOFT_PERSISTENCE.holding_preference_horizon_sessions
     ages = torch.arange(sold.numel(), device=sold.device, dtype=sold.dtype)
     weights = ((float(horizon) - ages).clamp_min(0.0) / float(horizon)).square()
     total = sold.sum()
-    weighted_fraction = (sold * weights).sum() / (total + config.sold_notional_epsilon)
+    weighted_notional = (sold * weights).sum()
+    weighted_notional_per_valid_session = (
+        weighted_notional / valid_decision_session_count
+    )
     warmup_multiplier = progress.early_exit_penalty_warmup_multiplier
     coefficient_as_return = (
         config.early_exit_penalty_bp_per_unit_at_age_zero * _BASIS_POINT_AS_RETURN
     )
-    penalty = coefficient_as_return * warmup_multiplier * weighted_fraction
+    penalty = (
+        coefficient_as_return * warmup_multiplier * weighted_notional_per_valid_session
+    )
     diagnostics = M03RV6SoftPersistenceDiagnostics(
         early_exit_penalty_paid=penalty.detach().clone(),
         discretionary_exit_notional_by_age=sold.detach().clone(),
-        weighted_early_exit_fraction=weighted_fraction.detach().clone(),
+        weighted_early_exit_notional=weighted_notional.detach().clone(),
+        weighted_early_exit_notional_per_valid_session=(
+            weighted_notional_per_valid_session.detach().clone()
+        ),
         total_discretionary_exit_notional=total.detach().clone(),
+        valid_decision_session_count=valid_decision_session_count,
         warmup_multiplier=warmup_multiplier,
         coefficient_bp_per_unit_at_age_zero=(
             config.early_exit_penalty_bp_per_unit_at_age_zero
@@ -312,11 +408,13 @@ def m03r_v6_gradient_norm_telemetry(
 
 __all__ = [
     "M03R_V6_SOFT_PERSISTENCE_OBJECTIVE_SCHEMA",
+    "M03R_V6_TRAINING_PLAN_SCHEMA",
     "M03RV6ExitNotionalByAge",
     "M03RV6GradientNormTelemetry",
     "M03RV6ObjectiveError",
     "M03RV6SoftPersistenceConfig",
     "M03RV6SoftPersistenceDiagnostics",
+    "M03RV6TrainingPlan",
     "M03RV6TrainingProgress",
     "m03r_v6_early_exit_age_weight",
     "m03r_v6_gradient_norm_telemetry",

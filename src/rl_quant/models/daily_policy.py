@@ -34,6 +34,16 @@ from rl_quant.models.decision_policy import _NewsAggregator
 from rl_quant.models.hold30_alpha import (
     Hold30AlphaHead,
     Hold30AlphaHeadConfig,
+    M03RV6ConfidenceLifecycleStage,
+)
+from rl_quant.models.hold30_confidence_v6 import (
+    M03RV6StandaloneConfidenceConfig,
+    M03RV6StandaloneConfidenceHead,
+)
+from rl_quant.models.hold30_exit_action_v6 import (
+    M03RV6ExitAction,
+    M03RV6ExitActionHead,
+    validate_m03r_v6_exit_action_protocol,
 )
 from rl_quant.models.hold30_hazard import (
     HOLD30_HAZARD_BOUND_MODES,
@@ -60,6 +70,12 @@ from rl_quant.protocol.hold30_alpha_m03r_v5 import (
 )
 from rl_quant.protocol.hold30_alpha_m03r_v5 import (
     resolve_m03r_v5_setting,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    M03R_SETTING_IDS as M03R_V6_SETTING_IDS,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v6 import (
+    resolve_m03r_v6_setting,
 )
 from rl_quant.protocol.hold30_alpha_v3 import (
     HOLD30_ALPHA_MECH8_SETTINGS,
@@ -93,6 +109,9 @@ class Hold30ModelSwitches:
     use_uncertainty: bool = False
     use_total_risk_overlay: bool = False
     use_direct_sharpe: bool = False
+    use_confidence_scaled_active_risk: bool = False
+    use_three_way_exit_action: bool = False
+    allow_exact_hold_atom: bool = False
 
 
 _HOLD30_MODEL_SWITCHES = {
@@ -159,6 +178,30 @@ _HOLD30_M03R_V5_MODEL_SWITCHES = {
     for setting_id in M03R_V5_SETTING_IDS
     for setting in (resolve_m03r_v5_setting(setting_id),)
 }
+_HOLD30_M03R_V6_MODEL_SWITCHES = {
+    setting_id: Hold30ModelSwitches(
+        setting_id=setting_id,
+        mechanism="H2",
+        use_age_input=setting.age_aware_holding,
+        use_exposure_timing=False,
+        use_early_exit_penalty=setting.age_aware_holding,
+        use_turnover_penalty=setting.age_aware_holding,
+        use_alpha_head=setting.residual_alpha_heads,
+        use_uncertainty=setting.use_downside_adjusted_stock_score,
+        use_total_risk_overlay=(setting.sharpe_mode == "separate-total-risk-overlay"),
+        use_direct_sharpe=(setting.sharpe_mode == "direct-two-pass-gradient"),
+        use_confidence_scaled_active_risk=(
+            setting.use_confidence_scaled_active_risk_budget
+        ),
+        use_three_way_exit_action=(setting.exit_hazard_mode == "learned-age-aware"),
+        allow_exact_hold_atom=(
+            setting.exit_hazard_mode == "learned-age-aware"
+            and setting.exact_hold_action_supported
+        ),
+    )
+    for setting_id in M03R_V6_SETTING_IDS
+    for setting in (resolve_m03r_v6_setting(setting_id),)
+}
 HOLD30_V2_MODEL_SETTING_IDS = tuple(
     setting.setting_id for setting in HOLD30_MECH8_SETTINGS
 )
@@ -168,6 +211,7 @@ HOLD30_ALPHA_MODEL_SETTING_IDS = tuple(
 HOLD30_M03R_MODEL_SETTING_IDS = M03R_V4_SETTING_IDS
 HOLD30_M03R_V4_MODEL_SETTING_IDS = M03R_V4_SETTING_IDS
 HOLD30_M03R_V5_MODEL_SETTING_IDS = M03R_V5_SETTING_IDS
+HOLD30_M03R_V6_MODEL_SETTING_IDS = M03R_V6_SETTING_IDS
 # Backward-compatible V2 public inventory; V3 has a disjoint explicit export.
 HOLD30_MODEL_SETTING_IDS = HOLD30_V2_MODEL_SETTING_IDS
 
@@ -183,13 +227,13 @@ def resolve_hold30_model_switches(setting_id: str) -> Hold30ModelSwitches:
     # Resolve through the protocol first so every artifact-producing surface
     # shares one alias-rejection/error contract.
     if setting_id in _HOLD30_MODEL_SWITCHES and setting_id.startswith("hold30a-"):
-        registered = resolve_hold30_alpha_setting(setting_id)
-        return _HOLD30_MODEL_SWITCHES[registered.setting_id]
+        alpha_setting = resolve_hold30_alpha_setting(setting_id)
+        return _HOLD30_MODEL_SWITCHES[alpha_setting.setting_id]
     if setting_id in M03R_V4_SETTING_IDS:
-        registered = resolve_m03r_v4_setting(setting_id)
-        return _HOLD30_MODEL_SWITCHES[registered.setting_id]
-    registered = resolve_hold30_setting(setting_id)
-    return _HOLD30_MODEL_SWITCHES[registered.setting_id]
+        m03r_setting = resolve_m03r_v4_setting(setting_id)
+        return _HOLD30_MODEL_SWITCHES[m03r_setting.setting_id]
+    hold30_setting = resolve_hold30_setting(setting_id)
+    return _HOLD30_MODEL_SWITCHES[hold30_setting.setting_id]
 
 
 def resolve_hold30_m03r_v5_model_switches(setting_id: str) -> Hold30ModelSwitches:
@@ -197,6 +241,14 @@ def resolve_hold30_m03r_v5_model_switches(setting_id: str) -> Hold30ModelSwitche
 
     registered = resolve_m03r_v5_setting(setting_id)
     return _HOLD30_M03R_V5_MODEL_SWITCHES[registered.setting_id]
+
+
+def resolve_hold30_m03r_v6_model_switches(setting_id: str) -> Hold30ModelSwitches:
+    """Return only the exact generation-qualified M03R v6 model contract."""
+
+    validate_m03r_v6_exit_action_protocol()
+    registered = resolve_m03r_v6_setting(setting_id)
+    return _HOLD30_M03R_V6_MODEL_SWITCHES[registered.setting_id]
 
 
 @dataclass(frozen=True)
@@ -227,6 +279,7 @@ class Hold30Intent:
     benchmark_derisk_request: torch.Tensor | None = None
     total_risk_overlay: torch.Tensor | None = None
     auxiliary_alpha_mean: torch.Tensor | None = None
+    exit_action_v6: M03RV6ExitAction | None = None
 
 
 def _clip_with_zero_boundary_gradient(
@@ -701,9 +754,9 @@ class DailyCrossSectionConfig:
     alpha_active_log_scale_bounds: tuple[float, float] | None = None
     alpha_uncertainty_log_scale_bounds: tuple[float, float] | None = None
     # Opt-in post-v3 contracts. Defaults preserve every frozen v2/v3 model.
-    hold30_mechanism_generation: Literal["v2-v3-frozen", "m03r-v1", "m03r-v2"] = (
-        "v2-v3-frozen"
-    )
+    hold30_mechanism_generation: Literal[
+        "v2-v3-frozen", "m03r-v1", "m03r-v2", "m03r-v3"
+    ] = "v2-v3-frozen"
     hold30_fast_raw_context_sessions: int | None = None
     hold30_slow_context_sessions: int | None = None
     hold30_hazard_bound_mode: Hold30HazardBoundMode = "hard_clip"
@@ -719,6 +772,8 @@ class DailyCrossSectionConfig:
     alpha_confidence_calibration_model_state_sha256: str | None = None
     alpha_confidence_calibration_source_score_array_sha256: str | None = None
     alpha_confidence_calibration_source_target_array_sha256: str | None = None
+    alpha_m03r_v6_confidence_stage: M03RV6ConfidenceLifecycleStage | None = None
+    alpha_confidence_calibration_fit_evidence: object | None = None
 
 
 class DailyCrossSectionPolicy(nn.Module):
@@ -743,12 +798,21 @@ class DailyCrossSectionPolicy(nn.Module):
             "v2-v3-frozen",
             "m03r-v1",
             "m03r-v2",
+            "m03r-v3",
         }:
             raise ValueError(
-                "hold30_mechanism_generation must be v2-v3-frozen, m03r-v1, or m03r-v2"
+                "hold30_mechanism_generation must be v2-v3-frozen, m03r-v1, "
+                "m03r-v2, or m03r-v3"
             )
         if not isinstance(config.hold30_exact_hold_mixture, bool):
             raise TypeError("hold30_exact_hold_mixture must be boolean")
+        if config.hold30_mechanism_generation != "m03r-v3" and (
+            config.alpha_m03r_v6_confidence_stage is not None
+            or config.alpha_confidence_calibration_fit_evidence is not None
+        ):
+            raise ValueError(
+                "the v6 confidence lifecycle and fit evidence require m03r-v3"
+            )
         if config.hold30_exact_hold_mixture:
             if (
                 config.hold30_exact_hold_logit_bias is None
@@ -800,10 +864,14 @@ class DailyCrossSectionPolicy(nn.Module):
         else:
             if context_values[0] is None:
                 raise ValueError(
-                    "m03r-v1 requires explicit fast and slow context sessions"
+                    f"{config.hold30_mechanism_generation} requires explicit fast "
+                    "and slow context sessions"
                 )
             if config.hold30_hazard_bound_mode != "smooth_tanh":
-                raise ValueError("m03r-v1 requires the smooth_tanh hazard bound")
+                raise ValueError(
+                    f"{config.hold30_mechanism_generation} requires the "
+                    "smooth_tanh hazard bound"
+                )
         self.hold30_context_contract: Hold30TwoSpeedContextContract | None = None
         if context_values[0] is not None:
             assert context_values[1] is not None
@@ -819,7 +887,17 @@ class DailyCrossSectionPolicy(nn.Module):
         self.config = config
         is_m03r_v4 = config.hold30_mechanism_generation == "m03r-v1"
         is_m03r_v5 = config.hold30_mechanism_generation == "m03r-v2"
-        if is_m03r_v5:
+        is_m03r_v6 = config.hold30_mechanism_generation == "m03r-v3"
+        if is_m03r_v6:
+            if config.hold30_setting is None:
+                raise ValueError("m03r-v3 requires an exact M03R v6 setting identity")
+            self.hold30_switches = _HOLD30_M03R_V6_MODEL_SWITCHES.get(
+                config.hold30_setting
+            )
+            if self.hold30_switches is None:
+                resolve_m03r_v6_setting(config.hold30_setting)
+                raise AssertionError("unreachable M03R v6 setting resolution")
+        elif is_m03r_v5:
             if config.hold30_setting is None:
                 raise ValueError("m03r-v2 requires an exact M03R v5 setting identity")
             self.hold30_switches = _HOLD30_M03R_V5_MODEL_SWITCHES.get(
@@ -841,18 +919,46 @@ class DailyCrossSectionPolicy(nn.Module):
                 )
             assert config.hold30_setting is not None
             resolve_m03r_v4_setting(config.hold30_setting)
-        if not (is_m03r_v4 or is_m03r_v5) and config.hold30_setting in (
-            set(M03R_V4_SETTING_IDS) | set(M03R_V5_SETTING_IDS)
+        v6_confidence_binding_present = any(
+            value is not None
+            for value in (
+                config.alpha_m03r_v6_confidence_stage,
+                config.alpha_confidence_calibration_fit_evidence,
+                config.alpha_confidence_calibration_manifest_sha256,
+                config.alpha_confidence_calibration_manifest,
+                config.alpha_confidence_calibration_seed,
+                config.alpha_confidence_calibration_checkpoint_sha256,
+                config.alpha_confidence_calibration_model_state_sha256,
+                config.alpha_confidence_calibration_source_score_array_sha256,
+                config.alpha_confidence_calibration_source_target_array_sha256,
+            )
+        )
+        if (
+            is_m03r_v6
+            and self.hold30_switches is not None
+            and not self.hold30_switches.use_confidence_scaled_active_risk
+            and v6_confidence_binding_present
+        ):
+            raise ValueError(
+                "a v6 setting without confidence-scaled active risk cannot bind "
+                "the confidence lifecycle or calibration evidence"
+            )
+        if not (is_m03r_v4 or is_m03r_v5 or is_m03r_v6) and config.hold30_setting in (
+            set(M03R_V4_SETTING_IDS)
+            | set(M03R_V5_SETTING_IDS)
+            | set(M03R_V6_SETTING_IDS)
         ):
             raise ValueError(
                 "an M03R setting identity requires its explicit M03R mechanism generation"
             )
-        if is_m03r_v4 or is_m03r_v5:
+        if is_m03r_v4 or is_m03r_v5 or is_m03r_v6:
             assert config.hold30_setting is not None
             m03r_setting = (
                 resolve_m03r_v4_setting(config.hold30_setting)
                 if is_m03r_v4
                 else resolve_m03r_v5_setting(config.hold30_setting)
+                if is_m03r_v5
+                else resolve_m03r_v6_setting(config.hold30_setting)
             )
             expected_slow = int(m03r_setting.slow_context_trading_sessions)
             if config.hold30_slow_context_sessions != expected_slow:
@@ -860,7 +966,16 @@ class DailyCrossSectionPolicy(nn.Module):
                     "M03R slow context must match its exact registered setting"
                 )
             fixed_expected = m03r_setting.exit_hazard_mode == "fixed-hold30-prior"
-            if not fixed_expected and not config.hold30_exact_hold_mixture:
+            if is_m03r_v6 and config.hold30_exact_hold_mixture:
+                raise ValueError(
+                    "M03R v6 uses its mutually exclusive three-way action head; "
+                    "the frozen v4/v5 exact-hold mixture must remain disabled"
+                )
+            if (
+                not is_m03r_v6
+                and not fixed_expected
+                and not config.hold30_exact_hold_mixture
+            ):
                 raise ValueError(
                     "learned M03R exit settings require the hard exact-hold "
                     "branch and an explicit initialization bias"
@@ -938,9 +1053,51 @@ class DailyCrossSectionPolicy(nn.Module):
         self.hazard_features: nn.Module | None = None
         self.hazard_head: nn.Linear | None = None
         self.exact_hold_head: nn.Linear | None = None
+        self.exit_action_head_v6: M03RV6ExitActionHead | None = None
         self.exposure_head: nn.Module | None = None
         self.alpha_head: Hold30AlphaHead | None = None
+        self.standalone_confidence_head_v6: M03RV6StandaloneConfidenceHead | None = None
         if self.hold30_switches is not None:
+            if (
+                self.hold30_switches.use_confidence_scaled_active_risk
+                and not self.hold30_switches.use_alpha_head
+            ):
+                stage = config.alpha_m03r_v6_confidence_stage
+                if stage is None:
+                    raise ValueError(
+                        "M02 confidence-scaled active risk requires an explicit "
+                        "v6 confidence lifecycle stage"
+                    )
+                assert config.hold30_setting is not None
+                self.standalone_confidence_head_v6 = M03RV6StandaloneConfidenceHead(
+                    M03RV6StandaloneConfidenceConfig(
+                        setting_id=config.hold30_setting,
+                        hidden_dim=config.token_dim,
+                        lifecycle_stage=stage,
+                        calibration_manifest_sha256=(
+                            config.alpha_confidence_calibration_manifest_sha256
+                        ),
+                        calibration_manifest=(
+                            config.alpha_confidence_calibration_manifest
+                        ),
+                        calibration_seed=config.alpha_confidence_calibration_seed,
+                        calibration_checkpoint_sha256=(
+                            config.alpha_confidence_calibration_checkpoint_sha256
+                        ),
+                        calibration_model_state_sha256=(
+                            config.alpha_confidence_calibration_model_state_sha256
+                        ),
+                        calibration_source_score_array_sha256=(
+                            config.alpha_confidence_calibration_source_score_array_sha256
+                        ),
+                        calibration_source_target_array_sha256=(
+                            config.alpha_confidence_calibration_source_target_array_sha256
+                        ),
+                        calibration_fit_evidence=(
+                            config.alpha_confidence_calibration_fit_evidence
+                        ),
+                    )
+                )
             if self.hold30_switches.use_alpha_head:
                 assert config.hold30_setting is not None
                 self.alpha_head = Hold30AlphaHead(
@@ -977,6 +1134,12 @@ class DailyCrossSectionPolicy(nn.Module):
                         ),
                         confidence_calibration_source_target_array_sha256=(
                             config.alpha_confidence_calibration_source_target_array_sha256
+                        ),
+                        m03r_v6_confidence_stage=(
+                            config.alpha_m03r_v6_confidence_stage
+                        ),
+                        confidence_calibration_fit_evidence=(
+                            config.alpha_confidence_calibration_fit_evidence
                         ),
                         mechanism_generation=(
                             "v3-frozen"
@@ -1015,6 +1178,13 @@ class DailyCrossSectionPolicy(nn.Module):
                     nn.init.constant_(
                         self.exact_hold_head.bias,
                         float(config.hold30_exact_hold_logit_bias),
+                    )
+                if self.hold30_switches.use_three_way_exit_action:
+                    self.exit_action_head_v6 = M03RV6ExitActionHead(
+                        config.token_dim,
+                        allow_exact_hold_atom=(
+                            self.hold30_switches.allow_exact_hold_atom
+                        ),
                     )
                 if self.hold30_switches.use_exposure_timing:
                     self.exposure_head = nn.Sequential(
@@ -1325,7 +1495,7 @@ class DailyCrossSectionPolicy(nn.Module):
         )
         if switches.use_alpha_head:
             if self.alpha_head is None:
-                raise RuntimeError("registered v3 alpha setting is missing its head")
+                raise RuntimeError("registered alpha setting is missing its head")
             expected_age = (B, A, int(self.config.age_summary_dim))
             if age_summaries is None or tuple(age_summaries.shape) != expected_age:
                 actual = None if age_summaries is None else tuple(age_summaries.shape)
@@ -1357,6 +1527,7 @@ class DailyCrossSectionPolicy(nn.Module):
                 benchmark_derisk_request=output.benchmark_derisk_request,
                 total_risk_overlay=output.total_risk_overlay,
                 auxiliary_alpha_mean=output.auxiliary_mean,
+                exit_action_v6=output.exit_action_v6,
             )
         if self.entry_head is None:
             raise RuntimeError("registered H2/H3 setting is missing its entry head")
@@ -1421,6 +1592,15 @@ class DailyCrossSectionPolicy(nn.Module):
                 exact_hold,
                 torch.ones_like(exact_hold),
             ).float()
+        exit_action_v6 = (
+            None
+            if self.exit_action_head_v6 is None
+            else self.exit_action_head_v6(
+                hazard_hidden,
+                risky_available,
+                cash_index=0,
+            )
+        )
         raw_hazard = torch.where(
             risky_available,
             raw_hazard,
@@ -1442,6 +1622,15 @@ class DailyCrossSectionPolicy(nn.Module):
             exposure = self.exposure_head(pooled).squeeze(-1).float()
         else:
             exposure = torch.zeros(B, device=state_t.device, dtype=torch.float32)
+        confidence_output = (
+            None
+            if self.standalone_confidence_head_v6 is None
+            else self.standalone_confidence_head_v6(
+                market_hidden,
+                available.bool(),
+                cash_index=0,
+            )
+        )
         return Hold30Intent(
             entry_scores=entry,
             hazard_residual=hazard,
@@ -1467,6 +1656,27 @@ class DailyCrossSectionPolicy(nn.Module):
                 else None
             ),
             exposure_residual=exposure,
+            exit_action_v6=exit_action_v6,
+            active_risk_scale=(
+                None
+                if confidence_output is None
+                else confidence_output.active_risk_scale
+            ),
+            signal_confidence=(
+                None
+                if confidence_output is None
+                else confidence_output.signal_confidence
+            ),
+            uncalibrated_signal_confidence_logit=(
+                None
+                if confidence_output is None
+                else confidence_output.uncalibrated_logit
+            ),
+            benchmark_derisk_request=(
+                None
+                if confidence_output is None
+                else confidence_output.benchmark_derisk_request
+            ),
         )
 
 

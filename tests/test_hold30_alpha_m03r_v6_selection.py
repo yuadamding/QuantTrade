@@ -9,6 +9,7 @@ import pytest
 from rl_quant.protocol.hold30_alpha_m03r_v6 import M03R_CANONICAL_SETTING_ID
 from rl_quant.training.hold30_alpha_m03r_v6_selection import (
     M03R_V6_SELECTION_ADAPTER_AVAILABLE,
+    M03RV6CandidateEvaluatorIdentity,
     M03RV6CheckpointSelectionContract,
     M03RV6FoldSeed,
     M03RV6SelectionError,
@@ -33,7 +34,7 @@ def _contract(**changes: object) -> M03RV6CheckpointSelectionContract:
         "inference_contract_sha256": "1" * 64,
         "common_evaluator_inputs_sha256": "2" * 64,
         "evaluator_implementation_sha256": "3" * 64,
-        "maximum_fold_censored_notional_fraction": 0.50,
+        "require_exact_age_ledger_content_binding": True,
         "maximum_requested_executed_projection_distance": 0.05,
         "maximum_forced_turnover_fraction": 0.10,
     }
@@ -74,6 +75,33 @@ def _metrics(**changes: object) -> M03RV6ValidationMetrics:
     return replace(row, **changes)  # type: ignore[arg-type]
 
 
+def _candidate_identity(
+    contract: M03RV6CheckpointSelectionContract,
+    *,
+    update: int,
+    policy_character: str,
+    receipt_character: str,
+    **changes: object,
+) -> M03RV6CandidateEvaluatorIdentity:
+    values: dict[str, object] = {
+        "update": update,
+        "common_evaluator_inputs_sha256": (
+            contract.common_evaluator_inputs_sha256
+        ),
+        "candidate_policy_returns_sha256": policy_character * 64,
+        "candidate_evaluator_receipt_sha256": receipt_character * 64,
+        "inference_contract_sha256": contract.inference_contract_sha256,
+        "evaluator_implementation_sha256": (
+            contract.evaluator_implementation_sha256
+        ),
+        "protocol_generation": contract.protocol_generation,
+        "design_id": contract.design_id,
+        "setting_id": contract.setting_id,
+    }
+    values.update(changes)
+    return M03RV6CandidateEvaluatorIdentity(**values)  # type: ignore[arg-type]
+
+
 def test_holding_duration_is_telemetry_not_a_hard_eligibility_gate() -> None:
     contract = _contract()
     short = _metrics(
@@ -93,6 +121,31 @@ def test_holding_duration_is_telemetry_not_a_hard_eligibility_gate() -> None:
     assert "notional_survival_at_20_sessions" not in hard_gates
     assert "notional_survival_at_30_sessions" not in hard_gates
     assert "restricted_mean_holding_time_through_60_sessions" not in hard_gates
+
+
+def test_profitable_rmst45_high_right_censor_candidate_remains_eligible() -> None:
+    candidate = _metrics(
+        net_active_return_20bp=0.03,
+        net_active_return_40bp=0.015,
+        block_bootstrap_lcb95_net_active_return_20bp=0.005,
+        notional_survival_at_20_sessions=0.95,
+        notional_survival_at_30_sessions=0.90,
+        restricted_mean_holding_time_through_60_sessions=45.0,
+        fold_censored_notional_fraction=0.99,
+    )
+    contract = _contract()
+    assert contract.metrics_satisfy_hard_gates(candidate)
+    assert order_m03r_v6_metrics_for_qualification(
+        (candidate,),
+        contract=contract,
+    ) == (candidate,)
+
+    payload = contract.canonical_payload()
+    hard_gates = payload["hard_eligibility_gates"]
+    assert "maximum_fold_censored_notional_fraction" not in hard_gates
+    assert hard_gates["exact_age_ledger_bin_count"] == 61
+    assert hard_gates["exact_age_ledger_content_binding_required"] is True
+    assert "fold_censored_notional_fraction" in payload["bound_non_gating_telemetry"]
 
 
 def test_zero_discretionary_exits_do_not_fail_hard_eligibility() -> None:
@@ -193,8 +246,8 @@ def test_economic_risk_and_data_quality_gates_remain_hard() -> None:
     assert not contract.metrics_satisfy_hard_gates(
         _metrics(active_beta_equivalence_upper_bound=0.100001)
     )
-    assert not contract.metrics_satisfy_hard_gates(
-        _metrics(fold_censored_notional_fraction=0.500001)
+    assert contract.metrics_satisfy_hard_gates(
+        _metrics(fold_censored_notional_fraction=1.0)
     )
     assert not contract.metrics_satisfy_hard_gates(
         _metrics(requested_executed_projection_distance=0.050001)
@@ -254,6 +307,8 @@ def test_contract_payload_binds_rank_order_and_fails_closed_without_ledger() -> 
     ]
     assert payload["chronological_selection_adapter"]["available"] is False
     assert M03R_V6_SELECTION_ADAPTER_AVAILABLE is False
+    with pytest.raises(M03RV6SelectionError, match="exact age-ledger"):
+        _contract(require_exact_age_ledger_content_binding=False)
     with pytest.raises(M03RV6SelectionError, match="adapter is unavailable"):
         select_m03r_v6_checkpoint(
             M03R_CANONICAL_SETTING_ID,
@@ -267,3 +322,56 @@ def test_contract_payload_binds_rank_order_and_fails_closed_without_ledger() -> 
         ).receipt_sha256
         != contract.receipt_sha256
     )
+
+
+def test_multiple_checkpoint_candidates_share_only_contract_common_inputs() -> None:
+    contract = _contract()
+    first = _candidate_identity(
+        contract,
+        update=8,
+        policy_character="4",
+        receipt_character="5",
+    )
+    second = _candidate_identity(
+        contract,
+        update=16,
+        policy_character="6",
+        receipt_character="7",
+    )
+
+    first.validate_against(contract)
+    second.validate_against(contract)
+    assert (
+        first.common_evaluator_inputs_sha256
+        == second.common_evaluator_inputs_sha256
+        == contract.common_evaluator_inputs_sha256
+    )
+    assert (
+        first.candidate_policy_returns_sha256
+        != second.candidate_policy_returns_sha256
+    )
+    assert (
+        first.candidate_evaluator_receipt_sha256
+        != second.candidate_evaluator_receipt_sha256
+    )
+    assert first.receipt_sha256 != second.receipt_sha256
+
+
+def test_checkpoint_candidate_rejects_common_or_candidate_identity_mutation() -> None:
+    contract = _contract()
+    candidate = _candidate_identity(
+        contract,
+        update=8,
+        policy_character="4",
+        receipt_character="5",
+    )
+    candidate.validate_against(contract)
+
+    wrong_common = replace(candidate, common_evaluator_inputs_sha256="8" * 64)
+    with pytest.raises(M03RV6SelectionError, match="common_evaluator_inputs_sha256"):
+        wrong_common.validate_against(contract)
+
+    changed_policy = replace(candidate, candidate_policy_returns_sha256="9" * 64)
+    changed_receipt = replace(candidate, candidate_evaluator_receipt_sha256="a" * 64)
+    assert changed_policy.receipt_sha256 != candidate.receipt_sha256
+    assert changed_receipt.receipt_sha256 != candidate.receipt_sha256
