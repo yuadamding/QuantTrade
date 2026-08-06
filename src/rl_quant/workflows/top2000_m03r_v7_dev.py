@@ -22,9 +22,10 @@ import os
 import platform
 import random
 import re
+import shutil
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,15 @@ QUALIFICATION_RECEIPT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v7-bounded-qualification-v1"
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_INTENTIONAL_RESTART_MARKER_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v7-intentional-restart-marker-v1"
+)
+_INTENTIONAL_RESTART_MARKER_ROOT = Path(
+    "/tmp/rl-quant-top2000-m03r-v7-intentional-restart"
+)
+_INTENTIONAL_RESTART_RENDEZVOUS_TIMEOUT_SECONDS = 30.0
+_INTENTIONAL_RESTART_POLL_SECONDS = 0.05
+_INTENTIONAL_RESTART_SOCKET_SETTLE_SECONDS = 5.0
 
 
 class Top2000M03RV7WorkerError(RuntimeError):
@@ -647,6 +657,193 @@ def _distributed_context(*, qualification_only: bool) -> _DistributedContext:
 def _barrier(context: _DistributedContext) -> None:
     if context.world_size == 2:
         dist.barrier()
+
+
+def _torchrun_restart_count() -> int:
+    raw = os.environ.get("TORCHELASTIC_RESTART_COUNT")
+    try:
+        value = int(raw) if raw is not None else 0
+    except ValueError as exc:
+        raise Top2000M03RV7WorkerError(
+            "TORCHELASTIC_RESTART_COUNT must be an exact integer"
+        ) from exc
+    if value not in {0, 1}:
+        raise Top2000M03RV7WorkerError(
+            "intentional qualification permits exactly one torchrun restart"
+        )
+    return value
+
+
+def _intentional_restart_rendezvous_path(
+    run_root: Path,
+    *,
+    restart_count: int,
+) -> Path:
+    run_id = os.environ.get("TORCHELASTIC_RUN_ID")
+    if not run_id:
+        raise Top2000M03RV7WorkerError(
+            "intentional qualification restart requires torchrun agent identity"
+        )
+    if restart_count not in {0, 1}:
+        raise Top2000M03RV7WorkerError(
+            "intentional restart rendezvous count must be zero or one"
+        )
+    key = _sha256_bytes(
+        _canonical_json_bytes(
+            {
+                "schema": _INTENTIONAL_RESTART_MARKER_SCHEMA,
+                "torchrun_run_id": run_id,
+                "torchrun_agent_pid": os.getppid(),
+                "run_root": str(run_root.absolute()),
+                "restart_count": restart_count,
+            }
+        )
+    )
+    return _INTENTIONAL_RESTART_MARKER_ROOT / key
+
+
+def _destroy_process_group(
+    context: _DistributedContext,
+    *,
+    force: bool = False,
+) -> bool:
+    """Destroy an owned group at most once; return whether this call did so."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    if not force and not context.owns_process_group:
+        return False
+    dist.destroy_process_group()
+    if dist.is_initialized():
+        raise Top2000M03RV7WorkerError(
+            "distributed process group remained initialized after destroy"
+        )
+    return True
+
+
+def _publish_destroyed_process_group_marker(
+    rendezvous: Path,
+    *,
+    context: _DistributedContext,
+    rendezvous_key: str,
+) -> None:
+    _require_sha256("intentional restart rendezvous key", rendezvous_key)
+    if rendezvous.name != rendezvous_key:
+        raise Top2000M03RV7WorkerError(
+            "intentional restart rendezvous path/key mismatch"
+        )
+    _atomic_write_json(
+        rendezvous / f"destroyed.rank-{context.rank:02d}.json",
+        {
+            "schema": _INTENTIONAL_RESTART_MARKER_SCHEMA,
+            "rendezvous_key": rendezvous_key,
+            "rank": context.rank,
+            "world_size": context.world_size,
+            "process_group_destroyed": True,
+        },
+    )
+
+
+def _wait_for_destroyed_process_group_markers(
+    rendezvous: Path,
+    *,
+    rendezvous_key: str,
+    world_size: int,
+    timeout_seconds: float = _INTENTIONAL_RESTART_RENDEZVOUS_TIMEOUT_SECONDS,
+    poll_seconds: float = _INTENTIONAL_RESTART_POLL_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    if world_size != 2:
+        raise Top2000M03RV7WorkerError(
+            "intentional restart marker rendezvous requires exactly two ranks"
+        )
+    if timeout_seconds <= 0.0 or poll_seconds <= 0.0:
+        raise Top2000M03RV7WorkerError(
+            "intentional restart marker timing must be positive"
+        )
+    _require_sha256("intentional restart rendezvous key", rendezvous_key)
+    deadline = monotonic() + timeout_seconds
+    while True:
+        complete = True
+        for rank in range(world_size):
+            marker_path = rendezvous / f"destroyed.rank-{rank:02d}.json"
+            if not marker_path.exists():
+                complete = False
+                continue
+            try:
+                marker = json.loads(marker_path.read_bytes())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise Top2000M03RV7WorkerError(
+                    "intentional restart marker cannot be read"
+                ) from exc
+            expected = {
+                "schema": _INTENTIONAL_RESTART_MARKER_SCHEMA,
+                "rendezvous_key": rendezvous_key,
+                "rank": rank,
+                "world_size": world_size,
+                "process_group_destroyed": True,
+            }
+            if marker != expected:
+                raise Top2000M03RV7WorkerError(
+                    "intentional restart marker identity drifted"
+                )
+        if complete:
+            return
+        remaining = deadline - monotonic()
+        if remaining <= 0.0:
+            raise Top2000M03RV7WorkerError(
+                "intentional restart marker rendezvous timed out"
+            )
+        sleep(min(poll_seconds, remaining))
+
+
+def _cleanup_intentional_restart_rendezvous(rendezvous: Path) -> None:
+    """Best-effort cleanup; safe when both restarted ranks call it."""
+
+    if rendezvous.parent != _INTENTIONAL_RESTART_MARKER_ROOT or not _SHA256_RE.fullmatch(
+        rendezvous.name
+    ):
+        raise Top2000M03RV7WorkerError(
+            "intentional restart cleanup path is outside the marker root"
+        )
+    shutil.rmtree(rendezvous, ignore_errors=True)
+
+
+def _prepare_intentional_qualification_restart(
+    context: _DistributedContext,
+    run_root: Path,
+    *,
+    restart_count: int,
+    settle_sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Quiesce both ranks before torchrun performs its one qualified restart."""
+
+    if context.world_size != 2 or restart_count != 0:
+        raise Top2000M03RV7WorkerError(
+            "intentional restart handshake requires the first two-rank attempt"
+        )
+    rendezvous = _intentional_restart_rendezvous_path(
+        run_root,
+        restart_count=restart_count,
+    )
+    rendezvous_key = rendezvous.name
+    _barrier(context)
+    if not _destroy_process_group(context, force=True):
+        raise Top2000M03RV7WorkerError(
+            "intentional restart handshake found no initialized process group"
+        )
+    _publish_destroyed_process_group_marker(
+        rendezvous,
+        context=context,
+        rendezvous_key=rendezvous_key,
+    )
+    _wait_for_destroyed_process_group_markers(
+        rendezvous,
+        rendezvous_key=rendezvous_key,
+        world_size=context.world_size,
+    )
+    settle_sleep(_INTENTIONAL_RESTART_SOCKET_SETTLE_SECONDS)
 
 
 def _gather_objects(value: Any, context: _DistributedContext) -> list[Any]:
@@ -1962,6 +2159,9 @@ def run_worker(
         raise Top2000M03RV7WorkerError(
             "intentional restart qualification requires exactly four updates"
         )
+    restart_count = (
+        _torchrun_restart_count() if qualification_restart_after_step1 else 0
+    )
     context = _distributed_context(qualification_only=qualification_only)
     mode = "qualification" if qualification_only else "full"
     try:
@@ -1973,9 +2173,22 @@ def run_worker(
         run_root = output_root / (
             "qualification" if qualification_only else "training"
         )
+        previous_restart_rendezvous: Path | None = None
+        if qualification_restart_after_step1 and restart_count == 1:
+            previous_restart_rendezvous = _intentional_restart_rendezvous_path(
+                run_root,
+                restart_count=0,
+            )
+            _wait_for_destroyed_process_group_markers(
+                previous_restart_rendezvous,
+                rendezvous_key=previous_restart_rendezvous.name,
+                world_size=context.world_size,
+            )
         if context.rank == 0:
             run_root.mkdir(parents=True, exist_ok=True)
         _barrier(context)
+        if context.rank == 0 and previous_restart_rendezvous is not None:
+            _cleanup_intentional_restart_rendezvous(previous_restart_rendezvous)
         if context.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(context.device)
 
@@ -2152,9 +2365,13 @@ def run_worker(
                 if (
                     qualification_restart_after_step1
                     and completed_steps == 1
-                    and int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")) == 0
+                    and restart_count == 0
                 ):
-                    _barrier(context)
+                    _prepare_intentional_qualification_restart(
+                        context,
+                        run_root,
+                        restart_count=restart_count,
+                    )
                     raise Top2000M03RV7WorkerError(
                         "intentional qualification restart after checkpoint 1"
                     )
@@ -2600,8 +2817,7 @@ def run_worker(
         terminal["receipt_sha256"] = terminal_sha256
         return terminal
     finally:
-        if context.owns_process_group and dist.is_initialized():
-            dist.destroy_process_group()
+        _destroy_process_group(context)
 
 
 def _setting_index(value: str) -> int:

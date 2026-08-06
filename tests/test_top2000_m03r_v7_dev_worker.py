@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from rl_quant.protocol.hold30_alpha_m03r_v7_top2000_dev import (
@@ -163,6 +164,160 @@ def test_episode_schedule_is_paired_across_settings_and_run_paths(
                 for step in range(8)
             )
             assert left_starts == right_starts
+
+
+def test_intentional_restart_handshake_orders_teardown_before_rendezvous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = worker._DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        device=torch.device("cuda", 0),
+        owns_process_group=True,
+    )
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "unit-test-agent")
+    events: list[str] = []
+
+    monkeypatch.setattr(worker, "_barrier", lambda _context: events.append("barrier"))
+
+    def destroy(
+        _context: worker._DistributedContext,
+        *,
+        force: bool = False,
+    ) -> bool:
+        assert force
+        events.append("destroy")
+        return True
+
+    def publish(
+        _rendezvous: Path,
+        *,
+        context: worker._DistributedContext,
+        rendezvous_key: str,
+    ) -> None:
+        assert context.rank == 0
+        assert len(rendezvous_key) == 64
+        events.append("publish")
+
+    def wait(
+        _rendezvous: Path,
+        *,
+        rendezvous_key: str,
+        world_size: int,
+        **_kwargs: Any,
+    ) -> None:
+        assert len(rendezvous_key) == 64
+        assert world_size == 2
+        events.append("rendezvous")
+
+    monkeypatch.setattr(worker, "_destroy_process_group", destroy)
+    monkeypatch.setattr(worker, "_publish_destroyed_process_group_marker", publish)
+    monkeypatch.setattr(worker, "_wait_for_destroyed_process_group_markers", wait)
+    worker._prepare_intentional_qualification_restart(
+        context,
+        tmp_path / "qualification",
+        restart_count=0,
+        settle_sleep=lambda seconds: events.append(f"settle:{seconds}"),
+    )
+    assert events == [
+        "barrier",
+        "destroy",
+        "publish",
+        "rendezvous",
+        f"settle:{worker._INTENTIONAL_RESTART_SOCKET_SETTLE_SECONDS}",
+    ]
+
+
+def test_intentional_restart_marker_rendezvous_times_out_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    key = "a" * 64
+    rendezvous = tmp_path / key
+    context = worker._DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        owns_process_group=False,
+    )
+    worker._publish_destroyed_process_group_marker(
+        rendezvous,
+        context=context,
+        rendezvous_key=key,
+    )
+    now = [0.0]
+
+    def advance(seconds: float) -> None:
+        now[0] += seconds
+
+    with pytest.raises(worker.Top2000M03RV7WorkerError, match="timed out"):
+        worker._wait_for_destroyed_process_group_markers(
+            rendezvous,
+            rendezvous_key=key,
+            world_size=2,
+            timeout_seconds=0.1,
+            poll_seconds=0.04,
+            monotonic=lambda: now[0],
+            sleep=advance,
+        )
+
+    worker._atomic_write_json(
+        rendezvous / "destroyed.rank-01.json",
+        {
+            "schema": worker._INTENTIONAL_RESTART_MARKER_SCHEMA,
+            "rendezvous_key": key,
+            "rank": 1,
+            "world_size": 1,
+            "process_group_destroyed": True,
+        },
+    )
+    with pytest.raises(worker.Top2000M03RV7WorkerError, match="identity drifted"):
+        worker._wait_for_destroyed_process_group_markers(
+            rendezvous,
+            rendezvous_key=key,
+            world_size=2,
+            timeout_seconds=0.1,
+            poll_seconds=0.04,
+            monotonic=lambda: now[0],
+            sleep=advance,
+        )
+
+
+def test_intentional_restart_cleanup_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = worker._DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        owns_process_group=True,
+    )
+    initialized = [True]
+    destroy_calls: list[bool] = []
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: initialized[0])
+
+    def destroy() -> None:
+        destroy_calls.append(True)
+        initialized[0] = False
+
+    monkeypatch.setattr(dist, "destroy_process_group", destroy)
+    assert worker._destroy_process_group(context)
+    assert not worker._destroy_process_group(context)
+    assert destroy_calls == [True]
+
+    marker_root = tmp_path / "markers"
+    monkeypatch.setattr(worker, "_INTENTIONAL_RESTART_MARKER_ROOT", marker_root)
+    rendezvous = marker_root / ("b" * 64)
+    (rendezvous / "nested").mkdir(parents=True)
+    (rendezvous / "nested" / "marker").write_text("retained", encoding="utf-8")
+    worker._cleanup_intentional_restart_rendezvous(rendezvous)
+    worker._cleanup_intentional_restart_rendezvous(rendezvous)
+    assert not rendezvous.exists()
 
 
 def test_package_plan_uses_completion_env_without_shell_expansion(
