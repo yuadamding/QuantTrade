@@ -278,7 +278,8 @@ def test_package_separates_artifacts_and_maps_all_twelve_indices() -> None:
     assert plan.source_pythonpath == "/mnt/package/source/src"
     assert payload["source_pythonpath"] == plan.source_pythonpath
     assert payload["runtime_profile"]["token_dim"] == 512
-    assert payload["runtime_profile"]["max_origin_batch"] == 22
+    assert payload["runtime_profile"]["max_origin_batch"] == 32
+    assert payload["runtime_profile"]["activation_checkpointing"] is False
     assert not plan.promotion_eligible
     assert not plan.outer_evaluation_authorized
 
@@ -293,12 +294,24 @@ def test_runtime_profile_is_content_bound_and_rejects_unqualified_shapes() -> No
         plan_artifact_path="/mnt/package/package-plan.json",
         runtime_profile=M03RV7Top2000RuntimeProfile(token_dim=448),
     )
+    checkpointed = build_m03r_v7_top2000_package_plan(
+        artifacts=_artifacts(),
+        plan_artifact_path="/mnt/package/package-plan.json",
+        runtime_profile=M03RV7Top2000RuntimeProfile(
+            activation_checkpointing=True,
+        ),
+    )
     assert base.package_plan_sha256 != smaller.package_plan_sha256
-    assert M03RV7Top2000RuntimeProfile(max_origin_batch=22).max_origin_batch == 22
+    assert base.package_plan_sha256 != checkpointed.package_plan_sha256
+    assert not base.runtime_profile.activation_checkpointing
+    assert checkpointed.runtime_profile.activation_checkpointing
+    assert M03RV7Top2000RuntimeProfile(max_origin_batch=32).max_origin_batch == 32
     with pytest.raises(M03RV7Top2000PackageError, match="runtime profile"):
         M03RV7Top2000RuntimeProfile(token_dim=513)
     with pytest.raises(M03RV7Top2000PackageError, match="runtime profile"):
         M03RV7Top2000RuntimeProfile(max_origin_batch=21)
+    with pytest.raises(M03RV7Top2000PackageError, match="runtime profile"):
+        M03RV7Top2000RuntimeProfile(activation_checkpointing=0)  # type: ignore[arg-type]
 
 
 def test_package_fails_closed_without_worker_and_capacity_and_rejects_stale_surface() -> None:

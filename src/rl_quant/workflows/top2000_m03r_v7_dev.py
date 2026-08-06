@@ -1299,6 +1299,7 @@ def _load_saved_seed_policy(
         plan.setting_id,
         token_dim=plan.token_dim,
         raw_stock_chunk=plan.raw_stock_chunk,
+        activation_checkpointing=plan.activation_checkpointing,
     ).to(device)
     policy.load_state_dict(state, strict=True)
     policy.eval()
@@ -1620,6 +1621,7 @@ def _new_cell(
         plan.setting_id,
         token_dim=plan.token_dim,
         raw_stock_chunk=plan.raw_stock_chunk,
+        activation_checkpointing=plan.activation_checkpointing,
     ).to(device)
     optimizer, overlay_optimizer = (
         build_top2000_m03r_v7_development_optimizers(

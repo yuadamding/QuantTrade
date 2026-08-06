@@ -32,6 +32,7 @@ def _plan(
     *,
     optimizer_steps: int = 2,
     setting_index: int = 0,
+    activation_checkpointing: bool = False,
 ) -> Top2000M03RV7DevelopmentTrainingPlan:
     return Top2000M03RV7DevelopmentTrainingPlan(
         setting_index=setting_index,
@@ -42,6 +43,7 @@ def _plan(
         total_optimizer_steps_per_fold_seed=optimizer_steps,
         token_dim=8,
         raw_stock_chunk=8,
+        activation_checkpointing=activation_checkpointing,
     )
 
 
@@ -66,6 +68,32 @@ def test_plan_round_trip_is_content_pinned(tmp_path: Path) -> None:
             expected_sha256=file_sha256,
             expected_setting_index=0,
         )
+
+
+def test_new_cell_applies_content_bound_activation_checkpointing(
+    tmp_path: Path,
+) -> None:
+    retained_plan = _plan(tmp_path / "retained")
+    retained, _, _ = worker._new_cell(
+        retained_plan,
+        seed=17,
+        device=torch.device("cpu"),
+    )
+    checkpointed_plan = _plan(
+        tmp_path / "checkpointed",
+        activation_checkpointing=True,
+    )
+    checkpointed, _, _ = worker._new_cell(
+        checkpointed_plan,
+        seed=17,
+        device=torch.device("cpu"),
+    )
+
+    assert retained_plan.receipt_sha256 != checkpointed_plan.receipt_sha256
+    assert not retained.core.config.grad_checkpoint
+    assert not retained.core.raw_encoder.grad_checkpoint
+    assert checkpointed.core.config.grad_checkpoint
+    assert checkpointed.core.raw_encoder.grad_checkpoint
 
 
 def test_episode_schedule_is_deterministic_bounded_and_step_sensitive() -> None:

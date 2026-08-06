@@ -66,18 +66,19 @@ class M03RV7Top2000RuntimeProfile:
     """Content-bound optimizer and memory geometry shared by all settings."""
 
     optimizer_steps_per_fold_seed: int = 64
-    # The original 16-origin profile measured only 47.50 GiB allocated per
-    # H100 on the exact TOP2000 path.  Twenty-two origins is the next bounded
-    # useful-work geometry; it still must pass the 60--75 GiB/rank receipt
-    # gate before a full Job can be rendered.
-    max_origin_batch: int = 22
+    # The original 16-origin checkpointed profile measured only 47.50 GiB
+    # allocated per H100.  The exact 63-origin, two-rank path shards 32/31;
+    # binding 32 avoids a redundant second encoder pass on each rank.
+    max_origin_batch: int = 32
     learning_rate: float = 1.0e-4
     weight_decay: float = 1.0e-4
     grad_clip: float = 1.0
     token_dim: int = 512
     raw_stock_chunk: int = 512
     expected_world_size: int = 2
-    activation_checkpointing: bool = True
+    # Retain useful forward activations on the exact H100 profile.  This avoids
+    # backward recompute and is independently bound into the package identity.
+    activation_checkpointing: bool = False
     mixed_precision: Literal["bfloat16"] = "bfloat16"
 
     def __post_init__(self) -> None:
@@ -90,7 +91,7 @@ class M03RV7Top2000RuntimeProfile:
             or self.token_dim not in {128, 192, 256, 320, 384, 448, 512}
             or self.raw_stock_chunk not in {128, 256, 512, 1024}
             or self.expected_world_size != 2
-            or not self.activation_checkpointing
+            or not isinstance(self.activation_checkpointing, bool)
             or self.mixed_precision != "bfloat16"
         ):
             raise M03RV7Top2000PackageError(
@@ -778,6 +779,8 @@ def verify_m03r_v7_top2000_qualification_artifact(
         or training_plan.get("token_dim") != plan.runtime_profile.token_dim
         or training_plan.get("max_origin_batch")
         != plan.runtime_profile.max_origin_batch
+        or training_plan.get("activation_checkpointing")
+        is not plan.runtime_profile.activation_checkpointing
     ):
         raise M03RV7Top2000PackageError(
             "qualification execution-plan binding does not match package plan"

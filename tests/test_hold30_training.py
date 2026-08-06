@@ -45,6 +45,32 @@ def test_hold30_geometry_rejects_a_block_without_an_anchor() -> None:
         Hold30ReplayGeometry().roles(94)
 
 
+def test_top2000_two_rank_63_anchor_shards_fit_one_32_origin_batch() -> None:
+    geometry_32 = Hold30ReplayGeometry(
+        warmup_decisions=251,
+        label_support_decisions=63,
+        max_origin_batch=32,
+    )
+    geometry_16 = Hold30ReplayGeometry(
+        warmup_decisions=251,
+        label_support_decisions=63,
+        max_origin_batch=16,
+    )
+    anchors = geometry_32.roles(378).anchors
+
+    assert anchors.numel() == 63
+    rank_shards = (anchors[0::2], anchors[1::2])
+    assert [shard.numel() for shard in rank_shards] == [32, 31]
+    assert [
+        [batch.numel() for batch in geometry_32.origin_batches(shard)]
+        for shard in rank_shards
+    ] == [[32], [31]]
+    assert [
+        [batch.numel() for batch in geometry_16.origin_batches(shard)]
+        for shard in rank_shards
+    ] == [[16, 16], [16, 15]]
+
+
 def test_benchmark_relative_log_utility_is_additive_and_guarded() -> None:
     policy = torch.tensor([0.02, -0.01])
     benchmark = torch.tensor([0.01, -0.02])
@@ -148,7 +174,10 @@ class _DeterministicAdapter:
     def canonical_pass(self, policy, sequence, roles):
         self.canonical_calls += 1
         assert not torch.is_grad_enabled()
-        rows = [Hold30CanonicalRow(0.0, discretionary_turnover=0.04) for _ in range(99)]
+        rows = [
+            Hold30CanonicalRow(0.0, discretionary_turnover=0.04)
+            for _ in range(roles.n_positions - 1)
+        ]
         return {"book": torch.tensor([0.25], requires_grad=False)}, rows
 
     def replay_origins(self, policy, sequence, canonical_state, origins, roles):
@@ -195,3 +224,42 @@ def test_train_hold30_update_replays_each_anchor_once_and_steps_once() -> None:
     assert metrics["optimizer_steps"] == 1
     assert metrics["calendar_objective"] == 0.0
     assert math.isfinite(metrics["objective"])
+
+
+def test_origin_batch_16_and_32_have_equivalent_objective_and_gradient() -> None:
+    def run(max_origin_batch: int) -> tuple[dict[str, object], torch.Tensor, list[list[int]]]:
+        policy = _ScalarPolicy()
+        policy.score.data.fill_(0.25)
+        optimizer = torch.optim.SGD(policy.parameters(), lr=0.0)
+        adapter = _DeterministicAdapter()
+        metrics = train_hold30_update(
+            policy,
+            sequence=object(),
+            adapter=adapter,
+            optimizer=optimizer,
+            n_positions=157,
+            contract=Hold30LossContract.for_setting(
+                "hold30-a06-no-turn-penalty"
+            ),
+            geometry=Hold30ReplayGeometry(max_origin_batch=max_origin_batch),
+        )
+        assert policy.score.grad is not None
+        return metrics, policy.score.grad.detach().clone(), adapter.replay_batches
+
+    batched_16, gradient_16, replay_batches_16 = run(16)
+    batched_32, gradient_32, replay_batches_32 = run(32)
+
+    assert [len(batch) for batch in replay_batches_16] == [16, 16, 16, 15]
+    assert [len(batch) for batch in replay_batches_32] == [32, 31]
+    assert batched_16["origin_batch_count"] == 4
+    assert batched_32["origin_batch_count"] == 2
+    assert float(batched_16["objective"]) == pytest.approx(
+        float(batched_32["objective"]),
+        abs=1.0e-8,
+    )
+    torch.testing.assert_close(
+        gradient_16,
+        gradient_32,
+        rtol=0.0,
+        atol=2.0 * torch.finfo(gradient_16.dtype).eps,
+    )

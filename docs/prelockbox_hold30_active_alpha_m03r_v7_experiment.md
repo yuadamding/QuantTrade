@@ -59,6 +59,17 @@ activation checkpointing enabled
 raw-stock chunking enabled
 ```
 
+The disjoint, development-only TOP2000 compatibility runtime has its own
+content-bound performance profile.  It disables activation checkpointing and
+uses a maximum origin batch of 32 without changing the canonical Active-300 v7
+topology above.  Its 63 loss-bearing origins split 32/31 across the two ranks,
+so each rank performs one useful episode-encoder pass per gradient route rather
+than two.  A06 deliberately has a second route for its isolated overlay.
+Retaining forward activations uses H100 memory for real trajectory work and
+removes activation-recompute overhead; its qualification receipt must still
+satisfy the frozen memory and headroom gates before the TOP2000 panel can
+launch.
+
 The two devices provide 160 GB of aggregate device capacity, not one 160-GB
 address space. The model and complete cross-section are replicated on each
 rank; trajectory/origin batches, not the stock axis, are partitioned. Stock-axis

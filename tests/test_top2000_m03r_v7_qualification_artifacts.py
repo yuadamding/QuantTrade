@@ -75,6 +75,7 @@ def _qualification_tree(
     tmp_path: Path,
     *,
     allocated_gib: int = 64,
+    binding_activation_checkpointing: bool | None = None,
 ) -> tuple[Any, Path, str, Path]:
     plan = _plan()
     row = plan.indices[0]
@@ -86,6 +87,11 @@ def _qualification_tree(
         "expected_world_size": 2,
         "token_dim": plan.runtime_profile.token_dim,
         "max_origin_batch": plan.runtime_profile.max_origin_batch,
+        "activation_checkpointing": (
+            plan.runtime_profile.activation_checkpointing
+            if binding_activation_checkpointing is None
+            else binding_activation_checkpointing
+        ),
     }
     binding = {
         "schema": "rl-quant.top2000-dev.m03r-v7-package-worker-binding-v1",
@@ -189,6 +195,21 @@ def test_verifier_rejects_tampered_cell_and_underfilled_memory(tmp_path: Path) -
     plan, receipt, receipt_sha, cell_path = _qualification_tree(tmp_path / "tamper")
     cell_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(M03RV7Top2000PackageError, match="SHA-256 mismatch"):
+        verify_m03r_v7_top2000_qualification_artifact(
+            plan=plan,
+            completion_index=0,
+            qualification_receipt_path=receipt,
+            expected_qualification_receipt_sha256=receipt_sha,
+        )
+
+    plan, receipt, receipt_sha, _ = _qualification_tree(
+        tmp_path / "checkpointing-drift",
+        binding_activation_checkpointing=True,
+    )
+    with pytest.raises(
+        M03RV7Top2000PackageError,
+        match="execution-plan binding",
+    ):
         verify_m03r_v7_top2000_qualification_artifact(
             plan=plan,
             completion_index=0,

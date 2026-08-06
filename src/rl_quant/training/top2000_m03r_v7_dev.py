@@ -725,6 +725,7 @@ def top2000_m03r_v7_policy_config(
     *,
     token_dim: int = 128,
     raw_stock_chunk: int = 512,
+    activation_checkpointing: bool = True,
 ) -> DailyCrossSectionConfig:
     """Build the compact daily-OHLCV policy backing one development row."""
 
@@ -770,7 +771,7 @@ def top2000_m03r_v7_policy_config(
         dropout=0.0,
         temperature=1.0,
         max_stock_weight=TOP2000_M03R_V7_DEV_MAX_STOCK_WEIGHT,
-        grad_checkpoint=True,
+        grad_checkpoint=activation_checkpointing,
         raw_norm="level",
         raw_recent_days=42,
         encode_aggregated_daily_ohlcv_all_days=True,
@@ -809,6 +810,7 @@ class Top2000M03RV7DevelopmentPolicy(nn.Module):
         *,
         token_dim: int = 128,
         raw_stock_chunk: int = 512,
+        activation_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.setting = resolve_m03r_top2000_dev_setting(setting_id)
@@ -817,6 +819,7 @@ class Top2000M03RV7DevelopmentPolicy(nn.Module):
                 setting_id,
                 token_dim=token_dim,
                 raw_stock_chunk=raw_stock_chunk,
+                activation_checkpointing=activation_checkpointing,
             )
         )
         self.register_buffer(
@@ -1737,7 +1740,7 @@ class Top2000M03RV7DevelopmentTrainingPlan:
             or self.token_dim <= 0
             or self.raw_stock_chunk <= 0
             or self.expected_world_size != 2
-            or not self.activation_checkpointing
+            or not isinstance(self.activation_checkpointing, bool)
             or self.mixed_precision != "bfloat16"
             or self.protocol_generation != M03R_TOP2000_DEV_PROTOCOL_GENERATION
             or self.design_id != M03R_TOP2000_DEV_DESIGN_ID
