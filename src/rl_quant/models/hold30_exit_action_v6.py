@@ -333,7 +333,11 @@ class M03RV6ExitActionHead(nn.Module):
             raise M03RV6ExitActionError("cash_index is outside the asset axis")
         risky = available.clone()
         risky[:, cash_index] = False
-        raw_logits = self.action_logits(hazard_hidden)
+        # The Linear itself remains autocast BF16, but this tiny public action
+        # surface is canonical FP32.  That keeps logits, stabilized softmax
+        # probabilities, straight-through decisions, replay, and ensemble
+        # validation independent of the ambient autocast scope.
+        raw_logits = self.action_logits(hazard_hidden).float()
         soft, decision = straight_through_m03r_v6_exit_action(
             raw_logits,
             allow_exact_hold_atom=self.allow_exact_hold_atom,

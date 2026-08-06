@@ -46,6 +46,32 @@ def _head_with_action(action_index: int) -> M03RV6ExitActionHead:
     return head
 
 
+def test_autocast_linear_keeps_a_canonical_fp32_action_and_gradients() -> None:
+    head = M03RV6ExitActionHead(hidden_dim=4)
+    hidden = torch.randn((1, 3, 4), requires_grad=True)
+    internal_dtypes: list[torch.dtype] = []
+    hook = head.action_logits.register_forward_hook(
+        lambda _module, _inputs, output: internal_dtypes.append(output.dtype)
+    )
+    try:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            action = head(hidden, _available())
+    finally:
+        hook.remove()
+
+    assert internal_dtypes == [torch.bfloat16]
+    assert action.logits.dtype == torch.float32
+    assert action.soft_probabilities.dtype == torch.float32
+    assert action.decision_st.dtype == torch.float32
+    action.validate()
+    action.exit_decision_st[0, 1].backward()
+    gradient = head.action_logits.bias.grad
+    assert gradient is not None
+    assert gradient.dtype == torch.float32
+    assert torch.isfinite(gradient).all()
+    assert float(gradient.abs().sum()) > 0.0
+
+
 def test_actual_model_exit_output_releases_every_cohort_exactly() -> None:
     head = _head_with_action(M03R_V6_EXIT_ACTION_INDEX)
     action = head(_hidden(), _available())
