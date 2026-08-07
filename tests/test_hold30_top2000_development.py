@@ -5,14 +5,23 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 
+import rl_quant.training.hold30_top2000_development as top2000_adapter
 from rl_quant.training.hold30_top2000_development import (
     DEVELOPMENT_ACK,
+    TOP2000_HOLD30_BENCHMARK_ID,
+    TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE,
+    TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT,
+    TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA,
+    TOP2000_HOLD30_LEGACY_BENCHMARK_ID,
+    TOP2000_HOLD30_LEGACY_DEVELOPMENT_ADAPTER_SCHEMA,
     TOP2000_HOLD30_MAX_STATE_ROWS,
+    TOP2000_HOLD30_MAX_STOCK_WEIGHT,
     TOP2000_HOLD30_OBSERVATION_REPRESENTATION,
     TOP2000_HOLD30_SOURCE_BAR_IDENTITY,
     Top2000Hold30DevelopmentError,
@@ -88,12 +97,19 @@ def _write_cache(
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _adapt(path: Path, digest: str, *, stop: int = 64):
+def _adapt(
+    path: Path,
+    digest: str,
+    *,
+    stop: int = 64,
+    max_stock_weight: float = TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT,
+):
     return build_top2000_hold30_development_sequence(
         path,
         expected_cache_sha256=digest,
         state_start_index=0,
         state_stop_index_exclusive=stop,
+        max_stock_weight=max_stock_weight,
         acknowledgement=DEVELOPMENT_ACK,
     )
 
@@ -116,6 +132,22 @@ def test_real_cache_adapter_is_causal_bounded_and_explicitly_nonpromotable(
     assert not adapted.identity.outer_evaluation_authorized
     assert not adapted.identity.promotion_eligible
     assert adapted.sequence.axis_id == adapted.identity.axis_id
+    assert adapted.identity.schema == TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA
+    assert adapted.identity.benchmark_id == TOP2000_HOLD30_BENCHMARK_ID
+    assert adapted.identity.benchmark_trace_sha256 == adapted.benchmark.trace_sha256
+    assert (
+        adapted.identity.max_stock_weight
+        == TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT
+    )
+    assert (
+        adapted.identity.benchmark_risk_repair_rule
+        == TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE
+    )
+    assert (
+        TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA
+        != TOP2000_HOLD30_LEGACY_DEVELOPMENT_ADAPTER_SCHEMA
+    )
+    assert TOP2000_HOLD30_BENCHMARK_ID != TOP2000_HOLD30_LEGACY_BENCHMARK_ID
     assert adapted.sequence.initial_ledger.retention_units.count_nonzero() == 0
     ledger = adapted.sequence.initial_ledger.economic_value[0]
     assert torch.allclose(
@@ -156,6 +188,7 @@ def test_monthly_equal_weight_buy_and_drift_charges_all_turnover_by_cause(
     )
     # The winner drifts above equal weight; no ordinary rebalance reverses it.
     assert trace.weights[1, 1] > trace.weights[1, 2]
+    assert trace.risk_forced_one_way_turnover[0] == pytest.approx(0.0, abs=1.0e-15)
     # A1 is unavailable at state two, so its full drifted weight moves to CASH.
     assert trace.weights[2, 1] == 0.0
     assert trace.weights[2, 0] > 0.0
@@ -178,7 +211,8 @@ def test_monthly_equal_weight_buy_and_drift_charges_all_turnover_by_cause(
     assert torch.allclose(
         trace.total_one_way_turnover,
         trace.availability_forced_one_way_turnover
-        + trace.monthly_rebalance_one_way_turnover,
+        + trace.monthly_rebalance_one_way_turnover
+        + trace.risk_forced_one_way_turnover,
     )
 
 
@@ -202,6 +236,133 @@ def test_monthly_rebalance_cannot_buy_a_name_first_visible_at_fill(
         adapted.benchmark.weights[february_first],
         torch.tensor([0.0, 0.0, 0.5, 0.5], dtype=torch.float64),
     )
+
+
+def test_buy_and_drift_benchmark_repairs_a_material_fill_cap_breach(
+    tmp_path: Path,
+) -> None:
+    path, digest = _write_cache(tmp_path, second_day_a1_close=200.0)
+    adapted = _adapt(
+        path,
+        digest,
+        max_stock_weight=TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+    )
+    trace = adapted.benchmark
+
+    # Without fill-time risk repair, A1 would drift from 1% to 1.980198%.
+    uncapped_weight = 0.02 / 1.01
+    expected_release = uncapped_weight - TOP2000_HOLD30_MAX_STOCK_WEIGHT
+    assert trace.weights[1, 1] == pytest.approx(
+        TOP2000_HOLD30_MAX_STOCK_WEIGHT
+    )
+    assert trace.risk_forced_one_way_turnover[0] == pytest.approx(
+        expected_release
+    )
+    assert trace.costs[0] == pytest.approx(0.002 * expected_release)
+    assert trace.net_returns[0] == pytest.approx(
+        float(trace.gross_returns[0] - trace.costs[0])
+    )
+    assert float(trace.weights[:, 1:].max()) <= TOP2000_HOLD30_MAX_STOCK_WEIGHT
+
+
+def test_every_benchmark_state_is_a_causal_fill_feasible_anchor(
+    tmp_path: Path,
+) -> None:
+    path, digest = _write_cache(tmp_path, second_day_a1_close=200.0)
+    adapted = _adapt(
+        path,
+        digest,
+        max_stock_weight=TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+    )
+    sequence = adapted.sequence
+    benchmark = sequence.benchmark_weights[:, 0]
+
+    causal_fill_mask = sequence.fill_availability[:, 0].clone()
+    causal_fill_mask[1:] &= sequence.decision_available[:-1, 0]
+    causal_fill_mask[:, 0] = True
+    risky = torch.ones_like(causal_fill_mask, dtype=torch.bool)
+    risky[:, 0] = False
+    effective_caps = torch.where(
+        risky & causal_fill_mask,
+        sequence.risk_asset_caps[:, 0],
+        torch.zeros_like(benchmark),
+    )
+    effective_caps[:, 0] = 1.0
+
+    assert torch.all(benchmark <= effective_caps + 1.0e-12)
+    assert torch.all(benchmark.masked_select(~causal_fill_mask) == 0.0)
+    assert torch.all(
+        torch.where(risky, benchmark, torch.zeros_like(benchmark)).sum(-1)
+        <= sequence.risk_gross_max[:, 0] + 1.0e-12
+    )
+    assert torch.allclose(
+        adapted.benchmark.total_one_way_turnover,
+        adapted.benchmark.availability_forced_one_way_turnover
+        + adapted.benchmark.monthly_rebalance_one_way_turnover
+        + adapted.benchmark.risk_forced_one_way_turnover,
+    )
+    assert torch.allclose(
+        adapted.benchmark.net_returns,
+        adapted.benchmark.gross_returns
+        - 0.002 * adapted.benchmark.total_one_way_turnover,
+    )
+
+
+def test_benchmark_preflight_names_exact_offending_fill_row_and_asset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, digest = _write_cache(tmp_path)
+    original = top2000_adapter._monthly_equal_weight_buy_and_drift
+
+    def _infeasible_trace(*args, **kwargs):
+        trace = original(*args, **kwargs)
+        weights = trace.weights.clone()
+        weights[1, 0] -= 0.01
+        weights[1, 1] += 0.01
+        return replace(trace, weights=weights)
+
+    monkeypatch.setattr(
+        top2000_adapter,
+        "_monthly_equal_weight_buy_and_drift",
+        _infeasible_trace,
+    )
+    with pytest.raises(
+        Top2000Hold30DevelopmentError,
+        match=(
+            r"fill-time benchmark feasibility preflight failed at "
+            r"state=1 date=2024-01-03 asset=A1 .*cap=0\.01"
+        ),
+    ):
+        _adapt(
+            path,
+            digest,
+            max_stock_weight=TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+        )
+
+
+def test_legacy_benchmark_and_adapter_ids_cannot_label_v2_arrays(
+    tmp_path: Path,
+) -> None:
+    path, digest = _write_cache(tmp_path)
+    generic = _adapt(path, digest)
+    capped = _adapt(
+        path,
+        digest,
+        max_stock_weight=TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+    )
+    identity = generic.identity
+
+    assert capped.identity.max_stock_weight == TOP2000_HOLD30_MAX_STOCK_WEIGHT
+    assert generic.identity.receipt_sha256 != capped.identity.receipt_sha256
+    assert generic.benchmark.trace_sha256 != capped.benchmark.trace_sha256
+
+    with pytest.raises(Top2000Hold30DevelopmentError, match="identity drifted"):
+        replace(identity, schema=TOP2000_HOLD30_LEGACY_DEVELOPMENT_ADAPTER_SCHEMA)
+    with pytest.raises(Top2000Hold30DevelopmentError, match="identity drifted"):
+        replace(identity, benchmark_id=TOP2000_HOLD30_LEGACY_BENCHMARK_ID)
+    with pytest.raises(Top2000Hold30DevelopmentError, match="identity drifted"):
+        replace(identity, benchmark_risk_repair_rule="none")
 
 
 def test_future_row_changes_return_but_not_preceding_decision_state(

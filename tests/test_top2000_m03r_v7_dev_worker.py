@@ -691,6 +691,13 @@ def test_qualification_resumes_exact_update_cursor_and_publishes_receipt(
     assert repeated is not None
     assert repeated["receipt_sha256"] == terminal["receipt_sha256"]
     assert hashlib.sha256(model_path.read_bytes()).hexdigest() == model_sha256
+    committed_cell = json.loads(
+        (run_root / "receipts" / "fold-00-seed-17.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert committed_cell["seed_validation_required"] is False
+    assert not (run_root / "seed-validation").exists()
     canonical_payload = torch.load(
         model_path,
         map_location="cpu",

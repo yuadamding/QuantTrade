@@ -50,6 +50,15 @@ from rl_quant.evaluation.top2000_m03r_v7_dev import (
     tensor_sha256,
     validate_fold_score_bounds,
 )
+from rl_quant.protocol.hold30_alpha_m03r_v7_seed17_top2000_dev import (
+    M03R_SEED17_TOP2000_COMPLETION_SCHEMA,
+    M03R_SEED17_TOP2000_DATA_ROLE,
+    M03R_SEED17_TOP2000_DESIGN_ID,
+    M03R_SEED17_TOP2000_FOLD_EXECUTION_SCHEMA,
+    M03R_SEED17_TOP2000_PROTOCOL_GENERATION,
+    M03R_SEED17_TOP2000_PROTOCOL_SHA256,
+    M03R_SEED17_TOP2000_SEED_VALIDATION_SCHEMA,
+)
 from rl_quant.protocol.hold30_alpha_m03r_v7_top2000_dev import (
     M03R_TOP2000_DEV_PROTOCOL_SHA256,
     M03R_TOP2000_DEV_SETTING_IDS,
@@ -70,6 +79,7 @@ from rl_quant.training.hold30_top2000_development import (
 )
 from rl_quant.training.top2000_m03r_v7_dev import (
     TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS,
+    TOP2000_M03R_V7_DEV_MAX_STOCK_WEIGHT,
     TOP2000_M03R_V7_DEV_REQUIRED_STATE_ROWS,
     TOP2000_M03R_V7_DEV_SEEDS,
     Top2000M03RV7DevelopmentError,
@@ -95,6 +105,7 @@ PROGRESS_MANIFEST_SCHEMA = (
 )
 SEED_VALIDATION_RECEIPT_DIRECTORY = "seed-validation"
 FOLD_ENSEMBLE_RECEIPT_DIRECTORY = "fold-ensemble"
+FOLD_EXECUTION_RECEIPT_DIRECTORY = "fold-execution"
 COMPLETION_RECEIPT_SCHEMA = "rl-quant.top2000-dev.m03r-v7-completion-receipt-v1"
 QUALIFICATION_RECEIPT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v7-bounded-qualification-v1"
@@ -191,11 +202,20 @@ def optimizer_state_sha256(optimizer: torch.optim.Optimizer) -> str:
     return optimizer_state_dict_sha256(optimizer.state_dict())
 
 
+def _runtime_setting_id(plan: Any) -> str:
+    value = getattr(plan, "runtime_setting_id", plan.setting_id)
+    if not isinstance(value, str) or value not in M03R_TOP2000_DEV_SETTING_IDS:
+        raise Top2000M03RV7WorkerError(
+            "worker plan omitted a valid numerical-route setting identity"
+        )
+    return value
+
+
 def _requires_overlay_optimizer(
     plan: Top2000M03RV7DevelopmentTrainingPlan,
 ) -> bool:
     return (
-        resolve_m03r_top2000_dev_setting(plan.setting_id).sharpe_mode
+        resolve_m03r_top2000_dev_setting(_runtime_setting_id(plan)).sharpe_mode
         == "separate-total-risk-overlay"
     )
 
@@ -1253,6 +1273,7 @@ def _build_episode(
             start + TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS
         ),
         max_state_rows=TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS,
+        max_stock_weight=TOP2000_M03R_V7_DEV_MAX_STOCK_WEIGHT,
         output_device="cpu",
     )
     calibration = build_top2000_hold30_development_sequence_from_loaded_cache(
@@ -1262,6 +1283,7 @@ def _build_episode(
             start + TOP2000_M03R_V7_FACTOR_CALIBRATION_TRANSITIONS + 1
         ),
         max_state_rows=TOP2000_M03R_V7_FACTOR_CALIBRATION_TRANSITIONS + 1,
+        max_stock_weight=TOP2000_M03R_V7_DEV_MAX_STOCK_WEIGHT,
         output_device="cpu",
     )
     fitted = fit_top2000_m03r_v7_warmup_factor_calibration(
@@ -1351,6 +1373,19 @@ def _fold_ensemble_receipt_path(
     )
 
 
+def _fold_execution_receipt_path(
+    run_root: Path,
+    *,
+    fold_index: int,
+) -> Path:
+    return (
+        run_root
+        / "receipts"
+        / FOLD_EXECUTION_RECEIPT_DIRECTORY
+        / f"fold-{fold_index:02d}.json"
+    )
+
+
 def _evaluate_seed_checkpoint(
     cache: Top2000VerifiedDevelopmentCache,
     fold: Top2000M03RV7DevelopmentFold,
@@ -1361,6 +1396,7 @@ def _evaluate_seed_checkpoint(
     seed: int,
     checkpoint_file_sha256: str,
     device: torch.device,
+    seed17_diagnostic: bool = False,
 ) -> tuple[Path, str]:
     """Evaluate one detached final checkpoint and publish bound evidence."""
 
@@ -1383,7 +1419,11 @@ def _evaluate_seed_checkpoint(
                 "prior seed validation receipt cannot be read"
             ) from exc
         expected = {
-            "schema": "rl-quant.top2000-dev.m03r-v7-seed-validation-v1",
+            "schema": (
+                M03R_SEED17_TOP2000_SEED_VALIDATION_SCHEMA
+                if seed17_diagnostic
+                else "rl-quant.top2000-dev.m03r-v7-seed-validation-v1"
+            ),
             "protocol_sha256": plan.protocol_sha256,
             "setting_index": plan.setting_index,
             "setting_id": plan.setting_id,
@@ -1446,27 +1486,55 @@ def _evaluate_seed_checkpoint(
             "promotion_eligible": False,
         },
     )
-    receipt = Top2000M03RV7SeedValidationReceipt(
-        setting_index=plan.setting_index,
-        setting_id=plan.setting_id,
-        fold_index=fold.fold_index,
-        seed=seed,
-        fold_receipt_sha256=fold.receipt_sha256,
-        sequence_receipt_sha256=built.identity.receipt_sha256,
-        checkpoint_file_sha256=checkpoint_file_sha256,
-        model_state_sha256=state_sha256,
-        validation_trace_artifact_sha256=artifact_sha256,
-        validation_trace_sha256=evidence.trace_sha256,
-        array_sha256=evidence.array_sha256s(),
-        metrics=evidence.metrics(),
-        validation_global_decision_start=fold.validation_decision_start,
-        validation_global_decision_stop_exclusive=(
+    receipt_fields: dict[str, Any] = {
+        "setting_index": plan.setting_index,
+        "setting_id": plan.setting_id,
+        "fold_index": fold.fold_index,
+        "seed": seed,
+        "fold_receipt_sha256": fold.receipt_sha256,
+        "sequence_receipt_sha256": built.identity.receipt_sha256,
+        "checkpoint_file_sha256": checkpoint_file_sha256,
+        "model_state_sha256": state_sha256,
+        "validation_trace_artifact_sha256": artifact_sha256,
+        "validation_trace_sha256": evidence.trace_sha256,
+        "array_sha256": evidence.array_sha256s(),
+        "metrics": evidence.metrics(),
+        "validation_global_decision_start": fold.validation_decision_start,
+        "validation_global_decision_stop_exclusive": (
             fold.validation_decision_stop_exclusive
         ),
-        first_validation_date=built.exchange_dates[score_start],
-        last_validation_date=built.exchange_dates[score_stop - 1],
-    )
-    receipt_sha256 = _write_immutable_json(receipt_path, asdict(receipt))
+        "first_validation_date": built.exchange_dates[score_start],
+        "last_validation_date": built.exchange_dates[score_stop - 1],
+    }
+    if seed17_diagnostic:
+        if (
+            plan.protocol_sha256 != M03R_SEED17_TOP2000_PROTOCOL_SHA256
+            or seed != 17
+        ):
+            raise Top2000M03RV7WorkerError(
+                "seed-17 validation requires its exact protocol and seed"
+            )
+        receipt_payload = {
+            **receipt_fields,
+            "checkpoint_selection_rule": (
+                "frozen-final-optimizer-update-no-validation-selection-v1"
+            ),
+            "evaluation_autograd_enabled": False,
+            "protocol_sha256": M03R_SEED17_TOP2000_PROTOCOL_SHA256,
+            "protocol_generation": M03R_SEED17_TOP2000_PROTOCOL_GENERATION,
+            "design_id": M03R_SEED17_TOP2000_DESIGN_ID,
+            "data_role": M03R_SEED17_TOP2000_DATA_ROLE,
+            "development_only": True,
+            "future_selected_universe": True,
+            "outer_evaluation_authorized": False,
+            "promotion_eligible": False,
+            "schema": M03R_SEED17_TOP2000_SEED_VALIDATION_SCHEMA,
+        }
+    else:
+        receipt_payload = asdict(
+            Top2000M03RV7SeedValidationReceipt(**receipt_fields)
+        )
+    receipt_sha256 = _write_immutable_json(receipt_path, receipt_payload)
     return receipt_path, receipt_sha256
 
 
@@ -1541,7 +1609,7 @@ def _load_saved_seed_policy(
             "non-A06 ensemble member contains an overlay optimizer"
         )
     policy = Top2000M03RV7DevelopmentPolicy(
-        plan.setting_id,
+        _runtime_setting_id(plan),
         token_dim=plan.token_dim,
         raw_stock_chunk=plan.raw_stock_chunk,
         activation_checkpointing=plan.activation_checkpointing,
@@ -1684,6 +1752,214 @@ def _evaluate_fold_ensemble(
     )
     receipt_sha256 = _write_immutable_json(receipt_path, asdict(receipt))
     return receipt_path, receipt_sha256
+
+
+def _publish_seed17_fold_execution(
+    fold: Top2000M03RV7DevelopmentFold,
+    *,
+    plan: Any,
+    run_root: Path,
+) -> tuple[Path, str]:
+    """Bind the single seed path as one chronological fold execution.
+
+    A one-member output-space ensemble is numerically the seed policy itself,
+    so this receipt binds the already evaluated seed trace instead of paying
+    for a redundant second model execution.  It is intentionally ineligible
+    for the five-seed ensemble schema.
+    """
+
+    if (
+        plan.protocol_sha256 != M03R_SEED17_TOP2000_PROTOCOL_SHA256
+        or tuple(getattr(plan, "paired_seeds", ())) != (17,)
+    ):
+        raise Top2000M03RV7WorkerError(
+            "one-member fold execution requires the seed-17 plan"
+        )
+    seed_path = _seed_validation_receipt_path(
+        run_root,
+        fold_index=fold.fold_index,
+        seed=17,
+    )
+    try:
+        seed_payload = json.loads(seed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Top2000M03RV7WorkerError(
+            "seed-17 fold execution cannot read its validation receipt"
+        ) from exc
+    if (
+        not isinstance(seed_payload, dict)
+        or seed_payload.get("schema")
+        != M03R_SEED17_TOP2000_SEED_VALIDATION_SCHEMA
+        or seed_payload.get("protocol_sha256") != plan.protocol_sha256
+        or seed_payload.get("setting_index") != plan.setting_index
+        or seed_payload.get("setting_id") != plan.setting_id
+        or seed_payload.get("fold_index") != fold.fold_index
+        or seed_payload.get("seed") != 17
+        or seed_payload.get("fold_receipt_sha256") != fold.receipt_sha256
+        or not isinstance(seed_payload.get("metrics"), dict)
+        or seed_payload["metrics"].get("decision_count") != 63
+    ):
+        raise Top2000M03RV7WorkerError(
+            "seed-17 validation cannot enter this fold execution"
+        )
+    seed_sha256 = _sha256_file(seed_path)
+    receipt = {
+        "schema": M03R_SEED17_TOP2000_FOLD_EXECUTION_SCHEMA,
+        "protocol_generation": M03R_SEED17_TOP2000_PROTOCOL_GENERATION,
+        "protocol_sha256": M03R_SEED17_TOP2000_PROTOCOL_SHA256,
+        "design_id": M03R_SEED17_TOP2000_DESIGN_ID,
+        "data_role": M03R_SEED17_TOP2000_DATA_ROLE,
+        "plan_receipt_sha256": plan.receipt_sha256,
+        "cache_sha256": plan.cache_sha256,
+        "setting_index": plan.setting_index,
+        "setting_id": plan.setting_id,
+        "runtime_setting_id": _runtime_setting_id(plan),
+        "fold_index": fold.fold_index,
+        "fold_receipt_sha256": fold.receipt_sha256,
+        "ordered_seeds": [17],
+        "member_count": 1,
+        "seed_validation_receipt_sha256s": [seed_sha256],
+        "member_checkpoint_file_sha256s": [
+            seed_payload["checkpoint_file_sha256"]
+        ],
+        "member_model_state_sha256s": [seed_payload["model_state_sha256"]],
+        "sequence_receipt_sha256": seed_payload["sequence_receipt_sha256"],
+        "validation_trace_artifact_sha256": seed_payload[
+            "validation_trace_artifact_sha256"
+        ],
+        "validation_trace_sha256": seed_payload["validation_trace_sha256"],
+        "array_sha256": seed_payload["array_sha256"],
+        "metrics": seed_payload["metrics"],
+        "validation_global_decision_start": seed_payload[
+            "validation_global_decision_start"
+        ],
+        "validation_global_decision_stop_exclusive": seed_payload[
+            "validation_global_decision_stop_exclusive"
+        ],
+        "first_validation_date": seed_payload["first_validation_date"],
+        "last_validation_date": seed_payload["last_validation_date"],
+        "one_member_fold_execution": True,
+        "output_space_ensemble": False,
+        "five_seed_ensemble_eligible": False,
+        "seed_return_paths_averaged": False,
+        "chronological_return_path_count": 1,
+        "evaluation_autograd_enabled": False,
+        "development_only": True,
+        "future_selected_universe": True,
+        "outer_evaluation_authorized": False,
+        "promotion_eligible": False,
+    }
+    path = _fold_execution_receipt_path(
+        run_root,
+        fold_index=fold.fold_index,
+    )
+    return path, _write_immutable_json(path, receipt)
+
+
+def _collect_seed17_validation_evidence(
+    run_root: Path,
+    *,
+    plan: Any,
+    folds: Sequence[Top2000M03RV7DevelopmentFold],
+    cells: Sequence[tuple[int, int]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fail closed unless all six seed and fold-execution receipts reconcile."""
+
+    expected_cells = tuple((fold.fold_index, 17) for fold in folds)
+    if tuple(cells) != expected_cells:
+        raise Top2000M03RV7WorkerError(
+            "seed-17 completion requires exactly six fold/seed cells"
+        )
+    seed_hashes: dict[str, str] = {}
+    fold_hashes: dict[str, str] = {}
+    expected_seed_paths = {
+        _seed_validation_receipt_path(
+            run_root,
+            fold_index=fold.fold_index,
+            seed=17,
+        )
+        for fold in folds
+    }
+    observed_seed_paths = set(
+        (run_root / "receipts" / SEED_VALIDATION_RECEIPT_DIRECTORY).glob(
+            "fold-*-seed-*.json"
+        )
+    )
+    if observed_seed_paths != expected_seed_paths:
+        raise Top2000M03RV7WorkerError(
+            "seed-17 completion requires exactly six seed validation receipts"
+        )
+    expected_fold_paths = {
+        _fold_execution_receipt_path(run_root, fold_index=fold.fold_index)
+        for fold in folds
+    }
+    observed_fold_paths = set(
+        (run_root / "receipts" / FOLD_EXECUTION_RECEIPT_DIRECTORY).glob(
+            "fold-*.json"
+        )
+    )
+    if observed_fold_paths != expected_fold_paths:
+        raise Top2000M03RV7WorkerError(
+            "seed-17 completion requires exactly six fold executions"
+        )
+    for fold in folds:
+        seed_path = _seed_validation_receipt_path(
+            run_root,
+            fold_index=fold.fold_index,
+            seed=17,
+        )
+        fold_path = _fold_execution_receipt_path(
+            run_root,
+            fold_index=fold.fold_index,
+        )
+        seed_payload = json.loads(seed_path.read_text(encoding="utf-8"))
+        fold_payload = json.loads(fold_path.read_text(encoding="utf-8"))
+        seed_digest = _sha256_file(seed_path)
+        if (
+            not isinstance(seed_payload, dict)
+            or seed_payload.get("schema")
+            != M03R_SEED17_TOP2000_SEED_VALIDATION_SCHEMA
+            or seed_payload.get("protocol_sha256") != plan.protocol_sha256
+            or seed_payload.get("setting_id") != plan.setting_id
+            or seed_payload.get("fold_index") != fold.fold_index
+            or seed_payload.get("seed") != 17
+            or seed_payload.get("metrics", {}).get("decision_count") != 63
+            or not isinstance(fold_payload, dict)
+            or fold_payload.get("schema")
+            != M03R_SEED17_TOP2000_FOLD_EXECUTION_SCHEMA
+            or fold_payload.get("seed_validation_receipt_sha256s")
+            != [seed_digest]
+            or fold_payload.get("ordered_seeds") != [17]
+            or fold_payload.get("member_count") != 1
+            or fold_payload.get("chronological_return_path_count") != 1
+            or fold_payload.get("one_member_fold_execution") is not True
+            or fold_payload.get("output_space_ensemble") is not False
+            or fold_payload.get("five_seed_ensemble_eligible") is not False
+        ):
+            raise Top2000M03RV7WorkerError(
+                "seed-17 validation or fold execution identity drifted"
+            )
+        cell_path = (
+            run_root
+            / "receipts"
+            / f"fold-{fold.fold_index:02d}-seed-17.json"
+        )
+        cell_payload = json.loads(cell_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(cell_payload, dict)
+            or cell_payload.get("seed_validation_receipt_sha256")
+            != seed_digest
+            or cell_payload.get("optimizer_steps")
+            != plan.total_optimizer_steps_per_fold_seed
+        ):
+            raise Top2000M03RV7WorkerError(
+                "seed-17 cell does not bind its validation receipt"
+            )
+        seed_hashes[str(seed_path.relative_to(run_root))] = seed_digest
+        fold_hashes[str(fold_path.relative_to(run_root))] = _sha256_file(
+            fold_path
+        )
+    return seed_hashes, fold_hashes
 
 
 def _collect_full_validation_evidence(
@@ -1863,7 +2139,7 @@ def _new_cell(
 ]:
     _seed_everything(seed)
     policy = Top2000M03RV7DevelopmentPolicy(
-        plan.setting_id,
+        _runtime_setting_id(plan),
         token_dim=plan.token_dim,
         raw_stock_chunk=plan.raw_stock_chunk,
         activation_checkpointing=plan.activation_checkpointing,
@@ -2151,7 +2427,11 @@ def _existing_cell_receipt_status(
                 raise Top2000M03RV7WorkerError(
                     "existing cell rank model-state inventory drifted"
                 )
-            validation_required = mode == "full"
+            validation_required = mode in {
+                "full",
+                "full-seed17",
+                "qualification-seed17-validation",
+            }
             if payload.get("seed_validation_required") is not validation_required:
                 raise Top2000M03RV7WorkerError(
                     "existing cell seed-validation requirement drifted"
@@ -2189,12 +2469,14 @@ def _existing_cell_receipt_status(
 
 
 def run_worker(
-    plan: Top2000M03RV7DevelopmentTrainingPlan,
+    plan: Any,
     *,
     plan_file_sha256: str,
     qualification_only: bool,
     qualification_steps: int = 1,
     qualification_restart_after_step1: bool = False,
+    seed17_diagnostic: bool = False,
+    seed17_validation_sentinel: bool = False,
 ) -> dict[str, Any] | None:
     """Run one setting, returning the rank-zero terminal receipt."""
 
@@ -2206,6 +2488,20 @@ def run_worker(
         raise Top2000M03RV7WorkerError(
             "qualification_steps must lie in [1, 4] or equal the approved "
             f"extended sentinel length {MAX_EXTENDED_QUALIFICATION_STEPS}"
+        )
+    if seed17_validation_sentinel and (
+        not seed17_diagnostic or not qualification_only
+    ):
+        raise Top2000M03RV7WorkerError(
+            "seed-17 validation sentinel requires seed17 qualification mode"
+        )
+    if seed17_diagnostic and (
+        plan.protocol_sha256 != M03R_SEED17_TOP2000_PROTOCOL_SHA256
+        or tuple(getattr(plan, "paired_seeds", ())) != (17,)
+        or tuple(getattr(plan, "fold_indices", ())) != tuple(range(6))
+    ):
+        raise Top2000M03RV7WorkerError(
+            "seed-17 worker plan omitted its immutable six-cell inventory"
         )
     extended_sentinel = qualification_steps == MAX_EXTENDED_QUALIFICATION_STEPS
     if extended_sentinel and (
@@ -2228,11 +2524,19 @@ def run_worker(
         _torchrun_restart_count() if qualification_restart_after_step1 else 0
     )
     context = _distributed_context(qualification_only=qualification_only)
+    if seed17_validation_sentinel and context.world_size != plan.expected_world_size:
+        raise Top2000M03RV7WorkerError(
+            "seed-17 validation sentinel requires the qualified two-rank topology"
+        )
     mode = (
-        "qualification-extended-a08-20"
+        "qualification-seed17-validation"
+        if seed17_validation_sentinel
+        else "qualification-extended-a08-20"
         if extended_sentinel
         else "qualification"
         if qualification_only
+        else "full-seed17"
+        if seed17_diagnostic
         else "full"
     )
     try:
@@ -2242,7 +2546,11 @@ def run_worker(
             )
         output_root = Path(plan.output_root)
         run_root = output_root / (
-            "qualification" if qualification_only else "training"
+            "qualification-seed17-validation"
+            if seed17_validation_sentinel
+            else "qualification"
+            if qualification_only
+            else "training"
         )
         previous_restart_rendezvous: Path | None = None
         if qualification_restart_after_step1 and restart_count == 1:
@@ -2275,7 +2583,11 @@ def run_worker(
         folds = render_top2000_m03r_v7_development_folds(
             cache.daily_ohlcv.shape[0]
         )
-        cells = _cell_inventory()
+        cells = (
+            tuple((fold_index, 17) for fold_index in range(6))
+            if seed17_diagnostic
+            else _cell_inventory()
+        )
         checkpoint_path = _manifest_checkpoint_path(run_root, context)
         checkpoint = _load_checkpoint(
             _checkpoint_path(run_root, context.rank, 0)
@@ -2455,6 +2767,14 @@ def run_worker(
                 / "receipts"
                 / f"fold-{fold_index:02d}-seed-{seed}.json"
             )
+            # This decision belongs to the run mode, not to whether the cell
+            # model/receipt must be published during this invocation.  Keep it
+            # outside the finalization branch so an idempotent resume from an
+            # already committed cell still takes the correct validation/fold
+            # boundary (or skips it for legacy qualification).
+            validation_required = (
+                not qualification_only or seed17_validation_sentinel
+            )
             already_finalized = _existing_cell_receipt_status(
                 receipt_path,
                 model_directory,
@@ -2557,7 +2877,7 @@ def run_worker(
                 if context.rank == 0:
                     seed_validation_path: Path | None = None
                     seed_validation_sha256: str | None = None
-                    if not qualification_only:
+                    if validation_required:
                         seed_validation_path, seed_validation_sha256 = (
                             _evaluate_seed_checkpoint(
                                 cache,
@@ -2568,6 +2888,7 @@ def run_worker(
                                 seed=seed,
                                 checkpoint_file_sha256=str(model_hashes[0]),
                                 device=context.device,
+                                seed17_diagnostic=seed17_diagnostic,
                             )
                         )
                     _write_immutable_json(
@@ -2606,7 +2927,7 @@ def run_worker(
                             ),
                             "rank_peak_cuda_memory": peaks,
                             "last_metrics": last_metrics,
-                            "seed_validation_required": not qualification_only,
+                            "seed_validation_required": validation_required,
                             "seed_validation_receipt": (
                                 None
                                 if seed_validation_path is None
@@ -2620,7 +2941,42 @@ def run_worker(
                         },
                     )
             _barrier(context)
-            if not qualification_only and seed == TOP2000_M03R_V7_DEV_SEEDS[-1]:
+            if validation_required and seed17_diagnostic:
+                fold_execution_status: list[dict[str, Any]] = [
+                    {"receipt": None, "sha256": None, "error": None}
+                ]
+                if context.rank == 0:
+                    try:
+                        fold_path, fold_sha256 = _publish_seed17_fold_execution(
+                            fold,
+                            plan=plan,
+                            run_root=run_root,
+                        )
+                        fold_execution_status[0] = {
+                            "receipt": str(fold_path),
+                            "sha256": fold_sha256,
+                            "error": None,
+                        }
+                    except (
+                        OSError,
+                        ValueError,
+                        json.JSONDecodeError,
+                        Top2000M03RV7WorkerError,
+                    ) as exc:
+                        fold_execution_status[0] = {
+                            "receipt": None,
+                            "sha256": None,
+                            "error": str(exc),
+                        }
+                if context.world_size == 2:
+                    dist.broadcast_object_list(fold_execution_status, src=0)
+                if fold_execution_status[0].get("error") is not None:
+                    raise Top2000M03RV7WorkerError(
+                        "seed-17 fold execution failed: "
+                        + str(fold_execution_status[0]["error"])
+                    )
+                _barrier(context)
+            elif not qualification_only and seed == TOP2000_M03R_V7_DEV_SEEDS[-1]:
                 fold_ensemble_status: list[dict[str, Any]] = [
                     {"receipt": None, "sha256": None, "error": None}
                 ]
@@ -2782,7 +3138,34 @@ def run_worker(
                 )
         seed_validation_hashes: dict[str, str] = {}
         fold_ensemble_hashes: dict[str, str] = {}
-        if not qualification_only:
+        fold_execution_hashes: dict[str, str] = {}
+        if seed17_validation_sentinel:
+            seed_path = _seed_validation_receipt_path(
+                run_root,
+                fold_index=0,
+                seed=17,
+            )
+            fold_path = _fold_execution_receipt_path(run_root, fold_index=0)
+            if not seed_path.is_file() or not fold_path.is_file():
+                raise Top2000M03RV7WorkerError(
+                    "seed-17 validation sentinel omitted its boundary receipts"
+                )
+            seed_validation_hashes[str(seed_path.relative_to(run_root))] = (
+                _sha256_file(seed_path)
+            )
+            fold_execution_hashes[str(fold_path.relative_to(run_root))] = (
+                _sha256_file(fold_path)
+            )
+        elif seed17_diagnostic and not qualification_only:
+            seed_validation_hashes, fold_execution_hashes = (
+                _collect_seed17_validation_evidence(
+                    run_root,
+                    plan=plan,
+                    folds=folds,
+                    cells=cells,
+                )
+            )
+        elif not qualification_only:
             seed_validation_hashes, fold_ensemble_hashes = (
                 _collect_full_validation_evidence(
                     run_root,
@@ -2793,8 +3176,12 @@ def run_worker(
             )
         terminal: dict[str, Any] = {
             "schema": (
-                QUALIFICATION_RECEIPT_SCHEMA
+                "rl-quant.top2000-dev.m03r-v7-seed17-validation-sentinel-v1"
+                if seed17_validation_sentinel
+                else QUALIFICATION_RECEIPT_SCHEMA
                 if qualification_only
+                else M03R_SEED17_TOP2000_COMPLETION_SCHEMA
+                if seed17_diagnostic
                 else COMPLETION_RECEIPT_SCHEMA
             ),
             "worker_schema": WORKER_SCHEMA,
@@ -2810,7 +3197,13 @@ def run_worker(
             "setting_id": plan.setting_id,
             "world_size": context.world_size,
             "fold_count": 1 if qualification_only else len(folds),
-            "paired_seeds": [cells[0][1]] if qualification_only else list(TOP2000_M03R_V7_DEV_SEEDS),
+            "paired_seeds": (
+                [17]
+                if seed17_diagnostic
+                else [cells[0][1]]
+                if qualification_only
+                else list(TOP2000_M03R_V7_DEV_SEEDS)
+            ),
             "completed_cells": final_cell_count,
             "optimizer_steps_per_cell": effective_steps,
             "cell_receipt_sha256": receipt_hashes,
@@ -2819,10 +3212,16 @@ def run_worker(
             "seed_validation_receipt_count": len(seed_validation_hashes),
             "fold_ensemble_receipt_count": len(fold_ensemble_hashes),
             "inference_path_count": (
-                0 if qualification_only else len(fold_ensemble_hashes)
+                len(fold_execution_hashes)
+                if seed17_diagnostic
+                else 0
+                if qualification_only
+                else len(fold_ensemble_hashes)
             ),
             "seeds_are_independent_return_paths": False,
-            "output_space_ensemble_required": not qualification_only,
+            "output_space_ensemble_required": (
+                not qualification_only and not seed17_diagnostic
+            ),
             "rank_peak_cuda_memory": peaks,
             "rank_elapsed_seconds": elapsed_seconds,
             "intentional_restart_after_step": (
@@ -2855,8 +3254,20 @@ def run_worker(
             "promotion_eligible": False,
             "complete": True,
         }
+        if seed17_diagnostic:
+            terminal.update(
+                {
+                    "runtime_setting_id": _runtime_setting_id(plan),
+                    "fold_execution_receipt_sha256": fold_execution_hashes,
+                    "fold_execution_receipt_count": len(fold_execution_hashes),
+                    "one_member_fold_execution_required": True,
+                    "five_seed_ensemble_eligible": False,
+                }
+            )
         terminal_path = run_root / (
-            "qualification-receipt.json"
+            "validation-sentinel-receipt.json"
+            if seed17_validation_sentinel
+            else "qualification-receipt.json"
             if qualification_only
             else "completion-receipt.json"
         )

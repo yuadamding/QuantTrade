@@ -25,6 +25,13 @@ from typing import Any, Final, cast
 
 import torch
 
+from rl_quant.protocol.hold30_alpha_m03r_v7_seed17_top2000_dev import (
+    M03R_SEED17_TOP2000_DESIGN_ID,
+    M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA,
+    M03R_SEED17_TOP2000_PROTOCOL_GENERATION,
+    M03R_SEED17_TOP2000_PROTOCOL_SHA256,
+    M03R_SEED17_TOP2000_SETTING_IDS,
+)
 from rl_quant.protocol.hold30_alpha_m03r_v7_top2000_dev import (
     M03R_TOP2000_DEV_DATA_ROLE,
     M03R_TOP2000_DEV_DESIGN_ID,
@@ -40,8 +47,18 @@ from rl_quant.training.hold30_alpha_m03r_v7_package import (
     M03RV7Top2000RuntimeProfile,
     build_m03r_v7_top2000_package_plan,
 )
+from rl_quant.training.hold30_alpha_m03r_v7_seed17_package import (
+    M03RV7Seed17IndexPlan,
+    M03RV7Seed17PackagePlan,
+    build_m03r_v7_seed17_top2000_package_plan,
+)
 from rl_quant.training.hold30_top2000_development import (
     DEVELOPMENT_ACK,
+    TOP2000_HOLD30_BENCHMARK_ID,
+    TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE,
+    TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA,
+    TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+    build_top2000_hold30_development_sequence_from_loaded_cache,
     load_verified_top2000_hold30_development_cache,
 )
 from rl_quant.training.top2000_m03r_v7_dev import (
@@ -52,6 +69,10 @@ from rl_quant.training.top2000_m03r_v7_dev import (
     TOP2000_M03R_V7_DEV_SEEDS,
     TOP2000_M03R_V7_DEV_VALIDATION_DECISIONS,
     TOP2000_M03R_V7_DEV_WARMUP_DECISIONS,
+    render_top2000_m03r_v7_development_folds,
+)
+from rl_quant.training.top2000_m03r_v7_factor_calibration import (
+    TOP2000_M03R_V7_FACTOR_CALIBRATION_TRANSITIONS,
 )
 
 PACKAGE_BUILDER_SCHEMA: Final = "rl-quant.top2000-dev.m03r-v7-package-builder-v1"
@@ -61,6 +82,9 @@ DATA_MANIFEST_SCHEMA: Final = "rl-quant.top2000-dev.data-manifest-v1"
 DEPENDENCY_MANIFEST_SCHEMA: Final = "rl-quant.top2000-dev.dependency-manifest-v1"
 RUNTIME_MANIFEST_SCHEMA: Final = "rl-quant.top2000-dev.runtime-manifest-v1"
 EXECUTION_MANIFEST_SCHEMA: Final = "rl-quant.top2000-dev.execution-manifest-v1"
+BENCHMARK_PREFLIGHT_SCHEMA: Final = (
+    "rl-quant.top2000-dev.seed17-benchmark-feasibility-preflight-v1"
+)
 
 PINNED_QUANTTRADE_IMAGE: Final = (
     "hpcharbor.mdanderson.edu/yding41/ml2:"
@@ -87,6 +111,14 @@ DEFAULT_CRITICAL_SOURCE_PATHS: Final = (
     "src/rl_quant/workflows/top2000_m03r_v7_dev.py",
     "src/rl_quant/workflows/top2000_m03r_v7_package_builder.py",
 )
+SEED17_CRITICAL_SOURCE_PATHS: Final = DEFAULT_CRITICAL_SOURCE_PATHS + (
+    "src/rl_quant/protocol/hold30_alpha_m03r_v7_seed17_top2000_dev.py",
+    "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_kubernetes.py",
+    "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_package.py",
+    "src/rl_quant/training/top2000_m03r_v7_seadragon_lifecycle.py",
+    "src/rl_quant/workflows/top2000_m03r_v7_seed17_dev.py",
+    "src/rl_quant/workflows/top2000_m03r_v7_seed17_operator.py",
+)
 ROOT_FILE_ALLOWLIST: Final = frozenset(
     {
         "cache.pt",
@@ -100,6 +132,9 @@ ROOT_FILE_ALLOWLIST: Final = frozenset(
         "source.tar",
     }
 )
+SEED17_ROOT_FILE_ALLOWLIST: Final = ROOT_FILE_ALLOWLIST | {
+    "benchmark-preflight.json"
+}
 
 
 class Top2000M03RV7PackageBuildError(RuntimeError):
@@ -599,6 +634,119 @@ def _validate_cache(
     }
 
 
+def _benchmark_feasibility_preflight(
+    path: Path,
+    contract: Top2000M03RV7CacheContract,
+) -> dict[str, Any]:
+    """Replay every governed fold anchor on CPU before GPU admission.
+
+    Both the 378-state fold chronology and its 64-state factor-calibration
+    prefix are constructed through the authoritative adapter.  That adapter's
+    v2 fill-time preflight therefore rejects an infeasible C1 anchor before a
+    package can be rendered or a Pod can request H100 capacity.
+    """
+
+    try:
+        cache = load_verified_top2000_hold30_development_cache(
+            path,
+            expected_cache_sha256=contract.cache_sha256,
+            acknowledgement=DEVELOPMENT_ACK,
+        )
+        folds = render_top2000_m03r_v7_development_folds(
+            len(cache.exchange_dates)
+        )
+        rows: list[dict[str, Any]] = []
+        for fold in folds:
+            state_start = (
+                fold.validation_decision_start
+                - TOP2000_M03R_V7_DEV_WARMUP_DECISIONS
+            )
+            validation = (
+                build_top2000_hold30_development_sequence_from_loaded_cache(
+                    cache,
+                    state_start_index=state_start,
+                    state_stop_index_exclusive=(
+                        state_start + TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS
+                    ),
+                    max_state_rows=TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS,
+                    max_stock_weight=TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+                    output_device="cpu",
+                )
+            )
+            calibration_rows = (
+                TOP2000_M03R_V7_FACTOR_CALIBRATION_TRANSITIONS + 1
+            )
+            calibration = (
+                build_top2000_hold30_development_sequence_from_loaded_cache(
+                    cache,
+                    state_start_index=state_start,
+                    state_stop_index_exclusive=(
+                        state_start + calibration_rows
+                    ),
+                    max_state_rows=calibration_rows,
+                    max_stock_weight=TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+                    output_device="cpu",
+                )
+            )
+            rows.append(
+                {
+                    "fold_index": fold.fold_index,
+                    "fold_receipt_sha256": fold.receipt_sha256,
+                    "state_start_index": state_start,
+                    "validation_state_stop_index_exclusive": (
+                        state_start + TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS
+                    ),
+                    "calibration_state_stop_index_exclusive": (
+                        state_start + calibration_rows
+                    ),
+                    "validation_slice_receipt_sha256": (
+                        validation.identity.receipt_sha256
+                    ),
+                    "validation_benchmark_trace_sha256": (
+                        validation.identity.benchmark_trace_sha256
+                    ),
+                    "validation_benchmark_weights_sha256": (
+                        validation.identity.benchmark_weights_sha256
+                    ),
+                    "calibration_slice_receipt_sha256": (
+                        calibration.identity.receipt_sha256
+                    ),
+                    "calibration_benchmark_trace_sha256": (
+                        calibration.identity.benchmark_trace_sha256
+                    ),
+                    "calibration_benchmark_weights_sha256": (
+                        calibration.identity.benchmark_weights_sha256
+                    ),
+                }
+            )
+    except Exception as exc:
+        raise Top2000M03RV7PackageBuildError(
+            "TOP2000 v2 benchmark feasibility preflight failed: " + str(exc)
+        ) from exc
+
+    identity = {
+        "adapter_schema": TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA,
+        "benchmark_id": TOP2000_HOLD30_BENCHMARK_ID,
+        "benchmark_risk_repair_rule": (
+            TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE
+        ),
+        "max_stock_weight": TOP2000_HOLD30_MAX_STOCK_WEIGHT,
+        "folds": rows,
+    }
+    return {
+        "schema": BENCHMARK_PREFLIGHT_SCHEMA,
+        **identity,
+        "benchmark_trace_cap_identity_sha256": hashlib.sha256(
+            _canonical_json_bytes(identity)
+        ).hexdigest(),
+        "fold_count": len(rows),
+        "cpu_only": True,
+        "all_validation_and_calibration_slices_feasible": True,
+        "development_only": True,
+        "promotion_eligible": False,
+    }
+
+
 def _read_canonical_json(path: Path) -> dict[str, Any]:
     _require_regular_file(path, label="package JSON manifest")
     raw = path.read_bytes()
@@ -615,10 +763,51 @@ def _read_canonical_json(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
-def _reconstruct_plan(payload: Mapping[str, Any]) -> M03RV7Top2000PackagePlan:
+def _reconstruct_plan(
+    payload: Mapping[str, Any],
+) -> M03RV7Top2000PackagePlan | M03RV7Seed17PackagePlan:
     try:
         artifacts = M03RV7Top2000ArtifactBindings(**payload["artifacts"])
         profile = M03RV7Top2000RuntimeProfile(**payload["runtime_profile"])
+        if (
+            payload.get("protocol_generation")
+            == M03R_SEED17_TOP2000_PROTOCOL_GENERATION
+        ):
+            seed17_indices = tuple(
+                M03RV7Seed17IndexPlan(
+                    **{
+                        **row,
+                        "fold_indices": tuple(row["fold_indices"]),
+                        "paired_seeds": tuple(row["paired_seeds"]),
+                    }
+                )
+                for row in payload["indices"]
+            )
+            return M03RV7Seed17PackagePlan(
+                artifacts=artifacts,
+                indices=seed17_indices,
+                runtime_profile=profile,
+                plan_artifact_path=payload["plan_artifact_path"],
+                benchmark_preflight_sha256=(
+                    payload["benchmark_preflight_sha256"]
+                ),
+                package_plan_sha256=payload["package_plan_sha256"],
+                source_pythonpath=payload["source_pythonpath"],
+                protocol_sha256=payload["protocol_sha256"],
+                protocol_generation=payload["protocol_generation"],
+                design_id=payload["design_id"],
+                data_role=payload["data_role"],
+                one_member_fold_execution=payload[
+                    "one_member_fold_execution"
+                ],
+                five_seed_ensemble_eligible=payload[
+                    "five_seed_ensemble_eligible"
+                ],
+                promotion_eligible=payload["promotion_eligible"],
+                outer_evaluation_authorized=payload[
+                    "outer_evaluation_authorized"
+                ],
+            )
         indices = tuple(
             M03RV7Top2000IndexPlan(
                 **{
@@ -653,7 +842,8 @@ def validate_top2000_m03r_v7_package(
     output_root: str | Path,
     *,
     cache_contract: Top2000M03RV7CacheContract = CURRENT_TOP2000_CACHE_CONTRACT,
-) -> M03RV7Top2000PackagePlan:
+    seed17_diagnostic: bool = False,
+) -> M03RV7Top2000PackagePlan | M03RV7Seed17PackagePlan:
     """Independently replay all package hashes and typed plan invariants."""
 
     root = Path(output_root)
@@ -663,7 +853,12 @@ def validate_top2000_m03r_v7_package(
             "package root must be a regular non-symlink directory"
         )
     root_entries = {entry.name for entry in root.iterdir()}
-    if root_entries != ROOT_FILE_ALLOWLIST | {"source"}:
+    expected_root = (
+        SEED17_ROOT_FILE_ALLOWLIST
+        if seed17_diagnostic
+        else ROOT_FILE_ALLOWLIST
+    )
+    if root_entries != expected_root | {"source"}:
         raise Top2000M03RV7PackageBuildError("package root inventory drifted")
     for directory, child_directories, files in os.walk(root / "source"):
         for name in child_directories + files:
@@ -678,8 +873,26 @@ def validate_top2000_m03r_v7_package(
     dependency_manifest = _read_canonical_json(root / "dependency-manifest.json")
     runtime_manifest = _read_canonical_json(root / "runtime-manifest.json")
     execution_manifest = _read_canonical_json(root / "execution-manifest.json")
+    benchmark_preflight = (
+        _read_canonical_json(root / "benchmark-preflight.json")
+        if seed17_diagnostic
+        else None
+    )
     plan_payload = _read_canonical_json(root / "package-plan.json")
+    expected_plan_file_schema = (
+        M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA
+        if seed17_diagnostic
+        else "rl-quant.m03r-v7-top2000-package-plan-file-v1"
+    )
+    if plan_payload.get("schema") != expected_plan_file_schema:
+        raise Top2000M03RV7PackageBuildError(
+            "package plan file schema drifted from the worker loader"
+        )
     plan = _reconstruct_plan(plan_payload)
+    if seed17_diagnostic != isinstance(plan, M03RV7Seed17PackagePlan):
+        raise Top2000M03RV7PackageBuildError(
+            "package generation does not match the requested validator"
+        )
 
     expected_hashes = {
         "source_archive_sha256": _file_sha256(root / "source.tar"),
@@ -713,6 +926,45 @@ def validate_top2000_m03r_v7_package(
             "package schema, image, or runtime binding drifted"
         )
     _validate_cache(root / "cache.pt", cache_contract)
+    if seed17_diagnostic:
+        assert benchmark_preflight is not None
+        replayed_preflight = _benchmark_feasibility_preflight(
+            root / "cache.pt", cache_contract
+        )
+        benchmark_preflight_sha256 = _file_sha256(
+            root / "benchmark-preflight.json"
+        )
+        if (
+            benchmark_preflight != replayed_preflight
+            or benchmark_preflight.get("schema")
+            != BENCHMARK_PREFLIGHT_SCHEMA
+            or not isinstance(plan, M03RV7Seed17PackagePlan)
+            or plan.benchmark_preflight_sha256
+            != benchmark_preflight_sha256
+            or execution_manifest.get("benchmark_preflight_sha256")
+            != benchmark_preflight_sha256
+            or execution_manifest.get(
+                "benchmark_trace_cap_identity_sha256"
+            )
+            != benchmark_preflight.get(
+                "benchmark_trace_cap_identity_sha256"
+            )
+            or data_manifest.get("benchmark_trace_cap_identity_sha256")
+            != benchmark_preflight.get(
+                "benchmark_trace_cap_identity_sha256"
+            )
+            or data_manifest.get("benchmark_max_stock_weight")
+            != TOP2000_HOLD30_MAX_STOCK_WEIGHT
+            or runtime_manifest.get("worker_argv_prefix", [None])[-1]
+            != "rl_quant.workflows.top2000_m03r_v7_seed17_dev"
+            or execution_manifest.get("protocol_generation")
+            != M03R_SEED17_TOP2000_PROTOCOL_GENERATION
+            or execution_manifest.get("protocol_sha256")
+            != M03R_SEED17_TOP2000_PROTOCOL_SHA256
+        ):
+            raise Top2000M03RV7PackageBuildError(
+                "seed-17 benchmark preflight bytes or identity drifted"
+            )
 
     file_rows = source_manifest.get("files")
     if not isinstance(file_rows, list):
@@ -782,8 +1034,9 @@ def build_top2000_m03r_v7_package(
     cache_path: str | Path,
     output_root: str | Path,
     cache_contract: Top2000M03RV7CacheContract = CURRENT_TOP2000_CACHE_CONTRACT,
-    critical_source_paths: Sequence[str] = DEFAULT_CRITICAL_SOURCE_PATHS,
+    critical_source_paths: Sequence[str] | None = None,
     runtime_profile: M03RV7Top2000RuntimeProfile | None = None,
+    seed17_diagnostic: bool = False,
 ) -> Top2000M03RV7PackageBuildResult:
     """Create and verify one new package directory without overwriting."""
 
@@ -805,11 +1058,48 @@ def build_top2000_m03r_v7_package(
         )
     _require_clean_git(repository)
     cache_summary = _validate_cache(cache, cache_contract)
+    benchmark_preflight = (
+        _benchmark_feasibility_preflight(cache, cache_contract)
+        if seed17_diagnostic
+        else None
+    )
+    selected_critical_sources = tuple(
+        critical_source_paths
+        if critical_source_paths is not None
+        else (
+            SEED17_CRITICAL_SOURCE_PATHS
+            if seed17_diagnostic
+            else DEFAULT_CRITICAL_SOURCE_PATHS
+        )
+    )
+    protocol_generation = (
+        M03R_SEED17_TOP2000_PROTOCOL_GENERATION
+        if seed17_diagnostic
+        else M03R_TOP2000_DEV_PROTOCOL_GENERATION
+    )
+    protocol_sha256 = (
+        M03R_SEED17_TOP2000_PROTOCOL_SHA256
+        if seed17_diagnostic
+        else M03R_TOP2000_DEV_PROTOCOL_SHA256
+    )
+    design_id = (
+        M03R_SEED17_TOP2000_DESIGN_ID
+        if seed17_diagnostic
+        else M03R_TOP2000_DEV_DESIGN_ID
+    )
+    setting_ids = (
+        M03R_SEED17_TOP2000_SETTING_IDS
+        if seed17_diagnostic
+        else M03R_TOP2000_DEV_SETTING_IDS
+    )
+    paired_seeds = (
+        (17,) if seed17_diagnostic else TOP2000_M03R_V7_DEV_SEEDS
+    )
     commit = _git_text(repository, "rev-parse", "HEAD")
     tree = _git_text(repository, "rev-parse", "HEAD^{tree}")
     blobs = _tracked_blobs(repository)
     blob_by_path = {blob.path: blob for blob in blobs}
-    missing = sorted(set(critical_source_paths) - set(blob_by_path))
+    missing = sorted(set(selected_critical_sources) - set(blob_by_path))
     if missing:
         raise Top2000M03RV7PackageBuildError(
             "critical execution source is not tracked: " + ", ".join(missing)
@@ -879,10 +1169,39 @@ def build_top2000_m03r_v7_package(
         "outer_evaluation_authorized": False,
         "contains_2026_lockbox": False,
     }
+    if benchmark_preflight is not None:
+        data_manifest.update(
+            {
+                "benchmark_adapter_schema": benchmark_preflight[
+                    "adapter_schema"
+                ],
+                "benchmark_id": benchmark_preflight["benchmark_id"],
+                "benchmark_risk_repair_rule": benchmark_preflight[
+                    "benchmark_risk_repair_rule"
+                ],
+                "benchmark_max_stock_weight": benchmark_preflight[
+                    "max_stock_weight"
+                ],
+                "benchmark_trace_cap_identity_sha256": (
+                    benchmark_preflight[
+                        "benchmark_trace_cap_identity_sha256"
+                    ]
+                ),
+            }
+        )
     _write_exclusive(
         output / "data-manifest.json",
         _canonical_json_bytes(data_manifest),
     )
+    benchmark_preflight_sha256: str | None = None
+    if benchmark_preflight is not None:
+        _write_exclusive(
+            output / "benchmark-preflight.json",
+            _canonical_json_bytes(benchmark_preflight),
+        )
+        benchmark_preflight_sha256 = _file_sha256(
+            output / "benchmark-preflight.json"
+        )
 
     dependency_paths = tuple(
         blob.path
@@ -924,7 +1243,11 @@ def build_top2000_m03r_v7_package(
         "--max-restarts=1",
         "--nproc-per-node=2",
         "-m",
-        "rl_quant.workflows.top2000_m03r_v7_dev",
+        (
+            "rl_quant.workflows.top2000_m03r_v7_seed17_dev"
+            if seed17_diagnostic
+            else "rl_quant.workflows.top2000_m03r_v7_dev"
+        ),
     )
     runtime_manifest = {
         "schema": RUNTIME_MANIFEST_SCHEMA,
@@ -966,10 +1289,10 @@ def build_top2000_m03r_v7_package(
     }
     execution_manifest = {
         "schema": EXECUTION_MANIFEST_SCHEMA,
-        "protocol_generation": M03R_TOP2000_DEV_PROTOCOL_GENERATION,
-        "protocol_sha256": M03R_TOP2000_DEV_PROTOCOL_SHA256,
-        "design_id": M03R_TOP2000_DEV_DESIGN_ID,
-        "setting_ids": list(M03R_TOP2000_DEV_SETTING_IDS),
+        "protocol_generation": protocol_generation,
+        "protocol_sha256": protocol_sha256,
+        "design_id": design_id,
+        "setting_ids": list(setting_ids),
         "runtime_profile": asdict(profile),
         "episode_state_rows": TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS,
         "observation_warmup_decisions": TOP2000_M03R_V7_DEV_WARMUP_DECISIONS,
@@ -977,14 +1300,14 @@ def build_top2000_m03r_v7_package(
         "label_support_decisions": TOP2000_M03R_V7_DEV_LABEL_SUPPORT_DECISIONS,
         "auxiliary_alpha_horizons": list(TOP2000_M03R_V7_DEV_ALPHA_HORIZONS),
         "fold_count": TOP2000_M03R_V7_DEV_FOLD_COUNT,
-        "paired_seeds": list(TOP2000_M03R_V7_DEV_SEEDS),
+        "paired_seeds": list(paired_seeds),
         "critical_source_files": [
             {
                 "path": path,
                 "sha256": blob_by_path[path].sha256,
                 "git_blob_oid": blob_by_path[path].git_blob_oid,
             }
-            for path in critical_source_paths
+            for path in selected_critical_sources
         ],
         "source_archive_sha256": source_archive_sha256,
         "cache_artifact_sha256": cache_contract.cache_sha256,
@@ -995,6 +1318,25 @@ def build_top2000_m03r_v7_package(
         "promotion_eligible": False,
         **manifest_hashes,
     }
+    if benchmark_preflight is not None:
+        assert benchmark_preflight_sha256 is not None
+        execution_manifest.update(
+            {
+                "benchmark_preflight_sha256": benchmark_preflight_sha256,
+                "benchmark_trace_cap_identity_sha256": (
+                    benchmark_preflight[
+                        "benchmark_trace_cap_identity_sha256"
+                    ]
+                ),
+                "benchmark_adapter_schema": (
+                    benchmark_preflight["adapter_schema"]
+                ),
+                "benchmark_id": benchmark_preflight["benchmark_id"],
+                "benchmark_max_stock_weight": benchmark_preflight[
+                    "max_stock_weight"
+                ],
+            }
+        )
     _write_exclusive(
         output / "execution-manifest.json",
         _canonical_json_bytes(execution_manifest),
@@ -1011,14 +1353,30 @@ def build_top2000_m03r_v7_package(
         image_reference=PINNED_QUANTTRADE_IMAGE,
         image_digest_sha256=PINNED_QUANTTRADE_IMAGE_DIGEST,
     )
-    plan = build_m03r_v7_top2000_package_plan(
-        artifacts=artifacts,
-        plan_artifact_path=PACKAGE_PLAN_CONTAINER_PATH,
-        runtime_profile=profile,
-    )
+    if seed17_diagnostic:
+        if benchmark_preflight_sha256 is None:
+            raise Top2000M03RV7PackageBuildError(
+                "seed-17 package omitted its benchmark preflight"
+            )
+        plan: M03RV7Top2000PackagePlan | M03RV7Seed17PackagePlan = (
+            build_m03r_v7_seed17_top2000_package_plan(
+                artifacts=artifacts,
+                plan_artifact_path=PACKAGE_PLAN_CONTAINER_PATH,
+                benchmark_preflight_sha256=benchmark_preflight_sha256,
+                runtime_profile=profile,
+            )
+        )
+        plan_file_schema = M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA
+    else:
+        plan = build_m03r_v7_top2000_package_plan(
+            artifacts=artifacts,
+            plan_artifact_path=PACKAGE_PLAN_CONTAINER_PATH,
+            runtime_profile=profile,
+        )
+        plan_file_schema = "rl-quant.m03r-v7-top2000-package-plan-file-v1"
     plan_payload = {
         **asdict(plan),
-        "schema": "rl-quant.m03r-v7-top2000-package-plan-file-v1",
+        "schema": plan_file_schema,
     }
     _write_exclusive(
         output / "package-plan.json",
@@ -1028,6 +1386,7 @@ def build_top2000_m03r_v7_package(
     verified_plan = validate_top2000_m03r_v7_package(
         output,
         cache_contract=cache_contract,
+        seed17_diagnostic=seed17_diagnostic,
     )
     if verified_plan != plan:
         raise Top2000M03RV7PackageBuildError(
@@ -1058,6 +1417,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--cache", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--seed17-diagnostic",
+        action="store_true",
+        help=(
+            "build the disjoint six-fold seed-17 diagnostic package and run "
+            "its CPU benchmark-feasibility preflight"
+        ),
+    )
     return parser
 
 
@@ -1069,6 +1436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repository_root=arguments.repo,
             cache_path=arguments.cache,
             output_root=arguments.output,
+            seed17_diagnostic=arguments.seed17_diagnostic,
         )
     except Top2000M03RV7PackageBuildError as exc:
         parser.error(str(exc))
@@ -1081,11 +1449,13 @@ if __name__ == "__main__":  # pragma: no cover - exercised through main
 
 
 __all__ = [
+    "BENCHMARK_PREFLIGHT_SCHEMA",
     "CURRENT_TOP2000_CACHE_CONTRACT",
     "PACKAGE_PLAN_CONTAINER_PATH",
     "PINNED_IMAGE_PYTHON",
     "PINNED_QUANTTRADE_IMAGE",
     "PINNED_QUANTTRADE_IMAGE_DIGEST",
+    "SEED17_CRITICAL_SOURCE_PATHS",
     "Top2000M03RV7CacheContract",
     "Top2000M03RV7PackageBuildError",
     "Top2000M03RV7PackageBuildResult",

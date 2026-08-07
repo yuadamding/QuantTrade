@@ -188,6 +188,46 @@ V3_LATER_GENERATION_SOURCE_TESTS = (
         "src/rl_quant/training/hold30_alpha_m03r_v7_schedule.py",
         "tests/test_hold30_alpha_m03r_v7_schedule.py",
     ),
+    (
+        "src/rl_quant/models/hold30_alpha_m03r_v7_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v7_top2000_dev_model.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v7_top2000_dev_protocol.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_kubernetes.py",
+        "tests/test_hold30_m03r_v7_top2000_kubernetes.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_package.py",
+        "tests/test_top2000_m03r_v7_package_builder.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_seed17_top2000_dev.py",
+        "tests/test_top2000_m03r_v7_seed17_generation.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_kubernetes.py",
+        "tests/test_hold30_m03r_v7_seed17_kubernetes.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_package.py",
+        "tests/test_top2000_m03r_v7_seed17_generation.py",
+    ),
+    (
+        "src/rl_quant/training/top2000_m03r_v7_seadragon_lifecycle.py",
+        "tests/test_top2000_m03r_v7_seadragon_lifecycle.py",
+    ),
+    (
+        "src/rl_quant/workflows/top2000_m03r_v7_seed17_dev.py",
+        "tests/test_top2000_m03r_v7_seed17_generation.py",
+    ),
+    (
+        "src/rl_quant/workflows/top2000_m03r_v7_seed17_operator.py",
+        "tests/test_hold30_m03r_v7_seed17_kubernetes.py",
+    ),
 )
 
 V3_REUSED_NON_HOLD30_SOURCES = (

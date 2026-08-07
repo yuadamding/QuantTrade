@@ -13,9 +13,14 @@ from pathlib import Path
 import pytest
 import torch
 
+from rl_quant.protocol.hold30_alpha_m03r_v7_seed17_top2000_dev import (
+    M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA,
+)
 from rl_quant.workflows.top2000_m03r_v7_package_builder import (
+    BENCHMARK_PREFLIGHT_SCHEMA,
     PINNED_IMAGE_PYTHON,
     PINNED_QUANTTRADE_IMAGE,
+    SEED17_CRITICAL_SOURCE_PATHS,
     Top2000M03RV7CacheContract,
     Top2000M03RV7PackageBuildError,
     build_top2000_m03r_v7_package,
@@ -76,10 +81,11 @@ def _write_cache(
     tmp_path: Path,
     *,
     days: int = 70,
+    first_date: dt.date = dt.date(2024, 1, 2),
 ) -> tuple[Path, Top2000M03RV7CacheContract]:
     actions = ("CASH", "A1", "A2", "A3")
     dates = tuple(
-        (dt.date(2024, 1, 2) + dt.timedelta(days=index)).isoformat()
+        (first_date + dt.timedelta(days=index)).isoformat()
         for index in range(days)
     )
     bars = torch.zeros((days, len(actions), 5), dtype=torch.float32)
@@ -250,5 +256,127 @@ def test_builder_rejects_tracked_symlink(tmp_path: Path) -> None:
         match="only stage-zero regular tracked files",
     ):
         _build(repository, cache, output, contract)
+
+    assert not output.exists()
+
+
+def test_seed17_builder_preflights_all_six_benchmark_slices_on_cpu(
+    tmp_path: Path,
+) -> None:
+    repository = _write_repository(tmp_path)
+    cache, contract = _write_cache(
+        tmp_path,
+        days=1001,
+        first_date=dt.date(2022, 1, 3),
+    )
+    output = tmp_path / "seed17-package"
+
+    result = build_top2000_m03r_v7_package(
+        repository_root=repository,
+        cache_path=cache,
+        output_root=output,
+        cache_contract=contract,
+        critical_source_paths=("src/demo.py",),
+        seed17_diagnostic=True,
+    )
+    plan = validate_top2000_m03r_v7_package(
+        output,
+        cache_contract=contract,
+        seed17_diagnostic=True,
+    )
+    preflight = json.loads(
+        (output / "benchmark-preflight.json").read_text(encoding="utf-8")
+    )
+    execution = json.loads(
+        (output / "execution-manifest.json").read_text(encoding="utf-8")
+    )
+    runtime = json.loads(
+        (output / "runtime-manifest.json").read_text(encoding="utf-8")
+    )
+    package_payload = json.loads(
+        (output / "package-plan.json").read_text(encoding="utf-8")
+    )
+
+    assert package_payload["schema"] == M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA
+    assert preflight["schema"] == BENCHMARK_PREFLIGHT_SCHEMA
+    assert preflight["cpu_only"] is True
+    assert preflight["fold_count"] == 6
+    assert len(preflight["folds"]) == 6
+    assert {row["fold_index"] for row in preflight["folds"]} == set(range(6))
+    assert preflight["max_stock_weight"] == pytest.approx(0.01)
+    assert (
+        plan.benchmark_preflight_sha256
+        == execution["benchmark_preflight_sha256"]
+    )
+    assert (
+        execution["benchmark_trace_cap_identity_sha256"]
+        == preflight["benchmark_trace_cap_identity_sha256"]
+    )
+    assert runtime["worker_argv_prefix"][-1].endswith(
+        "top2000_m03r_v7_seed17_dev"
+    )
+    assert plan.indices[0].paired_seeds == (17,)
+    assert result.package_plan_sha256 == plan.package_plan_sha256
+    assert {
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_seed17_top2000_dev.py",
+        "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_kubernetes.py",
+        "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_package.py",
+        "src/rl_quant/training/top2000_m03r_v7_seadragon_lifecycle.py",
+        "src/rl_quant/workflows/top2000_m03r_v7_seed17_dev.py",
+        "src/rl_quant/workflows/top2000_m03r_v7_seed17_operator.py",
+    }.issubset(SEED17_CRITICAL_SOURCE_PATHS)
+
+    package_payload["schema"] = "rl-quant.wrong-seed17-package-plan"
+    (output / "package-plan.json").write_text(
+        json.dumps(package_payload, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        Top2000M03RV7PackageBuildError,
+        match="schema drifted from the worker loader",
+    ):
+        validate_top2000_m03r_v7_package(
+            output,
+            cache_contract=contract,
+            seed17_diagnostic=True,
+        )
+
+
+def test_seed17_builder_fails_before_publication_on_benchmark_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _write_repository(tmp_path)
+    cache, contract = _write_cache(
+        tmp_path,
+        days=1001,
+        first_date=dt.date(2022, 1, 3),
+    )
+    output = tmp_path / "must-not-exist"
+
+    def fail_benchmark(*_args: object, **_kwargs: object) -> object:
+        raise ValueError(
+            "fill-time benchmark feasibility preflight failed at "
+            "state=408 asset=A1 weight=0.02 cap=0.01"
+        )
+
+    monkeypatch.setattr(
+        "rl_quant.workflows.top2000_m03r_v7_package_builder."
+        "build_top2000_hold30_development_sequence_from_loaded_cache",
+        fail_benchmark,
+    )
+
+    with pytest.raises(
+        Top2000M03RV7PackageBuildError,
+        match=r"state=408 asset=A1 weight=0.02 cap=0.01",
+    ):
+        build_top2000_m03r_v7_package(
+            repository_root=repository,
+            cache_path=cache,
+            output_root=output,
+            cache_contract=contract,
+            critical_source_paths=("src/demo.py",),
+            seed17_diagnostic=True,
+        )
 
     assert not output.exists()

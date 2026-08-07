@@ -25,22 +25,41 @@ from typing import Any
 import torch
 
 from rl_quant.datasets.raw_window import BAR_FIELDS
-from rl_quant.envs.hold30 import CohortLedger
+from rl_quant.envs.hold30 import CohortLedger, reconcile_cash_simplex_roundoff
 from rl_quant.training.hold30_runtime import Hold30Sequence
 
-TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA = (
+TOP2000_HOLD30_LEGACY_DEVELOPMENT_ADAPTER_SCHEMA = (
     "rl-quant.top2000-hold30-development-cache-adapter-v1"
+)
+TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA = (
+    "rl-quant.top2000-hold30-development-cache-adapter-v2"
 )
 TOP2000_HOLD30_SOURCE_BAR_SECONDS = 300
 TOP2000_HOLD30_SOURCE_BAR_IDENTITY = "5-minute-bars"
 TOP2000_HOLD30_OBSERVATION_REPRESENTATION = "daily-ohlcv-aggregated-from-5-minute-bars"
 TOP2000_HOLD30_UNIVERSE_IDENTITY = "future-selected-top2000-development-only"
-TOP2000_HOLD30_BENCHMARK_ID = (
+TOP2000_HOLD30_LEGACY_BENCHMARK_ID = (
     "C1-monthly-point-in-time-equal-weight-rebalance-and-drift-development-v1"
+)
+TOP2000_HOLD30_BENCHMARK_ID = (
+    "C1-monthly-point-in-time-equal-weight-rebalance-drift-and-risk-repair-"
+    "development-v2"
 )
 TOP2000_HOLD30_MAX_STATE_ROWS = 378
 TOP2000_HOLD30_CASH_INDEX = 0
 TOP2000_HOLD30_TRAINING_COST_RATE = 0.002
+TOP2000_HOLD30_MAX_STOCK_WEIGHT = 0.01
+TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT = 1.0
+TOP2000_HOLD30_BENCHMARK_INITIALIZATION_RULE = (
+    "equal-weight-risky-endowment-at-first-state-then-hard-risk-repair-"
+    "to-cash-no-startup-cost"
+)
+TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE = (
+    "after-drift-availability-and-any-monthly-target;"
+    "clip-risky-names-to-min-fill-cap-and-bound-max-stock-weight;"
+    "scale-to-fill-gross-ceiling;release-to-cash;"
+    "charge-post-startup-one-way-turnover"
+)
 DEVELOPMENT_ACK = "I acknowledge TOP2000 results are development-only"
 
 _TOP2000_CACHE_SCHEMA_VERSION = 1
@@ -413,22 +432,24 @@ def load_verified_top2000_hold30_development_cache(
 
 @dataclass(frozen=True, slots=True)
 class Top2000MonthlyEqualWeightBuyAndDriftTrace:
-    """Transparent C1 benchmark rebalanced at the first state of each month.
+    """Transparent, fill-feasible C1 benchmark rebalanced monthly.
 
     The first book is an uncharged equal-weight endowment over risky names
-    available at the first state.  Thereafter it earns the next close-to-close
-    return, performs availability-forced sales into CASH, and re-establishes
-    equal weight at the first state of each new calendar month over names that
-    were visible at the preceding decision and remain tradable at the fill.
-    This gives the deterministic benchmark the same one-session causal
-    availability contract as the policy.  Both forced and rebalance turnover
-    pay the same one-way linear cost as the policy.
+    available at the first state, repaired into the policy's hard cap/gross
+    envelope without a startup charge.  Thereafter it earns the next
+    close-to-close return, performs availability- and risk-forced sales into
+    CASH, and re-establishes equal weight at the first state of each new
+    calendar month over names that were visible at the preceding decision and
+    remain tradable at the fill.  The final fill book is then repaired through
+    the same deterministic risk projection as the policy.  Every post-startup
+    forced or rebalance trade pays the same one-way linear cost as the policy.
     """
 
     weights: torch.Tensor
     gross_returns: torch.Tensor
     availability_forced_one_way_turnover: torch.Tensor
     monthly_rebalance_one_way_turnover: torch.Tensor
+    risk_forced_one_way_turnover: torch.Tensor
     total_one_way_turnover: torch.Tensor
     costs: torch.Tensor
     net_returns: torch.Tensor
@@ -444,6 +465,7 @@ class Top2000MonthlyEqualWeightBuyAndDriftTrace:
             "gross_returns",
             "availability_forced_one_way_turnover",
             "monthly_rebalance_one_way_turnover",
+            "risk_forced_one_way_turnover",
             "total_one_way_turnover",
             "costs",
             "net_returns",
@@ -475,6 +497,7 @@ class Top2000MonthlyEqualWeightBuyAndDriftTrace:
         if (
             bool((self.availability_forced_one_way_turnover < 0).any())
             or bool((self.monthly_rebalance_one_way_turnover < 0).any())
+            or bool((self.risk_forced_one_way_turnover < 0).any())
             or bool((self.total_one_way_turnover < 0).any())
             or bool((self.costs < 0).any())
         ):
@@ -485,7 +508,8 @@ class Top2000MonthlyEqualWeightBuyAndDriftTrace:
             torch.allclose(
                 self.total_one_way_turnover,
                 self.availability_forced_one_way_turnover
-                + self.monthly_rebalance_one_way_turnover,
+                + self.monthly_rebalance_one_way_turnover
+                + self.risk_forced_one_way_turnover,
             )
         ):
             raise Top2000Hold30DevelopmentError(
@@ -493,8 +517,28 @@ class Top2000MonthlyEqualWeightBuyAndDriftTrace:
             )
         if not bool(torch.allclose(self.net_returns, self.gross_returns - self.costs)):
             raise Top2000Hold30DevelopmentError(
-                "benchmark net return must equal gross return minus forced-sale cost"
+                "benchmark net return must equal gross return minus trading cost"
             )
+
+    @property
+    def trace_sha256(self) -> str:
+        """Bind every economic and cause-typed benchmark array."""
+
+        return _canonical_sha256(
+            {
+                name: _tensor_sha256(getattr(self, name))
+                for name in (
+                    "weights",
+                    "gross_returns",
+                    "availability_forced_one_way_turnover",
+                    "monthly_rebalance_one_way_turnover",
+                    "risk_forced_one_way_turnover",
+                    "total_one_way_turnover",
+                    "costs",
+                    "net_returns",
+                )
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,6 +552,7 @@ class Top2000Hold30DevelopmentIdentity:
     date_slice_sha256: str
     benchmark_weights_sha256: str
     benchmark_net_returns_sha256: str
+    benchmark_trace_sha256: str
     state_start_index: int
     state_stop_index_exclusive: int
     first_exchange_date: str
@@ -516,14 +561,13 @@ class Top2000Hold30DevelopmentIdentity:
     transition_rows: int
     action_count: int
     one_way_cost_rate: float
+    max_stock_weight: float
     source_bar_seconds: int = TOP2000_HOLD30_SOURCE_BAR_SECONDS
     source_bar_identity: str = TOP2000_HOLD30_SOURCE_BAR_IDENTITY
     observation_representation: str = TOP2000_HOLD30_OBSERVATION_REPRESENTATION
     universe_identity: str = TOP2000_HOLD30_UNIVERSE_IDENTITY
     benchmark_id: str = TOP2000_HOLD30_BENCHMARK_ID
-    benchmark_initialization: str = (
-        "equal-weight-risky-endowment-at-first-state-no-startup-cost"
-    )
+    benchmark_initialization: str = TOP2000_HOLD30_BENCHMARK_INITIALIZATION_RULE
     policy_initial_ledger_rule: str = (
         "common-c1-endowment-staggered-untracked-ages-0-through-29"
     )
@@ -532,6 +576,7 @@ class Top2000Hold30DevelopmentIdentity:
         "fill-available-risky;"
         "availability-forced-sales-to-cash"
     )
+    benchmark_risk_repair_rule: str = TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE
     availability_semantics: str = (
         "legacy-cache-availability-used-for-membership-and-tradability"
     )
@@ -550,6 +595,7 @@ class Top2000Hold30DevelopmentIdentity:
             "date_slice_sha256",
             "benchmark_weights_sha256",
             "benchmark_net_returns_sha256",
+            "benchmark_trace_sha256",
         ):
             _require_digest(name, getattr(self, name))
         if (
@@ -560,6 +606,10 @@ class Top2000Hold30DevelopmentIdentity:
             != TOP2000_HOLD30_OBSERVATION_REPRESENTATION
             or self.universe_identity != TOP2000_HOLD30_UNIVERSE_IDENTITY
             or self.benchmark_id != TOP2000_HOLD30_BENCHMARK_ID
+            or self.benchmark_initialization
+            != TOP2000_HOLD30_BENCHMARK_INITIALIZATION_RULE
+            or self.benchmark_risk_repair_rule
+            != TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE
         ):
             raise Top2000Hold30DevelopmentError(
                 "TOP2000 development adapter identity drifted"
@@ -586,6 +636,9 @@ class Top2000Hold30DevelopmentIdentity:
             or not 2 <= self.state_rows <= TOP2000_HOLD30_MAX_STATE_ROWS
             or self.action_count < 2
             or self.one_way_cost_rate != TOP2000_HOLD30_TRAINING_COST_RATE
+            or isinstance(self.max_stock_weight, bool)
+            or not isinstance(self.max_stock_weight, (int, float))
+            or not 0.0 < float(self.max_stock_weight) <= 1.0
         ):
             raise Top2000Hold30DevelopmentError(
                 "TOP2000 slice geometry or cost identity is invalid"
@@ -658,32 +711,118 @@ def _equal_weight_target(
     return target
 
 
+def _benchmark_risk_project(
+    weights: torch.Tensor,
+    asset_caps: torch.Tensor,
+    gross_max: torch.Tensor,
+    *,
+    cash_index: int,
+    max_stock_weight: float,
+) -> torch.Tensor:
+    """Apply the caller-bound cap/gross envelope without hidden globals."""
+
+    risky = torch.ones_like(weights, dtype=torch.bool)
+    risky[:, cash_index] = False
+    cap = torch.where(
+        risky,
+        torch.minimum(
+            asset_caps.clamp_min(0.0),
+            weights.new_tensor(max_stock_weight),
+        ),
+        torch.zeros_like(asset_caps),
+    )
+    held = torch.where(risky, weights.clamp_min(0.0), torch.zeros_like(weights))
+    held = torch.minimum(held, cap)
+    hard_gross = torch.minimum(
+        torch.ones_like(gross_max),
+        torch.minimum(gross_max.clamp_min(0.0), cap.sum(-1)),
+    )
+    gross = held.sum(-1)
+    scale = torch.where(
+        gross > hard_gross,
+        hard_gross / gross.clamp_min(1.0e-18),
+        torch.ones_like(gross),
+    )
+    held = held * scale.unsqueeze(-1)
+    target = held.clone()
+    target[:, cash_index] = 1.0 - held.sum(-1)
+    return reconcile_cash_simplex_roundoff(
+        target,
+        cash_index=cash_index,
+        risky_gross_limit=hard_gross,
+    )
+
+
 def _monthly_equal_weight_buy_and_drift(
     asset_returns: torch.Tensor,
     availability: torch.Tensor,
+    risk_asset_caps: torch.Tensor,
+    risk_gross_max: torch.Tensor,
     exchange_dates: tuple[str, ...],
     *,
     cost_rate: float,
     cash_index: int,
+    max_stock_weight: float = TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT,
 ) -> Top2000MonthlyEqualWeightBuyAndDriftTrace:
     transitions, assets = asset_returns.shape
     if availability.shape != (transitions + 1, assets):
         raise Top2000Hold30DevelopmentError(
             "benchmark availability must have one row beyond returns"
         )
+    if (
+        risk_asset_caps.shape != (transitions + 1, assets)
+        or risk_asset_caps.dtype != asset_returns.dtype
+        or risk_asset_caps.device != asset_returns.device
+        or not bool(torch.isfinite(risk_asset_caps).all())
+        or bool((risk_asset_caps < 0).any())
+    ):
+        raise Top2000Hold30DevelopmentError(
+            "benchmark risk caps must be finite, nonnegative, and align with states"
+        )
+    if (
+        risk_gross_max.shape != (transitions + 1,)
+        or risk_gross_max.dtype != asset_returns.dtype
+        or risk_gross_max.device != asset_returns.device
+        or not bool(torch.isfinite(risk_gross_max).all())
+        or bool(((risk_gross_max < 0) | (risk_gross_max > 1)).any())
+    ):
+        raise Top2000Hold30DevelopmentError(
+            "benchmark gross ceilings must be finite [state] values in [0,1]"
+        )
     if len(exchange_dates) != transitions + 1:
         raise Top2000Hold30DevelopmentError(
             "benchmark exchange dates must align with states"
         )
+    if (
+        isinstance(max_stock_weight, bool)
+        or not isinstance(max_stock_weight, (int, float))
+        or not 0.0 < float(max_stock_weight) <= 1.0
+    ):
+        raise Top2000Hold30DevelopmentError(
+            "benchmark max_stock_weight must be a finite fraction in (0,1]"
+        )
+    max_stock_weight = float(max_stock_weight)
     parsed_dates = tuple(dt.date.fromisoformat(value) for value in exchange_dates)
     weights = asset_returns.new_zeros((transitions + 1, assets))
-    weights[0] = _equal_weight_target(
+    initial_target = _equal_weight_target(
         availability[0], cash_index=cash_index, dtype=asset_returns.dtype
     )
+    weights[0] = _benchmark_risk_project(
+        initial_target.unsqueeze(0),
+        risk_asset_caps[0].unsqueeze(0),
+        risk_gross_max[0].reshape(1),
+        cash_index=cash_index,
+        max_stock_weight=max_stock_weight,
+    ).squeeze(0)
+    if bool((weights[0][~availability[0]] != 0).any()):
+        raise Top2000Hold30DevelopmentError(
+            "risk-repaired benchmark endowment violated initial availability"
+        )
 
     gross = asset_returns.new_zeros(transitions)
     availability_turnover = asset_returns.new_zeros(transitions)
     rebalance_turnover = asset_returns.new_zeros(transitions)
+    risk_turnover = asset_returns.new_zeros(transitions)
     costs = asset_returns.new_zeros(transitions)
     for index in range(transitions):
         gross[index] = (weights[index] * asset_returns[index]).sum()
@@ -720,8 +859,19 @@ def _monthly_equal_weight_buy_and_drift(
             )
             rebalance_turnover[index] = 0.5 * (target - repaired).abs().sum()
             repaired = target
+        risk_repaired = _benchmark_risk_project(
+            repaired.unsqueeze(0),
+            risk_asset_caps[index + 1].unsqueeze(0),
+            risk_gross_max[index + 1].reshape(1),
+            cash_index=cash_index,
+            max_stock_weight=max_stock_weight,
+        ).squeeze(0)
+        risk_turnover[index] = 0.5 * (risk_repaired - repaired).abs().sum()
+        repaired = risk_repaired
         costs[index] = cost_rate * (
-            availability_turnover[index] + rebalance_turnover[index]
+            availability_turnover[index]
+            + rebalance_turnover[index]
+            + risk_turnover[index]
         )
         weights[index + 1] = repaired
     net = gross - costs
@@ -730,7 +880,10 @@ def _monthly_equal_weight_buy_and_drift(
         gross_returns=gross,
         availability_forced_one_way_turnover=availability_turnover,
         monthly_rebalance_one_way_turnover=rebalance_turnover,
-        total_one_way_turnover=availability_turnover + rebalance_turnover,
+        risk_forced_one_way_turnover=risk_turnover,
+        total_one_way_turnover=(
+            availability_turnover + rebalance_turnover + risk_turnover
+        ),
         costs=costs,
         net_returns=net,
     )
@@ -742,6 +895,7 @@ def build_top2000_hold30_development_sequence_from_loaded_cache(
     state_start_index: int,
     state_stop_index_exclusive: int,
     max_state_rows: int = TOP2000_HOLD30_MAX_STATE_ROWS,
+    max_stock_weight: float = TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT,
     output_device: str | torch.device = "cpu",
 ) -> Top2000Hold30DevelopmentSequence:
     """Build one causal sequence without rereading or rehashing the cache file."""
@@ -759,6 +913,15 @@ def build_top2000_hold30_development_sequence_from_loaded_cache(
         raise Top2000Hold30DevelopmentError(
             f"max_state_rows must lie in [2,{TOP2000_HOLD30_MAX_STATE_ROWS}]"
         )
+    if (
+        isinstance(max_stock_weight, bool)
+        or not isinstance(max_stock_weight, (int, float))
+        or not 0.0 < float(max_stock_weight) <= 1.0
+    ):
+        raise Top2000Hold30DevelopmentError(
+            "max_stock_weight must be a finite fraction in (0,1]"
+        )
+    max_stock_weight = float(max_stock_weight)
     if (
         isinstance(state_start_index, bool)
         or not isinstance(state_start_index, int)
@@ -787,13 +950,75 @@ def build_top2000_hold30_development_sequence_from_loaded_cache(
         selected_dates,
         output_device=output_device,
     )
+    risk_caps = torch.zeros_like(masks, dtype=asset_returns.dtype)
+    risk_caps[..., TOP2000_HOLD30_CASH_INDEX] = 1.0
+    risk_caps[..., 1:] = (
+        masks[..., 1:].to(asset_returns.dtype) * max_stock_weight
+    )
+    risk_gross = asset_returns.new_ones((len(selected_dates), 1))
     benchmark = _monthly_equal_weight_buy_and_drift(
         asset_returns[:, 0],
         masks[:, 0],
+        risk_caps[:, 0],
+        risk_gross[:, 0],
         selected_dates,
         cost_rate=TOP2000_HOLD30_TRAINING_COST_RATE,
         cash_index=TOP2000_HOLD30_CASH_INDEX,
+        max_stock_weight=max_stock_weight,
     )
+
+    # Fail before any model or GPU work if the benchmark cannot serve as the
+    # exact factor-neutral execution anchor under the policy's causal fill
+    # constraints.  Position zero has no preceding order; every later row must
+    # additionally have been visible at the prior decision.
+    causal_fill_mask = masks[:, 0].clone()
+    causal_fill_mask[1:] &= masks[:-1, 0]
+    causal_fill_mask[:, TOP2000_HOLD30_CASH_INDEX] = True
+    risky = torch.ones_like(causal_fill_mask, dtype=torch.bool)
+    risky[:, TOP2000_HOLD30_CASH_INDEX] = False
+    effective_caps = torch.where(
+        risky & causal_fill_mask,
+        torch.minimum(
+            risk_caps[:, 0],
+            risk_caps.new_tensor(max_stock_weight),
+        ),
+        torch.zeros_like(risk_caps[:, 0]),
+    )
+    effective_caps[:, TOP2000_HOLD30_CASH_INDEX] = 1.0
+    benchmark_gross = torch.where(
+        risky,
+        benchmark.weights,
+        torch.zeros_like(benchmark.weights),
+    ).sum(-1)
+    feasibility_tolerance = 5.0e-6
+    infeasible = (
+        (benchmark.weights < -feasibility_tolerance)
+        | (benchmark.weights - effective_caps > feasibility_tolerance)
+    )
+    gross_infeasible = (
+        benchmark_gross - risk_gross[:, 0] > feasibility_tolerance
+    )
+    if bool(infeasible.any()) or bool(gross_infeasible.any()):
+        first_state = int(
+            torch.nonzero(
+                infeasible.any(-1) | gross_infeasible,
+                as_tuple=False,
+            )[0, 0].item()
+        )
+        first_asset = (
+            int(torch.nonzero(infeasible[first_state], as_tuple=False)[0, 0].item())
+            if bool(infeasible[first_state].any())
+            else TOP2000_HOLD30_CASH_INDEX
+        )
+        raise Top2000Hold30DevelopmentError(
+            "fill-time benchmark feasibility preflight failed at "
+            f"state={first_state} date={selected_dates[first_state]} "
+            f"asset={actions[first_asset]} "
+            f"weight={float(benchmark.weights[first_state, first_asset]):g} "
+            f"cap={float(effective_caps[first_state, first_asset]):g} "
+            f"gross={float(benchmark_gross[first_state]):g} "
+            f"gross_max={float(risk_gross[first_state, 0]):g}"
+        )
 
     identity = Top2000Hold30DevelopmentIdentity(
         cache_sha256=cache.cache_sha256,
@@ -803,6 +1028,7 @@ def build_top2000_hold30_development_sequence_from_loaded_cache(
         date_slice_sha256=_canonical_sha256({"exchange_dates": list(selected_dates)}),
         benchmark_weights_sha256=_tensor_sha256(benchmark.weights),
         benchmark_net_returns_sha256=_tensor_sha256(benchmark.net_returns),
+        benchmark_trace_sha256=benchmark.trace_sha256,
         state_start_index=state_start_index,
         state_stop_index_exclusive=state_stop_index_exclusive,
         first_exchange_date=selected_dates[0],
@@ -811,12 +1037,9 @@ def build_top2000_hold30_development_sequence_from_loaded_cache(
         transition_rows=len(selected_dates) - 1,
         action_count=len(actions),
         one_way_cost_rate=TOP2000_HOLD30_TRAINING_COST_RATE,
+        max_stock_weight=max_stock_weight,
     )
 
-    risk_caps = torch.zeros_like(masks, dtype=asset_returns.dtype)
-    risk_caps[..., TOP2000_HOLD30_CASH_INDEX] = 1.0
-    risk_caps[..., 1:] = masks[..., 1:].to(asset_returns.dtype) * 0.01
-    risk_gross = asset_returns.new_ones((len(selected_dates), 1))
     initial_weights = benchmark.weights[0].unsqueeze(0)
     sequence = Hold30Sequence(
         decision_state=decision_state,
@@ -860,6 +1083,7 @@ def build_top2000_hold30_development_sequence(
     state_start_index: int,
     state_stop_index_exclusive: int,
     max_state_rows: int = TOP2000_HOLD30_MAX_STATE_ROWS,
+    max_stock_weight: float = TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT,
     output_device: str | torch.device = "cpu",
     acknowledgement: str,
 ) -> Top2000Hold30DevelopmentSequence:
@@ -881,6 +1105,7 @@ def build_top2000_hold30_development_sequence(
         state_start_index=state_start_index,
         state_stop_index_exclusive=state_stop_index_exclusive,
         max_state_rows=max_state_rows,
+        max_stock_weight=max_stock_weight,
         output_device=output_device,
     )
 
@@ -888,8 +1113,14 @@ def build_top2000_hold30_development_sequence(
 __all__ = [
     "DEVELOPMENT_ACK",
     "TOP2000_HOLD30_BENCHMARK_ID",
+    "TOP2000_HOLD30_BENCHMARK_INITIALIZATION_RULE",
+    "TOP2000_HOLD30_BENCHMARK_RISK_REPAIR_RULE",
+    "TOP2000_HOLD30_DEFAULT_MAX_STOCK_WEIGHT",
     "TOP2000_HOLD30_DEVELOPMENT_ADAPTER_SCHEMA",
+    "TOP2000_HOLD30_LEGACY_BENCHMARK_ID",
+    "TOP2000_HOLD30_LEGACY_DEVELOPMENT_ADAPTER_SCHEMA",
     "TOP2000_HOLD30_MAX_STATE_ROWS",
+    "TOP2000_HOLD30_MAX_STOCK_WEIGHT",
     "TOP2000_HOLD30_OBSERVATION_REPRESENTATION",
     "TOP2000_HOLD30_SOURCE_BAR_IDENTITY",
     "TOP2000_HOLD30_SOURCE_BAR_SECONDS",

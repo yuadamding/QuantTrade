@@ -286,6 +286,21 @@ dates: 2022-01-03 through 2025-12-29
 role: future-selected TOP2000 development-only, nonreportable
 ```
 
+The executable compatibility adapter uses the content-distinct v2 benchmark
+identity
+`C1-monthly-point-in-time-equal-weight-rebalance-drift-and-risk-repair-development-v2`.
+It retains the causal monthly equal-weight buy-and-drift rule, then applies a
+caller-bound fill-time per-name cap and gross-risk repair.  The governed M03R
+TOP2000 runtime must explicitly pass `max_stock_weight=0.01`; the adapter's
+generic default remains 1.0 so small-universe unit fixtures retain their prior
+equal-weight geometry.  The exact bound cap is part of the adapter receipt.
+Risk-forced benchmark sales move to CASH, are recorded separately from
+availability and monthly-rebalance turnover, and pay the common one-way cost.
+The uncharged initial endowment is repaired before use.  Consequently the
+exact benchmark weight path used as the factor-neutral execution anchor is
+also the path that generates the bound benchmark net-return series; the
+historical uncapped v1 identity cannot label these arrays.
+
 Every training replay has 378 state rows: 251 observation-only warmup
 decisions, 63 loss-bearing origins, and enough detached support for the full
 63-return auxiliary label. Each origin still owns exactly 30 post-fill
