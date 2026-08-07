@@ -1,69 +1,106 @@
-"""Two-stage training for the learning framework, decoupled to enforce the context/policy split.
+"""Two-stage training for the learning framework.
 
-  * context_pretrain -- Stage 1: self-supervised context learning, then freeze + encode windows to detached
-    context embeddings while carrying raw bars forward.
-  * decision_policy  -- Stage 2: differentiable-portfolio policy learning on detached context plus a trainable
-    raw-second policy encoder.
-
-Both expose resumable training routines (start_step + optimizer + checkpoint callback); persistence/resume
-orchestration is the caller's (the driver's) job.
+The public convenience exports remain available, but their implementation
+modules are imported only when a caller requests an exported name.  This keeps
+lightweight orchestration modules below :mod:`rl_quant.training` usable from a
+host-side lifecycle process that deliberately does not install PyTorch.
 """
+
 from __future__ import annotations
 
-from rl_quant.training.context_pretrain import (
-    encode_days,
-    freeze_encoder,
-    ssl_targets,
-    ssl_targets_daily,
-    ssl_targets_perstock,
-    train_context_encoder,
-)
-from rl_quant.training.daily_policy import (
-    daily_cost_paid_baselines,
-    daily_policy_telemetry,
-    evaluate_daily_detailed,
-    train_daily_policy,
-)
-from rl_quant.training.decision_policy import (
-    cost_paid_baselines,
-    evaluate_policy,
-    evaluate_policy_detailed,
-    policy_telemetry,
-    train_decision_policy,
-)
-from rl_quant.training.designs import (
-    DEFAULT_DESIGN,
-    DESIGNS,
-    SWEEP,
-    TOP2000_H100_CORE_SWEEP,
-    TOP2000_H100_WIDE_SWEEP,
-    TOP50_H100_CORE_SWEEP,
-    TOP50_H100_WIDE_SWEEP,
-    Phase1Design,
-)
+from importlib import import_module
+from typing import Any, Final
 
-__all__ = [
-    "DEFAULT_DESIGN",
-    "DESIGNS",
-    "Phase1Design",
-    "SWEEP",
-    "TOP2000_H100_CORE_SWEEP",
-    "TOP2000_H100_WIDE_SWEEP",
-    "TOP50_H100_CORE_SWEEP",
-    "TOP50_H100_WIDE_SWEEP",
-    "cost_paid_baselines",
-    "daily_cost_paid_baselines",
-    "daily_policy_telemetry",
-    "encode_days",
-    "evaluate_daily_detailed",
-    "evaluate_policy",
-    "evaluate_policy_detailed",
-    "freeze_encoder",
-    "policy_telemetry",
-    "ssl_targets",
-    "ssl_targets_daily",
-    "ssl_targets_perstock",
-    "train_context_encoder",
-    "train_daily_policy",
-    "train_decision_policy",
-]
+_LAZY_EXPORTS: Final[dict[str, tuple[str, str]]] = {
+    "encode_days": ("rl_quant.training.context_pretrain", "encode_days"),
+    "freeze_encoder": ("rl_quant.training.context_pretrain", "freeze_encoder"),
+    "ssl_targets": ("rl_quant.training.context_pretrain", "ssl_targets"),
+    "ssl_targets_daily": (
+        "rl_quant.training.context_pretrain",
+        "ssl_targets_daily",
+    ),
+    "ssl_targets_perstock": (
+        "rl_quant.training.context_pretrain",
+        "ssl_targets_perstock",
+    ),
+    "train_context_encoder": (
+        "rl_quant.training.context_pretrain",
+        "train_context_encoder",
+    ),
+    "daily_cost_paid_baselines": (
+        "rl_quant.training.daily_policy",
+        "daily_cost_paid_baselines",
+    ),
+    "daily_policy_telemetry": (
+        "rl_quant.training.daily_policy",
+        "daily_policy_telemetry",
+    ),
+    "evaluate_daily_detailed": (
+        "rl_quant.training.daily_policy",
+        "evaluate_daily_detailed",
+    ),
+    "train_daily_policy": (
+        "rl_quant.training.daily_policy",
+        "train_daily_policy",
+    ),
+    "cost_paid_baselines": (
+        "rl_quant.training.decision_policy",
+        "cost_paid_baselines",
+    ),
+    "evaluate_policy": (
+        "rl_quant.training.decision_policy",
+        "evaluate_policy",
+    ),
+    "evaluate_policy_detailed": (
+        "rl_quant.training.decision_policy",
+        "evaluate_policy_detailed",
+    ),
+    "policy_telemetry": (
+        "rl_quant.training.decision_policy",
+        "policy_telemetry",
+    ),
+    "train_decision_policy": (
+        "rl_quant.training.decision_policy",
+        "train_decision_policy",
+    ),
+    "DEFAULT_DESIGN": ("rl_quant.training.designs", "DEFAULT_DESIGN"),
+    "DESIGNS": ("rl_quant.training.designs", "DESIGNS"),
+    "SWEEP": ("rl_quant.training.designs", "SWEEP"),
+    "TOP2000_H100_CORE_SWEEP": (
+        "rl_quant.training.designs",
+        "TOP2000_H100_CORE_SWEEP",
+    ),
+    "TOP2000_H100_WIDE_SWEEP": (
+        "rl_quant.training.designs",
+        "TOP2000_H100_WIDE_SWEEP",
+    ),
+    "TOP50_H100_CORE_SWEEP": (
+        "rl_quant.training.designs",
+        "TOP50_H100_CORE_SWEEP",
+    ),
+    "TOP50_H100_WIDE_SWEEP": (
+        "rl_quant.training.designs",
+        "TOP50_H100_WIDE_SWEEP",
+    ),
+    "Phase1Design": ("rl_quant.training.designs", "Phase1Design"),
+}
+
+__all__ = list(_LAZY_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Load one legacy convenience export on first use."""
+
+    try:
+        module_name, attribute_name = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose lazy public names to interactive and documentation tooling."""
+
+    return sorted(set(globals()) | set(__all__))

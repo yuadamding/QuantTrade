@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,38 @@ SETTING_IDS = lifecycle.M03R_SEED17_TOP2000_SETTING_IDS
 PACKAGE_SHA = "d" * 64
 SOURCE_SHA = "e" * 64
 CAPACITY_SHA = "f" * 64
+
+
+def test_lifecycle_import_does_not_require_torch() -> None:
+    """The detached host supervisor must remain a standard-library surface."""
+
+    repository = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(repository / "src")
+    program = """
+import importlib.abc
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ModuleNotFoundError("torch deliberately unavailable")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+import rl_quant.training.top2000_m03r_v7_seadragon_lifecycle as lifecycle
+assert lifecycle.ATTACH_CONFIG_SCHEMA
+assert "torch" not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=repository,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def _bytes(value: Any) -> bytes:
