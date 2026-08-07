@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from rl_quant.protocol.hold30_alpha_m03r_v7_seed17_top2000_dev import (
@@ -220,9 +220,81 @@ def build_m03r_v7_seed17_top2000_package_plan(
     return M03RV7Seed17PackagePlan(**fields, package_plan_sha256=digest)
 
 
+def load_m03r_v7_seed17_top2000_package_plan(
+    path: str | Path,
+    *,
+    expected_package_plan_sha256: str,
+    require_file_location_matches_plan: bool,
+) -> M03RV7Seed17PackagePlan:
+    """Load one package copy while preserving its in-container plan identity.
+
+    Operators read an immutable copy from an arbitrary local staging path, but
+    workers must read the plan from the exact container pathname bound into the
+    package.  The explicit flag keeps those two trust boundaries distinct.
+    """
+
+    plan_path = Path(path)
+    if (
+        len(expected_package_plan_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_package_plan_sha256
+        )
+    ):
+        raise M03RV7Seed17PackageError(
+            "expected seed-17 package-plan hash is invalid"
+        )
+    try:
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise M03RV7Seed17PackageError(
+            "seed-17 package plan cannot be read"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.pop("schema", None)
+        != "rl-quant.top2000-dev.m03r-v7-seed17-package-plan-file-v1"
+    ):
+        raise M03RV7Seed17PackageError(
+            "seed-17 package plan file schema drifted"
+        )
+    try:
+        payload["artifacts"] = M03RV7Top2000ArtifactBindings(
+            **payload["artifacts"]
+        )
+        payload["runtime_profile"] = M03RV7Top2000RuntimeProfile(
+            **payload["runtime_profile"]
+        )
+        payload["indices"] = tuple(
+            M03RV7Seed17IndexPlan(
+                **{
+                    **row,
+                    "fold_indices": tuple(row["fold_indices"]),
+                    "paired_seeds": tuple(row["paired_seeds"]),
+                }
+            )
+            for row in payload["indices"]
+        )
+        plan = M03RV7Seed17PackagePlan(**payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise M03RV7Seed17PackageError(
+            "seed-17 package failed typed validation"
+        ) from exc
+    if plan.package_plan_sha256 != expected_package_plan_sha256:
+        raise M03RV7Seed17PackageError("seed-17 package hash drifted")
+    if require_file_location_matches_plan and plan.plan_artifact_path != str(
+        plan_path
+    ):
+        raise M03RV7Seed17PackageError(
+            "seed-17 worker plan path drifted from the container binding"
+        )
+    return plan
+
+
 __all__ = [
     "M03RV7Seed17IndexPlan",
     "M03RV7Seed17PackageError",
     "M03RV7Seed17PackagePlan",
     "build_m03r_v7_seed17_top2000_package_plan",
+    "load_m03r_v7_seed17_top2000_package_plan",
 ]

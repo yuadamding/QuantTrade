@@ -514,6 +514,48 @@ def _operator_artifact(
     return artifact_path
 
 
+def test_local_operator_preserves_container_plan_path(tmp_path: Path) -> None:
+    """A local plan copy must retain the immutable in-container mount path."""
+
+    plan = _package().plan
+    package_path = tmp_path / "package-plan-copy.json"
+    payload = asdict(plan)
+    payload["schema"] = M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA
+    _write_json(package_path, payload)
+    live_path = tmp_path / "live.json"
+    template_path = tmp_path / "template.json"
+    manifest_path = tmp_path / "sentinel.json"
+    rendered_path = tmp_path / "sentinel-receipt.json"
+    _write_json(live_path, asdict(_live_evidence()))
+    _write_json(template_path, asdict(_template()))
+
+    assert operator_main(
+        [
+            "render-sentinel",
+            "--package-plan",
+            str(package_path),
+            "--package-plan-sha256",
+            plan.package_plan_sha256,
+            "--live-evidence",
+            str(live_path),
+            "--template",
+            str(template_path),
+            "--now-utc",
+            "2026-08-07T12:01:00+00:00",
+            "--manifest-output",
+            str(manifest_path),
+            "--rendered-output",
+            str(rendered_path),
+            "--completion-index",
+            "3",
+        ]
+    ) == 0
+    manifest = json.loads(manifest_path.read_bytes())
+    arguments = manifest["spec"]["template"]["spec"]["containers"][0]["args"]
+    package_argument = arguments.index("--package-plan")
+    assert arguments[package_argument + 1] == plan.plan_artifact_path
+
+
 def test_seed17_operator_renders_qualifies_final_and_binds_activation(
     tmp_path: Path,
 ) -> None:

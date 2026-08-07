@@ -42,8 +42,8 @@ from rl_quant.training.hold30_alpha_m03r_v7_seed17_kubernetes import (
 )
 from rl_quant.training.hold30_alpha_m03r_v7_seed17_package import (
     M03RV7Seed17PackagePlan,
+    load_m03r_v7_seed17_top2000_package_plan,
 )
-from rl_quant.workflows.top2000_m03r_v7_seed17_dev import load_package_plan
 
 
 class Top2000M03RV7Seed17OperatorError(RuntimeError):
@@ -189,9 +189,10 @@ def _now(value: str) -> datetime:
 
 
 def _load_plan(args: argparse.Namespace) -> M03RV7Seed17PackagePlan:
-    return load_package_plan(
+    return load_m03r_v7_seed17_top2000_package_plan(
         args.package_plan,
         expected_package_plan_sha256=args.package_plan_sha256,
+        require_file_location_matches_plan=False,
     )
 
 

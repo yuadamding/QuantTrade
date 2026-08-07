@@ -24,7 +24,6 @@ from rl_quant.protocol.hold30_alpha_m03r_v7_seed17_top2000_dev import (
     M03R_SEED17_TOP2000_DATA_ROLE,
     M03R_SEED17_TOP2000_DESIGN_ID,
     M03R_SEED17_TOP2000_FOLDS,
-    M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA,
     M03R_SEED17_TOP2000_PROTOCOL_GENERATION,
     M03R_SEED17_TOP2000_PROTOCOL_SHA256,
     M03R_SEED17_TOP2000_SEEDS,
@@ -33,14 +32,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v7_seed17_top2000_dev import (
 from rl_quant.protocol.hold30_alpha_m03r_v7_seed17_top2000_dev import (
     runtime_setting_id as resolve_runtime_setting_id,
 )
-from rl_quant.training.hold30_alpha_m03r_v7_package import (
-    M03RV7Top2000ArtifactBindings,
-    M03RV7Top2000RuntimeProfile,
-)
 from rl_quant.training.hold30_alpha_m03r_v7_seed17_package import (
-    M03RV7Seed17IndexPlan,
     M03RV7Seed17PackageError,
     M03RV7Seed17PackagePlan,
+    load_m03r_v7_seed17_top2000_package_plan,
 )
 from rl_quant.training.top2000_m03r_v7_dev import (
     TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS,
@@ -189,54 +184,16 @@ def load_package_plan(
 ) -> M03RV7Seed17PackagePlan:
     """Load and fully reconstruct one pinned seed-17 package plan."""
 
-    plan_path = Path(path)
-    if _SHA256_RE.fullmatch(expected_package_plan_sha256) is None:
-        raise Top2000M03RV7Seed17WorkerError(
-            "expected package plan hash is invalid"
-        )
     try:
-        payload = json.loads(plan_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise Top2000M03RV7Seed17WorkerError(
-            "seed-17 package plan cannot be read"
-        ) from exc
-    if (
-        not isinstance(payload, dict)
-        or payload.pop("schema", None) != M03R_SEED17_TOP2000_PACKAGE_FILE_SCHEMA
-    ):
-        raise Top2000M03RV7Seed17WorkerError(
-            "seed-17 package plan file schema drifted"
+        return load_m03r_v7_seed17_top2000_package_plan(
+            path,
+            expected_package_plan_sha256=expected_package_plan_sha256,
+            require_file_location_matches_plan=True,
         )
-    try:
-        payload["artifacts"] = M03RV7Top2000ArtifactBindings(
-            **payload["artifacts"]
-        )
-        payload["runtime_profile"] = M03RV7Top2000RuntimeProfile(
-            **payload["runtime_profile"]
-        )
-        payload["indices"] = tuple(
-            M03RV7Seed17IndexPlan(
-                **{
-                    **row,
-                    "fold_indices": tuple(row["fold_indices"]),
-                    "paired_seeds": tuple(row["paired_seeds"]),
-                }
-            )
-            for row in payload["indices"]
-        )
-        plan = M03RV7Seed17PackagePlan(**payload)
-    except (KeyError, TypeError, ValueError, M03RV7Seed17PackageError) as exc:
+    except M03RV7Seed17PackageError as exc:
         raise Top2000M03RV7Seed17WorkerError(
             "seed-17 package failed typed validation"
         ) from exc
-    if (
-        plan.package_plan_sha256 != expected_package_plan_sha256
-        or plan.plan_artifact_path != str(plan_path)
-    ):
-        raise Top2000M03RV7Seed17WorkerError(
-            "seed-17 package hash or container path drifted"
-        )
-    return plan
 
 
 def resolve_completion_index(explicit: int | None) -> int:
