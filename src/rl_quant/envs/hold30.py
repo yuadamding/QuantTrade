@@ -255,6 +255,12 @@ def _validate_weight_tensor(weights: torch.Tensor, *, name: str) -> None:
         raise ValueError(f"{name} must sum to one along the asset dimension.")
 
 
+def _positive_or_one(value: torch.Tensor) -> torch.Tensor:
+    """Preserve every positive notional while making zero division finite."""
+
+    return torch.where(value > 0, value, torch.ones_like(value))
+
+
 def net_trade_legs(
     proposed_buys: torch.Tensor,
     proposed_sells: torch.Tensor,
@@ -590,7 +596,7 @@ class CohortLedger:
         if proposed_release is None:
             total_value = value.sum(dim=-1)
             sold_value = value * (
-                sells / total_value.clamp_min(torch.finfo(value.dtype).eps)
+                sells / _positive_or_one(total_value)
             ).unsqueeze(-1)
             sold_value = torch.where(
                 total_value.unsqueeze(-1) > 0, sold_value, torch.zeros_like(sold_value)
@@ -606,7 +612,7 @@ class CohortLedger:
             proposed = torch.minimum(proposed_release.clamp_min(0.0), value)
             proposed_total = proposed.sum(dim=-1)
             primary_scale = torch.minimum(
-                sells / proposed_total.clamp_min(torch.finfo(value.dtype).eps),
+                sells / _positive_or_one(proposed_total),
                 torch.ones_like(sells),
             )
             primary = proposed * primary_scale.unsqueeze(-1)
@@ -614,7 +620,7 @@ class CohortLedger:
             residual_value = (value - primary).clamp_min(0.0)
             residual_total = residual_value.sum(dim=-1)
             secondary = residual_value * (
-                residual_sale / residual_total.clamp_min(torch.finfo(value.dtype).eps)
+                residual_sale / _positive_or_one(residual_total)
             ).unsqueeze(-1)
             secondary = torch.where(
                 residual_total.unsqueeze(-1) > 0,
@@ -623,7 +629,7 @@ class CohortLedger:
             )
             sold_value = primary + secondary
 
-        removal_fraction = sold_value / value.clamp_min(torch.finfo(value.dtype).eps)
+        removal_fraction = sold_value / _positive_or_one(value)
         removal_fraction = torch.where(
             value > 0, removal_fraction, torch.zeros_like(removal_fraction)
         )

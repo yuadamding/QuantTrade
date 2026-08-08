@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from rl_quant.envs import (
@@ -169,6 +170,91 @@ def test_hazard_release_is_consumed_before_proportional_residual_sale() -> None:
     torch.testing.assert_close(
         accounting.sold_units_by_age, accounting.sold_value_by_age
     )
+
+
+@pytest.mark.parametrize("with_proposed_release", [False, True])
+@pytest.mark.parametrize("sale_fraction", [0.5, 1.0])
+def test_top2000_float32_dust_positions_exit_without_cohort_cash_drift(
+    with_proposed_release: bool,
+    sale_fraction: float,
+) -> None:
+    """Absolute epsilon must not turn legitimate small positions into dust."""
+
+    num_assets = 1_999
+    dust_count = 454
+    dust_notional = 8.0e-8
+    weights = torch.zeros((1, num_assets), dtype=torch.float32)
+    weights[:, 1 : dust_count + 1] = dust_notional
+    weights[:, dust_count + 1 :] = 0.9 / (num_assets - dust_count - 1)
+    weights[:, 0] = 1.0 - weights[:, 1:].sum(dim=-1)
+    ledger = CohortLedger.from_staggered_endowment(
+        weights,
+        cash_index=0,
+        youngest_age=0,
+        oldest_age=29,
+        track_initial_units=True,
+    )
+    target = ledger.weights.clone()
+    sold = sale_fraction * target[:, 1 : dust_count + 1]
+    target[:, 1 : dust_count + 1] -= sold
+    target[:, 0] += sold.sum(dim=-1)
+
+    proposed_release = None
+    if with_proposed_release:
+        proposed_release = torch.zeros_like(ledger.economic_value)
+        proposed_release[:, 1 : dust_count + 1] = ledger.economic_value[
+            :, 1 : dust_count + 1
+        ]
+    updated, accounting = ledger.trade_to(
+        target,
+        cause=TurnoverCause.DISCRETIONARY,
+        proposed_release=proposed_release,
+    )
+
+    updated.assert_reconciles(target)
+    torch.testing.assert_close(
+        accounting.sold_value_by_age.sum(dim=(-1, -2)),
+        accounting.net_sells.sum(dim=-1),
+        atol=1e-10,
+        rtol=1e-5,
+    )
+    if sale_fraction == 1.0:
+        torch.testing.assert_close(
+            updated.economic_value[:, 1 : dust_count + 1],
+            torch.zeros_like(updated.economic_value[:, 1 : dust_count + 1]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            updated.retention_units[:, 1 : dust_count + 1],
+            torch.zeros_like(updated.retention_units[:, 1 : dust_count + 1]),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+
+def test_top2000_float32_partial_dust_sale_has_finite_gradients() -> None:
+    value = torch.zeros((1, 1_999, 61), dtype=torch.float32)
+    value[0, 1:455, 5] = 8.0e-8
+    value[0, 455, 40] = 0.5
+    value.requires_grad_()
+    ledger = CohortLedger(value, value.detach().clone(), cash_index=0)
+    target = ledger.weights.clone()
+    target[:, 1:455] *= 0.5
+    target[:, 0] = 1.0 - target[:, 1:].sum(dim=-1)
+    proposed = torch.zeros_like(value)
+    proposed[:, 1:455] = ledger.economic_value[:, 1:455]
+
+    updated, accounting = ledger.trade_to(
+        target,
+        cause=TurnoverCause.DISCRETIONARY,
+        proposed_release=proposed,
+    )
+    loss = updated.economic_value.sum() + accounting.sold_value_by_age.sum()
+    loss.backward()
+
+    assert value.grad is not None
+    assert bool(torch.isfinite(value.grad).all())
 
 
 def test_environment_classifies_availability_forced_turnover_separately() -> None:
