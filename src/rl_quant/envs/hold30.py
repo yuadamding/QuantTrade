@@ -261,6 +261,30 @@ def _positive_or_one(value: torch.Tensor) -> torch.Tensor:
     return torch.where(value > 0, value, torch.ones_like(value))
 
 
+def _exact_ratio_with_bounded_gradient(
+    numerator: torch.Tensor,
+    denominator: torch.Tensor,
+) -> torch.Tensor:
+    """Divide exactly in the forward pass without a ``1 / dust`` backward.
+
+    Positive cohort notionals below machine epsilon are economically real and
+    therefore must not be rounded away in portfolio accounting.  Repeated
+    partial releases can nevertheless drive those notionals into the
+    subnormal range, where differentiating the exact quotient produces an
+    unbounded reciprocal and eventually a NaN gradient.  Preserve the exact
+    detached quotient as the forward value while borrowing the former
+    epsilon-bounded quotient solely for its backward derivative.
+    """
+
+    exact = numerator.detach() / _positive_or_one(denominator.detach())
+    stable = torch.where(
+        denominator > 0,
+        numerator / denominator.clamp_min(torch.finfo(denominator.dtype).eps),
+        torch.zeros_like(numerator),
+    )
+    return exact + (stable - stable.detach())
+
+
 def net_trade_legs(
     proposed_buys: torch.Tensor,
     proposed_sells: torch.Tensor,
@@ -595,8 +619,9 @@ class CohortLedger:
         value = self.economic_value
         if proposed_release is None:
             total_value = value.sum(dim=-1)
-            sold_value = value * (
-                sells / _positive_or_one(total_value)
+            sold_value = value * _exact_ratio_with_bounded_gradient(
+                sells,
+                total_value,
             ).unsqueeze(-1)
             sold_value = torch.where(
                 total_value.unsqueeze(-1) > 0, sold_value, torch.zeros_like(sold_value)
@@ -612,15 +637,16 @@ class CohortLedger:
             proposed = torch.minimum(proposed_release.clamp_min(0.0), value)
             proposed_total = proposed.sum(dim=-1)
             primary_scale = torch.minimum(
-                sells / _positive_or_one(proposed_total),
+                _exact_ratio_with_bounded_gradient(sells, proposed_total),
                 torch.ones_like(sells),
             )
             primary = proposed * primary_scale.unsqueeze(-1)
             residual_sale = (sells - primary.sum(dim=-1)).clamp_min(0.0)
             residual_value = (value - primary).clamp_min(0.0)
             residual_total = residual_value.sum(dim=-1)
-            secondary = residual_value * (
-                residual_sale / _positive_or_one(residual_total)
+            secondary = residual_value * _exact_ratio_with_bounded_gradient(
+                residual_sale,
+                residual_total,
             ).unsqueeze(-1)
             secondary = torch.where(
                 residual_total.unsqueeze(-1) > 0,
@@ -629,7 +655,7 @@ class CohortLedger:
             )
             sold_value = primary + secondary
 
-        removal_fraction = sold_value / _positive_or_one(value)
+        removal_fraction = _exact_ratio_with_bounded_gradient(sold_value, value)
         removal_fraction = torch.where(
             value > 0, removal_fraction, torch.zeros_like(removal_fraction)
         )

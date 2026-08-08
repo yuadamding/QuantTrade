@@ -1449,7 +1449,13 @@ def _gradient_norm_and_clip(
     if not populated:
         return 0.0
     if grad_clip > 0:
-        return float(torch.nn.utils.clip_grad_norm_(populated, grad_clip))
+        return float(
+            torch.nn.utils.clip_grad_norm_(
+                populated,
+                grad_clip,
+                error_if_nonfinite=True,
+            )
+        )
     gradients = []
     for parameter in populated:
         gradient = parameter.grad

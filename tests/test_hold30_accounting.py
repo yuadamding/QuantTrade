@@ -257,6 +257,46 @@ def test_top2000_float32_partial_dust_sale_has_finite_gradients() -> None:
     assert bool(torch.isfinite(value.grad).all())
 
 
+@pytest.mark.parametrize("with_proposed_release", [False, True])
+def test_repeated_partial_sales_reach_subnormal_without_nonfinite_gradients(
+    with_proposed_release: bool,
+) -> None:
+    """A fixed partial-release clock must not backpropagate through 1/dust."""
+
+    initial = torch.tensor([[0.50, 0.01, 0.49]], dtype=torch.float32)
+    initial.requires_grad_()
+    ledger = CohortLedger.from_weights(
+        initial,
+        cash_index=0,
+        initial_age=0,
+        track_initial_units=True,
+    )
+    sold_values: list[torch.Tensor] = []
+    for _ in range(130):
+        target = ledger.weights.clone()
+        target[:, 1] *= 0.5
+        target[:, 0] = 1.0 - target[:, 1:].sum(dim=-1)
+        proposed = None
+        if with_proposed_release:
+            proposed = ledger.economic_value.clone()
+            proposed[:, 0] = 0.0
+        ledger, accounting = ledger.trade_to(
+            target,
+            cause=TurnoverCause.DISCRETIONARY,
+            proposed_release=proposed,
+        )
+        ledger.assert_reconciles(target)
+        sold_values.append(accounting.sold_value_by_age[:, 1].sum())
+
+    remaining = ledger.weights[:, 1]
+    assert 0.0 < float(remaining.detach()) < torch.finfo(torch.float32).tiny
+    loss = remaining.sum() + torch.stack(sold_values).sum()
+    loss.backward()
+
+    assert initial.grad is not None
+    assert bool(torch.isfinite(initial.grad).all())
+
+
 def test_environment_classifies_availability_forced_turnover_separately() -> None:
     returns = torch.zeros((1, 2, 2))
     availability = torch.ones((1, 3, 2), dtype=torch.bool)

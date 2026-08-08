@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from itertools import pairwise
 
+import pytest
 import torch
+from torch import nn
 
 from rl_quant.protocol.hold30_alpha_m03r_v7_top2000_dev import (
     M03R_TOP2000_DEV_SETTING_IDS,
@@ -10,6 +12,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v7_top2000_dev import (
 from rl_quant.training.top2000_m03r_v7_dev import (
     TOP2000_M03R_V7_DEV_REQUIRED_STATE_ROWS,
     Top2000M03RV7DevelopmentPolicy,
+    _gradient_norm_and_clip,
     render_top2000_m03r_v7_development_folds,
     top2000_m03r_v7_persistence_penalty,
 )
@@ -63,6 +66,20 @@ def test_fixed_hazard_ablation_reaches_native_fixed_prior_route() -> None:
         raw_stock_chunk=32,
     )
     assert policy.core.config.hold30_fixed_hazard_residual == 0.0
+
+
+def test_gradient_clip_rejects_nonfinite_before_optimizer_step() -> None:
+    parameter = nn.Parameter(torch.tensor([1.0]))
+    parameter.grad = torch.tensor([float("nan")])
+    optimizer = torch.optim.AdamW((parameter,), lr=1.0e-4)
+    before = parameter.detach().clone()
+
+    with pytest.raises(RuntimeError, match="non-finite"):
+        _gradient_norm_and_clip((parameter,), 1.0)
+        optimizer.step()
+
+    torch.testing.assert_close(parameter, before)
+    assert optimizer.state == {}
 
 
 def test_persistence_penalty_is_proportional_and_mature_sales_cannot_dilute() -> None:
