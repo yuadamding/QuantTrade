@@ -30,9 +30,11 @@ basis against the manifest-side basis.
 
 ## Consequences
 
-- A change to the return economics changes the content hash and `source_manifest_hash`; the hashing algorithm
-  is pinned by `tests/test_golden_artifacts.py` so an accidental change to it (which would silently stale every
-  persisted hash) fails CI.
+- A change to the return economics changes the content hash and
+  `source_manifest_hash`. `tests/test_research_protocol.py` verifies canonical
+  construction and manifest agreement. A fixed known-digest golden test is
+  still required before changing the hashing algorithm; without it, a
+  self-consistent algorithm drift could silently stale downstream artifacts.
 - The fill convention is honestly disclosed even when optimistic: the direct-hourly builder records a
   zero-latency decision-bar-close fill (`execution_latency_ms=0`) plus a known-limitation, rather than implying
   a more conservative fill than it performs. A latency-aware/executable basis variant is a future, separately

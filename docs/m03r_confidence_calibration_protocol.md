@@ -6,6 +6,16 @@
 `rl-quant.m03r-confidence-calibration-fit-evidence-v2`  
 **Status:** package qualification only; no governed H100 launch authority
 
+## Generation use
+
+M03R v7 reuses the frozen two-stage ordering and standardized-unit-risk target
+semantics below. That semantic reuse does not let a v6 receipt label a v7
+artifact: a governed v7 path must bind its own protocol, design, setting,
+checkpoint, model, folds, and proposal-path identities through a
+generation-qualified public surface. The TOP2000 compatibility runtime's raw
+sigmoid sizing is explicitly uncalibrated development behavior and is not
+evidence that this deployment calibration was applied.
+
 ## Frozen two-stage order
 
 Confidence calibration is downstream of policy training. The only permitted

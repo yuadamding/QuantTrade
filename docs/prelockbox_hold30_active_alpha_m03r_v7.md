@@ -9,6 +9,11 @@ persistence-objective, route-inventory, and schedule-rendering primitives;
 governed PIT real-data/H100 launch blocked  
 **Predecessor:** [immutable M03R v6](prelockbox_hold30_active_alpha_m03r_v6.md)
 
+**Companion documents:**
+[canonical experiment](prelockbox_hold30_active_alpha_m03r_v7_experiment.md),
+[revision/training guide](m03r_v7_revision_and_training_guide.md), and
+[development-only seed-17 diagnostic](top2000_m03r_v7_seed17_diagnostic.md)
+
 This protocol is for non-PHI scientific research and software qualification.
 It is not a business-production, investment-advice, or deployment contract.
 
@@ -242,7 +247,16 @@ bound to the exact source, data, container, and protocol identities:
 Passing unit tests or publishing this RFC does not authorize training, GPU
 allocation, outer-data access, or promotion.
 
-## Planned generation-qualified software surfaces
+## Required generation-qualified software surfaces
+
+The table below is the canonical target boundary, not a claim that every row
+currently exists. The enforced later-generation source/test registry is
+`V3_LATER_GENERATION_SOURCE_TESTS` in
+`rl_quant.workflows.hold30_alpha_prelockbox`; future contributors must update
+that package-owned registry and its tests rather than relying on this prose as
+an executable inventory. The executable TOP2000 compatibility modules have
+separate development identities and do not satisfy a missing canonical v7
+surface.
 
 V7 should land through explicit public boundaries rather than adding v7 IDs to
 v6 modules. The minimum source-to-blocking-test inventory is:

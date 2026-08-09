@@ -3,8 +3,18 @@
 **Protocol:** `prelockbox-hold30-active-alpha-m03r-v7`  
 **Design:** `daily_raw_pit300_hold30_m03r_v7`  
 **Canonical:** `M03R-soft-persistence-active-alpha-hold30-v7`  
-**Status:** implementation-qualified locally; real two-H100 qualification required before launch
+**Status:** canonical protocol/objective/route/schedule locally qualified;
+governed PIT driver/evaluator/data and canonical two-H100 qualification/launch
+remain blocked. The executable TOP2000 compatibility route is a separate
+development-only identity.
+
 **Normative RFC:** [M03R v7 active-alpha Hold-30 RFC](prelockbox_hold30_active_alpha_m03r_v7.md)
+
+**Implementation guide:**
+[M03R v7 revision and training guide](m03r_v7_revision_and_training_guide.md)
+
+**Reduced diagnostic:**
+[TOP2000 seed-17 generation](top2000_m03r_v7_seed17_diagnostic.md)
 
 This document specifies the paired experiment, GPU topology, admission order,
 reporting, and promotion rules. It does not launch Kubernetes work and cannot

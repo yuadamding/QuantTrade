@@ -1,9 +1,16 @@
 # ADR-0007: Benchmark-relative alpha is the Hold-30 promotion objective
 
-**Status:** Accepted; components locally CPU integration-qualified; end-to-end
-training and launch blocked
+**Status:** Superseded before launch by the active-alpha M03R generations;
+retained as immutable design history
 
 **Date:** 2026-08-04
+
+The current scientific direction is the
+[M03R v7 active-alpha RFC](../prelockbox_hold30_active_alpha_m03r_v7.md).
+That generation removes the compulsory tracking-error floor, targets active
+rather than total market beta, and makes active multifactor alpha part of
+promotion evidence. The decision below records the earlier v3 rationale and
+must not authorize a v7 artifact or run.
 
 ## Context
 

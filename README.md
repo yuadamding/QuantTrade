@@ -242,7 +242,7 @@ PIT universe has cleared correctness, baseline, and artifact gates.
 ```bash
 cd QuantTrade
 PYTHONPATH=src conda run -n quanttrade python -m pytest tests/ -q
-conda run -n quanttrade ruff check src tests
+conda run -n quanttrade ruff check src scripts tests
 ```
 
 The most relevant contract suites are:
@@ -272,25 +272,24 @@ A result is not reportable merely because the driver completes. At minimum:
 - uncertainty, multiple testing, and cost/capacity stresses are reported;
 - the test split is not used to choose a seed, checkpoint, architecture, or hyperparameter.
 
-The Hold-30 path now has package-owned chronological training, checkpoint/resume,
-cohort telemetry, and receipt primitives. The current scientific design is the
-immutable `prelockbox-hold30-active-alpha-m03r-v6` generation. It treats 30
-sessions as a weak one-sided persistence prior—not a minimum hold, sell mask,
-expiry, or promotion gate—while retaining v5's active-beta, confidence-budget,
-30-return/63-session separation, and 252-session learned-context corrections.
-V5, v4, and v3 remain unchanged prelaunch audit generations; v2 was superseded
-before launch.
+The Hold-30 path now has package-owned chronological training,
+checkpoint/resume, cohort telemetry, and receipt primitives. The current
+scientific direction is the immutable
+`prelockbox-hold30-active-alpha-m03r-v7` generation. It seeks C1-relative
+active return, removes the tracking-error floor, targets active beta near zero,
+and treats 30 sessions as a weak one-sided persistence prior—not a minimum
+hold, sell mask, expiry, turnover proxy, or promotion gate. V6, v5, v4, and v3
+remain unchanged prelaunch audit generations; v2 was superseded before launch.
 
-M03R v6 currently has typed protocol, soft early-exit objective, cause-typed
-cohort-release qualification, and duration-free checkpoint-gate/ranking
-qualification. Its production trainer and governed 12-setting execution path
-are not yet connected. It remains launch-blocked pending verified calibration
-and ensemble/execution receipts, numerical factor/sector bounds, the complete
-inferential family, point-in-time real-data/global-path bindings,
-evaluator-derived checkpoint evidence, empirical execution, an immutable
-image, single-/two-rank CUDA parity, and an H100 capacity receipt.
-There is no M03R real-data training or performance result. Synthetic software
-qualification is not investment-performance evidence.
+Canonical PIT Active-300 v7 has typed protocol, objective, route, and schedule
+surfaces, but its governed production driver, evaluator, point-in-time data,
+five-seed ensemble, calibration, CUDA/H100 qualification, and promotion chain
+remain launch-blocked. A separate executable TOP2000 compatibility route and
+one-seed diagnostic qualify mechanisms and numerical behavior only. That
+future-selected universe is development-only, nonreportable, and cannot
+satisfy the canonical five-seed or promotion contracts. No local test,
+Kubernetes completion, or seed-17 result is M03R investment-performance
+evidence.
 
 The legacy Phase-1 verdict reports split-level `statistically_positive` diagnostics separately from its promotion
 gate. Dataset/news provenance now participates in `positive`, so a run admitted with `--allow-unreportable` is
@@ -298,11 +297,16 @@ forced non-positive and remains development-only.
 
 ## Documentation
 
+- [Documentation index and status map](docs/README.md)
+- [M03R v7 revision and training guide](docs/m03r_v7_revision_and_training_guide.md)
+- [Current M03R v7 active-alpha Hold-30 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md)
+- [M03R v7 twelve-setting experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
+- [Development-only TOP2000 seed-17 diagnostic](docs/top2000_m03r_v7_seed17_diagnostic.md)
 - [ADR-0006: one daily decision with a soft 30-session holding target](docs/adr/0006-daily-decision-soft-30-session-holding.md)
-- [ADR-0007: benchmark-relative alpha is the Hold-30 promotion objective](docs/adr/0007-benchmark-relative-hold30-alpha-objective.md)
+- [ADR-0007: historical benchmark-relative alpha decision](docs/adr/0007-benchmark-relative-hold30-alpha-objective.md)
 - [Hold-30 policy redesign RFC](docs/daily_hold30_policy_rfc.md)
 - [Normative pre-lockbox Hold-30 H0–H3 base specification](docs/prelockbox_hold30_h0_h3_experiment.md)
-- [Current launch-blocked M03R v6 soft-persistence specification](docs/prelockbox_hold30_active_alpha_m03r_v6.md)
+- [Immutable M03R v6 soft-persistence specification](docs/prelockbox_hold30_active_alpha_m03r_v6.md)
 - [Immutable M03R v5 active-alpha Hold-30 specification](docs/prelockbox_hold30_active_alpha_m03r_v5.md)
 - [Frozen M03R v4 specification](docs/prelockbox_hold30_active_alpha_m03r_v4.md)
 - [Superseded-before-launch Hold-30 alpha mechanism-8 v3 audit specification](docs/prelockbox_hold30_alpha_mech8_v3.md)

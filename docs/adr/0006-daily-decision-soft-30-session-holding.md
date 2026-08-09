@@ -1,6 +1,7 @@
 # ADR-0006: One daily decision with a soft 30-session holding target
 
-**Status:** Accepted; mechanism-8 v2 implementation/qualification in progress and launch blocked
+**Status:** Accepted strategy mandate; implemented in Hold-30/M03R accounting
+and v7 protocol/objective tests; governed PIT launch remains blocked
 
 **Date:** 2026-08-04
 
@@ -102,12 +103,14 @@ then face a separately registered untouched or prospective lockbox.
 
 ## Consequences
 
-- The [Hold-30 RFC](../daily_hold30_policy_rfc.md) is the proposed
-  implementation contract.
+- The [Hold-30 RFC](../daily_hold30_policy_rfc.md) remains the original
+  strategy mandate. The
+  [M03R v7 active-alpha RFC](../prelockbox_hold30_active_alpha_m03r_v7.md) is
+  the current canonical scientific contract.
 - The [H0–H3 experiment specification](../prelockbox_hold30_h0_h3_experiment.md)
-  remains the normative mechanics base. The
-  [alpha mechanism-8 v3 specification](../prelockbox_hold30_alpha_mech8_v3.md)
-  is the current pre-lockbox generation. The
+  and [alpha mechanism-8 v3 specification](../prelockbox_hold30_alpha_mech8_v3.md)
+  remain historical mechanics and alpha-design bases. M03R v4 through v7
+  supersede them without changing this ADR's soft-holding mandate. The
   [mechanism-8 v2 delta](../prelockbox_hold30_mech8_v2.md) was superseded
   before launch and remains implementation-history evidence only.
 - H1's scalar gate is an ineligible transitional mechanism control. Only H2
