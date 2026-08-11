@@ -1178,14 +1178,34 @@ def top2000_m03r_v7_decision_inputs(
 def bind_top2000_m03r_v7_runtime_sequence(
     sequence: Hold30Sequence,
     policy: Top2000M03RV7DevelopmentPolicy,
+    *,
+    placeholder_token_dim: int | None = None,
 ) -> tuple[Hold30Sequence, Top2000M03RV7DecisionStateProvider]:
+    """Bind raw inputs and an unused runtime placeholder.
+
+    Training retains the historical full-token placeholder by default.
+    Inference-only callers may request a smaller positive trailing dimension;
+    the functional provider remains the sole source of encoded policy states.
+    """
+
     inputs = top2000_m03r_v7_decision_inputs(sequence)
+    token_dim = policy.token_dim
+    if placeholder_token_dim is not None:
+        if (
+            isinstance(placeholder_token_dim, bool)
+            or not isinstance(placeholder_token_dim, int)
+            or placeholder_token_dim <= 0
+        ):
+            raise Top2000M03RV7DevelopmentError(
+                "runtime placeholder token dimension must be a positive integer"
+            )
+        token_dim = placeholder_token_dim
     placeholder = torch.zeros(
         (
             sequence.n_positions,
             sequence.batch_size,
             sequence.num_assets,
-            policy.token_dim,
+            token_dim,
         ),
         dtype=sequence.asset_returns.dtype,
         device=sequence.asset_returns.device,

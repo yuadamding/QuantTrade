@@ -17,6 +17,10 @@ product, or business-production system.
 - The [seed-17 TOP2000 diagnostic](docs/top2000_m03r_v7_seed17_diagnostic.md)
   is development-only and nonreportable. It cannot satisfy the canonical
   five-seed ensemble or promotion contracts.
+- Read the [2026-YTD retrospective guide](docs/top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
+  before opening 2026 TOP2000 outcomes or changing checkpoint, carry, factor,
+  censoring, inference, or one-GPU execution semantics. Its results remain
+  development-only, nonreportable, and nonpromotable.
 
 Repository documentation describes contracts and implementation state. It
 does not prove that a remote Job used this checkout, completed successfully,

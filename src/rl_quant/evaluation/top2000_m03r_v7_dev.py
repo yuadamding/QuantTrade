@@ -103,7 +103,7 @@ def tensor_sha256(value: torch.Tensor) -> str:
     digest = hashlib.sha256()
     digest.update(str(tensor.dtype).encode("ascii"))
     digest.update(_canonical_json(list(tensor.shape)))
-    digest.update(tensor.numpy().tobytes(order="C"))
+    digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C"))
     return digest.hexdigest()
 
 

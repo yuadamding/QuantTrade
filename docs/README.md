@@ -26,6 +26,23 @@ tests are not launch or performance evidence.
 - [TOP2000 M03R v7 seed-17 diagnostic](top2000_m03r_v7_seed17_diagnostic.md)
   — twelve settings, six folds, one seed, and a two-H100 worker shape. The
   future-selected universe makes it nonreportable and nonpromotable.
+- [TOP2000 M03R v7 seed-17 performance benchmark](top2000_m03r_v7_seed17_12_setting_performance_benchmark.md)
+  — explicit setting definitions, completed fold benchmark, exact Phase-0
+  cost ladder, predictive-alpha diagnostics, and the failed distinct-policy
+  gate.
+- [TOP2000 M03R v7 seed-17 Phase-0 forensic audit](top2000_m03r_v7_seed17_phase0_forensic_audit.md)
+  — frozen-checkpoint trace integrity, exact cost repricing, alpha-head
+  diagnostics, projection attribution, and the setting-9 risk audit required
+  before any v8 training allocation.
+- [TOP2000 M03R-v8 alpha-discovery stage](top2000_m03r_v8_alpha_discovery.md)
+  — development-only pretrained-alpha and cost-aware incremental-policy
+  contract created from the failed v7 Phase-0 distinct-policy gate. The local
+  action boundary exists, but training integration and remote launch remain
+  blocked.
+- [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
+  — pre-access freeze contract, leakage-safe chronological execution,
+  official factor evidence, cohort survival, and efficient one-H100
+  evaluation shape. It is not evidence that the retrospective has run.
 - [Seadragon training-source record](SEADRAGON_TRAINING_SOURCE.md) — historical
   source-lineage record for earlier sealed bundles, not a general operator
   runbook and not current Job status.
