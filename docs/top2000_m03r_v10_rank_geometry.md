@@ -1,5 +1,12 @@
 # TOP2000 M03R-v10 rank-geometry research
 
+> **Superseded before launch.** Correctness review found that setting identity
+> entered the episode schedule, regression-ineligible assets remained valid
+> zero targets, and the sleeve/inference boundary could move results. No v10
+> H100 launch is authorized. Corrections live under the fresh
+> [M03R-v11 identity](top2000_m03r_v11_rank_geometry_corrected.md); this file
+> remains the immutable record of the unlaunched v10 proposal.
+
 This is a non-PHI, development-only research generation. It is not a trading
 system, a business-production surface, reportable performance, or promotion
 evidence.

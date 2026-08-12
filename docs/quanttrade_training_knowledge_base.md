@@ -462,6 +462,16 @@ This distinguishes representation failure, execution-cost failure, projection
 signal destruction, regime concentration, and route/configuration failure
 without retraining.
 
+This audit is possible only while the exact checkpoint, qualification, and
+trace artifacts still exist. Terminal and cleanup receipts prove that a run
+completed and was removed from Kubernetes; they do not preserve the run output
+tree. Before deleting or reclaiming a completed generation, retain a
+hash-bound audit inventory containing every selected/final checkpoint and the
+prediction, score, probability, requested-book, projected-book, turnover, and
+return traces needed by the declared post-hoc analyses. If the receipt-bound
+output root is absent, report the audit as unavailable and never scan unrelated
+storage or reconstruct evidence from rounded summaries.
+
 ### Seeds, folds, and ensembles
 
 Chronological folds measure performance across time regimes. Seeds measure
@@ -554,6 +564,44 @@ Finally, a passing predictive receipt is not an economic-training protocol.
 Keep the economic entrypoint fail-closed until the selected predictor,
 horizon, calibration, action, and risk identities are frozen in a new
 economic generation.
+
+### Paired-ablation and residual-validity lesson from v9/v10 review
+
+A shared random seed is not a paired experiment when a setting-specific worker
+receipt enters the sampling hash. All causal settings must bind one panel-level
+episode schedule derived only from common data, fold geometry, seed, and update
+cursor. Rank shards must be complementary views of the same global origin set,
+and a loss-only change must preserve every input tensor hash.
+
+Future-return availability also does not imply that a factor residual is
+estimable. Intersect the target mask with the decision-origin positive
+regression-weight mask before any loss, IC, rank transform, or tail diagnostic.
+Never encode an unestimable residual as a valid zero. Record qualified fraction,
+effective design rank, and residual degrees of freedom.
+
+Target residualization and executable signal projection must use one exact
+operator: the same mask, weights, exposure order, collinearity convention,
+solver, and tolerance. Retain an intercept and drop one reference sector (or
+omit the intercept and retain all sectors); do not combine an intercept with a
+complete mutually exclusive sector basis.
+
+### Sleeve sizing and inference lesson
+
+A turnover cap is not a target. The desired proximal buy and sell notionals
+must bound common trade mass, so scaling all alpha means to zero also sends
+turnover to zero. Avoid applying uncertainty twice through both a probability
+hurdle and a full standard-deviation shrinkage. Prefer differentiable calibrated
+probability gates plus the exact transaction-cost penalty, and scale the risk
+model to the selected return horizon.
+
+Do not average fold-level lower confidence bounds or break-even ratios. Build
+one ordered out-of-sample chronology, use common fold-bounded moving-block
+draws, and compute aggregate break-even from summed gross active return and
+summed incremental turnover with explicit sign categories.
+
+Qualification must evaluate the exact published checkpoint bytes through a
+fresh strict loader. An in-memory clone does not test serialization completeness
+or buffer identity.
 
 For a new multi-GPU execution shape, make the capacity receipt terminal and
 cleanup-bound rather than startup-only. A valid two-H100 capacity
@@ -665,4 +713,6 @@ bytes.
 - [Phase-0 forensic audit](top2000_m03r_v7_seed17_phase0_forensic_audit.md)
 - [M03R-v8 alpha discovery](top2000_m03r_v8_alpha_discovery.md)
 - [M03R-v9 predictive stage](top2000_m03r_v9_predictive_stage.md)
+- [M03R-v10 superseded rank proposal](top2000_m03r_v10_rank_geometry.md)
+- [M03R-v11 corrected rank geometry](top2000_m03r_v11_rank_geometry_corrected.md)
 - [2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)

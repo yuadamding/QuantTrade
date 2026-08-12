@@ -50,10 +50,16 @@ tests are not launch or performance evidence.
   source-corrected A04 run completed but no setting-horizon pair passed, so it
   does not authorize economic training.
 - [TOP2000 M03R-v10 rank-geometry research](top2000_m03r_v10_rank_geometry.md)
-  — fresh post-v9 representation/label research. It retains factor-residual
-  targets, compares the v9 listwise control with a rank-Gaussian correlation
-  objective, keeps all economic and 2026 access blocked, and preserves the
-  unchanged 0.020 predictive gate.
+  — superseded-before-launch post-v9 proposal. Its review exposed result-moving
+  schedule, target-validity, sleeve-sizing, and inference defects; it remains
+  immutable and must not be packaged or launched.
+- [TOP2000 M03R-v11 corrected rank geometry](top2000_m03r_v11_rank_geometry_corrected.md)
+  — fresh corrective identity with paired setting-neutral episodes,
+  factor-qualified shared residual operators, magnitude-preserving soft-gated
+  actions, block inference, aggregate break-even accounting, and exact
+  checkpoint round-trip evaluation. Its receipt-gated predictive development
+  run is active after static, two-H100 capacity, and per-worker startup proofs;
+  economic training and 2026 access remain blocked.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100

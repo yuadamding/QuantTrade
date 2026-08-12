@@ -11,6 +11,9 @@ product, or business-production system.
 - Read [the QuantTrade training knowledge base](docs/quanttrade_training_knowledge_base.md)
   before packaging, launching, recovering, evaluating, or interpreting an
   M03R training run.
+- Treat [M03R-v11 corrected rank geometry](docs/top2000_m03r_v11_rank_geometry_corrected.md)
+  as the active post-v9 predictive research boundary. V10 was superseded
+  before launch; neither document authorizes remote GPU work.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   as the current canonical scientific direction.
