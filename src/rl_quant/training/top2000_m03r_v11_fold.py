@@ -31,6 +31,9 @@ from rl_quant.training.top2000_m03r_v11_schedule import (
 
 M03R_V11_TRAINING_SHARD_SCHEMA = "rl-quant.top2000-dev.m03r-v11-training-shard-v1"
 M03R_V11_MINIMUM_RESIDUAL_ORIGIN_STATE_INDEX = M03R_V9_MINIMUM_HISTORY_SESSIONS
+M03R_V11_MAX_LOCAL_ORIGIN = (
+    TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS - M03R_V9_MAX_TARGET_HORIZON - 2
+)
 
 
 class M03RV11FoldError(ValueError):
@@ -82,6 +85,13 @@ class M03RV11TrainingShardPlan:
                 character not in "0123456789abcdef" for character in value
             ):
                 raise M03RV11FoldError("v11 shard identity is not a SHA-256")
+        if any(
+            origin - self.episode_start > M03R_V11_MAX_LOCAL_ORIGIN
+            for origin in self.global_origins
+        ):
+            raise M03RV11FoldError(
+                "v11 shard origin lacks a complete maximum-horizon return path"
+            )
 
     @property
     def receipt_sha256(self) -> str:
@@ -121,7 +131,7 @@ def render_m03r_v11_training_shard_plan(
         imported_geometry.optimizer_target_stop_exclusive
         - M03R_V9_MAX_TARGET_HORIZON
         - 1,
-        start + TOP2000_M03R_V7_DEV_EPISODE_STATE_ROWS - M03R_V9_MAX_TARGET_HORIZON - 1,
+        start + M03R_V11_MAX_LOCAL_ORIGIN,
     )
     origins = tuple(range(first_origin, last_origin + 1))
     shards = m03r_v11_complementary_rank_shards(origins)
@@ -140,6 +150,7 @@ def render_m03r_v11_training_shard_plan(
 
 
 __all__ = [
+    "M03R_V11_MAX_LOCAL_ORIGIN",
     "M03R_V11_MINIMUM_RESIDUAL_ORIGIN_STATE_INDEX",
     "M03R_V11_TRAINING_SHARD_SCHEMA",
     "M03RV11FoldError",

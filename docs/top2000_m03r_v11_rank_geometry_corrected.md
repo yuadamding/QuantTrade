@@ -1,10 +1,11 @@
 # TOP2000 M03R-v11 corrected rank-geometry stage
 
 Status: local implementation, optimizer-bound structural qualification, a
-governed two-rank worker, and a content-bound package builder. A fresh
+governed two-rank worker, and a content-bound package builder. The fresh a14
 receipt-gated predictive development run is active after its same-image static
-gate, two-H100 capacity gate, and per-worker startup proofs passed. Economic
-optimization and 2026 outcome access remain forbidden.
+gate and two-H100 capacity gate passed. Its detached supervisor owns the
+remaining startup, terminal, and cleanup lifecycle. Economic optimization and
+2026 outcome access remain forbidden.
 
 ## Why v11 exists
 
@@ -54,6 +55,21 @@ P0/P1/P2. Rank 0 and rank 1
 receive complementary interleaved shards of that one origin set. Worker plans
 also bind one common initial-parameter-state hash. A change to the setting must
 not change any input tensor or origin hash.
+
+A 378-state episode contains only 377 forward return transitions. Therefore,
+the largest legal local origin for the 63-session target is:
+
+```text
+378 - 63 - 2 = 313
+```
+
+The earlier a13 implementation used 314. A small number of rank-1 schedules
+therefore reached an origin whose 63-session target required transition 378,
+which does not exist. The failure was preserved as immutable development
+evidence, all accepted Job and Pod state was exact-cleaned, and no a13 model or
+optimizer state entered a14. The corrected scheduler rejects any shard with a
+local origin above 313. Its regression enumerates all three settings, six
+folds, 64 updates, both rank shards, every origin, and all four horizons.
 
 The executable fold runtime builds the episode exactly once on CPU, binds its
 full raw decision-input tensors before rank sharding, transfers the reviewed

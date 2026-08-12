@@ -585,6 +585,26 @@ solver, and tolerance. Retain an intercept and drop one reference sector (or
 omit the intercept and retain all sectors); do not combine an intercept with a
 complete mutually exclusive sector basis.
 
+### State-row versus return-transition boundary lesson
+
+Do not size a maximum-horizon origin from state rows without accounting for the
+missing terminal transition. An episode with `N` state rows has `N - 1` return
+rows. If targets begin at `origin + 1` and consume `h` returns, the legal local
+origin must satisfy:
+
+```text
+local_origin + 1 + h <= N - 1
+local_origin <= N - h - 2
+```
+
+For the 378-state M03R episode and 63-session target, the maximum is 313, not
+314. Test this boundary over the complete deterministic schedule, including
+every setting, fold, update, rank shard, origin, and target horizon. A synthetic
+single-origin unit test is insufficient because a sparse hash schedule may hit
+the terminal origin only in later folds or updates. After a source-changing
+fix, preserve the failed receipts, exact-clean any accepted Kubernetes state,
+and mint a fresh source/package/run identity; never resume the old checkpoints.
+
 ### Sleeve sizing and inference lesson
 
 A turnover cap is not a target. The desired proximal buy and sell notionals
