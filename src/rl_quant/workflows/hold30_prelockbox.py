@@ -280,6 +280,30 @@ HOLD30_COMPONENT_TESTS = (
         "src/rl_quant/workflows/hold30_alpha_prelockbox.py",
         "tests/test_hold30_alpha_workflow.py",
     ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v7_seed17_top2000_2026_ytd.py",
+        "tests/test_hold30_alpha_m03r_v7_seed17_top2000_2026_ytd_protocol.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_2026_ytd_kubernetes.py",
+        "tests/test_top2000_m03r_v7_seed17_2026_ytd_workflow.py",
+    ),
+    (
+        "src/rl_quant/training/hold30_alpha_m03r_v7_seed17_2026_ytd_package.py",
+        "tests/test_top2000_m03r_v7_seed17_2026_ytd_workflow.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v8_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v8_top2000_dev_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v9_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v9_top2000_dev_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v10_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v10_top2000_dev_protocol.py",
+    ),
 )
 HOLD30_INTEGRATION_SOURCE_FILES = (
     "src/rl_quant/datasets/daily.py",
@@ -363,7 +387,10 @@ def _resolve_qualification_inventory(root: Path) -> Hold30QualificationInventory
 
     registered = {source: test for source, test in HOLD30_COMPONENT_TESTS}
     component_sources = list(registered)
-    hold30_tests = list(SOFTWARE_GATE_FILES)
+    hold30_tests = [
+        *SOFTWARE_GATE_FILES,
+        *(test for _source, test in HOLD30_COMPONENT_TESTS),
+    ]
 
     source_root = root / "src" / "rl_quant"
     if not source_root.is_dir():

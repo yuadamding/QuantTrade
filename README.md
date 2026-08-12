@@ -298,6 +298,7 @@ forced non-positive and remains development-only.
 ## Documentation
 
 - [Documentation index and status map](docs/README.md)
+- [QuantTrade training knowledge base](docs/quanttrade_training_knowledge_base.md)
 - [M03R v7 revision and training guide](docs/m03r_v7_revision_and_training_guide.md)
 - [Current M03R v7 active-alpha Hold-30 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md)
 - [M03R v7 twelve-setting experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)

@@ -8,6 +8,9 @@ product, or business-production system.
 
 - Read [the documentation index](docs/README.md) before changing a Hold-30 or
   M03R contract.
+- Read [the QuantTrade training knowledge base](docs/quanttrade_training_knowledge_base.md)
+  before packaging, launching, recovering, evaluating, or interpreting an
+  M03R training run.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   as the current canonical scientific direction.

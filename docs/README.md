@@ -6,6 +6,10 @@ tests are not launch or performance evidence.
 
 ## Current Hold-30 and M03R direction
 
+- [QuantTrade training knowledge base](quanttrade_training_knowledge_base.md)
+  — durable end-to-end lessons covering evidence boundaries, source identity,
+  numerical safety, efficient receipt-gated GPU execution, scientific
+  interpretation, evaluation, and recovery.
 - [M03R v7 active-alpha Hold-30 RFC](prelockbox_hold30_active_alpha_m03r_v7.md)
   — canonical scientific objective, twelve-setting inventory, persistence,
   selection, and promotion rules. The governed PIT Active-300 path remains
@@ -36,9 +40,20 @@ tests are not launch or performance evidence.
   before any v8 training allocation.
 - [TOP2000 M03R-v8 alpha-discovery stage](top2000_m03r_v8_alpha_discovery.md)
   — development-only pretrained-alpha and cost-aware incremental-policy
-  contract created from the failed v7 Phase-0 distinct-policy gate. The local
-  action boundary exists, but training integration and remote launch remain
-  blocked.
+  contract created from the failed v7 Phase-0 distinct-policy gate. Its
+  package and execution surfaces require their own exact run receipts; this
+  index does not claim current remote status.
+- [TOP2000 M03R-v9 predictive stage](top2000_m03r_v9_predictive_stage.md)
+  — disjoint predictive-first correction after the failed v8 attempt. It
+  freezes the shared mean/scale and horizon boundary, residual-label and
+  tradeability gates, and the materialized pre-2026 risk-source boundary. Its
+  source-corrected A04 run completed but no setting-horizon pair passed, so it
+  does not authorize economic training.
+- [TOP2000 M03R-v10 rank-geometry research](top2000_m03r_v10_rank_geometry.md)
+  — fresh post-v9 representation/label research. It retains factor-residual
+  targets, compares the v9 listwise control with a rank-Gaussian correlation
+  objective, keeps all economic and 2026 access blocked, and preserves the
+  unchanged 0.020 predictive gate.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100
