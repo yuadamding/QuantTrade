@@ -1,11 +1,10 @@
 # TOP2000 M03R-v11 corrected rank-geometry stage
 
-Status: local implementation, optimizer-bound structural qualification, a
-governed two-rank worker, and a content-bound package builder. The fresh a14
-receipt-gated predictive development run is active after its same-image static
-gate and two-H100 capacity gate passed. Its detached supervisor owns the
-remaining startup, terminal, and cleanup lifecycle. Economic optimization and
-2026 outcome access remain forbidden.
+Status: corrected predictive-only development generation with local
+implementation, optimizer-bound structural qualification, a governed two-rank
+worker, and a content-bound package builder. Remote execution state is not a
+property of this document and must be established from the exact external
+receipt chain. Economic optimization and 2026 outcome access remain forbidden.
 
 ## Why v11 exists
 
@@ -246,15 +245,15 @@ projector manifest and binding, worker source, fresh common initial state,
 setting-neutral episode schedule, exact mounted paths, and digest-pinned image.
 The immutable scientific package retains `package_authorized=false` and
 `kubernetes_launch_authorized=false`; those booleans cannot be inferred from
-local unit tests or connectivity. After local qualification, the package
-builder minted a separate execution-authorization receipt for only the exact
-validated predictive entrypoint, three Indexed completions, two H100 requests
-per completion, and a six-H100 request ceiling. Static, capacity, admission,
-activation, and startup receipts then authorized and proved the active
-predictive run. None of those receipts authorize economic training or 2026
-access, and they do not rewrite the scientific package.
+local unit tests or connectivity. A separate execution-authorization receipt
+may authorize only the exact validated predictive entrypoint, three Indexed
+completions, two H100 requests per completion, and a six-H100 request ceiling.
+Run-specific static, capacity, admission, activation, startup, terminal, and
+cleanup facts belong to the external receipt chain. None of those receipts
+authorize economic training or 2026 access, and they do not rewrite the
+scientific package.
 
-## Current authorization boundary
+## Stable authorization boundary
 
 The current worker plan deliberately sets:
 
@@ -265,14 +264,31 @@ economic_panel_authorized      false
 outer_2026_access_authorized   false
 ```
 
-Local structural gates were completed before the execution authorization was
-minted. The governed entrypoint writes both update-64 horizon checkpoints
-before opening the qualification tail, reloads the exact bytes, publishes six
-fold terminals, and treats a failed predictive gate as a valid scientific
-terminal. The active Seadragon lifecycle has exact source, data, image,
-capacity, admission, activation, and startup receipts; terminal and cleanup
-receipts remain pending while training runs. Hardware allocation is evidenced
-by those external receipts, not by this scientific document alone.
+The governed entrypoint writes both update-64 horizon checkpoints before
+opening the qualification tail, reloads the exact bytes, publishes six fold
+terminals, and treats a failed predictive gate as a valid scientific terminal.
+Whether a particular attempt reached source, data, image, capacity, admission,
+activation, startup, terminal, or cleanup boundaries is established only by
+its exact external receipts. Hardware allocation is never inferred from this
+scientific document.
+
+### Immutable a14 development outcome
+
+The receipt-gated `qt-m03r-v11-predictive-s17-20260812-a14` attempt reached
+two-H100 startup for all three Indexed workers and preserved 11 of 18 fold
+receipts before terminating in simple-sleeve trace validation. No economic
+training or 2026 outcome access occurred. Its exact cleanup receipt proves the
+Job and UID-owned Pods absent; its checkpoints and optimizer states must not be
+resumed under corrected source.
+
+The failure was an implementation defect in requested-to-executed retention:
+the projector included residual CASH in a weak active-book norm. Simplex CASH
+reconciliation could therefore make the reported ratio slightly greater than
+one even though risky positions were not amplified. The corrected boundary
+measures risky-active retention, rejects material amplification, and
+canonicalizes only sub-tolerance roundoff. Any rerun requires a fresh immutable
+source package, authorization receipt, and run identity; a14 remains failed
+development evidence.
 
 ## Governed Seadragon execution surface
 

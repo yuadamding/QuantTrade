@@ -36,24 +36,82 @@ def _close_cash_simplex_roundoff_unchecked(
 ) -> torch.Tensor:
     """Tensor-only closure for already validated internal economic books."""
 
-    risky_mask = torch.ones_like(weights, dtype=torch.bool)
+    output_dtype = weights.dtype
+    work_dtype = torch.float64 if output_dtype == torch.float32 else output_dtype
+    work = weights.to(work_dtype)
+    limit = gross_limit.to(work_dtype)
+    risky_mask = torch.ones_like(work, dtype=torch.bool)
     risky_mask[:, cash_index] = False
-    risky = torch.where(risky_mask, weights, torch.zeros_like(weights))
+    risky = torch.where(risky_mask, work, torch.zeros_like(work))
     gross = risky.sum(dim=-1)
-    guard = SIMPLEX_ROUNDOFF_GUARD_ULPS * torch.finfo(weights.dtype).eps
-    repair = gross > gross_limit
+    guard = SIMPLEX_ROUNDOFF_GUARD_ULPS * torch.finfo(output_dtype).eps
+    repair = gross > limit
     scale = torch.where(
         repair,
-        gross_limit
-        * (1.0 - guard)
-        / gross.clamp_min(torch.finfo(weights.dtype).tiny),
+        limit * (1.0 - guard) / gross.clamp_min(torch.finfo(work_dtype).tiny),
         torch.ones_like(gross),
     )
     risky = risky * scale.unsqueeze(-1)
     repaired_gross = risky.sum(dim=-1)
     reconciled = risky.clone()
     reconciled[:, cash_index] = (1.0 - repaired_gross).clamp_min(0.0)
-    return reconciled
+    output = reconciled.to(output_dtype)
+    output_risky_mask = torch.ones_like(output, dtype=torch.bool)
+    output_risky_mask[:, cash_index] = False
+    output_risky = torch.where(
+        output_risky_mask,
+        output,
+        torch.zeros_like(output),
+    )
+    output_gross = output_risky.sum(dim=-1)
+    output_limit = gross_limit.to(output_dtype)
+    output_scale = torch.where(
+        output_gross > output_limit,
+        output_limit
+        * (1.0 - guard)
+        / output_gross.clamp_min(torch.finfo(output_dtype).tiny),
+        torch.ones_like(output_gross),
+    )
+    output_risky = output_risky * output_scale.unsqueeze(-1)
+    output_repaired_gross = output_risky.sum(dim=-1)
+    output = output_risky.clone()
+    output[:, cash_index] = (1.0 - output_repaired_gross).clamp_min(0.0)
+    return output
+
+
+def _reconcile_economic_value_to_weights(
+    economic_value: torch.Tensor,
+    target_weights: torch.Tensor,
+    *,
+    cash_index: int,
+) -> torch.Tensor:
+    """Place only age-bin reduction residue into an existing risky cohort."""
+
+    observed = economic_value.sum(dim=-1)
+    target_risky = target_weights.clone()
+    target_risky[:, cash_index] = 0.0
+    scale = torch.where(
+        observed > 0.0,
+        _exact_ratio_with_bounded_gradient(target_risky, observed),
+        torch.zeros_like(observed),
+    )
+    reconciled = economic_value * scale.unsqueeze(-1)
+    missing_entry = torch.where(
+        observed == 0.0,
+        target_risky,
+        torch.zeros_like(target_risky),
+    )
+    reconciled = reconciled.clone()
+    reconciled[..., 0] = reconciled[..., 0] + missing_entry
+    reconciled_total = reconciled.sum(dim=-1)
+    residual = target_risky - reconciled_total
+    correction_bin = reconciled.argmax(dim=-1, keepdim=True)
+    correction = torch.zeros_like(economic_value).scatter(
+        -1,
+        correction_bin,
+        residual.unsqueeze(-1),
+    )
+    return reconciled + correction
 
 
 def reconcile_cash_simplex_roundoff(
@@ -362,9 +420,7 @@ class CohortLedger:
         ):
             raise ValueError("Both cohort ledgers must share dtype and device.")
         if self.economic_value.dtype not in (torch.float32, torch.float64):
-            raise TypeError(
-                "cohort economic accounting must use float32 or float64"
-            )
+            raise TypeError("cohort economic accounting must use float32 or float64")
         if not 0 <= self.cash_index < self.economic_value.shape[1]:
             raise ValueError("cash_index is outside the asset axis.")
         if not bool(torch.isfinite(self.economic_value).all()) or not bool(
@@ -570,6 +626,24 @@ class CohortLedger:
         aged_value[..., MAX_EXACT_AGE] = (
             normalized[..., MAX_EXACT_AGE - 1] + normalized[..., MAX_EXACT_AGE]
         )
+        # Summing up to 61 FP32 age bins can leave the cohort book one or more
+        # ULPs away from the economically drifted risky weights.  CASH is
+        # implicit, so that reduction residue would appear as manufactured
+        # CASH and can accumulate across a chronology.  Reconcile each risky
+        # asset to the exact drift target by preserving its cohort proportions
+        # and placing only the final reduction residue in its largest existing
+        # cohort. This preserves total economic weight without resetting age.
+        drifted_weights = current * (1.0 + asset_returns) / growth.unsqueeze(-1)
+        drifted_weights = _close_cash_simplex_roundoff_unchecked(
+            drifted_weights,
+            cash_index=self.cash_index,
+            gross_limit=torch.ones_like(growth),
+        )
+        aged_value = _reconcile_economic_value_to_weights(
+            aged_value,
+            drifted_weights,
+            cash_index=self.cash_index,
+        )
         aged_units = torch.zeros_like(self.retention_units)
         aged_units[..., 1:MAX_EXACT_AGE] = self.retention_units[
             ..., : MAX_EXACT_AGE - 1
@@ -668,8 +742,13 @@ class CohortLedger:
         entry_units = torch.zeros_like(value)
         if track_new_entries:
             entry_units[..., 0] = buys
+        next_economic_value = _reconcile_economic_value_to_weights(
+            remaining_value + entry_value,
+            target_weights,
+            cash_index=self.cash_index,
+        )
         next_ledger = CohortLedger(
-            economic_value=remaining_value + entry_value,
+            economic_value=next_economic_value,
             retention_units=remaining_units + entry_units,
             cash_index=self.cash_index,
         )

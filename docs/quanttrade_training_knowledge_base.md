@@ -8,10 +8,11 @@ the word `production` for an operationally hardened research lifecycle; that
 word does not change the scientific or business status of the work.
 
 This guide consolidates the most reusable lessons from the Hold-30 M03R-v7
-revision, the TOP2000 seed-17 diagnostic, the Phase-0 forensic audit, the
-M03R-v8 alpha-discovery work, receipt-gated GPU execution, and the 2026-YTD
-retrospective design. It explains how the pieces fit together. It does not
-replace a protocol, a package-owned validator, or a run receipt.
+revision, the TOP2000 seed-17 diagnostic and Phase-0 audit, the v8-v11
+predictive-first lineage, receipt-gated GPU execution, and the separately
+frozen 2026-YTD retrospective design. It explains how the pieces fit together.
+It does not replace a protocol, package-owned validator, data manifest, or run
+receipt.
 
 ## 1. Evidence and authority hierarchy
 
@@ -38,6 +39,34 @@ claimed commit or checkout file by file. A later documentation-only commit
 does not alter an already sealed training package, but it also must not be
 described as that package's runtime source without an exact inventory match.
 
+### Route future questions to the right evidence
+
+| Question | First authority | Do not substitute |
+| --- | --- | --- |
+| What is the scientific objective or gate? | Immutable protocol and generation document | Latest branch, old benchmark, or operator notes |
+| Which source and data did an attempt use? | Package plan, source manifest, and data/cache receipts | A clean local checkout or matching filename |
+| Is a remote attempt running or complete? | Exact external lifecycle receipts and one owned-Job snapshot | Repository prose or a stale Job name |
+| Is a date, symbol, or field admissible? | Frozen split/data contract plus row-usage evidence | Merely having downloaded the row |
+| Did a model qualify? | Exact published checkpoint, evaluator inputs, and gate receipt | GPU startup, training loss, or rounded summary |
+| Can another stage start? | Explicit successor authorization receipt | Inference from a prior stage's success |
+
+Repository documents intentionally contain no live status. A future session
+should identify the generation first, then follow only its exact receipts.
+
+### Scientific-generation ledger
+
+This table records lineage, not current cluster state:
+
+| Generation | Durable outcome or role | What follows |
+| --- | --- | --- |
+| Canonical PIT Active-300 v7 | Normative objective, five-seed design, inference, and promotion contract; still distinct from executable TOP2000 evidence | Qualify its own PIT data and research-grade surfaces before any canonical study |
+| TOP2000 v7 seed-17 | Completed one-seed mechanism diagnostic; holding duration was adequate, while predictive alpha, costs, and projection retention failed | Preserve as negative development evidence; do not call it promotion evidence |
+| v8 alpha discovery | Introduced predictive pretraining and cost-aware incremental action; the first predictive attempt failed and an objective-weight defect invalidated reuse | Preserve the failed artifacts; use a fresh identity for result-moving corrections |
+| v9 predictive | Bound one mean/scale distribution and horizon; all setting-horizon candidates failed the frozen gate | No economic training; use its negative evidence to narrow the next question |
+| v10 rank geometry | Superseded before launch after review exposed paired-schedule, target-validity, sleeve-sizing, and inference defects | Never package or launch it |
+| v11 corrected rank geometry | Current TOP2000 predictive-development protocol: paired samples, qualified residuals, magnitude-preserving actions, block inference, and exact checkpoint reload | A gate failure is a valid terminal; success can only support a separately frozen economic generation |
+| v7 2026-YTD retrospective | Separate, fixed 2026-01-02 through 2026-06-23 mechanism-evaluation contract | It is not a universal 2026 cutoff and cannot select v11 |
+
 ## 2. End-to-end lifecycle
 
 | Boundary | Required result | What it does not prove |
@@ -63,6 +92,19 @@ freeze -> qualify -> package -> dry-run -> create suspended once
 
 Do not skip a boundary because a later boundary happened to succeed. Do not
 repeat a completed boundary when its full immutable key still matches.
+
+### Treat compute topology as generation-specific
+
+An Indexed completion is a scientific worker, not automatically a rank. In
+v11, each of three completions owns one two-rank process group and requests two
+H100s, so the Job ceiling is six H100 requests—not one world-size-six model and
+not the historical v7 sixteen-H100 planning ceiling. Each worker runs its six
+folds under its own exact setting identity.
+
+Keep the user-authorized aggregate cap, one Job's request ceiling, namespace
+quota, Ready allocation, and startup-proved working devices separate. Never
+copy a GPU number from another generation or infer working devices from
+parallelism alone.
 
 ## 3. Scientific lessons from M03R-v7
 
@@ -176,9 +218,9 @@ The complete benchmark and audit are in the
 [twelve-setting performance benchmark](top2000_m03r_v7_seed17_12_setting_performance_benchmark.md)
 and [Phase-0 forensic audit](top2000_m03r_v7_seed17_phase0_forensic_audit.md).
 
-## 4. M03R-v8 alpha-discovery direction
+## 4. Predictive-first lineage from v8 through v11
 
-M03R-v8 responds to the v7 failure by changing the order of learning:
+M03R-v8 introduced the durable ordering that remains relevant:
 
 1. pretrain the raw encoder and multi-horizon residual-alpha heads;
 2. require predictive evidence before economic policy training;
@@ -188,18 +230,29 @@ M03R-v8 responds to the v7 failure by changing the order of learning:
    bounded factor/risk controls;
 6. use gross, net, and factor-adjusted active alpha as the progression gates.
 
-The frozen pretraining horizons are 5, 21, 30, and 63 sessions with intended
-weights 0.10, 0.35, 0.40, and 0.15. The 21- and 30-session horizons carry 75%
-of the objective because they are closest to the cross-day policy horizon.
+The predictive designs use 5-, 21-, 30-, and 63-session heads. The eligible
+execution candidates are separately bound 21- and 30-session horizons; a
+model cannot qualify one horizon and trade another.
 
-The primary predictive gate remains:
+The broad-rank gate begins with:
 
 - mean validation rank IC at least 0.02 for the 21- or 30-session horizon;
 - positive rank IC in at least four of six chronological folds.
 
-Do not lower this gate to make a failed run pass. Preserve failed evidence,
-diagnose the causal defect, change source under a new immutable identity, and
-rerun only the invalidated surface.
+V11 additionally requires date-level IC breadth, positive spread, block-LCB
+economics, aggregate break-even cost, noncollapsed dispersion, and projection
+retention. Do not lower any frozen gate to make a failed run pass. Preserve
+failed evidence, diagnose the causal defect, change source under a new
+immutable identity, and rerun only the invalidated surface.
+
+V9 established that factor-residual targets were preferable to subtracting a
+common benchmark return, but neither broad IC nor a profitable deterministic
+sleeve was established. V10 was never launched. Its review showed that the
+settings must share one panel-level episode schedule, factor-ineligible assets
+must not enter losses as artificial zero residuals, weak signals must not spend
+the turnover cap, and fold-level confidence summaries cannot be averaged into
+an aggregate confidence claim. V11 corrects those boundaries under a fresh
+identity.
 
 ### Objective-integrity lesson
 
@@ -227,9 +280,12 @@ validation, deterministic wiring, and bounded resource use. It does not prove:
 - predictive-gate success;
 - active-alpha success.
 
-The authoritative v8 design remains the
-[M03R-v8 alpha-discovery document](top2000_m03r_v8_alpha_discovery.md).
-Remote run state must be established from receipts, not from this guide.
+Generation-specific details are in the [v8 design](top2000_m03r_v8_alpha_discovery.md),
+[completed v9 record](top2000_m03r_v9_predictive_stage.md),
+[superseded v10 proposal](top2000_m03r_v10_rank_geometry.md), and
+[corrected v11 protocol](top2000_m03r_v11_rank_geometry_corrected.md).
+Remote run state must be established from receipts, not from any of these
+documents.
 
 ## 5. Numerical and accounting safety
 
@@ -250,6 +306,27 @@ removal.
 Regression tests should drive a positive weight into the FP32 subnormal range,
 exercise all sale paths, reconcile after every transition, and backpropagate a
 finite gradient.
+
+### Keep residual CASH out of risky-signal retention
+
+CASH is the simplex residual account, not a requested risky alpha signal.
+Recomputing it after projection can move its weight by several floating-point
+ULPs even when the risky active book is unchanged. For a weak requested signal,
+including that bookkeeping delta in the full-book norm can report
+requested-to-executed retention above one and invalidate an otherwise sound
+qualification trace.
+
+Define book retention on risky active weights only. Reject any material
+amplification, and canonicalize only a predeclared sub-tolerance numerical
+overshoot to one. Keep an exact weak-signal regression whose old full-book
+ratio exceeds one; this proves the guard covers CASH closure rather than
+silently relaxing the scientific gate.
+
+The same principle applies inside the 61-bin cohort ledger. FP32 reduction
+residue must be reconciled to the already approved risky target while
+preserving cohort proportions and age, before implicit CASH, turnover, or
+drift is measured. Do not widen cohort or cause-turnover tolerances to absorb a
+manufactured CASH balance.
 
 ### Reject non-finite gradients before optimizer mutation
 
@@ -287,6 +364,45 @@ and evidence paths are disjoint.
 Never modify packaged runtime source in place while a Job is running. Fixes
 for the next generation belong in a new immutable source archive. Preserve the
 old terminal and cleanup evidence even when the failure is operational.
+
+### Data freeze, conversion, and split discipline
+
+Downloaded data and admissible data are different objects. Keep provider raw
+responses append-only and intact; materialize converted caches under new,
+no-clobber identities. A training or evaluation package must bind:
+
+```text
+provider/source receipt and raw-member hashes
+conversion source and schema identities
+exact inclusive/exclusive date coverage
+row counts, gaps, duplicates, and adjustment rules
+symbol and asset-axis hashes
+decision-time availability and point-in-time classifications
+converted array/file hashes and row-usage hashes
+```
+
+Never put an API key in source, documentation, a manifest, a command argument,
+or a receipt. A transferred archive is not trusted until its exact final bytes,
+safe member inventory, and converted semantic manifest validate at the
+destination.
+
+For the current TOP2000 compatibility lineage, the frozen training cache has
+1,001 daily states from 2022-01-03 through 2025-12-29 and rejects every
+2026-or-later cache date. Its daily OHLCV states are aggregated from five-minute
+bars; they are not a learned intraday-token sequence. Newer provider rows may
+exist in a separately bound delta while contributing exactly zero rows to the
+training cache. “Use all available data” never overrides a frozen chronology,
+purge, label-support, untouched qualification tail, or test boundary.
+
+Point-in-time sector classification means the provider classification whose
+effective/availability record was knowable at the decision origin. Use an
+explicit unknown category when no eligible record exists. Never future-fill a
+later SIC or sector label backward. The sector/exposure asset axis, names, and
+origin-time availability must match the residual operator and risk manifest.
+
+Training context, optimizer origins, label support, validation, qualification,
+and outer evaluation are different date roles. Hash their actual row usage;
+calendar overlap or a downloaded source range alone cannot prove isolation.
 
 ## 7. Efficient receipt-gated Kubernetes execution
 
@@ -480,9 +596,10 @@ market samples. Select each seed checkpoint using inner-validation evidence,
 combine seed outputs into one deployed chronological path, and perform
 inference on that path.
 
-### 2026-YTD retrospective
+### Frozen v7 2026-YTD retrospective
 
-The 2026-YTD TOP2000 surface is a retrospective mechanism diagnostic only. It
+The implemented v7 2026-YTD TOP2000 surface is a retrospective mechanism
+diagnostic only. It
 uses an inclusive 2026-01-02 through 2026-06-23 score window and must freeze
 model, data, action, factor, cost, and statistical rules before opening outcome
 data. Fold 5/seed 17/rank 0 is the headline checkpoint; folds 0–4 are separate
@@ -506,6 +623,11 @@ The retrospective contract requires:
 - one-GPU execution with exact checkpoint and source binding.
 
 See the [2026-YTD retrospective guide](top2000_m03r_v7_seed17_2026_ytd_retrospective.md).
+July, August, or any later 2026 coverage is outside that immutable contract.
+Using it requires a fresh evaluation protocol, data/coverage identity, and
+pre-access freeze. It must not enter v11 training, validation, qualification,
+horizon selection, calibration, or debugging. Once 2026 outcomes are opened,
+they remain consumed adaptive evidence and cannot become a fresh lockbox.
 
 ## 10. Interpreting outcomes correctly
 
@@ -651,14 +773,12 @@ Keep verification claims precise:
 4. The complete repository suite detects integration and hygiene drift that a
    package-focused suite can miss.
 
-Do not summarize focused green tests as “all tests pass.” At the time this
-knowledge base was written, the active package had passed its focused
-qualification, while the broader repository suite still exposed separate
-integration debt, including later-generation source-inventory registration,
-package-entrypoint thinness, a legacy import-boundary expectation, a float32
-pipeline reconciliation edge, and a repository-hygiene literal. These are
-repository qualification issues, not evidence that an already running sealed
-package should be edited in place.
+Do not summarize focused green tests as “all tests pass.” Report the exact
+command, source identity, scope, test count, and result. Put concrete
+outstanding integration debt in the affected generation record or tracked
+issue rather than this durable guide. A focused package suite, full repository
+suite, same-image qualification, and remote execution each prove different
+boundaries.
 
 Resolve runtime-affecting debt at the next source-freeze boundary, rebuild a
 fresh package, and rerun the invalidated qualification. Documentation-only
@@ -675,6 +795,10 @@ bytes.
 - [ ] Focused semantic, numerical, route, and lifecycle tests pass.
 - [ ] Non-finite gradients fail before optimizer mutation.
 - [ ] Source manifest, data/cache, image, and plan hashes recorded.
+- [ ] Raw-to-converted data receipt binds schema, dates, row counts, gaps,
+      duplicates, asset axis, availability, and actual row usage.
+- [ ] Every train/validation/qualification/test date role is disjoint exactly
+      as required by the frozen protocol.
 - [ ] Package receipts use relocation-safe identities; operator-local absolute
       paths are not treated as worker mount identities.
 - [ ] Transfer archive has one top-level directory, deterministic metadata,

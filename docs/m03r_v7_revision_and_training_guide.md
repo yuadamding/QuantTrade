@@ -16,7 +16,7 @@ protocol disagree, the protocol and its package-owned validator win.
 
 | Layer | Purpose | What it cannot prove |
 |---|---|---|
-| Canonical PIT Active-300 v7 | Scientific objective, causal panel, five-seed ensemble, inference, and promotion contract | That the production driver, PIT data, or H100 study is qualified |
+| Canonical PIT Active-300 v7 | Scientific objective, causal panel, five-seed ensemble, inference, and promotion contract | That the research-grade driver, PIT data, or H100 study is qualified |
 | TOP2000 v7 compatibility route | Executable mechanism and numerical qualification on a future-selected universe | Point-in-time validity, canonical factor/sector evidence, or promotion |
 | Seed-17 TOP2000 diagnostic | Efficient twelve-setting, six-fold, one-seed screen | Seed robustness, a five-seed ensemble, reportability, or investment performance |
 

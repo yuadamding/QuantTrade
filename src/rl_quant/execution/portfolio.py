@@ -5,6 +5,7 @@ target-weight model below records an accounting transition and explicit cost
 assumptions; it does not claim latency, queue position, fill price, or empirical
 market impact that the input data cannot support.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -12,8 +13,14 @@ from typing import ClassVar, Mapping, Protocol, runtime_checkable
 
 import torch
 
-from rl_quant.execution.types import WeightExecutionCostConfig, weight_transition_cost_bps
-from rl_quant.execution.validation import coerce_finite_nonnegative, require_nonnegative_int
+from rl_quant.execution.types import (
+    WeightExecutionCostConfig,
+    weight_transition_cost_bps,
+)
+from rl_quant.execution.validation import (
+    coerce_finite_nonnegative,
+    require_nonnegative_int,
+)
 
 
 @dataclass(frozen=True)
@@ -36,8 +43,14 @@ class TargetWeightExecutionResult:
             "traded_notional": self.traded_notional,
         }
         for name, value in fields.items():
-            if value.shape != shape or value.device != device or value.dtype != self.execution_cost.dtype:
-                raise ValueError(f"{name} must have shape {shape}, dtype {self.execution_cost.dtype}, on {device}.")
+            if (
+                value.shape != shape
+                or value.device != device
+                or value.dtype != self.execution_cost.dtype
+            ):
+                raise ValueError(
+                    f"{name} must have shape {shape}, dtype {self.execution_cost.dtype}, on {device}."
+                )
             if not bool(torch.isfinite(value).all().item()):
                 raise ValueError(f"{name} must be finite.")
             if bool((value < 0).any().item()):
@@ -46,8 +59,12 @@ class TargetWeightExecutionResult:
             if not name:
                 raise ValueError("Execution diagnostic names must be non-empty.")
             if value.ndim == 0 or value.shape[0] != shape[0] or value.device != device:
-                raise ValueError(f"diagnostics[{name!r}] needs leading batch size {shape[0]} on {device}.")
-            if value.is_floating_point() and not bool(torch.isfinite(value).all().item()):
+                raise ValueError(
+                    f"diagnostics[{name!r}] needs leading batch size {shape[0]} on {device}."
+                )
+            if value.is_floating_point() and not bool(
+                torch.isfinite(value).all().item()
+            ):
                 raise ValueError(f"diagnostics[{name!r}] must be finite.")
 
 
@@ -87,7 +104,9 @@ class FixedTurnoverTargetWeightExecution:
     models_market_fills: ClassVar[bool] = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "cost_bps", coerce_finite_nonnegative("cost_bps", self.cost_bps))
+        object.__setattr__(
+            self, "cost_bps", coerce_finite_nonnegative("cost_bps", self.cost_bps)
+        )
 
     def execute(
         self,
@@ -97,13 +116,17 @@ class FixedTurnoverTargetWeightExecution:
         cash_index: int,
     ) -> TargetWeightExecutionResult:
         if current_weights.shape != target_weights.shape or current_weights.ndim < 2:
-            raise ValueError("current_weights and target_weights need identical [..., asset] shapes.")
+            raise ValueError(
+                "current_weights and target_weights need identical [..., asset] shapes."
+            )
         if (
             not current_weights.is_floating_point()
             or target_weights.dtype != current_weights.dtype
             or target_weights.device != current_weights.device
         ):
-            raise ValueError("Current and target weights must share one floating dtype and device.")
+            raise ValueError(
+                "Current and target weights must share one floating dtype and device."
+            )
         checked_cash_index = require_nonnegative_int("cash_index", cash_index)
         if checked_cash_index >= current_weights.shape[-1]:
             raise ValueError("cash_index is outside the target-weight action axis.")
@@ -139,11 +162,17 @@ class ImmediateTargetWeightExecution:
     fee_bps: float = 0.0
     modeled_linear_impact_bps_per_weight: float = 0.0
     models_market_fills: ClassVar[bool] = False
-    _weight_cost: WeightExecutionCostConfig = field(init=False, repr=False, compare=False)
+    _weight_cost: WeightExecutionCostConfig = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "spread_bps", coerce_finite_nonnegative("spread_bps", self.spread_bps))
-        object.__setattr__(self, "fee_bps", coerce_finite_nonnegative("fee_bps", self.fee_bps))
+        object.__setattr__(
+            self, "spread_bps", coerce_finite_nonnegative("spread_bps", self.spread_bps)
+        )
+        object.__setattr__(
+            self, "fee_bps", coerce_finite_nonnegative("fee_bps", self.fee_bps)
+        )
         object.__setattr__(
             self,
             "modeled_linear_impact_bps_per_weight",
@@ -157,7 +186,9 @@ class ImmediateTargetWeightExecution:
             "_weight_cost",
             WeightExecutionCostConfig(
                 fee_bps=self.fee_bps,
-                impact_kind="linear_bps" if self.modeled_linear_impact_bps_per_weight > 0.0 else "none",
+                impact_kind="linear_bps"
+                if self.modeled_linear_impact_bps_per_weight > 0.0
+                else "none",
                 linear_impact_bps_per_weight=self.modeled_linear_impact_bps_per_weight,
             ),
         )
@@ -170,13 +201,17 @@ class ImmediateTargetWeightExecution:
         cash_index: int,
     ) -> TargetWeightExecutionResult:
         if current_weights.shape != target_weights.shape or current_weights.ndim < 2:
-            raise ValueError("current_weights and target_weights need identical [..., asset] shapes.")
+            raise ValueError(
+                "current_weights and target_weights need identical [..., asset] shapes."
+            )
         if (
             not current_weights.is_floating_point()
             or target_weights.dtype != current_weights.dtype
             or target_weights.device != current_weights.device
         ):
-            raise ValueError("Current and target weights must share one floating dtype and device.")
+            raise ValueError(
+                "Current and target weights must share one floating dtype and device."
+            )
         if not 0 <= cash_index < current_weights.shape[-1]:
             raise ValueError("cash_index is outside the target-weight action axis.")
         if not bool(torch.isfinite(current_weights).all().item()) or not bool(
@@ -205,7 +240,9 @@ class ImmediateTargetWeightExecution:
         )
 
 
-def one_way_turnover(new_weights: torch.Tensor, old_weights: torch.Tensor) -> torch.Tensor:
+def one_way_turnover(
+    new_weights: torch.Tensor, old_weights: torch.Tensor
+) -> torch.Tensor:
     """Half-L1 portfolio turnover, including CASH, on the final axis."""
     if new_weights.shape != old_weights.shape:
         raise ValueError("new_weights and old_weights must have identical shapes")
@@ -242,9 +279,15 @@ def drift_weights(
     if valid is not None:
         if valid.shape != weights.shape:
             raise ValueError("valid must match weights")
-        marked = torch.where(valid.bool(), asset_returns, torch.zeros_like(asset_returns))
+        marked = torch.where(
+            valid.bool(), asset_returns, torch.zeros_like(asset_returns)
+        )
     growth = 1.0 + marked
-    portfolio_growth = (weights * growth).sum(dim=-1, keepdim=True)
+    # Compute portfolio growth as one plus the weighted return.  Expanding the
+    # leading one per asset and then reducing is mathematically equivalent only
+    # under exact arithmetic; in FP32 it can differ by enough ULPs to disagree
+    # with cohort accounting's canonical growth scalar.
+    portfolio_growth = 1.0 + (weights * marked).sum(dim=-1, keepdim=True)
     # Return inputs are validated/clipped at the data/environment boundary. Avoid a host synchronization in this
     # hot differentiable kernel; the denominator guard keeps tiny positive growth numerically stable.
     return weights * growth / portfolio_growth.clamp_min(1e-12)

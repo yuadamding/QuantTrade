@@ -1199,14 +1199,26 @@ def project_m03r_v9_active_book(
         covariance_factor,
         specific,
     )
-    requested_norm = torch.linalg.vector_norm(active64, dim=-1)
-    projected_norm = torch.linalg.vector_norm(projected_active64, dim=-1)
-    retention = torch.where(
-        requested_norm > 0.0,
-        projected_norm / requested_norm.clamp_min(torch.finfo(work_dtype).tiny),
-        torch.ones_like(requested_norm),
-    )
     tolerance = 2.0e-6
+    # CASH is the residual simplex account, not a requested risky signal.  Its
+    # value is recomputed after projection and can move by several ULPs even
+    # when the risky active book is unchanged.  Including that bookkeeping
+    # delta in a weak-signal norm can therefore report retention above one.
+    # Measure the economically meaningful risky-active book instead, reject
+    # material amplification, and canonicalize sub-tolerance roundoff to one.
+    requested_risky_norm = torch.linalg.vector_norm(active64[:, risky], dim=-1)
+    projected_risky_norm = torch.linalg.vector_norm(
+        projected_active64[:, risky], dim=-1
+    )
+    raw_retention = torch.where(
+        requested_risky_norm > 0.0,
+        projected_risky_norm
+        / requested_risky_norm.clamp_min(torch.finfo(work_dtype).tiny),
+        torch.ones_like(requested_risky_norm),
+    )
+    if bool((raw_retention > 1.0 + tolerance).any()):
+        raise M03RV9ProjectionError("v9 risk projection amplified risky active signal")
+    retention = raw_retention.clamp(0.0, 1.0)
     if (
         bool((projected < -tolerance).any())
         or bool((projected - caps > tolerance).any())

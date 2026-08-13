@@ -536,6 +536,7 @@ def test_cuda_startup_rejects_multi_process_and_multi_gpu(
         execution._start_single_cuda("cuda:0")
 
     monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
@@ -568,6 +569,7 @@ def test_cuda_startup_rejects_non_h100_before_loading_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)

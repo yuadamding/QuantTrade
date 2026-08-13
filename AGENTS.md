@@ -12,11 +12,14 @@ product, or business-production system.
   before packaging, launching, recovering, evaluating, or interpreting an
   M03R training run.
 - Treat [M03R-v11 corrected rank geometry](docs/top2000_m03r_v11_rank_geometry_corrected.md)
-  as the active post-v9 predictive research boundary. V10 was superseded
-  before launch; neither document authorizes remote GPU work.
+  as the current future-selected TOP2000 predictive-development generation.
+  V10 was superseded before launch. Repository text never establishes the
+  current state of a remote v11 attempt and neither document authorizes GPU
+  work.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
-  as the current canonical scientific direction.
+  as the canonical PIT Active-300 objective and promotion contract. That
+  scientific role is distinct from v11's executable TOP2000 development role.
 - Read [the M03R v7 revision and training guide](docs/m03r_v7_revision_and_training_guide.md)
   before changing the objective, cohort accounting, TOP2000 runtime, package,
   or recovery behavior.
@@ -53,6 +56,13 @@ Use the Python 3.11 `quanttrade` environment. Focus tests on the changed
 boundary before running the full suite.
 
 ```bash
+# Current v11 predictive boundary
+PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_hold30_alpha_m03r_v11_top2000_dev_protocol.py \
+  tests/test_top2000_m03r_v11_*.py \
+  tests/test_cost_aware_active_policy_v3.py
+
+# Canonical v7 contract boundary
 PYTHONPATH=src conda run -n quanttrade python -m pytest \
   tests/test_hold30_accounting.py \
   tests/test_hold30_alpha_m03r_v7_protocol.py \
@@ -65,9 +75,8 @@ PYTHONPATH=src conda run -n quanttrade python -m pytest \
 conda run -n quanttrade ruff check src scripts tests
 ```
 
-The complete commands supported by project configuration are documented in
-[the README](README.md). Do not treat the quarantined scripts under `legacy/`
-as runnable package entrypoints.
+The core repository commands are documented in [the README](README.md). Do not
+treat the quarantined scripts under `legacy/` as runnable package entrypoints.
 
 ## Scientific conventions
 

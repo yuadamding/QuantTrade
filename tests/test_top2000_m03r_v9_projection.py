@@ -306,6 +306,46 @@ def test_projection_enforces_caps_and_detects_hot_path_tensor_mutation() -> None
         )
 
 
+def test_projection_retention_excludes_cash_closure_roundoff() -> None:
+    source, projector, risk_state, _, _ = _device_state_fixture()
+    benchmark = torch.full((1, 102), 0.98 / 101.0, dtype=torch.float32)
+    benchmark[:, 0] = 0.02
+    generator = torch.Generator().manual_seed(1)
+    raw_signal = torch.empty_like(benchmark)
+    # This fixed draw reproduces the weak-signal geometry from the failed v11
+    # qualification path.  Full-book retention is greater than one because
+    # simplex closure adjusts residual CASH, while risky retention is only a
+    # sub-tolerance floating-point overshoot.
+    for _ in range(3_684):
+        raw_signal = torch.randn(
+            benchmark.shape,
+            generator=generator,
+            dtype=benchmark.dtype,
+        )
+    active_signal = raw_signal * 1.0e-5
+    active_signal -= active_signal.mean(dim=-1, keepdim=True)
+    requested = benchmark + active_signal
+
+    result = project_m03r_v9_active_book(
+        requested,
+        benchmark,
+        torch.ones_like(benchmark, dtype=torch.bool),
+        torch.ones_like(benchmark),
+        torch.tensor([0.98], dtype=torch.float32),
+        risk_state,
+        origin_state_index=89,
+        sequence_asset_axis_sha256=source.action_hash,
+        checkpoint_asset_axis_sha256=source.action_hash,
+        expected_manifest_sha256=projector.manifest_sha256,
+    )
+
+    full_book_ratio = torch.linalg.vector_norm(
+        (result.projected_weights - benchmark).to(torch.float64), dim=-1
+    ) / torch.linalg.vector_norm((requested - benchmark).to(torch.float64), dim=-1)
+    assert full_book_ratio.item() > 1.0 + 1.0e-5
+    assert result.requested_to_executed_retention.item() == 1.0
+
+
 def test_signal_is_projected_into_the_same_exposure_null_space() -> None:
     source, projector, risk_state, _, _ = _device_state_fixture()
     loadings = risk_state.exposure_loadings[1]

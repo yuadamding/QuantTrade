@@ -12,6 +12,7 @@ from rl_quant.envs.hold30 import (
     CohortLedger,
     CohortTradeAccounting,
     TurnoverCause,
+    reconcile_cash_simplex_roundoff,
     zero_turnover_by_cause,
 )
 from rl_quant.envs.market import (
@@ -655,7 +656,16 @@ class VectorPortfolioEnv:
         projected = torch.zeros_like(weights)
         projected[:, self._risky_mask] = risky
         projected[:, self.cash_index] = 1.0 - risky.sum(dim=-1)
-        return projected
+        return reconcile_cash_simplex_roundoff(
+            projected,
+            cash_index=self.cash_index,
+            risky_gross_limit=torch.full(
+                (weights.shape[0],),
+                self.constraints.max_leverage,
+                dtype=weights.dtype,
+                device=weights.device,
+            ),
+        )
 
     def _availability_project(
         self, weights: torch.Tensor, availability: torch.Tensor
@@ -669,7 +679,16 @@ class VectorPortfolioEnv:
             torch.zeros_like(projected[:, self._risky_mask]),
         )
         projected[:, self.cash_index] = 1.0 - projected[:, self._risky_mask].sum(dim=-1)
-        return projected
+        return reconcile_cash_simplex_roundoff(
+            projected,
+            cash_index=self.cash_index,
+            risky_gross_limit=torch.full(
+                (weights.shape[0],),
+                self.constraints.max_leverage,
+                dtype=weights.dtype,
+                device=weights.device,
+            ),
+        )
 
     @staticmethod
     def _one_way_turnover(new: torch.Tensor, old: torch.Tensor) -> torch.Tensor:
@@ -699,7 +718,16 @@ class VectorPortfolioEnv:
                 torch.ones_like(discretionary),
             )
             forced_excess = (forced - cap).clamp_min(0.0)
-        projected = anchor + alpha.unsqueeze(-1) * (candidate - anchor)
+        projected = reconcile_cash_simplex_roundoff(
+            anchor + alpha.unsqueeze(-1) * (candidate - anchor),
+            cash_index=self.cash_index,
+            risky_gross_limit=torch.full(
+                (requested.shape[0],),
+                self.constraints.max_leverage,
+                dtype=requested.dtype,
+                device=requested.device,
+            ),
+        )
         fallback = torch.zeros_like(projected)
         fallback[:, self.cash_index] = 1.0
         risk_override_turnover = self._one_way_turnover(fallback, projected)
@@ -862,7 +890,10 @@ class VectorPortfolioEnv:
             raise RuntimeError(
                 "Portfolio gross return reached -100%; weights cannot be drifted."
             )
-        drifted = drift_weights(target_weights, period_returns)
+        drifted = reconcile_cash_simplex_roundoff(
+            drift_weights(target_weights, period_returns),
+            cash_index=self.cash_index,
+        )
         ledger = ledger.age_and_drift(period_returns)
         ledger.assert_reconciles(drifted)
 

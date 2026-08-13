@@ -8,10 +8,10 @@ application, not the definition of the framework.
 The repository also retains the older two-stage **Phase-1 direct portfolio optimizer**. That workflow is useful
 as a baseline, but it is not PPO and is not yet wired through the new environment/trajectory interfaces.
 
-> **Implementation snapshot (2026-07; documentation updated 2026-08-04).** The tested library now includes recurrent PPO with masked simplex actions,
+> **Implementation snapshot (2026-07).** The tested library now includes recurrent PPO with masked simplex actions,
 > on-policy and replay rollout coordinators, schema-locked replay, offline training, twin-critic IQL, regime
 > mixtures, uncertainty abstention, market stress transforms, a purged/embargoed walk-forward splitter, and the
-> vectorized portfolio environment. These are library primitives, not a production trading runner: the
+> vectorized portfolio environment. These are library primitives, not a live-trading runner: the
 > Phase-1-to-RL encoder adapter/CLI, walk-forward runtime integration, and complete artifact-driven evaluator are
 > still pending. Existing TOP50/TOP2000 universes were ranked after their backtest start and remain development-only
 > until rebuilt point-in-time.
@@ -215,7 +215,7 @@ scoring are optional extras. Training consumes frozen news scores; it never invo
 
 ## Run the legacy Phase-1 experiment
 
-There is not yet a production RL rollout command. The following commands run the **legacy direct baseline**:
+There is not yet a governed research RL rollout command. The following commands run the **legacy direct baseline**:
 
 ```bash
 # CPU correctness smoke
@@ -282,7 +282,7 @@ hold, sell mask, expiry, turnover proxy, or promotion gate. V6, v5, v4, and v3
 remain unchanged prelaunch audit generations; v2 was superseded before launch.
 
 Canonical PIT Active-300 v7 has typed protocol, objective, route, and schedule
-surfaces, but its governed production driver, evaluator, point-in-time data,
+surfaces, but its governed research driver, evaluator, point-in-time data,
 five-seed ensemble, calibration, CUDA/H100 qualification, and promotion chain
 remain launch-blocked. A separate executable TOP2000 compatibility route and
 one-seed diagnostic qualify mechanisms and numerical behavior only. That
@@ -300,23 +300,8 @@ forced non-positive and remains development-only.
 - [Documentation index and status map](docs/README.md)
 - [QuantTrade training knowledge base](docs/quanttrade_training_knowledge_base.md)
 - [M03R-v11 corrected rank-geometry stage](docs/top2000_m03r_v11_rank_geometry_corrected.md)
-- [M03R v7 revision and training guide](docs/m03r_v7_revision_and_training_guide.md)
-- [Current M03R v7 active-alpha Hold-30 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md)
-- [M03R v7 twelve-setting experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
-- [Development-only TOP2000 seed-17 diagnostic](docs/top2000_m03r_v7_seed17_diagnostic.md)
-- [ADR-0006: one daily decision with a soft 30-session holding target](docs/adr/0006-daily-decision-soft-30-session-holding.md)
-- [ADR-0007: historical benchmark-relative alpha decision](docs/adr/0007-benchmark-relative-hold30-alpha-objective.md)
-- [Hold-30 policy redesign RFC](docs/daily_hold30_policy_rfc.md)
-- [Normative pre-lockbox Hold-30 H0–H3 base specification](docs/prelockbox_hold30_h0_h3_experiment.md)
-- [Immutable M03R v6 soft-persistence specification](docs/prelockbox_hold30_active_alpha_m03r_v6.md)
-- [Immutable M03R v5 active-alpha Hold-30 specification](docs/prelockbox_hold30_active_alpha_m03r_v5.md)
-- [Frozen M03R v4 specification](docs/prelockbox_hold30_active_alpha_m03r_v4.md)
-- [Superseded-before-launch Hold-30 alpha mechanism-8 v3 audit specification](docs/prelockbox_hold30_alpha_mech8_v3.md)
-- [Hold-30 alpha v3 sealed-evaluation contract](docs/prelockbox_hold30_alpha_evaluation_v3.md)
-- [Superseded-before-launch mechanism-8 v2 audit record](docs/prelockbox_hold30_mech8_v2.md)
-- [Seadragon training-source lineage](docs/SEADRAGON_TRAINING_SOURCE.md)
 - [General RL architecture and exact current limitations](docs/general_rl_architecture.md)
 - [Deep-RL migration ledger](docs/architecture_migration_plan.md)
-- [Decision tensor and reportability protocol](docs/decision_tensor_protocol.md)
-- [Architecture decision records](docs/adr/README.md)
-- [News-model provenance protocol](docs/news_llm_covariate_protocol.md)
+
+The [documentation index](docs/README.md) owns the complete current,
+development, historical, and superseded-document map.

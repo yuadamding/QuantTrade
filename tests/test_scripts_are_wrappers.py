@@ -37,6 +37,11 @@ LEGACY_NON_WRAPPER_SCRIPTS = {
     "download_hourly_ohlcv.py",
     "fetch_top_us_market_cap_universe.py",
     "fetch_top_volume_universes.py",
+    # Historical package tools that still own deterministic build/validation
+    # logic. Current v11 uses package-owned builders and does not invoke them.
+    "build_m03r_v7_phase0_audit_package.py",
+    "build_m03r_v8_pretraining_package.py",
+    "validate_m03r_v8_pretraining_package.py",
     # validate_research_protocol.py MIGRATED -> rl_quant.workflows.commands.validate (now a thin wrapper).
 }
 
@@ -45,7 +50,8 @@ def _owns_logic(path: pathlib.Path) -> bool:
     """True if the script defines top-level functions/classes (business logic belongs in the package)."""
     tree = ast.parse(path.read_text(), filename=str(path))
     return any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for node in tree.body
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        for node in tree.body
     )
 
 
@@ -55,11 +61,13 @@ class ScriptsAreWrappersTests(unittest.TestCase):
 
     def test_non_legacy_scripts_are_thin_wrappers(self) -> None:
         offenders = [
-            p.name for p in self._scripts()
+            p.name
+            for p in self._scripts()
             if p.name not in LEGACY_NON_WRAPPER_SCRIPTS and _owns_logic(p)
         ]
         self.assertEqual(
-            offenders, [],
+            offenders,
+            [],
             "These scripts own business logic (top-level functions/classes) but are not in the migration "
             f"backlog: {offenders}. Make them thin wrappers that delegate to rl_quant.* (the package owns "
             "logic), or -- with justification -- add them to LEGACY_NON_WRAPPER_SCRIPTS.",
@@ -69,18 +77,26 @@ class ScriptsAreWrappersTests(unittest.TestCase):
         # Once a backlog script is migrated it becomes a wrapper; it must then be REMOVED from the allowlist so
         # the backlog visibly shrinks and the wrapper cannot silently regress.
         migrated = [
-            name for name in sorted(LEGACY_NON_WRAPPER_SCRIPTS)
+            name
+            for name in sorted(LEGACY_NON_WRAPPER_SCRIPTS)
             if (_SCRIPTS_DIR / name).exists() and not _owns_logic(_SCRIPTS_DIR / name)
         ]
         self.assertEqual(
-            migrated, [],
+            migrated,
+            [],
             f"These scripts are now thin wrappers -- remove them from LEGACY_NON_WRAPPER_SCRIPTS: {migrated}.",
         )
 
     def test_legacy_allowlist_has_no_stale_entries(self) -> None:
         existing = {p.name for p in self._scripts()}
-        stale = sorted(name for name in LEGACY_NON_WRAPPER_SCRIPTS if name not in existing)
-        self.assertEqual(stale, [], f"LEGACY_NON_WRAPPER_SCRIPTS names non-existent scripts: {stale}.")
+        stale = sorted(
+            name for name in LEGACY_NON_WRAPPER_SCRIPTS if name not in existing
+        )
+        self.assertEqual(
+            stale,
+            [],
+            f"LEGACY_NON_WRAPPER_SCRIPTS names non-existent scripts: {stale}.",
+        )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from rl_quant.envs import (
     VectorPortfolioEnv,
     net_trade_legs,
 )
+from rl_quant.envs.hold30 import reconcile_cash_simplex_roundoff
 
 
 def _market(
@@ -89,8 +90,30 @@ def test_common_endowment_is_evenly_staggered_over_ages_zero_through_29() -> Non
         torch.full((30,), 0.01),
     )
     torch.testing.assert_close(ledger.economic_value[..., 30:], torch.zeros(1, 2, 31))
-    torch.testing.assert_close(ledger.retention_units, torch.zeros_like(ledger.retention_units))
+    torch.testing.assert_close(
+        ledger.retention_units, torch.zeros_like(ledger.retention_units)
+    )
     ledger.assert_reconciles(torch.tensor([[0.7, 0.3]]))
+
+
+def test_float32_age_drift_does_not_manufacture_residual_cash() -> None:
+    generator = torch.Generator().manual_seed(1234)
+    returns = torch.randn((11, 4), generator=generator) * 0.005
+    returns[:, 0] = 0.0
+    ledger = CohortLedger.from_staggered_endowment(
+        torch.tensor([[0.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]]),
+        cash_index=0,
+    )
+
+    for row in returns:
+        current = ledger.weights
+        growth = 1.0 + (current * row).sum(dim=-1, keepdim=True)
+        expected = reconcile_cash_simplex_roundoff(
+            current * (1.0 + row) / growth,
+            cash_index=0,
+        )
+        ledger = ledger.age_and_drift(row.unsqueeze(0))
+        ledger.assert_reconciles(expected, atol=1.0e-7, rtol=1.0e-7)
 
 
 def test_same_name_buy_and_sell_are_netted_without_resetting_existing_age() -> None:

@@ -13,7 +13,7 @@ tests are not launch or performance evidence.
 - [M03R v7 active-alpha Hold-30 RFC](prelockbox_hold30_active_alpha_m03r_v7.md)
   — canonical scientific objective, twelve-setting inventory, persistence,
   selection, and promotion rules. The governed PIT Active-300 path remains
-  launch-blocked until all named production surfaces qualify.
+  launch-blocked until all named research-grade execution surfaces qualify.
 - [M03R v7 twelve-setting experiment](prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   — canonical five-seed pairing, two-H100 topology, inference, and reporting
   contract.
@@ -57,9 +57,9 @@ tests are not launch or performance evidence.
   — fresh corrective identity with paired setting-neutral episodes,
   factor-qualified shared residual operators, magnitude-preserving soft-gated
   actions, block inference, aggregate break-even accounting, and exact
-  checkpoint round-trip evaluation. Its receipt-gated predictive development
-  run is active after static, two-H100 capacity, and per-worker startup proofs;
-  economic training and 2026 access remain blocked.
+  checkpoint round-trip evaluation. Remote run state must be established from
+  exact external receipts; economic training and 2026 access remain blocked by
+  the generation itself.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100
@@ -75,7 +75,8 @@ tests are not launch or performance evidence.
 - [Decision-tensor protocol](decision_tensor_protocol.md)
 - [Execution wiring design](execution_wiring_design.md)
 - [Daily Hold-30 policy RFC](daily_hold30_policy_rfc.md)
-- [Stock-covariate integration](stock_covariate_integration.md)
+- [Stock-covariate integration](stock_covariate_integration.md) — archived
+  source-data history, not the active model interface.
 - [News-model provenance](news_llm_covariate_protocol.md)
 - [Architecture decision records](adr/README.md)
 
