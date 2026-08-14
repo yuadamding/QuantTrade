@@ -1,6 +1,6 @@
-"""One-attempt suspended-Job preparation for M03R-v11 on Seadragon.
+"""One-attempt suspended-Job preparation for M03R-v13 on Seadragon.
 
-This operator is the sole v11 create surface.  It performs one server dry-run,
+This operator is the sole v13 create surface.  It performs one server dry-run,
 proves exact-name absence twice, issues exactly one create request, reconciles
 that request for the full bounded uncertainty window, binds two stable
 suspended reads with zero UID-owned Pods, and publishes the exact activation
@@ -24,42 +24,37 @@ from pathlib import Path
 from typing import Any, Final, Literal, Protocol, cast
 
 from rl_quant.training import top2000_m03r_v7_seadragon_lifecycle as common
-from rl_quant.training import top2000_m03r_v11_seadragon_lifecycle as lifecycle
+from rl_quant.training import top2000_m03r_v13_seadragon_lifecycle as lifecycle
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
     M03R_TOP2000_KUBERNETES_CONTEXT,
     M03R_TOP2000_KUBERNETES_NAMESPACE,
     M03RV7ExactJobCleanupRequest,
     build_m03r_v7_exact_job_activation_request,
 )
-from rl_quant.training.top2000_m03r_v11_kubernetes import (
-    M03R_V11_RENDERED_JOB_SCHEMA,
-    M03RV11RenderedJob,
-    bind_m03r_v11_admitted_suspended_job,
-)
-from rl_quant.training.top2000_m03r_v11_a15_inference_audit_kubernetes import (
-    M03R_V11_A15_AUDIT_RENDERED_JOB_SCHEMA,
-    M03RV11A15AuditRenderedJob,
-    bind_m03r_v11_a15_audit_admitted_suspended_job,
+from rl_quant.training.top2000_m03r_v13_kubernetes import (
+    M03R_V13_RENDERED_JOB_SCHEMA,
+    M03RV13RenderedJob,
+    bind_m03r_v13_admitted_suspended_job,
 )
 
 SEADRAGON_KUBECTL: Final = "/risapps/noarch/kubectl/1.28.4/bin/kubectl"
 SEADRAGON_KUBECONFIG: Final = "/rsrch8/home/bcb/yding4/.kube/config"
 SEADRAGON_QUANTTRADE_ROOT: Final = "/rsrch8/home/bcb/yding4/quant/training"
-CREATE_CONFIG_SCHEMA: Final = "rl-quant.top2000-dev.m03r-v11-create-config-v1"
+CREATE_CONFIG_SCHEMA: Final = "rl-quant.top2000-dev.m03r-v13-create-config-v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-class M03RV11SeadragonOperatorError(RuntimeError):
+class M03RV13SeadragonOperatorError(RuntimeError):
     """The one-attempt suspended preparation failed closed."""
 
 
-class M03RV11CreateAttachRequired(M03RV11SeadragonOperatorError):
+class M03RV13CreateAttachRequired(M03RV13SeadragonOperatorError):
     """Create may have been accepted; the exact identity must not be retried."""
 
 
 def _require_sha256(name: str, value: str) -> None:
     if _SHA256_RE.fullmatch(value) is None:
-        raise M03RV11SeadragonOperatorError(f"{name} must be a lowercase SHA-256")
+        raise M03RV13SeadragonOperatorError(f"{name} must be a lowercase SHA-256")
 
 
 def _file_sha256(path: Path) -> str:
@@ -84,7 +79,7 @@ def _compact_sha256(value: Any) -> str:
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise M03RV11SeadragonOperatorError(f"{label} must be an object")
+        raise M03RV13SeadragonOperatorError(f"{label} must be an object")
     return cast(Mapping[str, Any], value)
 
 
@@ -92,19 +87,19 @@ def _project_path(path: str, label: str) -> Path:
     value = Path(path)
     root = Path(SEADRAGON_QUANTTRADE_ROOT)
     if not value.is_absolute():
-        raise M03RV11SeadragonOperatorError(f"{label} must be absolute")
+        raise M03RV13SeadragonOperatorError(f"{label} must be absolute")
     try:
         value.relative_to(root)
     except ValueError as exc:
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             f"{label} must stay under the approved QuantTrade root"
         ) from exc
     return value
 
 
 @dataclass(frozen=True, slots=True)
-class M03RV11CreateOperatorConfig:
-    mode: Literal["static", "capacity", "predictive", "audit"]
+class M03RV13CreateOperatorConfig:
+    mode: Literal["static", "capacity", "predictive"]
     job_name: str
     run_id: str
     rendered_path: str
@@ -144,11 +139,11 @@ class M03RV11CreateOperatorConfig:
             if self.mode in {"static", "capacity"}
             else self.capacity_receipt_sha256
         )
-        if self.mode in {"predictive", "audit"}:
+        if self.mode == "predictive":
             _require_sha256("capacity_receipt_sha256", self.capacity_receipt_sha256)
         if (
             self.schema != CREATE_CONFIG_SCHEMA
-            or self.mode not in {"static", "capacity", "predictive", "audit"}
+            or self.mode not in {"static", "capacity", "predictive"}
             or not self.job_name
             or not self.run_id
             or self.context != M03R_TOP2000_KUBERNETES_CONTEXT
@@ -159,16 +154,15 @@ class M03RV11CreateOperatorConfig:
             not in {
                 ("static", 1),
                 ("capacity", 1),
-                ("predictive", 3),
-                ("audit", 2),
+                ("predictive", 2),
             }
             or not 1 <= self.parallelism <= self.completions
-            or (self.mode != "static" and self.parallelism * 2 > 6)
+            or (self.mode != "static" and self.parallelism * 2 > 4)
             or self.request_timeout_seconds < 5
             or not 0.1 <= self.reconciliation_poll_seconds <= 5.0
             or self.capacity_receipt_sha256 != expected_capacity
         ):
-            raise M03RV11SeadragonOperatorError("v11 create config identity drifted")
+            raise M03RV13SeadragonOperatorError("v13 create config identity drifted")
         for name in (
             "rendered_path",
             "manifest_path",
@@ -180,7 +174,7 @@ class M03RV11CreateOperatorConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class M03RV11CreateAttempt:
+class M03RV13CreateAttempt:
     returncode: int
     stdout: bytes
     stderr: bytes
@@ -195,7 +189,7 @@ class CreateTransport(Protocol):
 
     def get_owned_pods(self, job_uid: str) -> tuple[Mapping[str, Any], ...]: ...
 
-    def create_once(self, manifest_path: Path) -> M03RV11CreateAttempt: ...
+    def create_once(self, manifest_path: Path) -> M03RV13CreateAttempt: ...
 
     def delete(
         self, request: M03RV7ExactJobCleanupRequest, options_path: Path
@@ -227,7 +221,7 @@ class OneCreateKubectl:
         self, arguments: Sequence[str], *, check: bool = True
     ) -> subprocess.CompletedProcess[bytes]:
         if not arguments or arguments[0] not in {"create", "get", "delete"}:
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 "create transport rejected kubectl verb"
             )
         command = [
@@ -254,11 +248,11 @@ class OneCreateKubectl:
                 env=environment,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 "bounded kubectl create/get invocation failed"
             ) from exc
         if check and completed.returncode != 0:
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 completed.stderr.decode("utf-8", errors="replace")[-2000:]
             )
         return completed
@@ -286,7 +280,7 @@ class OneCreateKubectl:
         )
         items = payload.get("items")
         if not isinstance(items, list):
-            raise M03RV11SeadragonOperatorError("PodList items are invalid")
+            raise M03RV13SeadragonOperatorError("PodList items are invalid")
         return tuple(_mapping(item, "observed Pod") for item in items)
 
     def get_pods_by_job_name(self) -> tuple[Mapping[str, Any], ...]:
@@ -297,14 +291,14 @@ class OneCreateKubectl:
         common._validate_owned_pods(pods, expected_uid=job_uid)
         return pods
 
-    def create_once(self, manifest_path: Path) -> M03RV11CreateAttempt:
+    def create_once(self, manifest_path: Path) -> M03RV13CreateAttempt:
         if self._create_attempted:
-            raise M03RV11SeadragonOperatorError("create request must never be retried")
+            raise M03RV13SeadragonOperatorError("create request must never be retried")
         self._create_attempted = True
         completed = self._run(
             ("create", "-f", str(manifest_path), "-o", "json"), check=False
         )
-        return M03RV11CreateAttempt(
+        return M03RV13CreateAttempt(
             returncode=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
@@ -312,7 +306,7 @@ class OneCreateKubectl:
 
     def delete(self, request: M03RV7ExactJobCleanupRequest, options_path: Path) -> None:
         if request.job_name != self.job_name or request.namespace != self.namespace:
-            raise M03RV11SeadragonOperatorError("cleanup target is not this Job")
+            raise M03RV13SeadragonOperatorError("cleanup target is not this Job")
         raw_uri = f"/apis/batch/v1/namespaces/{self.namespace}/jobs/{self.job_name}"
         self._run(("delete", "--raw", raw_uri, "-f", str(options_path)))
 
@@ -332,11 +326,11 @@ class _CleanupAdapter:
 
     def get_pod_log(self, pod_name: str, *, limit_bytes: int) -> bytes:
         del pod_name, limit_bytes
-        raise M03RV11SeadragonOperatorError("preactivation cleanup has no Pod logs")
+        raise M03RV13SeadragonOperatorError("preactivation cleanup has no Pod logs")
 
     def activate(self, request: Any) -> Mapping[str, Any]:
         del request
-        raise M03RV11SeadragonOperatorError("create operator cannot activate")
+        raise M03RV13SeadragonOperatorError("create operator cannot activate")
 
     def delete(self, request: M03RV7ExactJobCleanupRequest, options_path: Path) -> None:
         self.transport.delete(request, options_path)
@@ -354,21 +348,21 @@ class _AcceptedConfig:
     request_timeout_seconds: int
 
 
-def _load_config(path: Path, expected_sha256: str) -> M03RV11CreateOperatorConfig:
+def _load_config(path: Path, expected_sha256: str) -> M03RV13CreateOperatorConfig:
     _require_sha256("create config file", expected_sha256)
     payload = _mapping(
         common._read_json_file(path, expected_sha256=expected_sha256),
-        "v11 create config",
+        "v13 create config",
     )
     try:
-        return M03RV11CreateOperatorConfig(**dict(payload))
+        return M03RV13CreateOperatorConfig(**dict(payload))
     except (TypeError, ValueError) as exc:
-        raise M03RV11SeadragonOperatorError("v11 create config is invalid") from exc
+        raise M03RV13SeadragonOperatorError("v13 create config is invalid") from exc
 
 
 def _load_rendered(
-    config: M03RV11CreateOperatorConfig,
-) -> M03RV11RenderedJob | M03RV11A15AuditRenderedJob:
+    config: M03RV13CreateOperatorConfig,
+) -> M03RV13RenderedJob:
     rendered_path = common._regular_no_symlink(
         Path(config.rendered_path), label="rendered Job"
     )
@@ -379,26 +373,19 @@ def _load_rendered(
         _file_sha256(rendered_path) != config.rendered_file_sha256
         or _file_sha256(manifest_path) != config.manifest_file_sha256
     ):
-        raise M03RV11SeadragonOperatorError("rendered or manifest file hash drifted")
+        raise M03RV13SeadragonOperatorError("rendered or manifest file hash drifted")
     rendered_payload = dict(
         _mapping(common._read_json_file(rendered_path), "rendered Job")
     )
     manifest = dict(_mapping(common._read_json_file(manifest_path), "Job manifest"))
     try:
-        rendered = (
-            M03RV11A15AuditRenderedJob(**rendered_payload)
-            if rendered_payload.get("schema") == M03R_V11_A15_AUDIT_RENDERED_JOB_SCHEMA
-            else M03RV11RenderedJob(**rendered_payload)
-        )
+        rendered = M03RV13RenderedJob(**rendered_payload)
     except (TypeError, ValueError) as exc:
-        raise M03RV11SeadragonOperatorError("rendered Job receipt is invalid") from exc
-    if isinstance(rendered, M03RV11A15AuditRenderedJob):
-        rendered.validate()
+        raise M03RV13SeadragonOperatorError("rendered Job receipt is invalid") from exc
     metadata = _mapping(manifest.get("metadata"), "manifest metadata")
     annotations = _mapping(metadata.get("annotations"), "manifest annotations")
     if (
-        rendered.schema
-        not in {M03R_V11_RENDERED_JOB_SCHEMA, M03R_V11_A15_AUDIT_RENDERED_JOB_SCHEMA}
+        rendered.schema != M03R_V13_RENDERED_JOB_SCHEMA
         or rendered.manifest != manifest
         or rendered.manifest_sha256 != _compact_sha256(manifest)
         or rendered.pod_template_sha256
@@ -430,7 +417,7 @@ def _load_rendered(
         or annotations.get("rl-quant/economic-panel-authorized") != "false"
         or rendered.economic_panel_authorized
     ):
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             "rendered Job and create config identity drifted"
         )
     return rendered
@@ -438,19 +425,12 @@ def _load_rendered(
 
 def _bind_rendered(
     *,
-    rendered: M03RV11RenderedJob | M03RV11A15AuditRenderedJob,
+    rendered: M03RV13RenderedJob,
     first_read: dict[str, Any],
     second_read: dict[str, Any],
     attached_owned_pod_uids: tuple[str, ...],
 ) -> Any:
-    if isinstance(rendered, M03RV11A15AuditRenderedJob):
-        return bind_m03r_v11_a15_audit_admitted_suspended_job(
-            rendered=rendered,
-            first_read=first_read,
-            second_read=second_read,
-            attached_owned_pod_uids=attached_owned_pod_uids,
-        )
-    return bind_m03r_v11_admitted_suspended_job(
+    return bind_m03r_v13_admitted_suspended_job(
         rendered=rendered,
         first_read=first_read,
         second_read=second_read,
@@ -459,7 +439,7 @@ def _bind_rendered(
 
 
 def _synthetic_dry_read(
-    dry: Mapping[str, Any], config: M03RV11CreateOperatorConfig
+    dry: Mapping[str, Any], config: M03RV13CreateOperatorConfig
 ) -> dict[str, Any]:
     value = json.loads(json.dumps(dry))
     spec = _mapping(value.get("spec"), "server dry-run spec")
@@ -467,7 +447,7 @@ def _synthetic_dry_read(
     match_labels = _mapping(selector.get("matchLabels"), "server dry-run matchLabels")
     uid = match_labels.get("batch.kubernetes.io/controller-uid")
     if not isinstance(uid, str) or not uid:
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             "server dry-run did not generate the controller UID selector"
         )
     metadata = cast(dict[str, Any], value["metadata"])
@@ -479,7 +459,7 @@ def _synthetic_dry_read(
 
 def _validate_created_identity(
     job: Mapping[str, Any],
-    config: M03RV11CreateOperatorConfig,
+    config: M03RV13CreateOperatorConfig,
     *,
     expected_uid: str | None = None,
 ) -> str:
@@ -505,13 +485,13 @@ def _validate_created_identity(
         or spec.get("completions") != config.completions
         or spec.get("parallelism") != config.parallelism
     ):
-        raise M03RV11SeadragonOperatorError("created Job identity drifted")
+        raise M03RV13SeadragonOperatorError("created Job identity drifted")
     return uid
 
 
 def _publish_attach(
     root: Path,
-    config: M03RV11CreateOperatorConfig,
+    config: M03RV13CreateOperatorConfig,
     *,
     phase: str,
     error: Exception,
@@ -521,7 +501,7 @@ def _publish_attach(
     common._exclusive_json(
         root / f"{phase}-attach-required.json",
         {
-            "schema": "rl-quant.top2000-dev.m03r-v11-create-attach-required-v1",
+            "schema": "rl-quant.top2000-dev.m03r-v13-create-attach-required-v1",
             "phase": phase,
             "job_name": config.job_name,
             "run_id": config.run_id,
@@ -541,7 +521,7 @@ def _publish_attach(
 def _cleanup_safe_binding(
     *,
     root: Path,
-    config: M03RV11CreateOperatorConfig,
+    config: M03RV13CreateOperatorConfig,
     binding: Any,
     job_uid: str,
     live: CreateTransport,
@@ -581,19 +561,19 @@ def prepare_suspended_job_once(
         Path(config.evidence_root), label="create evidence root"
     )
     if any(root.iterdir()):
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             "create evidence root must be a fresh empty directory"
         )
     if (
         Path(config.binding_output_path).exists()
         or Path(config.activation_output_path).exists()
     ):
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             "binding and activation outputs must be absent before create"
         )
     source = common._regular_no_symlink(Path(__file__), label="operator source")
     if _file_sha256(source) != config.operator_source_sha256:
-        raise M03RV11SeadragonOperatorError("operator source hash drifted")
+        raise M03RV13SeadragonOperatorError("operator source hash drifted")
     rendered = _load_rendered(config)
     live = transport or OneCreateKubectl(
         kubectl_path=config.kubectl_path,
@@ -614,7 +594,7 @@ def prepare_suspended_job_once(
         )
     except Exception as exc:
         common._exclusive_json(root / "server-dry-run-rejected.json", dry)
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             "server dry-run failed the exact admitted-surface allowlist"
         ) from exc
     common._exclusive_json(root / "server-dry-run.json", dry)
@@ -622,13 +602,13 @@ def prepare_suspended_job_once(
         job = live.get_job(allow_absent=True)
         pods = live.get_pods_by_job_name()
         if job is not None or pods:
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 "precreate exact Job name or Pod label is already occupied"
             )
         common._exclusive_json(
             root / f"precreate-absence-{ordinal}.json",
             {
-                "schema": "rl-quant.top2000-dev.m03r-v11-precreate-absence-v1",
+                "schema": "rl-quant.top2000-dev.m03r-v13-precreate-absence-v1",
                 "job_name": config.job_name,
                 "job_absent": True,
                 "name_scoped_pods": [],
@@ -636,7 +616,7 @@ def prepare_suspended_job_once(
         )
         if ordinal == "first":
             sleep(0.1)
-    attempt: M03RV11CreateAttempt | None = None
+    attempt: M03RV13CreateAttempt | None = None
     transport_error: Exception | None = None
     try:
         attempt = live.create_once(Path(config.manifest_path))
@@ -645,7 +625,7 @@ def prepare_suspended_job_once(
     common._exclusive_json(
         root / "create-outcome.json",
         {
-            "schema": "rl-quant.top2000-dev.m03r-v11-create-outcome-v1",
+            "schema": "rl-quant.top2000-dev.m03r-v13-create-outcome-v1",
             "returncode": None if attempt is None else attempt.returncode,
             "stderr_tail": (
                 None
@@ -678,11 +658,11 @@ def prepare_suspended_job_once(
                 create_attempted=True,
                 observed=response,
             )
-            raise M03RV11CreateAttachRequired(
+            raise M03RV13CreateAttachRequired(
                 "create response identity is ambiguous; never retry this name"
             ) from exc
     if attempt is not None and attempt.returncode == 0 and response_uid is None:
-        error = M03RV11SeadragonOperatorError(
+        error = M03RV13SeadragonOperatorError(
             "successful create did not return one exact Job UID"
         )
         _publish_attach(
@@ -693,7 +673,7 @@ def prepare_suspended_job_once(
             create_attempted=True,
             observed=response,
         )
-        raise M03RV11CreateAttachRequired(
+        raise M03RV13CreateAttachRequired(
             "successful create response is ambiguous; never retry this name"
         )
     started = monotonic()
@@ -727,7 +707,7 @@ def prepare_suspended_job_once(
                         create_attempted=True,
                         observed=candidate,
                     )
-                    raise M03RV11CreateAttachRequired(
+                    raise M03RV13CreateAttachRequired(
                         "reconciled Job identity drifted; never retry this name"
                     ) from exc
                 observed = candidate
@@ -749,7 +729,7 @@ def prepare_suspended_job_once(
         common._exclusive_json(
             root / "create-reconciliation.json",
             {
-                "schema": "rl-quant.top2000-dev.m03r-v11-create-reconciliation-v1",
+                "schema": "rl-quant.top2000-dev.m03r-v13-create-reconciliation-v1",
                 "outcome": (
                     "stable-absence" if stable_absence else "unknown-attach-required"
                 ),
@@ -762,10 +742,10 @@ def prepare_suspended_job_once(
             },
         )
         if stable_absence:
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 "sole create attempt reconciled to stable absence; use a fresh identity"
             )
-        error = M03RV11SeadragonOperatorError(
+        error = M03RV13SeadragonOperatorError(
             "create result remains ambiguous after the full request-timeout window"
         )
         _publish_attach(
@@ -776,7 +756,7 @@ def prepare_suspended_job_once(
             create_attempted=True,
             observed=None,
         )
-        raise M03RV11CreateAttachRequired(
+        raise M03RV13CreateAttachRequired(
             "create result remains ambiguous; never retry this name"
         )
     uid = _validate_created_identity(observed, config, expected_uid=response_uid)
@@ -784,13 +764,13 @@ def prepare_suspended_job_once(
         sleep(0.1)
         second = live.get_job()
         if second is None:
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 "accepted suspended Job disappeared before its second read"
             )
         _validate_created_identity(second, config, expected_uid=uid)
         pods = live.get_owned_pods(uid)
         if pods:
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 "accepted suspended Job unexpectedly created Pods"
             )
         binding = _bind_rendered(
@@ -808,14 +788,14 @@ def prepare_suspended_job_once(
             create_attempted=True,
             observed=observed,
         )
-        raise M03RV11CreateAttachRequired(
+        raise M03RV13CreateAttachRequired(
             "accepted Job lacks a safe binding; create must not be retried"
         ) from exc
     try:
         sleep(0.1)
         fresh = live.get_job()
         if fresh is None or live.get_owned_pods(uid):
-            raise M03RV11SeadragonOperatorError(
+            raise M03RV13SeadragonOperatorError(
                 "accepted Job lost the fresh suspended zero-Pod activation boundary"
             )
         activation = build_m03r_v7_exact_job_activation_request(binding, fresh)
@@ -838,20 +818,20 @@ def prepare_suspended_job_once(
                 create_attempted=True,
                 observed=observed,
             )
-            raise M03RV11CreateAttachRequired(
+            raise M03RV13CreateAttachRequired(
                 "accepted Job cleanup is ambiguous; create must not be retried"
             ) from cleanup_error
         common._exclusive_json(
             root / "postaccept-cleanup-error.json",
             {
-                "schema": "rl-quant.top2000-dev.m03r-v11-postaccept-cleanup-error-v1",
+                "schema": "rl-quant.top2000-dev.m03r-v13-postaccept-cleanup-error-v1",
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "exact_cleanup_completed": True,
                 "create_retried": False,
             },
         )
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             "activation handoff failed after safe exact cleanup; use a fresh identity"
         ) from exc
     try:
@@ -870,7 +850,7 @@ def prepare_suspended_job_once(
         common._exclusive_json(
             root / "prepare-success.json",
             {
-                "schema": "rl-quant.top2000-dev.m03r-v11-prepare-success-v1",
+                "schema": "rl-quant.top2000-dev.m03r-v13-prepare-success-v1",
                 "job_name": config.job_name,
                 "job_uid": uid,
                 "run_id": config.run_id,
@@ -907,10 +887,10 @@ def prepare_suspended_job_once(
                 create_attempted=True,
                 observed=observed,
             )
-            raise M03RV11CreateAttachRequired(
+            raise M03RV13CreateAttachRequired(
                 "prepared publication cleanup is ambiguous"
             ) from cleanup_error
-        raise M03RV11SeadragonOperatorError(
+        raise M03RV13SeadragonOperatorError(
             "prepared publication failed after safe exact cleanup"
         ) from exc
 
@@ -926,7 +906,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         prepare_suspended_job_once(args.config, args.config_sha256)
-    except M03RV11CreateAttachRequired as exc:
+    except M03RV13CreateAttachRequired as exc:
         print(
             json.dumps(
                 {"status": "attach_required", "error": str(exc)},
@@ -944,10 +924,10 @@ if __name__ == "__main__":  # pragma: no cover
 
 __all__ = [
     "CREATE_CONFIG_SCHEMA",
-    "M03RV11CreateAttachRequired",
-    "M03RV11CreateAttempt",
-    "M03RV11CreateOperatorConfig",
-    "M03RV11SeadragonOperatorError",
+    "M03RV13CreateAttachRequired",
+    "M03RV13CreateAttempt",
+    "M03RV13CreateOperatorConfig",
+    "M03RV13SeadragonOperatorError",
     "OneCreateKubectl",
     "prepare_suspended_job_once",
 ]

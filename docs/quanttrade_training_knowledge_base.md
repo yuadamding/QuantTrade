@@ -8,7 +8,7 @@ the word `production` for an operationally hardened research lifecycle; that
 word does not change the scientific or business status of the work.
 
 This guide consolidates the most reusable lessons from the Hold-30 M03R-v7
-revision, the TOP2000 seed-17 diagnostic and Phase-0 audit, the v8-v11
+revision, the TOP2000 seed-17 diagnostic and Phase-0 audit, the v8-v12
 predictive-first lineage, receipt-gated GPU execution, and the separately
 frozen 2026-YTD retrospective design. It explains how the pieces fit together.
 It does not replace a protocol, package-owned validator, data manifest, or run
@@ -64,7 +64,9 @@ This table records lineage, not current cluster state:
 | v8 alpha discovery | Introduced predictive pretraining and cost-aware incremental action; the first predictive attempt failed and an objective-weight defect invalidated reuse | Preserve the failed artifacts; use a fresh identity for result-moving corrections |
 | v9 predictive | Bound one mean/scale distribution and horizon; all setting-horizon candidates failed the frozen gate | No economic training; use its negative evidence to narrow the next question |
 | v10 rank geometry | Superseded before launch after review exposed paired-schedule, target-validity, sleeve-sizing, and inference defects | Never package or launch it |
-| v11 corrected rank geometry | Current TOP2000 predictive-development protocol: paired samples, qualified residuals, magnitude-preserving actions, block inference, and exact checkpoint reload | A gate failure is a valid terminal; success can only support a separately frozen economic generation |
+| v11 corrected rank geometry | Completed TOP2000 predictive predecessor: paired samples, qualified residuals, magnitude-preserving actions, block inference, and exact checkpoint reload | Preserve its result and the separate a15 audit; neither authorizes economic training |
+| v11 a15 inference audit | Exact-checkpoint controls confirmed a directional P0 effect, but every cap saturated and no 10-bp net or spread lower bound passed; P1 scale collapsed | No economic training; preserve the audit as exploratory evidence |
+| v12 rank/scale decoupling | Completed 3-session predictive study: dedicated rank score, separate economic mean/scale, bounded rank influence on the encoder, and nonsaturating turnover utilization; all three settings failed the frozen predictive gate | Preserve as negative evidence; do not start economic training or open 2026 outcomes |
 | v7 2026-YTD retrospective | Separate, fixed 2026-01-02 through 2026-06-23 mechanism-evaluation contract | It is not a universal 2026 cutoff and cannot select v11 |
 
 ## 2. End-to-end lifecycle
@@ -272,8 +274,12 @@ boundary before reduction and backpropagation.
 
 ### Qualification is not fit evidence
 
-A four-update seed-17 qualification proves startup, exact rank shape, imports,
-validation, deterministic wiring, and bounded resource use. It does not prove:
+The v7/v8 four-update seed-17 qualification sentinel proves startup, exact
+rank shape, imports, validation, deterministic wiring, and bounded resource
+use. V11 uses a different contract: a disjoint two-rank capacity Job proves the
+exact device/runtime shape, while the untouched-tail predictive decision is
+made only from update-64 checkpoints. Never copy a sentinel geometry or its
+meaning from one generation into another. Qualification does not prove:
 
 - restart or checkpoint continuation unless restart is explicitly exercised;
 - convergence or adequate optimizer updates;
@@ -283,7 +289,8 @@ validation, deterministic wiring, and bounded resource use. It does not prove:
 Generation-specific details are in the [v8 design](top2000_m03r_v8_alpha_discovery.md),
 [completed v9 record](top2000_m03r_v9_predictive_stage.md),
 [superseded v10 proposal](top2000_m03r_v10_rank_geometry.md), and
-[corrected v11 protocol](top2000_m03r_v11_rank_geometry_corrected.md).
+[corrected v11 protocol](top2000_m03r_v11_rank_geometry_corrected.md), and
+[completed v12 rank/scale-decoupled study](top2000_m03r_v12_rank_scale_decoupled.md).
 Remote run state must be established from receipts, not from any of these
 documents.
 
@@ -327,6 +334,40 @@ residue must be reconciled to the already approved risky target while
 preserving cohort proportions and age, before implicit CASH, turnover, or
 drift is measured. Do not widen cohort or cause-turnover tolerances to absorb a
 manufactured CASH balance.
+
+### Use one canonical portfolio-growth scalar
+
+Portfolio drift and age-cohort drift must normalize by the same scalar:
+
+```text
+portfolio_growth = 1 + sum(weight * asset_return)
+```
+
+Computing `sum(weight * (1 + asset_return))` is algebraically equivalent only
+under exact arithmetic. Across thousands of FP32 assets it can differ by enough
+ULPs to disagree with cohort accounting, manufacture residual CASH, and make a
+healthy chronology fail reconciliation.
+
+Simplex repair should perform its reduction and radial correction in a higher
+precision work dtype when the economic output uses FP32. Casting back is a new
+numerical boundary: recheck nonnegativity, risky-gross limits, and simplex
+closure after the cast instead of assuming a float64 repair remains feasible in
+float32. Use the repair before turnover measurement so numerical closure is not
+misclassified as trading.
+
+Every conservation comparison must reduce both sides in the same work dtype.
+For a roughly 2,000-asset FP32 book, comparing a float64 requested-weight sum
+with an FP32-reduced anchor can manufacture an error of several `1e-8` even
+when the float64 buys and sells balance exactly. Do not widen the scientific
+tolerance; cast the unchanged anchor to the work dtype before reducing it.
+
+Keep diagnostic operands on the same device as the result-bearing tensor.
+PyTorch operations such as `torch.quantile` require a tensor-valued probability
+argument to share the input device; constructing that small constant without
+an explicit device works on CPU tests but fails only after CUDA training reaches
+qualification. Construct diagnostic constants with the input tensor's dtype
+and device, and cover the boundary with a fake-CUDA or same-image regression
+so a controller without a physical GPU can still detect CPU/GPU drift.
 
 ### Reject non-finite gradients before optimizer mutation
 
@@ -441,9 +482,33 @@ qualification must not write a terminal receipt to the same physical path.
 Use phase-disjoint output roots, or consume the existing sentinel by exact
 hash without rerunning it.
 
+Precreate every writable PVC `subPath` on the approved host before activating
+its suspended Job. If the path is absent, kubelet may create it as a
+root-owned private directory even though the container itself is configured
+with a non-root UID/GID. Derive the host path from the exact rendered writable
+mount; walk it without following symlinks; require task scope, worker UID/GID,
+private searchable permissions, and an empty final phase root. Do not fix this
+after activation with broad `chmod`/`chown`, and do not reuse the failed
+static-gate evidence. Preserve and exact-clean the failed attempt, then use a
+fresh source/package/Job/output identity.
+
+Publish the exact directory the container mounts, not the transfer wrapper
+that contains it. Before Job creation, resolve the rendered read-only PVC
+`subPath` and require the package plan, `source/src` import root, and runtime
+entrypoint at that exact host directory. A safe archive and correct inner
+inventory do not prove that the mount points at the inner package level.
+
 Keep plan and binding receipts idempotent only when their complete content is
 identical. Never delete, move, or archive a published terminal receipt merely
 to make its canonical path writable again.
+
+Client output is not the state transition. A controller yield, truncated
+stdout, or an exception in post-action diagnostic printing does not prove that
+the preceding remote file-producing command failed. Before retrying, reconcile
+the one exact expected no-clobber artifact and its hash. If it exists and fully
+validates, consume it and continue; if it is absent, follow the command's
+bounded recovery contract. Never repeat a build, create, or activation merely
+because its final convenience output was lost.
 
 ### Detached work and status checks
 
@@ -457,6 +522,18 @@ or take one compact snapshot of the exact Job. If a qualification Job is
 expectedly absent after cleanup, validate the bound phase-success transition
 and retarget at most one snapshot to the successor Job. Do not recreate the
 qualifier or race the multi-phase supervisor.
+
+Progress receipts are terminal publication boundaries, not hidden update
+counters. During a long first fold, zero published fold receipts is compatible
+with healthy Running/Ready workers. Later, a partial count means only that
+those exact folds reached immutable publication. Do not interpolate optimizer
+updates from wall time or read logs solely to manufacture a percentage.
+
+Call a GPU hardware-verified only once the startup guard proves the exact
+visible device count and model for the current Pod UID. A completion-scoped
+startup receipt that does not bind Pod UID cannot prove a replacement Pod;
+use one bounded UID-owned startup-log read for that new Pod and cache the proof.
+Ready status alone establishes request occupancy, not the H100 contract.
 
 ### Capacity interpretation
 
@@ -489,6 +566,12 @@ precondition, captures terminal evidence first, issues one foreground delete,
 and proves Job plus UID-owned Pod absence twice. A fresh resourceVersion may
 equal a previously bound value for a never-activated suspended Job; two fresh
 exact reads and zero-Pod proof make that equality legitimate.
+
+Failure capture must precede success-only topology validation. An Indexed Job
+can fail after the cluster has already removed one or more terminal Pods; in
+that case, preserve the exact retained Job, owned Pods, and bounded logs, then
+exact-clean. Require the full predeclared Pod cardinality only when validating
+a successful scientific terminal.
 
 Cleanup failure, absent Job with remaining owned Pods, identity drift, or a
 live detached child is attach-required. Never claim absence or success from an
@@ -588,6 +671,46 @@ return traces needed by the declared post-hoc analyses. If the receipt-bound
 output root is absent, report the audit as unavailable and never scan unrelated
 storage or reconstruct evidence from rounded summaries.
 
+### Diagnose rank/economics disagreement before another training generation
+
+The completed v11 a15 panel exposed a reusable diagnostic pattern. One setting
+can have broad positive gross economics while failing mean rank IC, tail-spread
+uncertainty, and net-cost lower bounds; another can improve rank IC while its
+prediction magnitude collapses and produces no economic action. Neither result
+authorizes economic training. They answer different questions:
+
+- a coherent full cross-sectional ordering is not the same as useful extreme-
+  tail separation;
+- positive mean gross return is not a cost-surviving result when turnover is
+  frequently at its action cap;
+- a rank loss can dominate clipped gradients when prediction dispersion is
+  tiny, starving the magnitude and uncertainty heads even when weight decay is
+  negligible; and
+- nearly identical traces across scientific settings show that the ablation is
+  no longer adding information.
+
+Before changing model weights, run a separately identified, inference-only
+audit of the exact published checkpoints. Predeclare zero, sign-flipped, and
+deterministically shuffled signal controls; a downward action-cap ladder; full
+decile and vigintile curves; scale and probability calibration; carry,
+anchor-repair, and alpha-signal attribution; and common fold-bounded block
+draws. Outcomes may score these paths but must never construct the actions.
+The audit cannot retroactively change the original gate, select a checkpoint,
+or mint an economic generation.
+
+Bind such a follow-up to the complete parent closure: exact package and
+authorization files, worker and fold terminals, checkpoint file and semantic
+state hashes, terminal evidence, and cleanup receipt. Reuse large parent data,
+risk, and checkpoint surfaces through exact read-only mounts when possible;
+package only the new source, plan, and small lifecycle evidence. This reduces
+transfer and storage without weakening lineage.
+
+Finally, “unseen by the latest generation” is not the same as scientifically
+untouched. If earlier development generations already consumed the remaining
+pre-2026 chronology, later use is exploratory robustness evidence. Do not call
+it a fresh holdout, and do not open 2026 to choose the follow-up architecture,
+threshold, horizon, or action cap.
+
 ### Seeds, folds, and ensembles
 
 Chronological folds measure performance across time regimes. Seeds measure
@@ -671,6 +794,18 @@ counters. Construct the alpha proposal in the same exposure-null space used
 for target residualization, then keep the final projector as a safety layer.
 Record both signal-null retention and requested-to-executed book retention.
 
+Distinguish exact semantic inputs from derived floating-point byte identity.
+Cache bytes, asset order, exposure bytes, projector and estimator contracts,
+origin indexes, source code, image, and checkpoint bytes remain exact gates.
+A risk tensor recomputed on another Kubernetes node may nevertheless have a
+different byte hash because CPU math libraries or instruction paths need not
+be bitwise portable. Preserve both the parent and recomputed tensor hashes,
+bind a separate semantic construction receipt over all exact inputs, and make
+the cross-node byte-match status explicit. Never drop the numeric hash or
+silently call it equal. Exact same-process/rank agreement is still required;
+cross-node acceptance is valid only when the protocol predeclares semantic
+recomputation and every upstream identity matches.
+
 A tradeability gate should use a deterministic nonlearned sleeve before RL
 fine-tuning. Start from C1, carry one chronological book, disable the learned
 hazard, use the same selected mean/scale and risk projector, and publish gross
@@ -695,6 +830,15 @@ episode schedule derived only from common data, fold geometry, seed, and update
 cursor. Rank shards must be complementary views of the same global origin set,
 and a loss-only change must preserve every input tensor hash.
 
+Pair the initial model bytes as well as the data. A nominal seed and identical
+architecture do not guarantee byte-identical initializers across different
+PyTorch/runtime environments. Package one immutable CPU `state_dict`, bind its
+serialized-file hash and semantic model-state hash, strict-load it for every
+setting and fold, and rehash the loaded state before the first update. The
+same-image capacity qualification should prove that exact load. Without this
+boundary, a supposed loss-only ablation may also compare different starting
+parameters.
+
 Future-return availability also does not imply that a factor residual is
 estimable. Intersect the target mask with the decision-origin positive
 regression-weight mask before any loss, IC, rank transform, or tail diagnostic.
@@ -706,6 +850,15 @@ operator: the same mask, weights, exposure order, collinearity convention,
 solver, and tolerance. Retain an intercept and drop one reference sector (or
 omit the intercept and retain all sectors); do not combine an intercept with a
 complete mutually exclusive sector basis.
+
+Data-dependent linear algebra needs a real-data structural gate. Synthetic
+unit fixtures can cover formulas yet miss an unsupported sector, insufficient
+qualified history, or an origin-specific rank defect. Before packaging, replay
+the earliest real scheduled fold against the frozen risk tensors over every
+scheduled origin and target horizon. Bind the qualified masks, supported
+exposures, effective ranks, and residual-orthogonality checks in a distinct
+structural receipt. This is CPU validation and should fail before scarce GPU
+allocation.
 
 ### State-row versus return-transition boundary lesson
 
@@ -727,6 +880,63 @@ the terminal origin only in later folds or updates. After a source-changing
 fix, preserve the failed receipts, exact-clean any accepted Kubernetes state,
 and mint a fresh source/package/run identity; never resume the old checkpoints.
 
+### Context, horizon, and head-alignment lesson from v12
+
+A selected-horizon constructor argument does not by itself make that horizon
+the model's primary learning problem. Freeze and test the entire consequence
+chain: direct loss weight, longest auxiliary target, legal origin range,
+qualification geometry, execution horizon, and evaluator head. In v12 the
+selected three-session head received only 10% of horizon loss while 80% went
+to 21/30/63-session targets; the 63-session support still removed recent
+origins. A future corrected three-session study must either train that horizon
+alone or give it a declared primary weight with horizon-specific support.
+
+Training and qualification must also use the same local temporal context and
+positional-index distribution. A global origin being legal is insufficient.
+If qualification scores local positions 251 through 313 with a complete
+252-session context, loss-bearing training origins must have the same minimum
+local position. Record the distribution of context length and local position
+for every fold; reject a schedule when nearly all training rows are short
+context but all qualification rows are full context. Sample eligible global
+origins uniformly once per declared epoch rather than treating repeated
+overlapping windows as new market histories.
+
+Every head used by a ranking loss must be scored directly, and any head claimed
+to improve execution must reach the action boundary. An auxiliary rank head
+that influences only a capped share of shared-encoder gradient while IC,
+spreads, and actions consume a different mean head is not an economic rank
+ablation. Publish head-specific IC, dispersion, tail curves, action hashes,
+and requested books.
+
+Do not call daily OHLCV aggregated from five-minute bars an intraday sequence.
+A one-token intraday branch cannot learn within-session path geometry, and
+level normalization can make close and centered-volume coordinates exactly
+zero. Preserve the daily control, but compare it with a true ordered
+five-minute token sequence before further loss-only tuning when daily models
+cannot recover even simple origin-known baselines.
+
+### Action-mask and action/return chronology lesson
+
+Future label validity is diagnostic evidence, not an action input. Construct
+the action signal universe only from decision-origin availability and
+decision-origin regression qualification. Apply fill-time availability as an
+execution repair, and keep the future label-path mask on the target side only.
+Hash these masks separately so an evaluator cannot reuse a future-conditioned
+residual operator for execution.
+
+Map decisions to returns explicitly. When a decision at state `t` fills at
+`t + 1`, that action earns the `t + 1` return. A `D`-decision audit therefore
+requires `D` aligned post-fill returns; it must not earn one pre-action return
+and charge a final action that never receives exposure. Test the final action
+with a distinctive final return so endpoint errors cannot hide in aggregate
+metrics.
+
+Requested-to-executed retention after the final projector does not measure
+how much raw learned signal survives factor residualization. Record both
+raw-to-residual signal norm retention and requested-to-executed book
+retention. A final value of one can coexist with near-total upstream signal
+removal.
+
 ### Sleeve sizing and inference lesson
 
 A turnover cap is not a target. The desired proximal buy and sell notionals
@@ -743,7 +953,13 @@ summed incremental turnover with explicit sign categories.
 
 Qualification must evaluate the exact published checkpoint bytes through a
 fresh strict loader. An in-memory clone does not test serialization completeness
-or buffer identity.
+or buffer identity. Publish the checkpoint with no-clobber semantics and an
+fsync before its receipt. The loader must open a regular non-symlink file
+without following links, hash the bytes it actually reads, and verify that
+inode, size, and modification time did not change across the read. Load tensor
+state with `weights_only=True`, validate every scientific identity, strict-load
+all keys and buffers, and rehash the semantic model state. Both the file hash
+and semantic state hash are part of checkpoint identity.
 
 For a new multi-GPU execution shape, make the capacity receipt terminal and
 cleanup-bound rather than startup-only. A valid two-H100 capacity
@@ -752,6 +968,17 @@ captured terminal Job/Pod/log evidence, and final cleanup receipt. Publish it
 only after one UID/resourceVersion-conditioned delete and two absence reads.
 This prevents a short-lived CUDA startup from being reused after its Job or
 Pods were left ambiguous.
+
+Derive lifecycle receipt inventories from the immutable protocol rather than
+copying an earlier generation's horizon or setting list into a validator. A
+completed workload can otherwise be misclassified after the scientific work
+has ended. When historical evidence is intact and exact-clean, repair only the
+validator under a fresh CPU-only continuation that binds the original terminal
+evidence, exact failure, cleanup receipt, corrected source, and prior failed
+continuations; never recreate the training Job. Compare reconstructed typed
+receipts through canonical JSON bytes, not Python container equality: JSON
+arrays legitimately reconstruct as typed tuples and are semantically equal
+only after canonical serialization.
 
 Keep Kubernetes mutation ownership narrow and explicit. The v9 predictive
 path uses a pure-file preparer, one create-capable operator, and attach-only
@@ -793,6 +1020,10 @@ bytes.
 - [ ] Runtime objective demonstrably consumes every result-moving protocol
       field.
 - [ ] Focused semantic, numerical, route, and lifecycle tests pass.
+- [ ] All causal settings bind the same initial parameter file and semantic
+      state hashes, and the same-image runtime proves the exact load.
+- [ ] Real frozen fold/risk data pass the complete scheduled-origin and
+      target-horizon structural sweep.
 - [ ] Non-finite gradients fail before optimizer mutation.
 - [ ] Source manifest, data/cache, image, and plan hashes recorded.
 - [ ] Raw-to-converted data receipt binds schema, dates, row counts, gaps,
@@ -810,6 +1041,8 @@ bytes.
 
 - [ ] Approved session and mutation preflight receipt valid.
 - [ ] Package publication and safe inventory valid.
+- [ ] The rendered package `subPath` resolves to the inner package root and
+      contains the bound plan, `source/src`, and runtime entrypoint.
 - [ ] Output and lifecycle paths absent or explicitly reusable by exact hash.
 - [ ] Server dry-run completed once for the exact manifest hash.
 - [ ] Suspended Job accepted once and reconciled.

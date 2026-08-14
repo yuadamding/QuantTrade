@@ -11,11 +11,20 @@ product, or business-production system.
 - Read [the QuantTrade training knowledge base](docs/quanttrade_training_knowledge_base.md)
   before packaging, launching, recovering, evaluating, or interpreting an
   M03R training run.
-- Treat [M03R-v11 corrected rank geometry](docs/top2000_m03r_v11_rank_geometry_corrected.md)
-  as the current future-selected TOP2000 predictive-development generation.
-  V10 was superseded before launch. Repository text never establishes the
-  current state of a remote v11 attempt and neither document authorizes GPU
-  work.
+- Treat [M03R-v12 rank/scale-decoupled predictive research](docs/top2000_m03r_v12_rank_scale_decoupled.md)
+  as completed negative future-selected TOP2000 development evidence. Its
+  exact 3-session run did not pass the predictive gate and cannot authorize
+  economic training or 2026 access. V11 and its a15 audit are immutable
+  predecessor evidence; V10 was superseded before launch. Repository text
+  never establishes live remote state or authorizes GPU work.
+- Treat the [v12 post-hoc inference audit](docs/top2000_m03r_v12_posthoc_inference_audit.md)
+  as explanatory reuse of exact frozen checkpoints only. It compares rank and
+  economic heads under corrected causal masks and chronology, but cannot
+  select a v12 model, mint an economic generation, or access 2026.
+- Treat [M03R-v13 context-matched direct-h3 research](docs/top2000_m03r_v13_context_matched_h3.md)
+  as the current predictive implementation boundary. It is a fresh h3-only
+  generation with matched 252-session context and direct score routing; its
+  incomplete runtime/package boundary does not authorize GPU or 2026 access.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   as the canonical PIT Active-300 objective and promotion contract. That
@@ -56,11 +65,26 @@ Use the Python 3.11 `quanttrade` environment. Focus tests on the changed
 boundary before running the full suite.
 
 ```bash
-# Current v11 predictive boundary
+# V11 predecessor and a15 evidence boundary
 PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
   tests/test_hold30_alpha_m03r_v11_top2000_dev_protocol.py \
   tests/test_top2000_m03r_v11_*.py \
   tests/test_cost_aware_active_policy_v3.py
+
+# Completed v12 predictive boundary
+PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_hold30_alpha_m03r_v12_top2000_dev_protocol.py \
+  tests/test_top2000_m03r_v12_*.py \
+  tests/test_cost_aware_active_policy_v4.py
+
+# V12 exact-checkpoint post-hoc audit boundary
+PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_top2000_m03r_v12_posthoc_inference_audit.py
+
+# V13 context, direct-score, target/action, and schedule boundary
+PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_hold30_alpha_m03r_v13_top2000_dev_protocol.py \
+  tests/test_top2000_m03r_v13_*.py
 
 # Canonical v7 contract boundary
 PYTHONPATH=src conda run -n quanttrade python -m pytest \
@@ -100,10 +124,12 @@ treat the quarantined scripts under `legacy/` as runnable package entrypoints.
 - Keep canonical PIT Active-300 v7 separate from the executable TOP2000
   compatibility route. Shared causal questions do not make their artifact
   identities or evidentiary status interchangeable.
-- A four-update seed-17 qualification sentinel proves startup, wiring,
+- The v7/v8 four-update seed-17 qualification sentinel proves startup, wiring,
   validation, parity, and capacity surfaces—not checkpoint restart, fit, or
-  underfitting. The one-seed panel is a mechanism screen, not five-seed
-  ensemble evidence.
+  underfitting. V11 instead uses a disjoint two-rank capacity Job followed by
+  update-64 predictive qualification. Never transfer a sentinel shape or its
+  scientific meaning between generations. A one-seed panel remains a mechanism
+  screen, not five-seed ensemble evidence.
 - Positive FP32 cohort notionals below machine epsilon remain economically
   real. Preserve exact forward sale accounting while using bounded backward
   derivatives; reject non-finite gradients before any optimizer step.

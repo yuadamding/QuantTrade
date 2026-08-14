@@ -60,6 +60,27 @@ tests are not launch or performance evidence.
   checkpoint round-trip evaluation. Remote run state must be established from
   exact external receipts; economic training and 2026 access remain blocked by
   the generation itself.
+- [TOP2000 M03R-v11 a15 post-hoc inference audit](top2000_m03r_v11_a15_inference_audit.md)
+  — separate inference-only exact-checkpoint controls, action-cap ladder,
+  calibration, quantile curves, action/P&L attribution, and fold-bounded block
+  inference. It performs no training or checkpoint selection and cannot
+  authorize economic training or 2026 access.
+- [TOP2000 M03R-v12 rank/scale-decoupled predictive research](top2000_m03r_v12_rank_scale_decoupled.md)
+  — completed predictive-only 3-session study after the a15 audit: separate
+  rank and economic heads, bounded shared-encoder rank gradients, and
+  nonsaturating turnover utilization. All three settings failed the frozen
+  gate, so economic training and 2026 access remain prohibited.
+- [TOP2000 M03R-v12 post-hoc inference audit](top2000_m03r_v12_posthoc_inference_audit.md)
+  — inference-only exact-checkpoint comparison of the otherwise disconnected
+  rank and economic heads, with origin-only action masks, corrected post-fill
+  chronology, a compact cap/control ladder, and raw-to-residual attribution.
+  Its completed a08 evidence cannot reinterpret v12 as passing or authorize
+  economic training.
+- [TOP2000 M03R-v13 context-matched direct-h3 research](top2000_m03r_v13_context_matched_h3.md)
+  — fresh predictive-only successor with full 252-session context in training
+  and qualification, every-origin-once-per-epoch paired schedules, h3-only
+  supervision, one rank-and-execution mean, and separate causal action/target
+  operators. Its remaining runtime/package surfaces are not yet launch-ready.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100

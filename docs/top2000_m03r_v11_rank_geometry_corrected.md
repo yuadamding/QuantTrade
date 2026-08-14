@@ -320,3 +320,32 @@ The detached supervisor owns terminal capture and UID/resourceVersion-bound
 foreground cleanup. Once activation and the launch-success receipt are
 published, routine operation is intentionally left to Kubernetes and the
 supervisor; no controller-side polling loop is part of the research protocol.
+
+## Runtime warning and monitoring discipline
+
+Warnings are classified by their effect, not by their presence. A deprecation
+warning for the legacy NCCL async-error environment name or a disabled optional
+kernel cache does not by itself invalidate training when both ranks initialize,
+workers remain Running and Ready, receipts advance, and no CUDA/NCCL error or
+restart occurs. Record such warnings as source-freeze debt; do not interrupt a
+healthy immutable attempt to edit its packaged environment.
+
+At the next result-moving source freeze, remove the deprecated NCCL variable
+only after the replacement `TORCH_NCCL_ASYNC_ERROR_HANDLING` path is tested in
+the pinned image. Likewise, verify the exact cache path is writable under the
+read-only-root security context before relying on kernel caching for
+performance. These are package/runtime tests, not reasons to mutate an active
+Job.
+
+Routine progress is intentionally sparse. Fold receipts publish only after a
+fold terminal validates, so zero receipts during a long first fold is not a
+stall and a partial count is not an update counter. Use one exact Job snapshot,
+the predeclared receipt paths, and cached startup proof. Do not repeatedly read
+logs, infer hidden updates from elapsed time, or add controller-side polling.
+
+After this generation reaches terminal state, add an immutable attempt outcome
+here only when scientific terminal and cleanup receipts both validate. Record
+completed setting/fold coverage, the predictive-gate decision, continued
+economic/2026 prohibitions, failure class and checkpoint-reuse ruling when
+applicable, and cleanup disposition. Keep volatile Job identifiers, live
+progress, cluster paths, and receipt hashes in the external evidence chain.
