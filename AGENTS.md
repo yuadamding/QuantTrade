@@ -25,9 +25,12 @@ product, or business-production system.
   as completed negative development evidence. Neither setting passed the
   predictive or tradeability gate, so it cannot authorize economic training.
 - Treat [M03R-v15 corrected executable-score h3 research](docs/top2000_m03r_v15_executable_score_corrected_h3.md)
-  as the current local predictive implementation boundary. It corrects v14
-  provenance, rank-gradient, ablation, capacity, and checkpoint-selection
-  defects. Local source and tests do not authorize GPU or 2026 access.
+  as completed negative development evidence. Its exact A04 run completed all
+  twelve folds, but both settings failed predictive and tradeability gates.
+- Treat [M03R-v16 holding-aligned selection research](docs/top2000_m03r_v16_holding_aligned_selection.md)
+  as the current local predictive implementation boundary. It compares h21,
+  h30, and survival-weighted selection targets while retaining h3 only as a
+  timing output. Local source and tests do not authorize GPU or 2026 access.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   as the canonical PIT Active-300 objective and promotion contract. That
@@ -98,6 +101,11 @@ PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
 PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
   tests/test_hold30_alpha_m03r_v15_top2000_dev_protocol.py \
   tests/test_top2000_m03r_v15_*.py
+
+# V16 holding-aligned selection target, timing, and fold boundary
+PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_hold30_alpha_m03r_v16_top2000_dev_protocol.py \
+  tests/test_top2000_m03r_v16_*.py
 
 # Canonical v7 contract boundary
 PYTHONPATH=src conda run -n quanttrade python -m pytest \

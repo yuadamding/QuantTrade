@@ -1,0 +1,363 @@
+"""Training-only checkpoint evidence for M03R-v16 score learning."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass
+
+import torch
+
+from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_CHECKPOINT_SELECTION_RULE,
+    M03R_V16_PREDICTIVE_SPEC,
+    M03R_V16_PROTOCOL_SHA256,
+    M03R_V16_SETTINGS,
+)
+from rl_quant.training.top2000_m03r_v16_fold import (
+    M03RV16FoldGeometry,
+    render_m03r_v16_fold_geometries,
+)
+from rl_quant.training.top2000_m03r_v16_objective import m03r_v16_score_loss
+from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
+    M03RV16BuiltPredictiveBatch,
+)
+
+M03R_V16_INNER_VALIDATION_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-inner-validation-v1"
+)
+M03R_V16_CHECKPOINT_SELECTION_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-checkpoint-selection-v1"
+)
+
+
+class M03RV16ValidationError(ValueError):
+    """The V16 training-only validation or selection evidence drifted."""
+
+
+def _sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _digest(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _average_ranks(values: torch.Tensor) -> torch.Tensor:
+    order = torch.argsort(values, stable=True)
+    sorted_values = values.index_select(0, order)
+    ranks = torch.empty_like(values, dtype=torch.float64)
+    start = 0
+    while start < values.numel():
+        stop = start + 1
+        while stop < values.numel() and bool(sorted_values[stop] == sorted_values[start]):
+            stop += 1
+        ranks[order[start:stop]] = 0.5 * (start + stop - 1)
+        start = stop
+    return ranks
+
+
+def _spearman(first: torch.Tensor, second: torch.Tensor) -> float:
+    left = _average_ranks(first.to(torch.float64))
+    right = _average_ranks(second.to(torch.float64))
+    left -= left.mean()
+    right -= right.mean()
+    denominator = torch.sqrt(left.square().sum() * right.square().sum())
+    if float(denominator) <= 1.0e-18:
+        return 0.0
+    return float((left * right).sum() / denominator)
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16InnerValidationReceipt:
+    setting_index: int
+    fold_index: int
+    epoch_index: int
+    completed_score_updates: int
+    origin_count: int
+    mean_selection_rank_ic: float
+    mean_selection_top_bottom_spread: float
+    selection_robust_loss: float
+    mean_timing_rank_ic: float
+    selection_prediction_std: float
+    selection_target_std: float
+    model_state_sha256: str
+    epoch_checkpoint_file_sha256: str
+    batch_receipt_sha256: str
+    qualification_tail_accessed: bool = False
+    outer_2026_accessed: bool = False
+    protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
+    schema: str = M03R_V16_INNER_VALIDATION_SCHEMA
+
+    def validate(self) -> None:
+        metrics = (
+            self.mean_selection_rank_ic,
+            self.mean_selection_top_bottom_spread,
+            self.selection_robust_loss,
+            self.mean_timing_rank_ic,
+            self.selection_prediction_std,
+            self.selection_target_std,
+        )
+        if (
+            self.setting_index not in range(len(M03R_V16_SETTINGS))
+            or self.fold_index not in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
+            or self.epoch_index not in range(M03R_V16_PREDICTIVE_SPEC.maximum_score_training_epochs)
+            or self.completed_score_updates
+            != render_m03r_v16_fold_geometries(1001)[
+                self.fold_index
+            ].training_block_count
+            * (self.epoch_index + 1)
+            or self.origin_count != M03R_V16_PREDICTIVE_SPEC.inner_validation_origins_per_fold
+            or not all(math.isfinite(value) for value in metrics)
+            or min(self.selection_robust_loss, self.selection_prediction_std, self.selection_target_std) < 0.0
+            or not all(
+                _digest(value)
+                for value in (
+                    self.model_state_sha256,
+                    self.epoch_checkpoint_file_sha256,
+                    self.batch_receipt_sha256,
+                )
+            )
+            or self.qualification_tail_accessed
+            or self.outer_2026_accessed
+            or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+            or self.schema != M03R_V16_INNER_VALIDATION_SCHEMA
+        ):
+            raise M03RV16ValidationError("V16 inner-validation receipt drifted")
+
+    @property
+    def selection_key(self) -> tuple[float, float, float]:
+        self.validate()
+        return (
+            self.mean_selection_rank_ic,
+            self.mean_selection_top_bottom_spread,
+            -self.selection_robust_loss,
+        )
+
+    @property
+    def receipt_sha256(self) -> str:
+        self.validate()
+        return _sha256(asdict(self))
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16CheckpointSelectionReceipt:
+    setting_index: int
+    fold_index: int
+    selected_epoch_index: int
+    selected_model_state_sha256: str
+    selected_checkpoint_file_sha256: str
+    selected_validation_receipt_sha256: str
+    candidate_validation_receipt_sha256: tuple[str, ...]
+    observed_epoch_count: int
+    stop_authorized: bool
+    stop_reason: str
+    selection_rule: str = M03R_V16_CHECKPOINT_SELECTION_RULE
+    qualification_tail_accessed: bool = False
+    outer_2026_accessed: bool = False
+    protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
+    schema: str = M03R_V16_CHECKPOINT_SELECTION_SCHEMA
+
+    def validate(self) -> None:
+        spec = M03R_V16_PREDICTIVE_SPEC
+        if (
+            self.setting_index not in range(len(M03R_V16_SETTINGS))
+            or self.fold_index not in range(spec.chronological_fold_count)
+            or self.selected_epoch_index not in range(self.observed_epoch_count)
+            or self.observed_epoch_count not in range(1, spec.maximum_score_training_epochs + 1)
+            or len(self.candidate_validation_receipt_sha256) != self.observed_epoch_count
+            or not all(
+                _digest(value)
+                for value in (
+                    self.selected_model_state_sha256,
+                    self.selected_checkpoint_file_sha256,
+                    self.selected_validation_receipt_sha256,
+                    *self.candidate_validation_receipt_sha256,
+                )
+            )
+            or self.selected_validation_receipt_sha256
+            != self.candidate_validation_receipt_sha256[self.selected_epoch_index]
+            or self.stop_authorized
+            != (self.stop_reason in {"patience-exhausted", "maximum-epochs"})
+            or self.stop_reason not in {"continue", "patience-exhausted", "maximum-epochs"}
+            or (
+                self.stop_reason == "patience-exhausted"
+                and (
+                    self.observed_epoch_count < spec.minimum_score_training_epochs
+                    or self.observed_epoch_count - 1 - self.selected_epoch_index
+                    < spec.checkpoint_patience_epochs
+                )
+            )
+            or (
+                self.stop_reason == "maximum-epochs"
+                and self.observed_epoch_count != spec.maximum_score_training_epochs
+            )
+            or (
+                self.stop_reason == "continue"
+                and (
+                    self.observed_epoch_count == spec.maximum_score_training_epochs
+                    or (
+                        self.observed_epoch_count >= spec.minimum_score_training_epochs
+                        and self.observed_epoch_count - 1 - self.selected_epoch_index
+                        >= spec.checkpoint_patience_epochs
+                    )
+                )
+            )
+            or self.selection_rule != M03R_V16_CHECKPOINT_SELECTION_RULE
+            or self.qualification_tail_accessed
+            or self.outer_2026_accessed
+            or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+            or self.schema != M03R_V16_CHECKPOINT_SELECTION_SCHEMA
+        ):
+            raise M03RV16ValidationError("V16 checkpoint-selection receipt drifted")
+
+    @property
+    def receipt_sha256(self) -> str:
+        self.validate()
+        return _sha256(asdict(self))
+
+
+def evaluate_m03r_v16_inner_validation_batch(
+    batch: M03RV16BuiltPredictiveBatch,
+    geometry: M03RV16FoldGeometry,
+    *,
+    epoch_index: int,
+    completed_score_updates: int,
+    model_state_sha256: str,
+    epoch_checkpoint_file_sha256: str,
+) -> M03RV16InnerValidationReceipt:
+    """Score one already-built inner-validation batch without outer-tail access."""
+
+    batch.validate()
+    geometry.validate()
+    if (
+        batch.split != "inner_validation"
+        or batch.fold_index != geometry.fold_index
+        or batch.split_start_inclusive
+        != geometry.inner_validation_origin_start_inclusive
+        or batch.split_stop_exclusive != geometry.training_target_stop_exclusive
+        or tuple(int(value) for value in batch.origin_indices)
+        != tuple(
+            range(
+                geometry.inner_validation_origin_start_inclusive,
+                geometry.inner_validation_origin_stop_exclusive,
+            )
+        )
+        or completed_score_updates != geometry.training_block_count * (epoch_index + 1)
+        or batch.policy_state_binding_kind != "model-state-sha256"
+        or batch.policy_state_binding_sha256 != model_state_sha256
+        or not _digest(model_state_sha256)
+        or not _digest(epoch_checkpoint_file_sha256)
+    ):
+        raise M03RV16ValidationError("V16 validation batch or epoch cursor drifted")
+    score_loss = m03r_v16_score_loss(batch.objective)
+    selection_ic: list[float] = []
+    timing_ic: list[float] = []
+    spread: list[float] = []
+    predictions: list[torch.Tensor] = []
+    targets: list[torch.Tensor] = []
+    for row_index in range(batch.origin_indices.numel()):
+        selection_valid = batch.objective.selection_valid[row_index]
+        prediction = batch.objective.executable_selection_mean[row_index, selection_valid]
+        target = batch.objective.selection_target[row_index, selection_valid]
+        selection_ic.append(_spearman(prediction, target))
+        order = torch.argsort(prediction, stable=True)
+        tail = max(1, order.numel() // 10)
+        spread.append(
+            float(
+                target.index_select(0, order[-tail:]).mean()
+                - target.index_select(0, order[:tail]).mean()
+            )
+        )
+        timing_valid = batch.objective.timing_valid[row_index]
+        timing_ic.append(
+            _spearman(
+                batch.objective.executable_timing_mean[row_index, timing_valid],
+                batch.objective.timing_target[row_index, timing_valid],
+            )
+        )
+        predictions.append(prediction.to(torch.float64))
+        targets.append(target.to(torch.float64))
+    result = M03RV16InnerValidationReceipt(
+        setting_index=batch.objective.setting.setting_index,
+        fold_index=geometry.fold_index,
+        epoch_index=epoch_index,
+        completed_score_updates=completed_score_updates,
+        origin_count=len(selection_ic),
+        mean_selection_rank_ic=math.fsum(selection_ic) / len(selection_ic),
+        mean_selection_top_bottom_spread=math.fsum(spread) / len(spread),
+        selection_robust_loss=float(score_loss.selection_robust.detach()),
+        mean_timing_rank_ic=math.fsum(timing_ic) / len(timing_ic),
+        selection_prediction_std=float(torch.cat(predictions).std(unbiased=False)),
+        selection_target_std=float(torch.cat(targets).std(unbiased=False)),
+        model_state_sha256=model_state_sha256,
+        epoch_checkpoint_file_sha256=epoch_checkpoint_file_sha256,
+        batch_receipt_sha256=batch.receipt_sha256,
+    )
+    result.validate()
+    return result
+
+
+def select_m03r_v16_score_checkpoint(
+    receipts: tuple[M03RV16InnerValidationReceipt, ...],
+) -> M03RV16CheckpointSelectionReceipt:
+    """Select without qualification access and state whether score training stops."""
+
+    spec = M03R_V16_PREDICTIVE_SPEC
+    if not receipts or len(receipts) > spec.maximum_score_training_epochs:
+        raise M03RV16ValidationError("V16 checkpoint candidates are incomplete")
+    for epoch_index, receipt in enumerate(receipts):
+        receipt.validate()
+        if receipt.epoch_index != epoch_index:
+            raise M03RV16ValidationError("V16 validation epoch order drifted")
+    if len({(row.setting_index, row.fold_index) for row in receipts}) != 1:
+        raise M03RV16ValidationError("V16 validation candidates are not one fold-setting")
+    selected = max(receipts, key=lambda row: row.selection_key)
+    observed = len(receipts)
+    patience_exhausted = (
+        observed >= spec.minimum_score_training_epochs
+        and observed - 1 - selected.epoch_index >= spec.checkpoint_patience_epochs
+    )
+    maximum_reached = observed == spec.maximum_score_training_epochs
+    stop_reason = (
+        "maximum-epochs"
+        if maximum_reached
+        else "patience-exhausted"
+        if patience_exhausted
+        else "continue"
+    )
+    result = M03RV16CheckpointSelectionReceipt(
+        setting_index=selected.setting_index,
+        fold_index=selected.fold_index,
+        selected_epoch_index=selected.epoch_index,
+        selected_model_state_sha256=selected.model_state_sha256,
+        selected_checkpoint_file_sha256=selected.epoch_checkpoint_file_sha256,
+        selected_validation_receipt_sha256=selected.receipt_sha256,
+        candidate_validation_receipt_sha256=tuple(
+            row.receipt_sha256 for row in receipts
+        ),
+        observed_epoch_count=observed,
+        stop_authorized=patience_exhausted or maximum_reached,
+        stop_reason=stop_reason,
+    )
+    result.validate()
+    return result
+
+
+__all__ = [
+    "M03R_V16_CHECKPOINT_SELECTION_SCHEMA",
+    "M03R_V16_INNER_VALIDATION_SCHEMA",
+    "M03RV16CheckpointSelectionReceipt",
+    "M03RV16InnerValidationReceipt",
+    "M03RV16ValidationError",
+    "evaluate_m03r_v16_inner_validation_batch",
+    "select_m03r_v16_score_checkpoint",
+]

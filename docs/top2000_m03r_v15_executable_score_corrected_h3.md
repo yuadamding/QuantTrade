@@ -135,7 +135,7 @@ daily h3 loss study and directs the next generation toward a 21/30-session or
 survival-weighted selection target, followed by genuinely ordered five-minute
 inputs if the corrected daily control remains weak.
 
-## Current implementation status
+## Completed result
 
 The local source implements the protocol, causal batch, objective, optimizer,
 training-only checkpoint selection, immutable checkpoint reload, package-owned
@@ -154,13 +154,26 @@ device-independent tensor identity and was rebuilt from fresh source bytes;
 no A03 model or optimizer state was resumed.
 
 The immutable A04 package completed its package-owned real-data preflight,
-same-image zero-GPU static gate, and disposable exact-shape two-H100 capacity
-gate. The capacity terminal proves one real forward/backward/NCCL/update path,
-rank equality after mutation, one qualification projection, peak-memory
-capture, no scientific checkpoint, and exact cleanup. It does not establish
-predictive alpha. No predictive performance or economic result is claimed
-until the detached predictive lifecycle publishes and validates its terminal
-receipts.
+same-image zero-GPU static gate, disposable exact-shape two-H100 capacity gate,
+both predictive settings, and all twelve folds. Exact terminal coverage and
+cleanup receipts validate. Neither setting passed:
+
+| Setting | Mean projected IC | Annualized gross active | Annualized net active at 10 bp | Break-even cost |
+| --- | ---: | ---: | ---: | ---: |
+| P0 corrected rank h3 | 0.00789 | 0.0022% | -0.0711% | 0.30 bp |
+| P1 paired Huber h3 | 0.01013 | 0.0129% | -0.0573% | 1.84 bp |
+
+P0 had four positive-mean-IC folds but its primary 21-session gross and net
+LCBs were negative. P1 had four positive-mean-IC folds and five folds with a
+positive date-IC fraction, but only three positive-spread folds; its gross,
+net, and spread primary LCBs were negative. Risk projection retention was 1.0
+for both settings, so the failure is weak information and tradeability rather
+than final projection loss.
+
+No economic optimizer ran, no horizon was selected, and no 2026 outcomes were
+opened. V15 therefore closes the daily h3 loss-tuning line and directs the
+fresh successor toward longer holding-aligned selection targets with h3 used
+only for timing.
 
 The durable A04 qualification identities are:
 

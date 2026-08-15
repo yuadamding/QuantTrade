@@ -8,7 +8,7 @@ the word `production` for an operationally hardened research lifecycle; that
 word does not change the scientific or business status of the work.
 
 This guide consolidates the most reusable lessons from the Hold-30 M03R-v7
-revision, the TOP2000 seed-17 diagnostic and Phase-0 audit, the v8-v15
+revision, the TOP2000 seed-17 diagnostic and Phase-0 audit, the v8-v16
 predictive-first lineage, receipt-gated GPU execution, and the separately
 frozen 2026-YTD retrospective design. It explains how the pieces fit together.
 It does not replace a protocol, package-owned validator, data manifest, or run
@@ -69,7 +69,8 @@ This table records lineage, not current cluster state:
 | v12 rank/scale decoupling | Completed 3-session predictive study: dedicated rank score, separate economic mean/scale, bounded rank influence on the encoder, and nonsaturating turnover utilization; all three settings failed the frozen predictive gate | Preserve as negative evidence; do not start economic training or open 2026 outcomes |
 | v13 context-matched h3 | Corrected full-context and h3-only geometry, but still optimized and diagnosed a different tensor from the score traded after residualization | Preserve as superseded design evidence; do not launch it |
 | v14 executable-score h3 | Completed two-setting study with one action-projected score; both settings failed IC, net-cost, and break-even gates | Preserve as negative evidence; do not start economic training |
-| v15 corrected executable-score h3 | Current predictive successor: package-owned preflight, corrected rank gradient and pure ablation, training-only checkpoint selection, and an A04 static plus exact-workload capacity pass | Await exact predictive terminal evidence; no economic or 2026 access |
+| v15 corrected executable-score h3 | Completed all twelve A04 folds under the corrected package and runtime; both settings failed with IC below 0.011 and break-even cost below 2 bp | End daily h3 loss tuning; no economic or 2026 access |
+| v16 holding-aligned selection | Current local successor comparing h21, h30, and survival-weighted 1–30-session selection targets while retaining h3 only as timing | Complete package/runtime qualification locally before any remote authorization |
 | v7 2026-YTD retrospective | Separate, fixed 2026-01-02 through 2026-06-23 mechanism-evaluation contract | It is not a universal 2026 cutoff and cannot select v11 |
 
 ## 2. End-to-end lifecycle
@@ -223,7 +224,7 @@ The complete benchmark and audit are in the
 [twelve-setting performance benchmark](top2000_m03r_v7_seed17_12_setting_performance_benchmark.md)
 and [Phase-0 forensic audit](top2000_m03r_v7_seed17_phase0_forensic_audit.md).
 
-## 4. Predictive-first lineage from v8 through v15
+## 4. Predictive-first lineage from v8 through v16
 
 M03R-v8 introduced the durable ordering that remains relevant:
 
@@ -277,6 +278,22 @@ rescaled economic losses, its preflight was not bound to the package-owned
 risk/projector/source, and its load-only capacity job did not exercise the
 real workload. V15 corrects those boundaries and adds training-only
 checkpoint selection; it does not reinterpret v14 as passing.
+
+The corrected v15 A04 screen then completed both settings and all twelve
+folds. P0/P1 projected IC was `0.00789`/`0.01013`, annualized 10-bp net active
+return was `-0.0711%`/`-0.0573%`, and break-even cost was only `0.30`/`1.84`
+basis points. Risk projection retention was one for both settings, so the
+failure cannot be assigned to final portfolio projection. The paired Huber
+control exceeded the rank setting, leaving no evidence that another h3 rank
+or loss-weight experiment is the highest-value direction.
+
+V16 therefore changes the information horizon rather than relabeling the h3
+failure. It compares cumulative h21, cumulative h30, and normalized geometric
+survival-weighted 1–30-session residual selection targets under paired inputs.
+H3 remains a separately supervised timing output. The selection mean receives
+85% of score-stage weight, timing receives 15%, and uncertainty is calibrated
+only after the selected mean checkpoint is frozen. This preserves a clear
+information-alpha gate before any direct portfolio optimizer or RL controller.
 
 ### Train, diagnose, and trade one causal score
 
@@ -369,7 +386,8 @@ Generation-specific details are in the [v8 design](top2000_m03r_v8_alpha_discove
 [completed v12 rank/scale-decoupled study](top2000_m03r_v12_rank_scale_decoupled.md),
 [v13 context-matched design](top2000_m03r_v13_context_matched_h3.md), and
 [completed v14 executable-score study](top2000_m03r_v14_context_matched_h3.md),
-and [v15 corrected executable-score design](top2000_m03r_v15_executable_score_corrected_h3.md).
+[completed v15 corrected executable-score study](top2000_m03r_v15_executable_score_corrected_h3.md),
+and [v16 holding-aligned selection design](top2000_m03r_v16_holding_aligned_selection.md).
 Remote run state must be established from receipts, not from any of these
 documents.
 

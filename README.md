@@ -299,7 +299,7 @@ forced non-positive and remains development-only.
 
 - [Documentation index and status map](docs/README.md)
 - [QuantTrade training knowledge base](docs/quanttrade_training_knowledge_base.md)
-- [M03R-v11 corrected rank-geometry stage](docs/top2000_m03r_v11_rank_geometry_corrected.md)
+- [M03R-v16 holding-aligned selection stage](docs/top2000_m03r_v16_holding_aligned_selection.md)
 - [General RL architecture and exact current limitations](docs/general_rl_architecture.md)
 - [Deep-RL migration ledger](docs/architecture_migration_plan.md)
 

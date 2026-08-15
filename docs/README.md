@@ -88,12 +88,17 @@ tests are not launch or performance evidence.
   Both settings failed the predictive and tradeability gates, so economic
   training remains prohibited.
 - [TOP2000 M03R-v15 corrected executable-score h3 research](top2000_m03r_v15_executable_score_corrected_h3.md)
-  — current predictive boundary with package-owned structural preflight,
+  — completed predictive boundary with package-owned structural preflight,
   corrected rank-gradient and pure-ablation geometry, separate clipping,
   exact-workload capacity proof, and training-only checkpoint selection. Its
-  immutable A04 package, static gate, and disposable two-H100 capacity gate
-  passed; no predictive performance or economic claim exists until exact
-  terminal scientific receipts validate.
+  immutable A04 run completed all twelve folds, but both h3 settings failed;
+  no economic optimizer or 2026 outcomes were opened.
+- [TOP2000 M03R-v16 holding-aligned selection research](top2000_m03r_v16_holding_aligned_selection.md)
+  — current local predictive boundary comparing h21, h30, and normalized
+  survival-weighted 1–30-session selection targets under one paired daily
+  encoder, with h3 retained only as a separately supervised timing output.
+  Core score/calibration mutation and checkpoint-selection boundaries exist;
+  package, complete worker/lifecycle, GPU, and performance evidence do not.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100
