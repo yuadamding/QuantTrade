@@ -24,34 +24,44 @@ def _schedule() -> M03RV16PanelSchedule:
 def test_v16_fold_geometry_uses_long_support_and_all_pre2026_states() -> None:
     geometries = render_m03r_v16_fold_geometries(1001)
     assert [row.qualification_origin_start_inclusive for row in geometries] == [
-        507,
-        587,
-        667,
-        747,
-        827,
+        535,
+        628,
+        721,
+        814,
         907,
     ]
     assert geometries[-1].qualification_target_stop_exclusive == 1001
     assert [len(row.eligible_training_origins) for row in geometries] == [
-        132,
-        212,
-        292,
-        372,
-        452,
-        532,
+        129,
+        222,
+        315,
+        408,
+        501,
     ]
     assert all(
         row.inner_validation_origin_stop_exclusive
         - row.inner_validation_origin_start_inclusive
-        == 32
+        == 63
         for row in geometries
+    )
+    supports = [
+        set(
+            range(
+                row.qualification_origin_start_inclusive + 1,
+                row.qualification_origin_stop_exclusive + 30,
+            )
+        )
+        for row in geometries
+    ]
+    assert all(
+        not left.intersection(right) for left, right in zip(supports, supports[1:])
     )
 
 
 def test_v16_every_origin_appears_once_per_epoch_and_settings_are_paired() -> None:
     schedule = _schedule()
     for geometry in render_m03r_v16_fold_geometries(1001):
-        for epoch in range(24):
+        for epoch in range(8):
             plans = tuple(
                 render_m03r_v16_training_update_plan(
                     schedule,
@@ -65,7 +75,9 @@ def test_v16_every_origin_appears_once_per_epoch_and_settings_are_paired() -> No
             assert tuple(sorted(counts)) == geometry.eligible_training_origins
             assert set(counts.values()) == {1}
             for plan in plans:
-                local = tuple(origin - plan.episode_start for origin in plan.global_origins)
+                local = tuple(
+                    origin - plan.episode_start for origin in plan.global_origins
+                )
                 assert min(local) >= M03R_V16_MINIMUM_LOCAL_ORIGIN
                 assert max(local) <= M03R_V16_MAXIMUM_LOCAL_ORIGIN
                 assert max(local) + 31 <= 344

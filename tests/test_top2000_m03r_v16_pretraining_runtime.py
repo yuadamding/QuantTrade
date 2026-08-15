@@ -31,7 +31,6 @@ from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
     m03r_v16_selection_weights,
 )
 from rl_quant.training.top2000_m03r_v16_pretraining_step import (
-    train_m03r_v16_scale_calibration_update,
     train_m03r_v16_score_batch_update,
 )
 from rl_quant.training.top2000_m03r_v16_validation_runtime import (
@@ -117,7 +116,7 @@ def test_v16_target_weights_preserve_declared_economic_units() -> None:
     assert tuple(float(value) for value in survival) == pytest.approx(
         M03R_V16_SURVIVAL_WEIGHTS
     )
-    assert float(survival.sum()) == pytest.approx(1.0)
+    assert float(survival.sum()) > 20.0
 
 
 def test_v16_survival_weighting_is_not_a_mandatory_expiry() -> None:
@@ -127,42 +126,58 @@ def test_v16_survival_weighting_is_not_a_mandatory_expiry() -> None:
     assert float(survival[0]) > float(survival[-1])
 
 
-def test_v16_batch_uses_one_action_operator_and_target_specific_masks() -> None:
+def test_v16_settings_use_identical_common30_masks_and_operators() -> None:
     sequence, exposure = _surfaces()
-    policy = Top2000M03RV16PredictivePolicy(
-        2,
-        token_dim=16,
-        raw_stock_chunk=8,
-        activation_checkpointing=False,
+    state = torch.randn((1, 1, sequence.num_assets, 16))
+    batches = []
+    for setting_index in range(3):
+        torch.manual_seed(17)
+        policy = Top2000M03RV16PredictivePolicy(
+            setting_index,
+            token_dim=16,
+            raw_stock_chunk=8,
+            activation_checkpointing=False,
+        )
+        batches.append(
+            build_m03r_v16_batch_from_origin_states(
+                policy,
+                M03R_V16_SETTINGS[setting_index],
+                state,
+                sequence,
+                torch.tensor([251]),
+                sequence_global_state_start=0,
+                split="training",
+                split_start_inclusive=0,
+                split_stop_exclusive=345,
+                fold_index=0,
+                source_array_sha256="c" * 64,
+                asset_axis_sha256="a" * 64,
+                origin_risk_exposures=exposure,  # type: ignore[arg-type]
+            )
+        )
+    assert all(
+        batch.objective.executable_selection_score_z.shape == (1, 14)
+        for batch in batches
     )
-    batch = build_m03r_v16_batch_from_origin_states(
-        policy,
-        M03R_V16_SETTINGS[2],
-        torch.randn((1, 1, sequence.num_assets, 16)),
-        sequence,
-        torch.tensor([251]),
-        sequence_global_state_start=0,
-        split="training",
-        split_start_inclusive=0,
-        split_stop_exclusive=345,
-        fold_index=0,
-        source_array_sha256="c" * 64,
-        asset_axis_sha256="a" * 64,
-        origin_risk_exposures=exposure,  # type: ignore[arg-type]
+    assert (
+        len({batch.selection_target_operators[0].receipt_sha256 for batch in batches})
+        == 1
     )
-    assert batch.objective.executable_selection_mean.shape == (1, 14)
-    assert batch.objective.executable_timing_mean.shape == (1, 14)
-    assert bool(batch.action_operators[0].qualified_asset_mask[12])
-    assert not bool(batch.selection_target_operators[0].qualified_asset_mask[12])
-    assert not bool(batch.timing_target_operators[0].qualified_asset_mask[12])
-    assert not bool(batch.action_operators[0].qualified_asset_mask[11])
-    assert not bool(batch.objective.selection_valid[0, 11])
-    assert batch.objective.executable_selection_mean.grad_fn is not None
-    assert batch.objective.executable_timing_mean.grad_fn is not None
-    assert batch.receipt_sha256
+    assert len({batch.action_operators[0].receipt_sha256 for batch in batches}) == 1
+    assert all(
+        torch.equal(
+            batches[0].objective.selection_valid, batch.objective.selection_valid
+        )
+        for batch in batches[1:]
+    )
+    assert bool(batches[0].action_operators[0].qualified_asset_mask[12])
+    assert not bool(batches[0].selection_target_operators[0].qualified_asset_mask[12])
+    assert not bool(batches[0].action_operators[0].qualified_asset_mask[11])
+    assert batches[0].objective.executable_selection_score_z.grad_fn is not None
+    assert max(batches[0].action_returned_dtype_exposure_errors) <= 1.0e-5
 
 
-def test_v16_score_step_mutates_encoder_and_means_without_scale() -> None:
+def test_v16_score_step_mutates_encoder_and_selection_head_only() -> None:
     sequence, exposure = _surfaces()
     geometries = render_m03r_v16_fold_geometries(1001)
     schedule = M03RV16PanelSchedule(
@@ -178,7 +193,11 @@ def test_v16_score_step_mutates_encoder_and_means_without_scale() -> None:
         )
         for cursor in range(geometry.training_block_count)
     )
-    plan = next(value for value in plans if value.episode_start == 0 and len(value.global_origins) == 63)
+    plan = next(
+        value
+        for value in plans
+        if value.episode_start == 0 and len(value.global_origins) == 63
+    )
     policy = Top2000M03RV16PredictivePolicy(
         0,
         token_dim=16,
@@ -201,8 +220,6 @@ def test_v16_score_step_mutates_encoder_and_means_without_scale() -> None:
         asset_axis_sha256="a" * 64,
         origin_risk_exposures=exposure,  # type: ignore[arg-type]
     )
-    selection_scale_before = policy.selection_scale_head.weight.detach().clone()
-    timing_scale_before = policy.timing_scale_head.weight.detach().clone()
     receipt = train_m03r_v16_score_batch_update(
         policy,
         batch,
@@ -215,60 +232,12 @@ def test_v16_score_step_mutates_encoder_and_means_without_scale() -> None:
     )
     receipt.validate()
     assert receipt.encoder_version_root_before != receipt.encoder_version_root_after
-    assert receipt.mean_version_root_before != receipt.mean_version_root_after
-    assert torch.equal(selection_scale_before, policy.selection_scale_head.weight)
-    assert torch.equal(timing_scale_before, policy.timing_scale_head.weight)
-
-
-def test_v16_scale_calibration_mutates_only_scale_heads() -> None:
-    sequence, exposure = _surfaces()
-    geometry = render_m03r_v16_fold_geometries(1001)[0]
-    policy = Top2000M03RV16PredictivePolicy(
-        0,
-        token_dim=16,
-        raw_stock_chunk=8,
-        activation_checkpointing=False,
+    assert (
+        receipt.selection_head_version_root_before
+        != receipt.selection_head_version_root_after
     )
-    optimizer, partition = build_m03r_v16_optimizer(policy, "scale_calibration")
-    local_origins = torch.arange(251, 283, dtype=torch.long)
-    batch = build_m03r_v16_batch_from_origin_states(
-        policy,
-        M03R_V16_SETTINGS[0],
-        torch.randn((32, 1, sequence.num_assets, 16)),
-        sequence,
-        local_origins,
-        sequence_global_state_start=163,
-        split="inner_validation",
-        split_start_inclusive=geometry.inner_validation_origin_start_inclusive,
-        split_stop_exclusive=geometry.training_target_stop_exclusive,
-        fold_index=0,
-        source_array_sha256="f" * 64,
-        asset_axis_sha256="a" * 64,
-        origin_risk_exposures=exposure,  # type: ignore[arg-type]
-    )
-    selection_mean_before = policy.selection_mean_head.weight.detach().clone()
-    timing_mean_before = policy.timing_mean_head.weight.detach().clone()
-    selection_scale_before = policy.selection_scale_head.weight.detach().clone()
-    receipt = train_m03r_v16_scale_calibration_update(
-        policy,
-        batch,
-        geometry,
-        optimizer,
-        partition,
-        calibration_epoch_index=0,
-        distributed_rank=0,
-        distributed_world_size=1,
-        selected_score_model_state_sha256=batch.policy_state_binding_sha256,
-        selected_score_component_state_sha256=(
-            batch.policy_score_component_state_sha256
-        ),
-        selected_score_checkpoint_file_sha256="7" * 64,
-        checkpoint_selection_receipt_sha256="8" * 64,
-    )
-    receipt.validate()
-    assert torch.equal(selection_mean_before, policy.selection_mean_head.weight)
-    assert torch.equal(timing_mean_before, policy.timing_mean_head.weight)
-    assert not torch.equal(selection_scale_before, policy.selection_scale_head.weight)
+    assert receipt.timing_optimizer_updates == 0
+    assert receipt.uncertainty_calibration_updates == 0
 
 
 def test_v16_inner_validation_scores_the_executable_selection_tensor() -> None:
@@ -280,14 +249,14 @@ def test_v16_inner_validation_scores_the_executable_selection_tensor() -> None:
         raw_stock_chunk=8,
         activation_checkpointing=False,
     )
-    local_origins = torch.arange(251, 283, dtype=torch.long)
+    local_origins = torch.arange(251, 314, dtype=torch.long)
     batch = build_m03r_v16_batch_from_origin_states(
         policy,
         M03R_V16_SETTINGS[1],
-        torch.randn((32, 1, sequence.num_assets, 16)),
+        torch.randn((63, 1, sequence.num_assets, 16)),
         sequence,
         local_origins,
-        sequence_global_state_start=163,
+        sequence_global_state_start=160,
         split="inner_validation",
         split_start_inclusive=geometry.inner_validation_origin_start_inclusive,
         split_stop_exclusive=geometry.training_target_stop_exclusive,
@@ -305,7 +274,7 @@ def test_v16_inner_validation_scores_the_executable_selection_tensor() -> None:
         epoch_checkpoint_file_sha256="2" * 64,
     )
     receipt.validate()
-    assert receipt.origin_count == 32
+    assert receipt.origin_count == 63
     assert receipt.setting_index == 1
     assert receipt.batch_receipt_sha256 == batch.receipt_sha256
     with pytest.raises(M03RV16ValidationError, match="batch or epoch"):

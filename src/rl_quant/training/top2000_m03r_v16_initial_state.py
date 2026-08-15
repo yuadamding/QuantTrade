@@ -24,7 +24,7 @@ from rl_quant.training.top2000_m03r_v16_policy import (
 )
 
 M03R_V16_INITIAL_STATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-common-initial-parameter-state-v1"
+    "rl-quant.top2000-dev.m03r-v16-common-initial-parameter-state-v2"
 )
 _MAX_INITIAL_STATE_BYTES = 4 * 1024**3
 
@@ -160,8 +160,7 @@ def load_m03r_v16_initial_parameter_state(
     if (
         payload.get("schema") != M03R_V16_INITIAL_STATE_SCHEMA
         or payload.get("protocol_sha256") != M03R_V16_PROTOCOL_SHA256
-        or payload.get("output_contract_sha256")
-        != M03R_V16_OUTPUT_CONTRACT_SHA256
+        or payload.get("output_contract_sha256") != M03R_V16_OUTPUT_CONTRACT_SHA256
         or payload.get("model_state_sha256") != expected_state_sha256
         or payload.get("architecture_sha256") != expected_architecture_sha256
         or payload.get("common_across_settings") is not True

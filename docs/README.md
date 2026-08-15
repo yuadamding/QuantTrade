@@ -94,11 +94,12 @@ tests are not launch or performance evidence.
   immutable A04 run completed all twelve folds, but both h3 settings failed;
   no economic optimizer or 2026 outcomes were opened.
 - [TOP2000 M03R-v16 holding-aligned selection research](top2000_m03r_v16_holding_aligned_selection.md)
-  — current local predictive boundary comparing h21, h30, and normalized
-  survival-weighted 1–30-session selection targets under one paired daily
-  encoder, with h3 retained only as a separately supervised timing output.
-  Core score/calibration mutation and checkpoint-selection boundaries exist;
-  package, complete worker/lifecycle, GPU, and performance evidence do not.
+  — current local predictive boundary comparing h21, h30, and the actual
+  reference-Hold-30 survival-value target on common 30-session support. It is
+  selection-only, uses five disjoint outer supports and a fixed terminal
+  checkpoint, and now has local structural-slab, exact-capacity, and cohort
+  primitives. A sealed package, worker/lifecycle, GPU, and performance evidence
+  do not exist.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100

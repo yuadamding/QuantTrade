@@ -41,10 +41,9 @@ def _identity() -> dict[str, object]:
         ),
         "panel_schedule_sha256": "a" * 64,
         "selection_target_operator_root_sha256": "b" * 64,
-        "timing_target_operator_root_sha256": "c" * 64,
-        "action_operator_root_sha256": "d" * 64,
-        "source_array_sha256": "e" * 64,
-        "asset_axis_sha256": "f" * 64,
+        "action_operator_root_sha256": "c" * 64,
+        "source_array_sha256": "d" * 64,
+        "asset_axis_sha256": "e" * 64,
     }
 
 
@@ -71,18 +70,24 @@ def test_v16_epoch_checkpoint_rejects_wrong_update_cursor(tmp_path: Path) -> Non
     identity["completed_score_updates"] = int(identity["completed_score_updates"]) - 1
     with pytest.raises(M03RV16CheckpointError, match="cursor"):
         write_immutable_m03r_v16_epoch_checkpoint(
-            tmp_path / "epoch.pt", _policy(), **identity  # type: ignore[arg-type]
+            tmp_path / "epoch.pt",
+            _policy(),
+            **identity,  # type: ignore[arg-type]
         )
 
 
-def test_v16_epoch_checkpoint_rejects_missing_timing_mean(tmp_path: Path) -> None:
+def test_v16_epoch_checkpoint_rejects_missing_selection_score_head(
+    tmp_path: Path,
+) -> None:
     clean = tmp_path / "clean.pt"
     write_immutable_m03r_v16_epoch_checkpoint(
-        clean, _policy(), **_identity()  # type: ignore[arg-type]
+        clean,
+        _policy(),
+        **_identity(),  # type: ignore[arg-type]
     )
     payload = torch.load(clean, map_location="cpu", weights_only=True)
     state = payload["model_state_dict"]
-    del state["timing_mean_head.bias"]
+    del state["selection_score_head.bias"]
     from rl_quant.training.top2000_m03r_v9_pretraining_step import state_dict_sha256
 
     payload["model_state_sha256"] = state_dict_sha256(state)
@@ -100,9 +105,6 @@ def test_v16_epoch_checkpoint_rejects_missing_timing_mean(tmp_path: Path) -> Non
             expected_panel_schedule_sha256=str(identity["panel_schedule_sha256"]),
             expected_selection_target_operator_root_sha256=str(
                 identity["selection_target_operator_root_sha256"]
-            ),
-            expected_timing_target_operator_root_sha256=str(
-                identity["timing_target_operator_root_sha256"]
             ),
             expected_action_operator_root_sha256=str(
                 identity["action_operator_root_sha256"]

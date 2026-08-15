@@ -1,4 +1,4 @@
-"""Stage-separated score and uncertainty optimizers for M03R-v16."""
+"""Selection-only optimizer with module-aware decay for M03R-v16."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 import torch
+from torch import nn
 
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_OPTIMIZER_RULE,
@@ -22,12 +23,12 @@ from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
 )
 
-M03R_V16_OPTIMIZER_SCHEMA = "rl-quant.top2000-dev.m03r-v16-optimizer-v1"
-M03RV16TrainingStage = Literal["score", "scale_calibration"]
+M03R_V16_OPTIMIZER_SCHEMA = "rl-quant.top2000-dev.m03r-v16-optimizer-v2"
+M03RV16TrainingStage = Literal["score"]
 
 
 class M03RV16OptimizerError(ValueError):
-    """The V16 stage-specific parameter or optimizer inventory drifted."""
+    """The V16 selection parameter or optimizer inventory drifted."""
 
 
 def _sha256(value: object) -> str:
@@ -42,46 +43,40 @@ def _is_encoder(name: str) -> bool:
     )
 
 
-def _is_mean(name: str) -> bool:
-    return name.startswith(("selection_mean_head.", "timing_mean_head."))
+def _is_selection_head(name: str) -> bool:
+    return name.startswith("selection_score_head.")
 
 
-def _is_scale(name: str) -> bool:
-    return name.startswith(("selection_scale_head.", "timing_scale_head."))
-
-
-def _uses_weight_decay(name: str) -> bool:
-    lowered = name.lower()
-    return not (
-        name.endswith(".bias")
-        or ".norm." in lowered
-        or ".layernorm." in lowered
-        or ".layer_norm." in lowered
-    )
+def _no_decay_parameter_ids(
+    policy: Top2000M03RV16PredictivePolicy,
+) -> set[int]:
+    result: set[int] = set()
+    for module in policy.modules():
+        if isinstance(module, nn.LayerNorm):
+            result.update(
+                id(parameter) for parameter in module.parameters(recurse=False)
+            )
+        bias = getattr(module, "bias", None)
+        if isinstance(bias, nn.Parameter):
+            result.add(id(bias))
+    result.add(id(policy.source_policy.core.cash_bias))
+    return result
 
 
 def configure_m03r_v16_training_stage(
     policy: Top2000M03RV16PredictivePolicy,
     stage: M03RV16TrainingStage,
 ) -> None:
-    """Make the mutation boundary explicit before constructing an optimizer."""
+    """Expose only the encoder and one selection head to mutation."""
 
-    if not isinstance(policy, Top2000M03RV16PredictivePolicy) or stage not in {
-        "score",
-        "scale_calibration",
-    }:
-        raise M03RV16OptimizerError("V16 training stage is invalid")
+    if not isinstance(policy, Top2000M03RV16PredictivePolicy) or stage != "score":
+        raise M03RV16OptimizerError("V16 supports selection score training only")
     unknown: list[str] = []
     for name, parameter in policy.named_parameters():
-        known = _is_encoder(name) or _is_mean(name) or _is_scale(name)
+        known = _is_encoder(name) or _is_selection_head(name)
         if not known and parameter.requires_grad:
             unknown.append(name)
-        should_train = (
-            (_is_encoder(name) or _is_mean(name))
-            if stage == "score"
-            else _is_scale(name)
-        )
-        parameter.requires_grad_(should_train)
+        parameter.requires_grad_(known)
     if unknown:
         raise M03RV16OptimizerError(
             f"V16 has unassigned trainable parameters: {tuple(sorted(unknown))!r}"
@@ -93,42 +88,29 @@ class M03RV16OptimizerPartition:
     setting_id: str
     stage: M03RV16TrainingStage
     encoder_parameter_names: tuple[str, ...]
-    mean_parameter_names: tuple[str, ...]
-    scale_parameter_names: tuple[str, ...]
+    selection_head_parameter_names: tuple[str, ...]
     optimizer_rule: str = M03R_V16_OPTIMIZER_RULE
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
     schema: str = M03R_V16_OPTIMIZER_SCHEMA
 
+    @property
+    def mean_parameter_names(self) -> tuple[str, ...]:
+        return self.selection_head_parameter_names
+
     def validate(self) -> None:
-        groups = (
-            self.encoder_parameter_names,
-            self.mean_parameter_names,
-            self.scale_parameter_names,
-        )
+        groups = (self.encoder_parameter_names, self.selection_head_parameter_names)
         if (
             self.setting_id not in M03R_V16_SETTING_IDS
-            or self.stage not in {"score", "scale_calibration"}
-            or any(tuple(sorted(group)) != group for group in groups)
-            or len(set().union(*map(set, groups))) != sum(map(len, groups))
-            or (self.stage == "score" and (not groups[0] or not groups[1] or groups[2]))
-            or (self.stage == "scale_calibration" and (groups[0] or groups[1] or not groups[2]))
+            or self.stage != "score"
+            or any(tuple(sorted(group)) != group or not group for group in groups)
+            or set(groups[0]).intersection(groups[1])
             or not all(_is_encoder(name) for name in groups[0])
-            or not all(_is_mean(name) for name in groups[1])
-            or not all(_is_scale(name) for name in groups[2])
+            or not all(_is_selection_head(name) for name in groups[1])
             or self.optimizer_rule != M03R_V16_OPTIMIZER_RULE
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
             or self.schema != M03R_V16_OPTIMIZER_SCHEMA
         ):
             raise M03RV16OptimizerError("V16 optimizer partition drifted")
-
-    @property
-    def trainable_parameter_names(self) -> tuple[str, ...]:
-        self.validate()
-        return (
-            *self.encoder_parameter_names,
-            *self.mean_parameter_names,
-            *self.scale_parameter_names,
-        )
 
     @property
     def receipt_sha256(self) -> str:
@@ -142,18 +124,15 @@ def _partition(
 ) -> M03RV16OptimizerPartition:
     configure_m03r_v16_training_stage(policy, stage)
     encoder: list[str] = []
-    means: list[str] = []
-    scales: list[str] = []
+    selection: list[str] = []
     unknown: list[str] = []
     for name, parameter in policy.named_parameters():
         if not parameter.requires_grad:
             continue
         if _is_encoder(name):
             encoder.append(name)
-        elif _is_mean(name):
-            means.append(name)
-        elif _is_scale(name):
-            scales.append(name)
+        elif _is_selection_head(name):
+            selection.append(name)
         else:
             unknown.append(name)
     if unknown:
@@ -164,73 +143,33 @@ def _partition(
         setting_id=policy.v16_setting.setting_id,
         stage=stage,
         encoder_parameter_names=tuple(sorted(encoder)),
-        mean_parameter_names=tuple(sorted(means)),
-        scale_parameter_names=tuple(sorted(scales)),
+        selection_head_parameter_names=tuple(sorted(selection)),
     )
     result.validate()
     return result
 
 
-def build_m03r_v16_optimizer(
+def _expected_groups(
     policy: Top2000M03RV16PredictivePolicy,
-    stage: M03RV16TrainingStage,
-) -> tuple[torch.optim.AdamW, M03RV16OptimizerPartition]:
-    partition = _partition(policy, stage)
-    named = dict(policy.named_parameters())
-    spec = M03R_V16_PREDICTIVE_SPEC
-    logical: tuple[tuple[str, tuple[str, ...], float], ...]
-    if stage == "score":
-        logical = (
-            ("encoder", partition.encoder_parameter_names, spec.score_learning_rates[0]),
-            ("mean", partition.mean_parameter_names, spec.score_learning_rates[1]),
-        )
-    else:
-        logical = (
-            ("scale", partition.scale_parameter_names, spec.scale_calibration_learning_rate),
-        )
-    groups: list[dict[str, object]] = []
-    for logical_name, names, learning_rate in logical:
-        for decay in (True, False):
-            selected = tuple(name for name in names if _uses_weight_decay(name) == decay)
-            if selected:
-                groups.append(
-                    {
-                        "params": [named[name] for name in selected],
-                        "lr": learning_rate,
-                        "base_lr": learning_rate,
-                        "weight_decay": spec.weight_decay if decay else 0.0,
-                        "group_name": (
-                            f"{logical_name}-{'decay' if decay else 'no-decay'}"
-                        ),
-                        "parameter_names": selected,
-                    }
-                )
-    return torch.optim.AdamW(groups), partition
-
-
-def validate_m03r_v16_optimizer(
-    policy: Top2000M03RV16PredictivePolicy,
-    optimizer: torch.optim.Optimizer,
     partition: M03RV16OptimizerPartition,
-) -> None:
-    partition.validate()
-    observed = _partition(policy, partition.stage)
-    if observed != partition:
-        raise M03RV16OptimizerError("V16 optimizer parameter inventory drifted")
+) -> list[tuple[str, float, float, tuple[str, ...]]]:
     named = dict(policy.named_parameters())
+    no_decay_ids = _no_decay_parameter_ids(policy)
     spec = M03R_V16_PREDICTIVE_SPEC
     logical = (
+        ("encoder", partition.encoder_parameter_names, spec.score_learning_rates[0]),
         (
-            ("encoder", partition.encoder_parameter_names, spec.score_learning_rates[0]),
-            ("mean", partition.mean_parameter_names, spec.score_learning_rates[1]),
-        )
-        if partition.stage == "score"
-        else (("scale", partition.scale_parameter_names, spec.scale_calibration_learning_rate),)
+            "selection-head",
+            partition.selection_head_parameter_names,
+            spec.score_learning_rates[1],
+        ),
     )
     expected: list[tuple[str, float, float, tuple[str, ...]]] = []
     for logical_name, names, rate in logical:
         for decay in (True, False):
-            selected = tuple(name for name in names if _uses_weight_decay(name) == decay)
+            selected = tuple(
+                name for name in names if (id(named[name]) not in no_decay_ids) == decay
+            )
             if selected:
                 expected.append(
                     (
@@ -240,6 +179,40 @@ def validate_m03r_v16_optimizer(
                         selected,
                     )
                 )
+    return expected
+
+
+def build_m03r_v16_optimizer(
+    policy: Top2000M03RV16PredictivePolicy,
+    stage: M03RV16TrainingStage = "score",
+) -> tuple[torch.optim.AdamW, M03RV16OptimizerPartition]:
+    partition = _partition(policy, stage)
+    named = dict(policy.named_parameters())
+    groups: list[dict[str, object]] = []
+    for group_name, rate, weight_decay, names in _expected_groups(policy, partition):
+        groups.append(
+            {
+                "params": [named[name] for name in names],
+                "lr": rate,
+                "base_lr": rate,
+                "weight_decay": weight_decay,
+                "group_name": group_name,
+                "parameter_names": names,
+            }
+        )
+    return torch.optim.AdamW(groups), partition
+
+
+def validate_m03r_v16_optimizer(
+    policy: Top2000M03RV16PredictivePolicy,
+    optimizer: torch.optim.Optimizer,
+    partition: M03RV16OptimizerPartition,
+) -> None:
+    partition.validate()
+    if _partition(policy, "score") != partition:
+        raise M03RV16OptimizerError("V16 optimizer parameter inventory drifted")
+    named = dict(policy.named_parameters())
+    expected = _expected_groups(policy, partition)
     if len(optimizer.param_groups) != len(expected):
         raise M03RV16OptimizerError("V16 optimizer group count drifted")
     for group, (name, rate, expected_decay, names) in zip(

@@ -29,8 +29,10 @@ product, or business-production system.
   twelve folds, but both settings failed predictive and tradeability gates.
 - Treat [M03R-v16 holding-aligned selection research](docs/top2000_m03r_v16_holding_aligned_selection.md)
   as the current local predictive implementation boundary. It compares h21,
-  h30, and survival-weighted selection targets while retaining h3 only as a
-  timing output. Local source and tests do not authorize GPU or 2026 access.
+  h30, and reference-Hold-30 survival-value selection targets on one common
+  30-session support. Local source includes package-owned structural slabs,
+  exact-workload capacity and horizon-matched cohort primitives, but no sealed
+  package or remote evidence; tests do not authorize GPU or 2026 access.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   as the canonical PIT Active-300 objective and promotion contract. That
@@ -102,7 +104,7 @@ PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
   tests/test_hold30_alpha_m03r_v15_top2000_dev_protocol.py \
   tests/test_top2000_m03r_v15_*.py
 
-# V16 holding-aligned selection target, timing, and fold boundary
+# V16 paired selection, structural slab, capacity, and cohort boundary
 PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
   tests/test_hold30_alpha_m03r_v16_top2000_dev_protocol.py \
   tests/test_top2000_m03r_v16_*.py

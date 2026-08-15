@@ -18,15 +18,13 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_SETTINGS,
 )
 
-M03R_V16_FOLD_SCHEMA = "rl-quant.top2000-dev.m03r-v16-fold-geometry-v1"
+M03R_V16_FOLD_SCHEMA = "rl-quant.top2000-dev.m03r-v16-fold-geometry-v2"
 M03R_V16_PANEL_SCHEDULE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-episode-schedule-v1"
+    "rl-quant.top2000-dev.m03r-v16-panel-episode-schedule-v2"
 )
-M03R_V16_TRAINING_UPDATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-training-update-v1"
-)
+M03R_V16_TRAINING_UPDATE_SCHEMA = "rl-quant.top2000-dev.m03r-v16-training-update-v2"
 M03R_V16_REQUIRED_STATE_ROWS = 1001
-M03R_V16_FOLD_ADVANCE = 80
+M03R_V16_FOLD_ADVANCE = 93
 M03R_V16_FINAL_QUALIFICATION_START = 907
 M03R_V16_FIRST_QUALIFICATION_START = (
     M03R_V16_FINAL_QUALIFICATION_START
@@ -62,10 +60,7 @@ def _digest(value: str) -> bool:
 
 
 def _rank_shards(origins: tuple[int, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    if (
-        len(origins) < 2
-        or any(right <= left for left, right in pairwise(origins))
-    ):
+    if len(origins) < 2 or any(right <= left for left, right in pairwise(origins)):
         raise M03RV16FoldError("V16 origins cannot form paired rank shards")
     shards = (origins[::2], origins[1::2])
     if (
@@ -97,15 +92,13 @@ class M03RV16FoldGeometry:
     def validate(self) -> None:
         spec = M03R_V16_PREDICTIVE_SPEC
         expected_qualification_start = (
-            M03R_V16_FIRST_QUALIFICATION_START
-            + self.fold_index * M03R_V16_FOLD_ADVANCE
+            M03R_V16_FIRST_QUALIFICATION_START + self.fold_index * M03R_V16_FOLD_ADVANCE
         )
         if (
             self.fold_index not in range(spec.chronological_fold_count)
             or self.cache_state_rows != M03R_V16_REQUIRED_STATE_ROWS
             or self.training_origin_start_inclusive != M03R_V16_MINIMUM_LOCAL_ORIGIN
-            or self.qualification_origin_start_inclusive
-            != expected_qualification_start
+            or self.qualification_origin_start_inclusive != expected_qualification_start
             or self.qualification_origin_stop_exclusive
             - self.qualification_origin_start_inclusive
             != spec.qualification_origins_per_fold
@@ -160,8 +153,7 @@ class M03RV16FoldGeometry:
     @property
     def maximum_optimizer_updates(self) -> int:
         return (
-            self.training_block_count
-            * M03R_V16_PREDICTIVE_SPEC.maximum_score_training_epochs
+            self.training_block_count * M03R_V16_PREDICTIVE_SPEC.score_training_epochs
         )
 
     @property
@@ -206,6 +198,18 @@ def render_m03r_v16_fold_geometries(
         )
         row.validate()
         rows.append(row)
+    return_supports = tuple(
+        set(
+            range(
+                row.qualification_origin_start_inclusive + 1,
+                row.qualification_origin_stop_exclusive
+                + M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS,
+            )
+        )
+        for row in rows
+    )
+    if any(left.intersection(right) for left, right in pairwise(return_supports)):
+        raise M03RV16FoldError("V16 outer folds reuse return transitions")
     return tuple(rows)
 
 
@@ -223,8 +227,7 @@ class M03RV16PanelSchedule:
     def validate(self) -> None:
         geometries = render_m03r_v16_fold_geometries(M03R_V16_REQUIRED_STATE_ROWS)
         if (
-            self.fold_geometry_sha256
-            != tuple(row.receipt_sha256 for row in geometries)
+            self.fold_geometry_sha256 != tuple(row.receipt_sha256 for row in geometries)
             or self.seed != M03R_V16_PREDICTIVE_SPEC.seed
             or self.schedule_rule != M03R_V16_EPISODE_SCHEDULE_RULE
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
@@ -264,7 +267,12 @@ class M03RV16TrainingUpdatePlan:
 
     def validate(self) -> None:
         geometries = render_m03r_v16_fold_geometries(M03R_V16_REQUIRED_STATE_ROWS)
-        geometry = geometries[self.fold_index] if self.fold_index in range(6) else None
+        geometry = (
+            geometries[self.fold_index]
+            if self.fold_index
+            in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
+            else None
+        )
         if (
             self.setting_index not in range(len(M03R_V16_SETTINGS))
             or geometry is None
@@ -303,7 +311,7 @@ def _epoch_block_order(
     geometry: M03RV16FoldGeometry,
     epoch_index: int,
 ) -> tuple[int, ...]:
-    if epoch_index not in range(M03R_V16_PREDICTIVE_SPEC.maximum_score_training_epochs):
+    if epoch_index not in range(M03R_V16_PREDICTIVE_SPEC.score_training_epochs):
         raise M03RV16FoldError("V16 epoch cursor drifted")
     return tuple(
         sorted(
@@ -330,8 +338,7 @@ def render_m03r_v16_training_update_plan(
     if (
         setting_index not in range(len(M03R_V16_SETTINGS))
         or completed_update not in range(geometry.maximum_optimizer_updates)
-        or schedule.fold_geometry_sha256[geometry.fold_index]
-        != geometry.receipt_sha256
+        or schedule.fold_geometry_sha256[geometry.fold_index] != geometry.receipt_sha256
     ):
         raise M03RV16FoldError("V16 update request drifted")
     epoch_index, block_slot = divmod(completed_update, geometry.training_block_count)

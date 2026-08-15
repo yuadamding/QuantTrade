@@ -13,6 +13,7 @@ from typing import TypeVar, cast
 import torch
 
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
@@ -25,7 +26,7 @@ from rl_quant.training.top2000_m03r_v16_policy import (
 )
 
 M03R_V16_EPOCH_CHECKPOINT_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-score-epoch-checkpoint-v1"
+    "rl-quant.top2000-dev.m03r-v16-score-epoch-checkpoint-v2"
 )
 _MAX_CHECKPOINT_BYTES = 8 * 1024**3
 EvaluationResult = TypeVar("EvaluationResult")
@@ -54,14 +55,13 @@ def _file_sha256(path: Path) -> str:
 def _expected_updates(fold_index: int, epoch_index: int) -> int:
     if (
         isinstance(fold_index, bool)
-        or fold_index not in range(6)
+        or fold_index not in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
         or isinstance(epoch_index, bool)
-        or epoch_index not in range(24)
+        or epoch_index not in range(M03R_V16_PREDICTIVE_SPEC.score_training_epochs)
     ):
         raise M03RV16CheckpointError("V16 checkpoint cursor drifted")
-    return (
-        render_m03r_v16_fold_geometries(1001)[fold_index].training_block_count
-        * (epoch_index + 1)
+    return render_m03r_v16_fold_geometries(1001)[fold_index].training_block_count * (
+        epoch_index + 1
     )
 
 
@@ -77,7 +77,6 @@ class M03RV16LoadedEpochCheckpoint:
     checkpoint_file_sha256: str
     panel_schedule_sha256: str
     selection_target_operator_root_sha256: str
-    timing_target_operator_root_sha256: str
     action_operator_root_sha256: str
     source_array_sha256: str
     asset_axis_sha256: str
@@ -89,7 +88,8 @@ class M03RV16LoadedEpochCheckpoint:
         if (
             self.setting_index not in range(len(M03R_V16_SETTINGS))
             or self.setting_id != M03R_V16_SETTINGS[self.setting_index].setting_id
-            or self.fold_index not in range(6)
+            or self.fold_index
+            not in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
             or self.completed_score_updates
             != _expected_updates(self.fold_index, self.epoch_index)
             or self.head_identity.setting_id != self.setting_id
@@ -104,10 +104,6 @@ class M03RV16LoadedEpochCheckpoint:
             (
                 "selection_target_operator_root_sha256",
                 self.selection_target_operator_root_sha256,
-            ),
-            (
-                "timing_target_operator_root_sha256",
-                self.timing_target_operator_root_sha256,
             ),
             ("action_operator_root_sha256", self.action_operator_root_sha256),
             ("source_array_sha256", self.source_array_sha256),
@@ -125,7 +121,6 @@ def write_immutable_m03r_v16_epoch_checkpoint(
     completed_score_updates: int,
     panel_schedule_sha256: str,
     selection_target_operator_root_sha256: str,
-    timing_target_operator_root_sha256: str,
     action_operator_root_sha256: str,
     source_array_sha256: str,
     asset_axis_sha256: str,
@@ -140,7 +135,6 @@ def write_immutable_m03r_v16_epoch_checkpoint(
         "selection_target_operator_root_sha256": (
             selection_target_operator_root_sha256
         ),
-        "timing_target_operator_root_sha256": timing_target_operator_root_sha256,
         "action_operator_root_sha256": action_operator_root_sha256,
         "source_array_sha256": source_array_sha256,
         "asset_axis_sha256": asset_axis_sha256,
@@ -163,11 +157,10 @@ def write_immutable_m03r_v16_epoch_checkpoint(
         "head_identity": asdict(policy.v16_head_identity()),
         "model_state_dict": state,
         "model_state_sha256": state_dict_sha256(state),
-        "score_component_state_sha256": (
-            m03r_v16_score_component_state_sha256(policy)
-        ),
+        "score_component_state_sha256": (m03r_v16_score_component_state_sha256(policy)),
         "score_stage_only": True,
-        "scale_calibration_updates": 0,
+        "timing_optimizer_updates": 0,
+        "uncertainty_calibration_updates": 0,
         "v15_state_reused": False,
         "qualification_tail_accessed": False,
         "outer_2026_accessed": False,
@@ -205,7 +198,6 @@ def load_m03r_v16_epoch_checkpoint_for_evaluation(
     expected_completed_score_updates: int,
     expected_panel_schedule_sha256: str,
     expected_selection_target_operator_root_sha256: str,
-    expected_timing_target_operator_root_sha256: str,
     expected_action_operator_root_sha256: str,
     expected_source_array_sha256: str,
     expected_asset_axis_sha256: str,
@@ -270,10 +262,6 @@ def load_m03r_v16_epoch_checkpoint_for_evaluation(
             "expected_selection_target_operator_root_sha256",
             expected_selection_target_operator_root_sha256,
         ),
-        "timing_target_operator_root_sha256": _digest(
-            "expected_timing_target_operator_root_sha256",
-            expected_timing_target_operator_root_sha256,
-        ),
         "action_operator_root_sha256": _digest(
             "expected_action_operator_root_sha256", expected_action_operator_root_sha256
         ),
@@ -284,7 +272,8 @@ def load_m03r_v16_epoch_checkpoint_for_evaluation(
             "expected_asset_axis_sha256", expected_asset_axis_sha256
         ),
         "score_stage_only": True,
-        "scale_calibration_updates": 0,
+        "timing_optimizer_updates": 0,
+        "uncertainty_calibration_updates": 0,
         "v15_state_reused": False,
         "qualification_tail_accessed": False,
         "outer_2026_accessed": False,
@@ -331,12 +320,7 @@ def load_m03r_v16_epoch_checkpoint_for_evaluation(
         selection_target_operator_root_sha256=cast(
             str, expected["selection_target_operator_root_sha256"]
         ),
-        timing_target_operator_root_sha256=cast(
-            str, expected["timing_target_operator_root_sha256"]
-        ),
-        action_operator_root_sha256=cast(
-            str, expected["action_operator_root_sha256"]
-        ),
+        action_operator_root_sha256=cast(str, expected["action_operator_root_sha256"]),
         source_array_sha256=cast(str, expected["source_array_sha256"]),
         asset_axis_sha256=cast(str, expected["asset_axis_sha256"]),
         head_identity=stored_identity,
@@ -349,13 +333,17 @@ def write_reload_evaluate_m03r_v16_epoch_checkpoint(
     path: str | Path,
     policy: Top2000M03RV16PredictivePolicy,
     policy_factory: Callable[[], Top2000M03RV16PredictivePolicy],
-    evaluator: Callable[[Top2000M03RV16PredictivePolicy, M03RV16LoadedEpochCheckpoint], EvaluationResult],
+    evaluator: Callable[
+        [Top2000M03RV16PredictivePolicy, M03RV16LoadedEpochCheckpoint], EvaluationResult
+    ],
     **identity: object,
 ) -> tuple[M03RV16LoadedEpochCheckpoint, EvaluationResult]:
     """Destroy the training reference and evaluate only exact reloaded bytes."""
 
     file_sha256 = write_immutable_m03r_v16_epoch_checkpoint(
-        path, policy, **identity  # type: ignore[arg-type]
+        path,
+        policy,
+        **identity,  # type: ignore[arg-type]
     )
     expected_setting_index = policy.v16_setting.setting_index
     del policy
@@ -366,15 +354,10 @@ def write_reload_evaluate_m03r_v16_epoch_checkpoint(
         expected_setting_index=expected_setting_index,
         expected_fold_index=cast(int, identity["fold_index"]),
         expected_epoch_index=cast(int, identity["epoch_index"]),
-        expected_completed_score_updates=cast(
-            int, identity["completed_score_updates"]
-        ),
+        expected_completed_score_updates=cast(int, identity["completed_score_updates"]),
         expected_panel_schedule_sha256=str(identity["panel_schedule_sha256"]),
         expected_selection_target_operator_root_sha256=str(
             identity["selection_target_operator_root_sha256"]
-        ),
-        expected_timing_target_operator_root_sha256=str(
-            identity["timing_target_operator_root_sha256"]
         ),
         expected_action_operator_root_sha256=str(
             identity["action_operator_root_sha256"]

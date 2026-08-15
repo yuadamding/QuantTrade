@@ -1,43 +1,51 @@
-"""Causal long-horizon selection and h3 timing batches for M03R-v16."""
+"""Paired common-support selection batches for corrected M03R-v16."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS,
     M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS,
+    M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
-    M03R_V16_SURVIVAL_WEIGHTS,
-    M03R_V16_TIMING_HORIZON_SESSIONS,
     M03RV16PredictiveSetting,
+    m03r_v16_selection_target_weights_from_id,
 )
 from rl_quant.training.hold30_runtime import Hold30Sequence
 from rl_quant.training.top2000_m03r_v9_pretraining_runtime import (
     M03RV9OriginRiskExposures,
 )
+from rl_quant.training.top2000_m03r_v9_pretraining_step import model_state_sha256
 from rl_quant.training.top2000_m03r_v15_residual_operator import (
     M03RV15ResidualOperator,
+    M03RV15ResidualResult,
     apply_m03r_v15_residual_operator,
     build_m03r_v15_residual_operator,
 )
-from rl_quant.training.top2000_m03r_v9_pretraining_step import model_state_sha256
 from rl_quant.training.top2000_m03r_v16_fold import M03R_V16_MINIMUM_LOCAL_ORIGIN
 from rl_quant.training.top2000_m03r_v16_objective import M03RV16PredictiveBatch
 from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
-    m03r_v16_score_component_state_sha256,
 )
 
-M03R_V16_BUILT_BATCH_SCHEMA = "rl-quant.top2000-dev.m03r-v16-built-batch-v1"
+if TYPE_CHECKING:
+    from rl_quant.training.top2000_m03r_v16_structural import (
+        M03RV16StructuralSlab,
+    )
+
+M03R_V16_BUILT_BATCH_SCHEMA = "rl-quant.top2000-dev.m03r-v16-built-batch-v3"
+M03R_V16_RETURNED_DTYPE_ORTHOGONALITY_TOLERANCE = 1.0e-5
 
 
 class M03RV16PretrainingRuntimeError(ValueError):
-    """The V16 causal multi-horizon batch boundary drifted."""
+    """The V16 causal selection batch boundary drifted."""
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -54,17 +62,30 @@ def _digest(value: str) -> bool:
 
 
 def m03r_v16_selection_weights(setting: M03RV16PredictiveSetting) -> torch.Tensor:
+    """Return economic-unit target weights; they are never normalized."""
+
     setting.__post_init__()
-    if setting.selection_target == "survival-weighted-1-30-mean-factor-residual":
-        return torch.tensor(M03R_V16_SURVIVAL_WEIGHTS, dtype=torch.float64)
-    return torch.ones(setting.selection_support_sessions, dtype=torch.float64)
+    values = m03r_v16_selection_target_weights_from_id(setting.selection_target)
+    return torch.tensor(values, dtype=torch.float64)
+
+
+def _returned_dtype_exposure_error(
+    result: M03RV15ResidualResult,
+    operator: M03RV15ResidualOperator,
+) -> float:
+    selected = torch.nonzero(
+        operator.qualified_asset_mask.to(device=result.residual.device), as_tuple=False
+    ).flatten()
+    returned = result.residual.index_select(0, selected).to(torch.float64)
+    design = operator.base.qualified_design.to(device=returned.device)
+    weights = operator.base.qualified_weights.to(device=returned.device)
+    return float((design.T @ (weights * returned)).abs().max())
 
 
 @dataclass(frozen=True, slots=True)
 class M03RV16BuiltPredictiveBatch:
     objective: M03RV16PredictiveBatch
-    raw_selection_mean: torch.Tensor
-    raw_timing_mean: torch.Tensor
+    raw_selection_score_z: torch.Tensor
     origin_indices: torch.Tensor
     split: Literal["training", "inner_validation", "qualification"]
     fold_index: int
@@ -73,87 +94,82 @@ class M03RV16BuiltPredictiveBatch:
     source_array_sha256: str
     asset_axis_sha256: str
     exposure_receipt_sha256: str
-    policy_state_binding_kind: Literal[
-        "parameter-version-root", "model-state-sha256"
-    ]
+    policy_state_binding_kind: Literal["parameter-version-root", "model-state-sha256"]
     policy_state_binding_sha256: str
-    policy_score_component_state_sha256: str
     selection_target_operators: tuple[M03RV15ResidualOperator, ...]
-    timing_target_operators: tuple[M03RV15ResidualOperator, ...]
     action_operators: tuple[M03RV15ResidualOperator, ...]
+    action_returned_dtype_exposure_errors: tuple[float, ...]
+    target_returned_dtype_exposure_errors: tuple[float, ...]
+    structural_slab_receipt_sha256: str | None = None
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
     schema: str = M03R_V16_BUILT_BATCH_SCHEMA
 
     def validate(self) -> None:
         self.objective.validate()
-        rows = self.objective.executable_selection_mean.shape[0]
-        groups = (
-            self.selection_target_operators,
-            self.timing_target_operators,
-            self.action_operators,
-        )
-        if any(len(group) != rows for group in groups):
+        rows = self.objective.executable_selection_score_z.shape[0]
+        if (
+            len(self.selection_target_operators) != rows
+            or len(self.action_operators) != rows
+            or len(self.action_returned_dtype_exposure_errors) != rows
+            or len(self.target_returned_dtype_exposure_errors) != rows
+        ):
             raise M03RV16PretrainingRuntimeError("V16 operator count drifted")
-        for operator in (*groups[0], *groups[1], *groups[2]):
+        for operator in (*self.selection_target_operators, *self.action_operators):
             operator.require_fast_identity()
-        selection_masks = torch.stack(
-            tuple(operator.qualified_asset_mask for operator in groups[0])
-        )
-        timing_masks = torch.stack(
-            tuple(operator.qualified_asset_mask for operator in groups[1])
+        target_masks = torch.stack(
+            tuple(
+                operator.qualified_asset_mask
+                for operator in self.selection_target_operators
+            )
         )
         support_valid = all(
             not bool((target.qualified_asset_mask & ~action.qualified_asset_mask).any())
-            for targets in (groups[0], groups[1])
-            for target, action in zip(targets, groups[2], strict=True)
+            for target, action in zip(
+                self.selection_target_operators, self.action_operators, strict=True
+            )
         )
-        selection_score_valid = all(
+        score_valid = all(
             torch.equal(
                 apply_m03r_v15_residual_operator(
-                    self.raw_selection_mean[index], operator
+                    self.raw_selection_score_z[index], operator
                 ).residual,
-                self.objective.executable_selection_mean[index],
+                self.objective.executable_selection_score_z[index],
             )
-            for index, operator in enumerate(groups[2])
+            for index, operator in enumerate(self.action_operators)
         )
-        timing_score_valid = all(
-            torch.equal(
-                apply_m03r_v15_residual_operator(
-                    self.raw_timing_mean[index], operator
-                ).residual,
-                self.objective.executable_timing_mean[index],
-            )
-            for index, operator in enumerate(groups[2])
+        errors = (
+            *self.action_returned_dtype_exposure_errors,
+            *self.target_returned_dtype_exposure_errors,
         )
+        spec = M03R_V16_PREDICTIVE_SPEC
+
         if (
-            tuple(self.raw_selection_mean.shape)
-            != tuple(self.objective.executable_selection_mean.shape)
-            or tuple(self.raw_timing_mean.shape)
-            != tuple(self.objective.executable_timing_mean.shape)
-            or not bool(torch.isfinite(self.raw_selection_mean).all())
-            or not bool(torch.isfinite(self.raw_timing_mean).all())
-            or _tensor_sha256(selection_masks)
+            tuple(self.raw_selection_score_z.shape)
+            != tuple(self.objective.executable_selection_score_z.shape)
+            or not bool(torch.isfinite(self.raw_selection_score_z).all())
+            or _tensor_sha256(target_masks)
             != _tensor_sha256(self.objective.selection_valid)
-            or _tensor_sha256(timing_masks) != _tensor_sha256(self.objective.timing_valid)
             or not support_valid
-            or not selection_score_valid
-            or not timing_score_valid
+            or not score_valid
+            or any(
+                not math.isfinite(value)
+                or value > M03R_V16_RETURNED_DTYPE_ORTHOGONALITY_TOLERANCE
+                for value in errors
+            )
             or tuple(self.origin_indices.shape) != (rows,)
             or self.origin_indices.dtype != torch.long
             or self.origin_indices.device
-            != self.objective.executable_selection_mean.device
+            != self.objective.executable_selection_score_z.device
             or bool((self.origin_indices[1:] <= self.origin_indices[:-1]).any())
             or int(self.origin_indices[0]) < self.split_start_inclusive
             or bool(
                 (
-                    self.origin_indices
-                    + M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS
-                    + 2
+                    self.origin_indices + M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS + 2
                     > self.split_stop_exclusive
                 ).any()
             )
             or self.split not in {"training", "inner_validation", "qualification"}
-            or self.fold_index not in range(6)
+            or self.fold_index not in range(spec.chronological_fold_count)
             or not all(
                 _digest(value)
                 for value in (
@@ -161,7 +177,6 @@ class M03RV16BuiltPredictiveBatch:
                     self.asset_axis_sha256,
                     self.exposure_receipt_sha256,
                     self.policy_state_binding_sha256,
-                    self.policy_score_component_state_sha256,
                 )
             )
             or self.policy_state_binding_kind
@@ -171,6 +186,10 @@ class M03RV16BuiltPredictiveBatch:
                 "parameter-version-root"
                 if self.split == "training"
                 else "model-state-sha256"
+            )
+            or (
+                self.structural_slab_receipt_sha256 is not None
+                and not _digest(self.structural_slab_receipt_sha256)
             )
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
             or self.schema != M03R_V16_BUILT_BATCH_SCHEMA
@@ -188,67 +207,75 @@ class M03RV16BuiltPredictiveBatch:
                     "setting_sha256": self.objective.setting.receipt_sha256,
                     "split": self.split,
                     "fold_index": self.fold_index,
-                    "origin_indices": tuple(int(value) for value in self.origin_indices),
+                    "origin_indices": tuple(
+                        int(value) for value in self.origin_indices
+                    ),
                     "source_array_sha256": self.source_array_sha256,
                     "asset_axis_sha256": self.asset_axis_sha256,
                     "exposure_receipt_sha256": self.exposure_receipt_sha256,
                     "policy_state_binding_kind": self.policy_state_binding_kind,
                     "policy_state_binding_sha256": self.policy_state_binding_sha256,
-                    "policy_score_component_state_sha256": (
-                        self.policy_score_component_state_sha256
+                    "raw_selection_score_z_sha256": _tensor_sha256(
+                        self.raw_selection_score_z
                     ),
-                    "raw_selection_mean_sha256": _tensor_sha256(
-                        self.raw_selection_mean
+                    "selection_target_economic_sha256": _tensor_sha256(
+                        self.objective.selection_target_economic
                     ),
-                    "raw_timing_mean_sha256": _tensor_sha256(self.raw_timing_mean),
-                    "selection_target_sha256": _tensor_sha256(
-                        self.objective.selection_target
-                    ),
-                    "timing_target_sha256": _tensor_sha256(
-                        self.objective.timing_target
+                    "selection_target_z_sha256": _tensor_sha256(
+                        self.objective.selection_target_z
                     ),
                     "selection_operator_receipts": tuple(
                         operator.receipt_sha256
                         for operator in self.selection_target_operators
                     ),
-                    "timing_operator_receipts": tuple(
-                        operator.receipt_sha256
-                        for operator in self.timing_target_operators
-                    ),
                     "action_operator_receipts": tuple(
                         operator.receipt_sha256 for operator in self.action_operators
                     ),
+                    "action_returned_dtype_exposure_errors": (
+                        self.action_returned_dtype_exposure_errors
+                    ),
+                    "target_returned_dtype_exposure_errors": (
+                        self.target_returned_dtype_exposure_errors
+                    ),
+                    "structural_slab_receipt_sha256": (
+                        self.structural_slab_receipt_sha256
+                    ),
                 },
+                allow_nan=False,
                 separators=(",", ":"),
                 sort_keys=True,
             ).encode("ascii")
         ).hexdigest()
 
 
-def _future_target(
+def _future_selection_target(
     sequence: Hold30Sequence,
     *,
     local_origin: int,
-    horizon_weights: torch.Tensor,
+    target_weights: torch.Tensor,
     cash_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     first = local_origin + 1
-    stop = first + horizon_weights.numel()
-    if stop > sequence.asset_returns.shape[0]:
+    target_stop = first + target_weights.numel()
+    support_stop = first + M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS
+    if (
+        target_stop > sequence.asset_returns.shape[0]
+        or support_stop >= sequence.decision_available.shape[0]
+    ):
         raise M03RV16PretrainingRuntimeError("V16 target path is unavailable")
-    weights = horizon_weights.to(
+    weights = target_weights.to(
         device=sequence.asset_returns.device,
         dtype=sequence.asset_returns.dtype,
     )
     stock_rows = torch.log1p(
-        sequence.asset_returns[first:stop, 0].clamp_min(-0.999999)
+        sequence.asset_returns[first:target_stop, 0].clamp_min(-0.999999)
     )
     benchmark_rows = torch.log1p(
-        sequence.benchmark_net_returns[first:stop, 0].clamp_min(-0.999999)
+        sequence.benchmark_net_returns[first:target_stop, 0].clamp_min(-0.999999)
     )
     target = (stock_rows * weights.unsqueeze(-1)).sum(dim=0)
     benchmark = (benchmark_rows * weights).sum()
-    available = sequence.decision_available[first : stop + 1, 0].all(dim=0)
+    available = sequence.decision_available[first : support_stop + 1, 0].all(dim=0)
     available = available.clone()
     available[cash_index] = False
     return target - benchmark, available
@@ -269,8 +296,9 @@ def build_m03r_v16_batch_from_origin_states(
     source_array_sha256: str,
     asset_axis_sha256: str,
     origin_risk_exposures: M03RV9OriginRiskExposures,
+    structural_slab: M03RV16StructuralSlab | None = None,
 ) -> M03RV16BuiltPredictiveBatch:
-    """Build paired selection/timing targets under one causal action operator."""
+    """Build one target-only batch on the common 30-session support."""
 
     setting.__post_init__()
     if (
@@ -289,16 +317,11 @@ def build_m03r_v16_batch_from_origin_states(
     ):
         raise M03RV16PretrainingRuntimeError("V16 policy or origin geometry drifted")
     global_origins = local_origin_indices + sequence_global_state_start
-    if (
-        int(global_origins[0]) < split_start_inclusive
-        or bool(
-            (
-                global_origins
-                + M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS
-                + 2
-                > split_stop_exclusive
-            ).any()
-        )
+    if int(global_origins[0]) < split_start_inclusive or bool(
+        (
+            global_origins + M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS + 2
+            > split_stop_exclusive
+        ).any()
     ):
         raise M03RV16PretrainingRuntimeError("V16 origins leave the declared split")
     origin_risk_exposures.validate()
@@ -308,23 +331,28 @@ def build_m03r_v16_batch_from_origin_states(
         or origin_risk_exposures.cash_index != sequence.initial_ledger.cash_index
     ):
         raise M03RV16PretrainingRuntimeError("V16 exposure and sequence axes differ")
+    if structural_slab is not None:
+        structural_slab.validate()
+        if (
+            structural_slab.receipt.asset_axis_sha256 != asset_axis_sha256
+            or structural_slab.receipt.exposure_receipt_sha256
+            != origin_risk_exposures.receipt_sha256
+        ):
+            raise M03RV16PretrainingRuntimeError(
+                "V16 structural slab does not bind the batch risk axis"
+            )
 
-    selection_weights = m03r_v16_selection_weights(setting)
-    timing_weights = torch.ones(M03R_V16_TIMING_HORIZON_SESSIONS, dtype=torch.float64)
+    target_weights = m03r_v16_selection_weights(setting)
     cash_index = sequence.initial_ledger.cash_index
-    raw_selection: list[torch.Tensor] = []
-    raw_timing: list[torch.Tensor] = []
-    executable_selection: list[torch.Tensor] = []
-    executable_timing: list[torch.Tensor] = []
-    selection_scales: list[torch.Tensor] = []
-    timing_scales: list[torch.Tensor] = []
-    selection_targets: list[torch.Tensor] = []
-    timing_targets: list[torch.Tensor] = []
-    selection_valid: list[torch.Tensor] = []
-    timing_valid: list[torch.Tensor] = []
-    selection_operators: list[M03RV15ResidualOperator] = []
-    timing_operators: list[M03RV15ResidualOperator] = []
+    raw_scores: list[torch.Tensor] = []
+    executable_scores: list[torch.Tensor] = []
+    economic_targets: list[torch.Tensor] = []
+    target_z: list[torch.Tensor] = []
+    target_valid: list[torch.Tensor] = []
+    target_operators: list[M03RV15ResidualOperator] = []
     action_operators: list[M03RV15ResidualOperator] = []
+    action_errors: list[float] = []
+    target_errors: list[float] = []
 
     if split == "training":
         policy_state_binding_kind: Literal[
@@ -351,85 +379,104 @@ def build_m03r_v16_batch_from_origin_states(
         output = policy.predictive_output(
             origin_states[row_index], sequence.decision_available[local_origin]
         )
-        selection_mean = output.raw_selection_mean.squeeze(0)
-        timing_mean = output.raw_timing_mean.squeeze(0)
+        raw_score = output.raw_selection_score_z.squeeze(0)
         action_available = sequence.decision_available[local_origin, 0].clone()
         action_available[cash_index] = False
-        selection_raw_target, selection_future = _future_target(
-            sequence,
-            local_origin=local_origin,
-            horizon_weights=selection_weights,
-            cash_index=cash_index,
+        if structural_slab is None:
+            raw_target, common_future = _future_selection_target(
+                sequence,
+                local_origin=local_origin,
+                target_weights=target_weights,
+                cash_index=cash_index,
+            )
+            kwargs = {
+                "origin_state_index": global_origin,
+                "cash_index": cash_index,
+                "exposure_loadings": origin_risk_exposures.exposure_loadings[
+                    exposure_row
+                ],
+                "regression_weights": origin_risk_exposures.regression_weights[
+                    exposure_row
+                ],
+                "projector_exposure_names": (
+                    origin_risk_exposures.projector_exposure_names
+                ),
+                "projector_exposure_families": (
+                    origin_risk_exposures.projector_exposure_families
+                ),
+                "asset_axis_sha256": asset_axis_sha256,
+                "source_exposure_receipt_sha256": (
+                    origin_risk_exposures.receipt_sha256
+                ),
+            }
+            action_operator = build_m03r_v15_residual_operator(
+                available_mask=action_available,
+                **kwargs,
+            )
+            target_operator = build_m03r_v15_residual_operator(
+                available_mask=action_available & common_future,
+                **kwargs,
+            )
+            target_result = apply_m03r_v15_residual_operator(
+                raw_target.detach(), target_operator
+            )
+            economic_target = target_result.residual
+            standardized_target = (
+                target_result.residual / setting.selection_target_scale
+            )
+            target_error = _returned_dtype_exposure_error(
+                target_result, target_operator
+            )
+        else:
+            prepared = structural_slab.origin(global_origin)
+            action_operator = prepared.action_operator
+            target_operator = prepared.common_target_operator
+            expected_action_mask = action_available.to(device="cpu") & (
+                origin_risk_exposures.regression_weights[exposure_row]
+                .to(device="cpu")
+                .gt(0.0)
+            )
+            expected_action_mask[cash_index] = False
+            if not torch.equal(
+                action_operator.qualified_asset_mask, expected_action_mask
+            ):
+                raise M03RV16PretrainingRuntimeError(
+                    "V16 package-owned action support drifted"
+                )
+            economic_target = prepared.economic_targets[setting.setting_index].to(
+                device=origin_states.device
+            )
+            standardized_target = prepared.standardized_targets[
+                setting.setting_index
+            ].to(device=origin_states.device)
+            target_error = prepared.target_returned_dtype_exposure_errors[
+                setting.setting_index
+            ]
+        score_result = apply_m03r_v15_residual_operator(raw_score, action_operator)
+        raw_scores.append(raw_score)
+        executable_scores.append(score_result.residual)
+        economic_targets.append(economic_target)
+        target_z.append(standardized_target)
+        target_valid.append(
+            target_operator.qualified_asset_mask.to(device=origin_states.device)
         )
-        timing_raw_target, timing_future = _future_target(
-            sequence,
-            local_origin=local_origin,
-            horizon_weights=timing_weights,
-            cash_index=cash_index,
-        )
-        kwargs = {
-            "origin_state_index": global_origin,
-            "cash_index": cash_index,
-            "exposure_loadings": origin_risk_exposures.exposure_loadings[exposure_row],
-            "regression_weights": origin_risk_exposures.regression_weights[exposure_row],
-            "projector_exposure_names": origin_risk_exposures.projector_exposure_names,
-            "projector_exposure_families": (
-                origin_risk_exposures.projector_exposure_families
-            ),
-            "asset_axis_sha256": asset_axis_sha256,
-            "source_exposure_receipt_sha256": origin_risk_exposures.receipt_sha256,
-        }
-        action_operator = build_m03r_v15_residual_operator(
-            available_mask=action_available,
-            **kwargs,
-        )
-        selection_operator = build_m03r_v15_residual_operator(
-            available_mask=action_available & selection_future,
-            **kwargs,
-        )
-        timing_operator = build_m03r_v15_residual_operator(
-            available_mask=action_available & timing_future,
-            **kwargs,
-        )
-        raw_selection.append(selection_mean)
-        raw_timing.append(timing_mean)
-        executable_selection.append(
-            apply_m03r_v15_residual_operator(selection_mean, action_operator).residual
-        )
-        executable_timing.append(
-            apply_m03r_v15_residual_operator(timing_mean, action_operator).residual
-        )
-        selection_scales.append(output.raw_selection_log_scale.squeeze(0))
-        timing_scales.append(output.raw_timing_log_scale.squeeze(0))
-        selection_result = apply_m03r_v15_residual_operator(
-            selection_raw_target.detach(), selection_operator
-        )
-        timing_result = apply_m03r_v15_residual_operator(
-            timing_raw_target.detach(), timing_operator
-        )
-        selection_targets.append(selection_result.residual)
-        timing_targets.append(timing_result.residual)
-        selection_valid.append(selection_result.qualified_asset_mask)
-        timing_valid.append(timing_result.qualified_asset_mask)
-        selection_operators.append(selection_operator)
-        timing_operators.append(timing_operator)
+        target_operators.append(target_operator)
         action_operators.append(action_operator)
+        action_errors.append(
+            _returned_dtype_exposure_error(score_result, action_operator)
+        )
+        target_errors.append(target_error)
 
     objective = M03RV16PredictiveBatch(
-        executable_selection_mean=torch.stack(executable_selection),
-        selection_log_scale=torch.stack(selection_scales),
-        selection_target=torch.stack(selection_targets),
-        selection_valid=torch.stack(selection_valid),
-        executable_timing_mean=torch.stack(executable_timing),
-        timing_log_scale=torch.stack(timing_scales),
-        timing_target=torch.stack(timing_targets),
-        timing_valid=torch.stack(timing_valid),
+        executable_selection_score_z=torch.stack(executable_scores),
+        selection_target_z=torch.stack(target_z),
+        selection_target_economic=torch.stack(economic_targets),
+        selection_valid=torch.stack(target_valid),
         setting=setting,
     )
     result = M03RV16BuiltPredictiveBatch(
         objective=objective,
-        raw_selection_mean=torch.stack(raw_selection),
-        raw_timing_mean=torch.stack(raw_timing),
+        raw_selection_score_z=torch.stack(raw_scores),
         origin_indices=global_origins,
         split=split,
         fold_index=fold_index,
@@ -440,12 +487,13 @@ def build_m03r_v16_batch_from_origin_states(
         exposure_receipt_sha256=origin_risk_exposures.receipt_sha256,
         policy_state_binding_kind=policy_state_binding_kind,
         policy_state_binding_sha256=policy_state_binding_sha256,
-        policy_score_component_state_sha256=(
-            m03r_v16_score_component_state_sha256(policy)
-        ),
-        selection_target_operators=tuple(selection_operators),
-        timing_target_operators=tuple(timing_operators),
+        selection_target_operators=tuple(target_operators),
         action_operators=tuple(action_operators),
+        action_returned_dtype_exposure_errors=tuple(action_errors),
+        target_returned_dtype_exposure_errors=tuple(target_errors),
+        structural_slab_receipt_sha256=(
+            None if structural_slab is None else structural_slab.receipt.receipt_sha256
+        ),
     )
     result.validate()
     return result
@@ -453,6 +501,7 @@ def build_m03r_v16_batch_from_origin_states(
 
 __all__ = [
     "M03R_V16_BUILT_BATCH_SCHEMA",
+    "M03R_V16_RETURNED_DTYPE_ORTHOGONALITY_TOLERANCE",
     "M03RV16BuiltPredictiveBatch",
     "M03RV16PretrainingRuntimeError",
     "build_m03r_v16_batch_from_origin_states",

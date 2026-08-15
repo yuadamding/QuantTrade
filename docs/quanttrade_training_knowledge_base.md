@@ -70,7 +70,7 @@ This table records lineage, not current cluster state:
 | v13 context-matched h3 | Corrected full-context and h3-only geometry, but still optimized and diagnosed a different tensor from the score traded after residualization | Preserve as superseded design evidence; do not launch it |
 | v14 executable-score h3 | Completed two-setting study with one action-projected score; both settings failed IC, net-cost, and break-even gates | Preserve as negative evidence; do not start economic training |
 | v15 corrected executable-score h3 | Completed all twelve A04 folds under the corrected package and runtime; both settings failed with IC below 0.011 and break-even cost below 2 bp | End daily h3 loss tuning; no economic or 2026 access |
-| v16 holding-aligned selection | Current local successor comparing h21, h30, and survival-weighted 1–30-session selection targets while retaining h3 only as timing | Complete package/runtime qualification locally before any remote authorization |
+| v16 holding-aligned selection | Current local successor comparing h21, h30, and reference-Hold-30 value on common 30-session support; selection-only with disjoint outer evidence and local structural/capacity/cohort primitives | Seal and validate the package plus worker/lifecycle before any remote authorization |
 | v7 2026-YTD retrospective | Separate, fixed 2026-01-02 through 2026-06-23 mechanism-evaluation contract | It is not a universal 2026 cutoff and cannot select v11 |
 
 ## 2. End-to-end lifecycle
@@ -288,12 +288,14 @@ control exceeded the rank setting, leaving no evidence that another h3 rank
 or loss-weight experiment is the highest-value direction.
 
 V16 therefore changes the information horizon rather than relabeling the h3
-failure. It compares cumulative h21, cumulative h30, and normalized geometric
-survival-weighted 1–30-session residual selection targets under paired inputs.
-H3 remains a separately supervised timing output. The selection mean receives
-85% of score-stage weight, timing receives 15%, and uncertainty is calibrated
-only after the selected mean checkpoint is frozen. This preserves a clear
-information-alpha gate before any direct portfolio optimizer or RL controller.
+failure. It compares cumulative h21, cumulative h30, and an unnormalized
+1–30-session value derived from the actual age-dependent Hold-30 release prior.
+All three settings use one common 30-session label mask and residual operator,
+and dimensionless heads prevent target units from changing gradient geometry.
+H3 timing and uncertainty calibration are excluded from the target screen.
+Five outer scored supports are disjoint, epoch count is fixed at eight, and the
+Hold-30-prior setting is the sole predeclared primary hypothesis. This preserves
+a clean information-alpha gate before any portfolio optimizer or RL controller.
 
 ### Train, diagnose, and trade one causal score
 
@@ -321,6 +323,19 @@ small QR-derived coefficient map once, retain differentiability with respect
 to the score, and use immutable identity plus tensor-version checks in the hot
 path. Repeating QR, full tensor hashing, or CPU validation per score adds cost
 without changing the scientific object.
+
+Materialize the operator and target slab from the exact cache, risk, projector,
+and source bytes already owned by the package. A preflight receipt without the
+actual reusable tensors only proves that QR succeeded once; it does not prevent
+the training loop from rebuilding a different object. Load large slabs through
+one no-follow descriptor, hash before deserialization, verify descriptor
+identity again afterward, and revalidate every reconstructed operator.
+
+A horizon-matched cohort diagnostic must close the last decision. If the new
+cohort earns its first return on the decision/fill step, an h30 cohort needs 29
+additional no-new-decision transitions—not 30—and must earn all 30 returns.
+Charge terminal liquidation for any remaining active risk and publish absolute
+policy cost separately from incremental active cost.
 
 ### Test objective gradients, not only objective values
 
