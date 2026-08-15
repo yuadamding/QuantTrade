@@ -277,6 +277,10 @@ V3_LATER_GENERATION_SOURCE_TESTS = (
         "tests/test_hold30_alpha_m03r_v14_top2000_dev_protocol.py",
     ),
     (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v15_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v15_top2000_dev_protocol.py",
+    ),
+    (
         "src/rl_quant/execution/cost_aware_active_policy_v3.py",
         "tests/test_cost_aware_active_policy_v3.py",
     ),

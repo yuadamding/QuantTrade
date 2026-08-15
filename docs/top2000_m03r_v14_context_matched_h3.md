@@ -9,10 +9,8 @@ the same causal tensor.
 
 V14 cannot reuse V13 model or optimizer state, run an economic optimizer, or
 access 2026 outcomes. The TOP2000 universe remains future-selected, so all
-results are development-only, nonreportable, and nonpromotable. Source and
-tests do not authorize a remote run; a fresh source archive, real-data
-preflight, package, execution authorization, and lifecycle receipts are still
-required.
+results are development-only, nonreportable, and nonpromotable. The completed
+remote evidence is immutable and cannot be reused by a successor.
 
 ## Scientific settings
 
@@ -98,20 +96,20 @@ The small 25-bp fixed-rank sleeve is a score-ordering diagnostic, not a final
 portfolio policy. Economic policy training remains blocked until the frozen
 projected-score, spread, gross/net return, cost, and retention gates pass.
 
-## Current implementation status
+## Completed result
 
-The local V14 source includes protocol, policy, objective, causal batch
-construction, reusable residual operators, optimizer mutation, checkpoint,
-qualification, selection, package/workflow, and research lifecycle surfaces.
-The focused V11-V14 regression run on 2026-08-14 passed `253` tests with one
-environment-dependent skip. The focused V14 suite passed `53` tests; Ruff
-passed on all V14 source and tests. After repairing the explicit legacy
-Hold-30 source-to-test inventory for the landed V11-V14 protocols, the full
-repository suite passed `1,708` tests with `7` skips.
+The source-homogeneous seed-17 run completed both settings and all six folds,
+but neither setting passed:
 
-These local results establish implementation consistency only. No V14
-real-data structural receipt, source package, GPU result, or predictive result
-is claimed by this document.
+| Setting | Mean projected IC | Net active return at 10 bp | Break-even cost |
+| --- | ---: | ---: | ---: |
+| P0 rank | 0.01184 | -0.0601% | 1.07 bp |
+| P1 no-rank | 0.01334 | -0.0561% | 1.39 bp |
+
+Both IC values remained below `0.020`, both 10-bp returns were negative, and
+break-even costs remained far below `10 bp`. No economic optimizer ran and no
+2026 outcomes were opened. V14 is completed negative, development-only
+evidence rather than a current launch boundary.
 
 ## Advancement rule
 

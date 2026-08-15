@@ -82,10 +82,18 @@ tests are not launch or performance evidence.
   supervision, one rank-and-execution mean, and separate causal action/target
   operators. It remains immutable predecessor design/evidence for v14.
 - [TOP2000 M03R-v14 executable-score-aligned h3 research](top2000_m03r_v14_context_matched_h3.md)
-  — fresh predictive-only correction that trains, diagnoses, and trades one
+  — completed predictive-only correction that trained, diagnosed, and traded one
   action-projected score; intersects label support with origin eligibility;
   stabilizes rank scale and mean initialization; and precomputes residual maps.
-  It has no remote or performance claim until fresh package/run receipts exist.
+  Both settings failed the predictive and tradeability gates, so economic
+  training remains prohibited.
+- [TOP2000 M03R-v15 corrected executable-score h3 research](top2000_m03r_v15_executable_score_corrected_h3.md)
+  — current predictive boundary with package-owned structural preflight,
+  corrected rank-gradient and pure-ablation geometry, separate clipping,
+  exact-workload capacity proof, and training-only checkpoint selection. Its
+  immutable A04 package, static gate, and disposable two-H100 capacity gate
+  passed; no predictive performance or economic claim exists until exact
+  terminal scientific receipts validate.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100

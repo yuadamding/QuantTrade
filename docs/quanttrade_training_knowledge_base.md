@@ -8,7 +8,7 @@ the word `production` for an operationally hardened research lifecycle; that
 word does not change the scientific or business status of the work.
 
 This guide consolidates the most reusable lessons from the Hold-30 M03R-v7
-revision, the TOP2000 seed-17 diagnostic and Phase-0 audit, the v8-v12
+revision, the TOP2000 seed-17 diagnostic and Phase-0 audit, the v8-v15
 predictive-first lineage, receipt-gated GPU execution, and the separately
 frozen 2026-YTD retrospective design. It explains how the pieces fit together.
 It does not replace a protocol, package-owned validator, data manifest, or run
@@ -67,6 +67,9 @@ This table records lineage, not current cluster state:
 | v11 corrected rank geometry | Completed TOP2000 predictive predecessor: paired samples, qualified residuals, magnitude-preserving actions, block inference, and exact checkpoint reload | Preserve its result and the separate a15 audit; neither authorizes economic training |
 | v11 a15 inference audit | Exact-checkpoint controls confirmed a directional P0 effect, but every cap saturated and no 10-bp net or spread lower bound passed; P1 scale collapsed | No economic training; preserve the audit as exploratory evidence |
 | v12 rank/scale decoupling | Completed 3-session predictive study: dedicated rank score, separate economic mean/scale, bounded rank influence on the encoder, and nonsaturating turnover utilization; all three settings failed the frozen predictive gate | Preserve as negative evidence; do not start economic training or open 2026 outcomes |
+| v13 context-matched h3 | Corrected full-context and h3-only geometry, but still optimized and diagnosed a different tensor from the score traded after residualization | Preserve as superseded design evidence; do not launch it |
+| v14 executable-score h3 | Completed two-setting study with one action-projected score; both settings failed IC, net-cost, and break-even gates | Preserve as negative evidence; do not start economic training |
+| v15 corrected executable-score h3 | Current predictive successor: package-owned preflight, corrected rank gradient and pure ablation, training-only checkpoint selection, and an A04 static plus exact-workload capacity pass | Await exact predictive terminal evidence; no economic or 2026 access |
 | v7 2026-YTD retrospective | Separate, fixed 2026-01-02 through 2026-06-23 mechanism-evaluation contract | It is not a universal 2026 cutoff and cannot select v11 |
 
 ## 2. End-to-end lifecycle
@@ -220,7 +223,7 @@ The complete benchmark and audit are in the
 [twelve-setting performance benchmark](top2000_m03r_v7_seed17_12_setting_performance_benchmark.md)
 and [Phase-0 forensic audit](top2000_m03r_v7_seed17_phase0_forensic_audit.md).
 
-## 4. Predictive-first lineage from v8 through v14
+## 4. Predictive-first lineage from v8 through v15
 
 M03R-v8 introduced the durable ordering that remains relevant:
 
@@ -266,6 +269,15 @@ V14 therefore makes the action-projected score the single loss, diagnostic,
 and execution object and intersects label support with origin action
 eligibility.
 
+The completed v14 screen still failed: P0/P1 projected mean IC was only
+`0.01184`/`0.01334`, 10-bp net active return was negative, and break-even cost
+was `1.07`/`1.39 bp`. Review then found that v14's detached rank denominator
+had zero loss but a nonzero radial gradient, its nominal no-rank ablation also
+rescaled economic losses, its preflight was not bound to the package-owned
+risk/projector/source, and its load-only capacity job did not exercise the
+real workload. V15 corrects those boundaries and adds training-only
+checkpoint selection; it does not reinterpret v14 as passing.
+
 ### Train, diagnose, and trade one causal score
 
 A predictive gate is invalid when its IC or spread is computed from a raw head
@@ -292,6 +304,33 @@ small QR-derived coefficient map once, retain differentiability with respect
 to the score, and use immutable identity plus tensor-version checks in the hot
 path. Repeating QR, full tensor hashing, or CPU validation per score adds cost
 without changing the scientific object.
+
+### Test objective gradients, not only objective values
+
+Value invariance is not enough for a scale-invariant loss. If a prediction RMS
+is detached, a perfectly ranked prediction can have zero reported loss while
+retaining a nonzero radial gradient that keeps inflating the economic mean.
+For normalized rank objectives, require all of the following above the frozen
+dispersion floor:
+
+```text
+positive rescaling leaves the loss unchanged
+perfect positive alignment has near-zero loss and gradient
+the gradient has no radial component
+negative alignment points toward sign correction
+near-collapse inputs retain a finite anti-collapse gradient
+```
+
+For a loss-only ablation, preserve the absolute coefficients of every shared
+component. Removing a rank term and renormalizing robust or scale weights is
+not a pure rank ablation because it changes gradient magnitudes, clipping, and
+optimizer moments.
+
+Keep raw and executable prediction types distinct. A raw model output should
+not expose aliases named `rank_score` or `execution_score`; only the
+operator-bound executable type may expose those meanings. Validate the core
+mask subset and recompute the projected score at the built-batch boundary so a
+stale alternate builder cannot silently revive a raw-versus-traded mismatch.
 
 ### Objective-integrity lesson
 
@@ -329,7 +368,8 @@ Generation-specific details are in the [v8 design](top2000_m03r_v8_alpha_discove
 [corrected v11 protocol](top2000_m03r_v11_rank_geometry_corrected.md),
 [completed v12 rank/scale-decoupled study](top2000_m03r_v12_rank_scale_decoupled.md),
 [v13 context-matched design](top2000_m03r_v13_context_matched_h3.md), and
-[v14 executable-score correction](top2000_m03r_v14_context_matched_h3.md).
+[completed v14 executable-score study](top2000_m03r_v14_context_matched_h3.md),
+and [v15 corrected executable-score design](top2000_m03r_v15_executable_score_corrected_h3.md).
 Remote run state must be established from receipts, not from any of these
 documents.
 
@@ -407,6 +447,13 @@ an explicit device works on CPU tests but fails only after CUDA training reaches
 qualification. Construct diagnostic constants with the input tensor's dtype
 and device, and cover the boundary with a fake-CUDA or same-image regression
 so a controller without a physical GPU can still detect CPU/GPU drift.
+
+Immutable scientific metadata often remains CPU-resident while the result
+tensor is on CUDA. A validator must not call a binary tensor operation on those
+mixed devices. Reconcile a complete mask once through a device-independent
+tensor identity, or move one stacked immutable slab explicitly; do not transfer
+one mask per asset/date inside a Python loop. The exact-shape capacity update
+must exercise this validation path because CPU-only tests cannot prove it.
 
 ### Reject non-finite gradients before optimizer mutation
 
@@ -536,6 +583,14 @@ that contains it. Before Job creation, resolve the rendered read-only PVC
 `subPath` and require the package plan, `source/src` import root, and runtime
 entrypoint at that exact host directory. A safe archive and correct inner
 inventory do not prove that the mount points at the inner package level.
+
+Keep host-side lifecycle modules dependency-light. Rendering, attach, cleanup,
+and detached supervision run under the approved host Python, which need not
+contain PyTorch, PyArrow, or the workload image's scientific stack. Put shared
+receipt dataclasses in a small contract module and test that importing the
+lifecycle surface does not import heavy scientific dependencies. The exact
+runtime image, not the login host, qualifies those dependencies in the static
+and capacity gates.
 
 Keep plan and binding receipts idempotent only when their complete content is
 identical. Never delete, move, or archive a published terminal receipt merely
@@ -899,6 +954,13 @@ exposures, effective ranks, and residual-orthogonality checks in a distinct
 structural receipt. This is CPU validation and should fail before scarce GPU
 allocation.
 
+Run that structural gate from the package-owned copies, after exact source,
+cache, risk, exposure, and projector files have been staged. An external
+preflight that matches only the cache and fold geometry can be paired with a
+different risk model or source implementation. Bind both file hashes and
+semantic receipts, including the operator source and projector binding, then
+seal the package only after the package-local sweep passes.
+
 ### State-row versus return-transition boundary lesson
 
 Do not size a maximum-horizon origin from state rows without accounting for the
@@ -1007,6 +1069,28 @@ captured terminal Job/Pod/log evidence, and final cleanup receipt. Publish it
 only after one UID/resourceVersion-conditioned delete and two absence reads.
 This prevents a short-lived CUDA startup from being reused after its Job or
 Pods were left ambiguous.
+
+A load-only capacity check does not qualify training. The disposable capacity
+path must exercise one exact-shape forward, objective, backward, distributed
+gradient reduction, clipping, and optimizer mutation plus one qualification
+risk projection. It must prove rank equality, record peak device memory,
+publish no scientific checkpoint, and be terminally cleaned. This catches
+unsupported deterministic kernels, NCCL behavior, operator transfer, and
+peak-memory failures before the scientific Job exists.
+
+Completion of a fixed epoch count is not convergence evidence. When the outer
+qualification tail must remain untouched, reserve a chronological
+training-only validation slice, evaluate the executable score at every
+predeclared epoch, and select the immutable checkpoint with a frozen rule. A
+clean rule can maximize projected IC, then projected spread, then minimize
+robust loss, with exact ties favoring the earlier epoch. Bind every candidate
+receipt and prove the qualification tail was never read for selection.
+
+Once training itself consumes the action-projected score, raw-to-projected
+norm retention is attribution rather than a promotion gate: the raw null-space
+component receives no predictive gradient and is not scientifically
+identified. If reported, use the projection's weighted full-action-space norm.
+Keep requested-to-executed portfolio retention as the actual execution gate.
 
 Derive lifecycle receipt inventories from the immutable protocol rather than
 copying an earlier generation's horizon or setting list into a validator. A
