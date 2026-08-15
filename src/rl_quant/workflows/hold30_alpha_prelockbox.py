@@ -257,6 +257,26 @@ V3_LATER_GENERATION_SOURCE_TESTS = (
         "tests/test_hold30_alpha_m03r_v11_top2000_dev_protocol.py",
     ),
     (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v11_a15_inference_audit.py",
+        "tests/test_top2000_m03r_v11_a15_inference_audit.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v12_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v12_top2000_dev_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v12_posthoc_inference_audit.py",
+        "tests/test_top2000_m03r_v12_posthoc_inference_audit.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v13_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v13_top2000_dev_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v14_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v14_top2000_dev_protocol.py",
+    ),
+    (
         "src/rl_quant/execution/cost_aware_active_policy_v3.py",
         "tests/test_cost_aware_active_policy_v3.py",
     ),

@@ -308,6 +308,26 @@ HOLD30_COMPONENT_TESTS = (
         "src/rl_quant/protocol/hold30_alpha_m03r_v11_top2000_dev.py",
         "tests/test_hold30_alpha_m03r_v11_top2000_dev_protocol.py",
     ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v11_a15_inference_audit.py",
+        "tests/test_top2000_m03r_v11_a15_inference_audit.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v12_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v12_top2000_dev_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v12_posthoc_inference_audit.py",
+        "tests/test_top2000_m03r_v12_posthoc_inference_audit.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v13_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v13_top2000_dev_protocol.py",
+    ),
+    (
+        "src/rl_quant/protocol/hold30_alpha_m03r_v14_top2000_dev.py",
+        "tests/test_hold30_alpha_m03r_v14_top2000_dev_protocol.py",
+    ),
 )
 HOLD30_INTEGRATION_SOURCE_FILES = (
     "src/rl_quant/datasets/daily.py",

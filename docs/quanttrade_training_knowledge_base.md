@@ -220,7 +220,7 @@ The complete benchmark and audit are in the
 [twelve-setting performance benchmark](top2000_m03r_v7_seed17_12_setting_performance_benchmark.md)
 and [Phase-0 forensic audit](top2000_m03r_v7_seed17_phase0_forensic_audit.md).
 
-## 4. Predictive-first lineage from v8 through v11
+## 4. Predictive-first lineage from v8 through v14
 
 M03R-v8 introduced the durable ordering that remains relevant:
 
@@ -256,6 +256,43 @@ the turnover cap, and fold-level confidence summaries cannot be averaged into
 an aggregate confidence claim. V11 corrects those boundaries under a fresh
 identity.
 
+V12 showed that binding a selected horizon does not make it primary when most
+shared-representation loss weight remains on other targets. Its post-hoc audit
+also showed that action/return chronology, future-conditioned action support,
+and raw-versus-executed score mismatches can materially change the measured
+result. V13 corrected context and horizon geometry but still optimized and
+diagnosed a different tensor from the residualized score traded by its sleeve.
+V14 therefore makes the action-projected score the single loss, diagnostic,
+and execution object and intersects label support with origin action
+eligibility.
+
+### Train, diagnose, and trade one causal score
+
+A predictive gate is invalid when its IC or spread is computed from a raw head
+but execution trades a projected or otherwise transformed score. Define the
+executable score once:
+
+\[
+s_t=P_t^A f_\theta(x_{\le t}),
+\]
+
+then use that exact tensor for rank/regression loss, validation,
+qualification, and action construction. Record the raw score only for
+attribution. Bind both hashes so raw-to-executable retention is observable
+rather than hidden inside the final portfolio projector.
+
+Label support must be causal at the origin. An asset belongs in the label
+regression and loss only when it was action-eligible at the decision origin
+and has complete declared outcome support. Future availability may remove a
+label; it must never add an asset to the decision universe or influence the
+origin action operator.
+
+When a fixed exposure-null transform is applied repeatedly, precompute its
+small QR-derived coefficient map once, retain differentiability with respect
+to the score, and use immutable identity plus tensor-version checks in the hot
+path. Repeating QR, full tensor hashing, or CPU validation per score adds cost
+without changing the scientific object.
+
 ### Objective-integrity lesson
 
 An early v8 attempt imported the correct protocol weights but the executable
@@ -289,8 +326,10 @@ meaning from one generation into another. Qualification does not prove:
 Generation-specific details are in the [v8 design](top2000_m03r_v8_alpha_discovery.md),
 [completed v9 record](top2000_m03r_v9_predictive_stage.md),
 [superseded v10 proposal](top2000_m03r_v10_rank_geometry.md), and
-[corrected v11 protocol](top2000_m03r_v11_rank_geometry_corrected.md), and
-[completed v12 rank/scale-decoupled study](top2000_m03r_v12_rank_scale_decoupled.md).
+[corrected v11 protocol](top2000_m03r_v11_rank_geometry_corrected.md),
+[completed v12 rank/scale-decoupled study](top2000_m03r_v12_rank_scale_decoupled.md),
+[v13 context-matched design](top2000_m03r_v13_context_matched_h3.md), and
+[v14 executable-score correction](top2000_m03r_v14_context_matched_h3.md).
 Remote run state must be established from receipts, not from any of these
 documents.
 

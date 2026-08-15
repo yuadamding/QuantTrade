@@ -80,7 +80,12 @@ tests are not launch or performance evidence.
   — fresh predictive-only successor with full 252-session context in training
   and qualification, every-origin-once-per-epoch paired schedules, h3-only
   supervision, one rank-and-execution mean, and separate causal action/target
-  operators. Its remaining runtime/package surfaces are not yet launch-ready.
+  operators. It remains immutable predecessor design/evidence for v14.
+- [TOP2000 M03R-v14 executable-score-aligned h3 research](top2000_m03r_v14_context_matched_h3.md)
+  — fresh predictive-only correction that trains, diagnoses, and trades one
+  action-projected score; intersects label support with origin eligibility;
+  stabilizes rank scale and mean initialization; and precomputes residual maps.
+  It has no remote or performance claim until fresh package/run receipts exist.
 - [TOP2000 M03R v7 seed-17 2026-YTD retrospective](top2000_m03r_v7_seed17_2026_ytd_retrospective.md)
   — pre-access freeze contract, leakage-safe chronological execution,
   official factor evidence, cohort survival, and efficient one-H100

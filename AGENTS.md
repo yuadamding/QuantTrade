@@ -21,10 +21,10 @@ product, or business-production system.
   as explanatory reuse of exact frozen checkpoints only. It compares rank and
   economic heads under corrected causal masks and chronology, but cannot
   select a v12 model, mint an economic generation, or access 2026.
-- Treat [M03R-v13 context-matched direct-h3 research](docs/top2000_m03r_v13_context_matched_h3.md)
+- Treat [M03R-v14 executable-score-aligned h3 research](docs/top2000_m03r_v14_context_matched_h3.md)
   as the current predictive implementation boundary. It is a fresh h3-only
-  generation with matched 252-session context and direct score routing; its
-  incomplete runtime/package boundary does not authorize GPU or 2026 access.
+  generation whose loss, diagnostics, and sleeve share one action-projected
+  score. Local source and tests do not authorize GPU or 2026 access.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   as the canonical PIT Active-300 objective and promotion contract. That
@@ -85,6 +85,11 @@ PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
 PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
   tests/test_hold30_alpha_m03r_v13_top2000_dev_protocol.py \
   tests/test_top2000_m03r_v13_*.py
+
+# V14 executable-score, causal-support, and numerical boundary
+PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_hold30_alpha_m03r_v14_top2000_dev_protocol.py \
+  tests/test_top2000_m03r_v14_*.py
 
 # Canonical v7 contract boundary
 PYTHONPATH=src conda run -n quanttrade python -m pytest \
