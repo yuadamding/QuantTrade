@@ -32,12 +32,14 @@ from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
 from rl_quant.training.top2000_m03r_v16_activation import (
     M03RV16AdmittedJobAuthority,
     M03RV16PhaseLaunchAuthority,
+    M03RV16PodRuntimeAttestation,
     M03RV16QualificationActivation,
     M03RV16TrainingActivation,
     _issue_m03r_v16_phase_launch_authority,
     _issue_m03r_v16_training_activation_from_gates,
     admitted_job_authority_file_sha256,
     phase_launch_authority_file_sha256,
+    pod_runtime_attestation_file_sha256,
     write_m03r_v16_phase_launch_authority,
 )
 from rl_quant.training.top2000_m03r_v16_capacity import (
@@ -61,7 +63,7 @@ M03R_V16_CAPACITY_GATE_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v2"
 )
 M03R_V16_RENDERED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v5"
+    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v6"
 )
 _JOB_CONTRACT_ANNOTATION = "rl-quant/job-contract-sha256"
 _POD_CONTRACT_ANNOTATION = "rl-quant/pod-contract-sha256"
@@ -77,12 +79,27 @@ _POD_ATTESTATION_FILE_ANNOTATION = (
 _POD_ATTESTATION_RECEIPT_ANNOTATION = (
     "rl-quant/pod-runtime-attestation-receipt-sha256"
 )
+_POD_ATTESTATION_PATH_ANNOTATION = "rl-quant/pod-runtime-attestation-path"
 _PYTHON = "/opt/conda/envs/quanttrade/bin/python"
 _WORKER_MODULE = "rl_quant.workflows.top2000_m03r_v16_predictive"
 _STATIC_MODULE = "rl_quant.workflows.top2000_m03r_v16_static_validate"
 _STATIC_GATE_ISSUER = object()
 _CAPACITY_GATE_ISSUER = object()
 _MAX_GATE_RESULT_BYTES = 64 * 1024**2
+
+
+def m03r_v16_pod_runtime_attestation_annotations(
+    value: M03RV16PodRuntimeAttestation,
+) -> dict[str, str]:
+    """Return the exact annotations patched before atomic publication."""
+
+    return {
+        _POD_ATTESTATION_PATH_ANNOTATION: value.relative_path,
+        _POD_ATTESTATION_FILE_ANNOTATION: (
+            pod_runtime_attestation_file_sha256(value)
+        ),
+        _POD_ATTESTATION_RECEIPT_ANNOTATION: value.receipt_sha256,
+    }
 
 
 def _contract_payload(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -104,6 +121,7 @@ def _contract_payload(manifest: dict[str, Any]) -> dict[str, Any]:
         annotation_rows.pop(_ADMITTED_MANIFEST_FILE_ANNOTATION, None)
         annotation_rows.pop(_POD_ATTESTATION_FILE_ANNOTATION, None)
         annotation_rows.pop(_POD_ATTESTATION_RECEIPT_ANNOTATION, None)
+        annotation_rows.pop(_POD_ATTESTATION_PATH_ANNOTATION, None)
     return payload
 
 
@@ -398,12 +416,18 @@ class M03RV16RenderedSuspendedJob:
             len(pod.get("initContainers", ())) != 1
             or pod["initContainers"][0].get("name")
             != "runtime-attestation-gate"
+            or pod["initContainers"][0].get("image")
+            != containers[0].get("image")
+            or "@sha256:" not in str(containers[0].get("image"))
+            or "rl_quant.workflows.top2000_m03r_v16_attestation_gate"
+            not in pod["initContainers"][0].get("args", ())
             or not {
                 "M03R_V16_CURRENT_POD_UID",
                 "M03R_V16_CURRENT_POD_NAME",
                 "M03R_V16_CURRENT_NODE_NAME",
                 "M03R_V16_POD_ATTESTATION_FILE_SHA256",
                 "M03R_V16_POD_ATTESTATION_RECEIPT_SHA256",
+                "M03R_V16_POD_ATTESTATION_PATH",
             }.issubset(
                 {
                     row.get("name")
@@ -412,6 +436,8 @@ class M03RV16RenderedSuspendedJob:
                 }
             )
             or "--pod-runtime-attestation" not in containers[0].get("args", ())
+            or "--pod-runtime-attestation-marker"
+            not in containers[0].get("args", ())
         ):
             raise M03RV16KubernetesError(
                 "V16 H100 Pod runtime attestation gate drifted"
@@ -984,7 +1010,7 @@ def _render(
                 "--admitted-manifest-result-file-sha256",
                 "$(M03R_V16_ADMITTED_MANIFEST_FILE_SHA256)",
                 "--pod-runtime-attestation",
-                "/mnt/authority/pod-runtime-$(JOB_COMPLETION_INDEX).json",
+                "/mnt/authority/$(M03R_V16_POD_ATTESTATION_PATH)",
                 "--pod-runtime-attestation-file-sha256",
                 "$(M03R_V16_POD_ATTESTATION_FILE_SHA256)",
                 "--pod-runtime-attestation-receipt-sha256",
@@ -1161,6 +1187,19 @@ def _render(
                     },
                 },
                 {
+                    "name": "M03R_V16_POD_ATTESTATION_PATH",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _POD_ATTESTATION_PATH_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
                     "name": "M03R_V16_POD_ATTESTATION_FILE_SHA256",
                     "valueFrom": {
                         "fieldRef": {
@@ -1315,10 +1354,91 @@ def _render(
                     "sizeLimit": "1Gi" if mode == "static" else "32Gi",
                 },
             },
+            {"name": "attestation-status", "emptyDir": {}},
+            {
+                "name": "podinfo",
+                "downwardAPI": {
+                    "items": [
+                        {
+                            "path": "pod-runtime-attestation-path",
+                            "fieldRef": {
+                                "fieldPath": (
+                                    "metadata.annotations['"
+                                    + _POD_ATTESTATION_PATH_ANNOTATION
+                                    + "']"
+                                )
+                            },
+                        },
+                        {
+                            "path": "pod-runtime-attestation-file-sha256",
+                            "fieldRef": {
+                                "fieldPath": (
+                                    "metadata.annotations['"
+                                    + _POD_ATTESTATION_FILE_ANNOTATION
+                                    + "']"
+                                )
+                            },
+                        },
+                        {
+                            "path": "pod-runtime-attestation-receipt-sha256",
+                            "fieldRef": {
+                                "fieldPath": (
+                                    "metadata.annotations['"
+                                    + _POD_ATTESTATION_RECEIPT_ANNOTATION
+                                    + "']"
+                                )
+                            },
+                        },
+                    ]
+                },
+            },
         ],
     }
     if mode != "static":
-        completion_env = environment[0]
+        pod["containers"][0]["args"].extend(
+            (
+                "--pod-runtime-attestation-marker",
+                "/var/run/m03r-v16-attestation/validated.json",
+            )
+        )
+        pod["containers"][0]["volumeMounts"].append(
+            {
+                "name": "attestation-status",
+                "mountPath": "/var/run/m03r-v16-attestation",
+                "readOnly": True,
+            }
+        )
+    if mode != "static":
+        init_environment_names = {
+            "JOB_COMPLETION_INDEX",
+            "PYTHONPATH",
+            "PYTHONNOUSERSITE",
+            "PYTHONDONTWRITEBYTECODE",
+            "PYTHONHASHSEED",
+            "PYTHONUNBUFFERED",
+            "M03R_V16_JOB_CONTRACT_SHA256",
+            "M03R_V16_POD_CONTRACT_SHA256",
+            "M03R_V16_PHASE",
+            "M03R_V16_LAUNCH_FILE_SHA256",
+            "M03R_V16_LAUNCH_RECEIPT_SHA256",
+            "M03R_V16_ADMISSION_FILE_SHA256",
+            "M03R_V16_ADMISSION_RECEIPT_SHA256",
+            "M03R_V16_CURRENT_POD_UID",
+            "M03R_V16_CURRENT_POD_NAME",
+            "M03R_V16_CURRENT_NODE_NAME",
+        }
+        init_environment = [
+            row for row in environment if row["name"] in init_environment_names
+        ]
+        predecessor_receipt = (
+            cast(M03RV16StaticGateQualification, static).receipt_sha256
+            if mode == "capacity"
+            else cast(M03RV16TrainingActivation, training_activation).receipt_sha256
+            if mode == "training"
+            else cast(
+                M03RV16QualificationActivation, qualification_activation
+            ).receipt_sha256
+        )
         pod["initContainers"] = [
             {
                 "name": "runtime-attestation-gate",
@@ -1328,18 +1448,48 @@ def _render(
                 "args": [
                     "-I",
                     "-B",
-                    "-c",
-                    (
-                        "import os,pathlib,time;"
-                        "p=pathlib.Path('/mnt/authority/pod-runtime-'"
-                        "+os.environ['JOB_COMPLETION_INDEX']+'.json');"
-                        "deadline=time.monotonic()+1800;"
-                        "\nwhile not p.is_file():"
-                        "\n  if time.monotonic()>=deadline: raise SystemExit(75)"
-                        "\n  time.sleep(2)"
+                    "-m",
+                    "rl_quant.workflows.top2000_m03r_v16_attestation_gate",
+                    *_base_args(
+                        package,
+                        authorization,
+                        package_plan_file_sha256,
+                        authorization_file_sha256,
                     ),
+                    "--phase",
+                    mode,
+                    "--predecessor-authority-receipt-sha256",
+                    predecessor_receipt,
+                    "--job-contract-sha256",
+                    "$(M03R_V16_JOB_CONTRACT_SHA256)",
+                    "--pod-contract-sha256",
+                    "$(M03R_V16_POD_CONTRACT_SHA256)",
+                    "--launch-authority",
+                    "/mnt/authority/$(M03R_V16_PHASE)-launch.json",
+                    "--launch-authority-file-sha256",
+                    "$(M03R_V16_LAUNCH_FILE_SHA256)",
+                    "--launch-authority-receipt-sha256",
+                    "$(M03R_V16_LAUNCH_RECEIPT_SHA256)",
+                    "--admitted-job-authority",
+                    "/mnt/authority/$(M03R_V16_PHASE)-admission.json",
+                    "--admitted-job-authority-file-sha256",
+                    "$(M03R_V16_ADMISSION_FILE_SHA256)",
+                    "--admitted-job-authority-receipt-sha256",
+                    "$(M03R_V16_ADMISSION_RECEIPT_SHA256)",
+                    "--server-side-dry-run-result",
+                    "/mnt/authority/$(M03R_V16_PHASE)-dry-run.json",
+                    "--admitted-manifest-result",
+                    "/mnt/authority/$(M03R_V16_PHASE)-admitted-manifest.json",
+                    "--completion-index",
+                    "$(JOB_COMPLETION_INDEX)",
+                    "--downward-root",
+                    "/etc/podinfo",
+                    "--authority-root",
+                    "/mnt/authority",
+                    "--marker",
+                    "/var/run/m03r-v16-attestation/validated.json",
                 ],
-                "env": [completion_env],
+                "env": init_environment,
                 "resources": {
                     "requests": {"cpu": "50m", "memory": "64Mi"},
                     "limits": {"cpu": "250m", "memory": "128Mi"},
@@ -1352,13 +1502,31 @@ def _render(
                 "volumeMounts": [
                     {
                         "name": "research-data",
+                        "mountPath": template.package_mount_path,
+                        "subPath": (
+                            f"{template.pvc_training_subpath.rstrip('/')}/packages/"
+                            f"{template.run_id}"
+                        ),
+                        "readOnly": True,
+                    },
+                    {
+                        "name": "research-data",
                         "mountPath": "/mnt/authority",
                         "subPath": (
                             f"{template.pvc_training_subpath.rstrip('/')}/runs/"
                             f"{template.run_id}/authorities"
                         ),
                         "readOnly": True,
-                    }
+                    },
+                    {
+                        "name": "podinfo",
+                        "mountPath": "/etc/podinfo",
+                        "readOnly": True,
+                    },
+                    {
+                        "name": "attestation-status",
+                        "mountPath": "/var/run/m03r-v16-attestation",
+                    },
                 ],
             }
         ]
@@ -1604,6 +1772,7 @@ __all__ = [
     "issue_m03r_v16_training_activation_from_gates",
     "load_and_issue_m03r_v16_capacity_gate",
     "load_and_issue_m03r_v16_static_gate",
+    "m03r_v16_pod_runtime_attestation_annotations",
     "render_m03r_v16_suspended_capacity_job",
     "render_m03r_v16_suspended_qualification_job",
     "render_m03r_v16_suspended_static_job",

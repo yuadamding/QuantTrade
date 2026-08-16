@@ -7,12 +7,18 @@ import pytest
 import torch
 
 import rl_quant.training.top2000_m03r_v16_qualification_runtime as qualification
+import rl_quant.workflows.top2000_m03r_v16_attestation_gate as attestation_gate
 import rl_quant.workflows.top2000_m03r_v16_predictive as predictive
+from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_PROTOCOL_SHA256,
+)
 from rl_quant.training.top2000_m03r_v16_fold import (
     render_m03r_v16_fold_geometries,
 )
 from rl_quant.workflows.top2000_m03r_v16_predictive import (
     M03RV16PredictiveWorkflowError,
+    _await_m03r_v16_qualification_panel_barrier,
     _validate_gathered_update,
     resolve_m03r_v16_completion_index,
 )
@@ -116,6 +122,8 @@ def test_v16_worker_source_requires_terminal_authority_and_is_predictive_only() 
     assert 'output / "launch-consumption.json"' in source
     assert "load_m03r_v16_pod_runtime_attestation" in source
     assert "M03R_V16_CURRENT_POD_UID" in source
+    assert "_await_m03r_v16_qualification_panel_barrier" in source
+    assert 'output / "training-numerical-failure.json"' in source
     assert '"economic_optimizer_updates": 0' in source
     assert '"reinforcement_learning_updates": 0' in source
     assert '"outer_2026_accessed": False' in source
@@ -155,3 +163,152 @@ def test_v16_scientific_worker_rejects_direct_invocation_without_phase_authority
             expected_authorization_file_sha256="c" * 64,
             qualification_only=qualification_only,
         )
+
+
+def test_v16_panel_barrier_closes_all_settings_before_outer_access(
+    tmp_path: Path,
+) -> None:
+    package = SimpleNamespace(package_plan_sha256="a" * 64)
+    activation = SimpleNamespace(receipt_sha256="b" * 64)
+    closure_hashes: list[str] = []
+    for setting in range(3):
+        output = tmp_path / f"completion-{setting:02d}-setting-{setting:02d}"
+        unsigned = {
+            "schema": (
+                "rl-quant.top2000-dev."
+                "m03r-v16-qualification-inputs-complete-v2"
+            ),
+            "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
+            "package_plan_sha256": package.package_plan_sha256,
+            "qualification_activation_receipt_sha256": (
+                activation.receipt_sha256
+            ),
+            "setting_index": setting,
+            "folds": tuple({"fold_index": fold} for fold in range(5)),
+            "outer_qualification_access_started": False,
+            "outer_2026_accessed": False,
+        }
+        payload = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
+        closure_hashes.append(
+            predictive._write_immutable_json(
+                output / "qualification-inputs-complete.json", payload
+            )
+        )
+    barrier = _await_m03r_v16_qualification_panel_barrier(
+        phase_root=tmp_path,
+        setting_index=0,
+        package=package,  # type: ignore[arg-type]
+        qualification_activation=activation,  # type: ignore[arg-type]
+        local_closure_file_sha256=closure_hashes[0],
+        timeout_seconds=0.0,
+    )
+    assert all(len(value) == 64 for value in barrier)
+    assert (tmp_path / "qualification-panel-inputs-complete.json").is_file()
+    assert not tuple(tmp_path.glob("**/outer-access-fold-*.json"))
+
+
+def test_v16_missing_setting_closure_cannot_open_any_outer_fold(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(M03RV16PredictiveWorkflowError, match="timed out"):
+        _await_m03r_v16_qualification_panel_barrier(
+            phase_root=tmp_path,
+            setting_index=0,
+            package=SimpleNamespace(package_plan_sha256="a" * 64),  # type: ignore[arg-type]
+            qualification_activation=SimpleNamespace(  # type: ignore[arg-type]
+                receipt_sha256="b" * 64
+            ),
+            local_closure_file_sha256="c" * 64,
+            timeout_seconds=0.0,
+        )
+    assert not tuple(tmp_path.glob("**/outer-access-fold-*.json"))
+
+
+def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relative_path = "pod-runtime/training/job-uid/completion-01.json"
+    package = SimpleNamespace(
+        panel=SimpleNamespace(
+            workers=tuple(
+                SimpleNamespace(output_root=f"/mnt/output/completion-{index:02d}")
+                for index in range(3)
+            )
+        )
+    )
+    authorization = object()
+    admission = SimpleNamespace(job_uid="job-uid")
+    launch = SimpleNamespace(
+        receipt_sha256="1" * 64,
+        pod_runtime_attestation_relative_path=lambda index: relative_path,
+    )
+    attestation = SimpleNamespace(
+        receipt_sha256="2" * 64,
+        pod_uid="pod-uid",
+        pod_name="pod-name",
+        node_name="node-name",
+        relative_path=relative_path,
+    )
+    monkeypatch.setattr(
+        attestation_gate, "load_m03r_v16_package_plan", lambda *a, **k: package
+    )
+    monkeypatch.setattr(
+        attestation_gate,
+        "load_m03r_v16_execution_authorization",
+        lambda *a, **k: authorization,
+    )
+    monkeypatch.setattr(
+        attestation_gate,
+        "load_m03r_v16_admitted_job_authority",
+        lambda *a, **k: admission,
+    )
+    monkeypatch.setattr(
+        attestation_gate,
+        "load_m03r_v16_phase_launch_authority",
+        lambda *a, **k: launch,
+    )
+    monkeypatch.setattr(
+        attestation_gate,
+        "load_m03r_v16_pod_runtime_attestation",
+        lambda *a, **k: attestation,
+    )
+    downward = tmp_path / "podinfo"
+    downward.mkdir()
+    (downward / "pod-runtime-attestation-path").write_text(relative_path)
+    (downward / "pod-runtime-attestation-file-sha256").write_text("3" * 64)
+    (downward / "pod-runtime-attestation-receipt-sha256").write_text("2" * 64)
+    attestation_path = tmp_path / "authority" / relative_path
+    attestation_path.parent.mkdir(parents=True)
+    attestation_path.write_text("complete")
+    monkeypatch.setenv("M03R_V16_CURRENT_POD_UID", "pod-uid")
+    monkeypatch.setenv("M03R_V16_CURRENT_POD_NAME", "pod-name")
+    monkeypatch.setenv("M03R_V16_CURRENT_NODE_NAME", "node-name")
+    marker_path = tmp_path / "marker" / "validated.json"
+    marker = attestation_gate.validate_m03r_v16_pod_attestation_gate(
+        package_plan_path=tmp_path / "package.json",
+        package_plan_file_sha256="4" * 64,
+        authorization_path=tmp_path / "authorization.json",
+        authorization_file_sha256="5" * 64,
+        phase="training",
+        prerequisite_authority_receipt_sha256="6" * 64,
+        job_contract_sha256="7" * 64,
+        pod_contract_sha256="8" * 64,
+        launch_authority_path=tmp_path / "launch.json",
+        launch_authority_file_sha256="9" * 64,
+        launch_authority_receipt_sha256="1" * 64,
+        admitted_job_authority_path=tmp_path / "admission.json",
+        admitted_job_authority_file_sha256="a" * 64,
+        admitted_job_authority_receipt_sha256="b" * 64,
+        server_side_dry_run_result_path=tmp_path / "dry.json",
+        admitted_manifest_result_path=tmp_path / "admitted.json",
+        completion_index=1,
+        output_root="/mnt/output/completion-01",
+        downward_root=downward,
+        authority_root=tmp_path / "authority",
+        marker_path=marker_path,
+        timeout_seconds=0.0,
+    )
+    assert marker_path.is_file()
+    assert marker["attestation_receipt_sha256"] == "2" * 64
+    assert marker["relative_path"] == relative_path

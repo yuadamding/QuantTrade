@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from rl_quant.training.top2000_m03r_v16_fit import (
+    M03RV16NumericalTrainingFailure,
     build_m03r_v16_epoch_fit_payload,
     classify_m03r_v16_training_adequacy,
 )
@@ -45,6 +46,27 @@ def _updates(epoch: int) -> tuple[tuple[dict[str, object], ...], ...]:
         "learning_rate_multiplier": 0.5 + 0.01 * epoch,
     }
     return (({**row, "distributed_rank": 0}, {**row, "distributed_rank": 1}),)
+
+
+def test_v16_numerical_failure_is_a_typed_nonqualification_terminal() -> None:
+    failure = M03RV16NumericalTrainingFailure(
+        package_plan_sha256="a" * 64,
+        authorization_receipt_sha256="b" * 64,
+        worker_plan_sha256="c" * 64,
+        setting_index=2,
+        setting_id="V16-R2-hold30-prior-selection-primary",
+        fold_index=3,
+        update_index=17,
+        failure_phase="optimizer-update",
+        error_type="RuntimeError",
+        error="nonfinite selection gradient",
+        model_state_sha256="d" * 64,
+        optimizer_state_sha256="e" * 64,
+    )
+    failure.validate()
+    assert failure.status == "numerically-invalid"
+    assert failure.outer_qualification_access_started is False
+    assert len(failure.receipt_sha256) == 64
 
 
 def test_v16_fit_receipts_classify_adequate_terminal_training() -> None:

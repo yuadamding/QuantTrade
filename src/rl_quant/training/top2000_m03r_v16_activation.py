@@ -35,13 +35,13 @@ M03R_V16_QUALIFICATION_ACTIVATION_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-qualification-activation-v3"
 )
 M03R_V16_PHASE_LAUNCH_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-phase-launch-authority-v2"
+    "rl-quant.top2000-dev.m03r-v16-phase-launch-authority-v3"
 )
 M03R_V16_ADMITTED_JOB_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-prelaunch-job-authority-v2"
 )
 M03R_V16_POD_RUNTIME_ATTESTATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-pod-runtime-attestation-v1"
+    "rl-quant.top2000-dev.m03r-v16-pod-runtime-attestation-v2"
 )
 M03R_V16_DRY_RUN_RESULT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-server-dry-run-result-v1"
@@ -74,6 +74,12 @@ class M03RV16ActivationError(ValueError):
 def _digest(name: str, value: str) -> None:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise M03RV16ActivationError(f"{name} must be a lowercase SHA-256")
+
+
+def _safe_path_component(name: str, value: str) -> None:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._"
+    if not value or value in {".", ".."} or any(char not in allowed for char in value):
+        raise M03RV16ActivationError(f"{name} is not a safe path component")
 
 
 def _read_exact(path: Path, expected_file_sha256: str) -> dict[str, Any]:
@@ -387,6 +393,7 @@ class M03RV16PhaseLaunchAuthority:
     job_uid: str
     completions: int
     one_shot_nonce_sha256: str
+    pod_runtime_attestation_path_template: str
     source_tree_root_sha256: str
     image_digest_sha256: str
     _issuer: object = field(repr=False)
@@ -421,6 +428,10 @@ class M03RV16PhaseLaunchAuthority:
         ):
             _digest(name, getattr(self, name))
         expected_completions = {"capacity": 1, "training": 3, "qualification": 3}
+        _safe_path_component("job_uid", self.job_uid)
+        expected_attestation_template = (
+            f"pod-runtime/{self.phase}/{self.job_uid}/completion-{{completion_index:02d}}.json"
+        )
         if (
             self._issuer is not _LAUNCH_ISSUER
             or self.package_plan_sha256 != package.package_plan_sha256
@@ -437,6 +448,8 @@ class M03RV16PhaseLaunchAuthority:
             or not self.run_id
             or self.run_id != admission.run_id
             or self.job_uid != admission.job_uid
+            or self.pod_runtime_attestation_path_template
+            != expected_attestation_template
             or self.image_digest_sha256 != package.artifacts.image_digest_sha256
             or self.economic_training_authorized
             or self.reinforcement_learning_authorized
@@ -445,6 +458,15 @@ class M03RV16PhaseLaunchAuthority:
             or self.schema != M03R_V16_PHASE_LAUNCH_SCHEMA
         ):
             raise M03RV16ActivationError("V16 phase launch authority drifted")
+
+    def pod_runtime_attestation_relative_path(self, completion_index: int) -> str:
+        if not 0 <= completion_index < self.completions:
+            raise M03RV16ActivationError(
+                "V16 Pod attestation completion index is outside the launch"
+            )
+        return self.pod_runtime_attestation_path_template.format(
+            completion_index=completion_index
+        )
 
     @property
     def receipt_sha256(self) -> str:
@@ -716,6 +738,10 @@ def _issue_m03r_v16_phase_launch_authority(
         job_uid=admission.job_uid,
         completions={"capacity": 1, "training": 3, "qualification": 3}[phase],
         one_shot_nonce_sha256=nonce,
+        pod_runtime_attestation_path_template=(
+            f"pod-runtime/{phase}/{admission.job_uid}/"
+            "completion-{completion_index:02d}.json"
+        ),
         source_tree_root_sha256=source_tree_root_sha256,
         image_digest_sha256=package.artifacts.image_digest_sha256,
         _issuer=_LAUNCH_ISSUER,
@@ -795,13 +821,17 @@ def load_m03r_v16_phase_launch_authority(
     return value
 
 
-def _image_identity(value: str) -> tuple[str, str]:
+def _image_identity(value: str) -> tuple[str | None, str]:
     normalized = value.removeprefix("docker-pullable://")
-    if "@sha256:" not in normalized:
+    if "@sha256:" in normalized:
+        repository, digest = normalized.rsplit("@sha256:", 1)
+    elif normalized.startswith(("containerd://sha256:", "docker://sha256:")):
+        repository = None
+        digest = normalized.rsplit("sha256:", 1)[1]
+    else:
         raise M03RV16ActivationError("V16 runtime image is not digest pinned")
-    repository, digest = normalized.rsplit("@sha256:", 1)
     _digest("runtime image digest", digest)
-    if not repository:
+    if repository == "":
         raise M03RV16ActivationError("V16 runtime image repository is absent")
     return repository, digest
 
@@ -823,7 +853,13 @@ class M03RV16PodRuntimeAttestation:
     pod_uid: str
     pod_name: str
     node_name: str
-    observed_container_image_id: str
+    relative_path: str
+    attested_container_name: str
+    attested_container_kind: Literal["init", "app"]
+    observed_spec_image: str
+    observed_status_image: str
+    observed_status_image_id: str
+    normalized_image_digest: str
     output_root_sha256: str
     _issuer: object = field(repr=False)
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
@@ -847,13 +883,21 @@ class M03RV16PodRuntimeAttestation:
             "job_contract_sha256",
             "pod_contract_sha256",
             "output_root_sha256",
+            "normalized_image_digest",
         ):
             _digest(name, getattr(self, name))
         expected_repository, expected_digest = _image_identity(
             package.artifacts.image_reference
         )
-        observed_repository, observed_digest = _image_identity(
-            self.observed_container_image_id
+        spec_repository, spec_digest = _image_identity(self.observed_spec_image)
+        status_repository, status_digest = _image_identity(
+            self.observed_status_image
+        )
+        image_id_repository, image_id_digest = _image_identity(
+            self.observed_status_image_id
+        )
+        expected_relative_path = launch.pod_runtime_attestation_relative_path(
+            expected_completion_index
         )
         if (
             self._issuer is not _POD_ATTESTATION_ISSUER
@@ -874,9 +918,16 @@ class M03RV16PodRuntimeAttestation:
             or not self.pod_uid
             or not self.pod_name
             or not self.node_name
-            or observed_repository != expected_repository
-            or observed_digest != expected_digest
-            or observed_digest != package.artifacts.image_digest_sha256
+            or self.relative_path != expected_relative_path
+            or self.attested_container_name != "runtime-attestation-gate"
+            or self.attested_container_kind != "init"
+            or spec_repository != expected_repository
+            or status_repository != expected_repository
+            or spec_digest != expected_digest
+            or status_digest != expected_digest
+            or image_id_digest != expected_digest
+            or image_id_repository not in (None, expected_repository)
+            or self.normalized_image_digest != expected_digest
             or self.output_root_sha256 != expected_output_root_sha256
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
             or self.schema != M03R_V16_POD_RUNTIME_ATTESTATION_SCHEMA
@@ -900,7 +951,12 @@ def _issue_m03r_v16_pod_runtime_attestation(
     pod_uid: str,
     pod_name: str,
     node_name: str,
-    observed_container_image_id: str,
+    relative_path: str,
+    attested_container_name: str,
+    attested_container_kind: Literal["init", "app"],
+    observed_spec_image: str,
+    observed_status_image: str,
+    observed_status_image_id: str,
     output_root_sha256: str,
 ) -> M03RV16PodRuntimeAttestation:
     value = M03RV16PodRuntimeAttestation(
@@ -917,7 +973,13 @@ def _issue_m03r_v16_pod_runtime_attestation(
         pod_uid=pod_uid,
         pod_name=pod_name,
         node_name=node_name,
-        observed_container_image_id=observed_container_image_id,
+        relative_path=relative_path,
+        attested_container_name=attested_container_name,
+        attested_container_kind=attested_container_kind,
+        observed_spec_image=observed_spec_image,
+        observed_status_image=observed_status_image,
+        observed_status_image_id=observed_status_image_id,
+        normalized_image_digest=package.artifacts.image_digest_sha256,
         output_root_sha256=output_root_sha256,
         _issuer=_POD_ATTESTATION_ISSUER,
     )
@@ -935,11 +997,57 @@ def _issue_m03r_v16_pod_runtime_attestation(
 def write_m03r_v16_pod_runtime_attestation(
     path: str | Path, value: M03RV16PodRuntimeAttestation
 ) -> str:
+    """Atomically publish a complete attestation at its final immutable path."""
+
+    final_path = Path(path)
+    expected_suffix = Path(value.relative_path)
+    if tuple(final_path.parts[-len(expected_suffix.parts) :]) != expected_suffix.parts:
+        raise M03RV16ActivationError(
+            "V16 Pod attestation path differs from its launch namespace"
+        )
     payload = asdict(value)
     payload.pop("_issuer")
-    return _write(
-        Path(path), {"attestation": payload, "receipt_sha256": value.receipt_sha256}
+    complete = {"attestation": payload, "receipt_sha256": value.receipt_sha256}
+    data = canonical_json_file_bytes(complete)
+    final_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    temporary_path = final_path.with_name(
+        f".{final_path.name}.{value.receipt_sha256}.tmp"
     )
+    descriptor = os.open(
+        temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400
+    )
+    published = False
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary_path, final_path)
+        published = True
+        directory_descriptor = os.open(final_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        if published:
+            final_path.unlink(missing_ok=True)
+        raise
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return hashlib.sha256(data).hexdigest()
+
+
+def pod_runtime_attestation_file_sha256(
+    value: M03RV16PodRuntimeAttestation,
+) -> str:
+    payload = asdict(value)
+    payload.pop("_issuer")
+    return hashlib.sha256(
+        canonical_json_file_bytes(
+            {"attestation": payload, "receipt_sha256": value.receipt_sha256}
+        )
+    ).hexdigest()
 
 
 def load_m03r_v16_pod_runtime_attestation(
@@ -956,6 +1064,7 @@ def load_m03r_v16_pod_runtime_attestation(
     current_pod_uid: str,
     current_pod_name: str,
     current_node_name: str,
+    expected_relative_path: str | None = None,
 ) -> M03RV16PodRuntimeAttestation:
     payload = _read_exact(Path(path), expected_file_sha256)
     try:
@@ -983,6 +1092,10 @@ def load_m03r_v16_pod_runtime_attestation(
         value.pod_uid != current_pod_uid
         or value.pod_name != current_pod_name
         or value.node_name != current_node_name
+        or (
+            expected_relative_path is not None
+            and value.relative_path != expected_relative_path
+        )
     ):
         raise M03RV16ActivationError(
             "V16 worker Pod identity differs from runtime attestation"
@@ -1442,6 +1555,7 @@ __all__ = [
     "load_m03r_v16_training_activation",
     "load_m03r_v16_training_panel_authority",
     "phase_launch_authority_file_sha256",
+    "pod_runtime_attestation_file_sha256",
     "write_m03r_v16_admitted_job_authority",
     "write_m03r_v16_phase_launch_authority",
     "write_m03r_v16_pod_runtime_attestation",

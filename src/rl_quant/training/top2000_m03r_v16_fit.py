@@ -21,18 +21,87 @@ M03R_V16_EPOCH_FIT_SCHEMA = "rl-quant.top2000-dev.m03r-v16-epoch-fit-v2"
 M03R_V16_TRAINING_ADEQUACY_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-training-adequacy-v3"
 )
+M03R_V16_NUMERICAL_TRAINING_FAILURE_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-numerical-training-failure-v1"
+)
 M03RV16TrainingAdequacyStatus = Literal[
     "adequate",
     "still-improving",
     "collapsed-output",
     "overdispersed-output",
     "optimizer-clipping-dominated",
-    "numerically-invalid",
 ]
 
 
 class M03RV16FitError(ValueError):
     """The V16 fit trajectory or adequacy classification drifted."""
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16NumericalTrainingFailure:
+    package_plan_sha256: str
+    authorization_receipt_sha256: str
+    worker_plan_sha256: str
+    setting_index: int
+    setting_id: str
+    fold_index: int
+    update_index: int
+    failure_phase: str
+    error_type: str
+    error: str
+    model_state_sha256: str | None
+    optimizer_state_sha256: str | None
+    status: Literal["numerically-invalid"] = "numerically-invalid"
+    qualification_tail_accessed: bool = False
+    outer_qualification_access_started: bool = False
+    outer_2026_accessed: bool = False
+    economic_optimizer_updates: int = 0
+    reinforcement_learning_updates: int = 0
+    development_only: bool = True
+    reportable: bool = False
+    promotion_eligible: bool = False
+    protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
+    schema: str = M03R_V16_NUMERICAL_TRAINING_FAILURE_SCHEMA
+
+    def validate(self) -> None:
+        for name in (
+            "package_plan_sha256",
+            "authorization_receipt_sha256",
+            "worker_plan_sha256",
+        ):
+            _digest(name, getattr(self, name))
+        for name in ("model_state_sha256", "optimizer_state_sha256"):
+            value = getattr(self, name)
+            if value is not None:
+                _digest(name, value)
+        if (
+            self.setting_index not in range(len(M03R_V16_SETTINGS))
+            or self.fold_index not in range(
+                -1, M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
+            )
+            or self.update_index < -1
+            or not self.setting_id
+            or not self.failure_phase
+            or not self.error_type
+            or not self.error
+            or self.status != "numerically-invalid"
+            or self.qualification_tail_accessed
+            or self.outer_qualification_access_started
+            or self.outer_2026_accessed
+            or self.economic_optimizer_updates != 0
+            or self.reinforcement_learning_updates != 0
+            or not self.development_only
+            or self.reportable
+            or self.promotion_eligible
+            or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+            or self.schema != M03R_V16_NUMERICAL_TRAINING_FAILURE_SCHEMA
+        ):
+            raise M03RV16FitError("V16 numerical training failure drifted")
+
+    @property
+    def receipt_sha256(self) -> str:
+        self.validate()
+        return semantic_sha256(asdict(self))
 
 
 def _digest(name: str, value: str) -> None:
@@ -66,7 +135,9 @@ class M03RV16TrainingAdequacy:
             self.recent_selection_head_clip_fraction,
         )
         if not all(math.isfinite(value) for value in values):
-            return "numerically-invalid"
+            raise M03RV16FitError(
+                "V16 nonfinite fit evidence requires a numerical-failure terminal"
+            )
         still_improving = (
             self.recent_rank_ic_slope > spec.adequacy_rank_ic_slope_threshold
             or self.recent_robust_loss_relative_improvement
@@ -109,10 +180,7 @@ class M03RV16TrainingAdequacy:
             )
             or len(self.epoch_fit_receipt_sha256)
             != M03R_V16_PREDICTIVE_SPEC.score_training_epochs
-            or (
-                self.status != "numerically-invalid"
-                and not all(math.isfinite(value) for value in finite)
-            )
+            or not all(math.isfinite(value) for value in finite)
             or (
                 math.isfinite(self.final_prediction_to_target_std_ratio)
                 and self.final_prediction_to_target_std_ratio < 0.0
@@ -278,8 +346,10 @@ def classify_m03r_v16_training_adequacy(
 
 __all__ = [
     "M03R_V16_EPOCH_FIT_SCHEMA",
+    "M03R_V16_NUMERICAL_TRAINING_FAILURE_SCHEMA",
     "M03R_V16_TRAINING_ADEQUACY_SCHEMA",
     "M03RV16FitError",
+    "M03RV16NumericalTrainingFailure",
     "M03RV16TrainingAdequacy",
     "M03RV16TrainingAdequacyStatus",
     "build_m03r_v16_epoch_fit_payload",

@@ -22,6 +22,7 @@ from rl_quant.protocol.canonical_artifact import (
 )
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
+    M03R_V16_PROTOCOL_SHA256,
 )
 from rl_quant.training.top2000_m03r_v16_activation import (
     M03RV16QualificationActivation,
@@ -52,7 +53,7 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
 )
 
 M03R_V16_PANEL_AGGREGATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v4"
+    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v5"
 )
 _MAX_TERMINAL_BYTES = 16 * 1024**2
 _MAX_ARTIFACT_BYTES = 256 * 1024**2
@@ -263,6 +264,8 @@ def _worker_terminal(
         "launch_authority_receipt_sha256",
         "admitted_job_authority_receipt_sha256",
         "qualification_inputs_complete_file_sha256",
+        "qualification_panel_barrier_file_sha256",
+        "qualification_panel_barrier_receipt_sha256",
     ):
         _digest(name, str(payload.get(name)))
     if (
@@ -312,6 +315,8 @@ def _fold_evidence(
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
     qualification_activation: M03RV16QualificationActivation,
+    expected_panel_barrier_file_sha256: str,
+    expected_panel_barrier_receipt_sha256: str,
 ) -> M03RV16ReconciledFoldEvidence:
     fold_terminal = _read_exact(
         worker_root / "receipts" / f"fold-{fold_index:02d}-terminal.json",
@@ -343,6 +348,16 @@ def _fold_evidence(
             "qualification_inputs_complete_file_sha256",
             str(fold_terminal.get("qualification_inputs_complete_file_sha256")),
         ),
+        (
+            "qualification_panel_barrier_file_sha256",
+            str(fold_terminal.get("qualification_panel_barrier_file_sha256")),
+        ),
+        (
+            "qualification_panel_barrier_receipt_sha256",
+            str(
+                fold_terminal.get("qualification_panel_barrier_receipt_sha256")
+            ),
+        ),
     ):
         _digest(name, value)
     if (
@@ -358,6 +373,16 @@ def _fold_evidence(
         or not isinstance(
             fold_terminal.get("qualification_inputs_complete_file_sha256"), str
         )
+        or not isinstance(
+            fold_terminal.get("qualification_panel_barrier_file_sha256"), str
+        )
+        or not isinstance(
+            fold_terminal.get("qualification_panel_barrier_receipt_sha256"), str
+        )
+        or fold_terminal.get("qualification_panel_barrier_file_sha256")
+        != expected_panel_barrier_file_sha256
+        or fold_terminal.get("qualification_panel_barrier_receipt_sha256")
+        != expected_panel_barrier_receipt_sha256
         or fold_terminal.get("worker_plan_sha256") != worker.receipt_sha256
         or fold_terminal.get("setting_index") != setting_index
         or fold_terminal.get("setting_id") != worker.setting_id
@@ -449,6 +474,12 @@ def _reconcile_worker_evidence(
             package=package,
             authorization=authorization,
             qualification_activation=qualification_activation,
+            expected_panel_barrier_file_sha256=str(
+                terminal_payload["qualification_panel_barrier_file_sha256"]
+            ),
+            expected_panel_barrier_receipt_sha256=str(
+                terminal_payload["qualification_panel_barrier_receipt_sha256"]
+            ),
         )
         for index in range(folds)
     )
@@ -515,6 +546,53 @@ def aggregate_m03r_v16_panel(
             worker_terminal_paths, worker_terminal_file_sha256, strict=True
         )
     )
+    barrier_identities = {
+        (
+            str(payload.get("qualification_panel_barrier_file_sha256")),
+            str(payload.get("qualification_panel_barrier_receipt_sha256")),
+        )
+        for payload in terminal_payloads
+    }
+    if len(barrier_identities) != 1:
+        raise M03RV16AggregateError(
+            "V16 qualification workers did not share one panel input barrier"
+        )
+    phase_roots = {path.parent.parent for path in worker_terminal_paths}
+    if len(phase_roots) != 1:
+        raise M03RV16AggregateError(
+            "V16 qualification worker roots do not share one phase root"
+        )
+    barrier_file_sha256, barrier_receipt_sha256 = next(iter(barrier_identities))
+    barrier = _read_exact(
+        next(iter(phase_roots)) / "qualification-panel-inputs-complete.json",
+        barrier_file_sha256,
+    )
+    barrier_unsigned = {
+        key: value for key, value in barrier.items() if key != "receipt_sha256"
+    }
+    if (
+        barrier.get("schema")
+        != "rl-quant.top2000-dev.m03r-v16-qualification-panel-barrier-v1"
+        or barrier.get("receipt_sha256") != _sha256(barrier_unsigned)
+        or barrier.get("receipt_sha256") != barrier_receipt_sha256
+        or barrier.get("protocol_sha256") != M03R_V16_PROTOCOL_SHA256
+        or barrier.get("package_plan_sha256") != package.package_plan_sha256
+        or barrier.get("qualification_activation_receipt_sha256")
+        != qualification_activation.receipt_sha256
+        or tuple(barrier.get("setting_indices", ())) != (0, 1, 2)
+        or tuple(barrier.get("setting_input_closure_file_sha256", ()))
+        != tuple(
+            str(payload.get("qualification_inputs_complete_file_sha256"))
+            for payload in terminal_payloads
+        )
+        or len(tuple(barrier.get("setting_input_closure_receipt_sha256", ()))) != 3
+        or barrier.get("outer_access_authorized") is not True
+        or barrier.get("outer_qualification_access_started") is not False
+        or barrier.get("outer_2026_accessed") is not False
+    ):
+        raise M03RV16AggregateError(
+            "V16 qualification panel input barrier drifted"
+        )
     rows = tuple(
         _worker_terminal(
             terminal_payloads[index],

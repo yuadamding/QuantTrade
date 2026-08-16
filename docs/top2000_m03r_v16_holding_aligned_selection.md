@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v9 revision; older v16 source and
+current local protocol is the result-moving v10 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -184,7 +184,9 @@ static gate
 -> independent paired-panel adequacy aggregate
 -> strict CPU closure of all 15 terminal checkpoints
 -> private qualification activation, only when all 15 fits are adequate
--> qualification-only workers
+-> three-setting qualification input preflight
+-> global panel input barrier
+-> qualification-only outer access
 -> independent final panel aggregate
 ```
 
@@ -300,9 +302,20 @@ suspended prelaunch authority binds server-side-dry-run and admitted-manifest
 evidence, the Job UID, predecessor evidence, image digest, run ID, phase,
 completion count, and source tree; it deliberately contains no Pod facts,
 because a suspended Job has no Pods. After resume, an init gate waits for a
-controller-written per-completion runtime attestation. The worker compares the
+controller-written per-completion runtime attestation. Attestations are
+namespaced by phase, admitted Job UID, and completion index, so capacity,
+training, qualification, and same-phase retries cannot collide in the shared
+append-only authority directory. The controller calculates the immutable file
+identity in memory, patches and verifies the Pod annotations, and only then
+atomically publishes the completely written and fsynced final path. The init
+container runs the complete no-follow attestation loader, writes a validated
+marker through a shared `emptyDir`, and exits; the main process requires that
+marker and independently repeats validation. The worker compares the
 attested Pod UID, Pod name, node, completion index, and exact repository/digest
 image identity with its Downward API identity before loading market data.
+The package includes a controller-side publication primitive that enforces
+this patch-observe-publish order; cluster admission, Job resume, supervision,
+and cleanup remain external lifecycle operations.
 Admission, launch, and Pod-attestation files are mandatory worker inputs. The worker
 requires exactly two visible H100 80GB devices and either runs the disposable
 `train -> validation -> train` capacity path, runs training only, or performs
@@ -314,18 +327,22 @@ reconstructs validation receipts, paired update evidence, and the adequacy class
 trajectories retain loss, validation IC/spread, prediction/target dispersion,
 gradient norms, clipping, learning rates, and parameter-version evidence.
 Only `still-improving` can authorize a fresh longer-training protocol;
-collapsed, overdispersed, clipping-dominated, and numerically invalid outcomes
-require their predeclared diagnostic paths.
+collapsed, overdispersed, and clipping-dominated outcomes require their
+predeclared diagnostic paths. A nonfinite optimizer or validation failure emits
+a separate typed numerical-training-failure terminal before the worker exits.
 
 Before any outer origin is encoded, each qualification worker revalidates all
 five terminal checkpoints for its setting on CPU, validates all five risk-state
-inputs, and publishes one qualification-input-closure receipt. A corrupt later
-fold therefore prevents fold 0 access. Per-fold access markers and published
+inputs, and publishes one qualification-input-closure receipt. All three
+setting closures must be reconciled into one immutable global panel barrier
+before any worker may create its fold-0 access marker. A corrupt later fold or
+failed setting therefore produces zero outer-access markers across the panel.
+Per-fold access markers and published
 artifact names are included in failure evidence. The structural slab is also
 materialized into disjoint in-memory phase slabs: the training object contains
 no qualification origins, and the qualification object contains no optimizer
 or inner-validation origins. The transferred slab remains one common package
-file in v9; a later schema may split the on-disk mounts as additional defense.
+file in v10; a later schema may split the on-disk mounts as additional defense.
 
 After qualification is separately authorized, the final aggregate opens all
 three qualification terminals, all 15 qualification-fold terminals, and all 15
@@ -343,7 +360,10 @@ suspended three-completion qualification panel. Capacity and scientific-phase
 rendering require privately issued authorities loaded from exact immutable
 result or activation files. H100 workers require the matching launch authority,
 admitted-Job evidence, and per-Pod runtime attestation. An init-container gate
-allows Pod identity to be captured after resume but before scientific code.
+allows Pod identity to be captured after resume but before scientific code. It
+uses an updateable Downward API volume so annotation publication is ordered
+before the main container starts and writes a marker that the main container
+must validate.
 Create-only output and launch-consumption receipts reject completion replay.
 Static and worker startup rehash the executing
 package source tree against its manifest. All Jobs
