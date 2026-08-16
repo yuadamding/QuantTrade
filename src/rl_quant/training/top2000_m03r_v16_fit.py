@@ -13,6 +13,9 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
+from rl_quant.training.top2000_m03r_v16_numerical import (
+    M03RV16NumericalTrainingError,
+)
 from rl_quant.training.top2000_m03r_v16_validation_runtime import (
     M03RV16InnerValidationReceipt,
 )
@@ -41,7 +44,16 @@ class M03RV16FitError(ValueError):
 class M03RV16NumericalTrainingFailure:
     package_plan_sha256: str
     authorization_receipt_sha256: str
+    training_activation_receipt_sha256: str
     worker_plan_sha256: str
+    source_tree_root_sha256: str
+    rendered_manifest_sha256: str
+    pod_template_sha256: str
+    launch_authority_receipt_sha256: str
+    admitted_job_authority_receipt_sha256: str
+    pod_runtime_attestation_receipt_sha256: str
+    job_uid: str
+    pod_uid: str
     setting_index: int
     setting_id: str
     fold_index: int
@@ -51,6 +63,7 @@ class M03RV16NumericalTrainingFailure:
     error: str
     model_state_sha256: str | None
     optimizer_state_sha256: str | None
+    completed_fold_terminal_file_sha256: tuple[str, ...] = ()
     status: Literal["numerically-invalid"] = "numerically-invalid"
     qualification_tail_accessed: bool = False
     outer_qualification_access_started: bool = False
@@ -67,9 +80,18 @@ class M03RV16NumericalTrainingFailure:
         for name in (
             "package_plan_sha256",
             "authorization_receipt_sha256",
+            "training_activation_receipt_sha256",
             "worker_plan_sha256",
+            "source_tree_root_sha256",
+            "rendered_manifest_sha256",
+            "pod_template_sha256",
+            "launch_authority_receipt_sha256",
+            "admitted_job_authority_receipt_sha256",
+            "pod_runtime_attestation_receipt_sha256",
         ):
             _digest(name, getattr(self, name))
+        for value in self.completed_fold_terminal_file_sha256:
+            _digest("completed_fold_terminal_file_sha256", value)
         for name in ("model_state_sha256", "optimizer_state_sha256"):
             value = getattr(self, name)
             if value is not None:
@@ -84,6 +106,10 @@ class M03RV16NumericalTrainingFailure:
             or not self.failure_phase
             or not self.error_type
             or not self.error
+            or not self.job_uid
+            or not self.pod_uid
+            or len(self.completed_fold_terminal_file_sha256)
+            > M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
             or self.status != "numerically-invalid"
             or self.qualification_tail_accessed
             or self.outer_qualification_access_started
@@ -135,7 +161,7 @@ class M03RV16TrainingAdequacy:
             self.recent_selection_head_clip_fraction,
         )
         if not all(math.isfinite(value) for value in values):
-            raise M03RV16FitError(
+            raise M03RV16NumericalTrainingError(
                 "V16 nonfinite fit evidence requires a numerical-failure terminal"
             )
         still_improving = (

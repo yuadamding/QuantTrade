@@ -63,7 +63,7 @@ M03R_V16_CAPACITY_GATE_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v2"
 )
 M03R_V16_RENDERED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v6"
+    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v7"
 )
 _JOB_CONTRACT_ANNOTATION = "rl-quant/job-contract-sha256"
 _POD_CONTRACT_ANNOTATION = "rl-quant/pod-contract-sha256"
@@ -83,6 +83,17 @@ _POD_ATTESTATION_PATH_ANNOTATION = "rl-quant/pod-runtime-attestation-path"
 _PYTHON = "/opt/conda/envs/quanttrade/bin/python"
 _WORKER_MODULE = "rl_quant.workflows.top2000_m03r_v16_predictive"
 _STATIC_MODULE = "rl_quant.workflows.top2000_m03r_v16_static_validate"
+_INIT_GATE_BOOTSTRAP = (
+    "import pathlib,sys;"
+    "sys.dont_write_bytecode=True;"
+    "root=pathlib.Path('/mnt/package/source/src').resolve();"
+    "sys.path.insert(0,str(root));"
+    "from rl_quant.workflows import "
+    "top2000_m03r_v16_attestation_gate as gate;"
+    "resolved=pathlib.Path(gate.__file__).resolve();"
+    "resolved.relative_to(root);"
+    "raise SystemExit(gate.main())"
+)
 _STATIC_GATE_ISSUER = object()
 _CAPACITY_GATE_ISSUER = object()
 _MAX_GATE_RESULT_BYTES = 64 * 1024**2
@@ -419,8 +430,16 @@ class M03RV16RenderedSuspendedJob:
             or pod["initContainers"][0].get("image")
             != containers[0].get("image")
             or "@sha256:" not in str(containers[0].get("image"))
-            or "rl_quant.workflows.top2000_m03r_v16_attestation_gate"
+            or pod["initContainers"][0].get("command") != [_PYTHON]
+            or pod["initContainers"][0].get("args", ())[:4]
+            != ["-I", "-B", "-c", _INIT_GATE_BOOTSTRAP]
+            or _INIT_GATE_BOOTSTRAP
             not in pod["initContainers"][0].get("args", ())
+            or pod["initContainers"][0].get("resources")
+            != {
+                "requests": {"cpu": "50m", "memory": "512Mi"},
+                "limits": {"cpu": "250m", "memory": "1Gi"},
+            }
             or not {
                 "M03R_V16_CURRENT_POD_UID",
                 "M03R_V16_CURRENT_POD_NAME",
@@ -1411,7 +1430,6 @@ def _render(
     if mode != "static":
         init_environment_names = {
             "JOB_COMPLETION_INDEX",
-            "PYTHONPATH",
             "PYTHONNOUSERSITE",
             "PYTHONDONTWRITEBYTECODE",
             "PYTHONHASHSEED",
@@ -1448,8 +1466,8 @@ def _render(
                 "args": [
                     "-I",
                     "-B",
-                    "-m",
-                    "rl_quant.workflows.top2000_m03r_v16_attestation_gate",
+                    "-c",
+                    _INIT_GATE_BOOTSTRAP,
                     *_base_args(
                         package,
                         authorization,
@@ -1488,11 +1506,13 @@ def _render(
                     "/mnt/authority",
                     "--marker",
                     "/var/run/m03r-v16-attestation/validated.json",
+                    "--package-source-root",
+                    package.source_pythonpath,
                 ],
                 "env": init_environment,
                 "resources": {
-                    "requests": {"cpu": "50m", "memory": "64Mi"},
-                    "limits": {"cpu": "250m", "memory": "128Mi"},
+                    "requests": {"cpu": "50m", "memory": "512Mi"},
+                    "limits": {"cpu": "250m", "memory": "1Gi"},
                 },
                 "securityContext": {
                     "allowPrivilegeEscalation": False,

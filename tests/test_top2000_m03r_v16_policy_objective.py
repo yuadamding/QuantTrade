@@ -9,6 +9,9 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_SETTINGS,
     M03R_V16_SURVIVAL_WEIGHTS,
 )
+from rl_quant.training.top2000_m03r_v16_numerical import (
+    M03RV16NumericalTrainingError,
+)
 from rl_quant.training.top2000_m03r_v16_objective import (
     M03RV16PredictiveBatch,
     m03r_v16_score_loss,
@@ -82,6 +85,21 @@ def test_v16_equal_standardized_errors_have_equal_head_gradients() -> None:
         gradients.append(batch.executable_selection_score_z.grad.detach().clone())
     torch.testing.assert_close(gradients[0], gradients[1], rtol=0.0, atol=0.0)
     torch.testing.assert_close(gradients[0], gradients[2], rtol=0.0, atol=0.0)
+
+
+def test_v16_nonfinite_training_tensor_uses_typed_numerical_boundary() -> None:
+    batch = _batch()
+    invalid_target = batch.selection_target_z.clone()
+    invalid_target[1, 2] = torch.nan
+    invalid = M03RV16PredictiveBatch(
+        executable_selection_score_z=batch.executable_selection_score_z,
+        selection_target_z=invalid_target,
+        selection_target_economic=batch.selection_target_economic,
+        selection_valid=batch.selection_valid,
+        setting=batch.setting,
+    )
+    with pytest.raises(M03RV16NumericalTrainingError, match="non-finite"):
+        m03r_v16_score_loss(invalid)
 
 
 def test_v16_selection_target_scales_match_cumulative_units() -> None:

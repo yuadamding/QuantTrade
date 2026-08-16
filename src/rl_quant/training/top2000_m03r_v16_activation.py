@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import stat
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -41,7 +42,7 @@ M03R_V16_ADMITTED_JOB_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-prelaunch-job-authority-v2"
 )
 M03R_V16_POD_RUNTIME_ATTESTATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-pod-runtime-attestation-v2"
+    "rl-quant.top2000-dev.m03r-v16-pod-runtime-attestation-v3"
 )
 M03R_V16_DRY_RUN_RESULT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-server-dry-run-result-v1"
@@ -50,10 +51,10 @@ M03R_V16_ADMITTED_MANIFEST_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-admitted-manifest-result-v1"
 )
 M03R_V16_TRAINING_PANEL_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-training-adequacy-panel-v3"
+    "rl-quant.top2000-dev.m03r-v16-training-adequacy-panel-v4"
 )
 M03R_V16_PREQUALIFICATION_CLOSURE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-prequalification-closure-v3"
+    "rl-quant.top2000-dev.m03r-v16-prequalification-closure-v4"
 )
 M03R_V16_TRAINING_TERMINAL_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-training-terminal-v2"
@@ -853,6 +854,10 @@ class M03RV16PodRuntimeAttestation:
     pod_uid: str
     pod_name: str
     node_name: str
+    observed_owner_job_uid: str
+    observed_owner_job_name: str
+    observed_completion_index: int
+    observed_pod_resource_version: str
     relative_path: str
     attested_container_name: str
     attested_container_kind: Literal["init", "app"]
@@ -918,6 +923,10 @@ class M03RV16PodRuntimeAttestation:
             or not self.pod_uid
             or not self.pod_name
             or not self.node_name
+            or self.observed_owner_job_uid != admission.job_uid
+            or not self.observed_owner_job_name
+            or self.observed_completion_index != expected_completion_index
+            or not self.observed_pod_resource_version
             or self.relative_path != expected_relative_path
             or self.attested_container_name != "runtime-attestation-gate"
             or self.attested_container_kind != "init"
@@ -951,6 +960,10 @@ def _issue_m03r_v16_pod_runtime_attestation(
     pod_uid: str,
     pod_name: str,
     node_name: str,
+    observed_owner_job_uid: str,
+    observed_owner_job_name: str,
+    observed_completion_index: int,
+    observed_pod_resource_version: str,
     relative_path: str,
     attested_container_name: str,
     attested_container_kind: Literal["init", "app"],
@@ -973,6 +986,10 @@ def _issue_m03r_v16_pod_runtime_attestation(
         pod_uid=pod_uid,
         pod_name=pod_name,
         node_name=node_name,
+        observed_owner_job_uid=observed_owner_job_uid,
+        observed_owner_job_name=observed_owner_job_name,
+        observed_completion_index=observed_completion_index,
+        observed_pod_resource_version=observed_pod_resource_version,
         relative_path=relative_path,
         attested_container_name=attested_container_name,
         attested_container_kind=attested_container_kind,
@@ -1009,9 +1026,22 @@ def write_m03r_v16_pod_runtime_attestation(
     payload.pop("_issuer")
     complete = {"attestation": payload, "receipt_sha256": value.receipt_sha256}
     data = canonical_json_file_bytes(complete)
+    expected_file_sha256 = hashlib.sha256(data).hexdigest()
     final_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    if final_path.exists() or final_path.is_symlink():
+        if final_path.is_symlink():
+            raise M03RV16ActivationError(
+                "V16 Pod attestation final path is a symlink"
+            )
+        observed = _read_exact(final_path, expected_file_sha256)
+        if observed != complete:
+            raise M03RV16ActivationError(
+                "V16 existing Pod attestation differs from the retry"
+            )
+        return expected_file_sha256
     temporary_path = final_path.with_name(
-        f".{final_path.name}.{value.receipt_sha256}.tmp"
+        f".{final_path.name}.{value.receipt_sha256}."
+        f"{secrets.token_hex(8)}.tmp"
     )
     descriptor = os.open(
         temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400
@@ -1035,7 +1065,7 @@ def write_m03r_v16_pod_runtime_attestation(
         raise
     finally:
         temporary_path.unlink(missing_ok=True)
-    return hashlib.sha256(data).hexdigest()
+    return expected_file_sha256
 
 
 def pod_runtime_attestation_file_sha256(

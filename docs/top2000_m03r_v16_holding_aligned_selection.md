@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v10 revision; older v16 source and
+current local protocol is the result-moving v11 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -313,9 +313,13 @@ marker through a shared `emptyDir`, and exits; the main process requires that
 marker and independently repeats validation. The worker compares the
 attested Pod UID, Pod name, node, completion index, and exact repository/digest
 image identity with its Downward API identity before loading market data.
-The package includes a controller-side publication primitive that enforces
-this patch-observe-publish order; cluster admission, Job resume, supervision,
-and cleanup remain external lifecycle operations.
+The package includes controller-side publication and storage-qualification
+primitives that enforce this patch-observe-publish order, bind Pod owner UID,
+owner name, indexed completion, and resourceVersion, and verify the exact PVC's
+hard-link, directory-fsync, cross-mount visibility, and create-only semantics.
+Cluster admission, Job resume, supervision, and cleanup still require the
+separately permissioned Seadragon lifecycle controller; no remote mutation is
+claimed by this source revision.
 Admission, launch, and Pod-attestation files are mandatory worker inputs. The worker
 requires exactly two visible H100 80GB devices and either runs the disposable
 `train -> validation -> train` capacity path, runs training only, or performs
@@ -330,6 +334,9 @@ Only `still-improving` can authorize a fresh longer-training protocol;
 collapsed, overdispersed, and clipping-dominated outcomes require their
 predeclared diagnostic paths. A nonfinite optimizer or validation failure emits
 a separate typed numerical-training-failure terminal before the worker exits.
+The training-panel aggregate accepts exactly one normal or numerical terminal
+per setting. Any numerical terminal blocks checkpoint closure and qualification
+and deterministically routes the panel to numerical investigation.
 
 Before any outer origin is encoded, each qualification worker revalidates all
 five terminal checkpoints for its setting on CPU, validates all five risk-state
@@ -342,7 +349,7 @@ artifact names are included in failure evidence. The structural slab is also
 materialized into disjoint in-memory phase slabs: the training object contains
 no qualification origins, and the qualification object contains no optimizer
 or inner-validation origins. The transferred slab remains one common package
-file in v10; a later schema may split the on-disk mounts as additional defense.
+file in v11; a later schema may split the on-disk mounts as additional defense.
 
 After qualification is separately authorized, the final aggregate opens all
 three qualification terminals, all 15 qualification-fold terminals, and all 15
@@ -363,7 +370,14 @@ admitted-Job evidence, and per-Pod runtime attestation. An init-container gate
 allows Pod identity to be captured after resume but before scientific code. It
 uses an updateable Downward API volume so annotation publication is ordered
 before the main container starts and writes a marker that the main container
-must validate.
+must validate. Its isolated interpreter explicitly inserts the mounted package
+source and asserts that the resolved gate module remains under that root;
+`PYTHONPATH` is neither trusted nor required. The lifecycle contract imported
+by the gate is standard-library-only and cannot import PyTorch, model,
+optimizer, or market-data code. The temporary init-memory contract is
+`512 MiB` requested and `1 GiB` limited pending exact-image cgroup profiling;
+the local isolated import regression remains below `128 MiB` and proves that
+PyTorch is absent from `sys.modules`.
 Create-only output and launch-consumption receipts reject completion replay.
 Static and worker startup rehash the executing
 package source tree against its manifest. All Jobs
@@ -372,10 +386,12 @@ bounded by deadline/TTL, and mount only the scoped package/output PVC paths.
 SHA-256 receipts prove content identity, not provenance. The deployment trust
 assumption is that a separately permissioned lifecycle controller is the sole
 writer to the append-only authority path; external signing remains an optional
-hardening layer. The source contract for live admission and Job/Pod UID binding is implemented;
-the external controller that captures those cluster facts, detached
-supervision, UID-bound cleanup, and any remote mutation are intentionally not
-executed by this source-only revision.
+hardening layer. The source contract for live admission and Job/Pod UID binding
+is implemented. Attestation publication is retry-safe after a controller
+crash: completed final files validate idempotently, each attempt uses a unique
+temporary name, and stale controller-owned temporaries cannot block recovery.
+Detached supervision, UID-bound cleanup, and any remote mutation are
+intentionally not executed by this source-only revision.
 
 No real-data package or slab receipt, same-image result, capacity result,
 remote Job, GPU result, or performance result is claimed. Those evidence gates

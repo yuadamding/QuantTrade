@@ -31,6 +31,8 @@ from rl_quant.training.top2000_m03r_v16_checkpoint import (
 )
 from rl_quant.training.top2000_m03r_v16_fit import (
     M03R_V16_EPOCH_FIT_SCHEMA,
+    M03R_V16_NUMERICAL_TRAINING_FAILURE_SCHEMA,
+    M03RV16NumericalTrainingFailure,
     M03RV16TrainingAdequacy,
     classify_m03r_v16_training_adequacy,
 )
@@ -280,10 +282,63 @@ def aggregate_m03r_v16_training_panel(
     all_folds: list[tuple[dict[str, Any], ...]] = []
     terminal_receipts: list[str] = []
     source_roots: set[str] = set()
+    numerical_failures: dict[int, M03RV16NumericalTrainingFailure] = {}
+    outcome_kinds: list[str] = []
     for setting, (path, expected_sha) in enumerate(
         zip(training_terminal_paths, training_terminal_file_sha256, strict=True)
     ):
         payload = _read(path, expected_sha)
+        if payload.get("schema") == M03R_V16_NUMERICAL_TRAINING_FAILURE_SCHEMA:
+            if (path.parent / "training-terminal.json").exists():
+                raise M03RV16TrainingAggregateError(
+                    "V16 setting published both normal and numerical outcomes"
+                )
+            try:
+                row = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "receipt_sha256"
+                }
+                row["completed_fold_terminal_file_sha256"] = tuple(
+                    row.get("completed_fold_terminal_file_sha256", ())
+                )
+                failure = M03RV16NumericalTrainingFailure(**row)
+                failure.validate()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise M03RV16TrainingAggregateError(
+                    "V16 numerical training failure is malformed"
+                ) from exc
+            if (
+                payload.get("receipt_sha256") != failure.receipt_sha256
+                or failure.package_plan_sha256 != package.package_plan_sha256
+                or failure.authorization_receipt_sha256
+                != authorization.receipt_sha256
+                or failure.worker_plan_sha256
+                != package.panel.workers[setting].receipt_sha256
+                or failure.setting_index != setting
+                or failure.setting_id != package.panel.workers[setting].setting_id
+                or failure.outer_qualification_access_started
+                or failure.outer_2026_accessed
+            ):
+                raise M03RV16TrainingAggregateError(
+                    "V16 numerical training failure identity drifted"
+                )
+            if (path.parent / "fold-artifacts").exists():
+                raise M03RV16TrainingAggregateError(
+                    "V16 numerical worker opened outer qualification artifacts"
+                )
+            numerical_failures[setting] = failure
+            all_adequacy.append(())
+            all_folds.append(())
+            source_roots.add(failure.source_tree_root_sha256)
+            terminal_receipts.append(failure.receipt_sha256)
+            outcome_kinds.append("numerical-failure")
+            continue
+        if (path.parent / "training-numerical-failure.json").exists():
+            raise M03RV16TrainingAggregateError(
+                "V16 setting published both normal and numerical outcomes"
+            )
+        outcome_kinds.append("training-terminal")
         unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
         fold_hashes = tuple(payload.get("fold_terminal_file_sha256", ()))
         for name in (
@@ -350,7 +405,7 @@ def aggregate_m03r_v16_training_panel(
         raise M03RV16TrainingAggregateError("V16 training source roots diverged")
     # A paired target comparison is only valid when every control and primary
     # fold has an adequate terminal fit.
-    adequate = all(
+    adequate = not numerical_failures and all(
         row.status == "adequate"
         for setting_rows in all_adequacy
         for row in setting_rows
@@ -358,12 +413,12 @@ def aggregate_m03r_v16_training_panel(
     status_inventory = tuple(
         row.status for setting_rows in all_adequacy for row in setting_rows
     )
-    if adequate:
+    if numerical_failures:
+        next_action = "numerical-investigation"
+    elif adequate:
         next_action = "qualification-only-execution"
     elif set(status_inventory).issubset({"adequate", "still-improving"}):
         next_action = "fresh-longer-training-protocol"
-    elif "numerically-invalid" in status_inventory:
-        next_action = "numerical-investigation"
     else:
         next_action = "fit-pathology-investigation"
 
@@ -416,6 +471,11 @@ def aggregate_m03r_v16_training_panel(
         "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
         "package_plan_sha256": package.package_plan_sha256,
         "training_terminal_file_sha256": training_terminal_file_sha256,
+        "training_outcome_kind": tuple(outcome_kinds),
+        "numerical_failure_receipt_sha256": tuple(
+            numerical_failures[index].receipt_sha256
+            for index in sorted(numerical_failures)
+        ),
         "terminal_checkpoint_file_sha256": tuple(checkpoint_matrix),
         "all_setting_folds_adequate": adequate,
         "outer_qualification_outcomes_accessed": False,
@@ -427,11 +487,13 @@ def aggregate_m03r_v16_training_panel(
     closure_file_sha = _write(
         output / "prequalification-closure.json", closure
     )
-    primary_status = tuple(
-        row.status
-        for row in all_adequacy[M03R_V16_PREDICTIVE_SPEC.primary_setting_index]
+    primary_index = M03R_V16_PREDICTIVE_SPEC.primary_setting_index
+    primary_status = (
+        ("numerically-invalid",)
+        if primary_index in numerical_failures
+        else tuple(row.status for row in all_adequacy[primary_index])
     )
-    if all(status == "adequate" for status in primary_status):
+    if primary_status and all(status == "adequate" for status in primary_status):
         primary_aggregate = "all-adequate"
     elif "numerically-invalid" in primary_status:
         primary_aggregate = "numerically-invalid"
@@ -445,6 +507,11 @@ def aggregate_m03r_v16_training_panel(
         "package_plan_sha256": package.package_plan_sha256,
         "execution_authorization_receipt_sha256": authorization.receipt_sha256,
         "training_terminal_file_sha256": training_terminal_file_sha256,
+        "training_outcome_kind": tuple(outcome_kinds),
+        "numerical_failure_receipt_sha256": tuple(
+            numerical_failures[index].receipt_sha256
+            for index in sorted(numerical_failures)
+        ),
         "training_terminal_receipt_sha256": tuple(terminal_receipts),
         "setting_fold_adequacy_receipt_sha256": tuple(
             tuple(row.receipt_sha256 for row in setting_rows)

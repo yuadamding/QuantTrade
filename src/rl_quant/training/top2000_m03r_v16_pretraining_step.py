@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Callable
 
 import torch
 import torch.distributed as dist
 
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
-from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.top2000_m03r_v16_fold import M03RV16TrainingUpdatePlan
+from rl_quant.training.top2000_m03r_v16_numerical import (
+    M03RV16NumericalTrainingError,
+)
 from rl_quant.training.top2000_m03r_v16_objective import m03r_v16_score_loss
 from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
@@ -336,27 +339,41 @@ def train_m03r_v16_score_batch_update(
         not bool(torch.isfinite(value).all()) for value in gradients
     ):
         optimizer.zero_grad(set_to_none=True)
-        raise M03RV16ScoreStepError("V16 score gradients are absent or non-finite")
+        if gradients:
+            raise M03RV16NumericalTrainingError(
+                "V16 score gradients are non-finite"
+            )
+        raise M03RV16ScoreStepError("V16 score gradients are absent")
     encoder_norm = _gradient_norm(encoder)
     head_norm = _gradient_norm(selection_head)
     if min(encoder_norm, head_norm) <= 0.0:
         optimizer.zero_grad(set_to_none=True)
         raise M03RV16ScoreStepError("V16 encoder and selection head require gradients")
     clip = M03R_V16_PREDICTIVE_SPEC.gradient_clip_norm
-    torch.nn.utils.clip_grad_norm_(encoder, clip, error_if_nonfinite=True)
-    torch.nn.utils.clip_grad_norm_(selection_head, clip, error_if_nonfinite=True)
+    try:
+        torch.nn.utils.clip_grad_norm_(encoder, clip, error_if_nonfinite=True)
+        torch.nn.utils.clip_grad_norm_(
+            selection_head, clip, error_if_nonfinite=True
+        )
+    except RuntimeError as exc:
+        optimizer.zero_grad(set_to_none=True)
+        raise M03RV16NumericalTrainingError(
+            "V16 score gradient norm is non-finite"
+        ) from exc
     if any(
         parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
         for parameter in trainable
     ):
         optimizer.zero_grad(set_to_none=True)
-        raise M03RV16ScoreStepError("V16 clipped score gradients are invalid")
+        raise M03RV16NumericalTrainingError(
+            "V16 clipped score gradients are non-finite"
+        )
     optimizer.step()
     if any(not bool(torch.isfinite(parameter).all()) for parameter in trainable) or any(
         not bool(torch.isfinite(value).all()) for value in _optimizer_tensors(optimizer)
     ):
         optimizer.zero_grad(set_to_none=True)
-        raise M03RV16ScoreStepError(
+        raise M03RV16NumericalTrainingError(
             "V16 score mutation produced non-finite model or optimizer state"
         )
     after_encoder = _version_root(partition.encoder_parameter_names, named)

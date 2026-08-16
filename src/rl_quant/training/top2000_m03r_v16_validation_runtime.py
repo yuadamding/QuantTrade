@@ -7,16 +7,19 @@ from dataclasses import asdict, dataclass, field
 
 import torch
 
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_CHECKPOINT_SELECTION_RULE,
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
-from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16FoldGeometry,
     render_m03r_v16_fold_geometries,
+)
+from rl_quant.training.top2000_m03r_v16_numerical import (
+    M03RV16NumericalTrainingError,
 )
 from rl_quant.training.top2000_m03r_v16_objective import m03r_v16_score_loss
 from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
@@ -97,6 +100,10 @@ class M03RV16InnerValidationReceipt:
             self.selection_target_std,
         )
         spec = M03R_V16_PREDICTIVE_SPEC
+        if not all(math.isfinite(value) for value in metrics):
+            raise M03RV16NumericalTrainingError(
+                "V16 validation metrics are non-finite"
+            )
         if (
             self.setting_index not in range(len(M03R_V16_SETTINGS))
             or self.fold_index not in range(spec.chronological_fold_count)
@@ -107,7 +114,6 @@ class M03RV16InnerValidationReceipt:
             ].training_block_count
             * (self.epoch_index + 1)
             or self.origin_count != spec.inner_validation_origins_per_fold
-            or not all(math.isfinite(value) for value in metrics)
             or min(
                 self.selection_robust_loss,
                 self.selection_prediction_std,

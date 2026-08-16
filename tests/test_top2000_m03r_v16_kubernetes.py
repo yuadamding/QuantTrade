@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -69,7 +73,10 @@ from rl_quant.training.top2000_m03r_v16_kubernetes import (
 )
 from rl_quant.training.top2000_m03r_v16_lifecycle import (
     M03RV16PodObservation,
+    load_m03r_v16_storage_semantics_evidence,
     publish_m03r_v16_pod_runtime_attestation_after_annotation_patch,
+    qualify_m03r_v16_append_only_storage,
+    write_m03r_v16_storage_semantics_evidence,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
@@ -163,12 +170,66 @@ def _surfaces() -> tuple[
 def _template(name: str) -> M03RV7KubernetesTemplateConfig:
     return M03RV7KubernetesTemplateConfig(
         job_name=name,
-        run_id="m03r-v16-v10-local-contract",
+        run_id="m03r-v16-v11-local-contract",
         service_account_name="default",
         pvc_claim_name="research-pvc",
         package_mount_path="/mnt/package",
         output_mount_path="/mnt/output",
     )
+
+
+def test_v16_exact_isolated_init_bootstrap_prefers_mount_and_stays_torch_free(
+    tmp_path: Path,
+) -> None:
+    package, authorization, plan_file, authorization_file = _surfaces()
+    static = _static_gate(package, authorization, "d" * 64)
+    rendered = render_m03r_v16_suspended_capacity_job(
+        package=package,  # type: ignore[arg-type]
+        authorization=authorization,
+        package_plan_file_sha256=plan_file,
+        authorization_file_sha256=authorization_file,
+        template=_template("m03r-v16-init-bootstrap"),
+        static=static,
+    )
+    bootstrap = rendered.manifest["spec"]["template"]["spec"][
+        "initContainers"
+    ][0]["args"][3]
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    probe = bootstrap.replace(
+        "pathlib.Path('/mnt/package/source/src')", f"pathlib.Path({str(source_root)!r})"
+    ).replace(
+        "raise SystemExit(gate.main())",
+        (
+            "import json;"
+            "hwm_kib=next(int(line.split()[1]) for line in "
+            "pathlib.Path('/proc/self/status').read_text().splitlines() "
+            "if line.startswith('VmHWM:'));"
+            "print(json.dumps({'path':str(resolved),'torch':('torch' in sys.modules),"
+            "'maxrss_kib':hwm_kib}))"
+        ),
+    )
+    decoy = tmp_path / "decoy"
+    decoy_gate = (
+        decoy
+        / "rl_quant/workflows/top2000_m03r_v16_attestation_gate.py"
+    )
+    decoy_gate.parent.mkdir(parents=True)
+    (decoy / "rl_quant/__init__.py").write_text("", encoding="utf-8")
+    (decoy / "rl_quant/workflows/__init__.py").write_text("", encoding="utf-8")
+    decoy_gate.write_text("raise RuntimeError('decoy imported')\n", encoding="utf-8")
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(decoy)
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    evidence = json.loads(result.stdout)
+    assert Path(evidence["path"]).resolve().is_relative_to(source_root.resolve())
+    assert evidence["torch"] is False
+    assert int(evidence["maxrss_kib"]) < 128 * 1024
 
 
 def _static_gate(
@@ -329,7 +390,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v10-local-contract",
+        run_id="m03r-v16-v11-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),
@@ -366,10 +427,14 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         "initContainers"
     ][0]
     assert init_container["name"] == "runtime-attestation-gate"
-    assert "rl_quant.workflows.top2000_m03r_v16_attestation_gate" in (
-        init_container["args"]
-    )
-    assert "-c" not in init_container["args"]
+    assert init_container["args"][:3] == ["-I", "-B", "-c"]
+    assert "sys.path.insert(0,str(root))" in init_container["args"][3]
+    assert "top2000_m03r_v16_attestation_gate" in init_container["args"][3]
+    assert "PYTHONPATH" not in {row["name"] for row in init_container["env"]}
+    assert init_container["resources"] == {
+        "requests": {"cpu": "50m", "memory": "512Mi"},
+        "limits": {"cpu": "250m", "memory": "1Gi"},
+    }
     assert init_container["image"] == container["image"]
     assert any(
         row["mountPath"] == "/etc/podinfo"
@@ -392,6 +457,10 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         pod_uid="capacity-pod-uid",
         pod_name="capacity-pod-0",
         node_name="capacity-node",
+        observed_owner_job_uid=admission.job_uid,
+        observed_owner_job_name="m03r-v16-capacity",
+        observed_completion_index=0,
+        observed_pod_resource_version="17",
         relative_path=relative_attestation_path,
         attested_container_name="runtime-attestation-gate",
         attested_container_kind="init",
@@ -414,16 +483,38 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         pod_attestation_file
     )
     assert not tuple(pod_attestation_path.parent.glob("*.tmp"))
-    with pytest.raises(FileExistsError):
-        write_m03r_v16_pod_runtime_attestation(
-            pod_attestation_path, pod_attestation
-        )
+    assert write_m03r_v16_pod_runtime_attestation(
+        pod_attestation_path, pod_attestation
+    ) == pod_attestation_file
     controller_root = tmp_path / "controller-authorities"
     patched: dict[str, str] = {}
 
-    def patch_annotations(_pod_name: str, values: dict[str, str]) -> None:
+    def patch_annotations(precondition: object, values: dict[str, str]) -> None:
         assert not (controller_root / relative_attestation_path).exists()
+        assert precondition.pod_uid == "capacity-pod-uid"
+        assert precondition.pod_resource_version == "17"
         patched.update(values)
+
+    storage = qualify_m03r_v16_append_only_storage(controller_root)
+    storage_path = tmp_path / "storage-semantics.json"
+    storage_file_sha = write_m03r_v16_storage_semantics_evidence(
+        storage_path,
+        storage,
+        authority_root=controller_root,
+    )
+    storage = load_m03r_v16_storage_semantics_evidence(
+        storage_path,
+        expected_file_sha256=storage_file_sha,
+        authority_root=controller_root,
+    )
+    stale_temporary = (
+        controller_root
+        / relative_attestation_path
+    ).with_name(
+        f".completion-00.json.{pod_attestation.receipt_sha256}.stale.tmp"
+    )
+    stale_temporary.parent.mkdir(parents=True, exist_ok=True)
+    stale_temporary.write_text("abandoned-controller-attempt", encoding="utf-8")
 
     published = publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
         package=package,
@@ -435,6 +526,10 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
             pod_uid="capacity-pod-uid",
             pod_name="capacity-pod-0",
             node_name="capacity-node",
+            observed_owner_job_uid=admission.job_uid,
+            observed_owner_job_name="m03r-v16-capacity",
+            observed_completion_index=0,
+            observed_pod_resource_version="17",
             attested_container_name="runtime-attestation-gate",
             attested_container_kind="init",
             observed_spec_image=package.artifacts.image_reference,
@@ -445,11 +540,14 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         ),
         output_root_sha256=output_root_sha,
         authority_root=controller_root,
+        storage_evidence=storage,
         patch_annotations=patch_annotations,
-        read_annotations=lambda _pod_name: patched,
+        read_annotations=lambda _precondition: patched,
     )
     assert published.final_path.is_file()
+    assert not stale_temporary.exists()
     assert published.relative_path == relative_attestation_path
+    assert len(published.controller_transaction_receipt_sha256) == 64
     assert load_m03r_v16_pod_runtime_attestation(
         pod_attestation_path,
         expected_file_sha256=pod_attestation_file,
@@ -491,6 +589,10 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
             pod_uid="capacity-pod-uid",
             pod_name="capacity-pod-0",
             node_name="capacity-node",
+            observed_owner_job_uid=admission.job_uid,
+            observed_owner_job_name="m03r-v16-capacity",
+            observed_completion_index=0,
+            observed_pod_resource_version="17",
             relative_path=relative_attestation_path,
             attested_container_name="runtime-attestation-gate",
             attested_container_kind="init",
@@ -517,6 +619,10 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
             pod_uid="capacity-pod-uid",
             pod_name="capacity-pod-0",
             node_name="capacity-node",
+            observed_owner_job_uid=admission.job_uid,
+            observed_owner_job_name="m03r-v16-capacity",
+            observed_completion_index=0,
+            observed_pod_resource_version="17",
             relative_path=(
                 "pod-runtime/capacity/stale-job-uid/completion-00.json"
             ),
@@ -592,7 +698,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="training",
-        run_id="m03r-v16-v10-local-contract",
+        run_id="m03r-v16-v11-local-contract",
         job_contract_sha256=predictive.job_contract_sha256,
         pod_contract_sha256=predictive.pod_contract_sha256,
         server_side_dry_run_file_sha256=dry_run_file_sha256,
@@ -813,7 +919,7 @@ def test_v16_gate_authorities_are_issued_from_exact_result_files(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v10-local-contract",
+        run_id="m03r-v16-v11-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),

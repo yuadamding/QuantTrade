@@ -84,6 +84,9 @@ from rl_quant.training.top2000_m03r_v16_fold import (
 from rl_quant.training.top2000_m03r_v16_initial_state import (
     load_m03r_v16_initial_parameter_state,
 )
+from rl_quant.training.top2000_m03r_v16_numerical import (
+    M03RV16NumericalTrainingError,
+)
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16PackagePlan,
     load_m03r_v16_execution_authorization,
@@ -226,6 +229,7 @@ def _read_pod_attestation_marker(
     completion_index: int,
     pod_attestation: M03RV16PodRuntimeAttestation,
     launch_authority: M03RV16PhaseLaunchAuthority,
+    package_source_root: Path,
 ) -> dict[str, Any]:
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -253,9 +257,14 @@ def _read_pod_attestation_marker(
             "V16 init attestation marker is not canonical"
         )
     unsigned = {key: value for key, value in marker.items() if key != "receipt_sha256"}
+    expected_gate_path = (
+        package_source_root
+        / "rl_quant/workflows/top2000_m03r_v16_attestation_gate.py"
+    ).resolve()
+    expected_gate_sha = hashlib.sha256(expected_gate_path.read_bytes()).hexdigest()
     if (
         marker.get("schema")
-        != "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v1"
+        != "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v2"
         or marker.get("receipt_sha256") != _sha256(unsigned)
         or marker.get("phase") != phase
         or marker.get("completion_index") != completion_index
@@ -267,6 +276,10 @@ def _read_pod_attestation_marker(
         != pod_attestation.receipt_sha256
         or marker.get("launch_authority_receipt_sha256")
         != launch_authority.receipt_sha256
+        or marker.get("package_source_root")
+        != str(package_source_root.resolve())
+        or marker.get("gate_module_path") != str(expected_gate_path)
+        or marker.get("gate_module_file_sha256") != expected_gate_sha
     ):
         raise M03RV16PredictiveWorkflowError(
             "V16 init attestation marker drifted"
@@ -1434,12 +1447,14 @@ def run_m03r_v16_predictive_worker(
         completion_index=index,
         pod_attestation=pod_attestation,
         launch_authority=launch_authority,
+        package_source_root=Path(package.source_pythonpath),
     )
     failure_phase = "distributed-startup"
     failure_fold_index = -1
     failure_update_index = -1
     active_policy: Top2000M03RV16PredictivePolicy | None = None
     active_optimizer: torch.optim.Optimizer | None = None
+    fold_terminal_files: list[str] = []
     rank, local_rank, world_size, device, owns = _distributed_context()
     try:
         if rank == 0:
@@ -1677,7 +1692,6 @@ def run_m03r_v16_predictive_worker(
             raise M03RV16PredictiveWorkflowError(
                 "V16 training activation disappeared after startup validation"
             )
-        fold_terminal_files: list[str] = []
         fold_training_adequacy_files: list[str] = []
         fold_training_adequacy_receipts: list[str] = []
         fold_training_adequacy_status: list[str] = []
@@ -1997,14 +2011,10 @@ def run_m03r_v16_predictive_worker(
         dist.barrier()
         return terminal
     except BaseException as exc:
-        error_text = f"{type(exc).__name__}: {exc}".lower()
         numerical_failure = (
             not capacity_only
             and not qualification_only
-            and any(
-                token in error_text
-                for token in ("nonfinite", "non-finite", "nan", "numerical")
-            )
+            and isinstance(exc, (M03RV16NumericalTrainingError, FloatingPointError))
         )
         numerical_failure_file_sha256: str | None = None
         if rank == 0 and output.is_dir() and numerical_failure:
@@ -2018,7 +2028,22 @@ def run_m03r_v16_predictive_worker(
             numerical_failure_value = M03RV16NumericalTrainingFailure(
                 package_plan_sha256=package.package_plan_sha256,
                 authorization_receipt_sha256=authorization.receipt_sha256,
+                training_activation_receipt_sha256=cast(
+                    M03RV16TrainingActivation, training_activation
+                ).receipt_sha256,
                 worker_plan_sha256=worker.receipt_sha256,
+                source_tree_root_sha256=source_tree_root_sha256,
+                rendered_manifest_sha256=str(rendered_manifest_sha256),
+                pod_template_sha256=str(pod_template_sha256),
+                launch_authority_receipt_sha256=launch_authority.receipt_sha256,
+                admitted_job_authority_receipt_sha256=(
+                    admitted_job_authority.receipt_sha256
+                ),
+                pod_runtime_attestation_receipt_sha256=(
+                    pod_attestation.receipt_sha256
+                ),
+                job_uid=admitted_job_authority.job_uid,
+                pod_uid=pod_attestation.pod_uid,
                 setting_index=worker.setting_index,
                 setting_id=worker.setting_id,
                 fold_index=failure_fold_index,
@@ -2028,6 +2053,7 @@ def run_m03r_v16_predictive_worker(
                 error=str(exc),
                 model_state_sha256=model_sha,
                 optimizer_state_sha256=optimizer_sha,
+                completed_fold_terminal_file_sha256=tuple(fold_terminal_files),
             )
             numerical_failure_value.validate()
             numerical_unsigned = asdict(numerical_failure_value)

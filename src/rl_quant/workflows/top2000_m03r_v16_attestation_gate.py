@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from rl_quant.protocol.canonical_artifact import (
+from rl_quant.protocol.v16_lifecycle_contract import (
     canonical_json_file_bytes,
+    load_v16_lifecycle_admission,
+    load_v16_lifecycle_authorization,
+    load_v16_lifecycle_launch,
+    load_v16_lifecycle_package,
+    load_v16_lifecycle_pod_attestation,
     semantic_sha256,
-)
-from rl_quant.training.top2000_m03r_v16_activation import (
-    load_m03r_v16_admitted_job_authority,
-    load_m03r_v16_phase_launch_authority,
-    load_m03r_v16_pod_runtime_attestation,
-)
-from rl_quant.training.top2000_m03r_v16_package import (
-    load_m03r_v16_execution_authorization,
-    load_m03r_v16_package_plan,
 )
 
 
@@ -71,20 +68,36 @@ def validate_m03r_v16_pod_attestation_gate(
     downward_root: str | Path,
     authority_root: str | Path,
     marker_path: str | Path,
+    package_source_root: str | Path,
     timeout_seconds: float = 1800.0,
 ) -> dict[str, object]:
-    package = load_m03r_v16_package_plan(
+    source_root = Path(package_source_root).resolve()
+    gate_module_path = Path(__file__).resolve()
+    try:
+        gate_module_path.relative_to(source_root)
+    except ValueError as exc:
+        raise M03RV16AttestationGateError(
+            "V16 init gate did not resolve from package-owned source"
+        ) from exc
+    gate_module_file_sha256 = hashlib.sha256(
+        gate_module_path.read_bytes()
+    ).hexdigest()
+    package = load_v16_lifecycle_package(
         package_plan_path, expected_file_sha256=package_plan_file_sha256
     )
-    authorization = load_m03r_v16_execution_authorization(
+    if Path(package.source_pythonpath).resolve() != source_root:
+        raise M03RV16AttestationGateError(
+            "V16 package source root differs from its package plan"
+        )
+    authorization = load_v16_lifecycle_authorization(
         authorization_path,
-        expected_file_sha256=authorization_file_sha256,
+        authorization_file_sha256,
         package=package,
     )
-    admission = load_m03r_v16_admitted_job_authority(
+    admission = load_v16_lifecycle_admission(
         admitted_job_authority_path,
-        expected_file_sha256=admitted_job_authority_file_sha256,
-        expected_receipt_sha256=admitted_job_authority_receipt_sha256,
+        admitted_job_authority_file_sha256,
+        admitted_job_authority_receipt_sha256,
         package=package,
         authorization=authorization,
         expected_phase=phase,
@@ -93,10 +106,10 @@ def validate_m03r_v16_pod_attestation_gate(
         server_side_dry_run_path=server_side_dry_run_result_path,
         admitted_manifest_path=admitted_manifest_result_path,
     )
-    launch = load_m03r_v16_phase_launch_authority(
+    launch = load_v16_lifecycle_launch(
         launch_authority_path,
-        expected_file_sha256=launch_authority_file_sha256,
-        expected_receipt_sha256=launch_authority_receipt_sha256,
+        launch_authority_file_sha256,
+        launch_authority_receipt_sha256,
         package=package,
         authorization=authorization,
         expected_phase=phase,
@@ -109,15 +122,13 @@ def validate_m03r_v16_pod_attestation_gate(
         expected_admission_file_sha256=admitted_job_authority_file_sha256,
     )
     downward = Path(downward_root)
-    expected_relative = launch.pod_runtime_attestation_relative_path(
-        completion_index
-    )
+    expected_relative = launch.relative_path(completion_index)
     resolved_output_root = (
         Path(output_root)
         if output_root is not None
         else Path("/mnt/output/capacity-sentinel")
         if phase == "capacity"
-        else Path(package.panel.workers[completion_index].output_root)
+        else Path(package.worker_output_roots[completion_index])
     )
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -146,10 +157,10 @@ def validate_m03r_v16_pod_attestation_gate(
     current_pod_uid = os.environ.get("M03R_V16_CURRENT_POD_UID", "")
     current_pod_name = os.environ.get("M03R_V16_CURRENT_POD_NAME", "")
     current_node_name = os.environ.get("M03R_V16_CURRENT_NODE_NAME", "")
-    attestation = load_m03r_v16_pod_runtime_attestation(
+    attestation = load_v16_lifecycle_pod_attestation(
         attestation_path,
-        expected_file_sha256=expected_file_sha256,
-        expected_receipt_sha256=expected_receipt_sha256,
+        expected_file_sha256,
+        expected_receipt_sha256,
         package=package,
         authorization=authorization,
         admission=admission,
@@ -164,7 +175,7 @@ def validate_m03r_v16_pod_attestation_gate(
         expected_relative_path=relative_path,
     )
     unsigned: dict[str, object] = {
-        "schema": "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v1",
+        "schema": "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v2",
         "phase": phase,
         "job_uid": admission.job_uid,
         "completion_index": completion_index,
@@ -175,6 +186,9 @@ def validate_m03r_v16_pod_attestation_gate(
         "attestation_file_sha256": expected_file_sha256,
         "attestation_receipt_sha256": attestation.receipt_sha256,
         "launch_authority_receipt_sha256": launch.receipt_sha256,
+        "package_source_root": str(source_root),
+        "gate_module_path": str(gate_module_path),
+        "gate_module_file_sha256": gate_module_file_sha256,
     }
     marker = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
     _write_marker(Path(marker_path), marker)
@@ -204,6 +218,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--downward-root", required=True)
     parser.add_argument("--authority-root", required=True)
     parser.add_argument("--marker", required=True)
+    parser.add_argument("--package-source-root", required=True)
     return parser
 
 
@@ -237,6 +252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         downward_root=args.downward_root,
         authority_root=args.authority_root,
         marker_path=args.marker,
+        package_source_root=args.package_source_root,
     )
     return 0
 

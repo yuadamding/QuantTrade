@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,10 @@ from rl_quant.protocol.canonical_artifact import (
     file_sha256,
     semantic_sha256,
 )
-from rl_quant.training.top2000_m03r_v16_fit import M03RV16TrainingAdequacy
+from rl_quant.training.top2000_m03r_v16_fit import (
+    M03RV16NumericalTrainingFailure,
+    M03RV16TrainingAdequacy,
+)
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16PanelSchedule,
     render_m03r_v16_fold_geometries,
@@ -196,3 +200,120 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
         assert result["next_research_action"] == "fit-pathology-investigation"
         assert "qualification_activation_receipt_sha256" not in result
         assert not (tmp_path / "aggregate" / "qualification-activation.json").exists()
+
+
+def test_v16_numerical_setting_outcome_routes_panel_without_qualification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package, authorization = _surfaces()
+    monkeypatch.setattr(aggregate, "load_m03r_v16_package_plan", lambda *a, **k: package)
+    monkeypatch.setattr(
+        aggregate,
+        "load_m03r_v16_execution_authorization",
+        lambda *a, **k: authorization,
+    )
+    paths: list[Path] = []
+    hashes: list[str] = []
+    for setting in range(2):
+        root = tmp_path / f"setting-{setting}"
+        root.mkdir()
+        path = root / "training-terminal.json"
+        unsigned: dict[str, object] = {
+            "schema": aggregate.M03R_V16_TRAINING_TERMINAL_SCHEMA,
+            "package_plan_sha256": package.package_plan_sha256,  # type: ignore[union-attr]
+            "authorization_receipt_sha256": authorization.receipt_sha256,
+            "worker_plan_sha256": package.panel.workers[setting].receipt_sha256,  # type: ignore[union-attr]
+            "training_activation_receipt_sha256": "d" * 64,
+            "setting_index": setting,
+            "fold_terminal_file_sha256": tuple(
+                f"{setting * 10 + fold + 1:064x}" for fold in range(5)
+            ),
+            "fold_training_adequacy_status": ("adequate",) * 5,
+            "qualification_tail_accessed": False,
+            "outer_qualification_authorized": False,
+            "three_seed_confirmation_may_be_minted": False,
+            "source_tree_root_sha256": "e" * 64,
+            "rendered_manifest_sha256": "a" * 64,
+            "pod_template_sha256": "b" * 64,
+            "launch_authority_receipt_sha256": "c" * 64,
+            "admitted_job_authority_receipt_sha256": "f" * 64,
+            "job_uid": f"job-{setting}",
+            "pod_runtime_attestation_receipt_sha256": "9" * 64,
+            "pod_uid": f"pod-{setting}",
+        }
+        path.write_bytes(
+            canonical_json_file_bytes(
+                {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
+            )
+        )
+        paths.append(path)
+        hashes.append(file_sha256(path))
+    numerical_root = tmp_path / "setting-2"
+    numerical_root.mkdir()
+    numerical = M03RV16NumericalTrainingFailure(
+        package_plan_sha256=package.package_plan_sha256,  # type: ignore[union-attr]
+        authorization_receipt_sha256=authorization.receipt_sha256,
+        training_activation_receipt_sha256="d" * 64,
+        worker_plan_sha256=package.panel.workers[2].receipt_sha256,  # type: ignore[union-attr]
+        source_tree_root_sha256="e" * 64,
+        rendered_manifest_sha256="a" * 64,
+        pod_template_sha256="b" * 64,
+        launch_authority_receipt_sha256="c" * 64,
+        admitted_job_authority_receipt_sha256="f" * 64,
+        pod_runtime_attestation_receipt_sha256="9" * 64,
+        job_uid="job-2",
+        pod_uid="pod-2",
+        setting_index=2,
+        setting_id=package.panel.workers[2].setting_id,  # type: ignore[union-attr]
+        fold_index=1,
+        update_index=3,
+        failure_phase="optimizer-update",
+        error_type="M03RV16NumericalTrainingError",
+        error="V16 score gradients are non-finite",
+        model_state_sha256="1" * 64,
+        optimizer_state_sha256="2" * 64,
+    )
+    failure_path = numerical_root / "training-numerical-failure.json"
+    failure_unsigned = asdict(numerical)
+    failure_path.write_bytes(
+        canonical_json_file_bytes(
+            {
+                **failure_unsigned,
+                "receipt_sha256": numerical.receipt_sha256,
+            }
+        )
+    )
+    paths.append(failure_path)
+    hashes.append(file_sha256(failure_path))
+    monkeypatch.setattr(
+        aggregate,
+        "_recompute_fold",
+        lambda root, fold_sha, *, setting_index, fold_index, **kwargs: (
+            _adequacy(setting_index, fold_index, adequate=True),
+            {
+                "checkpoint_file_sha256": f"{setting_index * 10 + fold_index + 30:064x}",
+                "checkpoint_source_array_sha256": "f" * 64,
+            },
+        ),
+    )
+    result = aggregate.aggregate_m03r_v16_training_panel(
+        package_plan_path=tmp_path / "package.json",
+        package_plan_file_sha256="1" * 64,
+        execution_authorization_path=tmp_path / "authorization.json",
+        execution_authorization_file_sha256="2" * 64,
+        training_terminal_paths=tuple(paths),  # type: ignore[arg-type]
+        training_terminal_file_sha256=tuple(hashes),  # type: ignore[arg-type]
+        output_root=tmp_path / "aggregate-numerical",
+    )
+    assert result["next_research_action"] == "numerical-investigation"
+    assert result["outer_qualification_authorized"] is False
+    assert result["training_outcome_kind"] == (
+        "training-terminal",
+        "training-terminal",
+        "numerical-failure",
+    )
+    assert result["primary_aggregate_adequacy"] == "numerically-invalid"
+    assert not (
+        tmp_path / "aggregate-numerical/qualification-activation.json"
+    ).exists()

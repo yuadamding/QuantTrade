@@ -229,19 +229,18 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     relative_path = "pod-runtime/training/job-uid/completion-01.json"
+    source_root = Path(attestation_gate.__file__).resolve().parents[2]
     package = SimpleNamespace(
-        panel=SimpleNamespace(
-            workers=tuple(
-                SimpleNamespace(output_root=f"/mnt/output/completion-{index:02d}")
-                for index in range(3)
-            )
-        )
+        source_pythonpath=str(source_root),
+        worker_output_roots=tuple(
+            f"/mnt/output/completion-{index:02d}" for index in range(3)
+        ),
     )
     authorization = object()
     admission = SimpleNamespace(job_uid="job-uid")
     launch = SimpleNamespace(
         receipt_sha256="1" * 64,
-        pod_runtime_attestation_relative_path=lambda index: relative_path,
+        relative_path=lambda index: relative_path,
     )
     attestation = SimpleNamespace(
         receipt_sha256="2" * 64,
@@ -251,26 +250,26 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
         relative_path=relative_path,
     )
     monkeypatch.setattr(
-        attestation_gate, "load_m03r_v16_package_plan", lambda *a, **k: package
+        attestation_gate, "load_v16_lifecycle_package", lambda *a, **k: package
     )
     monkeypatch.setattr(
         attestation_gate,
-        "load_m03r_v16_execution_authorization",
+        "load_v16_lifecycle_authorization",
         lambda *a, **k: authorization,
     )
     monkeypatch.setattr(
         attestation_gate,
-        "load_m03r_v16_admitted_job_authority",
+        "load_v16_lifecycle_admission",
         lambda *a, **k: admission,
     )
     monkeypatch.setattr(
         attestation_gate,
-        "load_m03r_v16_phase_launch_authority",
+        "load_v16_lifecycle_launch",
         lambda *a, **k: launch,
     )
     monkeypatch.setattr(
         attestation_gate,
-        "load_m03r_v16_pod_runtime_attestation",
+        "load_v16_lifecycle_pod_attestation",
         lambda *a, **k: attestation,
     )
     downward = tmp_path / "podinfo"
@@ -307,8 +306,11 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
         downward_root=downward,
         authority_root=tmp_path / "authority",
         marker_path=marker_path,
+        package_source_root=source_root,
         timeout_seconds=0.0,
     )
     assert marker_path.is_file()
     assert marker["attestation_receipt_sha256"] == "2" * 64
     assert marker["relative_path"] == relative_path
+    assert marker["package_source_root"] == str(source_root)
+    assert marker["gate_module_path"] == str(Path(attestation_gate.__file__).resolve())
