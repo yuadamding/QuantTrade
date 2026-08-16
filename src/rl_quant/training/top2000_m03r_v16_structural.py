@@ -15,10 +15,16 @@ import os
 import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_payload as _canonical,
+)
+from rl_quant.protocol.canonical_artifact import (
+    semantic_sha256 as _sha256,
+)
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS,
     M03R_V16_PROTOCOL_SHA256,
@@ -26,12 +32,11 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     m03r_v16_selection_target_weights_from_id,
 )
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
-from rl_quant.protocol.canonical_artifact import (
-    canonical_json_payload as _canonical,
-    semantic_sha256 as _sha256,
-)
 from rl_quant.training.hold30_top2000_development import (
     Top2000VerifiedDevelopmentCache,
+)
+from rl_quant.training.top2000_m03r_v9_risk_materialization import (
+    M03RV9MaterializedRiskSource,
 )
 from rl_quant.training.top2000_m03r_v11_residual_operator import (
     M03RV11ResidualOperator,
@@ -44,9 +49,6 @@ from rl_quant.training.top2000_m03r_v15_residual_operator import (
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03R_V16_REQUIRED_STATE_ROWS,
     render_m03r_v16_fold_geometries,
-)
-from rl_quant.training.top2000_m03r_v9_risk_materialization import (
-    M03RV9MaterializedRiskSource,
 )
 
 M03R_V16_STRUCTURAL_SLAB_SCHEMA = (
@@ -430,6 +432,8 @@ class M03RV16ValidatedStructuralSlab:
     device_prepared_origin_cache: dict[
         tuple[int, str, int | None], M03RV16DevicePreparedOrigin
     ]
+    access_mode: Literal["full", "training", "qualification"]
+    allowed_origin_indices: frozenset[int]
     _issuer: object
 
     @property
@@ -445,11 +449,18 @@ class M03RV16ValidatedStructuralSlab:
             self._issuer is not _VALIDATED_SLAB_ISSUER
             or len(self.origin_to_slot) != len(self.slab.origins)
             or len(self.target_tensor_versions) != len(self.slab.origins)
+            or self.access_mode not in {"full", "training", "qualification"}
+            or not self.allowed_origin_indices
+            or not self.allowed_origin_indices.issubset(self.origin_to_slot)
         ):
             raise M03RV16StructuralError("V16 validated slab authority drifted")
 
     def origin(self, origin_state_index: int) -> M03RV16PreparedOrigin:
         self.require_fast_identity()
+        if origin_state_index not in self.allowed_origin_indices:
+            raise M03RV16StructuralError(
+                f"V16 {self.access_mode} slab authority forbids origin access"
+            )
         slot = self.origin_to_slot.get(origin_state_index)
         if slot is None:
             raise M03RV16StructuralError("V16 origin is absent from structural slab")
@@ -550,6 +561,55 @@ def qualify_m03r_v16_structural_slab(
         receipt_sha256=slab.receipt.receipt_sha256,
         device_action_operator_cache={},
         device_prepared_origin_cache={},
+        access_mode="full",
+        allowed_origin_indices=frozenset(origin_to_slot),
+        _issuer=_VALIDATED_SLAB_ISSUER,
+    )
+
+
+def restrict_m03r_v16_structural_slab(
+    authority: M03RV16ValidatedStructuralSlab,
+    *,
+    access_mode: Literal["training", "qualification"],
+) -> M03RV16ValidatedStructuralSlab:
+    """Issue a phase-scoped accessor that cannot cross the outer boundary."""
+
+    authority.require_fast_identity()
+    geometries = render_m03r_v16_fold_geometries(M03R_V16_REQUIRED_STATE_ROWS)
+    if access_mode == "training":
+        allowed = frozenset(
+            origin
+            for geometry in geometries
+            for origin in (
+                *geometry.eligible_training_origins,
+                *range(
+                    geometry.inner_validation_origin_start_inclusive,
+                    geometry.inner_validation_origin_stop_exclusive,
+                ),
+            )
+        )
+    elif access_mode == "qualification":
+        allowed = frozenset(
+            origin
+            for geometry in geometries
+            for origin in range(
+                geometry.qualification_origin_start_inclusive,
+                geometry.qualification_origin_stop_exclusive,
+            )
+        )
+    else:  # pragma: no cover - protected by the Literal public contract.
+        raise M03RV16StructuralError("V16 structural access mode drifted")
+    if not allowed.issubset(authority.origin_to_slot):
+        raise M03RV16StructuralError("V16 phase slab view is incomplete")
+    return M03RV16ValidatedStructuralSlab(
+        slab=authority.slab,
+        origin_to_slot=authority.origin_to_slot,
+        target_tensor_versions=authority.target_tensor_versions,
+        receipt_sha256=authority.receipt_sha256,
+        device_action_operator_cache=authority.device_action_operator_cache,
+        device_prepared_origin_cache=authority.device_prepared_origin_cache,
+        access_mode=access_mode,
+        allowed_origin_indices=allowed,
         _issuer=_VALIDATED_SLAB_ISSUER,
     )
 
@@ -954,9 +1014,9 @@ def load_m03r_v16_structural_slab(
 __all__ = [
     "M03R_V16_STRUCTURAL_SLAB_FILE_SCHEMA",
     "M03R_V16_STRUCTURAL_SLAB_SCHEMA",
-    "M03RV16PreparedOrigin",
     "M03RV16DeviceActionOperator",
     "M03RV16DevicePreparedOrigin",
+    "M03RV16PreparedOrigin",
     "M03RV16StructuralError",
     "M03RV16StructuralSlab",
     "M03RV16StructuralSlabReceipt",
@@ -964,6 +1024,7 @@ __all__ = [
     "build_m03r_v16_structural_slab",
     "load_m03r_v16_structural_slab",
     "qualify_m03r_v16_structural_slab",
+    "restrict_m03r_v16_structural_slab",
     "scheduled_m03r_v16_origins",
     "write_m03r_v16_structural_slab",
 ]

@@ -7,26 +7,39 @@ import hashlib
 import json
 import os
 import stat
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, cast
 
-from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes, semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    semantic_sha256,
+)
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
 )
 from rl_quant.training.top2000_m03r_v16_activation import (
-    issue_m03r_v16_qualification_activation,
+    _issue_m03r_v16_qualification_activation_from_panel,
     write_m03r_v16_qualification_activation,
+)
+from rl_quant.training.top2000_m03r_v16_checkpoint import (
+    load_m03r_v16_epoch_checkpoint_for_evaluation,
 )
 from rl_quant.training.top2000_m03r_v16_fit import (
     M03R_V16_EPOCH_FIT_SCHEMA,
     M03RV16TrainingAdequacy,
     classify_m03r_v16_training_adequacy,
 )
+from rl_quant.training.top2000_m03r_v16_fold import (
+    render_m03r_v16_fold_geometries,
+)
 from rl_quant.training.top2000_m03r_v16_package import (
     load_m03r_v16_execution_authorization,
     load_m03r_v16_package_plan,
+)
+from rl_quant.training.top2000_m03r_v16_policy import (
+    Top2000M03RV16PredictivePolicy,
 )
 from rl_quant.training.top2000_m03r_v16_validation_runtime import (
     M03RV16InnerValidationReceipt,
@@ -37,13 +50,20 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
 )
 
 M03R_V16_TRAINING_PANEL_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-training-adequacy-panel-v1"
+    "rl-quant.top2000-dev.m03r-v16-training-adequacy-panel-v2"
 )
 _MAX_BYTES = 64 * 1024**2
 
 
 class M03RV16TrainingAggregateError(ValueError):
     """Training evidence was incomplete, outcome-contaminated, or inconsistent."""
+
+
+def _digest(name: str, value: str) -> None:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise M03RV16TrainingAggregateError(f"{name} must be a SHA-256")
 
 
 def _read(path: Path, expected_sha256: str) -> dict[str, Any]:
@@ -98,7 +118,15 @@ def _recompute_fold(
     *,
     setting_index: int,
     fold_index: int,
-) -> M03RV16TrainingAdequacy:
+    package_plan_sha256: str,
+    authorization_receipt_sha256: str,
+    worker_plan_sha256: str,
+    training_activation_receipt_sha256: str,
+    panel_schedule_sha256: str,
+    structural_slab_receipt_sha256: str,
+    action_operator_root_sha256: str,
+    target_operator_root_sha256: str,
+) -> tuple[M03RV16TrainingAdequacy, dict[str, Any]]:
     fold = _read(
         root / "receipts" / f"fold-{fold_index:02d}-training-terminal.json",
         fold_terminal_sha256,
@@ -109,6 +137,15 @@ def _recompute_fold(
         or fold.get("receipt_sha256") != semantic_sha256(unsigned)
         or fold.get("setting_index") != setting_index
         or fold.get("fold_index") != fold_index
+        or fold.get("package_plan_sha256") != package_plan_sha256
+        or fold.get("authorization_receipt_sha256")
+        != authorization_receipt_sha256
+        or fold.get("worker_plan_sha256") != worker_plan_sha256
+        or fold.get("training_activation_receipt_sha256")
+        != training_activation_receipt_sha256
+        or fold.get("panel_schedule_sha256") != panel_schedule_sha256
+        or fold.get("structural_slab_receipt_sha256")
+        != structural_slab_receipt_sha256
         or fold.get("qualification_tail_accessed") is not False
         or fold.get("outer_2026_accessed") is not False
     ):
@@ -136,11 +173,61 @@ def _recompute_fold(
             or fit.get("setting_index") != setting_index
             or fit.get("fold_index") != fold_index
             or fit.get("epoch_index") != epoch
+            or fit.get("package_plan_sha256") != package_plan_sha256
+            or fit.get("worker_plan_sha256") != worker_plan_sha256
+            or fit.get("training_activation_receipt_sha256")
+            != training_activation_receipt_sha256
+            or fit.get("panel_schedule_sha256") != panel_schedule_sha256
+            or fit.get("structural_slab_receipt_sha256")
+            != structural_slab_receipt_sha256
             or fit.get("qualification_tail_accessed") is not False
         ):
             raise M03RV16TrainingAggregateError("V16 epoch fit evidence drifted")
         validation = M03RV16InnerValidationReceipt(**dict(fit["inner_validation"]))
         validation.validate()
+        update_pairs = tuple(fit.get("update_rows", ()))
+        expected_updates = render_m03r_v16_fold_geometries(1001)[
+            fold_index
+        ].training_block_count
+        if len(update_pairs) != expected_updates:
+            raise M03RV16TrainingAggregateError(
+                "V16 epoch update inventory drifted"
+            )
+        for local_update, pair in enumerate(update_pairs):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise M03RV16TrainingAggregateError(
+                    "V16 rank-pair update evidence is incomplete"
+                )
+            left, right = pair
+            if (
+                {left.get("distributed_rank"), right.get("distributed_rank")}
+                != {0, 1}
+                or any(
+                    row.get("setting_index") != setting_index
+                    or row.get("fold_index") != fold_index
+                    or row.get("selection_target_operator_root_sha256")
+                    != target_operator_root_sha256
+                    or row.get("action_operator_root_sha256")
+                    != action_operator_root_sha256
+                    for row in (left, right)
+                )
+                or left.get("update_plan_sha256")
+                != right.get("update_plan_sha256")
+                or left.get("source_array_sha256")
+                != right.get("source_array_sha256")
+                or left.get("completed_updates_after")
+                != right.get("completed_updates_after")
+                or left.get("completed_updates_after")
+                != epoch * expected_updates + local_update + 1
+                or left.get("global_origin_count")
+                != right.get("global_origin_count")
+                or int(left.get("local_origin_count", -1))
+                + int(right.get("local_origin_count", -1))
+                != int(left.get("global_origin_count", -2))
+            ):
+                raise M03RV16TrainingAggregateError(
+                    "V16 rank-pair update evidence drifted"
+                )
         fits.append(fit)
         validations.append(validation)
     recomputed = classify_m03r_v16_training_adequacy(
@@ -168,7 +255,7 @@ def _recompute_fold(
         raise M03RV16TrainingAggregateError(
             "V16 training adequacy could not be independently reproduced"
         )
-    return recomputed
+    return recomputed, fold
 
 
 def aggregate_m03r_v16_training_panel(
@@ -190,6 +277,7 @@ def aggregate_m03r_v16_training_panel(
         package=package,
     )
     all_adequacy: list[tuple[M03RV16TrainingAdequacy, ...]] = []
+    all_folds: list[tuple[dict[str, Any], ...]] = []
     terminal_receipts: list[str] = []
     source_roots: set[str] = set()
     for setting, (path, expected_sha) in enumerate(
@@ -198,16 +286,26 @@ def aggregate_m03r_v16_training_panel(
         payload = _read(path, expected_sha)
         unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
         fold_hashes = tuple(payload.get("fold_terminal_file_sha256", ()))
+        for name in (
+            "rendered_manifest_sha256",
+            "pod_template_sha256",
+            "launch_authority_receipt_sha256",
+            "admitted_job_authority_receipt_sha256",
+        ):
+            _digest(name, str(payload.get(name)))
         if (
             payload.get("schema") != M03R_V16_TRAINING_TERMINAL_SCHEMA
             or payload.get("receipt_sha256") != semantic_sha256(unsigned)
             or payload.get("package_plan_sha256") != package.package_plan_sha256
             or payload.get("authorization_receipt_sha256") != authorization.receipt_sha256
             or payload.get("worker_plan_sha256") != package.panel.workers[setting].receipt_sha256
+            or not isinstance(payload.get("training_activation_receipt_sha256"), str)
             or payload.get("setting_index") != setting
             or payload.get("qualification_tail_accessed") is not False
             or payload.get("outer_qualification_authorized") is not False
             or payload.get("three_seed_confirmation_may_be_minted") is not False
+            or not payload.get("job_uid")
+            or len(tuple(payload.get("pod_uids", ()))) != 3
             or len(fold_hashes) != M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
         ):
             raise M03RV16TrainingAggregateError("V16 training terminal drifted")
@@ -218,21 +316,108 @@ def aggregate_m03r_v16_training_panel(
             )
         source_roots.add(str(payload["source_tree_root_sha256"]))
         terminal_receipts.append(str(payload["receipt_sha256"]))
-        all_adequacy.append(
-            tuple(
-                _recompute_fold(
+        recomputed_folds = tuple(
+            _recompute_fold(
                     root,
                     str(fold_hashes[fold]),
                     setting_index=setting,
                     fold_index=fold,
+                    package_plan_sha256=package.package_plan_sha256,
+                    authorization_receipt_sha256=authorization.receipt_sha256,
+                    worker_plan_sha256=package.panel.workers[setting].receipt_sha256,
+                    training_activation_receipt_sha256=str(
+                        payload["training_activation_receipt_sha256"]
+                    ),
+                    panel_schedule_sha256=package.schedule.receipt_sha256,
+                    structural_slab_receipt_sha256=(
+                        package.artifacts.structural_slab_receipt_sha256
+                    ),
+                    action_operator_root_sha256=(
+                        package.artifacts.structural_action_operator_root_sha256
+                    ),
+                    target_operator_root_sha256=(
+                        package.artifacts.structural_target_operator_root_sha256
+                    ),
                 )
-                for fold in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
-            )
+            for fold in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
         )
+        all_adequacy.append(tuple(row[0] for row in recomputed_folds))
+        all_folds.append(tuple(row[1] for row in recomputed_folds))
     if len(source_roots) != 1:
         raise M03RV16TrainingAggregateError("V16 training source roots diverged")
-    primary_rows = all_adequacy[M03R_V16_PREDICTIVE_SPEC.primary_setting_index]
-    adequate = all(row.status == "adequate" for row in primary_rows)
+    # A paired target comparison is only valid when every control and primary
+    # fold has an adequate terminal fit.
+    adequate = all(
+        row.status == "adequate"
+        for setting_rows in all_adequacy
+        for row in setting_rows
+    )
+    status_inventory = tuple(
+        row.status for setting_rows in all_adequacy for row in setting_rows
+    )
+    if adequate:
+        next_action = "qualification-only-execution"
+    elif set(status_inventory).issubset({"adequate", "still-improving"}):
+        next_action = "fresh-longer-training-protocol"
+    elif "numerically-invalid" in status_inventory:
+        next_action = "numerical-investigation"
+    else:
+        next_action = "fit-pathology-investigation"
+
+    # Close every terminal checkpoint before issuing any authority that may
+    # open an outer origin.  A failure here leaves qualification unauthorized.
+    checkpoint_matrix: list[tuple[str, str, str, str, str]] = []
+    geometries = render_m03r_v16_fold_geometries(1001)
+    if adequate:
+        for setting, (terminal_path, folds) in enumerate(
+            zip(training_terminal_paths, all_folds, strict=True)
+        ):
+            root = terminal_path.parent
+            checkpoint_rows: list[str] = []
+            for geometry, fold in zip(geometries, folds, strict=True):
+                checkpoint_sha = str(fold["checkpoint_file_sha256"])
+                policy = Top2000M03RV16PredictivePolicy(setting)
+                load_m03r_v16_epoch_checkpoint_for_evaluation(
+                    root
+                    / "checkpoints"
+                    / (
+                        f"fold-{geometry.fold_index:02d}-epoch-"
+                        f"{M03R_V16_PREDICTIVE_SPEC.score_training_epochs:02d}.pt"
+                    ),
+                    expected_file_sha256=checkpoint_sha,
+                    expected_setting_index=setting,
+                    expected_fold_index=geometry.fold_index,
+                    expected_epoch_index=(
+                        M03R_V16_PREDICTIVE_SPEC.score_training_epochs - 1
+                    ),
+                    expected_completed_score_updates=(
+                        geometry.maximum_optimizer_updates
+                    ),
+                    expected_panel_schedule_sha256=package.schedule.receipt_sha256,
+                    expected_selection_target_operator_root_sha256=(
+                        package.artifacts.structural_target_operator_root_sha256
+                    ),
+                    expected_action_operator_root_sha256=(
+                        package.artifacts.structural_action_operator_root_sha256
+                    ),
+                    expected_source_array_sha256=str(
+                        fold["checkpoint_source_array_sha256"]
+                    ),
+                    expected_asset_axis_sha256=package.artifacts.asset_axis_sha256,
+                    policy=policy,
+                )
+                checkpoint_rows.append(checkpoint_sha)
+            checkpoint_matrix.append(tuple(checkpoint_rows))  # type: ignore[arg-type]
+    closure_unsigned = {
+        "schema": "rl-quant.top2000-dev.m03r-v16-prequalification-closure-v1",
+        "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
+        "package_plan_sha256": package.package_plan_sha256,
+        "training_terminal_file_sha256": training_terminal_file_sha256,
+        "terminal_checkpoint_file_sha256": tuple(checkpoint_matrix),
+        "all_setting_folds_adequate": adequate,
+        "outer_qualification_outcomes_accessed": False,
+    }
+    closure_receipt = semantic_sha256(closure_unsigned)
     output = Path(output_root)
     output.mkdir(mode=0o750, parents=True, exist_ok=False)
     unsigned = {
@@ -249,13 +434,14 @@ def aggregate_m03r_v16_training_panel(
         "setting_fold_adequacy_status": tuple(
             tuple(row.status for row in setting_rows) for setting_rows in all_adequacy
         ),
-        "primary_training_adequacy": (
-            "adequate" if adequate else "inconclusive-undertrained"
-        ),
+        "primary_training_adequacy": all_adequacy[
+            M03R_V16_PREDICTIVE_SPEC.primary_setting_index
+        ][0].status if not adequate else "adequate",
+        "all_setting_folds_adequate": adequate,
+        "terminal_checkpoint_file_sha256": tuple(checkpoint_matrix),
+        "prequalification_closure_receipt_sha256": closure_receipt,
         "outer_qualification_authorized": adequate,
-        "next_research_action": (
-            "qualification-only-execution" if adequate else "longer-training-protocol"
-        ),
+        "next_research_action": next_action,
         "source_tree_root_sha256": next(iter(source_roots)),
         "outer_qualification_outcomes_accessed": False,
         "economic_generation_may_be_minted": False,
@@ -269,14 +455,32 @@ def aggregate_m03r_v16_training_panel(
     panel_file_sha = _write(output / "training-panel-decision.json", panel)
     result = {**panel, "panel_file_sha256": panel_file_sha}
     if adequate:
-        activation = issue_m03r_v16_qualification_activation(
+        activation = _issue_m03r_v16_qualification_activation_from_panel(
             package=package,
             authorization=authorization,
             training_panel_receipt_sha256=str(panel["receipt_sha256"]),
+            training_panel_file_sha256=panel_file_sha,
             training_terminal_file_sha256=training_terminal_file_sha256,
-            primary_training_adequacy_receipt_sha256=tuple(
-                row.receipt_sha256 for row in primary_rows
+            setting_fold_training_adequacy_receipt_sha256=cast(
+                tuple[
+                    tuple[str, str, str, str, str],
+                    tuple[str, str, str, str, str],
+                    tuple[str, str, str, str, str],
+                ],
+                tuple(
+                    tuple(row.receipt_sha256 for row in setting_rows)
+                    for setting_rows in all_adequacy
+                ),
             ),
+            terminal_checkpoint_file_sha256=cast(
+                tuple[
+                    tuple[str, str, str, str, str],
+                    tuple[str, str, str, str, str],
+                    tuple[str, str, str, str, str],
+                ],
+                tuple(checkpoint_matrix),
+            ),
+            prequalification_closure_receipt_sha256=closure_receipt,
             source_tree_root_sha256=next(iter(source_roots)),
         )
         result["qualification_activation_file_sha256"] = (

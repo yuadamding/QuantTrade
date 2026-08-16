@@ -8,14 +8,27 @@ import io
 import json
 import os
 import stat
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes as _canonical,
+)
+from rl_quant.protocol.canonical_artifact import (
     semantic_sha256 as _sha256,
+)
+from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_PREDICTIVE_SPEC,
+)
+from rl_quant.training.top2000_m03r_v16_activation import (
+    M03RV16QualificationActivation,
+    load_m03r_v16_qualification_activation,
+)
+from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
+    M03RV16CohortTrace,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
@@ -23,24 +36,14 @@ from rl_quant.training.top2000_m03r_v16_package import (
     load_m03r_v16_execution_authorization,
     load_m03r_v16_package_plan,
 )
-from rl_quant.training.top2000_m03r_v16_activation import (
-    M03RV16QualificationActivation,
-    load_m03r_v16_qualification_activation,
-)
 from rl_quant.training.top2000_m03r_v16_selection import (
     M03RV16BootstrapPlan,
     M03RV16PredictiveQualification,
     M03RV16ReconciledFoldEvidence,
-    build_m03r_v16_panel_decision,
     build_m03r_v16_bootstrap_plan,
+    build_m03r_v16_panel_decision,
     qualify_m03r_v16_reconciled_evidence,
     write_m03r_v16_panel_decision,
-)
-from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
-    M03RV16CohortTrace,
-)
-from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
-    M03R_V16_PREDICTIVE_SPEC,
 )
 from rl_quant.workflows.top2000_m03r_v16_predictive import (
     M03R_V16_FOLD_TERMINAL_SCHEMA,
@@ -49,7 +52,7 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
 )
 
 M03R_V16_PANEL_AGGREGATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v3"
+    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v4"
 )
 _MAX_TERMINAL_BYTES = 16 * 1024**2
 _MAX_ARTIFACT_BYTES = 256 * 1024**2
@@ -254,6 +257,14 @@ def _worker_terminal(
     except (KeyError, TypeError, ValueError) as exc:
         raise M03RV16AggregateError("V16 worker terminal is incomplete") from exc
     worker = package.panel.workers[setting_index]
+    for name in (
+        "rendered_manifest_sha256",
+        "pod_template_sha256",
+        "launch_authority_receipt_sha256",
+        "admitted_job_authority_receipt_sha256",
+        "qualification_inputs_complete_file_sha256",
+    ):
+        _digest(name, str(payload.get(name)))
     if (
         payload.get("schema") != M03R_V16_WORKER_TERMINAL_SCHEMA
         or receipt_sha256 != _sha256(unsigned)
@@ -264,6 +275,10 @@ def _worker_terminal(
         != qualification_activation.receipt_sha256
         or payload.get("training_terminal_file_sha256")
         != qualification_activation.training_terminal_file_sha256[setting_index]
+        or not payload.get("job_uid")
+        or len(tuple(payload.get("pod_uids", ()))) != 3
+        or payload.get("prequalification_closure_receipt_sha256")
+        != qualification_activation.prequalification_closure_receipt_sha256
         or payload.get("worker_plan_sha256") != worker.receipt_sha256
         or payload.get("setting_index") != setting_index
         or payload.get("setting_id") != worker.setting_id
@@ -321,6 +336,10 @@ def _fold_evidence(
         ("qualification_trace_sha256", trace_sha256),
         ("terminal_checkpoint_authority_sha256", terminal_authority),
         ("qualified_score_authority_sha256", score_authority),
+        (
+            "qualification_inputs_complete_file_sha256",
+            str(fold_terminal.get("qualification_inputs_complete_file_sha256")),
+        ),
     ):
         _digest(name, value)
     if (
@@ -331,6 +350,11 @@ def _fold_evidence(
         != authorization.receipt_sha256
         or fold_terminal.get("qualification_activation_receipt_sha256")
         != qualification_activation.receipt_sha256
+        or fold_terminal.get("prequalification_closure_receipt_sha256")
+        != qualification_activation.prequalification_closure_receipt_sha256
+        or not isinstance(
+            fold_terminal.get("qualification_inputs_complete_file_sha256"), str
+        )
         or fold_terminal.get("worker_plan_sha256") != worker.receipt_sha256
         or fold_terminal.get("setting_index") != setting_index
         or fold_terminal.get("setting_id") != worker.setting_id
@@ -453,6 +477,8 @@ def aggregate_m03r_v16_panel(
     execution_authorization_file_sha256: str,
     qualification_activation_path: str | Path,
     qualification_activation_file_sha256: str,
+    training_panel_path: str | Path,
+    training_terminal_paths: tuple[Path, Path, Path],
     worker_terminal_paths: tuple[Path, Path, Path],
     worker_terminal_file_sha256: tuple[str, str, str],
     output_root: str | Path,
@@ -472,6 +498,8 @@ def aggregate_m03r_v16_panel(
             expected_file_sha256=qualification_activation_file_sha256,
             package=package,
             authorization=authorization,
+            training_panel_path=training_panel_path,
+            training_terminal_paths=training_terminal_paths,
         )
     )
     terminal_payloads = tuple(
@@ -528,7 +556,9 @@ def aggregate_m03r_v16_panel(
         bootstrap,
         primary_training_adequacy="adequate",
         primary_training_adequacy_receipt_sha256=(
-            qualification_activation.primary_training_adequacy_receipt_sha256
+            qualification_activation.setting_fold_training_adequacy_receipt_sha256[
+                M03R_V16_PREDICTIVE_SPEC.primary_setting_index
+            ]
         ),
     )
     output = Path(output_root)
@@ -563,7 +593,9 @@ def aggregate_m03r_v16_panel(
         "panel_decision_receipt_sha256": decision.receipt_sha256,
         "primary_training_adequacy": "adequate",
         "primary_training_adequacy_receipt_sha256": (
-            qualification_activation.primary_training_adequacy_receipt_sha256
+            qualification_activation.setting_fold_training_adequacy_receipt_sha256[
+                M03R_V16_PREDICTIVE_SPEC.primary_setting_index
+            ]
         ),
         "primary_hypothesis_passed": decision.primary_hypothesis_passed,
         "next_research_action": decision.next_research_action,
@@ -593,6 +625,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--execution-authorization-file-sha256", required=True)
     parser.add_argument("--qualification-activation", required=True)
     parser.add_argument("--qualification-activation-file-sha256", required=True)
+    parser.add_argument("--training-panel", required=True)
+    parser.add_argument("--training-terminal", action="append", required=True)
     parser.add_argument("--worker-terminal", action="append", required=True)
     parser.add_argument(
         "--worker-terminal-file-sha256", action="append", required=True
@@ -603,7 +637,11 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if len(args.worker_terminal) != 3 or len(args.worker_terminal_file_sha256) != 3:
+    if (
+        len(args.worker_terminal) != 3
+        or len(args.worker_terminal_file_sha256) != 3
+        or len(args.training_terminal) != 3
+    ):
         raise M03RV16AggregateError("V16 aggregate requires three worker terminals")
     aggregate_m03r_v16_panel(
         package_plan_path=args.package_plan,
@@ -615,6 +653,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         qualification_activation_path=args.qualification_activation,
         qualification_activation_file_sha256=(
             args.qualification_activation_file_sha256
+        ),
+        training_panel_path=args.training_panel,
+        training_terminal_paths=(
+            Path(args.training_terminal[0]),
+            Path(args.training_terminal[1]),
+            Path(args.training_terminal[2]),
         ),
         worker_terminal_paths=(
             Path(args.worker_terminal[0]),

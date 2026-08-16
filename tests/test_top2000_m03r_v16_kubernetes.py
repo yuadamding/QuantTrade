@@ -1,23 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 import torch
-import rl_quant.training.top2000_m03r_v16_kubernetes as kubernetes_runtime
-import rl_quant.training.top2000_m03r_v16_cohort_runtime as cohort_runtime
 
-from rl_quant.protocol.canonical_artifact import semantic_sha256
-from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes, file_sha256
+import rl_quant.training.top2000_m03r_v16_cohort_runtime as cohort_runtime
+import rl_quant.training.top2000_m03r_v16_kubernetes as kubernetes_runtime
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256,
+)
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_SETTINGS,
 )
-
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
     M03RV7KubernetesTemplateConfig,
+)
+from rl_quant.training.top2000_m03r_v16_activation import (
+    M03R_V16_ADMITTED_MANIFEST_SCHEMA,
+    M03R_V16_DRY_RUN_RESULT_SCHEMA,
+    _issue_m03r_v16_admitted_job_authority,
+    _issue_m03r_v16_qualification_activation_from_panel,
+    admitted_job_authority_file_sha256,
+    load_m03r_v16_admitted_job_authority,
+    load_m03r_v16_phase_launch_authority,
+    write_m03r_v16_admitted_job_authority,
+    write_m03r_v16_qualification_activation,
+)
+from rl_quant.training.top2000_m03r_v16_capacity import (
+    M03RV16CapacityRankEvidence,
+    build_m03r_v16_capacity_terminal,
+)
+from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
+    M03RV16CohortTrace,
 )
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16PanelSchedule,
@@ -27,24 +46,15 @@ from rl_quant.training.top2000_m03r_v16_kubernetes import (
     M03RV16CapacityGateQualification,
     M03RV16KubernetesError,
     M03RV16StaticGateQualification,
+    bind_m03r_v16_admitted_launch_authority,
+    issue_m03r_v16_training_activation_from_gates,
     load_and_issue_m03r_v16_capacity_gate,
     load_and_issue_m03r_v16_static_gate,
-    issue_m03r_v16_training_activation_from_gates,
     render_m03r_v16_suspended_capacity_job,
     render_m03r_v16_suspended_qualification_job,
     render_m03r_v16_suspended_static_job,
     render_m03r_v16_suspended_training_job,
-)
-from rl_quant.training.top2000_m03r_v16_capacity import (
-    M03RV16CapacityRankEvidence,
-    build_m03r_v16_capacity_terminal,
-)
-from rl_quant.training.top2000_m03r_v16_activation import (
-    issue_m03r_v16_qualification_activation,
-    write_m03r_v16_qualification_activation,
-)
-from rl_quant.training.top2000_m03r_v16_static_contract import (
-    M03R_V16_STATIC_RESULT_SCHEMA,
+    write_m03r_v16_rendered_launch_authority,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
@@ -59,8 +69,8 @@ from rl_quant.training.top2000_m03r_v16_selection import (
     build_m03r_v16_bootstrap_plan,
     qualify_m03r_v16_reconciled_evidence,
 )
-from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
-    M03RV16CohortTrace,
+from rl_quant.training.top2000_m03r_v16_static_contract import (
+    M03R_V16_STATIC_RESULT_SCHEMA,
 )
 from rl_quant.workflows.top2000_m03r_v16_aggregate import (
     M03RV16AggregateError,
@@ -137,7 +147,7 @@ def _surfaces() -> tuple[
 def _template(name: str) -> M03RV7KubernetesTemplateConfig:
     return M03RV7KubernetesTemplateConfig(
         job_name=name,
-        run_id="m03r-v16-v7-local-contract",
+        run_id="m03r-v16-v8-local-contract",
         service_account_name="default",
         pvc_claim_name="research-pvc",
         package_mount_path="/mnt/package",
@@ -210,7 +220,31 @@ def _capacity_rank(rank: int) -> M03RV16CapacityRankEvidence:
     )
 
 
-def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel() -> None:
+def _qualification_activation(package, authorization, source_root):
+    adequacy = tuple(
+        tuple(f"{20 + setting * 5 + fold:064x}" for fold in range(5))
+        for setting in range(3)
+    )
+    checkpoints = tuple(
+        tuple(f"{40 + setting * 5 + fold:064x}" for fold in range(5))
+        for setting in range(3)
+    )
+    return _issue_m03r_v16_qualification_activation_from_panel(
+        package=package,
+        authorization=authorization,
+        training_panel_receipt_sha256="6" * 64,
+        training_panel_file_sha256="7" * 64,
+        training_terminal_file_sha256=("3" * 64, "4" * 64, "5" * 64),
+        setting_fold_training_adequacy_receipt_sha256=adequacy,
+        terminal_checkpoint_file_sha256=checkpoints,
+        prequalification_closure_receipt_sha256="9" * 64,
+        source_tree_root_sha256=source_root,
+    )
+
+
+def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
+    tmp_path: Path,
+) -> None:
     package, authorization, plan_file, authorization_file = _surfaces()
     static_job = render_m03r_v16_suspended_static_job(
         package=package,  # type: ignore[arg-type]
@@ -234,6 +268,63 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel() -> None:
         authorization_file_sha256=authorization_file,
         template=_template("m03r-v16-capacity"),
         static=static,
+    )
+    dry_unsigned = {
+        "schema": M03R_V16_DRY_RUN_RESULT_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "phase": "capacity",
+        "job_contract_sha256": capacity_job.job_contract_sha256,
+        "pod_contract_sha256": capacity_job.pod_contract_sha256,
+        "passed": True,
+    }
+    dry_result = {
+        **dry_unsigned,
+        "receipt_sha256": semantic_sha256(dry_unsigned),
+    }
+    dry_path = tmp_path / "capacity-dry-run.json"
+    dry_path.write_bytes(canonical_json_file_bytes(dry_result))
+    admitted_unsigned = {
+        "schema": M03R_V16_ADMITTED_MANIFEST_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "phase": "capacity",
+        "job_contract_sha256": capacity_job.job_contract_sha256,
+        "pod_contract_sha256": capacity_job.pod_contract_sha256,
+        "job_uid": "capacity-job-uid",
+        "pod_uids": ["capacity-pod-uid"],
+        "container_image_ids": [package.artifacts.image_reference],
+        "node_names": ["capacity-node"],
+        "suspended_at_admission": True,
+    }
+    admitted_result = {
+        **admitted_unsigned,
+        "receipt_sha256": semantic_sha256(admitted_unsigned),
+    }
+    admitted_path = tmp_path / "capacity-admitted-manifest.json"
+    admitted_path.write_bytes(canonical_json_file_bytes(admitted_result))
+    admission = _issue_m03r_v16_admitted_job_authority(
+        package=package,
+        authorization=authorization,
+        phase="capacity",
+        run_id="m03r-v16-v8-local-contract",
+        job_contract_sha256=capacity_job.job_contract_sha256,
+        pod_contract_sha256=capacity_job.pod_contract_sha256,
+        server_side_dry_run_file_sha256=file_sha256(dry_path),
+        server_side_dry_run_receipt_sha256=dry_result["receipt_sha256"],
+        admitted_manifest_file_sha256=file_sha256(admitted_path),
+        admitted_manifest_sha256=admitted_result["receipt_sha256"],
+        job_uid="capacity-job-uid",
+        pod_uids=("capacity-pod-uid",),
+        container_image_ids=(package.artifacts.image_reference,),
+        node_names=("capacity-node",),
+    )
+    admission_file = admitted_job_authority_file_sha256(admission)
+    capacity_job = bind_m03r_v16_admitted_launch_authority(
+        rendered=capacity_job,
+        package=package,
+        authorization=authorization,
+        admission=admission,
+        admission_file_sha256=admission_file,
+        source_tree_root_sha256=static.source_tree_root_sha256,
     )
     assert capacity_job.maximum_gpu_requests == 2
     capacity = _capacity_gate(
@@ -261,15 +352,114 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel() -> None:
     assert predictive.maximum_gpu_requests == 6
     assert predictive.manifest["spec"]["suspend"] is True
     assert predictive.activation_authorized is False
-    qualification_activation = issue_m03r_v16_qualification_activation(
+    assert predictive.launch_authority is None
+    dry_run_unsigned = {
+        "schema": M03R_V16_DRY_RUN_RESULT_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "phase": "training",
+        "job_contract_sha256": predictive.job_contract_sha256,
+        "pod_contract_sha256": predictive.pod_contract_sha256,
+        "passed": True,
+    }
+    dry_run = {
+        **dry_run_unsigned,
+        "receipt_sha256": semantic_sha256(dry_run_unsigned),
+    }
+    dry_run_path = tmp_path / "training-dry-run.json"
+    dry_run_file_sha256 = _write_immutable_json(dry_run_path, dry_run)
+    admitted_unsigned = {
+        "schema": M03R_V16_ADMITTED_MANIFEST_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "phase": "training",
+        "job_contract_sha256": predictive.job_contract_sha256,
+        "pod_contract_sha256": predictive.pod_contract_sha256,
+        "job_uid": "job-uid-1",
+        "pod_uids": ["pod-uid-0", "pod-uid-1", "pod-uid-2"],
+        "container_image_ids": [package.artifacts.image_reference] * 3,
+        "node_names": ["node-0", "node-1", "node-2"],
+        "suspended_at_admission": True,
+    }
+    admitted_result = {
+        **admitted_unsigned,
+        "receipt_sha256": semantic_sha256(admitted_unsigned),
+    }
+    admitted_result_path = tmp_path / "training-admitted-manifest.json"
+    admitted_result_file_sha256 = _write_immutable_json(
+        admitted_result_path, admitted_result
+    )
+    admission = _issue_m03r_v16_admitted_job_authority(
         package=package,
         authorization=authorization,
-        training_panel_receipt_sha256="6" * 64,
-        training_terminal_file_sha256=("3" * 64, "4" * 64, "5" * 64),
-        primary_training_adequacy_receipt_sha256=tuple(
-            f"{index + 20:064x}" for index in range(5)
+        phase="training",
+        run_id="m03r-v16-v8-local-contract",
+        job_contract_sha256=predictive.job_contract_sha256,
+        pod_contract_sha256=predictive.pod_contract_sha256,
+        server_side_dry_run_file_sha256=dry_run_file_sha256,
+        server_side_dry_run_receipt_sha256=dry_run["receipt_sha256"],
+        admitted_manifest_file_sha256=admitted_result_file_sha256,
+        admitted_manifest_sha256=admitted_result["receipt_sha256"],
+        job_uid="job-uid-1",
+        pod_uids=("pod-uid-0", "pod-uid-1", "pod-uid-2"),
+        container_image_ids=(
+            package.artifacts.image_reference,
+            package.artifacts.image_reference,
+            package.artifacts.image_reference,
         ),
+        node_names=("node-0", "node-1", "node-2"),
+    )
+    admission_path = tmp_path / "training-admission.json"
+    admission_file_sha256 = write_m03r_v16_admitted_job_authority(
+        admission_path, admission
+    )
+    assert admission_file_sha256 == admitted_job_authority_file_sha256(admission)
+    assert load_m03r_v16_admitted_job_authority(
+        admission_path,
+        expected_file_sha256=admission_file_sha256,
+        expected_receipt_sha256=admission.receipt_sha256,
+        package=package,
+        authorization=authorization,
+        expected_phase="training",
+        expected_job_contract_sha256=predictive.job_contract_sha256,
+        expected_pod_contract_sha256=predictive.pod_contract_sha256,
+        server_side_dry_run_path=dry_run_path,
+        admitted_manifest_path=admitted_result_path,
+    ) == admission
+    predictive = bind_m03r_v16_admitted_launch_authority(
+        rendered=predictive,
+        package=package,
+        authorization=authorization,
+        admission=admission,
+        admission_file_sha256=admission_file_sha256,
         source_tree_root_sha256=capacity.source_tree_root_sha256,
+    )
+    assert predictive.launch_authority is not None
+    assert predictive.launch_authority.job_contract_sha256 == (
+        predictive.job_contract_sha256
+    )
+    launch_path = tmp_path / "training-launch.json"
+    assert write_m03r_v16_rendered_launch_authority(
+        launch_path, predictive
+    ) == predictive.launch_authority_file_sha256
+    assert load_m03r_v16_phase_launch_authority(
+        launch_path,
+        expected_file_sha256=predictive.launch_authority_file_sha256,
+        expected_receipt_sha256=predictive.launch_authority.receipt_sha256,
+        package=package,
+        authorization=authorization,
+        expected_phase="training",
+        expected_prerequisite_receipt_sha256=activation.receipt_sha256,
+        expected_job_contract_sha256=predictive.job_contract_sha256,
+        expected_pod_contract_sha256=predictive.pod_contract_sha256,
+        admission=admission,
+        expected_admission_file_sha256=admission_file_sha256,
+    ) == predictive.launch_authority
+    worker_args = predictive.manifest["spec"]["template"]["spec"]["containers"][0][
+        "args"
+    ]
+    assert "--launch-authority" in worker_args
+    assert "--rendered-manifest-sha256" in worker_args
+    qualification_activation = _qualification_activation(
+        package, authorization, capacity.source_tree_root_sha256
     )
     qualification_job = render_m03r_v16_suspended_qualification_job(
         package=package,
@@ -372,6 +562,62 @@ def test_v16_gate_authorities_are_issued_from_exact_result_files(
         template=_template("m03r-v16-capacity-issued"),
         static=static,
     )
+    dry_unsigned = {
+        "schema": M03R_V16_DRY_RUN_RESULT_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "phase": "capacity",
+        "job_contract_sha256": capacity_job.job_contract_sha256,
+        "pod_contract_sha256": capacity_job.pod_contract_sha256,
+        "passed": True,
+    }
+    dry_result = {
+        **dry_unsigned,
+        "receipt_sha256": semantic_sha256(dry_unsigned),
+    }
+    dry_path = tmp_path / "capacity-issued-dry-run.json"
+    dry_path.write_bytes(canonical_json_file_bytes(dry_result))
+    admitted_unsigned = {
+        "schema": M03R_V16_ADMITTED_MANIFEST_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "phase": "capacity",
+        "job_contract_sha256": capacity_job.job_contract_sha256,
+        "pod_contract_sha256": capacity_job.pod_contract_sha256,
+        "job_uid": "capacity-issued-job-uid",
+        "pod_uids": ["capacity-issued-pod-uid"],
+        "container_image_ids": [package.artifacts.image_reference],
+        "node_names": ["capacity-issued-node"],
+        "suspended_at_admission": True,
+    }
+    admitted_result = {
+        **admitted_unsigned,
+        "receipt_sha256": semantic_sha256(admitted_unsigned),
+    }
+    admitted_path = tmp_path / "capacity-issued-admitted-manifest.json"
+    admitted_path.write_bytes(canonical_json_file_bytes(admitted_result))
+    admission = _issue_m03r_v16_admitted_job_authority(
+        package=package,
+        authorization=authorization,
+        phase="capacity",
+        run_id="m03r-v16-v8-local-contract",
+        job_contract_sha256=capacity_job.job_contract_sha256,
+        pod_contract_sha256=capacity_job.pod_contract_sha256,
+        server_side_dry_run_file_sha256=file_sha256(dry_path),
+        server_side_dry_run_receipt_sha256=dry_result["receipt_sha256"],
+        admitted_manifest_file_sha256=file_sha256(admitted_path),
+        admitted_manifest_sha256=admitted_result["receipt_sha256"],
+        job_uid="capacity-issued-job-uid",
+        pod_uids=("capacity-issued-pod-uid",),
+        container_image_ids=(package.artifacts.image_reference,),
+        node_names=("capacity-issued-node",),
+    )
+    capacity_job = bind_m03r_v16_admitted_launch_authority(
+        rendered=capacity_job,
+        package=package,
+        authorization=authorization,
+        admission=admission,
+        admission_file_sha256=admitted_job_authority_file_sha256(admission),
+        source_tree_root_sha256=source_tree_root,
+    )
     terminal = build_m03r_v16_capacity_terminal(
         (_capacity_rank(0), _capacity_rank(1))
     )
@@ -380,6 +626,14 @@ def test_v16_gate_authorities_are_issued_from_exact_result_files(
         "package_plan_sha256": package.package_plan_sha256,
         "authorization_receipt_sha256": authorization.receipt_sha256,
         "source_tree_root_sha256": source_tree_root,
+        "rendered_manifest_sha256": capacity_job.job_contract_sha256,
+        "pod_template_sha256": capacity_job.pod_contract_sha256,
+        "launch_authority_receipt_sha256": (
+            capacity_job.launch_authority.receipt_sha256
+        ),
+        "admitted_job_authority_receipt_sha256": admission.receipt_sha256,
+        "job_uid": admission.job_uid,
+        "pod_uids": admission.pod_uids,
         "capacity": asdict(terminal),
         "capacity_receipt_sha256": terminal.receipt_sha256,
         "scientific_training_performed": False,
@@ -545,16 +799,56 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         for row in geometries
     )
     bootstrap = build_m03r_v16_bootstrap_plan(decisions, executions)
-    training_terminal_hashes = ("3" * 64, "4" * 64, "5" * 64)
-    qualification_activation = issue_m03r_v16_qualification_activation(
+    source_root = "7" * 64
+    training_evidence_paths = tuple(
+        tmp_path / f"training-terminal-{index}.json" for index in range(3)
+    )
+    for path in training_evidence_paths:
+        path.write_bytes(
+            canonical_json_file_bytes(
+                {
+                    "package_plan_sha256": package.package_plan_sha256,
+                    "authorization_receipt_sha256": authorization.receipt_sha256,
+                    "source_tree_root_sha256": source_root,
+                }
+            )
+        )
+    training_terminal_hashes = tuple(
+        file_sha256(path) for path in training_evidence_paths
+    )
+    adequacy_matrix = tuple(
+        tuple(f"{20 + setting * 5 + fold:064x}" for fold in range(5))
+        for setting in range(3)
+    )
+    checkpoint_matrix = tuple(
+        tuple(f"{40 + setting * 5 + fold:064x}" for fold in range(5))
+        for setting in range(3)
+    )
+    panel_unsigned = {
+        "package_plan_sha256": package.package_plan_sha256,
+        "execution_authorization_receipt_sha256": authorization.receipt_sha256,
+        "source_tree_root_sha256": source_root,
+        "outer_qualification_authorized": True,
+        "setting_fold_adequacy_receipt_sha256": adequacy_matrix,
+        "terminal_checkpoint_file_sha256": checkpoint_matrix,
+        "prequalification_closure_receipt_sha256": "9" * 64,
+    }
+    panel_payload = {
+        **panel_unsigned,
+        "receipt_sha256": semantic_sha256(panel_unsigned),
+    }
+    training_panel_path = tmp_path / "training-panel-decision.json"
+    training_panel_path.write_bytes(canonical_json_file_bytes(panel_payload))
+    qualification_activation = _issue_m03r_v16_qualification_activation_from_panel(
         package=package,
         authorization=authorization,
-        training_panel_receipt_sha256="6" * 64,
-        training_terminal_file_sha256=training_terminal_hashes,
-        primary_training_adequacy_receipt_sha256=tuple(
-            f"{index + 20:064x}" for index in range(5)
-        ),
-        source_tree_root_sha256="7" * 64,
+        training_panel_receipt_sha256=panel_payload["receipt_sha256"],
+        training_panel_file_sha256=file_sha256(training_panel_path),
+        training_terminal_file_sha256=training_terminal_hashes,  # type: ignore[arg-type]
+        setting_fold_training_adequacy_receipt_sha256=adequacy_matrix,  # type: ignore[arg-type]
+        terminal_checkpoint_file_sha256=checkpoint_matrix,  # type: ignore[arg-type]
+        prequalification_closure_receipt_sha256="9" * 64,
+        source_tree_root_sha256=source_root,
     )
     activation_path = plans / "qualification-activation.json"
     activation_file_sha = write_m03r_v16_qualification_activation(
@@ -608,6 +902,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
                 "qualification_activation_receipt_sha256": (
                     qualification_activation.receipt_sha256
                 ),
+                "qualification_inputs_complete_file_sha256": "a" * 64,
+                "prequalification_closure_receipt_sha256": "9" * 64,
                 "training_terminal_file_sha256": training_terminal_hashes[index],
                 "worker_plan_sha256": worker.receipt_sha256,
                 "setting_index": index,
@@ -649,6 +945,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             "qualification_activation_receipt_sha256": (
                 qualification_activation.receipt_sha256
             ),
+            "qualification_inputs_complete_file_sha256": "a" * 64,
+            "prequalification_closure_receipt_sha256": "9" * 64,
             "training_terminal_file_sha256": training_terminal_hashes[index],
             "worker_plan_sha256": worker.receipt_sha256,
             "startup_file_sha256": "e" * 64,
@@ -663,6 +961,12 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
                 qualification.primary_hypothesis_passed
             ),
             "three_seed_confirmation_may_be_minted": False,
+            "rendered_manifest_sha256": "b" * 64,
+            "pod_template_sha256": "c" * 64,
+            "launch_authority_receipt_sha256": "d" * 64,
+            "admitted_job_authority_receipt_sha256": "e" * 64,
+            "job_uid": "job-uid",
+            "pod_uids": ("pod-0", "pod-1", "pod-2"),
             "economic_generation_may_be_minted": False,
             "reinforcement_learning_authorized": False,
             "outer_2026_accessed": False,
@@ -684,6 +988,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         execution_authorization_file_sha256=authorization_file,
         qualification_activation_path=activation_path,
         qualification_activation_file_sha256=activation_file_sha,
+        training_panel_path=training_panel_path,
+        training_terminal_paths=training_evidence_paths,  # type: ignore[arg-type]
         worker_terminal_paths=(
             terminal_paths[0],
             terminal_paths[1],
@@ -711,6 +1017,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             execution_authorization_file_sha256=authorization_file,
             qualification_activation_path=activation_path,
             qualification_activation_file_sha256=activation_file_sha,
+            training_panel_path=training_panel_path,
+            training_terminal_paths=training_evidence_paths,  # type: ignore[arg-type]
             worker_terminal_paths=(
                 terminal_paths[0],
                 terminal_paths[1],

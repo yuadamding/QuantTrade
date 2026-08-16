@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v7 revision; older v16 source and
+current local protocol is the result-moving v8 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -181,8 +181,9 @@ static gate
 -> capacity gate
 -> private training activation
 -> training-only workers for R0/R1/R2
--> independent R2 adequacy aggregate
--> private qualification activation, only when all R2 folds are adequate
+-> independent paired-panel adequacy aggregate
+-> strict CPU closure of all 15 terminal checkpoints
+-> private qualification activation, only when all 15 fits are adequate
 -> qualification-only workers
 -> independent final panel aggregate
 ```
@@ -191,9 +192,12 @@ Training-only workers publish checkpoints, fit trajectories, terminal
 checkpoint authorities, and adequacy receipts. They are forbidden to construct
 qualification states, risk states, scores, returns, cohort traces, or any outer
 artifact. The adequacy aggregate independently reconstructs all eight epoch
-receipts. If any primary R2 fold is inconclusive-undertrained, it issues no
-qualification activation and routes to a fresh longer-training protocol while
-the outer periods remain unopened.
+receipts and their two-rank update inventories. A still-improving fit routes
+to a fresh longer-training protocol; collapsed, overdispersed, clipping-
+dominated, and numerically invalid fits route to their distinct diagnostic
+actions. Any non-adequate fold prevents a complete paired-panel qualification,
+so underfit controls cannot be presented as clean target comparisons. Outer
+periods remain unopened.
 
 Qualification retains two distinct diagnostics:
 
@@ -287,18 +291,35 @@ transfer archive that rejects traversal, duplicates, links, devices, and hash
 drift. The same-image static validator explicitly performs no training and
 claims zero GPU visibility only. The package execution authorization permits
 static validation but grants neither training nor outer qualification.
-Privately issued phase activations are mandatory worker inputs. The worker
+Phase activations are issued from and later revalidated against the exact
+static/capacity result files or the exact training-panel decision and all three
+training terminals. Digest-only activation issuance is not a public API.
+Every H100 Job also receives a self-reference-free Job/Pod contract and an
+immutable admitted-Job authority backed by exact server-side-dry-run and
+admitted-manifest result files. Only that evidence can bind the phase launch
+authority to the Job/Pod contracts, Job UID, complete Pod UID/node/image
+inventory, predecessor evidence, run ID, phase, completion count, and source
+tree. Admission and launch files are mandatory worker inputs. The worker
 requires exactly two visible H100 80GB devices and either runs the disposable
 `train -> validation -> train` capacity path, runs training only, or performs
 checkpoint-owned qualification only from frozen adequate checkpoints.
 
 The training aggregate opens all three training terminals, all 15 training-fold
 terminals, and every epoch-fit receipt by exact hash. It independently
-reconstructs validation receipts and the adequacy classifier. Compact epoch
+reconstructs validation receipts, paired update evidence, and the adequacy classifier. Compact epoch
 trajectories retain loss, validation IC/spread, prediction/target dispersion,
-gradient norms, clipping, learning rates, and parameter-version evidence. A
-collapsed, overdispersed, pervasively clipped, or still-materially-improving R2
-fit routes to a fresh longer-training protocol without opening outer outcomes.
+gradient norms, clipping, learning rates, and parameter-version evidence.
+Only `still-improving` can authorize a fresh longer-training protocol;
+collapsed, overdispersed, clipping-dominated, and numerically invalid outcomes
+require their predeclared diagnostic paths.
+
+Before any outer origin is encoded, each qualification worker revalidates all
+five terminal checkpoints for its setting on CPU, validates all five risk-state
+inputs, and publishes one qualification-input-closure receipt. A corrupt later
+fold therefore prevents fold 0 access. Per-fold access markers and published
+artifact names are included in failure evidence. The structural slab is also
+wrapped in phase-scoped authorities: training access rejects qualification
+origins, and qualification access rejects optimizer/inner-validation origins.
 
 After qualification is separately authorized, the final aggregate opens all
 three qualification terminals, all 15 qualification-fold terminals, and all 15
@@ -314,12 +335,17 @@ zero-GPU static validation with no GPU resource key, one two-H100 capacity
 sentinel, a suspended three-completion training panel, and a separately
 suspended three-completion qualification panel. Capacity and scientific-phase
 rendering require privately issued authorities loaded from exact immutable
-result or activation files. Static and worker startup rehash the executing
+result or activation files. H100 workers require the matching launch authority
+and admitted-Job evidence, including exact lifecycle-result files and Job/Pod
+contract identities, rather than accepting missing manifest fields.
+Static and worker startup rehash the executing
 package source tree against its manifest. All Jobs
 remain suspended, fail-fast, token-unmounted, nonprivileged, digest-pinned,
 bounded by deadline/TTL, and mount only the scoped package/output PVC paths.
-Live admission binding, detached supervision, UID-bound cleanup, and any remote
-mutation are intentionally not implemented by this source-only revision.
+The source contract for live admission and Job/Pod UID binding is implemented;
+the external controller that captures those cluster facts, detached
+supervision, UID-bound cleanup, and any remote mutation are intentionally not
+executed by this source-only revision.
 
 No real-data package or slab receipt, same-image result, capacity result,
 remote Job, GPU result, or performance result is claimed. Those evidence gates

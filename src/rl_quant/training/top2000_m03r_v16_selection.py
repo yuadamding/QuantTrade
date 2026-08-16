@@ -13,12 +13,12 @@ from typing import Literal
 
 import torch
 
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTING_IDS,
 )
-from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
     M03RV16CohortTrace,
 )
@@ -29,10 +29,10 @@ from rl_quant.training.top2000_m03r_v16_qualification_runtime import (
 M03R_V16_BOOTSTRAP_PLAN_SCHEMA = "rl-quant.top2000-dev.m03r-v16-bootstrap-plan-v2"
 M03R_V16_QUALIFICATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-qualification-v3"
 M03R_V16_PANEL_DECISION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-decision-v2"
+    "rl-quant.top2000-dev.m03r-v16-panel-decision-v3"
 )
 M03R_V16_PANEL_DECISION_FILE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-decision-file-v2"
+    "rl-quant.top2000-dev.m03r-v16-panel-decision-file-v3"
 )
 _MAX_PANEL_DECISION_BYTES = 1024**2
 M03R_V16_BOOTSTRAP_BLOCK_SESSIONS = (
@@ -754,14 +754,11 @@ class M03RV16PanelDecision:
     primary_setting_index: int
     primary_setting_id: str
     primary_hypothesis_passed: bool
-    primary_training_adequacy: Literal[
-        "adequate", "inconclusive-undertrained"
-    ]
+    primary_training_adequacy: Literal["adequate"]
     primary_training_adequacy_receipt_sha256: tuple[str, ...]
     next_research_action: Literal[
         "three-seed-predictive-confirmation",
         "ordered-five-minute-representation",
-        "longer-training-protocol",
     ]
     daily_target_or_loss_tuning_authorized: bool = False
     economic_generation_may_be_minted: bool = False
@@ -784,13 +781,9 @@ class M03RV16PanelDecision:
         primary_index = M03R_V16_PREDICTIVE_SPEC.primary_setting_index
         primary_passed = qualifications[primary_index].primary_hypothesis_passed
         expected_action = (
-            "longer-training-protocol"
-            if self.primary_training_adequacy == "inconclusive-undertrained"
-            else (
-                "three-seed-predictive-confirmation"
-                if primary_passed
-                else "ordered-five-minute-representation"
-            )
+            "three-seed-predictive-confirmation"
+            if primary_passed
+            else "ordered-five-minute-representation"
         )
         if (
             len(qualifications) != len(M03R_V16_SETTING_IDS)
@@ -809,7 +802,7 @@ class M03RV16PanelDecision:
             or self.primary_setting_id != M03R_V16_SETTING_IDS[primary_index]
             or self.primary_hypothesis_passed != primary_passed
             or self.primary_training_adequacy
-            not in {"adequate", "inconclusive-undertrained"}
+            != "adequate"
             or len(self.primary_training_adequacy_receipt_sha256)
             != M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
             or self.next_research_action != expected_action
@@ -838,9 +831,7 @@ def build_m03r_v16_panel_decision(
     qualifications: tuple[M03RV16PredictiveQualification, ...],
     bootstrap: M03RV16BootstrapPlan,
     *,
-    primary_training_adequacy: Literal[
-        "adequate", "inconclusive-undertrained"
-    ],
+    primary_training_adequacy: Literal["adequate"],
     primary_training_adequacy_receipt_sha256: tuple[str, ...],
 ) -> M03RV16PanelDecision:
     ordered = tuple(sorted(qualifications, key=lambda row: row.setting_index))
@@ -865,13 +856,9 @@ def build_m03r_v16_panel_decision(
             primary_training_adequacy_receipt_sha256
         ),
         next_research_action=(
-            "longer-training-protocol"
-            if primary_training_adequacy == "inconclusive-undertrained"
-            else (
-                "three-seed-predictive-confirmation"
-                if primary_passed
-                else "ordered-five-minute-representation"
-            )
+            "three-seed-predictive-confirmation"
+            if primary_passed
+            else "ordered-five-minute-representation"
         ),
     )
     result.validate(ordered, bootstrap)
@@ -975,9 +962,9 @@ def load_m03r_v16_panel_decision(
 __all__ = [
     "M03R_V16_BOOTSTRAP_BLOCK_SESSIONS",
     "M03R_V16_BOOTSTRAP_PLAN_SCHEMA",
-    "M03R_V16_QUALIFICATION_SCHEMA",
     "M03R_V16_PANEL_DECISION_FILE_SCHEMA",
     "M03R_V16_PANEL_DECISION_SCHEMA",
+    "M03R_V16_QUALIFICATION_SCHEMA",
     "M03RV16BootstrapPlan",
     "M03RV16PanelDecision",
     "M03RV16PredictiveQualification",

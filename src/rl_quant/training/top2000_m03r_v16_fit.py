@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
@@ -18,9 +19,16 @@ from rl_quant.training.top2000_m03r_v16_validation_runtime import (
 
 M03R_V16_EPOCH_FIT_SCHEMA = "rl-quant.top2000-dev.m03r-v16-epoch-fit-v2"
 M03R_V16_TRAINING_ADEQUACY_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-training-adequacy-v2"
+    "rl-quant.top2000-dev.m03r-v16-training-adequacy-v3"
 )
-M03RV16TrainingAdequacyStatus = Literal["adequate", "inconclusive-undertrained"]
+M03RV16TrainingAdequacyStatus = Literal[
+    "adequate",
+    "still-improving",
+    "collapsed-output",
+    "overdispersed-output",
+    "optimizer-clipping-dominated",
+    "numerically-invalid",
+]
 
 
 class M03RV16FitError(ValueError):
@@ -50,6 +58,15 @@ class M03RV16TrainingAdequacy:
 
     def _expected_status(self) -> M03RV16TrainingAdequacyStatus:
         spec = M03R_V16_PREDICTIVE_SPEC
+        values = (
+            self.final_prediction_to_target_std_ratio,
+            self.recent_rank_ic_slope,
+            self.recent_robust_loss_relative_improvement,
+            self.recent_encoder_clip_fraction,
+            self.recent_selection_head_clip_fraction,
+        )
+        if not all(math.isfinite(value) for value in values):
+            return "numerically-invalid"
         still_improving = (
             self.recent_rank_ic_slope > spec.adequacy_rank_ic_slope_threshold
             or self.recent_robust_loss_relative_improvement
@@ -67,11 +84,15 @@ class M03RV16TrainingAdequacy:
             self.recent_encoder_clip_fraction,
             self.recent_selection_head_clip_fraction,
         ) > spec.adequacy_maximum_recent_clip_fraction
-        return (
-            "inconclusive-undertrained"
-            if collapsed or overdispersed or still_improving or pervasive_clipping
-            else "adequate"
-        )
+        if collapsed:
+            return "collapsed-output"
+        if overdispersed:
+            return "overdispersed-output"
+        if pervasive_clipping:
+            return "optimizer-clipping-dominated"
+        if still_improving:
+            return "still-improving"
+        return "adequate"
 
     def validate(self) -> None:
         finite = (
@@ -88,10 +109,22 @@ class M03RV16TrainingAdequacy:
             )
             or len(self.epoch_fit_receipt_sha256)
             != M03R_V16_PREDICTIVE_SPEC.score_training_epochs
-            or not all(math.isfinite(value) for value in finite)
-            or self.final_prediction_to_target_std_ratio < 0.0
-            or not 0.0 <= self.recent_encoder_clip_fraction <= 1.0
-            or not 0.0 <= self.recent_selection_head_clip_fraction <= 1.0
+            or (
+                self.status != "numerically-invalid"
+                and not all(math.isfinite(value) for value in finite)
+            )
+            or (
+                math.isfinite(self.final_prediction_to_target_std_ratio)
+                and self.final_prediction_to_target_std_ratio < 0.0
+            )
+            or (
+                math.isfinite(self.recent_encoder_clip_fraction)
+                and not 0.0 <= self.recent_encoder_clip_fraction <= 1.0
+            )
+            or (
+                math.isfinite(self.recent_selection_head_clip_fraction)
+                and not 0.0 <= self.recent_selection_head_clip_fraction <= 1.0
+            )
             or self.status != self._expected_status()
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
             or self.schema != M03R_V16_TRAINING_ADEQUACY_SCHEMA
@@ -112,10 +145,21 @@ def build_m03r_v16_epoch_fit_payload(
     *,
     package_plan_sha256: str,
     worker_plan_sha256: str,
+    training_activation_receipt_sha256: str,
+    panel_schedule_sha256: str,
+    structural_slab_receipt_sha256: str,
 ) -> dict[str, Any]:
     """Build the compact but complete immutable evidence for one epoch."""
 
     validation.validate()
+    for name, value in (
+        ("package_plan_sha256", package_plan_sha256),
+        ("worker_plan_sha256", worker_plan_sha256),
+        ("training_activation_receipt_sha256", training_activation_receipt_sha256),
+        ("panel_schedule_sha256", panel_schedule_sha256),
+        ("structural_slab_receipt_sha256", structural_slab_receipt_sha256),
+    ):
+        _digest(name, value)
     if not update_rows or any(len(row) != 2 for row in update_rows):
         raise M03RV16FitError("V16 epoch update evidence is incomplete")
     flat = tuple(value for row in update_rows for value in row)
@@ -130,6 +174,9 @@ def build_m03r_v16_epoch_fit_payload(
         "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
         "package_plan_sha256": package_plan_sha256,
         "worker_plan_sha256": worker_plan_sha256,
+        "training_activation_receipt_sha256": training_activation_receipt_sha256,
+        "panel_schedule_sha256": panel_schedule_sha256,
+        "structural_slab_receipt_sha256": structural_slab_receipt_sha256,
         "setting_index": validation.setting_index,
         "fold_index": validation.fold_index,
         "epoch_index": validation.epoch_index,

@@ -82,7 +82,7 @@ def _adequacy(setting: int, fold: int, *, adequate: bool) -> M03RV16TrainingAdeq
         recent_robust_loss_relative_improvement=0.0,
         recent_encoder_clip_fraction=0.0,
         recent_selection_head_clip_fraction=0.0,
-        status="adequate" if adequate else "inconclusive-undertrained",
+        status="adequate" if adequate else "collapsed-output",
     )
     value.validate()
     return value
@@ -113,6 +113,7 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
             "package_plan_sha256": package.package_plan_sha256,  # type: ignore[union-attr]
             "authorization_receipt_sha256": authorization.receipt_sha256,
             "worker_plan_sha256": package.panel.workers[setting].receipt_sha256,  # type: ignore[union-attr]
+            "training_activation_receipt_sha256": "d" * 64,
             "setting_index": setting,
             "fold_terminal_file_sha256": tuple(
                 f"{setting * 10 + fold + 1:064x}" for fold in range(5)
@@ -121,6 +122,12 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
             "outer_qualification_authorized": False,
             "three_seed_confirmation_may_be_minted": False,
             "source_tree_root_sha256": "e" * 64,
+            "rendered_manifest_sha256": "a" * 64,
+            "pod_template_sha256": "b" * 64,
+            "launch_authority_receipt_sha256": "c" * 64,
+            "admitted_job_authority_receipt_sha256": "f" * 64,
+            "job_uid": f"job-{setting}",
+            "pod_uids": ("pod-0", "pod-1", "pod-2"),
         }
         terminals[path] = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
         terminal_paths.append(path)
@@ -134,11 +141,27 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
     monkeypatch.setattr(
         aggregate,
         "_recompute_fold",
-        lambda root, fold_sha, *, setting_index, fold_index: _adequacy(
-            setting_index,
-            fold_index,
-            adequate=(primary_adequate or setting_index != 2 or fold_index != 0),
+        lambda root, fold_sha, *, setting_index, fold_index, **kwargs: (
+            _adequacy(
+                setting_index,
+                fold_index,
+                adequate=(primary_adequate or setting_index != 2 or fold_index != 0),
+            ),
+            {
+                "checkpoint_file_sha256": f"{setting_index * 10 + fold_index + 30:064x}",
+                "checkpoint_source_array_sha256": "f" * 64,
+            },
         ),
+    )
+    monkeypatch.setattr(
+        aggregate,
+        "Top2000M03RV16PredictivePolicy",
+        lambda setting: object(),
+    )
+    monkeypatch.setattr(
+        aggregate,
+        "load_m03r_v16_epoch_checkpoint_for_evaluation",
+        lambda *args, **kwargs: object(),
     )
 
     result = aggregate.aggregate_m03r_v16_training_panel(
@@ -158,6 +181,6 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
         assert (tmp_path / "aggregate" / "qualification-activation.json").is_file()
     else:
         assert result["outer_qualification_authorized"] is False
-        assert result["next_research_action"] == "longer-training-protocol"
+        assert result["next_research_action"] == "fit-pathology-investigation"
         assert "qualification_activation_receipt_sha256" not in result
         assert not (tmp_path / "aggregate" / "qualification-activation.json").exists()

@@ -15,11 +15,11 @@ from rl_quant.training.top2000_m03r_v16_fold import (
 from rl_quant.training.top2000_m03r_v16_selection import (
     M03RV16PredictiveQualification,
     M03RV16SelectionError,
+    _draw_indices,
     build_m03r_v16_bootstrap_plan,
     build_m03r_v16_panel_decision,
     load_m03r_v16_panel_decision,
     write_m03r_v16_panel_decision,
-    _draw_indices,
 )
 
 
@@ -213,7 +213,7 @@ def test_v16_failed_primary_ends_daily_target_tuning() -> None:
     assert decision.daily_target_or_loss_tuning_authorized is False
 
 
-def test_v16_inconclusive_fit_routes_to_a_fresh_longer_training_protocol() -> None:
+def test_v16_final_panel_rejects_nonadequate_training() -> None:
     decisions, executions = _chronologies()
     bootstrap = build_m03r_v16_bootstrap_plan(decisions, executions)
     qualifications = tuple(
@@ -223,10 +223,10 @@ def test_v16_inconclusive_fit_routes_to_a_fresh_longer_training_protocol() -> No
         )
         for index in range(3)
     )
-    decision = build_m03r_v16_panel_decision(
-        qualifications,
-        bootstrap,
-        primary_training_adequacy="inconclusive-undertrained",
-        primary_training_adequacy_receipt_sha256=_adequacy_receipts(),
-    )
-    assert decision.next_research_action == "longer-training-protocol"
+    with pytest.raises(M03RV16SelectionError, match="decision drifted"):
+        build_m03r_v16_panel_decision(
+            qualifications,
+            bootstrap,
+            primary_training_adequacy="inconclusive-undertrained",  # type: ignore[arg-type]
+            primary_training_adequacy_receipt_sha256=_adequacy_receipts(),
+        )

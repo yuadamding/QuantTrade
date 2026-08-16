@@ -11,6 +11,9 @@ import torch
 from rl_quant.envs.hold30 import CohortLedger
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import M03R_V16_SETTINGS
 from rl_quant.training.hold30_runtime import Hold30Sequence
+from rl_quant.training.top2000_m03r_v9_pretraining_runtime import (
+    qualify_m03r_v9_origin_risk_exposures,
+)
 from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
 )
@@ -22,9 +25,6 @@ from rl_quant.training.top2000_m03r_v16_structural import (
     load_m03r_v16_structural_slab,
     qualify_m03r_v16_structural_slab,
     write_m03r_v16_structural_slab,
-)
-from rl_quant.training.top2000_m03r_v9_pretraining_runtime import (
-    qualify_m03r_v9_origin_risk_exposures,
 )
 
 
@@ -268,3 +268,22 @@ def test_v16_validated_slab_lookup_does_not_repeat_global_validation(
     first = authority.device_origin(251, torch.device("cpu"))
     second = authority.device_origin(251, torch.device("cpu"))
     assert first is second
+
+
+def test_v16_phase_slab_authority_rejects_out_of_view_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_structural as structural
+
+    monkeypatch.setattr(structural, "scheduled_m03r_v16_origins", lambda: (251, 252))
+    cache, risk, _sequence = _surfaces()
+    slab = build_m03r_v16_structural_slab(cache, risk, **_identities())
+    authority = qualify_m03r_v16_structural_slab(slab)
+    training_view = replace(
+        authority,
+        access_mode="training",
+        allowed_origin_indices=frozenset({251}),
+    )
+    assert training_view.origin(251).origin_state_index == 251
+    with pytest.raises(structural.M03RV16StructuralError, match="forbids"):
+        training_view.origin(252)

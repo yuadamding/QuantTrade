@@ -55,6 +55,9 @@ def test_v16_fit_receipts_classify_adequate_terminal_training() -> None:
             _updates(epoch),
             package_plan_sha256="a" * 64,
             worker_plan_sha256="b" * 64,
+            training_activation_receipt_sha256="c" * 64,
+            panel_schedule_sha256="d" * 64,
+            structural_slab_receipt_sha256="e" * 64,
         )
         for epoch in range(8)
     )
@@ -62,7 +65,7 @@ def test_v16_fit_receipts_classify_adequate_terminal_training() -> None:
     assert result.status == "adequate"
 
 
-def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive() -> (
+def test_v16_fit_receipts_distinguish_collapsed_and_still_improving_fit() -> (
     None
 ):
     validations = tuple(_validation(epoch) for epoch in range(8))
@@ -73,12 +76,15 @@ def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive
             _updates(epoch),
             package_plan_sha256="a" * 64,
             worker_plan_sha256="b" * 64,
+            training_activation_receipt_sha256="c" * 64,
+            panel_schedule_sha256="d" * 64,
+            structural_slab_receipt_sha256="e" * 64,
         )
         for epoch in range(8)
     )
     assert (
         classify_m03r_v16_training_adequacy(collapsed, epochs).status
-        == "inconclusive-undertrained"
+        == "collapsed-output"
     )
 
     trending_ic = tuple(
@@ -96,6 +102,9 @@ def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive
             _updates(epoch),
             package_plan_sha256="a" * 64,
             worker_plan_sha256="b" * 64,
+            training_activation_receipt_sha256="c" * 64,
+            panel_schedule_sha256="d" * 64,
+            structural_slab_receipt_sha256="e" * 64,
         )
         for epoch in range(8)
     )
@@ -103,7 +112,7 @@ def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive
         classify_m03r_v16_training_adequacy(
             trending_ic, trending_ic_epochs
         ).status
-        == "inconclusive-undertrained"
+        == "still-improving"
     )
 
     improving_loss = tuple(
@@ -121,6 +130,9 @@ def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive
             _updates(epoch),
             package_plan_sha256="a" * 64,
             worker_plan_sha256="b" * 64,
+            training_activation_receipt_sha256="c" * 64,
+            panel_schedule_sha256="d" * 64,
+            structural_slab_receipt_sha256="e" * 64,
         )
         for epoch in range(8)
     )
@@ -128,7 +140,7 @@ def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive
         classify_m03r_v16_training_adequacy(
             improving_loss, improving_loss_epochs
         ).status
-        == "inconclusive-undertrained"
+        == "still-improving"
     )
 
     overdispersed = (
@@ -141,12 +153,15 @@ def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive
             _updates(epoch),
             package_plan_sha256="a" * 64,
             worker_plan_sha256="b" * 64,
+            training_activation_receipt_sha256="c" * 64,
+            panel_schedule_sha256="d" * 64,
+            structural_slab_receipt_sha256="e" * 64,
         )
         for epoch in range(8)
     )
     assert (
-        classify_m03r_v16_training_adequacy(
-            overdispersed, overdispersed_epochs
-        ).status
-        == "inconclusive-undertrained"
-    )
+            classify_m03r_v16_training_adequacy(
+                overdispersed, overdispersed_epochs
+            ).status
+            == "overdispersed-output"
+        )

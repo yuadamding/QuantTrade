@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-import json
+import copy
 import hashlib
+import json
 import os
 import stat
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
+)
+from rl_quant.protocol.canonical_artifact import (
     semantic_sha256 as _sha256,
 )
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
@@ -26,19 +29,25 @@ from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
     M03R_TOP2000_TERMINATION_MESSAGE_POLICY,
     M03RV7KubernetesTemplateConfig,
 )
-from rl_quant.training.top2000_m03r_v16_package import (
-    M03RV16ExecutionAuthorization,
-    M03RV16PackagePlan,
+from rl_quant.training.top2000_m03r_v16_activation import (
+    M03RV16AdmittedJobAuthority,
+    M03RV16PhaseLaunchAuthority,
+    M03RV16QualificationActivation,
+    M03RV16TrainingActivation,
+    _issue_m03r_v16_phase_launch_authority,
+    _issue_m03r_v16_training_activation_from_gates,
+    admitted_job_authority_file_sha256,
+    phase_launch_authority_file_sha256,
+    write_m03r_v16_phase_launch_authority,
 )
 from rl_quant.training.top2000_m03r_v16_capacity import (
     M03R_V16_CAPACITY_TERMINAL_SCHEMA,
     M03RV16CapacityRankEvidence,
     M03RV16CapacityTerminal,
 )
-from rl_quant.training.top2000_m03r_v16_activation import (
-    M03RV16QualificationActivation,
-    M03RV16TrainingActivation,
-    issue_m03r_v16_training_activation,
+from rl_quant.training.top2000_m03r_v16_package import (
+    M03RV16ExecutionAuthorization,
+    M03RV16PackagePlan,
 )
 from rl_quant.training.top2000_m03r_v16_static_contract import (
     M03R_V16_STATIC_RESULT_SCHEMA,
@@ -52,14 +61,51 @@ M03R_V16_CAPACITY_GATE_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v2"
 )
 M03R_V16_RENDERED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v3"
+    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v4"
 )
+_JOB_CONTRACT_ANNOTATION = "rl-quant/job-contract-sha256"
+_POD_CONTRACT_ANNOTATION = "rl-quant/pod-contract-sha256"
+_LAUNCH_RECEIPT_ANNOTATION = "rl-quant/launch-authority-receipt-sha256"
+_LAUNCH_FILE_ANNOTATION = "rl-quant/launch-authority-file-sha256"
+_ADMISSION_RECEIPT_ANNOTATION = "rl-quant/admission-authority-receipt-sha256"
+_ADMISSION_FILE_ANNOTATION = "rl-quant/admission-authority-file-sha256"
+_DRY_RUN_FILE_ANNOTATION = "rl-quant/server-dry-run-file-sha256"
+_ADMITTED_MANIFEST_FILE_ANNOTATION = "rl-quant/admitted-manifest-file-sha256"
 _PYTHON = "/opt/conda/envs/quanttrade/bin/python"
 _WORKER_MODULE = "rl_quant.workflows.top2000_m03r_v16_predictive"
 _STATIC_MODULE = "rl_quant.workflows.top2000_m03r_v16_static_validate"
 _STATIC_GATE_ISSUER = object()
 _CAPACITY_GATE_ISSUER = object()
 _MAX_GATE_RESULT_BYTES = 64 * 1024**2
+
+
+def _contract_payload(manifest: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(manifest)
+    for annotation_rows in (
+        payload.get("metadata", {}).get("annotations", {}),
+        payload.get("spec", {})
+        .get("template", {})
+        .get("metadata", {})
+        .get("annotations", {}),
+    ):
+        annotation_rows.pop(_JOB_CONTRACT_ANNOTATION, None)
+        annotation_rows.pop(_POD_CONTRACT_ANNOTATION, None)
+        annotation_rows.pop(_LAUNCH_RECEIPT_ANNOTATION, None)
+        annotation_rows.pop(_LAUNCH_FILE_ANNOTATION, None)
+        annotation_rows.pop(_ADMISSION_RECEIPT_ANNOTATION, None)
+        annotation_rows.pop(_ADMISSION_FILE_ANNOTATION, None)
+        annotation_rows.pop(_DRY_RUN_FILE_ANNOTATION, None)
+        annotation_rows.pop(_ADMITTED_MANIFEST_FILE_ANNOTATION, None)
+    return payload
+
+
+def _job_contract_sha256(manifest: dict[str, Any]) -> str:
+    return _sha256(_contract_payload(manifest))
+
+
+def _pod_contract_sha256(manifest: dict[str, Any]) -> str:
+    payload = _contract_payload(manifest)
+    return _sha256(payload["spec"]["template"])
 
 
 class M03RV16KubernetesError(ValueError):
@@ -200,6 +246,8 @@ class M03RV16RenderedSuspendedJob:
     manifest: dict[str, Any]
     manifest_sha256: str
     pod_template_sha256: str
+    job_contract_sha256: str
+    pod_contract_sha256: str
     package_plan_sha256: str
     execution_authorization_receipt_sha256: str
     package_plan_file_sha256: str
@@ -208,6 +256,10 @@ class M03RV16RenderedSuspendedJob:
     completions: int
     parallelism: int
     gpus_per_completion: int
+    launch_authority: M03RV16PhaseLaunchAuthority | None = None
+    launch_authority_file_sha256: str | None = None
+    admitted_job_authority: M03RV16AdmittedJobAuthority | None = None
+    admitted_job_authority_file_sha256: str | None = None
     static_gate_receipt_sha256: str | None = None
     capacity_gate_receipt_sha256: str | None = None
     training_activation_receipt_sha256: str | None = None
@@ -226,6 +278,8 @@ class M03RV16RenderedSuspendedJob:
         for name in (
             "manifest_sha256",
             "pod_template_sha256",
+            "job_contract_sha256",
+            "pod_contract_sha256",
             "package_plan_sha256",
             "execution_authorization_receipt_sha256",
             "package_plan_file_sha256",
@@ -273,6 +327,12 @@ class M03RV16RenderedSuspendedJob:
             != self.package_plan_file_sha256
             or annotations.get("rl-quant/execution-authorization-file-sha256")
             != self.execution_authorization_file_sha256
+            or annotations.get(_JOB_CONTRACT_ANNOTATION)
+            != self.job_contract_sha256
+            or annotations.get(_POD_CONTRACT_ANNOTATION)
+            != self.pod_contract_sha256
+            or self.job_contract_sha256 != _job_contract_sha256(self.manifest)
+            or self.pod_contract_sha256 != _pod_contract_sha256(self.manifest)
             or spec.get("suspend") is not True
             or spec.get("completionMode") != "Indexed"
             or spec.get("completions") != expected[0]
@@ -301,6 +361,10 @@ class M03RV16RenderedSuspendedJob:
                 or self.capacity_gate_receipt_sha256 is not None
                 or self.training_activation_receipt_sha256 is not None
                 or self.qualification_activation_receipt_sha256 is not None
+                or self.launch_authority is not None
+                or self.launch_authority_file_sha256 is not None
+                or self.admitted_job_authority is not None
+                or self.admitted_job_authority_file_sha256 is not None
             ):
                 raise M03RV16KubernetesError("V16 static Job is not GPU neutral")
         elif (
@@ -322,6 +386,69 @@ class M03RV16RenderedSuspendedJob:
             )
         ):
             raise M03RV16KubernetesError("V16 H100 Job profile drifted")
+        elif any(
+            value is not None
+            for value in (
+                self.launch_authority,
+                self.launch_authority_file_sha256,
+                self.admitted_job_authority,
+                self.admitted_job_authority_file_sha256,
+            )
+        ):
+            if (
+                self.launch_authority is None
+                or self.launch_authority_file_sha256 is None
+                or self.admitted_job_authority is None
+                or self.admitted_job_authority_file_sha256 is None
+                or annotations.get(_LAUNCH_RECEIPT_ANNOTATION)
+                != self.launch_authority.receipt_sha256
+                or annotations.get(_LAUNCH_FILE_ANNOTATION)
+                != self.launch_authority_file_sha256
+                or annotations.get(_ADMISSION_RECEIPT_ANNOTATION)
+                != self.admitted_job_authority.receipt_sha256
+                or annotations.get(_ADMISSION_FILE_ANNOTATION)
+                != self.admitted_job_authority_file_sha256
+                or annotations.get(_DRY_RUN_FILE_ANNOTATION)
+                != self.admitted_job_authority.server_side_dry_run_file_sha256
+                or annotations.get(_ADMITTED_MANIFEST_FILE_ANNOTATION)
+                != self.admitted_job_authority.admitted_manifest_file_sha256
+            ):
+                raise M03RV16KubernetesError(
+                    "V16 admitted launch binding is incomplete"
+                )
+            _digest(
+                "launch_authority_file_sha256",
+                str(self.launch_authority_file_sha256),
+            )
+            _digest(
+                "admitted_job_authority_file_sha256",
+                str(self.admitted_job_authority_file_sha256),
+            )
+            prerequisite = {
+                "capacity": self.static_gate_receipt_sha256,
+                "training": self.training_activation_receipt_sha256,
+                "qualification": self.qualification_activation_receipt_sha256,
+            }[self.mode]
+            if (
+                self.launch_authority.phase != self.mode
+                or self.launch_authority.prerequisite_authority_receipt_sha256
+                != prerequisite
+                or self.launch_authority.job_contract_sha256
+                != self.job_contract_sha256
+                or self.launch_authority.pod_contract_sha256
+                != self.pod_contract_sha256
+                or self.launch_authority.admission_receipt_sha256
+                != self.admitted_job_authority.receipt_sha256
+                or self.launch_authority.admission_file_sha256
+                != self.admitted_job_authority_file_sha256
+                or phase_launch_authority_file_sha256(self.launch_authority)
+                != self.launch_authority_file_sha256
+                or admitted_job_authority_file_sha256(
+                    self.admitted_job_authority
+                )
+                != self.admitted_job_authority_file_sha256
+            ):
+                raise M03RV16KubernetesError("V16 phase launch authority drifted")
 
 
 def _read_exact_json(path: Path, expected_file_sha256: str) -> dict[str, Any]:
@@ -444,12 +571,24 @@ def load_and_issue_m03r_v16_capacity_gate(
     capacity = _capacity_from_payload(payload)
     if (
         rendered.mode != "capacity"
+        or rendered.launch_authority is None
+        or rendered.admitted_job_authority is None
         or rendered.static_gate_receipt_sha256 != static.receipt_sha256
         or payload.get("schema") != M03R_V16_CAPACITY_TERMINAL_SCHEMA
         or payload.get("capacity_receipt_sha256") != capacity.receipt_sha256
         or payload.get("package_plan_sha256") != package.package_plan_sha256
         or payload.get("authorization_receipt_sha256")
         != authorization.receipt_sha256
+        or payload.get("rendered_manifest_sha256")
+        != rendered.job_contract_sha256
+        or payload.get("pod_template_sha256") != rendered.pod_contract_sha256
+        or payload.get("launch_authority_receipt_sha256")
+        != rendered.launch_authority.receipt_sha256
+        or payload.get("admitted_job_authority_receipt_sha256")
+        != rendered.admitted_job_authority.receipt_sha256
+        or payload.get("job_uid") != rendered.admitted_job_authority.job_uid
+        or tuple(payload.get("pod_uids", ()))
+        != rendered.admitted_job_authority.pod_uids
         or payload.get("scientific_training_performed") is not False
         or payload.get("disposable_optimizer_update_executed") is not True
         or payload.get("disposable_train_validate_train_executed") is not True
@@ -486,13 +625,112 @@ def issue_m03r_v16_training_activation_from_gates(
     """Issue training authority only after matching static and capacity gates."""
 
     capacity.validate_for(package, authorization, static)
-    return issue_m03r_v16_training_activation(
+    return _issue_m03r_v16_training_activation_from_gates(
         package=package,
         authorization=authorization,
-        static_gate_receipt_sha256=static.receipt_sha256,
-        capacity_gate_receipt_sha256=capacity.receipt_sha256,
-        source_tree_root_sha256=capacity.source_tree_root_sha256,
+        static=static,
+        capacity=capacity,
     )
+
+
+def bind_m03r_v16_admitted_launch_authority(
+    *,
+    rendered: M03RV16RenderedSuspendedJob,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    admission: M03RV16AdmittedJobAuthority,
+    admission_file_sha256: str,
+    source_tree_root_sha256: str,
+) -> M03RV16RenderedSuspendedJob:
+    """Bind an admitted suspended Job to a one-shot scientific launch."""
+
+    rendered.validate()
+    if rendered.mode == "static" or rendered.launch_authority is not None:
+        raise M03RV16KubernetesError(
+            "only an unbound H100 Job can receive admission evidence"
+        )
+    admission.validate_for(
+        package,
+        authorization,
+        expected_phase=rendered.mode,
+        expected_job_contract_sha256=rendered.job_contract_sha256,
+        expected_pod_contract_sha256=rendered.pod_contract_sha256,
+    )
+    if (
+        admission.run_id
+        != rendered.manifest.get("metadata", {})
+        .get("labels", {})
+        .get("rl-quant/run-id")
+    ):
+        raise M03RV16KubernetesError("V16 admitted Job run identity drifted")
+    _digest("admission_file_sha256", admission_file_sha256)
+    _digest("source_tree_root_sha256", source_tree_root_sha256)
+    if admitted_job_authority_file_sha256(admission) != admission_file_sha256:
+        raise M03RV16KubernetesError("V16 admitted Job file bytes drifted")
+    prerequisite = {
+        "capacity": rendered.static_gate_receipt_sha256,
+        "training": rendered.training_activation_receipt_sha256,
+        "qualification": rendered.qualification_activation_receipt_sha256,
+    }[rendered.mode]
+    if prerequisite is None:
+        raise M03RV16KubernetesError("V16 launch prerequisite is absent")
+    launch = _issue_m03r_v16_phase_launch_authority(
+        package=package,
+        authorization=authorization,
+        phase=rendered.mode,
+        prerequisite_authority_receipt_sha256=prerequisite,
+        job_contract_sha256=rendered.job_contract_sha256,
+        pod_contract_sha256=rendered.pod_contract_sha256,
+        run_id=admission.run_id,
+        source_tree_root_sha256=source_tree_root_sha256,
+        admission=admission,
+        admission_file_sha256=admission_file_sha256,
+    )
+    launch_file_sha256 = phase_launch_authority_file_sha256(launch)
+    manifest = copy.deepcopy(rendered.manifest)
+    for annotation_rows in (
+        manifest["metadata"]["annotations"],
+        manifest["spec"]["template"]["metadata"]["annotations"],
+    ):
+        annotation_rows[_ADMISSION_RECEIPT_ANNOTATION] = admission.receipt_sha256
+        annotation_rows[_ADMISSION_FILE_ANNOTATION] = admission_file_sha256
+        annotation_rows[_DRY_RUN_FILE_ANNOTATION] = (
+            admission.server_side_dry_run_file_sha256
+        )
+        annotation_rows[_ADMITTED_MANIFEST_FILE_ANNOTATION] = (
+            admission.admitted_manifest_file_sha256
+        )
+        annotation_rows[_LAUNCH_RECEIPT_ANNOTATION] = launch.receipt_sha256
+        annotation_rows[_LAUNCH_FILE_ANNOTATION] = launch_file_sha256
+    value = replace(
+        rendered,
+        manifest=manifest,
+        manifest_sha256=_sha256(manifest),
+        pod_template_sha256=_sha256(manifest["spec"]["template"]["spec"]),
+        launch_authority=launch,
+        launch_authority_file_sha256=launch_file_sha256,
+        admitted_job_authority=admission,
+        admitted_job_authority_file_sha256=admission_file_sha256,
+    )
+    value.validate()
+    return value
+
+
+def write_m03r_v16_rendered_launch_authority(
+    path: str | Path,
+    rendered: M03RV16RenderedSuspendedJob,
+) -> str:
+    """Materialize the exact launch authority already bound to a Job."""
+
+    rendered.validate()
+    if rendered.launch_authority is None or rendered.launch_authority_file_sha256 is None:
+        raise M03RV16KubernetesError("V16 static Job has no H100 launch authority")
+    observed = write_m03r_v16_phase_launch_authority(
+        path, rendered.launch_authority
+    )
+    if observed != rendered.launch_authority_file_sha256:
+        raise M03RV16KubernetesError("V16 launch authority bytes drifted")
+    return observed
 
 
 def _base_args(
@@ -564,6 +802,21 @@ def _render(
                         "V16 training Job requires only training activation"
                     )
                 training_activation.validate_for(package, authorization)
+                if (
+                    training_activation.static_gate_receipt_sha256
+                    != static.receipt_sha256
+                    or training_activation.static_result_file_sha256
+                    != static.result_file_sha256
+                    or training_activation.capacity_gate_receipt_sha256
+                    != capacity.receipt_sha256
+                    or training_activation.capacity_terminal_file_sha256
+                    != capacity.terminal_file_sha256
+                    or training_activation.source_tree_root_sha256
+                    != capacity.source_tree_root_sha256
+                ):
+                    raise M03RV16KubernetesError(
+                        "V16 training activation predecessor evidence drifted"
+                    )
                 _digest(
                     "training_activation_file_sha256",
                     str(training_activation_file_sha256),
@@ -574,6 +827,13 @@ def _render(
                 )
             else:
                 qualification_activation.validate_for(package, authorization)
+                if (
+                    qualification_activation.source_tree_root_sha256
+                    != capacity.source_tree_root_sha256
+                ):
+                    raise M03RV16KubernetesError(
+                        "V16 qualification activation source tree drifted"
+                    )
                 _digest(
                     "qualification_activation_file_sha256",
                     str(qualification_activation_file_sha256),
@@ -616,6 +876,7 @@ def _render(
             ),
         ]
         if mode == "capacity":
+            static_value = cast(M03RV16StaticGateQualification, static)
             args.extend(
                 (
                     "--completion-index",
@@ -623,15 +884,30 @@ def _render(
                     "--capacity-only",
                     "--capacity-output-root",
                     "/mnt/output/capacity-sentinel",
+                    "--static-result",
+                    "/mnt/authority/static-result.json",
+                    "--static-result-file-sha256",
+                    str(static_value.result_file_sha256),
+                    "--predecessor-authority-receipt-sha256",
+                    str(static_value.receipt_sha256),
                 )
             )
         elif mode == "training":
+            training_value = cast(M03RV16TrainingActivation, training_activation)
             args.extend(
                 (
                     "--training-activation",
                     "/mnt/authority/training-activation.json",
                     "--training-activation-file-sha256",
                     str(training_activation_file_sha256),
+                    "--static-result",
+                    "/mnt/authority/static-result.json",
+                    "--static-result-file-sha256",
+                    str(training_value.static_result_file_sha256),
+                    "--capacity-terminal",
+                    "/mnt/authority/two-h100-capacity-terminal.json",
+                    "--capacity-terminal-file-sha256",
+                    str(training_value.capacity_terminal_file_sha256),
                 )
             )
         elif mode == "qualification":
@@ -644,8 +920,38 @@ def _render(
                     str(qualification_activation_file_sha256),
                     "--training-root",
                     "/mnt/training",
+                    "--training-panel",
+                    "/mnt/authority/training-panel-decision.json",
                 )
             )
+        args.extend(
+            (
+                "--rendered-manifest-sha256",
+                "$(M03R_V16_JOB_CONTRACT_SHA256)",
+                "--pod-template-sha256",
+                "$(M03R_V16_POD_CONTRACT_SHA256)",
+                "--launch-authority",
+                "/mnt/authority/$(M03R_V16_PHASE)-launch.json",
+                "--launch-authority-file-sha256",
+                "$(M03R_V16_LAUNCH_FILE_SHA256)",
+                "--launch-authority-receipt-sha256",
+                "$(M03R_V16_LAUNCH_RECEIPT_SHA256)",
+                "--admitted-job-authority",
+                "/mnt/authority/$(M03R_V16_PHASE)-admission.json",
+                "--admitted-job-authority-file-sha256",
+                "$(M03R_V16_ADMISSION_FILE_SHA256)",
+                "--admitted-job-authority-receipt-sha256",
+                "$(M03R_V16_ADMISSION_RECEIPT_SHA256)",
+                "--server-side-dry-run-result",
+                "/mnt/authority/$(M03R_V16_PHASE)-dry-run.json",
+                "--server-side-dry-run-result-file-sha256",
+                "$(M03R_V16_DRY_RUN_FILE_SHA256)",
+                "--admitted-manifest-result",
+                "/mnt/authority/$(M03R_V16_PHASE)-admitted-manifest.json",
+                "--admitted-manifest-result-file-sha256",
+                "$(M03R_V16_ADMITTED_MANIFEST_FILE_SHA256)",
+            )
+        )
     environment: list[dict[str, Any]] = [
         {
             "name": "JOB_COMPLETION_INDEX",
@@ -683,6 +989,111 @@ def _render(
                 {"name": "XDG_CACHE_HOME", "value": "/tmp/.cache"},
                 {"name": "TORCHINDUCTOR_CACHE_DIR", "value": "/tmp/torchinductor"},
                 {"name": "TRITON_CACHE_DIR", "value": "/tmp/triton"},
+                {
+                    "name": "M03R_V16_JOB_CONTRACT_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _JOB_CONTRACT_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_POD_CONTRACT_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _POD_CONTRACT_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {"name": "M03R_V16_PHASE", "value": mode},
+                {
+                    "name": "M03R_V16_LAUNCH_FILE_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _LAUNCH_FILE_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_LAUNCH_RECEIPT_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _LAUNCH_RECEIPT_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_ADMISSION_FILE_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _ADMISSION_FILE_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_ADMISSION_RECEIPT_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _ADMISSION_RECEIPT_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_DRY_RUN_FILE_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _DRY_RUN_FILE_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_ADMITTED_MANIFEST_FILE_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _ADMITTED_MANIFEST_FILE_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
             )
         )
     phase = {
@@ -826,7 +1237,7 @@ def _render(
                 "readOnly": True,
             }
         )
-    if mode in {"training", "qualification"}:
+    if mode in {"capacity", "training", "qualification"}:
         pod["containers"][0]["volumeMounts"].append(
             {
                 "name": "research-data",
@@ -874,7 +1285,7 @@ def _render(
             M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS,
         )
     )
-    manifest = {
+    manifest: dict[str, Any] = {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
@@ -897,10 +1308,20 @@ def _render(
             },
         },
     }
+    job_contract_sha256 = _job_contract_sha256(manifest)
+    pod_contract_sha256 = _pod_contract_sha256(manifest)
+    for contract_annotations in (
+        manifest["metadata"]["annotations"],
+        manifest["spec"]["template"]["metadata"]["annotations"],
+    ):
+        contract_annotations[_JOB_CONTRACT_ANNOTATION] = job_contract_sha256
+        contract_annotations[_POD_CONTRACT_ANNOTATION] = pod_contract_sha256
     rendered = M03RV16RenderedSuspendedJob(
         manifest=manifest,
         manifest_sha256=_sha256(manifest),
         pod_template_sha256=_sha256(pod),
+        job_contract_sha256=job_contract_sha256,
+        pod_contract_sha256=pod_contract_sha256,
         package_plan_sha256=package.package_plan_sha256,
         execution_authorization_receipt_sha256=authorization.receipt_sha256,
         package_plan_file_sha256=package_plan_file_sha256,
@@ -1042,11 +1463,13 @@ __all__ = [
     "M03RV16KubernetesError",
     "M03RV16RenderedSuspendedJob",
     "M03RV16StaticGateQualification",
+    "bind_m03r_v16_admitted_launch_authority",
+    "issue_m03r_v16_training_activation_from_gates",
     "load_and_issue_m03r_v16_capacity_gate",
     "load_and_issue_m03r_v16_static_gate",
-    "issue_m03r_v16_training_activation_from_gates",
     "render_m03r_v16_suspended_capacity_job",
     "render_m03r_v16_suspended_qualification_job",
     "render_m03r_v16_suspended_static_job",
     "render_m03r_v16_suspended_training_job",
+    "write_m03r_v16_rendered_launch_authority",
 ]
