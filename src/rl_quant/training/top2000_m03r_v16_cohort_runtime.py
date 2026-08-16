@@ -33,7 +33,7 @@ from rl_quant.training.top2000_m03r_v9_projection import (
 )
 
 M03R_V16_COHORT_TRACE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-horizon-matched-cohort-trace-v3"
+    "rl-quant.top2000-dev.m03r-v16-horizon-matched-cohort-trace-v4"
 )
 
 
@@ -280,11 +280,13 @@ def _reconcile_executed_cohorts(
             torch.zeros_like(requested_risky),
         )
         per_asset = strength.sum(dim=0)
+        signal_target_magnitude = torch.minimum(target_risky.abs(), per_asset)
+        signal_target = target_risky.sign() * signal_target_magnitude
         signal_allocation = torch.where(
             per_asset.unsqueeze(0) > 1.0e-18,
             strength
             / per_asset.clamp_min(1.0e-18).unsqueeze(0)
-            * target_risky.unsqueeze(0),
+            * signal_target.unsqueeze(0),
             torch.zeros_like(strength),
         )
         allocated_risky = signal_allocation.sum(dim=0)
@@ -337,6 +339,9 @@ class M03RV16CohortTrace:
     fold_index: int
     checkpoint_file_sha256: str
     checkpoint_model_state_sha256: str
+    terminal_checkpoint_authority_sha256: str
+    qualified_score_authority_sha256: str
+    panel_schedule_sha256: str
     qualification_batch_receipt_sha256: str
     asset_axis_sha256: str
     action_valid_sha256: str
@@ -351,11 +356,12 @@ class M03RV16CohortTrace:
     benchmark_one_way_turnover: torch.Tensor
     active_one_way_mass: torch.Tensor
     cohort_entry_one_way_mass: torch.Tensor
-    cohort_release_one_way_mass: torch.Tensor
+    signal_cohort_mass_reduction_after_execution: torch.Tensor
     weighted_mean_cohort_age: torch.Tensor
     requested_to_executed_retention: torch.Tensor
     risk_repair_active_one_way_mass: torch.Tensor
-    risk_forced_one_way_turnover: torch.Tensor
+    prior_risk_repair_unwind_one_way_mass: torch.Tensor
+    risk_projection_request_to_execution_one_way_distance: torch.Tensor
     absolute_policy_cost_by_cost: tuple[torch.Tensor, ...]
     benchmark_cost_by_cost: tuple[torch.Tensor, ...]
     incremental_active_cost_by_cost: tuple[torch.Tensor, ...]
@@ -390,11 +396,12 @@ class M03RV16CohortTrace:
             self.benchmark_one_way_turnover,
             self.active_one_way_mass,
             self.cohort_entry_one_way_mass,
-            self.cohort_release_one_way_mass,
+            self.signal_cohort_mass_reduction_after_execution,
             self.weighted_mean_cohort_age,
             self.requested_to_executed_retention,
             self.risk_repair_active_one_way_mass,
-            self.risk_forced_one_way_turnover,
+            self.prior_risk_repair_unwind_one_way_mass,
+            self.risk_projection_request_to_execution_one_way_distance,
             *self.absolute_policy_cost_by_cost,
             *self.benchmark_cost_by_cost,
             *self.incremental_active_cost_by_cost,
@@ -412,6 +419,11 @@ class M03RV16CohortTrace:
             "fold_index": self.fold_index,
             "checkpoint_file_sha256": self.checkpoint_file_sha256,
             "checkpoint_model_state_sha256": self.checkpoint_model_state_sha256,
+            "terminal_checkpoint_authority_sha256": (
+                self.terminal_checkpoint_authority_sha256
+            ),
+            "qualified_score_authority_sha256": (self.qualified_score_authority_sha256),
+            "panel_schedule_sha256": self.panel_schedule_sha256,
             "qualification_batch_receipt_sha256": (
                 self.qualification_batch_receipt_sha256
             ),
@@ -491,10 +503,13 @@ class M03RV16CohortTrace:
             or bool((self.benchmark_one_way_turnover < 0.0).any())
             or bool((self.active_one_way_mass < 0.0).any())
             or bool((self.cohort_entry_one_way_mass < 0.0).any())
-            or bool((self.cohort_release_one_way_mass < 0.0).any())
+            or bool((self.signal_cohort_mass_reduction_after_execution < 0.0).any())
             or bool((self.requested_to_executed_retention < 0.0).any())
             or bool((self.risk_repair_active_one_way_mass < 0.0).any())
-            or bool((self.risk_forced_one_way_turnover < 0.0).any())
+            or bool((self.prior_risk_repair_unwind_one_way_mass < 0.0).any())
+            or bool(
+                (self.risk_projection_request_to_execution_one_way_distance < 0.0).any()
+            )
             or not math.isfinite(self.terminal_liquidation_one_way_turnover)
             or self.terminal_liquidation_one_way_turnover < 0.0
             or not math.isfinite(self.terminal_preliquidation_active_one_way_mass)
@@ -518,6 +533,15 @@ class M03RV16CohortTrace:
         for name, value in (
             ("checkpoint_file_sha256", self.checkpoint_file_sha256),
             ("checkpoint_model_state_sha256", self.checkpoint_model_state_sha256),
+            (
+                "terminal_checkpoint_authority_sha256",
+                self.terminal_checkpoint_authority_sha256,
+            ),
+            (
+                "qualified_score_authority_sha256",
+                self.qualified_score_authority_sha256,
+            ),
+            ("panel_schedule_sha256", self.panel_schedule_sha256),
             (
                 "qualification_batch_receipt_sha256",
                 self.qualification_batch_receipt_sha256,
@@ -608,12 +632,15 @@ def _drift(
     return weights * (1.0 + returns) / gross, gross - 1.0
 
 
-def run_m03r_v16_horizon_matched_cohort_sleeve(
+def _run_m03r_v16_horizon_matched_cohort_sleeve(
     setting: M03RV16PredictiveSetting,
     *,
     fold_index: int,
     checkpoint_file_sha256: str,
     checkpoint_model_state_sha256: str,
+    terminal_checkpoint_authority_sha256: str,
+    qualified_score_authority_sha256: str,
+    panel_schedule_sha256: str,
     qualification_batch_receipt_sha256: str,
     asset_axis_sha256: str,
     decision_origin_indices: torch.Tensor,
@@ -686,6 +713,12 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
     for name, value in (
         ("checkpoint_file_sha256", checkpoint_file_sha256),
         ("checkpoint_model_state_sha256", checkpoint_model_state_sha256),
+        (
+            "terminal_checkpoint_authority_sha256",
+            terminal_checkpoint_authority_sha256,
+        ),
+        ("qualified_score_authority_sha256", qualified_score_authority_sha256),
+        ("panel_schedule_sha256", panel_schedule_sha256),
         ("qualification_batch_receipt_sha256", qualification_batch_receipt_sha256),
         ("asset_axis_sha256", asset_axis_sha256),
     ):
@@ -717,7 +750,8 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
     mean_age_rows: list[torch.Tensor] = []
     retention_rows: list[torch.Tensor] = []
     repair_mass_rows: list[torch.Tensor] = []
-    risk_forced_turnover_rows: list[torch.Tensor] = []
+    prior_repair_unwind_rows: list[torch.Tensor] = []
+    projection_distance_rows: list[torch.Tensor] = []
 
     for step in range(steps):
         benchmark = benchmark_weights[step]
@@ -740,10 +774,17 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
             for cohort in cohorts
             if cohort.attribution == "signal"
         }
+        prior_repair_unwind = math.fsum(
+            0.5 * float(cohort.executed_active_weights.abs().sum())
+            for cohort in cohorts
+            if cohort.attribution == "risk_repair"
+        )
+        # A prior repair remains part of current_policy for actual turnover, but
+        # it is never promoted into the next desired signal book.  Today's
+        # projector must recreate every repair direction still required.
+        cohorts = [row for row in cohorts if row.attribution == "signal"]
         for cohort in cohorts:
-            if cohort.attribution == "risk_repair":
-                multiplier = 1.0
-            elif fixed_horizon is not None:
+            if fixed_horizon is not None:
                 multiplier = 0.0 if cohort.age >= fixed_horizon else 1.0
             elif cohort.age >= 30:
                 multiplier = 0.0
@@ -810,7 +851,7 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
             executed - benchmark,
             cash_index=cash,
         )
-        risk_forced_turnover = 0.5 * (executed_active - requested_active).abs().sum()
+        projection_distance = 0.5 * (executed_active - requested_active).abs().sum()
         cohorts = _reconcile_executed_cohorts(
             cohorts,
             executed_active,
@@ -825,7 +866,7 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
             raise M03RV16CohortRuntimeError(
                 "V16 projection was not reconciled into executed cohorts"
             )
-        executed_release = math.fsum(
+        signal_mass_reduction_after_execution = math.fsum(
             0.5
             * float(
                 (
@@ -864,7 +905,7 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
             0.5 * (executed - benchmark).to(torch.float64).abs().sum()
         )
         entry_rows.append(executed.new_tensor(executed_entry))
-        release_rows.append(executed.new_tensor(executed_release))
+        release_rows.append(executed.new_tensor(signal_mass_reduction_after_execution))
         retention_rows.append(projection.requested_to_executed_retention.squeeze(0))
         repair_mass_rows.append(
             executed.new_tensor(
@@ -875,7 +916,8 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
                 )
             )
         )
-        risk_forced_turnover_rows.append(risk_forced_turnover.to(dtype=executed.dtype))
+        prior_repair_unwind_rows.append(executed.new_tensor(prior_repair_unwind))
+        projection_distance_rows.append(projection_distance.to(dtype=executed.dtype))
         masses = [
             0.5 * float(value.executed_active_weights.abs().sum())
             for value in cohorts
@@ -956,6 +998,9 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         fold_index=fold_index,
         checkpoint_file_sha256=checkpoint_file_sha256,
         checkpoint_model_state_sha256=checkpoint_model_state_sha256,
+        terminal_checkpoint_authority_sha256=(terminal_checkpoint_authority_sha256),
+        qualified_score_authority_sha256=qualified_score_authority_sha256,
+        panel_schedule_sha256=panel_schedule_sha256,
         qualification_batch_receipt_sha256=qualification_batch_receipt_sha256,
         asset_axis_sha256=asset_axis_sha256,
         action_valid_sha256=_tensor_sha256(action_valid),
@@ -970,11 +1015,14 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         benchmark_one_way_turnover=benchmark_turnover_tensor,
         active_one_way_mass=torch.stack(active_mass_rows),
         cohort_entry_one_way_mass=torch.stack(entry_rows),
-        cohort_release_one_way_mass=torch.stack(release_rows),
+        signal_cohort_mass_reduction_after_execution=torch.stack(release_rows),
         weighted_mean_cohort_age=torch.stack(mean_age_rows),
         requested_to_executed_retention=torch.stack(retention_rows),
         risk_repair_active_one_way_mass=torch.stack(repair_mass_rows),
-        risk_forced_one_way_turnover=torch.stack(risk_forced_turnover_rows),
+        prior_risk_repair_unwind_one_way_mass=torch.stack(prior_repair_unwind_rows),
+        risk_projection_request_to_execution_one_way_distance=torch.stack(
+            projection_distance_rows
+        ),
         absolute_policy_cost_by_cost=absolute_costs,
         benchmark_cost_by_cost=benchmark_costs,
         incremental_active_cost_by_cost=incremental_costs,
@@ -1000,5 +1048,4 @@ __all__ = [
     "M03R_V16_COHORT_TRACE_SCHEMA",
     "M03RV16CohortRuntimeError",
     "M03RV16CohortTrace",
-    "run_m03r_v16_horizon_matched_cohort_sleeve",
 ]

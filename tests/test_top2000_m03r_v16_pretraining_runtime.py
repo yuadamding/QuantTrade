@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+import rl_quant.training.top2000_m03r_v16_checkpoint as v16_checkpoint_runtime
 from rl_quant.envs.hold30 import CohortLedger
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_SETTINGS,
@@ -43,9 +44,47 @@ from rl_quant.training.top2000_m03r_v16_pretraining_step import (
     train_m03r_v16_score_batch_update,
 )
 from rl_quant.training.top2000_m03r_v16_validation_runtime import (
+    M03RV16CheckpointSelectionReceipt,
+    M03RV16InnerValidationReceipt,
     M03RV16ValidationError,
     evaluate_m03r_v16_inner_validation_batch,
+    select_m03r_v16_score_checkpoint,
 )
+
+
+def _selection_receipt(
+    checkpoint: M03RV16LoadedEpochCheckpoint,
+    *,
+    observed_epoch_count: int = 8,
+) -> M03RV16CheckpointSelectionReceipt:
+    geometry = render_m03r_v16_fold_geometries(1001)[checkpoint.fold_index]
+    receipts = tuple(
+        M03RV16InnerValidationReceipt(
+            setting_index=checkpoint.setting_index,
+            fold_index=checkpoint.fold_index,
+            epoch_index=epoch,
+            completed_score_updates=geometry.training_block_count * (epoch + 1),
+            origin_count=63,
+            mean_selection_rank_ic=0.0,
+            mean_selection_top_bottom_spread=0.0,
+            selection_robust_loss=0.1,
+            selection_prediction_std=0.02,
+            selection_target_std=0.05,
+            model_state_sha256=(
+                checkpoint.model_state_sha256
+                if epoch == observed_epoch_count - 1
+                else f"{700 + epoch:064x}"
+            ),
+            epoch_checkpoint_file_sha256=(
+                checkpoint.checkpoint_file_sha256
+                if epoch == observed_epoch_count - 1
+                else f"{800 + epoch:064x}"
+            ),
+            batch_receipt_sha256=f"{900 + epoch:064x}",
+        )
+        for epoch in range(observed_epoch_count)
+    )
+    return select_m03r_v16_score_checkpoint(receipts)
 
 
 def _surfaces() -> tuple[Hold30Sequence, object]:
@@ -138,6 +177,15 @@ def test_v16_survival_weighting_is_not_a_mandatory_expiry() -> None:
 def test_v16_qualification_authority_recomputes_checkpoint_score_projection() -> None:
     import rl_quant.training.top2000_m03r_v16_qualification_runtime as runtime
 
+    geometry = render_m03r_v16_fold_geometries(1001)[0]
+    schedule = M03RV16PanelSchedule(
+        protocol_common_data_sha256="f" * 64,
+        cache_sha256="b" * 64,
+        asset_axis_sha256="a" * 64,
+        fold_geometry_sha256=tuple(
+            row.receipt_sha256 for row in render_m03r_v16_fold_geometries(1001)
+        ),
+    )
     sequence, exposure = _surfaces()
     policy = Top2000M03RV16PredictivePolicy(
         0,
@@ -170,12 +218,20 @@ def test_v16_qualification_authority_recomputes_checkpoint_score_projection() ->
         model_state_sha256=model_state_sha256(policy),
         score_component_state_sha256="1" * 64,
         checkpoint_file_sha256="2" * 64,
-        panel_schedule_sha256="3" * 64,
+        panel_schedule_sha256=schedule.receipt_sha256,
         selection_target_operator_root_sha256="4" * 64,
         action_operator_root_sha256="5" * 64,
         source_array_sha256="c" * 64,
         asset_axis_sha256="a" * 64,
         head_identity=policy.v16_head_identity(),
+        _issuer=v16_checkpoint_runtime._LOADED_EPOCH_CHECKPOINT_ISSUER,
+    )
+    terminal = runtime.issue_m03r_v16_terminal_checkpoint_authority(
+        checkpoint,
+        _selection_receipt(checkpoint),
+        schedule,
+        geometry,
+        structural_slab_receipt_sha256="f" * 64,
     )
 
     class _DeviceOperator:
@@ -194,7 +250,7 @@ def test_v16_qualification_authority_recomputes_checkpoint_score_projection() ->
             )
 
     authority = runtime._issue_score_authority(
-        checkpoint,
+        terminal,
         batch,
         torch.randn((63, 1, sequence.num_assets, 16)),
         cast(Any, _Slab()),
@@ -209,7 +265,7 @@ def test_v16_qualification_authority_recomputes_checkpoint_score_projection() ->
     )
     with pytest.raises(ValueError, match="not reproduced"):
         runtime._issue_score_authority(
-            checkpoint,
+            terminal,
             replace(batch, objective=tampered_objective),
             torch.randn((63, 1, sequence.num_assets, 16)),
             cast(Any, _Slab()),
@@ -224,6 +280,61 @@ def test_v16_public_qualification_api_does_not_accept_a_prebuilt_batch() -> None
     )
 
     assert "batch" not in inspect.signature(run_m03r_v16_fold_qualification).parameters
+
+
+def test_v16_terminal_authority_rejects_early_or_schedule_mismatched_checkpoint() -> (
+    None
+):
+    import rl_quant.training.top2000_m03r_v16_qualification_runtime as runtime
+
+    geometry = render_m03r_v16_fold_geometries(1001)[0]
+    schedule = M03RV16PanelSchedule(
+        protocol_common_data_sha256="f" * 64,
+        cache_sha256="b" * 64,
+        asset_axis_sha256="a" * 64,
+        fold_geometry_sha256=tuple(
+            row.receipt_sha256 for row in render_m03r_v16_fold_geometries(1001)
+        ),
+    )
+    policy = Top2000M03RV16PredictivePolicy(
+        0,
+        token_dim=16,
+        raw_stock_chunk=8,
+        activation_checkpointing=False,
+    )
+    checkpoint = M03RV16LoadedEpochCheckpoint(
+        setting_index=0,
+        setting_id=M03R_V16_SETTINGS[0].setting_id,
+        fold_index=0,
+        epoch_index=7,
+        completed_score_updates=24,
+        model_state_sha256=model_state_sha256(policy),
+        score_component_state_sha256="1" * 64,
+        checkpoint_file_sha256="2" * 64,
+        panel_schedule_sha256=schedule.receipt_sha256,
+        selection_target_operator_root_sha256="4" * 64,
+        action_operator_root_sha256="5" * 64,
+        source_array_sha256="6" * 64,
+        asset_axis_sha256="a" * 64,
+        head_identity=policy.v16_head_identity(),
+        _issuer=v16_checkpoint_runtime._LOADED_EPOCH_CHECKPOINT_ISSUER,
+    )
+    with pytest.raises(ValueError, match="terminal checkpoint authority"):
+        runtime.issue_m03r_v16_terminal_checkpoint_authority(
+            checkpoint,
+            _selection_receipt(checkpoint, observed_epoch_count=4),
+            schedule,
+            geometry,
+            structural_slab_receipt_sha256="7" * 64,
+        )
+    with pytest.raises(ValueError, match="terminal checkpoint authority"):
+        runtime.issue_m03r_v16_terminal_checkpoint_authority(
+            replace(checkpoint, panel_schedule_sha256="9" * 64),
+            _selection_receipt(checkpoint),
+            schedule,
+            geometry,
+            structural_slab_receipt_sha256="7" * 64,
+        )
 
 
 def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
@@ -242,6 +353,14 @@ def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
             return None
 
     geometry = render_m03r_v16_fold_geometries(1001)[0]
+    schedule = M03RV16PanelSchedule(
+        protocol_common_data_sha256="f" * 64,
+        cache_sha256="b" * 64,
+        asset_axis_sha256="a" * 64,
+        fold_geometry_sha256=tuple(
+            row.receipt_sha256 for row in render_m03r_v16_fold_geometries(1001)
+        ),
+    )
     sequence, _exposure = _surfaces()
     policy = Top2000M03RV16PredictivePolicy(
         0,
@@ -258,12 +377,13 @@ def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
         model_state_sha256=model_state_sha256(policy),
         score_component_state_sha256="1" * 64,
         checkpoint_file_sha256="2" * 64,
-        panel_schedule_sha256="3" * 64,
+        panel_schedule_sha256=schedule.receipt_sha256,
         selection_target_operator_root_sha256="4" * 64,
         action_operator_root_sha256="5" * 64,
         source_array_sha256="6" * 64,
         asset_axis_sha256="a" * 64,
         head_identity=policy.v16_head_identity(),
+        _issuer=v16_checkpoint_runtime._LOADED_EPOCH_CHECKPOINT_ISSUER,
     )
     cache = _Validated(cache_sha256="b" * 64, action_hash="a" * 64)
     exposures = _Validated(receipt_sha256="c" * 64)
@@ -281,6 +401,7 @@ def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
     )
     slab = _Validated(
         receipt=SimpleNamespace(
+            receipt_sha256="8" * 64,
             cache_sha256="b" * 64,
             asset_axis_sha256="a" * 64,
             risk_source_receipt_sha256="d" * 64,
@@ -288,6 +409,13 @@ def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
             common_target_operator_root_sha256="4" * 64,
             action_operator_root_sha256="5" * 64,
         )
+    )
+    terminal = runtime.issue_m03r_v16_terminal_checkpoint_authority(
+        checkpoint,
+        _selection_receipt(checkpoint),
+        schedule,
+        geometry,
+        structural_slab_receipt_sha256="8" * 64,
     )
     built = SimpleNamespace(
         sequence=object(),
@@ -340,13 +468,21 @@ def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
     monkeypatch.setattr(
         runtime, "build_m03r_v16_batch_from_origin_states", _build_batch
     )
-    authority = _Validated(batch=batch)
+    authority = _Validated(
+        batch=batch,
+        receipt_sha256="9" * 64,
+        terminal_checkpoint_authority_sha256=terminal.receipt_sha256,
+        panel_schedule_sha256=schedule.receipt_sha256,
+    )
     monkeypatch.setattr(runtime, "_issue_score_authority", lambda *args: authority)
     trace = _Validated(
         fold_index=0,
         setting_index=0,
         checkpoint_file_sha256="2" * 64,
         checkpoint_model_state_sha256=checkpoint.model_state_sha256,
+        terminal_checkpoint_authority_sha256=terminal.receipt_sha256,
+        qualified_score_authority_sha256="9" * 64,
+        panel_schedule_sha256=schedule.receipt_sha256,
         qualification_batch_receipt_sha256="7" * 64,
     )
 
@@ -354,7 +490,11 @@ def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
         captured["cohort_kwargs"] = kwargs
         return trace
 
-    monkeypatch.setattr(runtime, "run_m03r_v16_horizon_matched_cohort_sleeve", _cohort)
+    monkeypatch.setattr(
+        runtime,
+        "_run_m03r_v16_horizon_matched_cohort_sleeve",
+        _cohort,
+    )
     result = runtime.run_m03r_v16_fold_qualification(
         cache,
         geometry,
@@ -362,7 +502,7 @@ def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
         risk_state,
         cast(Any, slab),
         policy,
-        checkpoint,
+        terminal,
         device=torch.device("cpu"),
     )
     result.validate()

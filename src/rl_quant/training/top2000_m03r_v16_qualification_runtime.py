@@ -28,7 +28,12 @@ from rl_quant.training.top2000_m03r_v7_dev import (
     top2000_m03r_v7_decision_inputs,
 )
 from rl_quant.training.top2000_m03r_v9_pretraining_step import model_state_sha256
-from rl_quant.training.top2000_m03r_v9_projection import M03RV9DeviceRiskState
+from rl_quant.training.top2000_m03r_v9_projection import (
+    M03RV9DeviceRiskState,
+    M03RV9ProjectorManifest,
+    M03RV9ProjectorRiskBinding,
+    build_m03r_v9_device_risk_state,
+)
 from rl_quant.training.top2000_m03r_v9_risk_materialization import (
     M03RV9MaterializedRiskSource,
 )
@@ -37,9 +42,12 @@ from rl_quant.training.top2000_m03r_v16_checkpoint import (
 )
 from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
     M03RV16CohortTrace,
-    run_m03r_v16_horizon_matched_cohort_sleeve,
+    _run_m03r_v16_horizon_matched_cohort_sleeve,
 )
-from rl_quant.training.top2000_m03r_v16_fold import M03RV16FoldGeometry
+from rl_quant.training.top2000_m03r_v16_fold import (
+    M03RV16FoldGeometry,
+    M03RV16PanelSchedule,
+)
 from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
 )
@@ -53,15 +61,122 @@ from rl_quant.training.top2000_m03r_v16_structural import (
 from rl_quant.training.top2000_m03r_v16_training_runtime import (
     move_and_bind_m03r_v16_sequence,
 )
+from rl_quant.training.top2000_m03r_v16_validation_runtime import (
+    M03RV16CheckpointSelectionReceipt,
+)
 
 M03R_V16_QUALIFIED_SCORE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-qualified-score-authority-v1"
+    "rl-quant.top2000-dev.m03r-v16-qualified-score-authority-v2"
+)
+M03R_V16_TERMINAL_CHECKPOINT_AUTHORITY_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-terminal-checkpoint-authority-v1"
 )
 _QUALIFIED_SCORE_ISSUER = object()
+_TERMINAL_CHECKPOINT_ISSUER = object()
 
 
 class M03RV16QualificationRuntimeError(ValueError):
     """The reloaded checkpoint, cache, score, slab, or risk lineage drifted."""
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16TerminalCheckpointAuthority:
+    """Issuer-bound proof that one fixed terminal checkpoint may qualify."""
+
+    loaded_checkpoint: M03RV16LoadedEpochCheckpoint
+    selection_receipt: M03RV16CheckpointSelectionReceipt
+    panel_schedule: M03RV16PanelSchedule
+    fold_geometry_sha256: str
+    structural_slab_receipt_sha256: str
+    receipt_sha256: str
+    _issuer: object = field(repr=False)
+    protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
+    schema: str = M03R_V16_TERMINAL_CHECKPOINT_AUTHORITY_SCHEMA
+
+    def unsigned_payload(self) -> dict[str, object]:
+        checkpoint = self.loaded_checkpoint
+        return {
+            "schema": self.schema,
+            "protocol_sha256": self.protocol_sha256,
+            "setting_index": checkpoint.setting_index,
+            "fold_index": checkpoint.fold_index,
+            "checkpoint_file_sha256": checkpoint.checkpoint_file_sha256,
+            "checkpoint_model_state_sha256": checkpoint.model_state_sha256,
+            "checkpoint_epoch_index": checkpoint.epoch_index,
+            "completed_score_updates": checkpoint.completed_score_updates,
+            "selection_receipt_sha256": self.selection_receipt.receipt_sha256,
+            "panel_schedule_sha256": self.panel_schedule.receipt_sha256,
+            "fold_geometry_sha256": self.fold_geometry_sha256,
+            "structural_slab_receipt_sha256": (self.structural_slab_receipt_sha256),
+        }
+
+    def validate(self) -> None:
+        checkpoint = self.loaded_checkpoint
+        selection = self.selection_receipt
+        schedule = self.panel_schedule
+        checkpoint.validate()
+        selection.validate()
+        schedule.validate()
+        terminal_epoch = M03R_V16_PREDICTIVE_SPEC.score_training_epochs - 1
+        if (
+            self._issuer is not _TERMINAL_CHECKPOINT_ISSUER
+            or checkpoint.epoch_index != terminal_epoch
+            or selection.observed_epoch_count
+            != M03R_V16_PREDICTIVE_SPEC.score_training_epochs
+            or selection.selected_epoch_index != terminal_epoch
+            or not selection.stop_authorized
+            or selection.stop_reason != "fixed-terminal-epoch"
+            or selection.setting_index != checkpoint.setting_index
+            or selection.fold_index != checkpoint.fold_index
+            or selection.selected_model_state_sha256 != checkpoint.model_state_sha256
+            or selection.selected_checkpoint_file_sha256
+            != checkpoint.checkpoint_file_sha256
+            or checkpoint.panel_schedule_sha256 != schedule.receipt_sha256
+            or schedule.fold_geometry_sha256[checkpoint.fold_index]
+            != self.fold_geometry_sha256
+            or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+            or self.schema != M03R_V16_TERMINAL_CHECKPOINT_AUTHORITY_SCHEMA
+            or self.receipt_sha256 != _sha256(self.unsigned_payload())
+        ):
+            raise M03RV16QualificationRuntimeError(
+                "V16 terminal checkpoint authority drifted"
+            )
+        for name, value in (
+            ("fold_geometry_sha256", self.fold_geometry_sha256),
+            (
+                "structural_slab_receipt_sha256",
+                self.structural_slab_receipt_sha256,
+            ),
+        ):
+            _digest(name, value)
+
+
+def issue_m03r_v16_terminal_checkpoint_authority(
+    checkpoint: M03RV16LoadedEpochCheckpoint,
+    selection_receipt: M03RV16CheckpointSelectionReceipt,
+    panel_schedule: M03RV16PanelSchedule,
+    geometry: M03RV16FoldGeometry,
+    *,
+    structural_slab_receipt_sha256: str,
+) -> M03RV16TerminalCheckpointAuthority:
+    """Issue qualification authority only for the frozen terminal epoch."""
+
+    geometry.validate()
+    provisional = M03RV16TerminalCheckpointAuthority(
+        loaded_checkpoint=checkpoint,
+        selection_receipt=selection_receipt,
+        panel_schedule=panel_schedule,
+        fold_geometry_sha256=geometry.receipt_sha256,
+        structural_slab_receipt_sha256=structural_slab_receipt_sha256,
+        receipt_sha256="0" * 64,
+        _issuer=_TERMINAL_CHECKPOINT_ISSUER,
+    )
+    result = replace(
+        provisional,
+        receipt_sha256=_sha256(provisional.unsigned_payload()),
+    )
+    result.validate()
+    return result
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -85,12 +200,90 @@ def _sha256(value: object) -> str:
     ).hexdigest()
 
 
+def _digest(name: str, value: str) -> str:
+    if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        raise M03RV16QualificationRuntimeError(f"{name} must be a lowercase SHA-256")
+    return value
+
+
+def _daily_log_returns(
+    cache: Top2000VerifiedDevelopmentCache,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    daily = cache.daily_ohlcv.to(dtype=torch.float64)
+    close = daily[..., 3]
+    valid = (
+        cache.availability[:-1]
+        & cache.availability[1:]
+        & (close[:-1] > 0.0)
+        & (close[1:] > 0.0)
+    )
+    returns = torch.zeros_like(close)
+    returns[1:] = torch.where(
+        valid,
+        torch.log(close[1:] / close[:-1]),
+        torch.zeros_like(close[1:]),
+    )
+    available = torch.zeros_like(cache.availability)
+    available[1:] = valid
+    returns[:, 0] = 0.0
+    available[:, 0] = False
+    receipt = _sha256(
+        {
+            "schema": "rl-quant.top2000-dev.m03r-v16-past-log-returns-v1",
+            "cache_sha256": cache.cache_sha256,
+            "asset_axis_sha256": cache.action_hash,
+            "return_sha256": _tensor_sha256(returns),
+            "availability_sha256": _tensor_sha256(available),
+            "current_origin_return_excluded": True,
+            "outer_2026_accessed": False,
+        }
+    )
+    return returns, available, receipt
+
+
+def build_m03r_v16_qualification_risk_state(
+    cache: Top2000VerifiedDevelopmentCache,
+    geometry: M03RV16FoldGeometry,
+    risk_source: M03RV9MaterializedRiskSource,
+    risk_binding: M03RV9ProjectorRiskBinding,
+    projector: M03RV9ProjectorManifest,
+    *,
+    device: torch.device,
+) -> M03RV9DeviceRiskState:
+    """Build risk tensors for all 63 decisions and the 29-return cohort tail."""
+
+    cache.validate_unmodified()
+    geometry.validate()
+    risk_source.validate()
+    daily_returns, return_available, receipt = _daily_log_returns(cache)
+    start = geometry.qualification_origin_start_inclusive
+    stop = (
+        start
+        + M03R_V16_PREDICTIVE_SPEC.qualification_origins_per_fold
+        + M03R_V16_PREDICTIVE_SPEC.cohort_no_new_decision_tail_sessions
+    )
+    return build_m03r_v9_device_risk_state(
+        risk_source,
+        risk_binding,
+        projector,
+        daily_log_returns=daily_returns,
+        return_available=return_available,
+        daily_returns_receipt_sha256=receipt,
+        sequence_asset_axis_sha256=cache.action_hash,
+        checkpoint_asset_axis_sha256=cache.action_hash,
+        origin_state_indices=tuple(range(start, stop)),
+        device=device,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class M03RV16QualifiedScoreAuthority:
     """Privately issued proof of checkpoint-owned score reconstruction."""
 
     batch: M03RV16BuiltPredictiveBatch
     checkpoint_model_state_sha256: str
+    terminal_checkpoint_authority_sha256: str
+    panel_schedule_sha256: str
     input_state_sha256: str
     raw_score_sha256: str
     executable_score_sha256: str
@@ -107,6 +300,10 @@ class M03RV16QualifiedScoreAuthority:
             "protocol_sha256": self.protocol_sha256,
             "batch_receipt_sha256": self.batch.receipt_sha256,
             "checkpoint_model_state_sha256": self.checkpoint_model_state_sha256,
+            "terminal_checkpoint_authority_sha256": (
+                self.terminal_checkpoint_authority_sha256
+            ),
+            "panel_schedule_sha256": self.panel_schedule_sha256,
             "input_state_sha256": self.input_state_sha256,
             "raw_score_sha256": self.raw_score_sha256,
             "executable_score_sha256": self.executable_score_sha256,
@@ -120,6 +317,14 @@ class M03RV16QualifiedScoreAuthority:
 
     def validate(self) -> None:
         self.batch.validate()
+        for name, value in (
+            (
+                "terminal_checkpoint_authority_sha256",
+                self.terminal_checkpoint_authority_sha256,
+            ),
+            ("panel_schedule_sha256", self.panel_schedule_sha256),
+        ):
+            _digest(name, value)
         if (
             self._issuer is not _QUALIFIED_SCORE_ISSUER
             or self.batch.split != "qualification"
@@ -143,26 +348,36 @@ class M03RV16QualifiedScoreAuthority:
 
 @dataclass(frozen=True, slots=True)
 class M03RV16FoldQualificationResult:
-    loaded_checkpoint: M03RV16LoadedEpochCheckpoint
+    terminal_checkpoint_authority: M03RV16TerminalCheckpointAuthority
     score_authority: M03RV16QualifiedScoreAuthority
     trace: M03RV16CohortTrace
 
     def validate(self) -> None:
-        self.loaded_checkpoint.validate()
+        self.terminal_checkpoint_authority.validate()
         self.score_authority.validate()
         self.trace.validate()
+        loaded_checkpoint = self.terminal_checkpoint_authority.loaded_checkpoint
         batch = self.score_authority.batch
         if (
-            batch.fold_index != self.loaded_checkpoint.fold_index
-            or batch.objective.setting.setting_index
-            != self.loaded_checkpoint.setting_index
-            or self.trace.fold_index != self.loaded_checkpoint.fold_index
-            or self.trace.setting_index != self.loaded_checkpoint.setting_index
+            batch.fold_index != loaded_checkpoint.fold_index
+            or batch.objective.setting.setting_index != loaded_checkpoint.setting_index
+            or self.trace.fold_index != loaded_checkpoint.fold_index
+            or self.trace.setting_index != loaded_checkpoint.setting_index
             or self.trace.checkpoint_file_sha256
-            != self.loaded_checkpoint.checkpoint_file_sha256
+            != loaded_checkpoint.checkpoint_file_sha256
             or self.trace.checkpoint_model_state_sha256
-            != self.loaded_checkpoint.model_state_sha256
+            != loaded_checkpoint.model_state_sha256
             or self.trace.qualification_batch_receipt_sha256 != batch.receipt_sha256
+            or self.score_authority.terminal_checkpoint_authority_sha256
+            != self.terminal_checkpoint_authority.receipt_sha256
+            or self.score_authority.panel_schedule_sha256
+            != self.terminal_checkpoint_authority.panel_schedule.receipt_sha256
+            or self.trace.terminal_checkpoint_authority_sha256
+            != self.terminal_checkpoint_authority.receipt_sha256
+            or self.trace.qualified_score_authority_sha256
+            != self.score_authority.receipt_sha256
+            or self.trace.panel_schedule_sha256
+            != self.terminal_checkpoint_authority.panel_schedule.receipt_sha256
         ):
             raise M03RV16QualificationRuntimeError(
                 "V16 fold qualification receipt chain drifted"
@@ -170,11 +385,13 @@ class M03RV16FoldQualificationResult:
 
 
 def _issue_score_authority(
-    checkpoint: M03RV16LoadedEpochCheckpoint,
+    terminal_checkpoint_authority: M03RV16TerminalCheckpointAuthority,
     batch: M03RV16BuiltPredictiveBatch,
     origin_states: torch.Tensor,
     structural_slab: M03RV16ValidatedStructuralSlab,
 ) -> M03RV16QualifiedScoreAuthority:
+    terminal_checkpoint_authority.validate()
+    checkpoint = terminal_checkpoint_authority.loaded_checkpoint
     recomputed: list[torch.Tensor] = []
     for row, origin in enumerate(batch.origin_indices.tolist()):
         device_operator = structural_slab.device_origin(
@@ -193,6 +410,12 @@ def _issue_score_authority(
     provisional = M03RV16QualifiedScoreAuthority(
         batch=batch,
         checkpoint_model_state_sha256=checkpoint.model_state_sha256,
+        terminal_checkpoint_authority_sha256=(
+            terminal_checkpoint_authority.receipt_sha256
+        ),
+        panel_schedule_sha256=(
+            terminal_checkpoint_authority.panel_schedule.receipt_sha256
+        ),
         input_state_sha256=_tensor_sha256(origin_states),
         raw_score_sha256=_tensor_sha256(batch.raw_selection_score_z),
         executable_score_sha256=_tensor_sha256(
@@ -219,7 +442,7 @@ def run_m03r_v16_fold_qualification(
     risk_state: M03RV9DeviceRiskState,
     structural_slab: M03RV16ValidatedStructuralSlab,
     policy: Top2000M03RV16PredictivePolicy,
-    checkpoint: M03RV16LoadedEpochCheckpoint,
+    terminal_checkpoint_authority: M03RV16TerminalCheckpointAuthority,
     *,
     device: torch.device,
 ) -> M03RV16FoldQualificationResult:
@@ -230,7 +453,9 @@ def run_m03r_v16_fold_qualification(
     risk_source.validate()
     risk_state.validate()
     structural_slab.require_fast_identity()
-    checkpoint.validate()
+    terminal_checkpoint_authority.validate()
+    checkpoint = terminal_checkpoint_authority.loaded_checkpoint
+    schedule = terminal_checkpoint_authority.panel_schedule
     spec = M03R_V16_PREDICTIVE_SPEC
     steps = spec.qualification_origins_per_fold + (
         spec.cohort_no_new_decision_tail_sessions
@@ -244,6 +469,13 @@ def run_m03r_v16_fold_qualification(
     setting = M03R_V16_SETTINGS[checkpoint.setting_index]
     if (
         checkpoint.fold_index != geometry.fold_index
+        or terminal_checkpoint_authority.fold_geometry_sha256 != geometry.receipt_sha256
+        or terminal_checkpoint_authority.structural_slab_receipt_sha256
+        != structural_slab.receipt.receipt_sha256
+        or checkpoint.panel_schedule_sha256 != schedule.receipt_sha256
+        or schedule.cache_sha256 != cache.cache_sha256
+        or schedule.asset_axis_sha256 != cache.action_hash
+        or schedule.fold_geometry_sha256[geometry.fold_index] != geometry.receipt_sha256
         or policy.v16_setting != setting
         or model_state_sha256(policy) != checkpoint.model_state_sha256
         or checkpoint.asset_axis_sha256 != cache.action_hash
@@ -324,7 +556,7 @@ def run_m03r_v16_fold_qualification(
             structural_slab=structural_slab,
         )
     score_authority = _issue_score_authority(
-        checkpoint,
+        terminal_checkpoint_authority,
         batch,
         origin_states,
         structural_slab,
@@ -342,11 +574,16 @@ def run_m03r_v16_fold_qualification(
     )
     fill_available = fill_available.clone()
     fill_available[:, bound_sequence.initial_ledger.cash_index] = False
-    trace = run_m03r_v16_horizon_matched_cohort_sleeve(
+    trace = _run_m03r_v16_horizon_matched_cohort_sleeve(
         setting,
         fold_index=checkpoint.fold_index,
         checkpoint_file_sha256=checkpoint.checkpoint_file_sha256,
         checkpoint_model_state_sha256=checkpoint.model_state_sha256,
+        terminal_checkpoint_authority_sha256=(
+            terminal_checkpoint_authority.receipt_sha256
+        ),
+        qualified_score_authority_sha256=score_authority.receipt_sha256,
+        panel_schedule_sha256=schedule.receipt_sha256,
         qualification_batch_receipt_sha256=batch.receipt_sha256,
         asset_axis_sha256=batch.asset_axis_sha256,
         decision_origin_indices=batch.origin_indices,
@@ -372,7 +609,7 @@ def run_m03r_v16_fold_qualification(
         risk_state=risk_state,
     )
     result = M03RV16FoldQualificationResult(
-        loaded_checkpoint=checkpoint,
+        terminal_checkpoint_authority=terminal_checkpoint_authority,
         score_authority=score_authority,
         trace=trace,
     )
@@ -382,8 +619,12 @@ def run_m03r_v16_fold_qualification(
 
 __all__ = [
     "M03R_V16_QUALIFIED_SCORE_SCHEMA",
+    "M03R_V16_TERMINAL_CHECKPOINT_AUTHORITY_SCHEMA",
     "M03RV16FoldQualificationResult",
     "M03RV16QualificationRuntimeError",
     "M03RV16QualifiedScoreAuthority",
+    "M03RV16TerminalCheckpointAuthority",
+    "build_m03r_v16_qualification_risk_state",
+    "issue_m03r_v16_terminal_checkpoint_authority",
     "run_m03r_v16_fold_qualification",
 ]

@@ -10,9 +10,6 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_SETTINGS,
 )
-from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
-    run_m03r_v16_horizon_matched_cohort_sleeve,
-)
 
 
 class _Risk(SimpleNamespace):
@@ -88,6 +85,18 @@ def _identity_projection(
     )
 
 
+def _run(setting: Any, **kwargs: Any) -> Any:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    return runtime._run_m03r_v16_horizon_matched_cohort_sleeve(
+        setting,
+        terminal_checkpoint_authority_sha256="1" * 64,
+        qualified_score_authority_sha256="2" * 64,
+        panel_schedule_sha256="3" * 64,
+        **kwargs,
+    )
+
+
 @pytest.mark.parametrize("setting_index", (0, 1, 2))
 def test_v16_cohort_path_is_closed_and_costs_reconcile(
     monkeypatch: pytest.MonkeyPatch,
@@ -96,7 +105,7 @@ def test_v16_cohort_path_is_closed_and_costs_reconcile(
     import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
 
     monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _identity_projection)
-    trace = run_m03r_v16_horizon_matched_cohort_sleeve(
+    trace = _run(
         M03R_V16_SETTINGS[setting_index],
         **_inputs(),
     )
@@ -111,7 +120,8 @@ def test_v16_cohort_path_is_closed_and_costs_reconcile(
         )
     assert trace.terminal_liquidation_one_way_turnover >= 0.0
     assert trace.risk_repair_active_one_way_mass.shape == (steps,)
-    assert trace.risk_forced_one_way_turnover.shape == (steps,)
+    assert trace.prior_risk_repair_unwind_one_way_mass.shape == (steps,)
+    assert trace.risk_projection_request_to_execution_one_way_distance.shape == (steps,)
     ten_bp = M03R_V16_PREDICTIVE_SPEC.evaluation_cost_basis_points.index(10.0)
     assert torch.allclose(
         trace.absolute_policy_cost_by_cost[ten_bp],
@@ -137,7 +147,7 @@ def test_v16_h30_final_decision_earns_exactly_thirty_returns(
     import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
 
     monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _identity_projection)
-    trace = run_m03r_v16_horizon_matched_cohort_sleeve(
+    trace = _run(
         M03R_V16_SETTINGS[1],
         **_inputs(),
     )
@@ -160,12 +170,8 @@ def test_v16_future_label_mask_cannot_change_action_path(
     baseline_inputs = _inputs()
     changed_inputs = _inputs()
     changed_inputs["diagnostic_valid"][:, -1] = False
-    baseline = run_m03r_v16_horizon_matched_cohort_sleeve(
-        M03R_V16_SETTINGS[1], **baseline_inputs
-    )
-    changed = run_m03r_v16_horizon_matched_cohort_sleeve(
-        M03R_V16_SETTINGS[1], **changed_inputs
-    )
+    baseline = _run(M03R_V16_SETTINGS[1], **baseline_inputs)
+    changed = _run(M03R_V16_SETTINGS[1], **changed_inputs)
     assert baseline.diagnostic_valid_sha256 != changed.diagnostic_valid_sha256
     assert torch.equal(baseline.policy_gross_returns, changed.policy_gross_returns)
     assert torch.equal(
@@ -194,7 +200,7 @@ def test_v16_origin_valid_future_invalid_asset_remains_actionable(
     monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _capture_projection)
     values = _inputs()
     values["diagnostic_valid"][0, -1] = False
-    run_m03r_v16_horizon_matched_cohort_sleeve(M03R_V16_SETTINGS[1], **values)
+    _run(M03R_V16_SETTINGS[1], **values)
     benchmark = values["benchmark_weights"][0, -1]
     assert float(requested[0][0, -1]) > float(benchmark)
 
@@ -228,7 +234,7 @@ def test_v16_projection_clipping_is_carried_in_executed_cohorts(
     values = _inputs()
     values["post_fill_asset_returns"].zero_()
     values["executable_selection_scores"][1:].zero_()
-    run_m03r_v16_horizon_matched_cohort_sleeve(M03R_V16_SETTINGS[1], **values)
+    _run(M03R_V16_SETTINGS[1], **values)
     benchmark = values["benchmark_weights"][0]
     first_requested_active = requested[0].squeeze(0) - benchmark
     second_requested_active = requested[1].squeeze(0) - benchmark
@@ -261,7 +267,7 @@ def test_v16_executed_cohorts_carry_return_drift_into_next_request(
     values["post_fill_asset_returns"].zero_()
     values["post_fill_asset_returns"][0, 1] = -0.10
     values["post_fill_asset_returns"][0, -1] = 0.10
-    run_m03r_v16_horizon_matched_cohort_sleeve(M03R_V16_SETTINGS[1], **values)
+    _run(M03R_V16_SETTINGS[1], **values)
 
     first = requested[0].squeeze(0)
     benchmark = values["benchmark_weights"][0]
@@ -272,7 +278,19 @@ def test_v16_executed_cohorts_carry_return_drift_into_next_request(
         first * (1.0 + returns) / policy_growth
         - benchmark * (1.0 + returns) / benchmark_growth
     )
-    expected_second = values["benchmark_weights"][1] + drifted_active
+    signal_active = first - benchmark
+    carried_signal = signal_active * (1.0 + returns) / policy_growth
+    carried_signal[0] = -carried_signal[1:].sum()
+    compatible = carried_signal[1:] * drifted_active[1:] > 0.0
+    expected_signal = torch.zeros_like(carried_signal)
+    expected_signal[1:] = torch.where(
+        compatible,
+        drifted_active[1:].sign()
+        * torch.minimum(drifted_active[1:].abs(), carried_signal[1:].abs()),
+        torch.zeros_like(carried_signal[1:]),
+    )
+    expected_signal[0] = -expected_signal[1:].sum()
+    expected_second = values["benchmark_weights"][1] + expected_signal
     assert torch.allclose(
         requested[1].squeeze(0),
         expected_second,
@@ -344,3 +362,84 @@ def test_v16_nonuniform_projection_keeps_every_cohort_self_financing() -> None:
         for row in reconciled
     )
     assert float((benchmark + released).sum()) == pytest.approx(1.0, abs=2.0e-12)
+
+
+def test_v16_same_direction_projection_excess_remains_risk_repair() -> None:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    signal = runtime._ExecutedActiveCohort(
+        torch.tensor([-0.01, 0.01, 0.0], dtype=torch.float64),
+        cohort_id=4,
+    )
+    reconciled = runtime._reconcile_executed_cohorts(
+        [signal],
+        torch.tensor([-0.015, 0.015, 0.0], dtype=torch.float64),
+        cash_index=0,
+    )
+    observed_signal = next(row for row in reconciled if row.attribution == "signal")
+    repair = next(row for row in reconciled if row.attribution == "risk_repair")
+    assert torch.equal(
+        observed_signal.executed_active_weights,
+        signal.executed_active_weights,
+    )
+    assert torch.allclose(
+        repair.executed_active_weights,
+        torch.tensor([-0.005, 0.005, 0.0], dtype=torch.float64),
+        rtol=0.0,
+        atol=2.0e-12,
+    )
+
+
+def test_v16_prior_risk_repair_is_unwound_unless_projection_recreates_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    requested: list[torch.Tensor] = []
+    calls = 0
+
+    def _one_day_repair(
+        requested_weights: torch.Tensor,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        nonlocal calls
+        requested.append(requested_weights.detach().clone())
+        projected = requested_weights.clone()
+        if calls == 0:
+            projected[:, 0] -= 0.004
+            projected[:, 3] += 0.004
+        calls += 1
+        requested_active = 0.5 * (requested_weights - _args[0]).abs().sum(dim=-1)
+        executed_active = 0.5 * (projected - _args[0]).abs().sum(dim=-1)
+        retention = torch.where(
+            requested_active > 0.0,
+            executed_active / requested_active,
+            torch.ones_like(requested_active),
+        )
+        return SimpleNamespace(
+            projected_weights=projected,
+            requested_to_executed_retention=retention,
+        )
+
+    monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _one_day_repair)
+    values = _inputs()
+    values["post_fill_asset_returns"].zero_()
+    values["executable_selection_scores"][1:].zero_()
+    trace = _run(M03R_V16_SETTINGS[1], **values)
+
+    benchmark = values["benchmark_weights"][0]
+    first_requested = requested[0].squeeze(0)
+    second_requested = requested[1].squeeze(0)
+    assert float(first_requested[3]) == pytest.approx(float(benchmark[3]))
+    assert float(second_requested[3]) == pytest.approx(float(benchmark[3]))
+    assert float(trace.risk_repair_active_one_way_mass[0]) == pytest.approx(0.004)
+    assert float(trace.risk_repair_active_one_way_mass[1]) == pytest.approx(0.0)
+    assert float(trace.prior_risk_repair_unwind_one_way_mass[1]) == pytest.approx(0.004)
+    assert float(
+        trace.risk_projection_request_to_execution_one_way_distance[0]
+    ) == pytest.approx(0.004)
+    assert float(
+        trace.risk_projection_request_to_execution_one_way_distance[1]
+    ) == pytest.approx(0.0)
+    assert float(trace.policy_one_way_turnover[1]) >= 0.004

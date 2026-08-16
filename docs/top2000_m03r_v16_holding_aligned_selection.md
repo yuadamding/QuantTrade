@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v4 revision; older v16 source and
+current local protocol is the result-moving v5 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -161,12 +161,15 @@ sensitivities, while preserving fold boundaries.
 
 ## Qualification path
 
-The local source now implements a package-owned structural slab, a slab-bound
-fold update, an exact-workload disposable capacity primitive, and the
-horizon-matched cohort accounting primitive. Package construction and H100
-execution remain blocked until a package builder, static validator, reloaded-
-checkpoint qualification wrapper, remote worker, and lifecycle integration
-bind these components end to end.
+The local source now binds the package-owned structural slab, slab-backed fold
+updates, exact-workload disposable capacity primitive, terminal-checkpoint
+qualification, horizon-matched cohort accounting, fold-preserving statistical
+aggregate, and primary-R2 decision rule end to end. It also provides a sealed
+local package builder, same-image static validator, deterministic safe transfer
+archive, two-rank image worker, and receipt-gated suspended Job renderers. No
+real package has been built and no Kubernetes object has been created; real-data
+package validation, server-side dry runs, live admission, capacity evidence,
+and scientific execution remain required.
 
 Qualification retains two distinct diagnostics:
 
@@ -181,9 +184,14 @@ fill-time availability. The common 30-session label mask is diagnostic-only
 and cannot influence action construction. Every signal cohort remains
 self-financing after projection, release, and drift. Projector-created
 exposures enter a separate age-independent risk-repair cohort, so they cannot
-inherit an arbitrary signal age. Cohort rows sum to the carried executed
-active book after every transition, while risk-forced turnover and repair mass
-are published separately.
+inherit an arbitrary signal age. Prior repair remains in the carried portfolio
+for P&L and actual-turnover accounting but is excluded from the next desired
+signal request; the current projector must recreate every still-required
+repair. Same-direction executed excess beyond compatible signal request also
+remains repair. Cohort rows sum to the carried executed active book after every
+transition. Prior-repair unwind mass and request-to-execution projection
+distance are explicitly non-additive telemetry, separate from actual policy
+turnover.
 
 The cost ladder is `0, 1, 2, 3, 5, 10, 20, 40 bp`. Report absolute policy cost,
 benchmark cost, incremental active cost, gross/net policy return, gross/net
@@ -227,18 +235,52 @@ training.
 
 The cohort primitive publishes separate absolute policy, benchmark, and
 incremental costs and net returns; 21-/30-session or truncated age-clock
-release; executed signal ages; risk-repair mass; risk-forced turnover;
-risk-projection retention; final-horizon chronology; and terminal liquidation.
+signal-cohort mass reduction after execution; executed signal ages;
+risk-repair mass; prior-repair unwind mass; request-to-execution projection
+distance; risk-projection retention;
+final-horizon chronology; and terminal liquidation.
 The authoritative fold qualifier accepts the reloaded policy, cache, risk,
 fold, and validated slab—not a caller-supplied score batch. It rebuilds origin
 states, raw scores, and action-projected scores internally, recomputes the
 projection once at the qualification boundary, and binds all arrays to the
-checkpoint before cohort economics can run.
+checkpoint before cohort economics can run. Qualification additionally requires
+an issuer-bound terminal authority that reconciles fixed epoch 8, the complete
+checkpoint-selection receipt, paired panel schedule, fold geometry, cache axis,
+and structural-slab receipt. Every trace binds the terminal-checkpoint and
+qualified-score authority receipts.
 
-No local package builder, same-image static gate, complete fold evaluator and
-statistical aggregate, remote worker, Kubernetes lifecycle, or real-data slab
-receipt exists yet. No capacity or performance evidence is claimed. Those
-remaining omissions still block packaging and H100 execution.
+The local package builder copies the exact source, cache, risk, and projector
+inputs; builds the structural slab from those package-owned copies in an
+isolated interpreter; seals the common initial state, panel schedule, package
+plan, execution authorization, and full inventory; and can emit a deterministic
+transfer archive that rejects traversal, duplicates, links, devices, and hash
+drift. The same-image static validator explicitly performs no training and
+claims zero GPU visibility only. The worker requires exactly two visible H100
+80GB devices, runs one disposable exact-shape capacity update plus a nontrivial
+risk projection, or serially trains and strictly reloads all five folds before
+checkpoint-owned qualification.
+
+The aggregate uses fold-preserving 42-session bootstrap blocks with frozen
+30-/63-session sensitivities. Only R2 can authorize a three-seed predictive
+confirmation; a failure routes to ordered five-minute research. It can never
+authorize an economic generation, reinforcement learning, or 2026 access. A
+no-follow file aggregator verifies the exact three worker-terminal hashes,
+package/authorization/worker identities, common bootstrap receipt, and each
+setting qualification before publishing the no-clobber panel decision.
+
+The local Kubernetes layer renders three distinct `batch/v1` Jobs: explicit
+zero-GPU static validation, one two-H100 capacity sentinel, and a suspended
+three-completion predictive panel requesting at most six H100s. Capacity and
+predictive rendering require the preceding immutable gate receipts. All Jobs
+remain suspended, fail-fast, token-unmounted, nonprivileged, digest-pinned,
+bounded by deadline/TTL, and mount only the scoped package/output PVC paths.
+Activation, live admission binding, detached supervision, UID-bound cleanup,
+and any remote mutation are intentionally not implemented by this source-only
+revision.
+
+No real-data package or slab receipt, same-image result, capacity result,
+remote Job, GPU result, or performance result is claimed. Those evidence gates
+still block H100 scientific execution.
 
 ## Local verification
 

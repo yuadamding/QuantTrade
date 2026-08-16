@@ -6,7 +6,7 @@ import hashlib
 import os
 import stat
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -27,9 +27,10 @@ from rl_quant.training.top2000_m03r_v16_policy import (
 )
 
 M03R_V16_EPOCH_CHECKPOINT_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-score-epoch-checkpoint-v3"
+    "rl-quant.top2000-dev.m03r-v16-score-epoch-checkpoint-v4"
 )
 _MAX_CHECKPOINT_BYTES = 8 * 1024**3
+_LOADED_EPOCH_CHECKPOINT_ISSUER = object()
 EvaluationResult = TypeVar("EvaluationResult")
 
 
@@ -82,6 +83,7 @@ class M03RV16LoadedEpochCheckpoint:
     source_array_sha256: str
     asset_axis_sha256: str
     head_identity: M03RV16HeadIdentity
+    _issuer: object = field(repr=False)
     hold_target_sessions: int = LEGACY_HOLD30_TARGET_SPEC.target_sessions
     hold_target_spec_sha256: str = LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
@@ -89,7 +91,8 @@ class M03RV16LoadedEpochCheckpoint:
     def validate(self) -> None:
         self.head_identity.validate()
         if (
-            self.setting_index not in range(len(M03R_V16_SETTINGS))
+            self._issuer is not _LOADED_EPOCH_CHECKPOINT_ISSUER
+            or self.setting_index not in range(len(M03R_V16_SETTINGS))
             or self.setting_id != M03R_V16_SETTINGS[self.setting_index].setting_id
             or self.fold_index
             not in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
@@ -333,6 +336,7 @@ def load_m03r_v16_epoch_checkpoint_for_evaluation(
         source_array_sha256=cast(str, expected["source_array_sha256"]),
         asset_axis_sha256=cast(str, expected["asset_axis_sha256"]),
         head_identity=stored_identity,
+        _issuer=_LOADED_EPOCH_CHECKPOINT_ISSUER,
     )
     result.validate()
     return result

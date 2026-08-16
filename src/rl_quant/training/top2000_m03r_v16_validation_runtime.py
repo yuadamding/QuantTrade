@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import torch
 
@@ -26,8 +26,9 @@ from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
 
 M03R_V16_INNER_VALIDATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-inner-validation-v3"
 M03R_V16_CHECKPOINT_SELECTION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-fixed-terminal-checkpoint-v3"
+    "rl-quant.top2000-dev.m03r-v16-fixed-terminal-checkpoint-v4"
 )
+_CHECKPOINT_SELECTION_ISSUER = object()
 
 
 class M03RV16ValidationError(ValueError):
@@ -159,6 +160,7 @@ class M03RV16CheckpointSelectionReceipt:
     observed_epoch_count: int
     stop_authorized: bool
     stop_reason: str
+    _issuer: object = field(repr=False)
     validation_metrics_used_for_selection: bool = False
     selection_rule: str = M03R_V16_CHECKPOINT_SELECTION_RULE
     qualification_tail_accessed: bool = False
@@ -170,7 +172,8 @@ class M03RV16CheckpointSelectionReceipt:
         spec = M03R_V16_PREDICTIVE_SPEC
         maximum = spec.score_training_epochs
         if (
-            self.setting_index not in range(len(M03R_V16_SETTINGS))
+            self._issuer is not _CHECKPOINT_SELECTION_ISSUER
+            or self.setting_index not in range(len(M03R_V16_SETTINGS))
             or self.fold_index not in range(spec.chronological_fold_count)
             or self.observed_epoch_count not in range(1, maximum + 1)
             or self.selected_epoch_index != self.observed_epoch_count - 1
@@ -202,7 +205,9 @@ class M03RV16CheckpointSelectionReceipt:
     @property
     def receipt_sha256(self) -> str:
         self.validate()
-        return _sha256(asdict(self))
+        payload = asdict(self)
+        payload.pop("_issuer")
+        return _sha256(payload)
 
 
 def evaluate_m03r_v16_inner_validation_batch(
@@ -308,6 +313,7 @@ def select_m03r_v16_score_checkpoint(
         observed_epoch_count=len(receipts),
         stop_authorized=stop,
         stop_reason="fixed-terminal-epoch" if stop else "continue",
+        _issuer=_CHECKPOINT_SELECTION_ISSUER,
     )
     result.validate()
     return result

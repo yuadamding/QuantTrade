@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,8 @@ def test_v16_epoch_checkpoint_round_trip_uses_exact_loaded_bytes(
     assert observed[0] == loaded.head_identity
     assert observed[1] == loaded.model_state_sha256
     assert loaded.epoch_index == 3
+    with pytest.raises(M03RV16CheckpointError, match="loaded checkpoint"):
+        replace(loaded, _issuer=object()).validate()
 
 
 def test_v16_epoch_checkpoint_rejects_wrong_update_cursor(tmp_path: Path) -> None:
