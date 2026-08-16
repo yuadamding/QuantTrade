@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import os
-import random
 import stat
 import subprocess
 import sys
@@ -14,11 +13,14 @@ import tarfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import torch
-
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
+)
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes as _canonical,
+    file_sha256 as _file_sha256,
+    semantic_sha256 as _sha256,
 )
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 from rl_quant.training.hold30_top2000_development import (
@@ -28,9 +30,6 @@ from rl_quant.training.hold30_top2000_development import (
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16PanelSchedule,
     render_m03r_v16_fold_geometries,
-)
-from rl_quant.training.top2000_m03r_v16_initial_state import (
-    write_m03r_v16_initial_parameter_state,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03R_V16_RUNTIME_ENTRYPOINT,
@@ -42,8 +41,8 @@ from rl_quant.training.top2000_m03r_v16_package import (
     write_m03r_v16_execution_authorization,
     write_m03r_v16_package_plan,
 )
-from rl_quant.training.top2000_m03r_v16_policy import (
-    Top2000M03RV16PredictivePolicy,
+from rl_quant.training.top2000_m03r_v16_source import (
+    M03R_V16_SOURCE_MANIFEST_SCHEMA,
 )
 from rl_quant.training.top2000_m03r_v16_structural import (
     load_m03r_v16_structural_slab,
@@ -51,9 +50,6 @@ from rl_quant.training.top2000_m03r_v16_structural import (
 
 M03R_V16_LOCAL_PACKAGE_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-local-predictive-package-v1"
-)
-M03R_V16_SOURCE_MANIFEST_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-runtime-source-manifest-v1"
 )
 M03R_V16_EXECUTION_MANIFEST_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-execution-manifest-v1"
@@ -65,6 +61,10 @@ M03R_V16_RUNTIME_WORKER = "src/rl_quant/workflows/top2000_m03r_v16_predictive.py
 M03R_V16_STRUCTURAL_BUILDER = (
     "src/rl_quant/workflows/top2000_m03r_v16_structural_build.py"
 )
+M03R_V16_INITIAL_STATE_BUILDER = (
+    "src/rl_quant/workflows/top2000_m03r_v16_initial_state_build.py"
+)
+M03R_V16_POLICY_SOURCE = "src/rl_quant/training/top2000_m03r_v16_policy.py"
 M03R_V16_OPERATOR_SOURCE = (
     "src/rl_quant/training/top2000_m03r_v15_residual_operator.py"
 )
@@ -76,31 +76,6 @@ PINNED_QUANTTRADE_IMAGE = (
 
 class M03RV16PackageBuildError(ValueError):
     """A V16 package member, identity, or no-clobber boundary drifted."""
-
-
-def _canonical(value: Any) -> bytes:
-    return (
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
-    ).encode("utf-8")
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _regular(path: Path, name: str) -> Path:
@@ -157,6 +132,8 @@ def _source_members(root: Path) -> tuple[Path, ...]:
         root / "uv.lock",
         root / M03R_V16_RUNTIME_WORKER,
         root / M03R_V16_STRUCTURAL_BUILDER,
+        root / M03R_V16_INITIAL_STATE_BUILDER,
+        root / M03R_V16_POLICY_SOURCE,
         root / M03R_V16_OPERATOR_SOURCE,
     )
     for path in required:
@@ -247,12 +224,6 @@ def _safe_source_tar(path: Path) -> None:
             names.add(member.name)
 
 
-def _initial_policy() -> Top2000M03RV16PredictivePolicy:
-    random.seed(M03R_V16_PREDICTIVE_SPEC.seed)
-    torch.manual_seed(M03R_V16_PREDICTIVE_SPEC.seed)
-    return Top2000M03RV16PredictivePolicy(0)
-
-
 def _read_structural_build_receipt(path: Path) -> dict[str, Any]:
     _regular(path, "structural build receipt")
     try:
@@ -267,6 +238,63 @@ def _read_structural_build_receipt(path: Path) -> dict[str, Any]:
     if receipt.get("receipt_sha256") != _sha256(unsigned):
         raise M03RV16PackageBuildError("V16 structural receipt hash drifted")
     return receipt
+
+
+def _run_package_owned_initial_state(package_root: Path) -> dict[str, Any]:
+    state = package_root / "model/common-initial-parameter-state.pt"
+    receipt = package_root / "plans/initial-state-build.json"
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONHASHSEED": str(M03R_V16_PREDICTIVE_SPEC.seed),
+    }
+    command = (
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            "import sys;"
+            "sys.path.insert(0,sys.argv.pop(1));"
+            "from rl_quant.workflows.top2000_m03r_v16_initial_state_build "
+            "import main;"
+            "raise SystemExit(main())"
+        ),
+        str(package_root / "source/src"),
+        "--output-state",
+        str(state),
+        "--output-receipt",
+        str(receipt),
+    )
+    try:
+        subprocess.run(
+            command,
+            cwd=package_root,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise M03RV16PackageBuildError(
+            "package-owned V16 initial-state builder failed"
+        ) from exc
+    _regular(receipt, "initial-state build receipt")
+    try:
+        loaded: object = json.loads(receipt.read_bytes())
+    except json.JSONDecodeError as exc:
+        raise M03RV16PackageBuildError(
+            "package-owned V16 initial-state receipt is malformed"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise M03RV16PackageBuildError(
+            "package-owned V16 initial-state receipt is not an object"
+        )
+    row: dict[str, Any] = dict(loaded)
+    unsigned = {key: value for key, value in row.items() if key != "receipt_sha256"}
+    if row.get("receipt_sha256") != _sha256(unsigned):
+        raise M03RV16PackageBuildError(
+            "package-owned V16 initial-state receipt drifted"
+        )
+    return row
 
 
 def _run_package_owned_structural_slab(
@@ -401,12 +429,30 @@ def build_m03r_v16_local_package(
     projector_file_sha = _copy(
         projector_manifest, package_root / "risk" / "projector-manifest.json"
     )
-    initial_state_sha, initial_file_sha, architecture_sha = (
-        write_m03r_v16_initial_parameter_state(
-            package_root / "model" / "common-initial-parameter-state.pt",
-            _initial_policy(),
+    initial_build = _run_package_owned_initial_state(package_root)
+    source_sha_by_path = {
+        str(row["path"]): str(row["sha256"]) for row in source_tuple
+    }
+    if (
+        initial_build.get("schema")
+        != "rl-quant.top2000-dev.m03r-v16-package-owned-initial-state-v1"
+        or initial_build.get("protocol_sha256") != M03R_V16_PROTOCOL_SHA256
+        or initial_build.get("policy_source_sha256")
+        != source_sha_by_path[M03R_V16_POLICY_SOURCE]
+        or initial_build.get("builder_source_sha256")
+        != source_sha_by_path[M03R_V16_INITIAL_STATE_BUILDER]
+        or initial_build.get("setting_index") != 0
+        or initial_build.get("seed") != M03R_V16_PREDICTIVE_SPEC.seed
+        or initial_build.get("development_only") is not True
+        or initial_build.get("reportable") is not False
+        or initial_build.get("promotion_eligible") is not False
+    ):
+        raise M03RV16PackageBuildError(
+            "package-owned V16 initial-state source identity drifted"
         )
-    )
+    initial_state_sha = str(initial_build["initial_parameter_state_sha256"])
+    initial_file_sha = str(initial_build["initial_parameter_state_file_sha256"])
+    architecture_sha = str(initial_build["initial_parameter_architecture_sha256"])
     operator_source_sha = next(
         row["sha256"]
         for row in source_tuple
@@ -432,7 +478,7 @@ def build_m03r_v16_local_package(
     artifacts = M03RV16PackageArtifacts(
         source_archive_sha256=source_archive_sha,
         source_manifest_sha256=source_manifest_sha,
-        dependency_lock_sha256=_file_sha256(source / "uv.lock"),
+        dependency_lock_sha256=_file_sha256(package_root / "source/uv.lock"),
         cache_artifact_sha256=cache_sha,
         cache_manifest_sha256=cache_manifest_sha,
         asset_axis_sha256=receipt.asset_axis_sha256,

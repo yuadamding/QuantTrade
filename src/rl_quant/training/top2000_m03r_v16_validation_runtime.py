@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from dataclasses import asdict, dataclass, field
 
@@ -15,6 +13,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16FoldGeometry,
     render_m03r_v16_fold_geometries,
@@ -33,17 +32,6 @@ _CHECKPOINT_SELECTION_ISSUER = object()
 
 class M03RV16ValidationError(ValueError):
     """The V16 training-only diagnostic evidence drifted."""
-
-
-def _sha256(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("ascii")
-    ).hexdigest()
 
 
 def _digest(value: str) -> bool:

@@ -13,12 +13,16 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_SETTINGS,
 )
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.hold30_top2000_development import (
     Top2000VerifiedDevelopmentCache,
 )
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16FoldGeometry,
     M03RV16PanelSchedule,
+)
+from rl_quant.training.top2000_m03r_v16_evaluation_runtime import (
+    build_m03r_v16_inner_validation_batch,
 )
 from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
@@ -45,26 +49,15 @@ from rl_quant.training.top2000_m03r_v9_risk_materialization import (
 )
 
 M03R_V16_CAPACITY_RANK_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-exact-workload-capacity-rank-v2"
+    "rl-quant.top2000-dev.m03r-v16-exact-workload-capacity-rank-v3"
 )
 M03R_V16_CAPACITY_TERMINAL_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-exact-workload-two-h100-terminal-v2"
+    "rl-quant.top2000-dev.m03r-v16-exact-workload-two-h100-terminal-v3"
 )
 
 
 class M03RV16CapacityError(ValueError):
     """The disposable V16 H100 capacity qualification failed or drifted."""
-
-
-def _sha256(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("ascii")
-    ).hexdigest()
 
 
 def _digest(value: str) -> bool:
@@ -89,6 +82,8 @@ class M03RV16CapacityRankEvidence:
     cuda_total_memory_bytes: int
     peak_allocated_bytes: int
     peak_reserved_bytes: int
+    pre_validation_update_receipt_sha256: str
+    validation_batch_receipt_sha256: str
     update_plan_sha256: str
     batch_receipt_sha256: str
     score_step_receipt_sha256: str
@@ -107,6 +102,8 @@ class M03RV16CapacityRankEvidence:
     bf16_forward_backward_executed: bool = True
     nccl_gradient_sum_executed: bool = True
     optimizer_mutation_executed: bool = True
+    train_validate_train_executed: bool = True
+    training_mode_restored_after_validation: bool = True
     qualification_projection_executed: bool = True
     qualification_risk_repair_executed: bool = True
     scientific_checkpoint_published: bool = False
@@ -135,6 +132,8 @@ class M03RV16CapacityRankEvidence:
                 _digest(value)
                 for value in (
                     self.update_plan_sha256,
+                    self.pre_validation_update_receipt_sha256,
+                    self.validation_batch_receipt_sha256,
                     self.batch_receipt_sha256,
                     self.score_step_receipt_sha256,
                     self.structural_slab_receipt_sha256,
@@ -146,6 +145,8 @@ class M03RV16CapacityRankEvidence:
             or not self.bf16_forward_backward_executed
             or not self.nccl_gradient_sum_executed
             or not self.optimizer_mutation_executed
+            or not self.train_validate_train_executed
+            or not self.training_mode_restored_after_validation
             or not self.qualification_projection_executed
             or not self.qualification_risk_repair_executed
             or self.scientific_checkpoint_published
@@ -265,11 +266,38 @@ def run_m03r_v16_disposable_capacity_rank(
     qualification_risk_asset_caps: torch.Tensor,
     qualification_risk_gross_max: torch.Tensor,
 ) -> M03RV16CapacityRankEvidence:
-    """Execute one disposable exact-shape update and one projection probe."""
+    """Execute disposable train→validate→train and one projection probe."""
 
     if device.type != "cuda" or distributed_rank not in {0, 1}:
         raise M03RV16CapacityError("V16 capacity requires CUDA ranks zero and one")
     torch.cuda.reset_peak_memory_stats(device)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        first_update = run_m03r_v16_pretraining_fold_update(
+            cache,
+            schedule,
+            geometry,
+            risk_source,
+            structural_slab,
+            policy,
+            optimizer,
+            partition,
+            completed_updates=0,
+            distributed_rank=distributed_rank,
+            distributed_world_size=2,
+            device=device,
+        )
+    validation = build_m03r_v16_inner_validation_batch(
+        cache,
+        geometry,
+        risk_source,
+        structural_slab,
+        policy,
+        device=device,
+    )
+    if not policy.training:
+        raise M03RV16CapacityError(
+            "V16 validation did not restore training mode"
+        )
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         update = run_m03r_v16_pretraining_fold_update(
             cache,
@@ -280,7 +308,7 @@ def run_m03r_v16_disposable_capacity_rank(
             policy,
             optimizer,
             partition,
-            completed_updates=0,
+            completed_updates=1,
             distributed_rank=distributed_rank,
             distributed_world_size=2,
             device=device,
@@ -365,6 +393,8 @@ def run_m03r_v16_disposable_capacity_rank(
         cuda_total_memory_bytes=properties.total_memory,
         peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
         peak_reserved_bytes=torch.cuda.max_memory_reserved(device),
+        pre_validation_update_receipt_sha256=first_update.step.receipt_sha256,
+        validation_batch_receipt_sha256=validation.receipt_sha256,
         update_plan_sha256=update.update_plan.receipt_sha256,
         batch_receipt_sha256=update.batch.receipt_sha256,
         score_step_receipt_sha256=update.step.receipt_sha256,
@@ -378,6 +408,8 @@ def run_m03r_v16_disposable_capacity_rank(
         episode_state_rows=M03R_V16_PREDICTIVE_SPEC.episode_state_rows,
         global_origin_count=len(update.update_plan.global_origins),
         local_origin_count=len(update.update_plan.rank_origins[distributed_rank]),
+        train_validate_train_executed=True,
+        training_mode_restored_after_validation=policy.training,
     )
     result.validate()
     return result

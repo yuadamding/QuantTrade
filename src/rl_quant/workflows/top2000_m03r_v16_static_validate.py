@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256,
+)
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 from rl_quant.training.top2000_m03r_v16_package import (
     load_m03r_v16_execution_authorization,
     load_m03r_v16_package_plan,
+)
+from rl_quant.training.top2000_m03r_v16_initial_state import (
+    load_m03r_v16_initial_parameter_state,
+)
+from rl_quant.training.top2000_m03r_v16_policy import (
+    Top2000M03RV16PredictivePolicy,
 )
 from rl_quant.training.top2000_m03r_v16_static_contract import (
     M03R_V16_STATIC_RESULT_SCHEMA,
@@ -21,23 +31,31 @@ from rl_quant.training.top2000_m03r_v16_static_contract import (
 from rl_quant.training.top2000_m03r_v16_structural import (
     load_m03r_v16_structural_slab,
 )
+from rl_quant.training.top2000_m03r_v16_source import (
+    verify_m03r_v16_source_tree,
+)
 
 
 class M03RV16StaticValidationError(RuntimeError):
     """The immutable V16 package or zero-GPU process surface drifted."""
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _require_hash(path: Path, expected: str, label: str) -> None:
-    if path.is_symlink() or not path.is_file() or _file_sha256(path) != expected:
+    if path.is_symlink() or not path.is_file() or file_sha256(path) != expected:
         raise M03RV16StaticValidationError(f"{label} hash or file type drifted")
+
+
+def _write_result(path: Path, value: dict[str, Any]) -> str:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o440)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_json_file_bytes(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return file_sha256(path)
 
 
 def validate_static_package(
@@ -93,6 +111,19 @@ def validate_static_package(
     }
     for path, digest in expected.items():
         _require_hash(path, digest, path.name)
+    for setting_index in range(3):
+        policy = Top2000M03RV16PredictivePolicy(setting_index)
+        load_m03r_v16_initial_parameter_state(
+            package_root / "model/common-initial-parameter-state.pt",
+            policy,
+            expected_file_sha256=(
+                package.artifacts.initial_parameter_state_file_sha256
+            ),
+            expected_state_sha256=package.artifacts.initial_parameter_state_sha256,
+            expected_architecture_sha256=(
+                package.artifacts.initial_parameter_architecture_sha256
+            ),
+        )
     structural = load_m03r_v16_structural_slab(
         package_root / "structural/structural-slab.pt",
         expected_file_sha256=package.artifacts.structural_slab_file_sha256,
@@ -132,7 +163,15 @@ def validate_static_package(
             raise M03RV16StaticValidationError(
                 "V16 static module resolved outside immutable source"
             )
-    return {
+    verified_source = verify_m03r_v16_source_tree(
+        package_root / "source",
+        package_root / "source-manifest.json",
+        expected_source_manifest_file_sha256=(
+            package.artifacts.source_manifest_sha256
+        ),
+        expected_runtime_worker_sha256=package.artifacts.worker_source_sha256,
+    )
+    unsigned = {
         "schema": M03R_V16_STATIC_RESULT_SCHEMA,
         "package_plan_sha256": package.package_plan_sha256,
         "package_plan_file_sha256": package_plan_file_sha256,
@@ -143,6 +182,7 @@ def validate_static_package(
         "source_archive_sha256": package.artifacts.source_archive_sha256,
         "source_manifest_sha256": package.artifacts.source_manifest_sha256,
         "worker_source_sha256": package.artifacts.worker_source_sha256,
+        "source_tree_root_sha256": verified_source.source_tree_root_sha256,
         "structural_slab_file_sha256": (
             package.artifacts.structural_slab_file_sha256
         ),
@@ -157,6 +197,7 @@ def validate_static_package(
         "unmasked_visibility_claimed": False,
         "output_empty": True,
         "container_started": True,
+        "initial_state_strict_loaded_all_settings": True,
         "training_performed": False,
         "economic_training_authorized": False,
         "reinforcement_learning_authorized": False,
@@ -165,6 +206,9 @@ def validate_static_package(
         "reportable": False,
         "promotion_eligible": False,
     }
+    result = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
+    result_file_sha256 = _write_result(output / "static-result.json", result)
+    return {**result, "result_file_sha256": result_file_sha256}
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -100,29 +100,35 @@ def build_m03r_v16_inner_validation_batch(
         ),
     )
     provider = Top2000M03RV7DecisionStateProvider(inputs)
+    was_training = policy.training
     policy.eval()
-    with torch.no_grad():
-        origin_states = provider.replay_origin_states(
-            policy.source_policy,
-            bound_sequence,
-            local_origins,
-        )
-        batch = build_m03r_v16_batch_from_origin_states(
-            policy,
-            policy.v16_setting,
-            origin_states,
-            bound_sequence,
-            local_origins,
-            sequence_global_state_start=start,
-            split="inner_validation",
-            split_start_inclusive=geometry.inner_validation_origin_start_inclusive,
-            split_stop_exclusive=geometry.training_target_stop_exclusive,
-            fold_index=geometry.fold_index,
-            source_array_sha256=built.identity.receipt_sha256,
-            asset_axis_sha256=cache.action_hash,
-            origin_risk_exposures=risk_source.exposures,
-            structural_slab=structural_slab,
-        )
+    try:
+        with torch.no_grad():
+            origin_states = provider.replay_origin_states(
+                policy.source_policy,
+                bound_sequence,
+                local_origins,
+            )
+            batch = build_m03r_v16_batch_from_origin_states(
+                policy,
+                policy.v16_setting,
+                origin_states,
+                bound_sequence,
+                local_origins,
+                sequence_global_state_start=start,
+                split="inner_validation",
+                split_start_inclusive=(
+                    geometry.inner_validation_origin_start_inclusive
+                ),
+                split_stop_exclusive=geometry.training_target_stop_exclusive,
+                fold_index=geometry.fold_index,
+                source_array_sha256=built.identity.receipt_sha256,
+                asset_axis_sha256=cache.action_hash,
+                origin_risk_exposures=risk_source.exposures,
+                structural_slab=structural_slab,
+            )
+    finally:
+        policy.train(was_training)
     if batch.policy_state_binding_sha256 != model_state_sha256(policy):
         raise M03RV16EvaluationRuntimeError(
             "V16 validation batch did not bind current model state"

@@ -47,6 +47,10 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         "src/rl_quant/workflows/top2000_m03r_v16_structural_build.py": (
             "VALUE = 17\n"
         ),
+        "src/rl_quant/workflows/top2000_m03r_v16_initial_state_build.py": (
+            "VALUE = 18\n"
+        ),
+        "src/rl_quant/training/top2000_m03r_v16_policy.py": "POLICY = 16\n",
         "src/rl_quant/training/top2000_m03r_v15_residual_operator.py": (
             "OPERATOR = 15\n"
         ),
@@ -80,10 +84,37 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
 
     holder: dict[str, Any] = {}
 
-    def initial_state(path: Path, _policy: Any) -> tuple[str, str, str]:
+    def initial_state(package_root: Path) -> dict[str, Any]:
+        path = package_root / "model/common-initial-parameter-state.pt"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"initial-state")
-        return "1" * 64, builder._file_sha256(path), "2" * 64
+        unsigned = {
+            "schema": (
+                "rl-quant.top2000-dev.m03r-v16-package-owned-initial-state-v1"
+            ),
+            "protocol_sha256": builder.M03R_V16_PROTOCOL_SHA256,
+            "initial_parameter_state_file_sha256": builder._file_sha256(path),
+            "initial_parameter_state_sha256": "1" * 64,
+            "initial_parameter_architecture_sha256": "2" * 64,
+            "policy_source_sha256": builder._file_sha256(
+                package_root / "source" / builder.M03R_V16_POLICY_SOURCE
+            ),
+            "builder_source_sha256": builder._file_sha256(
+                package_root
+                / "source"
+                / builder.M03R_V16_INITIAL_STATE_BUILDER
+            ),
+            "setting_index": 0,
+            "seed": builder.M03R_V16_PREDICTIVE_SPEC.seed,
+            "development_only": True,
+            "reportable": False,
+            "promotion_eligible": False,
+        }
+        row = {**unsigned, "receipt_sha256": builder._sha256(unsigned)}
+        receipt = package_root / "plans/initial-state-build.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_bytes(builder._canonical(row))
+        return row
 
     def structural(package_root: Path, **identities: str) -> dict[str, Any]:
         slab_path = package_root / "structural/structural-slab.pt"
@@ -130,8 +161,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     def load_slab(*_args: Any, **_kwargs: Any) -> Any:
         return SimpleNamespace(slab=SimpleNamespace(receipt=holder["receipt"]))
 
-    monkeypatch.setattr(builder, "_initial_policy", lambda: object())
-    monkeypatch.setattr(builder, "write_m03r_v16_initial_parameter_state", initial_state)
+    monkeypatch.setattr(builder, "_run_package_owned_initial_state", initial_state)
     monkeypatch.setattr(builder, "_run_package_owned_structural_slab", structural)
     monkeypatch.setattr(builder, "load_m03r_v16_structural_slab", load_slab)
     monkeypatch.setattr(

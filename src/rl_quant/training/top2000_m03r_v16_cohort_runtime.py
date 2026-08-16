@@ -10,7 +10,6 @@ charged at the terminal boundary.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
@@ -27,6 +26,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03RV16PredictiveSetting,
 )
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_payload as _canonical,
+    semantic_sha256 as _sha256,
+)
 from rl_quant.training.top2000_m03r_v9_projection import (
     M03RV9DeviceRiskState,
     project_m03r_v9_active_book,
@@ -39,20 +42,6 @@ M03R_V16_COHORT_TRACE_SCHEMA = (
 
 class M03RV16CohortRuntimeError(ValueError):
     """The V16 cohort chronology, risk projection, or accounting drifted."""
-
-
-def _canonical(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:

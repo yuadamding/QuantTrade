@@ -18,6 +18,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.hold30_top2000_development import (
     Top2000VerifiedDevelopmentCache,
     build_top2000_hold30_development_sequence_from_loaded_cache,
@@ -186,18 +187,6 @@ def _tensor_sha256(value: torch.Tensor) -> str:
     digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode())
     digest.update(tensor.view(torch.uint8).numpy().tobytes(order="C"))
     return digest.hexdigest()
-
-
-def _sha256(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("ascii")
-    ).hexdigest()
 
 
 def _digest(name: str, value: str) -> str:

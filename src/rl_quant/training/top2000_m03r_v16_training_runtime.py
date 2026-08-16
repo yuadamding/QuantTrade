@@ -185,6 +185,7 @@ def run_m03r_v16_pretraining_fold_update(
         ),
     )
     provider = Top2000M03RV7DecisionStateProvider(inputs)
+    policy.train()
     origin_states = provider.replay_origin_states(
         policy.source_policy,
         bound_sequence,

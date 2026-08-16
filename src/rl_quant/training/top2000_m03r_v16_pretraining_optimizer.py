@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -16,6 +14,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTING_IDS,
 )
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.top2000_m03r_v15_policy import (
     M03R_V15_ENCODER_PARAMETER_PREFIXES,
 )
@@ -29,12 +28,6 @@ M03RV16TrainingStage = Literal["score"]
 
 class M03RV16OptimizerError(ValueError):
     """The V16 selection parameter or optimizer inventory drifted."""
-
-
-def _sha256(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
-    ).hexdigest()
 
 
 def _is_encoder(name: str) -> bool:

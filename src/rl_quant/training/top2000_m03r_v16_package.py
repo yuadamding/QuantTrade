@@ -18,6 +18,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_SETTING_IDS,
 )
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_payload as _canonical,
+    semantic_sha256 as _sha256,
+)
 from rl_quant.training.top2000_m03r_v16_fold import M03RV16PanelSchedule
 from rl_quant.training.top2000_m03r_v16_worker import (
     M03RV16PredictivePanelPlan,
@@ -40,20 +44,6 @@ _IMAGE = re.compile(r"^[^@\s]+@sha256:([0-9a-f]{64})$")
 
 class M03RV16PackageError(ValueError):
     """The V16 package, artifact, schedule, or authorization drifted."""
-
-
-def _canonical(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
 def _digest(name: str, value: str) -> str:

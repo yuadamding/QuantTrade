@@ -22,9 +22,11 @@ from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v5"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v6"
 )
-M03R_V16_DESIGN_ID = "derived-repair-terminal-schedule-authority-hold30-primary-v5"
+M03R_V16_DESIGN_ID = (
+    "canonical-artifacts-mode-safe-hierarchical-inference-hold30-primary-v6"
+)
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30
 M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS = 30
 M03RV16SelectionTarget = Literal[
@@ -250,6 +252,10 @@ class M03RV16PredictiveSpec:
     episode_state_rows: int = 345
     origins_per_update: int = 63
     score_training_epochs: int = M03R_V16_SCORE_EPOCHS
+    adequacy_minimum_prediction_to_target_std_ratio: float = 0.05
+    adequacy_terminal_ic_improvement_threshold: float = 0.002
+    adequacy_terminal_loss_relative_improvement_threshold: float = 0.01
+    adequacy_maximum_recent_clip_fraction: float = 0.50
     score_learning_rates: tuple[float, float] = (2.0e-5, 1.0e-4)
     learning_rate_warmup_fraction: float = 0.05
     minimum_learning_rate_multiplier: float = 0.10
@@ -311,6 +317,10 @@ class M03RV16PredictiveSpec:
             or self.episode_state_rows != 345
             or self.origins_per_update != 63
             or self.score_training_epochs != 8
+            or self.adequacy_minimum_prediction_to_target_std_ratio != 0.05
+            or self.adequacy_terminal_ic_improvement_threshold != 0.002
+            or self.adequacy_terminal_loss_relative_improvement_threshold != 0.01
+            or self.adequacy_maximum_recent_clip_fraction != 0.50
             or self.score_learning_rates != (2.0e-5, 1.0e-4)
             or self.learning_rate_warmup_fraction != 0.05
             or self.minimum_learning_rate_multiplier != 0.10

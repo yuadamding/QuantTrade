@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 from pathlib import Path
 from typing import Any
+
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes as _canonical,
+    semantic_sha256 as _sha256,
+)
 
 from rl_quant.training.hold30_top2000_development import (
     DEVELOPMENT_ACK,
@@ -25,29 +28,12 @@ from rl_quant.training.top2000_m03r_v16_structural import (
 )
 
 M03R_V16_STRUCTURAL_BUILD_RECEIPT_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-structural-build-receipt-v1"
+    "rl-quant.top2000-dev.m03r-v16-structural-build-receipt-v2"
 )
 
 
 class M03RV16StructuralBuildError(ValueError):
     """Package-owned V16 structural construction failed closed."""
-
-
-def _canonical(value: Any) -> bytes:
-    return (
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
-    ).encode("utf-8")
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
 def build_package_owned_m03r_v16_structural_slab(

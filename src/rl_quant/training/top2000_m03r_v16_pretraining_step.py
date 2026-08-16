@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from dataclasses import asdict, dataclass
 from typing import Callable
@@ -16,6 +14,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.top2000_m03r_v16_fold import M03RV16TrainingUpdatePlan
 from rl_quant.training.top2000_m03r_v16_objective import m03r_v16_score_loss
 from rl_quant.training.top2000_m03r_v16_policy import (
@@ -34,12 +33,6 @@ M03R_V16_SCORE_STEP_SCHEMA = "rl-quant.top2000-dev.m03r-v16-score-step-v3"
 
 class M03RV16ScoreStepError(ValueError):
     """The V16 score mutation failed before a checkpoint boundary."""
-
-
-def _sha256(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(value, separators=(",", ":"), sort_keys=True).encode("ascii")
-    ).hexdigest()
 
 
 def _gradient_norm(parameters: tuple[torch.nn.Parameter, ...]) -> float:

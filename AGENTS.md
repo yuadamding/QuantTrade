@@ -28,12 +28,15 @@ product, or business-production system.
   as completed negative development evidence. Its exact A04 run completed all
   twelve folds, but both settings failed predictive and tradeability gates.
 - Treat [M03R-v16 holding-aligned selection research](docs/top2000_m03r_v16_holding_aligned_selection.md)
-  as the current local predictive implementation boundary. Its v5 protocol
+  as the current local predictive implementation boundary. Its v6 protocol
   compares h21, h30, and reference-Hold-30 survival-value selection targets on
-  one common 30-session support. Local v5 source includes causal action masks,
+  one common 30-session support. Local v6 source includes causal action masks,
   self-financing signal cohorts with freshly derived risk repair, balanced
   blocks, validated structural-slab caching, exact-workload capacity, and
-  terminal-checkpoint-plus-schedule qualification authority, but no
+  terminal-checkpoint-plus-schedule qualification authority, canonical
+  artifact hashing, mode-safe train/validation transitions, hierarchical
+  non-wrapping inference, file-issued gates, exact source-tree verification,
+  independent fold-artifact reconciliation, and fit-adequacy receipts, but no
   sealed package or remote evidence; tests do not authorize GPU or 2026 access.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)

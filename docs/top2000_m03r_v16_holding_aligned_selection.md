@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v5 revision; older v16 source and
+current local protocol is the result-moving v6 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -156,8 +156,11 @@ select an epoch. The immutable terminal epoch-8 checkpoint is evaluated after
 strict write/reload. This avoids searching many checkpoints on highly
 overlapping h30 labels.
 
-Primary moving-block inference uses 42 sessions, with 30- and 63-session
-sensitivities, while preserving fold boundaries.
+Primary hierarchical inference uses 42-session non-wrapping blocks, with 30-
+and 63-session sensitivities. Outer folds are resampled as clusters, and every
+within-fold block is bounded by its observed chronology. The 63-session
+sensitivity therefore measures fold-level uncertainty rather than degenerate
+cyclic rotations.
 
 ## Qualification path
 
@@ -224,14 +227,16 @@ no QR or full-slab semantic validation in the optimizer hot path. Origin lookup
 is O(1), device operators are cached, and scalar exposure telemetry is reduced
 only at the batch boundary.
 
-The exact-workload capacity primitive performs one disposable 345-state,
-balanced first-fold two-rank BF16 forward/backward, NCCL gradient sum, clipped
-Adam mutation, and an internally constructed nontrivial qualification
-projection. The request must have positive active mass, projection must change
-it while retaining nonzero mass, and the typed terminal requires at least 8 GiB
-or 10% unreserved device memory plus equal post-update model and optimizer
-identities across ranks. It cannot publish a scientific checkpoint or authorize
-training.
+The exact-workload capacity primitive performs a disposable
+`train -> validation -> train` sequence with 345-state balanced first-fold
+two-rank BF16 forward/backward, NCCL gradient sums, clipped Adam mutations, and
+an internally constructed nontrivial qualification projection. Validation
+preserves the previous model mode, and every optimizer update explicitly enters
+training mode so activation checkpointing cannot disappear after epoch 1. The
+request must have positive active mass, projection must change it while
+retaining nonzero mass, and the typed terminal requires at least 8 GiB or 10%
+unreserved device memory plus equal post-update model and optimizer identities
+across ranks. It cannot publish a scientific checkpoint or authorize training.
 
 The cohort primitive publishes separate absolute policy, benchmark, and
 incremental costs and net returns; 21-/30-session or truncated age-clock
@@ -251,7 +256,8 @@ qualified-score authority receipts.
 
 The local package builder copies the exact source, cache, risk, and projector
 inputs; builds the structural slab from those package-owned copies in an
-isolated interpreter; seals the common initial state, panel schedule, package
+isolated interpreter; generates and strict-loads the common initial state from
+that copied source; seals the panel schedule, package
 plan, execution authorization, and full inventory; and can emit a deterministic
 transfer archive that rejects traversal, duplicates, links, devices, and hash
 drift. The same-image static validator explicitly performs no training and
@@ -260,18 +266,27 @@ claims zero GPU visibility only. The worker requires exactly two visible H100
 risk projection, or serially trains and strictly reloads all five folds before
 checkpoint-owned qualification.
 
-The aggregate uses fold-preserving 42-session bootstrap blocks with frozen
-30-/63-session sensitivities. Only R2 can authorize a three-seed predictive
-confirmation; a failure routes to ordered five-minute research. It can never
+The aggregate opens all three worker terminals, all 15 fold terminals, all 15
+qualification artifacts, and every epoch-fit receipt by exact hash. It
+reconstructs each cohort trace, recomputes predictive/economic metrics and the
+shared hierarchical bootstrap, and requires exact agreement with the worker
+summaries. Compact epoch trajectories retain loss, validation IC/spread,
+prediction/target dispersion, gradient norms, clipping, learning rates, and
+parameter-version evidence. A frozen adequacy classifier routes a collapsed,
+pervasively clipped, or still-materially-improving R2 fit to a fresh longer-
+training protocol rather than misclassifying it as representation failure.
+Only an adequately trained R2 can authorize a three-seed predictive
+confirmation; an adequate failure routes to ordered five-minute research. It can never
 authorize an economic generation, reinforcement learning, or 2026 access. A
-no-follow file aggregator verifies the exact three worker-terminal hashes,
-package/authorization/worker identities, common bootstrap receipt, and each
-setting qualification before publishing the no-clobber panel decision.
+no-follow file aggregator publishes the no-clobber panel decision only after
+that independent reconciliation.
 
-The local Kubernetes layer renders three distinct `batch/v1` Jobs: explicit
-zero-GPU static validation, one two-H100 capacity sentinel, and a suspended
+The local Kubernetes layer renders three distinct `batch/v1` Jobs: zero-GPU
+static validation with no GPU resource key, one two-H100 capacity sentinel, and a suspended
 three-completion predictive panel requesting at most six H100s. Capacity and
-predictive rendering require the preceding immutable gate receipts. All Jobs
+predictive rendering require privately issued authorities loaded from exact
+immutable static/capacity result files. Static and worker startup rehash the
+executing package source tree against its manifest. All Jobs
 remain suspended, fail-fast, token-unmounted, nonprivileged, digest-pinned,
 bounded by deadline/TTL, and mount only the scoped package/output PVC paths.
 Activation, live admission binding, detached supervision, UID-bound cleanup,

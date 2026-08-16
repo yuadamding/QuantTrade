@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import asdict
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
+import rl_quant.training.top2000_m03r_v16_kubernetes as kubernetes_runtime
+import rl_quant.training.top2000_m03r_v16_cohort_runtime as cohort_runtime
+
+from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes, file_sha256
+from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_PREDICTIVE_SPEC,
+    M03R_V16_SETTINGS,
+)
 
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
     M03RV7KubernetesTemplateConfig,
@@ -20,9 +27,22 @@ from rl_quant.training.top2000_m03r_v16_kubernetes import (
     M03RV16CapacityGateQualification,
     M03RV16KubernetesError,
     M03RV16StaticGateQualification,
+    load_and_issue_m03r_v16_capacity_gate,
+    load_and_issue_m03r_v16_static_gate,
     render_m03r_v16_suspended_capacity_job,
     render_m03r_v16_suspended_predictive_job,
     render_m03r_v16_suspended_static_job,
+)
+from rl_quant.training.top2000_m03r_v16_capacity import (
+    M03RV16CapacityRankEvidence,
+    build_m03r_v16_capacity_terminal,
+)
+from rl_quant.training.top2000_m03r_v16_fit import (
+    M03R_V16_EPOCH_FIT_SCHEMA,
+    M03RV16TrainingAdequacy,
+)
+from rl_quant.training.top2000_m03r_v16_static_contract import (
+    M03R_V16_STATIC_RESULT_SCHEMA,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
@@ -33,14 +53,23 @@ from rl_quant.training.top2000_m03r_v16_package import (
     write_m03r_v16_package_plan,
 )
 from rl_quant.training.top2000_m03r_v16_selection import (
-    M03RV16PredictiveQualification,
+    M03RV16ReconciledFoldEvidence,
     build_m03r_v16_bootstrap_plan,
+    qualify_m03r_v16_reconciled_evidence,
+)
+from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
+    M03RV16CohortTrace,
 )
 from rl_quant.workflows.top2000_m03r_v16_aggregate import (
+    M03RV16AggregateError,
     aggregate_m03r_v16_panel,
 )
 from rl_quant.workflows.top2000_m03r_v16_predictive import (
+    M03R_V16_FOLD_TERMINAL_SCHEMA,
+    M03R_V16_QUALIFICATION_ARTIFACT_SCHEMA,
     M03R_V16_WORKER_TERMINAL_SCHEMA,
+    _write_immutable_json,
+    _write_immutable_torch,
 )
 
 
@@ -106,11 +135,76 @@ def _surfaces() -> tuple[
 def _template(name: str) -> M03RV7KubernetesTemplateConfig:
     return M03RV7KubernetesTemplateConfig(
         job_name=name,
-        run_id="m03r-v16-v5-local-contract",
+        run_id="m03r-v16-v6-local-contract",
         service_account_name="default",
         pvc_claim_name="research-pvc",
         package_mount_path="/mnt/package",
         output_mount_path="/mnt/output",
+    )
+
+
+def _static_gate(
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    manifest_sha256: str,
+) -> M03RV16StaticGateQualification:
+    return M03RV16StaticGateQualification(
+        package_plan_sha256=package.package_plan_sha256,
+        execution_authorization_receipt_sha256=authorization.receipt_sha256,
+        rendered_manifest_sha256=manifest_sha256,
+        result_file_sha256="d" * 64,
+        result_receipt_sha256="e" * 64,
+        image_digest_sha256=package.artifacts.image_digest_sha256,
+        source_tree_root_sha256="9" * 64,
+        _issuer=kubernetes_runtime._STATIC_GATE_ISSUER,
+    )
+
+
+def _capacity_gate(
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    static: M03RV16StaticGateQualification,
+    manifest_sha256: str,
+) -> M03RV16CapacityGateQualification:
+    return M03RV16CapacityGateQualification(
+        package_plan_sha256=package.package_plan_sha256,
+        execution_authorization_receipt_sha256=authorization.receipt_sha256,
+        static_gate_receipt_sha256=static.receipt_sha256,
+        rendered_manifest_sha256=manifest_sha256,
+        terminal_file_sha256="f" * 64,
+        terminal_receipt_sha256="1" * 64,
+        image_digest_sha256=package.artifacts.image_digest_sha256,
+        source_tree_root_sha256=static.source_tree_root_sha256,
+        _issuer=kubernetes_runtime._CAPACITY_GATE_ISSUER,
+    )
+
+
+def _capacity_rank(rank: int) -> M03RV16CapacityRankEvidence:
+    return M03RV16CapacityRankEvidence(
+        setting_index=2,
+        distributed_rank=rank,
+        distributed_world_size=2,
+        cuda_device_name="NVIDIA H100 80GB HBM3",
+        cuda_total_memory_bytes=80 * 1024**3,
+        peak_allocated_bytes=40 * 1024**3 + rank,
+        peak_reserved_bytes=50 * 1024**3 + rank,
+        pre_validation_update_receipt_sha256=("1" if rank == 0 else "2") * 64,
+        validation_batch_receipt_sha256=("3" if rank == 0 else "4") * 64,
+        update_plan_sha256="5" * 64,
+        batch_receipt_sha256=("6" if rank == 0 else "7") * 64,
+        score_step_receipt_sha256=("8" if rank == 0 else "9") * 64,
+        structural_slab_receipt_sha256="a" * 64,
+        qualification_projection_receipt_sha256=(
+            ("b" if rank == 0 else "c") * 64
+        ),
+        qualification_requested_active_one_way_mass=0.01,
+        qualification_projected_active_one_way_mass=0.0025,
+        qualification_requested_to_executed_retention=0.25,
+        post_update_model_state_sha256="d" * 64,
+        post_update_optimizer_state_sha256="e" * 64,
+        episode_state_rows=345,
+        global_origin_count=43,
+        local_origin_count=22 if rank == 0 else 21,
     )
 
 
@@ -125,14 +219,12 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel() -> None:
     )
     assert static_job.maximum_gpu_requests == 0
     assert static_job.manifest["spec"]["suspend"] is True
-    static = M03RV16StaticGateQualification(
-        package_plan_sha256=package.package_plan_sha256,  # type: ignore[attr-defined]
-        execution_authorization_receipt_sha256=authorization.receipt_sha256,
-        rendered_manifest_sha256=static_job.manifest_sha256,
-        result_file_sha256="d" * 64,
-        result_receipt_sha256="e" * 64,
-        image_digest_sha256=package.artifacts.image_digest_sha256,  # type: ignore[attr-defined]
-    )
+    resources = static_job.manifest["spec"]["template"]["spec"]["containers"][0][
+        "resources"
+    ]
+    assert "nvidia.com/gpu" not in resources["requests"]
+    assert "nvidia.com/gpu" not in resources["limits"]
+    static = _static_gate(package, authorization, static_job.manifest_sha256)
     capacity_job = render_m03r_v16_suspended_capacity_job(
         package=package,  # type: ignore[arg-type]
         authorization=authorization,
@@ -142,14 +234,8 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel() -> None:
         static=static,
     )
     assert capacity_job.maximum_gpu_requests == 2
-    capacity = M03RV16CapacityGateQualification(
-        package_plan_sha256=package.package_plan_sha256,  # type: ignore[attr-defined]
-        execution_authorization_receipt_sha256=authorization.receipt_sha256,
-        static_gate_receipt_sha256=static.receipt_sha256,
-        rendered_manifest_sha256=capacity_job.manifest_sha256,
-        terminal_file_sha256="f" * 64,
-        terminal_receipt_sha256="1" * 64,
-        image_digest_sha256=package.artifacts.image_digest_sha256,  # type: ignore[attr-defined]
+    capacity = _capacity_gate(
+        package, authorization, static, capacity_job.manifest_sha256
     )
     predictive = render_m03r_v16_suspended_predictive_job(
         package=package,  # type: ignore[arg-type]
@@ -176,23 +262,8 @@ def test_v16_predictive_job_rejects_missing_or_drifted_capacity() -> None:
         authorization_file_sha256=authorization_file,
         template=_template("m03r-v16-static-two"),
     )
-    static = M03RV16StaticGateQualification(
-        package_plan_sha256=package.package_plan_sha256,  # type: ignore[attr-defined]
-        execution_authorization_receipt_sha256=authorization.receipt_sha256,
-        rendered_manifest_sha256=static_job.manifest_sha256,
-        result_file_sha256="d" * 64,
-        result_receipt_sha256="e" * 64,
-        image_digest_sha256=package.artifacts.image_digest_sha256,  # type: ignore[attr-defined]
-    )
-    capacity = M03RV16CapacityGateQualification(
-        package_plan_sha256=package.package_plan_sha256,  # type: ignore[attr-defined]
-        execution_authorization_receipt_sha256=authorization.receipt_sha256,
-        static_gate_receipt_sha256=static.receipt_sha256,
-        rendered_manifest_sha256="f" * 64,
-        terminal_file_sha256="1" * 64,
-        terminal_receipt_sha256="2" * 64,
-        image_digest_sha256=package.artifacts.image_digest_sha256,  # type: ignore[attr-defined]
-    )
+    static = _static_gate(package, authorization, static_job.manifest_sha256)
+    capacity = _capacity_gate(package, authorization, static, "f" * 64)
     with pytest.raises(M03RV16KubernetesError, match="capacity"):
         render_m03r_v16_suspended_predictive_job(
             package=package,  # type: ignore[arg-type]
@@ -205,46 +276,194 @@ def test_v16_predictive_job_rejects_missing_or_drifted_capacity() -> None:
         )
 
 
-def _qualification(
-    setting_index: int,
-    bootstrap_sha256: str,
-    schedule_sha256: str,
-) -> M03RV16PredictiveQualification:
-    primary = setting_index == 2
-    return M03RV16PredictiveQualification(
-        setting_index=setting_index,
-        setting_id=(
-            "V16-R0-h21-selection-control",
-            "V16-R1-h30-selection-control",
-            "V16-R2-hold30-prior-selection-primary",
-        )[setting_index],
-        fold_trace_sha256=tuple(f"{index:x}" * 64 for index in range(1, 6)),
-        terminal_checkpoint_authority_sha256=tuple(
-            f"{index:x}" * 64 for index in range(6, 11)
-        ),
-        qualified_score_authority_sha256=tuple(
-            f"{index:x}" * 64 for index in range(11, 16)
-        ),
-        panel_schedule_sha256=schedule_sha256,
-        bootstrap_plan_sha256=bootstrap_sha256,
-        mean_projected_rank_ic=0.025,
-        positive_mean_ic_fold_count=5,
-        positive_spread_fold_count=5,
-        annualized_gross_active_return=0.04,
-        annualized_net_active_return_10bp=0.02,
-        gross_active_lcb_by_block=(0.01, 0.008, 0.006),
-        net_10bp_active_lcb_by_block=(0.005, 0.004, 0.003),
-        spread_lcb_by_block=(0.001, 0.0008, 0.0006),
-        break_even_category="finite-positive",
-        break_even_one_way_cost_basis_points=12.0,
-        absolute_policy_break_even_one_way_cost_basis_points=8.0,
-        median_risk_projection_retention=0.9,
-        minimum_fold_median_risk_projection_retention=0.8,
-        median_weighted_cohort_age=15.0,
-        gates_passed=True,
-        primary_hypothesis_passed=primary,
-        three_seed_confirmation_may_be_minted=primary,
+def test_v16_gate_authorities_are_issued_from_exact_result_files(
+    tmp_path: Path,
+) -> None:
+    package, authorization, plan_file, authorization_file = _surfaces()
+    static_job = render_m03r_v16_suspended_static_job(
+        package=package,  # type: ignore[arg-type]
+        authorization=authorization,
+        package_plan_file_sha256=plan_file,
+        authorization_file_sha256=authorization_file,
+        template=_template("m03r-v16-static-issued"),
     )
+    source_tree_root = "f" * 64
+    unsigned_static = {
+        "schema": M03R_V16_STATIC_RESULT_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "execution_authorization_receipt_sha256": authorization.receipt_sha256,
+        "image_digest_sha256": package.artifacts.image_digest_sha256,
+        "source_tree_root_sha256": source_tree_root,
+        "gpu_mask": "none",
+        "gpu_requests": 0,
+        "gpu_limits": 0,
+        "unmasked_visibility_claimed": False,
+        "training_performed": False,
+        "initial_state_strict_loaded_all_settings": True,
+        "development_only": True,
+    }
+    static_result = {
+        **unsigned_static,
+        "receipt_sha256": semantic_sha256(unsigned_static),
+    }
+    static_path = tmp_path / "static-result.json"
+    static_path.write_bytes(canonical_json_file_bytes(static_result))
+    static = load_and_issue_m03r_v16_static_gate(
+        static_path,
+        expected_result_file_sha256=file_sha256(static_path),
+        rendered=static_job,
+        package=package,
+        authorization=authorization,
+    )
+    static.validate_for(package, authorization)
+
+    capacity_job = render_m03r_v16_suspended_capacity_job(
+        package=package,  # type: ignore[arg-type]
+        authorization=authorization,
+        package_plan_file_sha256=plan_file,
+        authorization_file_sha256=authorization_file,
+        template=_template("m03r-v16-capacity-issued"),
+        static=static,
+    )
+    terminal = build_m03r_v16_capacity_terminal(
+        (_capacity_rank(0), _capacity_rank(1))
+    )
+    capacity_result = {
+        "schema": terminal.schema,
+        "package_plan_sha256": package.package_plan_sha256,
+        "authorization_receipt_sha256": authorization.receipt_sha256,
+        "source_tree_root_sha256": source_tree_root,
+        "capacity": asdict(terminal),
+        "capacity_receipt_sha256": terminal.receipt_sha256,
+        "scientific_training_performed": False,
+        "disposable_optimizer_update_executed": True,
+        "disposable_train_validate_train_executed": True,
+        "scientific_checkpoint_published": False,
+        "development_only": True,
+    }
+    capacity_path = tmp_path / "two-h100-capacity-terminal.json"
+    capacity_path.write_bytes(canonical_json_file_bytes(capacity_result))
+    capacity = load_and_issue_m03r_v16_capacity_gate(
+        capacity_path,
+        expected_terminal_file_sha256=file_sha256(capacity_path),
+        rendered=capacity_job,
+        package=package,
+        authorization=authorization,
+        static=static,
+    )
+    capacity.validate_for(package, authorization, static)
+
+    with pytest.raises(TypeError):
+        M03RV16StaticGateQualification(  # type: ignore[call-arg]
+            package_plan_sha256=package.package_plan_sha256,
+            execution_authorization_receipt_sha256=authorization.receipt_sha256,
+            rendered_manifest_sha256=static_job.manifest_sha256,
+            result_file_sha256=file_sha256(static_path),
+            result_receipt_sha256=semantic_sha256(unsigned_static),
+            image_digest_sha256=package.artifacts.image_digest_sha256,
+            source_tree_root_sha256=source_tree_root,
+        )
+
+
+def _synthetic_evidence(
+    setting_index: int,
+    fold_index: int,
+    decision_origins: torch.Tensor,
+    schedule_sha256: str,
+) -> M03RV16ReconciledFoldEvidence:
+    decisions = M03R_V16_PREDICTIVE_SPEC.qualification_origins_per_fold
+    steps = decisions + M03R_V16_PREDICTIVE_SPEC.cohort_no_new_decision_tail_sessions
+    execution_origins = torch.arange(
+        int(decision_origins[0]),
+        int(decision_origins[0]) + steps,
+        dtype=torch.int64,
+    )
+    score = torch.tensor((-2.0, -1.0, 1.0, 2.0), dtype=torch.float64).expand(
+        decisions, -1
+    ).clone()
+    target = score * 0.001
+    valid = torch.ones_like(score, dtype=torch.bool)
+    positive = torch.full((steps,), 0.0003, dtype=torch.float64)
+    zero = torch.zeros(steps, dtype=torch.float64)
+    turnover = torch.full((steps,), 0.01, dtype=torch.float64)
+    retention = torch.full((steps,), 0.9, dtype=torch.float64)
+    age = torch.full((steps,), 15.0, dtype=torch.float64)
+    terminal_authority = semantic_sha256(
+        ["terminal", setting_index, fold_index]
+    )
+    score_authority = semantic_sha256(["score", setting_index, fold_index])
+    costs = tuple(
+        turnover * (basis_points / 10_000.0)
+        for basis_points in M03R_V16_PREDICTIVE_SPEC.evaluation_cost_basis_points
+    )
+    zeros_by_cost = tuple(torch.zeros_like(row) for row in costs)
+    provisional = M03RV16CohortTrace(
+        setting_index=setting_index,
+        setting_id=M03R_V16_SETTINGS[setting_index].setting_id,
+        fold_index=fold_index,
+        checkpoint_file_sha256=semantic_sha256(
+            ["checkpoint-file", setting_index, fold_index]
+        ),
+        checkpoint_model_state_sha256=semantic_sha256(
+            ["checkpoint-model", setting_index, fold_index]
+        ),
+        terminal_checkpoint_authority_sha256=terminal_authority,
+        qualified_score_authority_sha256=score_authority,
+        panel_schedule_sha256=schedule_sha256,
+        qualification_batch_receipt_sha256=semantic_sha256(
+            ["batch", setting_index, fold_index]
+        ),
+        asset_axis_sha256="a" * 64,
+        action_valid_sha256=cohort_runtime._tensor_sha256(valid),
+        diagnostic_valid_sha256=cohort_runtime._tensor_sha256(valid),
+        risk_manifest_sha256="b" * 64,
+        risk_state_sha256=semantic_sha256(["risk", fold_index]),
+        decision_origin_indices=decision_origins,
+        execution_origin_indices=execution_origins,
+        policy_gross_returns=positive,
+        benchmark_gross_returns=zero,
+        policy_one_way_turnover=turnover,
+        benchmark_one_way_turnover=zero,
+        active_one_way_mass=turnover,
+        cohort_entry_one_way_mass=turnover,
+        signal_cohort_mass_reduction_after_execution=zero,
+        weighted_mean_cohort_age=age,
+        requested_to_executed_retention=retention,
+        risk_repair_active_one_way_mass=zero,
+        prior_risk_repair_unwind_one_way_mass=zero,
+        risk_projection_request_to_execution_one_way_distance=zero,
+        absolute_policy_cost_by_cost=costs,
+        benchmark_cost_by_cost=zeros_by_cost,
+        incremental_active_cost_by_cost=costs,
+        net_policy_return_by_cost=tuple(positive - row for row in costs),
+        net_benchmark_return_by_cost=zeros_by_cost,
+        net_active_return_by_cost=tuple(positive - row for row in costs),
+        terminal_liquidation_one_way_turnover=0.0,
+        terminal_preliquidation_active_one_way_mass=0.0,
+        array_sha256=(),
+        trace_sha256="0" * 64,
+    )
+    trace = replace(
+        provisional,
+        array_sha256=tuple(
+            cohort_runtime._tensor_sha256(row) for row in provisional.arrays
+        ),
+    )
+    trace = replace(
+        trace,
+        trace_sha256=cohort_runtime._sha256(trace.unsigned_payload()),
+    )
+    evidence = M03RV16ReconciledFoldEvidence(
+        trace=trace,
+        executable_selection_mean=score,
+        selection_target_economic=target,
+        selection_valid=valid,
+        terminal_checkpoint_authority_sha256=terminal_authority,
+        qualified_score_authority_sha256=score_authority,
+        panel_schedule_sha256=schedule_sha256,
+    )
+    evidence.validate()
+    return evidence
 
 
 def test_v16_file_aggregate_joins_exact_three_worker_terminals(
@@ -282,11 +501,140 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
     terminal_paths: list[Path] = []
     terminal_hashes: list[str] = []
     for index, worker in enumerate(package.panel.workers):
-        qualification = _qualification(
-            index,
-            bootstrap.receipt_sha256,
-            package.schedule.receipt_sha256,
+        worker_root = tmp_path / f"worker-{index}"
+        evidence = tuple(
+            _synthetic_evidence(
+                index,
+                fold_index,
+                decisions[fold_index],
+                package.schedule.receipt_sha256,
+            )
+            for fold_index in range(5)
         )
+        qualification = qualify_m03r_v16_reconciled_evidence(evidence, bootstrap)
+        fold_terminal_hashes: list[str] = []
+        fold_adequacy_file_hashes: list[str] = []
+        fold_adequacy_receipts: list[str] = []
+        fold_adequacy_status: list[str] = []
+        for fold_index, row in enumerate(evidence):
+            epoch_file_hashes: list[str] = []
+            epoch_receipts: list[str] = []
+            for epoch in range(M03R_V16_PREDICTIVE_SPEC.score_training_epochs):
+                unsigned_epoch = {
+                    "schema": M03R_V16_EPOCH_FIT_SCHEMA,
+                    "package_plan_sha256": package.package_plan_sha256,
+                    "worker_plan_sha256": worker.receipt_sha256,
+                    "setting_index": index,
+                    "fold_index": fold_index,
+                    "epoch_index": epoch,
+                }
+                epoch_payload = {
+                    **unsigned_epoch,
+                    "receipt_sha256": semantic_sha256(unsigned_epoch),
+                }
+                epoch_receipts.append(epoch_payload["receipt_sha256"])
+                epoch_file_hashes.append(
+                    _write_immutable_json(
+                        worker_root
+                        / "receipts"
+                        / (
+                            f"fold-{fold_index:02d}-"
+                            f"epoch-{epoch + 1:02d}-fit.json"
+                        ),
+                        epoch_payload,
+                    )
+                )
+            adequacy = M03RV16TrainingAdequacy(
+                setting_index=index,
+                fold_index=fold_index,
+                epoch_fit_receipt_sha256=tuple(epoch_receipts),
+                final_prediction_to_target_std_ratio=0.5,
+                terminal_rank_ic_improvement=0.0,
+                terminal_robust_loss_relative_improvement=0.0,
+                recent_encoder_clip_fraction=0.0,
+                recent_selection_head_clip_fraction=0.0,
+                status="adequate",
+            )
+            adequacy_payload = {
+                **asdict(adequacy),
+                "receipt_sha256": adequacy.receipt_sha256,
+                "epoch_fit_file_sha256": tuple(epoch_file_hashes),
+            }
+            adequacy_file_sha = _write_immutable_json(
+                worker_root
+                / "receipts"
+                / f"fold-{fold_index:02d}-training-adequacy.json",
+                adequacy_payload,
+            )
+            artifact = {
+                "schema": M03R_V16_QUALIFICATION_ARTIFACT_SCHEMA,
+                "terminal_checkpoint_authority_sha256": (
+                    row.terminal_checkpoint_authority_sha256
+                ),
+                "qualified_score_authority_sha256": (
+                    row.qualified_score_authority_sha256
+                ),
+                "trace_unsigned_payload": row.trace.unsigned_payload(),
+                "trace_arrays": row.trace.arrays,
+                "decision_origin_indices": row.trace.decision_origin_indices,
+                "executable_selection_mean": row.executable_selection_mean,
+                "selection_target_economic": row.selection_target_economic,
+                "selection_valid": row.selection_valid,
+                "action_valid": row.selection_valid,
+                "outer_2026_accessed": False,
+                "economic_optimizer_updates": 0,
+                "reinforcement_learning_updates": 0,
+            }
+            artifact_sha = _write_immutable_torch(
+                worker_root
+                / "fold-artifacts"
+                / f"fold-{fold_index:02d}-qualification.pt",
+                artifact,
+            )
+            unsigned_fold = {
+                "schema": M03R_V16_FOLD_TERMINAL_SCHEMA,
+                "package_plan_sha256": package.package_plan_sha256,
+                "authorization_receipt_sha256": authorization.receipt_sha256,
+                "worker_plan_sha256": worker.receipt_sha256,
+                "setting_index": index,
+                "setting_id": worker.setting_id,
+                "fold_index": fold_index,
+                "terminal_checkpoint_authority_sha256": (
+                    row.terminal_checkpoint_authority_sha256
+                ),
+                "qualified_score_authority_sha256": (
+                    row.qualified_score_authority_sha256
+                ),
+                "panel_schedule_sha256": package.schedule.receipt_sha256,
+                "qualification_artifact_file_sha256": artifact_sha,
+                "qualification_trace_sha256": row.trace.trace_sha256,
+                "epoch_fit_file_sha256": tuple(epoch_file_hashes),
+                "epoch_fit_receipt_sha256": tuple(epoch_receipts),
+                "training_adequacy_status": adequacy.status,
+                "training_adequacy_receipt_sha256": adequacy.receipt_sha256,
+                "training_adequacy_file_sha256": adequacy_file_sha,
+                "qualification_after_strict_terminal_reload": True,
+                "economic_optimizer_updates": 0,
+                "reinforcement_learning_updates": 0,
+                "outer_2026_accessed": False,
+                "development_only": True,
+                "reportable": False,
+                "promotion_eligible": False,
+            }
+            fold_terminal_hashes.append(
+                _write_immutable_json(
+                    worker_root
+                    / "receipts"
+                    / f"fold-{fold_index:02d}-terminal.json",
+                    {
+                        **unsigned_fold,
+                        "receipt_sha256": semantic_sha256(unsigned_fold),
+                    },
+                )
+            )
+            fold_adequacy_file_hashes.append(adequacy_file_sha)
+            fold_adequacy_receipts.append(adequacy.receipt_sha256)
+            fold_adequacy_status.append(adequacy.status)
         unsigned = {
             "schema": M03R_V16_WORKER_TERMINAL_SCHEMA,
             "package_plan_sha256": package.package_plan_sha256,
@@ -296,7 +644,14 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             "startup_file_sha256": "e" * 64,
             "setting_index": index,
             "setting_id": worker.setting_id,
-            "fold_terminal_file_sha256": tuple("f" * 64 for _ in range(5)),
+            "fold_terminal_file_sha256": tuple(fold_terminal_hashes),
+            "fold_training_adequacy_file_sha256": tuple(
+                fold_adequacy_file_hashes
+            ),
+            "fold_training_adequacy_receipt_sha256": tuple(
+                fold_adequacy_receipts
+            ),
+            "fold_training_adequacy_status": tuple(fold_adequacy_status),
             "bootstrap_plan": asdict(bootstrap),
             "bootstrap_plan_sha256": bootstrap.receipt_sha256,
             "predictive_qualification": asdict(qualification),
@@ -316,30 +671,11 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             "reportable": False,
             "promotion_eligible": False,
         }
-        receipt_sha = hashlib.sha256(
-            json.dumps(
-                unsigned,
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
-        payload = {**unsigned, "receipt_sha256": receipt_sha}
-        encoded = (
-            json.dumps(
-                payload,
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            + "\n"
-        ).encode("utf-8")
-        path = tmp_path / f"terminal-{index}.json"
-        path.write_bytes(encoded)
+        payload = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
+        path = worker_root / "predictive-terminal.json"
+        file_sha = _write_immutable_json(path, payload)
         terminal_paths.append(path)
-        terminal_hashes.append(hashlib.sha256(encoded).hexdigest())
+        terminal_hashes.append(file_sha)
     aggregate = aggregate_m03r_v16_panel(
         package_plan_path=plan_path,
         package_plan_file_sha256=plan_file,
@@ -361,3 +697,24 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
     assert aggregate["next_research_action"] == "three-seed-predictive-confirmation"
     assert aggregate["economic_generation_may_be_minted"] is False
     assert aggregate["reinforcement_learning_authorized"] is False
+
+    terminal_paths[0].chmod(0o640)
+    terminal_paths[0].write_bytes(terminal_paths[0].read_bytes() + b"\n")
+    with pytest.raises(M03RV16AggregateError, match="hash drifted"):
+        aggregate_m03r_v16_panel(
+            package_plan_path=plan_path,
+            package_plan_file_sha256=plan_file,
+            execution_authorization_path=authorization_path,
+            execution_authorization_file_sha256=authorization_file,
+            worker_terminal_paths=(
+                terminal_paths[0],
+                terminal_paths[1],
+                terminal_paths[2],
+            ),
+            worker_terminal_file_sha256=(
+                terminal_hashes[0],
+                terminal_hashes[1],
+                terminal_hashes[2],
+            ),
+            output_root=tmp_path / "aggregate-tampered",
+        )

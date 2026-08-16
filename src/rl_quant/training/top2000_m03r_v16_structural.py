@@ -10,7 +10,6 @@ worker startup.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
 import stat
@@ -27,6 +26,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     m03r_v16_selection_target_weights_from_id,
 )
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_payload as _canonical,
+    semantic_sha256 as _sha256,
+)
 from rl_quant.training.hold30_top2000_development import (
     Top2000VerifiedDevelopmentCache,
 )
@@ -58,20 +61,6 @@ _RETURNED_DTYPE_ORTHOGONALITY_TOLERANCE = 1.0e-5
 
 class M03RV16StructuralError(ValueError):
     """The package-owned V16 structural artifact failed or drifted."""
-
-
-def _canonical(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
 def _digest(name: str, value: str) -> str:

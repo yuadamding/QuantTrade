@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import random
 import stat
@@ -18,6 +17,11 @@ import torch.distributed as dist
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
+)
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes as _canonical,
+    file_sha256 as _file_sha256,
+    semantic_sha256 as _sha256,
 )
 from rl_quant.training.hold30_top2000_development import (
     DEVELOPMENT_ACK,
@@ -52,6 +56,10 @@ from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16FoldGeometry,
     render_m03r_v16_fold_geometries,
 )
+from rl_quant.training.top2000_m03r_v16_fit import (
+    build_m03r_v16_epoch_fit_payload,
+    classify_m03r_v16_training_adequacy,
+)
 from rl_quant.training.top2000_m03r_v16_initial_state import (
     load_m03r_v16_initial_parameter_state,
 )
@@ -79,6 +87,9 @@ from rl_quant.training.top2000_m03r_v16_selection import (
 from rl_quant.training.top2000_m03r_v16_structural import (
     load_m03r_v16_structural_slab,
 )
+from rl_quant.training.top2000_m03r_v16_source import (
+    verify_m03r_v16_source_tree,
+)
 from rl_quant.training.top2000_m03r_v16_training_runtime import (
     move_and_bind_m03r_v16_sequence,
     run_m03r_v16_pretraining_fold_update,
@@ -101,31 +112,6 @@ M03R_V16_QUALIFICATION_ARTIFACT_SCHEMA = (
 
 class M03RV16PredictiveWorkflowError(RuntimeError):
     """The sealed V16 worker, rank topology, or artifact lineage drifted."""
-
-
-def _canonical(value: Any) -> bytes:
-    return (
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
-    ).encode("utf-8")
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> str:
@@ -239,7 +225,7 @@ def resolve_m03r_v16_completion_index(value: int | None) -> int:
 def _validate_runtime_package_members(
     package_plan_path: str | Path,
     package: M03RV16PackagePlan,
-) -> Path:
+) -> tuple[Path, str]:
     package_root = Path(package_plan_path).resolve().parent.parent
     expected = {
         package_root / "source.tar": package.artifacts.source_archive_sha256,
@@ -281,7 +267,19 @@ def _validate_runtime_package_members(
         raise M03RV16PredictiveWorkflowError(
             "V16 worker resolved outside immutable package source"
         )
-    return package_root
+    verified_source = verify_m03r_v16_source_tree(
+        package_root / "source",
+        package_root / "source-manifest.json",
+        expected_source_manifest_file_sha256=(
+            package.artifacts.source_manifest_sha256
+        ),
+        expected_runtime_worker_sha256=package.artifacts.worker_source_sha256,
+    )
+    if _file_sha256(Path(__file__)) != verified_source.runtime_worker_sha256:
+        raise M03RV16PredictiveWorkflowError(
+            "V16 executing worker bytes drifted from the package manifest"
+        )
+    return package_root, verified_source.source_tree_root_sha256
 
 
 def _new_policy(setting_index: int, device: torch.device) -> Top2000M03RV16PredictivePolicy:
@@ -291,6 +289,8 @@ def _new_policy(setting_index: int, device: torch.device) -> Top2000M03RV16Predi
 
 def _rank_update_row(result: Any) -> dict[str, Any]:
     return {
+        "setting_index": result.step.setting_index,
+        "fold_index": result.step.fold_index,
         "update_plan_sha256": result.update_plan.receipt_sha256,
         "batch_receipt_sha256": result.batch.receipt_sha256,
         "step_receipt_sha256": result.step.receipt_sha256,
@@ -311,6 +311,21 @@ def _rank_update_row(result: Any) -> dict[str, Any]:
         "selection_head_version_root_after": (
             result.step.selection_head_version_root_after
         ),
+        "total_loss": result.step.total_loss,
+        "selection_robust_loss": result.step.selection_robust_loss,
+        "encoder_gradient_norm_before_clip": (
+            result.step.encoder_gradient_norm_before_clip
+        ),
+        "selection_head_gradient_norm_before_clip": (
+            result.step.selection_head_gradient_norm_before_clip
+        ),
+        "encoder_gradient_clipped": result.step.encoder_gradient_clipped,
+        "selection_head_gradient_clipped": (
+            result.step.selection_head_gradient_clipped
+        ),
+        "learning_rate_multiplier": result.step.learning_rate_multiplier,
+        "encoder_learning_rate": result.step.encoder_learning_rate,
+        "selection_head_learning_rate": result.step.selection_head_learning_rate,
     }
 
 
@@ -457,7 +472,9 @@ def run_m03r_v16_predictive_worker(
         expected_file_sha256=expected_authorization_file_sha256,
         package=package,
     )
-    package_root = _validate_runtime_package_members(package_plan_path, package)
+    package_root, source_tree_root_sha256 = _validate_runtime_package_members(
+        package_plan_path, package
+    )
     if authorization.package_plan_file_sha256 != expected_package_plan_file_sha256:
         raise M03RV16PredictiveWorkflowError(
             "V16 authorization and package plan disagree"
@@ -497,6 +514,7 @@ def run_m03r_v16_predictive_worker(
                     "package_plan_sha256": package.package_plan_sha256,
                     "authorization_receipt_sha256": authorization.receipt_sha256,
                     "worker_plan_sha256": worker.receipt_sha256,
+                    "source_tree_root_sha256": source_tree_root_sha256,
                     "setting_index": worker.setting_index,
                     "setting_id": worker.setting_id,
                     "mode": "capacity" if capacity_only else "predictive",
@@ -570,9 +588,12 @@ def run_m03r_v16_predictive_worker(
                     "authorization_receipt_sha256": authorization.receipt_sha256,
                     "worker_plan_sha256": worker.receipt_sha256,
                     "startup_file_sha256": startup_sha,
+                    "source_tree_root_sha256": source_tree_root_sha256,
                     "capacity": asdict(capacity),
                     "capacity_receipt_sha256": capacity.receipt_sha256,
-                    "training_performed": False,
+                    "scientific_training_performed": False,
+                    "disposable_optimizer_update_executed": True,
+                    "disposable_train_validate_train_executed": True,
                     "scientific_checkpoint_published": False,
                     "economic_optimizer_updates": 0,
                     "reinforcement_learning_updates": 0,
@@ -590,6 +611,9 @@ def run_m03r_v16_predictive_worker(
 
         fold_results: list[M03RV16FoldQualificationResult] = []
         fold_terminal_files: list[str] = []
+        fold_training_adequacy_files: list[str] = []
+        fold_training_adequacy_receipts: list[str] = []
+        fold_training_adequacy_status: list[str] = []
         for geometry in geometries:
             _seed_everything(worker.seed)
             policy = _new_policy(worker.setting_index, device)
@@ -611,6 +635,8 @@ def run_m03r_v16_predictive_worker(
             update_rows: list[list[Any]] = []
             epoch_checkpoint_paths: list[Path] = []
             epoch_checkpoint_hashes: list[str] = []
+            epoch_fit_payloads: list[dict[str, Any]] = []
+            epoch_fit_file_hashes: list[str] = []
             source_rows: list[str] = []
             for completed in range(geometry.maximum_optimizer_updates):
                 update = run_m03r_v16_pretraining_fold_update(
@@ -688,6 +714,25 @@ def run_m03r_v16_predictive_worker(
                 validation_receipts.append(validation)
                 epoch_checkpoint_paths.append(checkpoint_path)
                 epoch_checkpoint_hashes.append(checkpoint_sha)
+                if rank == 0:
+                    epoch_fit = build_m03r_v16_epoch_fit_payload(
+                        validation,
+                        tuple(update_rows[-geometry.training_block_count :]),
+                        package_plan_sha256=package.package_plan_sha256,
+                        worker_plan_sha256=worker.receipt_sha256,
+                    )
+                    epoch_fit_payloads.append(epoch_fit)
+                    epoch_fit_file_hashes.append(
+                        _write_immutable_json(
+                            output
+                            / "receipts"
+                            / (
+                                f"fold-{geometry.fold_index:02d}-"
+                                f"epoch-{epoch + 1:02d}-fit.json"
+                            ),
+                            epoch_fit,
+                        )
+                    )
             if len(validation_receipts) != M03R_V16_PREDICTIVE_SPEC.score_training_epochs:
                 raise M03RV16PredictiveWorkflowError(
                     "V16 fixed epoch coverage drifted"
@@ -703,6 +748,23 @@ def run_m03r_v16_predictive_worker(
             ):
                 raise M03RV16PredictiveWorkflowError(
                     "V16 terminal checkpoint selection drifted"
+                )
+            training_adequacy = None
+            training_adequacy_file_sha: str | None = None
+            if rank == 0:
+                training_adequacy = classify_m03r_v16_training_adequacy(
+                    tuple(validation_receipts), tuple(epoch_fit_payloads)
+                )
+                training_adequacy_payload = {
+                    **asdict(training_adequacy),
+                    "receipt_sha256": training_adequacy.receipt_sha256,
+                    "epoch_fit_file_sha256": tuple(epoch_fit_file_hashes),
+                }
+                training_adequacy_file_sha = _write_immutable_json(
+                    output
+                    / "receipts"
+                    / f"fold-{geometry.fold_index:02d}-training-adequacy.json",
+                    training_adequacy_payload,
                 )
             final_optimizer_hashes = _gather(
                 optimizer_state_sha256(optimizer), world_size
@@ -782,6 +844,13 @@ def run_m03r_v16_predictive_worker(
                     "V16 qualification artifact publication failed"
                 )
             if rank == 0:
+                if (
+                    training_adequacy is None
+                    or training_adequacy_file_sha is None
+                ):
+                    raise M03RV16PredictiveWorkflowError(
+                        "V16 training adequacy was not published"
+                    )
                 fold_results.append(fold_result)
                 unsigned_fold = {
                     "schema": M03R_V16_FOLD_TERMINAL_SCHEMA,
@@ -801,6 +870,17 @@ def run_m03r_v16_predictive_worker(
                     ),
                     "inner_validation_receipt_sha256": tuple(
                         row.receipt_sha256 for row in validation_receipts
+                    ),
+                    "epoch_fit_file_sha256": tuple(epoch_fit_file_hashes),
+                    "epoch_fit_receipt_sha256": (
+                        training_adequacy.epoch_fit_receipt_sha256
+                    ),
+                    "training_adequacy_status": training_adequacy.status,
+                    "training_adequacy_receipt_sha256": (
+                        training_adequacy.receipt_sha256
+                    ),
+                    "training_adequacy_file_sha256": (
+                        training_adequacy_file_sha
                     ),
                     "terminal_checkpoint_authority_sha256": (
                         terminal_authority.receipt_sha256
@@ -835,6 +915,11 @@ def run_m03r_v16_predictive_worker(
                         fold_terminal,
                     )
                 )
+                fold_training_adequacy_files.append(training_adequacy_file_sha)
+                fold_training_adequacy_receipts.append(
+                    training_adequacy.receipt_sha256
+                )
+                fold_training_adequacy_status.append(training_adequacy.status)
             dist.barrier()
             del loaded_policy, risk_state
             torch.cuda.empty_cache()
@@ -859,6 +944,15 @@ def run_m03r_v16_predictive_worker(
                 "setting_index": worker.setting_index,
                 "setting_id": worker.setting_id,
                 "fold_terminal_file_sha256": tuple(fold_terminal_files),
+                "fold_training_adequacy_file_sha256": tuple(
+                    fold_training_adequacy_files
+                ),
+                "fold_training_adequacy_receipt_sha256": tuple(
+                    fold_training_adequacy_receipts
+                ),
+                "fold_training_adequacy_status": tuple(
+                    fold_training_adequacy_status
+                ),
                 "bootstrap_plan": asdict(bootstrap),
                 "bootstrap_plan_sha256": bootstrap.receipt_sha256,
                 "predictive_qualification": asdict(qualification),

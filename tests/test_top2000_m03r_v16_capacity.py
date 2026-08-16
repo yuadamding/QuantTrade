@@ -21,6 +21,8 @@ def _rank(rank: int) -> M03RV16CapacityRankEvidence:
         cuda_total_memory_bytes=80 * 1024**3,
         peak_allocated_bytes=40 * 1024**3 + rank,
         peak_reserved_bytes=50 * 1024**3 + rank,
+        pre_validation_update_receipt_sha256=("b" if rank == 0 else "c") * 64,
+        validation_batch_receipt_sha256=("d" if rank == 0 else "e") * 64,
         update_plan_sha256="1" * 64,
         batch_receipt_sha256=("2" if rank == 0 else "3") * 64,
         score_step_receipt_sha256=("4" if rank == 0 else "5") * 64,
@@ -58,7 +60,9 @@ def test_v16_capacity_terminal_requires_exact_update_projection_and_rank_equalit
 
 def test_v16_capacity_runner_owns_the_real_projection_call() -> None:
     source = inspect.getsource(capacity.run_m03r_v16_disposable_capacity_rank)
-    assert "run_m03r_v16_pretraining_fold_update" in source
+    assert source.count("run_m03r_v16_pretraining_fold_update") == 2
+    assert "build_m03r_v16_inner_validation_batch" in source
+    assert "training_mode_restored_after_validation" in source
     assert "project_m03r_v9_active_book" in source
     assert "qualification_projection_probe" not in source
 

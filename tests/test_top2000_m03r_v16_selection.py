@@ -19,6 +19,7 @@ from rl_quant.training.top2000_m03r_v16_selection import (
     build_m03r_v16_panel_decision,
     load_m03r_v16_panel_decision,
     write_m03r_v16_panel_decision,
+    _draw_indices,
 )
 
 
@@ -77,6 +78,10 @@ def _passing_qualification(setting_index: int) -> M03RV16PredictiveQualification
     )
 
 
+def _adequacy_receipts() -> tuple[str, ...]:
+    return tuple(f"{index + 20:064x}" for index in range(5))
+
+
 def test_v16_bootstrap_plan_is_fold_bounded_and_deterministic() -> None:
     decisions, executions = _chronologies()
     first = build_m03r_v16_bootstrap_plan(decisions, executions)
@@ -86,6 +91,20 @@ def test_v16_bootstrap_plan_is_fold_bounded_and_deterministic() -> None:
     assert first.decision_fold_lengths == (63,) * 5
     assert first.execution_fold_lengths == (92,) * 5
     assert first.diagnostic_draw_sha256_by_block != first.economic_draw_sha256_by_block
+
+
+def test_v16_bootstrap_is_nonwrapping_and_block63_resamples_folds() -> None:
+    lengths = (63,) * 5
+    draws = _draw_indices(lengths, block_sessions=42, stream=1)
+    for destination in range(5):
+        row = draws[0, destination * 63 : (destination + 1) * 63]
+        assert len({int(value) // 63 for value in row}) == 1
+        assert bool((row[1:42] == row[:41] + 1).all())
+        assert bool((row[43:] == row[42:-1] + 1).all())
+    full_fold = _draw_indices(lengths, block_sessions=63, stream=1)
+    synthetic_fold_means = torch.arange(5, dtype=torch.float64).repeat_interleave(63)
+    distribution = synthetic_fold_means[full_fold].mean(dim=1)
+    assert float(distribution.std()) > 0.0
 
 
 def test_v16_bootstrap_rejects_overlapping_execution_support() -> None:
@@ -131,7 +150,12 @@ def test_v16_panel_decision_round_trip_preserves_primary_only_rule(
         )
         for index in range(3)
     )
-    decision = build_m03r_v16_panel_decision(qualifications, bootstrap)
+    decision = build_m03r_v16_panel_decision(
+        qualifications,
+        bootstrap,
+        primary_training_adequacy="adequate",
+        primary_training_adequacy_receipt_sha256=_adequacy_receipts(),
+    )
     assert decision.primary_hypothesis_passed is True
     assert decision.next_research_action == "three-seed-predictive-confirmation"
     assert decision.economic_generation_may_be_minted is False
@@ -179,7 +203,29 @@ def test_v16_failed_primary_ends_daily_target_tuning() -> None:
         three_seed_confirmation_may_be_minted=False,
     )
     decision = build_m03r_v16_panel_decision(
-        (*controls, failed_primary), bootstrap
+        (*controls, failed_primary),
+        bootstrap,
+        primary_training_adequacy="adequate",
+        primary_training_adequacy_receipt_sha256=_adequacy_receipts(),
     )
     assert decision.next_research_action == "ordered-five-minute-representation"
     assert decision.daily_target_or_loss_tuning_authorized is False
+
+
+def test_v16_inconclusive_fit_routes_to_a_fresh_longer_training_protocol() -> None:
+    decisions, executions = _chronologies()
+    bootstrap = build_m03r_v16_bootstrap_plan(decisions, executions)
+    qualifications = tuple(
+        replace(
+            _passing_qualification(index),
+            bootstrap_plan_sha256=bootstrap.receipt_sha256,
+        )
+        for index in range(3)
+    )
+    decision = build_m03r_v16_panel_decision(
+        qualifications,
+        bootstrap,
+        primary_training_adequacy="inconclusive-undertrained",
+        primary_training_adequacy_receipt_sha256=_adequacy_receipts(),
+    )
+    assert decision.next_research_action == "longer-training-protocol"

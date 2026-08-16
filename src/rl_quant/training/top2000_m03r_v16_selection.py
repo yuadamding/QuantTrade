@@ -9,7 +9,7 @@ import os
 import stat
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import torch
 
@@ -18,17 +18,21 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTING_IDS,
 )
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
+from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
+    M03RV16CohortTrace,
+)
 from rl_quant.training.top2000_m03r_v16_qualification_runtime import (
     M03RV16FoldQualificationResult,
 )
 
-M03R_V16_BOOTSTRAP_PLAN_SCHEMA = "rl-quant.top2000-dev.m03r-v16-bootstrap-plan-v1"
-M03R_V16_QUALIFICATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-qualification-v1"
+M03R_V16_BOOTSTRAP_PLAN_SCHEMA = "rl-quant.top2000-dev.m03r-v16-bootstrap-plan-v2"
+M03R_V16_QUALIFICATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-qualification-v2"
 M03R_V16_PANEL_DECISION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-decision-v1"
+    "rl-quant.top2000-dev.m03r-v16-panel-decision-v2"
 )
 M03R_V16_PANEL_DECISION_FILE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-decision-file-v1"
+    "rl-quant.top2000-dev.m03r-v16-panel-decision-file-v2"
 )
 _MAX_PANEL_DECISION_BYTES = 1024**2
 M03R_V16_BOOTSTRAP_BLOCK_SESSIONS = (
@@ -39,18 +43,6 @@ M03R_V16_BOOTSTRAP_BLOCK_SESSIONS = (
 
 class M03RV16SelectionError(ValueError):
     """The V16 chronology, inference, or primary-hypothesis gate drifted."""
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -76,32 +68,40 @@ def _draw_indices(
     block_sessions: int,
     stream: int,
 ) -> torch.Tensor:
+    if not fold_lengths or len(set(fold_lengths)) != 1:
+        raise M03RV16SelectionError(
+            "V16 hierarchical bootstrap requires equal nonempty fold lengths"
+        )
+    fold_length = fold_lengths[0]
+    if block_sessions <= 0 or block_sessions > fold_length:
+        raise M03RV16SelectionError("V16 bootstrap block exceeds its source fold")
     generator = torch.Generator(device="cpu")
     generator.manual_seed(
         M03R_V16_PREDICTIVE_SPEC.bootstrap_seed
         + block_sessions * 1_000_003
         + stream * 10_000_019
     )
-    rows: list[torch.Tensor] = []
-    offset = 0
-    block_offset = torch.arange(block_sessions, dtype=torch.int64)
-    for fold_length in fold_lengths:
-        blocks = (fold_length + block_sessions - 1) // block_sessions
-        starts = torch.randint(
-            fold_length,
-            (M03R_V16_PREDICTIVE_SPEC.bootstrap_replicates, blocks),
-            generator=generator,
-            dtype=torch.int64,
-        )
-        local = (starts.unsqueeze(-1) + block_offset) % fold_length
-        rows.append(
-            local.reshape(M03R_V16_PREDICTIVE_SPEC.bootstrap_replicates, -1)[
-                :, :fold_length
-            ]
-            + offset
-        )
-        offset += fold_length
-    return torch.cat(rows, dim=1)
+    replicates = M03R_V16_PREDICTIVE_SPEC.bootstrap_replicates
+    fold_count = len(fold_lengths)
+    source_folds = torch.randint(
+        fold_count,
+        (replicates, fold_count),
+        generator=generator,
+        dtype=torch.int64,
+    )
+    blocks = (fold_length + block_sessions - 1) // block_sessions
+    starts = torch.randint(
+        fold_length - block_sessions + 1,
+        (replicates, fold_count, blocks),
+        generator=generator,
+        dtype=torch.int64,
+    )
+    offsets = torch.arange(block_sessions, dtype=torch.int64)
+    local = (starts.unsqueeze(-1) + offsets).reshape(
+        replicates, fold_count, -1
+    )[:, :, :fold_length]
+    selected = local + source_folds.unsqueeze(-1) * fold_length
+    return selected.reshape(replicates, fold_count * fold_length)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +116,9 @@ class M03RV16BootstrapPlan:
     replicates: int = M03R_V16_PREDICTIVE_SPEC.bootstrap_replicates
     bootstrap_seed: int = M03R_V16_PREDICTIVE_SPEC.bootstrap_seed
     fold_boundaries_preserved: bool = True
+    fold_clusters_resampled: bool = True
+    within_fold_blocks_nonwrapping: bool = True
+    circular_blocks_used: bool = False
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
     schema: str = M03R_V16_BOOTSTRAP_PLAN_SCHEMA
 
@@ -156,6 +159,9 @@ class M03RV16BootstrapPlan:
                 for block in self.block_sessions
             )
             or not self.fold_boundaries_preserved
+            or not self.fold_clusters_resampled
+            or not self.within_fold_blocks_nonwrapping
+            or self.circular_blocks_used
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
             or self.schema != M03R_V16_BOOTSTRAP_PLAN_SCHEMA
         ):
@@ -262,14 +268,11 @@ def _spearman(prediction: torch.Tensor, target: torch.Tensor) -> float:
     return float((first * second).sum() / denominator)
 
 
-def _fold_predictive_diagnostics(
-    result: M03RV16FoldQualificationResult,
+def _predictive_diagnostics(
+    score: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    result.validate()
-    objective = result.score_authority.batch.objective
-    score = objective.executable_selection_mean
-    target = objective.selection_target_economic
-    valid = objective.selection_valid
     date_ic: list[float] = []
     date_spread: list[float] = []
     for row in range(score.shape[0]):
@@ -290,6 +293,133 @@ def _fold_predictive_diagnostics(
         torch.tensor(date_ic, dtype=torch.float64),
         torch.tensor(date_spread, dtype=torch.float64),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16ReconciledFoldEvidence:
+    """Minimal immutable fold evidence used by the independent aggregator."""
+
+    trace: M03RV16CohortTrace
+    executable_selection_mean: torch.Tensor
+    selection_target_economic: torch.Tensor
+    selection_valid: torch.Tensor
+    terminal_checkpoint_authority_sha256: str
+    qualified_score_authority_sha256: str
+    panel_schedule_sha256: str
+
+    def validate(self) -> None:
+        self.trace.validate()
+        score = self.executable_selection_mean
+        target = self.selection_target_economic
+        valid = self.selection_valid
+        decisions = M03R_V16_PREDICTIVE_SPEC.qualification_origins_per_fold
+        if (
+            score.ndim != 2
+            or target.shape != score.shape
+            or valid.shape != score.shape
+            or valid.dtype != torch.bool
+            or score.shape[0] != decisions
+            or not score.is_floating_point()
+            or not target.is_floating_point()
+            or not bool(torch.isfinite(score).all())
+            or not bool(torch.isfinite(target).all())
+            or self.trace.terminal_checkpoint_authority_sha256
+            != self.terminal_checkpoint_authority_sha256
+            or self.trace.qualified_score_authority_sha256
+            != self.qualified_score_authority_sha256
+            or self.trace.panel_schedule_sha256 != self.panel_schedule_sha256
+            or self.trace.diagnostic_valid_sha256 != _tensor_sha256(valid)
+        ):
+            raise M03RV16SelectionError("V16 reconciled fold evidence drifted")
+        for name, value in (
+            (
+                "terminal_checkpoint_authority_sha256",
+                self.terminal_checkpoint_authority_sha256,
+            ),
+            (
+                "qualified_score_authority_sha256",
+                self.qualified_score_authority_sha256,
+            ),
+            ("panel_schedule_sha256", self.panel_schedule_sha256),
+        ):
+            _digest(name, value)
+
+
+def reconcile_m03r_v16_fold_result(
+    result: M03RV16FoldQualificationResult,
+) -> M03RV16ReconciledFoldEvidence:
+    """Reduce an in-memory qualification authority to auditable CPU evidence."""
+
+    result.validate()
+    objective = result.score_authority.batch.objective
+    trace = result.trace
+    cpu_trace = replace(
+        trace,
+        decision_origin_indices=trace.decision_origin_indices.detach().cpu(),
+        execution_origin_indices=trace.execution_origin_indices.detach().cpu(),
+        policy_gross_returns=trace.policy_gross_returns.detach().cpu(),
+        benchmark_gross_returns=trace.benchmark_gross_returns.detach().cpu(),
+        policy_one_way_turnover=trace.policy_one_way_turnover.detach().cpu(),
+        benchmark_one_way_turnover=trace.benchmark_one_way_turnover.detach().cpu(),
+        active_one_way_mass=trace.active_one_way_mass.detach().cpu(),
+        cohort_entry_one_way_mass=(
+            trace.cohort_entry_one_way_mass.detach().cpu()
+        ),
+        signal_cohort_mass_reduction_after_execution=(
+            trace.signal_cohort_mass_reduction_after_execution.detach().cpu()
+        ),
+        weighted_mean_cohort_age=trace.weighted_mean_cohort_age.detach().cpu(),
+        requested_to_executed_retention=(
+            trace.requested_to_executed_retention.detach().cpu()
+        ),
+        risk_repair_active_one_way_mass=(
+            trace.risk_repair_active_one_way_mass.detach().cpu()
+        ),
+        prior_risk_repair_unwind_one_way_mass=(
+            trace.prior_risk_repair_unwind_one_way_mass.detach().cpu()
+        ),
+        risk_projection_request_to_execution_one_way_distance=(
+            trace.risk_projection_request_to_execution_one_way_distance.detach().cpu()
+        ),
+        absolute_policy_cost_by_cost=tuple(
+            row.detach().cpu() for row in trace.absolute_policy_cost_by_cost
+        ),
+        benchmark_cost_by_cost=tuple(
+            row.detach().cpu() for row in trace.benchmark_cost_by_cost
+        ),
+        incremental_active_cost_by_cost=tuple(
+            row.detach().cpu() for row in trace.incremental_active_cost_by_cost
+        ),
+        net_policy_return_by_cost=tuple(
+            row.detach().cpu() for row in trace.net_policy_return_by_cost
+        ),
+        net_benchmark_return_by_cost=tuple(
+            row.detach().cpu() for row in trace.net_benchmark_return_by_cost
+        ),
+        net_active_return_by_cost=tuple(
+            row.detach().cpu() for row in trace.net_active_return_by_cost
+        ),
+    )
+    cpu_trace.validate()
+    evidence = M03RV16ReconciledFoldEvidence(
+        trace=cpu_trace,
+        executable_selection_mean=(
+            objective.executable_selection_mean.detach().cpu()
+        ),
+        selection_target_economic=(
+            objective.selection_target_economic.detach().cpu()
+        ),
+        selection_valid=objective.selection_valid.detach().cpu(),
+        terminal_checkpoint_authority_sha256=(
+            result.terminal_checkpoint_authority.receipt_sha256
+        ),
+        qualified_score_authority_sha256=result.score_authority.receipt_sha256,
+        panel_schedule_sha256=(
+            result.terminal_checkpoint_authority.panel_schedule.receipt_sha256
+        ),
+    )
+    evidence.validate()
+    return evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,31 +576,27 @@ def _lcb_by_block(
     return (estimates[0], estimates[1], estimates[2])
 
 
-def qualify_m03r_v16_predictive_candidate(
-    results: tuple[M03RV16FoldQualificationResult, ...],
+def qualify_m03r_v16_reconciled_evidence(
+    evidence: tuple[M03RV16ReconciledFoldEvidence, ...],
     bootstrap: M03RV16BootstrapPlan,
 ) -> M03RV16PredictiveQualification:
     fold_count = M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
-    if len(results) != fold_count:
+    if len(evidence) != fold_count:
         raise M03RV16SelectionError("V16 qualification requires five folds")
     ordered = tuple(
-        sorted(results, key=lambda row: row.trace.fold_index)
+        sorted(evidence, key=lambda row: row.trace.fold_index)
     )
     for row in ordered:
         row.validate()
     bootstrap.validate()
     setting = ordered[0].trace.setting_index
-    schedule = ordered[0].terminal_checkpoint_authority.panel_schedule.receipt_sha256
+    schedule = ordered[0].panel_schedule_sha256
     decisions = tuple(row.trace.decision_origin_indices for row in ordered)
     executions = tuple(row.trace.execution_origin_indices for row in ordered)
     if (
         tuple(row.trace.fold_index for row in ordered) != tuple(range(fold_count))
         or any(row.trace.setting_index != setting for row in ordered)
-        or any(
-            row.terminal_checkpoint_authority.panel_schedule.receipt_sha256
-            != schedule
-            for row in ordered
-        )
+        or any(row.panel_schedule_sha256 != schedule for row in ordered)
         or bootstrap.decision_chronology_sha256
         != _sha256([int(value) for row in decisions for value in row])
         or bootstrap.execution_chronology_sha256
@@ -478,7 +604,14 @@ def qualify_m03r_v16_predictive_candidate(
     ):
         raise M03RV16SelectionError("V16 fold authority or chronology drifted")
 
-    diagnostic = tuple(_fold_predictive_diagnostics(row) for row in ordered)
+    diagnostic = tuple(
+        _predictive_diagnostics(
+            row.executable_selection_mean,
+            row.selection_target_economic,
+            row.selection_valid,
+        )
+        for row in ordered
+    )
     date_ic = torch.cat(tuple(row[0] for row in diagnostic))
     spread = torch.cat(tuple(row[1] for row in diagnostic))
     gross = torch.cat(
@@ -546,10 +679,10 @@ def qualify_m03r_v16_predictive_candidate(
         setting_id=M03R_V16_SETTING_IDS[setting],
         fold_trace_sha256=tuple(row.trace.trace_sha256 for row in ordered),
         terminal_checkpoint_authority_sha256=tuple(
-            row.terminal_checkpoint_authority.receipt_sha256 for row in ordered
+            row.terminal_checkpoint_authority_sha256 for row in ordered
         ),
         qualified_score_authority_sha256=tuple(
-            row.score_authority.receipt_sha256 for row in ordered
+            row.qualified_score_authority_sha256 for row in ordered
         ),
         panel_schedule_sha256=schedule,
         bootstrap_plan_sha256=bootstrap.receipt_sha256,
@@ -591,6 +724,18 @@ def qualify_m03r_v16_predictive_candidate(
     return result
 
 
+def qualify_m03r_v16_predictive_candidate(
+    results: tuple[M03RV16FoldQualificationResult, ...],
+    bootstrap: M03RV16BootstrapPlan,
+) -> M03RV16PredictiveQualification:
+    """Qualify live fold results through the same CPU evidence path as aggregation."""
+
+    return qualify_m03r_v16_reconciled_evidence(
+        tuple(reconcile_m03r_v16_fold_result(row) for row in results),
+        bootstrap,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class M03RV16PanelDecision:
     setting_qualification_sha256: tuple[str, str, str]
@@ -599,9 +744,14 @@ class M03RV16PanelDecision:
     primary_setting_index: int
     primary_setting_id: str
     primary_hypothesis_passed: bool
+    primary_training_adequacy: Literal[
+        "adequate", "inconclusive-undertrained"
+    ]
+    primary_training_adequacy_receipt_sha256: tuple[str, ...]
     next_research_action: Literal[
         "three-seed-predictive-confirmation",
         "ordered-five-minute-representation",
+        "longer-training-protocol",
     ]
     daily_target_or_loss_tuning_authorized: bool = False
     economic_generation_may_be_minted: bool = False
@@ -624,9 +774,13 @@ class M03RV16PanelDecision:
         primary_index = M03R_V16_PREDICTIVE_SPEC.primary_setting_index
         primary_passed = qualifications[primary_index].primary_hypothesis_passed
         expected_action = (
-            "three-seed-predictive-confirmation"
-            if primary_passed
-            else "ordered-five-minute-representation"
+            "longer-training-protocol"
+            if self.primary_training_adequacy == "inconclusive-undertrained"
+            else (
+                "three-seed-predictive-confirmation"
+                if primary_passed
+                else "ordered-five-minute-representation"
+            )
         )
         if (
             len(qualifications) != len(M03R_V16_SETTING_IDS)
@@ -644,6 +798,10 @@ class M03RV16PanelDecision:
             or self.primary_setting_index != primary_index
             or self.primary_setting_id != M03R_V16_SETTING_IDS[primary_index]
             or self.primary_hypothesis_passed != primary_passed
+            or self.primary_training_adequacy
+            not in {"adequate", "inconclusive-undertrained"}
+            or len(self.primary_training_adequacy_receipt_sha256)
+            != M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
             or self.next_research_action != expected_action
             or self.daily_target_or_loss_tuning_authorized
             or self.economic_generation_may_be_minted
@@ -658,6 +816,8 @@ class M03RV16PanelDecision:
             raise M03RV16SelectionError("V16 panel decision drifted")
         for value in self.setting_qualification_sha256:
             _digest("setting_qualification_sha256", value)
+        for value in self.primary_training_adequacy_receipt_sha256:
+            _digest("primary_training_adequacy_receipt_sha256", value)
 
     @property
     def receipt_sha256(self) -> str:
@@ -667,6 +827,11 @@ class M03RV16PanelDecision:
 def build_m03r_v16_panel_decision(
     qualifications: tuple[M03RV16PredictiveQualification, ...],
     bootstrap: M03RV16BootstrapPlan,
+    *,
+    primary_training_adequacy: Literal[
+        "adequate", "inconclusive-undertrained"
+    ],
+    primary_training_adequacy_receipt_sha256: tuple[str, ...],
 ) -> M03RV16PanelDecision:
     ordered = tuple(sorted(qualifications, key=lambda row: row.setting_index))
     if len(ordered) != len(M03R_V16_SETTING_IDS):
@@ -685,10 +850,18 @@ def build_m03r_v16_panel_decision(
         primary_setting_index=primary_index,
         primary_setting_id=M03R_V16_SETTING_IDS[primary_index],
         primary_hypothesis_passed=primary_passed,
+        primary_training_adequacy=primary_training_adequacy,
+        primary_training_adequacy_receipt_sha256=(
+            primary_training_adequacy_receipt_sha256
+        ),
         next_research_action=(
-            "three-seed-predictive-confirmation"
-            if primary_passed
-            else "ordered-five-minute-representation"
+            "longer-training-protocol"
+            if primary_training_adequacy == "inconclusive-undertrained"
+            else (
+                "three-seed-predictive-confirmation"
+                if primary_passed
+                else "ordered-five-minute-representation"
+            )
         ),
     )
     result.validate(ordered, bootstrap)
@@ -773,6 +946,9 @@ def load_m03r_v16_panel_decision(
         row["setting_qualification_sha256"] = tuple(
             row["setting_qualification_sha256"]
         )
+        row["primary_training_adequacy_receipt_sha256"] = tuple(
+            row["primary_training_adequacy_receipt_sha256"]
+        )
         decision = M03RV16PanelDecision(**row)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise M03RV16SelectionError("V16 panel decision is malformed") from exc
@@ -795,10 +971,13 @@ __all__ = [
     "M03RV16BootstrapPlan",
     "M03RV16PanelDecision",
     "M03RV16PredictiveQualification",
+    "M03RV16ReconciledFoldEvidence",
     "M03RV16SelectionError",
     "build_m03r_v16_bootstrap_plan",
     "build_m03r_v16_panel_decision",
     "load_m03r_v16_panel_decision",
     "qualify_m03r_v16_predictive_candidate",
+    "qualify_m03r_v16_reconciled_evidence",
+    "reconcile_m03r_v16_fold_result",
     "write_m03r_v16_panel_decision",
 ]

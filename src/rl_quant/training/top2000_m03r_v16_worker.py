@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import asdict, dataclass
 
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
@@ -15,6 +13,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     resolve_m03r_v16_setting,
 )
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 from rl_quant.training.top2000_m03r_v16_fold import (
     render_m03r_v16_fold_geometries,
 )
@@ -29,18 +28,6 @@ M03R_V16_FOLD_UPDATE_COUNTS = tuple(
 
 class M03RV16PredictiveWorkerError(ValueError):
     """The V16 worker or paired panel identity drifted."""
-
-
-def _sha256(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
 
 
 def _digest(name: str, value: str) -> str:

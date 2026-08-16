@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
-from dataclasses import asdict, dataclass
+import os
+import stat
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256 as _sha256,
+)
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
     M03R_TOP2000_H100_POOL_NODE_SELECTOR,
     M03R_TOP2000_H100_PRODUCT_LABEL_KEY,
@@ -23,38 +30,35 @@ from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
     M03RV16PackagePlan,
 )
+from rl_quant.training.top2000_m03r_v16_capacity import (
+    M03R_V16_CAPACITY_TERMINAL_SCHEMA,
+    M03RV16CapacityRankEvidence,
+    M03RV16CapacityTerminal,
+)
+from rl_quant.training.top2000_m03r_v16_static_contract import (
+    M03R_V16_STATIC_RESULT_SCHEMA,
+)
 
 M03R_V16_NAMESPACE = "yn-gpu-workload"
 M03R_V16_STATIC_GATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-static-gate-qualification-v1"
+    "rl-quant.top2000-dev.m03r-v16-static-gate-qualification-v2"
 )
 M03R_V16_CAPACITY_GATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v1"
+    "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v2"
 )
 M03R_V16_RENDERED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v1"
+    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v2"
 )
 _PYTHON = "/opt/conda/envs/quanttrade/bin/python"
 _WORKER_MODULE = "rl_quant.workflows.top2000_m03r_v16_predictive"
 _STATIC_MODULE = "rl_quant.workflows.top2000_m03r_v16_static_validate"
+_STATIC_GATE_ISSUER = object()
+_CAPACITY_GATE_ISSUER = object()
+_MAX_GATE_RESULT_BYTES = 64 * 1024**2
 
 
 class M03RV16KubernetesError(ValueError):
     """A V16 static, capacity, or suspended-Job identity drifted."""
-
-
-def _canonical(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
 def _digest(name: str, value: str) -> None:
@@ -72,6 +76,8 @@ class M03RV16StaticGateQualification:
     result_file_sha256: str
     result_receipt_sha256: str
     image_digest_sha256: str
+    source_tree_root_sha256: str
+    _issuer: object = field(repr=False)
     zero_gpu_requested: bool = True
     zero_gpu_admitted: bool = True
     zero_gpu_observed: bool = True
@@ -91,10 +97,12 @@ class M03RV16StaticGateQualification:
             "rendered_manifest_sha256",
             "result_file_sha256",
             "result_receipt_sha256",
+            "source_tree_root_sha256",
         ):
             _digest(name, getattr(self, name))
         if (
-            self.package_plan_sha256 != package.package_plan_sha256
+            self._issuer is not _STATIC_GATE_ISSUER
+            or self.package_plan_sha256 != package.package_plan_sha256
             or self.execution_authorization_receipt_sha256
             != authorization.receipt_sha256
             or self.image_digest_sha256 != package.artifacts.image_digest_sha256
@@ -110,7 +118,9 @@ class M03RV16StaticGateQualification:
 
     @property
     def receipt_sha256(self) -> str:
-        return _sha256(asdict(self))
+        payload = asdict(self)
+        payload.pop("_issuer")
+        return _sha256(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,13 +132,16 @@ class M03RV16CapacityGateQualification:
     terminal_file_sha256: str
     terminal_receipt_sha256: str
     image_digest_sha256: str
+    source_tree_root_sha256: str
+    _issuer: object = field(repr=False)
     world_size: int = 2
     h100s_per_worker: int = 2
     exact_h100_80gb_per_rank: bool = True
     disposable_exact_shape_update_performed: bool = True
+    disposable_train_validate_train_executed: bool = True
     nontrivial_qualification_projection_performed: bool = True
     scientific_checkpoint_published: bool = False
-    training_performed: bool = False
+    scientific_training_performed: bool = False
     passed: bool = True
     development_only: bool = True
     schema: str = M03R_V16_CAPACITY_GATE_SCHEMA
@@ -145,10 +158,12 @@ class M03RV16CapacityGateQualification:
             "rendered_manifest_sha256",
             "terminal_file_sha256",
             "terminal_receipt_sha256",
+            "source_tree_root_sha256",
         ):
             _digest(name, getattr(self, name))
         if (
-            self.package_plan_sha256 != package.package_plan_sha256
+            self._issuer is not _CAPACITY_GATE_ISSUER
+            or self.package_plan_sha256 != package.package_plan_sha256
             or self.execution_authorization_receipt_sha256
             != authorization.receipt_sha256
             or self.static_gate_receipt_sha256 != static.receipt_sha256
@@ -157,9 +172,10 @@ class M03RV16CapacityGateQualification:
             or self.h100s_per_worker != 2
             or not self.exact_h100_80gb_per_rank
             or not self.disposable_exact_shape_update_performed
+            or not self.disposable_train_validate_train_executed
             or not self.nontrivial_qualification_projection_performed
             or self.scientific_checkpoint_published
-            or self.training_performed
+            or self.scientific_training_performed
             or not self.passed
             or not self.development_only
             or self.schema != M03R_V16_CAPACITY_GATE_SCHEMA
@@ -168,7 +184,9 @@ class M03RV16CapacityGateQualification:
 
     @property
     def receipt_sha256(self) -> str:
-        return _sha256(asdict(self))
+        payload = asdict(self)
+        payload.pop("_issuer")
+        return _sha256(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +243,12 @@ class M03RV16RenderedSuspendedJob:
             "capacity": (1, 1, 2),
             "predictive": (3, 3, 2),
         }[self.mode]
+        gpu_resources_valid = (
+            "nvidia.com/gpu" not in requests and "nvidia.com/gpu" not in limits
+            if self.mode == "static"
+            else requests.get("nvidia.com/gpu") == str(expected[2])
+            and limits.get("nvidia.com/gpu") == str(expected[2])
+        )
         if (
             self.manifest_sha256 != _sha256(self.manifest)
             or self.pod_template_sha256 != _sha256(pod)
@@ -247,8 +271,7 @@ class M03RV16RenderedSuspendedJob:
             or spec.get("backoffLimit") != 0
             or (self.completions, self.parallelism, self.gpus_per_completion)
             != expected
-            or requests.get("nvidia.com/gpu") != str(expected[2])
-            or limits.get("nvidia.com/gpu") != str(expected[2])
+            or not gpu_resources_valid
             or self.maximum_gpu_requests > 6
             or pod.get("restartPolicy") != "Never"
             or pod.get("automountServiceAccountToken") is not False
@@ -280,6 +303,153 @@ class M03RV16RenderedSuspendedJob:
             )
         ):
             raise M03RV16KubernetesError("V16 H100 Job profile drifted")
+
+
+def _read_exact_json(path: Path, expected_file_sha256: str) -> dict[str, Any]:
+    _digest("expected_file_sha256", expected_file_sha256)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise M03RV16KubernetesError("V16 gate result is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > _MAX_GATE_RESULT_BYTES
+        ):
+            raise M03RV16KubernetesError("V16 gate result type or size drifted")
+        raw = os.read(descriptor, before.st_size + 1)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise M03RV16KubernetesError("V16 gate result changed while read")
+    finally:
+        os.close(descriptor)
+    if len(raw) != before.st_size or file_sha256(path) != expected_file_sha256:
+        raise M03RV16KubernetesError("V16 gate result hash drifted")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise M03RV16KubernetesError("V16 gate result is malformed") from exc
+    if not isinstance(payload, dict) or raw != canonical_json_file_bytes(payload):
+        raise M03RV16KubernetesError("V16 gate result is not canonical")
+    return payload
+
+
+def load_and_issue_m03r_v16_static_gate(
+    result_path: str | Path,
+    *,
+    expected_result_file_sha256: str,
+    rendered: M03RV16RenderedSuspendedJob,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+) -> M03RV16StaticGateQualification:
+    """Issue a static authority only from the exact immutable result file."""
+
+    rendered.validate()
+    package.validate()
+    authorization.validate(package)
+    payload = _read_exact_json(Path(result_path), expected_result_file_sha256)
+    unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    receipt = payload.get("receipt_sha256")
+    if (
+        rendered.mode != "static"
+        or payload.get("schema") != M03R_V16_STATIC_RESULT_SCHEMA
+        or receipt != _sha256(unsigned)
+        or payload.get("package_plan_sha256") != package.package_plan_sha256
+        or payload.get("execution_authorization_receipt_sha256")
+        != authorization.receipt_sha256
+        or payload.get("image_digest_sha256")
+        != package.artifacts.image_digest_sha256
+        or payload.get("gpu_mask") != "none"
+        or payload.get("gpu_requests") != 0
+        or payload.get("gpu_limits") != 0
+        or payload.get("unmasked_visibility_claimed") is not False
+        or payload.get("training_performed") is not False
+        or payload.get("initial_state_strict_loaded_all_settings") is not True
+        or payload.get("development_only") is not True
+    ):
+        raise M03RV16KubernetesError("V16 static result authority drifted")
+    source_root = str(payload.get("source_tree_root_sha256"))
+    _digest("source_tree_root_sha256", source_root)
+    result = M03RV16StaticGateQualification(
+        package_plan_sha256=package.package_plan_sha256,
+        execution_authorization_receipt_sha256=authorization.receipt_sha256,
+        rendered_manifest_sha256=rendered.manifest_sha256,
+        result_file_sha256=expected_result_file_sha256,
+        result_receipt_sha256=str(receipt),
+        image_digest_sha256=package.artifacts.image_digest_sha256,
+        source_tree_root_sha256=source_root,
+        _issuer=_STATIC_GATE_ISSUER,
+    )
+    result.validate_for(package, authorization)
+    return result
+
+
+def _capacity_from_payload(payload: dict[str, Any]) -> M03RV16CapacityTerminal:
+    try:
+        row = dict(payload["capacity"])
+        rank_rows = tuple(
+            M03RV16CapacityRankEvidence(**dict(value))
+            for value in row.pop("rank_evidence")
+        )
+        result = M03RV16CapacityTerminal(rank_evidence=rank_rows, **row)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise M03RV16KubernetesError("V16 capacity result is malformed") from exc
+    result.validate()
+    return result
+
+
+def load_and_issue_m03r_v16_capacity_gate(
+    terminal_path: str | Path,
+    *,
+    expected_terminal_file_sha256: str,
+    rendered: M03RV16RenderedSuspendedJob,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    static: M03RV16StaticGateQualification,
+) -> M03RV16CapacityGateQualification:
+    """Issue a capacity authority only from the exact two-rank terminal."""
+
+    rendered.validate()
+    static.validate_for(package, authorization)
+    payload = _read_exact_json(Path(terminal_path), expected_terminal_file_sha256)
+    capacity = _capacity_from_payload(payload)
+    if (
+        rendered.mode != "capacity"
+        or rendered.static_gate_receipt_sha256 != static.receipt_sha256
+        or payload.get("schema") != M03R_V16_CAPACITY_TERMINAL_SCHEMA
+        or payload.get("capacity_receipt_sha256") != capacity.receipt_sha256
+        or payload.get("package_plan_sha256") != package.package_plan_sha256
+        or payload.get("authorization_receipt_sha256")
+        != authorization.receipt_sha256
+        or payload.get("scientific_training_performed") is not False
+        or payload.get("disposable_optimizer_update_executed") is not True
+        or payload.get("disposable_train_validate_train_executed") is not True
+        or payload.get("scientific_checkpoint_published") is not False
+        or payload.get("development_only") is not True
+    ):
+        raise M03RV16KubernetesError("V16 capacity result authority drifted")
+    source_root = str(payload.get("source_tree_root_sha256"))
+    _digest("source_tree_root_sha256", source_root)
+    result = M03RV16CapacityGateQualification(
+        package_plan_sha256=package.package_plan_sha256,
+        execution_authorization_receipt_sha256=authorization.receipt_sha256,
+        static_gate_receipt_sha256=static.receipt_sha256,
+        rendered_manifest_sha256=rendered.manifest_sha256,
+        terminal_file_sha256=expected_terminal_file_sha256,
+        terminal_receipt_sha256=_sha256(payload),
+        image_digest_sha256=package.artifacts.image_digest_sha256,
+        source_tree_root_sha256=source_root,
+        _issuer=_CAPACITY_GATE_ISSUER,
+    )
+    result.validate_for(package, authorization, static)
+    return result
 
 
 def _base_args(
@@ -458,7 +628,6 @@ def _render(
             "ephemeral-storage": (
                 "1Gi" if mode == "static" else template.ephemeral_storage_request
             ),
-            "nvidia.com/gpu": str(gpus),
         },
         "limits": {
             "cpu": "1" if mode == "static" else template.cpu_limit,
@@ -466,9 +635,11 @@ def _render(
             "ephemeral-storage": (
                 "4Gi" if mode == "static" else template.ephemeral_storage_limit
             ),
-            "nvidia.com/gpu": str(gpus),
         },
     }
+    if mode != "static":
+        resources["requests"]["nvidia.com/gpu"] = str(gpus)
+        resources["limits"]["nvidia.com/gpu"] = str(gpus)
     pod: dict[str, Any] = {
         "restartPolicy": "Never",
         "serviceAccount": template.service_account_name,
@@ -691,6 +862,8 @@ __all__ = [
     "M03RV16KubernetesError",
     "M03RV16RenderedSuspendedJob",
     "M03RV16StaticGateQualification",
+    "load_and_issue_m03r_v16_capacity_gate",
+    "load_and_issue_m03r_v16_static_gate",
     "render_m03r_v16_suspended_capacity_job",
     "render_m03r_v16_suspended_predictive_job",
     "render_m03r_v16_suspended_static_job",

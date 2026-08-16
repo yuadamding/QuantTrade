@@ -6,6 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes
+from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_PROTOCOL_SHA256,
+)
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16PanelSchedule,
     render_m03r_v16_fold_geometries,
@@ -16,6 +20,10 @@ from rl_quant.training.top2000_m03r_v16_package import (
     build_m03r_v16_package_plan,
     write_m03r_v16_execution_authorization,
     write_m03r_v16_package_plan,
+)
+from rl_quant.training.top2000_m03r_v16_source import (
+    M03R_V16_SOURCE_MANIFEST_SCHEMA,
+    M03RV16SourceError,
 )
 from rl_quant.workflows.top2000_m03r_v16_static_validate import (
     M03RV16StaticValidationError,
@@ -63,11 +71,43 @@ def _surfaces(
         "source/src/rl_quant/workflows/top2000_m03r_v16_predictive.py": (
             b"worker-source"
         ),
+        "source/src/rl_quant/workflows/top2000_m03r_v16_structural_build.py": (
+            b"structural-builder-source"
+        ),
     }
     for relative, content in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
+    source_root = root / "source"
+    source_rows = tuple(
+        {
+            "path": path.relative_to(source_root).as_posix(),
+            "sha256": _sha(path),
+            "size": path.stat().st_size,
+        }
+        for path in sorted(source_root.rglob("*"))
+        if path.is_file()
+    )
+    (root / "source-manifest.json").write_bytes(
+        canonical_json_file_bytes(
+            {
+                "schema": M03R_V16_SOURCE_MANIFEST_SCHEMA,
+                "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
+                "file_count": len(source_rows),
+                "files": source_rows,
+                "runtime_worker": (
+                    "src/rl_quant/workflows/top2000_m03r_v16_predictive.py"
+                ),
+                "structural_builder": (
+                    "src/rl_quant/workflows/top2000_m03r_v16_structural_build.py"
+                ),
+                "development_only": True,
+                "reportable": False,
+                "promotion_eligible": False,
+            }
+        )
+    )
     receipt = _Receipt(
         cache_sha256=_sha(root / "cache/top2000-daily-bars.pt"),
         cache_manifest_sha256=_sha(root / "cache/cache-manifest.json"),
@@ -157,6 +197,16 @@ def _surfaces(
     )
     monkeypatch.setattr(
         static_module,
+        "Top2000M03RV16PredictivePolicy",
+        lambda _setting_index: object(),
+    )
+    monkeypatch.setattr(
+        static_module,
+        "load_m03r_v16_initial_parameter_state",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        static_module,
         "__file__",
         str(root / "source/src/rl_quant/workflows/top2000_m03r_v16_static_validate.py"),
     )
@@ -193,6 +243,10 @@ def test_v16_static_validator_binds_slab_and_zero_gpu(
     assert result["gpu_requests"] == 0
     assert result["structural_slab_receipt_sha256"] == "7" * 64
     assert result["reinforcement_learning_authorized"] is False
+    assert result["initial_state_strict_loaded_all_settings"] is True
+    result_file = output / "static-result.json"
+    assert result_file.is_file()
+    assert _sha(result_file) == result["result_file_sha256"]
 
 
 def test_v16_static_validator_rejects_unmasked_gpu_visibility(
@@ -202,6 +256,28 @@ def test_v16_static_validator_rejects_unmasked_gpu_visibility(
     plan, plan_sha, auth_sha, output = _surfaces(monkeypatch, tmp_path)
     monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", "all")
     with pytest.raises(M03RV16StaticValidationError, match="GPU-masked"):
+        validate_static_package(
+            package_plan_path=plan,
+            package_plan_file_sha256=plan_sha,
+            execution_authorization_path=plan.parent
+            / "execution-authorization.json",
+            execution_authorization_file_sha256=auth_sha,
+            output_root=output,
+            expected_package_root=plan.parent.parent,
+        )
+
+
+def test_v16_static_validator_rejects_executing_source_tree_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan, plan_sha, auth_sha, output = _surfaces(monkeypatch, tmp_path)
+    worker = (
+        plan.parent.parent
+        / "source/src/rl_quant/workflows/top2000_m03r_v16_predictive.py"
+    )
+    worker.write_bytes(b"tampered-worker-source")
+    with pytest.raises(M03RV16SourceError, match="member drifted"):
         validate_static_package(
             package_plan_path=plan,
             package_plan_file_sha256=plan_sha,

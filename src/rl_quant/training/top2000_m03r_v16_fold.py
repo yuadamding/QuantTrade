@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from dataclasses import asdict, dataclass
 from itertools import pairwise
-from typing import Any
-
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_EPISODE_SCHEDULE_RULE,
     M03R_V16_FOLD_GEOMETRY_RULE,
@@ -17,6 +14,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
+from rl_quant.protocol.canonical_artifact import semantic_sha256 as _sha256
 
 M03R_V16_FOLD_SCHEMA = "rl-quant.top2000-dev.m03r-v16-fold-geometry-v3"
 M03R_V16_PANEL_SCHEDULE_SCHEMA = (
@@ -42,17 +40,6 @@ M03R_V16_MAXIMUM_LOCAL_ORIGIN = (
 
 class M03RV16FoldError(ValueError):
     """The V16 fold or paired schedule drifted."""
-
-
-def _sha256(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
 
 
 def _digest(value: str) -> bool:
