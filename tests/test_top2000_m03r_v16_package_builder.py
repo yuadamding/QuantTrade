@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +19,7 @@ from rl_quant.workflows.top2000_m03r_v16_package_builder import (
     build_m03r_v16_transfer_archive,
     validate_m03r_v16_local_package,
     validate_m03r_v16_transfer_archive,
+    _freeze_source_tree,
 )
 
 
@@ -38,6 +41,35 @@ class _Receipt(SimpleNamespace):
         )
         assert set(expected) == set(names)
         assert all(getattr(self, name) == expected[name] for name in names)
+
+
+def test_v16_isolated_read_only_source_import_creates_no_bytecode(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    module = source / "mini/__init__.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("VALUE = 17\n", encoding="utf-8")
+    _freeze_source_tree(source)
+    subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            (
+                "import sys;"
+                "sys.dont_write_bytecode=True;"
+                "sys.path.insert(0,sys.argv[1]);"
+                "import mini;"
+                "assert mini.VALUE == 17"
+            ),
+            str(source),
+        ),
+        check=True,
+    )
+    assert not tuple(source.rglob("__pycache__"))
+    assert not tuple(source.rglob("*.pyc"))
 
 
 def _inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import stat
 from dataclasses import dataclass
@@ -11,7 +12,6 @@ from typing import Any
 
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
-    file_sha256,
     semantic_sha256,
 )
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
@@ -19,7 +19,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
 )
 
 M03R_V16_SOURCE_MANIFEST_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-runtime-source-manifest-v2"
+    "rl-quant.top2000-dev.m03r-v16-runtime-source-manifest-v3"
 )
 _MAX_SOURCE_MANIFEST_BYTES = 32 * 1024**2
 
@@ -35,6 +35,30 @@ class M03RV16VerifiedSourceTree:
     source_tree_root_sha256: str
     runtime_worker_sha256: str
     file_count: int
+
+
+def _verify_member(path: Path, expected_size: int, expected_sha256: str) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise M03RV16SourceError("V16 source tree member is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size:
+            raise M03RV16SourceError("V16 source tree member drifted")
+        raw = os.read(descriptor, expected_size + 1)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise M03RV16SourceError("V16 source tree member changed while read")
+    finally:
+        os.close(descriptor)
+    if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise M03RV16SourceError("V16 source tree member drifted")
 
 
 def _read_manifest(path: Path, expected_file_sha256: str) -> dict[str, Any]:
@@ -61,7 +85,10 @@ def _read_manifest(path: Path, expected_file_sha256: str) -> dict[str, Any]:
             raise M03RV16SourceError("V16 source manifest changed while read")
     finally:
         os.close(descriptor)
-    if len(raw) != before.st_size or file_sha256(path) != expected_file_sha256:
+    if (
+        len(raw) != before.st_size
+        or hashlib.sha256(raw).hexdigest() != expected_file_sha256
+    ):
         raise M03RV16SourceError("V16 source manifest hash drifted")
     try:
         payload = json.loads(raw)
@@ -127,8 +154,9 @@ def verify_m03r_v16_source_tree(
             if relative not in expected:
                 raise M03RV16SourceError("V16 source tree contains an extra file")
             expected_size, expected_sha = expected[relative]
-            if status.st_size != expected_size or file_sha256(path) != expected_sha:
+            if status.st_size != expected_size:
                 raise M03RV16SourceError("V16 source tree member drifted")
+            _verify_member(path, expected_size, expected_sha)
             observed.add(relative)
     if observed != set(expected):
         raise M03RV16SourceError("V16 source tree inventory is incomplete")

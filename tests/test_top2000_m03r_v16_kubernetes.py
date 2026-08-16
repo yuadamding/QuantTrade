@@ -29,17 +29,19 @@ from rl_quant.training.top2000_m03r_v16_kubernetes import (
     M03RV16StaticGateQualification,
     load_and_issue_m03r_v16_capacity_gate,
     load_and_issue_m03r_v16_static_gate,
+    issue_m03r_v16_training_activation_from_gates,
     render_m03r_v16_suspended_capacity_job,
-    render_m03r_v16_suspended_predictive_job,
+    render_m03r_v16_suspended_qualification_job,
     render_m03r_v16_suspended_static_job,
+    render_m03r_v16_suspended_training_job,
 )
 from rl_quant.training.top2000_m03r_v16_capacity import (
     M03RV16CapacityRankEvidence,
     build_m03r_v16_capacity_terminal,
 )
-from rl_quant.training.top2000_m03r_v16_fit import (
-    M03R_V16_EPOCH_FIT_SCHEMA,
-    M03RV16TrainingAdequacy,
+from rl_quant.training.top2000_m03r_v16_activation import (
+    issue_m03r_v16_qualification_activation,
+    write_m03r_v16_qualification_activation,
 )
 from rl_quant.training.top2000_m03r_v16_static_contract import (
     M03R_V16_STATIC_RESULT_SCHEMA,
@@ -135,7 +137,7 @@ def _surfaces() -> tuple[
 def _template(name: str) -> M03RV7KubernetesTemplateConfig:
     return M03RV7KubernetesTemplateConfig(
         job_name=name,
-        run_id="m03r-v16-v6-local-contract",
+        run_id="m03r-v16-v7-local-contract",
         service_account_name="default",
         pvc_claim_name="research-pvc",
         package_mount_path="/mnt/package",
@@ -237,7 +239,13 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel() -> None:
     capacity = _capacity_gate(
         package, authorization, static, capacity_job.manifest_sha256
     )
-    predictive = render_m03r_v16_suspended_predictive_job(
+    activation = issue_m03r_v16_training_activation_from_gates(
+        package=package,
+        authorization=authorization,
+        static=static,
+        capacity=capacity,
+    )
+    predictive = render_m03r_v16_suspended_training_job(
         package=package,  # type: ignore[arg-type]
         authorization=authorization,
         package_plan_file_sha256=plan_file,
@@ -245,12 +253,43 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel() -> None:
         template=_template("m03r-v16-predictive"),
         static=static,
         capacity=capacity,
+        training_activation=activation,
+        training_activation_file_sha256="2" * 64,
     )
     assert predictive.completions == 3
     assert predictive.parallelism == 3
     assert predictive.maximum_gpu_requests == 6
     assert predictive.manifest["spec"]["suspend"] is True
     assert predictive.activation_authorized is False
+    qualification_activation = issue_m03r_v16_qualification_activation(
+        package=package,
+        authorization=authorization,
+        training_panel_receipt_sha256="6" * 64,
+        training_terminal_file_sha256=("3" * 64, "4" * 64, "5" * 64),
+        primary_training_adequacy_receipt_sha256=tuple(
+            f"{index + 20:064x}" for index in range(5)
+        ),
+        source_tree_root_sha256=capacity.source_tree_root_sha256,
+    )
+    qualification_job = render_m03r_v16_suspended_qualification_job(
+        package=package,
+        authorization=authorization,
+        package_plan_file_sha256=plan_file,
+        authorization_file_sha256=authorization_file,
+        template=_template("m03r-v16-qualification"),
+        static=static,
+        capacity=capacity,
+        qualification_activation=qualification_activation,
+        qualification_activation_file_sha256="8" * 64,
+    )
+    assert qualification_job.mode == "qualification"
+    mounts = qualification_job.manifest["spec"]["template"]["spec"][
+        "containers"
+    ][0]["volumeMounts"]
+    assert any(
+        row.get("mountPath") == "/mnt/training" and row.get("readOnly") is True
+        for row in mounts
+    )
 
 
 def test_v16_predictive_job_rejects_missing_or_drifted_capacity() -> None:
@@ -265,7 +304,13 @@ def test_v16_predictive_job_rejects_missing_or_drifted_capacity() -> None:
     static = _static_gate(package, authorization, static_job.manifest_sha256)
     capacity = _capacity_gate(package, authorization, static, "f" * 64)
     with pytest.raises(M03RV16KubernetesError, match="capacity"):
-        render_m03r_v16_suspended_predictive_job(
+        activation = issue_m03r_v16_training_activation_from_gates(
+            package=package,
+            authorization=authorization,
+            static=static,
+            capacity=capacity,
+        )
+        render_m03r_v16_suspended_training_job(
             package=package,  # type: ignore[arg-type]
             authorization=authorization,
             package_plan_file_sha256=plan_file,
@@ -273,6 +318,8 @@ def test_v16_predictive_job_rejects_missing_or_drifted_capacity() -> None:
             template=_template("m03r-v16-predictive-two"),
             static=static,
             capacity=replace(capacity, passed=False),
+            training_activation=activation,
+            training_activation_file_sha256="2" * 64,
         )
 
 
@@ -498,6 +545,21 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         for row in geometries
     )
     bootstrap = build_m03r_v16_bootstrap_plan(decisions, executions)
+    training_terminal_hashes = ("3" * 64, "4" * 64, "5" * 64)
+    qualification_activation = issue_m03r_v16_qualification_activation(
+        package=package,
+        authorization=authorization,
+        training_panel_receipt_sha256="6" * 64,
+        training_terminal_file_sha256=training_terminal_hashes,
+        primary_training_adequacy_receipt_sha256=tuple(
+            f"{index + 20:064x}" for index in range(5)
+        ),
+        source_tree_root_sha256="7" * 64,
+    )
+    activation_path = plans / "qualification-activation.json"
+    activation_file_sha = write_m03r_v16_qualification_activation(
+        activation_path, qualification_activation
+    )
     terminal_paths: list[Path] = []
     terminal_hashes: list[str] = []
     for index, worker in enumerate(package.panel.workers):
@@ -513,59 +575,7 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         )
         qualification = qualify_m03r_v16_reconciled_evidence(evidence, bootstrap)
         fold_terminal_hashes: list[str] = []
-        fold_adequacy_file_hashes: list[str] = []
-        fold_adequacy_receipts: list[str] = []
-        fold_adequacy_status: list[str] = []
         for fold_index, row in enumerate(evidence):
-            epoch_file_hashes: list[str] = []
-            epoch_receipts: list[str] = []
-            for epoch in range(M03R_V16_PREDICTIVE_SPEC.score_training_epochs):
-                unsigned_epoch = {
-                    "schema": M03R_V16_EPOCH_FIT_SCHEMA,
-                    "package_plan_sha256": package.package_plan_sha256,
-                    "worker_plan_sha256": worker.receipt_sha256,
-                    "setting_index": index,
-                    "fold_index": fold_index,
-                    "epoch_index": epoch,
-                }
-                epoch_payload = {
-                    **unsigned_epoch,
-                    "receipt_sha256": semantic_sha256(unsigned_epoch),
-                }
-                epoch_receipts.append(epoch_payload["receipt_sha256"])
-                epoch_file_hashes.append(
-                    _write_immutable_json(
-                        worker_root
-                        / "receipts"
-                        / (
-                            f"fold-{fold_index:02d}-"
-                            f"epoch-{epoch + 1:02d}-fit.json"
-                        ),
-                        epoch_payload,
-                    )
-                )
-            adequacy = M03RV16TrainingAdequacy(
-                setting_index=index,
-                fold_index=fold_index,
-                epoch_fit_receipt_sha256=tuple(epoch_receipts),
-                final_prediction_to_target_std_ratio=0.5,
-                terminal_rank_ic_improvement=0.0,
-                terminal_robust_loss_relative_improvement=0.0,
-                recent_encoder_clip_fraction=0.0,
-                recent_selection_head_clip_fraction=0.0,
-                status="adequate",
-            )
-            adequacy_payload = {
-                **asdict(adequacy),
-                "receipt_sha256": adequacy.receipt_sha256,
-                "epoch_fit_file_sha256": tuple(epoch_file_hashes),
-            }
-            adequacy_file_sha = _write_immutable_json(
-                worker_root
-                / "receipts"
-                / f"fold-{fold_index:02d}-training-adequacy.json",
-                adequacy_payload,
-            )
             artifact = {
                 "schema": M03R_V16_QUALIFICATION_ARTIFACT_SCHEMA,
                 "terminal_checkpoint_authority_sha256": (
@@ -595,6 +605,10 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
                 "schema": M03R_V16_FOLD_TERMINAL_SCHEMA,
                 "package_plan_sha256": package.package_plan_sha256,
                 "authorization_receipt_sha256": authorization.receipt_sha256,
+                "qualification_activation_receipt_sha256": (
+                    qualification_activation.receipt_sha256
+                ),
+                "training_terminal_file_sha256": training_terminal_hashes[index],
                 "worker_plan_sha256": worker.receipt_sha256,
                 "setting_index": index,
                 "setting_id": worker.setting_id,
@@ -608,11 +622,6 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
                 "panel_schedule_sha256": package.schedule.receipt_sha256,
                 "qualification_artifact_file_sha256": artifact_sha,
                 "qualification_trace_sha256": row.trace.trace_sha256,
-                "epoch_fit_file_sha256": tuple(epoch_file_hashes),
-                "epoch_fit_receipt_sha256": tuple(epoch_receipts),
-                "training_adequacy_status": adequacy.status,
-                "training_adequacy_receipt_sha256": adequacy.receipt_sha256,
-                "training_adequacy_file_sha256": adequacy_file_sha,
                 "qualification_after_strict_terminal_reload": True,
                 "economic_optimizer_updates": 0,
                 "reinforcement_learning_updates": 0,
@@ -632,36 +641,28 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
                     },
                 )
             )
-            fold_adequacy_file_hashes.append(adequacy_file_sha)
-            fold_adequacy_receipts.append(adequacy.receipt_sha256)
-            fold_adequacy_status.append(adequacy.status)
         unsigned = {
             "schema": M03R_V16_WORKER_TERMINAL_SCHEMA,
             "package_plan_sha256": package.package_plan_sha256,
             "package_plan_file_sha256": plan_file,
             "authorization_receipt_sha256": authorization.receipt_sha256,
+            "qualification_activation_receipt_sha256": (
+                qualification_activation.receipt_sha256
+            ),
+            "training_terminal_file_sha256": training_terminal_hashes[index],
             "worker_plan_sha256": worker.receipt_sha256,
             "startup_file_sha256": "e" * 64,
             "setting_index": index,
             "setting_id": worker.setting_id,
             "fold_terminal_file_sha256": tuple(fold_terminal_hashes),
-            "fold_training_adequacy_file_sha256": tuple(
-                fold_adequacy_file_hashes
-            ),
-            "fold_training_adequacy_receipt_sha256": tuple(
-                fold_adequacy_receipts
-            ),
-            "fold_training_adequacy_status": tuple(fold_adequacy_status),
             "bootstrap_plan": asdict(bootstrap),
             "bootstrap_plan_sha256": bootstrap.receipt_sha256,
             "predictive_qualification": asdict(qualification),
             "predictive_qualification_sha256": qualification.receipt_sha256,
-            "primary_hypothesis_passed": (
+            "raw_predictive_gates_passed": (
                 qualification.primary_hypothesis_passed
             ),
-            "three_seed_confirmation_may_be_minted": (
-                qualification.three_seed_confirmation_may_be_minted
-            ),
+            "three_seed_confirmation_may_be_minted": False,
             "economic_generation_may_be_minted": False,
             "reinforcement_learning_authorized": False,
             "outer_2026_accessed": False,
@@ -681,6 +682,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         package_plan_file_sha256=plan_file,
         execution_authorization_path=authorization_path,
         execution_authorization_file_sha256=authorization_file,
+        qualification_activation_path=activation_path,
+        qualification_activation_file_sha256=activation_file_sha,
         worker_terminal_paths=(
             terminal_paths[0],
             terminal_paths[1],
@@ -706,6 +709,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             package_plan_file_sha256=plan_file,
             execution_authorization_path=authorization_path,
             execution_authorization_file_sha256=authorization_file,
+            qualification_activation_path=activation_path,
+            qualification_activation_file_sha256=activation_file_sha,
             worker_terminal_paths=(
                 terminal_paths[0],
                 terminal_paths[1],

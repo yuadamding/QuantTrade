@@ -27,7 +27,7 @@ from rl_quant.training.top2000_m03r_v16_qualification_runtime import (
 )
 
 M03R_V16_BOOTSTRAP_PLAN_SCHEMA = "rl-quant.top2000-dev.m03r-v16-bootstrap-plan-v2"
-M03R_V16_QUALIFICATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-qualification-v2"
+M03R_V16_QUALIFICATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-qualification-v3"
 M03R_V16_PANEL_DECISION_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-panel-decision-v2"
 )
@@ -448,6 +448,7 @@ class M03RV16PredictiveQualification:
     absolute_policy_break_even_one_way_cost_basis_points: float
     median_risk_projection_retention: float
     minimum_fold_median_risk_projection_retention: float
+    median_active_one_way_mass: float
     median_weighted_cohort_age: float
     gates_passed: bool
     primary_hypothesis_passed: bool
@@ -480,6 +481,12 @@ class M03RV16PredictiveQualification:
                     >= spec.minimum_break_even_one_way_cost_basis_points
                 )
             )
+            and self.median_risk_projection_retention
+            >= spec.minimum_median_risk_projection_retention
+            and self.minimum_fold_median_risk_projection_retention
+            >= spec.minimum_fold_median_risk_projection_retention
+            and self.median_active_one_way_mass
+            >= spec.minimum_median_active_one_way_mass
         )
 
     def validate(self) -> None:
@@ -494,6 +501,7 @@ class M03RV16PredictiveQualification:
             self.absolute_policy_break_even_one_way_cost_basis_points,
             self.median_risk_projection_retention,
             self.minimum_fold_median_risk_projection_retention,
+            self.median_active_one_way_mass,
             self.median_weighted_cohort_age,
         )
         primary = self.setting_index == M03R_V16_PREDICTIVE_SPEC.primary_setting_index
@@ -526,7 +534,6 @@ class M03RV16PredictiveQualification:
             or self.gates_passed != self._expected_gates()
             or self.primary_hypothesis_passed != (primary and self.gates_passed)
             or self.three_seed_confirmation_may_be_minted
-            != self.primary_hypothesis_passed
             or self.economic_generation_may_be_minted
             or self.reinforcement_learning_authorized
             or self.outer_2026_accessed
@@ -703,6 +710,9 @@ def qualify_m03r_v16_reconciled_evidence(
             ).median()
         ),
         minimum_fold_median_risk_projection_retention=min(fold_retention),
+        median_active_one_way_mass=float(
+            torch.cat(tuple(row.trace.active_one_way_mass for row in ordered)).median()
+        ),
         median_weighted_cohort_age=float(
             torch.cat(tuple(row.trace.weighted_mean_cohort_age for row in ordered)).median()
         ),
@@ -718,7 +728,7 @@ def qualify_m03r_v16_reconciled_evidence(
         provisional,
         gates_passed=gates,
         primary_hypothesis_passed=primary_pass,
-        three_seed_confirmation_may_be_minted=primary_pass,
+        three_seed_confirmation_may_be_minted=False,
     )
     result.validate()
     return result

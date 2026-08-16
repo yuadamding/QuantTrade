@@ -116,7 +116,10 @@ def test_v16_execution_authorization_is_predictive_only(tmp_path: Path) -> None:
     )
     assert loaded.runtime_entrypoint == M03R_V16_RUNTIME_ENTRYPOINT
     assert loaded.maximum_h100_requests == 6
-    assert loaded.predictive_training_authorized is True
+    assert loaded.static_validation_authorized is True
+    assert loaded.capacity_qualification_authorized is False
+    assert loaded.predictive_training_authorized is False
+    assert loaded.outer_qualification_authorized is False
     assert loaded.economic_training_authorized is False
     assert loaded.reinforcement_learning_authorized is False
     assert loaded.outer_2026_access_authorized is False

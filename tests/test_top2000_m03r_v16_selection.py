@@ -71,10 +71,11 @@ def _passing_qualification(setting_index: int) -> M03RV16PredictiveQualification
         absolute_policy_break_even_one_way_cost_basis_points=8.0,
         median_risk_projection_retention=0.9,
         minimum_fold_median_risk_projection_retention=0.8,
+        median_active_one_way_mass=0.001,
         median_weighted_cohort_age=15.0,
         gates_passed=True,
         primary_hypothesis_passed=primary,
-        three_seed_confirmation_may_be_minted=primary,
+        three_seed_confirmation_may_be_minted=False,
     )
 
 
@@ -125,7 +126,7 @@ def test_v16_only_primary_r2_can_authorize_three_seed_confirmation() -> None:
     primary = _passing_qualification(2)
     primary.validate()
     assert primary.primary_hypothesis_passed is True
-    assert primary.three_seed_confirmation_may_be_minted is True
+    assert primary.three_seed_confirmation_may_be_minted is False
     assert primary.economic_generation_may_be_minted is False
     assert primary.reinforcement_learning_authorized is False
 

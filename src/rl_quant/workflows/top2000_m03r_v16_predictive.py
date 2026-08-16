@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import random
 import stat
@@ -44,6 +45,12 @@ from rl_quant.training.top2000_m03r_v9_risk_materialization import (
 from rl_quant.training.top2000_m03r_v16_capacity import (
     build_m03r_v16_capacity_terminal,
     run_m03r_v16_disposable_capacity_rank,
+)
+from rl_quant.training.top2000_m03r_v16_activation import (
+    M03RV16QualificationActivation,
+    M03RV16TrainingActivation,
+    load_m03r_v16_qualification_activation,
+    load_m03r_v16_training_activation,
 )
 from rl_quant.training.top2000_m03r_v16_checkpoint import (
     load_m03r_v16_epoch_checkpoint_for_evaluation,
@@ -95,14 +102,21 @@ from rl_quant.training.top2000_m03r_v16_training_runtime import (
     run_m03r_v16_pretraining_fold_update,
 )
 from rl_quant.training.top2000_m03r_v16_validation_runtime import (
+    M03RV16InnerValidationReceipt,
     evaluate_m03r_v16_inner_validation_batch,
     select_m03r_v16_score_checkpoint,
 )
 
 M03R_V16_STARTUP_SCHEMA = "rl-quant.top2000-dev.m03r-v16-startup-v1"
-M03R_V16_FOLD_TERMINAL_SCHEMA = "rl-quant.top2000-dev.m03r-v16-fold-terminal-v1"
+M03R_V16_FOLD_TERMINAL_SCHEMA = "rl-quant.top2000-dev.m03r-v16-fold-terminal-v2"
+M03R_V16_TRAINING_FOLD_TERMINAL_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-training-fold-terminal-v1"
+)
+M03R_V16_TRAINING_TERMINAL_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-training-terminal-v1"
+)
 M03R_V16_WORKER_TERMINAL_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-worker-terminal-v1"
+    "rl-quant.top2000-dev.m03r-v16-qualification-worker-terminal-v2"
 )
 M03R_V16_WORKER_ERROR_SCHEMA = "rl-quant.top2000-dev.m03r-v16-worker-error-v1"
 M03R_V16_QUALIFICATION_ARTIFACT_SCHEMA = (
@@ -141,6 +155,37 @@ def _write_immutable_torch(path: Path, payload: dict[str, Any]) -> str:
         path.unlink(missing_ok=True)
         raise
     return _file_sha256(path)
+
+
+def _read_immutable_json(path: Path, expected_file_sha256: str) -> dict[str, Any]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise M03RV16PredictiveWorkflowError("V16 immutable input is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 64 * 1024**2:
+            raise M03RV16PredictiveWorkflowError("V16 immutable input size drifted")
+        raw = os.read(descriptor, before.st_size + 1)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise M03RV16PredictiveWorkflowError("V16 immutable input changed while read")
+    finally:
+        os.close(descriptor)
+    if len(raw) != before.st_size or hashlib.sha256(raw).hexdigest() != expected_file_sha256:
+        raise M03RV16PredictiveWorkflowError("V16 immutable input hash drifted")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise M03RV16PredictiveWorkflowError("V16 immutable input is malformed") from exc
+    if not isinstance(payload, dict) or raw != _canonical(payload):
+        raise M03RV16PredictiveWorkflowError("V16 immutable input is not canonical")
+    return payload
 
 
 def _seed_everything(seed: int) -> None:
@@ -449,6 +494,273 @@ def _capacity_probe_inputs(
     )
 
 
+def _training_fold_inputs(
+    training_root: Path,
+    fold_index: int,
+    fold_terminal_file_sha256: str,
+) -> tuple[dict[str, Any], tuple[M03RV16InnerValidationReceipt, ...]]:
+    fold = _read_immutable_json(
+        training_root / "receipts" / f"fold-{fold_index:02d}-training-terminal.json",
+        fold_terminal_file_sha256,
+    )
+    unsigned = {key: value for key, value in fold.items() if key != "receipt_sha256"}
+    if (
+        fold.get("schema") != M03R_V16_TRAINING_FOLD_TERMINAL_SCHEMA
+        or fold.get("receipt_sha256") != _sha256(unsigned)
+        or fold.get("fold_index") != fold_index
+        or fold.get("qualification_tail_accessed") is not False
+    ):
+        raise M03RV16PredictiveWorkflowError("V16 training fold terminal drifted")
+    fit_files = tuple(fold.get("epoch_fit_file_sha256", ()))
+    fit_receipts = tuple(fold.get("epoch_fit_receipt_sha256", ()))
+    if (
+        len(fit_files) != M03R_V16_PREDICTIVE_SPEC.score_training_epochs
+        or len(fit_receipts) != M03R_V16_PREDICTIVE_SPEC.score_training_epochs
+    ):
+        raise M03RV16PredictiveWorkflowError("V16 training epoch inventory drifted")
+    validations: list[M03RV16InnerValidationReceipt] = []
+    for epoch, expected_sha in enumerate(fit_files):
+        payload = _read_immutable_json(
+            training_root
+            / "receipts"
+            / f"fold-{fold_index:02d}-epoch-{epoch + 1:02d}-fit.json",
+            str(expected_sha),
+        )
+        payload_unsigned = {
+            key: value for key, value in payload.items() if key != "receipt_sha256"
+        }
+        if (
+            payload.get("receipt_sha256") != _sha256(payload_unsigned)
+            or payload.get("receipt_sha256") != fit_receipts[epoch]
+            or payload.get("epoch_index") != epoch
+            or payload.get("qualification_tail_accessed") is not False
+        ):
+            raise M03RV16PredictiveWorkflowError("V16 epoch fit evidence drifted")
+        try:
+            validation = M03RV16InnerValidationReceipt(
+                **dict(payload["inner_validation"])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise M03RV16PredictiveWorkflowError(
+                "V16 training validation evidence is malformed"
+            ) from exc
+        validation.validate()
+        validations.append(validation)
+    return fold, tuple(validations)
+
+
+def _run_m03r_v16_qualification_phase(
+    *,
+    package: M03RV16PackagePlan,
+    authorization: Any,
+    worker: Any,
+    cache: Any,
+    risk_source: Any,
+    projector: Any,
+    risk_binding: Any,
+    structural: Any,
+    geometries: tuple[M03RV16FoldGeometry, ...],
+    qualification_activation: M03RV16QualificationActivation,
+    training_root: Path,
+    output: Path,
+    startup_sha: str,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    rendered_manifest_sha256: str,
+    pod_template_sha256: str,
+) -> dict[str, Any] | None:
+    """Open outer folds only under the adequate-training authority."""
+
+    terminal_path = training_root / "training-terminal.json"
+    expected_terminal_sha = qualification_activation.training_terminal_file_sha256[
+        worker.setting_index
+    ]
+    training_terminal = _read_immutable_json(terminal_path, expected_terminal_sha)
+    training_unsigned = {
+        key: value for key, value in training_terminal.items() if key != "receipt_sha256"
+    }
+    fold_hashes = tuple(training_terminal.get("fold_terminal_file_sha256", ()))
+    if (
+        training_terminal.get("schema") != M03R_V16_TRAINING_TERMINAL_SCHEMA
+        or training_terminal.get("receipt_sha256") != _sha256(training_unsigned)
+        or training_terminal.get("package_plan_sha256") != package.package_plan_sha256
+        or training_terminal.get("authorization_receipt_sha256")
+        != authorization.receipt_sha256
+        or training_terminal.get("worker_plan_sha256") != worker.receipt_sha256
+        or training_terminal.get("setting_index") != worker.setting_index
+        or training_terminal.get("qualification_tail_accessed") is not False
+        or len(fold_hashes) != len(geometries)
+    ):
+        raise M03RV16PredictiveWorkflowError("V16 training terminal drifted")
+    if (training_root / "fold-artifacts").exists():
+        raise M03RV16PredictiveWorkflowError(
+            "V16 training phase improperly contains outer artifacts"
+        )
+
+    fold_results: list[M03RV16FoldQualificationResult] = []
+    fold_terminal_files: list[str] = []
+    for geometry, fold_file_sha in zip(geometries, fold_hashes, strict=True):
+        fold, validations = _training_fold_inputs(
+            training_root, geometry.fold_index, str(fold_file_sha)
+        )
+        selection = select_m03r_v16_score_checkpoint(validations)
+        if selection.receipt_sha256 != fold.get(
+            "checkpoint_selection_receipt_sha256"
+        ):
+            raise M03RV16PredictiveWorkflowError(
+                "V16 terminal checkpoint selection evidence drifted"
+            )
+        checkpoint_sha = str(fold["checkpoint_file_sha256"])
+        checkpoint_source = str(fold["checkpoint_source_array_sha256"])
+        loaded_policy = _new_policy(worker.setting_index, device)
+        loaded = load_m03r_v16_epoch_checkpoint_for_evaluation(
+            training_root
+            / "checkpoints"
+            / f"fold-{geometry.fold_index:02d}-epoch-{M03R_V16_PREDICTIVE_SPEC.score_training_epochs:02d}.pt",
+            expected_file_sha256=checkpoint_sha,
+            expected_setting_index=worker.setting_index,
+            expected_fold_index=geometry.fold_index,
+            expected_epoch_index=M03R_V16_PREDICTIVE_SPEC.score_training_epochs - 1,
+            expected_completed_score_updates=geometry.maximum_optimizer_updates,
+            expected_panel_schedule_sha256=package.schedule.receipt_sha256,
+            expected_selection_target_operator_root_sha256=(
+                structural.receipt.common_target_operator_root_sha256
+            ),
+            expected_action_operator_root_sha256=(
+                structural.receipt.action_operator_root_sha256
+            ),
+            expected_source_array_sha256=checkpoint_source,
+            expected_asset_axis_sha256=cache.action_hash,
+            policy=loaded_policy,
+        )
+        terminal_authority = issue_m03r_v16_terminal_checkpoint_authority(
+            loaded,
+            selection,
+            package.schedule,
+            geometry,
+            structural_slab_receipt_sha256=structural.receipt_sha256,
+        )
+        risk_state = build_m03r_v16_qualification_risk_state(
+            cache,
+            geometry,
+            risk_source,
+            risk_binding,
+            projector,
+            device=device,
+        )
+        result = run_m03r_v16_fold_qualification(
+            cache,
+            geometry,
+            risk_source,
+            risk_state,
+            structural,
+            loaded_policy,
+            terminal_authority,
+            device=device,
+        )
+        if len(set(_gather(result.trace.trace_sha256, world_size))) != 1:
+            raise M03RV16PredictiveWorkflowError(
+                "V16 qualification trace diverged between ranks"
+            )
+        artifact_sha: str | None = None
+        if rank == 0:
+            artifact_sha = _write_immutable_torch(
+                output
+                / "fold-artifacts"
+                / f"fold-{geometry.fold_index:02d}-qualification.pt",
+                _qualification_artifact(result, selection.receipt_sha256),
+            )
+        artifact_sha = _broadcast(artifact_sha, rank)
+        if not isinstance(artifact_sha, str):
+            raise M03RV16PredictiveWorkflowError(
+                "V16 qualification artifact publication failed"
+            )
+        if rank == 0:
+            fold_results.append(result)
+            unsigned_fold = {
+                "schema": M03R_V16_FOLD_TERMINAL_SCHEMA,
+                "package_plan_sha256": package.package_plan_sha256,
+                "authorization_receipt_sha256": authorization.receipt_sha256,
+                "qualification_activation_receipt_sha256": (
+                    qualification_activation.receipt_sha256
+                ),
+                "training_terminal_file_sha256": expected_terminal_sha,
+                "worker_plan_sha256": worker.receipt_sha256,
+                "setting_index": worker.setting_index,
+                "setting_id": worker.setting_id,
+                "fold_index": geometry.fold_index,
+                "panel_schedule_sha256": package.schedule.receipt_sha256,
+                "terminal_checkpoint_authority_sha256": (
+                    terminal_authority.receipt_sha256
+                ),
+                "qualified_score_authority_sha256": result.score_authority.receipt_sha256,
+                "qualification_artifact_file_sha256": artifact_sha,
+                "qualification_trace_sha256": result.trace.trace_sha256,
+                "qualification_after_strict_terminal_reload": True,
+                "economic_optimizer_updates": 0,
+                "reinforcement_learning_updates": 0,
+                "outer_2026_accessed": False,
+                "development_only": True,
+                "reportable": False,
+                "promotion_eligible": False,
+            }
+            fold_terminal_files.append(
+                _write_immutable_json(
+                    output
+                    / "receipts"
+                    / f"fold-{geometry.fold_index:02d}-terminal.json",
+                    {**unsigned_fold, "receipt_sha256": _sha256(unsigned_fold)},
+                )
+            )
+        dist.barrier()
+        del loaded_policy, risk_state
+        torch.cuda.empty_cache()
+
+    terminal: dict[str, Any] | None = None
+    if rank == 0:
+        results = tuple(fold_results)
+        bootstrap = build_m03r_v16_bootstrap_plan(
+            tuple(row.trace.decision_origin_indices for row in results),
+            tuple(row.trace.execution_origin_indices for row in results),
+        )
+        qualification = qualify_m03r_v16_predictive_candidate(results, bootstrap)
+        unsigned = {
+            "schema": M03R_V16_WORKER_TERMINAL_SCHEMA,
+            "package_plan_sha256": package.package_plan_sha256,
+            "authorization_receipt_sha256": authorization.receipt_sha256,
+            "qualification_activation_receipt_sha256": (
+                qualification_activation.receipt_sha256
+            ),
+            "training_terminal_file_sha256": expected_terminal_sha,
+            "worker_plan_sha256": worker.receipt_sha256,
+            "startup_file_sha256": startup_sha,
+            "setting_index": worker.setting_index,
+            "setting_id": worker.setting_id,
+            "fold_terminal_file_sha256": tuple(fold_terminal_files),
+            "bootstrap_plan": asdict(bootstrap),
+            "bootstrap_plan_sha256": bootstrap.receipt_sha256,
+            "predictive_qualification": asdict(qualification),
+            "predictive_qualification_sha256": qualification.receipt_sha256,
+            "raw_predictive_gates_passed": qualification.primary_hypothesis_passed,
+            "three_seed_confirmation_may_be_minted": False,
+            "rendered_manifest_sha256": rendered_manifest_sha256,
+            "pod_template_sha256": pod_template_sha256,
+            "economic_generation_may_be_minted": False,
+            "reinforcement_learning_authorized": False,
+            "outer_2026_accessed": False,
+            "world_size": 2,
+            "gpus_per_worker": 2,
+            "development_only": True,
+            "reportable": False,
+            "promotion_eligible": False,
+        }
+        terminal = {**unsigned, "receipt_sha256": _sha256(unsigned)}
+        _write_immutable_json(output / "predictive-terminal.json", terminal)
+    dist.barrier()
+    return terminal
+
+
 def run_m03r_v16_predictive_worker(
     package_plan_path: str | Path,
     authorization_path: str | Path,
@@ -458,11 +770,21 @@ def run_m03r_v16_predictive_worker(
     completion_index: int | None = None,
     capacity_only: bool = False,
     capacity_output_root: str | Path | None = None,
+    training_activation_path: str | Path | None = None,
+    expected_training_activation_file_sha256: str | None = None,
+    qualification_activation_path: str | Path | None = None,
+    expected_qualification_activation_file_sha256: str | None = None,
+    qualification_only: bool = False,
+    training_root: str | Path | None = None,
+    rendered_manifest_sha256: str | None = None,
+    pod_template_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     if capacity_only and capacity_output_root is None:
         raise M03RV16PredictiveWorkflowError(
             "V16 capacity evidence requires a disjoint output root"
         )
+    if capacity_only and qualification_only:
+        raise M03RV16PredictiveWorkflowError("V16 worker phase is ambiguous")
     package = load_m03r_v16_package_plan(
         package_plan_path,
         expected_file_sha256=expected_package_plan_file_sha256,
@@ -479,8 +801,69 @@ def run_m03r_v16_predictive_worker(
         raise M03RV16PredictiveWorkflowError(
             "V16 authorization and package plan disagree"
         )
+    training_activation: M03RV16TrainingActivation | None = None
+    qualification_activation: M03RV16QualificationActivation | None = None
+    if not capacity_only and not qualification_only:
+        if training_activation_path is None or expected_training_activation_file_sha256 is None:
+            raise M03RV16PredictiveWorkflowError(
+                "V16 training requires an immutable activation authority"
+            )
+        training_activation = load_m03r_v16_training_activation(
+            training_activation_path,
+            expected_file_sha256=expected_training_activation_file_sha256,
+            package=package,
+            authorization=authorization,
+        )
+    elif qualification_only:
+        if (
+            qualification_activation_path is None
+            or expected_qualification_activation_file_sha256 is None
+            or training_root is None
+        ):
+            raise M03RV16PredictiveWorkflowError(
+                "V16 qualification requires activation and frozen training evidence"
+            )
+        qualification_activation = load_m03r_v16_qualification_activation(
+            qualification_activation_path,
+            expected_file_sha256=expected_qualification_activation_file_sha256,
+            package=package,
+            authorization=authorization,
+        )
+    active_source_root = (
+        None
+        if capacity_only
+        else (
+            qualification_activation.source_tree_root_sha256
+            if qualification_activation is not None
+            else training_activation.source_tree_root_sha256
+            if training_activation is not None
+            else None
+        )
+    )
+    if active_source_root is not None and active_source_root != source_tree_root_sha256:
+        raise M03RV16PredictiveWorkflowError(
+            "V16 phase activation source tree drifted"
+        )
+    if not capacity_only and (
+        rendered_manifest_sha256 is not None or pod_template_sha256 is not None
+    ):
+        if rendered_manifest_sha256 is None or pod_template_sha256 is None:
+            raise M03RV16PredictiveWorkflowError(
+                "V16 rendered manifest identities must be supplied together"
+            )
+        for name, value in (
+            ("rendered_manifest_sha256", rendered_manifest_sha256),
+            ("pod_template_sha256", pod_template_sha256),
+        ):
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise M03RV16PredictiveWorkflowError(f"{name} drifted")
     index = resolve_m03r_v16_completion_index(completion_index)
     worker = package.panel.workers[index]
+    if qualification_only and training_root is not None:
+        training_root = (
+            Path(training_root)
+            / f"completion-{index:02d}-setting-{index:02d}"
+        )
     rank, local_rank, world_size, device, owns = _distributed_context()
     output = (
         Path(capacity_output_root)
@@ -517,7 +900,25 @@ def run_m03r_v16_predictive_worker(
                     "source_tree_root_sha256": source_tree_root_sha256,
                     "setting_index": worker.setting_index,
                     "setting_id": worker.setting_id,
-                    "mode": "capacity" if capacity_only else "predictive",
+                    "mode": (
+                        "capacity"
+                        if capacity_only
+                        else "qualification"
+                        if qualification_only
+                        else "training"
+                    ),
+                    "training_activation_receipt_sha256": (
+                        None
+                        if training_activation is None
+                        else training_activation.receipt_sha256
+                    ),
+                    "qualification_activation_receipt_sha256": (
+                        None
+                        if qualification_activation is None
+                        else qualification_activation.receipt_sha256
+                    ),
+                    "rendered_manifest_sha256": rendered_manifest_sha256,
+                    "pod_template_sha256": pod_template_sha256,
                     "rank_runtime": runtime_rows,
                     "exact_h100_80gb_per_rank": True,
                     "nccl_process_group_initialized": True,
@@ -609,7 +1010,32 @@ def run_m03r_v16_predictive_worker(
             dist.barrier()
             return capacity_terminal_payload
 
-        fold_results: list[M03RV16FoldQualificationResult] = []
+        if qualification_only:
+            if qualification_activation is None or training_root is None:
+                raise M03RV16PredictiveWorkflowError(
+                    "V16 qualification authority is absent"
+                )
+            return _run_m03r_v16_qualification_phase(
+                package=package,
+                authorization=authorization,
+                worker=worker,
+                cache=cache,
+                risk_source=risk_source,
+                projector=projector,
+                risk_binding=risk_binding,
+                structural=structural,
+                geometries=geometries,
+                qualification_activation=qualification_activation,
+                training_root=Path(training_root),
+                output=output,
+                startup_sha=startup_sha,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                rendered_manifest_sha256=str(rendered_manifest_sha256),
+                pod_template_sha256=str(pod_template_sha256),
+            )
+
         fold_terminal_files: list[str] = []
         fold_training_adequacy_files: list[str] = []
         fold_training_adequacy_receipts: list[str] = []
@@ -776,73 +1202,6 @@ def run_m03r_v16_predictive_worker(
             final_source_root = _sha256(tuple(source_rows))
             del optimizer, partition, policy
             torch.cuda.empty_cache()
-            loaded_policy = _new_policy(worker.setting_index, device)
-            loaded = load_m03r_v16_epoch_checkpoint_for_evaluation(
-                epoch_checkpoint_paths[-1],
-                expected_file_sha256=epoch_checkpoint_hashes[-1],
-                expected_setting_index=worker.setting_index,
-                expected_fold_index=geometry.fold_index,
-                expected_epoch_index=(
-                    M03R_V16_PREDICTIVE_SPEC.score_training_epochs - 1
-                ),
-                expected_completed_score_updates=geometry.maximum_optimizer_updates,
-                expected_panel_schedule_sha256=package.schedule.receipt_sha256,
-                expected_selection_target_operator_root_sha256=(
-                    structural.receipt.common_target_operator_root_sha256
-                ),
-                expected_action_operator_root_sha256=(
-                    structural.receipt.action_operator_root_sha256
-                ),
-                expected_source_array_sha256=final_source_root,
-                expected_asset_axis_sha256=cache.action_hash,
-                policy=loaded_policy,
-            )
-            terminal_authority = issue_m03r_v16_terminal_checkpoint_authority(
-                loaded,
-                selection,
-                package.schedule,
-                geometry,
-                structural_slab_receipt_sha256=structural.receipt_sha256,
-            )
-            risk_state = build_m03r_v16_qualification_risk_state(
-                cache,
-                geometry,
-                risk_source,
-                risk_binding,
-                projector,
-                device=device,
-            )
-            fold_result = run_m03r_v16_fold_qualification(
-                cache,
-                geometry,
-                risk_source,
-                risk_state,
-                structural,
-                loaded_policy,
-                terminal_authority,
-                device=device,
-            )
-            trace_hashes = _gather(fold_result.trace.trace_sha256, world_size)
-            if len(set(trace_hashes)) != 1:
-                raise M03RV16PredictiveWorkflowError(
-                    "V16 qualification trace diverged between ranks"
-                )
-            artifact_path = (
-                output
-                / "fold-artifacts"
-                / f"fold-{geometry.fold_index:02d}-qualification.pt"
-            )
-            artifact_sha: str | None = None
-            if rank == 0:
-                artifact_sha = _write_immutable_torch(
-                    artifact_path,
-                    _qualification_artifact(fold_result, selection.receipt_sha256),
-                )
-            artifact_sha = _broadcast(artifact_sha, rank)
-            if not isinstance(artifact_sha, str):
-                raise M03RV16PredictiveWorkflowError(
-                    "V16 qualification artifact publication failed"
-                )
             if rank == 0:
                 if (
                     training_adequacy is None
@@ -851,11 +1210,15 @@ def run_m03r_v16_predictive_worker(
                     raise M03RV16PredictiveWorkflowError(
                         "V16 training adequacy was not published"
                     )
-                fold_results.append(fold_result)
                 unsigned_fold = {
-                    "schema": M03R_V16_FOLD_TERMINAL_SCHEMA,
+                    "schema": M03R_V16_TRAINING_FOLD_TERMINAL_SCHEMA,
                     "package_plan_sha256": package.package_plan_sha256,
                     "authorization_receipt_sha256": authorization.receipt_sha256,
+                    "training_activation_receipt_sha256": (
+                        training_activation.receipt_sha256
+                        if training_activation is not None
+                        else None
+                    ),
                     "worker_plan_sha256": worker.receipt_sha256,
                     "setting_index": worker.setting_index,
                     "setting_id": worker.setting_id,
@@ -882,20 +1245,13 @@ def run_m03r_v16_predictive_worker(
                     "training_adequacy_file_sha256": (
                         training_adequacy_file_sha
                     ),
-                    "terminal_checkpoint_authority_sha256": (
-                        terminal_authority.receipt_sha256
-                    ),
-                    "qualified_score_authority_sha256": (
-                        fold_result.score_authority.receipt_sha256
-                    ),
                     "panel_schedule_sha256": package.schedule.receipt_sha256,
                     "structural_slab_receipt_sha256": (
                         structural.receipt.receipt_sha256
                     ),
                     "checkpoint_file_sha256": epoch_checkpoint_hashes[-1],
-                    "qualification_artifact_file_sha256": artifact_sha,
-                    "qualification_trace_sha256": fold_result.trace.trace_sha256,
-                    "qualification_after_strict_terminal_reload": True,
+                    "checkpoint_source_array_sha256": final_source_root,
+                    "qualification_tail_accessed": False,
                     "economic_optimizer_updates": 0,
                     "reinforcement_learning_updates": 0,
                     "outer_2026_accessed": False,
@@ -911,7 +1267,7 @@ def run_m03r_v16_predictive_worker(
                     _write_immutable_json(
                         output
                         / "receipts"
-                        / f"fold-{geometry.fold_index:02d}-terminal.json",
+                        / f"fold-{geometry.fold_index:02d}-training-terminal.json",
                         fold_terminal,
                     )
                 )
@@ -921,26 +1277,22 @@ def run_m03r_v16_predictive_worker(
                 )
                 fold_training_adequacy_status.append(training_adequacy.status)
             dist.barrier()
-            del loaded_policy, risk_state
-            torch.cuda.empty_cache()
 
         terminal: dict[str, Any] | None = None
         if rank == 0:
-            results = tuple(fold_results)
-            bootstrap = build_m03r_v16_bootstrap_plan(
-                tuple(row.trace.decision_origin_indices for row in results),
-                tuple(row.trace.execution_origin_indices for row in results),
-            )
-            qualification = qualify_m03r_v16_predictive_candidate(
-                results, bootstrap
-            )
             unsigned_terminal = {
-                "schema": M03R_V16_WORKER_TERMINAL_SCHEMA,
+                "schema": M03R_V16_TRAINING_TERMINAL_SCHEMA,
                 "package_plan_sha256": package.package_plan_sha256,
                 "package_plan_file_sha256": expected_package_plan_file_sha256,
                 "authorization_receipt_sha256": authorization.receipt_sha256,
+                "training_activation_receipt_sha256": (
+                    training_activation.receipt_sha256
+                    if training_activation is not None
+                    else None
+                ),
                 "worker_plan_sha256": worker.receipt_sha256,
                 "startup_file_sha256": startup_sha,
+                "source_tree_root_sha256": source_tree_root_sha256,
                 "setting_index": worker.setting_index,
                 "setting_id": worker.setting_id,
                 "fold_terminal_file_sha256": tuple(fold_terminal_files),
@@ -953,14 +1305,11 @@ def run_m03r_v16_predictive_worker(
                 "fold_training_adequacy_status": tuple(
                     fold_training_adequacy_status
                 ),
-                "bootstrap_plan": asdict(bootstrap),
-                "bootstrap_plan_sha256": bootstrap.receipt_sha256,
-                "predictive_qualification": asdict(qualification),
-                "predictive_qualification_sha256": qualification.receipt_sha256,
-                "primary_hypothesis_passed": qualification.primary_hypothesis_passed,
-                "three_seed_confirmation_may_be_minted": (
-                    qualification.three_seed_confirmation_may_be_minted
-                ),
+                "rendered_manifest_sha256": rendered_manifest_sha256,
+                "pod_template_sha256": pod_template_sha256,
+                "qualification_tail_accessed": False,
+                "outer_qualification_authorized": False,
+                "three_seed_confirmation_may_be_minted": False,
                 "economic_generation_may_be_minted": False,
                 "reinforcement_learning_authorized": False,
                 "outer_2026_accessed": False,
@@ -974,7 +1323,7 @@ def run_m03r_v16_predictive_worker(
                 **unsigned_terminal,
                 "receipt_sha256": _sha256(unsigned_terminal),
             }
-            _write_immutable_json(output / "predictive-terminal.json", terminal)
+            _write_immutable_json(output / "training-terminal.json", terminal)
         dist.barrier()
         return terminal
     except BaseException as exc:
@@ -988,7 +1337,13 @@ def run_m03r_v16_predictive_worker(
                     "worker_plan_sha256": worker.receipt_sha256,
                     "setting_index": worker.setting_index,
                     "setting_id": worker.setting_id,
-                    "mode": "capacity" if capacity_only else "predictive",
+                    "mode": (
+                        "capacity"
+                        if capacity_only
+                        else "qualification"
+                        if qualification_only
+                        else "training"
+                    ),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "checkpoint_published_after_failure": False,
@@ -1015,6 +1370,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--completion-index", type=int)
     parser.add_argument("--capacity-only", action="store_true")
     parser.add_argument("--capacity-output-root")
+    parser.add_argument("--training-activation")
+    parser.add_argument("--training-activation-file-sha256")
+    parser.add_argument("--qualification-activation")
+    parser.add_argument("--qualification-activation-file-sha256")
+    parser.add_argument("--qualification-only", action="store_true")
+    parser.add_argument("--training-root")
+    parser.add_argument("--rendered-manifest-sha256")
+    parser.add_argument("--pod-template-sha256")
     return parser
 
 
@@ -1030,6 +1393,18 @@ def main(argv: list[str] | None = None) -> int:
         completion_index=args.completion_index,
         capacity_only=args.capacity_only,
         capacity_output_root=args.capacity_output_root,
+        training_activation_path=args.training_activation,
+        expected_training_activation_file_sha256=(
+            args.training_activation_file_sha256
+        ),
+        qualification_activation_path=args.qualification_activation,
+        expected_qualification_activation_file_sha256=(
+            args.qualification_activation_file_sha256
+        ),
+        qualification_only=args.qualification_only,
+        training_root=args.training_root,
+        rendered_manifest_sha256=args.rendered_manifest_sha256,
+        pod_template_sha256=args.pod_template_sha256,
     )
     return 0
 
@@ -1040,6 +1415,8 @@ if __name__ == "__main__":  # pragma: no cover
 
 __all__ = [
     "M03R_V16_FOLD_TERMINAL_SCHEMA",
+    "M03R_V16_TRAINING_FOLD_TERMINAL_SCHEMA",
+    "M03R_V16_TRAINING_TERMINAL_SCHEMA",
     "M03R_V16_QUALIFICATION_ARTIFACT_SCHEMA",
     "M03R_V16_STARTUP_SCHEMA",
     "M03R_V16_WORKER_ERROR_SCHEMA",

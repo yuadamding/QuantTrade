@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import rl_quant.training.top2000_m03r_v16_qualification_runtime as qualification
+import rl_quant.workflows.top2000_m03r_v16_predictive as predictive
 from rl_quant.training.top2000_m03r_v16_fold import (
     render_m03r_v16_fold_geometries,
 )
@@ -108,7 +109,46 @@ def test_v16_worker_source_requires_terminal_authority_and_is_predictive_only() 
     assert "issue_m03r_v16_terminal_checkpoint_authority" in source
     assert "load_m03r_v16_epoch_checkpoint_for_evaluation" in source
     assert "build_m03r_v16_qualification_risk_state" in source
+    assert "V16 training requires an immutable activation authority" in source
+    assert "V16 qualification requires activation" in source
+    assert '"qualification_tail_accessed": False' in source
+    assert 'output / "training-terminal.json"' in source
     assert '"economic_optimizer_updates": 0' in source
     assert '"reinforcement_learning_updates": 0' in source
     assert '"outer_2026_accessed": False' in source
     assert "top2000_m03r_v15" not in source
+
+
+@pytest.mark.parametrize("qualification_only", [False, True])
+def test_v16_scientific_worker_rejects_direct_invocation_without_phase_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qualification_only: bool,
+) -> None:
+    package = SimpleNamespace()
+    authorization = SimpleNamespace(package_plan_file_sha256="a" * 64)
+    monkeypatch.setattr(predictive, "load_m03r_v16_package_plan", lambda *a, **k: package)
+    monkeypatch.setattr(
+        predictive,
+        "load_m03r_v16_execution_authorization",
+        lambda *a, **k: authorization,
+    )
+    monkeypatch.setattr(
+        predictive,
+        "_validate_runtime_package_members",
+        lambda *a, **k: (tmp_path, "b" * 64),
+    )
+
+    expected = (
+        "qualification requires activation"
+        if qualification_only
+        else "training requires an immutable activation authority"
+    )
+    with pytest.raises(M03RV16PredictiveWorkflowError, match=expected):
+        predictive.run_m03r_v16_predictive_worker(
+            tmp_path / "package-plan.json",
+            tmp_path / "execution-authorization.json",
+            expected_package_plan_file_sha256="a" * 64,
+            expected_authorization_file_sha256="c" * 64,
+            qualification_only=qualification_only,
+        )

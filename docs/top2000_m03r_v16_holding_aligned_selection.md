@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v6 revision; older v16 source and
+current local protocol is the result-moving v7 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -162,7 +162,7 @@ within-fold block is bounded by its observed chronology. The 63-session
 sensitivity therefore measures fold-level uncertainty rather than degenerate
 cyclic rotations.
 
-## Qualification path
+## Two-phase training and qualification path
 
 The local source now binds the package-owned structural slab, slab-backed fold
 updates, exact-workload disposable capacity primitive, terminal-checkpoint
@@ -173,6 +173,27 @@ archive, two-rank image worker, and receipt-gated suspended Job renderers. No
 real package has been built and no Kubernetes object has been created; real-data
 package validation, server-side dry runs, live admission, capacity evidence,
 and scientific execution remain required.
+
+Training and outer qualification are separate scientific phases:
+
+```text
+static gate
+-> capacity gate
+-> private training activation
+-> training-only workers for R0/R1/R2
+-> independent R2 adequacy aggregate
+-> private qualification activation, only when all R2 folds are adequate
+-> qualification-only workers
+-> independent final panel aggregate
+```
+
+Training-only workers publish checkpoints, fit trajectories, terminal
+checkpoint authorities, and adequacy receipts. They are forbidden to construct
+qualification states, risk states, scores, returns, cohort traces, or any outer
+artifact. The adequacy aggregate independently reconstructs all eight epoch
+receipts. If any primary R2 fold is inconclusive-undertrained, it issues no
+qualification activation and routes to a fresh longer-training protocol while
+the outer periods remain unopened.
 
 Qualification retains two distinct diagnostics:
 
@@ -255,43 +276,50 @@ and structural-slab receipt. Every trace binds the terminal-checkpoint and
 qualified-score authority receipts.
 
 The local package builder copies the exact source, cache, risk, and projector
-inputs; builds the structural slab from those package-owned copies in an
-isolated interpreter; generates and strict-loads the common initial state from
-that copied source; seals the panel schedule, package
+inputs; freezes the copied source read-only; disables bytecode creation in all
+isolated package-source subprocesses; rejects `__pycache__` and `.pyc` files;
+and re-verifies the complete source inventory after initial-state and slab
+construction. It builds the structural slab from those package-owned copies in
+an isolated interpreter; generates and strict-loads the common initial state
+from that copied source; seals the panel schedule, package
 plan, execution authorization, and full inventory; and can emit a deterministic
 transfer archive that rejects traversal, duplicates, links, devices, and hash
 drift. The same-image static validator explicitly performs no training and
-claims zero GPU visibility only. The worker requires exactly two visible H100
-80GB devices, runs one disposable exact-shape capacity update plus a nontrivial
-risk projection, or serially trains and strictly reloads all five folds before
-checkpoint-owned qualification.
+claims zero GPU visibility only. The package execution authorization permits
+static validation but grants neither training nor outer qualification.
+Privately issued phase activations are mandatory worker inputs. The worker
+requires exactly two visible H100 80GB devices and either runs the disposable
+`train -> validation -> train` capacity path, runs training only, or performs
+checkpoint-owned qualification only from frozen adequate checkpoints.
 
-The aggregate opens all three worker terminals, all 15 fold terminals, all 15
-qualification artifacts, and every epoch-fit receipt by exact hash. It
-reconstructs each cohort trace, recomputes predictive/economic metrics and the
-shared hierarchical bootstrap, and requires exact agreement with the worker
-summaries. Compact epoch trajectories retain loss, validation IC/spread,
-prediction/target dispersion, gradient norms, clipping, learning rates, and
-parameter-version evidence. A frozen adequacy classifier routes a collapsed,
-pervasively clipped, or still-materially-improving R2 fit to a fresh longer-
-training protocol rather than misclassifying it as representation failure.
-Only an adequately trained R2 can authorize a three-seed predictive
-confirmation; an adequate failure routes to ordered five-minute research. It can never
-authorize an economic generation, reinforcement learning, or 2026 access. A
-no-follow file aggregator publishes the no-clobber panel decision only after
-that independent reconciliation.
+The training aggregate opens all three training terminals, all 15 training-fold
+terminals, and every epoch-fit receipt by exact hash. It independently
+reconstructs validation receipts and the adequacy classifier. Compact epoch
+trajectories retain loss, validation IC/spread, prediction/target dispersion,
+gradient norms, clipping, learning rates, and parameter-version evidence. A
+collapsed, overdispersed, pervasively clipped, or still-materially-improving R2
+fit routes to a fresh longer-training protocol without opening outer outcomes.
 
-The local Kubernetes layer renders three distinct `batch/v1` Jobs: zero-GPU
-static validation with no GPU resource key, one two-H100 capacity sentinel, and a suspended
-three-completion predictive panel requesting at most six H100s. Capacity and
-predictive rendering require privately issued authorities loaded from exact
-immutable static/capacity result files. Static and worker startup rehash the
-executing package source tree against its manifest. All Jobs
+After qualification is separately authorized, the final aggregate opens all
+three qualification terminals, all 15 qualification-fold terminals, and all 15
+qualification artifacts. It reconstructs each cohort trace, recomputes
+predictive/economic metrics and the shared hierarchical bootstrap, and requires
+exact agreement with worker summaries. Only the final panel authority can
+authorize a three-seed predictive confirmation; an adequate failure routes to
+ordered five-minute research. It can never authorize an economic generation,
+reinforcement learning, or 2026 access.
+
+The local Kubernetes layer renders four distinct `batch/v1` Job contracts:
+zero-GPU static validation with no GPU resource key, one two-H100 capacity
+sentinel, a suspended three-completion training panel, and a separately
+suspended three-completion qualification panel. Capacity and scientific-phase
+rendering require privately issued authorities loaded from exact immutable
+result or activation files. Static and worker startup rehash the executing
+package source tree against its manifest. All Jobs
 remain suspended, fail-fast, token-unmounted, nonprivileged, digest-pinned,
 bounded by deadline/TTL, and mount only the scoped package/output PVC paths.
-Activation, live admission binding, detached supervision, UID-bound cleanup,
-and any remote mutation are intentionally not implemented by this source-only
-revision.
+Live admission binding, detached supervision, UID-bound cleanup, and any remote
+mutation are intentionally not implemented by this source-only revision.
 
 No real-data package or slab receipt, same-image result, capacity result,
 remote Job, GPU result, or performance result is claimed. Those evidence gates

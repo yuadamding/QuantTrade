@@ -80,3 +80,73 @@ def test_v16_fit_receipts_route_collapsed_or_still_improving_fit_to_inconclusive
         classify_m03r_v16_training_adequacy(collapsed, epochs).status
         == "inconclusive-undertrained"
     )
+
+    trending_ic = tuple(
+        replace(
+            value,
+            mean_selection_rank_ic=(
+                0.01 if epoch < 4 else 0.01 + 0.001 * (epoch - 3)
+            ),
+        )
+        for epoch, value in enumerate(validations)
+    )
+    trending_ic_epochs = tuple(
+        build_m03r_v16_epoch_fit_payload(
+            trending_ic[epoch],
+            _updates(epoch),
+            package_plan_sha256="a" * 64,
+            worker_plan_sha256="b" * 64,
+        )
+        for epoch in range(8)
+    )
+    assert (
+        classify_m03r_v16_training_adequacy(
+            trending_ic, trending_ic_epochs
+        ).status
+        == "inconclusive-undertrained"
+    )
+
+    improving_loss = tuple(
+        replace(
+            value,
+            selection_robust_loss=(
+                0.1 if epoch < 4 else 0.1 - 0.002 * (epoch - 3)
+            ),
+        )
+        for epoch, value in enumerate(validations)
+    )
+    improving_loss_epochs = tuple(
+        build_m03r_v16_epoch_fit_payload(
+            improving_loss[epoch],
+            _updates(epoch),
+            package_plan_sha256="a" * 64,
+            worker_plan_sha256="b" * 64,
+        )
+        for epoch in range(8)
+    )
+    assert (
+        classify_m03r_v16_training_adequacy(
+            improving_loss, improving_loss_epochs
+        ).status
+        == "inconclusive-undertrained"
+    )
+
+    overdispersed = (
+        *validations[:-1],
+        replace(validations[-1], selection_prediction_std=2.0),
+    )
+    overdispersed_epochs = tuple(
+        build_m03r_v16_epoch_fit_payload(
+            overdispersed[epoch],
+            _updates(epoch),
+            package_plan_sha256="a" * 64,
+            worker_plan_sha256="b" * 64,
+        )
+        for epoch in range(8)
+    )
+    assert (
+        classify_m03r_v16_training_adequacy(
+            overdispersed, overdispersed_epochs
+        ).status
+        == "inconclusive-undertrained"
+    )

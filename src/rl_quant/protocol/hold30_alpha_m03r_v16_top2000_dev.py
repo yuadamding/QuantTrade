@@ -22,10 +22,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v6"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v7"
 )
 M03R_V16_DESIGN_ID = (
-    "canonical-artifacts-mode-safe-hierarchical-inference-hold30-primary-v6"
+    "prequalification-adequacy-activated-two-phase-hold30-primary-v7"
 )
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30
 M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS = 30
@@ -253,8 +253,10 @@ class M03RV16PredictiveSpec:
     origins_per_update: int = 63
     score_training_epochs: int = M03R_V16_SCORE_EPOCHS
     adequacy_minimum_prediction_to_target_std_ratio: float = 0.05
-    adequacy_terminal_ic_improvement_threshold: float = 0.002
-    adequacy_terminal_loss_relative_improvement_threshold: float = 0.01
+    adequacy_maximum_prediction_to_target_std_ratio: float = 10.0
+    adequacy_trend_window_epochs: int = 4
+    adequacy_rank_ic_slope_threshold: float = 0.0005
+    adequacy_recent_loss_relative_improvement_threshold: float = 0.01
     adequacy_maximum_recent_clip_fraction: float = 0.50
     score_learning_rates: tuple[float, float] = (2.0e-5, 1.0e-4)
     learning_rate_warmup_fraction: float = 0.05
@@ -276,6 +278,9 @@ class M03RV16PredictiveSpec:
     minimum_net_10bp_active_return_lcb: float = 0.0
     minimum_spread_lcb: float = 0.0
     minimum_break_even_one_way_cost_basis_points: float = 10.0
+    minimum_median_risk_projection_retention: float = 0.25
+    minimum_fold_median_risk_projection_retention: float = 0.10
+    minimum_median_active_one_way_mass: float = 0.00025
     evaluation_cost_basis_points: tuple[float, ...] = (
         0.0,
         1.0,
@@ -318,8 +323,10 @@ class M03RV16PredictiveSpec:
             or self.origins_per_update != 63
             or self.score_training_epochs != 8
             or self.adequacy_minimum_prediction_to_target_std_ratio != 0.05
-            or self.adequacy_terminal_ic_improvement_threshold != 0.002
-            or self.adequacy_terminal_loss_relative_improvement_threshold != 0.01
+            or self.adequacy_maximum_prediction_to_target_std_ratio != 10.0
+            or self.adequacy_trend_window_epochs != 4
+            or self.adequacy_rank_ic_slope_threshold != 0.0005
+            or self.adequacy_recent_loss_relative_improvement_threshold != 0.01
             or self.adequacy_maximum_recent_clip_fraction != 0.50
             or self.score_learning_rates != (2.0e-5, 1.0e-4)
             or self.learning_rate_warmup_fraction != 0.05
@@ -341,6 +348,9 @@ class M03RV16PredictiveSpec:
             or self.minimum_net_10bp_active_return_lcb != 0.0
             or self.minimum_spread_lcb != 0.0
             or self.minimum_break_even_one_way_cost_basis_points != 10.0
+            or self.minimum_median_risk_projection_retention != 0.25
+            or self.minimum_fold_median_risk_projection_retention != 0.10
+            or self.minimum_median_active_one_way_mass != 0.00025
             or self.evaluation_cost_basis_points
             != (0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 40.0)
             or self.cohort_total_active_one_way_mass != 0.0025

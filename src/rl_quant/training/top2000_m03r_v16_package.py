@@ -28,12 +28,12 @@ from rl_quant.training.top2000_m03r_v16_worker import (
     M03RV16PredictiveWorkerPlan,
 )
 
-M03R_V16_PACKAGE_SCHEMA = "rl-quant.top2000-dev.m03r-v16-predictive-package-v1"
+M03R_V16_PACKAGE_SCHEMA = "rl-quant.top2000-dev.m03r-v16-predictive-package-v2"
 M03R_V16_PACKAGE_FILE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-predictive-package-file-v1"
+    "rl-quant.top2000-dev.m03r-v16-predictive-package-file-v2"
 )
 M03R_V16_EXECUTION_AUTHORIZATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-predictive-execution-authorization-v1"
+    "rl-quant.top2000-dev.m03r-v16-package-stage-authorization-v2"
 )
 M03R_V16_PACKAGE_SOURCE_PYTHONPATH = "/mnt/package/source/src"
 M03R_V16_RUNTIME_ENTRYPOINT = "rl_quant.workflows.top2000_m03r_v16_predictive"
@@ -241,7 +241,10 @@ class M03RV16ExecutionAuthorization:
     parallelism: int = 3
     h100s_per_completion: int = 2
     maximum_h100_requests: int = 6
-    predictive_training_authorized: bool = True
+    static_validation_authorized: bool = True
+    capacity_qualification_authorized: bool = False
+    predictive_training_authorized: bool = False
+    outer_qualification_authorized: bool = False
     economic_training_authorized: bool = False
     reinforcement_learning_authorized: bool = False
     outer_2026_access_authorized: bool = False
@@ -280,7 +283,10 @@ class M03RV16ExecutionAuthorization:
             or self.maximum_h100_requests != package.panel.maximum_h100_requests
             or self.parallelism * self.h100s_per_completion
             != self.maximum_h100_requests
-            or not self.predictive_training_authorized
+            or not self.static_validation_authorized
+            or self.capacity_qualification_authorized
+            or self.predictive_training_authorized
+            or self.outer_qualification_authorized
             or self.economic_training_authorized
             or self.reinforcement_learning_authorized
             or self.outer_2026_access_authorized

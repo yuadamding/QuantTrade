@@ -16,9 +16,9 @@ from rl_quant.training.top2000_m03r_v16_validation_runtime import (
     M03RV16InnerValidationReceipt,
 )
 
-M03R_V16_EPOCH_FIT_SCHEMA = "rl-quant.top2000-dev.m03r-v16-epoch-fit-v1"
+M03R_V16_EPOCH_FIT_SCHEMA = "rl-quant.top2000-dev.m03r-v16-epoch-fit-v2"
 M03R_V16_TRAINING_ADEQUACY_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-training-adequacy-v1"
+    "rl-quant.top2000-dev.m03r-v16-training-adequacy-v2"
 )
 M03RV16TrainingAdequacyStatus = Literal["adequate", "inconclusive-undertrained"]
 
@@ -40,8 +40,8 @@ class M03RV16TrainingAdequacy:
     fold_index: int
     epoch_fit_receipt_sha256: tuple[str, ...]
     final_prediction_to_target_std_ratio: float
-    terminal_rank_ic_improvement: float
-    terminal_robust_loss_relative_improvement: float
+    recent_rank_ic_slope: float
+    recent_robust_loss_relative_improvement: float
     recent_encoder_clip_fraction: float
     recent_selection_head_clip_fraction: float
     status: M03RV16TrainingAdequacyStatus
@@ -51,14 +51,17 @@ class M03RV16TrainingAdequacy:
     def _expected_status(self) -> M03RV16TrainingAdequacyStatus:
         spec = M03R_V16_PREDICTIVE_SPEC
         still_improving = (
-            self.terminal_rank_ic_improvement
-            > spec.adequacy_terminal_ic_improvement_threshold
-            and self.terminal_robust_loss_relative_improvement
-            > spec.adequacy_terminal_loss_relative_improvement_threshold
+            self.recent_rank_ic_slope > spec.adequacy_rank_ic_slope_threshold
+            or self.recent_robust_loss_relative_improvement
+            > spec.adequacy_recent_loss_relative_improvement_threshold
         )
         collapsed = (
             self.final_prediction_to_target_std_ratio
             < spec.adequacy_minimum_prediction_to_target_std_ratio
+        )
+        overdispersed = (
+            self.final_prediction_to_target_std_ratio
+            > spec.adequacy_maximum_prediction_to_target_std_ratio
         )
         pervasive_clipping = max(
             self.recent_encoder_clip_fraction,
@@ -66,15 +69,15 @@ class M03RV16TrainingAdequacy:
         ) > spec.adequacy_maximum_recent_clip_fraction
         return (
             "inconclusive-undertrained"
-            if collapsed or still_improving or pervasive_clipping
+            if collapsed or overdispersed or still_improving or pervasive_clipping
             else "adequate"
         )
 
     def validate(self) -> None:
         finite = (
             self.final_prediction_to_target_std_ratio,
-            self.terminal_rank_ic_improvement,
-            self.terminal_robust_loss_relative_improvement,
+            self.recent_rank_ic_slope,
+            self.recent_robust_loss_relative_improvement,
             self.recent_encoder_clip_fraction,
             self.recent_selection_head_clip_fraction,
         )
@@ -176,14 +179,27 @@ def classify_m03r_v16_training_adequacy(
     for value in validations:
         value.validate()
     final = validations[-1]
-    previous = validations[-2]
+    window = M03R_V16_PREDICTIVE_SPEC.adequacy_trend_window_epochs
+    if window < 2 or window > epochs:
+        raise M03RV16FitError("V16 adequacy trend window drifted")
+    recent_validations = validations[-window:]
     ratio = final.selection_prediction_std / max(
         final.selection_target_std, 1.0e-12
     )
+    first_loss = recent_validations[0].selection_robust_loss
     loss_improvement = (
-        previous.selection_robust_loss - final.selection_robust_loss
-    ) / max(previous.selection_robust_loss, 1.0e-12)
-    recent = epoch_fit_payloads[-2:]
+        first_loss - final.selection_robust_loss
+    ) / max(abs(first_loss), 1.0e-12)
+    x_mean = (window - 1) / 2.0
+    denominator = math.fsum((index - x_mean) ** 2 for index in range(window))
+    ic_mean = math.fsum(
+        value.mean_selection_rank_ic for value in recent_validations
+    ) / window
+    ic_slope = math.fsum(
+        (index - x_mean) * (value.mean_selection_rank_ic - ic_mean)
+        for index, value in enumerate(recent_validations)
+    ) / denominator
+    recent = epoch_fit_payloads[-window:]
     provisional = M03RV16TrainingAdequacy(
         setting_index=final.setting_index,
         fold_index=final.fold_index,
@@ -191,10 +207,8 @@ def classify_m03r_v16_training_adequacy(
             str(value["receipt_sha256"]) for value in epoch_fit_payloads
         ),
         final_prediction_to_target_std_ratio=ratio,
-        terminal_rank_ic_improvement=(
-            final.mean_selection_rank_ic - previous.mean_selection_rank_ic
-        ),
-        terminal_robust_loss_relative_improvement=loss_improvement,
+        recent_rank_ic_slope=ic_slope,
+        recent_robust_loss_relative_improvement=loss_improvement,
         recent_encoder_clip_fraction=math.fsum(
             float(value["encoder_clip_fraction"]) for value in recent
         )

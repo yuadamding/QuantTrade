@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import stat
 from dataclasses import asdict, dataclass, field
@@ -11,7 +12,6 @@ from typing import Any, Literal
 
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
-    file_sha256,
     semantic_sha256 as _sha256,
 )
 from rl_quant.training.hold30_alpha_m03r_v7_kubernetes import (
@@ -35,6 +35,11 @@ from rl_quant.training.top2000_m03r_v16_capacity import (
     M03RV16CapacityRankEvidence,
     M03RV16CapacityTerminal,
 )
+from rl_quant.training.top2000_m03r_v16_activation import (
+    M03RV16QualificationActivation,
+    M03RV16TrainingActivation,
+    issue_m03r_v16_training_activation,
+)
 from rl_quant.training.top2000_m03r_v16_static_contract import (
     M03R_V16_STATIC_RESULT_SCHEMA,
 )
@@ -47,7 +52,7 @@ M03R_V16_CAPACITY_GATE_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v2"
 )
 M03R_V16_RENDERED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v2"
+    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v3"
 )
 _PYTHON = "/opt/conda/envs/quanttrade/bin/python"
 _WORKER_MODULE = "rl_quant.workflows.top2000_m03r_v16_predictive"
@@ -168,6 +173,7 @@ class M03RV16CapacityGateQualification:
             != authorization.receipt_sha256
             or self.static_gate_receipt_sha256 != static.receipt_sha256
             or self.image_digest_sha256 != package.artifacts.image_digest_sha256
+            or self.source_tree_root_sha256 != static.source_tree_root_sha256
             or self.world_size != 2
             or self.h100s_per_worker != 2
             or not self.exact_h100_80gb_per_rank
@@ -198,12 +204,14 @@ class M03RV16RenderedSuspendedJob:
     execution_authorization_receipt_sha256: str
     package_plan_file_sha256: str
     execution_authorization_file_sha256: str
-    mode: Literal["static", "capacity", "predictive"]
+    mode: Literal["static", "capacity", "training", "qualification"]
     completions: int
     parallelism: int
     gpus_per_completion: int
     static_gate_receipt_sha256: str | None = None
     capacity_gate_receipt_sha256: str | None = None
+    training_activation_receipt_sha256: str | None = None
+    qualification_activation_receipt_sha256: str | None = None
     activation_authorized: bool = False
     economic_training_authorized: bool = False
     reinforcement_learning_authorized: bool = False
@@ -241,7 +249,8 @@ class M03RV16RenderedSuspendedJob:
         expected = {
             "static": (1, 1, 0),
             "capacity": (1, 1, 2),
-            "predictive": (3, 3, 2),
+            "training": (3, 3, 2),
+            "qualification": (3, 3, 2),
         }[self.mode]
         gpu_resources_valid = (
             "nvidia.com/gpu" not in requests and "nvidia.com/gpu" not in limits
@@ -290,6 +299,8 @@ class M03RV16RenderedSuspendedJob:
                 environment.get("NVIDIA_VISIBLE_DEVICES") != "none"
                 or self.static_gate_receipt_sha256 is not None
                 or self.capacity_gate_receipt_sha256 is not None
+                or self.training_activation_receipt_sha256 is not None
+                or self.qualification_activation_receipt_sha256 is not None
             ):
                 raise M03RV16KubernetesError("V16 static Job is not GPU neutral")
         elif (
@@ -298,8 +309,16 @@ class M03RV16RenderedSuspendedJob:
             or pod.get("tolerations") != [M03R_TOP2000_MULTI_GPU_TOLERATION]
             or self.static_gate_receipt_sha256 is None
             or (
-                self.mode == "predictive"
+                self.mode in {"training", "qualification"}
                 and self.capacity_gate_receipt_sha256 is None
+            )
+            or (
+                self.mode == "training"
+                and self.training_activation_receipt_sha256 is None
+            )
+            or (
+                self.mode == "qualification"
+                and self.qualification_activation_receipt_sha256 is None
             )
         ):
             raise M03RV16KubernetesError("V16 H100 Job profile drifted")
@@ -330,7 +349,10 @@ def _read_exact_json(path: Path, expected_file_sha256: str) -> dict[str, Any]:
             raise M03RV16KubernetesError("V16 gate result changed while read")
     finally:
         os.close(descriptor)
-    if len(raw) != before.st_size or file_sha256(path) != expected_file_sha256:
+    if (
+        len(raw) != before.st_size
+        or hashlib.sha256(raw).hexdigest() != expected_file_sha256
+    ):
         raise M03RV16KubernetesError("V16 gate result hash drifted")
     try:
         payload = json.loads(raw)
@@ -437,6 +459,8 @@ def load_and_issue_m03r_v16_capacity_gate(
         raise M03RV16KubernetesError("V16 capacity result authority drifted")
     source_root = str(payload.get("source_tree_root_sha256"))
     _digest("source_tree_root_sha256", source_root)
+    if source_root != static.source_tree_root_sha256:
+        raise M03RV16KubernetesError("V16 capacity source tree differs from static")
     result = M03RV16CapacityGateQualification(
         package_plan_sha256=package.package_plan_sha256,
         execution_authorization_receipt_sha256=authorization.receipt_sha256,
@@ -450,6 +474,25 @@ def load_and_issue_m03r_v16_capacity_gate(
     )
     result.validate_for(package, authorization, static)
     return result
+
+
+def issue_m03r_v16_training_activation_from_gates(
+    *,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    static: M03RV16StaticGateQualification,
+    capacity: M03RV16CapacityGateQualification,
+) -> M03RV16TrainingActivation:
+    """Issue training authority only after matching static and capacity gates."""
+
+    capacity.validate_for(package, authorization, static)
+    return issue_m03r_v16_training_activation(
+        package=package,
+        authorization=authorization,
+        static_gate_receipt_sha256=static.receipt_sha256,
+        capacity_gate_receipt_sha256=capacity.receipt_sha256,
+        source_tree_root_sha256=capacity.source_tree_root_sha256,
+    )
 
 
 def _base_args(
@@ -477,9 +520,13 @@ def _render(
     package_plan_file_sha256: str,
     authorization_file_sha256: str,
     template: M03RV7KubernetesTemplateConfig,
-    mode: Literal["static", "capacity", "predictive"],
+    mode: Literal["static", "capacity", "training", "qualification"],
     static: M03RV16StaticGateQualification | None,
     capacity: M03RV16CapacityGateQualification | None,
+    training_activation: M03RV16TrainingActivation | None,
+    training_activation_file_sha256: str | None,
+    qualification_activation: M03RV16QualificationActivation | None,
+    qualification_activation_file_sha256: str | None,
 ) -> M03RV16RenderedSuspendedJob:
     package.validate()
     authorization.validate(package)
@@ -490,25 +537,52 @@ def _render(
             "V16 authorization and package-plan file disagree"
         )
     if mode == "static":
-        if static is not None or capacity is not None:
+        if any(
+            value is not None
+            for value in (static, capacity, training_activation, qualification_activation)
+        ):
             raise M03RV16KubernetesError("V16 static Job precedes all gates")
     else:
         if static is None:
             raise M03RV16KubernetesError("V16 H100 Job requires the static gate")
         static.validate_for(package, authorization)
         if mode == "capacity":
-            if capacity is not None:
+            if any(
+                value is not None
+                for value in (capacity, training_activation, qualification_activation)
+            ):
                 raise M03RV16KubernetesError("capacity cannot prequalify itself")
         elif capacity is None:
             raise M03RV16KubernetesError(
-                "V16 predictive Job requires exact capacity evidence"
+                "V16 scientific Job requires exact capacity evidence"
             )
         else:
             capacity.validate_for(package, authorization, static)
+            if mode == "training":
+                if training_activation is None or qualification_activation is not None:
+                    raise M03RV16KubernetesError(
+                        "V16 training Job requires only training activation"
+                    )
+                training_activation.validate_for(package, authorization)
+                _digest(
+                    "training_activation_file_sha256",
+                    str(training_activation_file_sha256),
+                )
+            elif qualification_activation is None or training_activation is not None:
+                raise M03RV16KubernetesError(
+                    "V16 qualification Job requires only qualification activation"
+                )
+            else:
+                qualification_activation.validate_for(package, authorization)
+                _digest(
+                    "qualification_activation_file_sha256",
+                    str(qualification_activation_file_sha256),
+                )
     completions, parallelism, gpus = {
         "static": (1, 1, 0),
         "capacity": (1, 1, 2),
-        "predictive": (3, 3, 2),
+        "training": (3, 3, 2),
+        "qualification": (3, 3, 2),
     }[mode]
     if mode == "static":
         module = _STATIC_MODULE
@@ -551,12 +625,33 @@ def _render(
                     "/mnt/output/capacity-sentinel",
                 )
             )
+        elif mode == "training":
+            args.extend(
+                (
+                    "--training-activation",
+                    "/mnt/authority/training-activation.json",
+                    "--training-activation-file-sha256",
+                    str(training_activation_file_sha256),
+                )
+            )
+        elif mode == "qualification":
+            args.extend(
+                (
+                    "--qualification-only",
+                    "--qualification-activation",
+                    "/mnt/authority/qualification-activation.json",
+                    "--qualification-activation-file-sha256",
+                    str(qualification_activation_file_sha256),
+                    "--training-root",
+                    "/mnt/training",
+                )
+            )
     environment: list[dict[str, Any]] = [
         {
             "name": "JOB_COMPLETION_INDEX",
             "value": "0",
         }
-        if mode != "predictive"
+        if mode in {"static", "capacity"}
         else {
             "name": "JOB_COMPLETION_INDEX",
             "valueFrom": {
@@ -593,7 +688,8 @@ def _render(
     phase = {
         "static": "v16-static",
         "capacity": "v16-capacity",
-        "predictive": "v16-predictive",
+        "training": "v16-training",
+        "qualification": "v16-qualification",
     }[mode]
     labels = {
         "app.kubernetes.io/name": "quanttrade-m03r-v16",
@@ -616,6 +712,16 @@ def _render(
         ),
         "rl-quant/capacity-gate-sha256": (
             "not-yet-created" if capacity is None else capacity.receipt_sha256
+        ),
+        "rl-quant/training-activation-sha256": (
+            "not-issued"
+            if training_activation is None
+            else training_activation.receipt_sha256
+        ),
+        "rl-quant/qualification-activation-sha256": (
+            "not-issued"
+            if qualification_activation is None
+            else qualification_activation.receipt_sha256
         ),
         "rl-quant/economic-training-authorized": "false",
         "rl-quant/reinforcement-learning-authorized": "false",
@@ -708,6 +814,30 @@ def _render(
             },
         ],
     }
+    if mode == "qualification":
+        pod["containers"][0]["volumeMounts"].append(
+            {
+                "name": "research-data",
+                "mountPath": "/mnt/training",
+                "subPath": (
+                    f"{template.pvc_training_subpath.rstrip('/')}/runs/"
+                    f"{template.run_id}/phases/v16-training"
+                ),
+                "readOnly": True,
+            }
+        )
+    if mode in {"training", "qualification"}:
+        pod["containers"][0]["volumeMounts"].append(
+            {
+                "name": "research-data",
+                "mountPath": "/mnt/authority",
+                "subPath": (
+                    f"{template.pvc_training_subpath.rstrip('/')}/runs/"
+                    f"{template.run_id}/authorities"
+                ),
+                "readOnly": True,
+            }
+        )
     if mode != "static":
         pod.update(
             {
@@ -785,6 +915,14 @@ def _render(
         capacity_gate_receipt_sha256=(
             None if capacity is None else capacity.receipt_sha256
         ),
+        training_activation_receipt_sha256=(
+            None if training_activation is None else training_activation.receipt_sha256
+        ),
+        qualification_activation_receipt_sha256=(
+            None
+            if qualification_activation is None
+            else qualification_activation.receipt_sha256
+        ),
     )
     rendered.validate()
     return rendered
@@ -807,6 +945,10 @@ def render_m03r_v16_suspended_static_job(
         mode="static",
         static=None,
         capacity=None,
+        training_activation=None,
+        training_activation_file_sha256=None,
+        qualification_activation=None,
+        qualification_activation_file_sha256=None,
     )
 
 
@@ -828,10 +970,14 @@ def render_m03r_v16_suspended_capacity_job(
         mode="capacity",
         static=static,
         capacity=None,
+        training_activation=None,
+        training_activation_file_sha256=None,
+        qualification_activation=None,
+        qualification_activation_file_sha256=None,
     )
 
 
-def render_m03r_v16_suspended_predictive_job(
+def render_m03r_v16_suspended_training_job(
     *,
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
@@ -840,6 +986,8 @@ def render_m03r_v16_suspended_predictive_job(
     template: M03RV7KubernetesTemplateConfig,
     static: M03RV16StaticGateQualification,
     capacity: M03RV16CapacityGateQualification,
+    training_activation: M03RV16TrainingActivation,
+    training_activation_file_sha256: str,
 ) -> M03RV16RenderedSuspendedJob:
     return _render(
         package=package,
@@ -847,9 +995,41 @@ def render_m03r_v16_suspended_predictive_job(
         package_plan_file_sha256=package_plan_file_sha256,
         authorization_file_sha256=authorization_file_sha256,
         template=template,
-        mode="predictive",
+        mode="training",
         static=static,
         capacity=capacity,
+        training_activation=training_activation,
+        training_activation_file_sha256=training_activation_file_sha256,
+        qualification_activation=None,
+        qualification_activation_file_sha256=None,
+    )
+
+
+def render_m03r_v16_suspended_qualification_job(
+    *,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    package_plan_file_sha256: str,
+    authorization_file_sha256: str,
+    template: M03RV7KubernetesTemplateConfig,
+    static: M03RV16StaticGateQualification,
+    capacity: M03RV16CapacityGateQualification,
+    qualification_activation: M03RV16QualificationActivation,
+    qualification_activation_file_sha256: str,
+) -> M03RV16RenderedSuspendedJob:
+    return _render(
+        package=package,
+        authorization=authorization,
+        package_plan_file_sha256=package_plan_file_sha256,
+        authorization_file_sha256=authorization_file_sha256,
+        template=template,
+        mode="qualification",
+        static=static,
+        capacity=capacity,
+        training_activation=None,
+        training_activation_file_sha256=None,
+        qualification_activation=qualification_activation,
+        qualification_activation_file_sha256=qualification_activation_file_sha256,
     )
 
 
@@ -864,7 +1044,9 @@ __all__ = [
     "M03RV16StaticGateQualification",
     "load_and_issue_m03r_v16_capacity_gate",
     "load_and_issue_m03r_v16_static_gate",
+    "issue_m03r_v16_training_activation_from_gates",
     "render_m03r_v16_suspended_capacity_job",
-    "render_m03r_v16_suspended_predictive_job",
+    "render_m03r_v16_suspended_qualification_job",
     "render_m03r_v16_suspended_static_job",
+    "render_m03r_v16_suspended_training_job",
 ]

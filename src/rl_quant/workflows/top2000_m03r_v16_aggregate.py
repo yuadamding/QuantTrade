@@ -9,7 +9,7 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Sequence
 
 import torch
 
@@ -23,6 +23,10 @@ from rl_quant.training.top2000_m03r_v16_package import (
     load_m03r_v16_execution_authorization,
     load_m03r_v16_package_plan,
 )
+from rl_quant.training.top2000_m03r_v16_activation import (
+    M03RV16QualificationActivation,
+    load_m03r_v16_qualification_activation,
+)
 from rl_quant.training.top2000_m03r_v16_selection import (
     M03RV16BootstrapPlan,
     M03RV16PredictiveQualification,
@@ -35,10 +39,6 @@ from rl_quant.training.top2000_m03r_v16_selection import (
 from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
     M03RV16CohortTrace,
 )
-from rl_quant.training.top2000_m03r_v16_fit import (
-    M03R_V16_EPOCH_FIT_SCHEMA,
-    M03RV16TrainingAdequacy,
-)
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
 )
@@ -49,7 +49,7 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
 )
 
 M03R_V16_PANEL_AGGREGATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v2"
+    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v3"
 )
 _MAX_TERMINAL_BYTES = 16 * 1024**2
 _MAX_ARTIFACT_BYTES = 256 * 1024**2
@@ -244,17 +244,13 @@ def _worker_terminal(
     setting_index: int,
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
+    qualification_activation: M03RV16QualificationActivation,
 ) -> tuple[M03RV16BootstrapPlan, M03RV16PredictiveQualification, str]:
     unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
     try:
         bootstrap = _bootstrap(dict(payload["bootstrap_plan"]))
         qualification = _qualification(dict(payload["predictive_qualification"]))
         receipt_sha256 = str(payload["receipt_sha256"])
-        adequacy_files = tuple(payload["fold_training_adequacy_file_sha256"])
-        adequacy_receipts = tuple(
-            payload["fold_training_adequacy_receipt_sha256"]
-        )
-        adequacy_status = tuple(payload["fold_training_adequacy_status"])
     except (KeyError, TypeError, ValueError) as exc:
         raise M03RV16AggregateError("V16 worker terminal is incomplete") from exc
     worker = package.panel.workers[setting_index]
@@ -264,6 +260,10 @@ def _worker_terminal(
         or payload.get("package_plan_sha256") != package.package_plan_sha256
         or payload.get("authorization_receipt_sha256")
         != authorization.receipt_sha256
+        or payload.get("qualification_activation_receipt_sha256")
+        != qualification_activation.receipt_sha256
+        or payload.get("training_terminal_file_sha256")
+        != qualification_activation.training_terminal_file_sha256[setting_index]
         or payload.get("worker_plan_sha256") != worker.receipt_sha256
         or payload.get("setting_index") != setting_index
         or payload.get("setting_id") != worker.setting_id
@@ -271,31 +271,17 @@ def _worker_terminal(
         or payload.get("predictive_qualification_sha256")
         != qualification.receipt_sha256
         or qualification.setting_index != setting_index
-        or payload.get("primary_hypothesis_passed")
+        or payload.get("raw_predictive_gates_passed")
         != qualification.primary_hypothesis_passed
-        or payload.get("three_seed_confirmation_may_be_minted")
-        != qualification.three_seed_confirmation_may_be_minted
+        or payload.get("three_seed_confirmation_may_be_minted") is not False
         or payload.get("economic_generation_may_be_minted") is not False
         or payload.get("reinforcement_learning_authorized") is not False
         or payload.get("outer_2026_accessed") is not False
         or payload.get("development_only") is not True
         or payload.get("reportable") is not False
         or payload.get("promotion_eligible") is not False
-        or len(adequacy_files)
-        != M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
-        or len(adequacy_receipts)
-        != M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
-        or len(adequacy_status)
-        != M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
     ):
         raise M03RV16AggregateError("V16 worker terminal authority drifted")
-    for value in (*adequacy_files, *adequacy_receipts):
-        _digest("worker training adequacy inventory", value)
-    if any(
-        value not in {"adequate", "inconclusive-undertrained"}
-        for value in adequacy_status
-    ):
-        raise M03RV16AggregateError("V16 worker adequacy status drifted")
     return bootstrap, qualification, receipt_sha256
 
 
@@ -307,7 +293,8 @@ def _fold_evidence(
     fold_index: int,
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
-) -> tuple[M03RV16ReconciledFoldEvidence, M03RV16TrainingAdequacy]:
+    qualification_activation: M03RV16QualificationActivation,
+) -> M03RV16ReconciledFoldEvidence:
     fold_terminal = _read_exact(
         worker_root / "receipts" / f"fold-{fold_index:02d}-terminal.json",
         fold_terminal_file_sha256,
@@ -327,16 +314,6 @@ def _fold_evidence(
         score_authority = str(
             fold_terminal["qualified_score_authority_sha256"]
         )
-        adequacy_file_sha256 = str(
-            fold_terminal["training_adequacy_file_sha256"]
-        )
-        adequacy_receipt_sha256 = str(
-            fold_terminal["training_adequacy_receipt_sha256"]
-        )
-        epoch_fit_file_sha256 = tuple(fold_terminal["epoch_fit_file_sha256"])
-        epoch_fit_receipt_sha256 = tuple(
-            fold_terminal["epoch_fit_receipt_sha256"]
-        )
     except (KeyError, TypeError, ValueError) as exc:
         raise M03RV16AggregateError("V16 fold terminal is incomplete") from exc
     for name, value in (
@@ -344,8 +321,6 @@ def _fold_evidence(
         ("qualification_trace_sha256", trace_sha256),
         ("terminal_checkpoint_authority_sha256", terminal_authority),
         ("qualified_score_authority_sha256", score_authority),
-        ("training_adequacy_file_sha256", adequacy_file_sha256),
-        ("training_adequacy_receipt_sha256", adequacy_receipt_sha256),
     ):
         _digest(name, value)
     if (
@@ -354,6 +329,8 @@ def _fold_evidence(
         or fold_terminal.get("package_plan_sha256") != package.package_plan_sha256
         or fold_terminal.get("authorization_receipt_sha256")
         != authorization.receipt_sha256
+        or fold_terminal.get("qualification_activation_receipt_sha256")
+        != qualification_activation.receipt_sha256
         or fold_terminal.get("worker_plan_sha256") != worker.receipt_sha256
         or fold_terminal.get("setting_index") != setting_index
         or fold_terminal.get("setting_id") != worker.setting_id
@@ -370,65 +347,6 @@ def _fold_evidence(
         or fold_terminal.get("promotion_eligible") is not False
     ):
         raise M03RV16AggregateError("V16 fold terminal authority drifted")
-
-    epochs = M03R_V16_PREDICTIVE_SPEC.score_training_epochs
-    if len(epoch_fit_file_sha256) != epochs or len(epoch_fit_receipt_sha256) != epochs:
-        raise M03RV16AggregateError("V16 epoch fit inventory drifted")
-    for epoch in range(epochs):
-        epoch_payload = _read_exact(
-            worker_root
-            / "receipts"
-            / f"fold-{fold_index:02d}-epoch-{epoch + 1:02d}-fit.json",
-            epoch_fit_file_sha256[epoch],
-        )
-        epoch_unsigned = {
-            key: value
-            for key, value in epoch_payload.items()
-            if key != "receipt_sha256"
-        }
-        if (
-            epoch_payload.get("schema") != M03R_V16_EPOCH_FIT_SCHEMA
-            or epoch_payload.get("receipt_sha256") != _sha256(epoch_unsigned)
-            or epoch_payload.get("receipt_sha256")
-            != epoch_fit_receipt_sha256[epoch]
-            or epoch_payload.get("package_plan_sha256")
-            != package.package_plan_sha256
-            or epoch_payload.get("worker_plan_sha256") != worker.receipt_sha256
-            or epoch_payload.get("setting_index") != setting_index
-            or epoch_payload.get("fold_index") != fold_index
-            or epoch_payload.get("epoch_index") != epoch
-        ):
-            raise M03RV16AggregateError("V16 epoch fit evidence drifted")
-    adequacy_payload = _read_exact(
-        worker_root
-        / "receipts"
-        / f"fold-{fold_index:02d}-training-adequacy.json",
-        adequacy_file_sha256,
-    )
-    try:
-        adequacy_row = {
-            key: value
-            for key, value in adequacy_payload.items()
-            if key not in {"receipt_sha256", "epoch_fit_file_sha256"}
-        }
-        adequacy_row["epoch_fit_receipt_sha256"] = tuple(
-            adequacy_row["epoch_fit_receipt_sha256"]
-        )
-        adequacy = M03RV16TrainingAdequacy(**adequacy_row)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise M03RV16AggregateError("V16 training adequacy is malformed") from exc
-    adequacy.validate()
-    if (
-        adequacy.receipt_sha256 != adequacy_receipt_sha256
-        or adequacy_payload.get("receipt_sha256") != adequacy_receipt_sha256
-        or tuple(adequacy_payload.get("epoch_fit_file_sha256", ()))
-        != epoch_fit_file_sha256
-        or adequacy.epoch_fit_receipt_sha256 != epoch_fit_receipt_sha256
-        or adequacy.setting_index != setting_index
-        or adequacy.fold_index != fold_index
-        or fold_terminal.get("training_adequacy_status") != adequacy.status
-    ):
-        raise M03RV16AggregateError("V16 training adequacy authority drifted")
 
     artifact = _load_exact_torch(
         worker_root
@@ -474,7 +392,7 @@ def _fold_evidence(
         panel_schedule_sha256=package.schedule.receipt_sha256,
     )
     evidence.validate()
-    return evidence, adequacy
+    return evidence
 
 
 def _reconcile_worker_evidence(
@@ -484,10 +402,8 @@ def _reconcile_worker_evidence(
     setting_index: int,
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
-) -> tuple[
-    tuple[M03RV16ReconciledFoldEvidence, ...],
-    tuple[M03RV16TrainingAdequacy, ...],
-]:
+    qualification_activation: M03RV16QualificationActivation,
+) -> tuple[M03RV16ReconciledFoldEvidence, ...]:
     try:
         fold_hashes = tuple(terminal_payload["fold_terminal_file_sha256"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -505,10 +421,11 @@ def _reconcile_worker_evidence(
             fold_index=index,
             package=package,
             authorization=authorization,
+            qualification_activation=qualification_activation,
         )
         for index in range(folds)
     )
-    return tuple(row[0] for row in rows), tuple(row[1] for row in rows)
+    return rows
 
 
 def _write_exclusive(path: Path, value: dict[str, Any]) -> str:
@@ -534,6 +451,8 @@ def aggregate_m03r_v16_panel(
     package_plan_file_sha256: str,
     execution_authorization_path: str | Path,
     execution_authorization_file_sha256: str,
+    qualification_activation_path: str | Path,
+    qualification_activation_file_sha256: str,
     worker_terminal_paths: tuple[Path, Path, Path],
     worker_terminal_file_sha256: tuple[str, str, str],
     output_root: str | Path,
@@ -547,6 +466,14 @@ def aggregate_m03r_v16_panel(
         expected_file_sha256=execution_authorization_file_sha256,
         package=package,
     )
+    qualification_activation: M03RV16QualificationActivation = (
+        load_m03r_v16_qualification_activation(
+            qualification_activation_path,
+            expected_file_sha256=qualification_activation_file_sha256,
+            package=package,
+            authorization=authorization,
+        )
+    )
     terminal_payloads = tuple(
         _read_exact(path, expected_sha)
         for path, expected_sha in zip(
@@ -559,6 +486,7 @@ def aggregate_m03r_v16_panel(
             setting_index=index,
             package=package,
             authorization=authorization,
+            qualification_activation=qualification_activation,
         )
         for index in range(len(terminal_payloads))
     )
@@ -573,21 +501,11 @@ def aggregate_m03r_v16_panel(
             setting_index=index,
             package=package,
             authorization=authorization,
+            qualification_activation=qualification_activation,
         )
         for index in range(3)
     )
-    reconciled_evidence = tuple(row[0] for row in reconciled_rows)
-    reconciled_adequacy = tuple(row[1] for row in reconciled_rows)
-    for index, rows_for_setting in enumerate(reconciled_adequacy):
-        if (
-            tuple(terminal_payloads[index]["fold_training_adequacy_receipt_sha256"])
-            != tuple(row.receipt_sha256 for row in rows_for_setting)
-            or tuple(terminal_payloads[index]["fold_training_adequacy_status"])
-            != tuple(row.status for row in rows_for_setting)
-        ):
-            raise M03RV16AggregateError(
-                "V16 worker adequacy summary could not be reproduced"
-            )
+    reconciled_evidence = reconciled_rows
     reconciled_bootstrap = build_m03r_v16_bootstrap_plan(
         tuple(row.trace.decision_origin_indices for row in reconciled_evidence[0]),
         tuple(row.trace.execution_origin_indices for row in reconciled_evidence[0]),
@@ -605,20 +523,12 @@ def aggregate_m03r_v16_panel(
         raise M03RV16AggregateError(
             "V16 worker qualification could not be reproduced from fold evidence"
         )
-    primary_adequacy_rows = reconciled_adequacy[
-        M03R_V16_PREDICTIVE_SPEC.primary_setting_index
-    ]
-    primary_adequacy: Literal["adequate", "inconclusive-undertrained"] = (
-        "adequate"
-        if all(row.status == "adequate" for row in primary_adequacy_rows)
-        else "inconclusive-undertrained"
-    )
     decision = build_m03r_v16_panel_decision(
         qualifications,
         bootstrap,
-        primary_training_adequacy=primary_adequacy,
-        primary_training_adequacy_receipt_sha256=tuple(
-            row.receipt_sha256 for row in primary_adequacy_rows
+        primary_training_adequacy="adequate",
+        primary_training_adequacy_receipt_sha256=(
+            qualification_activation.primary_training_adequacy_receipt_sha256
         ),
     )
     output = Path(output_root)
@@ -637,6 +547,12 @@ def aggregate_m03r_v16_panel(
         "execution_authorization_file_sha256": (
             execution_authorization_file_sha256
         ),
+        "qualification_activation_file_sha256": (
+            qualification_activation_file_sha256
+        ),
+        "qualification_activation_receipt_sha256": (
+            qualification_activation.receipt_sha256
+        ),
         "worker_terminal_file_sha256": worker_terminal_file_sha256,
         "worker_terminal_receipt_sha256": tuple(row[2] for row in rows),
         "bootstrap_plan_sha256": bootstrap.receipt_sha256,
@@ -645,9 +561,9 @@ def aggregate_m03r_v16_panel(
         ),
         "panel_decision_file_sha256": decision_file_sha256,
         "panel_decision_receipt_sha256": decision.receipt_sha256,
-        "primary_training_adequacy": primary_adequacy,
-        "primary_training_adequacy_receipt_sha256": tuple(
-            row.receipt_sha256 for row in primary_adequacy_rows
+        "primary_training_adequacy": "adequate",
+        "primary_training_adequacy_receipt_sha256": (
+            qualification_activation.primary_training_adequacy_receipt_sha256
         ),
         "primary_hypothesis_passed": decision.primary_hypothesis_passed,
         "next_research_action": decision.next_research_action,
@@ -675,6 +591,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--package-plan-file-sha256", required=True)
     parser.add_argument("--execution-authorization", required=True)
     parser.add_argument("--execution-authorization-file-sha256", required=True)
+    parser.add_argument("--qualification-activation", required=True)
+    parser.add_argument("--qualification-activation-file-sha256", required=True)
     parser.add_argument("--worker-terminal", action="append", required=True)
     parser.add_argument(
         "--worker-terminal-file-sha256", action="append", required=True
@@ -693,6 +611,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_authorization_path=args.execution_authorization,
         execution_authorization_file_sha256=(
             args.execution_authorization_file_sha256
+        ),
+        qualification_activation_path=args.qualification_activation,
+        qualification_activation_file_sha256=(
+            args.qualification_activation_file_sha256
         ),
         worker_terminal_paths=(
             Path(args.worker_terminal[0]),
