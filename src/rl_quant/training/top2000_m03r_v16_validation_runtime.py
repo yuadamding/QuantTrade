@@ -24,9 +24,9 @@ from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
     M03RV16BuiltPredictiveBatch,
 )
 
-M03R_V16_INNER_VALIDATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-inner-validation-v2"
+M03R_V16_INNER_VALIDATION_SCHEMA = "rl-quant.top2000-dev.m03r-v16-inner-validation-v3"
 M03R_V16_CHECKPOINT_SELECTION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-fixed-terminal-checkpoint-v2"
+    "rl-quant.top2000-dev.m03r-v16-fixed-terminal-checkpoint-v3"
 )
 
 

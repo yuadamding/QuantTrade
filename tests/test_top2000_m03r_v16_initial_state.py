@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,28 @@ def test_v16_common_initial_state_rejects_tampered_file(tmp_path: Path) -> None:
             path,
             _policy(2),
             expected_file_sha256=file_sha,
+            expected_state_sha256=state_sha,
+            expected_architecture_sha256=architecture_sha,
+        )
+
+
+def test_v16_common_initial_state_rejects_hold_target_mismatch(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(17)
+    clean = tmp_path / "clean.pt"
+    state_sha, _file_sha, architecture_sha = write_m03r_v16_initial_parameter_state(
+        clean, _policy(0)
+    )
+    payload = torch.load(clean, map_location="cpu", weights_only=True)
+    payload["hold_target_sessions"] = 3
+    tampered = tmp_path / "target-3.pt"
+    torch.save(payload, tampered)
+    with pytest.raises(M03RV16InitialStateError, match="semantics"):
+        load_m03r_v16_initial_parameter_state(
+            tampered,
+            _policy(0),
+            expected_file_sha256=hashlib.sha256(tampered.read_bytes()).hexdigest(),
             expected_state_sha256=state_sha,
             expected_architecture_sha256=architecture_sha,
         )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -17,6 +19,10 @@ from rl_quant.training.top2000_m03r_v9_pretraining_runtime import (
 from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
 )
+from rl_quant.training.top2000_m03r_v9_pretraining_step import model_state_sha256
+from rl_quant.training.top2000_m03r_v16_checkpoint import (
+    M03RV16LoadedEpochCheckpoint,
+)
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16PanelSchedule,
     render_m03r_v16_fold_geometries,
@@ -32,6 +38,12 @@ from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
 )
 from rl_quant.training.top2000_m03r_v16_pretraining_step import (
     train_m03r_v16_score_batch_update,
+)
+from rl_quant.training.top2000_m03r_v16_qualification_runtime import (
+    run_m03r_v16_reloaded_checkpoint_cohort_qualification,
+)
+from rl_quant.training.top2000_m03r_v16_structural import (
+    M03RV16ValidatedStructuralSlab,
 )
 from rl_quant.training.top2000_m03r_v16_validation_runtime import (
     M03RV16ValidationError,
@@ -126,6 +138,101 @@ def test_v16_survival_weighting_is_not_a_mandatory_expiry() -> None:
     assert float(survival[0]) > float(survival[-1])
 
 
+def test_v16_qualification_wrapper_binds_checkpoint_to_exact_score_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_qualification_runtime as runtime
+
+    sequence, exposure = _surfaces()
+    policy = Top2000M03RV16PredictivePolicy(
+        0,
+        token_dim=16,
+        raw_stock_chunk=8,
+        activation_checkpointing=False,
+    )
+    origins = torch.arange(251, 314, dtype=torch.long)
+    batch = build_m03r_v16_batch_from_origin_states(
+        policy,
+        M03R_V16_SETTINGS[0],
+        torch.randn((63, 1, sequence.num_assets, 16)),
+        sequence,
+        origins,
+        sequence_global_state_start=284,
+        split="qualification",
+        split_start_inclusive=535,
+        split_stop_exclusive=629,
+        fold_index=0,
+        source_array_sha256="c" * 64,
+        asset_axis_sha256="a" * 64,
+        origin_risk_exposures=exposure,  # type: ignore[arg-type]
+    )
+    slab_receipt = "f" * 64
+    batch = replace(batch, structural_slab_receipt_sha256=slab_receipt)
+    checkpoint = M03RV16LoadedEpochCheckpoint(
+        setting_index=0,
+        setting_id=M03R_V16_SETTINGS[0].setting_id,
+        fold_index=0,
+        epoch_index=7,
+        completed_score_updates=24,
+        model_state_sha256=model_state_sha256(policy),
+        score_component_state_sha256="1" * 64,
+        checkpoint_file_sha256="2" * 64,
+        panel_schedule_sha256="3" * 64,
+        selection_target_operator_root_sha256="4" * 64,
+        action_operator_root_sha256="5" * 64,
+        source_array_sha256="c" * 64,
+        asset_axis_sha256="a" * 64,
+        head_identity=policy.v16_head_identity(),
+    )
+    slab = cast(
+        M03RV16ValidatedStructuralSlab,
+        SimpleNamespace(
+            require_fast_identity=lambda: None,
+            receipt=SimpleNamespace(
+                receipt_sha256=slab_receipt,
+                common_target_operator_root_sha256="4" * 64,
+                action_operator_root_sha256="5" * 64,
+            ),
+        ),
+    )
+    observed: dict[str, object] = {}
+
+    def _cohort(*_args: object, **kwargs: object) -> object:
+        observed.update(kwargs)
+        return "cohort-trace"
+
+    monkeypatch.setattr(runtime, "run_m03r_v16_horizon_matched_cohort_sleeve", _cohort)
+    result = run_m03r_v16_reloaded_checkpoint_cohort_qualification(
+        checkpoint,
+        batch,
+        slab,
+        post_fill_asset_returns=torch.empty(0),
+        benchmark_weights=torch.empty(0),
+        fill_available=torch.empty(0, dtype=torch.bool),
+        risk_asset_caps=torch.empty(0),
+        risk_gross_max=torch.empty(0),
+        risk_state=cast(object, None),  # type: ignore[arg-type]
+    )
+    assert result == "cohort-trace"
+    assert torch.equal(cast(torch.Tensor, observed["action_valid"]), batch.action_valid)
+    assert torch.equal(
+        cast(torch.Tensor, observed["diagnostic_valid"]),
+        batch.objective.selection_valid,
+    )
+    with pytest.raises(ValueError, match="lineage"):
+        run_m03r_v16_reloaded_checkpoint_cohort_qualification(
+            replace(checkpoint, model_state_sha256="9" * 64),
+            batch,
+            slab,
+            post_fill_asset_returns=torch.empty(0),
+            benchmark_weights=torch.empty(0),
+            fill_available=torch.empty(0, dtype=torch.bool),
+            risk_asset_caps=torch.empty(0),
+            risk_gross_max=torch.empty(0),
+            risk_state=cast(object, None),  # type: ignore[arg-type]
+        )
+
+
 def test_v16_settings_use_identical_common30_masks_and_operators() -> None:
     sequence, exposure = _surfaces()
     state = torch.randn((1, 1, sequence.num_assets, 16))
@@ -172,6 +279,11 @@ def test_v16_settings_use_identical_common30_masks_and_operators() -> None:
     )
     assert bool(batches[0].action_operators[0].qualified_asset_mask[12])
     assert not bool(batches[0].selection_target_operators[0].qualified_asset_mask[12])
+    assert bool(batches[0].action_valid[0, 12])
+    assert not bool(batches[0].objective.selection_valid[0, 12])
+    assert not bool(
+        (batches[0].objective.selection_valid & ~batches[0].action_valid).any()
+    )
     assert not bool(batches[0].action_operators[0].qualified_asset_mask[11])
     assert batches[0].objective.executable_selection_score_z.grad_fn is not None
     assert max(batches[0].action_returned_dtype_exposure_errors) <= 1.0e-5
@@ -193,11 +305,7 @@ def test_v16_score_step_mutates_encoder_and_selection_head_only() -> None:
         )
         for cursor in range(geometry.training_block_count)
     )
-    plan = next(
-        value
-        for value in plans
-        if value.episode_start == 0 and len(value.global_origins) == 63
-    )
+    plan = next(value for value in plans if value.episode_start == 0)
     policy = Top2000M03RV16PredictivePolicy(
         0,
         token_dim=16,
@@ -208,7 +316,7 @@ def test_v16_score_step_mutates_encoder_and_selection_head_only() -> None:
     batch = build_m03r_v16_batch_from_origin_states(
         policy,
         M03R_V16_SETTINGS[0],
-        torch.randn((63, 1, sequence.num_assets, 16)),
+        torch.randn((len(plan.global_origins), 1, sequence.num_assets, 16)),
         sequence,
         torch.tensor(plan.global_origins),
         sequence_global_state_start=0,

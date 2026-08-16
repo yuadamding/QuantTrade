@@ -26,11 +26,14 @@ def _rank(rank: int) -> M03RV16CapacityRankEvidence:
         score_step_receipt_sha256=("4" if rank == 0 else "5") * 64,
         structural_slab_receipt_sha256="6" * 64,
         qualification_projection_receipt_sha256=("7" if rank == 0 else "8") * 64,
+        qualification_requested_active_one_way_mass=0.01,
+        qualification_projected_active_one_way_mass=0.0025,
+        qualification_requested_to_executed_retention=0.25,
         post_update_model_state_sha256="9" * 64,
         post_update_optimizer_state_sha256="a" * 64,
         episode_state_rows=345,
-        global_origin_count=63,
-        local_origin_count=32 if rank == 0 else 31,
+        global_origin_count=43,
+        local_origin_count=22 if rank == 0 else 21,
     )
 
 
@@ -67,6 +70,7 @@ def test_v16_capacity_runner_owns_the_real_projection_call() -> None:
         ("nccl_gradient_sum_executed", False),
         ("optimizer_mutation_executed", False),
         ("qualification_projection_executed", False),
+        ("qualification_risk_repair_executed", False),
         ("scientific_checkpoint_published", True),
     ),
 )

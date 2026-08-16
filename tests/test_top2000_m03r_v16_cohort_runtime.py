@@ -58,7 +58,8 @@ def _inputs() -> dict[str, Any]:
         "asset_axis_sha256": "a" * 64,
         "decision_origin_indices": origins,
         "executable_selection_scores": scores,
-        "selection_valid": valid,
+        "action_valid": valid,
+        "diagnostic_valid": valid.clone(),
         "post_fill_asset_returns": returns,
         "benchmark_weights": benchmark,
         "fill_available": available,
@@ -115,6 +116,14 @@ def test_v16_cohort_path_is_closed_and_costs_reconcile(
         trace.policy_one_way_turnover * 0.001,
     )
     assert torch.allclose(
+        trace.benchmark_cost_by_cost[ten_bp],
+        trace.benchmark_one_way_turnover * 0.001,
+    )
+    assert torch.allclose(
+        trace.net_policy_return_by_cost[ten_bp],
+        trace.policy_gross_returns - trace.absolute_policy_cost_by_cost[ten_bp],
+    )
+    assert torch.allclose(
         trace.net_active_return_by_cost[ten_bp],
         trace.gross_active_returns - trace.incremental_active_cost_by_cost[ten_bp],
     )
@@ -136,5 +145,139 @@ def test_v16_h30_final_decision_earns_exactly_thirty_returns(
         - M03R_V16_PREDICTIVE_SPEC.qualification_origins_per_fold
         == 29
     )
-    assert float(trace.cohort_release_one_way_mass[-1]) > 0.0
+    assert trace.terminal_preliquidation_active_one_way_mass > 0.0
     assert trace.final_decision_receives_full_horizon
+
+
+def test_v16_future_label_mask_cannot_change_action_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _identity_projection)
+    baseline_inputs = _inputs()
+    changed_inputs = _inputs()
+    changed_inputs["diagnostic_valid"][:, -1] = False
+    baseline = run_m03r_v16_horizon_matched_cohort_sleeve(
+        M03R_V16_SETTINGS[1], **baseline_inputs
+    )
+    changed = run_m03r_v16_horizon_matched_cohort_sleeve(
+        M03R_V16_SETTINGS[1], **changed_inputs
+    )
+    assert baseline.diagnostic_valid_sha256 != changed.diagnostic_valid_sha256
+    assert torch.equal(baseline.policy_gross_returns, changed.policy_gross_returns)
+    assert torch.equal(
+        baseline.policy_one_way_turnover, changed.policy_one_way_turnover
+    )
+    assert torch.equal(
+        baseline.cohort_entry_one_way_mass, changed.cohort_entry_one_way_mass
+    )
+
+
+def test_v16_origin_valid_future_invalid_asset_remains_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    requested: list[torch.Tensor] = []
+
+    def _capture_projection(
+        requested_weights: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        requested.append(requested_weights.detach().clone())
+        return _identity_projection(requested_weights, *args, **kwargs)
+
+    monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _capture_projection)
+    values = _inputs()
+    values["diagnostic_valid"][0, -1] = False
+    run_m03r_v16_horizon_matched_cohort_sleeve(M03R_V16_SETTINGS[1], **values)
+    benchmark = values["benchmark_weights"][0, -1]
+    assert float(requested[0][0, -1]) > float(benchmark)
+
+
+def test_v16_projection_clipping_is_carried_in_executed_cohorts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    requested: list[torch.Tensor] = []
+
+    def _half_projection(
+        requested_weights: torch.Tensor,
+        benchmark_weights: torch.Tensor,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        requested.append(requested_weights.detach().clone())
+        projected = benchmark_weights + 0.5 * (requested_weights - benchmark_weights)
+        return SimpleNamespace(
+            projected_weights=projected,
+            requested_to_executed_retention=torch.full(
+                (requested_weights.shape[0],),
+                0.5,
+                dtype=requested_weights.dtype,
+                device=requested_weights.device,
+            ),
+        )
+
+    monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _half_projection)
+    values = _inputs()
+    values["post_fill_asset_returns"].zero_()
+    values["executable_selection_scores"][1:].zero_()
+    run_m03r_v16_horizon_matched_cohort_sleeve(M03R_V16_SETTINGS[1], **values)
+    benchmark = values["benchmark_weights"][0]
+    first_requested_active = requested[0].squeeze(0) - benchmark
+    second_requested_active = requested[1].squeeze(0) - benchmark
+    assert torch.allclose(
+        second_requested_active,
+        0.5 * first_requested_active,
+        rtol=0.0,
+        atol=2.0e-8,
+    )
+
+
+def test_v16_executed_cohorts_carry_return_drift_into_next_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    requested: list[torch.Tensor] = []
+
+    def _capture_identity(
+        requested_weights: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        requested.append(requested_weights.detach().clone())
+        return _identity_projection(requested_weights, *args, **kwargs)
+
+    monkeypatch.setattr(runtime, "project_m03r_v9_active_book", _capture_identity)
+    values = _inputs()
+    values["executable_selection_scores"][1:].zero_()
+    values["post_fill_asset_returns"].zero_()
+    values["post_fill_asset_returns"][0, 1] = -0.10
+    values["post_fill_asset_returns"][0, -1] = 0.10
+    run_m03r_v16_horizon_matched_cohort_sleeve(M03R_V16_SETTINGS[1], **values)
+
+    first = requested[0].squeeze(0)
+    benchmark = values["benchmark_weights"][0]
+    returns = values["post_fill_asset_returns"][0]
+    policy_growth = 1.0 + torch.dot(first, returns)
+    benchmark_growth = 1.0 + torch.dot(benchmark, returns)
+    drifted_active = (
+        first * (1.0 + returns) / policy_growth
+        - benchmark * (1.0 + returns) / benchmark_growth
+    )
+    expected_second = values["benchmark_weights"][1] + drifted_active
+    assert torch.allclose(
+        requested[1].squeeze(0),
+        expected_second,
+        rtol=0.0,
+        atol=2.0e-8,
+    )
+    assert not torch.allclose(
+        requested[1].squeeze(0) - values["benchmark_weights"][1],
+        first - benchmark,
+    )

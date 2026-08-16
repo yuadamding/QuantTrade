@@ -29,7 +29,7 @@ from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
     M03RV16BuiltPredictiveBatch,
 )
 
-M03R_V16_SCORE_STEP_SCHEMA = "rl-quant.top2000-dev.m03r-v16-score-step-v2"
+M03R_V16_SCORE_STEP_SCHEMA = "rl-quant.top2000-dev.m03r-v16-score-step-v3"
 
 
 class M03RV16ScoreStepError(ValueError):

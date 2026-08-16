@@ -19,19 +19,21 @@ import torch
 
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_COHORT_SLEEVE_RULE,
-    M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS_60,
+    M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS,
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
+    M03R_V16_SURVIVAL_WEIGHTS,
     M03RV16PredictiveSetting,
 )
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 from rl_quant.training.top2000_m03r_v9_projection import (
     M03RV9DeviceRiskState,
     project_m03r_v9_active_book,
 )
 
 M03R_V16_COHORT_TRACE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-horizon-matched-cohort-trace-v1"
+    "rl-quant.top2000-dev.m03r-v16-horizon-matched-cohort-trace-v2"
 )
 
 
@@ -159,19 +161,67 @@ def _new_rank_cohort(
     return result
 
 
-def _survival_lifetime() -> float:
-    survival = 1.0
-    result = 0.0
-    for hazard in M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS_60:
-        result += survival
-        survival *= 1.0 - hazard
-    return result
-
-
 @dataclass(slots=True)
-class _LiveCohort:
-    active_weights: torch.Tensor
+class _ExecutedActiveCohort:
+    executed_active_weights: torch.Tensor
     age: int = 0
+
+
+def _cohort_active_book(
+    cohorts: list[_ExecutedActiveCohort],
+    *,
+    assets: int,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    if not cohorts:
+        return torch.zeros(assets, dtype=torch.float64, device=reference.device)
+    return torch.stack(tuple(value.executed_active_weights for value in cohorts)).sum(
+        dim=0
+    )
+
+
+def _reconcile_executed_cohorts(
+    cohorts: list[_ExecutedActiveCohort],
+    target_active: torch.Tensor,
+) -> list[_ExecutedActiveCohort]:
+    """Minimum-disturbance attribution of one executed aggregate active book."""
+
+    target = target_active.to(torch.float64)
+    if not cohorts:
+        if float(target.abs().max()) > 2.0e-12:
+            raise M03RV16CohortRuntimeError(
+                "V16 executed active book has no cohort attribution"
+            )
+        return []
+    requested = torch.stack(
+        tuple(value.executed_active_weights.to(torch.float64) for value in cohorts)
+    )
+    difference = target - requested.sum(dim=0)
+    strength = requested.abs()
+    per_asset = strength.sum(dim=0)
+    cohort_mass = strength.sum(dim=1)
+    total_mass = cohort_mass.sum()
+    fallback = (
+        cohort_mass / total_mass
+        if float(total_mass) > 0.0
+        else torch.full_like(cohort_mass, 1.0 / len(cohorts))
+    )
+    shares = torch.where(
+        per_asset.unsqueeze(0) > 1.0e-18,
+        strength / per_asset.clamp_min(1.0e-18).unsqueeze(0),
+        fallback.unsqueeze(1).expand_as(strength),
+    )
+    reconciled = requested + shares * difference.unsqueeze(0)
+    residual = target - reconciled.sum(dim=0)
+    reconciled[torch.argmax(cohort_mass)] += residual
+    if not torch.allclose(reconciled.sum(dim=0), target, rtol=0.0, atol=2.0e-12):
+        raise M03RV16CohortRuntimeError(
+            "V16 executed cohorts do not reconcile to the active book"
+        )
+    return [
+        _ExecutedActiveCohort(row, cohort.age)
+        for row, cohort in zip(reconciled, cohorts, strict=True)
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +233,8 @@ class M03RV16CohortTrace:
     checkpoint_model_state_sha256: str
     qualification_batch_receipt_sha256: str
     asset_axis_sha256: str
+    action_valid_sha256: str
+    diagnostic_valid_sha256: str
     risk_manifest_sha256: str
     risk_state_sha256: str
     decision_origin_indices: torch.Tensor
@@ -197,12 +249,17 @@ class M03RV16CohortTrace:
     weighted_mean_cohort_age: torch.Tensor
     requested_to_executed_retention: torch.Tensor
     absolute_policy_cost_by_cost: tuple[torch.Tensor, ...]
+    benchmark_cost_by_cost: tuple[torch.Tensor, ...]
     incremental_active_cost_by_cost: tuple[torch.Tensor, ...]
+    net_policy_return_by_cost: tuple[torch.Tensor, ...]
+    net_benchmark_return_by_cost: tuple[torch.Tensor, ...]
     net_active_return_by_cost: tuple[torch.Tensor, ...]
     terminal_liquidation_one_way_turnover: float
     terminal_preliquidation_active_one_way_mass: float
     array_sha256: tuple[str, ...]
     trace_sha256: str
+    hold_target_sessions: int = LEGACY_HOLD30_TARGET_SPEC.target_sessions
+    hold_target_spec_sha256: str = LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     cohort_rule: str = M03R_V16_COHORT_SLEEVE_RULE
     action_mask_uses_future_availability: bool = False
     final_decision_receives_full_horizon: bool = True
@@ -229,7 +286,10 @@ class M03RV16CohortTrace:
             self.weighted_mean_cohort_age,
             self.requested_to_executed_retention,
             *self.absolute_policy_cost_by_cost,
+            *self.benchmark_cost_by_cost,
             *self.incremental_active_cost_by_cost,
+            *self.net_policy_return_by_cost,
+            *self.net_benchmark_return_by_cost,
             *self.net_active_return_by_cost,
         )
 
@@ -246,6 +306,8 @@ class M03RV16CohortTrace:
                 self.qualification_batch_receipt_sha256
             ),
             "asset_axis_sha256": self.asset_axis_sha256,
+            "action_valid_sha256": self.action_valid_sha256,
+            "diagnostic_valid_sha256": self.diagnostic_valid_sha256,
             "risk_manifest_sha256": self.risk_manifest_sha256,
             "risk_state_sha256": self.risk_state_sha256,
             "terminal_liquidation_one_way_turnover": (
@@ -255,6 +317,8 @@ class M03RV16CohortTrace:
                 self.terminal_preliquidation_active_one_way_mass
             ),
             "array_sha256": self.array_sha256,
+            "hold_target_sessions": self.hold_target_sessions,
+            "hold_target_spec_sha256": self.hold_target_spec_sha256,
             "cohort_rule": self.cohort_rule,
             "action_mask_uses_future_availability": (
                 self.action_mask_uses_future_availability
@@ -305,6 +369,12 @@ class M03RV16CohortTrace:
             != len(spec.evaluation_cost_basis_points)
             or len(self.incremental_active_cost_by_cost)
             != len(spec.evaluation_cost_basis_points)
+            or len(self.benchmark_cost_by_cost)
+            != len(spec.evaluation_cost_basis_points)
+            or len(self.net_policy_return_by_cost)
+            != len(spec.evaluation_cost_basis_points)
+            or len(self.net_benchmark_return_by_cost)
+            != len(spec.evaluation_cost_basis_points)
             or len(self.net_active_return_by_cost)
             != len(spec.evaluation_cost_basis_points)
             or bool((self.policy_one_way_turnover < 0.0).any())
@@ -318,6 +388,8 @@ class M03RV16CohortTrace:
             or not math.isfinite(self.terminal_preliquidation_active_one_way_mass)
             or self.terminal_preliquidation_active_one_way_mass < 0.0
             or self.array_sha256 != tuple(_tensor_sha256(row) for row in self.arrays)
+            or self.hold_target_sessions != LEGACY_HOLD30_TARGET_SPEC.target_sessions
+            or self.hold_target_spec_sha256 != LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
             or self.cohort_rule != M03R_V16_COHORT_SLEEVE_RULE
             or self.action_mask_uses_future_availability
             or not self.final_decision_receives_full_horizon
@@ -339,10 +411,55 @@ class M03RV16CohortTrace:
                 self.qualification_batch_receipt_sha256,
             ),
             ("asset_axis_sha256", self.asset_axis_sha256),
+            ("action_valid_sha256", self.action_valid_sha256),
+            ("diagnostic_valid_sha256", self.diagnostic_valid_sha256),
             ("risk_manifest_sha256", self.risk_manifest_sha256),
             ("risk_state_sha256", self.risk_state_sha256),
         ):
             _digest(name, value)
+        for (
+            policy_cost,
+            benchmark_cost,
+            incremental,
+            net_policy,
+            net_benchmark,
+            net_active,
+        ) in zip(
+            self.absolute_policy_cost_by_cost,
+            self.benchmark_cost_by_cost,
+            self.incremental_active_cost_by_cost,
+            self.net_policy_return_by_cost,
+            self.net_benchmark_return_by_cost,
+            self.net_active_return_by_cost,
+            strict=True,
+        ):
+            if (
+                not torch.allclose(
+                    incremental,
+                    policy_cost - benchmark_cost,
+                    rtol=1.0e-6,
+                    atol=1.0e-9,
+                )
+                or not torch.allclose(
+                    net_policy,
+                    self.policy_gross_returns - policy_cost,
+                    rtol=1.0e-6,
+                    atol=1.0e-9,
+                )
+                or not torch.allclose(
+                    net_benchmark,
+                    self.benchmark_gross_returns - benchmark_cost,
+                    rtol=1.0e-6,
+                    atol=1.0e-9,
+                )
+                or not torch.allclose(
+                    net_active,
+                    net_policy - net_benchmark,
+                    rtol=1.0e-6,
+                    atol=1.0e-9,
+                )
+            ):
+                raise M03RV16CohortRuntimeError("V16 cohort cost evidence drifted")
 
     @property
     def gross_active_returns(self) -> torch.Tensor:
@@ -360,6 +477,14 @@ class M03RV16CohortTrace:
         if incremental_turnover <= 0.0:
             return math.inf
         return 10_000.0 * gross / incremental_turnover
+
+    def absolute_policy_break_even_one_way_cost_basis_points(self) -> float:
+        self.validate()
+        gross = float(self.policy_gross_returns.sum())
+        turnover = float(self.policy_one_way_turnover.sum())
+        if gross <= 0.0 or turnover <= 0.0:
+            return 0.0
+        return 10_000.0 * gross / turnover
 
 
 def _drift(
@@ -381,7 +506,8 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
     asset_axis_sha256: str,
     decision_origin_indices: torch.Tensor,
     executable_selection_scores: torch.Tensor,
-    selection_valid: torch.Tensor,
+    action_valid: torch.Tensor,
+    diagnostic_valid: torch.Tensor,
     post_fill_asset_returns: torch.Tensor,
     benchmark_weights: torch.Tensor,
     fill_available: torch.Tensor,
@@ -402,8 +528,13 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         or decision_origin_indices.dtype != torch.int64
         or executable_selection_scores.ndim != 2
         or executable_selection_scores.shape[0] != decisions
-        or selection_valid.shape != executable_selection_scores.shape
-        or selection_valid.dtype != torch.bool
+        or action_valid.shape != executable_selection_scores.shape
+        or diagnostic_valid.shape != executable_selection_scores.shape
+        or action_valid.dtype != torch.bool
+        or diagnostic_valid.dtype != torch.bool
+        or action_valid.device != executable_selection_scores.device
+        or diagnostic_valid.device != executable_selection_scores.device
+        or bool((diagnostic_valid & ~action_valid).any())
     ):
         raise M03RV16CohortRuntimeError("V16 cohort decision inputs drifted")
     assets = executable_selection_scores.shape[1]
@@ -455,13 +586,15 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         entry_mass = spec.cohort_total_active_one_way_mass / 30.0
         fixed_horizon = 30
     else:
-        entry_mass = spec.cohort_total_active_one_way_mass / _survival_lifetime()
+        entry_mass = spec.cohort_total_active_one_way_mass / math.fsum(
+            M03R_V16_SURVIVAL_WEIGHTS
+        )
         fixed_horizon = None
 
     cash = risk_state.cash_index
     current_policy = benchmark_weights[0].clone()
     current_benchmark = current_policy.clone()
-    cohorts: list[_LiveCohort] = []
+    cohorts: list[_ExecutedActiveCohort] = []
     policy_returns: list[torch.Tensor] = []
     benchmark_returns: list[torch.Tensor] = []
     policy_turnover: list[torch.Tensor] = []
@@ -474,13 +607,41 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
 
     for step in range(steps):
         benchmark = benchmark_weights[step]
-        existing = torch.zeros(assets, dtype=torch.float64, device=benchmark.device)
+        observed_active = _cohort_active_book(
+            cohorts,
+            assets=assets,
+            reference=benchmark,
+        )
+        expected_active = (current_policy - current_benchmark).to(torch.float64)
+        if not torch.allclose(observed_active, expected_active, rtol=0.0, atol=2.0e-10):
+            raise M03RV16CohortRuntimeError(
+                "V16 cohort ledger does not match the carried active book"
+            )
+        previous_rows = tuple(
+            cohort.executed_active_weights.clone() for cohort in cohorts
+        )
         for cohort in cohorts:
-            existing += cohort.active_weights
+            if fixed_horizon is not None:
+                multiplier = 0.0 if cohort.age >= fixed_horizon else 1.0
+            elif cohort.age >= 30:
+                multiplier = 0.0
+            elif cohort.age > 0:
+                multiplier = (
+                    1.0 - M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS[cohort.age - 1]
+                )
+            else:
+                multiplier = 1.0
+            cohort.executed_active_weights = cohort.executed_active_weights * multiplier
+        existing = _cohort_active_book(
+            cohorts,
+            assets=assets,
+            reference=benchmark,
+        )
         anchor = benchmark.to(torch.float64) + existing
         entry = torch.zeros_like(existing)
+        entry_added = False
         if step < decisions:
-            mask = selection_valid[step] & fill_available[step]
+            mask = action_valid[step] & fill_available[step]
             mask = mask.clone()
             mask[cash] = False
             entry = _new_rank_cohort(
@@ -492,8 +653,18 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
                 one_way_mass=entry_mass,
             )
             if float(entry.abs().sum()) > 0.0:
-                cohorts.append(_LiveCohort(entry))
-        requested = (anchor + entry).to(benchmark.dtype).unsqueeze(0)
+                cohorts.append(_ExecutedActiveCohort(entry))
+                entry_added = True
+        requested_active = _cohort_active_book(
+            cohorts,
+            assets=assets,
+            reference=benchmark,
+        )
+        requested = (
+            (benchmark.to(torch.float64) + requested_active)
+            .to(benchmark.dtype)
+            .unsqueeze(0)
+        )
         projection = project_m03r_v9_active_book(
             requested,
             benchmark.unsqueeze(0),
@@ -507,45 +678,45 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
             expected_manifest_sha256=risk_state.manifest_sha256,
         )
         executed = projection.projected_weights.squeeze(0)
+        cohorts = _reconcile_executed_cohorts(
+            cohorts,
+            (executed - benchmark).to(torch.float64),
+        )
+        if not torch.allclose(
+            _cohort_active_book(cohorts, assets=assets, reference=benchmark),
+            (executed - benchmark).to(torch.float64),
+            rtol=0.0,
+            atol=2.0e-12,
+        ):
+            raise M03RV16CohortRuntimeError(
+                "V16 projection was not reconciled into executed cohorts"
+            )
+        old_count = len(previous_rows)
+        executed_release = math.fsum(
+            0.5
+            * float(
+                (before.abs() - cohorts[index].executed_active_weights.abs())
+                .clamp_min(0.0)
+                .sum()
+            )
+            for index, before in enumerate(previous_rows)
+        )
+        executed_entry = (
+            0.5 * float(cohorts[-1].executed_active_weights.abs().sum())
+            if entry_added and len(cohorts) == old_count + 1
+            else 0.0
+        )
         policy_turnover.append(0.5 * (executed - current_policy).abs().sum())
         benchmark_turnover.append(0.5 * (benchmark - current_benchmark).abs().sum())
-        current_policy, policy_return = _drift(executed, post_fill_asset_returns[step])
-        current_benchmark, benchmark_return = _drift(
-            benchmark, post_fill_asset_returns[step]
-        )
-        policy_returns.append(policy_return)
-        benchmark_returns.append(benchmark_return)
         active_mass_rows.append(
             0.5 * (executed - benchmark).to(torch.float64).abs().sum()
         )
-        entry_rows.append(0.5 * entry.abs().sum())
+        entry_rows.append(executed.new_tensor(executed_entry))
+        release_rows.append(executed.new_tensor(executed_release))
         retention_rows.append(projection.requested_to_executed_retention.squeeze(0))
-
-        released = 0.0
-        retained: list[_LiveCohort] = []
-        for cohort in cohorts:
-            cohort.age += 1
-            before = cohort.active_weights
-            if fixed_horizon is not None:
-                multiplier = 0.0 if cohort.age >= fixed_horizon else 1.0
-            else:
-                hazard_index = (
-                    min(
-                        cohort.age,
-                        len(M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS_60),
-                    )
-                    - 1
-                )
-                multiplier = (
-                    1.0 - M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS_60[hazard_index]
-                )
-            cohort.active_weights = before * multiplier
-            released += 0.5 * float((before - cohort.active_weights).abs().sum())
-            if float(cohort.active_weights.abs().sum()) > 1.0e-14:
-                retained.append(cohort)
-        cohorts = retained
-        release_rows.append(executed.new_tensor(released))
-        masses = [0.5 * float(value.active_weights.abs().sum()) for value in cohorts]
+        masses = [
+            0.5 * float(value.executed_active_weights.abs().sum()) for value in cohorts
+        ]
         total_mass = math.fsum(masses)
         mean_age = (
             math.fsum(
@@ -557,6 +728,25 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         )
         mean_age_rows.append(executed.new_tensor(mean_age))
 
+        current_policy, policy_return = _drift(executed, post_fill_asset_returns[step])
+        current_benchmark, benchmark_return = _drift(
+            benchmark, post_fill_asset_returns[step]
+        )
+        policy_returns.append(policy_return)
+        benchmark_returns.append(benchmark_return)
+        policy_growth = 1.0 + policy_return.to(torch.float64)
+        for cohort in cohorts:
+            cohort.executed_active_weights = (
+                cohort.executed_active_weights
+                * (1.0 + post_fill_asset_returns[step].to(torch.float64))
+                / policy_growth
+            )
+            cohort.age += 1
+        cohorts = _reconcile_executed_cohorts(
+            cohorts,
+            (current_policy - current_benchmark).to(torch.float64),
+        )
+
     terminal_active = 0.5 * float((current_policy - current_benchmark).abs().sum())
     terminal_turnover = terminal_active
     policy_turnover[-1] = policy_turnover[-1] + policy_turnover[-1].new_tensor(
@@ -566,16 +756,24 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
     benchmark_return_tensor = torch.stack(benchmark_returns)
     policy_turnover_tensor = torch.stack(policy_turnover)
     benchmark_turnover_tensor = torch.stack(benchmark_turnover)
-    gross_active = policy_return_tensor - benchmark_return_tensor
     absolute_costs = tuple(
         policy_turnover_tensor * (cost / 10_000.0)
         for cost in spec.evaluation_cost_basis_points
     )
-    incremental_costs = tuple(
-        (policy_turnover_tensor - benchmark_turnover_tensor) * (cost / 10_000.0)
+    benchmark_costs = tuple(
+        benchmark_turnover_tensor * (cost / 10_000.0)
         for cost in spec.evaluation_cost_basis_points
     )
-    net_active = tuple(gross_active - value for value in incremental_costs)
+    incremental_costs = tuple(
+        policy - benchmark
+        for policy, benchmark in zip(absolute_costs, benchmark_costs, strict=True)
+    )
+    net_policy = tuple(policy_return_tensor - cost for cost in absolute_costs)
+    net_benchmark = tuple(benchmark_return_tensor - cost for cost in benchmark_costs)
+    net_active = tuple(
+        policy - benchmark
+        for policy, benchmark in zip(net_policy, net_benchmark, strict=True)
+    )
     provisional = M03RV16CohortTrace(
         setting_index=setting.setting_index,
         setting_id=setting.setting_id,
@@ -584,6 +782,8 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         checkpoint_model_state_sha256=checkpoint_model_state_sha256,
         qualification_batch_receipt_sha256=qualification_batch_receipt_sha256,
         asset_axis_sha256=asset_axis_sha256,
+        action_valid_sha256=_tensor_sha256(action_valid),
+        diagnostic_valid_sha256=_tensor_sha256(diagnostic_valid),
         risk_manifest_sha256=risk_state.manifest_sha256,
         risk_state_sha256=risk_state.state_sha256,
         decision_origin_indices=decision_origin_indices.detach().clone(),
@@ -598,7 +798,10 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         weighted_mean_cohort_age=torch.stack(mean_age_rows),
         requested_to_executed_retention=torch.stack(retention_rows),
         absolute_policy_cost_by_cost=absolute_costs,
+        benchmark_cost_by_cost=benchmark_costs,
         incremental_active_cost_by_cost=incremental_costs,
+        net_policy_return_by_cost=net_policy,
+        net_benchmark_return_by_cost=net_benchmark,
         net_active_return_by_cost=net_active,
         terminal_liquidation_one_way_turnover=terminal_turnover,
         terminal_preliquidation_active_one_way_mass=terminal_active,

@@ -26,6 +26,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_SETTINGS,
     m03r_v16_selection_target_weights_from_id,
 )
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 from rl_quant.training.hold30_top2000_development import (
     Top2000VerifiedDevelopmentCache,
 )
@@ -46,10 +47,10 @@ from rl_quant.training.top2000_m03r_v9_risk_materialization import (
 )
 
 M03R_V16_STRUCTURAL_SLAB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-package-owned-structural-slab-v1"
+    "rl-quant.top2000-dev.m03r-v16-package-owned-structural-slab-v2"
 )
 M03R_V16_STRUCTURAL_SLAB_FILE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-package-owned-structural-slab-file-v1"
+    "rl-quant.top2000-dev.m03r-v16-package-owned-structural-slab-file-v2"
 )
 _MAX_SLAB_BYTES = 2 * 1024**3
 _RETURNED_DTYPE_ORTHOGONALITY_TOLERANCE = 1.0e-5
@@ -239,6 +240,8 @@ class M03RV16StructuralSlabReceipt:
     minimum_target_qualified_assets: int
     minimum_action_residual_degrees_of_freedom: int
     minimum_target_residual_degrees_of_freedom: int
+    hold_target_sessions: int = LEGACY_HOLD30_TARGET_SPEC.target_sessions
+    hold_target_spec_sha256: str = LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     all_scheduled_origins_qualified: bool = True
     economic_optimizer_updates: int = 0
     reinforcement_learning_updates: int = 0
@@ -283,6 +286,8 @@ class M03RV16StructuralSlabReceipt:
             )
             <= 0
             or not self.all_scheduled_origins_qualified
+            or self.hold_target_sessions != LEGACY_HOLD30_TARGET_SPEC.target_sessions
+            or self.hold_target_spec_sha256 != LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
             or self.economic_optimizer_updates != 0
             or self.reinforcement_learning_updates != 0
             or self.outer_2026_accessed
@@ -375,6 +380,189 @@ class M03RV16StructuralSlab:
             if value.origin_state_index == origin_state_index:
                 return value
         raise M03RV16StructuralError("V16 origin is absent from structural slab")
+
+
+_VALIDATED_SLAB_ISSUER = object()
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16DeviceActionOperator:
+    """One action operator materialized once on a worker device."""
+
+    origin_state_index: int
+    qualified_asset_mask: torch.Tensor
+    selected_indices: torch.Tensor
+    qualified_design: torch.Tensor
+    qualified_weights: torch.Tensor
+    coefficient_map: torch.Tensor
+    operator_receipt_sha256: str
+
+    def apply(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            value.ndim != 1
+            or value.numel() != self.qualified_asset_mask.numel()
+            or value.device != self.qualified_asset_mask.device
+            or not value.is_floating_point()
+        ):
+            raise M03RV16StructuralError("V16 device action value drifted")
+        target = value.index_select(0, self.selected_indices).to(torch.float64)
+        selected_residual = target - self.qualified_design @ (
+            self.coefficient_map @ target
+        )
+        residual = torch.zeros_like(value)
+        residual[self.selected_indices] = selected_residual.to(value.dtype)
+        returned = residual.index_select(0, self.selected_indices).to(torch.float64)
+        exposure_error = (
+            (self.qualified_design.T @ (self.qualified_weights * returned)).abs().max()
+        )
+        return residual, exposure_error
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16DevicePreparedOrigin:
+    origin_state_index: int
+    action_operator: M03RV16DeviceActionOperator
+    common_target_mask: torch.Tensor
+    economic_targets: tuple[torch.Tensor, ...]
+    standardized_targets: tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16ValidatedStructuralSlab:
+    """Startup-qualified slab authority with O(1) mutation-checked lookup."""
+
+    slab: M03RV16StructuralSlab
+    origin_to_slot: dict[int, int]
+    target_tensor_versions: tuple[tuple[int, ...], ...]
+    receipt_sha256: str
+    device_action_operator_cache: dict[
+        tuple[int, str, int | None], M03RV16DeviceActionOperator
+    ]
+    device_prepared_origin_cache: dict[
+        tuple[int, str, int | None], M03RV16DevicePreparedOrigin
+    ]
+    _issuer: object
+
+    @property
+    def receipt(self) -> M03RV16StructuralSlabReceipt:
+        return self.slab.receipt
+
+    @property
+    def origins(self) -> tuple[M03RV16PreparedOrigin, ...]:
+        return self.slab.origins
+
+    def require_fast_identity(self) -> None:
+        if (
+            self._issuer is not _VALIDATED_SLAB_ISSUER
+            or len(self.origin_to_slot) != len(self.slab.origins)
+            or len(self.target_tensor_versions) != len(self.slab.origins)
+        ):
+            raise M03RV16StructuralError("V16 validated slab authority drifted")
+
+    def origin(self, origin_state_index: int) -> M03RV16PreparedOrigin:
+        self.require_fast_identity()
+        slot = self.origin_to_slot.get(origin_state_index)
+        if slot is None:
+            raise M03RV16StructuralError("V16 origin is absent from structural slab")
+        value = self.slab.origins[slot]
+        if value.origin_state_index != origin_state_index:
+            raise M03RV16StructuralError("V16 structural slab lookup drifted")
+        value.action_operator.require_fast_identity()
+        value.common_target_operator.require_fast_identity()
+        observed_versions = tuple(
+            tensor._version
+            for tensor in (*value.economic_targets, *value.standardized_targets)
+        )
+        if observed_versions != self.target_tensor_versions[slot]:
+            raise M03RV16StructuralError("V16 structural target tensor mutated")
+        return value
+
+    def device_action_operator(
+        self,
+        origin_state_index: int,
+        device: torch.device,
+    ) -> M03RV16DeviceActionOperator:
+        value = self.origin(origin_state_index)
+        slot = self.origin_to_slot[origin_state_index]
+        key = (slot, device.type, device.index)
+        cached = self.device_action_operator_cache.get(key)
+        if cached is not None:
+            return cached
+        operator = value.action_operator
+        mask = operator.qualified_asset_mask.to(device=device)
+        created = M03RV16DeviceActionOperator(
+            origin_state_index=origin_state_index,
+            qualified_asset_mask=mask,
+            selected_indices=torch.nonzero(mask, as_tuple=False).flatten(),
+            qualified_design=operator.base.qualified_design.to(
+                device=device, dtype=torch.float64
+            ),
+            qualified_weights=operator.base.qualified_weights.to(
+                device=device, dtype=torch.float64
+            ),
+            coefficient_map=operator.coefficient_map.to(
+                device=device, dtype=torch.float64
+            ),
+            operator_receipt_sha256=operator.receipt_sha256,
+        )
+        self.device_action_operator_cache[key] = created
+        return created
+
+    def device_origin(
+        self,
+        origin_state_index: int,
+        device: torch.device,
+    ) -> M03RV16DevicePreparedOrigin:
+        value = self.origin(origin_state_index)
+        slot = self.origin_to_slot[origin_state_index]
+        key = (slot, device.type, device.index)
+        cached = self.device_prepared_origin_cache.get(key)
+        if cached is not None:
+            return cached
+        created = M03RV16DevicePreparedOrigin(
+            origin_state_index=origin_state_index,
+            action_operator=self.device_action_operator(origin_state_index, device),
+            common_target_mask=value.common_target_operator.qualified_asset_mask.to(
+                device=device
+            ),
+            economic_targets=tuple(
+                row.to(device=device) for row in value.economic_targets
+            ),
+            standardized_targets=tuple(
+                row.to(device=device) for row in value.standardized_targets
+            ),
+        )
+        self.device_prepared_origin_cache[key] = created
+        return created
+
+
+def qualify_m03r_v16_structural_slab(
+    slab: M03RV16StructuralSlab,
+) -> M03RV16ValidatedStructuralSlab:
+    """Deep-validate once, then issue a fast runtime authority."""
+
+    slab.validate()
+    origin_to_slot = {
+        value.origin_state_index: index for index, value in enumerate(slab.origins)
+    }
+    if len(origin_to_slot) != len(slab.origins):
+        raise M03RV16StructuralError("V16 structural slab origins are not unique")
+    versions = tuple(
+        tuple(
+            tensor._version
+            for tensor in (*value.economic_targets, *value.standardized_targets)
+        )
+        for value in slab.origins
+    )
+    return M03RV16ValidatedStructuralSlab(
+        slab=slab,
+        origin_to_slot=origin_to_slot,
+        target_tensor_versions=versions,
+        receipt_sha256=slab.receipt.receipt_sha256,
+        device_action_operator_cache={},
+        device_prepared_origin_cache={},
+        _issuer=_VALIDATED_SLAB_ISSUER,
+    )
 
 
 def _cache_simple_returns(cache: Top2000VerifiedDevelopmentCache) -> torch.Tensor:
@@ -694,7 +882,7 @@ def load_m03r_v16_structural_slab(
     *,
     expected_file_sha256: str,
     expected_receipt_sha256: str,
-) -> M03RV16StructuralSlab:
+) -> M03RV16ValidatedStructuralSlab:
     expected_file_sha256 = _digest("expected_file_sha256", expected_file_sha256)
     expected_receipt_sha256 = _digest(
         "expected_receipt_sha256", expected_receipt_sha256
@@ -771,19 +959,22 @@ def load_m03r_v16_structural_slab(
     ):
         raise M03RV16StructuralError("V16 structural slab receipt drifted")
     result = M03RV16StructuralSlab(receipt=receipt, origins=origins)
-    result.validate()
-    return result
+    return qualify_m03r_v16_structural_slab(result)
 
 
 __all__ = [
     "M03R_V16_STRUCTURAL_SLAB_FILE_SCHEMA",
     "M03R_V16_STRUCTURAL_SLAB_SCHEMA",
     "M03RV16PreparedOrigin",
+    "M03RV16DeviceActionOperator",
+    "M03RV16DevicePreparedOrigin",
     "M03RV16StructuralError",
     "M03RV16StructuralSlab",
     "M03RV16StructuralSlabReceipt",
+    "M03RV16ValidatedStructuralSlab",
     "build_m03r_v16_structural_slab",
     "load_m03r_v16_structural_slab",
+    "qualify_m03r_v16_structural_slab",
     "scheduled_m03r_v16_origins",
     "write_m03r_v16_structural_slab",
 ]

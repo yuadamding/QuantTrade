@@ -23,7 +23,7 @@ from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
 )
 
-M03R_V16_OPTIMIZER_SCHEMA = "rl-quant.top2000-dev.m03r-v16-optimizer-v2"
+M03R_V16_OPTIMIZER_SCHEMA = "rl-quant.top2000-dev.m03r-v16-optimizer-v3"
 M03RV16TrainingStage = Literal["score"]
 
 

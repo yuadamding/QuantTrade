@@ -18,6 +18,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03RV16ProtocolError,
     resolve_m03r_v16_setting,
 )
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 
 def test_v16_is_a_selection_only_primary_hypothesis_screen() -> None:
@@ -37,6 +38,12 @@ def test_v16_is_a_selection_only_primary_hypothesis_screen() -> None:
     assert M03R_V16_PREDICTIVE_SPEC.economic_optimizer_updates == 0
     assert M03R_V16_PREDICTIVE_SPEC.outer_2026_access_authorized is False
     assert M03R_V16_PREDICTIVE_SPEC.reportable is False
+    assert M03R_V16_PREDICTIVE_SPEC.hold_target_sessions == 30
+    assert M03R_V16_PREDICTIVE_SPEC.hold_age_cap_sessions == 60
+    assert M03R_V16_PREDICTIVE_SPEC.hold_prior_family == "legacy-hold30-v1"
+    assert M03R_V16_PREDICTIVE_SPEC.hold_target_spec_sha256 == (
+        LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
+    )
     assert M03R_V16_FILL_RULE.startswith("observe-close-t-fill-next-close")
 
 

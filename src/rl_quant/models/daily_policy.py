@@ -51,8 +51,14 @@ from rl_quant.models.hold30_hazard import (
     HOLD30_HAZARD_MIN,
     Hold30HazardBoundMode,
     bound_hold30_hazard_residual,
-    clip_hold30_hazard_residual,
+    clip_hold30_hazard_residual as _clip_hold30_hazard_residual,
     straight_through_exact_hold_decision,
+)
+from rl_quant.protocol.hold_target import (
+    DEFAULT_HOLD_TARGET_SPEC,
+    LEGACY_HOLD30_TARGET_SPEC,
+    HoldTargetSpec,
+    hold_release_hazard as _hold_release_hazard,
 )
 from rl_quant.protocol.constraints import project_capped_risky_simplex
 from rl_quant.protocol.hold30 import (
@@ -282,24 +288,55 @@ class Hold30Intent:
     exit_action_v6: M03RV6ExitAction | None = None
 
 
-def _clip_with_zero_boundary_gradient(
-    value: torch.Tensor,
-    lower: float,
-    upper: float,
-) -> torch.Tensor:
-    """Frozen endpoint-gradient behavior used by the v2/v3 release clock."""
-
-    lo = value.new_tensor(lower)
-    hi = value.new_tensor(upper)
-    return torch.where(value <= lo, lo, torch.where(value >= hi, hi, value))
-
-
 def hold30_age_prior_logit(age: torch.Tensor) -> torch.Tensor:
     """Reference age clock ``beta(a)`` for post-return fill-time ages."""
 
     if not age.is_floating_point():
         age = age.to(dtype=torch.float32)
     return -2.0 + (age.clamp(min=0.0, max=float(HOLD30_AGE_CAP)) - 30.0) / 4.0
+
+
+def clip_hold30_hazard_residual(raw_hazard: torch.Tensor) -> torch.Tensor:
+    """Preserve the historical public import while delegating to its owner."""
+
+    return _clip_hold30_hazard_residual(raw_hazard)
+
+
+def hold_age_prior_logit(
+    age: torch.Tensor,
+    *,
+    hold_spec: HoldTargetSpec = DEFAULT_HOLD_TARGET_SPEC,
+) -> torch.Tensor:
+    """Generic soft-holding age clock; new callers default to three sessions."""
+
+    hold_spec.validate()
+    if not age.is_floating_point():
+        age = age.to(dtype=torch.float32)
+    return (
+        -2.0
+        + (
+            age.clamp(min=0.0, max=float(hold_spec.age_cap_sessions))
+            - hold_spec.calibrated_release_location
+        )
+        / hold_spec.release_transition_width_sessions
+    )
+
+
+def hold_release_hazard(
+    age: torch.Tensor,
+    hazard_residual: torch.Tensor,
+    *,
+    hold_spec: HoldTargetSpec = DEFAULT_HOLD_TARGET_SPEC,
+    exact_hold_probability: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Generic normalized release hazard under one immutable hold target."""
+
+    return _hold_release_hazard(
+        age,
+        hazard_residual,
+        hold_spec=hold_spec,
+        exact_hold_probability=exact_hold_probability,
+    )
 
 
 def hold30_release_hazard(
@@ -318,50 +355,28 @@ def hold30_release_hazard(
     separate exact hold atom rather than hazard-logit saturation.
     """
 
-    if not hazard_residual.is_floating_point():
-        raise TypeError("hazard_residual must be a floating-point tensor")
-    beta = hold30_age_prior_logit(
-        age.to(device=hazard_residual.device, dtype=hazard_residual.dtype)
+    return hold_release_hazard(
+        age,
+        hazard_residual,
+        hold_spec=LEGACY_HOLD30_TARGET_SPEC,
+        exact_hold_probability=exact_hold_probability,
     )
-    bounded = clip_hold30_hazard_residual(hazard_residual)
-    p_min = torch.sigmoid(
-        _clip_with_zero_boundary_gradient(beta + HOLD30_HAZARD_MIN, -20.0, 20.0)
-    )
-    release = torch.sigmoid(
-        _clip_with_zero_boundary_gradient(beta + bounded, -20.0, 20.0)
-    )
-    normalized = (release - p_min) / (1.0 - p_min)
-    if exact_hold_probability is None:
-        return normalized
-    if (
-        not exact_hold_probability.is_floating_point()
-        or not bool(torch.isfinite(exact_hold_probability).all())
-        or bool(((exact_hold_probability < 0) | (exact_hold_probability > 1)).any())
-    ):
-        raise ValueError("exact_hold_probability must be finite and lie in [0,1]")
-    probability = exact_hold_probability.to(
-        device=normalized.device,
-        dtype=normalized.dtype,
-    )
-    try:
-        return normalized * (1.0 - probability)
-    except RuntimeError as error:
-        raise ValueError(
-            "exact_hold_probability must broadcast with the release hazard"
-        ) from error
 
 
-def hold30_proposed_release(
+def hold_proposed_release(
     age_notional: torch.Tensor,
     hazard_residual: torch.Tensor,
     *,
+    hold_spec: HoldTargetSpec = DEFAULT_HOLD_TARGET_SPEC,
     exact_hold_probability: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return gross proposed release by asset from ``[..., asset, 61]`` cohort notionals."""
+    """Return gross proposed release under one immutable holding target."""
 
-    if age_notional.ndim < 2 or age_notional.shape[-1] != HOLD30_AGE_CAP + 1:
+    hold_spec.validate()
+    age_bins = hold_spec.age_cap_sessions + 1
+    if age_notional.ndim < 2 or age_notional.shape[-1] != age_bins:
         raise ValueError(
-            f"age_notional must end in {HOLD30_AGE_CAP + 1} age bins; got {tuple(age_notional.shape)}"
+            f"age_notional must end in {age_bins} age bins; got {tuple(age_notional.shape)}"
         )
     if hazard_residual.shape != age_notional.shape[:-1]:
         raise ValueError(
@@ -377,12 +392,11 @@ def hold30_proposed_release(
             f"got {tuple(exact_hold_probability.shape)} and "
             f"{tuple(hazard_residual.shape)}"
         )
-    ages = torch.arange(
-        HOLD30_AGE_CAP + 1, device=age_notional.device, dtype=age_notional.dtype
-    )
-    hazards = hold30_release_hazard(
+    ages = torch.arange(age_bins, device=age_notional.device, dtype=age_notional.dtype)
+    hazards = hold_release_hazard(
         ages,
         hazard_residual.unsqueeze(-1).to(dtype=age_notional.dtype),
+        hold_spec=hold_spec,
         exact_hold_probability=(
             None
             if exact_hold_probability is None
@@ -390,6 +404,22 @@ def hold30_proposed_release(
         ),
     )
     return (age_notional * hazards).sum(dim=-1)
+
+
+def hold30_proposed_release(
+    age_notional: torch.Tensor,
+    hazard_residual: torch.Tensor,
+    *,
+    exact_hold_probability: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Legacy Hold-30 proposed release; historical callers remain target 30."""
+
+    return hold_proposed_release(
+        age_notional,
+        hazard_residual,
+        hold_spec=LEGACY_HOLD30_TARGET_SPEC,
+        exact_hold_probability=exact_hold_probability,
+    )
 
 
 def exact_hold30_intent(reference: torch.Tensor) -> Hold30Intent:

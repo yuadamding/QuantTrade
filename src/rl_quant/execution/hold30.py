@@ -13,9 +13,14 @@ from dataclasses import dataclass
 import torch
 
 from rl_quant.execution.hold30_exit_v6 import build_m03r_v6_exit_release
-from rl_quant.models.daily_policy import hold30_proposed_release, hold30_release_hazard
+from rl_quant.models.daily_policy import hold_proposed_release, hold_release_hazard
 from rl_quant.models.hold30_exit_action_v6 import M03RV6ExitAction
 from rl_quant.protocol.hold30_alpha_v3 import HOLD30_ALPHA_TE_TARGET_ANNUAL
+from rl_quant.protocol.hold_target import (
+    DEFAULT_HOLD_TARGET_SPEC,
+    LEGACY_HOLD30_TARGET_SPEC,
+    HoldTargetSpec,
+)
 
 HOLD30_MAX_STOCK_WEIGHT = 0.01
 HOLD30_MAX_DISCRETIONARY_TURNOVER = 0.10
@@ -23,24 +28,36 @@ HOLD30_EXPOSURE_BAND = 0.02
 HOLD30_EXPOSURE_STEP = 0.10
 
 
-def _require_matrix(name: str, value: torch.Tensor, reference: torch.Tensor | None = None) -> torch.Tensor:
-    if not isinstance(value, torch.Tensor) or value.ndim != 2 or not value.is_floating_point():
+def _require_matrix(
+    name: str, value: torch.Tensor, reference: torch.Tensor | None = None
+) -> torch.Tensor:
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim != 2
+        or not value.is_floating_point()
+    ):
         raise ValueError(f"{name} must be a floating-point [batch, asset] tensor")
     if reference is not None and value.shape != reference.shape:
-        raise ValueError(f"{name} shape {tuple(value.shape)} must match {tuple(reference.shape)}")
+        raise ValueError(
+            f"{name} shape {tuple(value.shape)} must match {tuple(reference.shape)}"
+        )
     if not bool(torch.isfinite(value).all()):
         raise ValueError(f"{name} must be finite")
     return value
 
 
-def _require_vector(name: str, value: torch.Tensor, batch_size: int, reference: torch.Tensor) -> torch.Tensor:
+def _require_vector(
+    name: str, value: torch.Tensor, batch_size: int, reference: torch.Tensor
+) -> torch.Tensor:
     value = torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
     if tuple(value.shape) != (batch_size,) or not bool(torch.isfinite(value).all()):
         raise ValueError(f"{name} must be a finite [batch] tensor")
     return value
 
 
-def _zero_boundary_clip(value: torch.Tensor, lower: float, upper: float) -> torch.Tensor:
+def _zero_boundary_clip(
+    value: torch.Tensor, lower: float, upper: float
+) -> torch.Tensor:
     lo = value.new_tensor(lower)
     hi = value.new_tensor(upper)
     return torch.where(value <= lo, lo, torch.where(value >= hi, hi, value))
@@ -71,7 +88,9 @@ def centered_benchmark_tilt(
         torch.zeros_like(scores),
     )
     total = unnormalized.sum(-1, keepdim=True)
-    return torch.where(total > 0, unnormalized / total.clamp_min(1e-18), torch.zeros_like(unnormalized))
+    return torch.where(
+        total > 0, unnormalized / total.clamp_min(1e-18), torch.zeros_like(unnormalized)
+    )
 
 
 @dataclass(frozen=True)
@@ -95,26 +114,41 @@ def hold30_exposure_envelope(
     """Fill-time cap and hold-preserving C1 exposure envelope."""
 
     repaired_weights = _require_matrix("repaired_weights", repaired_weights)
-    benchmark_weights = _require_matrix("benchmark_weights", benchmark_weights, repaired_weights)
-    risk_asset_caps = _require_matrix("risk_asset_caps", risk_asset_caps, repaired_weights)
+    benchmark_weights = _require_matrix(
+        "benchmark_weights", benchmark_weights, repaired_weights
+    )
+    risk_asset_caps = _require_matrix(
+        "risk_asset_caps", risk_asset_caps, repaired_weights
+    )
     batch, assets = repaired_weights.shape
-    risk_gross_max = _require_vector("risk_gross_max", risk_gross_max, batch, repaired_weights)
+    risk_gross_max = _require_vector(
+        "risk_gross_max", risk_gross_max, batch, repaired_weights
+    )
     if not 0 <= cash_index < assets:
         raise ValueError("cash_index is outside the asset axis")
     risky = torch.ones_like(repaired_weights, dtype=torch.bool)
     risky[:, cash_index] = False
     cap = torch.where(
         risky,
-        torch.minimum(risk_asset_caps.clamp_min(0.0), repaired_weights.new_tensor(HOLD30_MAX_STOCK_WEIGHT)),
+        torch.minimum(
+            risk_asset_caps.clamp_min(0.0),
+            repaired_weights.new_tensor(HOLD30_MAX_STOCK_WEIGHT),
+        ),
         torch.zeros_like(repaired_weights),
     )
     hard_max = torch.minimum(
         torch.ones_like(risk_gross_max),
         torch.minimum(risk_gross_max.clamp_min(0.0), cap.sum(-1)),
     )
-    benchmark_gross = torch.where(risky, benchmark_weights, torch.zeros_like(benchmark_weights)).sum(-1)
-    repaired_gross = torch.where(risky, repaired_weights, torch.zeros_like(repaired_weights)).sum(-1)
-    band_min = torch.minimum((benchmark_gross - HOLD30_EXPOSURE_BAND).clamp_min(0.0), hard_max)
+    benchmark_gross = torch.where(
+        risky, benchmark_weights, torch.zeros_like(benchmark_weights)
+    ).sum(-1)
+    repaired_gross = torch.where(
+        risky, repaired_weights, torch.zeros_like(repaired_weights)
+    ).sum(-1)
+    band_min = torch.minimum(
+        (benchmark_gross - HOLD30_EXPOSURE_BAND).clamp_min(0.0), hard_max
+    )
     band_max = torch.minimum(benchmark_gross + HOLD30_EXPOSURE_BAND, hard_max)
     minimum = torch.minimum(repaired_gross, band_min)
     maximum = torch.maximum(repaired_gross, band_max)
@@ -137,7 +171,9 @@ def _waterfill_one(
         return torch.zeros_like(direction), effective
     if float((available - effective).detach().abs()) <= 1e-12:
         # The v1 custom contract has a zero backward on the full-cap branch.
-        return torch.where(valid, capacity.detach(), torch.zeros_like(capacity)), effective
+        return torch.where(
+            valid, capacity.detach(), torch.zeros_like(capacity)
+        ), effective
 
     safe_direction = torch.where(valid, direction, torch.ones_like(direction))
     ratios = torch.where(valid, capacity / safe_direction, torch.zeros_like(capacity))
@@ -165,15 +201,21 @@ def _waterfill_one(
 
     fixed = saturated | tie
     saturated_mass = torch.where(fixed, capacity, torch.zeros_like(capacity)).sum()
-    unsaturated_direction = torch.where(unsaturated, direction, torch.zeros_like(direction)).sum()
+    unsaturated_direction = torch.where(
+        unsaturated, direction, torch.zeros_like(direction)
+    ).sum()
     alpha = torch.where(
         unsaturated_direction > 0,
         (effective - saturated_mass) / unsaturated_direction.clamp_min(1e-18),
         torch.zeros_like(effective),
     )
     allocated = torch.where(saturated, capacity, torch.zeros_like(capacity))
-    allocated = allocated + torch.where(unsaturated, alpha * direction, torch.zeros_like(direction))
-    allocated = allocated + torch.where(tie, capacity.detach(), torch.zeros_like(capacity))
+    allocated = allocated + torch.where(
+        unsaturated, alpha * direction, torch.zeros_like(direction)
+    )
+    allocated = allocated + torch.where(
+        tie, capacity.detach(), torch.zeros_like(capacity)
+    )
     return allocated, effective
 
 
@@ -186,11 +228,15 @@ def capped_waterfill(
 
     direction = _require_matrix("direction", direction)
     capacity = _require_matrix("capacity", capacity, direction)
-    requested_mass = _require_vector("requested_mass", requested_mass, direction.shape[0], direction)
+    requested_mass = _require_vector(
+        "requested_mass", requested_mass, direction.shape[0], direction
+    )
     allocations = []
     effective = []
     for row in range(direction.shape[0]):
-        allocation, mass = _waterfill_one(requested_mass[row], direction[row], capacity[row])
+        allocation, mass = _waterfill_one(
+            requested_mass[row], direction[row], capacity[row]
+        )
         allocations.append(allocation)
         effective.append(mass)
     return torch.stack(allocations), torch.stack(effective)
@@ -213,11 +259,205 @@ def _turnover(delta: torch.Tensor) -> torch.Tensor:
     return 0.5 * delta.abs().sum(-1)
 
 
-def _turnover_limit(delta: torch.Tensor, limit: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _turnover_limit(
+    delta: torch.Tensor, limit: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     requested = _turnover(delta)
-    scale = torch.where(requested > limit, delta.new_tensor(limit) / requested.clamp_min(1e-18), 1.0)
+    scale = torch.where(
+        requested > limit, delta.new_tensor(limit) / requested.clamp_min(1e-18), 1.0
+    )
     constructed = scale.unsqueeze(-1) * delta
     return constructed, requested, _turnover(constructed)
+
+
+def build_holding_action(
+    repaired_weights: torch.Tensor,
+    age_notional: torch.Tensor,
+    entry_scores: torch.Tensor,
+    hazard_residual: torch.Tensor,
+    exposure_residual: torch.Tensor,
+    benchmark_weights: torch.Tensor,
+    trade_mask: torch.Tensor,
+    risk_asset_caps: torch.Tensor,
+    risk_gross_max: torch.Tensor,
+    *,
+    hold_spec: HoldTargetSpec = DEFAULT_HOLD_TARGET_SPEC,
+    exact_hold_probability: torch.Tensor | None = None,
+    exit_action_v6: M03RV6ExitAction | None = None,
+    cash_index: int = 0,
+    max_turnover: float = HOLD30_MAX_DISCRETIONARY_TURNOVER,
+    exposure_step: float = HOLD30_EXPOSURE_STEP,
+) -> Hold30BuiltAction:
+    """Apply one H2 intent under a run-level soft holding target."""
+
+    hold_spec.validate()
+    repaired_weights = _require_matrix("repaired_weights", repaired_weights)
+    entry_scores = _require_matrix("entry_scores", entry_scores, repaired_weights)
+    hazard_residual = _require_matrix(
+        "hazard_residual", hazard_residual, repaired_weights
+    )
+    age_bins = hold_spec.age_cap_sessions + 1
+    if age_notional.shape != (*repaired_weights.shape, age_bins):
+        raise ValueError(f"age_notional must be [batch, asset, {age_bins}]")
+    if not age_notional.is_floating_point() or not bool(
+        torch.isfinite(age_notional).all()
+    ):
+        raise ValueError("age_notional must be finite and floating point")
+    if bool((age_notional < 0).any()):
+        raise ValueError("age_notional cannot be negative")
+    batch, _assets = repaired_weights.shape
+    exposure_residual = _require_vector(
+        "exposure_residual", exposure_residual, batch, repaired_weights
+    )
+    if trade_mask.shape != repaired_weights.shape:
+        raise ValueError("trade_mask must match repaired_weights")
+    envelope = hold30_exposure_envelope(
+        repaired_weights,
+        benchmark_weights,
+        risk_asset_caps,
+        risk_gross_max,
+        cash_index=cash_index,
+    )
+    if exit_action_v6 is not None:
+        if exact_hold_probability is not None:
+            raise ValueError(
+                "v6 three-way exit action and legacy exact-hold probability "
+                "are mutually exclusive"
+            )
+        exit_action_v6.validate()
+        if tuple(exit_action_v6.risky_available.shape) != tuple(repaired_weights.shape):
+            raise ValueError("exit_action_v6 asset axes must match repaired_weights")
+        if exit_action_v6.logits.device != repaired_weights.device:
+            raise ValueError("exit_action_v6 must share the repaired portfolio device")
+        # Exact HOLD and EXIT are complete per-name decisions for this fill.
+        # Neither name may be bought back by the entry allocator in the same
+        # action; CONTINUOUS remains eligible for ordinary resizing.
+        entry_trade_mask = trade_mask & (
+            exit_action_v6.continuous_decision_st.detach() == 1.0
+        )
+    else:
+        entry_trade_mask = trade_mask
+    direction = centered_benchmark_tilt(
+        entry_scores,
+        benchmark_weights,
+        entry_trade_mask,
+        cash_index=cash_index,
+    )
+    risky = torch.ones_like(repaired_weights, dtype=torch.bool)
+    risky[:, cash_index] = False
+    ages = torch.arange(age_bins, device=age_notional.device, dtype=age_notional.dtype)
+    if exact_hold_probability is not None:
+        exact_hold_probability = _require_matrix(
+            "exact_hold_probability",
+            exact_hold_probability,
+            repaired_weights,
+        )
+        if bool(((exact_hold_probability < 0) | (exact_hold_probability > 1)).any()):
+            raise ValueError("exact_hold_probability must lie in [0,1]")
+    if exit_action_v6 is None:
+        hazards = hold_release_hazard(
+            ages,
+            hazard_residual.unsqueeze(-1).to(age_notional.dtype),
+            hold_spec=hold_spec,
+            exact_hold_probability=(
+                None
+                if exact_hold_probability is None
+                else exact_hold_probability.unsqueeze(-1).to(age_notional.dtype)
+            ),
+        )
+        release_by_age = age_notional * hazards
+        release_by_age = torch.where(
+            risky.unsqueeze(-1),
+            release_by_age,
+            torch.zeros_like(release_by_age),
+        )
+        proposed_release = hold_proposed_release(
+            age_notional,
+            hazard_residual.to(age_notional.dtype),
+            hold_spec=hold_spec,
+            exact_hold_probability=(
+                None
+                if exact_hold_probability is None
+                else exact_hold_probability.to(age_notional.dtype)
+            ),
+        )
+    else:
+        release = build_m03r_v6_exit_release(
+            age_notional,
+            hazard_residual,
+            exit_action_v6,
+            hold_spec=hold_spec,
+        )
+        release_by_age = release.discretionary_release_by_age
+        proposed_release = release.discretionary_release
+    proposed_release = torch.where(
+        risky, proposed_release, torch.zeros_like(proposed_release)
+    )
+    proposed_release = torch.minimum(proposed_release, repaired_weights.clamp_min(0.0))
+    retained = torch.where(
+        risky, repaired_weights - proposed_release, torch.zeros_like(repaired_weights)
+    ).clamp_min(0.0)
+    retained_gross = retained.sum(-1)
+    repaired_gross = torch.where(
+        risky, repaired_weights, torch.zeros_like(repaired_weights)
+    ).sum(-1)
+    if (
+        isinstance(exposure_step, bool)
+        or not isinstance(exposure_step, (int, float))
+        or not torch.isfinite(torch.tensor(float(exposure_step)))
+        or float(exposure_step) < 0
+    ):
+        raise ValueError("exposure_step must be a finite non-negative scalar")
+    desired_gross = repaired_gross + float(exposure_step) * torch.tanh(
+        exposure_residual
+    )
+    desired_gross = torch.maximum(
+        envelope.minimum, torch.minimum(desired_gross, envelope.maximum)
+    )
+
+    buy_mass = (desired_gross - retained_gross).clamp_min(0.0)
+    capacity = (envelope.cap - retained).clamp_min(0.0)
+    buys, effective = capped_waterfill(buy_mass, direction, capacity)
+    buy_case = desired_gross >= retained_gross
+    sell_mass = (retained_gross - desired_gross).clamp_min(0.0)
+    sellable = (
+        retained
+        if exit_action_v6 is None
+        else retained * exit_action_v6.continuous_decision_st.to(dtype=retained.dtype)
+    )
+    protected = (retained - sellable).clamp_min(0.0)
+    sellable_gross = sellable.sum(-1)
+    effective_sell_mass = torch.minimum(sell_mass, sellable_gross)
+    proportional = torch.where(
+        sellable_gross.unsqueeze(-1) > 0,
+        protected
+        + sellable
+        * (1.0 - effective_sell_mass / sellable_gross.clamp_min(1e-18)).unsqueeze(-1),
+        protected,
+    )
+    desired_risky = torch.where(buy_case.unsqueeze(-1), retained + buys, proportional)
+    desired_risky = torch.where(risky, desired_risky, torch.zeros_like(desired_risky))
+    desired = desired_risky.clone()
+    desired[:, cash_index] = 1.0 - desired_risky.sum(-1)
+    requested_delta = desired - repaired_weights
+    constructed_delta, requested_turnover, constructed_turnover = _turnover_limit(
+        requested_delta, max_turnover
+    )
+    target = repaired_weights + constructed_delta
+    shortfall = torch.where(
+        buy_case, buy_mass - effective, torch.zeros_like(buy_mass)
+    ).clamp_min(0.0)
+    return Hold30BuiltAction(
+        target_weights=target,
+        requested_delta=requested_delta,
+        constructed_delta=constructed_delta,
+        requested_turnover=requested_turnover,
+        constructed_turnover=constructed_turnover,
+        desired_risky_exposure=desired_gross,
+        proposed_release_by_age=release_by_age,
+        proposed_release=proposed_release,
+        capacity_shortfall=shortfall,
+    )
 
 
 def build_h2_hold30_action(
@@ -237,162 +477,24 @@ def build_h2_hold30_action(
     max_turnover: float = HOLD30_MAX_DISCRETIONARY_TURNOVER,
     exposure_step: float = HOLD30_EXPOSURE_STEP,
 ) -> Hold30BuiltAction:
-    """Apply one H2 intent to a fill-time repaired portfolio."""
+    """Legacy H2 Hold-30 action; historical callers stay explicitly at 30."""
 
-    repaired_weights = _require_matrix("repaired_weights", repaired_weights)
-    entry_scores = _require_matrix("entry_scores", entry_scores, repaired_weights)
-    hazard_residual = _require_matrix("hazard_residual", hazard_residual, repaired_weights)
-    if age_notional.shape != (*repaired_weights.shape, 61):
-        raise ValueError("age_notional must be [batch, asset, 61]")
-    if not age_notional.is_floating_point() or not bool(torch.isfinite(age_notional).all()):
-        raise ValueError("age_notional must be finite and floating point")
-    if bool((age_notional < 0).any()):
-        raise ValueError("age_notional cannot be negative")
-    batch, _assets = repaired_weights.shape
-    exposure_residual = _require_vector("exposure_residual", exposure_residual, batch, repaired_weights)
-    if trade_mask.shape != repaired_weights.shape:
-        raise ValueError("trade_mask must match repaired_weights")
-    envelope = hold30_exposure_envelope(
+    return build_holding_action(
         repaired_weights,
+        age_notional,
+        entry_scores,
+        hazard_residual,
+        exposure_residual,
         benchmark_weights,
+        trade_mask,
         risk_asset_caps,
         risk_gross_max,
+        hold_spec=LEGACY_HOLD30_TARGET_SPEC,
+        exact_hold_probability=exact_hold_probability,
+        exit_action_v6=exit_action_v6,
         cash_index=cash_index,
-    )
-    if exit_action_v6 is not None:
-        if exact_hold_probability is not None:
-            raise ValueError(
-                "v6 three-way exit action and legacy exact-hold probability "
-                "are mutually exclusive"
-            )
-        exit_action_v6.validate()
-        if tuple(exit_action_v6.risky_available.shape) != tuple(repaired_weights.shape):
-            raise ValueError(
-                "exit_action_v6 asset axes must match repaired_weights"
-            )
-        if exit_action_v6.logits.device != repaired_weights.device:
-            raise ValueError(
-                "exit_action_v6 must share the repaired portfolio device"
-            )
-        # Exact HOLD and EXIT are complete per-name decisions for this fill.
-        # Neither name may be bought back by the entry allocator in the same
-        # action; CONTINUOUS remains eligible for ordinary resizing.
-        entry_trade_mask = trade_mask & (
-            exit_action_v6.continuous_decision_st.detach() == 1.0
-        )
-    else:
-        entry_trade_mask = trade_mask
-    direction = centered_benchmark_tilt(
-        entry_scores,
-        benchmark_weights,
-        entry_trade_mask,
-        cash_index=cash_index,
-    )
-    risky = torch.ones_like(repaired_weights, dtype=torch.bool)
-    risky[:, cash_index] = False
-    ages = torch.arange(61, device=age_notional.device, dtype=age_notional.dtype)
-    if exact_hold_probability is not None:
-        exact_hold_probability = _require_matrix(
-            "exact_hold_probability",
-            exact_hold_probability,
-            repaired_weights,
-        )
-        if bool(
-            ((exact_hold_probability < 0) | (exact_hold_probability > 1)).any()
-        ):
-            raise ValueError("exact_hold_probability must lie in [0,1]")
-    if exit_action_v6 is None:
-        hazards = hold30_release_hazard(
-            ages,
-            hazard_residual.unsqueeze(-1).to(age_notional.dtype),
-            exact_hold_probability=(
-                None
-                if exact_hold_probability is None
-                else exact_hold_probability.unsqueeze(-1).to(age_notional.dtype)
-            ),
-        )
-        release_by_age = age_notional * hazards
-        release_by_age = torch.where(
-            risky.unsqueeze(-1),
-            release_by_age,
-            torch.zeros_like(release_by_age),
-        )
-        proposed_release = hold30_proposed_release(
-            age_notional,
-            hazard_residual.to(age_notional.dtype),
-            exact_hold_probability=(
-                None
-                if exact_hold_probability is None
-                else exact_hold_probability.to(age_notional.dtype)
-            ),
-        )
-    else:
-        release = build_m03r_v6_exit_release(
-            age_notional,
-            hazard_residual,
-            exit_action_v6,
-        )
-        release_by_age = release.discretionary_release_by_age
-        proposed_release = release.discretionary_release
-    proposed_release = torch.where(risky, proposed_release, torch.zeros_like(proposed_release))
-    proposed_release = torch.minimum(proposed_release, repaired_weights.clamp_min(0.0))
-    retained = torch.where(risky, repaired_weights - proposed_release, torch.zeros_like(repaired_weights)).clamp_min(0.0)
-    retained_gross = retained.sum(-1)
-    repaired_gross = torch.where(risky, repaired_weights, torch.zeros_like(repaired_weights)).sum(-1)
-    if (
-        isinstance(exposure_step, bool)
-        or not isinstance(exposure_step, (int, float))
-        or not torch.isfinite(torch.tensor(float(exposure_step)))
-        or float(exposure_step) < 0
-    ):
-        raise ValueError("exposure_step must be a finite non-negative scalar")
-    desired_gross = repaired_gross + float(exposure_step) * torch.tanh(
-        exposure_residual
-    )
-    desired_gross = torch.maximum(envelope.minimum, torch.minimum(desired_gross, envelope.maximum))
-
-    buy_mass = (desired_gross - retained_gross).clamp_min(0.0)
-    capacity = (envelope.cap - retained).clamp_min(0.0)
-    buys, effective = capped_waterfill(buy_mass, direction, capacity)
-    buy_case = desired_gross >= retained_gross
-    sell_mass = (retained_gross - desired_gross).clamp_min(0.0)
-    sellable = (
-        retained
-        if exit_action_v6 is None
-        else retained
-        * exit_action_v6.continuous_decision_st.to(dtype=retained.dtype)
-    )
-    protected = (retained - sellable).clamp_min(0.0)
-    sellable_gross = sellable.sum(-1)
-    effective_sell_mass = torch.minimum(sell_mass, sellable_gross)
-    proportional = torch.where(
-        sellable_gross.unsqueeze(-1) > 0,
-        protected
-        + sellable
-        * (
-            1.0
-            - effective_sell_mass / sellable_gross.clamp_min(1e-18)
-        ).unsqueeze(-1),
-        protected,
-    )
-    desired_risky = torch.where(buy_case.unsqueeze(-1), retained + buys, proportional)
-    desired_risky = torch.where(risky, desired_risky, torch.zeros_like(desired_risky))
-    desired = desired_risky.clone()
-    desired[:, cash_index] = 1.0 - desired_risky.sum(-1)
-    requested_delta = desired - repaired_weights
-    constructed_delta, requested_turnover, constructed_turnover = _turnover_limit(requested_delta, max_turnover)
-    target = repaired_weights + constructed_delta
-    shortfall = torch.where(buy_case, buy_mass - effective, torch.zeros_like(buy_mass)).clamp_min(0.0)
-    return Hold30BuiltAction(
-        target_weights=target,
-        requested_delta=requested_delta,
-        constructed_delta=constructed_delta,
-        requested_turnover=requested_turnover,
-        constructed_turnover=constructed_turnover,
-        desired_risky_exposure=desired_gross,
-        proposed_release_by_age=release_by_age,
-        proposed_release=proposed_release,
-        capacity_shortfall=shortfall,
+        max_turnover=max_turnover,
+        exposure_step=exposure_step,
     )
 
 
@@ -489,14 +591,23 @@ def build_scalar_gate_hold30_action(
 
     repaired_weights = _require_matrix("repaired_weights", repaired_weights)
     target_logits = _require_matrix("target_logits", target_logits, repaired_weights)
-    gate = _require_vector("gate", gate, repaired_weights.shape[0], repaired_weights).clamp(0.0, 1.0)
+    gate = _require_vector(
+        "gate", gate, repaired_weights.shape[0], repaired_weights
+    ).clamp(0.0, 1.0)
     envelope = hold30_exposure_envelope(
-        repaired_weights, benchmark_weights, risk_asset_caps, risk_gross_max, cash_index=cash_index
+        repaired_weights,
+        benchmark_weights,
+        risk_asset_caps,
+        risk_gross_max,
+        cash_index=cash_index,
     )
     mask = trade_mask.bool().clone()
     mask[:, cash_index] = True
     count = mask.sum(-1).clamp_min(1).to(target_logits.dtype)
-    mean = torch.where(mask, target_logits, torch.zeros_like(target_logits)).sum(-1) / count
+    mean = (
+        torch.where(mask, target_logits, torch.zeros_like(target_logits)).sum(-1)
+        / count
+    )
     centered = _zero_boundary_clip(target_logits - mean.unsqueeze(-1), -8.0, 8.0)
     logits = centered / temperature
     logits = torch.where(mask, logits, torch.full_like(logits, -torch.inf))
@@ -505,20 +616,28 @@ def build_scalar_gate_hold30_action(
     risky_direction[:, cash_index] = 0.0
     risky_total = risky_direction.sum(-1, keepdim=True)
     risky_direction = torch.where(
-        risky_total > 0, risky_direction / risky_total.clamp_min(1e-18), torch.zeros_like(risky_direction)
+        risky_total > 0,
+        risky_direction / risky_total.clamp_min(1e-18),
+        torch.zeros_like(risky_direction),
     )
     risky_mask = torch.ones_like(absolute_direction, dtype=torch.bool)
     risky_mask[:, cash_index] = False
     requested_gross = torch.where(
         risky_mask, absolute_direction, torch.zeros_like(absolute_direction)
     ).sum(-1)
-    desired_gross = torch.maximum(envelope.band_min, torch.minimum(requested_gross, envelope.band_max))
+    desired_gross = torch.maximum(
+        envelope.band_min, torch.minimum(requested_gross, envelope.band_max)
+    )
     buys, effective = capped_waterfill(desired_gross, risky_direction, envelope.cap)
     desired = buys.clone()
     desired[:, cash_index] = 1.0 - buys.sum(-1)
-    interpolated = (1.0 - gate.unsqueeze(-1)) * repaired_weights + gate.unsqueeze(-1) * desired
+    interpolated = (1.0 - gate.unsqueeze(-1)) * repaired_weights + gate.unsqueeze(
+        -1
+    ) * desired
     requested_delta = interpolated - repaired_weights
-    constructed_delta, requested_turnover, constructed_turnover = _turnover_limit(requested_delta, max_turnover)
+    constructed_delta, requested_turnover, constructed_turnover = _turnover_limit(
+        requested_delta, max_turnover
+    )
     target = repaired_weights + constructed_delta
     return Hold30BuiltAction(
         target_weights=target,
@@ -527,7 +646,9 @@ def build_scalar_gate_hold30_action(
         requested_turnover=requested_turnover,
         constructed_turnover=constructed_turnover,
         desired_risky_exposure=desired_gross,
-        proposed_release_by_age=repaired_weights.new_zeros((*repaired_weights.shape, 61)),
+        proposed_release_by_age=repaired_weights.new_zeros(
+            (*repaired_weights.shape, 61)
+        ),
         proposed_release=repaired_weights.new_zeros(repaired_weights.shape),
         capacity_shortfall=(desired_gross - effective).clamp_min(0.0),
     )
@@ -542,6 +663,7 @@ __all__ = [
     "Hold30ExposureEnvelope",
     "build_alpha_hold30_action",
     "build_h2_hold30_action",
+    "build_holding_action",
     "build_scalar_gate_hold30_action",
     "capped_waterfill",
     "centered_benchmark_tilt",

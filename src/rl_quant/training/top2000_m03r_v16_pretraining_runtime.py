@@ -37,11 +37,12 @@ from rl_quant.training.top2000_m03r_v16_policy import (
 
 if TYPE_CHECKING:
     from rl_quant.training.top2000_m03r_v16_structural import (
-        M03RV16StructuralSlab,
+        M03RV16ValidatedStructuralSlab,
     )
 
-M03R_V16_BUILT_BATCH_SCHEMA = "rl-quant.top2000-dev.m03r-v16-built-batch-v3"
+M03R_V16_BUILT_BATCH_SCHEMA = "rl-quant.top2000-dev.m03r-v16-built-batch-v4"
 M03R_V16_RETURNED_DTYPE_ORTHOGONALITY_TOLERANCE = 1.0e-5
+_BUILT_BATCH_ISSUER = object()
 
 
 class M03RV16PretrainingRuntimeError(ValueError):
@@ -86,6 +87,7 @@ def _returned_dtype_exposure_error(
 class M03RV16BuiltPredictiveBatch:
     objective: M03RV16PredictiveBatch
     raw_selection_score_z: torch.Tensor
+    action_valid: torch.Tensor
     origin_indices: torch.Tensor
     split: Literal["training", "inner_validation", "qualification"]
     fold_index: int
@@ -101,6 +103,7 @@ class M03RV16BuiltPredictiveBatch:
     action_returned_dtype_exposure_errors: tuple[float, ...]
     target_returned_dtype_exposure_errors: tuple[float, ...]
     structural_slab_receipt_sha256: str | None = None
+    _issuer: object = _BUILT_BATCH_ISSUER
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
     schema: str = M03R_V16_BUILT_BATCH_SCHEMA
 
@@ -122,20 +125,14 @@ class M03RV16BuiltPredictiveBatch:
                 for operator in self.selection_target_operators
             )
         )
+        action_masks = torch.stack(
+            tuple(operator.qualified_asset_mask for operator in self.action_operators)
+        )
         support_valid = all(
             not bool((target.qualified_asset_mask & ~action.qualified_asset_mask).any())
             for target, action in zip(
                 self.selection_target_operators, self.action_operators, strict=True
             )
-        )
-        score_valid = all(
-            torch.equal(
-                apply_m03r_v15_residual_operator(
-                    self.raw_selection_score_z[index], operator
-                ).residual,
-                self.objective.executable_selection_score_z[index],
-            )
-            for index, operator in enumerate(self.action_operators)
         )
         errors = (
             *self.action_returned_dtype_exposure_errors,
@@ -146,11 +143,14 @@ class M03RV16BuiltPredictiveBatch:
         if (
             tuple(self.raw_selection_score_z.shape)
             != tuple(self.objective.executable_selection_score_z.shape)
+            or self.action_valid.shape != self.objective.selection_valid.shape
+            or self.action_valid.dtype != torch.bool
             or not bool(torch.isfinite(self.raw_selection_score_z).all())
             or _tensor_sha256(target_masks)
             != _tensor_sha256(self.objective.selection_valid)
+            or _tensor_sha256(action_masks) != _tensor_sha256(self.action_valid)
+            or bool((self.objective.selection_valid & ~self.action_valid).any())
             or not support_valid
-            or not score_valid
             or any(
                 not math.isfinite(value)
                 or value > M03R_V16_RETURNED_DTYPE_ORTHOGONALITY_TOLERANCE
@@ -193,6 +193,7 @@ class M03RV16BuiltPredictiveBatch:
             )
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
             or self.schema != M03R_V16_BUILT_BATCH_SCHEMA
+            or self._issuer is not _BUILT_BATCH_ISSUER
         ):
             raise M03RV16PretrainingRuntimeError("V16 built batch drifted")
 
@@ -218,6 +219,10 @@ class M03RV16BuiltPredictiveBatch:
                     "raw_selection_score_z_sha256": _tensor_sha256(
                         self.raw_selection_score_z
                     ),
+                    "executable_selection_score_z_sha256": _tensor_sha256(
+                        self.objective.executable_selection_score_z
+                    ),
+                    "action_valid_sha256": _tensor_sha256(self.action_valid),
                     "selection_target_economic_sha256": _tensor_sha256(
                         self.objective.selection_target_economic
                     ),
@@ -296,7 +301,7 @@ def build_m03r_v16_batch_from_origin_states(
     source_array_sha256: str,
     asset_axis_sha256: str,
     origin_risk_exposures: M03RV9OriginRiskExposures,
-    structural_slab: M03RV16StructuralSlab | None = None,
+    structural_slab: M03RV16ValidatedStructuralSlab | None = None,
 ) -> M03RV16BuiltPredictiveBatch:
     """Build one target-only batch on the common 30-session support."""
 
@@ -332,7 +337,7 @@ def build_m03r_v16_batch_from_origin_states(
     ):
         raise M03RV16PretrainingRuntimeError("V16 exposure and sequence axes differ")
     if structural_slab is not None:
-        structural_slab.validate()
+        structural_slab.require_fast_identity()
         if (
             structural_slab.receipt.asset_axis_sha256 != asset_axis_sha256
             or structural_slab.receipt.exposure_receipt_sha256
@@ -349,9 +354,10 @@ def build_m03r_v16_batch_from_origin_states(
     economic_targets: list[torch.Tensor] = []
     target_z: list[torch.Tensor] = []
     target_valid: list[torch.Tensor] = []
+    action_valid: list[torch.Tensor] = []
     target_operators: list[M03RV15ResidualOperator] = []
     action_operators: list[M03RV15ResidualOperator] = []
-    action_errors: list[float] = []
+    action_error_tensors: list[torch.Tensor] = []
     target_errors: list[float] = []
 
     if split == "training":
@@ -429,6 +435,9 @@ def build_m03r_v16_batch_from_origin_states(
             )
         else:
             prepared = structural_slab.origin(global_origin)
+            device_prepared = structural_slab.device_origin(
+                global_origin, origin_states.device
+            )
             action_operator = prepared.action_operator
             target_operator = prepared.common_target_operator
             expected_action_mask = action_available.to(device="cpu") & (
@@ -443,29 +452,45 @@ def build_m03r_v16_batch_from_origin_states(
                 raise M03RV16PretrainingRuntimeError(
                     "V16 package-owned action support drifted"
                 )
-            economic_target = prepared.economic_targets[setting.setting_index].to(
-                device=origin_states.device
-            )
-            standardized_target = prepared.standardized_targets[
+            economic_target = device_prepared.economic_targets[setting.setting_index]
+            standardized_target = device_prepared.standardized_targets[
                 setting.setting_index
-            ].to(device=origin_states.device)
+            ]
             target_error = prepared.target_returned_dtype_exposure_errors[
                 setting.setting_index
             ]
-        score_result = apply_m03r_v15_residual_operator(raw_score, action_operator)
+        if structural_slab is None:
+            score_result = apply_m03r_v15_residual_operator(raw_score, action_operator)
+            executable_score = score_result.residual
+            action_error = raw_score.new_tensor(
+                _returned_dtype_exposure_error(score_result, action_operator)
+            )
+            action_mask = action_operator.qualified_asset_mask.to(
+                device=origin_states.device
+            )
+        else:
+            device_operator = device_prepared.action_operator
+            executable_score, action_error = device_operator.apply(raw_score)
+            action_mask = device_operator.qualified_asset_mask
         raw_scores.append(raw_score)
-        executable_scores.append(score_result.residual)
+        executable_scores.append(executable_score)
         economic_targets.append(economic_target)
         target_z.append(standardized_target)
         target_valid.append(
             target_operator.qualified_asset_mask.to(device=origin_states.device)
+            if structural_slab is None
+            else device_prepared.common_target_mask
         )
+        action_valid.append(action_mask)
         target_operators.append(target_operator)
         action_operators.append(action_operator)
-        action_errors.append(
-            _returned_dtype_exposure_error(score_result, action_operator)
-        )
+        action_error_tensors.append(action_error)
         target_errors.append(target_error)
+
+    action_errors = tuple(
+        float(value)
+        for value in torch.stack(action_error_tensors).detach().to(device="cpu")
+    )
 
     objective = M03RV16PredictiveBatch(
         executable_selection_score_z=torch.stack(executable_scores),
@@ -477,6 +502,7 @@ def build_m03r_v16_batch_from_origin_states(
     result = M03RV16BuiltPredictiveBatch(
         objective=objective,
         raw_selection_score_z=torch.stack(raw_scores),
+        action_valid=torch.stack(action_valid),
         origin_indices=global_origins,
         split=split,
         fold_index=fold_index,
@@ -489,11 +515,12 @@ def build_m03r_v16_batch_from_origin_states(
         policy_state_binding_sha256=policy_state_binding_sha256,
         selection_target_operators=tuple(target_operators),
         action_operators=tuple(action_operators),
-        action_returned_dtype_exposure_errors=tuple(action_errors),
+        action_returned_dtype_exposure_errors=action_errors,
         target_returned_dtype_exposure_errors=tuple(target_errors),
         structural_slab_receipt_sha256=(
-            None if structural_slab is None else structural_slab.receipt.receipt_sha256
+            None if structural_slab is None else structural_slab.receipt_sha256
         ),
+        _issuer=_BUILT_BATCH_ISSUER,
     )
     result.validate()
     return result

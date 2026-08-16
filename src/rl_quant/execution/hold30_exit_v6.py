@@ -6,9 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
-from rl_quant.models.daily_policy import hold30_release_hazard
+from rl_quant.models.daily_policy import hold_release_hazard
 from rl_quant.models.hold30_exit_action_v6 import M03RV6ExitAction
 from rl_quant.protocol.hold30_alpha_m03r_v6 import M03R_AGE_LEDGER_BIN_COUNT
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC, HoldTargetSpec
 
 
 class M03RV6ExitExecutionError(ValueError):
@@ -94,6 +95,8 @@ def build_m03r_v6_exit_release(
     age_notional: torch.Tensor,
     hazard_residual: torch.Tensor,
     action: M03RV6ExitAction,
+    *,
+    hold_spec: HoldTargetSpec = LEGACY_HOLD30_TARGET_SPEC,
 ) -> M03RV6ExitRelease:
     """Apply one exact three-way model action to cohort notionals.
 
@@ -103,6 +106,9 @@ def build_m03r_v6_exit_release(
     gradient, so an economic loss can learn to cross either exact branch.
     """
 
+    hold_spec.validate()
+    if hold_spec.age_cap_sessions + 1 != M03R_AGE_LEDGER_BIN_COUNT:
+        raise M03RV6ExitExecutionError("holding target age cap differs from v6 ledger")
     if not isinstance(action, M03RV6ExitAction):
         raise M03RV6ExitExecutionError("action must be M03RV6ExitAction")
     action.validate()
@@ -140,9 +146,10 @@ def build_m03r_v6_exit_release(
         device=age_notional.device,
         dtype=dtype,
     )
-    continuous = hold30_release_hazard(
+    continuous = hold_release_hazard(
         ages,
         hazard_residual.to(dtype=dtype).unsqueeze(-1),
+        hold_spec=hold_spec,
     )
     # Normalization roundoff can otherwise produce 1+epsilon in FP32. Keep the
     # continuous branch strictly below one so only the explicit EXIT atom can

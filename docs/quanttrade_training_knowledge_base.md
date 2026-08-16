@@ -70,7 +70,7 @@ This table records lineage, not current cluster state:
 | v13 context-matched h3 | Corrected full-context and h3-only geometry, but still optimized and diagnosed a different tensor from the score traded after residualization | Preserve as superseded design evidence; do not launch it |
 | v14 executable-score h3 | Completed two-setting study with one action-projected score; both settings failed IC, net-cost, and break-even gates | Preserve as negative evidence; do not start economic training |
 | v15 corrected executable-score h3 | Completed all twelve A04 folds under the corrected package and runtime; both settings failed with IC below 0.011 and break-even cost below 2 bp | End daily h3 loss tuning; no economic or 2026 access |
-| v16 holding-aligned selection | Current local successor comparing h21, h30, and reference-Hold-30 value on common 30-session support; selection-only with disjoint outer evidence and local structural/capacity/cohort primitives | Seal and validate the package plus worker/lifecycle before any remote authorization |
+| v16 holding-aligned selection | Current local v3 successor comparing h21, h30, and reference-Hold-30 value on common 30-session support; selection-only with causal action masks, executed/drifted cohorts, balanced blocks, validated slab caching, and nontrivial capacity/lineage primitives | Complete and validate package, evaluator, worker, and lifecycle before any remote authorization |
 | v7 2026-YTD retrospective | Separate, fixed 2026-01-02 through 2026-06-23 mechanism-evaluation contract | It is not a universal 2026 cutoff and cannot select v11 |
 
 ## 2. End-to-end lifecycle
@@ -336,6 +336,46 @@ cohort earns its first return on the decision/fill step, an h30 cohort needs 29
 additional no-new-decision transitions—not 30—and must earn all 30 returns.
 Charge terminal liquidation for any remaining active risk and publish absolute
 policy cost separately from incremental active cost.
+
+The label-valid mask and the action-valid mask are different scientific
+objects. Complete future support may remove an observation from IC or loss, but
+it cannot remove an origin-actionable asset from the policy's candidate set.
+Actions use origin eligibility and fill-time availability only. Receipt both
+masks and test that changing an asset's future availability cannot change the
+current requested book.
+
+A cohort diagnostic must carry executed economic positions, not yesterday's
+requested target vectors. After every risk projection, reconcile the aggregate
+executed active book back to cohort rows; after every return, drift those rows
+and require their sum to equal the carried policy-minus-benchmark book. Cohort
+age, entry, and release telemetry otherwise describe intent rather than actual
+holdings and daily target reconstruction silently creates extra turnover.
+
+Every optimizer update must represent comparable date mass. Splitting 129
+origins as `63,63,3` and averaging each block gives the final three dates one
+full Adam step and about 21 times the per-date influence of a full block.
+Balance blocks so sizes differ by at most one, and test both exact origin
+coverage and per-epoch weighting.
+
+Validate immutable operator slabs deeply once at package/worker/fold
+boundaries, then issue a private validated authority with O(1) origin lookup,
+version checks, and cached device operators. Revalidating and rehashing every
+operator on every row defeats precomputation and can make an H100 workload
+CPU-bound without improving scientific safety.
+
+### Parameterize holding targets without rewriting experiment horizons
+
+New generic holding APIs default to a soft neutral expected duration of three
+earned sessions through `HoldTargetSpec`. Existing Hold-30 names and immutable
+protocols explicitly bind `legacy-hold30-v1` and target 30. Holding target,
+prediction horizon, label support, age cap, purge, and cohort evaluation horizon
+are separate values and must never inherit from one another implicitly.
+
+The generic hazard location is deterministically calibrated so the finite-age
+survival sum equals the requested duration. Merely substituting 3 for 30 in the
+legacy logit does not create a three-session expectation. Protocols, initial
+state, head identity, checkpoint, replay, and evaluation must bind the resolved
+hold-target receipt; target mismatch fails even when tensor shapes agree.
 
 ### Test objective gradients, not only objective values
 

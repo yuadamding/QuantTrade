@@ -18,11 +18,11 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_SETTINGS,
 )
 
-M03R_V16_FOLD_SCHEMA = "rl-quant.top2000-dev.m03r-v16-fold-geometry-v2"
+M03R_V16_FOLD_SCHEMA = "rl-quant.top2000-dev.m03r-v16-fold-geometry-v3"
 M03R_V16_PANEL_SCHEDULE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-episode-schedule-v2"
+    "rl-quant.top2000-dev.m03r-v16-panel-episode-schedule-v3"
 )
-M03R_V16_TRAINING_UPDATE_SCHEMA = "rl-quant.top2000-dev.m03r-v16-training-update-v2"
+M03R_V16_TRAINING_UPDATE_SCHEMA = "rl-quant.top2000-dev.m03r-v16-training-update-v3"
 M03R_V16_REQUIRED_STATE_ROWS = 1001
 M03R_V16_FOLD_ADVANCE = 93
 M03R_V16_FINAL_QUALIFICATION_START = 907
@@ -145,10 +145,7 @@ class M03RV16FoldGeometry:
 
     @property
     def training_block_count(self) -> int:
-        return math.ceil(
-            len(self.eligible_training_origins)
-            / M03R_V16_PREDICTIVE_SPEC.origins_per_update
-        )
+        return len(balanced_m03r_v16_training_blocks(self))
 
     @property
     def maximum_optimizer_updates(self) -> int:
@@ -326,6 +323,32 @@ def _epoch_block_order(
     )
 
 
+def balanced_m03r_v16_training_blocks(
+    geometry: M03RV16FoldGeometry,
+) -> tuple[tuple[int, ...], ...]:
+    """Partition one epoch so every origin has comparable Adam-step weight."""
+
+    geometry.validate()
+    origins = geometry.eligible_training_origins
+    block_count = math.ceil(len(origins) / M03R_V16_PREDICTIVE_SPEC.origins_per_update)
+    base, larger = divmod(len(origins), block_count)
+    rows: list[tuple[int, ...]] = []
+    cursor = 0
+    for block_index in range(block_count):
+        size = base + (1 if block_index < larger else 0)
+        rows.append(origins[cursor : cursor + size])
+        cursor += size
+    result = tuple(rows)
+    if (
+        cursor != len(origins)
+        or not result
+        or max(map(len, result)) - min(map(len, result)) > 1
+        or tuple(origin for row in result for origin in row) != origins
+    ):
+        raise M03RV16FoldError("V16 balanced training blocks drifted")
+    return result
+
+
 def render_m03r_v16_training_update_plan(
     schedule: M03RV16PanelSchedule,
     geometry: M03RV16FoldGeometry,
@@ -343,10 +366,7 @@ def render_m03r_v16_training_update_plan(
         raise M03RV16FoldError("V16 update request drifted")
     epoch_index, block_slot = divmod(completed_update, geometry.training_block_count)
     block = _epoch_block_order(schedule, geometry, epoch_index)[block_slot]
-    first = block * M03R_V16_PREDICTIVE_SPEC.origins_per_update
-    origins = geometry.eligible_training_origins[
-        first : first + M03R_V16_PREDICTIVE_SPEC.origins_per_update
-    ]
+    origins = balanced_m03r_v16_training_blocks(geometry)[block]
     if not origins:
         raise M03RV16FoldError("V16 selected an empty training block")
     lower_start = origins[-1] - M03R_V16_MAXIMUM_LOCAL_ORIGIN
@@ -389,6 +409,7 @@ __all__ = [
     "M03RV16FoldGeometry",
     "M03RV16PanelSchedule",
     "M03RV16TrainingUpdatePlan",
+    "balanced_m03r_v16_training_blocks",
     "render_m03r_v16_fold_geometries",
     "render_m03r_v16_training_update_plan",
 ]

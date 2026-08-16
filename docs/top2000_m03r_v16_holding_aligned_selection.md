@@ -13,7 +13,9 @@ model or optimizer state, train timing or uncertainty, run an economic/RL
 optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
-No V16 package, remote run, GPU result, or performance result is claimed.
+No V16 package, remote run, GPU result, or performance result is claimed. The
+current local protocol is the result-moving v3 revision; older v16 source and
+artifact identities may not be mixed with it.
 
 ## Scientific settings
 
@@ -98,6 +100,9 @@ y_t^{S,30}=\sum_{k=1}^{30}S(k)r^{\mathrm{res}}_{t+k}.
 It is not a normalized alpha rate, mandatory 30-day hold, forced expiry, or
 complete infinite-horizon holding value. About 55% of reference-prior survival
 remains after day 30 and is explicitly receipt-bound as truncation evidence.
+V16 explicitly binds the immutable legacy Hold-30 specification: holding target
+30, age cap 60, and `legacy-hold30-v1`. The generic framework default of three
+sessions does not alter this experiment, its label support, or its cohort tail.
 
 ## Dimensionless optimization
 
@@ -142,7 +147,10 @@ Each training episode contains:
 30 future-support transitions
 ```
 
-All eligible training origins appear once per each of eight fixed epochs. A
+All eligible training origins appear once per each of eight fixed epochs.
+Blocks are balanced within each fold, so their sizes differ by at most one; a
+three-date remainder can no longer receive one full optimizer step and twenty-
+one times the per-date weight of a full block. A
 63-origin inner-validation slice publishes fit diagnostics only; it cannot
 select an epoch. The immutable terminal epoch-8 checkpoint is evaluated after
 strict write/reload. This avoids searching many checkpoints on highly
@@ -164,9 +172,16 @@ Qualification retains two distinct diagnostics:
 
 1. a small fixed-rank ordering sleeve for projected IC and tail attribution;
 2. a horizon-matched cohort sleeve, with 21-/30-session carry or the exact
-   reference release clock. The final 30-session cohort earns once on its
-   decision/fill step and then through 29 no-new-decision transitions. Any
-   remaining active risk is terminally liquidated and charged.
+   reference release clock truncated at return 30. The final 30-session cohort
+   earns once on its decision/fill step and then through 29 no-new-decision
+   transitions. Any remaining active risk is terminally liquidated and charged.
+
+The cohort action mask is the causal origin-action mask intersected with
+fill-time availability. The common 30-session label mask is diagnostic-only
+and cannot influence action construction. Cohorts store reconciled executed
+active positions, not requested vectors; projection repairs and return drift
+are carried into the next decision, and the cohort sum must equal the carried
+executed active book after every transition.
 
 The cost ladder is `0, 1, 2, 3, 5, 10, 20, 40 bp`. Report absolute policy cost,
 benchmark cost, incremental active cost, gross/net policy return, gross/net
@@ -194,21 +209,29 @@ It additionally materializes all scheduled action/label operators and all
 three targets once from exact cache/risk bytes. The no-clobber slab loader
 hashes and loads through one no-follow descriptor, revalidates every operator,
 and binds cache, asset axis, risk, exposure, projector, and source identities.
-The canonical fold-update path consumes that slab and performs no QR in the
-optimizer hot path.
+The canonical fold-update path consumes a validated-slab authority and performs
+no QR or full-slab semantic validation in the optimizer hot path. Origin lookup
+is O(1), device operators are cached, and scalar exposure telemetry is reduced
+only at the batch boundary.
 
 The exact-workload capacity primitive performs one disposable 345-state,
-63-origin, two-rank BF16 forward/backward, NCCL gradient sum, clipped Adam
-mutation, and an internally executed qualification projection. Its typed
-terminal requires equal post-update model and optimizer identities across
-ranks and cannot publish a scientific checkpoint or authorize training.
+balanced first-fold two-rank BF16 forward/backward, NCCL gradient sum, clipped
+Adam mutation, and an internally constructed nontrivial qualification
+projection. The request must have positive active mass, projection must change
+it while retaining nonzero mass, and the typed terminal requires at least 8 GiB
+or 10% unreserved device memory plus equal post-update model and optimizer
+identities across ranks. It cannot publish a scientific checkpoint or authorize
+training.
 
 The cohort primitive publishes separate absolute policy, benchmark, and
-incremental costs; 21-/30-session or age-clock release; position ages; risk-
-projection retention; final-horizon chronology; and terminal liquidation.
+incremental costs and net returns; 21-/30-session or truncated age-clock
+release; executed position ages; risk-projection retention; final-horizon
+chronology; and terminal liquidation. A single qualification wrapper now binds
+the canonical score batch to the exact reloaded checkpoint and validated slab
+before cohort economics can run.
 
-No local package builder, same-image static gate, reloaded-checkpoint fold
-qualification wrapper, remote worker, Kubernetes lifecycle, or real-data slab
+No local package builder, same-image static gate, complete fold evaluator and
+statistical aggregate, remote worker, Kubernetes lifecycle, or real-data slab
 receipt exists yet. No capacity or performance evidence is claimed. Those
 remaining omissions still block packaging and H100 execution.
 
@@ -216,6 +239,7 @@ remaining omissions still block packaging and H100 execution.
 
 ```bash
 PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_hold_target_protocol.py \
   tests/test_hold30_alpha_m03r_v16_top2000_dev_protocol.py \
   tests/test_top2000_m03r_v16_*.py
 

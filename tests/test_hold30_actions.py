@@ -5,6 +5,7 @@ import torch
 
 from rl_quant.execution.hold30 import (
     build_h2_hold30_action,
+    build_holding_action,
     build_scalar_gate_hold30_action,
     capped_waterfill,
     centered_benchmark_tilt,
@@ -44,6 +45,27 @@ def test_h2_finite_neutral_action_is_exact_hold() -> None:
     assert torch.equal(result.constructed_delta, torch.zeros_like(weights))
     assert torch.equal(result.proposed_release, torch.zeros_like(weights))
     assert result.constructed_turnover.item() == 0.0
+
+
+def test_new_generic_action_defaults_to_calibrated_target_three() -> None:
+    weights = torch.tensor([[0.97, 0.01, 0.01, 0.01]], dtype=torch.float64)
+    benchmark, mask, caps, gross = _common(weights)
+    inputs = {
+        "repaired_weights": weights,
+        "age_notional": _ledger_from_weights(weights, age=1),
+        "entry_scores": torch.zeros_like(weights),
+        "hazard_residual": torch.zeros_like(weights),
+        "exposure_residual": torch.zeros(1, dtype=torch.float64),
+        "benchmark_weights": benchmark,
+        "trade_mask": mask,
+        "risk_asset_caps": caps,
+        "risk_gross_max": gross,
+    }
+    generic = build_holding_action(**inputs)
+    legacy = build_h2_hold30_action(**inputs)
+    assert float(generic.proposed_release[:, 1:].sum()) > 100.0 * float(
+        legacy.proposed_release[:, 1:].sum()
+    )
 
 
 def test_hold_envelope_does_not_force_an_out_of_band_book_to_rebalance() -> None:
@@ -144,7 +166,9 @@ def test_waterfill_interior_gradient_matches_finite_difference() -> None:
     direction = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float64, requires_grad=True)
     capacity = torch.tensor([[0.004, 0.020, 0.020]], dtype=torch.float64)
     allocated, effective = capped_waterfill(requested, direction, capacity)
-    objective = (allocated * torch.tensor([[0.0, 1.0, -0.5]], dtype=torch.float64)).sum()
+    objective = (
+        allocated * torch.tensor([[0.0, 1.0, -0.5]], dtype=torch.float64)
+    ).sum()
     objective.backward()
     analytic = direction.grad.detach().clone()
 
@@ -173,7 +197,9 @@ def test_waterfill_exact_cap_tie_conserves_requested_mass() -> None:
     direction = torch.tensor([[0.5, 0.5]], dtype=torch.float64, requires_grad=True)
     capacity = torch.tensor([[0.25, 1.0]], dtype=torch.float64)
     allocated, effective = capped_waterfill(requested, direction, capacity)
-    torch.testing.assert_close(allocated, torch.tensor([[0.25, 0.25]], dtype=torch.float64))
+    torch.testing.assert_close(
+        allocated, torch.tensor([[0.25, 0.25]], dtype=torch.float64)
+    )
     torch.testing.assert_close(allocated.sum(-1), effective)
     allocated.sum().backward()
     assert direction.grad is not None

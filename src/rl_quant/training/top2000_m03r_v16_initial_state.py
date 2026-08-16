@@ -14,6 +14,7 @@ import torch
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
 )
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 from rl_quant.training.top2000_m03r_v9_pretraining_step import (
     model_state_sha256,
     state_dict_sha256,
@@ -24,7 +25,7 @@ from rl_quant.training.top2000_m03r_v16_policy import (
 )
 
 M03R_V16_INITIAL_STATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-common-initial-parameter-state-v2"
+    "rl-quant.top2000-dev.m03r-v16-common-initial-parameter-state-v3"
 )
 _MAX_INITIAL_STATE_BYTES = 4 * 1024**3
 
@@ -78,6 +79,8 @@ def write_m03r_v16_initial_parameter_state(
         "schema": M03R_V16_INITIAL_STATE_SCHEMA,
         "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
         "output_contract_sha256": M03R_V16_OUTPUT_CONTRACT_SHA256,
+        "hold_target_sessions": LEGACY_HOLD30_TARGET_SPEC.target_sessions,
+        "hold_target_spec_sha256": LEGACY_HOLD30_TARGET_SPEC.receipt_sha256,
         "model_state_sha256": semantic_sha256,
         "architecture_sha256": architecture_sha256,
         "state_dict": state,
@@ -161,6 +164,10 @@ def load_m03r_v16_initial_parameter_state(
         payload.get("schema") != M03R_V16_INITIAL_STATE_SCHEMA
         or payload.get("protocol_sha256") != M03R_V16_PROTOCOL_SHA256
         or payload.get("output_contract_sha256") != M03R_V16_OUTPUT_CONTRACT_SHA256
+        or payload.get("hold_target_sessions")
+        != LEGACY_HOLD30_TARGET_SPEC.target_sessions
+        or payload.get("hold_target_spec_sha256")
+        != LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
         or payload.get("model_state_sha256") != expected_state_sha256
         or payload.get("architecture_sha256") != expected_architecture_sha256
         or payload.get("common_across_settings") is not True

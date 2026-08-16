@@ -94,6 +94,7 @@ tests are not launch or performance evidence.
   immutable A04 run completed all twelve folds, but both h3 settings failed;
   no economic optimizer or 2026 outcomes were opened.
 - [TOP2000 M03R-v16 holding-aligned selection research](top2000_m03r_v16_holding_aligned_selection.md)
+- [ADR-0008: parameterized soft holding target](adr/0008-parameterized-soft-holding-target.md)
   — current local predictive boundary comparing h21, h30, and the actual
   reference-Hold-30 survival-value target on common 30-session support. It is
   selection-only, uses five disjoint outer supports and a fixed terminal

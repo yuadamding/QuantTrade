@@ -19,13 +19,12 @@ from typing import Any, Literal
 from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
     M03R_V15_PROTOCOL_SHA256,
 )
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v2"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v3"
 )
-M03R_V16_DESIGN_ID = (
-    "paired-common30-dimensionless-selection-only-hold30-prior-primary-v2"
-)
+M03R_V16_DESIGN_ID = "causal-executed-cohort-balanced-fast-slab-hold30-primary-v3"
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30
 M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS = 30
 M03RV16SelectionTarget = Literal[
@@ -46,7 +45,7 @@ M03R_V16_SETTING_IDS = (
 M03R_V16_PRIMARY_SETTING_INDEX = 2
 M03R_V16_SCORE_EPOCHS = 8
 M03R_V16_EPISODE_SCHEDULE_RULE = (
-    "origin-aligned-252-context-63-origin-block-paired-selection-only-v2"
+    "origin-aligned-252-context-balanced-block-paired-selection-only-v3"
 )
 M03R_V16_FOLD_GEOMETRY_RULE = (
     "five-disjoint-93-advance-inner63-diagnostic-63-origin-common30-pre2026-v2"
@@ -70,7 +69,7 @@ M03R_V16_TARGET_SELECTION_RULE = (
     "hold30-prior-setting-2-primary-h21-h30-explanatory-controls-v1"
 )
 M03R_V16_COHORT_SLEEVE_RULE = (
-    "horizon-matched-staggered-cohorts-63-decisions-30-tail-terminal-close-v1"
+    "origin-action-mask-executed-drifted-cohorts-truncated30-terminal-close-v2"
 )
 
 
@@ -286,6 +285,10 @@ class M03RV16PredictiveSpec:
         40.0,
     )
     cohort_total_active_one_way_mass: float = 0.0025
+    hold_target_sessions: int = LEGACY_HOLD30_TARGET_SPEC.target_sessions
+    hold_age_cap_sessions: int = LEGACY_HOLD30_TARGET_SPEC.age_cap_sessions
+    hold_prior_family: str = LEGACY_HOLD30_TARGET_SPEC.prior_family
+    hold_target_spec_sha256: str = LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     # The final cohort earns its first return on its decision/fill step, so a
     # 30-return horizon needs 29 additional no-new-decision transitions.
     cohort_no_new_decision_tail_sessions: int = 29
@@ -335,6 +338,10 @@ class M03RV16PredictiveSpec:
             or self.evaluation_cost_basis_points
             != (0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 40.0)
             or self.cohort_total_active_one_way_mass != 0.0025
+            or self.hold_target_sessions != 30
+            or self.hold_age_cap_sessions != 60
+            or self.hold_prior_family != "legacy-hold30-v1"
+            or self.hold_target_spec_sha256 != LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
             or self.cohort_no_new_decision_tail_sessions != 29
             or self.timing_optimizer_updates != 0
             or self.uncertainty_calibration_updates != 0
@@ -370,6 +377,7 @@ M03R_V16_PROTOCOL_SHA256 = _sha256(
         ),
         "survival_weights": M03R_V16_SURVIVAL_WEIGHTS,
         "survival_after_day_30": M03R_V16_SURVIVAL_AFTER_DAY_30,
+        "hold_target_spec_sha256": LEGACY_HOLD30_TARGET_SPEC.receipt_sha256,
         "episode_schedule_rule": M03R_V16_EPISODE_SCHEDULE_RULE,
         "fold_geometry_rule": M03R_V16_FOLD_GEOMETRY_RULE,
         "executable_score_rule": M03R_V16_EXECUTABLE_SCORE_RULE,

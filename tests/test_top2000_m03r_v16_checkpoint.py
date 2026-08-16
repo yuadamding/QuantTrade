@@ -113,3 +113,36 @@ def test_v16_epoch_checkpoint_rejects_missing_selection_score_head(
             expected_asset_axis_sha256=str(identity["asset_axis_sha256"]),
             policy=_policy(),
         )
+
+
+def test_v16_epoch_checkpoint_rejects_hold_target_mismatch(tmp_path: Path) -> None:
+    clean = tmp_path / "clean.pt"
+    write_immutable_m03r_v16_epoch_checkpoint(
+        clean,
+        _policy(),
+        **_identity(),  # type: ignore[arg-type]
+    )
+    payload = torch.load(clean, map_location="cpu", weights_only=True)
+    payload["hold_target_sessions"] = 3
+    tampered = tmp_path / "target-3.pt"
+    torch.save(payload, tampered)
+    identity = _identity()
+    with pytest.raises(M03RV16CheckpointError, match="immutable identity"):
+        load_m03r_v16_epoch_checkpoint_for_evaluation(
+            tampered,
+            expected_file_sha256=hashlib.sha256(tampered.read_bytes()).hexdigest(),
+            expected_setting_index=0,
+            expected_fold_index=int(identity["fold_index"]),
+            expected_epoch_index=int(identity["epoch_index"]),
+            expected_completed_score_updates=int(identity["completed_score_updates"]),
+            expected_panel_schedule_sha256=str(identity["panel_schedule_sha256"]),
+            expected_selection_target_operator_root_sha256=str(
+                identity["selection_target_operator_root_sha256"]
+            ),
+            expected_action_operator_root_sha256=str(
+                identity["action_operator_root_sha256"]
+            ),
+            expected_source_array_sha256=str(identity["source_array_sha256"]),
+            expected_asset_axis_sha256=str(identity["asset_axis_sha256"]),
+            policy=_policy(),
+        )

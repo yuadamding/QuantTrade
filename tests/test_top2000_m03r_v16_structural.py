@@ -20,6 +20,7 @@ from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
 from rl_quant.training.top2000_m03r_v16_structural import (
     build_m03r_v16_structural_slab,
     load_m03r_v16_structural_slab,
+    qualify_m03r_v16_structural_slab,
     write_m03r_v16_structural_slab,
 )
 from rl_quant.training.top2000_m03r_v9_pretraining_runtime import (
@@ -191,6 +192,7 @@ def test_v16_batch_consumes_slab_without_rebuilding_qr(
     monkeypatch.setattr(structural, "scheduled_m03r_v16_origins", lambda: (251,))
     cache, risk, sequence = _surfaces()
     slab = build_m03r_v16_structural_slab(cache, risk, **_identities())
+    validated_slab = qualify_m03r_v16_structural_slab(slab)
 
     policy = Top2000M03RV16PredictivePolicy(
         0,
@@ -233,9 +235,9 @@ def test_v16_batch_consumes_slab_without_rebuilding_qr(
         source_array_sha256="6" * 64,
         asset_axis_sha256="b" * 64,
         origin_risk_exposures=risk.exposures,
-        structural_slab=slab,
+        structural_slab=validated_slab,
     )
-    assert batch.structural_slab_receipt_sha256 == slab.receipt.receipt_sha256
+    assert batch.structural_slab_receipt_sha256 == validated_slab.receipt_sha256
     assert torch.equal(
         batch.objective.selection_target_economic[0].cpu(),
         slab.origin(251).economic_targets[0],
@@ -246,3 +248,23 @@ def test_v16_batch_consumes_slab_without_rebuilding_qr(
         rtol=2.0e-5,
         atol=2.0e-7,
     )
+
+
+def test_v16_validated_slab_lookup_does_not_repeat_global_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_structural as structural
+
+    monkeypatch.setattr(structural, "scheduled_m03r_v16_origins", lambda: (251,))
+    cache, risk, _sequence = _surfaces()
+    slab = build_m03r_v16_structural_slab(cache, risk, **_identities())
+    authority = qualify_m03r_v16_structural_slab(slab)
+
+    def _forbidden(_self: Any) -> None:
+        raise AssertionError("deep slab validation entered the optimizer hot path")
+
+    monkeypatch.setattr(type(slab), "validate", _forbidden)
+    assert authority.origin(251).origin_state_index == 251
+    first = authority.device_origin(251, torch.device("cpu"))
+    second = authority.device_origin(251, torch.device("cpu"))
+    assert first is second

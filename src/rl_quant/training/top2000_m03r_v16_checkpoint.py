@@ -17,6 +17,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
 )
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 from rl_quant.training.top2000_m03r_v9_pretraining_step import state_dict_sha256
 from rl_quant.training.top2000_m03r_v16_fold import render_m03r_v16_fold_geometries
 from rl_quant.training.top2000_m03r_v16_policy import (
@@ -26,7 +27,7 @@ from rl_quant.training.top2000_m03r_v16_policy import (
 )
 
 M03R_V16_EPOCH_CHECKPOINT_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-score-epoch-checkpoint-v2"
+    "rl-quant.top2000-dev.m03r-v16-score-epoch-checkpoint-v3"
 )
 _MAX_CHECKPOINT_BYTES = 8 * 1024**3
 EvaluationResult = TypeVar("EvaluationResult")
@@ -81,6 +82,8 @@ class M03RV16LoadedEpochCheckpoint:
     source_array_sha256: str
     asset_axis_sha256: str
     head_identity: M03RV16HeadIdentity
+    hold_target_sessions: int = LEGACY_HOLD30_TARGET_SPEC.target_sessions
+    hold_target_spec_sha256: str = LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
 
     def validate(self) -> None:
@@ -93,6 +96,8 @@ class M03RV16LoadedEpochCheckpoint:
             or self.completed_score_updates
             != _expected_updates(self.fold_index, self.epoch_index)
             or self.head_identity.setting_id != self.setting_id
+            or self.hold_target_sessions != LEGACY_HOLD30_TARGET_SPEC.target_sessions
+            or self.hold_target_spec_sha256 != LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
         ):
             raise M03RV16CheckpointError("V16 loaded checkpoint drifted")
@@ -148,6 +153,8 @@ def write_immutable_m03r_v16_epoch_checkpoint(
     payload = {
         "schema": M03R_V16_EPOCH_CHECKPOINT_SCHEMA,
         "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
+        "hold_target_sessions": LEGACY_HOLD30_TARGET_SPEC.target_sessions,
+        "hold_target_spec_sha256": LEGACY_HOLD30_TARGET_SPEC.receipt_sha256,
         "setting_index": policy.v16_setting.setting_index,
         "setting_id": policy.v16_setting.setting_id,
         "fold_index": fold_index,
@@ -250,6 +257,8 @@ def load_m03r_v16_epoch_checkpoint_for_evaluation(
     expected = {
         "schema": M03R_V16_EPOCH_CHECKPOINT_SCHEMA,
         "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
+        "hold_target_sessions": LEGACY_HOLD30_TARGET_SPEC.target_sessions,
+        "hold_target_spec_sha256": LEGACY_HOLD30_TARGET_SPEC.receipt_sha256,
         "setting_index": expected_setting_index,
         "setting_id": M03R_V16_SETTINGS[expected_setting_index].setting_id,
         "fold_index": expected_fold_index,

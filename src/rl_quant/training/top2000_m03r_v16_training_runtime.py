@@ -37,7 +37,9 @@ from rl_quant.training.top2000_m03r_v16_pretraining_step import (
     M03RV16ScoreStepReceipt,
     train_m03r_v16_score_batch_update,
 )
-from rl_quant.training.top2000_m03r_v16_structural import M03RV16StructuralSlab
+from rl_quant.training.top2000_m03r_v16_structural import (
+    M03RV16ValidatedStructuralSlab,
+)
 from rl_quant.training.top2000_m03r_v9_risk_materialization import (
     M03RV9MaterializedRiskSource,
 )
@@ -53,13 +55,13 @@ class M03RV16FoldUpdateResult:
     batch: M03RV16BuiltPredictiveBatch
     step: M03RV16ScoreStepReceipt
 
-    def validate(self, slab: M03RV16StructuralSlab) -> None:
+    def validate(self, slab: M03RV16ValidatedStructuralSlab) -> None:
         self.update_plan.validate()
         self.batch.validate()
         self.step.validate()
-        slab.validate()
+        slab.require_fast_identity()
         if (
-            self.batch.structural_slab_receipt_sha256 != slab.receipt.receipt_sha256
+            self.batch.structural_slab_receipt_sha256 != slab.receipt_sha256
             or self.step.batch_receipt_sha256 != self.batch.receipt_sha256
             or self.step.update_plan_sha256 != self.update_plan.receipt_sha256
         ):
@@ -108,7 +110,7 @@ def run_m03r_v16_pretraining_fold_update(
     schedule: M03RV16PanelSchedule,
     geometry: M03RV16FoldGeometry,
     risk_source: M03RV9MaterializedRiskSource,
-    structural_slab: M03RV16StructuralSlab,
+    structural_slab: M03RV16ValidatedStructuralSlab,
     policy: Top2000M03RV16PredictivePolicy,
     optimizer: torch.optim.Optimizer,
     partition: M03RV16OptimizerPartition,
@@ -124,7 +126,7 @@ def run_m03r_v16_pretraining_fold_update(
     geometry.validate()
     cache.validate_unmodified()
     risk_source.validate()
-    structural_slab.validate()
+    structural_slab.require_fast_identity()
     if (
         schedule.cache_sha256 != cache.cache_sha256
         or schedule.asset_axis_sha256 != cache.action_hash

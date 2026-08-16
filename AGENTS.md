@@ -30,9 +30,10 @@ product, or business-production system.
 - Treat [M03R-v16 holding-aligned selection research](docs/top2000_m03r_v16_holding_aligned_selection.md)
   as the current local predictive implementation boundary. It compares h21,
   h30, and reference-Hold-30 survival-value selection targets on one common
-  30-session support. Local source includes package-owned structural slabs,
-  exact-workload capacity and horizon-matched cohort primitives, but no sealed
-  package or remote evidence; tests do not authorize GPU or 2026 access.
+  30-session support. Local v3 source includes causal action masks,
+  executed/drifted cohorts, balanced blocks, validated structural-slab caching,
+  exact-workload capacity and checkpoint-bound qualification primitives, but no
+  sealed package or remote evidence; tests do not authorize GPU or 2026 access.
 - Treat the [M03R v7 RFC](docs/prelockbox_hold30_active_alpha_m03r_v7.md) and
   [experiment specification](docs/prelockbox_hold30_active_alpha_m03r_v7_experiment.md)
   as the canonical PIT Active-300 objective and promotion contract. That

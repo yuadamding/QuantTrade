@@ -21,6 +21,12 @@ from enum import Enum
 
 import torch
 
+from rl_quant.protocol.hold_target import (
+    DEFAULT_HOLD_TARGET_SPEC,
+    LEGACY_HOLD30_TARGET_SPEC,
+    HoldTargetSpec,
+)
+
 MAX_EXACT_AGE = 60
 AGE_BIN_COUNT = MAX_EXACT_AGE + 1
 TARGET_HOLDING_DAYS = 30
@@ -654,11 +660,12 @@ class CohortLedger:
         )
         return CohortLedger(aged_value, aged_units, self.cash_index)
 
-    def trade_to(
+    def trade_to_holding_target(
         self,
         target_weights: torch.Tensor,
         *,
         cause: TurnoverCause | str,
+        hold_spec: HoldTargetSpec = DEFAULT_HOLD_TARGET_SPEC,
         proposed_release: torch.Tensor | None = None,
         track_new_entries: bool = True,
     ) -> tuple[CohortLedger, CohortTradeAccounting]:
@@ -670,6 +677,9 @@ class CohortLedger:
         remaining economic cohorts.  Without it, all sales are pro rata.
         """
 
+        hold_spec.validate()
+        if hold_spec.age_cap_sessions != MAX_EXACT_AGE:
+            raise ValueError("holding target age cap differs from the cohort ledger")
         resolved_cause = _as_cause(cause)
         _validate_weight_tensor(target_weights, name="target_weights")
         expected = (self.batch_size, self.num_assets)
@@ -754,7 +764,8 @@ class CohortLedger:
         )
 
         age = torch.arange(AGE_BIN_COUNT, dtype=value.dtype, device=value.device)
-        early_weight = ((TARGET_HOLDING_DAYS - age) / TARGET_HOLDING_DAYS).clamp(
+        target_holding_days = float(hold_spec.target_sessions)
+        early_weight = ((target_holding_days - age) / target_holding_days).clamp(
             min=0.0, max=1.0
         )
         if resolved_cause.early_exit_exempt:
@@ -777,6 +788,24 @@ class CohortLedger:
             early_exit_units=early_units,
         )
         return next_ledger, accounting
+
+    def trade_to(
+        self,
+        target_weights: torch.Tensor,
+        *,
+        cause: TurnoverCause | str,
+        proposed_release: torch.Tensor | None = None,
+        track_new_entries: bool = True,
+    ) -> tuple[CohortLedger, CohortTradeAccounting]:
+        """Legacy Hold-30 trade path retained for historical protocols."""
+
+        return self.trade_to_holding_target(
+            target_weights,
+            cause=cause,
+            hold_spec=LEGACY_HOLD30_TARGET_SPEC,
+            proposed_release=proposed_release,
+            track_new_entries=track_new_entries,
+        )
 
     def age_summaries(self) -> torch.Tensor:
         """Return five compact age features per asset.

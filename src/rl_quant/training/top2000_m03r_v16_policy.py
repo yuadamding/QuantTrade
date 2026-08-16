@@ -19,13 +19,14 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
 from rl_quant.protocol.hold30_alpha_m03r_v7_top2000_dev import (
     M03R_TOP2000_DEV_REFERENCE_SETTING_ID,
 )
+from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 from rl_quant.training.top2000_m03r_v15_policy import (
     M03R_V15_ENCODER_PARAMETER_PREFIXES,
 )
 from rl_quant.training.top2000_m03r_v7_dev import Top2000M03RV7DevelopmentPolicy
 
-M03R_V16_POLICY_SCHEMA = "rl-quant.top2000-dev.m03r-v16-selection-policy-v2"
-M03R_V16_RAW_OUTPUT_SCHEMA = "rl-quant.top2000-dev.m03r-v16-raw-selection-z-v2"
+M03R_V16_POLICY_SCHEMA = "rl-quant.top2000-dev.m03r-v16-selection-policy-v3"
+M03R_V16_RAW_OUTPUT_SCHEMA = "rl-quant.top2000-dev.m03r-v16-raw-selection-z-v3"
 M03R_V16_OUTPUT_CONTRACT_SHA256 = hashlib.sha256(
     (
         "raw-dimensionless-selection-z-only;no-timing-scale-rank-or-execution-alias;"
@@ -68,6 +69,8 @@ class M03RV16HeadIdentity:
     numerical_target_support_sessions: int
     selection_target_scale: float
     selection_score_head_state_sha256: str
+    hold_target_sessions: int = LEGACY_HOLD30_TARGET_SPEC.target_sessions
+    hold_target_spec_sha256: str = LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     output_contract_sha256: str = M03R_V16_OUTPUT_CONTRACT_SHA256
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
 
@@ -99,6 +102,8 @@ class M03RV16HeadIdentity:
             )
             or self.output_contract_sha256 != M03R_V16_OUTPUT_CONTRACT_SHA256
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+            or self.hold_target_sessions != LEGACY_HOLD30_TARGET_SPEC.target_sessions
+            or self.hold_target_spec_sha256 != LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
         ):
             raise M03RV16PolicyError("V16 head identity drifted")
 
@@ -118,6 +123,8 @@ class M03RV16RawSelectionPrediction:
     selection_target: str
     numerical_target_support_sessions: int
     selection_target_scale: float
+    hold_target_sessions: int = LEGACY_HOLD30_TARGET_SPEC.target_sessions
+    hold_target_spec_sha256: str = LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
     schema: str = M03R_V16_RAW_OUTPUT_SCHEMA
 
@@ -142,6 +149,8 @@ class M03RV16RawSelectionPrediction:
             )
             != expected.get(self.selection_target)
             or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+            or self.hold_target_sessions != LEGACY_HOLD30_TARGET_SPEC.target_sessions
+            or self.hold_target_spec_sha256 != LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
             or self.schema != M03R_V16_RAW_OUTPUT_SCHEMA
         ):
             raise M03RV16PolicyError("V16 raw selection output drifted")
@@ -159,6 +168,8 @@ class M03RV16RawSelectionPrediction:
                         self.numerical_target_support_sessions
                     ),
                     "selection_target_scale": self.selection_target_scale,
+                    "hold_target_sessions": self.hold_target_sessions,
+                    "hold_target_spec_sha256": self.hold_target_spec_sha256,
                     "raw_selection_score_z_sha256": _tensor_sha256(
                         self.raw_selection_score_z
                     ),
