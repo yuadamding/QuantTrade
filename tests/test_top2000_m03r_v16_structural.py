@@ -24,6 +24,7 @@ from rl_quant.training.top2000_m03r_v16_structural import (
     build_m03r_v16_structural_slab,
     load_m03r_v16_structural_slab,
     qualify_m03r_v16_structural_slab,
+    restrict_m03r_v16_structural_slab,
     write_m03r_v16_structural_slab,
 )
 
@@ -181,6 +182,42 @@ def test_v16_package_owned_structural_slab_round_trips_and_binds_package(
     )
     assert loaded.receipt == slab.receipt
     assert loaded.origin(251).receipt_sha256 == slab.origin(251).receipt_sha256
+
+
+def test_v16_phase_slab_materialization_removes_other_phase_origins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_structural as structural
+
+    monkeypatch.setattr(structural, "scheduled_m03r_v16_origins", lambda: (251, 252))
+    cache, risk, _sequence = _surfaces()
+    authority = qualify_m03r_v16_structural_slab(
+        build_m03r_v16_structural_slab(cache, risk, **_identities())
+    )
+    geometry = SimpleNamespace(
+        eligible_training_origins=(251,),
+        inner_validation_origin_start_inclusive=251,
+        inner_validation_origin_stop_exclusive=252,
+        qualification_origin_start_inclusive=252,
+        qualification_origin_stop_exclusive=253,
+    )
+    monkeypatch.setattr(
+        structural,
+        "render_m03r_v16_fold_geometries",
+        lambda _rows: (geometry,),
+    )
+    training = restrict_m03r_v16_structural_slab(
+        authority, access_mode="training"
+    )
+    qualification = restrict_m03r_v16_structural_slab(
+        authority, access_mode="qualification"
+    )
+    assert tuple(row.origin_state_index for row in training.slab.origins) == (251,)
+    assert tuple(row.origin_state_index for row in qualification.slab.origins) == (252,)
+    with pytest.raises(Exception, match="forbids origin access"):
+        training.origin(252)
+    with pytest.raises(Exception, match="forbids origin access"):
+        qualification.origin(251)
 
 
 def test_v16_batch_consumes_slab_without_rebuilding_qr(

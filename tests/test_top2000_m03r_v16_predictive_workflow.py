@@ -113,6 +113,9 @@ def test_v16_worker_source_requires_terminal_authority_and_is_predictive_only() 
     assert "V16 qualification requires activation" in source
     assert '"qualification_tail_accessed": False' in source
     assert 'output / "training-terminal.json"' in source
+    assert 'output / "launch-consumption.json"' in source
+    assert "load_m03r_v16_pod_runtime_attestation" in source
+    assert "M03R_V16_CURRENT_POD_UID" in source
     assert '"economic_optimizer_updates": 0' in source
     assert '"reinforcement_learning_updates": 0' in source
     assert '"outer_2026_accessed": False' in source

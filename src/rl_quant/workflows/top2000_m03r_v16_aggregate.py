@@ -276,7 +276,10 @@ def _worker_terminal(
         or payload.get("training_terminal_file_sha256")
         != qualification_activation.training_terminal_file_sha256[setting_index]
         or not payload.get("job_uid")
-        or len(tuple(payload.get("pod_uids", ()))) != 3
+        or not payload.get("pod_uid")
+        or not isinstance(
+            payload.get("pod_runtime_attestation_receipt_sha256"), str
+        )
         or payload.get("prequalification_closure_receipt_sha256")
         != qualification_activation.prequalification_closure_receipt_sha256
         or payload.get("worker_plan_sha256") != worker.receipt_sha256
@@ -499,6 +502,10 @@ def aggregate_m03r_v16_panel(
             package=package,
             authorization=authorization,
             training_panel_path=training_panel_path,
+            prequalification_closure_path=(
+                Path(training_panel_path).parent
+                / "prequalification-closure.json"
+            ),
             training_terminal_paths=training_terminal_paths,
         )
     )

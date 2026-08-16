@@ -22,10 +22,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v8"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v9"
 )
 M03R_V16_DESIGN_ID = (
-    "evidence-backed-launch-bound-preclosed-paired-panel-hold30-primary-v8"
+    "typed-evidence-pod-attested-preclosed-paired-panel-hold30-primary-v9"
 )
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30
 M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS = 30

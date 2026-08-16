@@ -17,6 +17,8 @@ from rl_quant.protocol.canonical_artifact import (
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import M03R_V16_PROTOCOL_SHA256
 from rl_quant.training.top2000_m03r_v16_capacity import (
     M03R_V16_CAPACITY_TERMINAL_SCHEMA,
+    M03RV16CapacityRankEvidence,
+    M03RV16CapacityTerminal,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
@@ -27,16 +29,19 @@ from rl_quant.training.top2000_m03r_v16_static_contract import (
 )
 
 M03R_V16_TRAINING_ACTIVATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-training-activation-v2"
+    "rl-quant.top2000-dev.m03r-v16-training-activation-v3"
 )
 M03R_V16_QUALIFICATION_ACTIVATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-qualification-activation-v2"
+    "rl-quant.top2000-dev.m03r-v16-qualification-activation-v3"
 )
 M03R_V16_PHASE_LAUNCH_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-phase-launch-authority-v1"
+    "rl-quant.top2000-dev.m03r-v16-phase-launch-authority-v2"
 )
 M03R_V16_ADMITTED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-admitted-job-authority-v1"
+    "rl-quant.top2000-dev.m03r-v16-prelaunch-job-authority-v2"
+)
+M03R_V16_POD_RUNTIME_ATTESTATION_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-pod-runtime-attestation-v1"
 )
 M03R_V16_DRY_RUN_RESULT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-server-dry-run-result-v1"
@@ -44,10 +49,21 @@ M03R_V16_DRY_RUN_RESULT_SCHEMA = (
 M03R_V16_ADMITTED_MANIFEST_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-admitted-manifest-result-v1"
 )
+M03R_V16_TRAINING_PANEL_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-training-adequacy-panel-v3"
+)
+M03R_V16_PREQUALIFICATION_CLOSURE_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-prequalification-closure-v3"
+)
+M03R_V16_TRAINING_TERMINAL_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-training-terminal-v2"
+)
 _TRAINING_ISSUER = object()
 _QUALIFICATION_ISSUER = object()
 _LAUNCH_ISSUER = object()
 _ADMISSION_ISSUER = object()
+_POD_ATTESTATION_ISSUER = object()
+_TRAINING_PANEL_ISSUER = object()
 _MAX_BYTES = 4 * 1024**2
 
 
@@ -189,6 +205,7 @@ class M03RV16QualificationActivation:
         tuple[str, str, str, str, str],
     ]
     prequalification_closure_receipt_sha256: str
+    prequalification_closure_file_sha256: str
     source_tree_root_sha256: str
     image_digest_sha256: str
     _issuer: object = field(repr=False)
@@ -213,6 +230,10 @@ class M03RV16QualificationActivation:
         _digest(
             "prequalification_closure_receipt_sha256",
             self.prequalification_closure_receipt_sha256,
+        )
+        _digest(
+            "prequalification_closure_file_sha256",
+            self.prequalification_closure_file_sha256,
         )
         _digest("source_tree_root_sha256", self.source_tree_root_sha256)
         for value in self.training_terminal_file_sha256:
@@ -256,6 +277,103 @@ class M03RV16QualificationActivation:
 
 
 @dataclass(frozen=True, slots=True)
+class M03RV16TrainingPanelAuthority:
+    """Validated all-setting fit and checkpoint closure authority."""
+
+    package_plan_sha256: str
+    execution_authorization_receipt_sha256: str
+    training_panel_receipt_sha256: str
+    training_panel_file_sha256: str
+    training_terminal_file_sha256: tuple[str, str, str]
+    training_terminal_receipt_sha256: tuple[str, str, str]
+    setting_fold_training_adequacy_receipt_sha256: tuple[
+        tuple[str, str, str, str, str],
+        tuple[str, str, str, str, str],
+        tuple[str, str, str, str, str],
+    ]
+    setting_fold_training_adequacy_status: tuple[
+        tuple[str, str, str, str, str],
+        tuple[str, str, str, str, str],
+        tuple[str, str, str, str, str],
+    ]
+    terminal_checkpoint_file_sha256: tuple[
+        tuple[str, str, str, str, str],
+        tuple[str, str, str, str, str],
+        tuple[str, str, str, str, str],
+    ]
+    prequalification_closure_receipt_sha256: str
+    prequalification_closure_file_sha256: str
+    source_tree_root_sha256: str
+    _issuer: object = field(repr=False)
+    all_setting_folds_adequate: bool = True
+    outer_qualification_outcomes_accessed: bool = False
+    protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
+    schema: str = "rl-quant.top2000-dev.m03r-v16-training-panel-authority-v1"
+
+    def validate_for(
+        self,
+        package: M03RV16PackagePlan,
+        authorization: M03RV16ExecutionAuthorization,
+    ) -> None:
+        package.validate()
+        authorization.validate(package)
+        for name in (
+            "training_panel_receipt_sha256",
+            "training_panel_file_sha256",
+            "prequalification_closure_receipt_sha256",
+            "prequalification_closure_file_sha256",
+            "source_tree_root_sha256",
+        ):
+            _digest(name, getattr(self, name))
+        for value in self.training_terminal_file_sha256:
+            _digest("training_terminal_file_sha256", value)
+        for value in self.training_terminal_receipt_sha256:
+            _digest("training_terminal_receipt_sha256", value)
+        for matrix in (
+            self.setting_fold_training_adequacy_receipt_sha256,
+            self.terminal_checkpoint_file_sha256,
+        ):
+            for row in matrix:
+                for value in row:
+                    _digest("training panel matrix digest", value)
+        if (
+            self._issuer is not _TRAINING_PANEL_ISSUER
+            or self.package_plan_sha256 != package.package_plan_sha256
+            or self.execution_authorization_receipt_sha256
+            != authorization.receipt_sha256
+            or len(self.training_terminal_file_sha256) != 3
+            or len(self.training_terminal_receipt_sha256) != 3
+            or len(self.setting_fold_training_adequacy_receipt_sha256) != 3
+            or any(
+                len(row) != 5
+                for row in self.setting_fold_training_adequacy_receipt_sha256
+            )
+            or len(self.setting_fold_training_adequacy_status) != 3
+            or any(
+                len(row) != 5
+                for row in self.setting_fold_training_adequacy_status
+            )
+            or any(
+                status != "adequate"
+                for row in self.setting_fold_training_adequacy_status
+                for status in row
+            )
+            or len(self.terminal_checkpoint_file_sha256) != 3
+            or any(len(row) != 5 for row in self.terminal_checkpoint_file_sha256)
+            or not self.all_setting_folds_adequate
+            or self.outer_qualification_outcomes_accessed
+            or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+        ):
+            raise M03RV16ActivationError("V16 training-panel authority drifted")
+
+    @property
+    def receipt_sha256(self) -> str:
+        payload = asdict(self)
+        payload.pop("_issuer")
+        return semantic_sha256(payload)
+
+
+@dataclass(frozen=True, slots=True)
 class M03RV16PhaseLaunchAuthority:
     package_plan_sha256: str
     execution_authorization_receipt_sha256: str
@@ -267,7 +385,6 @@ class M03RV16PhaseLaunchAuthority:
     pod_contract_sha256: str
     run_id: str
     job_uid: str
-    pod_uids: tuple[str, ...]
     completions: int
     one_shot_nonce_sha256: str
     source_tree_root_sha256: str
@@ -320,7 +437,6 @@ class M03RV16PhaseLaunchAuthority:
             or not self.run_id
             or self.run_id != admission.run_id
             or self.job_uid != admission.job_uid
-            or self.pod_uids != admission.pod_uids
             or self.image_digest_sha256 != package.artifacts.image_digest_sha256
             or self.economic_training_authorized
             or self.reinforcement_learning_authorized
@@ -350,10 +466,9 @@ class M03RV16AdmittedJobAuthority:
     admitted_manifest_file_sha256: str
     admitted_manifest_sha256: str
     job_uid: str
-    pod_uids: tuple[str, ...]
-    container_image_ids: tuple[str, ...]
-    node_names: tuple[str, ...]
     completions: int
+    image_reference: str
+    image_digest_sha256: str
     _issuer: object = field(repr=False)
     suspended_at_admission: bool = True
     economic_training_authorized: bool = False
@@ -381,6 +496,7 @@ class M03RV16AdmittedJobAuthority:
             "server_side_dry_run_receipt_sha256",
             "admitted_manifest_file_sha256",
             "admitted_manifest_sha256",
+            "image_digest_sha256",
         ):
             _digest(name, getattr(self, name))
         if (
@@ -392,16 +508,11 @@ class M03RV16AdmittedJobAuthority:
             or self.job_contract_sha256 != expected_job_contract_sha256
             or self.pod_contract_sha256 != expected_pod_contract_sha256
             or self.completions != expected.get(self.phase)
-            or len(self.pod_uids) != self.completions
-            or len(self.container_image_ids) != self.completions
-            or len(self.node_names) != self.completions
-            or len(set(self.pod_uids)) != self.completions
             or not self.run_id
             or not self.job_uid
-            or any(not value for value in (*self.pod_uids, *self.node_names))
-            or any(
-                "@sha256:" not in value for value in self.container_image_ids
-            )
+            or self.image_reference != package.artifacts.image_reference
+            or self.image_digest_sha256
+            != package.artifacts.image_digest_sha256
             or not self.suspended_at_admission
             or self.economic_training_authorized
             or self.reinforcement_learning_authorized
@@ -431,9 +542,6 @@ def _issue_m03r_v16_admitted_job_authority(
     admitted_manifest_file_sha256: str,
     admitted_manifest_sha256: str,
     job_uid: str,
-    pod_uids: tuple[str, ...],
-    container_image_ids: tuple[str, ...],
-    node_names: tuple[str, ...],
 ) -> M03RV16AdmittedJobAuthority:
     """Issue lifecycle evidence after admission; never from digest strings alone."""
 
@@ -449,10 +557,9 @@ def _issue_m03r_v16_admitted_job_authority(
         admitted_manifest_file_sha256=admitted_manifest_file_sha256,
         admitted_manifest_sha256=admitted_manifest_sha256,
         job_uid=job_uid,
-        pod_uids=pod_uids,
-        container_image_ids=container_image_ids,
-        node_names=node_names,
         completions={"capacity": 1, "training": 3, "qualification": 3}[phase],
+        image_reference=package.artifacts.image_reference,
+        image_digest_sha256=package.artifacts.image_digest_sha256,
         _issuer=_ADMISSION_ISSUER,
     )
     value.validate_for(
@@ -503,9 +610,6 @@ def load_m03r_v16_admitted_job_authority(
     payload = _read_exact(Path(path), expected_file_sha256)
     try:
         row = dict(payload["authority"])
-        row["pod_uids"] = tuple(row["pod_uids"])
-        row["container_image_ids"] = tuple(row["container_image_ids"])
-        row["node_names"] = tuple(row["node_names"])
         value = M03RV16AdmittedJobAuthority(**row, _issuer=_ADMISSION_ISSUER)
     except (KeyError, TypeError, ValueError) as exc:
         raise M03RV16ActivationError(
@@ -552,10 +656,11 @@ def load_m03r_v16_admitted_job_authority(
         or admitted.get("job_contract_sha256") != expected_job_contract_sha256
         or admitted.get("pod_contract_sha256") != expected_pod_contract_sha256
         or admitted.get("job_uid") != value.job_uid
-        or tuple(admitted.get("pod_uids", ())) != value.pod_uids
-        or tuple(admitted.get("container_image_ids", ()))
-        != value.container_image_ids
-        or tuple(admitted.get("node_names", ())) != value.node_names
+        or admitted.get("image_reference") != value.image_reference
+        or admitted.get("image_digest_sha256") != value.image_digest_sha256
+        or tuple(admitted.get("pod_uids", ())) != ()
+        or tuple(admitted.get("container_image_ids", ())) != ()
+        or tuple(admitted.get("node_names", ())) != ()
         or admitted.get("suspended_at_admission") is not True
     ):
         raise M03RV16ActivationError(
@@ -609,7 +714,6 @@ def _issue_m03r_v16_phase_launch_authority(
         pod_contract_sha256=pod_contract_sha256,
         run_id=run_id,
         job_uid=admission.job_uid,
-        pod_uids=admission.pod_uids,
         completions={"capacity": 1, "training": 3, "qualification": 3}[phase],
         one_shot_nonce_sha256=nonce,
         source_tree_root_sha256=source_tree_root_sha256,
@@ -668,7 +772,6 @@ def load_m03r_v16_phase_launch_authority(
     payload = _read_exact(Path(path), expected_file_sha256)
     try:
         row = dict(payload["authority"])
-        row["pod_uids"] = tuple(row["pod_uids"])
         value = M03RV16PhaseLaunchAuthority(**row, _issuer=_LAUNCH_ISSUER)
     except (KeyError, TypeError, ValueError) as exc:
         raise M03RV16ActivationError("V16 phase launch file is malformed") from exc
@@ -692,6 +795,201 @@ def load_m03r_v16_phase_launch_authority(
     return value
 
 
+def _image_identity(value: str) -> tuple[str, str]:
+    normalized = value.removeprefix("docker-pullable://")
+    if "@sha256:" not in normalized:
+        raise M03RV16ActivationError("V16 runtime image is not digest pinned")
+    repository, digest = normalized.rsplit("@sha256:", 1)
+    _digest("runtime image digest", digest)
+    if not repository:
+        raise M03RV16ActivationError("V16 runtime image repository is absent")
+    return repository, digest
+
+
+@dataclass(frozen=True, slots=True)
+class M03RV16PodRuntimeAttestation:
+    """Per-completion identity observed only after a suspended Job resumes."""
+
+    package_plan_sha256: str
+    execution_authorization_receipt_sha256: str
+    phase: Literal["capacity", "training", "qualification"]
+    run_id: str
+    admission_receipt_sha256: str
+    launch_authority_receipt_sha256: str
+    job_contract_sha256: str
+    pod_contract_sha256: str
+    job_uid: str
+    completion_index: int
+    pod_uid: str
+    pod_name: str
+    node_name: str
+    observed_container_image_id: str
+    output_root_sha256: str
+    _issuer: object = field(repr=False)
+    protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
+    schema: str = M03R_V16_POD_RUNTIME_ATTESTATION_SCHEMA
+
+    def validate_for(
+        self,
+        package: M03RV16PackagePlan,
+        authorization: M03RV16ExecutionAuthorization,
+        *,
+        admission: M03RV16AdmittedJobAuthority,
+        launch: M03RV16PhaseLaunchAuthority,
+        expected_completion_index: int,
+        expected_output_root_sha256: str,
+    ) -> None:
+        package.validate()
+        authorization.validate(package)
+        for name in (
+            "admission_receipt_sha256",
+            "launch_authority_receipt_sha256",
+            "job_contract_sha256",
+            "pod_contract_sha256",
+            "output_root_sha256",
+        ):
+            _digest(name, getattr(self, name))
+        expected_repository, expected_digest = _image_identity(
+            package.artifacts.image_reference
+        )
+        observed_repository, observed_digest = _image_identity(
+            self.observed_container_image_id
+        )
+        if (
+            self._issuer is not _POD_ATTESTATION_ISSUER
+            or self.package_plan_sha256 != package.package_plan_sha256
+            or self.execution_authorization_receipt_sha256
+            != authorization.receipt_sha256
+            or self.phase != admission.phase
+            or self.phase != launch.phase
+            or self.run_id != admission.run_id
+            or self.run_id != launch.run_id
+            or self.admission_receipt_sha256 != admission.receipt_sha256
+            or self.launch_authority_receipt_sha256 != launch.receipt_sha256
+            or self.job_contract_sha256 != admission.job_contract_sha256
+            or self.pod_contract_sha256 != admission.pod_contract_sha256
+            or self.job_uid != admission.job_uid
+            or self.completion_index != expected_completion_index
+            or not 0 <= self.completion_index < admission.completions
+            or not self.pod_uid
+            or not self.pod_name
+            or not self.node_name
+            or observed_repository != expected_repository
+            or observed_digest != expected_digest
+            or observed_digest != package.artifacts.image_digest_sha256
+            or self.output_root_sha256 != expected_output_root_sha256
+            or self.protocol_sha256 != M03R_V16_PROTOCOL_SHA256
+            or self.schema != M03R_V16_POD_RUNTIME_ATTESTATION_SCHEMA
+        ):
+            raise M03RV16ActivationError("V16 Pod runtime attestation drifted")
+
+    @property
+    def receipt_sha256(self) -> str:
+        payload = asdict(self)
+        payload.pop("_issuer")
+        return semantic_sha256(payload)
+
+
+def _issue_m03r_v16_pod_runtime_attestation(
+    *,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    admission: M03RV16AdmittedJobAuthority,
+    launch: M03RV16PhaseLaunchAuthority,
+    completion_index: int,
+    pod_uid: str,
+    pod_name: str,
+    node_name: str,
+    observed_container_image_id: str,
+    output_root_sha256: str,
+) -> M03RV16PodRuntimeAttestation:
+    value = M03RV16PodRuntimeAttestation(
+        package_plan_sha256=package.package_plan_sha256,
+        execution_authorization_receipt_sha256=authorization.receipt_sha256,
+        phase=admission.phase,
+        run_id=admission.run_id,
+        admission_receipt_sha256=admission.receipt_sha256,
+        launch_authority_receipt_sha256=launch.receipt_sha256,
+        job_contract_sha256=admission.job_contract_sha256,
+        pod_contract_sha256=admission.pod_contract_sha256,
+        job_uid=admission.job_uid,
+        completion_index=completion_index,
+        pod_uid=pod_uid,
+        pod_name=pod_name,
+        node_name=node_name,
+        observed_container_image_id=observed_container_image_id,
+        output_root_sha256=output_root_sha256,
+        _issuer=_POD_ATTESTATION_ISSUER,
+    )
+    value.validate_for(
+        package,
+        authorization,
+        admission=admission,
+        launch=launch,
+        expected_completion_index=completion_index,
+        expected_output_root_sha256=output_root_sha256,
+    )
+    return value
+
+
+def write_m03r_v16_pod_runtime_attestation(
+    path: str | Path, value: M03RV16PodRuntimeAttestation
+) -> str:
+    payload = asdict(value)
+    payload.pop("_issuer")
+    return _write(
+        Path(path), {"attestation": payload, "receipt_sha256": value.receipt_sha256}
+    )
+
+
+def load_m03r_v16_pod_runtime_attestation(
+    path: str | Path,
+    *,
+    expected_file_sha256: str,
+    expected_receipt_sha256: str,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    admission: M03RV16AdmittedJobAuthority,
+    launch: M03RV16PhaseLaunchAuthority,
+    expected_completion_index: int,
+    expected_output_root_sha256: str,
+    current_pod_uid: str,
+    current_pod_name: str,
+    current_node_name: str,
+) -> M03RV16PodRuntimeAttestation:
+    payload = _read_exact(Path(path), expected_file_sha256)
+    try:
+        value = M03RV16PodRuntimeAttestation(
+            **dict(payload["attestation"]), _issuer=_POD_ATTESTATION_ISSUER
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise M03RV16ActivationError(
+            "V16 Pod runtime attestation is malformed"
+        ) from exc
+    if (
+        payload.get("receipt_sha256") != value.receipt_sha256
+        or value.receipt_sha256 != expected_receipt_sha256
+    ):
+        raise M03RV16ActivationError("V16 Pod runtime attestation receipt drifted")
+    value.validate_for(
+        package,
+        authorization,
+        admission=admission,
+        launch=launch,
+        expected_completion_index=expected_completion_index,
+        expected_output_root_sha256=expected_output_root_sha256,
+    )
+    if (
+        value.pod_uid != current_pod_uid
+        or value.pod_name != current_pod_name
+        or value.node_name != current_node_name
+    ):
+        raise M03RV16ActivationError(
+            "V16 worker Pod identity differs from runtime attestation"
+        )
+    return value
+
+
 def write_m03r_v16_training_activation(path: str | Path, value: M03RV16TrainingActivation) -> str:
     payload = asdict(value)
     payload.pop("_issuer")
@@ -704,11 +1002,13 @@ def load_m03r_v16_training_activation(
     expected_file_sha256: str,
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
+    expected_authorization_file_sha256: str,
     static_result_path: str | Path,
     expected_static_result_file_sha256: str,
     capacity_terminal_path: str | Path,
     expected_capacity_terminal_file_sha256: str,
 ) -> M03RV16TrainingActivation:
+    _digest("expected_authorization_file_sha256", expected_authorization_file_sha256)
     payload = _read_exact(Path(path), expected_file_sha256)
     try:
         value = M03RV16TrainingActivation(**payload["activation"], _issuer=_TRAINING_ISSUER)
@@ -734,6 +1034,20 @@ def load_m03r_v16_training_activation(
     capacity_terminal = _read_exact(
         Path(capacity_terminal_path), value.capacity_terminal_file_sha256
     )
+    try:
+        capacity_row = dict(capacity_terminal["capacity"])
+        rank_rows = tuple(
+            M03RV16CapacityRankEvidence(**dict(row))
+            for row in capacity_row.pop("rank_evidence")
+        )
+        typed_capacity = M03RV16CapacityTerminal(
+            rank_evidence=rank_rows, **capacity_row
+        )
+        typed_capacity.validate()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise M03RV16ActivationError(
+            "V16 training activation capacity terminal is incomplete"
+        ) from exc
     expected_static_gate = {
         "package_plan_sha256": package.package_plan_sha256,
         "execution_authorization_receipt_sha256": authorization.receipt_sha256,
@@ -776,16 +1090,45 @@ def load_m03r_v16_training_activation(
         or value.static_result_receipt_sha256 != semantic_sha256(static_unsigned)
         or static_result.get("schema") != M03R_V16_STATIC_RESULT_SCHEMA
         or static_result.get("package_plan_sha256") != package.package_plan_sha256
+        or static_result.get("package_plan_file_sha256")
+        != authorization.package_plan_file_sha256
         or static_result.get("execution_authorization_receipt_sha256")
         != authorization.receipt_sha256
+        or static_result.get("execution_authorization_file_sha256")
+        != expected_authorization_file_sha256
+        or static_result.get("source_archive_sha256")
+        != package.artifacts.source_archive_sha256
+        or static_result.get("source_manifest_sha256")
+        != package.artifacts.source_manifest_sha256
+        or static_result.get("worker_source_sha256")
+        != package.artifacts.worker_source_sha256
         or static_result.get("source_tree_root_sha256")
         != value.source_tree_root_sha256
+        or static_result.get("structural_slab_file_sha256")
+        != package.artifacts.structural_slab_file_sha256
+        or static_result.get("structural_slab_receipt_sha256")
+        != package.artifacts.structural_slab_receipt_sha256
+        or static_result.get("panel_schedule_sha256")
+        != package.schedule.receipt_sha256
+        or static_result.get("hold_target_sessions") != 30
+        or static_result.get("hold_target_spec_sha256")
+        != package.hold_target_spec_sha256
+        or static_result.get("image_digest_sha256")
+        != package.artifacts.image_digest_sha256
         or static_result.get("training_performed") is not False
         or static_result.get("gpu_mask") != "none"
         or static_result.get("gpu_requests") != 0
         or static_result.get("gpu_limits") != 0
         or static_result.get("unmasked_visibility_claimed") is not False
         or static_result.get("initial_state_strict_loaded_all_settings") is not True
+        or static_result.get("output_empty") is not True
+        or static_result.get("container_started") is not True
+        or static_result.get("economic_training_authorized") is not False
+        or static_result.get("reinforcement_learning_authorized") is not False
+        or static_result.get("outer_2026_access_authorized") is not False
+        or static_result.get("development_only") is not True
+        or static_result.get("reportable") is not False
+        or static_result.get("promotion_eligible") is not False
         or capacity_terminal.get("schema") != M03R_V16_CAPACITY_TERMINAL_SCHEMA
         or capacity_terminal.get("package_plan_sha256")
         != package.package_plan_sha256
@@ -802,7 +1145,8 @@ def load_m03r_v16_training_activation(
         or capacity_terminal.get("scientific_checkpoint_published") is not False
         or not isinstance(capacity_terminal.get("capacity"), dict)
         or capacity_terminal.get("capacity_receipt_sha256")
-        != semantic_sha256(capacity_terminal["capacity"])
+        != typed_capacity.receipt_sha256
+        or typed_capacity.setting_index != 0
         or semantic_sha256(expected_static_gate)
         != value.static_gate_receipt_sha256
         or semantic_sha256(expected_capacity_gate)
@@ -822,6 +1166,144 @@ def write_m03r_v16_qualification_activation(
     return _write(Path(path), {"activation": payload, "receipt_sha256": value.receipt_sha256})
 
 
+def load_m03r_v16_training_panel_authority(
+    *,
+    training_panel_path: str | Path,
+    expected_training_panel_file_sha256: str,
+    prequalification_closure_path: str | Path,
+    expected_prequalification_closure_file_sha256: str,
+    training_terminal_paths: tuple[Path, Path, Path],
+    expected_training_terminal_file_sha256: tuple[str, str, str],
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+) -> M03RV16TrainingPanelAuthority:
+    """Reopen the complete panel/closure/terminal boundary and issue authority."""
+
+    panel = _read_exact(
+        Path(training_panel_path), expected_training_panel_file_sha256
+    )
+    panel_unsigned = {
+        key: row for key, row in panel.items() if key != "receipt_sha256"
+    }
+    closure = _read_exact(
+        Path(prequalification_closure_path),
+        expected_prequalification_closure_file_sha256,
+    )
+    closure_unsigned = {
+        key: row for key, row in closure.items() if key != "receipt_sha256"
+    }
+    terminals = tuple(
+        _read_exact(path, expected)
+        for path, expected in zip(
+            training_terminal_paths,
+            expected_training_terminal_file_sha256,
+            strict=True,
+        )
+    )
+    try:
+        terminal_receipts = tuple(str(row["receipt_sha256"]) for row in terminals)
+        adequacy_receipts = tuple(
+            tuple(str(value) for value in row)
+            for row in panel["setting_fold_adequacy_receipt_sha256"]
+        )
+        adequacy_status = tuple(
+            tuple(str(value) for value in row)
+            for row in panel["setting_fold_adequacy_status"]
+        )
+        checkpoint_matrix = tuple(
+            tuple(str(value) for value in row)
+            for row in panel["terminal_checkpoint_file_sha256"]
+        )
+        authority = M03RV16TrainingPanelAuthority(
+            package_plan_sha256=str(panel["package_plan_sha256"]),
+            execution_authorization_receipt_sha256=str(
+                panel["execution_authorization_receipt_sha256"]
+            ),
+            training_panel_receipt_sha256=str(panel["receipt_sha256"]),
+            training_panel_file_sha256=expected_training_panel_file_sha256,
+            training_terminal_file_sha256=expected_training_terminal_file_sha256,
+            training_terminal_receipt_sha256=terminal_receipts,  # type: ignore[arg-type]
+            setting_fold_training_adequacy_receipt_sha256=adequacy_receipts,  # type: ignore[arg-type]
+            setting_fold_training_adequacy_status=adequacy_status,  # type: ignore[arg-type]
+            terminal_checkpoint_file_sha256=checkpoint_matrix,  # type: ignore[arg-type]
+            prequalification_closure_receipt_sha256=str(
+                panel["prequalification_closure_receipt_sha256"]
+            ),
+            prequalification_closure_file_sha256=(
+                expected_prequalification_closure_file_sha256
+            ),
+            source_tree_root_sha256=str(panel["source_tree_root_sha256"]),
+            all_setting_folds_adequate=bool(
+                panel["all_setting_folds_adequate"]
+            ),
+            outer_qualification_outcomes_accessed=bool(
+                panel["outer_qualification_outcomes_accessed"]
+            ),
+            _issuer=_TRAINING_PANEL_ISSUER,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise M03RV16ActivationError(
+            "V16 training panel authority is malformed"
+        ) from exc
+    authority.validate_for(package, authorization)
+    if (
+        panel.get("schema") != M03R_V16_TRAINING_PANEL_SCHEMA
+        or panel.get("protocol_sha256") != M03R_V16_PROTOCOL_SHA256
+        or panel.get("receipt_sha256") != semantic_sha256(panel_unsigned)
+        or tuple(panel.get("training_terminal_file_sha256", ()))
+        != expected_training_terminal_file_sha256
+        or tuple(panel.get("training_terminal_receipt_sha256", ()))
+        != terminal_receipts
+        or panel.get("prequalification_closure_file_sha256")
+        != expected_prequalification_closure_file_sha256
+        or panel.get("outer_qualification_authorized") is not True
+        or panel.get("next_research_action") != "qualification-only-execution"
+        or panel.get("economic_generation_may_be_minted") is not False
+        or panel.get("reinforcement_learning_authorized") is not False
+        or panel.get("outer_2026_accessed") is not False
+        or closure.get("schema") != M03R_V16_PREQUALIFICATION_CLOSURE_SCHEMA
+        or closure.get("protocol_sha256") != M03R_V16_PROTOCOL_SHA256
+        or closure.get("receipt_sha256") != semantic_sha256(closure_unsigned)
+        or closure.get("receipt_sha256")
+        != authority.prequalification_closure_receipt_sha256
+        or tuple(closure.get("training_terminal_file_sha256", ()))
+        != expected_training_terminal_file_sha256
+        or tuple(
+            tuple(row)
+            for row in closure.get("terminal_checkpoint_file_sha256", ())
+        )
+        != authority.terminal_checkpoint_file_sha256
+        or closure.get("all_setting_folds_adequate") is not True
+        or closure.get("outer_qualification_outcomes_accessed") is not False
+    ):
+        raise M03RV16ActivationError(
+            "V16 training panel lacks complete prequalification evidence"
+        )
+    for setting, terminal in enumerate(terminals):
+        unsigned = {
+            key: row for key, row in terminal.items() if key != "receipt_sha256"
+        }
+        if (
+            terminal.get("schema") != M03R_V16_TRAINING_TERMINAL_SCHEMA
+            or terminal.get("receipt_sha256") != semantic_sha256(unsigned)
+            or terminal.get("package_plan_sha256") != package.package_plan_sha256
+            or terminal.get("authorization_receipt_sha256")
+            != authorization.receipt_sha256
+            or terminal.get("setting_index") != setting
+            or terminal.get("source_tree_root_sha256")
+            != authority.source_tree_root_sha256
+            or tuple(terminal.get("fold_training_adequacy_status", ()))
+            != ("adequate",) * 5
+            or terminal.get("qualification_tail_accessed") is not False
+            or terminal.get("outer_qualification_authorized") is not False
+            or terminal.get("three_seed_confirmation_may_be_minted") is not False
+        ):
+            raise M03RV16ActivationError(
+                "V16 training-panel terminal evidence drifted"
+            )
+    return authority
+
+
 def load_m03r_v16_qualification_activation(
     path: str | Path,
     *,
@@ -829,6 +1311,7 @@ def load_m03r_v16_qualification_activation(
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
     training_panel_path: str | Path,
+    prequalification_closure_path: str | Path,
     training_terminal_paths: tuple[Path, Path, Path],
 ) -> M03RV16QualificationActivation:
     payload = _read_exact(Path(path), expected_file_sha256)
@@ -848,42 +1331,30 @@ def load_m03r_v16_qualification_activation(
     if payload.get("receipt_sha256") != value.receipt_sha256:
         raise M03RV16ActivationError("V16 qualification activation receipt drifted")
     value.validate_for(package, authorization)
-    panel = _read_exact(Path(training_panel_path), value.training_panel_file_sha256)
-    panel_unsigned = {key: row for key, row in panel.items() if key != "receipt_sha256"}
-    terminals = tuple(
-        _read_exact(path, expected)
-        for path, expected in zip(
-            training_terminal_paths,
-            value.training_terminal_file_sha256,
-            strict=True,
-        )
+    panel = load_m03r_v16_training_panel_authority(
+        training_panel_path=training_panel_path,
+        expected_training_panel_file_sha256=value.training_panel_file_sha256,
+        prequalification_closure_path=prequalification_closure_path,
+        expected_prequalification_closure_file_sha256=(
+            value.prequalification_closure_file_sha256
+        ),
+        training_terminal_paths=training_terminal_paths,
+        expected_training_terminal_file_sha256=(
+            value.training_terminal_file_sha256
+        ),
+        package=package,
+        authorization=authorization,
     )
     if (
-        panel.get("receipt_sha256") != value.training_panel_receipt_sha256
-        or value.training_panel_receipt_sha256 != semantic_sha256(panel_unsigned)
-        or panel.get("package_plan_sha256") != package.package_plan_sha256
-        or panel.get("execution_authorization_receipt_sha256")
-        != authorization.receipt_sha256
-        or panel.get("source_tree_root_sha256") != value.source_tree_root_sha256
-        or panel.get("outer_qualification_authorized") is not True
-        or tuple(
-            tuple(row) for row in panel.get(
-                "setting_fold_adequacy_receipt_sha256", ()
-            )
-        ) != value.setting_fold_training_adequacy_receipt_sha256
-        or tuple(
-            tuple(row) for row in panel.get("terminal_checkpoint_file_sha256", ())
-        ) != value.terminal_checkpoint_file_sha256
-        or panel.get("prequalification_closure_receipt_sha256")
+        panel.training_panel_receipt_sha256
+        != value.training_panel_receipt_sha256
+        or panel.setting_fold_training_adequacy_receipt_sha256
+        != value.setting_fold_training_adequacy_receipt_sha256
+        or panel.terminal_checkpoint_file_sha256
+        != value.terminal_checkpoint_file_sha256
+        or panel.prequalification_closure_receipt_sha256
         != value.prequalification_closure_receipt_sha256
-        or any(
-            terminal.get("package_plan_sha256") != package.package_plan_sha256
-            or terminal.get("authorization_receipt_sha256")
-            != authorization.receipt_sha256
-            or terminal.get("source_tree_root_sha256")
-            != value.source_tree_root_sha256
-            for terminal in terminals
-        )
+        or panel.source_tree_root_sha256 != value.source_tree_root_sha256
     ):
         raise M03RV16ActivationError(
             "V16 qualification activation lacks exact training-panel evidence"
@@ -919,40 +1390,30 @@ def _issue_m03r_v16_training_activation_from_gates(
     return value
 
 
-def _issue_m03r_v16_qualification_activation_from_panel(
+def _issue_m03r_v16_qualification_activation_from_panel_authority(
     *,
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
-    training_panel_receipt_sha256: str,
-    training_panel_file_sha256: str,
-    training_terminal_file_sha256: tuple[str, str, str],
-    setting_fold_training_adequacy_receipt_sha256: tuple[
-        tuple[str, str, str, str, str],
-        tuple[str, str, str, str, str],
-        tuple[str, str, str, str, str],
-    ],
-    terminal_checkpoint_file_sha256: tuple[
-        tuple[str, str, str, str, str],
-        tuple[str, str, str, str, str],
-        tuple[str, str, str, str, str],
-    ],
-    prequalification_closure_receipt_sha256: str,
-    source_tree_root_sha256: str,
+    panel: M03RV16TrainingPanelAuthority,
 ) -> M03RV16QualificationActivation:
+    panel.validate_for(package, authorization)
     value = M03RV16QualificationActivation(
         package_plan_sha256=package.package_plan_sha256,
         execution_authorization_receipt_sha256=authorization.receipt_sha256,
-        training_panel_receipt_sha256=training_panel_receipt_sha256,
-        training_panel_file_sha256=training_panel_file_sha256,
-        training_terminal_file_sha256=training_terminal_file_sha256,
+        training_panel_receipt_sha256=panel.training_panel_receipt_sha256,
+        training_panel_file_sha256=panel.training_panel_file_sha256,
+        training_terminal_file_sha256=panel.training_terminal_file_sha256,
         setting_fold_training_adequacy_receipt_sha256=(
-            setting_fold_training_adequacy_receipt_sha256
+            panel.setting_fold_training_adequacy_receipt_sha256
         ),
-        terminal_checkpoint_file_sha256=terminal_checkpoint_file_sha256,
+        terminal_checkpoint_file_sha256=panel.terminal_checkpoint_file_sha256,
         prequalification_closure_receipt_sha256=(
-            prequalification_closure_receipt_sha256
+            panel.prequalification_closure_receipt_sha256
         ),
-        source_tree_root_sha256=source_tree_root_sha256,
+        prequalification_closure_file_sha256=(
+            panel.prequalification_closure_file_sha256
+        ),
+        source_tree_root_sha256=panel.source_tree_root_sha256,
         image_digest_sha256=package.artifacts.image_digest_sha256,
         _issuer=_QUALIFICATION_ISSUER,
     )
@@ -963,21 +1424,27 @@ def _issue_m03r_v16_qualification_activation_from_panel(
 __all__ = [
     "M03R_V16_ADMITTED_JOB_SCHEMA",
     "M03R_V16_PHASE_LAUNCH_SCHEMA",
+    "M03R_V16_POD_RUNTIME_ATTESTATION_SCHEMA",
     "M03R_V16_QUALIFICATION_ACTIVATION_SCHEMA",
     "M03R_V16_TRAINING_ACTIVATION_SCHEMA",
     "M03RV16ActivationError",
     "M03RV16AdmittedJobAuthority",
     "M03RV16PhaseLaunchAuthority",
+    "M03RV16PodRuntimeAttestation",
     "M03RV16QualificationActivation",
     "M03RV16TrainingActivation",
+    "M03RV16TrainingPanelAuthority",
     "admitted_job_authority_file_sha256",
     "load_m03r_v16_admitted_job_authority",
     "load_m03r_v16_phase_launch_authority",
+    "load_m03r_v16_pod_runtime_attestation",
     "load_m03r_v16_qualification_activation",
     "load_m03r_v16_training_activation",
+    "load_m03r_v16_training_panel_authority",
     "phase_launch_authority_file_sha256",
     "write_m03r_v16_admitted_job_authority",
     "write_m03r_v16_phase_launch_authority",
+    "write_m03r_v16_pod_runtime_attestation",
     "write_m03r_v16_qualification_activation",
     "write_m03r_v16_training_activation",
 ]

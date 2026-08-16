@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v8 revision; older v16 source and
+current local protocol is the result-moving v9 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -291,15 +291,19 @@ transfer archive that rejects traversal, duplicates, links, devices, and hash
 drift. The same-image static validator explicitly performs no training and
 claims zero GPU visibility only. The package execution authorization permits
 static validation but grants neither training nor outer qualification.
-Phase activations are issued from and later revalidated against the exact
-static/capacity result files or the exact training-panel decision and all three
-training terminals. Digest-only activation issuance is not a public API.
-Every H100 Job also receives a self-reference-free Job/Pod contract and an
-immutable admitted-Job authority backed by exact server-side-dry-run and
-admitted-manifest result files. Only that evidence can bind the phase launch
-authority to the Job/Pod contracts, Job UID, complete Pod UID/node/image
-inventory, predecessor evidence, run ID, phase, completion count, and source
-tree. Admission and launch files are mandatory worker inputs. The worker
+Phase activations are issued from and later revalidated against the complete
+typed static/capacity result files or an immutable prequalification-closure
+file, the exact training-panel decision, and all three training terminals.
+Minimal self-hashed predecessor dictionaries are rejected.
+Every H100 Job also receives a self-reference-free Job/Pod contract. A
+suspended prelaunch authority binds server-side-dry-run and admitted-manifest
+evidence, the Job UID, predecessor evidence, image digest, run ID, phase,
+completion count, and source tree; it deliberately contains no Pod facts,
+because a suspended Job has no Pods. After resume, an init gate waits for a
+controller-written per-completion runtime attestation. The worker compares the
+attested Pod UID, Pod name, node, completion index, and exact repository/digest
+image identity with its Downward API identity before loading market data.
+Admission, launch, and Pod-attestation files are mandatory worker inputs. The worker
 requires exactly two visible H100 80GB devices and either runs the disposable
 `train -> validation -> train` capacity path, runs training only, or performs
 checkpoint-owned qualification only from frozen adequate checkpoints.
@@ -318,8 +322,10 @@ five terminal checkpoints for its setting on CPU, validates all five risk-state
 inputs, and publishes one qualification-input-closure receipt. A corrupt later
 fold therefore prevents fold 0 access. Per-fold access markers and published
 artifact names are included in failure evidence. The structural slab is also
-wrapped in phase-scoped authorities: training access rejects qualification
-origins, and qualification access rejects optimizer/inner-validation origins.
+materialized into disjoint in-memory phase slabs: the training object contains
+no qualification origins, and the qualification object contains no optimizer
+or inner-validation origins. The transferred slab remains one common package
+file in v9; a later schema may split the on-disk mounts as additional defense.
 
 After qualification is separately authorized, the final aggregate opens all
 three qualification terminals, all 15 qualification-fold terminals, and all 15
@@ -335,14 +341,18 @@ zero-GPU static validation with no GPU resource key, one two-H100 capacity
 sentinel, a suspended three-completion training panel, and a separately
 suspended three-completion qualification panel. Capacity and scientific-phase
 rendering require privately issued authorities loaded from exact immutable
-result or activation files. H100 workers require the matching launch authority
-and admitted-Job evidence, including exact lifecycle-result files and Job/Pod
-contract identities, rather than accepting missing manifest fields.
+result or activation files. H100 workers require the matching launch authority,
+admitted-Job evidence, and per-Pod runtime attestation. An init-container gate
+allows Pod identity to be captured after resume but before scientific code.
+Create-only output and launch-consumption receipts reject completion replay.
 Static and worker startup rehash the executing
 package source tree against its manifest. All Jobs
 remain suspended, fail-fast, token-unmounted, nonprivileged, digest-pinned,
 bounded by deadline/TTL, and mount only the scoped package/output PVC paths.
-The source contract for live admission and Job/Pod UID binding is implemented;
+SHA-256 receipts prove content identity, not provenance. The deployment trust
+assumption is that a separately permissioned lifecycle controller is the sole
+writer to the append-only authority path; external signing remains an optional
+hardening layer. The source contract for live admission and Job/Pod UID binding is implemented;
 the external controller that captures those cluster facts, detached
 supervision, UID-bound cleanup, and any remote mutation are intentionally not
 executed by this source-only revision.

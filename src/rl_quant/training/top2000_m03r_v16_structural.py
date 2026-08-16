@@ -601,13 +601,34 @@ def restrict_m03r_v16_structural_slab(
         raise M03RV16StructuralError("V16 structural access mode drifted")
     if not allowed.issubset(authority.origin_to_slot):
         raise M03RV16StructuralError("V16 phase slab view is incomplete")
+    # Materialize a disjoint in-memory slab rather than retaining the full
+    # authority behind a guarded accessor.  This prevents trusted phase code
+    # from bypassing ``origin()`` through ``authority.slab.origins``.
+    selected = tuple(
+        authority.slab.origins[authority.origin_to_slot[origin]]
+        for origin in sorted(allowed)
+    )
+    phase_slab = M03RV16StructuralSlab(
+        receipt=authority.slab.receipt,
+        origins=selected,
+    )
+    phase_origin_to_slot = {
+        value.origin_state_index: index for index, value in enumerate(selected)
+    }
+    phase_versions = tuple(
+        tuple(
+            tensor._version
+            for tensor in (*value.economic_targets, *value.standardized_targets)
+        )
+        for value in selected
+    )
     return M03RV16ValidatedStructuralSlab(
-        slab=authority.slab,
-        origin_to_slot=authority.origin_to_slot,
-        target_tensor_versions=authority.target_tensor_versions,
+        slab=phase_slab,
+        origin_to_slot=phase_origin_to_slot,
+        target_tensor_versions=phase_versions,
         receipt_sha256=authority.receipt_sha256,
-        device_action_operator_cache=authority.device_action_operator_cache,
-        device_prepared_origin_cache=authority.device_prepared_origin_cache,
+        device_action_operator_cache={},
+        device_prepared_origin_cache={},
         access_mode=access_mode,
         allowed_origin_indices=allowed,
         _issuer=_VALIDATED_SLAB_ISSUER,

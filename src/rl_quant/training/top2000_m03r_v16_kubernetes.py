@@ -61,7 +61,7 @@ M03R_V16_CAPACITY_GATE_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v2"
 )
 M03R_V16_RENDERED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v4"
+    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v5"
 )
 _JOB_CONTRACT_ANNOTATION = "rl-quant/job-contract-sha256"
 _POD_CONTRACT_ANNOTATION = "rl-quant/pod-contract-sha256"
@@ -71,6 +71,12 @@ _ADMISSION_RECEIPT_ANNOTATION = "rl-quant/admission-authority-receipt-sha256"
 _ADMISSION_FILE_ANNOTATION = "rl-quant/admission-authority-file-sha256"
 _DRY_RUN_FILE_ANNOTATION = "rl-quant/server-dry-run-file-sha256"
 _ADMITTED_MANIFEST_FILE_ANNOTATION = "rl-quant/admitted-manifest-file-sha256"
+_POD_ATTESTATION_FILE_ANNOTATION = (
+    "rl-quant/pod-runtime-attestation-file-sha256"
+)
+_POD_ATTESTATION_RECEIPT_ANNOTATION = (
+    "rl-quant/pod-runtime-attestation-receipt-sha256"
+)
 _PYTHON = "/opt/conda/envs/quanttrade/bin/python"
 _WORKER_MODULE = "rl_quant.workflows.top2000_m03r_v16_predictive"
 _STATIC_MODULE = "rl_quant.workflows.top2000_m03r_v16_static_validate"
@@ -96,6 +102,8 @@ def _contract_payload(manifest: dict[str, Any]) -> dict[str, Any]:
         annotation_rows.pop(_ADMISSION_FILE_ANNOTATION, None)
         annotation_rows.pop(_DRY_RUN_FILE_ANNOTATION, None)
         annotation_rows.pop(_ADMITTED_MANIFEST_FILE_ANNOTATION, None)
+        annotation_rows.pop(_POD_ATTESTATION_FILE_ANNOTATION, None)
+        annotation_rows.pop(_POD_ATTESTATION_RECEIPT_ANNOTATION, None)
     return payload
 
 
@@ -386,6 +394,28 @@ class M03RV16RenderedSuspendedJob:
             )
         ):
             raise M03RV16KubernetesError("V16 H100 Job profile drifted")
+        elif (
+            len(pod.get("initContainers", ())) != 1
+            or pod["initContainers"][0].get("name")
+            != "runtime-attestation-gate"
+            or not {
+                "M03R_V16_CURRENT_POD_UID",
+                "M03R_V16_CURRENT_POD_NAME",
+                "M03R_V16_CURRENT_NODE_NAME",
+                "M03R_V16_POD_ATTESTATION_FILE_SHA256",
+                "M03R_V16_POD_ATTESTATION_RECEIPT_SHA256",
+            }.issubset(
+                {
+                    row.get("name")
+                    for row in containers[0].get("env", ())
+                    if isinstance(row, dict)
+                }
+            )
+            or "--pod-runtime-attestation" not in containers[0].get("args", ())
+        ):
+            raise M03RV16KubernetesError(
+                "V16 H100 Pod runtime attestation gate drifted"
+            )
         elif any(
             value is not None
             for value in (
@@ -587,8 +617,11 @@ def load_and_issue_m03r_v16_capacity_gate(
         or payload.get("admitted_job_authority_receipt_sha256")
         != rendered.admitted_job_authority.receipt_sha256
         or payload.get("job_uid") != rendered.admitted_job_authority.job_uid
-        or tuple(payload.get("pod_uids", ()))
-        != rendered.admitted_job_authority.pod_uids
+        or not isinstance(
+            payload.get("pod_runtime_attestation_receipt_sha256"), str
+        )
+        or not isinstance(payload.get("pod_uid"), str)
+        or not payload.get("pod_uid")
         or payload.get("scientific_training_performed") is not False
         or payload.get("disposable_optimizer_update_executed") is not True
         or payload.get("disposable_train_validate_train_executed") is not True
@@ -950,6 +983,12 @@ def _render(
                 "/mnt/authority/$(M03R_V16_PHASE)-admitted-manifest.json",
                 "--admitted-manifest-result-file-sha256",
                 "$(M03R_V16_ADMITTED_MANIFEST_FILE_SHA256)",
+                "--pod-runtime-attestation",
+                "/mnt/authority/pod-runtime-$(JOB_COMPLETION_INDEX).json",
+                "--pod-runtime-attestation-file-sha256",
+                "$(M03R_V16_POD_ATTESTATION_FILE_SHA256)",
+                "--pod-runtime-attestation-receipt-sha256",
+                "$(M03R_V16_POD_ATTESTATION_RECEIPT_SHA256)",
             )
         )
     environment: list[dict[str, Any]] = [
@@ -1094,6 +1133,59 @@ def _render(
                         }
                     },
                 },
+                {
+                    "name": "M03R_V16_CURRENT_POD_UID",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": "metadata.uid",
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_CURRENT_POD_NAME",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": "metadata.name",
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_CURRENT_NODE_NAME",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": "spec.nodeName",
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_POD_ATTESTATION_FILE_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _POD_ATTESTATION_FILE_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_POD_ATTESTATION_RECEIPT_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _POD_ATTESTATION_RECEIPT_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
             )
         )
     phase = {
@@ -1225,6 +1317,51 @@ def _render(
             },
         ],
     }
+    if mode != "static":
+        completion_env = environment[0]
+        pod["initContainers"] = [
+            {
+                "name": "runtime-attestation-gate",
+                "image": package.artifacts.image_reference,
+                "imagePullPolicy": "IfNotPresent",
+                "command": [_PYTHON],
+                "args": [
+                    "-I",
+                    "-B",
+                    "-c",
+                    (
+                        "import os,pathlib,time;"
+                        "p=pathlib.Path('/mnt/authority/pod-runtime-'"
+                        "+os.environ['JOB_COMPLETION_INDEX']+'.json');"
+                        "deadline=time.monotonic()+1800;"
+                        "\nwhile not p.is_file():"
+                        "\n  if time.monotonic()>=deadline: raise SystemExit(75)"
+                        "\n  time.sleep(2)"
+                    ),
+                ],
+                "env": [completion_env],
+                "resources": {
+                    "requests": {"cpu": "50m", "memory": "64Mi"},
+                    "limits": {"cpu": "250m", "memory": "128Mi"},
+                },
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                },
+                "volumeMounts": [
+                    {
+                        "name": "research-data",
+                        "mountPath": "/mnt/authority",
+                        "subPath": (
+                            f"{template.pvc_training_subpath.rstrip('/')}/runs/"
+                            f"{template.run_id}/authorities"
+                        ),
+                        "readOnly": True,
+                    }
+                ],
+            }
+        ]
     if mode == "qualification":
         pod["containers"][0]["volumeMounts"].append(
             {

@@ -49,10 +49,12 @@ from rl_quant.training.top2000_m03r_v9_risk_materialization import (
 from rl_quant.training.top2000_m03r_v16_activation import (
     M03RV16AdmittedJobAuthority,
     M03RV16PhaseLaunchAuthority,
+    M03RV16PodRuntimeAttestation,
     M03RV16QualificationActivation,
     M03RV16TrainingActivation,
     load_m03r_v16_admitted_job_authority,
     load_m03r_v16_phase_launch_authority,
+    load_m03r_v16_pod_runtime_attestation,
     load_m03r_v16_qualification_activation,
     load_m03r_v16_training_activation,
 )
@@ -571,6 +573,7 @@ def _run_m03r_v16_qualification_phase(
     geometries: tuple[M03RV16FoldGeometry, ...],
     qualification_activation: M03RV16QualificationActivation,
     launch_authority: M03RV16PhaseLaunchAuthority,
+    pod_attestation: M03RV16PodRuntimeAttestation,
     training_root: Path,
     output: Path,
     startup_sha: str,
@@ -879,7 +882,12 @@ def _run_m03r_v16_qualification_phase(
                 launch_authority.admission_receipt_sha256
             ),
             "job_uid": launch_authority.job_uid,
-            "pod_uids": launch_authority.pod_uids,
+            "pod_runtime_attestation_receipt_sha256": (
+                pod_attestation.receipt_sha256
+            ),
+            "pod_uid": pod_attestation.pod_uid,
+            "pod_name": pod_attestation.pod_name,
+            "node_name": pod_attestation.node_name,
             "economic_generation_may_be_minted": False,
             "reinforcement_learning_authorized": False,
             "outer_2026_accessed": False,
@@ -928,6 +936,9 @@ def run_m03r_v16_predictive_worker(
     admitted_manifest_result_path: str | Path | None = None,
     expected_admitted_manifest_result_file_sha256: str | None = None,
     predecessor_authority_receipt_sha256: str | None = None,
+    pod_runtime_attestation_path: str | Path | None = None,
+    expected_pod_runtime_attestation_file_sha256: str | None = None,
+    expected_pod_runtime_attestation_receipt_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     if capacity_only and capacity_output_root is None:
         raise M03RV16PredictiveWorkflowError(
@@ -1004,6 +1015,9 @@ def run_m03r_v16_predictive_worker(
             ),
             package=package,
             authorization=authorization,
+            expected_authorization_file_sha256=(
+                expected_authorization_file_sha256
+            ),
             static_result_path=str(static_result_path),
             expected_static_result_file_sha256=str(
                 expected_static_result_file_sha256
@@ -1029,6 +1043,10 @@ def run_m03r_v16_predictive_worker(
             package=package,
             authorization=authorization,
             training_panel_path=training_panel_path,
+            prequalification_closure_path=(
+                Path(training_panel_path).parent
+                / "prequalification-closure.json"
+            ),
             training_terminal_paths=(
                 Path(training_root)
                 / "completion-00-setting-00/training-terminal.json",
@@ -1078,6 +1096,9 @@ def run_m03r_v16_predictive_worker(
             expected_server_side_dry_run_result_file_sha256,
             admitted_manifest_result_path,
             expected_admitted_manifest_result_file_sha256,
+            pod_runtime_attestation_path,
+            expected_pod_runtime_attestation_file_sha256,
+            expected_pod_runtime_attestation_receipt_sha256,
         )
     ):
         raise M03RV16PredictiveWorkflowError(
@@ -1156,15 +1177,67 @@ def run_m03r_v16_predictive_worker(
             Path(training_root)
             / f"completion-{index:02d}-setting-{index:02d}"
         )
-    rank, local_rank, world_size, device, owns = _distributed_context()
     output = (
         Path(capacity_output_root)
         if capacity_only and capacity_output_root is not None
         else Path(worker.output_root)
     )
+    output_root_sha256 = _sha256(
+        {"output_root": str(output.resolve())}
+    )
+    current_pod_uid = os.environ.get("M03R_V16_CURRENT_POD_UID", "")
+    current_pod_name = os.environ.get("M03R_V16_CURRENT_POD_NAME", "")
+    current_node_name = os.environ.get("M03R_V16_CURRENT_NODE_NAME", "")
+    if not current_pod_uid or not current_pod_name or not current_node_name:
+        raise M03RV16PredictiveWorkflowError(
+            "V16 worker lacks Downward API Pod identity"
+        )
+    pod_attestation: M03RV16PodRuntimeAttestation = (
+        load_m03r_v16_pod_runtime_attestation(
+            str(pod_runtime_attestation_path),
+            expected_file_sha256=str(
+                expected_pod_runtime_attestation_file_sha256
+            ),
+            expected_receipt_sha256=str(
+                expected_pod_runtime_attestation_receipt_sha256
+            ),
+            package=package,
+            authorization=authorization,
+            admission=admitted_job_authority,
+            launch=launch_authority,
+            expected_completion_index=index,
+            expected_output_root_sha256=output_root_sha256,
+            current_pod_uid=current_pod_uid,
+            current_pod_name=current_pod_name,
+            current_node_name=current_node_name,
+        )
+    )
+    rank, local_rank, world_size, device, owns = _distributed_context()
     try:
         if rank == 0:
             output.mkdir(mode=0o750, parents=True, exist_ok=False)
+            _write_immutable_json(
+                output / "launch-consumption.json",
+                {
+                    "schema": (
+                        "rl-quant.top2000-dev."
+                        "m03r-v16-launch-consumption-v1"
+                    ),
+                    "launch_authority_receipt_sha256": (
+                        launch_authority.receipt_sha256
+                    ),
+                    "one_shot_nonce_sha256": (
+                        launch_authority.one_shot_nonce_sha256
+                    ),
+                    "pod_runtime_attestation_receipt_sha256": (
+                        pod_attestation.receipt_sha256
+                    ),
+                    "job_uid": admitted_job_authority.job_uid,
+                    "completion_index": index,
+                    "pod_uid": current_pod_uid,
+                    "output_root_sha256": output_root_sha256,
+                },
+            )
         dist.barrier()
         properties = torch.cuda.get_device_properties(device)
         runtime_rows = _gather(
@@ -1301,7 +1374,10 @@ def run_m03r_v16_predictive_worker(
                         admitted_job_authority.receipt_sha256
                     ),
                     "job_uid": admitted_job_authority.job_uid,
-                    "pod_uids": admitted_job_authority.pod_uids,
+                    "pod_runtime_attestation_receipt_sha256": (
+                        pod_attestation.receipt_sha256
+                    ),
+                    "pod_uid": pod_attestation.pod_uid,
                     "capacity": asdict(capacity),
                     "capacity_receipt_sha256": capacity.receipt_sha256,
                     "scientific_training_performed": False,
@@ -1339,6 +1415,7 @@ def run_m03r_v16_predictive_worker(
                 geometries=geometries,
                 qualification_activation=qualification_activation,
                 launch_authority=launch_authority,
+                pod_attestation=pod_attestation,
                 training_root=Path(training_root),
                 output=output,
                 startup_sha=startup_sha,
@@ -1638,7 +1715,10 @@ def run_m03r_v16_predictive_worker(
                     admitted_job_authority.receipt_sha256
                 ),
                 "job_uid": admitted_job_authority.job_uid,
-                "pod_uids": admitted_job_authority.pod_uids,
+                "pod_runtime_attestation_receipt_sha256": (
+                    pod_attestation.receipt_sha256
+                ),
+                "pod_uid": pod_attestation.pod_uid,
                 "qualification_tail_accessed": False,
                 "outer_qualification_authorized": False,
                 "three_seed_confirmation_may_be_minted": False,
@@ -1737,6 +1817,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--admitted-manifest-result")
     parser.add_argument("--admitted-manifest-result-file-sha256")
     parser.add_argument("--predecessor-authority-receipt-sha256")
+    parser.add_argument("--pod-runtime-attestation")
+    parser.add_argument("--pod-runtime-attestation-file-sha256")
+    parser.add_argument("--pod-runtime-attestation-receipt-sha256")
     return parser
 
 
@@ -1795,6 +1878,13 @@ def main(argv: list[str] | None = None) -> int:
         ),
         predecessor_authority_receipt_sha256=(
             args.predecessor_authority_receipt_sha256
+        ),
+        pod_runtime_attestation_path=args.pod_runtime_attestation,
+        expected_pod_runtime_attestation_file_sha256=(
+            args.pod_runtime_attestation_file_sha256
+        ),
+        expected_pod_runtime_attestation_receipt_sha256=(
+            args.pod_runtime_attestation_receipt_sha256
         ),
     )
     return 0

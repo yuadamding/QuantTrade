@@ -487,6 +487,8 @@ class M03RV16PredictiveQualification:
             >= spec.minimum_fold_median_risk_projection_retention
             and self.median_active_one_way_mass
             >= spec.minimum_median_active_one_way_mass
+            and self.absolute_policy_break_even_one_way_cost_basis_points
+            >= spec.minimum_break_even_one_way_cost_basis_points
         )
 
     def validate(self) -> None:

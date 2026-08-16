@@ -9,7 +9,7 @@ import os
 import stat
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
@@ -20,7 +20,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PROTOCOL_SHA256,
 )
 from rl_quant.training.top2000_m03r_v16_activation import (
-    _issue_m03r_v16_qualification_activation_from_panel,
+    M03R_V16_PREQUALIFICATION_CLOSURE_SCHEMA,
+    M03R_V16_TRAINING_PANEL_SCHEMA,
+    _issue_m03r_v16_qualification_activation_from_panel_authority,
+    load_m03r_v16_training_panel_authority,
     write_m03r_v16_qualification_activation,
 )
 from rl_quant.training.top2000_m03r_v16_checkpoint import (
@@ -49,9 +52,6 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
     M03R_V16_TRAINING_TERMINAL_SCHEMA,
 )
 
-M03R_V16_TRAINING_PANEL_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-training-adequacy-panel-v2"
-)
 _MAX_BYTES = 64 * 1024**2
 
 
@@ -305,7 +305,10 @@ def aggregate_m03r_v16_training_panel(
             or payload.get("outer_qualification_authorized") is not False
             or payload.get("three_seed_confirmation_may_be_minted") is not False
             or not payload.get("job_uid")
-            or len(tuple(payload.get("pod_uids", ()))) != 3
+            or not payload.get("pod_uid")
+            or not isinstance(
+                payload.get("pod_runtime_attestation_receipt_sha256"), str
+            )
             or len(fold_hashes) != M03R_V16_PREDICTIVE_SPEC.chronological_fold_count
         ):
             raise M03RV16TrainingAggregateError("V16 training terminal drifted")
@@ -409,7 +412,7 @@ def aggregate_m03r_v16_training_panel(
                 checkpoint_rows.append(checkpoint_sha)
             checkpoint_matrix.append(tuple(checkpoint_rows))  # type: ignore[arg-type]
     closure_unsigned = {
-        "schema": "rl-quant.top2000-dev.m03r-v16-prequalification-closure-v1",
+        "schema": M03R_V16_PREQUALIFICATION_CLOSURE_SCHEMA,
         "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
         "package_plan_sha256": package.package_plan_sha256,
         "training_terminal_file_sha256": training_terminal_file_sha256,
@@ -420,6 +423,22 @@ def aggregate_m03r_v16_training_panel(
     closure_receipt = semantic_sha256(closure_unsigned)
     output = Path(output_root)
     output.mkdir(mode=0o750, parents=True, exist_ok=False)
+    closure = {**closure_unsigned, "receipt_sha256": closure_receipt}
+    closure_file_sha = _write(
+        output / "prequalification-closure.json", closure
+    )
+    primary_status = tuple(
+        row.status
+        for row in all_adequacy[M03R_V16_PREDICTIVE_SPEC.primary_setting_index]
+    )
+    if all(status == "adequate" for status in primary_status):
+        primary_aggregate = "all-adequate"
+    elif "numerically-invalid" in primary_status:
+        primary_aggregate = "numerically-invalid"
+    elif set(primary_status).issubset({"adequate", "still-improving"}):
+        primary_aggregate = "still-improving"
+    else:
+        primary_aggregate = "fit-pathology"
     unsigned = {
         "schema": M03R_V16_TRAINING_PANEL_SCHEMA,
         "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
@@ -434,12 +453,12 @@ def aggregate_m03r_v16_training_panel(
         "setting_fold_adequacy_status": tuple(
             tuple(row.status for row in setting_rows) for setting_rows in all_adequacy
         ),
-        "primary_training_adequacy": all_adequacy[
-            M03R_V16_PREDICTIVE_SPEC.primary_setting_index
-        ][0].status if not adequate else "adequate",
+        "primary_fold_adequacy_status": primary_status,
+        "primary_aggregate_adequacy": primary_aggregate,
         "all_setting_folds_adequate": adequate,
         "terminal_checkpoint_file_sha256": tuple(checkpoint_matrix),
         "prequalification_closure_receipt_sha256": closure_receipt,
+        "prequalification_closure_file_sha256": closure_file_sha,
         "outer_qualification_authorized": adequate,
         "next_research_action": next_action,
         "source_tree_root_sha256": next(iter(source_roots)),
@@ -455,33 +474,24 @@ def aggregate_m03r_v16_training_panel(
     panel_file_sha = _write(output / "training-panel-decision.json", panel)
     result = {**panel, "panel_file_sha256": panel_file_sha}
     if adequate:
-        activation = _issue_m03r_v16_qualification_activation_from_panel(
+        panel_authority = load_m03r_v16_training_panel_authority(
+            training_panel_path=output / "training-panel-decision.json",
+            expected_training_panel_file_sha256=panel_file_sha,
+            prequalification_closure_path=(
+                output / "prequalification-closure.json"
+            ),
+            expected_prequalification_closure_file_sha256=closure_file_sha,
+            training_terminal_paths=training_terminal_paths,
+            expected_training_terminal_file_sha256=(
+                training_terminal_file_sha256
+            ),
             package=package,
             authorization=authorization,
-            training_panel_receipt_sha256=str(panel["receipt_sha256"]),
-            training_panel_file_sha256=panel_file_sha,
-            training_terminal_file_sha256=training_terminal_file_sha256,
-            setting_fold_training_adequacy_receipt_sha256=cast(
-                tuple[
-                    tuple[str, str, str, str, str],
-                    tuple[str, str, str, str, str],
-                    tuple[str, str, str, str, str],
-                ],
-                tuple(
-                    tuple(row.receipt_sha256 for row in setting_rows)
-                    for setting_rows in all_adequacy
-                ),
-            ),
-            terminal_checkpoint_file_sha256=cast(
-                tuple[
-                    tuple[str, str, str, str, str],
-                    tuple[str, str, str, str, str],
-                    tuple[str, str, str, str, str],
-                ],
-                tuple(checkpoint_matrix),
-            ),
-            prequalification_closure_receipt_sha256=closure_receipt,
-            source_tree_root_sha256=next(iter(source_roots)),
+        )
+        activation = _issue_m03r_v16_qualification_activation_from_panel_authority(
+            package=package,
+            authorization=authorization,
+            panel=panel_authority,
         )
         result["qualification_activation_file_sha256"] = (
             write_m03r_v16_qualification_activation(

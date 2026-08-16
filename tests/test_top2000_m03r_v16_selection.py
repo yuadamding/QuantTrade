@@ -68,7 +68,7 @@ def _passing_qualification(setting_index: int) -> M03RV16PredictiveQualification
         spread_lcb_by_block=(0.001, 0.0008, 0.0006),
         break_even_category="finite-positive",
         break_even_one_way_cost_basis_points=12.0,
-        absolute_policy_break_even_one_way_cost_basis_points=8.0,
+        absolute_policy_break_even_one_way_cost_basis_points=12.0,
         median_risk_projection_retention=0.9,
         minimum_fold_median_risk_projection_retention=0.8,
         median_active_one_way_mass=0.001,
@@ -129,6 +129,17 @@ def test_v16_only_primary_r2_can_authorize_three_seed_confirmation() -> None:
     assert primary.three_seed_confirmation_may_be_minted is False
     assert primary.economic_generation_may_be_minted is False
     assert primary.reinforcement_learning_authorized is False
+
+
+def test_v16_absolute_policy_break_even_is_a_blocking_gate() -> None:
+    failed = replace(
+        _passing_qualification(2),
+        absolute_policy_break_even_one_way_cost_basis_points=9.99,
+        gates_passed=False,
+        primary_hypothesis_passed=False,
+    )
+    failed.validate()
+    assert failed.gates_passed is False
 
 
 def test_v16_one_seed_gate_cannot_authorize_economic_or_rl_training() -> None:

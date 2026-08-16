@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256,
+)
 from rl_quant.training.top2000_m03r_v16_fit import M03RV16TrainingAdequacy
 from rl_quant.training.top2000_m03r_v16_fold import (
     M03RV16PanelSchedule,
@@ -118,6 +122,12 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
             "fold_terminal_file_sha256": tuple(
                 f"{setting * 10 + fold + 1:064x}" for fold in range(5)
             ),
+            "fold_training_adequacy_status": tuple(
+                "adequate"
+                if (primary_adequate or setting != 2 or fold != 0)
+                else "still-improving"
+                for fold in range(5)
+            ),
             "qualification_tail_accessed": False,
             "outer_qualification_authorized": False,
             "three_seed_confirmation_may_be_minted": False,
@@ -127,11 +137,13 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
             "launch_authority_receipt_sha256": "c" * 64,
             "admitted_job_authority_receipt_sha256": "f" * 64,
             "job_uid": f"job-{setting}",
-            "pod_uids": ("pod-0", "pod-1", "pod-2"),
+            "pod_runtime_attestation_receipt_sha256": "9" * 64,
+            "pod_uid": f"pod-{setting}",
         }
         terminals[path] = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
+        path.write_bytes(canonical_json_file_bytes(terminals[path]))
         terminal_paths.append(path)
-        terminal_files.append(f"{setting + 1:064x}")
+        terminal_files.append(file_sha256(path))
 
     monkeypatch.setattr(
         aggregate,
