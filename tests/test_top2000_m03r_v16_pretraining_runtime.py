@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -20,6 +20,9 @@ from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
 )
 from rl_quant.training.top2000_m03r_v9_pretraining_step import model_state_sha256
+from rl_quant.training.top2000_m03r_v15_residual_operator import (
+    apply_m03r_v15_residual_operator,
+)
 from rl_quant.training.top2000_m03r_v16_checkpoint import (
     M03RV16LoadedEpochCheckpoint,
 )
@@ -38,12 +41,6 @@ from rl_quant.training.top2000_m03r_v16_pretraining_runtime import (
 )
 from rl_quant.training.top2000_m03r_v16_pretraining_step import (
     train_m03r_v16_score_batch_update,
-)
-from rl_quant.training.top2000_m03r_v16_qualification_runtime import (
-    run_m03r_v16_reloaded_checkpoint_cohort_qualification,
-)
-from rl_quant.training.top2000_m03r_v16_structural import (
-    M03RV16ValidatedStructuralSlab,
 )
 from rl_quant.training.top2000_m03r_v16_validation_runtime import (
     M03RV16ValidationError,
@@ -138,9 +135,7 @@ def test_v16_survival_weighting_is_not_a_mandatory_expiry() -> None:
     assert float(survival[0]) > float(survival[-1])
 
 
-def test_v16_qualification_wrapper_binds_checkpoint_to_exact_score_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_v16_qualification_authority_recomputes_checkpoint_score_projection() -> None:
     import rl_quant.training.top2000_m03r_v16_qualification_runtime as runtime
 
     sequence, exposure = _surfaces()
@@ -166,8 +161,6 @@ def test_v16_qualification_wrapper_binds_checkpoint_to_exact_score_batch(
         asset_axis_sha256="a" * 64,
         origin_risk_exposures=exposure,  # type: ignore[arg-type]
     )
-    slab_receipt = "f" * 64
-    batch = replace(batch, structural_slab_receipt_sha256=slab_receipt)
     checkpoint = M03RV16LoadedEpochCheckpoint(
         setting_index=0,
         setting_id=M03R_V16_SETTINGS[0].setting_id,
@@ -184,53 +177,205 @@ def test_v16_qualification_wrapper_binds_checkpoint_to_exact_score_batch(
         asset_axis_sha256="a" * 64,
         head_identity=policy.v16_head_identity(),
     )
-    slab = cast(
-        M03RV16ValidatedStructuralSlab,
-        SimpleNamespace(
-            require_fast_identity=lambda: None,
-            receipt=SimpleNamespace(
-                receipt_sha256=slab_receipt,
-                common_target_operator_root_sha256="4" * 64,
-                action_operator_root_sha256="5" * 64,
-            ),
-        ),
-    )
-    observed: dict[str, object] = {}
 
-    def _cohort(*_args: object, **kwargs: object) -> object:
-        observed.update(kwargs)
-        return "cohort-trace"
+    class _DeviceOperator:
+        def __init__(self, operator: Any) -> None:
+            self.operator = operator
 
-    monkeypatch.setattr(runtime, "run_m03r_v16_horizon_matched_cohort_sleeve", _cohort)
-    result = run_m03r_v16_reloaded_checkpoint_cohort_qualification(
+        def apply(self, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            residual = apply_m03r_v15_residual_operator(value, self.operator).residual
+            return residual, residual.new_zeros(())
+
+    class _Slab:
+        def device_origin(self, origin: int, _device: torch.device) -> object:
+            row = int(origin - int(batch.origin_indices[0]))
+            return SimpleNamespace(
+                action_operator=_DeviceOperator(batch.action_operators[row])
+            )
+
+    authority = runtime._issue_score_authority(
         checkpoint,
         batch,
-        slab,
-        post_fill_asset_returns=torch.empty(0),
-        benchmark_weights=torch.empty(0),
-        fill_available=torch.empty(0, dtype=torch.bool),
-        risk_asset_caps=torch.empty(0),
-        risk_gross_max=torch.empty(0),
-        risk_state=cast(object, None),  # type: ignore[arg-type]
+        torch.randn((63, 1, sequence.num_assets, 16)),
+        cast(Any, _Slab()),
     )
-    assert result == "cohort-trace"
-    assert torch.equal(cast(torch.Tensor, observed["action_valid"]), batch.action_valid)
-    assert torch.equal(
-        cast(torch.Tensor, observed["diagnostic_valid"]),
-        batch.objective.selection_valid,
+    authority.validate()
+    assert authority.batch is batch
+    tampered_objective = replace(
+        batch.objective,
+        executable_selection_score_z=(
+            batch.objective.executable_selection_score_z + 0.01
+        ),
     )
-    with pytest.raises(ValueError, match="lineage"):
-        run_m03r_v16_reloaded_checkpoint_cohort_qualification(
-            replace(checkpoint, model_state_sha256="9" * 64),
-            batch,
-            slab,
-            post_fill_asset_returns=torch.empty(0),
-            benchmark_weights=torch.empty(0),
-            fill_available=torch.empty(0, dtype=torch.bool),
-            risk_asset_caps=torch.empty(0),
-            risk_gross_max=torch.empty(0),
-            risk_state=cast(object, None),  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="not reproduced"):
+        runtime._issue_score_authority(
+            checkpoint,
+            replace(batch, objective=tampered_objective),
+            torch.randn((63, 1, sequence.num_assets, 16)),
+            cast(Any, _Slab()),
         )
+
+
+def test_v16_public_qualification_api_does_not_accept_a_prebuilt_batch() -> None:
+    import inspect
+
+    from rl_quant.training.top2000_m03r_v16_qualification_runtime import (
+        run_m03r_v16_fold_qualification,
+    )
+
+    assert "batch" not in inspect.signature(run_m03r_v16_fold_qualification).parameters
+
+
+def test_v16_fold_qualification_rebuilds_states_scores_and_fill_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_quant.training.top2000_m03r_v16_qualification_runtime as runtime
+
+    class _Validated(SimpleNamespace):
+        def validate(self) -> None:
+            return None
+
+        def validate_unmodified(self) -> None:
+            return None
+
+        def require_fast_identity(self) -> None:
+            return None
+
+    geometry = render_m03r_v16_fold_geometries(1001)[0]
+    sequence, _exposure = _surfaces()
+    policy = Top2000M03RV16PredictivePolicy(
+        0,
+        token_dim=16,
+        raw_stock_chunk=8,
+        activation_checkpointing=False,
+    )
+    checkpoint = M03RV16LoadedEpochCheckpoint(
+        setting_index=0,
+        setting_id=M03R_V16_SETTINGS[0].setting_id,
+        fold_index=0,
+        epoch_index=7,
+        completed_score_updates=24,
+        model_state_sha256=model_state_sha256(policy),
+        score_component_state_sha256="1" * 64,
+        checkpoint_file_sha256="2" * 64,
+        panel_schedule_sha256="3" * 64,
+        selection_target_operator_root_sha256="4" * 64,
+        action_operator_root_sha256="5" * 64,
+        source_array_sha256="6" * 64,
+        asset_axis_sha256="a" * 64,
+        head_identity=policy.v16_head_identity(),
+    )
+    cache = _Validated(cache_sha256="b" * 64, action_hash="a" * 64)
+    exposures = _Validated(receipt_sha256="c" * 64)
+    risk_source = _Validated(
+        cache_sha256="b" * 64,
+        action_hash="a" * 64,
+        receipt_sha256="d" * 64,
+        exposures=exposures,
+    )
+    steps = 63 + 29
+    risk_state = _Validated(
+        origin_state_indices=tuple(range(535, 535 + steps)),
+        asset_axis_sha256="a" * 64,
+        source_exposure_receipt_sha256="c" * 64,
+    )
+    slab = _Validated(
+        receipt=SimpleNamespace(
+            cache_sha256="b" * 64,
+            asset_axis_sha256="a" * 64,
+            risk_source_receipt_sha256="d" * 64,
+            exposure_receipt_sha256="c" * 64,
+            common_target_operator_root_sha256="4" * 64,
+            action_operator_root_sha256="5" * 64,
+        )
+    )
+    built = SimpleNamespace(
+        sequence=object(),
+        identity=SimpleNamespace(receipt_sha256="e" * 64),
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        runtime,
+        "build_top2000_hold30_development_sequence_from_loaded_cache",
+        lambda *args, **kwargs: built,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "move_and_bind_m03r_v16_sequence",
+        lambda *args, **kwargs: sequence,
+    )
+    monkeypatch.setattr(runtime, "top2000_m03r_v7_decision_inputs", lambda _: object())
+
+    class _Provider:
+        def __init__(self, _inputs: object) -> None:
+            return None
+
+        def replay_origin_states(
+            self,
+            _source_policy: object,
+            _sequence: object,
+            local_origins: torch.Tensor,
+        ) -> torch.Tensor:
+            captured["local_origins"] = tuple(int(value) for value in local_origins)
+            return torch.ones((63, 1, sequence.num_assets, 16))
+
+    monkeypatch.setattr(runtime, "Top2000M03RV7DecisionStateProvider", _Provider)
+    batch = _Validated(
+        fold_index=0,
+        objective=SimpleNamespace(
+            setting=M03R_V16_SETTINGS[0],
+            executable_selection_score_z=torch.ones((63, sequence.num_assets)),
+            selection_valid=torch.ones((63, sequence.num_assets), dtype=torch.bool),
+        ),
+        action_valid=torch.ones((63, sequence.num_assets), dtype=torch.bool),
+        origin_indices=torch.arange(535, 598, dtype=torch.long),
+        asset_axis_sha256="a" * 64,
+        receipt_sha256="7" * 64,
+    )
+
+    def _build_batch(*args: object, **kwargs: Any) -> object:
+        captured["batch_kwargs"] = kwargs
+        return batch
+
+    monkeypatch.setattr(
+        runtime, "build_m03r_v16_batch_from_origin_states", _build_batch
+    )
+    authority = _Validated(batch=batch)
+    monkeypatch.setattr(runtime, "_issue_score_authority", lambda *args: authority)
+    trace = _Validated(
+        fold_index=0,
+        setting_index=0,
+        checkpoint_file_sha256="2" * 64,
+        checkpoint_model_state_sha256=checkpoint.model_state_sha256,
+        qualification_batch_receipt_sha256="7" * 64,
+    )
+
+    def _cohort(*args: object, **kwargs: Any) -> object:
+        captured["cohort_kwargs"] = kwargs
+        return trace
+
+    monkeypatch.setattr(runtime, "run_m03r_v16_horizon_matched_cohort_sleeve", _cohort)
+    result = runtime.run_m03r_v16_fold_qualification(
+        cache,
+        geometry,
+        risk_source,
+        risk_state,
+        cast(Any, slab),
+        policy,
+        checkpoint,
+        device=torch.device("cpu"),
+    )
+    result.validate()
+    assert captured["local_origins"] == tuple(range(251, 314))
+    cohort_kwargs = cast(dict[str, Any], captured["cohort_kwargs"])
+    assert cohort_kwargs["post_fill_asset_returns"].shape == (
+        steps,
+        sequence.num_assets,
+    )
+    assert cohort_kwargs["benchmark_weights"].shape == (
+        steps,
+        sequence.num_assets,
+    )
 
 
 def test_v16_settings_use_identical_common30_masks_and_operators() -> None:

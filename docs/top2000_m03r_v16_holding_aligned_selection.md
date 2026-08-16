@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v3 revision; older v16 source and
+current local protocol is the result-moving v4 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -178,10 +178,12 @@ Qualification retains two distinct diagnostics:
 
 The cohort action mask is the causal origin-action mask intersected with
 fill-time availability. The common 30-session label mask is diagnostic-only
-and cannot influence action construction. Cohorts store reconciled executed
-active positions, not requested vectors; projection repairs and return drift
-are carried into the next decision, and the cohort sum must equal the carried
-executed active book after every transition.
+and cannot influence action construction. Every signal cohort remains
+self-financing after projection, release, and drift. Projector-created
+exposures enter a separate age-independent risk-repair cohort, so they cannot
+inherit an arbitrary signal age. Cohort rows sum to the carried executed
+active book after every transition, while risk-forced turnover and repair mass
+are published separately.
 
 The cost ladder is `0, 1, 2, 3, 5, 10, 20, 40 bp`. Report absolute policy cost,
 benchmark cost, incremental active cost, gross/net policy return, gross/net
@@ -225,10 +227,13 @@ training.
 
 The cohort primitive publishes separate absolute policy, benchmark, and
 incremental costs and net returns; 21-/30-session or truncated age-clock
-release; executed position ages; risk-projection retention; final-horizon
-chronology; and terminal liquidation. A single qualification wrapper now binds
-the canonical score batch to the exact reloaded checkpoint and validated slab
-before cohort economics can run.
+release; executed signal ages; risk-repair mass; risk-forced turnover;
+risk-projection retention; final-horizon chronology; and terminal liquidation.
+The authoritative fold qualifier accepts the reloaded policy, cache, risk,
+fold, and validated slab—not a caller-supplied score batch. It rebuilds origin
+states, raw scores, and action-projected scores internally, recomputes the
+projection once at the qualification boundary, and binds all arrays to the
+checkpoint before cohort economics can run.
 
 No local package builder, same-image static gate, complete fold evaluator and
 statistical aggregate, remote worker, Kubernetes lifecycle, or real-data slab

@@ -13,7 +13,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 
@@ -25,7 +25,8 @@ _LEGACY_HAZARD_RESIDUAL_MIN = -12.0
 _LEGACY_HAZARD_RESIDUAL_MAX = 12.0
 _CALIBRATION_ITERATIONS = 160
 
-HoldPriorFamily = Literal["calibrated-logistic-v1", "legacy-hold30-v1"]
+HoldPriorFamily = Literal["calibrated-logistic-v2", "legacy-hold30-v1"]
+TerminalAgeMode = Literal["repeat-last-hazard"]
 
 
 class HoldTargetProtocolError(ValueError):
@@ -97,6 +98,28 @@ def _survival_schedule_from_location(
     return tuple(hazards), tuple(weights)
 
 
+def _runtime_expectation(
+    hazards: tuple[float, ...],
+    survival_weights: tuple[float, ...],
+) -> tuple[float, float, float]:
+    """Return terminal survival, terminal tail, and total runtime expectation."""
+
+    if not hazards or len(hazards) != len(survival_weights):
+        raise HoldTargetProtocolError("holding schedule is empty or misaligned")
+    terminal_hazard = hazards[-1]
+    survival_after_age_cap = survival_weights[-1] * (1.0 - terminal_hazard)
+    if not 0.0 < terminal_hazard <= 1.0:
+        raise HoldTargetProtocolError("terminal holding hazard is invalid")
+    terminal_tail = survival_after_age_cap / terminal_hazard
+    expectation = math.fsum(survival_weights) + terminal_tail
+    if not all(
+        math.isfinite(value) and value >= 0.0
+        for value in (survival_after_age_cap, terminal_tail, expectation)
+    ):
+        raise HoldTargetProtocolError("holding runtime expectation is invalid")
+    return survival_after_age_cap, terminal_tail, expectation
+
+
 @lru_cache(maxsize=None)
 def _calibrated_location(
     *,
@@ -109,13 +132,14 @@ def _calibrated_location(
     target = float(target_sessions)
     for _ in range(_CALIBRATION_ITERATIONS):
         midpoint = 0.5 * (lower + upper)
-        _, survival = _survival_schedule_from_location(
+        hazards, survival = _survival_schedule_from_location(
             age_cap_sessions=age_cap_sessions,
             location=midpoint,
             width=width,
             residual_minimum=_GENERIC_HAZARD_RESIDUAL_MIN,
         )
-        if math.fsum(survival) < target:
+        _, _, expectation = _runtime_expectation(hazards, survival)
+        if expectation < target:
             lower = midpoint
         else:
             upper = midpoint
@@ -132,9 +156,10 @@ class HoldTargetSpec:
 
     target_sessions: int = DEFAULT_HOLD_TARGET_SESSIONS
     age_cap_sessions: int = DEFAULT_HOLD_AGE_CAP_SESSIONS
-    prior_family: HoldPriorFamily = "calibrated-logistic-v1"
+    prior_family: HoldPriorFamily = "calibrated-logistic-v2"
     release_transition_width_sessions: float = 4.0
     hard_minimum_hold: bool = False
+    terminal_age_mode: TerminalAgeMode = "repeat-last-hazard"
 
     def validate(self) -> None:
         if (
@@ -143,11 +168,12 @@ class HoldTargetSpec:
             or isinstance(self.age_cap_sessions, bool)
             or not isinstance(self.age_cap_sessions, int)
             or not 1 <= self.target_sessions <= self.age_cap_sessions
-            or self.age_cap_sessions <= 0
+            or self.age_cap_sessions != DEFAULT_HOLD_AGE_CAP_SESSIONS
             or not math.isfinite(self.release_transition_width_sessions)
             or self.release_transition_width_sessions <= 0.0
-            or self.prior_family not in {"calibrated-logistic-v1", "legacy-hold30-v1"}
+            or self.prior_family not in {"calibrated-logistic-v2", "legacy-hold30-v1"}
             or self.hard_minimum_hold
+            or self.terminal_age_mode != "repeat-last-hazard"
         ):
             raise HoldTargetProtocolError("holding-target specification is invalid")
         if self.prior_family == "legacy-hold30-v1" and (
@@ -202,7 +228,32 @@ class HoldTargetSpec:
 
     @property
     def expected_neutral_hold_sessions(self) -> float:
+        return _runtime_expectation(
+            self.neutral_release_hazards,
+            self.neutral_survival_weights,
+        )[2]
+
+    @property
+    def finite_support_expected_hold_sessions(self) -> float:
         return math.fsum(self.neutral_survival_weights)
+
+    @property
+    def survival_after_age_cap(self) -> float:
+        return _runtime_expectation(
+            self.neutral_release_hazards,
+            self.neutral_survival_weights,
+        )[0]
+
+    @property
+    def terminal_hazard(self) -> float:
+        return self.neutral_release_hazards[-1]
+
+    @property
+    def terminal_expected_tail_sessions(self) -> float:
+        return _runtime_expectation(
+            self.neutral_release_hazards,
+            self.neutral_survival_weights,
+        )[1]
 
     @property
     def hazard_schedule_sha256(self) -> str:
@@ -210,7 +261,7 @@ class HoldTargetSpec:
 
     @property
     def survival_schedule_sha256(self) -> str:
-        return _sha256(self.neutral_survival_weights)
+        return _sha256((*self.neutral_survival_weights, self.survival_after_age_cap))
 
     @property
     def receipt_sha256(self) -> str:
@@ -219,7 +270,15 @@ class HoldTargetSpec:
             {
                 **asdict(self),
                 "calibrated_release_location": self.calibrated_release_location,
-                "expected_neutral_hold_sessions": (self.expected_neutral_hold_sessions),
+                "finite_support_expected_hold_sessions": (
+                    self.finite_support_expected_hold_sessions
+                ),
+                "survival_after_age_cap": self.survival_after_age_cap,
+                "terminal_hazard": self.terminal_hazard,
+                "terminal_expected_tail_sessions": (
+                    self.terminal_expected_tail_sessions
+                ),
+                "runtime_expected_hold_sessions": (self.expected_neutral_hold_sessions),
                 "hazard_schedule_sha256": self.hazard_schedule_sha256,
                 "survival_schedule_sha256": self.survival_schedule_sha256,
             }
@@ -297,7 +356,7 @@ def hold_release_hazard(
             1.0 - torch.exp(bounded.new_tensor(residual_minimum) - bounded)
         ) * torch.sigmoid(beta + bounded)
     if exact_hold_probability is None:
-        return normalized
+        return cast(torch.Tensor, normalized)
     if (
         not exact_hold_probability.is_floating_point()
         or not bool(torch.isfinite(exact_hold_probability).all())
@@ -307,12 +366,16 @@ def hold_release_hazard(
             "exact_hold_probability must be finite and lie in [0,1]"
         )
     try:
-        return normalized * (
-            1.0
-            - exact_hold_probability.to(
-                device=normalized.device,
-                dtype=normalized.dtype,
-            )
+        return cast(
+            torch.Tensor,
+            normalized
+            * (
+                1.0
+                - exact_hold_probability.to(
+                    device=normalized.device,
+                    dtype=normalized.dtype,
+                )
+            ),
         )
     except RuntimeError as error:
         raise HoldTargetProtocolError(
@@ -349,6 +412,7 @@ __all__ = [
     "DEFAULT_HOLD_TARGET_SPEC",
     "LEGACY_HOLD30_TARGET_SPEC",
     "HoldPriorFamily",
+    "TerminalAgeMode",
     "HoldTargetProtocolError",
     "HoldTargetSpec",
     "hold_release_hazard",

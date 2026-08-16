@@ -24,13 +24,23 @@ New generic holding APIs consume an immutable `HoldTargetSpec` and default to:
 ```text
 target_sessions = 3
 age_cap_sessions = 60
-prior_family = calibrated-logistic-v1
+prior_family = calibrated-logistic-v2
 hard_minimum_hold = false
+terminal_age_mode = repeat-last-hazard
 ```
 
-The generic logistic hazard location is deterministically calibrated so the
-finite-age survival sum equals `target_sessions`. The target remains a soft
-prior: early release is legal and there is no minimum-hold action mask.
+The generic logistic hazard location is deterministically calibrated against
+the actual finite-state ledger process. Ages through 59 advance normally; the
+terminal `60+` bin repeats the age-60 hazard. The calibrated expectation is:
+
+\[
+E[T]=\sum_{a=1}^{60}S(a)+\frac{S(61)}{h(60)}.
+\]
+
+The target remains a soft prior: early release is legal and there is no
+minimum-hold action mask. The current ledger architecture fixes the age cap at
+60; `HoldTargetSpec` rejects other caps until the whole environment, model,
+replay, and checkpoint state are parameterized together.
 
 Existing Hold-30 APIs remain compatibility wrappers around:
 
@@ -52,6 +62,8 @@ absent.
 ## Consequences
 
 - `HoldTargetSpec()` means a neutral expected three earned sessions.
+- Generic targets through 60 include the terminal-bin tail in both calibration
+  and receipts; a finite survival prefix is not called the runtime expectation.
 - Historical `hold30_*`, `Hold30*`, and immutable M03R contracts retain target
   30 unless a new scientific generation explicitly changes them.
 - M03R-v16 binds legacy target 30, 30-session common label support, and a

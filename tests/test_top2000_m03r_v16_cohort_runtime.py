@@ -110,6 +110,8 @@ def test_v16_cohort_path_is_closed_and_costs_reconcile(
             trace.benchmark_gross_returns[-1]
         )
     assert trace.terminal_liquidation_one_way_turnover >= 0.0
+    assert trace.risk_repair_active_one_way_mass.shape == (steps,)
+    assert trace.risk_forced_one_way_turnover.shape == (steps,)
     ten_bp = M03R_V16_PREDICTIVE_SPEC.evaluation_cost_basis_points.index(10.0)
     assert torch.allclose(
         trace.absolute_policy_cost_by_cost[ten_bp],
@@ -281,3 +283,64 @@ def test_v16_executed_cohorts_carry_return_drift_into_next_request(
         requested[1].squeeze(0) - values["benchmark_weights"][1],
         first - benchmark,
     )
+
+
+def test_v16_nonuniform_projection_keeps_every_cohort_self_financing() -> None:
+    import rl_quant.training.top2000_m03r_v16_cohort_runtime as runtime
+
+    first = runtime._ExecutedActiveCohort(
+        torch.tensor([-0.01, 0.03, -0.02, 0.0, 0.0], dtype=torch.float64),
+        age=2,
+        cohort_id=7,
+    )
+    second = runtime._ExecutedActiveCohort(
+        torch.tensor([0.01, 0.0, -0.01, 0.0, 0.0], dtype=torch.float64),
+        age=11,
+        cohort_id=8,
+    )
+    target = torch.tensor(
+        [-0.005, 0.015, -0.020, 0.020, -0.010],
+        dtype=torch.float64,
+    )
+    reconciled = runtime._reconcile_executed_cohorts(
+        [first, second],
+        target,
+        cash_index=0,
+    )
+    assert torch.allclose(
+        torch.stack([row.executed_active_weights for row in reconciled]).sum(0),
+        target,
+        rtol=0.0,
+        atol=2.0e-12,
+    )
+    assert all(
+        float(row.executed_active_weights.sum()) == pytest.approx(0.0, abs=2.0e-12)
+        for row in reconciled
+    )
+    repair = [row for row in reconciled if row.attribution == "risk_repair"]
+    assert len(repair) == 1
+    assert float(repair[0].executed_active_weights[3]) > 0.0
+    assert float(repair[0].executed_active_weights[4]) < 0.0
+    for original in (first, second):
+        observed = next(
+            row for row in reconciled if row.cohort_id == original.cohort_id
+        )
+        assert not bool(
+            (
+                observed.executed_active_weights[1:]
+                * original.executed_active_weights[1:]
+                < 0.0
+            ).any()
+        )
+
+    # Differently aged signal releases cannot break the requested simplex.
+    for row in reconciled:
+        multiplier = 1.0 if row.attribution == "risk_repair" else 0.2 + 0.05 * row.age
+        row.executed_active_weights *= multiplier
+    released = torch.stack([row.executed_active_weights for row in reconciled]).sum(0)
+    benchmark = torch.tensor([0.8, 0.05, 0.05, 0.05, 0.05], dtype=torch.float64)
+    assert all(
+        float(row.executed_active_weights.sum()) == pytest.approx(0.0, abs=2.0e-12)
+        for row in reconciled
+    )
+    assert float((benchmark + released).sum()) == pytest.approx(1.0, abs=2.0e-12)

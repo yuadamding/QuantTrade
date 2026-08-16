@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -102,8 +102,8 @@ class M03RV16BuiltPredictiveBatch:
     action_operators: tuple[M03RV15ResidualOperator, ...]
     action_returned_dtype_exposure_errors: tuple[float, ...]
     target_returned_dtype_exposure_errors: tuple[float, ...]
+    _issuer: object = field(repr=False)
     structural_slab_receipt_sha256: str | None = None
-    _issuer: object = _BUILT_BATCH_ISSUER
     protocol_sha256: str = M03R_V16_PROTOCOL_SHA256
     schema: str = M03R_V16_BUILT_BATCH_SCHEMA
 

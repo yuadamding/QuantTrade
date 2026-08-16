@@ -13,7 +13,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal, cast
 
 import torch
 
@@ -33,7 +33,7 @@ from rl_quant.training.top2000_m03r_v9_projection import (
 )
 
 M03R_V16_COHORT_TRACE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-horizon-matched-cohort-trace-v2"
+    "rl-quant.top2000-dev.m03r-v16-horizon-matched-cohort-trace-v3"
 )
 
 
@@ -158,13 +158,56 @@ def _new_rank_cohort(
     result[cash_index] = -result.sum()
     if not math.isclose(float(result.sum()), 0.0, abs_tol=2.0e-12):
         raise M03RV16CohortRuntimeError("V16 cohort is not self-financing")
-    return result
+    return cast(torch.Tensor, result)
 
 
 @dataclass(slots=True)
 class _ExecutedActiveCohort:
     executed_active_weights: torch.Tensor
     age: int = 0
+    cohort_id: int = 0
+    attribution: Literal["signal", "risk_repair"] = "signal"
+
+
+def _require_self_financing_cohorts(
+    cohorts: list[_ExecutedActiveCohort],
+    *,
+    cash_index: int,
+) -> None:
+    for cohort in cohorts:
+        row = cohort.executed_active_weights
+        if (
+            row.ndim != 1
+            or not row.is_floating_point()
+            or not bool(torch.isfinite(row).all())
+            or not 0 <= cash_index < row.numel()
+            or not math.isclose(float(row.sum()), 0.0, abs_tol=2.0e-12)
+            or cohort.age < 0
+            or cohort.attribution not in {"signal", "risk_repair"}
+            or (cohort.attribution == "risk_repair" and cohort.cohort_id != -1)
+        ):
+            raise M03RV16CohortRuntimeError(
+                "V16 executed cohort is not a valid self-financing row"
+            )
+
+
+def _canonical_self_financing_active(
+    value: torch.Tensor,
+    *,
+    cash_index: int,
+) -> torch.Tensor:
+    result = value.to(torch.float64).clone()
+    if (
+        result.ndim != 1
+        or not bool(torch.isfinite(result).all())
+        or not 0 <= cash_index < result.numel()
+        or abs(float(result.sum())) > 2.0e-6
+    ):
+        raise M03RV16CohortRuntimeError("V16 active book cannot be closed through cash")
+    risky = torch.ones(result.numel(), dtype=torch.bool, device=result.device)
+    risky[cash_index] = False
+    result[cash_index] = -result[risky].sum()
+    return result
 
 
 def _cohort_active_book(
@@ -183,45 +226,108 @@ def _cohort_active_book(
 def _reconcile_executed_cohorts(
     cohorts: list[_ExecutedActiveCohort],
     target_active: torch.Tensor,
+    *,
+    cash_index: int,
 ) -> list[_ExecutedActiveCohort]:
-    """Minimum-disturbance attribution of one executed aggregate active book."""
+    """Reconcile one active book without assigning artificial ages to repairs."""
 
-    target = target_active.to(torch.float64)
+    target = _canonical_self_financing_active(
+        target_active,
+        cash_index=cash_index,
+    )
+    if (
+        target.ndim != 1
+        or not bool(torch.isfinite(target).all())
+        or not 0 <= cash_index < target.numel()
+        or not math.isclose(float(target.sum()), 0.0, abs_tol=2.0e-12)
+    ):
+        raise M03RV16CohortRuntimeError(
+            "V16 executed active target is not self-financing"
+        )
+    _require_self_financing_cohorts(cohorts, cash_index=cash_index)
+    risky = torch.ones(target.numel(), dtype=torch.bool, device=target.device)
+    risky[cash_index] = False
     if not cohorts:
         if float(target.abs().max()) > 2.0e-12:
-            raise M03RV16CohortRuntimeError(
-                "V16 executed active book has no cohort attribution"
-            )
+            repair = target.clone()
+            repair[cash_index] = -repair[risky].sum()
+            result = [
+                _ExecutedActiveCohort(
+                    repair,
+                    cohort_id=-1,
+                    attribution="risk_repair",
+                )
+            ]
+            _require_self_financing_cohorts(result, cash_index=cash_index)
+            return result
         return []
-    requested = torch.stack(
-        tuple(value.executed_active_weights.to(torch.float64) for value in cohorts)
-    )
-    difference = target - requested.sum(dim=0)
-    strength = requested.abs()
-    per_asset = strength.sum(dim=0)
-    cohort_mass = strength.sum(dim=1)
-    total_mass = cohort_mass.sum()
-    fallback = (
-        cohort_mass / total_mass
-        if float(total_mass) > 0.0
-        else torch.full_like(cohort_mass, 1.0 / len(cohorts))
-    )
-    shares = torch.where(
-        per_asset.unsqueeze(0) > 1.0e-18,
-        strength / per_asset.clamp_min(1.0e-18).unsqueeze(0),
-        fallback.unsqueeze(1).expand_as(strength),
-    )
-    reconciled = requested + shares * difference.unsqueeze(0)
-    residual = target - reconciled.sum(dim=0)
-    reconciled[torch.argmax(cohort_mass)] += residual
-    if not torch.allclose(reconciled.sum(dim=0), target, rtol=0.0, atol=2.0e-12):
+
+    signal_cohorts = [row for row in cohorts if row.attribution == "signal"]
+    target_risky = target[risky]
+    reconciled: list[_ExecutedActiveCohort] = []
+    allocated_risky = torch.zeros_like(target_risky)
+    if signal_cohorts:
+        requested_risky = torch.stack(
+            tuple(
+                row.executed_active_weights.to(torch.float64)[risky]
+                for row in signal_cohorts
+            )
+        )
+        same_direction = requested_risky * target_risky.unsqueeze(0) > 0.0
+        strength = torch.where(
+            same_direction,
+            requested_risky.abs(),
+            torch.zeros_like(requested_risky),
+        )
+        per_asset = strength.sum(dim=0)
+        signal_allocation = torch.where(
+            per_asset.unsqueeze(0) > 1.0e-18,
+            strength
+            / per_asset.clamp_min(1.0e-18).unsqueeze(0)
+            * target_risky.unsqueeze(0),
+            torch.zeros_like(strength),
+        )
+        allocated_risky = signal_allocation.sum(dim=0)
+        for values, cohort in zip(signal_allocation, signal_cohorts, strict=True):
+            row = torch.zeros_like(target)
+            row[risky] = values
+            row[cash_index] = -values.sum()
+            reconciled.append(
+                _ExecutedActiveCohort(
+                    row,
+                    age=cohort.age,
+                    cohort_id=cohort.cohort_id,
+                    attribution="signal",
+                )
+            )
+
+    repair_risky = target_risky - allocated_risky
+    if float(repair_risky.abs().max()) > 2.0e-12:
+        repair = torch.zeros_like(target)
+        repair[risky] = repair_risky
+        repair[cash_index] = -repair_risky.sum()
+        reconciled.append(
+            _ExecutedActiveCohort(
+                repair,
+                cohort_id=-1,
+                attribution="risk_repair",
+            )
+        )
+    _require_self_financing_cohorts(reconciled, cash_index=cash_index)
+    if not torch.allclose(
+        _cohort_active_book(
+            reconciled,
+            assets=target.numel(),
+            reference=target,
+        ),
+        target,
+        rtol=0.0,
+        atol=2.0e-12,
+    ):
         raise M03RV16CohortRuntimeError(
             "V16 executed cohorts do not reconcile to the active book"
         )
-    return [
-        _ExecutedActiveCohort(row, cohort.age)
-        for row, cohort in zip(reconciled, cohorts, strict=True)
-    ]
+    return reconciled
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +354,8 @@ class M03RV16CohortTrace:
     cohort_release_one_way_mass: torch.Tensor
     weighted_mean_cohort_age: torch.Tensor
     requested_to_executed_retention: torch.Tensor
+    risk_repair_active_one_way_mass: torch.Tensor
+    risk_forced_one_way_turnover: torch.Tensor
     absolute_policy_cost_by_cost: tuple[torch.Tensor, ...]
     benchmark_cost_by_cost: tuple[torch.Tensor, ...]
     incremental_active_cost_by_cost: tuple[torch.Tensor, ...]
@@ -285,6 +393,8 @@ class M03RV16CohortTrace:
             self.cohort_release_one_way_mass,
             self.weighted_mean_cohort_age,
             self.requested_to_executed_retention,
+            self.risk_repair_active_one_way_mass,
+            self.risk_forced_one_way_turnover,
             *self.absolute_policy_cost_by_cost,
             *self.benchmark_cost_by_cost,
             *self.incremental_active_cost_by_cost,
@@ -383,6 +493,8 @@ class M03RV16CohortTrace:
             or bool((self.cohort_entry_one_way_mass < 0.0).any())
             or bool((self.cohort_release_one_way_mass < 0.0).any())
             or bool((self.requested_to_executed_retention < 0.0).any())
+            or bool((self.risk_repair_active_one_way_mass < 0.0).any())
+            or bool((self.risk_forced_one_way_turnover < 0.0).any())
             or not math.isfinite(self.terminal_liquidation_one_way_turnover)
             or self.terminal_liquidation_one_way_turnover < 0.0
             or not math.isfinite(self.terminal_preliquidation_active_one_way_mass)
@@ -604,6 +716,8 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
     release_rows: list[torch.Tensor] = []
     mean_age_rows: list[torch.Tensor] = []
     retention_rows: list[torch.Tensor] = []
+    repair_mass_rows: list[torch.Tensor] = []
+    risk_forced_turnover_rows: list[torch.Tensor] = []
 
     for step in range(steps):
         benchmark = benchmark_weights[step]
@@ -612,16 +726,24 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
             assets=assets,
             reference=benchmark,
         )
-        expected_active = (current_policy - current_benchmark).to(torch.float64)
+        _require_self_financing_cohorts(cohorts, cash_index=cash)
+        expected_active = _canonical_self_financing_active(
+            current_policy - current_benchmark,
+            cash_index=cash,
+        )
         if not torch.allclose(observed_active, expected_active, rtol=0.0, atol=2.0e-10):
             raise M03RV16CohortRuntimeError(
                 "V16 cohort ledger does not match the carried active book"
             )
-        previous_rows = tuple(
-            cohort.executed_active_weights.clone() for cohort in cohorts
-        )
+        previous_rows = {
+            cohort.cohort_id: cohort.executed_active_weights.clone()
+            for cohort in cohorts
+            if cohort.attribution == "signal"
+        }
         for cohort in cohorts:
-            if fixed_horizon is not None:
+            if cohort.attribution == "risk_repair":
+                multiplier = 1.0
+            elif fixed_horizon is not None:
                 multiplier = 0.0 if cohort.age >= fixed_horizon else 1.0
             elif cohort.age >= 30:
                 multiplier = 0.0
@@ -653,7 +775,13 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
                 one_way_mass=entry_mass,
             )
             if float(entry.abs().sum()) > 0.0:
-                cohorts.append(_ExecutedActiveCohort(entry))
+                cohorts.append(
+                    _ExecutedActiveCohort(
+                        entry,
+                        cohort_id=step,
+                        attribution="signal",
+                    )
+                )
                 entry_added = True
         requested_active = _cohort_active_book(
             cohorts,
@@ -678,32 +806,56 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
             expected_manifest_sha256=risk_state.manifest_sha256,
         )
         executed = projection.projected_weights.squeeze(0)
+        executed_active = _canonical_self_financing_active(
+            executed - benchmark,
+            cash_index=cash,
+        )
+        risk_forced_turnover = 0.5 * (executed_active - requested_active).abs().sum()
         cohorts = _reconcile_executed_cohorts(
             cohorts,
-            (executed - benchmark).to(torch.float64),
+            executed_active,
+            cash_index=cash,
         )
         if not torch.allclose(
             _cohort_active_book(cohorts, assets=assets, reference=benchmark),
-            (executed - benchmark).to(torch.float64),
+            executed_active,
             rtol=0.0,
             atol=2.0e-12,
         ):
             raise M03RV16CohortRuntimeError(
                 "V16 projection was not reconciled into executed cohorts"
             )
-        old_count = len(previous_rows)
         executed_release = math.fsum(
             0.5
             * float(
-                (before.abs() - cohorts[index].executed_active_weights.abs())
+                (
+                    before.abs()
+                    - next(
+                        (
+                            cohort.executed_active_weights
+                            for cohort in cohorts
+                            if cohort.attribution == "signal"
+                            and cohort.cohort_id == cohort_id
+                        ),
+                        torch.zeros_like(before),
+                    ).abs()
+                )
                 .clamp_min(0.0)
                 .sum()
             )
-            for index, before in enumerate(previous_rows)
+            for cohort_id, before in previous_rows.items()
+        )
+        new_signal = next(
+            (
+                cohort
+                for cohort in cohorts
+                if cohort.attribution == "signal" and cohort.cohort_id == step
+            ),
+            None,
         )
         executed_entry = (
-            0.5 * float(cohorts[-1].executed_active_weights.abs().sum())
-            if entry_added and len(cohorts) == old_count + 1
+            0.5 * float(new_signal.executed_active_weights.abs().sum())
+            if entry_added and new_signal is not None
             else 0.0
         )
         policy_turnover.append(0.5 * (executed - current_policy).abs().sum())
@@ -714,13 +866,27 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         entry_rows.append(executed.new_tensor(executed_entry))
         release_rows.append(executed.new_tensor(executed_release))
         retention_rows.append(projection.requested_to_executed_retention.squeeze(0))
+        repair_mass_rows.append(
+            executed.new_tensor(
+                math.fsum(
+                    0.5 * float(value.executed_active_weights.abs().sum())
+                    for value in cohorts
+                    if value.attribution == "risk_repair"
+                )
+            )
+        )
+        risk_forced_turnover_rows.append(risk_forced_turnover.to(dtype=executed.dtype))
         masses = [
-            0.5 * float(value.executed_active_weights.abs().sum()) for value in cohorts
+            0.5 * float(value.executed_active_weights.abs().sum())
+            for value in cohorts
+            if value.attribution == "signal"
         ]
+        signal_cohorts = [value for value in cohorts if value.attribution == "signal"]
         total_mass = math.fsum(masses)
         mean_age = (
             math.fsum(
-                mass * cohort.age for mass, cohort in zip(masses, cohorts, strict=True)
+                mass * cohort.age
+                for mass, cohort in zip(masses, signal_cohorts, strict=True)
             )
             / total_mass
             if total_mass > 0.0
@@ -735,16 +901,26 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         policy_returns.append(policy_return)
         benchmark_returns.append(benchmark_return)
         policy_growth = 1.0 + policy_return.to(torch.float64)
+        risky = torch.ones(assets, dtype=torch.bool, device=executed.device)
+        risky[cash] = False
         for cohort in cohorts:
             cohort.executed_active_weights = (
                 cohort.executed_active_weights
                 * (1.0 + post_fill_asset_returns[step].to(torch.float64))
                 / policy_growth
             )
-            cohort.age += 1
+            cohort.executed_active_weights[cash] = -cohort.executed_active_weights[
+                risky
+            ].sum()
+            if cohort.attribution == "signal":
+                cohort.age += 1
         cohorts = _reconcile_executed_cohorts(
             cohorts,
-            (current_policy - current_benchmark).to(torch.float64),
+            _canonical_self_financing_active(
+                current_policy - current_benchmark,
+                cash_index=cash,
+            ),
+            cash_index=cash,
         )
 
     terminal_active = 0.5 * float((current_policy - current_benchmark).abs().sum())
@@ -797,6 +973,8 @@ def run_m03r_v16_horizon_matched_cohort_sleeve(
         cohort_release_one_way_mass=torch.stack(release_rows),
         weighted_mean_cohort_age=torch.stack(mean_age_rows),
         requested_to_executed_retention=torch.stack(retention_rows),
+        risk_repair_active_one_way_mass=torch.stack(repair_mass_rows),
+        risk_forced_one_way_turnover=torch.stack(risk_forced_turnover_rows),
         absolute_policy_cost_by_cost=absolute_costs,
         benchmark_cost_by_cost=benchmark_costs,
         incremental_active_cost_by_cost=incremental_costs,

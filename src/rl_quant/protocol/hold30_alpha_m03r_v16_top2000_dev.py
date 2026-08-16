@@ -22,9 +22,11 @@ from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v3"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v4"
 )
-M03R_V16_DESIGN_ID = "causal-executed-cohort-balanced-fast-slab-hold30-primary-v3"
+M03R_V16_DESIGN_ID = (
+    "terminal-aware-self-financing-authoritative-qualification-hold30-primary-v4"
+)
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30
 M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS = 30
 M03RV16SelectionTarget = Literal[
@@ -51,7 +53,7 @@ M03R_V16_FOLD_GEOMETRY_RULE = (
     "five-disjoint-93-advance-inner63-diagnostic-63-origin-common30-pre2026-v2"
 )
 M03R_V16_EXECUTABLE_SCORE_RULE = (
-    "dimensionless-action-projected-selection-score-used-by-loss-and-evaluation-v2"
+    "dimensionless-action-projected-checkpoint-recomputed-score-used-everywhere-v3"
 )
 M03R_V16_LABEL_SUPPORT_RULE = (
     "common-origin-action-eligible-intersect-full-30-session-future-support-v2"
@@ -69,7 +71,7 @@ M03R_V16_TARGET_SELECTION_RULE = (
     "hold30-prior-setting-2-primary-h21-h30-explanatory-controls-v1"
 )
 M03R_V16_COHORT_SLEEVE_RULE = (
-    "origin-action-mask-executed-drifted-cohorts-truncated30-terminal-close-v2"
+    "self-financing-signal-and-risk-repair-cohorts-truncated30-terminal-close-v3"
 )
 
 

@@ -40,12 +40,14 @@ def test_generic_holding_default_is_soft_three_sessions() -> None:
     assert bool((hazards < 1.0).all())
 
 
-@pytest.mark.parametrize("target", (1, 3, 5, 21, 30, 60))
+@pytest.mark.parametrize("target", (1, 3, 5, 21, 30, 50, 59, 60))
 def test_generic_holding_target_is_semantically_calibrated(target: int) -> None:
     spec = HoldTargetSpec(target_sessions=target)
     assert spec.expected_neutral_hold_sessions == pytest.approx(target, abs=1.0e-6)
-    assert hold_survival_weights(hold_spec=spec).sum().item() == pytest.approx(
-        target, abs=1.0e-6
+    finite = hold_survival_weights(hold_spec=spec).sum().item()
+    assert finite == pytest.approx(
+        spec.finite_support_expected_hold_sessions,
+        abs=1.0e-12,
     )
     ages = torch.arange(1, spec.age_cap_sessions + 1, dtype=torch.float64)
     hazards = hold_release_hazard(
@@ -57,7 +59,48 @@ def test_generic_holding_target_is_semantically_calibrated(target: int) -> None:
         torch.cat((torch.ones(1, dtype=torch.float64), 1.0 - hazards[:-1])),
         dim=0,
     )
-    assert float(survival.sum()) == pytest.approx(target, abs=1.0e-6)
+    survival_after_cap = float(survival[-1] * (1.0 - hazards[-1]))
+    terminal_tail = survival_after_cap / float(hazards[-1])
+    assert float(survival.sum()) + terminal_tail == pytest.approx(target, abs=1.0e-6)
+    assert spec.survival_after_age_cap == pytest.approx(survival_after_cap, abs=1.0e-12)
+    assert spec.terminal_expected_tail_sessions == pytest.approx(
+        terminal_tail, abs=1.0e-12
+    )
+
+
+@pytest.mark.parametrize("target", (3, 30, 60))
+def test_generic_runtime_expectation_matches_deterministic_and_monte_carlo_process(
+    target: int,
+) -> None:
+    spec = HoldTargetSpec(target_sessions=target)
+    hazards = torch.tensor(spec.neutral_release_hazards, dtype=torch.float64)
+
+    survival = 1.0
+    deterministic = 0.0
+    for hazard in hazards.tolist():
+        deterministic += survival
+        survival *= 1.0 - hazard
+    for _ in range(10_000):
+        if survival <= 1.0e-15:
+            break
+        deterministic += survival
+        survival *= 1.0 - float(hazards[-1])
+    assert deterministic == pytest.approx(target, abs=1.0e-6)
+
+    sample_count = 100_000
+    generator = torch.Generator().manual_seed(16_004 + target)
+    alive = torch.ones(sample_count, dtype=torch.bool)
+    duration = torch.zeros(sample_count, dtype=torch.float64)
+    for hazard in hazards:
+        duration += alive
+        draws = torch.rand(sample_count, generator=generator)
+        alive &= draws >= hazard
+    terminal_count = int(alive.sum())
+    if terminal_count:
+        draws = torch.rand(terminal_count, generator=generator).clamp_min(1.0e-15)
+        geometric = torch.floor(torch.log(draws) / torch.log1p(-hazards[-1])) + 1.0
+        duration[alive] += geometric
+    assert float(duration.mean()) == pytest.approx(target, abs=0.35)
 
 
 def test_legacy_hold30_wrapper_preserves_the_frozen_numerical_clock() -> None:
@@ -95,6 +138,7 @@ def test_holding_target_does_not_change_age_cap_or_legacy_identity() -> None:
         HoldTargetSpec(target_sessions=True),
         HoldTargetSpec(target_sessions=0),
         HoldTargetSpec(target_sessions=61),
+        HoldTargetSpec(target_sessions=3, age_cap_sessions=30),
         HoldTargetSpec(hard_minimum_hold=True),
         HoldTargetSpec(target_sessions=3, prior_family="legacy-hold30-v1"),
     ),

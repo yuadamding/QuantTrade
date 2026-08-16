@@ -70,7 +70,7 @@ This table records lineage, not current cluster state:
 | v13 context-matched h3 | Corrected full-context and h3-only geometry, but still optimized and diagnosed a different tensor from the score traded after residualization | Preserve as superseded design evidence; do not launch it |
 | v14 executable-score h3 | Completed two-setting study with one action-projected score; both settings failed IC, net-cost, and break-even gates | Preserve as negative evidence; do not start economic training |
 | v15 corrected executable-score h3 | Completed all twelve A04 folds under the corrected package and runtime; both settings failed with IC below 0.011 and break-even cost below 2 bp | End daily h3 loss tuning; no economic or 2026 access |
-| v16 holding-aligned selection | Current local v3 successor comparing h21, h30, and reference-Hold-30 value on common 30-session support; selection-only with causal action masks, executed/drifted cohorts, balanced blocks, validated slab caching, and nontrivial capacity/lineage primitives | Complete and validate package, evaluator, worker, and lifecycle before any remote authorization |
+| v16 holding-aligned selection | Current local v4 successor comparing h21, h30, and reference-Hold-30 value on common 30-session support; selection-only with causal action masks, self-financing signal/risk-repair cohorts, balanced blocks, validated slab caching, nontrivial capacity, and checkpoint-owned qualification | Complete and validate package, evaluator, worker, and lifecycle before any remote authorization |
 | v7 2026-YTD retrospective | Separate, fixed 2026-01-02 through 2026-06-23 mechanism-evaluation contract | It is not a universal 2026 cutoff and cannot select v11 |
 
 ## 2. End-to-end lifecycle
@@ -371,11 +371,13 @@ protocols explicitly bind `legacy-hold30-v1` and target 30. Holding target,
 prediction horizon, label support, age cap, purge, and cohort evaluation horizon
 are separate values and must never inherit from one another implicitly.
 
-The generic hazard location is deterministically calibrated so the finite-age
-survival sum equals the requested duration. Merely substituting 3 for 30 in the
-legacy logit does not create a three-session expectation. Protocols, initial
-state, head identity, checkpoint, replay, and evaluation must bind the resolved
-hold-target receipt; target mismatch fails even when tensor shapes agree.
+The generic hazard location is deterministically calibrated against the actual
+finite-state process, including the geometric tail created when the `60+` bin
+repeats the age-60 hazard. A finite survival-prefix sum is not the runtime
+expectation. Merely substituting 3 for 30 in the legacy logit does not create a
+three-session expectation. Protocols, initial state, head identity, checkpoint,
+replay, and evaluation must bind the resolved hold-target receipt; target
+mismatch fails even when tensor shapes agree.
 
 ### Test objective gradients, not only objective values
 
