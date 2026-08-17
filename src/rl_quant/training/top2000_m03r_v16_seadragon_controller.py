@@ -814,7 +814,7 @@ def admit_m03r_v16_suspended_job(
             patched = transport.invoke(
                 (
                     "patch", "job", job_name, "--type", "merge",
-                    "--patch-file", "-", "--output", "json",
+                    "--patch-file", "/dev/stdin", "--output", "json",
                 ),
                 payload={
                     "metadata": {
@@ -1266,7 +1266,7 @@ def launch_m03r_v16_zero_gpu_gate(
                 resumed = transport.invoke(
                     (
                         "patch", "job", job_name, "--type", "merge",
-                        "--patch-file", "-", "--output", "json",
+                        "--patch-file", "/dev/stdin", "--output", "json",
                     ),
                     payload={
                         "metadata": {"resourceVersion": resource_version},
@@ -1816,7 +1816,7 @@ def resume_and_attest_m03r_v16_job(
             resumed = transport.invoke(
                 (
                     "patch", "job", job_name, "--type", "merge",
-                    "--patch-file", "-", "--output", "json",
+                    "--patch-file", "/dev/stdin", "--output", "json",
                 ),
                 payload={
                     "metadata": {"resourceVersion": current_resource_version},
@@ -2041,7 +2041,7 @@ def resume_and_attest_m03r_v16_job(
                 patched = transport.invoke(
                     (
                         "patch", "pod", pod_name, "--type", "merge",
-                        "--patch-file", "-", "--output", "json",
+                        "--patch-file", "/dev/stdin", "--output", "json",
                     ),
                     payload={
                         "metadata": {

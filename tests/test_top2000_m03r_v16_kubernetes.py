@@ -179,6 +179,14 @@ def test_v16_controller_never_emits_the_unsupported_file_flag() -> None:
     assert controller_source.count('"-f", "-"') == 4
 
 
+def test_v16_controller_reads_patch_payloads_from_dev_stdin() -> None:
+    controller_source = Path(seadragon_controller_runtime.__file__).read_text(
+        encoding="utf-8"
+    )
+    assert '"--patch-file", "-"' not in controller_source
+    assert controller_source.count('"--patch-file", "/dev/stdin"') == 4
+
+
 def test_v16_kubectl_transport_classifies_api_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
