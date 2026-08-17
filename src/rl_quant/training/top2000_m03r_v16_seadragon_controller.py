@@ -38,17 +38,16 @@ from rl_quant.training.top2000_m03r_v16_activation import (
     load_m03r_v16_phase_launch_authority,
     load_m03r_v16_pod_runtime_attestation,
     phase_launch_authority_file_sha256,
+    pod_runtime_attestation_file_identity,
     write_m03r_v16_admitted_job_authority,
 )
 from rl_quant.training.top2000_m03r_v16_kubernetes import (
     M03R_V16_NAMESPACE,
     M03RV16RenderedSuspendedJob,
     bind_m03r_v16_admitted_launch_authority,
-    m03r_v16_pod_runtime_attestation_annotations,
     write_m03r_v16_rendered_launch_authority,
 )
 from rl_quant.training.top2000_m03r_v16_lifecycle import (
-    M03RV16PodAnnotationReadback,
     M03RV16PodObservation,
     M03RV16PublishedPodAttestation,
     M03RV16StorageSemanticsEvidence,
@@ -89,15 +88,6 @@ M03R_V16_CONTROLLER_JOB_PLAN_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-controller-job-plan-v1"
 )
 _MAX_KUBECTL_RESPONSE_BYTES = 64 * 1024**2
-_POD_ATTESTATION_PATH_ANNOTATION = "rl-quant/pod-runtime-attestation-path"
-_POD_ATTESTATION_FILE_SHA_ANNOTATION = (
-    "rl-quant/pod-runtime-attestation-file-sha256"
-)
-_POD_ATTESTATION_RECEIPT_ANNOTATION = (
-    "rl-quant/pod-runtime-attestation-receipt-sha256"
-)
-
-
 class M03RV16SeadragonControllerError(RuntimeError):
     """An exact Kubernetes identity or lifecycle transition drifted."""
 
@@ -1660,7 +1650,7 @@ def _load_completion_attestation_journal(
     attestation_receipt = _text(
         "Pod attestation receipt", value.get("attestation_receipt_sha256")
     )
-    attestation = load_m03r_v16_pod_runtime_attestation(
+    load_m03r_v16_pod_runtime_attestation(
         Path(authority_root) / relative_path,
         expected_file_sha256=attestation_file_sha,
         expected_receipt_sha256=attestation_receipt,
@@ -1679,15 +1669,7 @@ def _load_completion_attestation_journal(
         current_node_name=observation.node_name,
         expected_relative_path=relative_path,
     )
-    annotations = m03r_v16_pod_runtime_attestation_annotations(attestation)
-    observed_annotations = _metadata(pod).get("annotations", {})
-    if not isinstance(observed_annotations, dict) or any(
-        observed_annotations.get(key) != expected
-        for key, expected in annotations.items()
-    ):
-        raise M03RV16SeadragonControllerError(
-            "V16 recovered Pod attestation annotations drifted"
-        )
+    del pod
     transaction_receipt = _text(
         "Pod attestation transaction receipt",
         value.get("controller_transaction_receipt_sha256"),
@@ -1695,9 +1677,9 @@ def _load_completion_attestation_journal(
     row = M03RV16PublishedPodAttestation(
         final_path=Path(authority_root) / relative_path,
         file_sha256=attestation_file_sha,
-        receipt_sha256=attestation.receipt_sha256,
+        receipt_sha256=attestation_receipt,
         relative_path=relative_path,
-        patched_annotations=annotations,
+        patched_annotations={},
         controller_transaction_receipt_sha256=transaction_receipt,
     )
     return _M03RV16CompletionAttestationJournal(
@@ -1726,26 +1708,11 @@ def _recover_published_attestation_without_journal(
     launch: Any,
     storage_receipt_sha256: str,
 ) -> _M03RV16CompletionAttestationJournal:
-    annotations = _metadata(pod).get("annotations", {})
-    if not isinstance(annotations, dict):
-        raise M03RV16SeadragonControllerError(
-            "V16 recovered Pod annotations are absent"
-        )
     relative_path = launch.pod_runtime_attestation_relative_path(completion_index)
-    file_sha = _text(
-        "Pod attestation file SHA",
-        annotations.get(_POD_ATTESTATION_FILE_SHA_ANNOTATION),
-    )
-    receipt = _text(
-        "Pod attestation receipt",
-        annotations.get(_POD_ATTESTATION_RECEIPT_ANNOTATION),
-    )
-    if annotations.get(_POD_ATTESTATION_PATH_ANNOTATION) != relative_path:
-        raise M03RV16SeadragonControllerError(
-            "V16 recovered Pod attestation path drifted"
-        )
-    attestation = load_m03r_v16_pod_runtime_attestation(
-        Path(authority_root) / relative_path,
+    attestation_path = Path(authority_root) / relative_path
+    file_sha, receipt = pod_runtime_attestation_file_identity(attestation_path)
+    load_m03r_v16_pod_runtime_attestation(
+        attestation_path,
         expected_file_sha256=file_sha,
         expected_receipt_sha256=receipt,
         package=package,
@@ -1763,14 +1730,6 @@ def _recover_published_attestation_without_journal(
         current_node_name=observation.node_name,
         expected_relative_path=relative_path,
     )
-    expected_annotations = m03r_v16_pod_runtime_attestation_annotations(attestation)
-    if any(
-        annotations.get(key) != expected
-        for key, expected in expected_annotations.items()
-    ):
-        raise M03RV16SeadragonControllerError(
-            "V16 recovered immutable Pod attestation annotations drifted"
-        )
     recovery_transaction = semantic_sha256(
         {
             "schema": M03R_V16_CONTROLLER_COMPLETION_ATTESTATION_SCHEMA,
@@ -1791,7 +1750,7 @@ def _recover_published_attestation_without_journal(
         file_sha256=file_sha,
         receipt_sha256=receipt,
         relative_path=relative_path,
-        patched_annotations=expected_annotations,
+        patched_annotations={},
         controller_transaction_receipt_sha256=recovery_transaction,
     )
     return _write_completion_attestation_journal(
@@ -2061,69 +2020,6 @@ def resume_and_attest_m03r_v16_job(
                 published_journals[index] = journal
                 continue
 
-            def patch_annotations(
-                precondition: object,
-                values: Mapping[str, str],
-                *,
-                pod_name: str = pod_observation.pod_name,
-                expected_pod_uid: str = pod_observation.pod_uid,
-            ) -> None:
-                resource_version = getattr(
-                    precondition, "pod_resource_version", None
-                )
-                pod_uid = getattr(precondition, "pod_uid", None)
-                if pod_uid != expected_pod_uid:
-                    raise M03RV16SeadragonControllerError(
-                        "V16 Pod patch UID precondition drifted"
-                    )
-                patched = transport.invoke(
-                    (
-                        "patch", "pod", pod_name, "--type", "merge",
-                        "--patch-file", "/dev/stdin", "--output", "json",
-                    ),
-                    payload={
-                        "metadata": {
-                            "resourceVersion": resource_version,
-                            "annotations": dict(values),
-                        }
-                    },
-                )
-                if patched is None or _metadata(patched).get("uid") != pod_uid:
-                    raise M03RV16SeadragonControllerError(
-                        "V16 Pod changed across annotation patch"
-                    )
-
-            def read_annotations(
-                precondition: object,
-                *,
-                pod_name: str = pod_observation.pod_name,
-            ) -> M03RV16PodAnnotationReadback:
-                current = transport.invoke(
-                    ("get", "pod", pod_name, "--output", "json")
-                )
-                if current is None:
-                    raise M03RV16SeadragonControllerError("V16 Pod vanished")
-                metadata = _metadata(current)
-                expected_uid = getattr(precondition, "pod_uid", None)
-                if metadata.get("uid") != expected_uid:
-                    raise M03RV16SeadragonControllerError(
-                        "V16 Pod UID changed before annotation readback"
-                    )
-                annotations = metadata.get("annotations")
-                if not isinstance(annotations, dict):
-                    raise M03RV16SeadragonControllerError(
-                        "V16 Pod annotations vanished"
-                    )
-                return M03RV16PodAnnotationReadback(
-                    pod_uid=_text("Pod UID", metadata.get("uid")),
-                    pod_resource_version=_text(
-                        "Pod resourceVersion", metadata.get("resourceVersion")
-                    ),
-                    annotations={
-                        str(key): str(value) for key, value in annotations.items()
-                    },
-                )
-
             try:
                 row = publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
                     package=package,
@@ -2145,8 +2041,6 @@ def resume_and_attest_m03r_v16_job(
                     storage_observer_identity_root=(
                         storage_observer_identity_root
                     ),
-                    patch_annotations=patch_annotations,
-                    read_annotations=read_annotations,
                 )
             except M03RV16KubernetesConflictError:
                 conflicts[index] = conflicts.get(index, 0) + 1

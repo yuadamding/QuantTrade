@@ -173,7 +173,7 @@ def test_v16_h100_qualification_has_no_in_process_peer_barrier(
     assert not tuple(tmp_path.glob("**/outer-access-fold-*.json"))
 
 
-def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
+def test_v16_init_gate_uses_deterministic_path_and_writes_validated_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -231,6 +231,11 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
         attestation_gate,
         "load_v16_lifecycle_pod_attestation",
         lambda *a, **k: attestation,
+    )
+    monkeypatch.setattr(
+        attestation_gate,
+        "pod_attestation_file_identity",
+        lambda *a, **k: ("3" * 64, "2" * 64),
     )
     downward = tmp_path / "podinfo"
     downward.mkdir()

@@ -184,7 +184,7 @@ def test_v16_controller_reads_patch_payloads_from_dev_stdin() -> None:
         encoding="utf-8"
     )
     assert '"--patch-file", "-"' not in controller_source
-    assert controller_source.count('"--patch-file", "/dev/stdin"') == 4
+    assert controller_source.count('"--patch-file", "/dev/stdin"') == 3
 
 
 def test_v16_kubectl_transport_classifies_api_failures(
@@ -926,7 +926,14 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
             if arguments[:2] == ("get", "pods"):
                 if live_job["spec"]["suspend"]:
                     return {"items": []}
-                if crash_after_first_attestation and "attest:0" in events:
+                completion_zero_path = (
+                    authority_root
+                    / "pod-runtime"
+                    / "training"
+                    / "training-controller-job-uid"
+                    / "completion-00.json"
+                )
+                if crash_after_first_attestation and completion_zero_path.is_file():
                     raise KeyboardInterrupt("crash after completion-0 attestation")
                 pod_list_calls += 1
                 visible = (0,) if pod_list_calls <= 2 else (0, 1, 2)
@@ -997,8 +1004,7 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
     )
     assert journal.is_file()
     # Exercise the narrower crash boundary where the immutable attestation
-    # exists and Pod annotations are visible, but the per-completion journal
-    # was not durably published.
+    # exists, but the per-completion journal was not durably published.
     journal.unlink()
     assert not (authority_root / "training-controller-attestations.json").exists()
     completion_zero_annotations = dict(pods[0]["metadata"]["annotations"])
@@ -1018,9 +1024,9 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
     )
 
     assert len(result.rows) == 3
-    assert events.index("attest:0") < events.index("list:0,1,2")
-    assert events.count("conflict:0") == 1
-    assert events.count("attest:0") == 1
+    assert events.index("list:0") < events.index("list:0,1,2")
+    assert events.count("conflict:0") == 0
+    assert events.count("attest:0") == 0
     assert pods[0]["metadata"]["annotations"] == completion_zero_annotations
     assert (
         pods[0]["metadata"]["resourceVersion"]

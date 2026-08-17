@@ -88,8 +88,11 @@ def _safe_path_component(name: str, value: str) -> None:
         raise M03RV16ActivationError(f"{name} is not a safe path component")
 
 
-def _read_exact(path: Path, expected_file_sha256: str) -> dict[str, Any]:
-    _digest("expected_file_sha256", expected_file_sha256)
+def _read_canonical(
+    path: Path,
+    *,
+    expected_file_sha256: str | None = None,
+) -> tuple[dict[str, Any], str]:
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
@@ -109,7 +112,13 @@ def _read_exact(path: Path, expected_file_sha256: str) -> dict[str, Any]:
             raise M03RV16ActivationError("V16 activation changed while read")
     finally:
         os.close(descriptor)
-    if len(raw) != before.st_size or hashlib.sha256(raw).hexdigest() != expected_file_sha256:
+    observed_file_sha256 = hashlib.sha256(raw).hexdigest()
+    if len(raw) != before.st_size:
+        raise M03RV16ActivationError("V16 activation file size drifted")
+    if (
+        expected_file_sha256 is not None
+        and observed_file_sha256 != expected_file_sha256
+    ):
         raise M03RV16ActivationError("V16 activation file hash drifted")
     try:
         payload = json.loads(raw)
@@ -117,6 +126,14 @@ def _read_exact(path: Path, expected_file_sha256: str) -> dict[str, Any]:
         raise M03RV16ActivationError("V16 activation file is malformed") from exc
     if not isinstance(payload, dict) or raw != canonical_json_file_bytes(payload):
         raise M03RV16ActivationError("V16 activation file is not canonical")
+    return payload, observed_file_sha256
+
+
+def _read_exact(path: Path, expected_file_sha256: str) -> dict[str, Any]:
+    _digest("expected_file_sha256", expected_file_sha256)
+    payload, _ = _read_canonical(
+        path, expected_file_sha256=expected_file_sha256
+    )
     return payload
 
 
@@ -1273,6 +1290,26 @@ def pod_runtime_attestation_file_sha256(
     ).hexdigest()
 
 
+def pod_runtime_attestation_file_identity(
+    path: str | Path,
+) -> tuple[str, str]:
+    """Discover the identities of one canonical, append-only attestation."""
+
+    payload, file_sha256 = _read_canonical(Path(path))
+    attestation = payload.get("attestation")
+    receipt_sha256 = payload.get("receipt_sha256")
+    if not isinstance(attestation, dict) or not isinstance(receipt_sha256, str):
+        raise M03RV16ActivationError(
+            "V16 Pod runtime attestation identity is malformed"
+        )
+    _digest("Pod runtime attestation receipt", receipt_sha256)
+    if semantic_sha256(attestation) != receipt_sha256:
+        raise M03RV16ActivationError(
+            "V16 Pod runtime attestation self-receipt drifted"
+        )
+    return file_sha256, receipt_sha256
+
+
 def load_m03r_v16_pod_runtime_attestation(
     path: str | Path,
     *,
@@ -2025,6 +2062,7 @@ __all__ = [
     "load_m03r_v16_training_activation",
     "load_m03r_v16_training_panel_authority",
     "phase_launch_authority_file_sha256",
+    "pod_runtime_attestation_file_identity",
     "pod_runtime_attestation_file_sha256",
     "write_m03r_v16_admitted_job_authority",
     "write_m03r_v16_phase_launch_authority",

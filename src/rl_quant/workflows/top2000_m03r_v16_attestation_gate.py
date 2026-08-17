@@ -17,19 +17,13 @@ from rl_quant.protocol.v16_lifecycle_contract import (
     load_v16_lifecycle_package,
     load_v16_lifecycle_pod_attestation,
     load_v16_lifecycle_storage,
+    pod_attestation_file_identity,
     semantic_sha256,
 )
 
 
 class M03RV16AttestationGateError(RuntimeError):
     """The init container could not validate its immutable Pod authority."""
-
-
-def _read_downward_value(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
 
 
 def _write_marker(path: Path, payload: dict[str, object]) -> None:
@@ -134,7 +128,7 @@ def validate_m03r_v16_pod_attestation_gate(
         expected_admission_file_sha256=admitted_job_authority_file_sha256,
         storage=storage,
     )
-    downward = Path(downward_root)
+    del downward_root
     expected_relative = launch.relative_path(completion_index)
     resolved_output_root = (
         Path(output_root)
@@ -143,30 +137,17 @@ def validate_m03r_v16_pod_attestation_gate(
         if phase == "capacity"
         else Path(package.worker_output_roots[completion_index])
     )
+    attestation_path = Path(authority_root) / expected_relative
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        relative_path = _read_downward_value(
-            downward / "pod-runtime-attestation-path"
-        )
-        expected_file_sha256 = _read_downward_value(
-            downward / "pod-runtime-attestation-file-sha256"
-        )
-        expected_receipt_sha256 = _read_downward_value(
-            downward / "pod-runtime-attestation-receipt-sha256"
-        )
-        if relative_path and expected_file_sha256 and expected_receipt_sha256:
-            if relative_path != expected_relative:
-                raise M03RV16AttestationGateError(
-                    "V16 Pod attestation annotation path drifted"
-                )
-            attestation_path = Path(authority_root) / relative_path
-            if attestation_path.is_file():
-                break
+    while not attestation_path.is_file():
         if time.monotonic() >= deadline:
             raise M03RV16AttestationGateError(
                 "V16 Pod attestation was not atomically published"
             )
         time.sleep(1.0)
+    expected_file_sha256, expected_receipt_sha256 = (
+        pod_attestation_file_identity(attestation_path)
+    )
     current_pod_uid = os.environ.get("M03R_V16_CURRENT_POD_UID", "")
     current_pod_name = os.environ.get("M03R_V16_CURRENT_POD_NAME", "")
     current_node_name = os.environ.get("M03R_V16_CURRENT_NODE_NAME", "")
@@ -185,7 +166,7 @@ def validate_m03r_v16_pod_attestation_gate(
         current_pod_uid=current_pod_uid,
         current_pod_name=current_pod_name,
         current_node_name=current_node_name,
-        expected_relative_path=relative_path,
+        expected_relative_path=expected_relative,
     )
     unsigned: dict[str, object] = {
         "schema": "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v3",
@@ -195,7 +176,7 @@ def validate_m03r_v16_pod_attestation_gate(
         "pod_uid": current_pod_uid,
         "pod_name": current_pod_name,
         "node_name": current_node_name,
-        "relative_path": relative_path,
+        "relative_path": expected_relative,
         "attestation_file_sha256": expected_file_sha256,
         "attestation_receipt_sha256": attestation.receipt_sha256,
         "launch_authority_receipt_sha256": launch.receipt_sha256,

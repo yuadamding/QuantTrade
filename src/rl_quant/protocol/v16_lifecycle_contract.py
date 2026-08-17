@@ -95,8 +95,11 @@ def _mapping(name: str, value: object) -> dict[str, Any]:
     return dict(value)
 
 
-def _read_exact(path: str | Path, expected_file_sha256: str) -> dict[str, Any]:
-    _digest("expected_file_sha256", expected_file_sha256)
+def _read_canonical(
+    path: str | Path,
+    *,
+    expected_file_sha256: str | None = None,
+) -> tuple[dict[str, Any], str]:
     candidate = Path(path)
     try:
         descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -123,11 +126,16 @@ def _read_exact(path: str | Path, expected_file_sha256: str) -> dict[str, Any]:
             )
     finally:
         os.close(descriptor)
+    observed_file_sha256 = hashlib.sha256(raw).hexdigest()
+    if len(raw) != before.st_size:
+        raise V16LifecycleContractError("V16 lifecycle authority file size drifted")
     if (
-        len(raw) != before.st_size
-        or hashlib.sha256(raw).hexdigest() != expected_file_sha256
+        expected_file_sha256 is not None
+        and observed_file_sha256 != expected_file_sha256
     ):
-        raise V16LifecycleContractError("V16 lifecycle authority file hash drifted")
+        raise V16LifecycleContractError(
+            "V16 lifecycle authority file hash drifted"
+        )
     try:
         payload = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -138,7 +146,26 @@ def _read_exact(path: str | Path, expected_file_sha256: str) -> dict[str, Any]:
         raise V16LifecycleContractError(
             "V16 lifecycle authority file is not canonical"
         )
+    return payload, observed_file_sha256
+
+
+def _read_exact(path: str | Path, expected_file_sha256: str) -> dict[str, Any]:
+    _digest("expected_file_sha256", expected_file_sha256)
+    payload, _ = _read_canonical(
+        path, expected_file_sha256=expected_file_sha256
+    )
     return payload
+
+
+def pod_attestation_file_identity(path: str | Path) -> tuple[str, str]:
+    payload, file_sha256_value = _read_canonical(path)
+    attestation = _mapping("attestation", payload.get("attestation"))
+    receipt_sha256 = _digest("receipt_sha256", payload.get("receipt_sha256"))
+    if semantic_sha256(attestation) != receipt_sha256:
+        raise V16LifecycleContractError(
+            "V16 lifecycle attestation self-receipt drifted"
+        )
+    return file_sha256_value, receipt_sha256
 
 
 def _receipt_payload(
@@ -664,5 +691,6 @@ __all__ = [
     "load_v16_lifecycle_package",
     "load_v16_lifecycle_pod_attestation",
     "load_v16_lifecycle_storage",
+    "pod_attestation_file_identity",
     "semantic_sha256",
 ]

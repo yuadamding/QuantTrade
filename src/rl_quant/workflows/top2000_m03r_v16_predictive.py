@@ -231,15 +231,7 @@ def _read_immutable_json(path: Path, expected_file_sha256: str) -> dict[str, Any
     return payload
 
 
-def _read_pod_attestation_marker(
-    path: Path,
-    *,
-    phase: str,
-    completion_index: int,
-    pod_attestation: M03RV16PodRuntimeAttestation,
-    launch_authority: M03RV16PhaseLaunchAuthority,
-    package_source_root: Path,
-) -> dict[str, Any]:
+def _read_pod_attestation_marker_payload(path: Path) -> dict[str, Any]:
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
@@ -266,6 +258,23 @@ def _read_pod_attestation_marker(
             "V16 init attestation marker is not canonical"
         )
     unsigned = {key: value for key, value in marker.items() if key != "receipt_sha256"}
+    if marker.get("receipt_sha256") != _sha256(unsigned):
+        raise M03RV16PredictiveWorkflowError(
+            "V16 init attestation marker receipt drifted"
+        )
+    return marker
+
+
+def _read_pod_attestation_marker(
+    path: Path,
+    *,
+    phase: str,
+    completion_index: int,
+    pod_attestation: M03RV16PodRuntimeAttestation,
+    launch_authority: M03RV16PhaseLaunchAuthority,
+    package_source_root: Path,
+) -> dict[str, Any]:
+    marker = _read_pod_attestation_marker_payload(path)
     expected_gate_path = (
         package_source_root
         / "rl_quant/workflows/top2000_m03r_v16_attestation_gate.py"
@@ -274,7 +283,6 @@ def _read_pod_attestation_marker(
     if (
         marker.get("schema")
         != "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v3"
-        or marker.get("receipt_sha256") != _sha256(unsigned)
         or marker.get("phase") != phase
         or marker.get("completion_index") != completion_index
         or marker.get("pod_uid") != pod_attestation.pod_uid
@@ -1384,9 +1392,6 @@ def run_m03r_v16_predictive_worker(
             expected_server_side_dry_run_result_file_sha256,
             admitted_manifest_result_path,
             expected_admitted_manifest_result_file_sha256,
-            pod_runtime_attestation_path,
-            expected_pod_runtime_attestation_file_sha256,
-            expected_pod_runtime_attestation_receipt_sha256,
             pod_runtime_attestation_marker_path,
             storage_semantics_path,
             expected_storage_semantics_file_sha256,
@@ -1506,6 +1511,41 @@ def run_m03r_v16_predictive_worker(
         raise M03RV16PredictiveWorkflowError(
             "V16 worker lacks Downward API Pod identity"
         )
+    marker_payload = _read_pod_attestation_marker_payload(
+        Path(str(pod_runtime_attestation_marker_path))
+    )
+    expected_relative_path = (
+        launch_authority.pod_runtime_attestation_relative_path(index)
+    )
+    marker_file_sha256 = marker_payload.get("attestation_file_sha256")
+    marker_receipt_sha256 = marker_payload.get(
+        "attestation_receipt_sha256"
+    )
+    if (
+        marker_payload.get("phase") != phase
+        or marker_payload.get("completion_index") != index
+        or marker_payload.get("relative_path") != expected_relative_path
+        or not isinstance(marker_file_sha256, str)
+        or not isinstance(marker_receipt_sha256, str)
+        or (
+            expected_pod_runtime_attestation_file_sha256 not in (None, "")
+            and expected_pod_runtime_attestation_file_sha256
+            != marker_file_sha256
+        )
+        or (
+            expected_pod_runtime_attestation_receipt_sha256 not in (None, "")
+            and expected_pod_runtime_attestation_receipt_sha256
+            != marker_receipt_sha256
+        )
+    ):
+        raise M03RV16PredictiveWorkflowError(
+            "V16 init marker attestation identity drifted"
+        )
+    pod_runtime_attestation_path = (
+        Path(str(storage_semantics_path)).parent / expected_relative_path
+    )
+    expected_pod_runtime_attestation_file_sha256 = marker_file_sha256
+    expected_pod_runtime_attestation_receipt_sha256 = marker_receipt_sha256
     pod_attestation: M03RV16PodRuntimeAttestation = (
         load_m03r_v16_pod_runtime_attestation(
             str(pod_runtime_attestation_path),
@@ -1524,9 +1564,7 @@ def run_m03r_v16_predictive_worker(
             current_pod_uid=current_pod_uid,
             current_pod_name=current_pod_name,
             current_node_name=current_node_name,
-            expected_relative_path=(
-                launch_authority.pod_runtime_attestation_relative_path(index)
-            ),
+            expected_relative_path=expected_relative_path,
         )
     )
     attestation_marker = _read_pod_attestation_marker(

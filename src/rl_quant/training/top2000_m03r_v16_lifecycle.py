@@ -351,12 +351,14 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
     storage_observer_identity_root: str | Path | None = None,
     patch_annotations: Callable[
         [M03RV16PodPatchPrecondition, Mapping[str, str]], None
-    ],
+    ]
+    | None = None,
     read_annotations: Callable[
         [M03RV16PodPatchPrecondition], M03RV16PodAnnotationReadback
-    ],
+    ]
+    | None = None,
 ) -> M03RV16PublishedPodAttestation:
-    """Patch and observe annotations before the atomic final link appears."""
+    """Publish a complete attestation, with optional Pod annotation binding."""
 
     storage_evidence.validate_for(
         authority_root
@@ -422,35 +424,44 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
         raise M03RV16LifecycleControllerError(
             "V16 Pod attestation final path is a symlink"
         )
-    annotations = {
+    expected_annotations = {
         _PATH_ANNOTATION: relative_path,
         _FILE_ANNOTATION: pod_runtime_attestation_file_sha256(attestation),
         _RECEIPT_ANNOTATION: attestation.receipt_sha256,
     }
-    precondition = M03RV16PodPatchPrecondition(
-        pod_name=observation.pod_name,
-        pod_uid=observation.pod_uid,
-        pod_resource_version=observation.observed_pod_resource_version,
-    )
-    patch_annotations(precondition, annotations)
-    observed = read_annotations(precondition)
-    if not isinstance(observed, M03RV16PodAnnotationReadback):
+    if (patch_annotations is None) != (read_annotations is None):
         raise M03RV16LifecycleControllerError(
-            "V16 Pod annotation readback lacks UID/resource-version evidence"
+            "V16 Pod annotation publication callbacks are incomplete"
         )
-    if (
-        observed.pod_uid != observation.pod_uid
-        or not observed.pod_resource_version
-        or observed.pod_resource_version
-        == observation.observed_pod_resource_version
-        or any(
-            observed.annotations.get(key) != value
-            for key, value in annotations.items()
+    annotations: Mapping[str, str] = {}
+    post_patch_resource_version: str | None = None
+    if patch_annotations is not None and read_annotations is not None:
+        precondition = M03RV16PodPatchPrecondition(
+            pod_name=observation.pod_name,
+            pod_uid=observation.pod_uid,
+            pod_resource_version=observation.observed_pod_resource_version,
         )
-    ):
-        raise M03RV16LifecycleControllerError(
-            "V16 Pod attestation annotations were not observed exactly"
-        )
+        patch_annotations(precondition, expected_annotations)
+        observed = read_annotations(precondition)
+        if not isinstance(observed, M03RV16PodAnnotationReadback):
+            raise M03RV16LifecycleControllerError(
+                "V16 Pod annotation readback lacks UID/resource-version evidence"
+            )
+        if (
+            observed.pod_uid != observation.pod_uid
+            or not observed.pod_resource_version
+            or observed.pod_resource_version
+            == observation.observed_pod_resource_version
+            or any(
+                observed.annotations.get(key) != value
+                for key, value in expected_annotations.items()
+            )
+        ):
+            raise M03RV16LifecycleControllerError(
+                "V16 Pod attestation annotations were not observed exactly"
+            )
+        annotations = expected_annotations
+        post_patch_resource_version = observed.pod_resource_version
     if not final_path.exists():
         for stale in final_path.parent.glob(
             f".{final_path.name}.{attestation.receipt_sha256}.*.tmp"
@@ -463,7 +474,7 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
     observed_file_sha = write_m03r_v16_pod_runtime_attestation(
         final_path, attestation
     )
-    if observed_file_sha != annotations[_FILE_ANNOTATION]:
+    if observed_file_sha != expected_annotations[_FILE_ANNOTATION]:
         raise M03RV16LifecycleControllerError(
             "V16 published Pod attestation bytes drifted"
         )
@@ -477,7 +488,12 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
             "pre_patch_resource_version": (
                 observation.observed_pod_resource_version
             ),
-            "post_patch_resource_version": observed.pod_resource_version,
+            "post_patch_resource_version": post_patch_resource_version,
+            "publication_mode": (
+                "pod-annotation-bound"
+                if annotations
+                else "deterministic-authority-path"
+            ),
             "relative_path": relative_path,
             "file_sha256": observed_file_sha,
             "attestation_receipt_sha256": attestation.receipt_sha256,
