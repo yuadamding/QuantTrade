@@ -189,6 +189,25 @@ def _status_image_matches(
     return repository == expected_repository and digest == expected_digest
 
 
+def _image_id_repository_matches(
+    repository: str | None,
+    *,
+    expected_repository: str | None,
+) -> bool:
+    if repository is None or repository == expected_repository:
+        return True
+    if expected_repository is None:
+        return False
+    last_slash = expected_repository.rfind("/")
+    last_colon = expected_repository.rfind(":")
+    tagless_repository = (
+        expected_repository[:last_colon]
+        if last_colon > last_slash
+        else expected_repository
+    )
+    return repository == tagless_repository
+
+
 @dataclass(frozen=True, slots=True)
 class V16LifecyclePackageView:
     package_plan_sha256: str
@@ -596,7 +615,10 @@ def load_v16_lifecycle_pod_attestation(
         or value.get("attested_container_kind") != "init"
         or spec_repository != package_repository
         or not status_image_matches
-        or image_id_repository not in (None, package_repository)
+        or not _image_id_repository_matches(
+            image_id_repository,
+            expected_repository=package_repository,
+        )
         or {spec_digest, image_id_digest} != {package_digest}
         or value.get("normalized_image_digest") != package_digest
         or value.get("storage_semantics_file_sha256")

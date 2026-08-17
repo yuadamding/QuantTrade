@@ -993,6 +993,25 @@ def _status_image_matches(
     return repository == expected_repository and digest == expected_digest
 
 
+def _image_id_repository_matches(
+    repository: str | None,
+    *,
+    expected_repository: str | None,
+) -> bool:
+    if repository is None or repository == expected_repository:
+        return True
+    if expected_repository is None:
+        return False
+    last_slash = expected_repository.rfind("/")
+    last_colon = expected_repository.rfind(":")
+    tagless_repository = (
+        expected_repository[:last_colon]
+        if last_colon > last_slash
+        else expected_repository
+    )
+    return repository == tagless_repository
+
+
 @dataclass(frozen=True, slots=True)
 class M03RV16PodRuntimeAttestation:
     """Per-completion identity observed only after a suspended Job resumes."""
@@ -1098,7 +1117,10 @@ class M03RV16PodRuntimeAttestation:
             or spec_digest != expected_digest
             or not status_image_matches
             or image_id_digest != expected_digest
-            or image_id_repository not in (None, expected_repository)
+            or not _image_id_repository_matches(
+                image_id_repository,
+                expected_repository=expected_repository,
+            )
             or self.normalized_image_digest != expected_digest
             or self.output_root_sha256 != expected_output_root_sha256
             or self.storage_semantics_file_sha256

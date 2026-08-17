@@ -1236,6 +1236,10 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
     relative_attestation_path = (
         capacity_job.launch_authority.pod_runtime_attestation_relative_path(0)
     )
+    package_image_repository = package.artifacts.image_reference.split(
+        "@sha256:", 1
+    )[0]
+    runtime_image_id_repository = package_image_repository.rsplit(":", 1)[0]
     pod_attestation = _issue_m03r_v16_pod_runtime_attestation(
         package=package,
         authorization=authorization,
@@ -1255,7 +1259,9 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         observed_spec_image=package.artifacts.image_reference,
         observed_status_image="sha256:" + "c" * 64,
         observed_status_image_id=(
-            "containerd://sha256:" + package.artifacts.image_digest_sha256
+            runtime_image_id_repository
+            + "@sha256:"
+            + package.artifacts.image_digest_sha256
         ),
         output_root_sha256=output_root_sha,
     )
@@ -1311,7 +1317,9 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
             observed_spec_image=package.artifacts.image_reference,
             observed_status_image="sha256:" + "c" * 64,
             observed_status_image_id=(
-                "containerd://sha256:" + package.artifacts.image_digest_sha256
+                runtime_image_id_repository
+                + "@sha256:"
+                + package.artifacts.image_digest_sha256
             ),
         ),
         output_root_sha256=output_root_sha,
