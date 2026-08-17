@@ -769,6 +769,45 @@ def test_v16_zero_gpu_launch_recovers_after_resume_before_receipt(
     ).is_file()
 
 
+def test_v16_zero_gpu_launch_rejects_admission_gpu_injection(
+    tmp_path: Path,
+) -> None:
+    package, authorization, plan_file, authorization_file = _surfaces()
+    rendered = render_m03r_v16_suspended_static_job(
+        package=package,
+        authorization=authorization,
+        package_plan_file_sha256=plan_file,
+        authorization_file_sha256=authorization_file,
+        template=_template("m03r-v16-static-gpu-injection"),
+    )
+
+    class FakeTransport:
+        def invoke(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            payload: dict | None = None,
+            allow_not_found: bool = False,
+        ) -> dict | None:
+            del payload, allow_not_found
+            if arguments[:2] == ("create", "--dry-run=server"):
+                admitted = json.loads(json.dumps(rendered.manifest))
+                resources = admitted["spec"]["template"]["spec"]["containers"][0][
+                    "resources"
+                ]
+                resources["requests"]["nvidia.com/gpu"] = "1"
+                resources["limits"]["nvidia.com/gpu"] = "1"
+                return admitted
+            raise AssertionError(arguments)
+
+    with pytest.raises(M03RV16SeadragonControllerError, match="admitted a GPU"):
+        launch_m03r_v16_zero_gpu_gate(
+            transport=FakeTransport(),
+            rendered=rendered,
+            authority_root=tmp_path / "zero-gpu-injection-authority",
+        )
+
+
 def test_v16_controller_attests_partial_pods_and_retries_conflict(
     tmp_path: Path,
 ) -> None:
@@ -1064,8 +1103,8 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
     resources = static_job.manifest["spec"]["template"]["spec"]["containers"][0][
         "resources"
     ]
-    assert "nvidia.com/gpu" not in resources["requests"]
-    assert "nvidia.com/gpu" not in resources["limits"]
+    assert resources["requests"]["nvidia.com/gpu"] == "0"
+    assert resources["limits"]["nvidia.com/gpu"] == "0"
     static = _static_gate(package, authorization, static_job.manifest_sha256)
     storage_job = render_m03r_v16_suspended_storage_job(
         package=package,
@@ -1543,9 +1582,9 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         qualification_activation_file_sha256="8" * 64,
     )
     assert preflight_job.maximum_gpu_requests == 0
-    assert "nvidia.com/gpu" not in preflight_job.manifest["spec"]["template"][
-        "spec"
-    ]["containers"][0]["resources"]["requests"]
+    assert preflight_job.manifest["spec"]["template"]["spec"]["containers"][0][
+        "resources"
+    ]["requests"]["nvidia.com/gpu"] == "0"
     preflight_resources = preflight_job.manifest["spec"]["template"]["spec"][
         "containers"
     ][0]["resources"]
@@ -1553,11 +1592,13 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         "cpu": "12",
         "memory": "64Gi",
         "ephemeral-storage": "8Gi",
+        "nvidia.com/gpu": "0",
     }
     assert preflight_resources["limits"] == {
         "cpu": "16",
         "memory": "128Gi",
         "ephemeral-storage": "16Gi",
+        "nvidia.com/gpu": "0",
     }
     outer_access = _issue_m03r_v16_qualification_outer_access_authority(
         package=package,

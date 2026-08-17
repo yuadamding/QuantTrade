@@ -435,6 +435,42 @@ def _job_name(rendered: M03RV16RenderedSuspendedJob) -> str:
     return _text("Job name", _metadata(rendered.manifest).get("name"))
 
 
+def _validate_zero_gpu_job_profile(value: Mapping[str, Any]) -> None:
+    spec = value.get("spec")
+    template = spec.get("template") if isinstance(spec, dict) else None
+    pod = template.get("spec") if isinstance(template, dict) else None
+    containers = pod.get("containers") if isinstance(pod, dict) else None
+    if not isinstance(containers, list) or len(containers) != 1:
+        raise M03RV16SeadragonControllerError(
+            "V16 zero-GPU Job container inventory drifted"
+        )
+    container = containers[0]
+    if not isinstance(container, dict):
+        raise M03RV16SeadragonControllerError(
+            "V16 zero-GPU Job container is malformed"
+        )
+    resources = container.get("resources")
+    requests = resources.get("requests") if isinstance(resources, dict) else None
+    limits = resources.get("limits") if isinstance(resources, dict) else None
+    environment = container.get("env")
+    if (
+        not isinstance(requests, dict)
+        or not isinstance(limits, dict)
+        or requests.get("nvidia.com/gpu") != "0"
+        or limits.get("nvidia.com/gpu") != "0"
+        or not isinstance(environment, list)
+        or not any(
+            isinstance(row, dict)
+            and row.get("name") == "NVIDIA_VISIBLE_DEVICES"
+            and row.get("value") == "none"
+            for row in environment
+        )
+    ):
+        raise M03RV16SeadragonControllerError(
+            "V16 zero-GPU Job admitted a GPU or lost its visibility mask"
+        )
+
+
 def _validate_exact_job(
     value: Mapping[str, Any],
     rendered: M03RV16RenderedSuspendedJob,
@@ -480,6 +516,8 @@ def _validate_exact_job(
         raise M03RV16SeadragonControllerError(
             "V16 exact admitted Job contract drifted"
         )
+    if rendered.mode in {"static", "storage"}:
+        _validate_zero_gpu_job_profile(value)
     return uid, resource_version
 
 

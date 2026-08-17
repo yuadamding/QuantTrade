@@ -363,9 +363,7 @@ class M03RV16RenderedSuspendedJob:
             "qualification": (3, 3, 2),
         }[self.mode]
         gpu_resources_valid = (
-            "nvidia.com/gpu" not in requests and "nvidia.com/gpu" not in limits
-            if self.mode in {"static", "storage", "qualification-preflight"}
-            else requests.get("nvidia.com/gpu") == str(expected[2])
+            requests.get("nvidia.com/gpu") == str(expected[2])
             and limits.get("nvidia.com/gpu") == str(expected[2])
         )
         if (
@@ -448,12 +446,14 @@ class M03RV16RenderedSuspendedJob:
                     "cpu": "12",
                     "memory": "64Gi",
                     "ephemeral-storage": "8Gi",
+                    "nvidia.com/gpu": "0",
                 }
                 or limits
                 != {
                     "cpu": "16",
                     "memory": "128Gi",
                     "ephemeral-storage": "16Gi",
+                    "nvidia.com/gpu": "0",
                 }
                 or pod.get("nodeSelector") is not None
                 or pod.get("priorityClassName") is not None
@@ -1596,9 +1596,8 @@ def _render(
             ),
         },
     }
-    if mode not in {"static", "storage", "qualification-preflight"}:
-        resources["requests"]["nvidia.com/gpu"] = str(gpus)
-        resources["limits"]["nvidia.com/gpu"] = str(gpus)
+    resources["requests"]["nvidia.com/gpu"] = str(gpus)
+    resources["limits"]["nvidia.com/gpu"] = str(gpus)
     pod: dict[str, Any] = {
         "restartPolicy": "Never",
         "serviceAccount": template.service_account_name,
