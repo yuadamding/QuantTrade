@@ -978,6 +978,21 @@ def _image_identity(value: str) -> tuple[str | None, str]:
     return repository, digest
 
 
+def _status_image_matches(
+    value: str,
+    *,
+    expected_repository: str | None,
+    expected_digest: str,
+) -> bool:
+    """Accept a pinned reference or a CRI-local image/config identifier."""
+
+    if value.startswith("sha256:"):
+        _digest("runtime status image ID", value.removeprefix("sha256:"))
+        return True
+    repository, digest = _image_identity(value)
+    return repository == expected_repository and digest == expected_digest
+
+
 @dataclass(frozen=True, slots=True)
 class M03RV16PodRuntimeAttestation:
     """Per-completion identity observed only after a suspended Job resumes."""
@@ -1042,8 +1057,10 @@ class M03RV16PodRuntimeAttestation:
             package.artifacts.image_reference
         )
         spec_repository, spec_digest = _image_identity(self.observed_spec_image)
-        status_repository, status_digest = _image_identity(
-            self.observed_status_image
+        status_image_matches = _status_image_matches(
+            self.observed_status_image,
+            expected_repository=expected_repository,
+            expected_digest=expected_digest,
         )
         image_id_repository, image_id_digest = _image_identity(
             self.observed_status_image_id
@@ -1078,9 +1095,8 @@ class M03RV16PodRuntimeAttestation:
             or self.attested_container_name != "runtime-attestation-gate"
             or self.attested_container_kind != "init"
             or spec_repository != expected_repository
-            or status_repository != expected_repository
             or spec_digest != expected_digest
-            or status_digest != expected_digest
+            or not status_image_matches
             or image_id_digest != expected_digest
             or image_id_repository not in (None, expected_repository)
             or self.normalized_image_digest != expected_digest

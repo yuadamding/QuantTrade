@@ -1253,7 +1253,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         attested_container_name="runtime-attestation-gate",
         attested_container_kind="init",
         observed_spec_image=package.artifacts.image_reference,
-        observed_status_image=package.artifacts.image_reference,
+        observed_status_image="sha256:" + "c" * 64,
         observed_status_image_id=(
             "containerd://sha256:" + package.artifacts.image_digest_sha256
         ),
@@ -1309,7 +1309,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
             attested_container_name="runtime-attestation-gate",
             attested_container_kind="init",
             observed_spec_image=package.artifacts.image_reference,
-            observed_status_image=package.artifacts.image_reference,
+            observed_status_image="sha256:" + "c" * 64,
             observed_status_image_id=(
                 "containerd://sha256:" + package.artifacts.image_digest_sha256
             ),

@@ -175,6 +175,20 @@ def _image_identity(value: object) -> tuple[str | None, str]:
     return repository, _digest("runtime image digest", digest)
 
 
+def _status_image_matches(
+    value: object,
+    *,
+    expected_repository: str | None,
+    expected_digest: str,
+) -> bool:
+    text = _text("runtime status image", value)
+    if text.startswith("sha256:"):
+        _digest("runtime status image ID", text.removeprefix("sha256:"))
+        return True
+    repository, digest = _image_identity(text)
+    return repository == expected_repository and digest == expected_digest
+
+
 @dataclass(frozen=True, slots=True)
 class V16LifecyclePackageView:
     package_plan_sha256: str
@@ -550,13 +564,15 @@ def load_v16_lifecycle_pod_attestation(
         expected_receipt_sha256=expected_receipt_sha256,
     )
     spec_repository, spec_digest = _image_identity(value.get("observed_spec_image"))
-    status_repository, status_digest = _image_identity(
-        value.get("observed_status_image")
-    )
     image_id_repository, image_id_digest = _image_identity(
         value.get("observed_status_image_id")
     )
     package_repository, package_digest = _image_identity(package.image_reference)
+    status_image_matches = _status_image_matches(
+        value.get("observed_status_image"),
+        expected_repository=package_repository,
+        expected_digest=package_digest,
+    )
     if (
         value.get("schema") != _ATTESTATION_SCHEMA
         or value.get("package_plan_sha256") != package.package_plan_sha256
@@ -579,10 +595,9 @@ def load_v16_lifecycle_pod_attestation(
         or value.get("attested_container_name") != "runtime-attestation-gate"
         or value.get("attested_container_kind") != "init"
         or spec_repository != package_repository
-        or status_repository != package_repository
+        or not status_image_matches
         or image_id_repository not in (None, package_repository)
-        or {spec_digest, status_digest, image_id_digest}
-        != {package_digest}
+        or {spec_digest, image_id_digest} != {package_digest}
         or value.get("normalized_image_digest") != package_digest
         or value.get("storage_semantics_file_sha256")
         != launch.storage_semantics_file_sha256
