@@ -96,6 +96,25 @@ def _adequacy(setting: int, fold: int, *, adequate: bool) -> M03RV16TrainingAdeq
     return value
 
 
+def test_v16_training_aggregate_accepts_rank_local_operator_roots() -> None:
+    rows = (
+        {
+            "selection_target_operator_root_sha256": "1" * 64,
+            "action_operator_root_sha256": "2" * 64,
+        },
+        {
+            "selection_target_operator_root_sha256": "3" * 64,
+            "action_operator_root_sha256": "4" * 64,
+        },
+    )
+    aggregate._validate_rank_local_operator_evidence(rows)
+
+    with pytest.raises(aggregate.M03RV16TrainingAggregateError, match="SHA-256"):
+        aggregate._validate_rank_local_operator_evidence(
+            ({**rows[0], "action_operator_root_sha256": "invalid"}, rows[1])
+        )
+
+
 @pytest.mark.parametrize("primary_adequate", [False, True])
 def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy(
     tmp_path: Path,

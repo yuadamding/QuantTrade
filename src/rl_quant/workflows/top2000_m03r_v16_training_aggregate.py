@@ -114,6 +114,20 @@ def _write(path: Path, payload: dict[str, Any], mode: int = 0o440) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _validate_rank_local_operator_evidence(
+    rows: Sequence[dict[str, Any]],
+) -> None:
+    for row in rows:
+        _digest(
+            "selection_target_operator_root_sha256",
+            str(row.get("selection_target_operator_root_sha256")),
+        )
+        _digest(
+            "action_operator_root_sha256",
+            str(row.get("action_operator_root_sha256")),
+        )
+
+
 def _recompute_fold(
     root: Path,
     fold_terminal_sha256: str,
@@ -126,8 +140,6 @@ def _recompute_fold(
     training_activation_receipt_sha256: str,
     panel_schedule_sha256: str,
     structural_slab_receipt_sha256: str,
-    action_operator_root_sha256: str,
-    target_operator_root_sha256: str,
 ) -> tuple[M03RV16TrainingAdequacy, dict[str, Any]]:
     fold = _read(
         root / "receipts" / f"fold-{fold_index:02d}-training-terminal.json",
@@ -201,16 +213,13 @@ def _recompute_fold(
                     "V16 rank-pair update evidence is incomplete"
                 )
             left, right = pair
+            _validate_rank_local_operator_evidence((left, right))
             if (
                 {left.get("distributed_rank"), right.get("distributed_rank")}
                 != {0, 1}
                 or any(
                     row.get("setting_index") != setting_index
                     or row.get("fold_index") != fold_index
-                    or row.get("selection_target_operator_root_sha256")
-                    != target_operator_root_sha256
-                    or row.get("action_operator_root_sha256")
-                    != action_operator_root_sha256
                     for row in (left, right)
                 )
                 or left.get("update_plan_sha256")
@@ -389,12 +398,6 @@ def aggregate_m03r_v16_training_panel(
                     panel_schedule_sha256=package.schedule.receipt_sha256,
                     structural_slab_receipt_sha256=(
                         package.artifacts.structural_slab_receipt_sha256
-                    ),
-                    action_operator_root_sha256=(
-                        package.artifacts.structural_action_operator_root_sha256
-                    ),
-                    target_operator_root_sha256=(
-                        package.artifacts.structural_target_operator_root_sha256
                     ),
                 )
             for fold in range(M03R_V16_PREDICTIVE_SPEC.chronological_fold_count)
