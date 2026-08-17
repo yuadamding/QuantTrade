@@ -97,6 +97,7 @@ from rl_quant.training.top2000_m03r_v16_seadragon_controller import (
     M03RV16SeadragonControllerError,
     admit_m03r_v16_suspended_job,
     cleanup_m03r_v16_exact_job,
+    launch_m03r_v16_zero_gpu_gate,
     load_m03r_v16_controller_job_plan,
     resume_and_attest_m03r_v16_job,
     write_m03r_v16_controller_job_plan,
@@ -211,7 +212,7 @@ def _surfaces() -> tuple[
 def _template(name: str) -> M03RV7KubernetesTemplateConfig:
     return M03RV7KubernetesTemplateConfig(
         job_name=name,
-        run_id="m03r-v16-v13-local-contract",
+        run_id="m03r-v16-v14-local-contract",
         service_account_name="default",
         pvc_claim_name="research-pvc",
         package_mount_path="/mnt/package",
@@ -452,12 +453,32 @@ def test_v16_controller_admits_and_binds_one_exact_suspended_job(
         authorization=authorization,
         authority_root=authority_root,
         cleanup_authorized=True,
-        timeout_seconds=1.0,
+        timeout_seconds=1e-9,
         poll_seconds=0.001,
     )
     assert cleanup["delete_submitted"] is True
+    assert cleanup["cleanup_complete"] is False
+    assert not (
+        authority_root / "capacity-controller-cleanup-complete.json"
+    ).exists()
+    assert tuple(
+        (authority_root / "cleanup-attempts").rglob("attempt-*.json")
+    )
+    cleanup = cleanup_m03r_v16_exact_job(
+        transport=transport,
+        controller_admission=recovered,
+        package=package,
+        authorization=authorization,
+        authority_root=authority_root,
+        cleanup_authorized=True,
+        timeout_seconds=1.0,
+        poll_seconds=0.001,
+    )
     assert cleanup["cleanup_complete"] is True
-    assert deletion_polls == 2
+    assert (
+        authority_root / "capacity-controller-cleanup-complete.json"
+    ).is_file()
+    assert deletion_polls >= 2
 
     class ReplacementTransport:
         deleted = False
@@ -524,6 +545,82 @@ def test_v16_controller_job_plan_round_trips_exact_rendered_bytes(
         )
 
 
+def test_v16_zero_gpu_launch_recovers_after_resume_before_receipt(
+    tmp_path: Path,
+) -> None:
+    package, authorization, plan_file, authorization_file = _surfaces()
+    rendered = render_m03r_v16_suspended_static_job(
+        package=package,
+        authorization=authorization,
+        package_plan_file_sha256=plan_file,
+        authorization_file_sha256=authorization_file,
+        template=_template("m03r-v16-static-restart"),
+    )
+    live_job: dict | None = None
+    crash_after_resume = True
+    resume_calls = 0
+
+    class FakeTransport:
+        def invoke(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            payload: dict | None = None,
+            allow_not_found: bool = False,
+        ) -> dict | None:
+            nonlocal live_job, crash_after_resume, resume_calls
+            del allow_not_found
+            if arguments[:2] == ("create", "--dry-run=server"):
+                return json.loads(json.dumps(rendered.manifest))
+            if arguments[:2] == ("get", "job"):
+                return None if live_job is None else json.loads(json.dumps(live_job))
+            if arguments[:2] == ("create", "--file"):
+                live_job = json.loads(json.dumps(rendered.manifest))
+                live_job["metadata"]["uid"] = "static-restart-job-uid"
+                live_job["metadata"]["resourceVersion"] = "1"
+                return json.loads(json.dumps(live_job))
+            if arguments[:2] == ("get", "pods"):
+                return {"items": []}
+            if arguments[:2] == ("patch", "job"):
+                assert live_job is not None and payload is not None
+                resume_calls += 1
+                live_job["spec"]["suspend"] = False
+                live_job["metadata"]["resourceVersion"] = "2"
+                if crash_after_resume:
+                    raise KeyboardInterrupt("crash after zero-GPU resume")
+                return json.loads(json.dumps(live_job))
+            raise AssertionError(arguments)
+
+    authority_root = tmp_path / "zero-gpu-authority"
+    with pytest.raises(KeyboardInterrupt, match="zero-GPU resume"):
+        launch_m03r_v16_zero_gpu_gate(
+            transport=FakeTransport(),
+            rendered=rendered,
+            authority_root=authority_root,
+        )
+    assert live_job is not None and live_job["spec"]["suspend"] is False
+    assert (
+        authority_root / "static-zero-gpu-admitted.json"
+    ).is_file()
+    assert not (
+        authority_root / "static-controller-admission.json"
+    ).exists()
+    crash_after_resume = False
+    recovered = launch_m03r_v16_zero_gpu_gate(
+        transport=FakeTransport(),
+        rendered=rendered,
+        authority_root=authority_root,
+    )
+    assert recovered.job_uid == "static-restart-job-uid"
+    assert resume_calls == 1
+    assert (
+        authority_root / "static-zero-gpu-resumed.json"
+    ).is_file()
+    assert (
+        authority_root / "static-controller-admission.json"
+    ).is_file()
+
+
 def test_v16_controller_attests_partial_pods_and_retries_conflict(
     tmp_path: Path,
 ) -> None:
@@ -554,6 +651,7 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
     events: list[str] = []
     pod_list_calls = 0
     conflict_injected = False
+    crash_after_first_attestation = True
 
     def build_pod(index: int) -> dict:
         return {
@@ -612,6 +710,7 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
             allow_not_found: bool = False,
         ) -> dict | None:
             nonlocal pod_list_calls, conflict_injected
+            nonlocal crash_after_first_attestation
             del allow_not_found
             if arguments[:2] == ("create", "--dry-run=server"):
                 return json.loads(json.dumps(rendered.manifest))
@@ -640,6 +739,8 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
             if arguments[:2] == ("get", "pods"):
                 if live_job["spec"]["suspend"]:
                     return {"items": []}
+                if crash_after_first_attestation and "attest:0" in events:
+                    raise KeyboardInterrupt("crash after completion-0 attestation")
                 pod_list_calls += 1
                 visible = (0,) if pod_list_calls <= 2 else (0, 1, 2)
                 for index in visible:
@@ -687,6 +788,35 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
         storage_authority_identity_root=authority_root,
         storage_observer_identity_root=observer_root,
     )
+    with pytest.raises(KeyboardInterrupt, match="completion-0"):
+        resume_and_attest_m03r_v16_job(
+            transport=FakeTransport(),
+            controller_admission=controller_admission,
+            package=package,
+            authorization=authorization,
+            storage_evidence=storage,
+            authority_root=authority_root,
+            storage_authority_identity_root=authority_root,
+            storage_observer_identity_root=observer_root,
+            timeout_seconds=1.0,
+            poll_seconds=0.001,
+        )
+    journal = (
+        authority_root
+        / "controller-attestations"
+        / "training"
+        / "training-controller-job-uid"
+        / "completion-00.json"
+    )
+    assert journal.is_file()
+    # Exercise the narrower crash boundary where the immutable attestation
+    # exists and Pod annotations are visible, but the per-completion journal
+    # was not durably published.
+    journal.unlink()
+    assert not (authority_root / "training-controller-attestations.json").exists()
+    completion_zero_annotations = dict(pods[0]["metadata"]["annotations"])
+    completion_zero_resource_version = pods[0]["metadata"]["resourceVersion"]
+    crash_after_first_attestation = False
     result = resume_and_attest_m03r_v16_job(
         transport=FakeTransport(),
         controller_admission=controller_admission,
@@ -703,6 +833,16 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
     assert len(result.rows) == 3
     assert events.index("attest:0") < events.index("list:0,1,2")
     assert events.count("conflict:0") == 1
+    assert events.count("attest:0") == 1
+    assert pods[0]["metadata"]["annotations"] == completion_zero_annotations
+    assert (
+        pods[0]["metadata"]["resourceVersion"]
+        == completion_zero_resource_version
+    )
+    recovered_journal = json.loads(journal.read_text())
+    assert recovered_journal["recovery_mode"] == (
+        "recovered-after-final-publication"
+    )
     controller_receipt = json.loads(result.controller_receipt_path.read_text())
     assert controller_receipt["scheduling_policy"] == (
         "independent-per-completion"
@@ -843,7 +983,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v13-local-contract",
+        run_id="m03r-v16-v14-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),
@@ -1153,7 +1293,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="training",
-        run_id="m03r-v16-v13-local-contract",
+        run_id="m03r-v16-v14-local-contract",
         job_contract_sha256=predictive.job_contract_sha256,
         pod_contract_sha256=predictive.pod_contract_sha256,
         server_side_dry_run_file_sha256=dry_run_file_sha256,
@@ -1420,7 +1560,7 @@ def test_v16_gate_authorities_are_issued_from_exact_result_files(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v13-local-contract",
+        run_id="m03r-v16-v14-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),
@@ -1777,7 +1917,7 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         preflight_unsigned = {
             "schema": (
                 "rl-quant.top2000-dev."
-                "m03r-v16-qualification-preflight-terminal-v1"
+                "m03r-v16-qualification-preflight-terminal-v2"
             ),
             "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
             "package_plan_sha256": package.package_plan_sha256,
@@ -1797,6 +1937,12 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             "pod_runtime_attestation_receipt_sha256": f"{140 + index:064x}",
             "storage_semantics_file_sha256": f"{150 + index:064x}",
             "storage_semantics_receipt_sha256": f"{160 + index:064x}",
+            "resource_profile_id": (
+                "qualification-preflight-cpu12-memory64gi-limit128gi-v1"
+            ),
+            "measured_peak_rss_bytes": 4 * 1024**3,
+            "measured_process_cpu_seconds": 12.5,
+            "measured_wall_seconds": 15.0,
             "gpu_requested": False,
             "gpu_visible": False,
             "outer_qualification_access_started": False,

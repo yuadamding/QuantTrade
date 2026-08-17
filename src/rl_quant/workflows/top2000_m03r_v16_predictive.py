@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 import random
+import resource
 import stat
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict
@@ -1544,6 +1546,8 @@ def run_m03r_v16_predictive_worker(
             raise M03RV16PredictiveWorkflowError(
                 "V16 qualification preflight must not expose a GPU"
             )
+        preflight_wall_started = time.monotonic()
+        preflight_cpu_started = time.process_time()
         output.mkdir(mode=0o750, parents=True, exist_ok=False)
         _write_immutable_json(
             output / "launch-consumption.json",
@@ -1598,10 +1602,11 @@ def run_m03r_v16_predictive_worker(
         closure_file_sha = _write_immutable_json(
             output / "qualification-inputs-complete.json", closure
         )
+        preflight_usage = resource.getrusage(resource.RUSAGE_SELF)
         unsigned_preflight = {
             "schema": (
                 "rl-quant.top2000-dev."
-                "m03r-v16-qualification-preflight-terminal-v1"
+                "m03r-v16-qualification-preflight-terminal-v2"
             ),
             "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
             "package_plan_sha256": package.package_plan_sha256,
@@ -1630,6 +1635,14 @@ def run_m03r_v16_predictive_worker(
                 launch_authority.storage_semantics_file_sha256
             ),
             "storage_semantics_receipt_sha256": storage_evidence.receipt_sha256,
+            "resource_profile_id": (
+                "qualification-preflight-cpu12-memory64gi-limit128gi-v1"
+            ),
+            "measured_peak_rss_bytes": int(preflight_usage.ru_maxrss) * 1024,
+            "measured_process_cpu_seconds": (
+                time.process_time() - preflight_cpu_started
+            ),
+            "measured_wall_seconds": time.monotonic() - preflight_wall_started,
             "gpu_requested": False,
             "gpu_visible": False,
             "outer_qualification_access_started": False,
@@ -2080,37 +2093,81 @@ def run_m03r_v16_predictive_worker(
                 raise M03RV16PredictiveWorkflowError(
                     "V16 fixed epoch coverage drifted"
                 )
-            selection = select_m03r_v16_score_checkpoint(
-                tuple(validation_receipts)
-            )
-            if (
-                selection.selected_checkpoint_file_sha256
-                != epoch_checkpoint_hashes[-1]
-                or selection.selected_model_state_sha256
-                != model_state_sha256(policy)
-            ):
-                raise M03RV16PredictiveWorkflowError(
-                    "V16 terminal checkpoint selection drifted"
+            def verify_terminal_selection(
+                validations_: tuple[Any, ...] = tuple(validation_receipts),
+                terminal_checkpoint_sha_: str = epoch_checkpoint_hashes[-1],
+                policy_: Top2000M03RV16PredictivePolicy = policy,
+            ) -> Any:
+                selected = select_m03r_v16_score_checkpoint(
+                    validations_
                 )
+                if (
+                    selected.selected_checkpoint_file_sha256
+                    != terminal_checkpoint_sha_
+                    or selected.selected_model_state_sha256
+                    != model_state_sha256(policy_)
+                ):
+                    raise M03RV16PredictiveWorkflowError(
+                        "V16 terminal checkpoint selection drifted"
+                    )
+                return selected
+
+            selection = _paired_failure_boundary(
+                "terminal-checkpoint-verification",
+                verify_terminal_selection,
+                device=device,
+                world_size=world_size,
+            )
             training_adequacy = None
             training_adequacy_file_sha: str | None = None
-            if rank == 0:
+            def publish_training_adequacy(
+                validations_: tuple[Any, ...] = tuple(validation_receipts),
+                fit_payloads_: tuple[dict[str, Any], ...] = tuple(
+                    epoch_fit_payloads
+                ),
+                fit_file_hashes_: tuple[str, ...] = tuple(
+                    epoch_fit_file_hashes
+                ),
+                fold_index_: int = geometry.fold_index,
+            ) -> str:
+                nonlocal training_adequacy, training_adequacy_file_sha
+                if rank != 0:
+                    return "rank-1-training-adequacy-not-applicable"
                 training_adequacy = classify_m03r_v16_training_adequacy(
-                    tuple(validation_receipts), tuple(epoch_fit_payloads)
+                    validations_, fit_payloads_
                 )
                 training_adequacy_payload = {
                     **asdict(training_adequacy),
                     "receipt_sha256": training_adequacy.receipt_sha256,
-                    "epoch_fit_file_sha256": tuple(epoch_fit_file_hashes),
+                    "epoch_fit_file_sha256": fit_file_hashes_,
                 }
                 training_adequacy_file_sha = _write_immutable_json(
                     output
                     / "receipts"
-                    / f"fold-{geometry.fold_index:02d}-training-adequacy.json",
+                    / f"fold-{fold_index_:02d}-training-adequacy.json",
                     training_adequacy_payload,
                 )
+                return training_adequacy_file_sha
+
+            _paired_failure_boundary(
+                "training-adequacy-publication",
+                publish_training_adequacy,
+                device=device,
+                world_size=world_size,
+            )
+            def terminal_optimizer_state_hash(
+                optimizer_: torch.optim.Optimizer = optimizer,
+            ) -> str:
+                return optimizer_state_sha256(optimizer_)
+
+            final_optimizer_hash = _paired_failure_boundary(
+                "terminal-optimizer-verification",
+                terminal_optimizer_state_hash,
+                device=device,
+                world_size=world_size,
+            )
             final_optimizer_hashes = _gather(
-                optimizer_state_sha256(optimizer), world_size
+                final_optimizer_hash, world_size
             )
             if len(set(final_optimizer_hashes)) != 1:
                 raise M03RV16PredictiveWorkflowError(
@@ -2119,10 +2176,28 @@ def run_m03r_v16_predictive_worker(
             final_source_root = _sha256(tuple(source_rows))
             del optimizer, partition
             torch.cuda.empty_cache()
-            if rank == 0:
+            fold_terminal_context = {
+                "training_adequacy": training_adequacy,
+                "training_adequacy_file_sha": training_adequacy_file_sha,
+                "fold_index": geometry.fold_index,
+                "maximum_optimizer_updates": geometry.maximum_optimizer_updates,
+                "optimizer_state_sha256": final_optimizer_hashes[0],
+                "selection": selection,
+                "validation_receipts": tuple(validation_receipts),
+                "epoch_fit_file_hashes": tuple(epoch_fit_file_hashes),
+                "terminal_checkpoint_sha256": epoch_checkpoint_hashes[-1],
+                "source_array_sha256": final_source_root,
+            }
+            def publish_fold_terminal(
+                context_: dict[str, Any] = fold_terminal_context,
+            ) -> str:
+                if rank != 0:
+                    return "rank-1-fold-terminal-not-applicable"
+                adequate = context_["training_adequacy"]
+                adequate_file_sha = context_["training_adequacy_file_sha"]
                 if (
-                    training_adequacy is None
-                    or training_adequacy_file_sha is None
+                    adequate is None
+                    or adequate_file_sha is None
                 ):
                     raise M03RV16PredictiveWorkflowError(
                         "V16 training adequacy was not published"
@@ -2139,35 +2214,40 @@ def run_m03r_v16_predictive_worker(
                     "worker_plan_sha256": worker.receipt_sha256,
                     "setting_index": worker.setting_index,
                     "setting_id": worker.setting_id,
-                    "fold_index": geometry.fold_index,
-                    "completed_updates": geometry.maximum_optimizer_updates,
+                    "fold_index": context_["fold_index"],
+                    "completed_updates": context_["maximum_optimizer_updates"],
                     "training_epoch_count": (
                         M03R_V16_PREDICTIVE_SPEC.score_training_epochs
                     ),
-                    "optimizer_state_sha256": final_optimizer_hashes[0],
+                    "optimizer_state_sha256": context_["optimizer_state_sha256"],
                     "checkpoint_selection_receipt_sha256": (
-                        selection.receipt_sha256
+                        context_["selection"].receipt_sha256
                     ),
                     "inner_validation_receipt_sha256": tuple(
-                        row.receipt_sha256 for row in validation_receipts
+                        row.receipt_sha256
+                        for row in context_["validation_receipts"]
                     ),
-                    "epoch_fit_file_sha256": tuple(epoch_fit_file_hashes),
+                    "epoch_fit_file_sha256": context_["epoch_fit_file_hashes"],
                     "epoch_fit_receipt_sha256": (
-                        training_adequacy.epoch_fit_receipt_sha256
+                        adequate.epoch_fit_receipt_sha256
                     ),
-                    "training_adequacy_status": training_adequacy.status,
+                    "training_adequacy_status": adequate.status,
                     "training_adequacy_receipt_sha256": (
-                        training_adequacy.receipt_sha256
+                        adequate.receipt_sha256
                     ),
                     "training_adequacy_file_sha256": (
-                        training_adequacy_file_sha
+                        adequate_file_sha
                     ),
                     "panel_schedule_sha256": package.schedule.receipt_sha256,
                     "structural_slab_receipt_sha256": (
                         structural.receipt.receipt_sha256
                     ),
-                    "checkpoint_file_sha256": epoch_checkpoint_hashes[-1],
-                    "checkpoint_source_array_sha256": final_source_root,
+                    "checkpoint_file_sha256": context_[
+                        "terminal_checkpoint_sha256"
+                    ],
+                    "checkpoint_source_array_sha256": context_[
+                        "source_array_sha256"
+                    ],
                     "qualification_tail_accessed": False,
                     "economic_optimizer_updates": 0,
                     "reinforcement_learning_updates": 0,
@@ -2184,19 +2264,30 @@ def run_m03r_v16_predictive_worker(
                     _write_immutable_json(
                         output
                         / "receipts"
-                        / f"fold-{geometry.fold_index:02d}-training-terminal.json",
+                        / f"fold-{context_['fold_index']:02d}-training-terminal.json",
                         fold_terminal,
                     )
                 )
-                fold_training_adequacy_files.append(training_adequacy_file_sha)
+                fold_training_adequacy_files.append(adequate_file_sha)
                 fold_training_adequacy_receipts.append(
-                    training_adequacy.receipt_sha256
+                    adequate.receipt_sha256
                 )
-                fold_training_adequacy_status.append(training_adequacy.status)
+                fold_training_adequacy_status.append(adequate.status)
+                return fold_terminal_files[-1]
+
+            _paired_failure_boundary(
+                "training-fold-terminal-publication",
+                publish_fold_terminal,
+                device=device,
+                world_size=world_size,
+            )
             dist.barrier()
 
         terminal: dict[str, Any] | None = None
-        if rank == 0:
+        def publish_training_terminal() -> str:
+            nonlocal terminal
+            if rank != 0:
+                return "rank-1-training-terminal-not-applicable"
             unsigned_terminal = {
                 "schema": M03R_V16_TRAINING_TERMINAL_SCHEMA,
                 "package_plan_sha256": package.package_plan_sha256,
@@ -2260,7 +2351,16 @@ def run_m03r_v16_predictive_worker(
                 **unsigned_terminal,
                 "receipt_sha256": _sha256(unsigned_terminal),
             }
-            _write_immutable_json(output / "training-terminal.json", terminal)
+            return _write_immutable_json(
+                output / "training-terminal.json", terminal
+            )
+
+        _paired_failure_boundary(
+            "training-terminal-publication",
+            publish_training_terminal,
+            device=device,
+            world_size=world_size,
+        )
         dist.barrier()
         return terminal
     except BaseException as exc:

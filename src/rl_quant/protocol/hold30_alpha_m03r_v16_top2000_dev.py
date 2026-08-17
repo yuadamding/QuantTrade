@@ -22,10 +22,10 @@ from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v13"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v14"
 )
 M03R_V16_DESIGN_ID = (
-    "restartable-per-pod-controller-authority-cleanup-paired-hold30-primary-v13"
+    "journaled-per-completion-controller-cleanup-paired-hold30-primary-v14"
 )
 M03R_V16_SCHEDULING_POLICY = "independent-per-completion"
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30

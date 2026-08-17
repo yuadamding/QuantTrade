@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import stat
 import subprocess
 import time
@@ -67,21 +68,34 @@ M03R_V16_CONTEXT = "yding4_yn-gpu-workload@kubernetes-admin@kubernetes"
 M03R_V16_POD_AUTHORITY_ROOT = "/mnt/authority"
 M03R_V16_POD_AUTHORITY_OBSERVER_ROOT = "/mnt/authority-observer"
 M03R_V16_CONTROLLER_ADMISSION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-controller-admission-v2"
+    "rl-quant.top2000-dev.m03r-v16-controller-admission-v3"
 )
 M03R_V16_CONTROLLER_ATTESTATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-controller-attestation-v2"
+    "rl-quant.top2000-dev.m03r-v16-controller-attestation-v3"
+)
+M03R_V16_CONTROLLER_COMPLETION_ATTESTATION_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-controller-completion-attestation-v1"
 )
 M03R_V16_CONTROLLER_TERMINAL_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-controller-terminal-v2"
 )
 M03R_V16_CONTROLLER_CLEANUP_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-controller-cleanup-v2"
+    "rl-quant.top2000-dev.m03r-v16-controller-cleanup-v3"
+)
+M03R_V16_ZERO_GPU_TRANSITION_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-zero-gpu-transition-v1"
 )
 M03R_V16_CONTROLLER_JOB_PLAN_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-controller-job-plan-v1"
 )
 _MAX_KUBECTL_RESPONSE_BYTES = 64 * 1024**2
+_POD_ATTESTATION_PATH_ANNOTATION = "rl-quant/pod-runtime-attestation-path"
+_POD_ATTESTATION_FILE_SHA_ANNOTATION = (
+    "rl-quant/pod-runtime-attestation-file-sha256"
+)
+_POD_ATTESTATION_RECEIPT_ANNOTATION = (
+    "rl-quant/pod-runtime-attestation-receipt-sha256"
+)
 
 
 class M03RV16SeadragonControllerError(RuntimeError):
@@ -216,6 +230,15 @@ class M03RV16ZeroGpuJobAuthority:
     job_uid: str
     completions: int
     controller_receipt_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _M03RV16CompletionAttestationJournal:
+    row: M03RV16PublishedPodAttestation
+    pod_uid: str
+    file_sha256: str
+    receipt_sha256: str
+    recovery_mode: str
 
 
 def _write_create_only_json(path: Path, value: Mapping[str, Any]) -> str:
@@ -1065,7 +1088,7 @@ def launch_m03r_v16_zero_gpu_gate(
     rendered: M03RV16RenderedSuspendedJob,
     authority_root: str | Path,
 ) -> M03RV16ZeroGpuJobAuthority:
-    """Dry-run, create, audit, and resume one exact static or storage Job."""
+    """Converge one static or storage Job through durable launch stages."""
 
     rendered.validate()
     if rendered.mode not in {"static", "storage"}:
@@ -1073,9 +1096,11 @@ def launch_m03r_v16_zero_gpu_gate(
             "V16 zero-GPU launch received a scientific phase"
         )
     job_name = _job_name(rendered)
-    receipt_path = Path(authority_root) / (
-        f"{rendered.mode}-controller-admission.json"
-    )
+    root = Path(authority_root)
+    receipt_path = root / f"{rendered.mode}-controller-admission.json"
+    dry_stage_path = root / f"{rendered.mode}-zero-gpu-dry-run.json"
+    admitted_stage_path = root / f"{rendered.mode}-zero-gpu-admitted.json"
+    resumed_stage_path = root / f"{rendered.mode}-zero-gpu-resumed.json"
     if receipt_path.exists():
         prior, _ = _read_self_receipted_json(receipt_path)
         job_uid = _text("zero-GPU Job UID", prior.get("job_uid"))
@@ -1109,56 +1134,201 @@ def launch_m03r_v16_zero_gpu_gate(
                 "zero-GPU controller receipt", prior.get("receipt_sha256")
             ),
         )
-    dry = transport.invoke(
-        ("create", "--dry-run=server", "--file", "-", "--output", "json"),
-        payload=rendered.manifest,
-    )
-    if dry is None:
-        raise M03RV16SeadragonControllerError("V16 zero-GPU dry-run vanished")
-    _validate_exact_job(
-        dry,
-        rendered,
-        expected_uid=None,
-        expected_suspended=True,
-        require_admitted_identity=False,
-    )
-    admitted = _create_or_reconcile_suspended_job(transport, rendered)
-    job_uid, resource_version = _validate_exact_job(
-        admitted,
-        rendered,
-        expected_uid=None,
-        expected_suspended=True,
-    )
-    if _list_exact_job_pods(transport, job_name=job_name):
-        raise M03RV16SeadragonControllerError(
-            "V16 suspended zero-GPU Job created a Pod"
+    if dry_stage_path.exists():
+        dry_stage, _ = _read_self_receipted_json(dry_stage_path)
+        if (
+            dry_stage.get("schema") != M03R_V16_ZERO_GPU_TRANSITION_SCHEMA
+            or dry_stage.get("stage") != "server-dry-run-complete"
+            or dry_stage.get("phase") != rendered.mode
+            or dry_stage.get("job_name") != job_name
+            or dry_stage.get("job_contract_sha256")
+            != rendered.job_contract_sha256
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 prior zero-GPU dry-run stage drifted"
+            )
+        dry_sha = _text(
+            "zero-GPU dry-run response SHA",
+            dry_stage.get("server_dry_run_response_sha256"),
         )
-    resumed = transport.invoke(
-        (
-            "patch",
-            "job",
-            job_name,
-            "--type",
-            "merge",
-            "--patch-file",
-            "-",
-            "--output",
-            "json",
-        ),
-        payload={
-            "metadata": {"resourceVersion": resource_version},
-            "spec": {"suspend": False},
-        },
+    else:
+        dry = transport.invoke(
+            ("create", "--dry-run=server", "--file", "-", "--output", "json"),
+            payload=rendered.manifest,
+        )
+        if dry is None:
+            raise M03RV16SeadragonControllerError("V16 zero-GPU dry-run vanished")
+        _validate_exact_job(
+            dry,
+            rendered,
+            expected_uid=None,
+            expected_suspended=True,
+            require_admitted_identity=False,
+        )
+        dry_sha = semantic_sha256(dry)
+        dry_unsigned = {
+            "schema": M03R_V16_ZERO_GPU_TRANSITION_SCHEMA,
+            "stage": "server-dry-run-complete",
+            "phase": rendered.mode,
+            "job_name": job_name,
+            "job_contract_sha256": rendered.job_contract_sha256,
+            "server_dry_run_response_sha256": dry_sha,
+        }
+        _write_or_validate_json(
+            dry_stage_path,
+            {**dry_unsigned, "receipt_sha256": semantic_sha256(dry_unsigned)},
+        )
+
+    current = transport.invoke(
+        ("get", "job", job_name, "--output", "json"),
+        allow_not_found=True,
     )
+    if admitted_stage_path.exists():
+        admitted_stage, _ = _read_self_receipted_json(admitted_stage_path)
+        job_uid = _text("zero-GPU Job UID", admitted_stage.get("job_uid"))
+        if (
+            admitted_stage.get("schema")
+            != M03R_V16_ZERO_GPU_TRANSITION_SCHEMA
+            or admitted_stage.get("stage") != "suspended-job-admitted"
+            or admitted_stage.get("phase") != rendered.mode
+            or admitted_stage.get("job_name") != job_name
+            or admitted_stage.get("server_dry_run_response_sha256") != dry_sha
+            or current is None
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 prior zero-GPU admission stage drifted"
+            )
+        current_spec = current.get("spec")
+        currently_suspended = (
+            isinstance(current_spec, dict)
+            and current_spec.get("suspend") is True
+        )
+        _, resource_version = _validate_exact_job(
+            current,
+            rendered,
+            expected_uid=job_uid,
+            expected_suspended=currently_suspended,
+        )
+        admitted_sha = _text(
+            "zero-GPU admitted manifest SHA",
+            admitted_stage.get("admitted_manifest_sha256"),
+        )
+    else:
+        admitted = (
+            _create_or_reconcile_suspended_job(transport, rendered)
+            if current is None
+            else current
+        )
+        admitted_spec = admitted.get("spec")
+        currently_suspended = (
+            isinstance(admitted_spec, dict)
+            and admitted_spec.get("suspend") is True
+        )
+        job_uid, resource_version = _validate_exact_job(
+            admitted,
+            rendered,
+            expected_uid=None,
+            expected_suspended=currently_suspended,
+        )
+        admitted_sha = semantic_sha256(admitted)
+        admitted_unsigned = {
+            "schema": M03R_V16_ZERO_GPU_TRANSITION_SCHEMA,
+            "stage": "suspended-job-admitted",
+            "phase": rendered.mode,
+            "job_uid": job_uid,
+            "job_name": job_name,
+            "job_contract_sha256": rendered.job_contract_sha256,
+            "server_dry_run_response_sha256": dry_sha,
+            "admitted_manifest_sha256": admitted_sha,
+            "admitted_job_resource_version": resource_version,
+            "suspended_when_journaled": currently_suspended,
+        }
+        _write_or_validate_json(
+            admitted_stage_path,
+            {
+                **admitted_unsigned,
+                "receipt_sha256": semantic_sha256(admitted_unsigned),
+            },
+        )
+
+    if currently_suspended:
+        if _list_exact_job_pods(transport, job_name=job_name):
+            raise M03RV16SeadragonControllerError(
+                "V16 suspended zero-GPU Job created a Pod"
+            )
+        for _attempt in range(5):
+            try:
+                resumed = transport.invoke(
+                    (
+                        "patch", "job", job_name, "--type", "merge",
+                        "--patch-file", "-", "--output", "json",
+                    ),
+                    payload={
+                        "metadata": {"resourceVersion": resource_version},
+                        "spec": {"suspend": False},
+                    },
+                )
+            except M03RV16KubernetesConflictError:
+                resumed = transport.invoke(
+                    ("get", "job", job_name, "--output", "json")
+                )
+                if resumed is None:
+                    continue
+                resumed_spec = resumed.get("spec")
+                if isinstance(resumed_spec, dict) and resumed_spec.get("suspend") is False:
+                    break
+                _, resource_version = _validate_exact_job(
+                    resumed,
+                    rendered,
+                    expected_uid=job_uid,
+                    expected_suspended=True,
+                )
+                continue
+            except M03RV16SeadragonControllerError:
+                resumed = transport.invoke(
+                    ("get", "job", job_name, "--output", "json"),
+                    allow_not_found=True,
+                )
+                if resumed is None:
+                    raise
+                resumed_spec = resumed.get("spec")
+                if not (
+                    isinstance(resumed_spec, dict)
+                    and resumed_spec.get("suspend") is False
+                ):
+                    raise
+                break
+            if resumed is None:
+                raise M03RV16SeadragonControllerError(
+                    "V16 zero-GPU Job resume vanished"
+                )
+            break
+        else:
+            raise M03RV16SeadragonControllerError(
+                "V16 zero-GPU resume conflicts did not converge"
+            )
+    else:
+        resumed = current
     if resumed is None:
-        raise M03RV16SeadragonControllerError(
-            "V16 zero-GPU Job resume vanished"
-        )
+        raise M03RV16SeadragonControllerError("V16 zero-GPU resumed Job vanished")
     _, resumed_resource_version = _validate_exact_job(
         resumed,
         rendered,
         expected_uid=job_uid,
         expected_suspended=False,
+    )
+    resumed_unsigned = {
+        "schema": M03R_V16_ZERO_GPU_TRANSITION_SCHEMA,
+        "stage": "job-resume-observed",
+        "phase": rendered.mode,
+        "job_uid": job_uid,
+        "job_name": job_name,
+        "job_contract_sha256": rendered.job_contract_sha256,
+        "resumed_job_resource_version": resumed_resource_version,
+    }
+    _write_or_validate_json(
+        resumed_stage_path,
+        {**resumed_unsigned, "receipt_sha256": semantic_sha256(resumed_unsigned)},
     )
     unsigned: dict[str, Any] = {
         "schema": M03R_V16_CONTROLLER_ADMISSION_SCHEMA,
@@ -1166,9 +1336,14 @@ def launch_m03r_v16_zero_gpu_gate(
         "job_uid": job_uid,
         "job_name": job_name,
         "completions": rendered.completions,
-        "server_dry_run_response_sha256": semantic_sha256(dry),
-        "admitted_manifest_sha256": semantic_sha256(admitted),
+        "server_dry_run_response_sha256": dry_sha,
+        "admitted_manifest_sha256": admitted_sha,
         "resumed_job_resource_version": resumed_resource_version,
+        "zero_gpu_dry_run_stage_file_sha256": _file_sha256(dry_stage_path),
+        "zero_gpu_admitted_stage_file_sha256": _file_sha256(
+            admitted_stage_path
+        ),
+        "zero_gpu_resumed_stage_file_sha256": _file_sha256(resumed_stage_path),
         "zero_gpu": True,
     }
     receipt = semantic_sha256(unsigned)
@@ -1314,6 +1489,282 @@ def _runtime_image_digest(value: object) -> str:
     return digest
 
 
+def _completion_attestation_journal_path(
+    authority_root: str | Path,
+    *,
+    phase: str,
+    job_uid: str,
+    completion_index: int,
+) -> Path:
+    return (
+        Path(authority_root)
+        / "controller-attestations"
+        / phase
+        / job_uid
+        / f"completion-{completion_index:02d}.json"
+    )
+
+
+def _write_completion_attestation_journal(
+    *,
+    authority_root: str | Path,
+    phase: str,
+    job_uid: str,
+    job_name: str,
+    launch_receipt_sha256: str,
+    storage_receipt_sha256: str,
+    completion_index: int,
+    observation: M03RV16PodObservation,
+    row: M03RV16PublishedPodAttestation,
+    recovery_mode: str,
+) -> _M03RV16CompletionAttestationJournal:
+    if recovery_mode not in {
+        "published-by-controller",
+        "recovered-after-final-publication",
+    }:
+        raise M03RV16SeadragonControllerError(
+            "V16 completion attestation recovery mode drifted"
+        )
+    path = _completion_attestation_journal_path(
+        authority_root,
+        phase=phase,
+        job_uid=job_uid,
+        completion_index=completion_index,
+    )
+    unsigned: dict[str, Any] = {
+        "schema": M03R_V16_CONTROLLER_COMPLETION_ATTESTATION_SCHEMA,
+        "phase": phase,
+        "job_uid": job_uid,
+        "job_name": job_name,
+        "launch_authority_receipt_sha256": launch_receipt_sha256,
+        "storage_semantics_receipt_sha256": storage_receipt_sha256,
+        "completion_index": completion_index,
+        "pod_uid": observation.pod_uid,
+        "pod_name": observation.pod_name,
+        "node_name": observation.node_name,
+        "attestation_relative_path": row.relative_path,
+        "attestation_file_sha256": row.file_sha256,
+        "attestation_receipt_sha256": row.receipt_sha256,
+        "controller_transaction_receipt_sha256": (
+            row.controller_transaction_receipt_sha256
+        ),
+        "recovery_mode": recovery_mode,
+    }
+    receipt = semantic_sha256(unsigned)
+    file_sha = _write_or_validate_json(
+        path, {**unsigned, "receipt_sha256": receipt}
+    )
+    return _M03RV16CompletionAttestationJournal(
+        row=row,
+        pod_uid=observation.pod_uid,
+        file_sha256=file_sha,
+        receipt_sha256=receipt,
+        recovery_mode=recovery_mode,
+    )
+
+
+def _load_completion_attestation_journal(
+    *,
+    authority_root: str | Path,
+    phase: str,
+    job_uid: str,
+    job_name: str,
+    launch_receipt_sha256: str,
+    storage_receipt_sha256: str,
+    completion_index: int,
+    pod: Mapping[str, Any],
+    observation: M03RV16PodObservation,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    admission: M03RV16AdmittedJobAuthority,
+    launch: Any,
+) -> _M03RV16CompletionAttestationJournal:
+    path = _completion_attestation_journal_path(
+        authority_root,
+        phase=phase,
+        job_uid=job_uid,
+        completion_index=completion_index,
+    )
+    value, file_sha = _read_self_receipted_json(path)
+    relative_path = launch.pod_runtime_attestation_relative_path(completion_index)
+    recovery_mode = _text(
+        "completion attestation recovery mode", value.get("recovery_mode")
+    )
+    if (
+        value.get("schema")
+        != M03R_V16_CONTROLLER_COMPLETION_ATTESTATION_SCHEMA
+        or value.get("phase") != phase
+        or value.get("job_uid") != job_uid
+        or value.get("job_name") != job_name
+        or value.get("launch_authority_receipt_sha256")
+        != launch_receipt_sha256
+        or value.get("storage_semantics_receipt_sha256")
+        != storage_receipt_sha256
+        or value.get("completion_index") != completion_index
+        or value.get("pod_uid") != observation.pod_uid
+        or value.get("pod_name") != observation.pod_name
+        or value.get("node_name") != observation.node_name
+        or value.get("attestation_relative_path") != relative_path
+        or recovery_mode
+        not in {"published-by-controller", "recovered-after-final-publication"}
+    ):
+        raise M03RV16SeadragonControllerError(
+            "V16 completion attestation journal drifted"
+        )
+    attestation_file_sha = _text(
+        "Pod attestation file SHA", value.get("attestation_file_sha256")
+    )
+    attestation_receipt = _text(
+        "Pod attestation receipt", value.get("attestation_receipt_sha256")
+    )
+    attestation = load_m03r_v16_pod_runtime_attestation(
+        Path(authority_root) / relative_path,
+        expected_file_sha256=attestation_file_sha,
+        expected_receipt_sha256=attestation_receipt,
+        package=package,
+        authorization=authorization,
+        admission=admission,
+        launch=launch,
+        expected_completion_index=completion_index,
+        expected_output_root_sha256=_output_root_sha256(
+            package,
+            phase=phase,
+            completion_index=completion_index,
+        ),
+        current_pod_uid=observation.pod_uid,
+        current_pod_name=observation.pod_name,
+        current_node_name=observation.node_name,
+        expected_relative_path=relative_path,
+    )
+    annotations = m03r_v16_pod_runtime_attestation_annotations(attestation)
+    observed_annotations = _metadata(pod).get("annotations", {})
+    if not isinstance(observed_annotations, dict) or any(
+        observed_annotations.get(key) != expected
+        for key, expected in annotations.items()
+    ):
+        raise M03RV16SeadragonControllerError(
+            "V16 recovered Pod attestation annotations drifted"
+        )
+    transaction_receipt = _text(
+        "Pod attestation transaction receipt",
+        value.get("controller_transaction_receipt_sha256"),
+    )
+    row = M03RV16PublishedPodAttestation(
+        final_path=Path(authority_root) / relative_path,
+        file_sha256=attestation_file_sha,
+        receipt_sha256=attestation.receipt_sha256,
+        relative_path=relative_path,
+        patched_annotations=annotations,
+        controller_transaction_receipt_sha256=transaction_receipt,
+    )
+    return _M03RV16CompletionAttestationJournal(
+        row=row,
+        pod_uid=observation.pod_uid,
+        file_sha256=file_sha,
+        receipt_sha256=_text(
+            "completion attestation journal receipt", value.get("receipt_sha256")
+        ),
+        recovery_mode=recovery_mode,
+    )
+
+
+def _recover_published_attestation_without_journal(
+    *,
+    authority_root: str | Path,
+    phase: str,
+    job_uid: str,
+    job_name: str,
+    completion_index: int,
+    pod: Mapping[str, Any],
+    observation: M03RV16PodObservation,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    admission: M03RV16AdmittedJobAuthority,
+    launch: Any,
+    storage_receipt_sha256: str,
+) -> _M03RV16CompletionAttestationJournal:
+    annotations = _metadata(pod).get("annotations", {})
+    if not isinstance(annotations, dict):
+        raise M03RV16SeadragonControllerError(
+            "V16 recovered Pod annotations are absent"
+        )
+    relative_path = launch.pod_runtime_attestation_relative_path(completion_index)
+    file_sha = _text(
+        "Pod attestation file SHA",
+        annotations.get(_POD_ATTESTATION_FILE_SHA_ANNOTATION),
+    )
+    receipt = _text(
+        "Pod attestation receipt",
+        annotations.get(_POD_ATTESTATION_RECEIPT_ANNOTATION),
+    )
+    if annotations.get(_POD_ATTESTATION_PATH_ANNOTATION) != relative_path:
+        raise M03RV16SeadragonControllerError(
+            "V16 recovered Pod attestation path drifted"
+        )
+    attestation = load_m03r_v16_pod_runtime_attestation(
+        Path(authority_root) / relative_path,
+        expected_file_sha256=file_sha,
+        expected_receipt_sha256=receipt,
+        package=package,
+        authorization=authorization,
+        admission=admission,
+        launch=launch,
+        expected_completion_index=completion_index,
+        expected_output_root_sha256=_output_root_sha256(
+            package,
+            phase=phase,
+            completion_index=completion_index,
+        ),
+        current_pod_uid=observation.pod_uid,
+        current_pod_name=observation.pod_name,
+        current_node_name=observation.node_name,
+        expected_relative_path=relative_path,
+    )
+    expected_annotations = m03r_v16_pod_runtime_attestation_annotations(attestation)
+    if any(
+        annotations.get(key) != expected
+        for key, expected in expected_annotations.items()
+    ):
+        raise M03RV16SeadragonControllerError(
+            "V16 recovered immutable Pod attestation annotations drifted"
+        )
+    recovery_transaction = semantic_sha256(
+        {
+            "schema": M03R_V16_CONTROLLER_COMPLETION_ATTESTATION_SCHEMA,
+            "recovered_after_final_publication": True,
+            "phase": phase,
+            "job_uid": job_uid,
+            "completion_index": completion_index,
+            "pod_uid": observation.pod_uid,
+            "attestation_file_sha256": file_sha,
+            "attestation_receipt_sha256": receipt,
+            "recovery_observed_pod_resource_version": (
+                observation.observed_pod_resource_version
+            ),
+        }
+    )
+    row = M03RV16PublishedPodAttestation(
+        final_path=Path(authority_root) / relative_path,
+        file_sha256=file_sha,
+        receipt_sha256=receipt,
+        relative_path=relative_path,
+        patched_annotations=expected_annotations,
+        controller_transaction_receipt_sha256=recovery_transaction,
+    )
+    return _write_completion_attestation_journal(
+        authority_root=authority_root,
+        phase=phase,
+        job_uid=job_uid,
+        job_name=job_name,
+        launch_receipt_sha256=launch.receipt_sha256,
+        storage_receipt_sha256=storage_receipt_sha256,
+        completion_index=completion_index,
+        observation=observation,
+        row=row,
+        recovery_mode="recovered-after-final-publication",
+    )
+
+
 def resume_and_attest_m03r_v16_job(
     *,
     transport: M03RV16KubernetesTransport,
@@ -1433,9 +1884,26 @@ def resume_and_attest_m03r_v16_job(
             prior.get("controller_transaction_receipt_sha256", ())
         )
         pod_uid_rows = tuple(prior.get("pod_uids", ()))
+        journal_file_rows = tuple(
+            prior.get("completion_journal_file_sha256", ())
+        )
+        journal_receipt_rows = tuple(
+            prior.get("completion_journal_receipt_sha256", ())
+        )
+        journal_recovery_modes = tuple(
+            prior.get("completion_journal_recovery_mode", ())
+        )
         if not all(
             len(rows) == bound.completions
-            for rows in (file_rows, receipt_rows, transaction_rows, pod_uid_rows)
+            for rows in (
+                file_rows,
+                receipt_rows,
+                transaction_rows,
+                pod_uid_rows,
+                journal_file_rows,
+                journal_receipt_rows,
+                journal_recovery_modes,
+            )
         ):
             raise M03RV16SeadragonControllerError(
                 "V16 recovered attestation inventory drifted"
@@ -1443,58 +1911,35 @@ def resume_and_attest_m03r_v16_job(
         recovered_rows: list[M03RV16PublishedPodAttestation] = []
         for index in range(bound.completions):
             pod, observation = pods_by_index[index]
-            relative_path = launch.pod_runtime_attestation_relative_path(index)
-            attestation = load_m03r_v16_pod_runtime_attestation(
-                Path(authority_root) / relative_path,
-                expected_file_sha256=_text(
-                    "Pod attestation file SHA", file_rows[index]
-                ),
-                expected_receipt_sha256=_text(
-                    "Pod attestation receipt", receipt_rows[index]
-                ),
+            journal = _load_completion_attestation_journal(
+                authority_root=authority_root,
+                phase=bound.mode,
+                job_uid=admission.job_uid,
+                job_name=job_name,
+                launch_receipt_sha256=launch.receipt_sha256,
+                storage_receipt_sha256=storage_evidence.receipt_sha256,
+                completion_index=index,
+                pod=pod,
+                observation=observation,
                 package=package,
                 authorization=authorization,
                 admission=admission,
                 launch=launch,
-                expected_completion_index=index,
-                expected_output_root_sha256=_output_root_sha256(
-                    package,
-                    phase=bound.mode,
-                    completion_index=index,
-                ),
-                current_pod_uid=observation.pod_uid,
-                current_pod_name=observation.pod_name,
-                current_node_name=observation.node_name,
-                expected_relative_path=relative_path,
             )
-            annotations = m03r_v16_pod_runtime_attestation_annotations(attestation)
-            observed_annotations = _metadata(pod).get("annotations", {})
             if (
                 observation.pod_uid != pod_uid_rows[index]
-                or not isinstance(observed_annotations, dict)
-                or any(
-                    observed_annotations.get(key) != value
-                    for key, value in annotations.items()
-                )
+                or journal.file_sha256 != journal_file_rows[index]
+                or journal.receipt_sha256 != journal_receipt_rows[index]
+                or journal.row.file_sha256 != file_rows[index]
+                or journal.row.receipt_sha256 != receipt_rows[index]
+                or journal.row.controller_transaction_receipt_sha256
+                != transaction_rows[index]
+                or journal.recovery_mode != journal_recovery_modes[index]
             ):
                 raise M03RV16SeadragonControllerError(
-                    "V16 recovered Pod attestation annotations drifted"
+                    "V16 recovered Pod attestation aggregate drifted"
                 )
-            recovered_rows.append(
-                M03RV16PublishedPodAttestation(
-                    final_path=Path(authority_root) / relative_path,
-                    file_sha256=_text(
-                        "Pod attestation file SHA", file_rows[index]
-                    ),
-                    receipt_sha256=attestation.receipt_sha256,
-                    relative_path=relative_path,
-                    patched_annotations=annotations,
-                    controller_transaction_receipt_sha256=_text(
-                        "Pod attestation transaction receipt",
-                        transaction_rows[index],
-                    ),
-                )
-            )
+            recovered_rows.append(journal.row)
         return M03RV16ControllerAttestations(
             rows=tuple(recovered_rows),
             controller_receipt_path=receipt_path,
@@ -1503,6 +1948,7 @@ def resume_and_attest_m03r_v16_job(
     deadline = time.monotonic() + timeout_seconds
     published: dict[int, M03RV16PublishedPodAttestation] = {}
     published_pod_uids: dict[int, str] = {}
+    published_journals: dict[int, _M03RV16CompletionAttestationJournal] = {}
     conflicts: dict[int, int] = {}
     while len(published) != bound.completions:
         observed_this_poll: dict[int, M03RV16PodObservation] = {}
@@ -1522,6 +1968,54 @@ def resume_and_attest_m03r_v16_job(
                     raise M03RV16SeadragonControllerError(
                         "V16 attested completion was replaced by another Pod"
                     )
+                continue
+
+            journal_path = _completion_attestation_journal_path(
+                authority_root,
+                phase=bound.mode,
+                job_uid=admission.job_uid,
+                completion_index=index,
+            )
+            relative_path = launch.pod_runtime_attestation_relative_path(index)
+            final_attestation_path = Path(authority_root) / relative_path
+            if journal_path.exists():
+                journal = _load_completion_attestation_journal(
+                    authority_root=authority_root,
+                    phase=bound.mode,
+                    job_uid=admission.job_uid,
+                    job_name=job_name,
+                    launch_receipt_sha256=launch.receipt_sha256,
+                    storage_receipt_sha256=storage_evidence.receipt_sha256,
+                    completion_index=index,
+                    pod=pod,
+                    observation=pod_observation,
+                    package=package,
+                    authorization=authorization,
+                    admission=admission,
+                    launch=launch,
+                )
+                published[index] = journal.row
+                published_pod_uids[index] = journal.pod_uid
+                published_journals[index] = journal
+                continue
+            if final_attestation_path.exists():
+                journal = _recover_published_attestation_without_journal(
+                    authority_root=authority_root,
+                    phase=bound.mode,
+                    job_uid=admission.job_uid,
+                    job_name=job_name,
+                    completion_index=index,
+                    pod=pod,
+                    observation=pod_observation,
+                    package=package,
+                    authorization=authorization,
+                    admission=admission,
+                    launch=launch,
+                    storage_receipt_sha256=storage_evidence.receipt_sha256,
+                )
+                published[index] = journal.row
+                published_pod_uids[index] = journal.pod_uid
+                published_journals[index] = journal
                 continue
 
             def patch_annotations(
@@ -1618,8 +2112,21 @@ def resume_and_attest_m03r_v16_job(
                         "V16 Pod annotation conflicts did not converge"
                     )
                 continue
-            published[index] = row
-            published_pod_uids[index] = pod_observation.pod_uid
+            journal = _write_completion_attestation_journal(
+                authority_root=authority_root,
+                phase=bound.mode,
+                job_uid=admission.job_uid,
+                job_name=job_name,
+                launch_receipt_sha256=launch.receipt_sha256,
+                storage_receipt_sha256=storage_evidence.receipt_sha256,
+                completion_index=index,
+                observation=pod_observation,
+                row=row,
+                recovery_mode="published-by-controller",
+            )
+            published[index] = journal.row
+            published_pod_uids[index] = journal.pod_uid
+            published_journals[index] = journal
 
         if len(published) == bound.completions:
             break
@@ -1647,6 +2154,18 @@ def resume_and_attest_m03r_v16_job(
         ],
         "controller_transaction_receipt_sha256": [
             row.controller_transaction_receipt_sha256 for row in published_rows
+        ],
+        "completion_journal_file_sha256": [
+            published_journals[index].file_sha256
+            for index in range(bound.completions)
+        ],
+        "completion_journal_receipt_sha256": [
+            published_journals[index].receipt_sha256
+            for index in range(bound.completions)
+        ],
+        "completion_journal_recovery_mode": [
+            published_journals[index].recovery_mode
+            for index in range(bound.completions)
         ],
     }
     value = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
@@ -1902,6 +2421,25 @@ def cleanup_m03r_v16_exact_job(
         raise M03RV16SeadragonControllerError(
             "V16 cleanup wait intervals must be positive"
         )
+    cleanup_complete_path = (
+        Path(authority_root)
+        / f"{admission.phase}-controller-cleanup-complete.json"
+    )
+    if cleanup_complete_path.exists():
+        prior, _ = _read_self_receipted_json(cleanup_complete_path)
+        if (
+            prior.get("schema") != M03R_V16_CONTROLLER_CLEANUP_SCHEMA
+            or prior.get("phase") != admission.phase
+            or prior.get("job_uid") != admission.job_uid
+            or prior.get("job_name") != admission.job_name
+            or prior.get("cleanup_complete") is not True
+            or prior.get("job_absent") is not True
+            or prior.get("pod_inventory_empty") is not True
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 prior completed cleanup terminal drifted"
+            )
+        return prior
     current = transport.invoke(
         ("get", "job", admission.job_name, "--output", "json"),
         allow_not_found=True,
@@ -1929,30 +2467,31 @@ def cleanup_m03r_v16_exact_job(
                 raise M03RV16SeadragonControllerError(
                     "V16 cleanup target lacks the admitted launch authority"
                 )
-            response = transport.invoke(
-                (
-                    "delete", "--raw",
+            if metadata.get("deletionTimestamp") is None:
+                response = transport.invoke(
                     (
-                        f"/apis/batch/v1/namespaces/{M03R_V16_NAMESPACE}/jobs/"
-                        f"{admission.job_name}"
+                        "delete", "--raw",
+                        (
+                            f"/apis/batch/v1/namespaces/{M03R_V16_NAMESPACE}/jobs/"
+                            f"{admission.job_name}"
+                        ),
+                        "--file", "-",
                     ),
-                    "--file", "-",
-                ),
-                payload={
-                    "apiVersion": "v1",
-                    "kind": "DeleteOptions",
-                    "propagationPolicy": "Foreground",
-                    "preconditions": {
-                        "uid": admission.job_uid,
-                        "resourceVersion": resource_version,
+                    payload={
+                        "apiVersion": "v1",
+                        "kind": "DeleteOptions",
+                        "propagationPolicy": "Foreground",
+                        "preconditions": {
+                            "uid": admission.job_uid,
+                            "resourceVersion": resource_version,
+                        },
                     },
-                },
-            )
-            if response is None:
-                raise M03RV16SeadragonControllerError(
-                    "V16 cleanup response vanished"
                 )
-            delete_submitted = True
+                if response is None:
+                    raise M03RV16SeadragonControllerError(
+                        "V16 cleanup response vanished"
+                    )
+                delete_submitted = True
         else:
             # The exact admitted UID is already absent.  A replacement with
             # the same name is outside scope and is never mutated.
@@ -2007,10 +2546,38 @@ def cleanup_m03r_v16_exact_job(
         "pod_inventory_empty": complete,
         "cleanup_complete": complete,
     }
-    value = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
-    path = Path(authority_root) / f"{admission.phase}-controller-cleanup.json"
-    _write_or_validate_json(path, value)
-    return value
+    attempt_receipt = semantic_sha256(unsigned)
+    value = {**unsigned, "receipt_sha256": attempt_receipt}
+    attempt_path = (
+        Path(authority_root)
+        / "cleanup-attempts"
+        / admission.phase
+        / admission.job_uid
+        / f"attempt-{time.time_ns()}-{secrets.token_hex(8)}.json"
+    )
+    attempt_file_sha = _write_create_only_json(attempt_path, value)
+    if not complete:
+        return {
+            **value,
+            "cleanup_attempt_relative_path": str(
+                attempt_path.relative_to(Path(authority_root))
+            ),
+            "cleanup_attempt_file_sha256": attempt_file_sha,
+        }
+    complete_unsigned = {
+        **unsigned,
+        "cleanup_attempt_relative_path": str(
+            attempt_path.relative_to(Path(authority_root))
+        ),
+        "cleanup_attempt_file_sha256": attempt_file_sha,
+        "cleanup_attempt_receipt_sha256": attempt_receipt,
+    }
+    complete_value = {
+        **complete_unsigned,
+        "receipt_sha256": semantic_sha256(complete_unsigned),
+    }
+    _write_or_validate_json(cleanup_complete_path, complete_value)
+    return complete_value
 
 
 def _add_package_arguments(parser: argparse.ArgumentParser) -> None:
@@ -2255,6 +2822,7 @@ __all__ = [
     "M03R_V16_CONTROLLER_ADMISSION_SCHEMA",
     "M03R_V16_CONTROLLER_ATTESTATION_SCHEMA",
     "M03R_V16_CONTROLLER_CLEANUP_SCHEMA",
+    "M03R_V16_CONTROLLER_COMPLETION_ATTESTATION_SCHEMA",
     "M03R_V16_CONTROLLER_JOB_PLAN_SCHEMA",
     "M03R_V16_CONTROLLER_TERMINAL_SCHEMA",
     "M03R_V16_KUBECONFIG",
@@ -2262,6 +2830,7 @@ __all__ = [
     "M03R_V16_POD_AUTHORITY_OBSERVER_ROOT",
     "M03R_V16_POD_AUTHORITY_ROOT",
     "M03R_V16_SCHEDULING_POLICY",
+    "M03R_V16_ZERO_GPU_TRANSITION_SCHEMA",
     "M03RV16ControllerAdmission",
     "M03RV16ControllerAttestations",
     "M03RV16ExactJobAuthority",

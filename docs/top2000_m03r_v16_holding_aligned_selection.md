@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v13 revision; older v16 source and
+current local protocol is the result-moving v14 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -323,6 +323,11 @@ controller pins the approved kubectl binary, kubeconfig path, context, and
 namespace; performs exact server dry-run, suspended admission, authority
 publication, UID/resourceVersion-bound resume, per-Pod attestation, compact
 terminal supervision, and explicitly authorized UID-preconditioned cleanup.
+Every completed Pod attestation is journaled immediately under its phase, Job
+UID, and completion index. A restart reopens that journal—or, for the narrow
+final-file-before-journal crash window, the exact immutable file and its Pod
+annotations—without regenerating evidence from a newer resourceVersion. The
+all-completion receipt is derived only after those journals exist.
 Its executable command consumes a create-only rendered-Job plan plus the exact
 package and phase evidence, supervises only that Job name and UID, and exposes
 separate exact-identity status and explicitly authorized cleanup actions. No
@@ -355,12 +360,17 @@ three setting closures into one immutable outer-access authority. H100
 qualification accepts that authority as a predecessor and never waits for a
 peer while holding GPUs. A corrupt later fold or failed setting therefore
 produces zero outer-access markers across the panel.
+The preflight has a dedicated provisional `12 CPU / 64 GiB` request and
+`16 CPU / 128 GiB` limit rather than inheriting the H100 worker profile. Its
+terminal records peak RSS, process CPU time, and wall time; a real-package
+rehearsal must use that evidence before this resource envelope is considered
+final.
 Per-fold access markers and published
 artifact names are included in failure evidence. The structural slab is also
 materialized into disjoint in-memory phase slabs: the training object contains
 no qualification origins, and the qualification object contains no optimizer
 or inner-validation origins. The transferred slab remains one common package
-file in v13; a later schema may split the on-disk mounts as additional defense.
+file in v14; a later schema may split the on-disk mounts as additional defense.
 
 After qualification is separately authorized, the final aggregate opens all
 three qualification terminals, all 15 qualification-fold terminals, and all 15
@@ -409,6 +419,11 @@ Pods before its init gate is released. The controller reconciles existing
 immutable stage artifacts and the exact admitted Job UID after restart, retries
 Pod resource-version conflicts from a fresh observation, and waits for
 foreground deletion to remove both the admitted Job UID and all UID-owned Pods.
+Static and storage launches keep separate dry-run, admission, and resume-stage
+journals, so supervision can resume after the exact Job has already been
+unsuspended. Cleanup timeouts append attempt receipts; only verified Job and
+Pod absence creates the immutable cleanup-complete terminal, so a later retry
+can finish without rewriting earlier evidence.
 Cleanup derives its target from the admitted controller authority, so a
 same-name replacement Job is never mutated. Final panel aggregation requires
 complete controller terminals for training, qualification preflight, and

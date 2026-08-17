@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import stat
@@ -1643,7 +1644,7 @@ def load_m03r_v16_qualification_outer_access_authority(
         }
         if (
             terminal.get("schema")
-            != "rl-quant.top2000-dev.m03r-v16-qualification-preflight-terminal-v1"
+            != "rl-quant.top2000-dev.m03r-v16-qualification-preflight-terminal-v2"
             or terminal.get("receipt_sha256")
             != semantic_sha256(terminal_unsigned)
             or terminal.get("receipt_sha256")
@@ -1667,6 +1668,27 @@ def load_m03r_v16_qualification_outer_access_authority(
             or terminal.get("gpu_visible") is not False
             or terminal.get("outer_qualification_access_started") is not False
             or terminal.get("outer_2026_accessed") is not False
+            or terminal.get("resource_profile_id")
+            != "qualification-preflight-cpu12-memory64gi-limit128gi-v1"
+            or not isinstance(terminal.get("measured_peak_rss_bytes"), int)
+            or isinstance(terminal.get("measured_peak_rss_bytes"), bool)
+            or int(terminal.get("measured_peak_rss_bytes", 0)) <= 0
+            or not isinstance(
+                terminal.get("measured_process_cpu_seconds"), (int, float)
+            )
+            or isinstance(terminal.get("measured_process_cpu_seconds"), bool)
+            or not math.isfinite(
+                float(terminal.get("measured_process_cpu_seconds", -1.0))
+            )
+            or float(terminal.get("measured_process_cpu_seconds", -1.0)) < 0.0
+            or not isinstance(
+                terminal.get("measured_wall_seconds"), (int, float)
+            )
+            or isinstance(terminal.get("measured_wall_seconds"), bool)
+            or not math.isfinite(
+                float(terminal.get("measured_wall_seconds", -1.0))
+            )
+            or float(terminal.get("measured_wall_seconds", -1.0)) <= 0.0
         ):
             raise M03RV16ActivationError(
                 "V16 qualification preflight terminal drifted"
