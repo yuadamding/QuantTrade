@@ -12,6 +12,7 @@ import torch
 
 import rl_quant.training.top2000_m03r_v16_cohort_runtime as cohort_runtime
 import rl_quant.training.top2000_m03r_v16_kubernetes as kubernetes_runtime
+import rl_quant.training.top2000_m03r_v16_seadragon_controller as seadragon_controller_runtime
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
     file_sha256,
@@ -93,6 +94,8 @@ from rl_quant.training.top2000_m03r_v16_package import (
 )
 from rl_quant.training.top2000_m03r_v16_seadragon_controller import (
     M03R_V16_CONTROLLER_TERMINAL_SCHEMA,
+    M03R_V16_KUBECTL,
+    M03RV16KubectlTransport,
     M03RV16KubernetesConflictError,
     M03RV16SeadragonControllerError,
     admit_m03r_v16_suspended_job,
@@ -122,6 +125,143 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
     _write_immutable_json,
     _write_immutable_torch,
 )
+
+
+def test_v16_kubectl_transport_uses_the_supported_filename_stdin_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"apiVersion": "batch/v1", "kind": "Job"}
+    response = {"kind": "Job", "metadata": {"name": "contract-test"}}
+    observed: dict[str, object] = {}
+
+    def fake_run(command: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        observed["command"] = command
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=canonical_json_file_bytes(response),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(seadragon_controller_runtime.subprocess, "run", fake_run)
+    transport = M03RV16KubectlTransport()
+    arguments = (
+        "create",
+        "--dry-run=server",
+        "-f",
+        "-",
+        "--output",
+        "json",
+    )
+
+    assert transport.invoke(arguments, payload=payload) == response
+    assert observed["command"] == (
+        M03R_V16_KUBECTL,
+        "--kubeconfig",
+        seadragon_controller_runtime.M03R_V16_KUBECONFIG,
+        "--context",
+        seadragon_controller_runtime.M03R_V16_CONTEXT,
+        "--namespace",
+        kubernetes_runtime.M03R_V16_NAMESPACE,
+        *arguments,
+    )
+    assert observed["input"] == canonical_json_file_bytes(payload)
+    assert observed["capture_output"] is True
+    assert observed["check"] is False
+
+
+def test_v16_controller_never_emits_the_unsupported_file_flag() -> None:
+    controller_source = Path(seadragon_controller_runtime.__file__).read_text(
+        encoding="utf-8"
+    )
+    assert '"--file"' not in controller_source
+    assert controller_source.count('"-f", "-"') == 4
+
+
+def test_v16_kubectl_transport_classifies_api_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        (
+            subprocess.CompletedProcess(
+                (), 1, stdout=b"", stderr=b"Error from server (NotFound): not found"
+            ),
+            subprocess.CompletedProcess(
+                (), 1, stdout=b"", stderr=b"Error from server: 409 Conflict"
+            ),
+            subprocess.CompletedProcess(
+                (), 1, stdout=b"", stderr=b"error: unknown flag: --file"
+            ),
+        )
+    )
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return next(responses)
+
+    monkeypatch.setattr(seadragon_controller_runtime.subprocess, "run", fake_run)
+    transport = M03RV16KubectlTransport()
+    get_arguments = ("get", "job", "missing", "--output", "json")
+    assert transport.invoke(get_arguments, allow_not_found=True) is None
+    with pytest.raises(M03RV16KubernetesConflictError, match="conflict"):
+        transport.invoke(get_arguments)
+    with pytest.raises(M03RV16SeadragonControllerError, match="unknown flag"):
+        transport.invoke(get_arguments)
+
+
+def test_v16_kubectl_transport_rejects_bad_responses_and_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = M03RV16KubectlTransport()
+    arguments = ("get", "job", "contract-test", "--output", "json")
+
+    monkeypatch.setattr(
+        seadragon_controller_runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            (), 0, stdout=b"not-json", stderr=b""
+        ),
+    )
+    with pytest.raises(M03RV16SeadragonControllerError, match="malformed"):
+        transport.invoke(arguments)
+
+    monkeypatch.setattr(seadragon_controller_runtime, "_MAX_KUBECTL_RESPONSE_BYTES", 8)
+    monkeypatch.setattr(
+        seadragon_controller_runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            (), 0, stdout=b'{"long":1}', stderr=b""
+        ),
+    )
+    with pytest.raises(M03RV16SeadragonControllerError, match="oversized"):
+        transport.invoke(arguments)
+
+    def time_out(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired(M03R_V16_KUBECTL, 120.0)
+
+    monkeypatch.setattr(seadragon_controller_runtime.subprocess, "run", time_out)
+    with pytest.raises(M03RV16SeadragonControllerError, match="timed out"):
+        transport.invoke(arguments)
+
+
+@pytest.mark.skipif(
+    not Path(M03R_V16_KUBECTL).is_file()
+    or not os.access(M03R_V16_KUBECTL, os.X_OK),
+    reason="the pinned Seadragon kubectl binary is unavailable locally",
+)
+def test_v16_pinned_kubectl_create_parser_exposes_filename_flag() -> None:
+    completed = subprocess.run(
+        (M03R_V16_KUBECTL, "create", "--help"),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10.0,
+    )
+    assert completed.returncode == 0
+    assert any(
+        "-f" in line and "--filename" in line
+        for line in completed.stdout.splitlines()
+    )
 
 
 def _storage_evidence(
@@ -212,7 +352,7 @@ def _surfaces() -> tuple[
 def _template(name: str) -> M03RV7KubernetesTemplateConfig:
     return M03RV7KubernetesTemplateConfig(
         job_name=name,
-        run_id="m03r-v16-v14-local-contract",
+        run_id="m03r-v16-v15-local-contract",
         service_account_name="default",
         pvc_claim_name="research-pvc",
         package_mount_path="/mnt/package",
@@ -375,7 +515,7 @@ def test_v16_controller_admits_and_binds_one_exact_suspended_job(
                 return {"items": []}
             if arguments[:2] == ("create", "--dry-run=server"):
                 return json.loads(json.dumps(rendered.manifest))
-            if arguments[:2] == ("create", "--file"):
+            if arguments[:2] == ("create", "-f"):
                 return json.loads(json.dumps(live_job))
             if arguments[:2] == ("get", "job"):
                 if deletion_started:
@@ -574,7 +714,7 @@ def test_v16_zero_gpu_launch_recovers_after_resume_before_receipt(
                 return json.loads(json.dumps(rendered.manifest))
             if arguments[:2] == ("get", "job"):
                 return None if live_job is None else json.loads(json.dumps(live_job))
-            if arguments[:2] == ("create", "--file"):
+            if arguments[:2] == ("create", "-f"):
                 live_job = json.loads(json.dumps(rendered.manifest))
                 live_job["metadata"]["uid"] = "static-restart-job-uid"
                 live_job["metadata"]["resourceVersion"] = "1"
@@ -714,7 +854,7 @@ def test_v16_controller_attests_partial_pods_and_retries_conflict(
             del allow_not_found
             if arguments[:2] == ("create", "--dry-run=server"):
                 return json.loads(json.dumps(rendered.manifest))
-            if arguments[:2] == ("create", "--file"):
+            if arguments[:2] == ("create", "-f"):
                 return json.loads(json.dumps(live_job))
             if arguments[:2] == ("get", "job"):
                 return json.loads(json.dumps(live_job))
@@ -983,7 +1123,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v14-local-contract",
+        run_id="m03r-v16-v15-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),
@@ -1293,7 +1433,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="training",
-        run_id="m03r-v16-v14-local-contract",
+        run_id="m03r-v16-v15-local-contract",
         job_contract_sha256=predictive.job_contract_sha256,
         pod_contract_sha256=predictive.pod_contract_sha256,
         server_side_dry_run_file_sha256=dry_run_file_sha256,
@@ -1560,7 +1700,7 @@ def test_v16_gate_authorities_are_issued_from_exact_result_files(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v14-local-contract",
+        run_id="m03r-v16-v15-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),

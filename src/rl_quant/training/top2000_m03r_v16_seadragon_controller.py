@@ -170,13 +170,18 @@ class M03RV16KubectlTransport:
             *arguments,
         )
         encoded = None if payload is None else canonical_json_file_bytes(payload)
-        completed = subprocess.run(
-            command,
-            input=encoded,
-            capture_output=True,
-            check=False,
-            timeout=self.timeout_seconds,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                input=encoded,
+                capture_output=True,
+                check=False,
+                timeout=self.timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise M03RV16SeadragonControllerError(
+                "V16 exact kubectl request timed out"
+            ) from exc
         stderr = completed.stderr.decode("utf-8", errors="replace")
         if completed.returncode != 0:
             if allow_not_found and "not found" in stderr.lower():
@@ -506,7 +511,7 @@ def _create_or_reconcile_suspended_job(
 
     try:
         admitted = transport.invoke(
-            ("create", "--file", "-", "--output", "json"),
+            ("create", "-f", "-", "--output", "json"),
             payload=rendered.manifest,
         )
     except M03RV16SeadragonControllerError:
@@ -582,7 +587,7 @@ def admit_m03r_v16_suspended_job(
             )
     else:
         dry_observed = transport.invoke(
-            ("create", "--dry-run=server", "--file", "-", "--output", "json"),
+            ("create", "--dry-run=server", "-f", "-", "--output", "json"),
             payload=rendered.manifest,
         )
         if dry_observed is None:
@@ -1153,7 +1158,7 @@ def launch_m03r_v16_zero_gpu_gate(
         )
     else:
         dry = transport.invoke(
-            ("create", "--dry-run=server", "--file", "-", "--output", "json"),
+            ("create", "--dry-run=server", "-f", "-", "--output", "json"),
             payload=rendered.manifest,
         )
         if dry is None:
@@ -2475,7 +2480,7 @@ def cleanup_m03r_v16_exact_job(
                             f"/apis/batch/v1/namespaces/{M03R_V16_NAMESPACE}/jobs/"
                             f"{admission.job_name}"
                         ),
-                        "--file", "-",
+                        "-f", "-",
                     ),
                     payload={
                         "apiVersion": "v1",

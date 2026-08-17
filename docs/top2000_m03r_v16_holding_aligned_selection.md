@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v14 revision; older v16 source and
+current local protocol is the lifecycle-only v15 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -323,6 +323,10 @@ controller pins the approved kubectl binary, kubeconfig path, context, and
 namespace; performs exact server dry-run, suspended admission, authority
 publication, UID/resourceVersion-bound resume, per-Pod attestation, compact
 terminal supervision, and explicitly authorized UID-preconditioned cleanup.
+Every manifest or raw request body supplied through standard input uses
+kubectl's supported `-f -` filename contract. Direct transport tests freeze the
+exact command prefix, canonical input bytes, response/error classification,
+and the pinned binary's create-command parser when that binary is available.
 Every completed Pod attestation is journaled immediately under its phase, Job
 UID, and completion index. A restart reopens that journal—or, for the narrow
 final-file-before-journal crash window, the exact immutable file and its Pod
