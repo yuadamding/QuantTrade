@@ -16,6 +16,7 @@ from rl_quant.protocol.v16_lifecycle_contract import (
     load_v16_lifecycle_launch,
     load_v16_lifecycle_package,
     load_v16_lifecycle_pod_attestation,
+    load_v16_lifecycle_storage,
     semantic_sha256,
 )
 
@@ -67,6 +68,10 @@ def validate_m03r_v16_pod_attestation_gate(
     output_root: str | Path | None,
     downward_root: str | Path,
     authority_root: str | Path,
+    authority_observer_root: str | Path,
+    storage_semantics_path: str | Path,
+    storage_semantics_file_sha256: str,
+    storage_semantics_receipt_sha256: str,
     marker_path: str | Path,
     package_source_root: str | Path,
     timeout_seconds: float = 1800.0,
@@ -94,6 +99,13 @@ def validate_m03r_v16_pod_attestation_gate(
         authorization_file_sha256,
         package=package,
     )
+    storage = load_v16_lifecycle_storage(
+        storage_semantics_path,
+        storage_semantics_file_sha256,
+        storage_semantics_receipt_sha256,
+        authority_root=authority_root,
+        observer_root=authority_observer_root,
+    )
     admission = load_v16_lifecycle_admission(
         admitted_job_authority_path,
         admitted_job_authority_file_sha256,
@@ -120,6 +132,7 @@ def validate_m03r_v16_pod_attestation_gate(
         expected_pod_contract_sha256=pod_contract_sha256,
         admission=admission,
         expected_admission_file_sha256=admitted_job_authority_file_sha256,
+        storage=storage,
     )
     downward = Path(downward_root)
     expected_relative = launch.relative_path(completion_index)
@@ -175,7 +188,7 @@ def validate_m03r_v16_pod_attestation_gate(
         expected_relative_path=relative_path,
     )
     unsigned: dict[str, object] = {
-        "schema": "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v2",
+        "schema": "rl-quant.top2000-dev.m03r-v16-pod-attestation-marker-v3",
         "phase": phase,
         "job_uid": admission.job_uid,
         "completion_index": completion_index,
@@ -186,6 +199,10 @@ def validate_m03r_v16_pod_attestation_gate(
         "attestation_file_sha256": expected_file_sha256,
         "attestation_receipt_sha256": attestation.receipt_sha256,
         "launch_authority_receipt_sha256": launch.receipt_sha256,
+        "storage_semantics_file_sha256": storage.file_sha256,
+        "storage_semantics_receipt_sha256": storage.receipt_sha256,
+        "storage_authority_root_sha256": storage.authority_root_sha256,
+        "storage_observer_root_sha256": storage.observer_root_sha256,
         "package_source_root": str(source_root),
         "gate_module_path": str(gate_module_path),
         "gate_module_file_sha256": gate_module_file_sha256,
@@ -217,6 +234,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root")
     parser.add_argument("--downward-root", required=True)
     parser.add_argument("--authority-root", required=True)
+    parser.add_argument("--authority-observer-root", required=True)
+    parser.add_argument("--storage-semantics", required=True)
+    parser.add_argument("--storage-semantics-file-sha256", required=True)
+    parser.add_argument("--storage-semantics-receipt-sha256", required=True)
     parser.add_argument("--marker", required=True)
     parser.add_argument("--package-source-root", required=True)
     return parser
@@ -251,6 +272,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_root=args.output_root,
         downward_root=args.downward_root,
         authority_root=args.authority_root,
+        authority_observer_root=args.authority_observer_root,
+        storage_semantics_path=args.storage_semantics,
+        storage_semantics_file_sha256=args.storage_semantics_file_sha256,
+        storage_semantics_receipt_sha256=(
+            args.storage_semantics_receipt_sha256
+        ),
         marker_path=args.marker,
         package_source_root=args.package_source_root,
     )

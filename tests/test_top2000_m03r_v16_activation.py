@@ -353,7 +353,8 @@ def test_v16_phase_activations_round_trip_and_cannot_be_forged(
         "training_terminal_file_sha256": terminal_files,
         "training_terminal_receipt_sha256": tuple(terminal_receipts),
         "source_tree_root_sha256": source_root,
-        "outer_qualification_authorized": True,
+        "qualification_input_preflight_authorized": True,
+        "outer_qualification_authorized": False,
         "setting_fold_adequacy_receipt_sha256": adequacy,
         "setting_fold_adequacy_status": (("adequate",) * 5,) * 3,
         "terminal_checkpoint_file_sha256": checkpoints,
@@ -361,7 +362,7 @@ def test_v16_phase_activations_round_trip_and_cannot_be_forged(
         "prequalification_closure_file_sha256": file_sha256(closure_path),
         "all_setting_folds_adequate": True,
         "outer_qualification_outcomes_accessed": False,
-        "next_research_action": "qualification-only-execution",
+        "next_research_action": "qualification-input-preflight",
         "economic_generation_may_be_minted": False,
         "reinforcement_learning_authorized": False,
         "outer_2026_accessed": False,
@@ -372,7 +373,8 @@ def test_v16_phase_activations_round_trip_and_cannot_be_forged(
     minimal_panel = {
         "package_plan_sha256": package.package_plan_sha256,  # type: ignore[union-attr]
         "execution_authorization_receipt_sha256": authorization.receipt_sha256,
-        "outer_qualification_authorized": True,
+        "qualification_input_preflight_authorized": True,
+        "outer_qualification_authorized": False,
     }
     minimal_panel_path = tmp_path / "minimal-panel.json"
     minimal_panel_path.write_bytes(canonical_json_file_bytes(minimal_panel))

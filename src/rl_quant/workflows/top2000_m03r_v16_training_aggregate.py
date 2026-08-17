@@ -416,7 +416,7 @@ def aggregate_m03r_v16_training_panel(
     if numerical_failures:
         next_action = "numerical-investigation"
     elif adequate:
-        next_action = "qualification-only-execution"
+        next_action = "qualification-input-preflight"
     elif set(status_inventory).issubset({"adequate", "still-improving"}):
         next_action = "fresh-longer-training-protocol"
     else:
@@ -526,7 +526,8 @@ def aggregate_m03r_v16_training_panel(
         "terminal_checkpoint_file_sha256": tuple(checkpoint_matrix),
         "prequalification_closure_receipt_sha256": closure_receipt,
         "prequalification_closure_file_sha256": closure_file_sha,
-        "outer_qualification_authorized": adequate,
+        "qualification_input_preflight_authorized": adequate,
+        "outer_qualification_authorized": False,
         "next_research_action": next_action,
         "source_tree_root_sha256": next(iter(source_roots)),
         "outer_qualification_outcomes_accessed": False,

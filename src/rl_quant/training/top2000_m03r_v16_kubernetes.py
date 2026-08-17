@@ -34,6 +34,7 @@ from rl_quant.training.top2000_m03r_v16_activation import (
     M03RV16PhaseLaunchAuthority,
     M03RV16PodRuntimeAttestation,
     M03RV16QualificationActivation,
+    M03RV16QualificationOuterAccessAuthority,
     M03RV16TrainingActivation,
     _issue_m03r_v16_phase_launch_authority,
     _issue_m03r_v16_training_activation_from_gates,
@@ -46,6 +47,9 @@ from rl_quant.training.top2000_m03r_v16_capacity import (
     M03R_V16_CAPACITY_TERMINAL_SCHEMA,
     M03RV16CapacityRankEvidence,
     M03RV16CapacityTerminal,
+)
+from rl_quant.training.top2000_m03r_v16_lifecycle import (
+    M03RV16StorageSemanticsEvidence,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
@@ -63,7 +67,7 @@ M03R_V16_CAPACITY_GATE_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-capacity-gate-qualification-v2"
 )
 M03R_V16_RENDERED_JOB_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v7"
+    "rl-quant.top2000-dev.m03r-v16-rendered-suspended-job-v8"
 )
 _JOB_CONTRACT_ANNOTATION = "rl-quant/job-contract-sha256"
 _POD_CONTRACT_ANNOTATION = "rl-quant/pod-contract-sha256"
@@ -80,9 +84,12 @@ _POD_ATTESTATION_RECEIPT_ANNOTATION = (
     "rl-quant/pod-runtime-attestation-receipt-sha256"
 )
 _POD_ATTESTATION_PATH_ANNOTATION = "rl-quant/pod-runtime-attestation-path"
+_STORAGE_FILE_ANNOTATION = "rl-quant/storage-semantics-file-sha256"
+_STORAGE_RECEIPT_ANNOTATION = "rl-quant/storage-semantics-receipt-sha256"
 _PYTHON = "/opt/conda/envs/quanttrade/bin/python"
 _WORKER_MODULE = "rl_quant.workflows.top2000_m03r_v16_predictive"
 _STATIC_MODULE = "rl_quant.workflows.top2000_m03r_v16_static_validate"
+_STORAGE_MODULE = "rl_quant.workflows.top2000_m03r_v16_storage_gate"
 _INIT_GATE_BOOTSTRAP = (
     "import pathlib,sys;"
     "sys.dont_write_bytecode=True;"
@@ -130,6 +137,8 @@ def _contract_payload(manifest: dict[str, Any]) -> dict[str, Any]:
         annotation_rows.pop(_ADMISSION_FILE_ANNOTATION, None)
         annotation_rows.pop(_DRY_RUN_FILE_ANNOTATION, None)
         annotation_rows.pop(_ADMITTED_MANIFEST_FILE_ANNOTATION, None)
+        annotation_rows.pop(_STORAGE_FILE_ANNOTATION, None)
+        annotation_rows.pop(_STORAGE_RECEIPT_ANNOTATION, None)
         annotation_rows.pop(_POD_ATTESTATION_FILE_ANNOTATION, None)
         annotation_rows.pop(_POD_ATTESTATION_RECEIPT_ANNOTATION, None)
         annotation_rows.pop(_POD_ATTESTATION_PATH_ANNOTATION, None)
@@ -289,7 +298,14 @@ class M03RV16RenderedSuspendedJob:
     execution_authorization_receipt_sha256: str
     package_plan_file_sha256: str
     execution_authorization_file_sha256: str
-    mode: Literal["static", "capacity", "training", "qualification"]
+    mode: Literal[
+        "static",
+        "storage",
+        "capacity",
+        "training",
+        "qualification-preflight",
+        "qualification",
+    ]
     completions: int
     parallelism: int
     gpus_per_completion: int
@@ -301,6 +317,7 @@ class M03RV16RenderedSuspendedJob:
     capacity_gate_receipt_sha256: str | None = None
     training_activation_receipt_sha256: str | None = None
     qualification_activation_receipt_sha256: str | None = None
+    qualification_outer_access_receipt_sha256: str | None = None
     activation_authorized: bool = False
     economic_training_authorized: bool = False
     reinforcement_learning_authorized: bool = False
@@ -339,13 +356,15 @@ class M03RV16RenderedSuspendedJob:
         annotations = self.manifest.get("metadata", {}).get("annotations", {})
         expected = {
             "static": (1, 1, 0),
+            "storage": (1, 1, 0),
             "capacity": (1, 1, 2),
             "training": (3, 3, 2),
+            "qualification-preflight": (3, 3, 0),
             "qualification": (3, 3, 2),
         }[self.mode]
         gpu_resources_valid = (
             "nvidia.com/gpu" not in requests and "nvidia.com/gpu" not in limits
-            if self.mode == "static"
+            if self.mode in {"static", "storage", "qualification-preflight"}
             else requests.get("nvidia.com/gpu") == str(expected[2])
             and limits.get("nvidia.com/gpu") == str(expected[2])
         )
@@ -404,13 +423,45 @@ class M03RV16RenderedSuspendedJob:
                 or self.admitted_job_authority_file_sha256 is not None
             ):
                 raise M03RV16KubernetesError("V16 static Job is not GPU neutral")
-        elif (
+        elif self.mode == "storage":
+            environment = {
+                row["name"]: row.get("value")
+                for row in containers[0].get("env", [])
+            }
+            if (
+                environment.get("NVIDIA_VISIBLE_DEVICES") != "none"
+                or self.static_gate_receipt_sha256 is None
+                or self.capacity_gate_receipt_sha256 is not None
+                or self.training_activation_receipt_sha256 is not None
+                or self.qualification_activation_receipt_sha256 is not None
+                or pod.get("initContainers") not in (None, [])
+                or self.launch_authority is not None
+                or self.admitted_job_authority is not None
+            ):
+                raise M03RV16KubernetesError(
+                    "V16 storage Job is not a zero-GPU predecessor gate"
+                )
+        elif self.mode == "qualification-preflight":
+            if (
+                pod.get("nodeSelector") is not None
+                or pod.get("priorityClassName") is not None
+                or pod.get("tolerations") not in (None, [])
+                or self.static_gate_receipt_sha256 is None
+                or self.capacity_gate_receipt_sha256 is None
+                or self.qualification_activation_receipt_sha256 is None
+                or self.qualification_outer_access_receipt_sha256 is not None
+            ):
+                raise M03RV16KubernetesError(
+                    "V16 qualification preflight is not CPU neutral"
+                )
+        elif self.mode != "qualification-preflight" and (
             pod.get("nodeSelector") != M03R_TOP2000_H100_POOL_NODE_SELECTOR
             or pod.get("priorityClassName") != M03R_TOP2000_PRIORITY_CLASS_NAME
             or pod.get("tolerations") != [M03R_TOP2000_MULTI_GPU_TOLERATION]
             or self.static_gate_receipt_sha256 is None
             or (
-                self.mode in {"training", "qualification"}
+                self.mode
+                in {"training", "qualification-preflight", "qualification"}
                 and self.capacity_gate_receipt_sha256 is None
             )
             or (
@@ -418,8 +469,12 @@ class M03RV16RenderedSuspendedJob:
                 and self.training_activation_receipt_sha256 is None
             )
             or (
-                self.mode == "qualification"
+                self.mode in {"qualification-preflight", "qualification"}
                 and self.qualification_activation_receipt_sha256 is None
+            )
+            or (
+                self.mode == "qualification"
+                and self.qualification_outer_access_receipt_sha256 is None
             )
         ):
             raise M03RV16KubernetesError("V16 H100 Job profile drifted")
@@ -447,6 +502,8 @@ class M03RV16RenderedSuspendedJob:
                 "M03R_V16_POD_ATTESTATION_FILE_SHA256",
                 "M03R_V16_POD_ATTESTATION_RECEIPT_SHA256",
                 "M03R_V16_POD_ATTESTATION_PATH",
+                "M03R_V16_STORAGE_FILE_SHA256",
+                "M03R_V16_STORAGE_RECEIPT_SHA256",
             }.issubset(
                 {
                     row.get("name")
@@ -487,6 +544,10 @@ class M03RV16RenderedSuspendedJob:
                 != self.admitted_job_authority.server_side_dry_run_file_sha256
                 or annotations.get(_ADMITTED_MANIFEST_FILE_ANNOTATION)
                 != self.admitted_job_authority.admitted_manifest_file_sha256
+                or annotations.get(_STORAGE_FILE_ANNOTATION)
+                != self.launch_authority.storage_semantics_file_sha256
+                or annotations.get(_STORAGE_RECEIPT_ANNOTATION)
+                != self.launch_authority.storage_semantics_receipt_sha256
             ):
                 raise M03RV16KubernetesError(
                     "V16 admitted launch binding is incomplete"
@@ -502,7 +563,10 @@ class M03RV16RenderedSuspendedJob:
             prerequisite = {
                 "capacity": self.static_gate_receipt_sha256,
                 "training": self.training_activation_receipt_sha256,
-                "qualification": self.qualification_activation_receipt_sha256,
+                "qualification-preflight": (
+                    self.qualification_activation_receipt_sha256
+                ),
+                "qualification": self.qualification_outer_access_receipt_sha256,
             }[self.mode]
             if (
                 self.launch_authority.phase != self.mode
@@ -719,11 +783,15 @@ def bind_m03r_v16_admitted_launch_authority(
     admission: M03RV16AdmittedJobAuthority,
     admission_file_sha256: str,
     source_tree_root_sha256: str,
+    storage_evidence: M03RV16StorageSemanticsEvidence,
+    storage_evidence_file_sha256: str,
+    authority_root: str | Path,
+    observer_root: str | Path,
 ) -> M03RV16RenderedSuspendedJob:
     """Bind an admitted suspended Job to a one-shot scientific launch."""
 
     rendered.validate()
-    if rendered.mode == "static" or rendered.launch_authority is not None:
+    if rendered.mode in {"static", "storage"} or rendered.launch_authority is not None:
         raise M03RV16KubernetesError(
             "only an unbound H100 Job can receive admission evidence"
         )
@@ -743,19 +811,29 @@ def bind_m03r_v16_admitted_launch_authority(
         raise M03RV16KubernetesError("V16 admitted Job run identity drifted")
     _digest("admission_file_sha256", admission_file_sha256)
     _digest("source_tree_root_sha256", source_tree_root_sha256)
+    _digest("storage_evidence_file_sha256", storage_evidence_file_sha256)
+    storage_evidence.validate_for(authority_root, observer_root)
     if admitted_job_authority_file_sha256(admission) != admission_file_sha256:
         raise M03RV16KubernetesError("V16 admitted Job file bytes drifted")
     prerequisite = {
         "capacity": rendered.static_gate_receipt_sha256,
         "training": rendered.training_activation_receipt_sha256,
-        "qualification": rendered.qualification_activation_receipt_sha256,
+        "qualification-preflight": (
+            rendered.qualification_activation_receipt_sha256
+        ),
+        "qualification": rendered.qualification_outer_access_receipt_sha256,
     }[rendered.mode]
     if prerequisite is None:
         raise M03RV16KubernetesError("V16 launch prerequisite is absent")
     launch = _issue_m03r_v16_phase_launch_authority(
         package=package,
         authorization=authorization,
-        phase=rendered.mode,
+        phase=cast(
+            Literal[
+                "capacity", "training", "qualification-preflight", "qualification"
+            ],
+            rendered.mode,
+        ),
         prerequisite_authority_receipt_sha256=prerequisite,
         job_contract_sha256=rendered.job_contract_sha256,
         pod_contract_sha256=rendered.pod_contract_sha256,
@@ -763,6 +841,12 @@ def bind_m03r_v16_admitted_launch_authority(
         source_tree_root_sha256=source_tree_root_sha256,
         admission=admission,
         admission_file_sha256=admission_file_sha256,
+        storage_semantics_file_sha256=storage_evidence_file_sha256,
+        storage_semantics_receipt_sha256=storage_evidence.receipt_sha256,
+        storage_authority_root_sha256=(
+            storage_evidence.authority_root_sha256
+        ),
+        storage_observer_root_sha256=storage_evidence.observer_root_sha256,
     )
     launch_file_sha256 = phase_launch_authority_file_sha256(launch)
     manifest = copy.deepcopy(rendered.manifest)
@@ -780,6 +864,12 @@ def bind_m03r_v16_admitted_launch_authority(
         )
         annotation_rows[_LAUNCH_RECEIPT_ANNOTATION] = launch.receipt_sha256
         annotation_rows[_LAUNCH_FILE_ANNOTATION] = launch_file_sha256
+        annotation_rows[_STORAGE_FILE_ANNOTATION] = (
+            launch.storage_semantics_file_sha256
+        )
+        annotation_rows[_STORAGE_RECEIPT_ANNOTATION] = (
+            launch.storage_semantics_receipt_sha256
+        )
     value = replace(
         rendered,
         manifest=manifest,
@@ -836,13 +926,24 @@ def _render(
     package_plan_file_sha256: str,
     authorization_file_sha256: str,
     template: M03RV7KubernetesTemplateConfig,
-    mode: Literal["static", "capacity", "training", "qualification"],
+    mode: Literal[
+        "static",
+        "storage",
+        "capacity",
+        "training",
+        "qualification-preflight",
+        "qualification",
+    ],
     static: M03RV16StaticGateQualification | None,
     capacity: M03RV16CapacityGateQualification | None,
     training_activation: M03RV16TrainingActivation | None,
     training_activation_file_sha256: str | None,
     qualification_activation: M03RV16QualificationActivation | None,
     qualification_activation_file_sha256: str | None,
+    qualification_outer_access: (
+        M03RV16QualificationOuterAccessAuthority | None
+    ),
+    qualification_outer_access_file_sha256: str | None,
 ) -> M03RV16RenderedSuspendedJob:
     package.validate()
     authorization.validate(package)
@@ -855,17 +956,41 @@ def _render(
     if mode == "static":
         if any(
             value is not None
-            for value in (static, capacity, training_activation, qualification_activation)
+            for value in (
+                static,
+                capacity,
+                training_activation,
+                qualification_activation,
+                qualification_outer_access,
+            )
         ):
             raise M03RV16KubernetesError("V16 static Job precedes all gates")
     else:
         if static is None:
-            raise M03RV16KubernetesError("V16 H100 Job requires the static gate")
+            raise M03RV16KubernetesError("V16 Job requires the static gate")
         static.validate_for(package, authorization)
-        if mode == "capacity":
+        if mode == "storage":
             if any(
                 value is not None
-                for value in (capacity, training_activation, qualification_activation)
+                for value in (
+                    capacity,
+                    training_activation,
+                    qualification_activation,
+                    qualification_outer_access,
+                )
+            ):
+                raise M03RV16KubernetesError(
+                    "V16 storage qualification precedes capacity"
+                )
+        elif mode == "capacity":
+            if any(
+                value is not None
+                for value in (
+                    capacity,
+                    training_activation,
+                    qualification_activation,
+                    qualification_outer_access,
+                )
             ):
                 raise M03RV16KubernetesError("capacity cannot prequalify itself")
         elif capacity is None:
@@ -875,7 +1000,11 @@ def _render(
         else:
             capacity.validate_for(package, authorization, static)
             if mode == "training":
-                if training_activation is None or qualification_activation is not None:
+                if (
+                    training_activation is None
+                    or qualification_activation is not None
+                    or qualification_outer_access is not None
+                ):
                     raise M03RV16KubernetesError(
                         "V16 training Job requires only training activation"
                     )
@@ -899,7 +1028,10 @@ def _render(
                     "training_activation_file_sha256",
                     str(training_activation_file_sha256),
                 )
-            elif qualification_activation is None or training_activation is not None:
+            elif (
+                qualification_activation is None
+                or training_activation is not None
+            ):
                 raise M03RV16KubernetesError(
                     "V16 qualification Job requires only qualification activation"
                 )
@@ -916,10 +1048,29 @@ def _render(
                     "qualification_activation_file_sha256",
                     str(qualification_activation_file_sha256),
                 )
+                if mode == "qualification-preflight":
+                    if qualification_outer_access is not None:
+                        raise M03RV16KubernetesError(
+                            "V16 preflight cannot receive outer access"
+                        )
+                else:
+                    if qualification_outer_access is None:
+                        raise M03RV16KubernetesError(
+                            "V16 qualification requires CPU outer access"
+                        )
+                    qualification_outer_access.validate_for(
+                        package, authorization, qualification_activation
+                    )
+                    _digest(
+                        "qualification_outer_access_file_sha256",
+                        str(qualification_outer_access_file_sha256),
+                    )
     completions, parallelism, gpus = {
         "static": (1, 1, 0),
+        "storage": (1, 1, 0),
         "capacity": (1, 1, 2),
         "training": (3, 3, 2),
+        "qualification-preflight": (3, 3, 0),
         "qualification": (3, 3, 2),
     }[mode]
     if mode == "static":
@@ -935,6 +1086,53 @@ def _render(
             ),
             "--output-root",
             "/mnt/output",
+        ]
+    elif mode == "storage":
+        module = _STORAGE_MODULE
+        args = [
+            "-I",
+            "-B",
+            "-c",
+            (
+                "import pathlib,sys;"
+                "sys.dont_write_bytecode=True;"
+                "root=pathlib.Path('/mnt/package/source/src').resolve();"
+                "sys.path.insert(0,str(root));"
+                "from rl_quant.workflows import "
+                "top2000_m03r_v16_storage_gate as gate;"
+                "resolved=pathlib.Path(gate.__file__).resolve();"
+                "resolved.relative_to(root);"
+                "raise SystemExit(gate.main())"
+            ),
+            "--authority-root",
+            "/mnt/authority",
+            "--observer-root",
+            "/mnt/authority-observer",
+            "--output",
+            "/mnt/authority/storage-semantics.json",
+            "--terminal",
+            "/mnt/authority/storage-gate-terminal.json",
+        ]
+    elif mode == "qualification-preflight":
+        module = _WORKER_MODULE
+        args = [
+            "-m",
+            module,
+            *_base_args(
+                package,
+                authorization,
+                package_plan_file_sha256,
+                authorization_file_sha256,
+            ),
+            "--qualification-preflight-only",
+            "--qualification-activation",
+            "/mnt/authority/qualification-activation.json",
+            "--qualification-activation-file-sha256",
+            str(qualification_activation_file_sha256),
+            "--training-root",
+            "/mnt/training",
+            "--training-panel",
+            "/mnt/authority/training-panel-decision.json",
         ]
     else:
         module = _WORKER_MODULE
@@ -1000,8 +1198,22 @@ def _render(
                     "/mnt/training",
                     "--training-panel",
                     "/mnt/authority/training-panel-decision.json",
+                    "--qualification-outer-access-authority",
+                    "/mnt/authority/qualification-outer-access.json",
+                    "--qualification-outer-access-authority-file-sha256",
+                    str(qualification_outer_access_file_sha256),
+                    "--qualification-outer-access-authority-receipt-sha256",
+                    str(
+                        cast(
+                            M03RV16QualificationOuterAccessAuthority,
+                            qualification_outer_access,
+                        ).receipt_sha256
+                    ),
+                    "--qualification-preflight-root",
+                    "/mnt/preflight",
                 )
             )
+    if mode not in {"static", "storage"}:
         args.extend(
             (
                 "--rendered-manifest-sha256",
@@ -1034,6 +1246,14 @@ def _render(
                 "$(M03R_V16_POD_ATTESTATION_FILE_SHA256)",
                 "--pod-runtime-attestation-receipt-sha256",
                 "$(M03R_V16_POD_ATTESTATION_RECEIPT_SHA256)",
+                "--storage-semantics",
+                "/mnt/authority/storage-semantics.json",
+                "--storage-semantics-file-sha256",
+                "$(M03R_V16_STORAGE_FILE_SHA256)",
+                "--storage-semantics-receipt-sha256",
+                "$(M03R_V16_STORAGE_RECEIPT_SHA256)",
+                "--authority-observer-root",
+                "/mnt/authority-observer",
             )
         )
     environment: list[dict[str, Any]] = [
@@ -1060,9 +1280,9 @@ def _render(
         {"name": "PYTHONHASHSEED", "value": "0"},
         {"name": "PYTHONUNBUFFERED", "value": "1"},
     ]
-    if mode == "static":
+    if mode in {"static", "storage"}:
         environment.insert(0, {"name": "NVIDIA_VISIBLE_DEVICES", "value": "none"})
-    else:
+    if mode not in {"static", "storage"}:
         environment.extend(
             (
                 {"name": "NCCL_ASYNC_ERROR_HANDLING", "value": "1"},
@@ -1244,12 +1464,40 @@ def _render(
                         }
                     },
                 },
+                {
+                    "name": "M03R_V16_STORAGE_FILE_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _STORAGE_FILE_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
+                {
+                    "name": "M03R_V16_STORAGE_RECEIPT_SHA256",
+                    "valueFrom": {
+                        "fieldRef": {
+                            "apiVersion": "v1",
+                            "fieldPath": (
+                                "metadata.annotations['"
+                                + _STORAGE_RECEIPT_ANNOTATION
+                                + "']"
+                            ),
+                        }
+                    },
+                },
             )
         )
     phase = {
         "static": "v16-static",
+        "storage": "v16-storage",
         "capacity": "v16-capacity",
         "training": "v16-training",
+        "qualification-preflight": "v16-qualification-preflight",
         "qualification": "v16-qualification",
     }[mode]
     labels = {
@@ -1290,21 +1538,29 @@ def _render(
     }
     resources = {
         "requests": {
-            "cpu": "1" if mode == "static" else template.cpu_request,
-            "memory": "4Gi" if mode == "static" else template.memory_request,
+            "cpu": "1" if mode in {"static", "storage"} else template.cpu_request,
+            "memory": (
+                "4Gi" if mode in {"static", "storage"} else template.memory_request
+            ),
             "ephemeral-storage": (
-                "1Gi" if mode == "static" else template.ephemeral_storage_request
+                "1Gi"
+                if mode in {"static", "storage"}
+                else template.ephemeral_storage_request
             ),
         },
         "limits": {
-            "cpu": "1" if mode == "static" else template.cpu_limit,
-            "memory": "4Gi" if mode == "static" else template.memory_limit,
+            "cpu": "1" if mode in {"static", "storage"} else template.cpu_limit,
+            "memory": (
+                "4Gi" if mode in {"static", "storage"} else template.memory_limit
+            ),
             "ephemeral-storage": (
-                "4Gi" if mode == "static" else template.ephemeral_storage_limit
+                "4Gi"
+                if mode in {"static", "storage"}
+                else template.ephemeral_storage_limit
             ),
         },
     }
-    if mode != "static":
+    if mode not in {"static", "storage", "qualification-preflight"}:
         resources["requests"]["nvidia.com/gpu"] = str(gpus)
         resources["limits"]["nvidia.com/gpu"] = str(gpus)
     pod: dict[str, Any] = {
@@ -1323,7 +1579,13 @@ def _render(
         },
         "containers": [
             {
-                "name": "validator" if mode == "static" else "trainer",
+                "name": (
+                    "validator"
+                    if mode == "static"
+                    else "storage-gate"
+                    if mode == "storage"
+                    else "trainer"
+                ),
                 "image": package.artifacts.image_reference,
                 "imagePullPolicy": "IfNotPresent",
                 "command": [_PYTHON],
@@ -1370,7 +1632,11 @@ def _render(
                 "name": "dshm",
                 "emptyDir": {
                     "medium": "Memory",
-                    "sizeLimit": "1Gi" if mode == "static" else "32Gi",
+                    "sizeLimit": (
+                        "1Gi"
+                        if mode in {"static", "storage", "qualification-preflight"}
+                        else "32Gi"
+                    ),
                 },
             },
             {"name": "attestation-status", "emptyDir": {}},
@@ -1413,7 +1679,7 @@ def _render(
             },
         ],
     }
-    if mode != "static":
+    if mode not in {"static", "storage"}:
         pod["containers"][0]["args"].extend(
             (
                 "--pod-runtime-attestation-marker",
@@ -1427,7 +1693,7 @@ def _render(
                 "readOnly": True,
             }
         )
-    if mode != "static":
+    if mode not in {"static", "storage"}:
         init_environment_names = {
             "JOB_COMPLETION_INDEX",
             "PYTHONNOUSERSITE",
@@ -1444,6 +1710,8 @@ def _render(
             "M03R_V16_CURRENT_POD_UID",
             "M03R_V16_CURRENT_POD_NAME",
             "M03R_V16_CURRENT_NODE_NAME",
+            "M03R_V16_STORAGE_FILE_SHA256",
+            "M03R_V16_STORAGE_RECEIPT_SHA256",
         }
         init_environment = [
             row for row in environment if row["name"] in init_environment_names
@@ -1504,6 +1772,14 @@ def _render(
                     "/etc/podinfo",
                     "--authority-root",
                     "/mnt/authority",
+                    "--authority-observer-root",
+                    "/mnt/authority-observer",
+                    "--storage-semantics",
+                    "/mnt/authority/storage-semantics.json",
+                    "--storage-semantics-file-sha256",
+                    "$(M03R_V16_STORAGE_FILE_SHA256)",
+                    "--storage-semantics-receipt-sha256",
+                    "$(M03R_V16_STORAGE_RECEIPT_SHA256)",
                     "--marker",
                     "/var/run/m03r-v16-attestation/validated.json",
                     "--package-source-root",
@@ -1539,6 +1815,15 @@ def _render(
                         "readOnly": True,
                     },
                     {
+                        "name": "research-data",
+                        "mountPath": "/mnt/authority-observer",
+                        "subPath": (
+                            f"{template.pvc_training_subpath.rstrip('/')}/runs/"
+                            f"{template.run_id}/authorities"
+                        ),
+                        "readOnly": True,
+                    },
+                    {
                         "name": "podinfo",
                         "mountPath": "/etc/podinfo",
                         "readOnly": True,
@@ -1550,7 +1835,7 @@ def _render(
                 ],
             }
         ]
-    if mode == "qualification":
+    if mode in {"qualification-preflight", "qualification"}:
         pod["containers"][0]["volumeMounts"].append(
             {
                 "name": "research-data",
@@ -1562,7 +1847,25 @@ def _render(
                 "readOnly": True,
             }
         )
-    if mode in {"capacity", "training", "qualification"}:
+    if mode == "qualification":
+        pod["containers"][0]["volumeMounts"].append(
+            {
+                "name": "research-data",
+                "mountPath": "/mnt/preflight",
+                "subPath": (
+                    f"{template.pvc_training_subpath.rstrip('/')}/runs/"
+                    f"{template.run_id}/phases/v16-qualification-preflight"
+                ),
+                "readOnly": True,
+            }
+        )
+    if mode in {
+        "storage",
+        "capacity",
+        "training",
+        "qualification-preflight",
+        "qualification",
+    }:
         pod["containers"][0]["volumeMounts"].append(
             {
                 "name": "research-data",
@@ -1571,10 +1874,21 @@ def _render(
                     f"{template.pvc_training_subpath.rstrip('/')}/runs/"
                     f"{template.run_id}/authorities"
                 ),
+                "readOnly": mode != "storage",
+            }
+        )
+        pod["containers"][0]["volumeMounts"].append(
+            {
+                "name": "research-data",
+                "mountPath": "/mnt/authority-observer",
+                "subPath": (
+                    f"{template.pvc_training_subpath.rstrip('/')}/runs/"
+                    f"{template.run_id}/authorities"
+                ),
                 "readOnly": True,
             }
         )
-    if mode != "static":
+    if mode in {"capacity", "training", "qualification"}:
         pod.update(
             {
                 "schedulerName": template.scheduler_name,
@@ -1604,7 +1918,7 @@ def _render(
         )
     deadline = (
         M03R_TOP2000_PILOT_MAX_ACTIVE_DEADLINE_SECONDS
-        if mode in {"static", "capacity"}
+        if mode in {"static", "storage", "capacity", "qualification-preflight"}
         else min(
             template.active_deadline_seconds,
             M03R_TOP2000_MAX_ACTIVE_DEADLINE_SECONDS,
@@ -1669,6 +1983,11 @@ def _render(
             if qualification_activation is None
             else qualification_activation.receipt_sha256
         ),
+        qualification_outer_access_receipt_sha256=(
+            None
+            if qualification_outer_access is None
+            else qualification_outer_access.receipt_sha256
+        ),
     )
     rendered.validate()
     return rendered
@@ -1695,6 +2014,37 @@ def render_m03r_v16_suspended_static_job(
         training_activation_file_sha256=None,
         qualification_activation=None,
         qualification_activation_file_sha256=None,
+        qualification_outer_access=None,
+        qualification_outer_access_file_sha256=None,
+    )
+
+
+def render_m03r_v16_suspended_storage_job(
+    *,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    package_plan_file_sha256: str,
+    authorization_file_sha256: str,
+    template: M03RV7KubernetesTemplateConfig,
+    static: M03RV16StaticGateQualification,
+) -> M03RV16RenderedSuspendedJob:
+    """Render the zero-GPU, cross-mount append-only storage gate."""
+
+    return _render(
+        package=package,
+        authorization=authorization,
+        package_plan_file_sha256=package_plan_file_sha256,
+        authorization_file_sha256=authorization_file_sha256,
+        template=template,
+        mode="storage",
+        static=static,
+        capacity=None,
+        training_activation=None,
+        training_activation_file_sha256=None,
+        qualification_activation=None,
+        qualification_activation_file_sha256=None,
+        qualification_outer_access=None,
+        qualification_outer_access_file_sha256=None,
     )
 
 
@@ -1720,6 +2070,8 @@ def render_m03r_v16_suspended_capacity_job(
         training_activation_file_sha256=None,
         qualification_activation=None,
         qualification_activation_file_sha256=None,
+        qualification_outer_access=None,
+        qualification_outer_access_file_sha256=None,
     )
 
 
@@ -1748,10 +2100,12 @@ def render_m03r_v16_suspended_training_job(
         training_activation_file_sha256=training_activation_file_sha256,
         qualification_activation=None,
         qualification_activation_file_sha256=None,
+        qualification_outer_access=None,
+        qualification_outer_access_file_sha256=None,
     )
 
 
-def render_m03r_v16_suspended_qualification_job(
+def render_m03r_v16_suspended_qualification_preflight_job(
     *,
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
@@ -1769,6 +2123,40 @@ def render_m03r_v16_suspended_qualification_job(
         package_plan_file_sha256=package_plan_file_sha256,
         authorization_file_sha256=authorization_file_sha256,
         template=template,
+        mode="qualification-preflight",
+        static=static,
+        capacity=capacity,
+        training_activation=None,
+        training_activation_file_sha256=None,
+        qualification_activation=qualification_activation,
+        qualification_activation_file_sha256=(
+            qualification_activation_file_sha256
+        ),
+        qualification_outer_access=None,
+        qualification_outer_access_file_sha256=None,
+    )
+
+
+def render_m03r_v16_suspended_qualification_job(
+    *,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    package_plan_file_sha256: str,
+    authorization_file_sha256: str,
+    template: M03RV7KubernetesTemplateConfig,
+    static: M03RV16StaticGateQualification,
+    capacity: M03RV16CapacityGateQualification,
+    qualification_activation: M03RV16QualificationActivation,
+    qualification_activation_file_sha256: str,
+    qualification_outer_access: M03RV16QualificationOuterAccessAuthority,
+    qualification_outer_access_file_sha256: str,
+) -> M03RV16RenderedSuspendedJob:
+    return _render(
+        package=package,
+        authorization=authorization,
+        package_plan_file_sha256=package_plan_file_sha256,
+        authorization_file_sha256=authorization_file_sha256,
+        template=template,
         mode="qualification",
         static=static,
         capacity=capacity,
@@ -1776,6 +2164,10 @@ def render_m03r_v16_suspended_qualification_job(
         training_activation_file_sha256=None,
         qualification_activation=qualification_activation,
         qualification_activation_file_sha256=qualification_activation_file_sha256,
+        qualification_outer_access=qualification_outer_access,
+        qualification_outer_access_file_sha256=(
+            qualification_outer_access_file_sha256
+        ),
     )
 
 
@@ -1795,7 +2187,9 @@ __all__ = [
     "m03r_v16_pod_runtime_attestation_annotations",
     "render_m03r_v16_suspended_capacity_job",
     "render_m03r_v16_suspended_qualification_job",
+    "render_m03r_v16_suspended_qualification_preflight_job",
     "render_m03r_v16_suspended_static_job",
+    "render_m03r_v16_suspended_storage_job",
     "render_m03r_v16_suspended_training_job",
     "write_m03r_v16_rendered_launch_authority",
 ]

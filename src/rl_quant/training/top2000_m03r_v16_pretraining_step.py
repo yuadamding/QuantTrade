@@ -19,7 +19,10 @@ from rl_quant.training.top2000_m03r_v16_fold import M03RV16TrainingUpdatePlan
 from rl_quant.training.top2000_m03r_v16_numerical import (
     M03RV16NumericalTrainingError,
 )
-from rl_quant.training.top2000_m03r_v16_objective import m03r_v16_score_loss
+from rl_quant.training.top2000_m03r_v16_objective import (
+    M03RV16ScoreLoss,
+    m03r_v16_score_loss,
+)
 from rl_quant.training.top2000_m03r_v16_policy import (
     Top2000M03RV16PredictivePolicy,
 )
@@ -321,7 +324,30 @@ def train_m03r_v16_score_batch_update(
     before_encoder = _version_root(partition.encoder_parameter_names, named)
     before_head = _version_root(partition.selection_head_parameter_names, named)
     optimizer.zero_grad(set_to_none=True)
-    loss = m03r_v16_score_loss(batch.objective)
+    loss: M03RV16ScoreLoss | None = None
+    local_numerical_error: M03RV16NumericalTrainingError | None = None
+    try:
+        loss = m03r_v16_score_loss(batch.objective)
+    except M03RV16NumericalTrainingError as exc:
+        local_numerical_error = exc
+    if distributed_world_size == 2 and dist.is_available() and dist.is_initialized():
+        # Both ranks enter the same failure collective before backward.  A
+        # rank-local non-finite loss therefore becomes one paired scientific
+        # terminal instead of leaving its peer blocked in gradient all-reduce.
+        failure = torch.tensor(
+            int(local_numerical_error is not None),
+            device=batch.objective.executable_selection_score_z.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(failure, op=dist.ReduceOp.MAX)
+        if int(failure.item()) != 0:
+            raise M03RV16NumericalTrainingError(
+                "V16 paired score loss is non-finite"
+            ) from local_numerical_error
+    elif local_numerical_error is not None:
+        raise local_numerical_error
+    if loss is None:  # pragma: no cover - guarded by the paired failure path
+        raise M03RV16ScoreStepError("V16 score loss was not constructed")
     local_count = int(batch.origin_indices.numel())
     global_count = len(update_plan.global_origins)
     local_weight = local_count / global_count

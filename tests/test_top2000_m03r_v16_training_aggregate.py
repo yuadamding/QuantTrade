@@ -192,8 +192,9 @@ def test_v16_training_panel_authorizes_qualification_only_after_primary_adequacy
 
     assert result["outer_qualification_outcomes_accessed"] is False
     if primary_adequate:
-        assert result["outer_qualification_authorized"] is True
-        assert result["next_research_action"] == "qualification-only-execution"
+        assert result["qualification_input_preflight_authorized"] is True
+        assert result["outer_qualification_authorized"] is False
+        assert result["next_research_action"] == "qualification-input-preflight"
         assert (tmp_path / "aggregate" / "qualification-activation.json").is_file()
     else:
         assert result["outer_qualification_authorized"] is False
@@ -262,6 +263,8 @@ def test_v16_numerical_setting_outcome_routes_panel_without_qualification(
         launch_authority_receipt_sha256="c" * 64,
         admitted_job_authority_receipt_sha256="f" * 64,
         pod_runtime_attestation_receipt_sha256="9" * 64,
+        storage_semantics_file_sha256="7" * 64,
+        storage_semantics_receipt_sha256="8" * 64,
         job_uid="job-2",
         pod_uid="pod-2",
         setting_index=2,

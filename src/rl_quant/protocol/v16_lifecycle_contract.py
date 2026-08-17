@@ -27,10 +27,13 @@ _ADMISSION_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-prelaunch-job-authority-v2"
 )
 _LAUNCH_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-phase-launch-authority-v3"
+    "rl-quant.top2000-dev.m03r-v16-phase-launch-authority-v4"
 )
 _ATTESTATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-pod-runtime-attestation-v3"
+    "rl-quant.top2000-dev.m03r-v16-pod-runtime-attestation-v4"
+)
+_STORAGE_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-storage-semantics-evidence-v3"
 )
 _DRY_RUN_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-server-dry-run-result-v1"
@@ -192,15 +195,28 @@ class V16LifecycleAdmissionView:
     receipt_sha256: str
     job_uid: str
     run_id: str
+    job_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class V16LifecycleStorageView:
+    receipt_sha256: str
+    file_sha256: str
+    authority_root_sha256: str
+    observer_root_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
 class V16LifecycleLaunchView:
     receipt_sha256: str
-    phase: Literal["capacity", "training", "qualification"]
+    phase: Literal[
+        "capacity", "training", "qualification-preflight", "qualification"
+    ]
     job_uid: str
     completions: int
     relative_path_template: str
+    storage_semantics_receipt_sha256: str
+    storage_semantics_file_sha256: str
 
     def relative_path(self, completion_index: int) -> str:
         if not 0 <= completion_index < self.completions:
@@ -317,7 +333,12 @@ def load_v16_lifecycle_admission(
         value_key="authority",
         expected_receipt_sha256=expected_receipt_sha256,
     )
-    expected_completions = {"capacity": 1, "training": 3, "qualification": 3}
+    expected_completions = {
+        "capacity": 1,
+        "training": 3,
+        "qualification-preflight": 3,
+        "qualification": 3,
+    }
     if (
         value.get("schema") != _ADMISSION_SCHEMA
         or value.get("package_plan_sha256") != package.package_plan_sha256
@@ -372,6 +393,7 @@ def load_v16_lifecycle_admission(
         or admitted.get("job_contract_sha256") != expected_job_contract_sha256
         or admitted.get("pod_contract_sha256") != expected_pod_contract_sha256
         or admitted.get("job_uid") != value.get("job_uid")
+        or admitted.get("job_name") != value.get("job_name")
         or admitted.get("image_reference") != package.image_reference
         or admitted.get("image_digest_sha256") != package.image_digest_sha256
         or admitted.get("suspended_at_admission") is not True
@@ -383,6 +405,51 @@ def load_v16_lifecycle_admission(
         receipt_sha256=receipt,
         job_uid=_text("job_uid", value.get("job_uid")),
         run_id=_text("run_id", value.get("run_id")),
+        job_name=_text("job_name", value.get("job_name")),
+    )
+
+
+def load_v16_lifecycle_storage(
+    path: str | Path,
+    expected_file_sha256: str,
+    expected_receipt_sha256: str,
+    *,
+    authority_root: str | Path,
+    observer_root: str | Path,
+) -> V16LifecycleStorageView:
+    value, receipt = _receipt_payload(
+        path,
+        expected_file_sha256,
+        value_key="evidence",
+        expected_receipt_sha256=expected_receipt_sha256,
+    )
+    authority_root_sha256 = semantic_sha256(
+        {"resolved_root": str(Path(authority_root).resolve())}
+    )
+    observer_root_sha256 = semantic_sha256(
+        {"resolved_root": str(Path(observer_root).resolve())}
+    )
+    if (
+        value.get("schema") != _STORAGE_SCHEMA
+        or value.get("authority_root_sha256") != authority_root_sha256
+        or value.get("observer_root_sha256") != observer_root_sha256
+        or authority_root_sha256 == observer_root_sha256
+        or value.get("distinct_observer_mount") is not True
+        or value.get("hard_link_supported") is not True
+        or value.get("directory_fsync_supported") is not True
+        or value.get("observer_read_matched") is not True
+        or value.get("observer_same_file") is not True
+        or value.get("duplicate_publication_rejected") is not True
+    ):
+        raise V16LifecycleContractError(
+            "V16 lightweight storage authority drifted"
+        )
+    _digest("storage payload", value.get("payload_sha256"))
+    return V16LifecycleStorageView(
+        receipt_sha256=receipt,
+        file_sha256=_digest("storage file", expected_file_sha256),
+        authority_root_sha256=authority_root_sha256,
+        observer_root_sha256=observer_root_sha256,
     )
 
 
@@ -399,6 +466,7 @@ def load_v16_lifecycle_launch(
     expected_job_contract_sha256: str,
     expected_pod_contract_sha256: str,
     expected_admission_file_sha256: str,
+    storage: V16LifecycleStorageView,
 ) -> V16LifecycleLaunchView:
     value, receipt = _receipt_payload(
         path,
@@ -406,7 +474,12 @@ def load_v16_lifecycle_launch(
         value_key="authority",
         expected_receipt_sha256=expected_receipt_sha256,
     )
-    expected_completions = {"capacity": 1, "training": 3, "qualification": 3}
+    expected_completions = {
+        "capacity": 1,
+        "training": 3,
+        "qualification-preflight": 3,
+        "qualification": 3,
+    }
     expected_template = (
         f"pod-runtime/{expected_phase}/{admission.job_uid}/"
         "completion-{completion_index:02d}.json"
@@ -428,6 +501,13 @@ def load_v16_lifecycle_launch(
         or value.get("completions") != expected_completions.get(expected_phase)
         or value.get("pod_runtime_attestation_path_template") != expected_template
         or value.get("source_tree_root_sha256") is None
+        or value.get("storage_semantics_file_sha256") != storage.file_sha256
+        or value.get("storage_semantics_receipt_sha256")
+        != storage.receipt_sha256
+        or value.get("storage_authority_root_sha256")
+        != storage.authority_root_sha256
+        or value.get("storage_observer_root_sha256")
+        != storage.observer_root_sha256
         or value.get("image_digest_sha256") != package.image_digest_sha256
         or value.get("economic_training_authorized") is not False
         or value.get("reinforcement_learning_authorized") is not False
@@ -442,6 +522,8 @@ def load_v16_lifecycle_launch(
         job_uid=admission.job_uid,
         completions=expected_completions[expected_phase],
         relative_path_template=expected_template,
+        storage_semantics_receipt_sha256=storage.receipt_sha256,
+        storage_semantics_file_sha256=storage.file_sha256,
     )
 
 
@@ -492,7 +574,7 @@ def load_v16_lifecycle_pod_attestation(
         or value.get("node_name") != current_node_name
         or value.get("observed_owner_job_uid") != admission.job_uid
         or value.get("observed_completion_index") != expected_completion_index
-        or not value.get("observed_owner_job_name")
+        or value.get("observed_owner_job_name") != admission.job_name
         or not value.get("observed_pod_resource_version")
         or value.get("attested_container_name") != "runtime-attestation-gate"
         or value.get("attested_container_kind") != "init"
@@ -502,6 +584,10 @@ def load_v16_lifecycle_pod_attestation(
         or {spec_digest, status_digest, image_id_digest}
         != {package_digest}
         or value.get("normalized_image_digest") != package_digest
+        or value.get("storage_semantics_file_sha256")
+        != launch.storage_semantics_file_sha256
+        or value.get("storage_semantics_receipt_sha256")
+        != launch.storage_semantics_receipt_sha256
         or value.get("output_root_sha256")
         != _digest("expected_output_root_sha256", expected_output_root_sha256)
         or value.get("protocol_sha256") != package.protocol_sha256
@@ -532,6 +618,7 @@ __all__ = [
     "V16LifecycleContractError",
     "V16LifecycleLaunchView",
     "V16LifecyclePackageView",
+    "V16LifecycleStorageView",
     "canonical_json_file_bytes",
     "file_sha256",
     "load_v16_lifecycle_admission",
@@ -539,5 +626,6 @@ __all__ = [
     "load_v16_lifecycle_launch",
     "load_v16_lifecycle_package",
     "load_v16_lifecycle_pod_attestation",
+    "load_v16_lifecycle_storage",
     "semantic_sha256",
 ]

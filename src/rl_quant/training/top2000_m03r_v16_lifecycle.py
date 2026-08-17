@@ -74,6 +74,13 @@ class M03RV16PodPatchPrecondition:
 
 
 @dataclass(frozen=True, slots=True)
+class M03RV16PodAnnotationReadback:
+    pod_uid: str
+    pod_resource_version: str
+    annotations: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class M03RV16StorageSemanticsEvidence:
     authority_root_sha256: str
     observer_root_sha256: str
@@ -81,10 +88,12 @@ class M03RV16StorageSemanticsEvidence:
     hard_link_supported: bool
     directory_fsync_supported: bool
     observer_read_matched: bool
+    observer_same_file: bool
     duplicate_publication_rejected: bool
+    distinct_observer_mount: bool
     _issuer: object = field(repr=False)
     schema: str = (
-        "rl-quant.top2000-dev.m03r-v16-storage-semantics-evidence-v1"
+        "rl-quant.top2000-dev.m03r-v16-storage-semantics-evidence-v3"
     )
 
     @property
@@ -93,16 +102,34 @@ class M03RV16StorageSemanticsEvidence:
         payload.pop("_issuer")
         return semantic_sha256(payload)
 
-    def validate_for(self, authority_root: str | Path) -> None:
-        expected = semantic_sha256(
+    def validate_for(
+        self,
+        authority_root: str | Path,
+        observer_root: str | Path,
+    ) -> None:
+        expected_authority = semantic_sha256(
             {"resolved_root": str(Path(authority_root).resolve())}
+        )
+        expected_observer = semantic_sha256(
+            {"resolved_root": str(Path(observer_root).resolve())}
+        )
+        valid_payload_digest = len(self.payload_sha256) == 64 and all(
+            character in "0123456789abcdef"
+            for character in self.payload_sha256
         )
         if (
             self._issuer is not _STORAGE_ISSUER
-            or self.authority_root_sha256 != expected
+            or self.schema
+            != "rl-quant.top2000-dev.m03r-v16-storage-semantics-evidence-v3"
+            or self.authority_root_sha256 != expected_authority
+            or self.observer_root_sha256 != expected_observer
+            or self.authority_root_sha256 == self.observer_root_sha256
+            or not self.distinct_observer_mount
+            or not valid_payload_digest
             or not self.hard_link_supported
             or not self.directory_fsync_supported
             or not self.observer_read_matched
+            or not self.observer_same_file
             or not self.duplicate_publication_rejected
         ):
             raise M03RV16LifecycleControllerError(
@@ -113,12 +140,17 @@ class M03RV16StorageSemanticsEvidence:
 def qualify_m03r_v16_append_only_storage(
     authority_root: str | Path,
     *,
-    observer_root: str | Path | None = None,
+    observer_root: str | Path,
+    publish_observer_view: Callable[[Path, Path], None] | None = None,
 ) -> M03RV16StorageSemanticsEvidence:
     """Qualify link/fsync/create-only behavior in one disposable namespace."""
 
     root = Path(authority_root).resolve()
-    observer = Path(observer_root).resolve() if observer_root is not None else root
+    observer = Path(observer_root).resolve()
+    if root == observer:
+        raise M03RV16LifecycleControllerError(
+            "V16 storage qualification requires a distinct observer mount"
+        )
     root.mkdir(mode=0o750, parents=True, exist_ok=True)
     token = secrets.token_hex(12)
     relative_directory = Path("storage-probes") / token
@@ -126,10 +158,12 @@ def qualify_m03r_v16_append_only_storage(
     probe.mkdir(mode=0o700, parents=True, exist_ok=False)
     temporary = probe / "payload.tmp"
     final = probe / "payload.final"
+    observed_path = observer / relative_directory / "payload.final"
     payload = f"m03r-v16-storage-probe:{token}\n".encode("ascii")
     payload_sha = hashlib.sha256(payload).hexdigest()
     directory_fsync_supported = False
     observer_read_matched = False
+    observer_same_file = False
     duplicate_rejected = False
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
@@ -144,10 +178,17 @@ def qualify_m03r_v16_append_only_storage(
             directory_fsync_supported = True
         finally:
             os.close(directory_descriptor)
-        observed_path = observer / relative_directory / "payload.final"
+        if publish_observer_view is not None:
+            publish_observer_view(final, observed_path)
         observed = observed_path.read_bytes()
         observer_read_matched = (
             observed == payload and hashlib.sha256(observed).hexdigest() == payload_sha
+        )
+        published_stat = final.stat()
+        observed_stat = observed_path.stat()
+        observer_same_file = (
+            published_stat.st_dev == observed_stat.st_dev
+            and published_stat.st_ino == observed_stat.st_ino
         )
         try:
             os.link(temporary, final)
@@ -163,6 +204,13 @@ def qualify_m03r_v16_append_only_storage(
         ) from exc
     finally:
         final.unlink(missing_ok=True)
+        try:
+            observed_path.unlink(missing_ok=True)
+        except OSError:
+            # A real observer is mounted read-only.  Removing the authoritative
+            # directory entry above makes its observer alias disappear.
+            if observed_path.exists():
+                raise
         temporary.unlink(missing_ok=True)
         try:
             probe.rmdir()
@@ -180,10 +228,12 @@ def qualify_m03r_v16_append_only_storage(
         hard_link_supported=True,
         directory_fsync_supported=directory_fsync_supported,
         observer_read_matched=observer_read_matched,
+        observer_same_file=observer_same_file,
         duplicate_publication_rejected=duplicate_rejected,
+        distinct_observer_mount=True,
         _issuer=_STORAGE_ISSUER,
     )
-    evidence.validate_for(root)
+    evidence.validate_for(root, observer)
     return evidence
 
 
@@ -192,10 +242,11 @@ def write_m03r_v16_storage_semantics_evidence(
     evidence: M03RV16StorageSemanticsEvidence,
     *,
     authority_root: str | Path,
+    observer_root: str | Path,
 ) -> str:
     """Publish one create-only storage qualification receipt."""
 
-    evidence.validate_for(authority_root)
+    evidence.validate_for(authority_root, observer_root)
     payload = asdict(evidence)
     payload.pop("_issuer")
     value = {
@@ -226,6 +277,7 @@ def load_m03r_v16_storage_semantics_evidence(
     *,
     expected_file_sha256: str,
     authority_root: str | Path,
+    observer_root: str | Path,
 ) -> M03RV16StorageSemanticsEvidence:
     """Reissue storage evidence only from the exact immutable file."""
 
@@ -280,7 +332,7 @@ def load_m03r_v16_storage_semantics_evidence(
         raise M03RV16LifecycleControllerError(
             "V16 storage evidence receipt drifted"
         )
-    evidence.validate_for(authority_root)
+    evidence.validate_for(authority_root, observer_root)
     return evidence
 
 
@@ -293,15 +345,38 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
     observation: M03RV16PodObservation,
     output_root_sha256: str,
     authority_root: str | Path,
+    observer_root: str | Path,
     storage_evidence: M03RV16StorageSemanticsEvidence,
+    storage_authority_identity_root: str | Path | None = None,
+    storage_observer_identity_root: str | Path | None = None,
     patch_annotations: Callable[
         [M03RV16PodPatchPrecondition, Mapping[str, str]], None
     ],
-    read_annotations: Callable[[M03RV16PodPatchPrecondition], Mapping[str, str]],
+    read_annotations: Callable[
+        [M03RV16PodPatchPrecondition], M03RV16PodAnnotationReadback
+    ],
 ) -> M03RV16PublishedPodAttestation:
     """Patch and observe annotations before the atomic final link appears."""
 
-    storage_evidence.validate_for(authority_root)
+    storage_evidence.validate_for(
+        authority_root
+        if storage_authority_identity_root is None
+        else storage_authority_identity_root,
+        observer_root
+        if storage_observer_identity_root is None
+        else storage_observer_identity_root,
+    )
+    if (
+        launch.storage_semantics_receipt_sha256
+        != storage_evidence.receipt_sha256
+        or launch.storage_authority_root_sha256
+        != storage_evidence.authority_root_sha256
+        or launch.storage_observer_root_sha256
+        != storage_evidence.observer_root_sha256
+    ):
+        raise M03RV16LifecycleControllerError(
+            "V16 launch authority is not bound to storage qualification"
+        )
     if (
         observation.observed_owner_job_uid != admission.job_uid
         or not observation.observed_owner_job_name
@@ -359,7 +434,20 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
     )
     patch_annotations(precondition, annotations)
     observed = read_annotations(precondition)
-    if any(observed.get(key) != value for key, value in annotations.items()):
+    if not isinstance(observed, M03RV16PodAnnotationReadback):
+        raise M03RV16LifecycleControllerError(
+            "V16 Pod annotation readback lacks UID/resource-version evidence"
+        )
+    if (
+        observed.pod_uid != observation.pod_uid
+        or not observed.pod_resource_version
+        or observed.pod_resource_version
+        == observation.observed_pod_resource_version
+        or any(
+            observed.annotations.get(key) != value
+            for key, value in annotations.items()
+        )
+    ):
         raise M03RV16LifecycleControllerError(
             "V16 Pod attestation annotations were not observed exactly"
         )
@@ -383,13 +471,17 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
         {
             "schema": (
                 "rl-quant.top2000-dev."
-                "m03r-v16-pod-attestation-publication-v1"
+                "m03r-v16-pod-attestation-publication-v2"
             ),
             "pod_uid": observation.pod_uid,
-            "pod_resource_version": observation.observed_pod_resource_version,
+            "pre_patch_resource_version": (
+                observation.observed_pod_resource_version
+            ),
+            "post_patch_resource_version": observed.pod_resource_version,
             "relative_path": relative_path,
             "file_sha256": observed_file_sha,
             "attestation_receipt_sha256": attestation.receipt_sha256,
+            "storage_semantics_receipt_sha256": storage_evidence.receipt_sha256,
             "annotations": dict(annotations),
         }
     )
@@ -405,6 +497,7 @@ def publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
 
 __all__ = [
     "M03RV16LifecycleControllerError",
+    "M03RV16PodAnnotationReadback",
     "M03RV16PodObservation",
     "M03RV16PodPatchPrecondition",
     "M03RV16PublishedPodAttestation",

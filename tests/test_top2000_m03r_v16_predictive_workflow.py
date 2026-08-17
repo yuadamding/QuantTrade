@@ -9,16 +9,11 @@ import torch
 import rl_quant.training.top2000_m03r_v16_qualification_runtime as qualification
 import rl_quant.workflows.top2000_m03r_v16_attestation_gate as attestation_gate
 import rl_quant.workflows.top2000_m03r_v16_predictive as predictive
-from rl_quant.protocol.canonical_artifact import semantic_sha256
-from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
-    M03R_V16_PROTOCOL_SHA256,
-)
 from rl_quant.training.top2000_m03r_v16_fold import (
     render_m03r_v16_fold_geometries,
 )
 from rl_quant.workflows.top2000_m03r_v16_predictive import (
     M03RV16PredictiveWorkflowError,
-    _await_m03r_v16_qualification_panel_barrier,
     _validate_gathered_update,
     resolve_m03r_v16_completion_index,
 )
@@ -122,7 +117,9 @@ def test_v16_worker_source_requires_terminal_authority_and_is_predictive_only() 
     assert 'output / "launch-consumption.json"' in source
     assert "load_m03r_v16_pod_runtime_attestation" in source
     assert "M03R_V16_CURRENT_POD_UID" in source
-    assert "_await_m03r_v16_qualification_panel_barrier" in source
+    assert "load_m03r_v16_qualification_outer_access_authority" in source
+    assert "qualification_preflight_only" in source
+    assert "_await_m03r_v16_qualification_panel_barrier" not in source
     assert 'output / "training-numerical-failure.json"' in source
     assert '"economic_optimizer_updates": 0' in source
     assert '"reinforcement_learning_updates": 0' in source
@@ -165,62 +162,14 @@ def test_v16_scientific_worker_rejects_direct_invocation_without_phase_authority
         )
 
 
-def test_v16_panel_barrier_closes_all_settings_before_outer_access(
+def test_v16_h100_qualification_has_no_in_process_peer_barrier(
     tmp_path: Path,
 ) -> None:
-    package = SimpleNamespace(package_plan_sha256="a" * 64)
-    activation = SimpleNamespace(receipt_sha256="b" * 64)
-    closure_hashes: list[str] = []
-    for setting in range(3):
-        output = tmp_path / f"completion-{setting:02d}-setting-{setting:02d}"
-        unsigned = {
-            "schema": (
-                "rl-quant.top2000-dev."
-                "m03r-v16-qualification-inputs-complete-v2"
-            ),
-            "protocol_sha256": M03R_V16_PROTOCOL_SHA256,
-            "package_plan_sha256": package.package_plan_sha256,
-            "qualification_activation_receipt_sha256": (
-                activation.receipt_sha256
-            ),
-            "setting_index": setting,
-            "folds": tuple({"fold_index": fold} for fold in range(5)),
-            "outer_qualification_access_started": False,
-            "outer_2026_accessed": False,
-        }
-        payload = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
-        closure_hashes.append(
-            predictive._write_immutable_json(
-                output / "qualification-inputs-complete.json", payload
-            )
-        )
-    barrier = _await_m03r_v16_qualification_panel_barrier(
-        phase_root=tmp_path,
-        setting_index=0,
-        package=package,  # type: ignore[arg-type]
-        qualification_activation=activation,  # type: ignore[arg-type]
-        local_closure_file_sha256=closure_hashes[0],
-        timeout_seconds=0.0,
-    )
-    assert all(len(value) == 64 for value in barrier)
-    assert (tmp_path / "qualification-panel-inputs-complete.json").is_file()
-    assert not tuple(tmp_path.glob("**/outer-access-fold-*.json"))
-
-
-def test_v16_missing_setting_closure_cannot_open_any_outer_fold(
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(M03RV16PredictiveWorkflowError, match="timed out"):
-        _await_m03r_v16_qualification_panel_barrier(
-            phase_root=tmp_path,
-            setting_index=0,
-            package=SimpleNamespace(package_plan_sha256="a" * 64),  # type: ignore[arg-type]
-            qualification_activation=SimpleNamespace(  # type: ignore[arg-type]
-                receipt_sha256="b" * 64
-            ),
-            local_closure_file_sha256="c" * 64,
-            timeout_seconds=0.0,
-        )
+    source = Path(
+        "src/rl_quant/workflows/top2000_m03r_v16_predictive.py"
+    ).read_text(encoding="utf-8")
+    assert "qualification_outer_access.validate_for" in source
+    assert "qualification_panel_barrier" not in source
     assert not tuple(tmp_path.glob("**/outer-access-fold-*.json"))
 
 
@@ -242,6 +191,12 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
         receipt_sha256="1" * 64,
         relative_path=lambda index: relative_path,
     )
+    storage = SimpleNamespace(
+        file_sha256="c" * 64,
+        receipt_sha256="d" * 64,
+        authority_root_sha256="e" * 64,
+        observer_root_sha256="f" * 64,
+    )
     attestation = SimpleNamespace(
         receipt_sha256="2" * 64,
         pod_uid="pod-uid",
@@ -256,6 +211,11 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
         attestation_gate,
         "load_v16_lifecycle_authorization",
         lambda *a, **k: authorization,
+    )
+    monkeypatch.setattr(
+        attestation_gate,
+        "load_v16_lifecycle_storage",
+        lambda *a, **k: storage,
     )
     monkeypatch.setattr(
         attestation_gate,
@@ -305,6 +265,10 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
         output_root="/mnt/output/completion-01",
         downward_root=downward,
         authority_root=tmp_path / "authority",
+        authority_observer_root=tmp_path / "authority-observer",
+        storage_semantics_path=tmp_path / "authority/storage.json",
+        storage_semantics_file_sha256=storage.file_sha256,
+        storage_semantics_receipt_sha256=storage.receipt_sha256,
         marker_path=marker_path,
         package_source_root=source_root,
         timeout_seconds=0.0,
@@ -314,3 +278,4 @@ def test_v16_init_gate_requires_annotations_and_writes_validated_marker(
     assert marker["relative_path"] == relative_path
     assert marker["package_source_root"] == str(source_root)
     assert marker["gate_module_path"] == str(Path(attestation_gate.__file__).resolve())
+    assert marker["storage_semantics_receipt_sha256"] == storage.receipt_sha256

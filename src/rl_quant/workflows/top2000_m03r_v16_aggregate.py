@@ -22,14 +22,18 @@ from rl_quant.protocol.canonical_artifact import (
 )
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
-    M03R_V16_PROTOCOL_SHA256,
 )
 from rl_quant.training.top2000_m03r_v16_activation import (
     M03RV16QualificationActivation,
+    M03RV16QualificationOuterAccessAuthority,
     load_m03r_v16_qualification_activation,
+    load_m03r_v16_qualification_outer_access_authority,
 )
 from rl_quant.training.top2000_m03r_v16_cohort_runtime import (
     M03RV16CohortTrace,
+)
+from rl_quant.training.top2000_m03r_v16_lifecycle import (
+    load_m03r_v16_storage_semantics_evidence,
 )
 from rl_quant.training.top2000_m03r_v16_package import (
     M03RV16ExecutionAuthorization,
@@ -53,7 +57,7 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
 )
 
 M03R_V16_PANEL_AGGREGATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v5"
+    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v6"
 )
 _MAX_TERMINAL_BYTES = 16 * 1024**2
 _MAX_ARTIFACT_BYTES = 256 * 1024**2
@@ -263,9 +267,11 @@ def _worker_terminal(
         "pod_template_sha256",
         "launch_authority_receipt_sha256",
         "admitted_job_authority_receipt_sha256",
+        "storage_semantics_file_sha256",
+        "storage_semantics_receipt_sha256",
         "qualification_inputs_complete_file_sha256",
-        "qualification_panel_barrier_file_sha256",
-        "qualification_panel_barrier_receipt_sha256",
+        "qualification_outer_access_authority_file_sha256",
+        "qualification_outer_access_authority_receipt_sha256",
     ):
         _digest(name, str(payload.get(name)))
     if (
@@ -315,8 +321,8 @@ def _fold_evidence(
     package: M03RV16PackagePlan,
     authorization: M03RV16ExecutionAuthorization,
     qualification_activation: M03RV16QualificationActivation,
-    expected_panel_barrier_file_sha256: str,
-    expected_panel_barrier_receipt_sha256: str,
+    expected_outer_access_file_sha256: str,
+    expected_outer_access_receipt_sha256: str,
 ) -> M03RV16ReconciledFoldEvidence:
     fold_terminal = _read_exact(
         worker_root / "receipts" / f"fold-{fold_index:02d}-terminal.json",
@@ -349,13 +355,19 @@ def _fold_evidence(
             str(fold_terminal.get("qualification_inputs_complete_file_sha256")),
         ),
         (
-            "qualification_panel_barrier_file_sha256",
-            str(fold_terminal.get("qualification_panel_barrier_file_sha256")),
+            "qualification_outer_access_authority_file_sha256",
+            str(
+                fold_terminal.get(
+                    "qualification_outer_access_authority_file_sha256"
+                )
+            ),
         ),
         (
-            "qualification_panel_barrier_receipt_sha256",
+            "qualification_outer_access_authority_receipt_sha256",
             str(
-                fold_terminal.get("qualification_panel_barrier_receipt_sha256")
+                fold_terminal.get(
+                    "qualification_outer_access_authority_receipt_sha256"
+                )
             ),
         ),
     ):
@@ -374,15 +386,25 @@ def _fold_evidence(
             fold_terminal.get("qualification_inputs_complete_file_sha256"), str
         )
         or not isinstance(
-            fold_terminal.get("qualification_panel_barrier_file_sha256"), str
+            fold_terminal.get(
+                "qualification_outer_access_authority_file_sha256"
+            ),
+            str,
         )
         or not isinstance(
-            fold_terminal.get("qualification_panel_barrier_receipt_sha256"), str
+            fold_terminal.get(
+                "qualification_outer_access_authority_receipt_sha256"
+            ),
+            str,
         )
-        or fold_terminal.get("qualification_panel_barrier_file_sha256")
-        != expected_panel_barrier_file_sha256
-        or fold_terminal.get("qualification_panel_barrier_receipt_sha256")
-        != expected_panel_barrier_receipt_sha256
+        or fold_terminal.get(
+            "qualification_outer_access_authority_file_sha256"
+        )
+        != expected_outer_access_file_sha256
+        or fold_terminal.get(
+            "qualification_outer_access_authority_receipt_sha256"
+        )
+        != expected_outer_access_receipt_sha256
         or fold_terminal.get("worker_plan_sha256") != worker.receipt_sha256
         or fold_terminal.get("setting_index") != setting_index
         or fold_terminal.get("setting_id") != worker.setting_id
@@ -474,11 +496,15 @@ def _reconcile_worker_evidence(
             package=package,
             authorization=authorization,
             qualification_activation=qualification_activation,
-            expected_panel_barrier_file_sha256=str(
-                terminal_payload["qualification_panel_barrier_file_sha256"]
+            expected_outer_access_file_sha256=str(
+                terminal_payload[
+                    "qualification_outer_access_authority_file_sha256"
+                ]
             ),
-            expected_panel_barrier_receipt_sha256=str(
-                terminal_payload["qualification_panel_barrier_receipt_sha256"]
+            expected_outer_access_receipt_sha256=str(
+                terminal_payload[
+                    "qualification_outer_access_authority_receipt_sha256"
+                ]
             ),
         )
         for index in range(folds)
@@ -511,6 +537,15 @@ def aggregate_m03r_v16_panel(
     execution_authorization_file_sha256: str,
     qualification_activation_path: str | Path,
     qualification_activation_file_sha256: str,
+    qualification_outer_access_authority_path: str | Path,
+    qualification_outer_access_authority_file_sha256: str,
+    qualification_outer_access_authority_receipt_sha256: str,
+    qualification_preflight_root: str | Path,
+    storage_semantics_path: str | Path,
+    storage_semantics_file_sha256: str,
+    storage_semantics_receipt_sha256: str,
+    authority_root: str | Path,
+    authority_observer_root: str | Path,
     training_panel_path: str | Path,
     training_terminal_paths: tuple[Path, Path, Path],
     worker_terminal_paths: tuple[Path, Path, Path],
@@ -540,58 +575,88 @@ def aggregate_m03r_v16_panel(
             training_terminal_paths=training_terminal_paths,
         )
     )
+    preflight_root = Path(qualification_preflight_root)
+    closure_paths = tuple(
+        preflight_root
+        / f"completion-{index:02d}-setting-{index:02d}"
+        / "qualification-inputs-complete.json"
+        for index in range(3)
+    )
+    qualification_outer_access: M03RV16QualificationOuterAccessAuthority = (
+        load_m03r_v16_qualification_outer_access_authority(
+            qualification_outer_access_authority_path,
+            expected_file_sha256=(
+                qualification_outer_access_authority_file_sha256
+            ),
+            expected_receipt_sha256=(
+                qualification_outer_access_authority_receipt_sha256
+            ),
+            package=package,
+            authorization=authorization,
+            activation=qualification_activation,
+            setting_input_closure_paths=closure_paths,  # type: ignore[arg-type]
+            setting_preflight_terminal_paths=tuple(
+                path.parent / "qualification-preflight-terminal.json"
+                for path in closure_paths
+            ),  # type: ignore[arg-type]
+        )
+    )
+    storage_evidence = load_m03r_v16_storage_semantics_evidence(
+        storage_semantics_path,
+        expected_file_sha256=storage_semantics_file_sha256,
+        authority_root=authority_root,
+        observer_root=authority_observer_root,
+    )
+    if storage_evidence.receipt_sha256 != storage_semantics_receipt_sha256:
+        raise M03RV16AggregateError("V16 storage authority receipt drifted")
     terminal_payloads = tuple(
         _read_exact(path, expected_sha)
         for path, expected_sha in zip(
             worker_terminal_paths, worker_terminal_file_sha256, strict=True
         )
     )
-    barrier_identities = {
+    outer_access_identities = {
         (
-            str(payload.get("qualification_panel_barrier_file_sha256")),
-            str(payload.get("qualification_panel_barrier_receipt_sha256")),
+            str(
+                payload.get(
+                    "qualification_outer_access_authority_file_sha256"
+                )
+            ),
+            str(
+                payload.get(
+                    "qualification_outer_access_authority_receipt_sha256"
+                )
+            ),
         )
         for payload in terminal_payloads
     }
-    if len(barrier_identities) != 1:
-        raise M03RV16AggregateError(
-            "V16 qualification workers did not share one panel input barrier"
-        )
-    phase_roots = {path.parent.parent for path in worker_terminal_paths}
-    if len(phase_roots) != 1:
-        raise M03RV16AggregateError(
-            "V16 qualification worker roots do not share one phase root"
-        )
-    barrier_file_sha256, barrier_receipt_sha256 = next(iter(barrier_identities))
-    barrier = _read_exact(
-        next(iter(phase_roots)) / "qualification-panel-inputs-complete.json",
-        barrier_file_sha256,
+    expected_outer_identity = (
+        qualification_outer_access_authority_file_sha256,
+        qualification_outer_access.receipt_sha256,
     )
-    barrier_unsigned = {
-        key: value for key, value in barrier.items() if key != "receipt_sha256"
-    }
-    if (
-        barrier.get("schema")
-        != "rl-quant.top2000-dev.m03r-v16-qualification-panel-barrier-v1"
-        or barrier.get("receipt_sha256") != _sha256(barrier_unsigned)
-        or barrier.get("receipt_sha256") != barrier_receipt_sha256
-        or barrier.get("protocol_sha256") != M03R_V16_PROTOCOL_SHA256
-        or barrier.get("package_plan_sha256") != package.package_plan_sha256
-        or barrier.get("qualification_activation_receipt_sha256")
-        != qualification_activation.receipt_sha256
-        or tuple(barrier.get("setting_indices", ())) != (0, 1, 2)
-        or tuple(barrier.get("setting_input_closure_file_sha256", ()))
-        != tuple(
-            str(payload.get("qualification_inputs_complete_file_sha256"))
-            for payload in terminal_payloads
+    if outer_access_identities != {expected_outer_identity}:
+        raise M03RV16AggregateError(
+            "V16 qualification workers did not share the outer-access authority"
         )
-        or len(tuple(barrier.get("setting_input_closure_receipt_sha256", ()))) != 3
-        or barrier.get("outer_access_authorized") is not True
-        or barrier.get("outer_qualification_access_started") is not False
-        or barrier.get("outer_2026_accessed") is not False
+    storage_identities = {
+        (
+            str(payload.get("storage_semantics_file_sha256")),
+            str(payload.get("storage_semantics_receipt_sha256")),
+        )
+        for payload in terminal_payloads
+    }
+    if storage_identities != {
+        (storage_semantics_file_sha256, storage_evidence.receipt_sha256)
+    }:
+        raise M03RV16AggregateError(
+            "V16 qualification workers did not share the storage authority"
+        )
+    if qualification_outer_access.setting_input_closure_file_sha256 != tuple(
+        str(payload.get("qualification_inputs_complete_file_sha256"))
+        for payload in terminal_payloads
     ):
         raise M03RV16AggregateError(
-            "V16 qualification panel input barrier drifted"
+            "V16 worker input closures drifted from outer-access authority"
         )
     rows = tuple(
         _worker_terminal(
@@ -668,6 +733,14 @@ def aggregate_m03r_v16_panel(
         "qualification_activation_receipt_sha256": (
             qualification_activation.receipt_sha256
         ),
+        "qualification_outer_access_authority_file_sha256": (
+            qualification_outer_access_authority_file_sha256
+        ),
+        "qualification_outer_access_authority_receipt_sha256": (
+            qualification_outer_access.receipt_sha256
+        ),
+        "storage_semantics_file_sha256": storage_semantics_file_sha256,
+        "storage_semantics_receipt_sha256": storage_evidence.receipt_sha256,
         "worker_terminal_file_sha256": worker_terminal_file_sha256,
         "worker_terminal_receipt_sha256": tuple(row[2] for row in rows),
         "bootstrap_plan_sha256": bootstrap.receipt_sha256,
@@ -710,6 +783,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--execution-authorization-file-sha256", required=True)
     parser.add_argument("--qualification-activation", required=True)
     parser.add_argument("--qualification-activation-file-sha256", required=True)
+    parser.add_argument("--qualification-outer-access-authority", required=True)
+    parser.add_argument(
+        "--qualification-outer-access-authority-file-sha256", required=True
+    )
+    parser.add_argument(
+        "--qualification-outer-access-authority-receipt-sha256", required=True
+    )
+    parser.add_argument("--qualification-preflight-root", required=True)
+    parser.add_argument("--storage-semantics", required=True)
+    parser.add_argument("--storage-semantics-file-sha256", required=True)
+    parser.add_argument("--storage-semantics-receipt-sha256", required=True)
+    parser.add_argument("--authority-root", required=True)
+    parser.add_argument("--authority-observer-root", required=True)
     parser.add_argument("--training-panel", required=True)
     parser.add_argument("--training-terminal", action="append", required=True)
     parser.add_argument("--worker-terminal", action="append", required=True)
@@ -739,6 +825,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         qualification_activation_file_sha256=(
             args.qualification_activation_file_sha256
         ),
+        qualification_outer_access_authority_path=(
+            args.qualification_outer_access_authority
+        ),
+        qualification_outer_access_authority_file_sha256=(
+            args.qualification_outer_access_authority_file_sha256
+        ),
+        qualification_outer_access_authority_receipt_sha256=(
+            args.qualification_outer_access_authority_receipt_sha256
+        ),
+        qualification_preflight_root=args.qualification_preflight_root,
+        storage_semantics_path=args.storage_semantics,
+        storage_semantics_file_sha256=args.storage_semantics_file_sha256,
+        storage_semantics_receipt_sha256=(
+            args.storage_semantics_receipt_sha256
+        ),
+        authority_root=args.authority_root,
+        authority_observer_root=args.authority_observer_root,
         training_panel_path=args.training_panel,
         training_terminal_paths=(
             Path(args.training_terminal[0]),

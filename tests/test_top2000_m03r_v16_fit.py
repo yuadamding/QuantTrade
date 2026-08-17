@@ -60,6 +60,8 @@ def test_v16_numerical_failure_is_a_typed_nonqualification_terminal() -> None:
         launch_authority_receipt_sha256="5" * 64,
         admitted_job_authority_receipt_sha256="6" * 64,
         pod_runtime_attestation_receipt_sha256="7" * 64,
+        storage_semantics_file_sha256="8" * 64,
+        storage_semantics_receipt_sha256="9" * 64,
         job_uid="job-uid",
         pod_uid="pod-uid",
         setting_index=2,

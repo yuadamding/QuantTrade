@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v11 revision; older v16 source and
+current local protocol is the result-moving v12 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -178,14 +178,15 @@ Training and outer qualification are separate scientific phases:
 
 ```text
 static gate
+-> cross-mount storage gate
 -> capacity gate
 -> private training activation
 -> training-only workers for R0/R1/R2
 -> independent paired-panel adequacy aggregate
 -> strict CPU closure of all 15 terminal checkpoints
 -> private qualification activation, only when all 15 fits are adequate
--> three-setting qualification input preflight
--> global panel input barrier
+-> zero-GPU three-setting qualification input preflight
+-> immutable global outer-access authority
 -> qualification-only outer access
 -> independent final panel aggregate
 ```
@@ -315,11 +316,18 @@ attested Pod UID, Pod name, node, completion index, and exact repository/digest
 image identity with its Downward API identity before loading market data.
 The package includes controller-side publication and storage-qualification
 primitives that enforce this patch-observe-publish order, bind Pod owner UID,
-owner name, indexed completion, and resourceVersion, and verify the exact PVC's
-hard-link, directory-fsync, cross-mount visibility, and create-only semantics.
-Cluster admission, Job resume, supervision, and cleanup still require the
-separately permissioned Seadragon lifecycle controller; no remote mutation is
-claimed by this source revision.
+owner name, indexed completion, and resourceVersion, and verify that a distinct
+observer mount sees the same published inode through the exact PVC's hard-link,
+directory-fsync, and create-only semantics. The source-owned Seadragon
+controller pins the approved kubectl binary, kubeconfig path, context, and
+namespace; performs exact server dry-run, suspended admission, authority
+publication, UID/resourceVersion-bound resume, per-Pod attestation, compact
+terminal supervision, and explicitly authorized UID-preconditioned cleanup.
+Its executable command consumes a create-only rendered-Job plan plus the exact
+package and phase evidence, supervises only that Job name and UID, and exposes
+separate exact-identity status and explicitly authorized cleanup actions. No
+controller command was invoked and no remote mutation is claimed by this
+source revision.
 Admission, launch, and Pod-attestation files are mandatory worker inputs. The worker
 requires exactly two visible H100 80GB devices and either runs the disposable
 `train -> validation -> train` capacity path, runs training only, or performs
@@ -333,23 +341,26 @@ gradient norms, clipping, learning rates, and parameter-version evidence.
 Only `still-improving` can authorize a fresh longer-training protocol;
 collapsed, overdispersed, and clipping-dominated outcomes require their
 predeclared diagnostic paths. A nonfinite optimizer or validation failure emits
-a separate typed numerical-training-failure terminal before the worker exits.
+a separate typed numerical-training-failure terminal and exits the Kubernetes
+completion successfully so the other two setting outcomes can finish.
 The training-panel aggregate accepts exactly one normal or numerical terminal
 per setting. Any numerical terminal blocks checkpoint closure and qualification
 and deterministically routes the panel to numerical investigation.
 
-Before any outer origin is encoded, each qualification worker revalidates all
-five terminal checkpoints for its setting on CPU, validates all five risk-state
-inputs, and publishes one qualification-input-closure receipt. All three
-setting closures must be reconciled into one immutable global panel barrier
-before any worker may create its fold-0 access marker. A corrupt later fold or
-failed setting therefore produces zero outer-access markers across the panel.
+Before any H100 qualification Job is rendered, a separate three-completion,
+zero-GPU preflight revalidates all five terminal checkpoints for each setting
+on CPU, validates all five risk-state inputs, and publishes one
+qualification-input-closure receipt. A zero-GPU aggregate must reconcile all
+three setting closures into one immutable outer-access authority. H100
+qualification accepts that authority as a predecessor and never waits for a
+peer while holding GPUs. A corrupt later fold or failed setting therefore
+produces zero outer-access markers across the panel.
 Per-fold access markers and published
 artifact names are included in failure evidence. The structural slab is also
 materialized into disjoint in-memory phase slabs: the training object contains
 no qualification origins, and the qualification object contains no optimizer
 or inner-validation origins. The transferred slab remains one common package
-file in v11; a later schema may split the on-disk mounts as additional defense.
+file in v12; a later schema may split the on-disk mounts as additional defense.
 
 After qualification is separately authorized, the final aggregate opens all
 three qualification terminals, all 15 qualification-fold terminals, and all 15
@@ -360,10 +371,11 @@ authorize a three-seed predictive confirmation; an adequate failure routes to
 ordered five-minute research. It can never authorize an economic generation,
 reinforcement learning, or 2026 access.
 
-The local Kubernetes layer renders four distinct `batch/v1` Job contracts:
-zero-GPU static validation with no GPU resource key, one two-H100 capacity
-sentinel, a suspended three-completion training panel, and a separately
-suspended three-completion qualification panel. Capacity and scientific-phase
+The local Kubernetes layer renders six distinct `batch/v1` Job contracts:
+zero-GPU static validation; a zero-GPU two-mount storage gate; one two-H100
+capacity sentinel; a suspended three-completion training panel; a zero-GPU
+three-completion qualification-input preflight; and a separately suspended
+three-completion qualification panel. Capacity and scientific-phase
 rendering require privately issued authorities loaded from exact immutable
 result or activation files. H100 workers require the matching launch authority,
 admitted-Job evidence, and per-Pod runtime attestation. An init-container gate
@@ -387,11 +399,12 @@ SHA-256 receipts prove content identity, not provenance. The deployment trust
 assumption is that a separately permissioned lifecycle controller is the sole
 writer to the append-only authority path; external signing remains an optional
 hardening layer. The source contract for live admission and Job/Pod UID binding
-is implemented. Attestation publication is retry-safe after a controller
-crash: completed final files validate idempotently, each attempt uses a unique
+is implemented. Attestation publication is retry-safe after a controller crash:
+completed final files validate idempotently, each attempt uses a unique
 temporary name, and stale controller-owned temporaries cannot block recovery.
-Detached supervision, UID-bound cleanup, and any remote mutation are
-intentionally not executed by this source-only revision.
+The controller exposes exact detached supervision and UID-bound cleanup
+primitives. Any invocation against Seadragon remains an explicit external
+operation and was intentionally not executed by this source-only revision.
 
 No real-data package or slab receipt, same-image result, capacity result,
 remote Job, GPU result, or performance result is claimed. Those evidence gates

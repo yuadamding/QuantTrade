@@ -52,6 +52,8 @@ class M03RV16NumericalTrainingFailure:
     launch_authority_receipt_sha256: str
     admitted_job_authority_receipt_sha256: str
     pod_runtime_attestation_receipt_sha256: str
+    storage_semantics_file_sha256: str
+    storage_semantics_receipt_sha256: str
     job_uid: str
     pod_uid: str
     setting_index: int
@@ -88,6 +90,8 @@ class M03RV16NumericalTrainingFailure:
             "launch_authority_receipt_sha256",
             "admitted_job_authority_receipt_sha256",
             "pod_runtime_attestation_receipt_sha256",
+            "storage_semantics_file_sha256",
+            "storage_semantics_receipt_sha256",
         ):
             _digest(name, getattr(self, name))
         for value in self.completed_fold_terminal_file_sha256:
