@@ -14,7 +14,7 @@ optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
 No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the result-moving v12 revision; older v16 source and
+current local protocol is the result-moving v13 revision; older v16 source and
 artifact identities may not be mixed with it.
 
 ## Scientific settings
@@ -360,7 +360,7 @@ artifact names are included in failure evidence. The structural slab is also
 materialized into disjoint in-memory phase slabs: the training object contains
 no qualification origins, and the qualification object contains no optimizer
 or inner-validation origins. The transferred slab remains one common package
-file in v12; a later schema may split the on-disk mounts as additional defense.
+file in v13; a later schema may split the on-disk mounts as additional defense.
 
 After qualification is separately authorized, the final aggregate opens all
 three qualification terminals, all 15 qualification-fold terminals, and all 15
@@ -403,7 +403,17 @@ is implemented. Attestation publication is retry-safe after a controller crash:
 completed final files validate idempotently, each attempt uses a unique
 temporary name, and stale controller-owned temporaries cannot block recovery.
 The controller exposes exact detached supervision and UID-bound cleanup
-primitives. Any invocation against Seadragon remains an explicit external
+primitives. Scientific completions are independently scheduled and attested as
+soon as each Pod becomes observable; no completion waits for the other two
+Pods before its init gate is released. The controller reconciles existing
+immutable stage artifacts and the exact admitted Job UID after restart, retries
+Pod resource-version conflicts from a fresh observation, and waits for
+foreground deletion to remove both the admitted Job UID and all UID-owned Pods.
+Cleanup derives its target from the admitted controller authority, so a
+same-name replacement Job is never mutated. Final panel aggregation requires
+complete controller terminals for training, qualification preflight, and
+qualification, including the observed main-container image digest for every
+completion. Any invocation against Seadragon remains an explicit external
 operation and was intentionally not executed by this source-only revision.
 
 No real-data package or slab receipt, same-image result, capacity result,

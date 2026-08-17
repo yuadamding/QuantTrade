@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import math
+from dataclasses import replace
+from itertools import pairwise
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS,
     M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
+    M03R_V16_SCHEDULING_POLICY,
     M03R_V16_SETTINGS,
     M03R_V16_SURVIVAL_AFTER_DAY_30,
     M03R_V16_SURVIVAL_WEIGHTS,
@@ -45,6 +47,7 @@ def test_v16_is_a_selection_only_primary_hypothesis_screen() -> None:
         LEGACY_HOLD30_TARGET_SPEC.receipt_sha256
     )
     assert M03R_V16_FILL_RULE.startswith("observe-close-t-fill-next-close")
+    assert M03R_V16_SCHEDULING_POLICY == "independent-per-completion"
 
 
 def test_v16_survival_target_uses_the_exact_reference_age_clock() -> None:
@@ -61,11 +64,7 @@ def test_v16_survival_target_uses_the_exact_reference_age_clock() -> None:
     assert 0.5 < M03R_V16_SURVIVAL_AFTER_DAY_30 < 0.6
     assert all(
         later < earlier
-        for earlier, later in zip(
-            M03R_V16_SURVIVAL_WEIGHTS,
-            M03R_V16_SURVIVAL_WEIGHTS[1:],
-            strict=False,
-        )
+        for earlier, later in pairwise(M03R_V16_SURVIVAL_WEIGHTS)
     )
 
 

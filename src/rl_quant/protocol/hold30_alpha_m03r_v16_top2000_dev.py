@@ -22,11 +22,12 @@ from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v12"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v13"
 )
 M03R_V16_DESIGN_ID = (
-    "cpu-preflight-storage-authority-operational-lifecycle-paired-hold30-primary-v12"
+    "restartable-per-pod-controller-authority-cleanup-paired-hold30-primary-v13"
 )
+M03R_V16_SCHEDULING_POLICY = "independent-per-completion"
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30
 M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS = 30
 M03RV16SelectionTarget = Literal[
@@ -383,6 +384,7 @@ M03R_V16_PROTOCOL_SHA256 = _sha256(
     {
         "generation": M03R_V16_PROTOCOL_GENERATION,
         "design_id": M03R_V16_DESIGN_ID,
+        "scheduling_policy": M03R_V16_SCHEDULING_POLICY,
         "parent_protocol_sha256": M03R_V15_PROTOCOL_SHA256,
         "selection_targets": M03R_V16_SELECTION_TARGET_IDS,
         "maximum_target_support_sessions": M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS,

@@ -8,10 +8,11 @@ import json
 import os
 import random
 import stat
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -144,6 +145,8 @@ M03R_V16_WORKER_ERROR_SCHEMA = "rl-quant.top2000-dev.m03r-v16-worker-error-v3"
 M03R_V16_QUALIFICATION_ARTIFACT_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-fold-qualification-artifact-v1"
 )
+
+_T = TypeVar("_T")
 
 
 class M03RV16PredictiveWorkflowError(RuntimeError):
@@ -353,6 +356,53 @@ def _broadcast(value: Any, rank: int) -> Any:
     rows = [value if rank == 0 else None]
     dist.broadcast_object_list(rows, src=0)
     return rows[0]
+
+
+def _paired_failure_boundary(
+    phase: str,
+    operation: Callable[[], _T],
+    *,
+    device: torch.device,
+    world_size: int,
+) -> _T:
+    """Make rank-local numerical and infrastructure failures paired."""
+
+    result: _T | None = None
+    failure: Exception | None = None
+    failure_kind = 0
+    try:
+        result = operation()
+    except (M03RV16NumericalTrainingError, FloatingPointError) as exc:
+        failure = exc
+        failure_kind = 1
+    except Exception as exc:  # noqa: BLE001 - pair any rank-local infrastructure failure
+        failure = exc
+        failure_kind = 2
+    flag = torch.tensor(
+        failure_kind, device=device, dtype=torch.int32
+    )
+    if world_size == 2:
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    paired_failure_kind = int(flag.item())
+    if paired_failure_kind != 0:
+        rows = _gather(
+            None
+            if failure is None
+            else {"type": type(failure).__name__, "error": str(failure)},
+            world_size,
+        )
+        if paired_failure_kind == 1:
+            raise M03RV16NumericalTrainingError(
+                f"V16 paired numerical failure during {phase}: {rows!r}"
+            ) from failure
+        raise M03RV16PredictiveWorkflowError(
+            f"V16 paired infrastructure failure during {phase}: {rows!r}"
+        ) from failure
+    if result is None:
+        raise M03RV16PredictiveWorkflowError(
+            f"V16 paired phase {phase} returned no result"
+        )
+    return result
 
 
 def resolve_m03r_v16_completion_index(value: int | None) -> int:
@@ -1570,6 +1620,9 @@ def run_m03r_v16_predictive_worker(
             ),
             "source_tree_root_sha256": source_tree_root_sha256,
             "launch_authority_receipt_sha256": launch_authority.receipt_sha256,
+            "admitted_job_authority_receipt_sha256": (
+                admitted_job_authority.receipt_sha256
+            ),
             "pod_runtime_attestation_receipt_sha256": (
                 pod_attestation.receipt_sha256
             ),
@@ -1920,14 +1973,22 @@ def run_m03r_v16_predictive_worker(
                     / "checkpoints"
                     / f"fold-{geometry.fold_index:02d}-epoch-{epoch + 1:02d}.pt"
                 )
-                checkpoint_sha: str | None = None
-                if rank == 0:
-                    checkpoint_sha = write_immutable_m03r_v16_epoch_checkpoint(
-                        checkpoint_path,
-                        policy,
-                        fold_index=geometry.fold_index,
-                        epoch_index=epoch,
-                        completed_score_updates=completed + 1,
+                def publish_checkpoint(
+                    checkpoint_path_: Path = checkpoint_path,
+                    policy_: Top2000M03RV16PredictivePolicy = policy,
+                    fold_index_: int = geometry.fold_index,
+                    epoch_: int = epoch,
+                    completed_: int = completed,
+                    source_root_: str = source_root,
+                ) -> str:
+                    if rank != 0:
+                        return "rank-1-checkpoint-publication-not-applicable"
+                    return write_immutable_m03r_v16_epoch_checkpoint(
+                        checkpoint_path_,
+                        policy_,
+                        fold_index=fold_index_,
+                        epoch_index=epoch_,
+                        completed_score_updates=completed_ + 1,
                         panel_schedule_sha256=package.schedule.receipt_sha256,
                         selection_target_operator_root_sha256=(
                             structural.receipt.common_target_operator_root_sha256
@@ -1935,30 +1996,51 @@ def run_m03r_v16_predictive_worker(
                         action_operator_root_sha256=(
                             structural.receipt.action_operator_root_sha256
                         ),
-                        source_array_sha256=source_root,
+                        source_array_sha256=source_root_,
                         asset_axis_sha256=cache.action_hash,
                     )
+
+                checkpoint_sha: str | None = _paired_failure_boundary(
+                    "epoch-checkpoint-publication",
+                    publish_checkpoint,
+                    device=device,
+                    world_size=world_size,
+                )
                 checkpoint_sha = _broadcast(checkpoint_sha, rank)
                 if not isinstance(checkpoint_sha, str):
                     raise M03RV16PredictiveWorkflowError(
                         "V16 epoch checkpoint publication failed"
                     )
                 dist.barrier()
-                validation_batch = build_m03r_v16_inner_validation_batch(
-                    cache,
-                    geometry,
-                    risk_source,
-                    structural,
-                    policy,
+                def evaluate_validation(
+                    geometry_: M03RV16FoldGeometry = geometry,
+                    policy_: Top2000M03RV16PredictivePolicy = policy,
+                    epoch_: int = epoch,
+                    completed_: int = completed,
+                    checkpoint_sha_: str = cast(str, checkpoint_sha),
+                ) -> M03RV16InnerValidationReceipt:
+                    validation_batch = build_m03r_v16_inner_validation_batch(
+                        cache,
+                        geometry_,
+                        risk_source,
+                        structural,
+                        policy_,
+                        device=device,
+                    )
+                    return evaluate_m03r_v16_inner_validation_batch(
+                        validation_batch,
+                        geometry_,
+                        epoch_index=epoch_,
+                        completed_score_updates=completed_ + 1,
+                        model_state_sha256=model_state_sha256(policy_),
+                        epoch_checkpoint_file_sha256=checkpoint_sha_,
+                    )
+
+                validation = _paired_failure_boundary(
+                    "epoch-validation",
+                    evaluate_validation,
                     device=device,
-                )
-                validation = evaluate_m03r_v16_inner_validation_batch(
-                    validation_batch,
-                    geometry,
-                    epoch_index=epoch,
-                    completed_score_updates=completed + 1,
-                    model_state_sha256=model_state_sha256(policy),
-                    epoch_checkpoint_file_sha256=checkpoint_sha,
+                    world_size=world_size,
                 )
                 validation_rows = _gather(asdict(validation), world_size)
                 if len({_sha256(row) for row in validation_rows}) != 1:
@@ -2035,7 +2117,7 @@ def run_m03r_v16_predictive_worker(
                     "V16 terminal optimizer states diverged"
                 )
             final_source_root = _sha256(tuple(source_rows))
-            del optimizer, partition, policy
+            del optimizer, partition
             torch.cuda.empty_cache()
             if rank == 0:
                 if (

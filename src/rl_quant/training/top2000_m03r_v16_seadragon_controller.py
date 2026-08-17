@@ -24,17 +24,26 @@ from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
     semantic_sha256,
 )
+from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_SCHEDULING_POLICY,
+)
 from rl_quant.training.top2000_m03r_v16_activation import (
     M03R_V16_ADMITTED_MANIFEST_SCHEMA,
     M03R_V16_DRY_RUN_RESULT_SCHEMA,
     M03RV16AdmittedJobAuthority,
     _issue_m03r_v16_admitted_job_authority,
+    admitted_job_authority_file_sha256,
+    load_m03r_v16_admitted_job_authority,
+    load_m03r_v16_phase_launch_authority,
+    load_m03r_v16_pod_runtime_attestation,
+    phase_launch_authority_file_sha256,
     write_m03r_v16_admitted_job_authority,
 )
 from rl_quant.training.top2000_m03r_v16_kubernetes import (
     M03R_V16_NAMESPACE,
     M03RV16RenderedSuspendedJob,
     bind_m03r_v16_admitted_launch_authority,
+    m03r_v16_pod_runtime_attestation_annotations,
     write_m03r_v16_rendered_launch_authority,
 )
 from rl_quant.training.top2000_m03r_v16_lifecycle import (
@@ -58,16 +67,16 @@ M03R_V16_CONTEXT = "yding4_yn-gpu-workload@kubernetes-admin@kubernetes"
 M03R_V16_POD_AUTHORITY_ROOT = "/mnt/authority"
 M03R_V16_POD_AUTHORITY_OBSERVER_ROOT = "/mnt/authority-observer"
 M03R_V16_CONTROLLER_ADMISSION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-controller-admission-v1"
+    "rl-quant.top2000-dev.m03r-v16-controller-admission-v2"
 )
 M03R_V16_CONTROLLER_ATTESTATION_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-controller-attestation-v1"
+    "rl-quant.top2000-dev.m03r-v16-controller-attestation-v2"
 )
 M03R_V16_CONTROLLER_TERMINAL_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-controller-terminal-v1"
+    "rl-quant.top2000-dev.m03r-v16-controller-terminal-v2"
 )
 M03R_V16_CONTROLLER_CLEANUP_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-controller-cleanup-v1"
+    "rl-quant.top2000-dev.m03r-v16-controller-cleanup-v2"
 )
 M03R_V16_CONTROLLER_JOB_PLAN_SCHEMA = (
     "rl-quant.top2000-dev.m03r-v16-controller-job-plan-v1"
@@ -77,6 +86,10 @@ _MAX_KUBECTL_RESPONSE_BYTES = 64 * 1024**2
 
 class M03RV16SeadragonControllerError(RuntimeError):
     """An exact Kubernetes identity or lifecycle transition drifted."""
+
+
+class M03RV16KubernetesConflictError(M03RV16SeadragonControllerError):
+    """A Kubernetes optimistic-concurrency precondition was stale."""
 
 
 class M03RV16KubernetesTransport(Protocol):
@@ -154,6 +167,10 @@ class M03RV16KubectlTransport:
         if completed.returncode != 0:
             if allow_not_found and "not found" in stderr.lower():
                 return None
+            if "conflict" in stderr.lower() or "409" in stderr:
+                raise M03RV16KubernetesConflictError(
+                    "V16 Kubernetes resourceVersion conflict"
+                )
             raise M03RV16SeadragonControllerError(
                 "V16 exact kubectl request failed: " + stderr.strip()[:2048]
             )
@@ -201,33 +218,6 @@ class M03RV16ZeroGpuJobAuthority:
     controller_receipt_sha256: str
 
 
-@dataclass(frozen=True, slots=True)
-class _M03RV16CliExactJobAuthority:
-    phase: str
-    job_name: str
-    job_uid: str
-    completions: int
-
-    def validate(self) -> None:
-        expected = {
-            "static": 1,
-            "storage": 1,
-            "capacity": 1,
-            "training": 3,
-            "qualification-preflight": 3,
-            "qualification": 3,
-        }
-        if (
-            self.phase not in expected
-            or self.completions != expected[self.phase]
-            or not self.job_name
-            or not self.job_uid
-        ):
-            raise M03RV16SeadragonControllerError(
-                "V16 exact CLI Job identity is malformed"
-            )
-
-
 def _write_create_only_json(path: Path, value: Mapping[str, Any]) -> str:
     raw = canonical_json_file_bytes(value)
     path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
@@ -241,6 +231,61 @@ def _write_create_only_json(path: Path, value: Mapping[str, Any]) -> str:
         path.unlink(missing_ok=True)
         raise
     return hashlib.sha256(raw).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise M03RV16SeadragonControllerError(
+            "V16 controller artifact is unavailable"
+        ) from exc
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            raise M03RV16SeadragonControllerError(
+                "V16 controller artifact is not regular"
+            )
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise M03RV16SeadragonControllerError(
+            "V16 controller artifact changed while hashed"
+        )
+    return digest.hexdigest()
+
+
+def _write_or_validate_json(path: Path, value: Mapping[str, Any]) -> str:
+    """Publish once or validate the exact prior state after controller restart."""
+
+    raw = canonical_json_file_bytes(value)
+    expected = hashlib.sha256(raw).hexdigest()
+    try:
+        return _write_create_only_json(path, value)
+    except FileExistsError:
+        observed = _read_exact_json(path, expected)
+        if canonical_json_file_bytes(observed) != raw:
+            raise M03RV16SeadragonControllerError(
+                "V16 durable controller state conflicts with the requested transition"
+            )
+        return expected
 
 
 def _read_exact_json(path: Path, expected_file_sha256: str) -> dict[str, Any]:
@@ -283,6 +328,17 @@ def _read_exact_json(path: Path, expected_file_sha256: str) -> dict[str, Any]:
             "V16 controller file is not canonical"
         )
     return value
+
+
+def _read_self_receipted_json(path: Path) -> tuple[dict[str, Any], str]:
+    file_sha256 = _file_sha256(path)
+    value = _read_exact_json(path, file_sha256)
+    unsigned = {key: row for key, row in value.items() if key != "receipt_sha256"}
+    if value.get("receipt_sha256") != semantic_sha256(unsigned):
+        raise M03RV16SeadragonControllerError(
+            "V16 durable controller receipt drifted"
+        )
+    return value, file_sha256
 
 
 def write_m03r_v16_controller_job_plan(
@@ -464,7 +520,7 @@ def admit_m03r_v16_suspended_job(
         M03R_V16_POD_AUTHORITY_OBSERVER_ROOT
     ),
 ) -> M03RV16ControllerAdmission:
-    """Dry-run, create, bind, and seal one still-suspended exact Job."""
+    """Converge one exact Job through dry-run, admission, and launch binding."""
 
     rendered.validate()
     if rendered.mode in {"static", "storage"}:
@@ -480,69 +536,132 @@ def admit_m03r_v16_suspended_job(
         raise M03RV16SeadragonControllerError(
             "V16 controller run identity differs from the rendered Job"
         )
-    dry_observed = transport.invoke(
-        ("create", "--dry-run=server", "--file", "-", "--output", "json"),
-        payload=rendered.manifest,
-    )
-    if dry_observed is None:
-        raise M03RV16SeadragonControllerError("V16 server dry-run vanished")
-    _validate_exact_job(
-        dry_observed,
-        rendered,
-        expected_uid=None,
-        expected_suspended=True,
-        require_admitted_identity=False,
-    )
-    dry_unsigned: dict[str, Any] = {
-        "schema": M03R_V16_DRY_RUN_RESULT_SCHEMA,
-        "package_plan_sha256": package.package_plan_sha256,
-        "phase": rendered.mode,
-        "job_contract_sha256": rendered.job_contract_sha256,
-        "pod_contract_sha256": rendered.pod_contract_sha256,
-        "server_response_sha256": semantic_sha256(dry_observed),
-        "passed": True,
-    }
-    dry_value = {
-        **dry_unsigned,
-        "receipt_sha256": semantic_sha256(dry_unsigned),
-    }
     dry_path = root / f"{rendered.mode}-dry-run.json"
-    dry_file_sha = _write_create_only_json(dry_path, dry_value)
-
-    admitted = _create_or_reconcile_suspended_job(transport, rendered)
-    job_uid, job_resource_version = _validate_exact_job(
-        admitted,
-        rendered,
-        expected_uid=None,
-        expected_suspended=True,
-    )
-    if _list_exact_job_pods(transport, job_name=job_name):
-        raise M03RV16SeadragonControllerError(
-            "V16 suspended Job created Pods before launch authority"
-        )
-    admitted_unsigned: dict[str, Any] = {
-        "schema": M03R_V16_ADMITTED_MANIFEST_SCHEMA,
-        "package_plan_sha256": package.package_plan_sha256,
-        "phase": rendered.mode,
-        "job_contract_sha256": rendered.job_contract_sha256,
-        "pod_contract_sha256": rendered.pod_contract_sha256,
-        "job_uid": job_uid,
-        "job_name": job_name,
-        "job_resource_version": job_resource_version,
-        "image_reference": package.artifacts.image_reference,
-        "image_digest_sha256": package.artifacts.image_digest_sha256,
-        "observed_manifest_sha256": semantic_sha256(admitted),
-        "pod_uids": [],
-        "container_image_ids": [],
-        "node_names": [],
-        "suspended_at_admission": True,
-    }
-    admitted_value = {
-        **admitted_unsigned,
-        "receipt_sha256": semantic_sha256(admitted_unsigned),
-    }
     admitted_path = root / f"{rendered.mode}-admitted-manifest.json"
-    admitted_file_sha = _write_create_only_json(admitted_path, admitted_value)
+    admission_path = root / f"{rendered.mode}-admission.json"
+    launch_path = root / f"{rendered.mode}-launch.json"
+    controller_receipt_path = root / f"{rendered.mode}-controller-admission.json"
+
+    if dry_path.exists():
+        dry_value, dry_file_sha = _read_self_receipted_json(dry_path)
+        if (
+            dry_value.get("schema") != M03R_V16_DRY_RUN_RESULT_SCHEMA
+            or dry_value.get("package_plan_sha256") != package.package_plan_sha256
+            or dry_value.get("phase") != rendered.mode
+            or dry_value.get("job_contract_sha256")
+            != rendered.job_contract_sha256
+            or dry_value.get("pod_contract_sha256")
+            != rendered.pod_contract_sha256
+            or dry_value.get("passed") is not True
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 prior server dry-run state drifted"
+            )
+    else:
+        dry_observed = transport.invoke(
+            ("create", "--dry-run=server", "--file", "-", "--output", "json"),
+            payload=rendered.manifest,
+        )
+        if dry_observed is None:
+            raise M03RV16SeadragonControllerError("V16 server dry-run vanished")
+        _validate_exact_job(
+            dry_observed,
+            rendered,
+            expected_uid=None,
+            expected_suspended=True,
+            require_admitted_identity=False,
+        )
+        dry_unsigned: dict[str, Any] = {
+            "schema": M03R_V16_DRY_RUN_RESULT_SCHEMA,
+            "package_plan_sha256": package.package_plan_sha256,
+            "phase": rendered.mode,
+            "job_contract_sha256": rendered.job_contract_sha256,
+            "pod_contract_sha256": rendered.pod_contract_sha256,
+            "server_response_sha256": semantic_sha256(dry_observed),
+            "passed": True,
+        }
+        dry_value = {
+            **dry_unsigned,
+            "receipt_sha256": semantic_sha256(dry_unsigned),
+        }
+        dry_file_sha = _write_or_validate_json(dry_path, dry_value)
+
+    if admitted_path.exists():
+        admitted_value, admitted_file_sha = _read_self_receipted_json(
+            admitted_path
+        )
+        job_uid = _text("admitted Job UID", admitted_value.get("job_uid"))
+        current = transport.invoke(
+            ("get", "job", job_name, "--output", "json"),
+            allow_not_found=True,
+        )
+        if current is None:
+            raise M03RV16SeadragonControllerError(
+                "V16 previously admitted Job is absent"
+            )
+        current_spec = current.get("spec")
+        is_suspended = (
+            isinstance(current_spec, dict)
+            and current_spec.get("suspend") is True
+        )
+        _, job_resource_version = _validate_exact_job(
+            current,
+            rendered,
+            expected_uid=job_uid,
+            expected_suspended=is_suspended,
+        )
+    else:
+        admitted = _create_or_reconcile_suspended_job(transport, rendered)
+        job_uid, job_resource_version = _validate_exact_job(
+            admitted,
+            rendered,
+            expected_uid=None,
+            expected_suspended=True,
+        )
+        if _list_exact_job_pods(transport, job_name=job_name):
+            raise M03RV16SeadragonControllerError(
+                "V16 suspended Job created Pods before launch authority"
+            )
+        admitted_unsigned: dict[str, Any] = {
+            "schema": M03R_V16_ADMITTED_MANIFEST_SCHEMA,
+            "package_plan_sha256": package.package_plan_sha256,
+            "phase": rendered.mode,
+            "job_contract_sha256": rendered.job_contract_sha256,
+            "pod_contract_sha256": rendered.pod_contract_sha256,
+            "job_uid": job_uid,
+            "job_name": job_name,
+            "job_resource_version": job_resource_version,
+            "image_reference": package.artifacts.image_reference,
+            "image_digest_sha256": package.artifacts.image_digest_sha256,
+            "observed_manifest_sha256": semantic_sha256(admitted),
+            "pod_uids": [],
+            "container_image_ids": [],
+            "node_names": [],
+            "suspended_at_admission": True,
+        }
+        admitted_value = {
+            **admitted_unsigned,
+            "receipt_sha256": semantic_sha256(admitted_unsigned),
+        }
+        admitted_file_sha = _write_or_validate_json(
+            admitted_path, admitted_value
+        )
+
+    if (
+        admitted_value.get("schema") != M03R_V16_ADMITTED_MANIFEST_SCHEMA
+        or admitted_value.get("package_plan_sha256") != package.package_plan_sha256
+        or admitted_value.get("phase") != rendered.mode
+        or admitted_value.get("job_contract_sha256")
+        != rendered.job_contract_sha256
+        or admitted_value.get("pod_contract_sha256")
+        != rendered.pod_contract_sha256
+        or admitted_value.get("job_uid") != job_uid
+        or admitted_value.get("job_name") != job_name
+        or admitted_value.get("suspended_at_admission") is not True
+    ):
+        raise M03RV16SeadragonControllerError(
+            "V16 prior admitted-manifest state drifted"
+        )
     admission = _issue_m03r_v16_admitted_job_authority(
         package=package,
         authorization=authorization,
@@ -557,10 +676,29 @@ def admit_m03r_v16_suspended_job(
         admitted_manifest_sha256=admitted_value["receipt_sha256"],
         job_uid=job_uid,
     )
-    admission_path = root / f"{rendered.mode}-admission.json"
-    admission_file_sha = write_m03r_v16_admitted_job_authority(
-        admission_path, admission
-    )
+    expected_admission_file_sha = admitted_job_authority_file_sha256(admission)
+    if admission_path.exists():
+        admission_file_sha = _file_sha256(admission_path)
+        if admission_file_sha != expected_admission_file_sha:
+            raise M03RV16SeadragonControllerError(
+                "V16 prior admission authority differs"
+            )
+        admission = load_m03r_v16_admitted_job_authority(
+            admission_path,
+            expected_file_sha256=admission_file_sha,
+            expected_receipt_sha256=admission.receipt_sha256,
+            package=package,
+            authorization=authorization,
+            expected_phase=rendered.mode,
+            expected_job_contract_sha256=rendered.job_contract_sha256,
+            expected_pod_contract_sha256=rendered.pod_contract_sha256,
+            server_side_dry_run_path=dry_path,
+            admitted_manifest_path=admitted_path,
+        )
+    else:
+        admission_file_sha = write_m03r_v16_admitted_job_authority(
+            admission_path, admission
+        )
     bound = bind_m03r_v16_admitted_launch_authority(
         rendered=rendered,
         package=package,
@@ -573,8 +711,37 @@ def admit_m03r_v16_suspended_job(
         authority_root=storage_authority_identity_root,
         observer_root=storage_observer_identity_root,
     )
-    launch_path = root / f"{rendered.mode}-launch.json"
-    write_m03r_v16_rendered_launch_authority(launch_path, bound)
+    launch = bound.launch_authority
+    if launch is None or bound.launch_authority_file_sha256 is None:
+        raise M03RV16SeadragonControllerError(
+            "V16 bound launch authority is absent"
+        )
+    expected_launch_file_sha = phase_launch_authority_file_sha256(launch)
+    if launch_path.exists():
+        launch_file_sha = _file_sha256(launch_path)
+        if launch_file_sha != expected_launch_file_sha:
+            raise M03RV16SeadragonControllerError(
+                "V16 prior launch authority differs"
+            )
+        load_m03r_v16_phase_launch_authority(
+            launch_path,
+            expected_file_sha256=launch_file_sha,
+            expected_receipt_sha256=launch.receipt_sha256,
+            package=package,
+            authorization=authorization,
+            expected_phase=rendered.mode,
+            expected_prerequisite_receipt_sha256=(
+                launch.prerequisite_authority_receipt_sha256
+            ),
+            expected_job_contract_sha256=rendered.job_contract_sha256,
+            expected_pod_contract_sha256=rendered.pod_contract_sha256,
+            admission=admission,
+            expected_admission_file_sha256=admission_file_sha,
+        )
+    else:
+        launch_file_sha = write_m03r_v16_rendered_launch_authority(
+            launch_path, bound
+        )
     bound_annotations = _metadata(bound.manifest).get("annotations", {})
     bound_pod_annotations = (
         bound.manifest.get("spec", {})
@@ -582,36 +749,103 @@ def admit_m03r_v16_suspended_job(
         .get("metadata", {})
         .get("annotations", {})
     )
-    patched = transport.invoke(
-        (
-            "patch",
-            "job",
-            job_name,
-            "--type",
-            "merge",
-            "--patch-file",
-            "-",
-            "--output",
-            "json",
-        ),
-        payload={
-            "metadata": {
-                "resourceVersion": job_resource_version,
-                "annotations": bound_annotations,
-            },
-            "spec": {
-                "suspend": True,
-                "template": {"metadata": {"annotations": bound_pod_annotations}},
-            },
-        },
-    )
+    patched: dict[str, Any] | None = None
+    for _attempt in range(5):
+        current = transport.invoke(("get", "job", job_name, "--output", "json"))
+        if current is None:
+            raise M03RV16SeadragonControllerError("V16 bound Job vanished")
+        current_spec = current.get("spec")
+        suspended = isinstance(current_spec, dict) and current_spec.get("suspend") is True
+        _, current_resource_version = _validate_exact_job(
+            current,
+            rendered,
+            expected_uid=job_uid,
+            expected_suspended=suspended,
+        )
+        current_annotations = _metadata(current).get("annotations", {})
+        current_pod_annotations = (
+            current.get("spec", {})
+            .get("template", {})
+            .get("metadata", {})
+            .get("annotations", {})
+        )
+        if all(
+            current_annotations.get(key) == value
+            for key, value in bound_annotations.items()
+        ) and all(
+            current_pod_annotations.get(key) == value
+            for key, value in bound_pod_annotations.items()
+        ):
+            patched = current
+            break
+        if not suspended:
+            raise M03RV16SeadragonControllerError(
+                "V16 resumed Job lacks frozen launch annotations"
+            )
+        try:
+            patched = transport.invoke(
+                (
+                    "patch", "job", job_name, "--type", "merge",
+                    "--patch-file", "-", "--output", "json",
+                ),
+                payload={
+                    "metadata": {
+                        "resourceVersion": current_resource_version,
+                        "annotations": bound_annotations,
+                    },
+                    "spec": {
+                        "suspend": True,
+                        "template": {
+                            "metadata": {"annotations": bound_pod_annotations}
+                        },
+                    },
+                },
+            )
+            break
+        except M03RV16KubernetesConflictError:
+            continue
+        except M03RV16SeadragonControllerError:
+            # Reconcile a response that may have been lost after the API
+            # accepted the exact patch.  Any uncommitted mutation still fails.
+            observed = transport.invoke(
+                ("get", "job", job_name, "--output", "json"),
+                allow_not_found=True,
+            )
+            if observed is None or _metadata(observed).get("uid") != job_uid:
+                raise
+            observed_annotations = _metadata(observed).get("annotations", {})
+            observed_pod_annotations = (
+                observed.get("spec", {})
+                .get("template", {})
+                .get("metadata", {})
+                .get("annotations", {})
+            )
+            if not (
+                all(
+                    observed_annotations.get(key) == value
+                    for key, value in bound_annotations.items()
+                )
+                and all(
+                    observed_pod_annotations.get(key) == value
+                    for key, value in bound_pod_annotations.items()
+                )
+            ):
+                raise
+            patched = observed
+            break
     if patched is None:
-        raise M03RV16SeadragonControllerError("V16 bound Job patch vanished")
+        raise M03RV16SeadragonControllerError(
+            "V16 launch annotation patch did not converge"
+        )
+    patched_spec = patched.get("spec")
+    patched_suspended = (
+        isinstance(patched_spec, dict) and patched_spec.get("suspend") is True
+    )
     _, patched_resource_version = _validate_exact_job(
         patched,
         rendered,
         expected_uid=job_uid,
-        expected_suspended=True,
+        expected_suspended=patched_suspended,
     )
     patched_metadata_annotations = _metadata(patched).get("annotations", {})
     patched_pod_annotations = (
@@ -630,28 +864,38 @@ def admit_m03r_v16_suspended_job(
         raise M03RV16SeadragonControllerError(
             "V16 launch annotations were not admitted while suspended"
         )
-    if _list_exact_job_pods(transport, job_name=job_name):
+    if patched_suspended and _list_exact_job_pods(transport, job_name=job_name):
         raise M03RV16SeadragonControllerError(
             "V16 launch-bound Job created Pods while suspended"
         )
     controller_unsigned: dict[str, Any] = {
         "schema": M03R_V16_CONTROLLER_ADMISSION_SCHEMA,
+        "package_plan_sha256": package.package_plan_sha256,
+        "execution_authorization_receipt_sha256": authorization.receipt_sha256,
         "phase": rendered.mode,
         "run_id": run_id,
         "job_name": job_name,
         "job_uid": job_uid,
+        "job_contract_sha256": rendered.job_contract_sha256,
+        "pod_contract_sha256": rendered.pod_contract_sha256,
+        "source_tree_root_sha256": source_tree_root_sha256,
         "prelaunch_job_resource_version": patched_resource_version,
         "server_side_dry_run_file_sha256": dry_file_sha,
         "admitted_manifest_file_sha256": admitted_file_sha,
         "admission_authority_file_sha256": admission_file_sha,
         "admission_authority_receipt_sha256": admission.receipt_sha256,
-        "launch_authority_file_sha256": bound.launch_authority_file_sha256,
+        "launch_authority_file_sha256": launch_file_sha,
         "launch_authority_receipt_sha256": (
             None
             if bound.launch_authority is None
             else bound.launch_authority.receipt_sha256
         ),
         "storage_semantics_receipt_sha256": storage_evidence.receipt_sha256,
+        "scheduling_policy": M03R_V16_SCHEDULING_POLICY,
+        "gang_scheduling_required": False,
+        "minimum_schedulable_h100s": (
+            2 if rendered.mode in {"capacity", "training", "qualification"} else 0
+        ),
         "suspended": True,
         "pod_inventory_empty": True,
     }
@@ -659,8 +903,26 @@ def admit_m03r_v16_suspended_job(
         **controller_unsigned,
         "receipt_sha256": semantic_sha256(controller_unsigned),
     }
-    controller_receipt_path = root / f"{rendered.mode}-controller-admission.json"
-    _write_create_only_json(controller_receipt_path, controller_value)
+    if controller_receipt_path.exists():
+        prior, _ = _read_self_receipted_json(controller_receipt_path)
+        stable_keys = (
+            "schema", "package_plan_sha256",
+            "execution_authorization_receipt_sha256", "phase", "run_id",
+            "job_name", "job_uid", "job_contract_sha256",
+            "pod_contract_sha256", "source_tree_root_sha256",
+            "server_side_dry_run_file_sha256", "admitted_manifest_file_sha256",
+            "admission_authority_file_sha256", "admission_authority_receipt_sha256",
+            "launch_authority_file_sha256", "launch_authority_receipt_sha256",
+            "storage_semantics_receipt_sha256",
+            "scheduling_policy", "gang_scheduling_required",
+            "minimum_schedulable_h100s",
+        )
+        if any(prior.get(key) != controller_value.get(key) for key in stable_keys):
+            raise M03RV16SeadragonControllerError(
+                "V16 recovered controller admission differs"
+            )
+    else:
+        _write_or_validate_json(controller_receipt_path, controller_value)
     return M03RV16ControllerAdmission(
         rendered=bound,
         admission=admission,
@@ -670,6 +932,130 @@ def admit_m03r_v16_suspended_job(
         launch_path=launch_path,
         controller_receipt_path=controller_receipt_path,
         prelaunch_job_resource_version=patched_resource_version,
+    )
+
+
+def load_m03r_v16_controller_admission(
+    path: str | Path,
+    *,
+    expected_file_sha256: str,
+    rendered: M03RV16RenderedSuspendedJob,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+    storage_evidence: M03RV16StorageSemanticsEvidence,
+    storage_evidence_file_sha256: str,
+    storage_authority_identity_root: str | Path = M03R_V16_POD_AUTHORITY_ROOT,
+    storage_observer_identity_root: str | Path = (
+        M03R_V16_POD_AUTHORITY_OBSERVER_ROOT
+    ),
+) -> M03RV16ControllerAdmission:
+    """Reconstruct one controller transaction without mutating Kubernetes."""
+
+    controller_path = Path(path)
+    value = _read_exact_json(controller_path, expected_file_sha256)
+    unsigned = {key: row for key, row in value.items() if key != "receipt_sha256"}
+    root = controller_path.parent
+    phase = rendered.mode
+    dry_path = root / f"{phase}-dry-run.json"
+    admitted_path = root / f"{phase}-admitted-manifest.json"
+    admission_path = root / f"{phase}-admission.json"
+    launch_path = root / f"{phase}-launch.json"
+    if (
+        value.get("schema") != M03R_V16_CONTROLLER_ADMISSION_SCHEMA
+        or value.get("receipt_sha256") != semantic_sha256(unsigned)
+        or value.get("package_plan_sha256") != package.package_plan_sha256
+        or value.get("execution_authorization_receipt_sha256")
+        != authorization.receipt_sha256
+        or value.get("phase") != phase
+        or value.get("job_name") != _job_name(rendered)
+        or value.get("job_contract_sha256") != rendered.job_contract_sha256
+        or value.get("pod_contract_sha256") != rendered.pod_contract_sha256
+        or value.get("storage_semantics_receipt_sha256")
+        != storage_evidence.receipt_sha256
+        or value.get("scheduling_policy") != M03R_V16_SCHEDULING_POLICY
+        or value.get("gang_scheduling_required") is not False
+        or value.get("minimum_schedulable_h100s")
+        != (2 if phase in {"capacity", "training", "qualification"} else 0)
+    ):
+        raise M03RV16SeadragonControllerError(
+            "V16 controller admission receipt drifted"
+        )
+    admission = load_m03r_v16_admitted_job_authority(
+        admission_path,
+        expected_file_sha256=_text(
+            "admission authority file SHA",
+            value.get("admission_authority_file_sha256"),
+        ),
+        expected_receipt_sha256=_text(
+            "admission authority receipt",
+            value.get("admission_authority_receipt_sha256"),
+        ),
+        package=package,
+        authorization=authorization,
+        expected_phase=phase,
+        expected_job_contract_sha256=rendered.job_contract_sha256,
+        expected_pod_contract_sha256=rendered.pod_contract_sha256,
+        server_side_dry_run_path=dry_path,
+        admitted_manifest_path=admitted_path,
+    )
+    bound = bind_m03r_v16_admitted_launch_authority(
+        rendered=rendered,
+        package=package,
+        authorization=authorization,
+        admission=admission,
+        admission_file_sha256=_text(
+            "admission authority file SHA",
+            value.get("admission_authority_file_sha256"),
+        ),
+        source_tree_root_sha256=_text(
+            "source-tree root", value.get("source_tree_root_sha256")
+        ),
+        storage_evidence=storage_evidence,
+        storage_evidence_file_sha256=storage_evidence_file_sha256,
+        authority_root=storage_authority_identity_root,
+        observer_root=storage_observer_identity_root,
+    )
+    launch = bound.launch_authority
+    if launch is None:
+        raise M03RV16SeadragonControllerError(
+            "V16 recovered launch authority is absent"
+        )
+    load_m03r_v16_phase_launch_authority(
+        launch_path,
+        expected_file_sha256=_text(
+            "launch authority file SHA",
+            value.get("launch_authority_file_sha256"),
+        ),
+        expected_receipt_sha256=_text(
+            "launch authority receipt",
+            value.get("launch_authority_receipt_sha256"),
+        ),
+        package=package,
+        authorization=authorization,
+        expected_phase=phase,
+        expected_prerequisite_receipt_sha256=(
+            launch.prerequisite_authority_receipt_sha256
+        ),
+        expected_job_contract_sha256=rendered.job_contract_sha256,
+        expected_pod_contract_sha256=rendered.pod_contract_sha256,
+        admission=admission,
+        expected_admission_file_sha256=_text(
+            "admission authority file SHA",
+            value.get("admission_authority_file_sha256"),
+        ),
+    )
+    return M03RV16ControllerAdmission(
+        rendered=bound,
+        admission=admission,
+        dry_run_path=dry_path,
+        admitted_manifest_path=admitted_path,
+        admission_path=admission_path,
+        launch_path=launch_path,
+        controller_receipt_path=controller_path,
+        prelaunch_job_resource_version=_text(
+            "prelaunch Job resourceVersion",
+            value.get("prelaunch_job_resource_version"),
+        ),
     )
 
 
@@ -687,6 +1073,42 @@ def launch_m03r_v16_zero_gpu_gate(
             "V16 zero-GPU launch received a scientific phase"
         )
     job_name = _job_name(rendered)
+    receipt_path = Path(authority_root) / (
+        f"{rendered.mode}-controller-admission.json"
+    )
+    if receipt_path.exists():
+        prior, _ = _read_self_receipted_json(receipt_path)
+        job_uid = _text("zero-GPU Job UID", prior.get("job_uid"))
+        current = transport.invoke(
+            ("get", "job", job_name, "--output", "json"),
+            allow_not_found=True,
+        )
+        if (
+            prior.get("schema") != M03R_V16_CONTROLLER_ADMISSION_SCHEMA
+            or prior.get("phase") != rendered.mode
+            or prior.get("job_name") != job_name
+            or prior.get("completions") != rendered.completions
+            or prior.get("zero_gpu") is not True
+            or current is None
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 prior zero-GPU controller state drifted"
+            )
+        _validate_exact_job(
+            current,
+            rendered,
+            expected_uid=job_uid,
+            expected_suspended=False,
+        )
+        return M03RV16ZeroGpuJobAuthority(
+            phase=rendered.mode,
+            job_name=job_name,
+            job_uid=job_uid,
+            completions=rendered.completions,
+            controller_receipt_sha256=_text(
+                "zero-GPU controller receipt", prior.get("receipt_sha256")
+            ),
+        )
     dry = transport.invoke(
         ("create", "--dry-run=server", "--file", "-", "--output", "json"),
         payload=rendered.manifest,
@@ -750,9 +1172,8 @@ def launch_m03r_v16_zero_gpu_gate(
         "zero_gpu": True,
     }
     receipt = semantic_sha256(unsigned)
-    _write_create_only_json(
-        Path(authority_root) / f"{rendered.mode}-controller-admission.json",
-        {**unsigned, "receipt_sha256": receipt},
+    _write_or_validate_json(
+        receipt_path, {**unsigned, "receipt_sha256": receipt}
     )
     return M03RV16ZeroGpuJobAuthority(
         phase=rendered.mode,
@@ -908,7 +1329,7 @@ def resume_and_attest_m03r_v16_job(
     timeout_seconds: float = 1800.0,
     poll_seconds: float = 2.0,
 ) -> M03RV16ControllerAttestations:
-    """Resume one exact Job and publish every completion's Pod attestation."""
+    """Resume one exact Job and release each observable completion immediately."""
 
     bound = controller_admission.rendered
     admission = controller_admission.admission
@@ -916,152 +1337,298 @@ def resume_and_attest_m03r_v16_job(
     if launch is None:
         raise M03RV16SeadragonControllerError("V16 launch authority is absent")
     job_name = admission.job_name
-    resumed = transport.invoke(
-        (
-            "patch",
-            "job",
-            job_name,
-            "--type",
-            "merge",
-            "--patch-file",
-            "-",
-            "--output",
-            "json",
-        ),
-        payload={
-            "metadata": {
-                "resourceVersion": (
-                    controller_admission.prelaunch_job_resource_version
+    for _attempt in range(5):
+        current_job = transport.invoke(
+            ("get", "job", job_name, "--output", "json")
+        )
+        if current_job is None:
+            raise M03RV16SeadragonControllerError("V16 Job resume target vanished")
+        current_spec = current_job.get("spec")
+        is_suspended = (
+            isinstance(current_spec, dict)
+            and current_spec.get("suspend") is True
+        )
+        _, current_resource_version = _validate_exact_job(
+            current_job,
+            bound,
+            expected_uid=admission.job_uid,
+            expected_suspended=is_suspended,
+        )
+        if not is_suspended:
+            break
+        try:
+            resumed = transport.invoke(
+                (
+                    "patch", "job", job_name, "--type", "merge",
+                    "--patch-file", "-", "--output", "json",
+                ),
+                payload={
+                    "metadata": {"resourceVersion": current_resource_version},
+                    "spec": {"suspend": False},
+                },
+            )
+        except M03RV16KubernetesConflictError:
+            continue
+        except M03RV16SeadragonControllerError:
+            # A lost response may follow a successful API mutation.  Reconcile
+            # the exact UID before deciding whether the resume failed.
+            observed = transport.invoke(
+                ("get", "job", job_name, "--output", "json"),
+                allow_not_found=True,
+            )
+            if observed is None:
+                raise
+            observed_spec = observed.get("spec")
+            if not (
+                isinstance(observed_spec, dict)
+                and observed_spec.get("suspend") is False
+            ):
+                raise
+            resumed = observed
+        if resumed is None:
+            raise M03RV16SeadragonControllerError("V16 Job resume vanished")
+        _validate_exact_job(
+            resumed,
+            bound,
+            expected_uid=admission.job_uid,
+            expected_suspended=False,
+        )
+        break
+    else:
+        raise M03RV16SeadragonControllerError(
+            "V16 Job resume resourceVersion conflicts did not converge"
+        )
+
+    receipt_path = (
+        Path(authority_root) / f"{bound.mode}-controller-attestations.json"
+    )
+    if receipt_path.exists():
+        prior, _ = _read_self_receipted_json(receipt_path)
+        if (
+            prior.get("schema") != M03R_V16_CONTROLLER_ATTESTATION_SCHEMA
+            or prior.get("phase") != bound.mode
+            or prior.get("job_uid") != admission.job_uid
+            or prior.get("job_name") != job_name
+            or prior.get("launch_authority_receipt_sha256")
+            != launch.receipt_sha256
+            or prior.get("storage_semantics_receipt_sha256")
+            != storage_evidence.receipt_sha256
+            or tuple(prior.get("completion_indices", ()))
+            != tuple(range(bound.completions))
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 prior controller attestation aggregate drifted"
+            )
+        pods_by_index: dict[int, tuple[dict[str, Any], M03RV16PodObservation]] = {}
+        for pod in _list_exact_job_pods(transport, job_name=job_name):
+            observation = _observe_pod(pod, admission=admission)
+            pods_by_index[observation.completion_index] = (pod, observation)
+        if tuple(sorted(pods_by_index)) != tuple(range(bound.completions)):
+            raise M03RV16SeadragonControllerError(
+                "V16 recovered controller lacks its exact Pod inventory"
+            )
+        file_rows = tuple(prior.get("attestation_file_sha256", ()))
+        receipt_rows = tuple(prior.get("attestation_receipt_sha256", ()))
+        transaction_rows = tuple(
+            prior.get("controller_transaction_receipt_sha256", ())
+        )
+        pod_uid_rows = tuple(prior.get("pod_uids", ()))
+        if not all(
+            len(rows) == bound.completions
+            for rows in (file_rows, receipt_rows, transaction_rows, pod_uid_rows)
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 recovered attestation inventory drifted"
+            )
+        recovered_rows: list[M03RV16PublishedPodAttestation] = []
+        for index in range(bound.completions):
+            pod, observation = pods_by_index[index]
+            relative_path = launch.pod_runtime_attestation_relative_path(index)
+            attestation = load_m03r_v16_pod_runtime_attestation(
+                Path(authority_root) / relative_path,
+                expected_file_sha256=_text(
+                    "Pod attestation file SHA", file_rows[index]
+                ),
+                expected_receipt_sha256=_text(
+                    "Pod attestation receipt", receipt_rows[index]
+                ),
+                package=package,
+                authorization=authorization,
+                admission=admission,
+                launch=launch,
+                expected_completion_index=index,
+                expected_output_root_sha256=_output_root_sha256(
+                    package,
+                    phase=bound.mode,
+                    completion_index=index,
+                ),
+                current_pod_uid=observation.pod_uid,
+                current_pod_name=observation.pod_name,
+                current_node_name=observation.node_name,
+                expected_relative_path=relative_path,
+            )
+            annotations = m03r_v16_pod_runtime_attestation_annotations(attestation)
+            observed_annotations = _metadata(pod).get("annotations", {})
+            if (
+                observation.pod_uid != pod_uid_rows[index]
+                or not isinstance(observed_annotations, dict)
+                or any(
+                    observed_annotations.get(key) != value
+                    for key, value in annotations.items()
                 )
-            },
-            "spec": {"suspend": False},
-        },
-    )
-    if resumed is None:
-        raise M03RV16SeadragonControllerError("V16 Job resume vanished")
-    _validate_exact_job(
-        resumed,
-        bound,
-        expected_uid=admission.job_uid,
-        expected_suspended=False,
-    )
+            ):
+                raise M03RV16SeadragonControllerError(
+                    "V16 recovered Pod attestation annotations drifted"
+                )
+            recovered_rows.append(
+                M03RV16PublishedPodAttestation(
+                    final_path=Path(authority_root) / relative_path,
+                    file_sha256=_text(
+                        "Pod attestation file SHA", file_rows[index]
+                    ),
+                    receipt_sha256=attestation.receipt_sha256,
+                    relative_path=relative_path,
+                    patched_annotations=annotations,
+                    controller_transaction_receipt_sha256=_text(
+                        "Pod attestation transaction receipt",
+                        transaction_rows[index],
+                    ),
+                )
+            )
+        return M03RV16ControllerAttestations(
+            rows=tuple(recovered_rows),
+            controller_receipt_path=receipt_path,
+        )
+
     deadline = time.monotonic() + timeout_seconds
-    observations: dict[int, M03RV16PodObservation] = {}
-    while len(observations) != bound.completions:
-        observations.clear()
+    published: dict[int, M03RV16PublishedPodAttestation] = {}
+    published_pod_uids: dict[int, str] = {}
+    conflicts: dict[int, int] = {}
+    while len(published) != bound.completions:
+        observed_this_poll: dict[int, M03RV16PodObservation] = {}
         for pod in _list_exact_job_pods(transport, job_name=job_name):
             try:
-                observed = _observe_pod(pod, admission=admission)
+                pod_observation = _observe_pod(pod, admission=admission)
             except M03RV16SeadragonControllerError:
                 continue
-            if observed.completion_index in observations:
+            index = pod_observation.completion_index
+            if index in observed_this_poll:
                 raise M03RV16SeadragonControllerError(
                     "V16 completion has multiple observable Pods"
                 )
-            observations[observed.completion_index] = observed
-        if len(observations) == bound.completions:
+            observed_this_poll[index] = pod_observation
+            if index in published:
+                if published_pod_uids[index] != pod_observation.pod_uid:
+                    raise M03RV16SeadragonControllerError(
+                        "V16 attested completion was replaced by another Pod"
+                    )
+                continue
+
+            def patch_annotations(
+                precondition: object,
+                values: Mapping[str, str],
+                *,
+                pod_name: str = pod_observation.pod_name,
+                expected_pod_uid: str = pod_observation.pod_uid,
+            ) -> None:
+                resource_version = getattr(
+                    precondition, "pod_resource_version", None
+                )
+                pod_uid = getattr(precondition, "pod_uid", None)
+                if pod_uid != expected_pod_uid:
+                    raise M03RV16SeadragonControllerError(
+                        "V16 Pod patch UID precondition drifted"
+                    )
+                patched = transport.invoke(
+                    (
+                        "patch", "pod", pod_name, "--type", "merge",
+                        "--patch-file", "-", "--output", "json",
+                    ),
+                    payload={
+                        "metadata": {
+                            "resourceVersion": resource_version,
+                            "annotations": dict(values),
+                        }
+                    },
+                )
+                if patched is None or _metadata(patched).get("uid") != pod_uid:
+                    raise M03RV16SeadragonControllerError(
+                        "V16 Pod changed across annotation patch"
+                    )
+
+            def read_annotations(
+                precondition: object,
+                *,
+                pod_name: str = pod_observation.pod_name,
+            ) -> M03RV16PodAnnotationReadback:
+                current = transport.invoke(
+                    ("get", "pod", pod_name, "--output", "json")
+                )
+                if current is None:
+                    raise M03RV16SeadragonControllerError("V16 Pod vanished")
+                metadata = _metadata(current)
+                expected_uid = getattr(precondition, "pod_uid", None)
+                if metadata.get("uid") != expected_uid:
+                    raise M03RV16SeadragonControllerError(
+                        "V16 Pod UID changed before annotation readback"
+                    )
+                annotations = metadata.get("annotations")
+                if not isinstance(annotations, dict):
+                    raise M03RV16SeadragonControllerError(
+                        "V16 Pod annotations vanished"
+                    )
+                return M03RV16PodAnnotationReadback(
+                    pod_uid=_text("Pod UID", metadata.get("uid")),
+                    pod_resource_version=_text(
+                        "Pod resourceVersion", metadata.get("resourceVersion")
+                    ),
+                    annotations={
+                        str(key): str(value) for key, value in annotations.items()
+                    },
+                )
+
+            try:
+                row = publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
+                    package=package,
+                    authorization=authorization,
+                    admission=admission,
+                    launch=launch,
+                    observation=pod_observation,
+                    output_root_sha256=_output_root_sha256(
+                        package,
+                        phase=bound.mode,
+                        completion_index=index,
+                    ),
+                    authority_root=authority_root,
+                    observer_root=storage_observer_identity_root,
+                    storage_evidence=storage_evidence,
+                    storage_authority_identity_root=(
+                        storage_authority_identity_root
+                    ),
+                    storage_observer_identity_root=(
+                        storage_observer_identity_root
+                    ),
+                    patch_annotations=patch_annotations,
+                    read_annotations=read_annotations,
+                )
+            except M03RV16KubernetesConflictError:
+                conflicts[index] = conflicts.get(index, 0) + 1
+                if conflicts[index] >= 5:
+                    raise M03RV16SeadragonControllerError(
+                        "V16 Pod annotation conflicts did not converge"
+                    )
+                continue
+            published[index] = row
+            published_pod_uids[index] = pod_observation.pod_uid
+
+        if len(published) == bound.completions:
             break
         if time.monotonic() >= deadline:
             raise M03RV16SeadragonControllerError(
                 "V16 exact Pod inventory did not become attestable"
             )
         time.sleep(poll_seconds)
-
-    published_rows: list[M03RV16PublishedPodAttestation] = []
-    for index in range(bound.completions):
-        observation = observations[index]
-
-        def patch_annotations(
-            precondition: object,
-            values: Mapping[str, str],
-            *,
-            pod_name: str = observation.pod_name,
-            expected_pod_uid: str = observation.pod_uid,
-        ) -> None:
-            resource_version = getattr(precondition, "pod_resource_version", None)
-            pod_uid = getattr(precondition, "pod_uid", None)
-            if pod_uid != expected_pod_uid:
-                raise M03RV16SeadragonControllerError(
-                    "V16 Pod patch UID precondition drifted"
-                )
-            patched = transport.invoke(
-                (
-                    "patch",
-                    "pod",
-                    pod_name,
-                    "--type",
-                    "merge",
-                    "--patch-file",
-                    "-",
-                    "--output",
-                    "json",
-                ),
-                payload={
-                    "metadata": {
-                        "resourceVersion": resource_version,
-                        "annotations": dict(values),
-                    }
-                },
-            )
-            if patched is None or _metadata(patched).get("uid") != pod_uid:
-                raise M03RV16SeadragonControllerError(
-                    "V16 Pod changed across annotation patch"
-                )
-
-        def read_annotations(
-            precondition: object,
-            *,
-            pod_name: str = observation.pod_name,
-        ) -> M03RV16PodAnnotationReadback:
-            current = transport.invoke(
-                ("get", "pod", pod_name, "--output", "json")
-            )
-            if current is None:
-                raise M03RV16SeadragonControllerError("V16 Pod vanished")
-            metadata = _metadata(current)
-            expected_uid = getattr(precondition, "pod_uid", None)
-            if metadata.get("uid") != expected_uid:
-                raise M03RV16SeadragonControllerError(
-                    "V16 Pod UID changed before annotation readback"
-                )
-            annotations = metadata.get("annotations")
-            if not isinstance(annotations, dict):
-                raise M03RV16SeadragonControllerError(
-                    "V16 Pod annotations vanished"
-                )
-            return M03RV16PodAnnotationReadback(
-                pod_uid=_text("Pod UID", metadata.get("uid")),
-                pod_resource_version=_text(
-                    "Pod resourceVersion", metadata.get("resourceVersion")
-                ),
-                annotations={str(key): str(value) for key, value in annotations.items()},
-            )
-
-        published_rows.append(
-            publish_m03r_v16_pod_runtime_attestation_after_annotation_patch(
-                package=package,
-                authorization=authorization,
-                admission=admission,
-                launch=launch,
-                observation=observation,
-                output_root_sha256=_output_root_sha256(
-                    package,
-                    phase=bound.mode,
-                    completion_index=index,
-                ),
-                authority_root=authority_root,
-                observer_root=storage_observer_identity_root,
-                storage_evidence=storage_evidence,
-                storage_authority_identity_root=(
-                    storage_authority_identity_root
-                ),
-                storage_observer_identity_root=(
-                    storage_observer_identity_root
-                ),
-                patch_annotations=patch_annotations,
-                read_annotations=read_annotations,
-            )
-        )
+    published_rows = tuple(published[index] for index in range(bound.completions))
     unsigned: dict[str, Any] = {
         "schema": M03R_V16_CONTROLLER_ATTESTATION_SCHEMA,
         "phase": bound.mode,
@@ -1069,8 +1636,11 @@ def resume_and_attest_m03r_v16_job(
         "job_name": job_name,
         "launch_authority_receipt_sha256": launch.receipt_sha256,
         "storage_semantics_receipt_sha256": storage_evidence.receipt_sha256,
+        "scheduling_policy": M03R_V16_SCHEDULING_POLICY,
+        "attestation_release_mode": "as-each-completion-becomes-observable",
+        "gang_scheduling_required": False,
         "completion_indices": list(range(bound.completions)),
-        "pod_uids": [observations[index].pod_uid for index in range(bound.completions)],
+        "pod_uids": [published_pod_uids[index] for index in range(bound.completions)],
         "attestation_file_sha256": [row.file_sha256 for row in published_rows],
         "attestation_receipt_sha256": [
             row.receipt_sha256 for row in published_rows
@@ -1080,12 +1650,9 @@ def resume_and_attest_m03r_v16_job(
         ],
     }
     value = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
-    receipt_path = (
-        Path(authority_root) / f"{bound.mode}-controller-attestations.json"
-    )
-    _write_create_only_json(receipt_path, value)
+    _write_or_validate_json(receipt_path, value)
     return M03RV16ControllerAttestations(
-        rows=tuple(published_rows),
+        rows=published_rows,
         controller_receipt_path=receipt_path,
     )
 
@@ -1199,6 +1766,42 @@ def wait_for_m03r_v16_exact_job_terminal(
 ) -> dict[str, Any]:
     """Wait for one exact Job and publish its compact terminal snapshot."""
 
+    path = Path(authority_root) / f"{admission.phase}-controller-terminal.json"
+    if path.exists():
+        prior, _ = _read_self_receipted_json(path)
+        prior_snapshot = prior.get("snapshot")
+        if (
+            prior.get("schema") != M03R_V16_CONTROLLER_TERMINAL_SCHEMA
+            or prior.get("phase") != admission.phase
+            or prior.get("job_uid") != admission.job_uid
+            or prior.get("job_name") != admission.job_name
+            or prior.get("package_plan_sha256") != package.package_plan_sha256
+            or prior.get("outcome") not in {"complete", "failed"}
+            or prior.get("scheduling_policy") != M03R_V16_SCHEDULING_POLICY
+            or prior.get("gang_scheduling_required") is not False
+            or not isinstance(prior_snapshot, dict)
+        ):
+            raise M03RV16SeadragonControllerError(
+                "V16 prior controller terminal drifted"
+            )
+        if prior.get("outcome") == "complete":
+            prior_pods = prior_snapshot.get("pods")
+            if (
+                prior_snapshot.get("succeeded") != admission.completions
+                or prior_snapshot.get("failed") != 0
+                or not isinstance(prior_pods, list)
+                or len(prior_pods) != admission.completions
+                or any(
+                    not isinstance(row, dict)
+                    or row.get("main_container_image_digest")
+                    != package.artifacts.image_digest_sha256
+                    for row in prior_pods
+                )
+            ):
+                raise M03RV16SeadragonControllerError(
+                    "V16 prior completed controller terminal drifted"
+                )
+        return prior
     deadline = time.monotonic() + timeout_seconds
     while True:
         snapshot = snapshot_m03r_v16_exact_job(
@@ -1232,93 +1835,181 @@ def wait_for_m03r_v16_exact_job_terminal(
     unsigned: dict[str, Any] = {
         "schema": M03R_V16_CONTROLLER_TERMINAL_SCHEMA,
         "phase": admission.phase,
+        "package_plan_sha256": package.package_plan_sha256,
+        "admitted_job_authority_receipt_sha256": getattr(
+            admission, "receipt_sha256", None
+        ),
         "job_uid": admission.job_uid,
         "job_name": admission.job_name,
         "outcome": outcome,
+        "scheduling_policy": M03R_V16_SCHEDULING_POLICY,
+        "gang_scheduling_required": False,
         "snapshot": snapshot,
     }
     value = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
-    path = Path(authority_root) / f"{admission.phase}-controller-terminal.json"
-    _write_create_only_json(path, value)
+    _write_or_validate_json(path, value)
     return value
+
+
+def _uid_owned_pods(
+    transport: M03RV16KubernetesTransport,
+    *,
+    job_name: str,
+    job_uid: str,
+) -> tuple[dict[str, Any], ...]:
+    rows: list[dict[str, Any]] = []
+    for pod in _list_exact_job_pods(transport, job_name=job_name):
+        owners = _metadata(pod).get("ownerReferences", ())
+        if any(
+            isinstance(owner, dict)
+            and owner.get("uid") == job_uid
+            and owner.get("controller") is True
+            for owner in owners
+        ):
+            rows.append(pod)
+    return tuple(rows)
 
 
 def cleanup_m03r_v16_exact_job(
     *,
     transport: M03RV16KubernetesTransport,
-    admission: M03RV16ExactJobAuthority,
+    controller_admission: M03RV16ControllerAdmission,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
     authority_root: str | Path,
     cleanup_authorized: bool,
+    timeout_seconds: float = 900.0,
+    poll_seconds: float = 2.0,
 ) -> dict[str, Any]:
-    """Delete one exact Job using UID/resourceVersion preconditions."""
+    """Delete one authority-bound Job and await foreground garbage collection."""
 
     if not cleanup_authorized:
         raise M03RV16SeadragonControllerError(
             "V16 exact cleanup lacks explicit authorization"
         )
+    package.validate()
+    authorization.validate(package)
+    admission = controller_admission.admission
+    bound = controller_admission.rendered
+    admission.validate_for(
+        package,
+        authorization,
+        expected_phase=bound.mode,
+        expected_job_contract_sha256=bound.job_contract_sha256,
+        expected_pod_contract_sha256=bound.pod_contract_sha256,
+    )
+    if timeout_seconds <= 0 or poll_seconds <= 0:
+        raise M03RV16SeadragonControllerError(
+            "V16 cleanup wait intervals must be positive"
+        )
     current = transport.invoke(
         ("get", "job", admission.job_name, "--output", "json"),
         allow_not_found=True,
     )
-    if current is None:
-        raise M03RV16SeadragonControllerError(
-            "V16 cleanup target is already absent"
+    resource_version: str | None = None
+    delete_submitted = False
+    target_already_absent = current is None
+    if current is not None:
+        metadata = _metadata(current)
+        if metadata.get("uid") == admission.job_uid:
+            spec = current.get("spec")
+            suspended = isinstance(spec, dict) and spec.get("suspend") is True
+            _, resource_version = _validate_exact_job(
+                current,
+                bound,
+                expected_uid=admission.job_uid,
+                expected_suspended=suspended,
+            )
+            expected_annotations = _metadata(bound.manifest).get("annotations", {})
+            observed_annotations = metadata.get("annotations", {})
+            if not isinstance(observed_annotations, dict) or any(
+                observed_annotations.get(key) != value
+                for key, value in expected_annotations.items()
+            ):
+                raise M03RV16SeadragonControllerError(
+                    "V16 cleanup target lacks the admitted launch authority"
+                )
+            response = transport.invoke(
+                (
+                    "delete", "--raw",
+                    (
+                        f"/apis/batch/v1/namespaces/{M03R_V16_NAMESPACE}/jobs/"
+                        f"{admission.job_name}"
+                    ),
+                    "--file", "-",
+                ),
+                payload={
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "propagationPolicy": "Foreground",
+                    "preconditions": {
+                        "uid": admission.job_uid,
+                        "resourceVersion": resource_version,
+                    },
+                },
+            )
+            if response is None:
+                raise M03RV16SeadragonControllerError(
+                    "V16 cleanup response vanished"
+                )
+            delete_submitted = True
+        else:
+            # The exact admitted UID is already absent.  A replacement with
+            # the same name is outside scope and is never mutated.
+            target_already_absent = True
+
+    deadline = time.monotonic() + timeout_seconds
+    complete = False
+    while True:
+        observed = transport.invoke(
+            ("get", "job", admission.job_name, "--output", "json"),
+            allow_not_found=True,
         )
-    metadata = _metadata(current)
-    if metadata.get("uid") != admission.job_uid:
-        raise M03RV16SeadragonControllerError(
-            "V16 cleanup target UID drifted"
+        original_present = (
+            observed is not None
+            and _metadata(observed).get("uid") == admission.job_uid
         )
-    resource_version = _text(
-        "cleanup resourceVersion", metadata.get("resourceVersion")
-    )
-    response = transport.invoke(
-        (
-            "delete",
-            "--raw",
-            (
-                f"/apis/batch/v1/namespaces/{M03R_V16_NAMESPACE}/jobs/"
-                f"{admission.job_name}"
-            ),
-            "--file",
-            "-",
-        ),
-        payload={
-            "apiVersion": "v1",
-            "kind": "DeleteOptions",
-            "propagationPolicy": "Foreground",
-            "preconditions": {
-                "uid": admission.job_uid,
-                "resourceVersion": resource_version,
-            },
-        },
-    )
-    if response is None:
-        raise M03RV16SeadragonControllerError("V16 cleanup response vanished")
-    observed = transport.invoke(
-        ("get", "job", admission.job_name, "--output", "json"),
-        allow_not_found=True,
-    )
-    if observed is not None:
-        raise M03RV16SeadragonControllerError(
-            "V16 exact Job remains after cleanup"
+        owned_pods = _uid_owned_pods(
+            transport,
+            job_name=admission.job_name,
+            job_uid=admission.job_uid,
         )
-    if _list_exact_job_pods(transport, job_name=admission.job_name):
-        raise M03RV16SeadragonControllerError(
-            "V16 UID-owned Pod inventory remains after cleanup"
-        )
+        if not original_present and not owned_pods:
+            complete = True
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_seconds)
     unsigned: dict[str, Any] = {
         "schema": M03R_V16_CONTROLLER_CLEANUP_SCHEMA,
         "phase": admission.phase,
         "job_uid": admission.job_uid,
         "job_name": admission.job_name,
         "resource_version": resource_version,
-        "job_absent": True,
-        "pod_inventory_empty": True,
+        "controller_admission_file_sha256": _file_sha256(
+            controller_admission.controller_receipt_path
+        ),
+        "controller_admission_receipt_sha256": _text(
+            "controller admission receipt",
+            _read_self_receipted_json(
+                controller_admission.controller_receipt_path
+            )[0].get("receipt_sha256"),
+        ),
+        "admitted_job_authority_receipt_sha256": admission.receipt_sha256,
+        "launch_authority_receipt_sha256": (
+            None
+            if bound.launch_authority is None
+            else bound.launch_authority.receipt_sha256
+        ),
+        "delete_submitted": delete_submitted,
+        "target_already_absent": target_already_absent,
+        "job_absent": complete,
+        "pod_inventory_empty": complete,
+        "cleanup_complete": complete,
     }
     value = {**unsigned, "receipt_sha256": semantic_sha256(unsigned)}
     path = Path(authority_root) / f"{admission.phase}-controller-cleanup.json"
-    _write_create_only_json(path, value)
+    _write_or_validate_json(path, value)
     return value
 
 
@@ -1347,15 +2038,32 @@ def _load_cli_package(
     return package, authorization
 
 
-def _cli_exact_job(args: argparse.Namespace) -> _M03RV16CliExactJobAuthority:
-    value = _M03RV16CliExactJobAuthority(
-        phase=args.phase,
-        job_name=args.job_name,
-        job_uid=args.job_uid,
-        completions=args.completions,
+def _load_cli_controller_admission(
+    args: argparse.Namespace,
+    package: M03RV16PackagePlan,
+    authorization: M03RV16ExecutionAuthorization,
+) -> M03RV16ControllerAdmission:
+    rendered = load_m03r_v16_controller_job_plan(
+        args.controller_job_plan,
+        expected_file_sha256=args.controller_job_plan_file_sha256,
     )
-    value.validate()
-    return value
+    storage = load_m03r_v16_storage_semantics_evidence(
+        args.storage_semantics,
+        expected_file_sha256=args.storage_semantics_file_sha256,
+        authority_root=args.storage_authority_identity_root,
+        observer_root=args.storage_observer_identity_root,
+    )
+    return load_m03r_v16_controller_admission(
+        args.controller_admission,
+        expected_file_sha256=args.controller_admission_file_sha256,
+        rendered=rendered,
+        package=package,
+        authorization=authorization,
+        storage_evidence=storage,
+        storage_evidence_file_sha256=args.storage_semantics_file_sha256,
+        storage_authority_identity_root=args.storage_authority_identity_root,
+        storage_observer_identity_root=args.storage_observer_identity_root,
+    )
 
 
 def _execute_controller_job(args: argparse.Namespace) -> dict[str, Any]:
@@ -1476,26 +2184,27 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("status", "cleanup"):
         command = subparsers.add_parser(
             name,
-            help=f"{name} one exact Job name and UID",
+            help=f"{name} one authority-bound exact Job UID",
         )
         _add_package_arguments(command)
+        command.add_argument("--controller-job-plan", required=True)
+        command.add_argument("--controller-job-plan-file-sha256", required=True)
+        command.add_argument("--controller-admission", required=True)
+        command.add_argument("--controller-admission-file-sha256", required=True)
+        command.add_argument("--storage-semantics", required=True)
+        command.add_argument("--storage-semantics-file-sha256", required=True)
         command.add_argument(
-            "--phase",
-            choices=(
-                "static",
-                "storage",
-                "capacity",
-                "training",
-                "qualification-preflight",
-                "qualification",
-            ),
-            required=True,
+            "--storage-authority-identity-root",
+            default=M03R_V16_POD_AUTHORITY_ROOT,
         )
-        command.add_argument("--job-name", required=True)
-        command.add_argument("--job-uid", required=True)
-        command.add_argument("--completions", type=int, required=True)
+        command.add_argument(
+            "--storage-observer-identity-root",
+            default=M03R_V16_POD_AUTHORITY_OBSERVER_ROOT,
+        )
         if name == "cleanup":
             command.add_argument("--authority-root", required=True)
+            command.add_argument("--timeout-seconds", type=float, default=900.0)
+            command.add_argument("--poll-seconds", type=float, default=2.0)
             command.add_argument(
                 "--cleanup-authorized",
                 action="store_true",
@@ -1515,21 +2224,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         value = _execute_controller_job(args)
     else:
-        package, _ = _load_cli_package(args)
-        exact = _cli_exact_job(args)
+        package, authorization = _load_cli_package(args)
+        controller_admission = _load_cli_controller_admission(
+            args, package, authorization
+        )
         transport = M03RV16KubectlTransport()
         if args.command == "status":
             value = snapshot_m03r_v16_exact_job(
                 transport=transport,
-                admission=exact,
+                admission=controller_admission.admission,
                 package=package,
             )
         else:
             value = cleanup_m03r_v16_exact_job(
                 transport=transport,
-                admission=exact,
+                controller_admission=controller_admission,
+                package=package,
+                authorization=authorization,
                 authority_root=args.authority_root,
                 cleanup_authorized=args.cleanup_authorized,
+                timeout_seconds=args.timeout_seconds,
+                poll_seconds=args.poll_seconds,
             )
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
     return 0
@@ -1546,6 +2261,7 @@ __all__ = [
     "M03R_V16_KUBECTL",
     "M03R_V16_POD_AUTHORITY_OBSERVER_ROOT",
     "M03R_V16_POD_AUTHORITY_ROOT",
+    "M03R_V16_SCHEDULING_POLICY",
     "M03RV16ControllerAdmission",
     "M03RV16ControllerAttestations",
     "M03RV16ExactJobAuthority",

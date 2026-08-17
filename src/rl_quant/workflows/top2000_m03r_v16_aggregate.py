@@ -22,6 +22,7 @@ from rl_quant.protocol.canonical_artifact import (
 )
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
     M03R_V16_PREDICTIVE_SPEC,
+    M03R_V16_SCHEDULING_POLICY,
 )
 from rl_quant.training.top2000_m03r_v16_activation import (
     M03RV16QualificationActivation,
@@ -57,7 +58,10 @@ from rl_quant.workflows.top2000_m03r_v16_predictive import (
 )
 
 M03R_V16_PANEL_AGGREGATE_SCHEMA = (
-    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v6"
+    "rl-quant.top2000-dev.m03r-v16-panel-aggregate-v7"
+)
+M03R_V16_CONTROLLER_TERMINAL_SCHEMA = (
+    "rl-quant.top2000-dev.m03r-v16-controller-terminal-v2"
 )
 _MAX_TERMINAL_BYTES = 16 * 1024**2
 _MAX_ARTIFACT_BYTES = 256 * 1024**2
@@ -529,6 +533,65 @@ def _write_exclusive(path: Path, value: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _controller_terminal(
+    path: Path,
+    expected_file_sha256: str,
+    *,
+    phase: str,
+    package: M03RV16PackagePlan,
+) -> dict[str, Any]:
+    value = _read_exact(path, expected_file_sha256)
+    unsigned = {key: row for key, row in value.items() if key != "receipt_sha256"}
+    snapshot = value.get("snapshot")
+    if not isinstance(snapshot, dict):
+        raise M03RV16AggregateError("V16 controller terminal snapshot is absent")
+    pods = snapshot.get("pods")
+    if (
+        not isinstance(pods, list)
+        or len(pods) != 3
+        or any(not isinstance(row, dict) for row in pods)
+    ):
+        raise M03RV16AggregateError(
+            "V16 controller terminal Pod inventory drifted"
+        )
+    try:
+        completion_indices = tuple(
+            sorted(int(row.get("completion_index", -1)) for row in pods)
+        )
+    except (TypeError, ValueError) as exc:
+        raise M03RV16AggregateError(
+            "V16 controller terminal completion inventory drifted"
+        ) from exc
+    admitted_receipt = value.get("admitted_job_authority_receipt_sha256")
+    if not isinstance(admitted_receipt, str):
+        raise M03RV16AggregateError(
+            "V16 controller terminal admission receipt is absent"
+        )
+    _digest("controller admission receipt", admitted_receipt)
+    if (
+        value.get("schema") != M03R_V16_CONTROLLER_TERMINAL_SCHEMA
+        or value.get("receipt_sha256") != _sha256(unsigned)
+        or value.get("phase") != phase
+        or value.get("package_plan_sha256") != package.package_plan_sha256
+        or value.get("outcome") != "complete"
+        or value.get("scheduling_policy") != M03R_V16_SCHEDULING_POLICY
+        or value.get("gang_scheduling_required") is not False
+        or snapshot.get("state") != "present"
+        or snapshot.get("job_uid") != value.get("job_uid")
+        or snapshot.get("job_name") != value.get("job_name")
+        or snapshot.get("succeeded") != 3
+        or snapshot.get("failed") != 0
+        or completion_indices != (0, 1, 2)
+        or any(
+            row.get("main_container_image_digest")
+            != package.artifacts.image_digest_sha256
+            for row in pods
+        )
+    ):
+        raise M03RV16AggregateError("V16 controller terminal drifted")
+    return value
+
+
 def aggregate_m03r_v16_panel(
     *,
     package_plan_path: str | Path,
@@ -548,6 +611,8 @@ def aggregate_m03r_v16_panel(
     authority_observer_root: str | Path,
     training_panel_path: str | Path,
     training_terminal_paths: tuple[Path, Path, Path],
+    controller_terminal_paths: tuple[Path, Path, Path],
+    controller_terminal_file_sha256: tuple[str, str, str],
     worker_terminal_paths: tuple[Path, Path, Path],
     worker_terminal_file_sha256: tuple[str, str, str],
     output_root: str | Path,
@@ -609,12 +674,66 @@ def aggregate_m03r_v16_panel(
     )
     if storage_evidence.receipt_sha256 != storage_semantics_receipt_sha256:
         raise M03RV16AggregateError("V16 storage authority receipt drifted")
+    controller_terminals = tuple(
+        _controller_terminal(
+            controller_terminal_paths[index],
+            controller_terminal_file_sha256[index],
+            phase=phase,
+            package=package,
+        )
+        for index, phase in enumerate(
+            ("training", "qualification-preflight", "qualification")
+        )
+    )
+    training_terminal_payloads = tuple(
+        _read_exact(path, expected_sha)
+        for path, expected_sha in zip(
+            training_terminal_paths,
+            qualification_activation.training_terminal_file_sha256,
+            strict=True,
+        )
+    )
+    preflight_terminal_payloads = tuple(
+        _read_exact(
+            path.parent / "qualification-preflight-terminal.json",
+            expected_sha,
+        )
+        for path, expected_sha in zip(
+            closure_paths,
+            qualification_outer_access.setting_preflight_terminal_file_sha256,
+            strict=True,
+        )
+    )
     terminal_payloads = tuple(
         _read_exact(path, expected_sha)
         for path, expected_sha in zip(
             worker_terminal_paths, worker_terminal_file_sha256, strict=True
         )
     )
+    for phase_index, payloads in (
+        (0, training_terminal_payloads),
+        (1, preflight_terminal_payloads),
+        (2, terminal_payloads),
+    ):
+        if {str(payload.get("job_uid")) for payload in payloads} != {
+            str(controller_terminals[phase_index]["job_uid"])
+        }:
+            raise M03RV16AggregateError(
+                "V16 worker Job UID drifted from controller terminal"
+            )
+        if {
+            str(payload.get("admitted_job_authority_receipt_sha256"))
+            for payload in payloads
+        } != {
+            str(
+                controller_terminals[phase_index][
+                    "admitted_job_authority_receipt_sha256"
+                ]
+            )
+        }:
+            raise M03RV16AggregateError(
+                "V16 worker admission drifted from controller terminal"
+            )
     outer_access_identities = {
         (
             str(
@@ -741,6 +860,13 @@ def aggregate_m03r_v16_panel(
         ),
         "storage_semantics_file_sha256": storage_semantics_file_sha256,
         "storage_semantics_receipt_sha256": storage_evidence.receipt_sha256,
+        "controller_terminal_file_sha256": controller_terminal_file_sha256,
+        "controller_terminal_receipt_sha256": tuple(
+            str(row["receipt_sha256"]) for row in controller_terminals
+        ),
+        "controller_job_uid": tuple(
+            str(row["job_uid"]) for row in controller_terminals
+        ),
         "worker_terminal_file_sha256": worker_terminal_file_sha256,
         "worker_terminal_receipt_sha256": tuple(row[2] for row in rows),
         "bootstrap_plan_sha256": bootstrap.receipt_sha256,
@@ -798,6 +924,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--authority-observer-root", required=True)
     parser.add_argument("--training-panel", required=True)
     parser.add_argument("--training-terminal", action="append", required=True)
+    parser.add_argument("--controller-terminal", action="append", required=True)
+    parser.add_argument(
+        "--controller-terminal-file-sha256", action="append", required=True
+    )
     parser.add_argument("--worker-terminal", action="append", required=True)
     parser.add_argument(
         "--worker-terminal-file-sha256", action="append", required=True
@@ -812,6 +942,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         len(args.worker_terminal) != 3
         or len(args.worker_terminal_file_sha256) != 3
         or len(args.training_terminal) != 3
+        or len(args.controller_terminal) != 3
+        or len(args.controller_terminal_file_sha256) != 3
     ):
         raise M03RV16AggregateError("V16 aggregate requires three worker terminals")
     aggregate_m03r_v16_panel(
@@ -847,6 +979,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.training_terminal[0]),
             Path(args.training_terminal[1]),
             Path(args.training_terminal[2]),
+        ),
+        controller_terminal_paths=(
+            Path(args.controller_terminal[0]),
+            Path(args.controller_terminal[1]),
+            Path(args.controller_terminal[2]),
+        ),
+        controller_terminal_file_sha256=(
+            args.controller_terminal_file_sha256[0],
+            args.controller_terminal_file_sha256[1],
+            args.controller_terminal_file_sha256[2],
         ),
         worker_terminal_paths=(
             Path(args.worker_terminal[0]),

@@ -443,7 +443,19 @@ class M03RV16RenderedSuspendedJob:
                 )
         elif self.mode == "qualification-preflight":
             if (
-                pod.get("nodeSelector") is not None
+                requests
+                != {
+                    "cpu": "12",
+                    "memory": "64Gi",
+                    "ephemeral-storage": "8Gi",
+                }
+                or limits
+                != {
+                    "cpu": "16",
+                    "memory": "128Gi",
+                    "ephemeral-storage": "16Gi",
+                }
+                or pod.get("nodeSelector") is not None
                 or pod.get("priorityClassName") is not None
                 or pod.get("tolerations") not in (None, [])
                 or self.static_gate_receipt_sha256 is None
@@ -1538,24 +1550,48 @@ def _render(
     }
     resources = {
         "requests": {
-            "cpu": "1" if mode in {"static", "storage"} else template.cpu_request,
+            "cpu": (
+                "1"
+                if mode in {"static", "storage"}
+                else "12"
+                if mode == "qualification-preflight"
+                else template.cpu_request
+            ),
             "memory": (
-                "4Gi" if mode in {"static", "storage"} else template.memory_request
+                "4Gi"
+                if mode in {"static", "storage"}
+                else "64Gi"
+                if mode == "qualification-preflight"
+                else template.memory_request
             ),
             "ephemeral-storage": (
                 "1Gi"
                 if mode in {"static", "storage"}
+                else "8Gi"
+                if mode == "qualification-preflight"
                 else template.ephemeral_storage_request
             ),
         },
         "limits": {
-            "cpu": "1" if mode in {"static", "storage"} else template.cpu_limit,
+            "cpu": (
+                "1"
+                if mode in {"static", "storage"}
+                else "16"
+                if mode == "qualification-preflight"
+                else template.cpu_limit
+            ),
             "memory": (
-                "4Gi" if mode in {"static", "storage"} else template.memory_limit
+                "4Gi"
+                if mode in {"static", "storage"}
+                else "128Gi"
+                if mode == "qualification-preflight"
+                else template.memory_limit
             ),
             "ephemeral-storage": (
                 "4Gi"
                 if mode in {"static", "storage"}
+                else "16Gi"
+                if mode == "qualification-preflight"
                 else template.ephemeral_storage_limit
             ),
         },

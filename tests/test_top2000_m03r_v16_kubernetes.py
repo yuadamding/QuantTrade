@@ -92,9 +92,13 @@ from rl_quant.training.top2000_m03r_v16_package import (
     write_m03r_v16_package_plan,
 )
 from rl_quant.training.top2000_m03r_v16_seadragon_controller import (
+    M03R_V16_CONTROLLER_TERMINAL_SCHEMA,
+    M03RV16KubernetesConflictError,
     M03RV16SeadragonControllerError,
     admit_m03r_v16_suspended_job,
+    cleanup_m03r_v16_exact_job,
     load_m03r_v16_controller_job_plan,
+    resume_and_attest_m03r_v16_job,
     write_m03r_v16_controller_job_plan,
 )
 from rl_quant.training.top2000_m03r_v16_selection import (
@@ -207,7 +211,7 @@ def _surfaces() -> tuple[
 def _template(name: str) -> M03RV7KubernetesTemplateConfig:
     return M03RV7KubernetesTemplateConfig(
         job_name=name,
-        run_id="m03r-v16-v11-local-contract",
+        run_id="m03r-v16-v13-local-contract",
         service_account_name="default",
         pvc_claim_name="research-pvc",
         package_mount_path="/mnt/package",
@@ -350,7 +354,10 @@ def test_v16_controller_admits_and_binds_one_exact_suspended_job(
     admitted = json.loads(json.dumps(rendered.manifest))
     admitted["metadata"]["uid"] = "capacity-controller-job-uid"
     admitted["metadata"]["resourceVersion"] = "17"
+    live_job = json.loads(json.dumps(admitted))
     calls: list[tuple[str, ...]] = []
+    deletion_started = False
+    deletion_polls = 0
 
     class FakeTransport:
         def invoke(
@@ -360,6 +367,7 @@ def test_v16_controller_admits_and_binds_one_exact_suspended_job(
             payload: dict | None = None,
             allow_not_found: bool = False,
         ) -> dict | None:
+            nonlocal deletion_started, deletion_polls
             del allow_not_found
             calls.append(arguments)
             if arguments[:2] == ("get", "pods"):
@@ -367,10 +375,16 @@ def test_v16_controller_admits_and_binds_one_exact_suspended_job(
             if arguments[:2] == ("create", "--dry-run=server"):
                 return json.loads(json.dumps(rendered.manifest))
             if arguments[:2] == ("create", "--file"):
-                return json.loads(json.dumps(admitted))
+                return json.loads(json.dumps(live_job))
+            if arguments[:2] == ("get", "job"):
+                if deletion_started:
+                    deletion_polls += 1
+                    if deletion_polls >= 2:
+                        return None
+                return json.loads(json.dumps(live_job))
             if arguments[:2] == ("patch", "job"):
                 assert payload is not None
-                patched = json.loads(json.dumps(admitted))
+                patched = json.loads(json.dumps(live_job))
                 patched["metadata"]["resourceVersion"] = "18"
                 patched["metadata"]["annotations"].update(
                     payload["metadata"]["annotations"]
@@ -378,14 +392,24 @@ def test_v16_controller_admits_and_binds_one_exact_suspended_job(
                 patched["spec"]["template"]["metadata"]["annotations"].update(
                     payload["spec"]["template"]["metadata"]["annotations"]
                 )
+                live_job.clear()
+                live_job.update(json.loads(json.dumps(patched)))
                 return patched
+            if arguments[:2] == ("delete", "--raw"):
+                assert payload is not None
+                assert payload["preconditions"]["uid"] == (
+                    "capacity-controller-job-uid"
+                )
+                deletion_started = True
+                return {"status": "Success"}
             raise AssertionError(arguments)
 
     storage, _storage_path, storage_file, authority_root, observer_root = (
         _storage_evidence(tmp_path)
     )
+    transport = FakeTransport()
     result = admit_m03r_v16_suspended_job(
-        transport=FakeTransport(),
+        transport=transport,
         rendered=rendered,
         package=package,
         authorization=authorization,
@@ -404,9 +428,72 @@ def test_v16_controller_admits_and_binds_one_exact_suspended_job(
     assert result.admission_path.is_file()
     assert result.launch_path.is_file()
     assert result.controller_receipt_path.is_file()
+    recovered = admit_m03r_v16_suspended_job(
+        transport=transport,
+        rendered=rendered,
+        package=package,
+        authorization=authorization,
+        storage_evidence=storage,
+        storage_evidence_file_sha256=storage_file,
+        authority_root=authority_root,
+        source_tree_root_sha256=static.source_tree_root_sha256,
+        run_id=rendered.manifest["metadata"]["labels"]["rl-quant/run-id"],
+        storage_authority_identity_root=authority_root,
+        storage_observer_identity_root=observer_root,
+    )
+    assert recovered.admission.receipt_sha256 == result.admission.receipt_sha256
     assert calls.count(("get", "pods", "--selector", (
         "job-name=m03r-v16-capacity-controller"
-    ), "--output", "json")) == 2
+    ), "--output", "json")) == 3
+    cleanup = cleanup_m03r_v16_exact_job(
+        transport=transport,
+        controller_admission=recovered,
+        package=package,
+        authorization=authorization,
+        authority_root=authority_root,
+        cleanup_authorized=True,
+        timeout_seconds=1.0,
+        poll_seconds=0.001,
+    )
+    assert cleanup["delete_submitted"] is True
+    assert cleanup["cleanup_complete"] is True
+    assert deletion_polls == 2
+
+    class ReplacementTransport:
+        deleted = False
+
+        def invoke(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            payload: dict | None = None,
+            allow_not_found: bool = False,
+        ) -> dict | None:
+            del payload, allow_not_found
+            if arguments[:2] == ("get", "job"):
+                replacement = json.loads(json.dumps(live_job))
+                replacement["metadata"]["uid"] = "replacement-job-uid"
+                return replacement
+            if arguments[:2] == ("get", "pods"):
+                return {"items": []}
+            if arguments[:2] == ("delete", "--raw"):
+                self.deleted = True
+            raise AssertionError(arguments)
+
+    replacement_transport = ReplacementTransport()
+    replacement_cleanup = cleanup_m03r_v16_exact_job(
+        transport=replacement_transport,
+        controller_admission=recovered,
+        package=package,
+        authorization=authorization,
+        authority_root=authority_root / "replacement-cleanup",
+        cleanup_authorized=True,
+        timeout_seconds=1.0,
+        poll_seconds=0.001,
+    )
+    assert replacement_cleanup["target_already_absent"] is True
+    assert replacement_cleanup["cleanup_complete"] is True
+    assert replacement_transport.deleted is False
 
 
 def test_v16_controller_job_plan_round_trips_exact_rendered_bytes(
@@ -435,6 +522,211 @@ def test_v16_controller_job_plan_round_trips_exact_rendered_bytes(
             path,
             expected_file_sha256="0" * 64,
         )
+
+
+def test_v16_controller_attests_partial_pods_and_retries_conflict(
+    tmp_path: Path,
+) -> None:
+    package, authorization, plan_file, authorization_file = _surfaces()
+    static = _static_gate(package, authorization, "d" * 64)
+    capacity = _capacity_gate(package, authorization, static, "e" * 64)
+    training_activation = issue_m03r_v16_training_activation_from_gates(
+        package=package,
+        authorization=authorization,
+        static=static,
+        capacity=capacity,
+    )
+    rendered = render_m03r_v16_suspended_training_job(
+        package=package,
+        authorization=authorization,
+        package_plan_file_sha256=plan_file,
+        authorization_file_sha256=authorization_file,
+        template=_template("m03r-v16-training-controller-partial"),
+        static=static,
+        capacity=capacity,
+        training_activation=training_activation,
+        training_activation_file_sha256="f" * 64,
+    )
+    live_job = json.loads(json.dumps(rendered.manifest))
+    live_job["metadata"]["uid"] = "training-controller-job-uid"
+    live_job["metadata"]["resourceVersion"] = "10"
+    pods: dict[int, dict] = {}
+    events: list[str] = []
+    pod_list_calls = 0
+    conflict_injected = False
+
+    def build_pod(index: int) -> dict:
+        return {
+            "metadata": {
+                "uid": f"pod-uid-{index}",
+                "name": f"training-pod-{index}",
+                "resourceVersion": "20",
+                "annotations": {
+                    "batch.kubernetes.io/job-completion-index": str(index)
+                },
+                "ownerReferences": [
+                    {
+                        "kind": "Job",
+                        "controller": True,
+                        "uid": "training-controller-job-uid",
+                        "name": "m03r-v16-training-controller-partial",
+                    }
+                ],
+            },
+            "spec": {
+                "nodeName": f"node-{index}",
+                "initContainers": [
+                    {
+                        "name": "runtime-attestation-gate",
+                        "image": package.artifacts.image_reference,
+                    }
+                ],
+                "containers": [
+                    {
+                        "name": "trainer",
+                        "image": package.artifacts.image_reference,
+                    }
+                ],
+            },
+            "status": {
+                "phase": "Pending",
+                "initContainerStatuses": [
+                    {
+                        "name": "runtime-attestation-gate",
+                        "image": package.artifacts.image_reference,
+                        "imageID": (
+                            "containerd://sha256:"
+                            + package.artifacts.image_digest_sha256
+                        ),
+                    }
+                ],
+            },
+        }
+
+    class FakeTransport:
+        def invoke(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            payload: dict | None = None,
+            allow_not_found: bool = False,
+        ) -> dict | None:
+            nonlocal pod_list_calls, conflict_injected
+            del allow_not_found
+            if arguments[:2] == ("create", "--dry-run=server"):
+                return json.loads(json.dumps(rendered.manifest))
+            if arguments[:2] == ("create", "--file"):
+                return json.loads(json.dumps(live_job))
+            if arguments[:2] == ("get", "job"):
+                return json.loads(json.dumps(live_job))
+            if arguments[:2] == ("patch", "job"):
+                assert payload is not None
+                live_job["metadata"]["resourceVersion"] = str(
+                    int(live_job["metadata"]["resourceVersion"]) + 1
+                )
+                live_job["metadata"]["annotations"].update(
+                    payload["metadata"].get("annotations", {})
+                )
+                if "template" in payload.get("spec", {}):
+                    live_job["spec"]["template"]["metadata"][
+                        "annotations"
+                    ].update(
+                        payload["spec"]["template"]["metadata"][
+                            "annotations"
+                        ]
+                    )
+                live_job["spec"]["suspend"] = payload["spec"]["suspend"]
+                return json.loads(json.dumps(live_job))
+            if arguments[:2] == ("get", "pods"):
+                if live_job["spec"]["suspend"]:
+                    return {"items": []}
+                pod_list_calls += 1
+                visible = (0,) if pod_list_calls <= 2 else (0, 1, 2)
+                for index in visible:
+                    pods.setdefault(index, build_pod(index))
+                events.append("list:" + ",".join(str(index) for index in visible))
+                return {
+                    "items": [
+                        json.loads(json.dumps(pods[index])) for index in visible
+                    ]
+                }
+            if arguments[:2] == ("patch", "pod"):
+                assert payload is not None
+                index = int(arguments[2].rsplit("-", 1)[-1])
+                if index == 0 and not conflict_injected:
+                    conflict_injected = True
+                    pods[index]["metadata"]["resourceVersion"] = "21"
+                    events.append("conflict:0")
+                    raise M03RV16KubernetesConflictError("synthetic conflict")
+                pods[index]["metadata"]["resourceVersion"] = str(
+                    int(pods[index]["metadata"]["resourceVersion"]) + 1
+                )
+                pods[index]["metadata"]["annotations"].update(
+                    payload["metadata"]["annotations"]
+                )
+                events.append(f"attest:{index}")
+                return json.loads(json.dumps(pods[index]))
+            if arguments[:2] == ("get", "pod"):
+                index = int(arguments[2].rsplit("-", 1)[-1])
+                return json.loads(json.dumps(pods[index]))
+            raise AssertionError(arguments)
+
+    storage, _storage_path, storage_file, authority_root, observer_root = (
+        _storage_evidence(tmp_path)
+    )
+    controller_admission = admit_m03r_v16_suspended_job(
+        transport=FakeTransport(),
+        rendered=rendered,
+        package=package,
+        authorization=authorization,
+        storage_evidence=storage,
+        storage_evidence_file_sha256=storage_file,
+        authority_root=authority_root,
+        source_tree_root_sha256=static.source_tree_root_sha256,
+        run_id=rendered.manifest["metadata"]["labels"]["rl-quant/run-id"],
+        storage_authority_identity_root=authority_root,
+        storage_observer_identity_root=observer_root,
+    )
+    result = resume_and_attest_m03r_v16_job(
+        transport=FakeTransport(),
+        controller_admission=controller_admission,
+        package=package,
+        authorization=authorization,
+        storage_evidence=storage,
+        authority_root=authority_root,
+        storage_authority_identity_root=authority_root,
+        storage_observer_identity_root=observer_root,
+        timeout_seconds=1.0,
+        poll_seconds=0.001,
+    )
+
+    assert len(result.rows) == 3
+    assert events.index("attest:0") < events.index("list:0,1,2")
+    assert events.count("conflict:0") == 1
+    controller_receipt = json.loads(result.controller_receipt_path.read_text())
+    assert controller_receipt["scheduling_policy"] == (
+        "independent-per-completion"
+    )
+    assert controller_receipt["attestation_release_mode"] == (
+        "as-each-completion-becomes-observable"
+    )
+    assert controller_receipt["gang_scheduling_required"] is False
+    recovered = resume_and_attest_m03r_v16_job(
+        transport=FakeTransport(),
+        controller_admission=controller_admission,
+        package=package,
+        authorization=authorization,
+        storage_evidence=storage,
+        authority_root=authority_root,
+        storage_authority_identity_root=authority_root,
+        storage_observer_identity_root=observer_root,
+        timeout_seconds=1.0,
+        poll_seconds=0.001,
+    )
+    assert recovered.controller_receipt_path == result.controller_receipt_path
+    assert tuple(row.file_sha256 for row in recovered.rows) == tuple(
+        row.file_sha256 for row in result.rows
+    )
 
 
 def _qualification_activation(package, authorization, source_root):
@@ -551,7 +843,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v11-local-contract",
+        run_id="m03r-v16-v13-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),
@@ -861,7 +1153,7 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
         package=package,
         authorization=authorization,
         phase="training",
-        run_id="m03r-v16-v11-local-contract",
+        run_id="m03r-v16-v13-local-contract",
         job_contract_sha256=predictive.job_contract_sha256,
         pod_contract_sha256=predictive.pod_contract_sha256,
         server_side_dry_run_file_sha256=dry_run_file_sha256,
@@ -966,6 +1258,19 @@ def test_v16_jobs_are_suspended_and_gate_predictive_h100_panel(
     assert "nvidia.com/gpu" not in preflight_job.manifest["spec"]["template"][
         "spec"
     ]["containers"][0]["resources"]["requests"]
+    preflight_resources = preflight_job.manifest["spec"]["template"]["spec"][
+        "containers"
+    ][0]["resources"]
+    assert preflight_resources["requests"] == {
+        "cpu": "12",
+        "memory": "64Gi",
+        "ephemeral-storage": "8Gi",
+    }
+    assert preflight_resources["limits"] == {
+        "cpu": "16",
+        "memory": "128Gi",
+        "ephemeral-storage": "16Gi",
+    }
     outer_access = _issue_m03r_v16_qualification_outer_access_authority(
         package=package,
         authorization=authorization,
@@ -1115,7 +1420,7 @@ def test_v16_gate_authorities_are_issued_from_exact_result_files(
         package=package,
         authorization=authorization,
         phase="capacity",
-        run_id="m03r-v16-v11-local-contract",
+        run_id="m03r-v16-v13-local-contract",
         job_contract_sha256=capacity_job.job_contract_sha256,
         pod_contract_sha256=capacity_job.pod_contract_sha256,
         server_side_dry_run_file_sha256=file_sha256(dry_path),
@@ -1333,6 +1638,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             "package_plan_sha256": package.package_plan_sha256,
             "authorization_receipt_sha256": authorization.receipt_sha256,
             "setting_index": setting,
+            "job_uid": "training-job-uid",
+            "admitted_job_authority_receipt_sha256": "1" * 64,
             "source_tree_root_sha256": source_root,
             "fold_training_adequacy_status": ("adequate",) * 5,
             "qualification_tail_accessed": False,
@@ -1479,6 +1786,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
                 qualification_activation.receipt_sha256
             ),
             "setting_index": index,
+            "job_uid": "preflight-job-uid",
+            "admitted_job_authority_receipt_sha256": "2" * 64,
             "setting_id": package.panel.workers[index].setting_id,
             "qualification_input_closure_file_sha256": closure_files[-1],
             "qualification_input_closure_receipt_sha256": closure_receipts[-1],
@@ -1655,8 +1964,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             "rendered_manifest_sha256": "b" * 64,
             "pod_template_sha256": "c" * 64,
             "launch_authority_receipt_sha256": "d" * 64,
-            "admitted_job_authority_receipt_sha256": "e" * 64,
-            "job_uid": "job-uid",
+            "admitted_job_authority_receipt_sha256": "3" * 64,
+            "job_uid": "qualification-job-uid",
             "pod_runtime_attestation_receipt_sha256": "f" * 64,
             "storage_semantics_file_sha256": storage_file,
             "storage_semantics_receipt_sha256": storage.receipt_sha256,
@@ -1675,6 +1984,62 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         file_sha = _write_immutable_json(path, payload)
         terminal_paths.append(path)
         terminal_hashes.append(file_sha)
+    controller_terminal_paths: list[Path] = []
+    controller_terminal_hashes: list[str] = []
+    for phase, job_uid, admission_receipt in (
+        ("training", "training-job-uid", "1" * 64),
+        ("qualification-preflight", "preflight-job-uid", "2" * 64),
+        ("qualification", "qualification-job-uid", "3" * 64),
+    ):
+        pods = [
+            {
+                "completion_index": index,
+                "pod_uid": f"{phase}-pod-{index}",
+                "pod_name": f"{phase}-pod-{index}",
+                "phase": "Succeeded",
+                "node_name": f"node-{index}",
+                "main_container_image_id": (
+                    "docker-pullable://"
+                    f"{package.artifacts.image_reference}"
+                ),
+                "main_container_image_digest": (
+                    package.artifacts.image_digest_sha256
+                ),
+            }
+            for index in range(3)
+        ]
+        snapshot = {
+            "job_name": f"{phase}-job",
+            "job_uid": job_uid,
+            "state": "present",
+            "resource_version": "9",
+            "active": 0,
+            "ready": 0,
+            "succeeded": 3,
+            "failed": 0,
+            "pods": pods,
+        }
+        controller_unsigned = {
+            "schema": M03R_V16_CONTROLLER_TERMINAL_SCHEMA,
+            "phase": phase,
+            "package_plan_sha256": package.package_plan_sha256,
+            "admitted_job_authority_receipt_sha256": admission_receipt,
+            "job_uid": job_uid,
+            "job_name": f"{phase}-job",
+            "outcome": "complete",
+            "scheduling_policy": "independent-per-completion",
+            "gang_scheduling_required": False,
+            "snapshot": snapshot,
+        }
+        controller_payload = {
+            **controller_unsigned,
+            "receipt_sha256": semantic_sha256(controller_unsigned),
+        }
+        controller_path = tmp_path / f"{phase}-controller-terminal.json"
+        controller_terminal_paths.append(controller_path)
+        controller_terminal_hashes.append(
+            _write_immutable_json(controller_path, controller_payload)
+        )
     aggregate = aggregate_m03r_v16_panel(
         package_plan_path=plan_path,
         package_plan_file_sha256=plan_file,
@@ -1697,6 +2062,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
         authority_observer_root=observer_root,
         training_panel_path=training_panel_path,
         training_terminal_paths=training_evidence_paths,  # type: ignore[arg-type]
+        controller_terminal_paths=tuple(controller_terminal_paths),  # type: ignore[arg-type]
+        controller_terminal_file_sha256=tuple(controller_terminal_hashes),  # type: ignore[arg-type]
         worker_terminal_paths=(
             terminal_paths[0],
             terminal_paths[1],
@@ -1713,6 +2080,48 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
     assert aggregate["next_research_action"] == "three-seed-predictive-confirmation"
     assert aggregate["economic_generation_may_be_minted"] is False
     assert aggregate["reinforcement_learning_authorized"] is False
+
+    controller_bytes = controller_terminal_paths[2].read_bytes()
+    controller_terminal_paths[2].chmod(0o640)
+    controller_terminal_paths[2].write_bytes(controller_bytes + b"\n")
+    with pytest.raises(M03RV16AggregateError, match="hash drifted"):
+        aggregate_m03r_v16_panel(
+            package_plan_path=plan_path,
+            package_plan_file_sha256=plan_file,
+            execution_authorization_path=authorization_path,
+            execution_authorization_file_sha256=authorization_file,
+            qualification_activation_path=activation_path,
+            qualification_activation_file_sha256=activation_file_sha,
+            qualification_outer_access_authority_path=outer_access_path,
+            qualification_outer_access_authority_file_sha256=(
+                outer_access_file_sha
+            ),
+            qualification_outer_access_authority_receipt_sha256=(
+                outer_access.receipt_sha256
+            ),
+            qualification_preflight_root=preflight_root,
+            storage_semantics_path=storage_path,
+            storage_semantics_file_sha256=storage_file,
+            storage_semantics_receipt_sha256=storage.receipt_sha256,
+            authority_root=authority_root,
+            authority_observer_root=observer_root,
+            training_panel_path=training_panel_path,
+            training_terminal_paths=training_evidence_paths,  # type: ignore[arg-type]
+            controller_terminal_paths=tuple(controller_terminal_paths),  # type: ignore[arg-type]
+            controller_terminal_file_sha256=tuple(controller_terminal_hashes),  # type: ignore[arg-type]
+            worker_terminal_paths=(
+                terminal_paths[0],
+                terminal_paths[1],
+                terminal_paths[2],
+            ),
+            worker_terminal_file_sha256=(
+                terminal_hashes[0],
+                terminal_hashes[1],
+                terminal_hashes[2],
+            ),
+            output_root=tmp_path / "aggregate-controller-tampered",
+        )
+    controller_terminal_paths[2].write_bytes(controller_bytes)
 
     terminal_paths[0].chmod(0o640)
     terminal_paths[0].write_bytes(terminal_paths[0].read_bytes() + b"\n")
@@ -1739,6 +2148,8 @@ def test_v16_file_aggregate_joins_exact_three_worker_terminals(
             authority_observer_root=observer_root,
             training_panel_path=training_panel_path,
             training_terminal_paths=training_evidence_paths,  # type: ignore[arg-type]
+            controller_terminal_paths=tuple(controller_terminal_paths),  # type: ignore[arg-type]
+            controller_terminal_file_sha256=tuple(controller_terminal_hashes),  # type: ignore[arg-type]
             worker_terminal_paths=(
                 terminal_paths[0],
                 terminal_paths[1],
