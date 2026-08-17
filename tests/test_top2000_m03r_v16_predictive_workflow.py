@@ -25,8 +25,10 @@ def _rank_row(rank: int, *, local_count: int = 22) -> dict[str, object]:
         "batch_receipt_sha256": str(rank) * 64,
         "step_receipt_sha256": str(rank + 2) * 64,
         "source_array_sha256": "3" * 64,
-        "selection_target_operator_root_sha256": "4" * 64,
-        "action_operator_root_sha256": "5" * 64,
+        # Each rank owns a disjoint origin shard, so its origin-specific
+        # operator roots must remain rank-local rather than compare equal.
+        "selection_target_operator_root_sha256": str(rank + 4) * 64,
+        "action_operator_root_sha256": str(rank + 6) * 64,
         "completed_updates_after": 1,
         "distributed_rank": rank,
         "local_origin_count": local_count,

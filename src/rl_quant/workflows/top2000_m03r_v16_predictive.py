@@ -548,8 +548,6 @@ def _validate_gathered_update(rows: list[Any], world_size: int) -> None:
         or len({row["update_plan_sha256"] for row in rows}) != 1
         or len({row["source_array_sha256"] for row in rows}) != 1
         or len({row["completed_updates_after"] for row in rows}) != 1
-        or len({row["selection_target_operator_root_sha256"] for row in rows}) != 1
-        or len({row["action_operator_root_sha256"] for row in rows}) != 1
         or len({row["global_origin_count"] for row in rows}) != 1
         or sum(row["local_origin_count"] for row in rows)
         != rows[0]["global_origin_count"]
