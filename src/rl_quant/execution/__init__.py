@@ -14,6 +14,13 @@ know which submodule a symbol lives in.
 
 from __future__ import annotations
 
+from rl_quant.execution.age_aware_no_trade import (
+    AgeAwareNoTradeConfig,
+    AgeAwareNoTradeError,
+    ForecastDistribution,
+    ReplacementDecision,
+    evaluate_replacement,
+)
 from rl_quant.execution.fills import (
     MarketSnapshot,
 )
@@ -25,6 +32,15 @@ from rl_quant.execution.leg import (
     LegSide,
     SymbolQuote,
     simulate_action_transition,
+)
+from rl_quant.execution.impact_model import (
+    AlphaExecutionCostError,
+    CapacityEstimate,
+    ExecutionCostEstimate,
+    ExecutionCostObservation,
+    SquareRootImpactConfig,
+    estimate_execution_cost,
+    evaluate_capacity,
 )
 from rl_quant.execution.portfolio import (
     FixedTurnoverTargetWeightExecution,
@@ -63,17 +79,26 @@ from rl_quant.execution.validation import (
 
 __all__ = [
     "ActionTransitionOutcome",
+    "AgeAwareNoTradeConfig",
+    "AgeAwareNoTradeError",
+    "AlphaExecutionCostError",
+    "CapacityEstimate",
     "ExecutionConfig",
+    "ExecutionCostEstimate",
+    "ExecutionCostObservation",
     "ExecutionLeg",
     "FillLevel",
     "FillStatus",
     "FixedTurnoverTargetWeightExecution",
+    "ForecastDistribution",
     "Holdings",
     "ImpactModel",
     "ImmediateTargetWeightExecution",
     "LegSide",
     "MarketSnapshot",
     "PositionState",
+    "ReplacementDecision",
+    "SquareRootImpactConfig",
     "SwitchFillPolicy",
     "SymbolQuote",
     "TargetWeightExecutionModel",
@@ -95,5 +120,8 @@ __all__ = [
     "simulate_transition",
     "transition_pnl",
     "drift_weights",
+    "estimate_execution_cost",
+    "evaluate_capacity",
+    "evaluate_replacement",
     "weight_transition_cost_bps",
 ]

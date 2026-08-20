@@ -11,6 +11,19 @@ context encoder. Training the policy on detached context tensors (see rl_quant.t
 """
 from __future__ import annotations
 
+from rl_quant.models.alpha_hierarchical import (
+    AlphaDistribution,
+    AlphaDistributionHead,
+    AlphaModelError,
+    CrossDayAlphaConfig,
+    CrossDayAlphaEncoder,
+    HierarchicalAlphaModel,
+    HierarchicalAlphaOutput,
+    MarketLatentConfig,
+    MarketLatentEncoder,
+    OrderedFiveMinuteConfig,
+    OrderedFiveMinuteEncoder,
+)
 from rl_quant.models.context_encoder import (
     ContextEncoder,
     ContextEncoderConfig,
@@ -27,9 +40,14 @@ from rl_quant.models.daily_policy import (
 from rl_quant.models.decision_policy import DecisionPolicyConfig, DecisionPolicyHead, RawSecondPolicyEncoder
 
 __all__ = [
+    "AlphaDistribution",
+    "AlphaDistributionHead",
+    "AlphaModelError",
     "ContextEncoder",
     "ContextEncoderConfig",
     "ContextForwardHead",
+    "CrossDayAlphaConfig",
+    "CrossDayAlphaEncoder",
     "CrossDayTemporalEncoder",
     "DailyCrossSectionConfig",
     "DailyCrossSectionPolicy",
@@ -37,6 +55,12 @@ __all__ = [
     "DecisionPolicyConfig",
     "DecisionPolicyHead",
     "FullDayRawEncoder",
+    "HierarchicalAlphaModel",
+    "HierarchicalAlphaOutput",
+    "MarketLatentConfig",
+    "MarketLatentEncoder",
+    "OrderedFiveMinuteConfig",
+    "OrderedFiveMinuteEncoder",
     "PerStockForwardHead",
     "RawSecondPolicyEncoder",
 ]

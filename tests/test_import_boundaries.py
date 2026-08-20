@@ -24,6 +24,11 @@ import unittest
 # Layer order, lowest (most foundational) first. Verified to make the current runtime import graph a clean DAG.
 LAYER_ORDER = [
     "protocol",
+    # Cross-model PIT identity, data-authority, and economic-accounting
+    # contracts.  Alpha may reuse canonical protocol primitives, while model,
+    # dataset, execution, training, and workflow adapters depend downward on
+    # this source-owned semantic layer.
+    "alpha",
     "rl",
     "data_sources",
     "models",

@@ -111,6 +111,12 @@ tests are not launch or performance evidence.
 
 ## Shared architecture and data contracts
 
+- [PITAlphaDatasetV1 data authority](pit_alpha_dataset_v1.md) — permanent
+  security identity, point-in-time membership and availability, complete
+  economic outcomes, causal cash, and exact byte inventory.
+- [Alpha-learning foundation](alpha_learning_foundation.md) — post-v16 target,
+  attribution, ordered five-minute representation, objective, paired
+  evaluation, soft replacement, and execution-cost implementation boundary.
 - [General RL architecture](general_rl_architecture.md)
 - [Architecture migration ledger](architecture_migration_plan.md)
 - [Decision-tensor protocol](decision_tensor_protocol.md)
