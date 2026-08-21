@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_PREDICTIVE_SPEC,
     M03R_V16_PROTOCOL_SHA256,
     M03R_V16_SETTINGS,
     M03RV16PredictiveSetting,
@@ -216,7 +217,10 @@ class Top2000M03RV16PredictivePolicy(nn.Module):
             parameter.requires_grad_(False)
 
         self.selection_score_head = nn.Linear(token_dim, 1)
-        nn.init.xavier_uniform_(self.selection_score_head.weight, gain=0.10)
+        nn.init.xavier_uniform_(
+            self.selection_score_head.weight,
+            gain=M03R_V16_PREDICTIVE_SPEC.selection_head_initialization_gain,
+        )
         nn.init.zeros_(self.selection_score_head.bias)
 
     @property

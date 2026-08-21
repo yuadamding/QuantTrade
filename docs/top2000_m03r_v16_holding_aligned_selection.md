@@ -13,9 +13,15 @@ model or optimizer state, train timing or uncertainty, run an economic/RL
 optimizer, or access 2026 outcomes. The future-selected TOP2000 surface remains
 development-only, nonreportable, and nonpromotable.
 
-No V16 package, remote run, GPU result, or performance result is claimed. The
-current local protocol is the lifecycle-only v15 revision; older v16 source and
-artifact identities may not be mixed with it.
+The current source is the v16 fit-repair revision. It binds the exact prior
+training-panel and closure file hashes that routed all setting/fold fits to
+`collapsed-output` before any outer outcome was opened. The repair changes only
+the selection-head initialization gain from `0.10` to standard Xavier gain
+`1.0` and its learning rate from `1e-4` to `1e-3`. Encoder learning rate,
+targets, folds, epoch count, loss, gates, and the 2026 prohibition are
+unchanged. The older lifecycle-v15 source and artifacts remain immutable and
+must not be mixed with this revision. Repository prose does not validate the
+external parent receipts or claim that this repair has run.
 
 ## Scientific settings
 
@@ -123,6 +129,12 @@ This prevents the target's units from changing the effective head gradient or
 clipping probability. There is no h3, rank, or distributional loss in this
 screen. Timing and uncertainty require later identities after a selection
 target passes.
+
+The fit-repair revision uses standard Xavier gain `1.0` for the selection head,
+an encoder/head learning-rate pair of `(2e-5, 1e-3)`, and the same eight fixed
+epochs. These values are frozen before any outer qualification or 2026 access.
+They correct a pre-outer fit pathology rather than tune against predictive
+outcomes.
 
 LayerNorm parameters, module biases, and `cash_bias` receive zero weight decay;
 classification is based on module identity rather than name fragments.

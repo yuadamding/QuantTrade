@@ -22,10 +22,16 @@ from rl_quant.protocol.hold30_alpha_m03r_v15_top2000_dev import (
 from rl_quant.protocol.hold_target import LEGACY_HOLD30_TARGET_SPEC
 
 M03R_V16_PROTOCOL_GENERATION = (
-    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v15"
+    "top2000-dev-hold30-active-alpha-m03r-v16-holding-aligned-selection-v16"
 )
 M03R_V16_DESIGN_ID = (
-    "kubectl-filename-cli-contract-journaled-controller-paired-hold30-v15"
+    "fit-pathology-head-scale-lr-correction-paired-hold30-v16"
+)
+M03R_V16_FIT_REPAIR_PARENT_TRAINING_PANEL_FILE_SHA256 = (
+    "3735ef94106a27ab6a8a08d7bbce9461d65d33928803e89e8521b8e95e10acad"
+)
+M03R_V16_FIT_REPAIR_PARENT_CLOSURE_FILE_SHA256 = (
+    "1bfdcd7e13f0263fec3aa2f2f34c518daf8107c05e96dd466afe245a057bfb4c"
 )
 M03R_V16_SCHEDULING_POLICY = "independent-per-completion"
 M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS = 30
@@ -61,7 +67,7 @@ M03R_V16_FILL_RULE = (
     "observe-close-t-fill-next-close-t-plus-1-development-diagnostic-v1"
 )
 M03R_V16_OPTIMIZER_RULE = (
-    "selection-only-encoder-and-dimensionless-mean-module-aware-decay-v2"
+    "selection-only-encoder-and-standard-xavier-head-tenfold-head-lr-v3"
 )
 M03R_V16_CHECKPOINT_SELECTION_RULE = (
     "fixed-terminal-epoch-8-inner-validation-diagnostics-only-v2"
@@ -259,7 +265,8 @@ class M03RV16PredictiveSpec:
     adequacy_rank_ic_slope_threshold: float = 0.0005
     adequacy_recent_loss_relative_improvement_threshold: float = 0.01
     adequacy_maximum_recent_clip_fraction: float = 0.50
-    score_learning_rates: tuple[float, float] = (2.0e-5, 1.0e-4)
+    selection_head_initialization_gain: float = 1.0
+    score_learning_rates: tuple[float, float] = (2.0e-5, 1.0e-3)
     learning_rate_warmup_fraction: float = 0.05
     minimum_learning_rate_multiplier: float = 0.10
     weight_decay: float = 1.0e-4
@@ -329,7 +336,8 @@ class M03RV16PredictiveSpec:
             or self.adequacy_rank_ic_slope_threshold != 0.0005
             or self.adequacy_recent_loss_relative_improvement_threshold != 0.01
             or self.adequacy_maximum_recent_clip_fraction != 0.50
-            or self.score_learning_rates != (2.0e-5, 1.0e-4)
+            or self.selection_head_initialization_gain != 1.0
+            or self.score_learning_rates != (2.0e-5, 1.0e-3)
             or self.learning_rate_warmup_fraction != 0.05
             or self.minimum_learning_rate_multiplier != 0.10
             or self.weight_decay != 1.0e-4
@@ -386,6 +394,12 @@ M03R_V16_PROTOCOL_SHA256 = _sha256(
         "design_id": M03R_V16_DESIGN_ID,
         "scheduling_policy": M03R_V16_SCHEDULING_POLICY,
         "parent_protocol_sha256": M03R_V15_PROTOCOL_SHA256,
+        "fit_repair_parent_training_panel_file_sha256": (
+            M03R_V16_FIT_REPAIR_PARENT_TRAINING_PANEL_FILE_SHA256
+        ),
+        "fit_repair_parent_closure_file_sha256": (
+            M03R_V16_FIT_REPAIR_PARENT_CLOSURE_FILE_SHA256
+        ),
         "selection_targets": M03R_V16_SELECTION_TARGET_IDS,
         "maximum_target_support_sessions": M03R_V16_MAXIMUM_TARGET_SUPPORT_SESSIONS,
         "common_label_support_sessions": M03R_V16_COMMON_LABEL_SUPPORT_SESSIONS,

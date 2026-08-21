@@ -9,6 +9,8 @@ import torch
 
 from rl_quant.models.daily_policy import hold30_release_hazard
 from rl_quant.protocol.hold30_alpha_m03r_v16_top2000_dev import (
+    M03R_V16_FIT_REPAIR_PARENT_CLOSURE_FILE_SHA256,
+    M03R_V16_FIT_REPAIR_PARENT_TRAINING_PANEL_FILE_SHA256,
     M03R_V16_FILL_RULE,
     M03R_V16_HOLD30_REFERENCE_RELEASE_HAZARDS,
     M03R_V16_PREDICTIVE_SPEC,
@@ -34,6 +36,10 @@ def test_v16_is_a_selection_only_primary_hypothesis_screen() -> None:
     assert [row.promotion_eligible for row in M03R_V16_SETTINGS] == [False, False, True]
     assert M03R_V16_PREDICTIVE_SPEC.primary_setting_index == 2
     assert M03R_V16_PREDICTIVE_SPEC.maximum_h100_requests == 6
+    assert M03R_V16_PREDICTIVE_SPEC.selection_head_initialization_gain == 1.0
+    assert M03R_V16_PREDICTIVE_SPEC.score_learning_rates == (2.0e-5, 1.0e-3)
+    assert len(M03R_V16_FIT_REPAIR_PARENT_TRAINING_PANEL_FILE_SHA256) == 64
+    assert len(M03R_V16_FIT_REPAIR_PARENT_CLOSURE_FILE_SHA256) == 64
     assert M03R_V16_PREDICTIVE_SPEC.timing_optimizer_updates == 0
     assert M03R_V16_PREDICTIVE_SPEC.uncertainty_calibration_updates == 0
     assert M03R_V16_PREDICTIVE_SPEC.reinforcement_learning_updates == 0

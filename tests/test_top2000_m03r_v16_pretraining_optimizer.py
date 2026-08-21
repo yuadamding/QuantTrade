@@ -27,6 +27,16 @@ def test_v16_optimizer_trains_only_encoder_and_selection_head() -> None:
         "selection_score_head.bias",
         "selection_score_head.weight",
     }
+    base_rates = {
+        str(group["group_name"]): float(group["base_lr"])
+        for group in optimizer.param_groups
+    }
+    assert {value for key, value in base_rates.items() if key.startswith("encoder-")} == {
+        2.0e-5
+    }
+    assert {
+        value for key, value in base_rates.items() if key.startswith("selection-head-")
+    } == {1.0e-3}
     with pytest.raises(M03RV16OptimizerError, match="selection score training only"):
         build_m03r_v16_optimizer(policy, "scale_calibration")  # type: ignore[arg-type]
 
@@ -60,3 +70,4 @@ def test_v16_setting_neutral_initial_parameter_bytes() -> None:
         torch.equal(first.state_dict()[name], second.state_dict()[name])
         for name in first.state_dict()
     )
+    assert float(first.selection_score_head.weight.norm()) > 0.5
