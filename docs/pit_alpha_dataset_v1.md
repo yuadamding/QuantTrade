@@ -93,3 +93,47 @@ That materialization must produce `DatasetFileRecord` entries from the actual
 bytes, pass the authority validator, and reconcile total returns and terminal
 events against an independent source before five-minute model training is
 authorized.
+
+## Organized Polygon conversion boundary
+
+The prior organized TOP2000 cache can be audited and sampled through:
+
+```bash
+python -m rl_quant.workflows.pit_alpha_dataset_v1 \
+  --data-root /approved/quant/data \
+  audit --output /approved/staging/conversion-audit.json \
+  --verify-canonical-files
+
+python -m rl_quant.workflows.pit_alpha_dataset_v1 \
+  --data-root /approved/quant/data \
+  convert-symbol-day --symbol AAPL --date 2022-01-03 \
+  --output /approved/staging/AAPL/2022-01-03.parquet
+```
+
+The converter rebases stale manifest paths onto the canonical organized roots,
+rejects malformed symbols, records FIGI/CIK identity transitions, extracts
+dividend and split candidates, and aggregates regular-session second bars into
+sparse ordered five-minute intervals. Missing five-minute intervals are not
+zero-filled. Every staged symbol-day has an exact source/output receipt and is
+explicitly nonreportable.
+
+The audit always refuses to mint `PITAlphaDatasetV1` from this cache alone. Its
+2026-ranked universe is future-selected for the 2022--2026 history; it lacks
+historical membership events, a terminal-event/successor ledger, causal cash
+returns, and independent total-return reconciliation. Polygon overview
+snapshots are identity observations rather than permanent-ID authority, and
+adjusted prices must not be combined with split share transformations until one
+coherent accounting convention has been independently reconciled.
+
+The source-to-authority mapping is therefore deliberately staged:
+
+| Organized source | Safe conversion now | Final V1 destination | Remaining authority |
+|---|---|---|---|
+| One-second adjusted aggregates | Sparse ordered five-minute development bars | `partitions/<date>/bars_5m.parquet` | Session calendar, permanent IDs, and adjusted/unadjusted accounting policy |
+| Monthly overview snapshots | FIGI/CIK identity observations | `security_master.parquet`, `ticker_history.parquet` | Effective ticker/security event reconciliation |
+| One 2026 dollar-volume rank | Source evidence only | `membership_events.parquet` | Historical point-in-time eligibility and rank events |
+| Dividend and split JSONL | Deduplicated action candidates | `corporate_actions.parquet` | Complete announcement timing and independent reconciliation |
+| Missing from organized cache | None | cash, availability, total-return, and terminal ledgers | Approved causal sources must be acquired |
+
+Only after the rightmost column is closed may the candidate tables be renamed
+to the authoritative V1 filenames and included in a canonical dataset manifest.
