@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ from rl_quant.workflows.top2000_m03r_v16_package_builder import (
     validate_m03r_v16_local_package,
     validate_m03r_v16_transfer_archive,
     _freeze_source_tree,
+    _isolated_subprocess_environment,
 )
 
 
@@ -70,6 +72,21 @@ def test_v16_isolated_read_only_source_import_creates_no_bytecode(
     )
     assert not tuple(source.rglob("__pycache__"))
     assert not tuple(source.rglob("*.pyc"))
+
+
+def test_v16_isolated_builder_preserves_only_absolute_library_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    library_path = os.pathsep.join(("/risapps/python/lib", "/opt/runtime/lib"))
+    monkeypatch.setenv("LD_LIBRARY_PATH", library_path)
+    environment = _isolated_subprocess_environment(deterministic_seed=17)
+    assert environment["LD_LIBRARY_PATH"] == library_path
+    assert environment["PYTHONHASHSEED"] == "17"
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    monkeypatch.setenv("LD_LIBRARY_PATH", ".:/opt/runtime/lib")
+    with pytest.raises(M03RV16PackageBuildError, match="absolute entries"):
+        _isolated_subprocess_environment()
 
 
 def _inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:

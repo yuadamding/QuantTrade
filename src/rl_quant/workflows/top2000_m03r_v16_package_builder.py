@@ -127,6 +127,30 @@ def _copy(source: Path, target: Path) -> str:
     return digest.hexdigest()
 
 
+def _isolated_subprocess_environment(*, deterministic_seed: int | None = None) -> dict[str, str]:
+    """Keep isolated builders minimal while preserving the bound interpreter runtime."""
+
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    library_path = os.environ.get("LD_LIBRARY_PATH")
+    if library_path is not None:
+        components = library_path.split(os.pathsep)
+        if not components or any(
+            not component or not Path(component).is_absolute()
+            for component in components
+        ):
+            raise M03RV16PackageBuildError(
+                "V16 package-builder library path must contain absolute entries"
+            )
+        environment["LD_LIBRARY_PATH"] = library_path
+    if deterministic_seed is not None:
+        environment["PYTHONHASHSEED"] = str(deterministic_seed)
+    return environment
+
+
 def _source_members(root: Path) -> tuple[Path, ...]:
     required = (
         root / "pyproject.toml",
@@ -277,10 +301,9 @@ def _read_structural_build_receipt(path: Path) -> dict[str, Any]:
 def _run_package_owned_initial_state(package_root: Path) -> dict[str, Any]:
     state = package_root / "model/common-initial-parameter-state.pt"
     receipt = package_root / "plans/initial-state-build.json"
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONHASHSEED": str(M03R_V16_PREDICTIVE_SPEC.seed),
-    }
+    environment = _isolated_subprocess_environment(
+        deterministic_seed=M03R_V16_PREDICTIVE_SPEC.seed
+    )
     command = (
         sys.executable,
         "-I",
@@ -346,11 +369,7 @@ def _run_package_owned_structural_slab(
 ) -> dict[str, Any]:
     slab = package_root / "structural" / "structural-slab.pt"
     receipt = package_root / "plans" / "structural-slab-build.json"
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
+    environment = _isolated_subprocess_environment()
     command = (
         sys.executable,
         "-I",
