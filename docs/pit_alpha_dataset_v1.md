@@ -187,3 +187,69 @@ The source-to-authority mapping is therefore deliberately staged:
 
 Only after the rightmost column is closed may the candidate tables be renamed
 to the authoritative V1 filenames and included in a canonical dataset manifest.
+
+## Permanent identity and historical PIT universe boundary
+
+`rl_quant.alpha.pit_universe` is the successor to Polygon staging. It does not
+derive identity or membership from the future-selected 2026 TOP2000 list.
+Instead, it requires a source-receipted permanent security graph and reconstructs
+membership from complete causal rank-input cross-sections.
+
+The default production rule is PIT-500. Its central invariant is:
+
+\[
+U_t=f(X_{\leq t-1}).
+\]
+
+Every rank-input row binds an effective session, an observation window, its
+availability timestamp, observed-session count, trailing mean dollar volume,
+closing price, and source receipt. The observation window must end at least one
+session before membership becomes effective. Every active listed security must
+appear in each rank-input cross-section; missing candidates fail the authority
+instead of disappearing from the rank.
+
+Permanent identity issuance requires:
+
+- one source-receipted security-master row per permanent `security_id`;
+- nonoverlapping, causally available ticker intervals;
+- one listing event per security matching its initial ticker and exchange;
+- one delisting event for every delisted security;
+- known successor identities where applicable;
+- no overlapping reuse of the same ticker on the same exchange.
+
+Future delisting never changes earlier membership. A delisted security receives
+an explicit later negative membership event rather than being removed from
+history.
+
+The materializer publishes exactly these first-stage data products:
+
+```text
+security_master.parquet
+ticker_history.parquet
+listing_events.parquet
+delisting_events.parquet
+membership_events.parquet
+universe_rank_inputs.parquet
+universe_rule.json
+identity_universe_authority.json
+```
+
+The loader reopens every exact file, validates its frozen schema, physical and
+semantic hashes, reconstructs the identity graph, and independently rebuilds
+membership from the rank inputs. This bundle can declare identity and historical
+universe closure, but it always keeps:
+
+```text
+pit_alpha_training_ready: false
+reportable_pit_authority_ready: false
+```
+
+Training remains blocked until terminal economics, causal cash, availability,
+independent total-return reconciliation, and deterministic training tensors are
+issued.
+
+The same module audits hardened Polygon staging coverage against the permanent
+identity graph and historical ticker intervals. It reports every required,
+covered, missing, unresolved-ticker, and unused symbol-day. Even 100% Polygon
+bar coverage cannot authorize training because Polygon remains only the raw
+observation source.

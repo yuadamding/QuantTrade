@@ -27,6 +27,8 @@ from pathlib import Path, PurePath
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from rl_quant.alpha.contracts import PITAlphaDataError
+from rl_quant.alpha.pit_universe import PolygonStagingInventoryRecord
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
     file_sha256,
@@ -2175,6 +2177,44 @@ def write_conversion_audit(path: Path, audit: PolygonPITAlphaConversionAudit) ->
     return _write_new_bytes(path, canonical_json_file_bytes(audit.to_dict()))
 
 
+def load_polygon_staging_inventory(
+    publications: Sequence[tuple[Path, str]],
+) -> tuple[PolygonStagingInventoryRecord, ...]:
+    """Load exact committed Polygon bundles into a coverage-only inventory."""
+
+    inventory: list[PolygonStagingInventoryRecord] = []
+    keys: set[tuple[str, str]] = set()
+    for output_path, expected_commit_file_sha256 in publications:
+        loaded = load_five_minute_staging_publication(
+            output_path,
+            expected_commit_file_sha256=expected_commit_file_sha256,
+        )
+        try:
+            receipt = loaded["receipt"]
+            commit = loaded["commit"]
+            source = receipt["source_authority"]
+            row = PolygonStagingInventoryRecord(
+                symbol=receipt["symbol"],
+                session_date=receipt["session_date"],
+                source_receipt_sha256=source["source_receipt_sha256"],
+                output_file_sha256=loaded["output_file_sha256"],
+                commit_receipt_sha256=commit["commit_receipt_sha256"],
+            )
+        except (KeyError, TypeError) as exc:
+            raise PITAlphaDataError(
+                "committed Polygon publication lacks coverage identities"
+            ) from exc
+        row.validate()
+        key = (row.symbol, row.session_date)
+        if key in keys:
+            raise PITAlphaDataError(
+                "committed Polygon coverage inventory contains duplicate symbol-days"
+            )
+        keys.add(key)
+        inventory.append(row)
+    return tuple(sorted(inventory, key=lambda row: (row.session_date, row.symbol)))
+
+
 __all__ = [
     "EXPECTED_NORMAL_SESSION_INTERVALS",
     "PIT_ALPHA_CONVERSION_AUDIT_SCHEMA",
@@ -2200,6 +2240,7 @@ __all__ = [
     "iter_identity_observations",
     "load_exchange_session_authority",
     "load_five_minute_staging_publication",
+    "load_polygon_staging_inventory",
     "resolve_symbol_day_path",
     "resolve_symbol_day_source",
     "write_conversion_audit",

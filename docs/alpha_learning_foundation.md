@@ -35,9 +35,20 @@ No downstream layer may compensate for a failed upstream gate.
 - post-fill total returns that reject missing economic paths and never replace
   delistings or missing marks with zero returns.
 
-The implementation does not include a vendor adapter. A source adapter may be
-added only when its approved inputs, timestamps, and independent reconciliation
-authority are available.
+`rl_quant.alpha.pit_universe` adds the source-provenanced identity and
+historical-universe materialization boundary:
+
+- permanent security, issuer, ticker, listing, delisting, and successor
+  reconciliation;
+- causal trailing-dollar-volume rank inputs ending no later than `t-1`;
+- complete active-candidate cross-sections and deterministic PIT-500 ranking;
+- explicit exits for delisted prior members without future-survival filtering;
+- exact seven-file Parquet/JSON materialization and independent reload;
+- required-versus-covered Polygon staging inventory by historical ticker-day.
+
+The implementation does not invent vendor identity or historical universe
+records. A source adapter may be added only when its approved inputs,
+timestamps, and independent reconciliation authority are available.
 
 ### Targets and residualization
 
