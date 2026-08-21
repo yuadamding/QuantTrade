@@ -11,7 +11,8 @@ from rl_quant.data_sources.polygon_pit_alpha import (
     audit_organized_polygon_for_pit_alpha,
     convert_symbol_day_to_five_minute_staging,
     default_organized_polygon_shards,
-    resolve_symbol_day_path,
+    load_exchange_session_authority,
+    resolve_symbol_day_source,
     write_conversion_audit,
 )
 
@@ -34,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     convert.add_argument("--symbol", required=True)
     convert.add_argument("--date", required=True)
+    convert.add_argument("--session-authority", type=Path, required=True)
+    convert.add_argument("--session-authority-file-sha256", required=True)
     convert.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -52,9 +55,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "audit_file": str(args.output),
                     "audit_file_sha256": file_sha,
-                    "development_five_minute_conversion_ready": (
-                        audit.development_five_minute_conversion_ready
+                    "staging_conversion_possible": audit.staging_conversion_possible,
+                    "bar_source_inventory_verified": (
+                        audit.bar_source_inventory_verified
                     ),
+                    "pit_alpha_training_ready": audit.pit_alpha_training_ready,
                     "reportable_pit_authority_ready": audit.reportable_pit_authority_ready,
                     "blockers": audit.blockers,
                 },
@@ -63,9 +68,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0
-    source = resolve_symbol_day_path(shards, args.symbol, args.date)
-    receipt = convert_symbol_day_to_five_minute_staging(source, args.output)
-    print(json.dumps(receipt, indent=2, sort_keys=True))
+    source = resolve_symbol_day_source(shards, args.symbol, args.date)
+    session = load_exchange_session_authority(
+        args.session_authority,
+        expected_file_sha256=args.session_authority_file_sha256,
+    )
+    publication = convert_symbol_day_to_five_minute_staging(
+        source, session, args.output
+    )
+    print(json.dumps(publication, indent=2, sort_keys=True))
     return 0
 
 

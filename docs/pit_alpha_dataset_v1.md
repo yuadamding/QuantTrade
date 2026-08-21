@@ -107,15 +107,58 @@ python -m rl_quant.workflows.pit_alpha_dataset_v1 \
 python -m rl_quant.workflows.pit_alpha_dataset_v1 \
   --data-root /approved/quant/data \
   convert-symbol-day --symbol AAPL --date 2022-01-03 \
+  --session-authority /approved/calendars/XNYS/2022-01-03.json \
+  --session-authority-file-sha256 <exact-file-sha256> \
   --output /approved/staging/AAPL/2022-01-03.parquet
 ```
 
-The converter rebases stale manifest paths onto the canonical organized roots,
-rejects malformed symbols, records FIGI/CIK identity transitions, extracts
-dividend and split candidates, and aggregates regular-session second bars into
-sparse ordered five-minute intervals. Missing five-minute intervals are not
-zero-filled. Every staged symbol-day has an exact source/output receipt and is
-explicitly nonreportable.
+The audit reports four deliberately different readiness states:
+
+```text
+staging_conversion_possible
+bar_source_inventory_verified
+pit_alpha_training_ready
+reportable_pit_authority_ready
+```
+
+The old cache may satisfy the first state and, where its manifest contains
+correct hashes, the second. It cannot satisfy either training or reportability
+state by itself.
+
+The converter no longer accepts a bare file path. It resolves exactly one
+accepted legacy manifest row, opens the canonical regular file without
+following a final symlink, hashes its current bytes, validates Parquet schema
+and row count, and reconciles any declared size, row count, and SHA-256. The
+source authority also binds the exact legacy manifest-file bytes and row
+number. A legacy row with no SHA can receive a new observed source hash for
+nonreportable staging, but it is explicitly not historically hash-verified.
+
+Each conversion also requires an exact exchange-session authority supplied by
+an external calendar source. The authority freezes exchange, open, close,
+scheduled interval count, special-session reason, and a model-availability
+lag. Early closes therefore have a shorter structural grid; intervals after a
+scheduled close are not mislabeled as missing observations.
+
+The converter records FIGI/CIK identity transitions, extracts dividend and
+split candidates with source-file, line, and record provenance, and aggregates
+authorized session rows into sparse ordered five-minute intervals. Missing
+scheduled intervals are not zero-filled. Economic interval end and assumed
+strategy availability are separate timestamps.
+
+Publication is transactional and create-only. Each staged symbol-day consists
+of:
+
+```text
+<symbol-day>.parquet
+<symbol-day>.parquet.receipt.json
+<symbol-day>.parquet.commit.json
+```
+
+The receipt binds source and output semantic table hashes, the physical Parquet
+hash, frozen schema and writer settings, source authority, and session
+authority. The commit marker is written last and binds the exact Parquet and
+receipt files. A bundle without a valid commit marker is incomplete. Every
+bundle remains explicitly nonreportable and unauthorized for alpha training.
 
 The audit always refuses to mint `PITAlphaDatasetV1` from this cache alone. Its
 2026-ranked universe is future-selected for the 2022--2026 history; it lacks
@@ -124,6 +167,13 @@ returns, and independent total-return reconciliation. Polygon overview
 snapshots are identity observations rather than permanent-ID authority, and
 adjusted prices must not be combined with split share transformations until one
 coherent accounting convention has been independently reconciled.
+
+Adjusted-price semantics remain a hard barrier. Staging currently accepts the
+organized adjusted observations only to preserve the source as found. Those
+bars cannot become model inputs until the protocol freezes whether observations
+are unadjusted or constructed from adjustment factors causally effective at
+each decision time, and economic labels are reconciled from one independent
+total-return and terminal-event authority.
 
 The source-to-authority mapping is therefore deliberately staged:
 
