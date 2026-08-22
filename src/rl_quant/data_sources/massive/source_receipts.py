@@ -8,12 +8,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
-import tempfile
 from typing import BinaryIO
+import uuid
 
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
-    file_sha256,
     semantic_sha256,
 )
 
@@ -55,30 +54,97 @@ def _safe_object_key(value: object) -> str:
     return key.as_posix()
 
 
-def _canonical_write_once(path: Path, payload: object) -> str:
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_parent_directory(
+    root: Path, relative_path: str, *, create: bool
+) -> tuple[int, str]:
+    try:
+        current = os.open(root, _DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise MassiveSourceObjectError(
+            "source root must be a no-follow directory"
+        ) from exc
+    parts = PurePosixPath(relative_path).parts
+    try:
+        for component in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(component, 0o755, dir_fd=current)
+                except FileExistsError:
+                    pass
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            except OSError as exc:
+                raise MassiveSourceObjectError(
+                    "source path traverses a non-directory or symlink"
+                ) from exc
+            os.close(current)
+            current = child
+        return current, parts[-1]
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _read_regular_at(directory_fd: int, name: str) -> tuple[bytes, os.stat_result]:
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=directory_fd)
+    except OSError as exc:
+        raise MassiveSourceObjectError(f"cannot open no-follow artifact: {name}") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise MassiveSourceObjectError(f"not a regular artifact: {name}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read()
+        return data, info
+    finally:
+        os.close(descriptor)
+
+
+def _exists_at(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _canonical_write_once_at(directory_fd: int, name: str, payload: object) -> tuple[str, tuple[int, int]]:
     data = canonical_json_file_bytes(payload)
-    if path.exists():
-        if path.is_symlink() or path.read_bytes() != data:
-            raise MassiveSourceObjectError(f"existing immutable artifact differs: {path}")
-        return hashlib.sha256(data).hexdigest()
+    if _exists_at(directory_fd, name):
+        raise MassiveSourceObjectError(f"immutable artifact already exists: {name}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o444)
+    descriptor = os.open(name, flags, 0o444, dir_fd=directory_fd)
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
-    os.chmod(path, 0o444)
-    return hashlib.sha256(data).hexdigest()
+        info = os.fstat(stream.fileno())
+        os.fchmod(stream.fileno(), 0o444)
+    return hashlib.sha256(data).hexdigest(), (info.st_dev, info.st_ino)
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+def _unlink_owned_at(
+    directory_fd: int, name: str, identity: tuple[int, int] | None
+) -> None:
+    if identity is None:
+        return
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (info.st_dev, info.st_ino) == identity:
+        os.unlink(name, dir_fd=directory_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,27 +251,33 @@ def publish_massive_source_object(
     destination_root = Path(root)
     payload_relative = _safe_object_key(relative_payload_path)
     source_key = _safe_object_key(source_object_key)
-    if destination_root.is_symlink() or not destination_root.is_dir():
-        raise MassiveSourceObjectError("source root must be a no-follow directory")
-    payload_path = destination_root / payload_relative
-    payload_path.parent.mkdir(parents=True, exist_ok=True)
-    if payload_path.parent.is_symlink():
-        raise MassiveSourceObjectError("payload parent cannot be a symlink")
-    receipt_path = payload_path.with_name(payload_path.name + ".receipt.json")
-    commit_path = payload_path.with_name(payload_path.name + ".commit.json")
-    if any(path.exists() for path in (payload_path, receipt_path, commit_path)):
-        raise MassiveSourceObjectError("source publication target already exists")
     if isinstance(block_bytes, bool) or not isinstance(block_bytes, int) or block_bytes <= 0:
         raise MassiveSourceObjectError("stream block size must be positive")
+    parent_fd, payload_name = _open_parent_directory(
+        destination_root, payload_relative, create=True
+    )
+    receipt_name = payload_name + ".receipt.json"
+    commit_name = payload_name + ".commit.json"
+    if any(
+        _exists_at(parent_fd, name)
+        for name in (payload_name, receipt_name, commit_name)
+    ):
+        os.close(parent_fd)
+        raise MassiveSourceObjectError("source publication target already exists")
 
-    digest = hashlib.sha256()
-    content_length = 0
-    temporary: Path | None = None
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    created: dict[str, tuple[int, int] | None] = {
+        payload_name: None,
+        receipt_name: None,
+        commit_name: None,
+    }
     try:
-        descriptor, name = tempfile.mkstemp(
-            prefix=f".{payload_path.name}.", suffix=".partial", dir=payload_path.parent
-        )
-        temporary = Path(name)
+        temporary_name = f".{payload_name}.{uuid.uuid4().hex}.partial"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+        digest = hashlib.sha256()
+        content_length = 0
         with os.fdopen(descriptor, "wb") as output:
             while True:
                 block = stream.read(block_bytes)
@@ -218,6 +290,8 @@ def publish_massive_source_object(
                 content_length += len(block)
             output.flush()
             os.fsync(output.fileno())
+            info = os.fstat(output.fileno())
+            temporary_identity = (info.st_dev, info.st_ino)
         observed_sha256 = digest.hexdigest()
         if expected_physical_sha256 is not None:
             _digest("expected physical SHA", expected_physical_sha256)
@@ -264,7 +338,9 @@ def publish_massive_source_object(
         receipt_file_sha256 = hashlib.sha256(
             canonical_json_file_bytes(asdict(receipt))
         ).hexdigest()
-        relative_receipt = receipt_path.relative_to(destination_root).as_posix()
+        relative_receipt = str(
+            PurePosixPath(payload_relative).with_name(receipt_name)
+        )
         commit_body = {
             "schema": MASSIVE_SOURCE_COMMIT_SCHEMA,
             "payload_relative_path": payload_relative,
@@ -285,28 +361,44 @@ def publish_massive_source_object(
         )
         commit.validate()
 
-        os.link(temporary, payload_path)
-        temporary.unlink()
-        temporary = None
-        os.chmod(payload_path, 0o444)
-        _fsync_directory(payload_path.parent)
-        observed_receipt_file_sha256 = _canonical_write_once(
-            receipt_path, asdict(receipt)
+        os.link(
+            temporary_name,
+            payload_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
         )
+        created[payload_name] = temporary_identity
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_name = None
+        payload_descriptor = os.open(payload_name, _READ_FLAGS, dir_fd=parent_fd)
+        try:
+            os.fchmod(payload_descriptor, 0o444)
+        finally:
+            os.close(payload_descriptor)
+        os.fsync(parent_fd)
+        observed_receipt_file_sha256, receipt_identity = _canonical_write_once_at(
+            parent_fd, receipt_name, asdict(receipt)
+        )
+        created[receipt_name] = receipt_identity
         if observed_receipt_file_sha256 != receipt_file_sha256:
             raise MassiveSourceObjectError("receipt file identity drifted")
-        _fsync_directory(receipt_path.parent)
-        _canonical_write_once(commit_path, asdict(commit))
-        _fsync_directory(commit_path.parent)
+        os.fsync(parent_fd)
+        _, commit_identity = _canonical_write_once_at(
+            parent_fd, commit_name, asdict(commit)
+        )
+        created[commit_name] = commit_identity
+        os.fsync(parent_fd)
         return receipt, commit
     except BaseException:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        for created_path in (commit_path, receipt_path, payload_path):
-            created_path.unlink(missing_ok=True)
-        if payload_path.parent.is_dir():
-            _fsync_directory(payload_path.parent)
+        if temporary_name is not None:
+            _unlink_owned_at(parent_fd, temporary_name, temporary_identity)
+        for name in (commit_name, receipt_name, payload_name):
+            _unlink_owned_at(parent_fd, name, created[name])
+        os.fsync(parent_fd)
         raise
+    finally:
+        os.close(parent_fd)
 
 
 def load_massive_source_object(
@@ -315,30 +407,39 @@ def load_massive_source_object(
     """Reopen one complete source transaction and verify every exact byte."""
 
     destination_root = Path(root)
-    payload_path = destination_root / _safe_object_key(relative_payload_path)
-    receipt_path = payload_path.with_name(payload_path.name + ".receipt.json")
-    commit_path = payload_path.with_name(payload_path.name + ".commit.json")
-    for path in (payload_path, receipt_path, commit_path):
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or path.is_symlink():
-            raise MassiveSourceObjectError(f"not a no-follow regular file: {path}")
-    receipt = MassiveSourceObjectReceipt(**json.loads(receipt_path.read_bytes()))
-    commit = MassiveSourceCommit(**json.loads(commit_path.read_bytes()))
-    receipt.validate()
-    commit.validate()
-    if file_sha256(payload_path) != receipt.physical_sha256:
-        raise MassiveSourceObjectError("published payload bytes changed")
-    if payload_path.stat().st_size != receipt.content_length:
-        raise MassiveSourceObjectError("published payload size changed")
-    if file_sha256(receipt_path) != commit.receipt_file_sha256:
-        raise MassiveSourceObjectError("published receipt bytes changed")
-    if commit.payload_file_sha256 != receipt.physical_sha256:
-        raise MassiveSourceObjectError("commit payload identity drifted")
-    if commit.source_receipt_sha256 != receipt.receipt_sha256:
-        raise MassiveSourceObjectError("commit semantic identity drifted")
-    if commit.payload_relative_path != payload_path.relative_to(destination_root).as_posix():
-        raise MassiveSourceObjectError("commit payload path drifted")
-    return receipt, commit
+    payload_relative = _safe_object_key(relative_payload_path)
+    parent_fd, payload_name = _open_parent_directory(
+        destination_root, payload_relative, create=False
+    )
+    receipt_name = payload_name + ".receipt.json"
+    commit_name = payload_name + ".commit.json"
+    try:
+        payload_bytes, payload_info = _read_regular_at(parent_fd, payload_name)
+        receipt_bytes, _ = _read_regular_at(parent_fd, receipt_name)
+        commit_bytes, _ = _read_regular_at(parent_fd, commit_name)
+        receipt = MassiveSourceObjectReceipt(**json.loads(receipt_bytes))
+        commit = MassiveSourceCommit(**json.loads(commit_bytes))
+        receipt.validate()
+        commit.validate()
+        if hashlib.sha256(payload_bytes).hexdigest() != receipt.physical_sha256:
+            raise MassiveSourceObjectError("published payload bytes changed")
+        if payload_info.st_size != receipt.content_length:
+            raise MassiveSourceObjectError("published payload size changed")
+        if hashlib.sha256(receipt_bytes).hexdigest() != commit.receipt_file_sha256:
+            raise MassiveSourceObjectError("published receipt bytes changed")
+        if commit.payload_file_sha256 != receipt.physical_sha256:
+            raise MassiveSourceObjectError("commit payload identity drifted")
+        if commit.source_receipt_sha256 != receipt.receipt_sha256:
+            raise MassiveSourceObjectError("commit semantic identity drifted")
+        if commit.payload_relative_path != payload_relative:
+            raise MassiveSourceObjectError("commit payload path drifted")
+        if commit.receipt_relative_path != str(
+            PurePosixPath(payload_relative).with_name(receipt_name)
+        ):
+            raise MassiveSourceObjectError("commit receipt path drifted")
+        return receipt, commit
+    finally:
+        os.close(parent_fd)
 
 
 __all__ = [

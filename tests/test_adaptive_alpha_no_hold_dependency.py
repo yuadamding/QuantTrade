@@ -46,9 +46,20 @@ def test_import_firewall_rejects_historical_hold_modules(tmp_path: Path) -> None
 
 def test_all_current_adaptive_python_modules_pass_import_firewall() -> None:
     root = Path(__file__).parents[1] / "src" / "rl_quant"
-    paths = [root / "protocol" / "massive_adaptive_alpha_v1.py"]
-    paths.extend(sorted((root / "data_sources" / "massive").glob("*.py")))
-    parity = root / "evaluation" / "massive_replay_parity.py"
-    if parity.exists():
-        paths.append(parity)
+    patterns = (
+        "protocol/massive_adaptive_*.py",
+        "data_sources/massive/**/*.py",
+        "alpha/massive_*.py",
+        "features/massive_*.py",
+        "models/adaptive_alpha_*.py",
+        "training/adaptive_alpha_*.py",
+        "execution/adaptive_alpha_*.py",
+        "evaluation/*adaptive_alpha*.py",
+        "evaluation/massive_replay*.py",
+        "workflows/*massive_adaptive*.py",
+    )
+    paths = sorted(
+        {path for pattern in patterns for path in root.glob(pattern) if path.is_file()}
+    )
+    assert paths
     assert_adaptive_import_firewall(paths)

@@ -3,7 +3,9 @@
 from rl_quant.data_sources.massive.aggregate_reconciliation import (
     MassiveAggregateReconciliation,
     MassiveAggregateReconciliationError,
+    MassiveAggregateReconciliationSpec,
     MassiveFiveMinuteBar,
+    MassiveVendorAggregateBar,
     reconcile_massive_aggregate_bars,
     reconstruct_massive_five_minute_bars,
 )
@@ -43,7 +45,8 @@ from rl_quant.data_sources.massive.source_receipts import (
     publish_massive_source_object,
 )
 from rl_quant.data_sources.massive.trade_replay import (
-    MassiveTradeEventV1,
+    MassiveResolvedSecurityIdentity,
+    MassiveTradeEventV2,
     MassiveTradeReplayError,
     MassiveTradeReplayResult,
     normalize_massive_trade_event,
@@ -53,6 +56,7 @@ from rl_quant.data_sources.massive.websocket_capture import (
     MassiveDelayedWebSocketCaptureAuthority,
     MassiveDelayedWebSocketEvent,
     MassiveWebSocketCaptureError,
+    MassiveWebSocketCaptureLifecycle,
     build_massive_delayed_websocket_capture_authority,
 )
 
@@ -63,6 +67,7 @@ __all__ = [
     "MASSIVE_SOURCE_OBJECT_SCHEMA",
     "MassiveAggregateReconciliation",
     "MassiveAggregateReconciliationError",
+    "MassiveAggregateReconciliationSpec",
     "MassiveConditionAuthority",
     "MassiveConditionError",
     "MassiveCorrectionAuthority",
@@ -80,11 +85,14 @@ __all__ = [
     "MassiveSourceObjectError",
     "MassiveSourceObjectReceipt",
     "MassiveFiveMinuteBar",
+    "MassiveResolvedSecurityIdentity",
     "MassiveTradeConditionRule",
-    "MassiveTradeEventV1",
+    "MassiveTradeEventV2",
     "MassiveTradeReplayError",
     "MassiveTradeReplayResult",
     "MassiveWebSocketCaptureError",
+    "MassiveWebSocketCaptureLifecycle",
+    "MassiveVendorAggregateBar",
     "build_massive_condition_authority",
     "build_massive_correction_authority",
     "build_massive_delayed_websocket_capture_authority",

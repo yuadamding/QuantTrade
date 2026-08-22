@@ -62,6 +62,30 @@ The first milestone is limited to:
 It authorizes no model training, portfolio optimization, historical lockbox,
 prospective access, or RL.
 
+The source milestone is evidence-derived rather than label-derived:
+
+- normalized trade events bind the entitlement, session, condition,
+  correction, source-object, permanent-identity, and ticker-history receipts;
+- replay re-resolves the condition and correction rules and rechecks the
+  Developer delay, session boundary, source bytes, and identity;
+- open/close, high/low, and volume eligibility remain separate through bar
+  reconstruction;
+- delayed capture completeness is derived from authentication, subscription,
+  heartbeat coverage, disconnect inventory, raw-capture identity, and the
+  subscribed ticker set;
+- delayed/final parity is computed from typed capture, source, replay, and
+  feature artifacts, with one actual row required per canary kind and a
+  minimum six-symbol-day/two-session coverage contract;
+- aggregate reconciliation is nonempty, source-homogeneous, unadjusted, and
+  bound to a finite immutable tolerance specification;
+- source publication and reload traverse directories and open files relative
+  to no-follow directory descriptors.
+
+These contracts can authorize historical as-of replay only after real canary
+artifacts satisfy the coverage gate. They still cannot authorize predictive
+training; PIT identity, both PIT universes, economic accounting, targets, and
+repeatable tensors remain separate blocking authorities.
+
 ## Discovery family
 
 `AD00`–`AD11` are cumulative registered neural settings. `AD00` is a daily

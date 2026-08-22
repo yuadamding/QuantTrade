@@ -12,6 +12,7 @@ from rl_quant.data_sources.massive.entitlement import (
     build_massive_developer_entitlement_authority,
     documented_massive_surface,
 )
+from rl_quant.workflows.massive_entitlement_canary import _parser
 
 
 def _observation(
@@ -67,7 +68,6 @@ def test_developer_entitlement_is_secret_free_and_non_authorizing() -> None:
     assert not authority.financials_and_ratios_available
     assert not authority.predictive_training_authorized
     assert not authority.historical_performance_authorized
-    assert "7zwE_" not in payload
     assert "apiKey=" not in payload
     authority.validate()
 
@@ -83,3 +83,10 @@ def test_entitlement_rejects_credential_in_request_path() -> None:
 def test_entitlement_receipt_detects_mutation() -> None:
     with pytest.raises(MassiveEntitlementError, match="drifted|differs"):
         replace(_authority(), history_years=11).validate()
+
+
+def test_canary_credential_environment_name_cannot_drift() -> None:
+    destinations = {action.dest for action in _parser()._actions}
+
+    assert "api_key_env" not in destinations
+    assert _authority().credential_source == "environment:MASSIVE_API_KEY"

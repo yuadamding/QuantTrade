@@ -88,15 +88,42 @@ def test_invalid_metadata_is_rejected_before_final_publication(tmp_path: Path) -
 def test_receipt_write_failure_rolls_back_the_linked_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fail_write_once(path: Path, payload: object) -> str:
-        raise OSError(f"injected receipt failure: {path.name}")
+    def fail_write_once(directory_fd: int, name: str, payload: object):
+        raise OSError(f"injected receipt failure: {name}")
 
-    monkeypatch.setattr(source_receipts, "_canonical_write_once", fail_write_once)
+    monkeypatch.setattr(
+        source_receipts, "_canonical_write_once_at", fail_write_once
+    )
 
     with pytest.raises(OSError, match="injected receipt failure"):
         _publish(tmp_path)
 
     assert tuple(tmp_path.rglob("*.*")) == ()
+
+
+def test_source_publication_rejects_intermediate_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "bronze").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(MassiveSourceObjectError, match="symlink"):
+        _publish(tmp_path)
+
+    assert tuple(outside.iterdir()) == ()
+
+
+def test_source_loader_rejects_final_symlink(tmp_path: Path) -> None:
+    payload = tmp_path / "target.bin"
+    payload.write_bytes(b"not-authority")
+    nested = tmp_path / "bronze/trades/2026/08"
+    nested.mkdir(parents=True)
+    (nested / "2026-08-20.csv.gz").symlink_to(payload)
+
+    with pytest.raises(MassiveSourceObjectError, match="no-follow"):
+        load_massive_source_object(
+            root=tmp_path,
+            relative_payload_path="bronze/trades/2026/08/2026-08-20.csv.gz",
+        )
 
 
 def test_source_mutation_fails_reopen(tmp_path: Path) -> None:

@@ -117,8 +117,8 @@ class MassiveConditionAuthority:
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveConditionError("condition authority receipt differs")
 
-    def resolve(self, condition_ids: Sequence[int]) -> tuple[bool, bool]:
-        """Return price-forming and volume-forming flags for one trade."""
+    def resolve(self, condition_ids: Sequence[int]) -> tuple[bool, bool, bool]:
+        """Return open/close, high/low, and volume eligibility for one trade."""
 
         self.validate()
         by_id = {rule.condition_id: rule for rule in self.rules}
@@ -129,13 +129,13 @@ class MassiveConditionAuthority:
         if unknown:
             raise MassiveConditionError(f"unknown trade conditions: {unknown}")
         if not normalized:
-            return True, True
+            return True, True, True
         rules = tuple(by_id[value] for value in normalized)
-        price_forming = all(
-            rule.updates_high_low or rule.updates_open_close for rule in rules
+        return (
+            all(rule.updates_open_close for rule in rules),
+            all(rule.updates_high_low for rule in rules),
+            all(rule.updates_volume for rule in rules),
         )
-        volume_forming = all(rule.updates_volume for rule in rules)
-        return price_forming, volume_forming
 
 
 def build_massive_condition_authority(

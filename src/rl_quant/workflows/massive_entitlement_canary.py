@@ -36,17 +36,16 @@ def _write_once(path: Path, payload: object) -> str:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-key-env", default="MASSIVE_API_KEY")
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    key = os.environ.get(args.api_key_env)
+    key = os.environ.get("MASSIVE_API_KEY")
     if key is None:
         raise MassiveEntitlementError(
-            f"required secret environment variable is absent: {args.api_key_env}"
+            "required secret environment variable is absent: MASSIVE_API_KEY"
         )
     observed = (
         observe_massive_rest_surface(
