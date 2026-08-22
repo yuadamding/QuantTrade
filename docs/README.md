@@ -111,6 +111,17 @@ tests are not launch or performance evidence.
 
 ## Shared architecture and data contracts
 
+- [Massive PIT adaptive-alpha V1](massive_pit_adaptive_alpha_v1.md) — fresh
+  no-duration generation for a seven-bucket factor-residual return term
+  structure, delayed-replay qualification, and daily cost-aware receding-horizon
+  allocation. It is source-only and authorizes no training, lockbox access,
+  economic optimization, or RL.
+- [Massive alpha-source hypotheses](massive_alpha_source_hypotheses_v1.md) —
+  restricted trend, reversal, intraday, quote-free tape, liquidity, and regime
+  hypotheses plus the evidence required before calling one an alpha source.
+- [Massive adaptive portfolio compiler](massive_adaptive_portfolio_compiler_v1.md)
+  — age-free continuation/entry economics and the future deterministic solver
+  boundary.
 - [PITAlphaDatasetV1 data authority](pit_alpha_dataset_v1.md) — permanent
   security identity, point-in-time membership and availability, complete
   economic outcomes, causal cash, and exact byte inventory.
