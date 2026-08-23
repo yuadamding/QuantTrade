@@ -11,6 +11,7 @@ from rl_quant.data_sources.massive.source_receipts import LoadedMassiveSourceObj
 from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_PARSER_SOURCE_SHA256,
     MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256,
+    MassiveExtractedWebSocketTradeRow,
     MassiveTradeExtractionEvidence,
 )
 from rl_quant.data_sources.massive.trade_replay import MassiveTradeReplayResult
@@ -18,7 +19,6 @@ from rl_quant.data_sources.massive.websocket_capture import (
     MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA,
     MASSIVE_WEBSOCKET_CAPTURE_PARSER_SOURCE_SHA256,
     MassiveDelayedWebSocketCaptureAuthority,
-    MassiveDelayedWebSocketEvent,
 )
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_payload,
@@ -28,20 +28,18 @@ from rl_quant.protocol.canonical_artifact import (
 
 
 MASSIVE_TRADE_EXTRACTION_MANIFEST_SCHEMA = (
-    "rl-quant.massive-trade-extraction-manifest-v2"
+    "rl-quant.massive-trade-extraction-manifest-v3"
 )
 MASSIVE_DELAYED_CAPTURE_PARSER_SPEC_SHA256 = semantic_sha256(
     {
         "schema": MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA,
         "parser": "canonical-jsonl-server-batch-v1",
         "selection": "exact-pit-ticker-and-session-date",
-        "availability": "actual-local-receive-time",
+        "availability": "conservative-clock-adjusted-receive-bound",
     }
 )
 MASSIVE_REPLAY_FEATURE_SPEC_SCHEMA = "rl-quant.massive-replay-feature-spec-v1"
-MASSIVE_REPLAY_FEATURE_ARTIFACT_SCHEMA = (
-    "rl-quant.massive-replay-feature-artifact-v3"
-)
+MASSIVE_REPLAY_FEATURE_ARTIFACT_SCHEMA = "rl-quant.massive-replay-feature-artifact-v3"
 MASSIVE_REPLAY_FEATURE_IDS = (
     "active_state_inventory_sha256",
     "active_event_count",
@@ -91,6 +89,7 @@ class MassiveTradeExtractionManifest:
     session_date: str
     selected_row_count: int
     selected_source_row_inventory_sha256: str
+    selected_canonical_record_inventory_sha256: str
     selected_row_provenance_inventory_sha256: str | None
     complete_for_security_session: bool
     canonical_parser_qualified: bool
@@ -99,9 +98,7 @@ class MassiveTradeExtractionManifest:
 
     def unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
         }
 
     def validate(self) -> None:
@@ -113,6 +110,7 @@ class MassiveTradeExtractionManifest:
             "loaded_source_receipt_sha256",
             "parser_spec_sha256",
             "selected_source_row_inventory_sha256",
+            "selected_canonical_record_inventory_sha256",
             "receipt_sha256",
         ):
             _digest(name, getattr(self, name))
@@ -125,7 +123,9 @@ class MassiveTradeExtractionManifest:
         ):
             raise MassiveReplayArtifactError("extraction must select at least one row")
         if self.complete_for_security_session is not True:
-            raise MassiveReplayArtifactError("security-session extraction is incomplete")
+            raise MassiveReplayArtifactError(
+                "security-session extraction is incomplete"
+            )
         if not isinstance(self.canonical_parser_qualified, bool):
             raise MassiveReplayArtifactError("parser qualification must be Boolean")
         if self.canonical_parser_qualified:
@@ -139,11 +139,12 @@ class MassiveTradeExtractionManifest:
                 MASSIVE_DELAYED_CAPTURE_PARSER_SPEC_SHA256,
                 MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256,
             }:
-                raise MassiveReplayArtifactError("canonical parser spec is unrecognized")
+                raise MassiveReplayArtifactError(
+                    "canonical parser spec is unrecognized"
+                )
             expected_source = (
                 MASSIVE_WEBSOCKET_CAPTURE_PARSER_SOURCE_SHA256
-                if self.parser_spec_sha256
-                == MASSIVE_DELAYED_CAPTURE_PARSER_SPEC_SHA256
+                if self.parser_spec_sha256 == MASSIVE_DELAYED_CAPTURE_PARSER_SPEC_SHA256
                 else MASSIVE_FLAT_TRADE_PARSER_SOURCE_SHA256
             )
             if self.parser_source_sha256 != expected_source:
@@ -189,6 +190,7 @@ class MassiveTradeExtractionManifest:
             "session_date": replay.session_date,
             "selected_row_count": replay.input_event_count,
             "selected_source_row_inventory_sha256": replay.input_source_record_inventory_sha256,
+            "selected_canonical_record_inventory_sha256": replay.input_canonical_record_inventory_sha256,
             "selected_row_provenance_inventory_sha256": None,
             "complete_for_security_session": True,
             "canonical_parser_qualified": False,
@@ -204,6 +206,7 @@ class MassiveTradeExtractionManifest:
             session_date=replay.session_date,
             selected_row_count=replay.input_event_count,
             selected_source_row_inventory_sha256=replay.input_source_record_inventory_sha256,
+            selected_canonical_record_inventory_sha256=replay.input_canonical_record_inventory_sha256,
             selected_row_provenance_inventory_sha256=None,
             complete_for_security_session=True,
             canonical_parser_qualified=False,
@@ -223,17 +226,38 @@ class MassiveTradeExtractionManifest:
 
         evidence.validate()
         replay.validate()
-        if evidence.security_id != replay.security_id or evidence.session_date != replay.session_date:
-            raise MassiveReplayArtifactError("flat extraction and replay identities differ")
+        if (
+            evidence.security_id != replay.security_id
+            or evidence.session_date != replay.session_date
+        ):
+            raise MassiveReplayArtifactError(
+                "flat extraction and replay identities differ"
+            )
         if evidence.source_receipt_sha256 != replay.source_object_receipt_sha256:
-            raise MassiveReplayArtifactError("flat extraction and replay sources differ")
+            raise MassiveReplayArtifactError(
+                "flat extraction and replay sources differ"
+            )
         if evidence.selected_row_count != replay.input_event_count:
             raise MassiveReplayArtifactError("flat extraction and replay counts differ")
         if (
             evidence.selected_raw_source_record_inventory_sha256
-            != replay.input_source_record_inventory_sha256
+            != replay.input_raw_record_inventory_sha256
         ):
             raise MassiveReplayArtifactError("flat extraction row inventory differs")
+        if (
+            evidence.selected_canonical_record_inventory_sha256
+            != replay.input_canonical_record_inventory_sha256
+        ):
+            raise MassiveReplayArtifactError(
+                "flat extraction canonical inventory differs"
+            )
+        if (
+            evidence.selected_row_provenance_inventory_sha256
+            != replay.input_transport_provenance_inventory_sha256
+        ):
+            raise MassiveReplayArtifactError(
+                "flat extraction transport inventory differs"
+            )
         body = {
             "schema": MASSIVE_TRADE_EXTRACTION_MANIFEST_SCHEMA,
             "source_receipt_sha256": evidence.source_receipt_sha256,
@@ -245,7 +269,8 @@ class MassiveTradeExtractionManifest:
             "security_id": replay.security_id,
             "session_date": replay.session_date,
             "selected_row_count": replay.input_event_count,
-            "selected_source_row_inventory_sha256": replay.input_source_record_inventory_sha256,
+            "selected_source_row_inventory_sha256": replay.input_raw_record_inventory_sha256,
+            "selected_canonical_record_inventory_sha256": replay.input_canonical_record_inventory_sha256,
             "selected_row_provenance_inventory_sha256": evidence.selected_row_provenance_inventory_sha256,
             "complete_for_security_session": evidence.complete_for_security_session,
             "canonical_parser_qualified": True,
@@ -260,7 +285,8 @@ class MassiveTradeExtractionManifest:
             security_id=replay.security_id,
             session_date=replay.session_date,
             selected_row_count=replay.input_event_count,
-            selected_source_row_inventory_sha256=replay.input_source_record_inventory_sha256,
+            selected_source_row_inventory_sha256=replay.input_raw_record_inventory_sha256,
+            selected_canonical_record_inventory_sha256=replay.input_canonical_record_inventory_sha256,
             selected_row_provenance_inventory_sha256=evidence.selected_row_provenance_inventory_sha256,
             complete_for_security_session=evidence.complete_for_security_session,
             canonical_parser_qualified=True,
@@ -275,7 +301,7 @@ class MassiveTradeExtractionManifest:
         *,
         loaded_source: LoadedMassiveSourceObject,
         capture: MassiveDelayedWebSocketCaptureAuthority,
-        capture_events: tuple[MassiveDelayedWebSocketEvent, ...],
+        extracted_rows: tuple[MassiveExtractedWebSocketTradeRow, ...],
         replay: MassiveTradeReplayResult,
         source_ticker: str,
     ) -> MassiveTradeExtractionManifest:
@@ -291,7 +317,9 @@ class MassiveTradeExtractionManifest:
                 "delayed capture was not derived by the canonical file parser"
             )
         if capture.loaded_source_receipt_sha256 != loaded_source.receipt_sha256:
-            raise MassiveReplayArtifactError("delayed capture used another loaded source")
+            raise MassiveReplayArtifactError(
+                "delayed capture used another loaded source"
+            )
         parser_evidence = capture.parser_evidence
         if parser_evidence is None:  # defensive against property/field divergence
             raise MassiveReplayArtifactError(
@@ -304,28 +332,53 @@ class MassiveTradeExtractionManifest:
             != loaded_source.receipt.receipt_sha256
         ):
             raise MassiveReplayArtifactError("delayed extraction source differs")
-        for event in capture_events:
-            event.validate()
-        if len(capture_events) != capture.event_count:
-            raise MassiveReplayArtifactError("capture event count differs from parsed rows")
+        for extracted in extracted_rows:
+            extracted.validate()
+            if (
+                extracted.parser_evidence_receipt_sha256
+                != parser_evidence.receipt_sha256
+            ):
+                raise MassiveReplayArtifactError(
+                    "extracted WebSocket row used another parser evidence"
+                )
+        if len(extracted_rows) != capture.event_count:
+            raise MassiveReplayArtifactError(
+                "capture event count differs from parsed rows"
+            )
+        if (
+            semantic_sha256(
+                tuple(
+                    extracted.parsed_message_receipt_sha256
+                    for extracted in extracted_rows
+                )
+            )
+            != parser_evidence.parsed_trade_transport_inventory_sha256
+        ):
+            raise MassiveReplayArtifactError(
+                "capture parser transport inventory differs from extracted rows"
+            )
         event_inventory = semantic_sha256(
             tuple(
                 sorted(
                     (
-                        event.received_at_ns,
-                        event.ticker,
-                        event.sequence_number,
-                        event.payload_sha256,
+                        extracted.local_received_at_ns,
+                        extracted.canonical_record.ticker,
+                        extracted.canonical_record.sequence_number,
+                        extracted.raw_payload_sha256,
                     )
-                    for event in capture_events
+                    for extracted in extracted_rows
                 )
             )
         )
         payload_inventory = semantic_sha256(
             tuple(
                 sorted(
-                    (event.ticker, event.sequence_number, event.payload_sha256)
-                    for event in capture_events
+                    (
+                        extracted.canonical_record.ticker,
+                        extracted.canonical_record.sequence_number,
+                        extracted.raw_payload_sha256,
+                    )
+                    for extracted in extracted_rows
                 )
             )
         )
@@ -333,24 +386,56 @@ class MassiveTradeExtractionManifest:
             event_inventory != capture.event_inventory_sha256
             or payload_inventory != capture.payload_inventory_sha256
         ):
-            raise MassiveReplayArtifactError("capture inventory differs from parsed rows")
-        selected = tuple(
-            sorted(
+            raise MassiveReplayArtifactError(
+                "capture inventory differs from parsed rows"
+            )
+        selected_rows = tuple(
+            extracted
+            for extracted in extracted_rows
+            if extracted.canonical_record.ticker == source_ticker
+            and extracted.session_date == replay.session_date
+        )
+        if not selected_rows or len(selected_rows) != replay.input_event_count:
+            raise MassiveReplayArtifactError("delayed capture selection is incomplete")
+        selected_inventory = semantic_sha256(
+            tuple(
                 (
-                    event.ticker,
-                    event.sequence_number,
-                    event.payload_sha256,
+                    extracted.canonical_record.ticker,
+                    extracted.canonical_record.sequence_number,
+                    extracted.raw_payload_sha256,
                 )
-                for event in capture_events
-                if event.ticker == source_ticker
-                and event.session_date == replay.session_date
+                for extracted in selected_rows
             )
         )
-        if not selected or len(selected) != replay.input_event_count:
-            raise MassiveReplayArtifactError("delayed capture selection is incomplete")
-        selected_inventory = semantic_sha256(selected)
-        if selected_inventory != replay.input_source_record_inventory_sha256:
+        canonical_inventory = semantic_sha256(
+            tuple(
+                extracted.canonical_record.receipt_sha256 for extracted in selected_rows
+            )
+        )
+        transport_inventory = semantic_sha256(
+            tuple(
+                (
+                    extracted.source_line_number,
+                    extracted.server_batch_index,
+                    extracted.message_index,
+                    extracted.local_received_at_ns,
+                    extracted.canonical_received_at_ns,
+                    extracted.raw_payload_sha256,
+                    extracted.canonical_record.receipt_sha256,
+                )
+                for extracted in selected_rows
+            )
+        )
+        if selected_inventory != replay.input_raw_record_inventory_sha256:
             raise MassiveReplayArtifactError("delayed capture row inventory differs")
+        if canonical_inventory != replay.input_canonical_record_inventory_sha256:
+            raise MassiveReplayArtifactError(
+                "delayed capture canonical inventory differs"
+            )
+        if transport_inventory != replay.input_transport_provenance_inventory_sha256:
+            raise MassiveReplayArtifactError(
+                "delayed capture transport inventory differs"
+            )
         body = {
             "schema": MASSIVE_TRADE_EXTRACTION_MANIFEST_SCHEMA,
             "source_receipt_sha256": loaded_source.receipt.receipt_sha256,
@@ -361,9 +446,10 @@ class MassiveTradeExtractionManifest:
             "parser_evidence_receipt_sha256": parser_evidence.receipt_sha256,
             "security_id": replay.security_id,
             "session_date": replay.session_date,
-            "selected_row_count": len(selected),
+            "selected_row_count": len(selected_rows),
             "selected_source_row_inventory_sha256": selected_inventory,
-            "selected_row_provenance_inventory_sha256": selected_inventory,
+            "selected_canonical_record_inventory_sha256": canonical_inventory,
+            "selected_row_provenance_inventory_sha256": transport_inventory,
             "complete_for_security_session": True,
             "canonical_parser_qualified": True,
         }
@@ -376,9 +462,10 @@ class MassiveTradeExtractionManifest:
             parser_evidence_receipt_sha256=parser_evidence.receipt_sha256,
             security_id=replay.security_id,
             session_date=replay.session_date,
-            selected_row_count=len(selected),
+            selected_row_count=len(selected_rows),
             selected_source_row_inventory_sha256=selected_inventory,
-            selected_row_provenance_inventory_sha256=selected_inventory,
+            selected_canonical_record_inventory_sha256=canonical_inventory,
+            selected_row_provenance_inventory_sha256=transport_inventory,
             complete_for_security_session=True,
             canonical_parser_qualified=True,
             receipt_sha256=semantic_sha256(body),
@@ -396,9 +483,7 @@ class MassiveReplayFeatureSpec:
 
     def unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
         }
 
     def validate(self) -> None:
@@ -453,9 +538,7 @@ class MassiveReplayFeatureArtifact:
 
     def unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
         }
 
     def validate(self) -> None:
@@ -478,7 +561,9 @@ class MassiveReplayFeatureArtifact:
             raise MassiveReplayArtifactError("feature materializer source drifted")
         canonical_spec = MassiveReplayFeatureSpec.canonical()
         if self.feature_spec_receipt_sha256 != canonical_spec.receipt_sha256:
-            raise MassiveReplayArtifactError("feature artifact used a noncanonical spec")
+            raise MassiveReplayArtifactError(
+                "feature artifact used a noncanonical spec"
+            )
         if self.feature_schema_sha256 != MASSIVE_REPLAY_FEATURE_SCHEMA_SHA256:
             raise MassiveReplayArtifactError("feature artifact schema receipt drifted")
         payload = self.canonical_feature_payload_json.encode("ascii")

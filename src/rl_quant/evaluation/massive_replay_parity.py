@@ -21,9 +21,16 @@ from rl_quant.data_sources.massive.session_calendar import (
 from rl_quant.data_sources.massive.source_receipts import LoadedMassiveSourceObject
 from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256,
+    MassiveExtractedTradeRow,
+    MassiveExtractedWebSocketTradeRow,
     MassiveTradeExtractionEvidence,
 )
-from rl_quant.data_sources.massive.trade_replay import MassiveTradeReplayResult
+from rl_quant.data_sources.massive.trade_replay import (
+    MassiveResolvedSecurityIdentity,
+    MassiveTradeReplayResult,
+    normalize_massive_canonical_trade_event,
+    replay_massive_trades,
+)
 from rl_quant.data_sources.massive.websocket_capture import (
     MassiveDelayedWebSocketCaptureAuthority,
 )
@@ -37,8 +44,8 @@ from rl_quant.evaluation.massive_replay_artifacts import (
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 
-MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA = "rl-quant.massive-delayed-replay-v3"
-MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA = "rl-quant.massive-replay-parity-evidence-v2"
+MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA = "rl-quant.massive-delayed-replay-v4"
+MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA = "rl-quant.massive-replay-parity-evidence-v3"
 MASSIVE_TICKER_CHANGE_CANARY_SCHEMA = "rl-quant.massive-ticker-change-canary-v2"
 
 MassiveReplayCanaryKind = Literal[
@@ -103,14 +110,18 @@ class MassiveTickerChangeCanaryEvidence:
         self.prior_record.validate()
         self.current_record.validate()
         if self.prior_record.security_id != self.current_record.security_id:
-            raise MassiveReplayParityError("ticker transition changed security identity")
+            raise MassiveReplayParityError(
+                "ticker transition changed security identity"
+            )
         if self.prior_record.ticker == self.current_record.ticker:
             raise MassiveReplayParityError("ticker transition did not change ticker")
         if self.prior_record.valid_to_ms != self.current_record.valid_from_ms:
             raise MassiveReplayParityError("ticker records are not adjacent")
         if self.prior_record.primary_exchange != self.current_record.primary_exchange:
             raise MassiveReplayParityError("ticker transition changed primary exchange")
-        _digest("ticker history authority", self.ticker_history_authority_receipt_sha256)
+        _digest(
+            "ticker history authority", self.ticker_history_authority_receipt_sha256
+        )
         _digest("ticker transition receipt", self.receipt_sha256)
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveReplayParityError("ticker transition receipt differs")
@@ -159,12 +170,105 @@ class MassiveReplayParityInput:
     decision_clock: MassiveDecisionClockAuthority
     recorder_clock_authority: MassiveRecorderClockAuthority
     session: MassiveExchangeSession
+    identity_resolution: MassiveResolvedSecurityIdentity
+    delayed_extracted_rows: tuple[MassiveExtractedWebSocketTradeRow, ...]
+    finalized_extracted_rows: tuple[MassiveExtractedTradeRow, ...]
     delayed_replay: MassiveTradeReplayResult
     finalized_replay: MassiveTradeReplayResult
     delayed_features: MassiveReplayFeatureArtifact
     finalized_features: MassiveReplayFeatureArtifact
     ticker_change: MassiveTickerChangeCanaryEvidence | None = None
     ticker_history_authority: PITSecurityUniverseAuthority | None = None
+
+
+def _rebuild_delayed_replay(
+    row: MassiveReplayParityInput,
+    *,
+    entitlement_authority: MassiveEntitlementAuthority,
+    session_authority: MassiveSessionAuthority,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+) -> MassiveTradeReplayResult:
+    """Rebuild delayed replay solely from committed-parser canonical rows."""
+
+    selected = tuple(
+        extracted
+        for extracted in row.delayed_extracted_rows
+        if extracted.canonical_record.ticker == row.identity_resolution.source_ticker
+        and extracted.session_date == row.session.session_date
+    )
+    if not selected:
+        raise MassiveReplayParityError(
+            "committed delayed extraction has no identity-session rows"
+        )
+    events = tuple(
+        normalize_massive_canonical_trade_event(
+            extracted.canonical_record,
+            entitlement_authority=entitlement_authority,
+            session_authority=session_authority,
+            session=row.session,
+            condition_authority=condition_authority,
+            correction_authority=correction_authority,
+            source_object_receipt=row.delayed_source.receipt,
+            identity_resolution=row.identity_resolution,
+            source_row_number=extracted.source_line_number,
+            source_batch_index=extracted.server_batch_index,
+            source_message_index=extracted.message_index,
+            recorder_clock_authority=row.recorder_clock_authority,
+        )
+        for extracted in selected
+    )
+    return replay_massive_trades(
+        events,
+        decision_clock=row.decision_clock,
+        entitlement_authority=entitlement_authority,
+        session_authority=session_authority,
+        session=row.session,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+        source_object_receipt=row.delayed_source.receipt,
+        identity_resolution=row.identity_resolution,
+        recorder_clock_authority=row.recorder_clock_authority,
+    )
+
+
+def _rebuild_finalized_replay(
+    row: MassiveReplayParityInput,
+    *,
+    entitlement_authority: MassiveEntitlementAuthority,
+    session_authority: MassiveSessionAuthority,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+) -> MassiveTradeReplayResult:
+    """Rebuild finalized replay solely from complete flat-file extraction rows."""
+
+    if not row.finalized_extracted_rows:
+        raise MassiveReplayParityError("committed finalized extraction has no rows")
+    events = tuple(
+        normalize_massive_canonical_trade_event(
+            extracted.canonical_record,
+            entitlement_authority=entitlement_authority,
+            session_authority=session_authority,
+            session=row.session,
+            condition_authority=condition_authority,
+            correction_authority=correction_authority,
+            source_object_receipt=row.finalized_source.receipt,
+            identity_resolution=row.identity_resolution,
+            source_row_number=extracted.source_row_number,
+        )
+        for extracted in row.finalized_extracted_rows
+    )
+    return replay_massive_trades(
+        events,
+        decision_clock=row.decision_clock,
+        entitlement_authority=entitlement_authority,
+        session_authority=session_authority,
+        session=row.session,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+        source_object_receipt=row.finalized_source.receipt,
+        identity_resolution=row.identity_resolution,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,22 +556,98 @@ def _derive_parity_evidence(
         row.finalized_features,
     ):
         artifact.validate()
+    row.identity_resolution.validate()
+    for delayed_extracted in row.delayed_extracted_rows:
+        delayed_extracted.validate()
+    for finalized_extracted in row.finalized_extracted_rows:
+        finalized_extracted.validate()
     if row.ticker_history_authority is not None:
         row.ticker_history_authority.validate()
+    expected_delayed_rows = tuple(
+        MassiveExtractedWebSocketTradeRow.build(
+            parsed_message=extracted.parsed_message,
+            parser_evidence_receipt_sha256=(
+                row.capture.parser_evidence.receipt_sha256
+                if row.capture.parser_evidence is not None
+                else extracted.parser_evidence_receipt_sha256
+            ),
+            recorder_clock_authority=row.recorder_clock_authority,
+        )
+        for extracted in row.delayed_extracted_rows
+    )
+    if row.delayed_extracted_rows != expected_delayed_rows:
+        raise MassiveReplayParityError(
+            "delayed canonical rows were not emitted by the committed parser"
+        )
     if row.capture.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
         raise MassiveReplayParityError("capture entitlement differs")
     for source in (row.delayed_source, row.finalized_source):
-        if source.receipt.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
+        if (
+            source.receipt.entitlement_receipt_sha256
+            != entitlement_authority.receipt_sha256
+        ):
             raise MassiveReplayParityError("source entitlement differs")
-    if row.capture.raw_capture_source_receipt_sha256 != row.delayed_source.receipt.receipt_sha256:
-        raise MassiveReplayParityError("capture source is not the committed delayed source")
+    if (
+        row.capture.raw_capture_source_receipt_sha256
+        != row.delayed_source.receipt.receipt_sha256
+    ):
+        raise MassiveReplayParityError(
+            "capture source is not the committed delayed source"
+        )
     if row.capture.parser_evidence is None:
         raise MassiveReplayParityError("capture lacks committed parser evidence")
     if (
         row.capture.parser_evidence.receipt_sha256
         != row.delayed_extraction.parser_evidence_receipt_sha256
     ):
-        raise MassiveReplayParityError("delayed extraction lacks capture parser evidence")
+        raise MassiveReplayParityError(
+            "delayed extraction lacks capture parser evidence"
+        )
+
+    expected_delayed_replay = _rebuild_delayed_replay(
+        row,
+        entitlement_authority=entitlement_authority,
+        session_authority=session_authority,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+    )
+    expected_finalized_replay = _rebuild_finalized_replay(
+        row,
+        entitlement_authority=entitlement_authority,
+        session_authority=session_authority,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+    )
+    if row.delayed_replay != expected_delayed_replay:
+        raise MassiveReplayParityError(
+            "delayed replay was not rebuilt from parser-extracted rows"
+        )
+    if row.finalized_replay != expected_finalized_replay:
+        raise MassiveReplayParityError(
+            "finalized replay was not rebuilt from parser-extracted rows"
+        )
+
+    expected_delayed_extraction = MassiveTradeExtractionManifest.from_delayed_capture(
+        loaded_source=row.delayed_source,
+        capture=row.capture,
+        extracted_rows=row.delayed_extracted_rows,
+        replay=expected_delayed_replay,
+        source_ticker=row.identity_resolution.source_ticker,
+    )
+    expected_finalized_extraction = (
+        MassiveTradeExtractionManifest.from_flat_file_evidence(
+            evidence=row.finalized_flat_extraction_evidence,
+            replay=expected_finalized_replay,
+        )
+    )
+    if row.delayed_extraction != expected_delayed_extraction:
+        raise MassiveReplayParityError(
+            "delayed extraction manifest was not parser-derived"
+        )
+    if row.finalized_extraction != expected_finalized_extraction:
+        raise MassiveReplayParityError(
+            "finalized extraction manifest was not parser-derived"
+        )
     for source, extraction, replay in (
         (row.delayed_source, row.delayed_extraction, row.delayed_replay),
         (row.finalized_source, row.finalized_extraction, row.finalized_replay),
@@ -478,15 +658,34 @@ def _derive_parity_evidence(
             raise MassiveReplayParityError("extraction used another loaded source")
         if extraction.source_commit_receipt_sha256 != source.commit.receipt_sha256:
             raise MassiveReplayParityError("extraction used another source commit")
-        if extraction.selected_source_row_inventory_sha256 != replay.input_source_record_inventory_sha256:
+        if (
+            extraction.selected_source_row_inventory_sha256
+            != replay.input_raw_record_inventory_sha256
+        ):
             raise MassiveReplayParityError("extraction row inventory differs")
+        if (
+            extraction.selected_canonical_record_inventory_sha256
+            != replay.input_canonical_record_inventory_sha256
+        ):
+            raise MassiveReplayParityError("extraction canonical inventory differs")
+        if (
+            extraction.selected_row_provenance_inventory_sha256
+            != replay.input_transport_provenance_inventory_sha256
+        ):
+            raise MassiveReplayParityError("extraction transport inventory differs")
         if extraction.selected_row_count != replay.input_event_count:
             raise MassiveReplayParityError("extraction count differs")
         if replay.decision_clock_receipt_sha256 != row.decision_clock.receipt_sha256:
             raise MassiveReplayParityError("replay used another decision clock")
-    if row.capture.lifecycle.decision_clock_receipt_sha256 != row.decision_clock.receipt_sha256:
+    if (
+        row.capture.lifecycle.decision_clock_receipt_sha256
+        != row.decision_clock.receipt_sha256
+    ):
         raise MassiveReplayParityError("capture used another decision clock")
-    if row.capture.lifecycle.required_capture_end_ns != row.decision_clock.decision_at_ns:
+    if (
+        row.capture.lifecycle.required_capture_end_ns
+        != row.decision_clock.decision_at_ns
+    ):
         raise MassiveReplayParityError("capture cutoff differs from decision clock")
     if (
         row.capture.lifecycle.required_capture_start_ns
@@ -511,15 +710,24 @@ def _derive_parity_evidence(
     ):
         raise MassiveReplayParityError("finalized extraction evidence differs")
     for replay in (row.delayed_replay, row.finalized_replay):
-        if replay.condition_authority_receipt_sha256 != condition_authority.receipt_sha256:
+        if (
+            replay.condition_authority_receipt_sha256
+            != condition_authority.receipt_sha256
+        ):
             raise MassiveReplayParityError("replay condition authority differs")
-        if replay.correction_authority_receipt_sha256 != correction_authority.receipt_sha256:
+        if (
+            replay.correction_authority_receipt_sha256
+            != correction_authority.receipt_sha256
+        ):
             raise MassiveReplayParityError("replay correction authority differs")
         if replay.session_authority_receipt_sha256 != session_authority.receipt_sha256:
             raise MassiveReplayParityError("replay session authority differs")
-    if session_authority.resolve(
-        exchange=row.session.exchange, session_date=row.session.session_date
-    ) != row.session:
+    if (
+        session_authority.resolve(
+            exchange=row.session.exchange, session_date=row.session.session_date
+        )
+        != row.session
+    ):
         raise MassiveReplayParityError("parity session was not authority-resolved")
     identities = {
         (row.delayed_replay.security_id, row.delayed_replay.session_date),
@@ -528,12 +736,23 @@ def _derive_parity_evidence(
         (row.finalized_features.security_id, row.finalized_features.session_date),
     }
     if len(identities) != 1 or next(iter(identities))[1] != row.capture.session_date:
-        raise MassiveReplayParityError("parity artifacts mix security-session identities")
-    if row.delayed_features.input_replay_receipt_sha256 != row.delayed_replay.receipt_sha256:
+        raise MassiveReplayParityError(
+            "parity artifacts mix security-session identities"
+        )
+    if (
+        row.delayed_features.input_replay_receipt_sha256
+        != row.delayed_replay.receipt_sha256
+    ):
         raise MassiveReplayParityError("delayed features used another replay")
-    if row.finalized_features.input_replay_receipt_sha256 != row.finalized_replay.receipt_sha256:
+    if (
+        row.finalized_features.input_replay_receipt_sha256
+        != row.finalized_replay.receipt_sha256
+    ):
         raise MassiveReplayParityError("final features used another replay")
-    if row.delayed_features.feature_spec_receipt_sha256 != row.finalized_features.feature_spec_receipt_sha256:
+    if (
+        row.delayed_features.feature_spec_receipt_sha256
+        != row.finalized_features.feature_spec_receipt_sha256
+    ):
         raise MassiveReplayParityError("feature specifications differ")
     feature_specification = MassiveReplayFeatureSpec.canonical()
     expected_delayed_features = materialize_massive_replay_features(

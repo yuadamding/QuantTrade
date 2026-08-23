@@ -17,11 +17,17 @@ from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
     open_loaded_massive_source_stream,
 )
+from rl_quant.data_sources.massive.recorder_clock import MassiveRecorderClockAuthority
 from rl_quant.data_sources.massive.trade_canonicalization import (
     MassiveCanonicalTradeSourceRecord,
     canonicalize_massive_flat_file_trade,
+    canonicalize_massive_websocket_trade,
 )
 from rl_quant.data_sources.massive.trade_replay import MassiveResolvedSecurityIdentity
+from rl_quant.data_sources.massive.websocket_capture import (
+    MassiveDelayedWebSocketCaptureAuthority,
+    MassiveParsedWebSocketTradeMessage,
+)
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 
 
@@ -61,6 +67,9 @@ MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256 = semantic_sha256(
 )
 MASSIVE_FLAT_TRADE_PARSER_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_EXTRACTED_TRADE_ROW_SCHEMA = "rl-quant.massive-extracted-trade-row-v1"
+MASSIVE_EXTRACTED_WEBSOCKET_TRADE_ROW_SCHEMA = (
+    "rl-quant.massive-extracted-websocket-trade-row-v3"
+)
 MASSIVE_TRADE_EXTRACTION_EVIDENCE_SCHEMA = (
     "rl-quant.massive-trade-extraction-evidence-v2"
 )
@@ -104,7 +113,9 @@ class MassiveExtractedTradeRow:
             or not isinstance(self.source_row_number, int)
             or self.source_row_number < 2
         ):
-            raise MassiveTradeExtractionError("source row number must include the header")
+            raise MassiveTradeExtractionError(
+                "source row number must include the header"
+            )
         _digest("raw row SHA", self.raw_row_sha256)
         self.canonical_record.validate()
         if self.canonical_record.raw_source_record_sha256 != self.raw_row_sha256:
@@ -138,6 +149,203 @@ class MassiveExtractedTradeRow:
 
 
 @dataclass(frozen=True, slots=True)
+class MassiveExtractedWebSocketTradeRow:
+    source_line_number: int
+    server_batch_index: int
+    message_index: int
+    session_date: str
+    local_received_at_ns: int
+    canonical_received_at_ns: int
+    raw_payload_sha256: str
+    parsed_message: MassiveParsedWebSocketTradeMessage
+    parsed_message_receipt_sha256: str
+    canonical_record: MassiveCanonicalTradeSourceRecord
+    parser_evidence_receipt_sha256: str
+    receipt_sha256: str
+    schema: str = MASSIVE_EXTRACTED_WEBSOCKET_TRADE_ROW_SCHEMA
+
+    def unsigned(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "source_line_number": self.source_line_number,
+            "server_batch_index": self.server_batch_index,
+            "message_index": self.message_index,
+            "session_date": self.session_date,
+            "local_received_at_ns": self.local_received_at_ns,
+            "canonical_received_at_ns": self.canonical_received_at_ns,
+            "raw_payload_sha256": self.raw_payload_sha256,
+            "parsed_message": asdict(self.parsed_message),
+            "parsed_message_receipt_sha256": self.parsed_message_receipt_sha256,
+            "canonical_record": asdict(self.canonical_record),
+            "parser_evidence_receipt_sha256": self.parser_evidence_receipt_sha256,
+        }
+
+    def validate(self) -> None:
+        if self.schema != MASSIVE_EXTRACTED_WEBSOCKET_TRADE_ROW_SCHEMA:
+            raise MassiveTradeExtractionError(
+                "extracted WebSocket trade schema drifted"
+            )
+        for name in (
+            "source_line_number",
+            "server_batch_index",
+            "message_index",
+            "local_received_at_ns",
+            "canonical_received_at_ns",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise MassiveTradeExtractionError(
+                    f"extracted WebSocket {name} must be nonnegative"
+                )
+        if self.source_line_number <= 0 or self.server_batch_index <= 0:
+            raise MassiveTradeExtractionError(
+                "extracted WebSocket source location is absent"
+            )
+        if not self.session_date or self.session_date != self.session_date.strip():
+            raise MassiveTradeExtractionError(
+                "extracted WebSocket session date is absent"
+            )
+        for name in (
+            "raw_payload_sha256",
+            "parsed_message_receipt_sha256",
+            "parser_evidence_receipt_sha256",
+            "receipt_sha256",
+        ):
+            _digest(name, getattr(self, name))
+        self.parsed_message.validate()
+        if (
+            self.parsed_message.receipt_sha256 != self.parsed_message_receipt_sha256
+            or self.parsed_message.source_line_number != self.source_line_number
+            or self.parsed_message.server_batch_index != self.server_batch_index
+            or self.parsed_message.message_index != self.message_index
+            or self.parsed_message.event.session_date != self.session_date
+            or self.parsed_message.event.received_at_ns != self.local_received_at_ns
+            or self.parsed_message.event.payload_sha256 != self.raw_payload_sha256
+        ):
+            raise MassiveTradeExtractionError(
+                "extracted WebSocket row differs from its parsed message"
+            )
+        self.canonical_record.validate()
+        if self.canonical_record.source_kind != "delayed-websocket":
+            raise MassiveTradeExtractionError(
+                "extracted WebSocket row has another source kind"
+            )
+        if (
+            self.canonical_record.raw_source_record_sha256 != self.raw_payload_sha256
+            or self.canonical_record.local_received_at_ns != self.local_received_at_ns
+            or self.canonical_record.canonical_received_at_ns
+            != self.canonical_received_at_ns
+        ):
+            raise MassiveTradeExtractionError(
+                "extracted WebSocket canonical provenance differs"
+            )
+        if self.receipt_sha256 != semantic_sha256(self.unsigned()):
+            raise MassiveTradeExtractionError(
+                "extracted WebSocket trade receipt differs"
+            )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        parsed_message: MassiveParsedWebSocketTradeMessage,
+        parser_evidence_receipt_sha256: str,
+        recorder_clock_authority: MassiveRecorderClockAuthority,
+    ) -> MassiveExtractedWebSocketTradeRow:
+        parsed_message.validate()
+        recorder_clock_authority.validate()
+        canonical_record = canonicalize_massive_websocket_trade(
+            parsed_message.event,
+            recorder_clock_authority=recorder_clock_authority,
+        )
+        if (
+            canonical_record.local_received_at_ns is None
+            or canonical_record.canonical_received_at_ns is None
+        ):  # defensive against canonicalizer contract drift
+            raise MassiveTradeExtractionError(
+                "canonical WebSocket row lacks receive-time provenance"
+            )
+        body = {
+            "schema": MASSIVE_EXTRACTED_WEBSOCKET_TRADE_ROW_SCHEMA,
+            "source_line_number": parsed_message.source_line_number,
+            "server_batch_index": parsed_message.server_batch_index,
+            "message_index": parsed_message.message_index,
+            "session_date": parsed_message.event.session_date,
+            "local_received_at_ns": canonical_record.local_received_at_ns,
+            "canonical_received_at_ns": canonical_record.canonical_received_at_ns,
+            "raw_payload_sha256": parsed_message.event.payload_sha256,
+            "parsed_message": asdict(parsed_message),
+            "parsed_message_receipt_sha256": parsed_message.receipt_sha256,
+            "canonical_record": asdict(canonical_record),
+            "parser_evidence_receipt_sha256": parser_evidence_receipt_sha256,
+        }
+        value = cls(
+            source_line_number=parsed_message.source_line_number,
+            server_batch_index=parsed_message.server_batch_index,
+            message_index=parsed_message.message_index,
+            session_date=parsed_message.event.session_date,
+            local_received_at_ns=canonical_record.local_received_at_ns,
+            canonical_received_at_ns=canonical_record.canonical_received_at_ns,
+            raw_payload_sha256=parsed_message.event.payload_sha256,
+            parsed_message=parsed_message,
+            parsed_message_receipt_sha256=parsed_message.receipt_sha256,
+            canonical_record=canonical_record,
+            parser_evidence_receipt_sha256=parser_evidence_receipt_sha256,
+            receipt_sha256=semantic_sha256(body),
+        )
+        value.validate()
+        return value
+
+
+def extract_massive_websocket_trade_rows(
+    *,
+    parsed_messages: Sequence[MassiveParsedWebSocketTradeMessage],
+    capture: MassiveDelayedWebSocketCaptureAuthority,
+    recorder_clock_authority: MassiveRecorderClockAuthority,
+) -> tuple[MassiveExtractedWebSocketTradeRow, ...]:
+    """Derive canonical rows only from the committed capture parser output."""
+
+    capture.validate()
+    recorder_clock_authority.validate()
+    parser_evidence = capture.parser_evidence
+    if parser_evidence is None:
+        raise MassiveTradeExtractionError(
+            "WebSocket capture lacks committed parser evidence"
+        )
+    for message in parsed_messages:
+        message.validate()
+    if len(parsed_messages) != capture.event_count:
+        raise MassiveTradeExtractionError(
+            "parsed WebSocket message count differs from capture"
+        )
+    if (
+        semantic_sha256(tuple(message.receipt_sha256 for message in parsed_messages))
+        != parser_evidence.parsed_trade_transport_inventory_sha256
+    ):
+        raise MassiveTradeExtractionError(
+            "parsed WebSocket transport inventory differs"
+        )
+    rows = tuple(
+        MassiveExtractedWebSocketTradeRow.build(
+            parsed_message=message,
+            parser_evidence_receipt_sha256=parser_evidence.receipt_sha256,
+            recorder_clock_authority=recorder_clock_authority,
+        )
+        for message in parsed_messages
+    )
+    return tuple(
+        sorted(
+            rows,
+            key=lambda row: (
+                row.source_line_number,
+                row.server_batch_index,
+                row.message_index,
+            ),
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class MassiveTradeExtractionEvidence:
     loaded_source_receipt_sha256: str
     source_receipt_sha256: str
@@ -163,9 +371,7 @@ class MassiveTradeExtractionEvidence:
 
     def unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
         }
 
     def validate(self) -> None:
@@ -314,10 +520,14 @@ def extract_massive_flat_file_security_session(
                         row,
                         raw_source_record_sha256=raw_row_sha256,
                     )
-                    observed_date = datetime.fromtimestamp(
-                        canonical.sip_timestamp_ns / 1_000_000_000,
-                        tz=ZoneInfo("America/New_York"),
-                    ).date().isoformat()
+                    observed_date = (
+                        datetime.fromtimestamp(
+                            canonical.sip_timestamp_ns / 1_000_000_000,
+                            tz=ZoneInfo("America/New_York"),
+                        )
+                        .date()
+                        .isoformat()
+                    )
                     if (
                         canonical.ticker == identity_resolution.source_ticker
                         and observed_date == identity_resolution.session_date
@@ -345,8 +555,9 @@ def extract_massive_flat_file_security_session(
             ),
         )
     )
+    source_ordered = tuple(sorted(ordered, key=lambda row: row.source_row_number))
     canonical_inventory = semantic_sha256(
-        tuple(row.canonical_record.receipt_sha256 for row in ordered)
+        tuple(row.canonical_record.receipt_sha256 for row in source_ordered)
     )
     raw_replay_inventory = semantic_sha256(
         tuple(
@@ -355,7 +566,7 @@ def extract_massive_flat_file_security_session(
                 row.canonical_record.sequence_number,
                 row.raw_row_sha256,
             )
-            for row in ordered
+            for row in source_ordered
         )
     )
     provenance_inventory = semantic_sha256(
@@ -365,7 +576,7 @@ def extract_massive_flat_file_security_session(
                 row.raw_row_sha256,
                 row.canonical_record.receipt_sha256,
             )
-            for row in ordered
+            for row in source_ordered
         )
     )
     body = {
@@ -418,6 +629,7 @@ def extract_massive_flat_file_security_session(
 
 __all__ = [
     "MASSIVE_EXTRACTED_TRADE_ROW_SCHEMA",
+    "MASSIVE_EXTRACTED_WEBSOCKET_TRADE_ROW_SCHEMA",
     "MASSIVE_FLAT_TRADES_DATASET_ID",
     "MASSIVE_FLAT_TRADE_COLUMNS",
     "MASSIVE_FLAT_TRADE_PARSER_SOURCE_SHA256",
@@ -425,7 +637,9 @@ __all__ = [
     "MASSIVE_FLAT_TRADE_SCHEMA_SHA256",
     "MASSIVE_TRADE_EXTRACTION_EVIDENCE_SCHEMA",
     "MassiveExtractedTradeRow",
+    "MassiveExtractedWebSocketTradeRow",
     "MassiveTradeExtractionError",
     "MassiveTradeExtractionEvidence",
     "extract_massive_flat_file_security_session",
+    "extract_massive_websocket_trade_rows",
 ]

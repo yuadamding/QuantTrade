@@ -4,12 +4,15 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 import gzip
 from io import BytesIO
+import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from rl_quant.data_sources.massive.decision_clock import build_massive_decision_clock_authority
+from rl_quant.data_sources.massive.decision_clock import (
+    build_massive_decision_clock_authority,
+)
 from rl_quant.data_sources.massive.recorder_clock import MassiveRecorderClockAuthority
 from rl_quant.data_sources.massive.session_calendar import (
     MassiveExchangeSession,
@@ -23,12 +26,14 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADES_DATASET_ID,
     MASSIVE_FLAT_TRADE_COLUMNS,
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
+    MassiveExtractedTradeRow,
+    MassiveExtractedWebSocketTradeRow,
     extract_massive_flat_file_security_session,
+    extract_massive_websocket_trade_rows,
 )
 from rl_quant.data_sources.massive.trade_replay import (
     MassiveResolvedSecurityIdentity,
     normalize_massive_canonical_trade_event,
-    normalize_massive_delayed_websocket_trade,
     replay_massive_trades,
 )
 from rl_quant.data_sources.massive.websocket_capture import (
@@ -37,6 +42,7 @@ from rl_quant.data_sources.massive.websocket_capture import (
     MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA,
     MASSIVE_WEBSOCKET_CAPTURE_SOURCE_SCHEMA_SHA256,
     MassiveDelayedWebSocketEvent,
+    MassiveParsedWebSocketTradeMessage,
     MassiveWebSocketCaptureError,
     build_massive_delayed_websocket_capture_authority,
     parse_massive_delayed_websocket_capture,
@@ -185,13 +191,28 @@ def _capture_rows(
 
 
 def _flat_payload(
-    *, ticker: str, sip_ns: int, participant_ns: int, trade_id: str = "T1",
+    *,
+    ticker: str,
+    sip_ns: int,
+    participant_ns: int,
+    trade_id: str = "T1",
     sequence: int = 1,
 ) -> bytes:
     header = ",".join(MASSIVE_FLAT_TRADE_COLUMNS)
     values = (
-        ticker, "[1]", "0", "4", trade_id, str(participant_ns), "10.0",
-        str(sequence), str(sip_ns), "100", "1", "12", str(sip_ns),
+        ticker,
+        "[1]",
+        "0",
+        "4",
+        trade_id,
+        str(participant_ns),
+        "10.0",
+        str(sequence),
+        str(sip_ns),
+        "100",
+        "1",
+        "12",
+        str(sip_ns),
     )
     return gzip.compress(f"{header}\n{','.join(values)}\n".encode(), mtime=0)
 
@@ -241,15 +262,28 @@ def _parity_input(
         else sip_ns + 15 * 60 * 1_000_000_000
     )
     trade = {
-        "ev": "T", "sym": "AAA", "x": 4, "i": "T1", "p": 10.0,
-        "s": 100, "c": [1], "t": sip_ms, "pt": participant_ms, "q": 1,
-        "trfi": 12, "trft": sip_ms, "z": 1,
+        "ev": "T",
+        "sym": "AAA",
+        "x": 4,
+        "i": "T1",
+        "p": 10.0,
+        "s": 100,
+        "c": [1],
+        "t": sip_ms,
+        "pt": participant_ms,
+        "q": 1,
+        "trfi": 12,
+        "trft": sip_ms,
+        "z": 1,
     }
     captures: list[tuple[dict[str, object], int]] = [(trade, received_at_ns)]
     subscriptions = ["AAA"]
     if extra_capture_ticker is not None:
         captures.append(
-            ({**trade, "sym": extra_capture_ticker, "i": "T2", "q": 2}, received_at_ns + 1)
+            (
+                {**trade, "sym": extra_capture_ticker, "i": "T2", "q": 2},
+                received_at_ns + 1,
+            )
         )
         subscriptions.append(extra_capture_ticker)
     capture_rows = _capture_rows(
@@ -259,7 +293,9 @@ def _parity_input(
         subscriptions=tuple(subscriptions),
         disconnected=disconnected,
     )
-    capture_payload = b"\n".join(canonical_json_payload(item) for item in capture_rows) + b"\n"
+    capture_payload = (
+        b"\n".join(canonical_json_payload(item) for item in capture_rows) + b"\n"
+    )
     capture_key = f"{MASSIVE_DELAYED_CAPTURE_DATASET_ID}/2026/08/{session_date}.jsonl"
     raw_source = _loaded_source(
         tmp_path / "capture",
@@ -272,7 +308,9 @@ def _parity_input(
     final_source = _loaded_source(
         tmp_path / "flat",
         relative=flat_key,
-        payload=_flat_payload(ticker="AAA", sip_ns=sip_ns, participant_ns=participant_ns),
+        payload=_flat_payload(
+            ticker="AAA", sip_ns=sip_ns, participant_ns=participant_ns
+        ),
         dataset_id=MASSIVE_FLAT_TRADES_DATASET_ID,
         schema_sha256=MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
     )
@@ -294,23 +332,34 @@ def _parity_input(
         "correction_authority": _corrections(),
         "identity_resolution": identity,
     }
-    captured_events, capture = parse_massive_delayed_websocket_capture(
+    parsed_messages, capture = parse_massive_delayed_websocket_capture(
         root=tmp_path / "capture",
         loaded_source=raw_source,
         decision_clock=decision_clock,
         recorder_clock_authority=recorder_clock,
         entitlement_authority=common["entitlement_authority"],
     )
-    selected_capture_events = tuple(event for event in captured_events if event.ticker == "AAA")
+    extracted_websocket_rows = extract_massive_websocket_trade_rows(
+        parsed_messages=parsed_messages,
+        capture=capture,
+        recorder_clock_authority=recorder_clock,
+    )
+    selected_capture_rows = tuple(
+        extracted
+        for extracted in extracted_websocket_rows
+        if extracted.canonical_record.ticker == "AAA"
+    )
     delayed_events = tuple(
-        normalize_massive_delayed_websocket_trade(
-            event,
+        normalize_massive_canonical_trade_event(
+            extracted.canonical_record,
             source_object_receipt=raw_source.receipt,
-            source_row_number=index,
+            source_row_number=extracted.source_line_number,
+            source_batch_index=extracted.server_batch_index,
+            source_message_index=extracted.message_index,
             recorder_clock_authority=recorder_clock,
             **common,
         )
-        for index, event in enumerate(selected_capture_events, start=1)
+        for extracted in selected_capture_rows
     )
     delayed_replay = replay_massive_trades(
         delayed_events,
@@ -348,7 +397,7 @@ def _parity_input(
         delayed_extraction=MassiveTradeExtractionManifest.from_delayed_capture(
             loaded_source=raw_source,
             capture=capture,
-            capture_events=captured_events,
+            extracted_rows=extracted_websocket_rows,
             replay=delayed_replay,
             source_ticker="AAA",
         ),
@@ -359,6 +408,9 @@ def _parity_input(
         decision_clock=decision_clock,
         recorder_clock_authority=recorder_clock,
         session=session,
+        identity_resolution=identity,
+        delayed_extracted_rows=extracted_websocket_rows,
+        finalized_extracted_rows=flat_rows,
         delayed_replay=delayed_replay,
         finalized_replay=finalized_replay,
         delayed_features=materialize_massive_replay_features(
@@ -381,7 +433,9 @@ def _build(row, common):
     )
 
 
-def test_committed_parity_is_development_only_without_runtime_entitlement(tmp_path: Path) -> None:
+def test_committed_parity_is_development_only_without_runtime_entitlement(
+    tmp_path: Path,
+) -> None:
     row, common = _parity_input(tmp_path)
     authority = _build(row, common)
     assert authority.development_asof_replay_authorized
@@ -391,7 +445,9 @@ def test_committed_parity_is_development_only_without_runtime_entitlement(tmp_pa
     assert not authority.predictive_training_authorized
 
 
-def test_actual_receipt_after_decision_fails_event_and_feature_parity(tmp_path: Path) -> None:
+def test_actual_receipt_after_decision_fails_event_and_feature_parity(
+    tmp_path: Path,
+) -> None:
     row, common = _parity_input(tmp_path, received_after_decision=True)
     authority = _build(row, common)
     assert row.delayed_replay.post_cutoff_event_count == 1
@@ -400,7 +456,9 @@ def test_actual_receipt_after_decision_fails_event_and_feature_parity(tmp_path: 
     assert authority.failed_feature_symbol_days
 
 
-def test_capture_disconnect_is_evidence_not_self_asserted_completeness(tmp_path: Path) -> None:
+def test_capture_disconnect_is_evidence_not_self_asserted_completeness(
+    tmp_path: Path,
+) -> None:
     row, common = _parity_input(tmp_path, disconnected=True)
     authority = _build(row, common)
     assert not row.capture.capture_complete
@@ -437,18 +495,26 @@ def test_full_source_day_capture_reconciles_premarket_trade(tmp_path: Path) -> N
     assert not authority.failed_event_symbol_days
 
 
-def test_generic_capture_builder_cannot_claim_parser_qualification(tmp_path: Path) -> None:
+def test_generic_capture_builder_cannot_claim_parser_qualification(
+    tmp_path: Path,
+) -> None:
     row, common = _parity_input(tmp_path)
     event = row.delayed_replay.active_events[0]
     unqualified = build_massive_delayed_websocket_capture_authority(
         (
             MassiveDelayedWebSocketEvent.from_payload(
                 {
-                    "ev": "T", "sym": event.source_ticker, "x": event.exchange_id,
-                    "i": event.trade_id, "p": event.price, "s": int(event.decimal_size),
-                    "c": list(event.conditions), "t": event.sip_timestamp_ns // 1_000_000,
+                    "ev": "T",
+                    "sym": event.source_ticker,
+                    "x": event.exchange_id,
+                    "i": event.trade_id,
+                    "p": event.price,
+                    "s": int(event.decimal_size),
+                    "c": list(event.conditions),
+                    "t": event.sip_timestamp_ns // 1_000_000,
                     "pt": event.participant_timestamp_ns // 1_000_000,
-                    "q": event.sequence_number, "z": event.tape_id,
+                    "q": event.sequence_number,
+                    "z": event.tape_id,
                 },
                 received_at_ns=event.actual_received_at_ns or 0,
             ),
@@ -476,3 +542,84 @@ def test_recorder_clock_uses_conservative_upper_receive_bound(tmp_path: Path) ->
         event.actual_received_at_ns
         + row.recorder_clock_authority.maximum_positive_clock_error_ns
     )
+
+
+def test_same_websocket_payload_with_changed_receive_time_fails_parity(
+    tmp_path: Path,
+) -> None:
+    row, common = _parity_input(tmp_path)
+    original = row.delayed_extracted_rows[0]
+    payload = json.loads(original.parsed_message.event.canonical_payload_json)
+    forged_event = MassiveDelayedWebSocketEvent.from_payload(
+        payload,
+        received_at_ns=original.local_received_at_ns - 1,
+    )
+    forged_message = MassiveParsedWebSocketTradeMessage.build(
+        source_line_number=original.source_line_number,
+        server_batch_index=original.server_batch_index,
+        message_index=original.message_index,
+        event=forged_event,
+    )
+    parser_evidence = row.capture.parser_evidence
+    assert parser_evidence is not None
+    forged_row = MassiveExtractedWebSocketTradeRow.build(
+        parsed_message=forged_message,
+        parser_evidence_receipt_sha256=parser_evidence.receipt_sha256,
+        recorder_clock_authority=row.recorder_clock_authority,
+    )
+    with pytest.raises((MassiveReplayArtifactError, MassiveReplayParityError)):
+        _build(replace(row, delayed_extracted_rows=(forged_row,)), common)
+
+
+def test_same_websocket_payload_with_changed_clock_bound_fails_parity(
+    tmp_path: Path,
+) -> None:
+    row, common = _parity_input(tmp_path)
+    original = row.delayed_extracted_rows[0]
+    canonical = replace(
+        original.canonical_record,
+        canonical_received_at_ns=original.canonical_received_at_ns + 1,
+    )
+    canonical = replace(
+        canonical,
+        receipt_sha256=semantic_sha256(canonical.unsigned()),
+    )
+    forged = replace(
+        original,
+        canonical_received_at_ns=original.canonical_received_at_ns + 1,
+        canonical_record=canonical,
+    )
+    forged = replace(forged, receipt_sha256=semantic_sha256(forged.unsigned()))
+    forged.validate()
+    with pytest.raises((MassiveReplayArtifactError, MassiveReplayParityError)):
+        _build(replace(row, delayed_extracted_rows=(forged,)), common)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("price_decimal", "11"),
+        ("size_decimal", "200"),
+        ("correction_code", 3),
+        ("tape_id", 2),
+    ),
+)
+def test_same_flat_raw_row_with_changed_canonical_field_fails_parity(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    row, common = _parity_input(tmp_path)
+    original = row.finalized_extracted_rows[0]
+    canonical = replace(original.canonical_record, **{field: replacement})
+    canonical = replace(
+        canonical,
+        receipt_sha256=semantic_sha256(canonical.unsigned()),
+    )
+    forged = MassiveExtractedTradeRow.build(
+        source_row_number=original.source_row_number,
+        raw_row_sha256=original.raw_row_sha256,
+        canonical_record=canonical,
+    )
+    with pytest.raises((MassiveReplayArtifactError, MassiveReplayParityError)):
+        _build(replace(row, finalized_extracted_rows=(forged,)), common)

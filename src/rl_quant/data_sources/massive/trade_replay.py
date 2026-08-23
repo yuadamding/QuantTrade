@@ -35,8 +35,8 @@ from rl_quant.protocol.canonical_artifact import semantic_sha256
 MASSIVE_RESOLVED_SECURITY_IDENTITY_SCHEMA = (
     "rl-quant.massive-resolved-security-identity-v1"
 )
-MASSIVE_TRADE_EVENT_SCHEMA = "rl-quant.massive-trade-event-v4"
-MASSIVE_TRADE_REPLAY_SCHEMA = "rl-quant.massive-trade-replay-v4"
+MASSIVE_TRADE_EVENT_SCHEMA = "rl-quant.massive-trade-event-v5"
+MASSIVE_TRADE_REPLAY_SCHEMA = "rl-quant.massive-trade-replay-v5"
 
 
 class MassiveTradeReplayError(ValueError):
@@ -94,9 +94,7 @@ class MassiveResolvedSecurityIdentity:
 
     def unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
         }
 
     def validate(self) -> None:
@@ -193,6 +191,8 @@ class MassiveTradeEventV3:
     regular_session: bool
     source_file_sha256: str
     source_row_number: int
+    source_batch_index: int | None
+    source_message_index: int | None
     source_record_sha256: str
     source_kind: str
     canonical_source_record_receipt_sha256: str
@@ -259,14 +259,24 @@ class MassiveTradeEventV3:
         if self.participant_timestamp_ns > self.sip_timestamp_ns:
             raise MassiveTradeReplayError("participant timestamp exceeds SIP timestamp")
         if self.strategy_available_timestamp_ns < self.sip_timestamp_ns:
-            raise MassiveTradeReplayError("strategy availability precedes SIP dissemination")
+            raise MassiveTradeReplayError(
+                "strategy availability precedes SIP dissemination"
+            )
         if self.source_kind == "delayed-websocket":
             if (
                 self.actual_received_at_ns is None
                 or self.canonical_received_at_ns is None
                 or self.recorder_clock_authority_receipt_sha256 is None
+                or self.source_batch_index is None
+                or self.source_message_index is None
             ):
-                raise MassiveTradeReplayError("delayed event lacks clock-bound receipt")
+                raise MassiveTradeReplayError(
+                    "delayed event lacks clock-bound transport receipt"
+                )
+            _nonnegative_int("source batch index", self.source_batch_index)
+            _nonnegative_int("source message index", self.source_message_index)
+            if self.source_batch_index <= 0:
+                raise MassiveTradeReplayError("source batch index is absent")
             _digest(
                 "recorder clock authority",
                 self.recorder_clock_authority_receipt_sha256,
@@ -276,7 +286,9 @@ class MassiveTradeEventV3:
             if self.canonical_received_at_ns < self.actual_received_at_ns:
                 raise MassiveTradeReplayError("clock bound understates actual receipt")
             if self.strategy_available_timestamp_ns < self.canonical_received_at_ns:
-                raise MassiveTradeReplayError("availability precedes clock-bound receipt")
+                raise MassiveTradeReplayError(
+                    "availability precedes clock-bound receipt"
+                )
         elif self.source_kind in {"rest-trades", "flat-file-trades"}:
             if any(
                 value is not None
@@ -284,6 +296,8 @@ class MassiveTradeEventV3:
                     self.actual_received_at_ns,
                     self.canonical_received_at_ns,
                     self.recorder_clock_authority_receipt_sha256,
+                    self.source_batch_index,
+                    self.source_message_index,
                 )
             ):
                 raise MassiveTradeReplayError("finalized event claims receive time")
@@ -291,7 +305,11 @@ class MassiveTradeEventV3:
                 raise MassiveTradeReplayError("finalized availability kind drifted")
         else:
             raise MassiveTradeReplayError("trade source kind is unsupported")
-        if not isinstance(self.price, (int, float)) or not math.isfinite(float(self.price)) or self.price <= 0:
+        if (
+            not isinstance(self.price, (int, float))
+            or not math.isfinite(float(self.price))
+            or self.price <= 0
+        ):
             raise MassiveTradeReplayError("trade price must be finite and positive")
         try:
             size = Decimal(self.decimal_size)
@@ -333,7 +351,10 @@ class MassiveTradeEventV3:
             "identity_resolution_receipt_sha256",
         ):
             _digest(name, getattr(self, name))
-        if self.canonicalization_spec_sha256 != MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256:
+        if (
+            self.canonicalization_spec_sha256
+            != MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256
+        ):
             raise MassiveTradeReplayError("trade canonicalization spec drifted")
 
 
@@ -352,7 +373,9 @@ class MassiveTradeReplayResult:
     identity_authority_receipt_sha256: str
     ticker_history_receipt_sha256: str
     identity_resolution_receipt_sha256: str
-    input_source_record_inventory_sha256: str
+    input_raw_record_inventory_sha256: str
+    input_canonical_record_inventory_sha256: str
+    input_transport_provenance_inventory_sha256: str
     input_event_count: int
     visible_event_count: int
     active_events: tuple[MassiveTradeEventV3, ...]
@@ -377,13 +400,21 @@ class MassiveTradeReplayResult:
             "identity_authority_receipt_sha256": self.identity_authority_receipt_sha256,
             "ticker_history_receipt_sha256": self.ticker_history_receipt_sha256,
             "identity_resolution_receipt_sha256": self.identity_resolution_receipt_sha256,
-            "input_source_record_inventory_sha256": self.input_source_record_inventory_sha256,
+            "input_raw_record_inventory_sha256": self.input_raw_record_inventory_sha256,
+            "input_canonical_record_inventory_sha256": self.input_canonical_record_inventory_sha256,
+            "input_transport_provenance_inventory_sha256": self.input_transport_provenance_inventory_sha256,
             "input_event_count": self.input_event_count,
             "visible_event_count": self.visible_event_count,
             "active_events": [event.economic_payload() for event in self.active_events],
             "cancelled_event_keys": list(self.cancelled_event_keys),
             "post_cutoff_event_count": self.post_cutoff_event_count,
         }
+
+    @property
+    def input_source_record_inventory_sha256(self) -> str:
+        """Compatibility alias for the now-explicit raw-record inventory."""
+
+        return self.input_raw_record_inventory_sha256
 
     @property
     def active_state_inventory_sha256(self) -> str:
@@ -439,7 +470,9 @@ class MassiveTradeReplayResult:
             "identity_authority_receipt_sha256",
             "ticker_history_receipt_sha256",
             "identity_resolution_receipt_sha256",
-            "input_source_record_inventory_sha256",
+            "input_raw_record_inventory_sha256",
+            "input_canonical_record_inventory_sha256",
+            "input_transport_provenance_inventory_sha256",
             "receipt_sha256",
         ):
             _digest(name, getattr(self, name))
@@ -454,14 +487,20 @@ class MassiveTradeReplayResult:
             "post_cutoff_event_count",
         ):
             _nonnegative_int(name, getattr(self, name))
-        if self.visible_event_count + self.post_cutoff_event_count != self.input_event_count:
+        if (
+            self.visible_event_count + self.post_cutoff_event_count
+            != self.input_event_count
+        ):
             raise MassiveTradeReplayError("replay event inventory does not reconcile")
         keys = tuple(event.event_key for event in self.active_events)
         if keys != tuple(sorted(set(keys))):
             raise MassiveTradeReplayError("active event inventory is not canonical")
         for event in self.active_events:
             event.validate()
-            if event.security_id != self.security_id or event.session_date != self.session_date:
+            if (
+                event.security_id != self.security_id
+                or event.session_date != self.session_date
+            ):
                 raise MassiveTradeReplayError("replay mixed security-day identities")
             if event.strategy_available_timestamp_ns > self.decision_at_ns:
                 raise MassiveTradeReplayError("post-cutoff trade entered replay")
@@ -505,6 +544,8 @@ def _normalize_canonical_trade_event(
     source_object_receipt: MassiveSourceObjectReceipt,
     identity_resolution: MassiveResolvedSecurityIdentity,
     source_row_number: int,
+    source_batch_index: int | None = None,
+    source_message_index: int | None = None,
     recorder_clock_authority: MassiveRecorderClockAuthority | None = None,
 ) -> MassiveTradeEventV3:
     """Bind one source-neutral canonical record to causal authorities."""
@@ -519,13 +560,23 @@ def _normalize_canonical_trade_event(
     record.validate()
     if recorder_clock_authority is not None:
         recorder_clock_authority.validate()
-    if source_object_receipt.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
-        raise MassiveTradeReplayError("source object used another entitlement authority")
-    if session_authority.resolve(
-        exchange=identity_resolution.primary_exchange,
-        session_date=identity_resolution.session_date,
-    ) != session:
-        raise MassiveTradeReplayError("session was not resolved by the supplied authority")
+    if (
+        source_object_receipt.entitlement_receipt_sha256
+        != entitlement_authority.receipt_sha256
+    ):
+        raise MassiveTradeReplayError(
+            "source object used another entitlement authority"
+        )
+    if (
+        session_authority.resolve(
+            exchange=identity_resolution.primary_exchange,
+            session_date=identity_resolution.session_date,
+        )
+        != session
+    ):
+        raise MassiveTradeReplayError(
+            "session was not resolved by the supplied authority"
+        )
     if identity_resolution.session_date != session.session_date:
         raise MassiveTradeReplayError("identity and session dates differ")
     if record.ticker != identity_resolution.source_ticker:
@@ -539,7 +590,9 @@ def _normalize_canonical_trade_event(
     sip_timestamp_ns = record.sip_timestamp_ns
     participant_timestamp_ns = record.participant_timestamp_ns
     if not identity_resolution.contains(participant_timestamp_ns):
-        raise MassiveTradeReplayError("trade lies outside the PIT ticker identity interval")
+        raise MassiveTradeReplayError(
+            "trade lies outside the PIT ticker identity interval"
+        )
     entitlement_delay_ns = (
         entitlement_authority.entitlement_delay_minutes * 60 * 1_000_000_000
     )
@@ -596,6 +649,8 @@ def _normalize_canonical_trade_event(
         regular_session=session.is_regular(participant_timestamp_ns),
         source_file_sha256=source_object_receipt.physical_sha256,
         source_row_number=source_row_number,
+        source_batch_index=source_batch_index,
+        source_message_index=source_message_index,
         source_record_sha256=record.raw_source_record_sha256,
         source_kind=record.source_kind,
         canonical_source_record_receipt_sha256=record.receipt_sha256,
@@ -655,6 +710,8 @@ def normalize_massive_canonical_trade_event(
     source_object_receipt: MassiveSourceObjectReceipt,
     identity_resolution: MassiveResolvedSecurityIdentity,
     source_row_number: int,
+    source_batch_index: int | None = None,
+    source_message_index: int | None = None,
     recorder_clock_authority: MassiveRecorderClockAuthority | None = None,
 ) -> MassiveTradeEventV3:
     """Public authority-binding boundary for a source-specific canonical row."""
@@ -669,6 +726,8 @@ def normalize_massive_canonical_trade_event(
         source_object_receipt=source_object_receipt,
         identity_resolution=identity_resolution,
         source_row_number=source_row_number,
+        source_batch_index=source_batch_index,
+        source_message_index=source_message_index,
         recorder_clock_authority=recorder_clock_authority,
     )
 
@@ -684,6 +743,8 @@ def normalize_massive_delayed_websocket_trade(
     source_object_receipt: MassiveSourceObjectReceipt,
     identity_resolution: MassiveResolvedSecurityIdentity,
     source_row_number: int,
+    source_batch_index: int,
+    source_message_index: int,
     recorder_clock_authority: MassiveRecorderClockAuthority,
 ) -> MassiveTradeEventV3:
     """Bind an actual compact delayed message using its local receive time."""
@@ -701,8 +762,71 @@ def normalize_massive_delayed_websocket_trade(
         source_object_receipt=source_object_receipt,
         identity_resolution=identity_resolution,
         source_row_number=source_row_number,
+        source_batch_index=source_batch_index,
+        source_message_index=source_message_index,
         recorder_clock_authority=recorder_clock_authority,
     )
+
+
+def _replay_input_inventories(
+    events: Sequence[MassiveTradeEventV3],
+) -> tuple[str, str, str]:
+    ordered = tuple(
+        sorted(
+            events,
+            key=lambda event: (
+                event.source_row_number,
+                -1 if event.source_batch_index is None else event.source_batch_index,
+                -1
+                if event.source_message_index is None
+                else event.source_message_index,
+                event.sequence_number,
+            ),
+        )
+    )
+    source_kinds = {event.source_kind for event in ordered}
+    if len(source_kinds) != 1:
+        raise MassiveTradeReplayError("replay mixes source transport kinds")
+    raw_inventory = semantic_sha256(
+        tuple(
+            (
+                event.source_ticker,
+                event.sequence_number,
+                event.source_record_sha256,
+            )
+            for event in ordered
+        )
+    )
+    canonical_inventory = semantic_sha256(
+        tuple(event.canonical_source_record_receipt_sha256 for event in ordered)
+    )
+    if ordered[0].source_kind == "delayed-websocket":
+        transport_inventory = semantic_sha256(
+            tuple(
+                (
+                    event.source_row_number,
+                    event.source_batch_index,
+                    event.source_message_index,
+                    event.actual_received_at_ns,
+                    event.canonical_received_at_ns,
+                    event.source_record_sha256,
+                    event.canonical_source_record_receipt_sha256,
+                )
+                for event in ordered
+            )
+        )
+    else:
+        transport_inventory = semantic_sha256(
+            tuple(
+                (
+                    event.source_row_number,
+                    event.source_record_sha256,
+                    event.canonical_source_record_receipt_sha256,
+                )
+                for event in ordered
+            )
+        )
+    return raw_inventory, canonical_inventory, transport_inventory
 
 
 def replay_massive_trades(
@@ -730,13 +854,23 @@ def replay_massive_trades(
     identity_resolution.validate()
     if recorder_clock_authority is not None:
         recorder_clock_authority.validate()
-    if source_object_receipt.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
-        raise MassiveTradeReplayError("source object used another entitlement authority")
-    if session_authority.resolve(
-        exchange=identity_resolution.primary_exchange,
-        session_date=identity_resolution.session_date,
-    ) != session:
-        raise MassiveTradeReplayError("session was not resolved by the supplied authority")
+    if (
+        source_object_receipt.entitlement_receipt_sha256
+        != entitlement_authority.receipt_sha256
+    ):
+        raise MassiveTradeReplayError(
+            "source object used another entitlement authority"
+        )
+    if (
+        session_authority.resolve(
+            exchange=identity_resolution.primary_exchange,
+            session_date=identity_resolution.session_date,
+        )
+        != session
+    ):
+        raise MassiveTradeReplayError(
+            "session was not resolved by the supplied authority"
+        )
     if identity_resolution.session_date != session.session_date:
         raise MassiveTradeReplayError("identity and session dates differ")
     if (
@@ -758,9 +892,13 @@ def replay_massive_trades(
             event.updates_high_low,
             event.updates_volume,
         ):
-            raise MassiveTradeReplayError("trade condition eligibility differs from authority")
+            raise MassiveTradeReplayError(
+                "trade condition eligibility differs from authority"
+            )
         if correction_authority.resolve(event.correction_code) != event.correction_kind:
-            raise MassiveTradeReplayError("trade correction semantic differs from authority")
+            raise MassiveTradeReplayError(
+                "trade correction semantic differs from authority"
+            )
         expected_receipts = {
             "entitlement_authority_receipt_sha256": entitlement_authority.receipt_sha256,
             "session_authority_receipt_sha256": session_authority.receipt_sha256,
@@ -775,11 +913,18 @@ def replay_massive_trades(
             if getattr(event, field) != expected:
                 raise MassiveTradeReplayError(f"trade {field} differs from authority")
         if event.source_file_sha256 != source_object_receipt.physical_sha256:
-            raise MassiveTradeReplayError("trade source bytes differ from source authority")
-        if event.security_id != identity_resolution.security_id or event.source_ticker != identity_resolution.source_ticker:
+            raise MassiveTradeReplayError(
+                "trade source bytes differ from source authority"
+            )
+        if (
+            event.security_id != identity_resolution.security_id
+            or event.source_ticker != identity_resolution.source_ticker
+        ):
             raise MassiveTradeReplayError("trade identity differs from PIT resolution")
         if event.session_date != session.session_date:
-            raise MassiveTradeReplayError("trade session differs from session authority")
+            raise MassiveTradeReplayError(
+                "trade session differs from session authority"
+            )
         theoretical_availability = (
             event.sip_timestamp_ns
             + entitlement_authority.entitlement_delay_minutes * 60 * 1_000_000_000
@@ -795,8 +940,8 @@ def replay_massive_trades(
                     event.actual_received_at_ns
                 )
                 or (
-                event.strategy_available_timestamp_ns
-                != max(event.canonical_received_at_ns, theoretical_availability)
+                    event.strategy_available_timestamp_ns
+                    != max(event.canonical_received_at_ns, theoretical_availability)
                 )
             ):
                 raise MassiveTradeReplayError(
@@ -809,8 +954,12 @@ def replay_massive_trades(
             raise MassiveTradeReplayError(
                 "finalized trade availability or recorder clock differs"
             )
-        if event.regular_session is not session.is_regular(event.participant_timestamp_ns):
-            raise MassiveTradeReplayError("trade session eligibility differs from calendar")
+        if event.regular_session is not session.is_regular(
+            event.participant_timestamp_ns
+        ):
+            raise MassiveTradeReplayError(
+                "trade session eligibility differs from calendar"
+            )
     identities = {(event.security_id, event.session_date) for event in events}
     if len(identities) != 1:
         raise MassiveTradeReplayError("trade replay mixed symbol-day identities")
@@ -820,13 +969,17 @@ def replay_massive_trades(
             (
                 event
                 for event in events
-                if event.strategy_available_timestamp_ns <= decision_clock.decision_at_ns
+                if event.strategy_available_timestamp_ns
+                <= decision_clock.decision_at_ns
             ),
             key=lambda event: event.replay_order,
         )
     )
     for left, right in zip(visible, visible[1:], strict=False):
-        if left.replay_order == right.replay_order and left.economic_payload() != right.economic_payload():
+        if (
+            left.replay_order == right.replay_order
+            and left.economic_payload() != right.economic_payload()
+        ):
             raise MassiveTradeReplayError("ambiguous events share one replay order")
 
     active: dict[str, MassiveTradeEventV3] = {}
@@ -836,7 +989,10 @@ def replay_massive_trades(
         kind = event.correction_kind
         if kind in {"new-trade", "late-report"}:
             existing = active.get(key)
-            if existing is not None and existing.economic_payload() != event.economic_payload():
+            if (
+                existing is not None
+                and existing.economic_payload() != event.economic_payload()
+            ):
                 raise MassiveTradeReplayError("conflicting duplicate new trade")
             active[key] = event
             cancelled.discard(key)
@@ -847,12 +1003,17 @@ def replay_massive_trades(
             cancelled.discard(key)
         elif kind == "cancellation":
             if key not in active:
-                raise MassiveTradeReplayError("cancellation lacks a visible predecessor")
+                raise MassiveTradeReplayError(
+                    "cancellation lacks a visible predecessor"
+                )
             del active[key]
             cancelled.add(key)
         else:  # pragma: no cover - authority validation makes this unreachable
             raise MassiveTradeReplayError("unqualified correction semantic")
     ordered_active = tuple(active[key] for key in sorted(active))
+    raw_inventory, canonical_inventory, transport_inventory = _replay_input_inventories(
+        events
+    )
     body = {
         "schema": MASSIVE_TRADE_REPLAY_SCHEMA,
         "security_id": security_id,
@@ -870,18 +1031,9 @@ def replay_massive_trades(
         "identity_authority_receipt_sha256": identity_resolution.identity_authority_receipt_sha256,
         "ticker_history_receipt_sha256": identity_resolution.ticker_history_receipt_sha256,
         "identity_resolution_receipt_sha256": identity_resolution.receipt_sha256,
-        "input_source_record_inventory_sha256": semantic_sha256(
-            tuple(
-                sorted(
-                    (
-                        event.source_ticker,
-                        event.sequence_number,
-                        event.source_record_sha256,
-                    )
-                    for event in events
-                )
-            )
-        ),
+        "input_raw_record_inventory_sha256": raw_inventory,
+        "input_canonical_record_inventory_sha256": canonical_inventory,
+        "input_transport_provenance_inventory_sha256": transport_inventory,
         "input_event_count": len(events),
         "visible_event_count": len(visible),
         "active_events": [event.economic_payload() for event in ordered_active],
@@ -904,18 +1056,9 @@ def replay_massive_trades(
         identity_authority_receipt_sha256=identity_resolution.identity_authority_receipt_sha256,
         ticker_history_receipt_sha256=identity_resolution.ticker_history_receipt_sha256,
         identity_resolution_receipt_sha256=identity_resolution.receipt_sha256,
-        input_source_record_inventory_sha256=semantic_sha256(
-            tuple(
-                sorted(
-                    (
-                        event.source_ticker,
-                        event.sequence_number,
-                        event.source_record_sha256,
-                    )
-                    for event in events
-                )
-            )
-        ),
+        input_raw_record_inventory_sha256=raw_inventory,
+        input_canonical_record_inventory_sha256=canonical_inventory,
+        input_transport_provenance_inventory_sha256=transport_inventory,
         input_event_count=len(events),
         visible_event_count=len(visible),
         active_events=ordered_active,
