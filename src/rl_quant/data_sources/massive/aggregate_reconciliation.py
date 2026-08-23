@@ -9,7 +9,7 @@ from typing import Sequence
 
 from rl_quant.data_sources.massive.session_calendar import MassiveExchangeSession
 from rl_quant.data_sources.massive.trade_replay import (
-    MassiveTradeEventV2,
+    MassiveTradeEventV3,
     MassiveTradeReplayResult,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
@@ -310,7 +310,7 @@ def reconstruct_massive_five_minute_bars(
     session.validate()
     if replay.session_date != session.session_date:
         raise MassiveAggregateReconciliationError("replay and session dates differ")
-    by_interval: dict[int, list[MassiveTradeEventV2]] = {}
+    by_interval: dict[int, list[MassiveTradeEventV3]] = {}
     for event in replay.active_events:
         if not event.regular_session or not session.is_regular(event.participant_timestamp_ns):
             continue
@@ -432,8 +432,14 @@ def reconcile_massive_aggregate_bars(
             > vwap_tolerance
         ):
             mismatched.append(index)
-    reconstructed_receipt = semantic_sha256([asdict(row) for row in reconstructed])
-    vendor_receipt = semantic_sha256([asdict(row) for row in vendor])
+    canonical_reconstructed = tuple(
+        sorted(reconstructed, key=lambda row: row.interval_index)
+    )
+    canonical_vendor = tuple(sorted(vendor, key=lambda row: row.interval_index))
+    reconstructed_receipt = semantic_sha256(
+        [asdict(row) for row in canonical_reconstructed]
+    )
+    vendor_receipt = semantic_sha256([asdict(row) for row in canonical_vendor])
     security_id, session_date = next(iter(left_identities))
     missing_reconstructed = tuple(sorted(right_keys - left_keys))
     missing_vendor = tuple(sorted(left_keys - right_keys))

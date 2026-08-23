@@ -66,6 +66,39 @@ def main(argv: list[str] | None = None) -> int:
             api_key=key,
             timeout_seconds=args.timeout_seconds,
         ),
+        observe_massive_rest_surface(
+            surface_id="minute-aggregates",
+            request_path=(
+                "/v2/aggs/ticker/AAPL/range/1/minute/2026-08-20/2026-08-20"
+                "?adjusted=false&limit=1"
+            ),
+            api_key=key,
+            timeout_seconds=args.timeout_seconds,
+        ),
+        observe_massive_rest_surface(
+            surface_id="day-aggregates",
+            request_path=(
+                "/v2/aggs/ticker/AAPL/range/1/day/2016-08-22/2016-08-22"
+                "?adjusted=false&limit=1"
+            ),
+            api_key=key,
+            timeout_seconds=args.timeout_seconds,
+        ),
+        observe_massive_rest_surface(
+            surface_id="corporate-actions",
+            request_path="/v3/reference/dividends?ticker=AAPL&limit=1",
+            api_key=key,
+            timeout_seconds=args.timeout_seconds,
+        ),
+        observe_massive_rest_surface(
+            surface_id="history-boundary",
+            request_path=(
+                "/v2/aggs/ticker/AAPL/range/1/day/2016-08-22/2016-08-22"
+                "?adjusted=false&limit=1"
+            ),
+            api_key=key,
+            timeout_seconds=args.timeout_seconds,
+        ),
     )
     observed_at_ms = max(
         time.time_ns() // 1_000_000, *(row.observed_at_ms for row in observed)

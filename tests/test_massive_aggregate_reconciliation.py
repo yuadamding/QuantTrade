@@ -11,13 +11,16 @@ from rl_quant.data_sources.massive.aggregate_reconciliation import (
     reconcile_massive_aggregate_bars,
     reconstruct_massive_five_minute_bars,
 )
-from rl_quant.data_sources.massive.conditions import build_massive_condition_authority
+from rl_quant.data_sources.massive.conditions import (
+    MASSIVE_STOCK_TRADE_CONDITION_QUERY,
+    build_massive_condition_authority,
+)
 from rl_quant.data_sources.massive.session_calendar import MassiveExchangeSession
 from rl_quant.data_sources.massive.trade_replay import (
     normalize_massive_trade_event,
     replay_massive_trades,
 )
-from test_massive_trade_replay import _normalization_authorities
+from test_massive_trade_replay import _decision_clock, _normalization_authorities
 
 
 FIVE_MINUTES_NS = 300_000_000_000
@@ -29,6 +32,7 @@ def _conditions():
             {
                 "id": 1,
                 "name": "Regular Sale",
+                "asset_class": "stocks",
                 "data_types": ["trade"],
                 "update_rules": {
                     "consolidated": {
@@ -40,6 +44,7 @@ def _conditions():
             },
         ),
         source_object_receipt_sha256="a" * 64,
+        source_query_path=MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     )
 
 
@@ -54,6 +59,7 @@ def _event(
 ):
     return normalize_massive_trade_event(
         {
+            "ticker": "AAA",
             "id": trade_id,
             "exchange": 4,
             "sequence_number": sequence,
@@ -122,7 +128,7 @@ def test_trade_reconstruction_keeps_sparse_support_and_reconciles() -> None:
     )
     replay = replay_massive_trades(
         (first, second),
-        decision_at_ns=10 * FIVE_MINUTES_NS,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
     bars = reconstruct_massive_five_minute_bars(replay, session=_session())
@@ -135,11 +141,36 @@ def test_trade_reconstruction_keeps_sparse_support_and_reconciles() -> None:
     assert parity.all_values_match
 
 
+def test_reconciliation_receipt_is_input_order_invariant() -> None:
+    first = _event(trade_id="T1", sequence=1, sip=100, price=10.0)
+    second = _event(
+        trade_id="T2", sequence=2, sip=FIVE_MINUTES_NS + 100, price=12.0
+    )
+    replay = replay_massive_trades(
+        (first, second),
+        decision_clock=_decision_clock(),
+        **_normalization_authorities(),
+    )
+    bars = reconstruct_massive_five_minute_bars(replay, session=_session())
+    specification = MassiveAggregateReconciliationSpec.build()
+
+    forward = reconcile_massive_aggregate_bars(
+        bars, _vendor(bars), specification=specification
+    )
+    reverse = reconcile_massive_aggregate_bars(
+        tuple(reversed(bars)),
+        tuple(reversed(_vendor(bars))),
+        specification=specification,
+    )
+
+    assert forward.receipt_sha256 == reverse.receipt_sha256
+
+
 def test_aggregate_value_mutation_fails_parity() -> None:
     event = _event(trade_id="T1", sequence=1, sip=100, price=10.0)
     replay = replay_massive_trades(
         (event,),
-        decision_at_ns=4 * FIVE_MINUTES_NS,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
     bars = reconstruct_massive_five_minute_bars(replay, session=_session())
@@ -156,7 +187,7 @@ def test_aggregate_identity_mismatch_fails_before_numeric_comparison() -> None:
     event = _event(trade_id="T1", sequence=1, sip=100, price=10.0)
     replay = replay_massive_trades(
         (event,),
-        decision_at_ns=4 * FIVE_MINUTES_NS,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
     bars = reconstruct_massive_five_minute_bars(replay, session=_session())
@@ -201,7 +232,7 @@ def test_vendor_bar_rejects_adjusted_or_nonfinite_activity(
     event = _event(trade_id="T1", sequence=1, sip=100, price=10.0)
     replay = replay_massive_trades(
         (event,),
-        decision_at_ns=4 * FIVE_MINUTES_NS,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
     bars = reconstruct_massive_five_minute_bars(replay, session=_session())
@@ -216,6 +247,7 @@ def test_split_condition_families_build_distinct_ohlc_and_volume() -> None:
             {
                 "id": 10,
                 "name": "Open Close",
+                "asset_class": "stocks",
                 "data_types": ["trade"],
                 "update_rules": {"consolidated": {
                     "updates_high_low": False,
@@ -226,6 +258,7 @@ def test_split_condition_families_build_distinct_ohlc_and_volume() -> None:
             {
                 "id": 11,
                 "name": "High Low",
+                "asset_class": "stocks",
                 "data_types": ["trade"],
                 "update_rules": {"consolidated": {
                     "updates_high_low": True,
@@ -236,6 +269,7 @@ def test_split_condition_families_build_distinct_ohlc_and_volume() -> None:
             {
                 "id": 12,
                 "name": "Volume",
+                "asset_class": "stocks",
                 "data_types": ["trade"],
                 "update_rules": {"consolidated": {
                     "updates_high_low": False,
@@ -245,6 +279,7 @@ def test_split_condition_families_build_distinct_ohlc_and_volume() -> None:
             },
         ),
         source_object_receipt_sha256="a" * 64,
+        source_query_path=MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     )
     authorities = _normalization_authorities()
     authorities["condition_authority"] = conditions
@@ -256,7 +291,7 @@ def test_split_condition_families_build_distinct_ohlc_and_volume() -> None:
         _event(trade_id="V1", sequence=5, sip=500, price=8, authorities=authorities, condition=12),
     )
     replay = replay_massive_trades(
-        events, decision_at_ns=4 * FIVE_MINUTES_NS, **authorities
+        events, decision_clock=_decision_clock(), **authorities
     )
 
     bars = reconstruct_massive_five_minute_bars(replay, session=_session())

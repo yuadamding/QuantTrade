@@ -14,7 +14,7 @@ from rl_quant.protocol.canonical_artifact import semantic_sha256
 MASSIVE_ENTITLEMENT_OBSERVATION_SCHEMA = (
     "rl-quant.massive-entitlement-observation-v1"
 )
-MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA = "rl-quant.massive-entitlement-authority-v1"
+MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA = "rl-quant.massive-entitlement-authority-v2"
 
 MassiveAccessState = Literal[
     "available",
@@ -123,6 +123,7 @@ class MassiveEntitlementAuthority:
     financials_and_ratios_available: bool
     history_years: int
     entitlement_delay_minutes: int
+    runtime_entitlement_qualified: bool
     secret_material_persisted: bool
     predictive_training_authorized: bool
     historical_performance_authorized: bool
@@ -143,6 +144,7 @@ class MassiveEntitlementAuthority:
             "financials_and_ratios_available": self.financials_and_ratios_available,
             "history_years": self.history_years,
             "entitlement_delay_minutes": self.entitlement_delay_minutes,
+            "runtime_entitlement_qualified": self.runtime_entitlement_qualified,
             "secret_material_persisted": self.secret_material_persisted,
             "predictive_training_authorized": self.predictive_training_authorized,
             "historical_performance_authorized": self.historical_performance_authorized,
@@ -169,10 +171,14 @@ class MassiveEntitlementAuthority:
                 raise MassiveEntitlementError("authority predates one observation")
         by_surface = {row.surface_id: row for row in self.observations}
         required = {
+            "corporate-actions",
+            "day-aggregates",
             "delayed-websocket",
             "flat-files",
             "financials-and-ratios",
+            "history-boundary",
             "historical-quotes",
+            "minute-aggregates",
             "reference-rest",
             "trades-rest",
         }
@@ -201,6 +207,22 @@ class MassiveEntitlementAuthority:
                 raise MassiveEntitlementError(f"{field} differs from observations")
         if self.history_years != 10 or self.entitlement_delay_minutes != 15:
             raise MassiveEntitlementError("Stocks Developer plan terms drifted")
+        runtime_required = {
+            "corporate-actions",
+            "day-aggregates",
+            "delayed-websocket",
+            "flat-files",
+            "history-boundary",
+            "minute-aggregates",
+            "reference-rest",
+            "trades-rest",
+        }
+        runtime_qualified = all(
+            by_surface[surface].access_state == "available"
+            for surface in runtime_required
+        )
+        if self.runtime_entitlement_qualified is not runtime_qualified:
+            raise MassiveEntitlementError("runtime entitlement qualification drifted")
         if any(
             (
                 self.secret_material_persisted,
@@ -250,6 +272,20 @@ def build_massive_developer_entitlement_authority(
         and by_surface["financials-and-ratios"].access_state == "available",
         "history_years": 10,
         "entitlement_delay_minutes": 15,
+        "runtime_entitlement_qualified": all(
+            by_surface.get(surface) is not None
+            and by_surface[surface].access_state == "available"
+            for surface in (
+                "corporate-actions",
+                "day-aggregates",
+                "delayed-websocket",
+                "flat-files",
+                "history-boundary",
+                "minute-aggregates",
+                "reference-rest",
+                "trades-rest",
+            )
+        ),
         "secret_material_persisted": False,
         "predictive_training_authorized": False,
         "historical_performance_authorized": False,
@@ -268,6 +304,7 @@ def build_massive_developer_entitlement_authority(
         ),
         history_years=10,
         entitlement_delay_minutes=15,
+        runtime_entitlement_qualified=bool(body["runtime_entitlement_qualified"]),
         secret_material_persisted=False,
         predictive_training_authorized=False,
         historical_performance_authorized=False,

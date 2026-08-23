@@ -10,6 +10,7 @@ from rl_quant.data_sources.massive.aggregate_reconciliation import (
     reconstruct_massive_five_minute_bars,
 )
 from rl_quant.data_sources.massive.conditions import (
+    MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     MassiveConditionAuthority,
     MassiveConditionError,
     MassiveTradeConditionRule,
@@ -20,6 +21,11 @@ from rl_quant.data_sources.massive.corrections import (
     MassiveCorrectionError,
     MassiveCorrectionRule,
     build_massive_correction_authority,
+)
+from rl_quant.data_sources.massive.decision_clock import (
+    MassiveDecisionClockAuthority,
+    MassiveDecisionClockError,
+    build_massive_decision_clock_authority,
 )
 from rl_quant.data_sources.massive.entitlement import (
     MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA,
@@ -36,35 +42,57 @@ from rl_quant.data_sources.massive.session_calendar import (
     build_massive_session_authority,
 )
 from rl_quant.data_sources.massive.source_receipts import (
+    LoadedMassiveSourceObject,
     MASSIVE_SOURCE_COMMIT_SCHEMA,
     MASSIVE_SOURCE_OBJECT_SCHEMA,
     MassiveSourceCommit,
     MassiveSourceObjectError,
     MassiveSourceObjectReceipt,
+    load_massive_source_bundle,
     load_massive_source_object,
     publish_massive_source_object,
+    read_loaded_massive_source_bytes,
 )
 from rl_quant.data_sources.massive.trade_replay import (
     MassiveResolvedSecurityIdentity,
-    MassiveTradeEventV2,
+    MassiveTradeEventV3,
     MassiveTradeReplayError,
     MassiveTradeReplayResult,
+    normalize_massive_canonical_trade_event,
+    normalize_massive_delayed_websocket_trade,
     normalize_massive_trade_event,
     replay_massive_trades,
 )
+from rl_quant.data_sources.massive.trade_extraction import (
+    MassiveTradeExtractionError,
+    MassiveTradeExtractionEvidence,
+    extract_massive_flat_file_security_session,
+)
+from rl_quant.data_sources.massive.trade_canonicalization import (
+    MassiveCanonicalTradeSourceRecord,
+    MassiveTradeCanonicalizationError,
+    canonicalize_massive_flat_file_trade,
+    canonicalize_massive_rest_trade,
+    canonicalize_massive_websocket_trade,
+)
 from rl_quant.data_sources.massive.websocket_capture import (
+    MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA,
     MassiveDelayedWebSocketCaptureAuthority,
     MassiveDelayedWebSocketEvent,
     MassiveWebSocketCaptureError,
     MassiveWebSocketCaptureLifecycle,
     build_massive_delayed_websocket_capture_authority,
+    parse_massive_delayed_websocket_capture,
 )
 
 __all__ = [
+    "LoadedMassiveSourceObject",
     "MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA",
     "MASSIVE_ENTITLEMENT_OBSERVATION_SCHEMA",
     "MASSIVE_SOURCE_COMMIT_SCHEMA",
     "MASSIVE_SOURCE_OBJECT_SCHEMA",
+    "MASSIVE_STOCK_TRADE_CONDITION_QUERY",
+    "MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA",
     "MassiveAggregateReconciliation",
     "MassiveAggregateReconciliationError",
     "MassiveAggregateReconciliationSpec",
@@ -73,6 +101,8 @@ __all__ = [
     "MassiveCorrectionAuthority",
     "MassiveCorrectionError",
     "MassiveCorrectionRule",
+    "MassiveDecisionClockAuthority",
+    "MassiveDecisionClockError",
     "MassiveDelayedWebSocketCaptureAuthority",
     "MassiveDelayedWebSocketEvent",
     "MassiveEntitlementAuthority",
@@ -87,7 +117,11 @@ __all__ = [
     "MassiveFiveMinuteBar",
     "MassiveResolvedSecurityIdentity",
     "MassiveTradeConditionRule",
-    "MassiveTradeEventV2",
+    "MassiveCanonicalTradeSourceRecord",
+    "MassiveTradeCanonicalizationError",
+    "MassiveTradeEventV3",
+    "MassiveTradeExtractionError",
+    "MassiveTradeExtractionEvidence",
     "MassiveTradeReplayError",
     "MassiveTradeReplayResult",
     "MassiveWebSocketCaptureError",
@@ -95,13 +129,23 @@ __all__ = [
     "MassiveVendorAggregateBar",
     "build_massive_condition_authority",
     "build_massive_correction_authority",
+    "build_massive_decision_clock_authority",
     "build_massive_delayed_websocket_capture_authority",
     "build_massive_developer_entitlement_authority",
     "build_massive_session_authority",
+    "canonicalize_massive_flat_file_trade",
+    "canonicalize_massive_rest_trade",
+    "canonicalize_massive_websocket_trade",
+    "load_massive_source_bundle",
     "load_massive_source_object",
+    "extract_massive_flat_file_security_session",
+    "normalize_massive_canonical_trade_event",
+    "normalize_massive_delayed_websocket_trade",
     "normalize_massive_trade_event",
     "publish_massive_source_object",
+    "read_loaded_massive_source_bytes",
     "reconcile_massive_aggregate_bars",
     "reconstruct_massive_five_minute_bars",
     "replay_massive_trades",
+    "parse_massive_delayed_websocket_capture",
 ]

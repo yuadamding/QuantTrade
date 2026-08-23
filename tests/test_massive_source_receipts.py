@@ -8,8 +8,10 @@ import pytest
 from rl_quant.data_sources.massive import source_receipts
 from rl_quant.data_sources.massive.source_receipts import (
     MassiveSourceObjectError,
+    load_massive_source_bundle,
     load_massive_source_object,
     publish_massive_source_object,
+    read_loaded_massive_source_bytes,
 )
 
 
@@ -136,6 +138,20 @@ def test_source_mutation_fails_reopen(tmp_path: Path) -> None:
             root=tmp_path,
             relative_payload_path="bronze/trades/2026/08/2026-08-20.csv.gz",
         )
+
+
+def test_loaded_bundle_rejects_same_path_replacement(tmp_path: Path) -> None:
+    _publish(tmp_path)
+    relative = "bronze/trades/2026/08/2026-08-20.csv.gz"
+    loaded = load_massive_source_bundle(
+        root=tmp_path, relative_payload_path=relative, verified_at_ms=1_300
+    )
+    payload = tmp_path / relative
+    payload.unlink()
+    payload.write_bytes(b"massive-source-bytes")
+
+    with pytest.raises(MassiveSourceObjectError, match="inode was replaced"):
+        read_loaded_massive_source_bytes(root=tmp_path, loaded_source=loaded)
 
 
 @pytest.mark.parametrize(

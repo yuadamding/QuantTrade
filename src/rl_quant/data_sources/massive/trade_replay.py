@@ -12,20 +12,30 @@ from rl_quant.data_sources.massive.corrections import (
     MassiveCorrectionAuthority,
     MassiveCorrectionKind,
 )
+from rl_quant.data_sources.massive.decision_clock import (
+    MassiveDecisionClockAuthority,
+)
 from rl_quant.data_sources.massive.entitlement import MassiveEntitlementAuthority
 from rl_quant.data_sources.massive.session_calendar import (
     MassiveExchangeSession,
     MassiveSessionAuthority,
 )
 from rl_quant.data_sources.massive.source_receipts import MassiveSourceObjectReceipt
+from rl_quant.data_sources.massive.trade_canonicalization import (
+    MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256,
+    MassiveCanonicalTradeSourceRecord,
+    canonicalize_massive_rest_trade,
+    canonicalize_massive_websocket_trade,
+)
+from rl_quant.data_sources.massive.websocket_capture import MassiveDelayedWebSocketEvent
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 
 MASSIVE_RESOLVED_SECURITY_IDENTITY_SCHEMA = (
     "rl-quant.massive-resolved-security-identity-v1"
 )
-MASSIVE_TRADE_EVENT_SCHEMA = "rl-quant.massive-trade-event-v2"
-MASSIVE_TRADE_REPLAY_SCHEMA = "rl-quant.massive-trade-replay-v2"
+MASSIVE_TRADE_EVENT_SCHEMA = "rl-quant.massive-trade-event-v3"
+MASSIVE_TRADE_REPLAY_SCHEMA = "rl-quant.massive-trade-replay-v3"
 
 
 class MassiveTradeReplayError(ValueError):
@@ -54,16 +64,6 @@ def _nonnegative_int(name: str, value: object) -> int:
     return value
 
 
-def _integer(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise MassiveTradeReplayError(f"{name} must be an integer")
-    try:
-        observed = int(value)
-    except ValueError as exc:
-        raise MassiveTradeReplayError(f"{name} must be an integer") from exc
-    return observed
-
-
 def _positive_float(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise MassiveTradeReplayError(f"{name} must be numeric")
@@ -74,12 +74,6 @@ def _positive_float(name: str, value: object) -> float:
     if not math.isfinite(observed) or observed <= 0:
         raise MassiveTradeReplayError(f"{name} must be finite and positive")
     return observed
-
-
-def _object_sequence(name: str, value: object) -> Sequence[object]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise MassiveTradeReplayError(f"{name} must be a sequence")
-    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +168,7 @@ class MassiveResolvedSecurityIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class MassiveTradeEventV2:
+class MassiveTradeEventV3:
     security_id: str
     source_ticker: str
     session_date: str
@@ -198,6 +192,11 @@ class MassiveTradeEventV2:
     source_file_sha256: str
     source_row_number: int
     source_record_sha256: str
+    source_kind: str
+    canonical_source_record_receipt_sha256: str
+    canonicalization_spec_sha256: str
+    actual_received_at_ns: int | None
+    availability_kind: str
     entitlement_authority_receipt_sha256: str
     session_authority_receipt_sha256: str
     condition_authority_receipt_sha256: str
@@ -245,6 +244,8 @@ class MassiveTradeEventV2:
             "source_row_number",
         ):
             _nonnegative_int(name, getattr(self, name))
+        if self.actual_received_at_ns is not None:
+            _nonnegative_int("actual received timestamp", self.actual_received_at_ns)
         if self.trf_id is not None:
             _nonnegative_int("TRF ID", self.trf_id)
         if self.trf_timestamp_ns is not None:
@@ -253,6 +254,20 @@ class MassiveTradeEventV2:
             raise MassiveTradeReplayError("participant timestamp exceeds SIP timestamp")
         if self.strategy_available_timestamp_ns < self.sip_timestamp_ns:
             raise MassiveTradeReplayError("strategy availability precedes SIP dissemination")
+        if self.source_kind == "delayed-websocket":
+            if self.actual_received_at_ns is None:
+                raise MassiveTradeReplayError("delayed event lacks actual receive time")
+            if self.availability_kind != "actual-receive-time":
+                raise MassiveTradeReplayError("delayed event availability kind drifted")
+            if self.strategy_available_timestamp_ns < self.actual_received_at_ns:
+                raise MassiveTradeReplayError("delayed availability precedes actual receipt")
+        elif self.source_kind in {"rest-trades", "flat-file-trades"}:
+            if self.actual_received_at_ns is not None:
+                raise MassiveTradeReplayError("finalized event claims receive time")
+            if self.availability_kind != "qualified-sip-delay":
+                raise MassiveTradeReplayError("finalized availability kind drifted")
+        else:
+            raise MassiveTradeReplayError("trade source kind is unsupported")
         if not isinstance(self.price, (int, float)) or not math.isfinite(float(self.price)) or self.price <= 0:
             raise MassiveTradeReplayError("trade price must be finite and positive")
         try:
@@ -283,6 +298,8 @@ class MassiveTradeEventV2:
         for name in (
             "source_file_sha256",
             "source_record_sha256",
+            "canonical_source_record_receipt_sha256",
+            "canonicalization_spec_sha256",
             "entitlement_authority_receipt_sha256",
             "session_authority_receipt_sha256",
             "condition_authority_receipt_sha256",
@@ -293,6 +310,8 @@ class MassiveTradeEventV2:
             "identity_resolution_receipt_sha256",
         ):
             _digest(name, getattr(self, name))
+        if self.canonicalization_spec_sha256 != MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256:
+            raise MassiveTradeReplayError("trade canonicalization spec drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +319,7 @@ class MassiveTradeReplayResult:
     security_id: str
     session_date: str
     decision_at_ns: int
+    decision_clock_receipt_sha256: str
     entitlement_authority_receipt_sha256: str
     session_authority_receipt_sha256: str
     condition_authority_receipt_sha256: str
@@ -311,7 +331,7 @@ class MassiveTradeReplayResult:
     input_source_record_inventory_sha256: str
     input_event_count: int
     visible_event_count: int
-    active_events: tuple[MassiveTradeEventV2, ...]
+    active_events: tuple[MassiveTradeEventV3, ...]
     cancelled_event_keys: tuple[str, ...]
     post_cutoff_event_count: int
     receipt_sha256: str
@@ -323,6 +343,7 @@ class MassiveTradeReplayResult:
             "security_id": self.security_id,
             "session_date": self.session_date,
             "decision_at_ns": self.decision_at_ns,
+            "decision_clock_receipt_sha256": self.decision_clock_receipt_sha256,
             "entitlement_authority_receipt_sha256": self.entitlement_authority_receipt_sha256,
             "session_authority_receipt_sha256": self.session_authority_receipt_sha256,
             "condition_authority_receipt_sha256": self.condition_authority_receipt_sha256,
@@ -384,6 +405,7 @@ class MassiveTradeReplayResult:
         _nonnegative_int("decision timestamp", self.decision_at_ns)
         for name in (
             "entitlement_authority_receipt_sha256",
+            "decision_clock_receipt_sha256",
             "session_authority_receipt_sha256",
             "condition_authority_receipt_sha256",
             "correction_authority_receipt_sha256",
@@ -434,8 +456,8 @@ class MassiveTradeReplayResult:
             raise MassiveTradeReplayError("trade replay receipt differs")
 
 
-def normalize_massive_trade_event(
-    record: Mapping[str, object],
+def _normalize_canonical_trade_event(
+    record: MassiveCanonicalTradeSourceRecord,
     *,
     entitlement_authority: MassiveEntitlementAuthority,
     session_authority: MassiveSessionAuthority,
@@ -445,8 +467,8 @@ def normalize_massive_trade_event(
     source_object_receipt: MassiveSourceObjectReceipt,
     identity_resolution: MassiveResolvedSecurityIdentity,
     source_row_number: int,
-) -> MassiveTradeEventV2:
-    """Normalize one vendor record using separately qualified semantics."""
+) -> MassiveTradeEventV3:
+    """Bind one source-neutral canonical record to causal authorities."""
 
     entitlement_authority.validate()
     session_authority.validate()
@@ -455,6 +477,7 @@ def normalize_massive_trade_event(
     correction_authority.validate()
     source_object_receipt.validate()
     identity_resolution.validate()
+    record.validate()
     if source_object_receipt.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
         raise MassiveTradeReplayError("source object used another entitlement authority")
     if session_authority.resolve(
@@ -464,55 +487,44 @@ def normalize_massive_trade_event(
         raise MassiveTradeReplayError("session was not resolved by the supplied authority")
     if identity_resolution.session_date != session.session_date:
         raise MassiveTradeReplayError("identity and session dates differ")
-    record_ticker = record.get("ticker", record.get("sym"))
-    if record_ticker is not None and str(record_ticker) != identity_resolution.source_ticker:
+    if record.ticker != identity_resolution.source_ticker:
         raise MassiveTradeReplayError("trade ticker differs from the PIT identity")
-
-    raw_conditions = record.get("conditions", ())
-    condition_ids = tuple(
-        sorted(
-            _integer("condition ID", value)
-            for value in _object_sequence("conditions", raw_conditions)
-        )
-    )
+    condition_ids = record.conditions
     updates_open_close, updates_high_low, updates_volume = condition_authority.resolve(
         condition_ids
     )
-    correction_code = _integer("correction code", record.get("correction", 0))
+    correction_code = 0 if record.correction_code is None else record.correction_code
     correction_kind = correction_authority.resolve(correction_code)
-    sip_timestamp_ns = _integer("SIP timestamp", record["sip_timestamp"])
-    participant_timestamp_ns = _integer(
-        "participant timestamp", record["participant_timestamp"]
-    )
+    sip_timestamp_ns = record.sip_timestamp_ns
+    participant_timestamp_ns = record.participant_timestamp_ns
     if not identity_resolution.contains(participant_timestamp_ns):
         raise MassiveTradeReplayError("trade lies outside the PIT ticker identity interval")
     entitlement_delay_ns = (
         entitlement_authority.entitlement_delay_minutes * 60 * 1_000_000_000
     )
-    raw_size = record.get("decimal_size")
-    if raw_size is None:
-        raw_size = record["size"]
-    payload_for_source_hash = {
-        key: record[key] for key in sorted(record)
-    }
-    event = MassiveTradeEventV2(
+    theoretical_availability = sip_timestamp_ns + entitlement_delay_ns
+    actual_received_at_ns = record.received_at_ns
+    if record.source_kind == "delayed-websocket":
+        assert actual_received_at_ns is not None
+        availability = max(actual_received_at_ns, theoretical_availability)
+        availability_kind = "actual-receive-time"
+    else:
+        availability = theoretical_availability
+        availability_kind = "qualified-sip-delay"
+    event = MassiveTradeEventV3(
         security_id=identity_resolution.security_id,
         source_ticker=identity_resolution.source_ticker,
         session_date=session.session_date,
-        trade_id=str(record["id"]),
-        exchange_id=_integer("exchange ID", record["exchange"]),
-        trf_id=None
-        if record.get("trf_id") is None
-        else _integer("TRF ID", record["trf_id"]),
-        sequence_number=_integer("sequence number", record["sequence_number"]),
+        trade_id=record.trade_id,
+        exchange_id=record.exchange_id,
+        trf_id=record.trf_id,
+        sequence_number=record.sequence_number,
         participant_timestamp_ns=participant_timestamp_ns,
         sip_timestamp_ns=sip_timestamp_ns,
-        trf_timestamp_ns=None
-        if record.get("trf_timestamp") is None
-        else _integer("TRF timestamp", record["trf_timestamp"]),
-        strategy_available_timestamp_ns=sip_timestamp_ns + entitlement_delay_ns,
-        price=_positive_float("price", record["price"]),
-        decimal_size=str(raw_size),
+        trf_timestamp_ns=record.trf_timestamp_ns,
+        strategy_available_timestamp_ns=availability,
+        price=_positive_float("price", record.price_decimal),
+        decimal_size=record.size_decimal,
         conditions=condition_ids,
         correction_code=correction_code,
         correction_kind=correction_kind,
@@ -522,7 +534,12 @@ def normalize_massive_trade_event(
         regular_session=session.is_regular(participant_timestamp_ns),
         source_file_sha256=source_object_receipt.physical_sha256,
         source_row_number=source_row_number,
-        source_record_sha256=semantic_sha256(payload_for_source_hash),
+        source_record_sha256=record.raw_source_record_sha256,
+        source_kind=record.source_kind,
+        canonical_source_record_receipt_sha256=record.receipt_sha256,
+        canonicalization_spec_sha256=record.canonicalization_spec_sha256,
+        actual_received_at_ns=actual_received_at_ns,
+        availability_kind=availability_kind,
         entitlement_authority_receipt_sha256=entitlement_authority.receipt_sha256,
         session_authority_receipt_sha256=session_authority.receipt_sha256,
         condition_authority_receipt_sha256=condition_authority.receipt_sha256,
@@ -536,10 +553,91 @@ def normalize_massive_trade_event(
     return event
 
 
-def replay_massive_trades(
-    events: Sequence[MassiveTradeEventV2],
+def normalize_massive_trade_event(
+    record: Mapping[str, object],
     *,
-    decision_at_ns: int,
+    entitlement_authority: MassiveEntitlementAuthority,
+    session_authority: MassiveSessionAuthority,
+    session: MassiveExchangeSession,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+    source_object_receipt: MassiveSourceObjectReceipt,
+    identity_resolution: MassiveResolvedSecurityIdentity,
+    source_row_number: int,
+) -> MassiveTradeEventV3:
+    """Canonicalize and bind one REST-style trade row."""
+
+    return _normalize_canonical_trade_event(
+        canonicalize_massive_rest_trade(record),
+        entitlement_authority=entitlement_authority,
+        session_authority=session_authority,
+        session=session,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+        source_object_receipt=source_object_receipt,
+        identity_resolution=identity_resolution,
+        source_row_number=source_row_number,
+    )
+
+
+def normalize_massive_canonical_trade_event(
+    record: MassiveCanonicalTradeSourceRecord,
+    *,
+    entitlement_authority: MassiveEntitlementAuthority,
+    session_authority: MassiveSessionAuthority,
+    session: MassiveExchangeSession,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+    source_object_receipt: MassiveSourceObjectReceipt,
+    identity_resolution: MassiveResolvedSecurityIdentity,
+    source_row_number: int,
+) -> MassiveTradeEventV3:
+    """Public authority-binding boundary for a source-specific canonical row."""
+
+    return _normalize_canonical_trade_event(
+        record,
+        entitlement_authority=entitlement_authority,
+        session_authority=session_authority,
+        session=session,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+        source_object_receipt=source_object_receipt,
+        identity_resolution=identity_resolution,
+        source_row_number=source_row_number,
+    )
+
+
+def normalize_massive_delayed_websocket_trade(
+    capture_event: MassiveDelayedWebSocketEvent,
+    *,
+    entitlement_authority: MassiveEntitlementAuthority,
+    session_authority: MassiveSessionAuthority,
+    session: MassiveExchangeSession,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+    source_object_receipt: MassiveSourceObjectReceipt,
+    identity_resolution: MassiveResolvedSecurityIdentity,
+    source_row_number: int,
+) -> MassiveTradeEventV3:
+    """Bind an actual compact delayed message using its local receive time."""
+
+    return _normalize_canonical_trade_event(
+        canonicalize_massive_websocket_trade(capture_event),
+        entitlement_authority=entitlement_authority,
+        session_authority=session_authority,
+        session=session,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+        source_object_receipt=source_object_receipt,
+        identity_resolution=identity_resolution,
+        source_row_number=source_row_number,
+    )
+
+
+def replay_massive_trades(
+    events: Sequence[MassiveTradeEventV3],
+    *,
+    decision_clock: MassiveDecisionClockAuthority,
     entitlement_authority: MassiveEntitlementAuthority,
     session_authority: MassiveSessionAuthority,
     session: MassiveExchangeSession,
@@ -550,7 +648,7 @@ def replay_massive_trades(
 ) -> MassiveTradeReplayResult:
     """Replay all strategy-visible events in deterministic timestamp order."""
 
-    _nonnegative_int("decision timestamp", decision_at_ns)
+    decision_clock.validate()
     entitlement_authority.validate()
     session_authority.validate()
     session.validate()
@@ -567,6 +665,15 @@ def replay_massive_trades(
         raise MassiveTradeReplayError("session was not resolved by the supplied authority")
     if identity_resolution.session_date != session.session_date:
         raise MassiveTradeReplayError("identity and session dates differ")
+    if (
+        decision_clock.session_authority_receipt_sha256
+        != session_authority.receipt_sha256
+        or decision_clock.exchange != session.exchange
+        or decision_clock.session_date != session.session_date
+        or decision_clock.regular_open_ns != session.regular_open_ns
+        or decision_clock.regular_close_ns != session.regular_close_ns
+    ):
+        raise MassiveTradeReplayError("decision clock differs from session authority")
     if not events:
         raise MassiveTradeReplayError("trade replay requires one symbol-day event")
     for event in events:
@@ -599,10 +706,19 @@ def replay_massive_trades(
             raise MassiveTradeReplayError("trade identity differs from PIT resolution")
         if event.session_date != session.session_date:
             raise MassiveTradeReplayError("trade session differs from session authority")
-        if event.strategy_available_timestamp_ns != (
+        theoretical_availability = (
             event.sip_timestamp_ns
             + entitlement_authority.entitlement_delay_minutes * 60 * 1_000_000_000
-        ):
+        )
+        if event.source_kind == "delayed-websocket":
+            if event.actual_received_at_ns is None or (
+                event.strategy_available_timestamp_ns
+                != max(event.actual_received_at_ns, theoretical_availability)
+            ):
+                raise MassiveTradeReplayError(
+                    "delayed trade availability differs from actual receipt"
+                )
+        elif event.strategy_available_timestamp_ns != theoretical_availability:
             raise MassiveTradeReplayError("trade availability differs from entitlement delay")
         if event.regular_session is not session.is_regular(event.participant_timestamp_ns):
             raise MassiveTradeReplayError("trade session eligibility differs from calendar")
@@ -615,7 +731,7 @@ def replay_massive_trades(
             (
                 event
                 for event in events
-                if event.strategy_available_timestamp_ns <= decision_at_ns
+                if event.strategy_available_timestamp_ns <= decision_clock.decision_at_ns
             ),
             key=lambda event: event.replay_order,
         )
@@ -624,7 +740,7 @@ def replay_massive_trades(
         if left.replay_order == right.replay_order and left.economic_payload() != right.economic_payload():
             raise MassiveTradeReplayError("ambiguous events share one replay order")
 
-    active: dict[str, MassiveTradeEventV2] = {}
+    active: dict[str, MassiveTradeEventV3] = {}
     cancelled: set[str] = set()
     for event in visible:
         key = event.event_key
@@ -652,7 +768,8 @@ def replay_massive_trades(
         "schema": MASSIVE_TRADE_REPLAY_SCHEMA,
         "security_id": security_id,
         "session_date": session_date,
-        "decision_at_ns": decision_at_ns,
+        "decision_at_ns": decision_clock.decision_at_ns,
+        "decision_clock_receipt_sha256": decision_clock.receipt_sha256,
         "entitlement_authority_receipt_sha256": entitlement_authority.receipt_sha256,
         "session_authority_receipt_sha256": session_authority.receipt_sha256,
         "condition_authority_receipt_sha256": condition_authority.receipt_sha256,
@@ -682,7 +799,8 @@ def replay_massive_trades(
     result = MassiveTradeReplayResult(
         security_id=security_id,
         session_date=session_date,
-        decision_at_ns=decision_at_ns,
+        decision_at_ns=decision_clock.decision_at_ns,
+        decision_clock_receipt_sha256=decision_clock.receipt_sha256,
         entitlement_authority_receipt_sha256=entitlement_authority.receipt_sha256,
         session_authority_receipt_sha256=session_authority.receipt_sha256,
         condition_authority_receipt_sha256=condition_authority.receipt_sha256,
@@ -719,9 +837,11 @@ __all__ = [
     "MASSIVE_TRADE_EVENT_SCHEMA",
     "MASSIVE_TRADE_REPLAY_SCHEMA",
     "MassiveResolvedSecurityIdentity",
-    "MassiveTradeEventV2",
+    "MassiveTradeEventV3",
     "MassiveTradeReplayError",
     "MassiveTradeReplayResult",
+    "normalize_massive_delayed_websocket_trade",
+    "normalize_massive_canonical_trade_event",
     "normalize_massive_trade_event",
     "replay_massive_trades",
 ]

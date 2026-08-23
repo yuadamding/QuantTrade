@@ -1,35 +1,38 @@
-"""Evidence-derived delayed-stream versus finalized-file replay qualification."""
+"""Committed-byte delayed-stream versus finalized-file replay qualification."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import json
-from typing import Literal, Mapping, Sequence
+from typing import Literal, Sequence
 
+from rl_quant.alpha.pit_universe import SourcedTickerHistoryRecord
 from rl_quant.data_sources.massive.conditions import MassiveConditionAuthority
 from rl_quant.data_sources.massive.corrections import MassiveCorrectionAuthority
+from rl_quant.data_sources.massive.decision_clock import MassiveDecisionClockAuthority
 from rl_quant.data_sources.massive.entitlement import MassiveEntitlementAuthority
 from rl_quant.data_sources.massive.session_calendar import (
     MassiveExchangeSession,
     MassiveSessionAuthority,
 )
-from rl_quant.data_sources.massive.source_receipts import MassiveSourceObjectReceipt
+from rl_quant.data_sources.massive.source_receipts import LoadedMassiveSourceObject
+from rl_quant.data_sources.massive.trade_extraction import (
+    MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256,
+)
 from rl_quant.data_sources.massive.trade_replay import MassiveTradeReplayResult
 from rl_quant.data_sources.massive.websocket_capture import (
     MassiveDelayedWebSocketCaptureAuthority,
 )
-from rl_quant.protocol.canonical_artifact import (
-    canonical_json_payload,
-    semantic_sha256,
+from rl_quant.evaluation.massive_replay_artifacts import (
+    MASSIVE_DELAYED_CAPTURE_PARSER_SPEC_SHA256,
+    MassiveReplayFeatureArtifact,
+    MassiveTradeExtractionManifest,
 )
+from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 
-MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA = "rl-quant.massive-delayed-replay-v2"
-MASSIVE_REPLAY_FEATURE_ARTIFACT_SCHEMA = (
-    "rl-quant.massive-replay-feature-artifact-v1"
-)
-MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA = "rl-quant.massive-replay-parity-evidence-v1"
-MASSIVE_TICKER_CHANGE_CANARY_SCHEMA = "rl-quant.massive-ticker-change-canary-v1"
+MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA = "rl-quant.massive-delayed-replay-v3"
+MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA = "rl-quant.massive-replay-parity-evidence-v2"
+MASSIVE_TICKER_CHANGE_CANARY_SCHEMA = "rl-quant.massive-ticker-change-canary-v2"
 
 MassiveReplayCanaryKind = Literal[
     "correction-activity",
@@ -63,140 +66,66 @@ def _digest(name: str, value: object) -> str:
     return value
 
 
-def _text(name: str, value: object) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise MassiveReplayParityError(f"{name} must be canonical text")
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class MassiveReplayFeatureArtifact:
-    security_id: str
-    session_date: str
-    source_replay_receipt_sha256: str
-    canonical_feature_payload_json: str
-    feature_payload_sha256: str
-    receipt_sha256: str
-    schema: str = MASSIVE_REPLAY_FEATURE_ARTIFACT_SCHEMA
-
-    def unsigned(self) -> dict[str, object]:
-        return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
-        }
-
-    def validate(self) -> None:
-        if self.schema != MASSIVE_REPLAY_FEATURE_ARTIFACT_SCHEMA:
-            raise MassiveReplayParityError("feature artifact schema drifted")
-        _text("security ID", self.security_id)
-        _text("session date", self.session_date)
-        _digest("source replay receipt", self.source_replay_receipt_sha256)
-        _text("canonical feature payload", self.canonical_feature_payload_json)
-        payload = json.loads(self.canonical_feature_payload_json)
-        if canonical_json_payload(payload).decode("ascii") != self.canonical_feature_payload_json:
-            raise MassiveReplayParityError("feature payload is not canonical JSON")
-        _digest("feature payload SHA", self.feature_payload_sha256)
-        if self.feature_payload_sha256 != semantic_sha256(payload):
-            raise MassiveReplayParityError("feature payload SHA differs")
-        _digest("feature artifact receipt", self.receipt_sha256)
-        if self.receipt_sha256 != semantic_sha256(self.unsigned()):
-            raise MassiveReplayParityError("feature artifact receipt differs")
-
-    @classmethod
-    def build(
-        cls,
-        *,
-        security_id: str,
-        session_date: str,
-        source_replay_receipt_sha256: str,
-        feature_payload: Mapping[str, object],
-    ) -> MassiveReplayFeatureArtifact:
-        canonical = canonical_json_payload(feature_payload).decode("ascii")
-        body = {
-            "schema": MASSIVE_REPLAY_FEATURE_ARTIFACT_SCHEMA,
-            "security_id": security_id,
-            "session_date": session_date,
-            "source_replay_receipt_sha256": source_replay_receipt_sha256,
-            "canonical_feature_payload_json": canonical,
-            "feature_payload_sha256": semantic_sha256(feature_payload),
-        }
-        value = cls(receipt_sha256=semantic_sha256(body), **body)
-        value.validate()
-        return value
-
-
 @dataclass(frozen=True, slots=True)
 class MassiveTickerChangeCanaryEvidence:
-    security_id: str
-    session_date: str
-    prior_ticker: str
-    current_ticker: str
-    identity_authority_receipt_sha256: str
-    ticker_history_receipt_sha256: str
-    transition_source_receipt_sha256: str
+    prior_record: SourcedTickerHistoryRecord
+    current_record: SourcedTickerHistoryRecord
+    ticker_history_authority_receipt_sha256: str
     receipt_sha256: str
     schema: str = MASSIVE_TICKER_CHANGE_CANARY_SCHEMA
 
+    @property
+    def security_id(self) -> str:
+        return self.current_record.security_id
+
+    @property
+    def current_ticker(self) -> str:
+        return self.current_record.ticker
+
     def unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
+            "schema": self.schema,
+            "prior_record": asdict(self.prior_record),
+            "current_record": asdict(self.current_record),
+            "ticker_history_authority_receipt_sha256": self.ticker_history_authority_receipt_sha256,
         }
 
     def validate(self) -> None:
         if self.schema != MASSIVE_TICKER_CHANGE_CANARY_SCHEMA:
             raise MassiveReplayParityError("ticker-change canary schema drifted")
-        for name in (
-            "security_id",
-            "session_date",
-            "prior_ticker",
-            "current_ticker",
-        ):
-            _text(name, getattr(self, name))
-        if self.prior_ticker == self.current_ticker:
-            raise MassiveReplayParityError("ticker-change canary did not change ticker")
-        for name in (
-            "identity_authority_receipt_sha256",
-            "ticker_history_receipt_sha256",
-            "transition_source_receipt_sha256",
-            "receipt_sha256",
-        ):
-            _digest(name, getattr(self, name))
+        self.prior_record.validate()
+        self.current_record.validate()
+        if self.prior_record.security_id != self.current_record.security_id:
+            raise MassiveReplayParityError("ticker transition changed security identity")
+        if self.prior_record.ticker == self.current_record.ticker:
+            raise MassiveReplayParityError("ticker transition did not change ticker")
+        if self.prior_record.valid_to_ms != self.current_record.valid_from_ms:
+            raise MassiveReplayParityError("ticker records are not adjacent")
+        if self.prior_record.primary_exchange != self.current_record.primary_exchange:
+            raise MassiveReplayParityError("ticker transition changed primary exchange")
+        _digest("ticker history authority", self.ticker_history_authority_receipt_sha256)
+        _digest("ticker transition receipt", self.receipt_sha256)
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
-            raise MassiveReplayParityError("ticker-change canary receipt differs")
+            raise MassiveReplayParityError("ticker transition receipt differs")
 
     @classmethod
     def build(
         cls,
         *,
-        security_id: str,
-        session_date: str,
-        prior_ticker: str,
-        current_ticker: str,
-        identity_authority_receipt_sha256: str,
-        ticker_history_receipt_sha256: str,
-        transition_source_receipt_sha256: str,
+        prior_record: SourcedTickerHistoryRecord,
+        current_record: SourcedTickerHistoryRecord,
+        ticker_history_authority_receipt_sha256: str,
     ) -> MassiveTickerChangeCanaryEvidence:
         body = {
             "schema": MASSIVE_TICKER_CHANGE_CANARY_SCHEMA,
-            "security_id": security_id,
-            "session_date": session_date,
-            "prior_ticker": prior_ticker,
-            "current_ticker": current_ticker,
-            "identity_authority_receipt_sha256": identity_authority_receipt_sha256,
-            "ticker_history_receipt_sha256": ticker_history_receipt_sha256,
-            "transition_source_receipt_sha256": transition_source_receipt_sha256,
+            "prior_record": asdict(prior_record),
+            "current_record": asdict(current_record),
+            "ticker_history_authority_receipt_sha256": ticker_history_authority_receipt_sha256,
         }
         value = cls(
-            security_id=security_id,
-            session_date=session_date,
-            prior_ticker=prior_ticker,
-            current_ticker=current_ticker,
-            identity_authority_receipt_sha256=identity_authority_receipt_sha256,
-            ticker_history_receipt_sha256=ticker_history_receipt_sha256,
-            transition_source_receipt_sha256=transition_source_receipt_sha256,
+            prior_record=prior_record,
+            current_record=current_record,
+            ticker_history_authority_receipt_sha256=ticker_history_authority_receipt_sha256,
             receipt_sha256=semantic_sha256(body),
         )
         value.validate()
@@ -207,7 +136,11 @@ class MassiveTickerChangeCanaryEvidence:
 class MassiveReplayParityInput:
     canary_kind: MassiveReplayCanaryKind
     capture: MassiveDelayedWebSocketCaptureAuthority
-    finalized_source: MassiveSourceObjectReceipt
+    delayed_source: LoadedMassiveSourceObject
+    finalized_source: LoadedMassiveSourceObject
+    delayed_extraction: MassiveTradeExtractionManifest
+    finalized_extraction: MassiveTradeExtractionManifest
+    decision_clock: MassiveDecisionClockAuthority
     session: MassiveExchangeSession
     delayed_replay: MassiveTradeReplayResult
     finalized_replay: MassiveTradeReplayResult
@@ -221,51 +154,61 @@ class MassiveReplayParityEvidence:
     canary_kind: MassiveReplayCanaryKind
     security_id: str
     session_date: str
+    decision_clock_receipt_sha256: str
     websocket_capture_receipt_sha256: str
-    finalized_source_receipt_sha256: str
+    delayed_loaded_source_receipt_sha256: str
+    finalized_loaded_source_receipt_sha256: str
+    delayed_extraction_receipt_sha256: str
+    finalized_extraction_receipt_sha256: str
     delayed_replay_receipt_sha256: str
     finalized_replay_receipt_sha256: str
     delayed_active_state_sha256: str
     finalized_active_state_sha256: str
     delayed_feature_artifact_receipt_sha256: str
     finalized_feature_artifact_receipt_sha256: str
+    feature_spec_receipt_sha256: str
     delayed_feature_sha256: str
     finalized_feature_sha256: str
     event_exact: bool
     feature_exact: bool
     canary_observed: bool
     capture_complete: bool
+    committed_sources_complete: bool
     failure_reason: str | None
     receipt_sha256: str
     schema: str = MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA
 
     def unsigned(self) -> dict[str, object]:
-        return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
-        }
+        payload = asdict(self)
+        payload.pop("receipt_sha256")
+        return payload
 
     def validate(self) -> None:
         if self.schema != MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA:
             raise MassiveReplayParityError("parity evidence schema drifted")
         if self.canary_kind not in REQUIRED_MASSIVE_REPLAY_CANARIES:
             raise MassiveReplayParityError("parity canary kind is unsupported")
-        _text("security ID", self.security_id)
-        _text("session date", self.session_date)
-        for name in (
+        if not self.security_id or not self.session_date:
+            raise MassiveReplayParityError("parity identity is absent")
+        digest_fields = (
+            "decision_clock_receipt_sha256",
             "websocket_capture_receipt_sha256",
-            "finalized_source_receipt_sha256",
+            "delayed_loaded_source_receipt_sha256",
+            "finalized_loaded_source_receipt_sha256",
+            "delayed_extraction_receipt_sha256",
+            "finalized_extraction_receipt_sha256",
             "delayed_replay_receipt_sha256",
             "finalized_replay_receipt_sha256",
             "delayed_active_state_sha256",
             "finalized_active_state_sha256",
             "delayed_feature_artifact_receipt_sha256",
             "finalized_feature_artifact_receipt_sha256",
+            "feature_spec_receipt_sha256",
             "delayed_feature_sha256",
             "finalized_feature_sha256",
             "receipt_sha256",
-        ):
+        )
+        for name in digest_fields:
             _digest(name, getattr(self, name))
         if self.event_exact is not (
             self.delayed_active_state_sha256 == self.finalized_active_state_sha256
@@ -275,20 +218,19 @@ class MassiveReplayParityEvidence:
             self.delayed_feature_sha256 == self.finalized_feature_sha256
         ):
             raise MassiveReplayParityError("feature parity flag differs from evidence")
-        if not isinstance(self.capture_complete, bool):
-            raise MassiveReplayParityError("capture-complete flag must be Boolean")
-        exact = (
-            self.event_exact
-            and self.feature_exact
-            and self.canary_observed
-            and self.capture_complete
+        exact = all(
+            (
+                self.event_exact,
+                self.feature_exact,
+                self.canary_observed,
+                self.capture_complete,
+                self.committed_sources_complete,
+            )
         )
         if exact and self.failure_reason is not None:
             raise MassiveReplayParityError("exact parity cannot have a failure reason")
-        if not exact and (
-            not self.failure_reason or self.failure_reason != self.failure_reason.strip()
-        ):
-            raise MassiveReplayParityError("failed parity needs a canonical reason")
+        if not exact and not self.failure_reason:
+            raise MassiveReplayParityError("failed parity needs a reason")
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveReplayParityError("parity evidence receipt differs")
 
@@ -296,6 +238,8 @@ class MassiveReplayParityEvidence:
 @dataclass(frozen=True, slots=True)
 class MassiveDelayedReplayAuthority:
     entitlement_receipt_sha256: str
+    runtime_entitlement_qualified: bool
+    canonical_source_parsers_qualified: bool
     session_authority_receipt_sha256: str
     correction_semantics_receipt_sha256: str
     condition_authority_receipt_sha256: str
@@ -303,9 +247,7 @@ class MassiveDelayedReplayAuthority:
     canary_kinds_present: tuple[str, ...]
     compared_session_count: int
     compared_symbol_day_count: int
-    exact_event_symbol_day_count: int
     failed_event_symbol_days: tuple[str, ...]
-    exact_feature_symbol_day_count: int
     failed_feature_symbol_days: tuple[str, ...]
     development_asof_replay_authorized: bool
     historical_asof_replay_authorized: bool
@@ -314,24 +256,9 @@ class MassiveDelayedReplayAuthority:
     schema: str = MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA
 
     def unsigned(self) -> dict[str, object]:
-        return {
-            "schema": self.schema,
-            "entitlement_receipt_sha256": self.entitlement_receipt_sha256,
-            "session_authority_receipt_sha256": self.session_authority_receipt_sha256,
-            "correction_semantics_receipt_sha256": self.correction_semantics_receipt_sha256,
-            "condition_authority_receipt_sha256": self.condition_authority_receipt_sha256,
-            "parity_rows": [asdict(row) for row in self.parity_rows],
-            "canary_kinds_present": self.canary_kinds_present,
-            "compared_session_count": self.compared_session_count,
-            "compared_symbol_day_count": self.compared_symbol_day_count,
-            "exact_event_symbol_day_count": self.exact_event_symbol_day_count,
-            "failed_event_symbol_days": self.failed_event_symbol_days,
-            "exact_feature_symbol_day_count": self.exact_feature_symbol_day_count,
-            "failed_feature_symbol_days": self.failed_feature_symbol_days,
-            "development_asof_replay_authorized": self.development_asof_replay_authorized,
-            "historical_asof_replay_authorized": self.historical_asof_replay_authorized,
-            "predictive_training_authorized": self.predictive_training_authorized,
-        }
+        payload = asdict(self)
+        payload.pop("receipt_sha256")
+        return payload
 
     def validate(self) -> None:
         if self.schema != MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA:
@@ -360,51 +287,66 @@ class MassiveDelayedReplayAuthority:
             raise MassiveReplayParityError("compared session count drifted")
         if self.compared_symbol_day_count != len(symbol_days):
             raise MassiveReplayParityError("compared symbol-day count drifted")
-        failed_events = tuple(
-            f"{row.security_id}:{row.session_date}:{row.canary_kind}"
-            for row in self.parity_rows
-            if not row.event_exact or not row.canary_observed or not row.capture_complete
-        )
-        failed_features = tuple(
-            f"{row.security_id}:{row.session_date}:{row.canary_kind}"
-            for row in self.parity_rows
-            if not row.feature_exact or not row.canary_observed or not row.capture_complete
-        )
-        if self.exact_event_symbol_day_count != sum(
-            row.event_exact and row.canary_observed and row.capture_complete
-            for row in self.parity_rows
-        ):
-            raise MassiveReplayParityError("exact event count drifted")
-        if self.exact_feature_symbol_day_count != sum(
-            row.feature_exact and row.canary_observed and row.capture_complete
-            for row in self.parity_rows
-        ):
-            raise MassiveReplayParityError("exact feature count drifted")
+        failed_events, failed_features = _failed_rows(self.parity_rows)
         if self.failed_event_symbol_days != failed_events:
             raise MassiveReplayParityError("failed event inventory drifted")
         if self.failed_feature_symbol_days != failed_features:
             raise MassiveReplayParityError("failed feature inventory drifted")
-        expected_canaries = tuple(
+        canaries = tuple(
             sorted({row.canary_kind for row in self.parity_rows if row.canary_observed})
         )
-        if self.canary_kinds_present != expected_canaries:
+        if self.canary_kinds_present != canaries:
             raise MassiveReplayParityError("observed canary inventory drifted")
         coverage = (
             len(sessions) >= 2
             and len(symbol_days) >= len(REQUIRED_MASSIVE_REPLAY_CANARIES)
-            and set(REQUIRED_MASSIVE_REPLAY_CANARIES).issubset(expected_canaries)
+            and set(REQUIRED_MASSIVE_REPLAY_CANARIES).issubset(canaries)
         )
-        exact = not failed_events and not failed_features and coverage
-        if self.development_asof_replay_authorized is not True:
-            raise MassiveReplayParityError("validated evidence must allow development replay")
+        exact = (
+            not failed_events
+            and not failed_features
+            and coverage
+            and self.runtime_entitlement_qualified
+            and self.canonical_source_parsers_qualified
+        )
+        if not self.development_asof_replay_authorized:
+            raise MassiveReplayParityError("development replay must remain available")
         if self.historical_asof_replay_authorized is not exact:
-            raise MassiveReplayParityError("historical replay authority differs from evidence")
+            raise MassiveReplayParityError("historical replay authority differs")
         if self.predictive_training_authorized:
-            raise MassiveReplayParityError(
-                "replay parity alone cannot authorize predictive training"
-            )
+            raise MassiveReplayParityError("parity cannot authorize training")
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveReplayParityError("delayed replay receipt differs")
+
+
+def _failed_rows(
+    rows: Sequence[MassiveReplayParityEvidence],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    failed_events = tuple(
+        f"{row.security_id}:{row.session_date}:{row.canary_kind}"
+        for row in rows
+        if not all(
+            (
+                row.event_exact,
+                row.canary_observed,
+                row.capture_complete,
+                row.committed_sources_complete,
+            )
+        )
+    )
+    failed_features = tuple(
+        f"{row.security_id}:{row.session_date}:{row.canary_kind}"
+        for row in rows
+        if not all(
+            (
+                row.feature_exact,
+                row.canary_observed,
+                row.capture_complete,
+                row.committed_sources_complete,
+            )
+        )
+    )
+    return failed_events, failed_features
 
 
 def _canary_observed(
@@ -414,14 +356,12 @@ def _canary_observed(
 ) -> bool:
     events = (*row.delayed_replay.active_events, *row.finalized_replay.active_events)
     if row.canary_kind == "normal-session":
-        return (
-            row.session.special_session_reason is None
-            and row.session.scheduled_five_minute_intervals == 78
+        return row.session.special_session_reason is None and (
+            row.session.scheduled_five_minute_intervals == 78
         )
     if row.canary_kind == "early-close-session":
-        return (
-            row.session.special_session_reason is not None
-            and row.session.scheduled_five_minute_intervals < 78
+        return row.session.special_session_reason is not None and (
+            row.session.scheduled_five_minute_intervals < 78
         )
     if row.canary_kind == "correction-activity":
         return bool(
@@ -430,31 +370,31 @@ def _canary_observed(
             or any(event.correction_kind != "new-trade" for event in events)
         )
     if row.canary_kind == "special-condition":
-        special_ids = {
+        special = {
             rule.condition_id
             for rule in condition_authority.rules
-            if not (
-                rule.updates_open_close
-                and rule.updates_high_low
-                and rule.updates_volume
+            if not all(
+                (
+                    rule.updates_open_close,
+                    rule.updates_high_low,
+                    rule.updates_volume,
+                )
             )
             or rule.name.casefold() != "regular sale"
         }
-        return any(special_ids.intersection(event.conditions) for event in events)
+        return any(special.intersection(event.conditions) for event in events)
     if row.canary_kind == "trf-trades":
         return any(event.trf_id is not None for event in events)
     if row.canary_kind == "ticker-change-identity":
-        if row.ticker_change is None:
+        if row.ticker_change is None or not events:
             return False
         row.ticker_change.validate()
-        tickers = {event.source_ticker for event in events}
         return (
             row.ticker_change.security_id == row.delayed_replay.security_id
-            and row.ticker_change.session_date == row.delayed_replay.session_date
-            and row.ticker_change.current_ticker in tickers
-            and row.ticker_change.identity_authority_receipt_sha256
-            == row.delayed_replay.identity_authority_receipt_sha256
-            and row.ticker_change.ticker_history_receipt_sha256
+            and row.ticker_change.current_ticker == events[0].source_ticker
+            and row.ticker_change.current_record.valid_from_ms * 1_000_000
+            <= row.decision_clock.decision_at_ns
+            and row.ticker_change.ticker_history_authority_receipt_sha256
             == row.delayed_replay.ticker_history_receipt_sha256
         )
     return False
@@ -468,44 +408,56 @@ def _derive_parity_evidence(
     condition_authority: MassiveConditionAuthority,
     correction_authority: MassiveCorrectionAuthority,
 ) -> MassiveReplayParityEvidence:
-    row.capture.validate()
-    row.finalized_source.validate()
-    row.session.validate()
-    row.delayed_replay.validate()
-    row.finalized_replay.validate()
-    row.delayed_features.validate()
-    row.finalized_features.validate()
+    for artifact in (
+        row.capture,
+        row.delayed_source,
+        row.finalized_source,
+        row.delayed_extraction,
+        row.finalized_extraction,
+        row.decision_clock,
+        row.session,
+        row.delayed_replay,
+        row.finalized_replay,
+        row.delayed_features,
+        row.finalized_features,
+    ):
+        artifact.validate()
     if row.capture.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
-        raise MassiveReplayParityError("capture entitlement differs from authority")
-    if row.finalized_source.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
-        raise MassiveReplayParityError("final source entitlement differs from authority")
-    if row.capture.raw_capture_source_receipt_sha256 != row.delayed_replay.source_object_receipt_sha256:
-        raise MassiveReplayParityError("capture source differs from delayed replay")
+        raise MassiveReplayParityError("capture entitlement differs")
+    for source in (row.delayed_source, row.finalized_source):
+        if source.receipt.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
+            raise MassiveReplayParityError("source entitlement differs")
+    if row.capture.raw_capture_source_receipt_sha256 != row.delayed_source.receipt.receipt_sha256:
+        raise MassiveReplayParityError("capture source is not the committed delayed source")
     if row.capture.payload_inventory_sha256 != row.delayed_replay.input_source_record_inventory_sha256:
-        raise MassiveReplayParityError("capture payload inventory differs from delayed replay")
-    if row.finalized_source.receipt_sha256 != row.finalized_replay.source_object_receipt_sha256:
-        raise MassiveReplayParityError("final source differs from finalized replay")
-    if (
-        row.delayed_replay.condition_authority_receipt_sha256
-        != condition_authority.receipt_sha256
-        or row.finalized_replay.condition_authority_receipt_sha256
-        != condition_authority.receipt_sha256
+        raise MassiveReplayParityError("capture payload inventory differs from replay")
+    for source, extraction, replay in (
+        (row.delayed_source, row.delayed_extraction, row.delayed_replay),
+        (row.finalized_source, row.finalized_extraction, row.finalized_replay),
     ):
-        raise MassiveReplayParityError("replay condition authority differs")
-    if (
-        row.delayed_replay.correction_authority_receipt_sha256
-        != correction_authority.receipt_sha256
-        or row.finalized_replay.correction_authority_receipt_sha256
-        != correction_authority.receipt_sha256
-    ):
-        raise MassiveReplayParityError("replay correction authority differs")
-    if (
-        row.delayed_replay.session_authority_receipt_sha256
-        != session_authority.receipt_sha256
-        or row.finalized_replay.session_authority_receipt_sha256
-        != session_authority.receipt_sha256
-    ):
-        raise MassiveReplayParityError("replay session authority differs")
+        if replay.source_object_receipt_sha256 != source.receipt.receipt_sha256:
+            raise MassiveReplayParityError("replay source differs from committed bytes")
+        if extraction.loaded_source_receipt_sha256 != source.receipt_sha256:
+            raise MassiveReplayParityError("extraction used another loaded source")
+        if extraction.source_commit_receipt_sha256 != source.commit.receipt_sha256:
+            raise MassiveReplayParityError("extraction used another source commit")
+        if extraction.selected_source_row_inventory_sha256 != replay.input_source_record_inventory_sha256:
+            raise MassiveReplayParityError("extraction row inventory differs")
+        if extraction.selected_row_count != replay.input_event_count:
+            raise MassiveReplayParityError("extraction count differs")
+        if replay.decision_clock_receipt_sha256 != row.decision_clock.receipt_sha256:
+            raise MassiveReplayParityError("replay used another decision clock")
+    if row.capture.lifecycle.decision_clock_receipt_sha256 != row.decision_clock.receipt_sha256:
+        raise MassiveReplayParityError("capture used another decision clock")
+    if row.capture.lifecycle.required_capture_end_ns != row.decision_clock.decision_at_ns:
+        raise MassiveReplayParityError("capture cutoff differs from decision clock")
+    for replay in (row.delayed_replay, row.finalized_replay):
+        if replay.condition_authority_receipt_sha256 != condition_authority.receipt_sha256:
+            raise MassiveReplayParityError("replay condition authority differs")
+        if replay.correction_authority_receipt_sha256 != correction_authority.receipt_sha256:
+            raise MassiveReplayParityError("replay correction authority differs")
+        if replay.session_authority_receipt_sha256 != session_authority.receipt_sha256:
+            raise MassiveReplayParityError("replay session authority differs")
     if session_authority.resolve(
         exchange=row.session.exchange, session_date=row.session.session_date
     ) != row.session:
@@ -518,77 +470,96 @@ def _derive_parity_evidence(
     }
     if len(identities) != 1 or next(iter(identities))[1] != row.capture.session_date:
         raise MassiveReplayParityError("parity artifacts mix security-session identities")
-    if (
-        row.delayed_features.source_replay_receipt_sha256
-        != row.delayed_replay.receipt_sha256
-    ):
+    if row.delayed_features.input_replay_receipt_sha256 != row.delayed_replay.receipt_sha256:
         raise MassiveReplayParityError("delayed features used another replay")
-    if (
-        row.finalized_features.source_replay_receipt_sha256
-        != row.finalized_replay.receipt_sha256
-    ):
+    if row.finalized_features.input_replay_receipt_sha256 != row.finalized_replay.receipt_sha256:
         raise MassiveReplayParityError("final features used another replay")
+    if row.delayed_features.feature_spec_receipt_sha256 != row.finalized_features.feature_spec_receipt_sha256:
+        raise MassiveReplayParityError("feature specifications differ")
     delayed_state = row.delayed_replay.active_state_inventory_sha256
     finalized_state = row.finalized_replay.active_state_inventory_sha256
-    canary_observed = _canary_observed(
-        row, condition_authority=condition_authority
-    )
     event_exact = delayed_state == finalized_state
-    feature_exact = (
-        row.delayed_features.feature_payload_sha256
-        == row.finalized_features.feature_payload_sha256
+    delayed_feature = row.delayed_features.output_feature_receipt_sha256
+    finalized_feature = row.finalized_features.output_feature_receipt_sha256
+    feature_exact = delayed_feature == finalized_feature
+    canary = _canary_observed(row, condition_authority=condition_authority)
+    committed = (
+        row.capture.capture_file_parser_qualified
+        and row.capture.loaded_source_receipt_sha256
+        == row.delayed_source.receipt_sha256
+        and row.delayed_extraction.complete_for_security_session
+        and row.finalized_extraction.complete_for_security_session
+        and row.delayed_extraction.canonical_parser_qualified
+        and row.finalized_extraction.canonical_parser_qualified
+        and row.delayed_extraction.parser_spec_sha256
+        == MASSIVE_DELAYED_CAPTURE_PARSER_SPEC_SHA256
+        and row.finalized_extraction.parser_spec_sha256
+        == MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256
     )
     failures = []
     if not row.capture.capture_complete:
         failures.append("capture-incomplete")
+    if not committed:
+        failures.append("source-extraction-incomplete")
     if not event_exact:
         failures.append("event-mismatch")
     if not feature_exact:
         failures.append("feature-mismatch")
-    if not canary_observed:
+    if not canary:
         failures.append("canary-not-observed")
-    failure_reason = "+".join(failures) or None
     security_id, session_date = next(iter(identities))
     body = {
         "schema": MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA,
         "canary_kind": row.canary_kind,
         "security_id": security_id,
         "session_date": session_date,
+        "decision_clock_receipt_sha256": row.decision_clock.receipt_sha256,
         "websocket_capture_receipt_sha256": row.capture.receipt_sha256,
-        "finalized_source_receipt_sha256": row.finalized_source.receipt_sha256,
+        "delayed_loaded_source_receipt_sha256": row.delayed_source.receipt_sha256,
+        "finalized_loaded_source_receipt_sha256": row.finalized_source.receipt_sha256,
+        "delayed_extraction_receipt_sha256": row.delayed_extraction.receipt_sha256,
+        "finalized_extraction_receipt_sha256": row.finalized_extraction.receipt_sha256,
         "delayed_replay_receipt_sha256": row.delayed_replay.receipt_sha256,
         "finalized_replay_receipt_sha256": row.finalized_replay.receipt_sha256,
         "delayed_active_state_sha256": delayed_state,
         "finalized_active_state_sha256": finalized_state,
         "delayed_feature_artifact_receipt_sha256": row.delayed_features.receipt_sha256,
         "finalized_feature_artifact_receipt_sha256": row.finalized_features.receipt_sha256,
-        "delayed_feature_sha256": row.delayed_features.feature_payload_sha256,
-        "finalized_feature_sha256": row.finalized_features.feature_payload_sha256,
+        "feature_spec_receipt_sha256": row.delayed_features.feature_spec_receipt_sha256,
+        "delayed_feature_sha256": delayed_feature,
+        "finalized_feature_sha256": finalized_feature,
         "event_exact": event_exact,
         "feature_exact": feature_exact,
-        "canary_observed": canary_observed,
+        "canary_observed": canary,
         "capture_complete": row.capture.capture_complete,
-        "failure_reason": failure_reason,
+        "committed_sources_complete": committed,
+        "failure_reason": "+".join(failures) or None,
     }
     value = MassiveReplayParityEvidence(
         canary_kind=row.canary_kind,
         security_id=security_id,
         session_date=session_date,
+        decision_clock_receipt_sha256=row.decision_clock.receipt_sha256,
         websocket_capture_receipt_sha256=row.capture.receipt_sha256,
-        finalized_source_receipt_sha256=row.finalized_source.receipt_sha256,
+        delayed_loaded_source_receipt_sha256=row.delayed_source.receipt_sha256,
+        finalized_loaded_source_receipt_sha256=row.finalized_source.receipt_sha256,
+        delayed_extraction_receipt_sha256=row.delayed_extraction.receipt_sha256,
+        finalized_extraction_receipt_sha256=row.finalized_extraction.receipt_sha256,
         delayed_replay_receipt_sha256=row.delayed_replay.receipt_sha256,
         finalized_replay_receipt_sha256=row.finalized_replay.receipt_sha256,
         delayed_active_state_sha256=delayed_state,
         finalized_active_state_sha256=finalized_state,
         delayed_feature_artifact_receipt_sha256=row.delayed_features.receipt_sha256,
         finalized_feature_artifact_receipt_sha256=row.finalized_features.receipt_sha256,
-        delayed_feature_sha256=row.delayed_features.feature_payload_sha256,
-        finalized_feature_sha256=row.finalized_features.feature_payload_sha256,
+        feature_spec_receipt_sha256=row.delayed_features.feature_spec_receipt_sha256,
+        delayed_feature_sha256=delayed_feature,
+        finalized_feature_sha256=finalized_feature,
         event_exact=event_exact,
         feature_exact=feature_exact,
-        canary_observed=canary_observed,
+        canary_observed=canary,
         capture_complete=row.capture.capture_complete,
-        failure_reason=failure_reason,
+        committed_sources_complete=committed,
+        failure_reason="+".join(failures) or None,
         receipt_sha256=semantic_sha256(body),
     )
     value.validate()
@@ -603,7 +574,7 @@ def build_massive_delayed_replay_authority(
     condition_authority: MassiveConditionAuthority,
     correction_authority: MassiveCorrectionAuthority,
 ) -> MassiveDelayedReplayAuthority:
-    """Derive replay parity from typed capture, source, replay, and feature evidence."""
+    """Derive parity only from committed sources and canonical features."""
 
     entitlement_authority.validate()
     session_authority.validate()
@@ -631,26 +602,31 @@ def build_massive_delayed_replay_authority(
         raise MassiveReplayParityError("parity inputs contain duplicate evidence")
     sessions = {row.session_date for row in rows}
     symbol_days = {(row.security_id, row.session_date) for row in rows}
-    failed_events = tuple(
-        f"{row.security_id}:{row.session_date}:{row.canary_kind}"
-        for row in rows
-        if not row.event_exact or not row.canary_observed or not row.capture_complete
-    )
-    failed_features = tuple(
-        f"{row.security_id}:{row.session_date}:{row.canary_kind}"
-        for row in rows
-        if not row.feature_exact or not row.canary_observed or not row.capture_complete
-    )
+    failed_events, failed_features = _failed_rows(rows)
     canaries = tuple(sorted({row.canary_kind for row in rows if row.canary_observed}))
     coverage = (
         len(sessions) >= 2
         and len(symbol_days) >= len(REQUIRED_MASSIVE_REPLAY_CANARIES)
         and set(REQUIRED_MASSIVE_REPLAY_CANARIES).issubset(canaries)
     )
-    historical = not failed_events and not failed_features and coverage
-    body = {
+    runtime_qualified = bool(
+        getattr(entitlement_authority, "runtime_entitlement_qualified", False)
+    )
+    canonical_source_parsers_qualified = all(
+        row.committed_sources_complete for row in rows
+    )
+    historical = (
+        not failed_events
+        and not failed_features
+        and coverage
+        and runtime_qualified
+        and canonical_source_parsers_qualified
+    )
+    receipt_body = {
         "schema": MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA,
         "entitlement_receipt_sha256": entitlement_authority.receipt_sha256,
+        "runtime_entitlement_qualified": runtime_qualified,
+        "canonical_source_parsers_qualified": canonical_source_parsers_qualified,
         "session_authority_receipt_sha256": session_authority.receipt_sha256,
         "correction_semantics_receipt_sha256": correction_authority.receipt_sha256,
         "condition_authority_receipt_sha256": condition_authority.receipt_sha256,
@@ -658,15 +634,7 @@ def build_massive_delayed_replay_authority(
         "canary_kinds_present": canaries,
         "compared_session_count": len(sessions),
         "compared_symbol_day_count": len(symbol_days),
-        "exact_event_symbol_day_count": sum(
-            row.event_exact and row.canary_observed and row.capture_complete
-            for row in rows
-        ),
         "failed_event_symbol_days": failed_events,
-        "exact_feature_symbol_day_count": sum(
-            row.feature_exact and row.canary_observed and row.capture_complete
-            for row in rows
-        ),
         "failed_feature_symbol_days": failed_features,
         "development_asof_replay_authorized": True,
         "historical_asof_replay_authorized": historical,
@@ -674,6 +642,8 @@ def build_massive_delayed_replay_authority(
     }
     authority = MassiveDelayedReplayAuthority(
         entitlement_receipt_sha256=entitlement_authority.receipt_sha256,
+        runtime_entitlement_qualified=runtime_qualified,
+        canonical_source_parsers_qualified=canonical_source_parsers_qualified,
         session_authority_receipt_sha256=session_authority.receipt_sha256,
         correction_semantics_receipt_sha256=correction_authority.receipt_sha256,
         condition_authority_receipt_sha256=condition_authority.receipt_sha256,
@@ -681,20 +651,12 @@ def build_massive_delayed_replay_authority(
         canary_kinds_present=canaries,
         compared_session_count=len(sessions),
         compared_symbol_day_count=len(symbol_days),
-        exact_event_symbol_day_count=sum(
-            row.event_exact and row.canary_observed and row.capture_complete
-            for row in rows
-        ),
         failed_event_symbol_days=failed_events,
-        exact_feature_symbol_day_count=sum(
-            row.feature_exact and row.canary_observed and row.capture_complete
-            for row in rows
-        ),
         failed_feature_symbol_days=failed_features,
         development_asof_replay_authorized=True,
         historical_asof_replay_authorized=historical,
         predictive_training_authorized=False,
-        receipt_sha256=semantic_sha256(body),
+        receipt_sha256=semantic_sha256(receipt_body),
     )
     authority.validate()
     return authority
@@ -702,7 +664,6 @@ def build_massive_delayed_replay_authority(
 
 __all__ = [
     "MASSIVE_DELAYED_REPLAY_AUTHORITY_SCHEMA",
-    "MASSIVE_REPLAY_FEATURE_ARTIFACT_SCHEMA",
     "MASSIVE_REPLAY_PARITY_EVIDENCE_SCHEMA",
     "MASSIVE_TICKER_CHANGE_CANARY_SCHEMA",
     "REQUIRED_MASSIVE_REPLAY_CANARIES",

@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import json
+from pathlib import Path
 from typing import Sequence
 from zoneinfo import ZoneInfo
 
+from rl_quant.data_sources.massive.decision_clock import (
+    MassiveDecisionClockAuthority,
+)
 from rl_quant.data_sources.massive.entitlement import MassiveEntitlementAuthority
-from rl_quant.data_sources.massive.source_receipts import MassiveSourceObjectReceipt
+from rl_quant.data_sources.massive.source_receipts import (
+    LoadedMassiveSourceObject,
+    MassiveSourceObjectReceipt,
+    read_loaded_massive_source_bytes,
+)
 from rl_quant.protocol.canonical_artifact import canonical_json_payload, semantic_sha256
 
 
@@ -17,11 +26,12 @@ MASSIVE_DELAYED_WEBSOCKET_EVENT_SCHEMA = (
     "rl-quant.massive-delayed-websocket-event-v2"
 )
 MASSIVE_DELAYED_WEBSOCKET_CAPTURE_SCHEMA = (
-    "rl-quant.massive-delayed-websocket-capture-v2"
+    "rl-quant.massive-delayed-websocket-capture-v3"
 )
 MASSIVE_WEBSOCKET_CAPTURE_LIFECYCLE_SCHEMA = (
-    "rl-quant.massive-websocket-capture-lifecycle-v1"
+    "rl-quant.massive-websocket-capture-lifecycle-v2"
 )
+MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA = "rl-quant.massive-websocket-capture-file-v1"
 
 
 class MassiveWebSocketCaptureError(ValueError):
@@ -89,6 +99,34 @@ class MassiveDelayedWebSocketEvent:
             raise MassiveWebSocketCaptureError("capture timestamp differs from payload")
         if _integer("sequence number", payload.get("q")) != self.sequence_number:
             raise MassiveWebSocketCaptureError("capture sequence differs from payload")
+        for key, name in (("x", "exchange"), ("pt", "participant timestamp")):
+            _integer(name, payload.get(key))
+        trade_id = payload.get("i")
+        if not isinstance(trade_id, str) or not trade_id:
+            raise MassiveWebSocketCaptureError("capture trade ID is absent")
+        try:
+            price = Decimal(str(payload.get("p")))
+            size = Decimal(str(payload.get("ds", payload.get("s"))))
+        except InvalidOperation as exc:
+            raise MassiveWebSocketCaptureError(
+                "capture price or size is not decimal"
+            ) from exc
+        if not price.is_finite() or price <= 0 or not size.is_finite() or size <= 0:
+            raise MassiveWebSocketCaptureError(
+                "capture price and size must be finite and positive"
+            )
+        conditions = payload.get("c", ())
+        if not isinstance(conditions, list):
+            raise MassiveWebSocketCaptureError("capture conditions must be a list")
+        normalized_conditions = tuple(_integer("condition ID", row) for row in conditions)
+        if normalized_conditions != tuple(sorted(set(normalized_conditions))):
+            raise MassiveWebSocketCaptureError(
+                "capture conditions must be sorted and unique"
+            )
+        if payload.get("trfi") is not None:
+            _integer("TRF ID", payload["trfi"])
+        if payload.get("trft") is not None:
+            _integer("TRF timestamp", payload["trft"])
         observed_session = datetime.fromtimestamp(
             self.sip_timestamp_ms / 1_000,
             tz=ZoneInfo("America/New_York"),
@@ -134,7 +172,7 @@ class MassiveWebSocketCaptureLifecycle:
     disconnected_intervals: tuple[tuple[int, int], ...]
     authentication_ack_sha256: str
     subscription_ack_sha256: str
-    clock_authority_receipt_sha256: str
+    decision_clock_receipt_sha256: str
     raw_capture_source_receipt_sha256: str
     subscription_universe_receipt_sha256: str
     receipt_sha256: str
@@ -178,7 +216,7 @@ class MassiveWebSocketCaptureLifecycle:
         for name in (
             "authentication_ack_sha256",
             "subscription_ack_sha256",
-            "clock_authority_receipt_sha256",
+            "decision_clock_receipt_sha256",
             "raw_capture_source_receipt_sha256",
             "subscription_universe_receipt_sha256",
             "receipt_sha256",
@@ -207,48 +245,46 @@ class MassiveWebSocketCaptureLifecycle:
     def build(
         cls,
         *,
-        session_date: str,
+        decision_clock: MassiveDecisionClockAuthority,
         connected_at_ns: int,
         authenticated_at_ns: int,
         subscribed_at_ns: int,
-        required_capture_start_ns: int,
-        required_capture_end_ns: int,
         last_heartbeat_at_ns: int,
         disconnected_intervals: Sequence[tuple[int, int]],
         authentication_ack_sha256: str,
         subscription_ack_sha256: str,
-        clock_authority_receipt_sha256: str,
         raw_capture_source_receipt_sha256: str,
         subscription_universe_receipt_sha256: str,
     ) -> MassiveWebSocketCaptureLifecycle:
+        decision_clock.validate()
         body = {
             "schema": MASSIVE_WEBSOCKET_CAPTURE_LIFECYCLE_SCHEMA,
-            "session_date": session_date,
+            "session_date": decision_clock.session_date,
             "connected_at_ns": connected_at_ns,
             "authenticated_at_ns": authenticated_at_ns,
             "subscribed_at_ns": subscribed_at_ns,
-            "required_capture_start_ns": required_capture_start_ns,
-            "required_capture_end_ns": required_capture_end_ns,
+            "required_capture_start_ns": decision_clock.regular_open_ns,
+            "required_capture_end_ns": decision_clock.decision_at_ns,
             "last_heartbeat_at_ns": last_heartbeat_at_ns,
             "disconnected_intervals": tuple(sorted(set(disconnected_intervals))),
             "authentication_ack_sha256": authentication_ack_sha256,
             "subscription_ack_sha256": subscription_ack_sha256,
-            "clock_authority_receipt_sha256": clock_authority_receipt_sha256,
+            "decision_clock_receipt_sha256": decision_clock.receipt_sha256,
             "raw_capture_source_receipt_sha256": raw_capture_source_receipt_sha256,
             "subscription_universe_receipt_sha256": subscription_universe_receipt_sha256,
         }
         value = cls(
-            session_date=session_date,
+            session_date=decision_clock.session_date,
             connected_at_ns=connected_at_ns,
             authenticated_at_ns=authenticated_at_ns,
             subscribed_at_ns=subscribed_at_ns,
-            required_capture_start_ns=required_capture_start_ns,
-            required_capture_end_ns=required_capture_end_ns,
+            required_capture_start_ns=decision_clock.regular_open_ns,
+            required_capture_end_ns=decision_clock.decision_at_ns,
             last_heartbeat_at_ns=last_heartbeat_at_ns,
             disconnected_intervals=tuple(sorted(set(disconnected_intervals))),
             authentication_ack_sha256=authentication_ack_sha256,
             subscription_ack_sha256=subscription_ack_sha256,
-            clock_authority_receipt_sha256=clock_authority_receipt_sha256,
+            decision_clock_receipt_sha256=decision_clock.receipt_sha256,
             raw_capture_source_receipt_sha256=raw_capture_source_receipt_sha256,
             subscription_universe_receipt_sha256=subscription_universe_receipt_sha256,
             receipt_sha256=semantic_sha256(body),
@@ -269,6 +305,8 @@ class MassiveDelayedWebSocketCaptureAuthority:
     payload_inventory_sha256: str
     entitlement_receipt_sha256: str
     raw_capture_source_receipt_sha256: str
+    loaded_source_receipt_sha256: str | None
+    capture_file_parser_qualified: bool
     lifecycle: MassiveWebSocketCaptureLifecycle
     capture_complete: bool
     secret_material_persisted: bool
@@ -311,6 +349,16 @@ class MassiveDelayedWebSocketCaptureAuthority:
             "receipt_sha256",
         ):
             _digest(name, getattr(self, name))
+        if not isinstance(self.capture_file_parser_qualified, bool):
+            raise MassiveWebSocketCaptureError(
+                "capture parser qualification must be Boolean"
+            )
+        if self.capture_file_parser_qualified:
+            _digest("loaded capture source", self.loaded_source_receipt_sha256)
+        elif self.loaded_source_receipt_sha256 is not None:
+            raise MassiveWebSocketCaptureError(
+                "unqualified capture cannot claim a loaded source receipt"
+            )
         self.lifecycle.validate()
         if self.lifecycle.session_date != self.session_date:
             raise MassiveWebSocketCaptureError(
@@ -342,6 +390,7 @@ def build_massive_delayed_websocket_capture_authority(
     subscribed_tickers: Sequence[str],
     entitlement_authority: MassiveEntitlementAuthority,
     raw_capture_source_receipt: MassiveSourceObjectReceipt,
+    loaded_source: LoadedMassiveSourceObject | None = None,
 ) -> MassiveDelayedWebSocketCaptureAuthority:
     """Seal one already-recorded delayed session without retaining a key."""
 
@@ -355,6 +404,12 @@ def build_massive_delayed_websocket_capture_authority(
         raise MassiveWebSocketCaptureError(
             "raw capture used another entitlement authority"
         )
+    if loaded_source is not None:
+        loaded_source.validate()
+        if loaded_source.receipt != raw_capture_source_receipt:
+            raise MassiveWebSocketCaptureError(
+                "loaded capture source differs from source receipt"
+            )
     if (
         lifecycle.raw_capture_source_receipt_sha256
         != raw_capture_source_receipt.receipt_sha256
@@ -380,6 +435,12 @@ def build_massive_delayed_websocket_capture_authority(
     subscriptions = tuple(sorted(set(subscribed_tickers)))
     if not subscriptions:
         raise MassiveWebSocketCaptureError("capture subscription inventory is empty")
+    if lifecycle.subscription_universe_receipt_sha256 != semantic_sha256(
+        subscriptions
+    ):
+        raise MassiveWebSocketCaptureError(
+            "subscription inventory differs from lifecycle evidence"
+        )
     for event in events:
         if event.session_date != lifecycle.session_date:
             raise MassiveWebSocketCaptureError(
@@ -416,6 +477,10 @@ def build_massive_delayed_websocket_capture_authority(
         ),
         "entitlement_receipt_sha256": entitlement_authority.receipt_sha256,
         "raw_capture_source_receipt_sha256": raw_capture_source_receipt.receipt_sha256,
+        "loaded_source_receipt_sha256": None
+        if loaded_source is None
+        else loaded_source.receipt_sha256,
+        "capture_file_parser_qualified": loaded_source is not None,
         "lifecycle": asdict(lifecycle),
         "capture_complete": lifecycle.covers_required_window,
         "secret_material_persisted": False,
@@ -438,6 +503,10 @@ def build_massive_delayed_websocket_capture_authority(
         ),
         entitlement_receipt_sha256=entitlement_authority.receipt_sha256,
         raw_capture_source_receipt_sha256=raw_capture_source_receipt.receipt_sha256,
+        loaded_source_receipt_sha256=None
+        if loaded_source is None
+        else loaded_source.receipt_sha256,
+        capture_file_parser_qualified=loaded_source is not None,
         lifecycle=lifecycle,
         capture_complete=lifecycle.covers_required_window,
         secret_material_persisted=False,
@@ -447,13 +516,158 @@ def build_massive_delayed_websocket_capture_authority(
     return authority
 
 
+def parse_massive_delayed_websocket_capture(
+    *,
+    root: str | Path,
+    loaded_source: LoadedMassiveSourceObject,
+    decision_clock: MassiveDecisionClockAuthority,
+    entitlement_authority: MassiveEntitlementAuthority,
+) -> tuple[
+    tuple[MassiveDelayedWebSocketEvent, ...],
+    MassiveDelayedWebSocketCaptureAuthority,
+]:
+    """Derive lifecycle and trade events from one committed recorder JSONL file.
+
+    Recorder rows are canonical JSON objects with ``schema``, ``kind``, and
+    ``recorded_at_ns``. ``server-batch`` rows contain the unmodified Massive
+    message array. ``subscription-ack`` rows bind the safe ticker inventory to
+    the corresponding server status payload. Disconnect and checkpoint rows
+    are local recorder evidence; credential-bearing client auth messages are
+    prohibited.
+    """
+
+    loaded_source.validate()
+    decision_clock.validate()
+    entitlement_authority.validate()
+    if (
+        loaded_source.receipt.entitlement_receipt_sha256
+        != entitlement_authority.receipt_sha256
+    ):
+        raise MassiveWebSocketCaptureError(
+            "committed capture used another entitlement authority"
+        )
+    raw = read_loaded_massive_source_bytes(root=root, loaded_source=loaded_source)
+    rows: list[dict[str, object]] = []
+    for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+        if not raw_line:
+            continue
+        try:
+            row = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            raise MassiveWebSocketCaptureError(
+                f"capture row {line_number} is not JSON"
+            ) from exc
+        if not isinstance(row, dict):
+            raise MassiveWebSocketCaptureError("capture rows must be objects")
+        if canonical_json_payload(row) != raw_line:
+            raise MassiveWebSocketCaptureError("capture row is not canonical JSON")
+        if row.get("schema") != MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA:
+            raise MassiveWebSocketCaptureError("capture file schema drifted")
+        if "apiKey" in raw_line.decode("utf-8") or row.get("action") == "auth":
+            raise MassiveWebSocketCaptureError("capture file contains credential material")
+        _integer("recorded timestamp", row.get("recorded_at_ns"))
+        rows.append(row)
+    if not rows:
+        raise MassiveWebSocketCaptureError("committed capture file is empty")
+
+    connected_at: int | None = None
+    authenticated_at: int | None = None
+    authentication_payload: dict[str, object] | None = None
+    subscription_at: int | None = None
+    subscription_payload: dict[str, object] | None = None
+    subscriptions: tuple[str, ...] = ()
+    checkpoint_at: int | None = None
+    disconnect_start: int | None = None
+    disconnects: list[tuple[int, int]] = []
+    events: list[MassiveDelayedWebSocketEvent] = []
+    for row in rows:
+        kind = row.get("kind")
+        recorded_at = _integer("recorded timestamp", row["recorded_at_ns"])
+        if kind == "server-batch":
+            messages = row.get("payload")
+            if not isinstance(messages, list) or not messages:
+                raise MassiveWebSocketCaptureError("server batch is empty")
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise MassiveWebSocketCaptureError("server message is not an object")
+                if message.get("ev") == "status":
+                    if message.get("status") == "connected":
+                        connected_at = recorded_at
+                    elif message.get("status") == "auth_success":
+                        authenticated_at = recorded_at
+                        authentication_payload = message
+                elif message.get("ev") == "T":
+                    events.append(
+                        MassiveDelayedWebSocketEvent.from_payload(
+                            message, received_at_ns=recorded_at
+                        )
+                    )
+        elif kind == "subscription-ack":
+            tickers = row.get("tickers")
+            payload = row.get("payload")
+            if not isinstance(tickers, list) or not tickers:
+                raise MassiveWebSocketCaptureError("subscription inventory is absent")
+            if not isinstance(payload, dict) or payload.get("ev") != "status":
+                raise MassiveWebSocketCaptureError("subscription acknowledgement is absent")
+            subscriptions = tuple(sorted(set(str(ticker) for ticker in tickers)))
+            subscription_at = recorded_at
+            subscription_payload = payload
+        elif kind == "disconnect-start":
+            if disconnect_start is not None:
+                raise MassiveWebSocketCaptureError("nested disconnect interval")
+            disconnect_start = recorded_at
+        elif kind == "disconnect-end":
+            if disconnect_start is None or recorded_at <= disconnect_start:
+                raise MassiveWebSocketCaptureError("disconnect end lacks a start")
+            disconnects.append((disconnect_start, recorded_at))
+            disconnect_start = None
+        elif kind == "recorder-checkpoint":
+            checkpoint_at = max(checkpoint_at or 0, recorded_at)
+        else:
+            raise MassiveWebSocketCaptureError("capture row kind is unsupported")
+    if disconnect_start is not None:
+        disconnects.append((disconnect_start, checkpoint_at or disconnect_start + 1))
+    if (
+        connected_at is None
+        or authenticated_at is None
+        or authentication_payload is None
+        or subscription_at is None
+        or subscription_payload is None
+        or checkpoint_at is None
+    ):
+        raise MassiveWebSocketCaptureError("capture lifecycle evidence is incomplete")
+    lifecycle = MassiveWebSocketCaptureLifecycle.build(
+        decision_clock=decision_clock,
+        connected_at_ns=connected_at,
+        authenticated_at_ns=authenticated_at,
+        subscribed_at_ns=subscription_at,
+        last_heartbeat_at_ns=checkpoint_at,
+        disconnected_intervals=disconnects,
+        authentication_ack_sha256=semantic_sha256(authentication_payload),
+        subscription_ack_sha256=semantic_sha256(subscription_payload),
+        raw_capture_source_receipt_sha256=loaded_source.receipt.receipt_sha256,
+        subscription_universe_receipt_sha256=semantic_sha256(subscriptions),
+    )
+    capture = build_massive_delayed_websocket_capture_authority(
+        events,
+        lifecycle=lifecycle,
+        subscribed_tickers=subscriptions,
+        entitlement_authority=entitlement_authority,
+        raw_capture_source_receipt=loaded_source.receipt,
+        loaded_source=loaded_source,
+    )
+    return tuple(events), capture
+
+
 __all__ = [
     "MASSIVE_DELAYED_WEBSOCKET_CAPTURE_SCHEMA",
     "MASSIVE_DELAYED_WEBSOCKET_EVENT_SCHEMA",
     "MASSIVE_WEBSOCKET_CAPTURE_LIFECYCLE_SCHEMA",
+    "MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA",
     "MassiveDelayedWebSocketCaptureAuthority",
     "MassiveDelayedWebSocketEvent",
     "MassiveWebSocketCaptureError",
     "MassiveWebSocketCaptureLifecycle",
     "build_massive_delayed_websocket_capture_authority",
+    "parse_massive_delayed_websocket_capture",
 ]

@@ -66,25 +66,36 @@ The source milestone is evidence-derived rather than label-derived:
 
 - normalized trade events bind the entitlement, session, condition,
   correction, source-object, permanent-identity, and ticker-history receipts;
+- compact delayed-WebSocket, REST, and flat-file records pass through distinct
+  canonicalizers, preserving the raw payload hash and timestamp units;
+- delayed events use the later of actual local receipt and the qualified
+  SIP-plus-delay time, while finalized rows use only the qualified delay rule;
+- every replay and capture lifecycle binds one protocol-derived decision clock
+  equal to the authority-resolved regular close plus exactly 60 minutes;
 - replay re-resolves the condition and correction rules and rechecks the
   Developer delay, session boundary, source bytes, and identity;
 - open/close, high/low, and volume eligibility remain separate through bar
   reconstruction;
-- delayed capture completeness is derived from authentication, subscription,
-  heartbeat coverage, disconnect inventory, raw-capture identity, and the
-  subscribed ticker set;
-- delayed/final parity is computed from typed capture, source, replay, and
-  feature artifacts, with one actual row required per canary kind and a
-  minimum six-symbol-day/two-session coverage contract;
+- committed recorder JSONL derives authentication, subscription, checkpoint,
+  disconnect, trade, and subscribed-ticker evidence without persisting auth
+  requests or credentials;
+- delayed/final parity requires committed source bundles, extraction receipts,
+  and one fixed feature materializer; arbitrary feature mappings are not an
+  evidence surface;
 - aggregate reconciliation is nonempty, source-homogeneous, unadjusted, and
   bound to a finite immutable tolerance specification;
 - source publication and reload traverse directories and open files relative
-  to no-follow directory descriptors.
+  to no-follow directory descriptors and bind the final inode and ctime;
+- the Stocks condition authority binds the exact stocks/trade query and rejects
+  non-stock condition rows;
+- aggregate receipts sort intervals canonically before hashing.
 
-These contracts can authorize historical as-of replay only after real canary
-artifacts satisfy the coverage gate. They still cannot authorize predictive
-training; PIT identity, both PIT universes, economic accounting, targets, and
-repeatable tensors remain separate blocking authorities.
+Historical as-of replay remains fail-closed in this source generation:
+`runtime_entitlement_qualified` and `canonical_source_parsers_qualified` are
+both required, and the latter remains false until the real finalized-file and
+delayed-capture parser rehearsal is sealed. Even after that closure, replay
+parity cannot authorize predictive training; PIT identity, both PIT universes,
+economic accounting, targets, and repeatable tensors remain separate blockers.
 
 ## Discovery family
 

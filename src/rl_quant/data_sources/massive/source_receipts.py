@@ -19,6 +19,7 @@ from rl_quant.protocol.canonical_artifact import (
 
 MASSIVE_SOURCE_OBJECT_SCHEMA = "rl-quant.massive-source-object-v1"
 MASSIVE_SOURCE_COMMIT_SCHEMA = "rl-quant.massive-source-commit-v1"
+MASSIVE_LOADED_SOURCE_OBJECT_SCHEMA = "rl-quant.massive-loaded-source-object-v1"
 
 
 class MassiveSourceObjectError(ValueError):
@@ -229,6 +230,51 @@ class MassiveSourceCommit:
             raise MassiveSourceObjectError("source commit receipt differs from payload")
 
 
+@dataclass(frozen=True, slots=True)
+class LoadedMassiveSourceObject:
+    """One committed source transaction reopened from its exact final inode."""
+
+    receipt: MassiveSourceObjectReceipt
+    commit: MassiveSourceCommit
+    payload_relative_path: str
+    payload_device: int
+    payload_inode: int
+    payload_ctime_ns: int
+    verified_at_ms: int
+    receipt_sha256: str
+    schema: str = MASSIVE_LOADED_SOURCE_OBJECT_SCHEMA
+
+    def unsigned(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "receipt": asdict(self.receipt),
+            "commit": asdict(self.commit),
+            "payload_relative_path": self.payload_relative_path,
+            "payload_device": self.payload_device,
+            "payload_inode": self.payload_inode,
+            "payload_ctime_ns": self.payload_ctime_ns,
+            "verified_at_ms": self.verified_at_ms,
+        }
+
+    def validate(self) -> None:
+        if self.schema != MASSIVE_LOADED_SOURCE_OBJECT_SCHEMA:
+            raise MassiveSourceObjectError("loaded source schema drifted")
+        self.receipt.validate()
+        self.commit.validate()
+        if self.payload_relative_path != self.commit.payload_relative_path:
+            raise MassiveSourceObjectError("loaded payload path differs from commit")
+        for name in (
+            "payload_device",
+            "payload_inode",
+            "payload_ctime_ns",
+            "verified_at_ms",
+        ):
+            _nonnegative_int(name, getattr(self, name))
+        _digest("loaded source receipt", self.receipt_sha256)
+        if self.receipt_sha256 != semantic_sha256(self.unsigned()):
+            raise MassiveSourceObjectError("loaded source receipt differs")
+
+
 def publish_massive_source_object(
     *,
     stream: BinaryIO,
@@ -373,6 +419,19 @@ def publish_massive_source_object(
         temporary_name = None
         payload_descriptor = os.open(payload_name, _READ_FLAGS, dir_fd=parent_fd)
         try:
+            final_info = os.fstat(payload_descriptor)
+            if (final_info.st_dev, final_info.st_ino) != temporary_identity:
+                raise MassiveSourceObjectError(
+                    "final payload inode differs from the published temporary"
+                )
+            final_digest = hashlib.sha256()
+            while True:
+                block = os.read(payload_descriptor, block_bytes)
+                if not block:
+                    break
+                final_digest.update(block)
+            if final_digest.hexdigest() != observed_sha256:
+                raise MassiveSourceObjectError("final payload bytes changed before commit")
             os.fchmod(payload_descriptor, 0o444)
         finally:
             os.close(payload_descriptor)
@@ -442,12 +501,85 @@ def load_massive_source_object(
         os.close(parent_fd)
 
 
+def load_massive_source_bundle(
+    *,
+    root: str | Path,
+    relative_payload_path: str,
+    verified_at_ms: int,
+) -> LoadedMassiveSourceObject:
+    """Return committed bytes plus the final inode identity used for replay."""
+
+    receipt, commit = load_massive_source_object(
+        root=root, relative_payload_path=relative_payload_path
+    )
+    payload_relative = _safe_object_key(relative_payload_path)
+    parent_fd, payload_name = _open_parent_directory(
+        Path(root), payload_relative, create=False
+    )
+    try:
+        payload_bytes, info = _read_regular_at(parent_fd, payload_name)
+        if hashlib.sha256(payload_bytes).hexdigest() != receipt.physical_sha256:
+            raise MassiveSourceObjectError("loaded source bytes changed after verification")
+    finally:
+        os.close(parent_fd)
+    body = {
+        "schema": MASSIVE_LOADED_SOURCE_OBJECT_SCHEMA,
+        "receipt": asdict(receipt),
+        "commit": asdict(commit),
+        "payload_relative_path": payload_relative,
+        "payload_device": info.st_dev,
+        "payload_inode": info.st_ino,
+        "payload_ctime_ns": info.st_ctime_ns,
+        "verified_at_ms": _nonnegative_int("verified timestamp", verified_at_ms),
+    }
+    value = LoadedMassiveSourceObject(
+        receipt=receipt,
+        commit=commit,
+        payload_relative_path=payload_relative,
+        payload_device=info.st_dev,
+        payload_inode=info.st_ino,
+        payload_ctime_ns=info.st_ctime_ns,
+        verified_at_ms=verified_at_ms,
+        receipt_sha256=semantic_sha256(body),
+    )
+    value.validate()
+    return value
+
+
+def read_loaded_massive_source_bytes(
+    *, root: str | Path, loaded_source: LoadedMassiveSourceObject
+) -> bytes:
+    """Read the exact inode previously sealed by ``load_massive_source_bundle``."""
+
+    loaded_source.validate()
+    parent_fd, payload_name = _open_parent_directory(
+        Path(root), loaded_source.payload_relative_path, create=False
+    )
+    try:
+        payload, info = _read_regular_at(parent_fd, payload_name)
+    finally:
+        os.close(parent_fd)
+    if (info.st_dev, info.st_ino, info.st_ctime_ns) != (
+        loaded_source.payload_device,
+        loaded_source.payload_inode,
+        loaded_source.payload_ctime_ns,
+    ):
+        raise MassiveSourceObjectError("loaded source inode was replaced")
+    if hashlib.sha256(payload).hexdigest() != loaded_source.receipt.physical_sha256:
+        raise MassiveSourceObjectError("loaded source bytes were replaced")
+    return payload
+
+
 __all__ = [
+    "LoadedMassiveSourceObject",
     "MASSIVE_SOURCE_COMMIT_SCHEMA",
+    "MASSIVE_LOADED_SOURCE_OBJECT_SCHEMA",
     "MASSIVE_SOURCE_OBJECT_SCHEMA",
     "MassiveSourceCommit",
     "MassiveSourceObjectError",
     "MassiveSourceObjectReceipt",
     "load_massive_source_object",
+    "load_massive_source_bundle",
     "publish_massive_source_object",
+    "read_loaded_massive_source_bytes",
 ]

@@ -8,7 +8,10 @@ from typing import Mapping, Sequence
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 
-MASSIVE_CONDITION_AUTHORITY_SCHEMA = "rl-quant.massive-condition-authority-v1"
+MASSIVE_CONDITION_AUTHORITY_SCHEMA = "rl-quant.massive-condition-authority-v2"
+MASSIVE_STOCK_TRADE_CONDITION_QUERY = (
+    "/v3/reference/conditions?asset_class=stocks&data_type=trade"
+)
 
 
 class MassiveConditionError(ValueError):
@@ -48,6 +51,7 @@ class MassiveTradeConditionRule:
     condition_id: int
     name: str
     data_types: tuple[str, ...]
+    asset_class: str
     updates_high_low: bool
     updates_open_close: bool
     updates_volume: bool
@@ -70,6 +74,8 @@ class MassiveTradeConditionRule:
             raise MassiveConditionError(
                 "condition data types must be sorted, unique, and include trade"
             )
+        if self.asset_class != "stocks":
+            raise MassiveConditionError("condition asset class must be stocks")
         if any(
             not isinstance(value, bool)
             for value in (
@@ -86,6 +92,7 @@ class MassiveTradeConditionRule:
 class MassiveConditionAuthority:
     rules: tuple[MassiveTradeConditionRule, ...]
     source_object_receipt_sha256: str
+    source_query_path: str
     unknown_condition_invalidates_symbol_day: bool
     receipt_sha256: str
     schema: str = MASSIVE_CONDITION_AUTHORITY_SCHEMA
@@ -95,6 +102,7 @@ class MassiveConditionAuthority:
             "schema": self.schema,
             "rules": [asdict(rule) for rule in self.rules],
             "source_object_receipt_sha256": self.source_object_receipt_sha256,
+            "source_query_path": self.source_query_path,
             "unknown_condition_invalidates_symbol_day": self.unknown_condition_invalidates_symbol_day,
         }
 
@@ -111,6 +119,8 @@ class MassiveConditionAuthority:
             if rule.source_receipt_sha256 != self.source_object_receipt_sha256:
                 raise MassiveConditionError("condition source identities differ")
         _digest("condition source object receipt", self.source_object_receipt_sha256)
+        if self.source_query_path != MASSIVE_STOCK_TRADE_CONDITION_QUERY:
+            raise MassiveConditionError("condition source query was not stocks/trade")
         if self.unknown_condition_invalidates_symbol_day is not True:
             raise MassiveConditionError("unknown conditions must fail closed")
         _digest("condition authority receipt", self.receipt_sha256)
@@ -139,13 +149,20 @@ class MassiveConditionAuthority:
 
 
 def build_massive_condition_authority(
-    records: Sequence[Mapping[str, object]], *, source_object_receipt_sha256: str
+    records: Sequence[Mapping[str, object]],
+    *,
+    source_object_receipt_sha256: str,
+    source_query_path: str,
 ) -> MassiveConditionAuthority:
     """Build a frozen condition map from the Massive reference response."""
 
     source = _digest("condition source object receipt", source_object_receipt_sha256)
     rules: list[MassiveTradeConditionRule] = []
+    if source_query_path != MASSIVE_STOCK_TRADE_CONDITION_QUERY:
+        raise MassiveConditionError("condition query must freeze stocks/trade filters")
     for record in records:
+        if record.get("asset_class") != "stocks":
+            raise MassiveConditionError("non-stock condition entered stock authority")
         data_types = tuple(
             sorted(set(_string_sequence("condition data types", record.get("data_types"))))
         )
@@ -162,6 +179,7 @@ def build_massive_condition_authority(
                 condition_id=_integer("condition ID", record["id"]),
                 name=str(record["name"]),
                 data_types=data_types,
+                asset_class="stocks",
                 updates_high_low=consolidated.get("updates_high_low") is True,
                 updates_open_close=consolidated.get("updates_open_close") is True,
                 updates_volume=consolidated.get("updates_volume") is True,
@@ -173,11 +191,13 @@ def build_massive_condition_authority(
         "schema": MASSIVE_CONDITION_AUTHORITY_SCHEMA,
         "rules": [asdict(rule) for rule in ordered],
         "source_object_receipt_sha256": source,
+        "source_query_path": source_query_path,
         "unknown_condition_invalidates_symbol_day": True,
     }
     authority = MassiveConditionAuthority(
         rules=ordered,
         source_object_receipt_sha256=source,
+        source_query_path=source_query_path,
         unknown_condition_invalidates_symbol_day=True,
         receipt_sha256=semantic_sha256(body),
     )
@@ -187,6 +207,7 @@ def build_massive_condition_authority(
 
 __all__ = [
     "MASSIVE_CONDITION_AUTHORITY_SCHEMA",
+    "MASSIVE_STOCK_TRADE_CONDITION_QUERY",
     "MassiveConditionAuthority",
     "MassiveConditionError",
     "MassiveTradeConditionRule",

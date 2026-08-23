@@ -5,8 +5,12 @@ from dataclasses import replace
 import pytest
 
 from rl_quant.data_sources.massive.conditions import (
+    MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     MassiveConditionError,
     build_massive_condition_authority,
+)
+from rl_quant.data_sources.massive.decision_clock import (
+    build_massive_decision_clock_authority,
 )
 from rl_quant.data_sources.massive.corrections import (
     MassiveCorrectionError,
@@ -37,6 +41,7 @@ def _conditions():
             {
                 "id": 1,
                 "name": "Regular Sale",
+                "asset_class": "stocks",
                 "data_types": ["trade"],
                 "update_rules": {
                     "consolidated": {
@@ -49,6 +54,7 @@ def _conditions():
             {
                 "id": 2,
                 "name": "Volume Only",
+                "asset_class": "stocks",
                 "data_types": ["trade"],
                 "update_rules": {
                     "consolidated": {
@@ -60,6 +66,7 @@ def _conditions():
             },
         ),
         source_object_receipt_sha256="a" * 64,
+        source_query_path=MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     )
 
 
@@ -84,10 +91,14 @@ def _entitlement():
             observed_at_ms=observed_at_ms,
         )
         for surface in (
+            "corporate-actions",
+            "day-aggregates",
             "delayed-websocket",
             "financials-and-ratios",
             "flat-files",
+            "history-boundary",
             "historical-quotes",
+            "minute-aggregates",
             "reference-rest",
             "trades-rest",
         )
@@ -159,10 +170,19 @@ def _normalization_authorities():
     }
 
 
+def _decision_clock():
+    session, session_authority = _session()
+    return build_massive_decision_clock_authority(
+        session_authority=session_authority,
+        session=session,
+    )
+
+
 def _event(
     *, trade_id: str, sequence: int, correction: int, sip: int, price: float
 ):
     record = {
+        "ticker": "AAA",
         "id": trade_id,
         "exchange": 4,
         "sequence_number": sequence,
@@ -191,12 +211,12 @@ def test_replay_is_permutation_invariant_and_applies_replacement_cancellation() 
     )
     forward = replay_massive_trades(
         events,
-        decision_at_ns=1_000_000_000_000,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
     reverse = replay_massive_trades(
         tuple(reversed(events)),
-        decision_at_ns=1_000_000_000_000,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
 
@@ -208,16 +228,16 @@ def test_replay_is_permutation_invariant_and_applies_replacement_cancellation() 
 def test_post_cutoff_mutation_does_not_change_visible_replay() -> None:
     visible = _event(trade_id="T1", sequence=1, correction=0, sip=100, price=10.0)
     future = _event(
-        trade_id="T2", sequence=2, correction=0, sip=2_000_000_000_000, price=20.0
+        trade_id="T2", sequence=2, correction=0, sip=40_000_000_000_000, price=20.0
     )
     first = replay_massive_trades(
         (visible, future),
-        decision_at_ns=1_000_000_000_000,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
     second = replay_massive_trades(
         (visible, replace(future, price=999.0)),
-        decision_at_ns=1_000_000_000_000,
+        decision_clock=_decision_clock(),
         **_normalization_authorities(),
     )
 
@@ -225,11 +245,58 @@ def test_post_cutoff_mutation_does_not_change_visible_replay() -> None:
     assert first.active_events == second.active_events == (visible,)
 
 
+def test_replay_accepts_only_protocol_derived_decision_clock() -> None:
+    event = _event(trade_id="T1", sequence=1, correction=0, sip=100, price=10.0)
+
+    with pytest.raises(TypeError, match="decision_at_ns"):
+        replay_massive_trades(
+            (event,),
+            decision_at_ns=_decision_clock().decision_at_ns,  # type: ignore[call-arg]
+            **_normalization_authorities(),
+        )
+    with pytest.raises(ValueError, match="decision clock"):
+        replay_massive_trades(
+            (event,),
+            decision_clock=replace(
+                _decision_clock(), session_authority_receipt_sha256="8" * 64
+            ),
+            **_normalization_authorities(),
+        )
+
+
 def test_unknown_condition_or_correction_fails_closed() -> None:
     with pytest.raises(MassiveConditionError, match="unknown"):
         _conditions().resolve((999,))
     with pytest.raises(MassiveCorrectionError, match="unqualified"):
         _corrections().resolve(999)
+
+
+def test_condition_authority_requires_exact_stock_trade_query() -> None:
+    record = {
+        "id": 1,
+        "name": "Regular Sale",
+        "asset_class": "options",
+        "data_types": ["trade"],
+        "update_rules": {
+            "consolidated": {
+                "updates_high_low": True,
+                "updates_open_close": True,
+                "updates_volume": True,
+            }
+        },
+    }
+    with pytest.raises(MassiveConditionError, match="non-stock"):
+        build_massive_condition_authority(
+            (record,),
+            source_object_receipt_sha256="a" * 64,
+            source_query_path=MASSIVE_STOCK_TRADE_CONDITION_QUERY,
+        )
+    with pytest.raises(MassiveConditionError, match="query"):
+        build_massive_condition_authority(
+            ({**record, "asset_class": "stocks"},),
+            source_object_receipt_sha256="a" * 64,
+            source_query_path="/v3/reference/conditions",
+        )
 
 
 def test_volume_only_condition_is_not_price_forming() -> None:
@@ -243,13 +310,13 @@ def test_replay_rejects_authority_substitution_and_availability_forgery() -> Non
     with pytest.raises(MassiveTradeReplayError, match="condition_authority"):
         replay_massive_trades(
             (replace(event, condition_authority_receipt_sha256="9" * 64),),
-            decision_at_ns=1_000_000_000_000,
+            decision_clock=_decision_clock(),
             **authorities,
         )
     with pytest.raises(MassiveTradeReplayError, match="availability"):
         replay_massive_trades(
             (replace(event, strategy_available_timestamp_ns=event.sip_timestamp_ns),),
-            decision_at_ns=1_000_000_000_000,
+            decision_clock=_decision_clock(),
             **authorities,
         )
 
@@ -273,7 +340,7 @@ def test_every_normalized_event_authority_is_reconciled(
     with pytest.raises(MassiveTradeReplayError, match=field):
         replay_massive_trades(
             (replace(event, **{field: value}),),
-            decision_at_ns=1_000_000_000_000,
+            decision_clock=_decision_clock(),
             **_normalization_authorities(),
         )
 
@@ -311,13 +378,13 @@ def test_replay_reresolves_condition_and_correction_semantics() -> None:
     with pytest.raises(MassiveTradeReplayError, match="condition eligibility"):
         replay_massive_trades(
             (replace(event, updates_open_close=False),),
-            decision_at_ns=1_000_000_000_000,
+            decision_clock=_decision_clock(),
             **_normalization_authorities(),
         )
     with pytest.raises(MassiveTradeReplayError, match="correction semantic"):
         replay_massive_trades(
             (replace(event, correction_kind="late-report"),),
-            decision_at_ns=1_000_000_000_000,
+            decision_clock=_decision_clock(),
             **_normalization_authorities(),
         )
 
@@ -335,6 +402,6 @@ def test_session_and_identity_are_derived_not_caller_flags() -> None:
     with pytest.raises(MassiveTradeReplayError, match="session eligibility"):
         replay_massive_trades(
             (replace(event, regular_session=True),),
-            decision_at_ns=100 * FIVE_MINUTES_NS,
+            decision_clock=_decision_clock(),
             **_normalization_authorities(),
         )

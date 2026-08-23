@@ -34,6 +34,16 @@ def _observation(
 def _authority():
     observations = (
         documented_massive_surface(
+            surface_id="corporate-actions",
+            request_path="/documented/corporate-actions",
+            observed_at_ms=1_000,
+        ),
+        documented_massive_surface(
+            surface_id="day-aggregates",
+            request_path="/documented/day-aggregates",
+            observed_at_ms=1_000,
+        ),
+        documented_massive_surface(
             surface_id="delayed-websocket",
             request_path="/documented/delayed-websocket",
             observed_at_ms=1_000,
@@ -48,7 +58,17 @@ def _authority():
             request_path="/documented/flat-files",
             observed_at_ms=1_000,
         ),
+        documented_massive_surface(
+            surface_id="history-boundary",
+            request_path="/documented/history-boundary",
+            observed_at_ms=1_000,
+        ),
         _observation("historical-quotes", "forbidden", 403),
+        documented_massive_surface(
+            surface_id="minute-aggregates",
+            request_path="/documented/minute-aggregates",
+            observed_at_ms=1_000,
+        ),
         _observation("reference-rest", "available", 200),
         _observation("trades-rest", "available", 200),
     )
@@ -66,6 +86,7 @@ def test_developer_entitlement_is_secret_free_and_non_authorizing() -> None:
     assert authority.flat_files_documented
     assert not authority.historical_quotes_available
     assert not authority.financials_and_ratios_available
+    assert not authority.runtime_entitlement_qualified
     assert not authority.predictive_training_authorized
     assert not authority.historical_performance_authorized
     assert "apiKey=" not in payload
