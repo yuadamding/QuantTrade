@@ -307,6 +307,13 @@ def extract_massive_websocket_trade_rows(
 
     capture.validate()
     recorder_clock_authority.validate()
+    if (
+        capture.lifecycle.recorder_clock_authority_receipt_sha256
+        != recorder_clock_authority.receipt_sha256
+    ):
+        raise MassiveTradeExtractionError(
+            "WebSocket extraction used another recorder clock"
+        )
     parser_evidence = capture.parser_evidence
     if parser_evidence is None:
         raise MassiveTradeExtractionError(
@@ -333,7 +340,7 @@ def extract_massive_websocket_trade_rows(
         )
         for message in parsed_messages
     )
-    return tuple(
+    ordered = tuple(
         sorted(
             rows,
             key=lambda row: (
@@ -343,6 +350,14 @@ def extract_massive_websocket_trade_rows(
             ),
         )
     )
+    if (
+        semantic_sha256(tuple(row.canonical_record.receipt_sha256 for row in ordered))
+        != parser_evidence.parsed_trade_canonical_inventory_sha256
+    ):
+        raise MassiveTradeExtractionError(
+            "parsed WebSocket canonical inventory differs"
+        )
+    return ordered
 
 
 @dataclass(frozen=True, slots=True)

@@ -23,7 +23,9 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256,
     MassiveExtractedTradeRow,
     MassiveExtractedWebSocketTradeRow,
+    MassiveTradeExtractionError,
     MassiveTradeExtractionEvidence,
+    extract_massive_websocket_trade_rows,
 )
 from rl_quant.data_sources.massive.trade_replay import (
     MassiveResolvedSecurityIdentity,
@@ -563,18 +565,18 @@ def _derive_parity_evidence(
         finalized_extracted.validate()
     if row.ticker_history_authority is not None:
         row.ticker_history_authority.validate()
-    expected_delayed_rows = tuple(
-        MassiveExtractedWebSocketTradeRow.build(
-            parsed_message=extracted.parsed_message,
-            parser_evidence_receipt_sha256=(
-                row.capture.parser_evidence.receipt_sha256
-                if row.capture.parser_evidence is not None
-                else extracted.parser_evidence_receipt_sha256
+    try:
+        expected_delayed_rows = extract_massive_websocket_trade_rows(
+            parsed_messages=tuple(
+                extracted.parsed_message for extracted in row.delayed_extracted_rows
             ),
+            capture=row.capture,
             recorder_clock_authority=row.recorder_clock_authority,
         )
-        for extracted in row.delayed_extracted_rows
-    )
+    except MassiveTradeExtractionError as exc:
+        raise MassiveReplayParityError(
+            "delayed rows differ from committed parser evidence"
+        ) from exc
     if row.delayed_extracted_rows != expected_delayed_rows:
         raise MassiveReplayParityError(
             "delayed canonical rows were not emitted by the committed parser"

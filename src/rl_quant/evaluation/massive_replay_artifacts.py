@@ -357,6 +357,18 @@ class MassiveTradeExtractionManifest:
             raise MassiveReplayArtifactError(
                 "capture parser transport inventory differs from extracted rows"
             )
+        if (
+            semantic_sha256(
+                tuple(
+                    extracted.canonical_record.receipt_sha256
+                    for extracted in extracted_rows
+                )
+            )
+            != parser_evidence.parsed_trade_canonical_inventory_sha256
+        ):
+            raise MassiveReplayArtifactError(
+                "capture parser canonical inventory differs from extracted rows"
+            )
         event_inventory = semantic_sha256(
             tuple(
                 sorted(

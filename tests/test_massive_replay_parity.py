@@ -28,6 +28,7 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
     MassiveExtractedTradeRow,
     MassiveExtractedWebSocketTradeRow,
+    MassiveTradeExtractionError,
     extract_massive_flat_file_security_session,
     extract_massive_websocket_trade_rows,
 )
@@ -197,6 +198,7 @@ def _flat_payload(
     participant_ns: int,
     trade_id: str = "T1",
     sequence: int = 1,
+    price: str = "10.0",
 ) -> bytes:
     header = ",".join(MASSIVE_FLAT_TRADE_COLUMNS)
     values = (
@@ -206,7 +208,7 @@ def _flat_payload(
         "4",
         trade_id,
         str(participant_ns),
-        "10.0",
+        price,
         str(sequence),
         str(sip_ns),
         "100",
@@ -224,6 +226,8 @@ def _parity_input(
     received_after_decision: bool = False,
     extra_capture_ticker: str | None = None,
     premarket: bool = False,
+    delayed_price: float = 10.0,
+    finalized_price: str = "10.0",
 ):
     eastern = ZoneInfo("America/New_York")
     session_date = "2026-08-20"
@@ -266,7 +270,7 @@ def _parity_input(
         "sym": "AAA",
         "x": 4,
         "i": "T1",
-        "p": 10.0,
+        "p": delayed_price,
         "s": 100,
         "c": [1],
         "t": sip_ms,
@@ -309,7 +313,10 @@ def _parity_input(
         tmp_path / "flat",
         relative=flat_key,
         payload=_flat_payload(
-            ticker="AAA", sip_ns=sip_ns, participant_ns=participant_ns
+            ticker="AAA",
+            sip_ns=sip_ns,
+            participant_ns=participant_ns,
+            price=finalized_price,
         ),
         dataset_id=MASSIVE_FLAT_TRADES_DATASET_ID,
         schema_sha256=MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
@@ -443,6 +450,14 @@ def test_committed_parity_is_development_only_without_runtime_entitlement(
     assert authority.canonical_source_parsers_qualified
     assert not authority.historical_asof_replay_authorized
     assert not authority.predictive_training_authorized
+    parser_evidence = row.capture.parser_evidence
+    assert parser_evidence is not None
+    assert parser_evidence.parsed_trade_canonical_inventory_sha256 == semantic_sha256(
+        tuple(
+            extracted.canonical_record.receipt_sha256
+            for extracted in row.delayed_extracted_rows
+        )
+    )
 
 
 def test_actual_receipt_after_decision_fails_event_and_feature_parity(
@@ -544,6 +559,28 @@ def test_recorder_clock_uses_conservative_upper_receive_bound(tmp_path: Path) ->
     )
 
 
+def test_websocket_extraction_rejects_another_recorder_clock(tmp_path: Path) -> None:
+    row, _ = _parity_input(tmp_path)
+    another_clock = MassiveRecorderClockAuthority.build(
+        host_id="station001",
+        clock_source="chrony-tracking",
+        synchronization_protocol="ntp",
+        measured_before_capture_offset_ns=30_000_000,
+        measured_after_capture_offset_ns=35_000_000,
+        maximum_absolute_offset_ns=40_000_000,
+        maximum_drift_ns=5_000_000,
+        measurement_source_receipts=("c" * 64, "d" * 64),
+    )
+    with pytest.raises(MassiveTradeExtractionError, match="another recorder clock"):
+        extract_massive_websocket_trade_rows(
+            parsed_messages=tuple(
+                extracted.parsed_message for extracted in row.delayed_extracted_rows
+            ),
+            capture=row.capture,
+            recorder_clock_authority=another_clock,
+        )
+
+
 def test_same_websocket_payload_with_changed_receive_time_fails_parity(
     tmp_path: Path,
 ) -> None:
@@ -592,6 +629,75 @@ def test_same_websocket_payload_with_changed_clock_bound_fails_parity(
     forged = replace(forged, receipt_sha256=semantic_sha256(forged.unsigned()))
     forged.validate()
     with pytest.raises((MassiveReplayArtifactError, MassiveReplayParityError)):
+        _build(replace(row, delayed_extracted_rows=(forged,)), common)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("ticker", "ZZZ"),
+        ("exchange_id", 5),
+        ("trade_id", "T-ALTERED"),
+        ("sequence_number", 2),
+        ("participant_timestamp_ns", "decrement"),
+        ("sip_timestamp_ns", "increment"),
+        ("trf_id", 13),
+        ("trf_timestamp_ns", "increment"),
+        ("tape_id", 2),
+        ("price_decimal", "11"),
+        ("size_decimal", "200"),
+        ("conditions", (2,)),
+    ),
+)
+def test_parsed_websocket_payload_rejects_changed_canonical_economic_field(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    row, common = _parity_input(tmp_path)
+    original = row.delayed_extracted_rows[0]
+    if replacement == "increment":
+        replacement = getattr(original.canonical_record, field) + 1
+    elif replacement == "decrement":
+        replacement = getattr(original.canonical_record, field) - 1
+    canonical = replace(original.canonical_record, **{field: replacement})
+    canonical = replace(
+        canonical,
+        receipt_sha256=semantic_sha256(canonical.unsigned()),
+    )
+    forged = replace(original, canonical_record=canonical)
+    forged = replace(forged, receipt_sha256=semantic_sha256(forged.unsigned()))
+    forged.validate()
+
+    with pytest.raises(
+        (MassiveReplayArtifactError, MassiveReplayParityError),
+        match="canonical rows|canonical inventory",
+    ):
+        _build(replace(row, delayed_extracted_rows=(forged,)), common)
+
+
+def test_delayed_price_cannot_be_rewritten_to_match_finalized_price(
+    tmp_path: Path,
+) -> None:
+    row, common = _parity_input(
+        tmp_path,
+        delayed_price=9.0,
+        finalized_price="10.0",
+    )
+    original = row.delayed_extracted_rows[0]
+    canonical = replace(original.canonical_record, price_decimal="10")
+    canonical = replace(
+        canonical,
+        receipt_sha256=semantic_sha256(canonical.unsigned()),
+    )
+    forged = replace(original, canonical_record=canonical)
+    forged = replace(forged, receipt_sha256=semantic_sha256(forged.unsigned()))
+    forged.validate()
+
+    with pytest.raises(
+        (MassiveReplayArtifactError, MassiveReplayParityError),
+        match="canonical rows|canonical inventory",
+    ):
         _build(replace(row, delayed_extracted_rows=(forged,)), common)
 
 

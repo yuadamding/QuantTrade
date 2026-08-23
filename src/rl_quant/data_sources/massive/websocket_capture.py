@@ -39,7 +39,7 @@ MASSIVE_WEBSOCKET_CAPTURE_LIFECYCLE_SCHEMA = (
     "rl-quant.massive-websocket-capture-lifecycle-v3"
 )
 MASSIVE_WEBSOCKET_CAPTURE_PARSE_EVIDENCE_SCHEMA = (
-    "rl-quant.massive-websocket-capture-parse-evidence-v2"
+    "rl-quant.massive-websocket-capture-parse-evidence-v3"
 )
 MASSIVE_WEBSOCKET_CAPTURE_FILE_SCHEMA = "rl-quant.massive-websocket-capture-file-v2"
 MASSIVE_DELAYED_CAPTURE_DATASET_ID = "massive-delayed-websocket-capture-v1"
@@ -271,6 +271,7 @@ class MassiveWebSocketCaptureParseEvidence:
     raw_row_inventory_sha256: str
     parsed_trade_inventory_sha256: str
     parsed_trade_transport_inventory_sha256: str
+    parsed_trade_canonical_inventory_sha256: str
     receipt_sha256: str
     schema: str = MASSIVE_WEBSOCKET_CAPTURE_PARSE_EVIDENCE_SCHEMA
 
@@ -291,6 +292,7 @@ class MassiveWebSocketCaptureParseEvidence:
             "raw_row_inventory_sha256",
             "parsed_trade_inventory_sha256",
             "parsed_trade_transport_inventory_sha256",
+            "parsed_trade_canonical_inventory_sha256",
             "receipt_sha256",
         ):
             _digest(name, getattr(self, name))
@@ -996,6 +998,22 @@ def parse_massive_delayed_websocket_capture(
             )
         )
     )
+    # Canonicalization consumes this module's event type, so import locally to
+    # avoid a module-level cycle while still binding parser evidence to the
+    # complete clock-qualified economic record.
+    from rl_quant.data_sources.massive.trade_canonicalization import (
+        canonicalize_massive_websocket_trade,
+    )
+
+    parsed_trade_canonical_inventory_sha256 = semantic_sha256(
+        tuple(
+            canonicalize_massive_websocket_trade(
+                message.event,
+                recorder_clock_authority=recorder_clock_authority,
+            ).receipt_sha256
+            for message in parsed_messages
+        )
+    )
     parser_body = {
         "schema": MASSIVE_WEBSOCKET_CAPTURE_PARSE_EVIDENCE_SCHEMA,
         "loaded_source_receipt_sha256": loaded_source.receipt_sha256,
@@ -1016,6 +1034,9 @@ def parse_massive_delayed_websocket_capture(
         "parsed_trade_transport_inventory_sha256": semantic_sha256(
             tuple(message.receipt_sha256 for message in parsed_messages)
         ),
+        "parsed_trade_canonical_inventory_sha256": (
+            parsed_trade_canonical_inventory_sha256
+        ),
     }
     parser_evidence = MassiveWebSocketCaptureParseEvidence(
         loaded_source_receipt_sha256=loaded_source.receipt_sha256,
@@ -1035,6 +1056,9 @@ def parse_massive_delayed_websocket_capture(
         parsed_trade_inventory_sha256=parsed_trade_inventory_sha256,
         parsed_trade_transport_inventory_sha256=semantic_sha256(
             tuple(message.receipt_sha256 for message in parsed_messages)
+        ),
+        parsed_trade_canonical_inventory_sha256=(
+            parsed_trade_canonical_inventory_sha256
         ),
         receipt_sha256=semantic_sha256(parser_body),
     )
