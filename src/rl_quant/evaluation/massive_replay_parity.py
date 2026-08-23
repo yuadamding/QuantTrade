@@ -5,11 +5,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal, Sequence
 
-from rl_quant.alpha.pit_universe import SourcedTickerHistoryRecord
+from rl_quant.alpha.pit_universe import (
+    PITSecurityUniverseAuthority,
+    SourcedTickerHistoryRecord,
+)
 from rl_quant.data_sources.massive.conditions import MassiveConditionAuthority
 from rl_quant.data_sources.massive.corrections import MassiveCorrectionAuthority
 from rl_quant.data_sources.massive.decision_clock import MassiveDecisionClockAuthority
 from rl_quant.data_sources.massive.entitlement import MassiveEntitlementAuthority
+from rl_quant.data_sources.massive.recorder_clock import MassiveRecorderClockAuthority
 from rl_quant.data_sources.massive.session_calendar import (
     MassiveExchangeSession,
     MassiveSessionAuthority,
@@ -17,6 +21,7 @@ from rl_quant.data_sources.massive.session_calendar import (
 from rl_quant.data_sources.massive.source_receipts import LoadedMassiveSourceObject
 from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_PARSER_SPEC_SHA256,
+    MassiveTradeExtractionEvidence,
 )
 from rl_quant.data_sources.massive.trade_replay import MassiveTradeReplayResult
 from rl_quant.data_sources.massive.websocket_capture import (
@@ -25,7 +30,9 @@ from rl_quant.data_sources.massive.websocket_capture import (
 from rl_quant.evaluation.massive_replay_artifacts import (
     MASSIVE_DELAYED_CAPTURE_PARSER_SPEC_SHA256,
     MassiveReplayFeatureArtifact,
+    MassiveReplayFeatureSpec,
     MassiveTradeExtractionManifest,
+    materialize_massive_replay_features,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 
@@ -114,18 +121,26 @@ class MassiveTickerChangeCanaryEvidence:
         *,
         prior_record: SourcedTickerHistoryRecord,
         current_record: SourcedTickerHistoryRecord,
-        ticker_history_authority_receipt_sha256: str,
+        ticker_history_authority: PITSecurityUniverseAuthority,
     ) -> MassiveTickerChangeCanaryEvidence:
+        ticker_history_authority.validate()
+        if (
+            prior_record not in ticker_history_authority.ticker_history
+            or current_record not in ticker_history_authority.ticker_history
+        ):
+            raise MassiveReplayParityError(
+                "ticker transition is absent from the PIT universe authority"
+            )
         body = {
             "schema": MASSIVE_TICKER_CHANGE_CANARY_SCHEMA,
             "prior_record": asdict(prior_record),
             "current_record": asdict(current_record),
-            "ticker_history_authority_receipt_sha256": ticker_history_authority_receipt_sha256,
+            "ticker_history_authority_receipt_sha256": ticker_history_authority.receipt_sha256,
         }
         value = cls(
             prior_record=prior_record,
             current_record=current_record,
-            ticker_history_authority_receipt_sha256=ticker_history_authority_receipt_sha256,
+            ticker_history_authority_receipt_sha256=ticker_history_authority.receipt_sha256,
             receipt_sha256=semantic_sha256(body),
         )
         value.validate()
@@ -140,13 +155,16 @@ class MassiveReplayParityInput:
     finalized_source: LoadedMassiveSourceObject
     delayed_extraction: MassiveTradeExtractionManifest
     finalized_extraction: MassiveTradeExtractionManifest
+    finalized_flat_extraction_evidence: MassiveTradeExtractionEvidence
     decision_clock: MassiveDecisionClockAuthority
+    recorder_clock_authority: MassiveRecorderClockAuthority
     session: MassiveExchangeSession
     delayed_replay: MassiveTradeReplayResult
     finalized_replay: MassiveTradeReplayResult
     delayed_features: MassiveReplayFeatureArtifact
     finalized_features: MassiveReplayFeatureArtifact
     ticker_change: MassiveTickerChangeCanaryEvidence | None = None
+    ticker_history_authority: PITSecurityUniverseAuthority | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,16 +404,26 @@ def _canary_observed(
     if row.canary_kind == "trf-trades":
         return any(event.trf_id is not None for event in events)
     if row.canary_kind == "ticker-change-identity":
-        if row.ticker_change is None or not events:
+        if (
+            row.ticker_change is None
+            or row.ticker_history_authority is None
+            or not events
+        ):
             return False
         row.ticker_change.validate()
+        row.ticker_history_authority.validate()
         return (
             row.ticker_change.security_id == row.delayed_replay.security_id
             and row.ticker_change.current_ticker == events[0].source_ticker
             and row.ticker_change.current_record.valid_from_ms * 1_000_000
             <= row.decision_clock.decision_at_ns
             and row.ticker_change.ticker_history_authority_receipt_sha256
+            == row.ticker_history_authority.receipt_sha256
             == row.delayed_replay.ticker_history_receipt_sha256
+            and row.ticker_change.prior_record
+            in row.ticker_history_authority.ticker_history
+            and row.ticker_change.current_record
+            in row.ticker_history_authority.ticker_history
         )
     return False
 
@@ -414,7 +442,9 @@ def _derive_parity_evidence(
         row.finalized_source,
         row.delayed_extraction,
         row.finalized_extraction,
+        row.finalized_flat_extraction_evidence,
         row.decision_clock,
+        row.recorder_clock_authority,
         row.session,
         row.delayed_replay,
         row.finalized_replay,
@@ -422,6 +452,8 @@ def _derive_parity_evidence(
         row.finalized_features,
     ):
         artifact.validate()
+    if row.ticker_history_authority is not None:
+        row.ticker_history_authority.validate()
     if row.capture.entitlement_receipt_sha256 != entitlement_authority.receipt_sha256:
         raise MassiveReplayParityError("capture entitlement differs")
     for source in (row.delayed_source, row.finalized_source):
@@ -429,8 +461,13 @@ def _derive_parity_evidence(
             raise MassiveReplayParityError("source entitlement differs")
     if row.capture.raw_capture_source_receipt_sha256 != row.delayed_source.receipt.receipt_sha256:
         raise MassiveReplayParityError("capture source is not the committed delayed source")
-    if row.capture.payload_inventory_sha256 != row.delayed_replay.input_source_record_inventory_sha256:
-        raise MassiveReplayParityError("capture payload inventory differs from replay")
+    if row.capture.parser_evidence is None:
+        raise MassiveReplayParityError("capture lacks committed parser evidence")
+    if (
+        row.capture.parser_evidence.receipt_sha256
+        != row.delayed_extraction.parser_evidence_receipt_sha256
+    ):
+        raise MassiveReplayParityError("delayed extraction lacks capture parser evidence")
     for source, extraction, replay in (
         (row.delayed_source, row.delayed_extraction, row.delayed_replay),
         (row.finalized_source, row.finalized_extraction, row.finalized_replay),
@@ -451,6 +488,28 @@ def _derive_parity_evidence(
         raise MassiveReplayParityError("capture used another decision clock")
     if row.capture.lifecycle.required_capture_end_ns != row.decision_clock.decision_at_ns:
         raise MassiveReplayParityError("capture cutoff differs from decision clock")
+    if (
+        row.capture.lifecycle.required_capture_start_ns
+        != row.decision_clock.source_day_start_ns
+        or row.capture.lifecycle.observation_domain
+        != row.decision_clock.observation_domain
+    ):
+        raise MassiveReplayParityError("capture observation domain differs")
+    if (
+        row.capture.lifecycle.recorder_clock_authority_receipt_sha256
+        != row.recorder_clock_authority.receipt_sha256
+        or row.delayed_replay.recorder_clock_authority_receipt_sha256
+        != row.recorder_clock_authority.receipt_sha256
+        or row.finalized_replay.recorder_clock_authority_receipt_sha256 is not None
+    ):
+        raise MassiveReplayParityError("parity recorder clock evidence differs")
+    if (
+        row.finalized_extraction.parser_evidence_receipt_sha256
+        != row.finalized_flat_extraction_evidence.receipt_sha256
+        or row.finalized_extraction.selected_row_provenance_inventory_sha256
+        != row.finalized_flat_extraction_evidence.selected_row_provenance_inventory_sha256
+    ):
+        raise MassiveReplayParityError("finalized extraction evidence differs")
     for replay in (row.delayed_replay, row.finalized_replay):
         if replay.condition_authority_receipt_sha256 != condition_authority.receipt_sha256:
             raise MassiveReplayParityError("replay condition authority differs")
@@ -476,6 +535,23 @@ def _derive_parity_evidence(
         raise MassiveReplayParityError("final features used another replay")
     if row.delayed_features.feature_spec_receipt_sha256 != row.finalized_features.feature_spec_receipt_sha256:
         raise MassiveReplayParityError("feature specifications differ")
+    feature_specification = MassiveReplayFeatureSpec.canonical()
+    expected_delayed_features = materialize_massive_replay_features(
+        row.delayed_replay,
+        specification=feature_specification,
+    )
+    expected_finalized_features = materialize_massive_replay_features(
+        row.finalized_replay,
+        specification=feature_specification,
+    )
+    if row.delayed_features != expected_delayed_features:
+        raise MassiveReplayParityError(
+            "delayed feature artifact was not canonically materialized"
+        )
+    if row.finalized_features != expected_finalized_features:
+        raise MassiveReplayParityError(
+            "finalized feature artifact was not canonically materialized"
+        )
     delayed_state = row.delayed_replay.active_state_inventory_sha256
     finalized_state = row.finalized_replay.active_state_inventory_sha256
     event_exact = delayed_state == finalized_state

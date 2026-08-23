@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -109,11 +111,16 @@ def _entitlement():
 
 
 def _session():
+    eastern = ZoneInfo("America/New_York")
+    regular_open_ns = int(
+        datetime(2026, 8, 20, 9, 30, tzinfo=eastern).timestamp()
+        * 1_000_000_000
+    )
     row = MassiveExchangeSession(
         session_date="2026-08-20",
         exchange="XNYS",
-        regular_open_ns=0,
-        regular_close_ns=78 * FIVE_MINUTES_NS,
+        regular_open_ns=regular_open_ns,
+        regular_close_ns=regular_open_ns + 78 * FIVE_MINUTES_NS,
         scheduled_five_minute_intervals=78,
         special_session_reason=None,
         calendar_source_receipt_sha256="d" * 64,
@@ -144,12 +151,13 @@ def _source():
 
 
 def _identity():
+    session, _ = _session()
     return MassiveResolvedSecurityIdentity.build(
         security_id="SEC-A",
         source_ticker="AAA",
         primary_exchange="XNYS",
         session_date="2026-08-20",
-        valid_from_ns=0,
+        valid_from_ns=session.regular_open_ns - 12 * 60 * 60 * 1_000_000_000,
         valid_to_ns=None,
         identity_authority_receipt_sha256="f" * 64,
         ticker_history_receipt_sha256="0" * 64,
@@ -181,19 +189,22 @@ def _decision_clock():
 def _event(
     *, trade_id: str, sequence: int, correction: int, sip: int, price: float
 ):
+    session, _ = _session()
+    sip_timestamp = session.regular_open_ns + sip
     record = {
         "ticker": "AAA",
         "id": trade_id,
         "exchange": 4,
         "sequence_number": sequence,
-        "participant_timestamp": sip - 5,
-        "sip_timestamp": sip,
+        "participant_timestamp": sip_timestamp - 5,
+        "sip_timestamp": sip_timestamp,
         "price": price,
         "decimal_size": "100.5",
         "conditions": [1],
         "correction": correction,
         "trf_id": 12,
-        "trf_timestamp": sip - 2,
+        "trf_timestamp": sip_timestamp - 2,
+        "tape": 1,
     }
     return normalize_massive_trade_event(
         record,

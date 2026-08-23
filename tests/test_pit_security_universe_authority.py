@@ -24,6 +24,10 @@ from rl_quant.alpha import (
     load_pit_security_universe,
     materialize_pit_security_universe,
 )
+from rl_quant.evaluation.massive_replay_parity import (
+    MassiveReplayParityError,
+    MassiveTickerChangeCanaryEvidence,
+)
 
 
 def _rule() -> PITUniverseRuleSpec:
@@ -182,6 +186,37 @@ def _authority() -> PITSecurityUniverseAuthority:
         delisting_events=_delistings(),
         rank_inputs=_rank_inputs(),
     )
+
+
+def test_ticker_change_canary_must_resolve_inside_pit_authority() -> None:
+    prior = SourcedTickerHistoryRecord(
+        "SEC-A", "AAA", 100, 800, 90, "XNYS", "d" * 64
+    )
+    current = SourcedTickerHistoryRecord(
+        "SEC-A", "AAB", 800, None, 700, "XNYS", "7" * 64
+    )
+    authority = PITSecurityUniverseAuthority.build(
+        rule=_rule(),
+        security_master=_masters(),
+        ticker_history=(prior, current, *_tickers()[1:]),
+        listing_events=_listings(),
+        delisting_events=_delistings(),
+        rank_inputs=_rank_inputs(),
+    )
+
+    evidence = MassiveTickerChangeCanaryEvidence.build(
+        prior_record=prior,
+        current_record=current,
+        ticker_history_authority=authority,
+    )
+
+    assert evidence.ticker_history_authority_receipt_sha256 == authority.receipt_sha256
+    with pytest.raises(MassiveReplayParityError, match="absent"):
+        MassiveTickerChangeCanaryEvidence.build(
+            prior_record=prior,
+            current_record=replace(current, source_receipt_sha256="8" * 64),
+            ticker_history_authority=authority,
+        )
 
 
 def _inventory(symbol: str, session_date: str) -> PolygonStagingInventoryRecord:

@@ -57,30 +57,33 @@ def _event(
     authorities=None,
     condition: int = 1,
 ):
+    resolved = _normalization_authorities() if authorities is None else authorities
+    origin = resolved["session"].regular_open_ns
     return normalize_massive_trade_event(
         {
             "ticker": "AAA",
             "id": trade_id,
             "exchange": 4,
             "sequence_number": sequence,
-            "participant_timestamp": sip - 5,
-            "sip_timestamp": sip,
+            "participant_timestamp": origin + sip - 5,
+            "sip_timestamp": origin + sip,
             "price": price,
             "decimal_size": "100",
             "conditions": [condition],
             "correction": 0,
         },
         source_row_number=sequence,
-        **(_normalization_authorities() if authorities is None else authorities),
+        **resolved,
     )
 
 
 def _session(*, intervals: int = 78) -> MassiveExchangeSession:
+    regular_open_ns = _normalization_authorities()["session"].regular_open_ns
     return MassiveExchangeSession(
         session_date="2026-08-20",
         exchange="XNYS",
-        regular_open_ns=0,
-        regular_close_ns=intervals * FIVE_MINUTES_NS,
+        regular_open_ns=regular_open_ns,
+        regular_close_ns=regular_open_ns + intervals * FIVE_MINUTES_NS,
         scheduled_five_minute_intervals=intervals,
         special_session_reason=None if intervals == 78 else "early-close",
         calendar_source_receipt_sha256="d" * 64,

@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 import json
 from typing import Literal, Mapping, Sequence
 
+from rl_quant.data_sources.massive.recorder_clock import MassiveRecorderClockAuthority
 from rl_quant.data_sources.massive.websocket_capture import (
     MassiveDelayedWebSocketEvent,
 )
@@ -14,7 +15,7 @@ from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 
 MASSIVE_CANONICAL_TRADE_SOURCE_SCHEMA = (
-    "rl-quant.massive-canonical-trade-source-record-v1"
+    "rl-quant.massive-canonical-trade-source-record-v2"
 )
 MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256 = semantic_sha256(
     {
@@ -25,6 +26,8 @@ MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256 = semantic_sha256(
         "price_representation": "canonical-decimal-string",
         "size_representation": "canonical-decimal-string",
         "condition_order": "sorted-unique",
+        "tape": "integer-or-null",
+        "delayed_receive_time": "clock-error-upper-bound",
     }
 )
 
@@ -37,6 +40,16 @@ MassiveTradeSourceKind = Literal[
 
 class MassiveTradeCanonicalizationError(ValueError):
     """A vendor trade row cannot be mapped without ambiguity."""
+
+
+def _digest(name: str, value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise MassiveTradeCanonicalizationError(f"{name} is not a SHA-256")
+    return value
 
 
 def _integer(name: str, value: object) -> int:
@@ -84,6 +97,7 @@ class MassiveCanonicalTradeSourceRecord:
     sip_timestamp_ns: int
     trf_id: int | None
     trf_timestamp_ns: int | None
+    tape_id: int | None
     price_decimal: str
     size_decimal: str
     conditions: tuple[int, ...]
@@ -91,7 +105,9 @@ class MassiveCanonicalTradeSourceRecord:
     source_kind: MassiveTradeSourceKind
     raw_source_record_sha256: str
     canonicalization_spec_sha256: str
-    received_at_ns: int | None
+    local_received_at_ns: int | None
+    canonical_received_at_ns: int | None
+    recorder_clock_authority_receipt_sha256: str | None
     receipt_sha256: str
     schema: str = MASSIVE_CANONICAL_TRADE_SOURCE_SCHEMA
 
@@ -122,6 +138,8 @@ class MassiveCanonicalTradeSourceRecord:
             _integer("TRF ID", self.trf_id)
         if self.trf_timestamp_ns is not None:
             _integer("TRF timestamp", self.trf_timestamp_ns)
+        if self.tape_id is not None:
+            _integer("tape ID", self.tape_id)
         _decimal("price", self.price_decimal)
         _decimal("size", self.size_decimal)
         if self.conditions != tuple(sorted(set(self.conditions))):
@@ -135,16 +153,36 @@ class MassiveCanonicalTradeSourceRecord:
         }:
             raise MassiveTradeCanonicalizationError("trade source kind is unsupported")
         if self.source_kind == "delayed-websocket":
-            if self.received_at_ns is None:
+            if (
+                self.local_received_at_ns is None
+                or self.canonical_received_at_ns is None
+                or self.recorder_clock_authority_receipt_sha256 is None
+            ):
                 raise MassiveTradeCanonicalizationError(
-                    "delayed trade lacks actual receive time"
+                    "delayed trade lacks clock-bound receive time"
                 )
-            _integer("received timestamp", self.received_at_ns)
-            if self.received_at_ns < self.sip_timestamp_ns:
+            _integer("local received timestamp", self.local_received_at_ns)
+            _integer("canonical received timestamp", self.canonical_received_at_ns)
+            if self.canonical_received_at_ns < self.local_received_at_ns:
+                raise MassiveTradeCanonicalizationError(
+                    "canonical receive time understates the local clock"
+                )
+            if self.canonical_received_at_ns < self.sip_timestamp_ns:
                 raise MassiveTradeCanonicalizationError(
                     "delayed receive time predates SIP dissemination"
                 )
-        elif self.received_at_ns is not None:
+            _digest(
+                "recorder clock authority",
+                self.recorder_clock_authority_receipt_sha256,
+            )
+        elif any(
+            value is not None
+            for value in (
+                self.local_received_at_ns,
+                self.canonical_received_at_ns,
+                self.recorder_clock_authority_receipt_sha256,
+            )
+        ):
             raise MassiveTradeCanonicalizationError(
                 "non-WebSocket source cannot claim a local receive time"
             )
@@ -178,13 +216,16 @@ def _build_canonical_record(
     sip_timestamp_ns: int,
     trf_id: object,
     trf_timestamp_ns: int | None,
+    tape_id: object,
     price: object,
     size: object,
     conditions: object,
     correction_code: object,
     source_kind: MassiveTradeSourceKind,
     raw_source_record_sha256: str,
-    received_at_ns: int | None,
+    local_received_at_ns: int | None,
+    canonical_received_at_ns: int | None,
+    recorder_clock_authority_receipt_sha256: str | None,
 ) -> MassiveCanonicalTradeSourceRecord:
     canonical_exchange_id = _integer("exchange ID", exchange_id)
     canonical_sequence_number = _integer("sequence number", sequence_number)
@@ -207,6 +248,7 @@ def _build_canonical_record(
         "sip_timestamp_ns": sip_timestamp_ns,
         "trf_id": canonical_trf_id,
         "trf_timestamp_ns": trf_timestamp_ns,
+        "tape_id": None if tape_id is None else _integer("tape ID", tape_id),
         "price_decimal": canonical_price,
         "size_decimal": canonical_size,
         "conditions": canonical_conditions,
@@ -214,7 +256,9 @@ def _build_canonical_record(
         "source_kind": source_kind,
         "raw_source_record_sha256": raw_source_record_sha256,
         "canonicalization_spec_sha256": MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256,
-        "received_at_ns": received_at_ns,
+        "local_received_at_ns": local_received_at_ns,
+        "canonical_received_at_ns": canonical_received_at_ns,
+        "recorder_clock_authority_receipt_sha256": recorder_clock_authority_receipt_sha256,
     }
     value = MassiveCanonicalTradeSourceRecord(
         ticker=str(ticker),
@@ -225,6 +269,7 @@ def _build_canonical_record(
         sip_timestamp_ns=sip_timestamp_ns,
         trf_id=canonical_trf_id,
         trf_timestamp_ns=trf_timestamp_ns,
+        tape_id=None if tape_id is None else _integer("tape ID", tape_id),
         price_decimal=canonical_price,
         size_decimal=canonical_size,
         conditions=canonical_conditions,
@@ -232,7 +277,9 @@ def _build_canonical_record(
         source_kind=source_kind,
         raw_source_record_sha256=raw_source_record_sha256,
         canonicalization_spec_sha256=MASSIVE_TRADE_CANONICALIZATION_SPEC_SHA256,
-        received_at_ns=received_at_ns,
+        local_received_at_ns=local_received_at_ns,
+        canonical_received_at_ns=canonical_received_at_ns,
+        recorder_clock_authority_receipt_sha256=recorder_clock_authority_receipt_sha256,
         receipt_sha256=semantic_sha256(body),
     )
     value.validate()
@@ -241,10 +288,13 @@ def _build_canonical_record(
 
 def canonicalize_massive_websocket_trade(
     event: MassiveDelayedWebSocketEvent,
+    *,
+    recorder_clock_authority: MassiveRecorderClockAuthority,
 ) -> MassiveCanonicalTradeSourceRecord:
     """Canonicalize the actual compact delayed WebSocket stock-trade schema."""
 
     event.validate()
+    recorder_clock_authority.validate()
     payload = json.loads(event.canonical_payload_json)
     return _build_canonical_record(
         ticker=payload["sym"],
@@ -258,18 +308,26 @@ def canonicalize_massive_websocket_trade(
         trf_timestamp_ns=None
         if payload.get("trft") is None
         else _integer("TRF timestamp", payload["trft"]) * 1_000_000,
+        tape_id=payload.get("z"),
         price=payload["p"],
         size=payload.get("ds", payload.get("s")),
         conditions=payload.get("c", ()),
         correction_code=None,
         source_kind="delayed-websocket",
         raw_source_record_sha256=event.payload_sha256,
-        received_at_ns=event.received_at_ns,
+        local_received_at_ns=event.received_at_ns,
+        canonical_received_at_ns=recorder_clock_authority.conservative_upper_timestamp_ns(
+            event.received_at_ns
+        ),
+        recorder_clock_authority_receipt_sha256=recorder_clock_authority.receipt_sha256,
     )
 
 
 def _canonicalize_long_trade(
-    record: Mapping[str, object], *, source_kind: MassiveTradeSourceKind
+    record: Mapping[str, object],
+    *,
+    source_kind: MassiveTradeSourceKind,
+    raw_source_record_sha256: str | None = None,
 ) -> MassiveCanonicalTradeSourceRecord:
     raw_size = record.get("decimal_size", record.get("size"))
     return _build_canonical_record(
@@ -285,15 +343,17 @@ def _canonicalize_long_trade(
         trf_timestamp_ns=None
         if record.get("trf_timestamp") is None
         else _integer("TRF timestamp", record["trf_timestamp"]),
+        tape_id=record.get("tape"),
         price=record["price"],
         size=raw_size,
         conditions=record.get("conditions", ()),
         correction_code=record.get("correction", 0),
         source_kind=source_kind,
-        raw_source_record_sha256=semantic_sha256(
-            {key: record[key] for key in sorted(record)}
-        ),
-        received_at_ns=None,
+        raw_source_record_sha256=raw_source_record_sha256
+        or semantic_sha256({key: record[key] for key in sorted(record)}),
+        local_received_at_ns=None,
+        canonical_received_at_ns=None,
+        recorder_clock_authority_receipt_sha256=None,
     )
 
 
@@ -305,8 +365,14 @@ def canonicalize_massive_rest_trade(
 
 def canonicalize_massive_flat_file_trade(
     record: Mapping[str, object],
+    *,
+    raw_source_record_sha256: str | None = None,
 ) -> MassiveCanonicalTradeSourceRecord:
-    return _canonicalize_long_trade(record, source_kind="flat-file-trades")
+    return _canonicalize_long_trade(
+        record,
+        source_kind="flat-file-trades",
+        raw_source_record_sha256=raw_source_record_sha256,
+    )
 
 
 __all__ = [

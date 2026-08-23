@@ -68,20 +68,33 @@ The source milestone is evidence-derived rather than label-derived:
   correction, source-object, permanent-identity, and ticker-history receipts;
 - compact delayed-WebSocket, REST, and flat-file records pass through distinct
   canonicalizers, preserving the raw payload hash and timestamp units;
-- delayed events use the later of actual local receipt and the qualified
-  SIP-plus-delay time, while finalized rows use only the qualified delay rule;
+- delayed events use the later of a conservative clock-error upper bound on
+  actual local receipt and the qualified SIP-plus-delay time, while finalized
+  rows use only the qualified delay rule;
 - every replay and capture lifecycle binds one protocol-derived decision clock
   equal to the authority-resolved regular close plus exactly 60 minutes;
 - replay re-resolves the condition and correction rules and rechecks the
   Developer delay, session boundary, source bytes, and identity;
 - open/close, high/low, and volume eligibility remain separate through bar
   reconstruction;
-- committed recorder JSONL derives authentication, subscription, checkpoint,
-  disconnect, trade, and subscribed-ticker evidence without persisting auth
-  requests or credentials;
+- committed recorder JSONL derives authentication, successful subscription,
+  transport heartbeat, disconnect, trade, clock, recorder-image, and
+  subscribed-ticker evidence without persisting auth requests or credentials;
+- the capture domain begins at the Eastern source-calendar-day boundary and
+  continues through the protocol decision, preserving premarket events and
+  correction ancestry; one multi-ticker capture is extracted independently
+  for each security-session;
 - delayed/final parity requires committed source bundles, extraction receipts,
-  and one fixed feature materializer; arbitrary feature mappings are not an
-  evidence surface;
+  and one source-byte-bound feature materializer that parity reruns itself;
+  arbitrary feature mappings are not an evidence surface;
+- finalized daily gzip files are scanned as streams, require the exact
+  `us_stocks_sip/trades_v1` identity and schema, and retain original physical
+  line numbers, raw-row hashes, and tape IDs;
+- ticker-change canaries resolve both adjacent records inside the supplied PIT
+  universe authority rather than trusting a caller-provided authority digest;
+- transport success and HTTP 200 are not runtime entitlement evidence: every
+  required surface also needs bound, typed semantic evidence for its schema,
+  requested date, and returned inventory;
 - aggregate reconciliation is nonempty, source-homogeneous, unadjusted, and
   bound to a finite immutable tolerance specification;
 - source publication and reload traverse directories and open files relative
@@ -90,10 +103,11 @@ The source milestone is evidence-derived rather than label-derived:
   non-stock condition rows;
 - aggregate receipts sort intervals canonically before hashing.
 
-Historical as-of replay remains fail-closed in this source generation:
+Historical as-of replay remains fail-closed for the current runtime evidence:
 `runtime_entitlement_qualified` and `canonical_source_parsers_qualified` are
-both required, and the latter remains false until the real finalized-file and
-delayed-capture parser rehearsal is sealed. Even after that closure, replay
+both required. Synthetic committed-parser tests do not qualify the real
+entitlement or real source inventory; the real finalized-file and delayed-
+capture rehearsal must be sealed. Even after that closure, replay
 parity cannot authorize predictive training; PIT identity, both PIT universes,
 economic accounting, targets, and repeatable tensors remain separate blockers.
 

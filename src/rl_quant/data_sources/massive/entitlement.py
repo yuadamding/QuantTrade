@@ -12,9 +12,23 @@ from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 
 MASSIVE_ENTITLEMENT_OBSERVATION_SCHEMA = (
-    "rl-quant.massive-entitlement-observation-v1"
+    "rl-quant.massive-entitlement-observation-v2"
 )
-MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA = "rl-quant.massive-entitlement-authority-v2"
+MASSIVE_ENTITLEMENT_SEMANTIC_EVIDENCE_SCHEMA = (
+    "rl-quant.massive-entitlement-semantic-evidence-v1"
+)
+MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA = "rl-quant.massive-entitlement-authority-v3"
+
+MASSIVE_ENTITLEMENT_EVIDENCE_KINDS = {
+    "corporate-actions": "corporate-action-schema-and-result-derived",
+    "day-aggregates": "day-aggregate-schema-and-date-derived",
+    "delayed-websocket": "websocket-auth-subscription-delay-derived",
+    "flat-files": "flat-listing-download-schema-derived",
+    "history-boundary": "history-boundary-record-derived",
+    "minute-aggregates": "minute-aggregate-schema-and-date-derived",
+    "reference-rest": "reference-schema-and-result-derived",
+    "trades-rest": "trade-schema-and-date-derived",
+}
 
 MassiveAccessState = Literal[
     "available",
@@ -61,6 +75,7 @@ class MassiveEntitlementObservation:
     response_content_length: int
     response_body_sha256: str
     request_id: str | None
+    semantic_evidence_receipt_sha256: str | None = None
     schema: str = MASSIVE_ENTITLEMENT_OBSERVATION_SCHEMA
 
     def validate(self) -> None:
@@ -100,6 +115,15 @@ class MassiveEntitlementObservation:
         _digest("response body SHA", self.response_body_sha256)
         if self.request_id is not None:
             _text("request ID", self.request_id)
+        if self.semantic_evidence_receipt_sha256 is not None:
+            _digest(
+                "semantic evidence receipt",
+                self.semantic_evidence_receipt_sha256,
+            )
+            if self.access_state != "available":
+                raise MassiveEntitlementError(
+                    "unavailable surface cannot claim semantic evidence"
+                )
 
     def payload(self) -> dict[str, object]:
         self.validate()
@@ -111,11 +135,104 @@ class MassiveEntitlementObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class MassiveEntitlementSemanticEvidence:
+    surface_id: str
+    evidence_kind: str
+    source_receipts: tuple[str, ...]
+    observed_schema_sha256: str
+    result_count: int
+    requested_date: str | None
+    returned_min_date: str | None
+    returned_max_date: str | None
+    receipt_sha256: str
+    schema: str = MASSIVE_ENTITLEMENT_SEMANTIC_EVIDENCE_SCHEMA
+
+    def unsigned(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload.pop("receipt_sha256")
+        return payload
+
+    def validate(self) -> None:
+        if self.schema != MASSIVE_ENTITLEMENT_SEMANTIC_EVIDENCE_SCHEMA:
+            raise MassiveEntitlementError("semantic evidence schema drifted")
+        _text("semantic surface ID", self.surface_id)
+        expected_kind = MASSIVE_ENTITLEMENT_EVIDENCE_KINDS.get(self.surface_id)
+        if self.evidence_kind != expected_kind:
+            raise MassiveEntitlementError("semantic evidence kind differs")
+        if (
+            not self.source_receipts
+            or self.source_receipts != tuple(sorted(set(self.source_receipts)))
+        ):
+            raise MassiveEntitlementError(
+                "semantic evidence sources are not canonical"
+            )
+        for receipt in self.source_receipts:
+            _digest("semantic evidence source", receipt)
+        _digest("observed response schema", self.observed_schema_sha256)
+        if self.result_count <= 0:
+            raise MassiveEntitlementError("semantic evidence has no result")
+        for name in ("requested_date", "returned_min_date", "returned_max_date"):
+            value = getattr(self, name)
+            if value is not None:
+                _text(name, value)
+        if self.requested_date is not None and not (
+            self.returned_min_date is not None
+            and self.returned_max_date is not None
+            and self.returned_min_date <= self.requested_date <= self.returned_max_date
+        ):
+            raise MassiveEntitlementError(
+                "requested date is absent from semantic evidence"
+            )
+        _digest("semantic evidence receipt", self.receipt_sha256)
+        if self.receipt_sha256 != semantic_sha256(self.unsigned()):
+            raise MassiveEntitlementError("semantic evidence receipt differs")
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        surface_id: str,
+        evidence_kind: str,
+        source_receipts: Sequence[str],
+        observed_schema_sha256: str,
+        result_count: int,
+        requested_date: str | None = None,
+        returned_min_date: str | None = None,
+        returned_max_date: str | None = None,
+    ) -> MassiveEntitlementSemanticEvidence:
+        body = {
+            "schema": MASSIVE_ENTITLEMENT_SEMANTIC_EVIDENCE_SCHEMA,
+            "surface_id": surface_id,
+            "evidence_kind": evidence_kind,
+            "source_receipts": tuple(sorted(set(source_receipts))),
+            "observed_schema_sha256": observed_schema_sha256,
+            "result_count": result_count,
+            "requested_date": requested_date,
+            "returned_min_date": returned_min_date,
+            "returned_max_date": returned_max_date,
+        }
+        value = cls(
+            surface_id=surface_id,
+            evidence_kind=evidence_kind,
+            source_receipts=tuple(sorted(set(source_receipts))),
+            observed_schema_sha256=observed_schema_sha256,
+            result_count=result_count,
+            requested_date=requested_date,
+            returned_min_date=returned_min_date,
+            returned_max_date=returned_max_date,
+            receipt_sha256=semantic_sha256(body),
+        )
+        value.validate()
+        return value
+
+
+@dataclass(frozen=True, slots=True)
 class MassiveEntitlementAuthority:
     plan_id: str
     observed_at_ms: int
     credential_source: str
     observations: tuple[MassiveEntitlementObservation, ...]
+    semantic_evidence: tuple[MassiveEntitlementSemanticEvidence, ...]
     trades_rest_available: bool
     delayed_websocket_documented: bool
     flat_files_documented: bool
@@ -137,6 +254,10 @@ class MassiveEntitlementAuthority:
             "observed_at_ms": self.observed_at_ms,
             "credential_source": self.credential_source,
             "observations": [row.payload() for row in self.observations],
+            "semantic_evidence": [
+                row.unsigned() | {"receipt_sha256": row.receipt_sha256}
+                for row in self.semantic_evidence
+            ],
             "trades_rest_available": self.trades_rest_available,
             "delayed_websocket_documented": self.delayed_websocket_documented,
             "flat_files_documented": self.flat_files_documented,
@@ -170,6 +291,24 @@ class MassiveEntitlementAuthority:
             if row.observed_at_ms > self.observed_at_ms:
                 raise MassiveEntitlementError("authority predates one observation")
         by_surface = {row.surface_id: row for row in self.observations}
+        evidence_by_surface = {row.surface_id: row for row in self.semantic_evidence}
+        evidence_surface_ids = tuple(
+            row.surface_id for row in self.semantic_evidence
+        )
+        if evidence_surface_ids != tuple(sorted(set(evidence_surface_ids))):
+            raise MassiveEntitlementError(
+                "semantic evidence must be sorted and unique by surface"
+            )
+        for evidence in self.semantic_evidence:
+            evidence.validate()
+            observation = by_surface.get(evidence.surface_id)
+            if observation is None or (
+                observation.semantic_evidence_receipt_sha256
+                != evidence.receipt_sha256
+            ):
+                raise MassiveEntitlementError(
+                    "semantic evidence is not bound to its observation"
+                )
         required = {
             "corporate-actions",
             "day-aggregates",
@@ -219,6 +358,7 @@ class MassiveEntitlementAuthority:
         }
         runtime_qualified = all(
             by_surface[surface].access_state == "available"
+            and surface in evidence_by_surface
             for surface in runtime_required
         )
         if self.runtime_entitlement_qualified is not runtime_qualified:
@@ -242,17 +382,26 @@ def build_massive_developer_entitlement_authority(
     observations: Sequence[MassiveEntitlementObservation],
     *,
     observed_at_ms: int,
+    semantic_evidence: Sequence[MassiveEntitlementSemanticEvidence] = (),
 ) -> MassiveEntitlementAuthority:
     """Build a secret-free authority from observed/documented access rows."""
 
     ordered = tuple(sorted(observations, key=lambda row: row.surface_id))
     by_surface = {row.surface_id: row for row in ordered}
+    ordered_evidence = tuple(
+        sorted(semantic_evidence, key=lambda row: row.surface_id)
+    )
+    evidence_by_surface = {row.surface_id: row for row in ordered_evidence}
     body = {
         "schema": MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA,
         "plan_id": "stocks-developer",
         "observed_at_ms": observed_at_ms,
         "credential_source": "environment:MASSIVE_API_KEY",
         "observations": [row.payload() for row in ordered],
+        "semantic_evidence": [
+            row.unsigned() | {"receipt_sha256": row.receipt_sha256}
+            for row in ordered_evidence
+        ],
         "trades_rest_available": by_surface.get("trades-rest") is not None
         and by_surface["trades-rest"].access_state == "available",
         "delayed_websocket_documented": by_surface.get("delayed-websocket")
@@ -275,6 +424,7 @@ def build_massive_developer_entitlement_authority(
         "runtime_entitlement_qualified": all(
             by_surface.get(surface) is not None
             and by_surface[surface].access_state == "available"
+            and surface in evidence_by_surface
             for surface in (
                 "corporate-actions",
                 "day-aggregates",
@@ -295,6 +445,7 @@ def build_massive_developer_entitlement_authority(
         observed_at_ms=observed_at_ms,
         credential_source="environment:MASSIVE_API_KEY",
         observations=ordered,
+        semantic_evidence=ordered_evidence,
         trades_rest_available=bool(body["trades_rest_available"]),
         delayed_websocket_documented=bool(body["delayed_websocket_documented"]),
         flat_files_documented=bool(body["flat_files_documented"]),
@@ -375,6 +526,7 @@ def observe_massive_rest_surface(
         response_content_length=len(body),
         response_body_sha256=hashlib.sha256(body).hexdigest(),
         request_id=request_id,
+        semantic_evidence_receipt_sha256=None,
     )
 
 
@@ -392,15 +544,19 @@ def documented_massive_surface(
         response_content_length=0,
         response_body_sha256=hashlib.sha256(b"").hexdigest(),
         request_id=None,
+        semantic_evidence_receipt_sha256=None,
     )
 
 
 __all__ = [
     "MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA",
     "MASSIVE_ENTITLEMENT_OBSERVATION_SCHEMA",
+    "MASSIVE_ENTITLEMENT_SEMANTIC_EVIDENCE_SCHEMA",
+    "MASSIVE_ENTITLEMENT_EVIDENCE_KINDS",
     "MassiveEntitlementAuthority",
     "MassiveEntitlementError",
     "MassiveEntitlementObservation",
+    "MassiveEntitlementSemanticEvidence",
     "build_massive_developer_entitlement_authority",
     "documented_massive_surface",
     "observe_massive_rest_surface",

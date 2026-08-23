@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import stat
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 import uuid
 
 from rl_quant.protocol.canonical_artifact import (
@@ -570,6 +571,53 @@ def read_loaded_massive_source_bytes(
     return payload
 
 
+@contextmanager
+def open_loaded_massive_source_stream(
+    *, root: str | Path, loaded_source: LoadedMassiveSourceObject
+) -> Iterator[BinaryIO]:
+    """Open the exact committed source inode without materializing it in memory."""
+
+    loaded_source.validate()
+    parent_fd, payload_name = _open_parent_directory(
+        Path(root), loaded_source.payload_relative_path, create=False
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(payload_name, _READ_FLAGS, dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise MassiveSourceObjectError("loaded source is not a regular file")
+        if (info.st_dev, info.st_ino, info.st_ctime_ns) != (
+            loaded_source.payload_device,
+            loaded_source.payload_inode,
+            loaded_source.payload_ctime_ns,
+        ):
+            raise MassiveSourceObjectError("loaded source inode was replaced")
+        if info.st_size != loaded_source.receipt.content_length:
+            raise MassiveSourceObjectError("loaded source size changed")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            try:
+                yield stream
+            finally:
+                final_info = os.fstat(descriptor)
+                if (
+                    final_info.st_dev,
+                    final_info.st_ino,
+                    final_info.st_ctime_ns,
+                ) != (
+                    loaded_source.payload_device,
+                    loaded_source.payload_inode,
+                    loaded_source.payload_ctime_ns,
+                ):
+                    raise MassiveSourceObjectError(
+                        "loaded source changed while streaming"
+                    )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 __all__ = [
     "LoadedMassiveSourceObject",
     "MASSIVE_SOURCE_COMMIT_SCHEMA",
@@ -580,6 +628,7 @@ __all__ = [
     "MassiveSourceObjectReceipt",
     "load_massive_source_object",
     "load_massive_source_bundle",
+    "open_loaded_massive_source_stream",
     "publish_massive_source_object",
     "read_loaded_massive_source_bytes",
 ]

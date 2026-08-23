@@ -13,6 +13,7 @@ from rl_quant.data_sources.massive.source_receipts import (
     publish_massive_source_object,
 )
 from rl_quant.data_sources.massive.trade_extraction import (
+    MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
     MassiveTradeExtractionError,
     extract_massive_flat_file_security_session,
 )
@@ -38,7 +39,7 @@ def _loaded(tmp_path: Path, csv_payload: str):
         requested_at_ms=1,
         downloaded_at_ms=2,
         committed_at_ms=3,
-        schema_sha256="a" * 64,
+        schema_sha256=MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
         entitlement_receipt_sha256=entitlement.receipt_sha256,
     )
     return load_massive_source_bundle(
@@ -82,6 +83,8 @@ def test_flat_file_extraction_reads_every_committed_row(tmp_path: Path) -> None:
     )
 
     assert len(records) == 1
+    assert records[0].source_row_number == 2
+    assert records[0].canonical_record.tape_id == 1
     assert evidence.source_row_count == 2
     assert evidence.selected_row_count == 1
     assert evidence.unselected_row_count == 1

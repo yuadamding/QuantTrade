@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from rl_quant.data_sources.massive.session_calendar import (
     MassiveExchangeSession,
@@ -16,8 +18,9 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 )
 
 
-MASSIVE_DECISION_CLOCK_SCHEMA = "rl-quant.massive-decision-clock-v1"
+MASSIVE_DECISION_CLOCK_SCHEMA = "rl-quant.massive-decision-clock-v2"
 MASSIVE_DECISION_DELAY_NS = 60 * 60 * 1_000_000_000
+MASSIVE_OBSERVATION_DOMAIN = "eastern-source-calendar-day"
 
 
 class MassiveDecisionClockError(ValueError):
@@ -43,6 +46,8 @@ class MassiveDecisionClockAuthority:
     session_date: str
     regular_open_ns: int
     regular_close_ns: int
+    source_day_start_ns: int
+    observation_domain: str
     decision_delay_ns: int
     decision_at_ns: int
     receipt_sha256: str
@@ -68,12 +73,29 @@ class MassiveDecisionClockAuthority:
             raise MassiveDecisionClockError("adaptive protocol decision rule drifted")
         if not self.exchange or not self.session_date:
             raise MassiveDecisionClockError("decision clock identity is absent")
-        for name in ("regular_open_ns", "regular_close_ns", "decision_at_ns"):
+        for name in (
+            "regular_open_ns",
+            "regular_close_ns",
+            "source_day_start_ns",
+            "decision_at_ns",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise MassiveDecisionClockError(f"{name} must be nonnegative")
         if self.regular_close_ns <= self.regular_open_ns:
             raise MassiveDecisionClockError("decision clock session is empty")
+        if self.observation_domain != MASSIVE_OBSERVATION_DOMAIN:
+            raise MassiveDecisionClockError("decision observation domain drifted")
+        expected_source_day_start = int(
+            datetime.fromisoformat(self.session_date)
+            .replace(tzinfo=ZoneInfo("America/New_York"))
+            .timestamp()
+            * 1_000_000_000
+        )
+        if self.source_day_start_ns != expected_source_day_start:
+            raise MassiveDecisionClockError("source-day start was not derived causally")
+        if self.source_day_start_ns > self.regular_open_ns:
+            raise MassiveDecisionClockError("source-day starts after the regular open")
         if self.decision_delay_ns != MASSIVE_DECISION_DELAY_NS:
             raise MassiveDecisionClockError("decision clock delay drifted")
         if self.decision_at_ns != self.regular_close_ns + self.decision_delay_ns:
@@ -97,6 +119,12 @@ def build_massive_decision_clock_authority(
         exchange=session.exchange, session_date=session.session_date
     ) != session:
         raise MassiveDecisionClockError("session was not resolved by its authority")
+    source_day_start_ns = int(
+        datetime.fromisoformat(session.session_date)
+        .replace(tzinfo=ZoneInfo("America/New_York"))
+        .timestamp()
+        * 1_000_000_000
+    )
     body = {
         "schema": MASSIVE_DECISION_CLOCK_SCHEMA,
         "protocol_id": MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL_ID,
@@ -106,6 +134,8 @@ def build_massive_decision_clock_authority(
         "session_date": session.session_date,
         "regular_open_ns": session.regular_open_ns,
         "regular_close_ns": session.regular_close_ns,
+        "source_day_start_ns": source_day_start_ns,
+        "observation_domain": MASSIVE_OBSERVATION_DOMAIN,
         "decision_delay_ns": MASSIVE_DECISION_DELAY_NS,
         "decision_at_ns": session.regular_close_ns + MASSIVE_DECISION_DELAY_NS,
     }
@@ -117,6 +147,8 @@ def build_massive_decision_clock_authority(
         session_date=session.session_date,
         regular_open_ns=session.regular_open_ns,
         regular_close_ns=session.regular_close_ns,
+        source_day_start_ns=source_day_start_ns,
+        observation_domain=MASSIVE_OBSERVATION_DOMAIN,
         decision_delay_ns=MASSIVE_DECISION_DELAY_NS,
         decision_at_ns=session.regular_close_ns + MASSIVE_DECISION_DELAY_NS,
         receipt_sha256=semantic_sha256(body),
@@ -128,6 +160,7 @@ def build_massive_decision_clock_authority(
 __all__ = [
     "MASSIVE_DECISION_CLOCK_SCHEMA",
     "MASSIVE_DECISION_DELAY_NS",
+    "MASSIVE_OBSERVATION_DOMAIN",
     "MassiveDecisionClockAuthority",
     "MassiveDecisionClockError",
     "build_massive_decision_clock_authority",

@@ -7,8 +7,10 @@ import json
 import pytest
 
 from rl_quant.data_sources.massive.entitlement import (
+    MASSIVE_ENTITLEMENT_EVIDENCE_KINDS,
     MassiveEntitlementError,
     MassiveEntitlementObservation,
+    MassiveEntitlementSemanticEvidence,
     build_massive_developer_entitlement_authority,
     documented_massive_surface,
 )
@@ -111,3 +113,71 @@ def test_canary_credential_environment_name_cannot_drift() -> None:
 
     assert "api_key_env" not in destinations
     assert _authority().credential_source == "environment:MASSIVE_API_KEY"
+
+
+def test_http_200_inventory_cannot_qualify_runtime_without_semantic_evidence() -> None:
+    observations = tuple(
+        _observation(surface, "available", 200)
+        for surface in (
+            "corporate-actions",
+            "day-aggregates",
+            "delayed-websocket",
+            "financials-and-ratios",
+            "flat-files",
+            "historical-quotes",
+            "history-boundary",
+            "minute-aggregates",
+            "reference-rest",
+            "trades-rest",
+        )
+    )
+
+    authority = build_massive_developer_entitlement_authority(
+        observations, observed_at_ms=1_001
+    )
+
+    assert all(row.access_state == "available" for row in authority.observations)
+    assert not authority.runtime_entitlement_qualified
+
+
+def test_runtime_qualification_requires_bound_typed_semantic_evidence() -> None:
+    required = tuple(sorted(MASSIVE_ENTITLEMENT_EVIDENCE_KINDS))
+    evidence = tuple(
+        MassiveEntitlementSemanticEvidence.build(
+            surface_id=surface,
+            evidence_kind=MASSIVE_ENTITLEMENT_EVIDENCE_KINDS[surface],
+            source_receipts=(hashlib.sha256(surface.encode()).hexdigest(),),
+            observed_schema_sha256=hashlib.sha256(
+                f"schema:{surface}".encode()
+            ).hexdigest(),
+            result_count=1,
+        )
+        for surface in required
+    )
+    receipts = {row.surface_id: row.receipt_sha256 for row in evidence}
+    observations = tuple(
+        replace(
+            _observation(surface, "available", 200),
+            semantic_evidence_receipt_sha256=receipts.get(surface),
+        )
+        for surface in (
+            "corporate-actions",
+            "day-aggregates",
+            "delayed-websocket",
+            "financials-and-ratios",
+            "flat-files",
+            "historical-quotes",
+            "history-boundary",
+            "minute-aggregates",
+            "reference-rest",
+            "trades-rest",
+        )
+    )
+
+    authority = build_massive_developer_entitlement_authority(
+        observations,
+        observed_at_ms=1_001,
+        semantic_evidence=evidence,
+    )
+
+    assert authority.runtime_entitlement_qualified
