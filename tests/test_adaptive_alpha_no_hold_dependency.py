@@ -47,7 +47,7 @@ def test_import_firewall_rejects_historical_hold_modules(tmp_path: Path) -> None
 def test_all_current_adaptive_python_modules_pass_import_firewall() -> None:
     root = Path(__file__).parents[1] / "src" / "rl_quant"
     patterns = (
-        "protocol/massive_adaptive_*.py",
+        "protocol/massive_*.py",
         "data_sources/massive/**/*.py",
         "alpha/massive_*.py",
         "features/massive_*.py",
