@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from io import BytesIO
+import json
 from pathlib import Path
 import time
 from typing import Any, Callable, Mapping
@@ -23,6 +24,7 @@ from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
     load_massive_source_bundle,
     publish_massive_source_object,
+    read_loaded_massive_source_bytes,
 )
 from rl_quant.data_sources.massive.trade_extraction import MASSIVE_FLAT_TRADES_DATASET_ID
 from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes, semantic_sha256
@@ -153,6 +155,10 @@ class MassiveFlatFileListingAcquisitionEvidenceV0:
             tuple(asdict(row) for row in self.page_metadata)
         ):
             raise MassiveFlatFileListingAcquisitionError("page metadata inventory differs")
+        if sum(row.key_count for row in self.page_metadata) != self.object_count:
+            raise MassiveFlatFileListingAcquisitionError(
+                "page key counts do not reconcile to the object inventory"
+            )
         for name in (
             "page_metadata_inventory_sha256",
             "object_inventory_sha256",
@@ -196,6 +202,161 @@ class MassiveCapturedFlatFileListingV0:
             != self.loaded_listing.receipt_sha256
         ):
             raise MassiveFlatFileListingAcquisitionError("captured listing links differ")
+        if (
+            self.acquisition_evidence.completed_at_ms
+            != self.loaded_acquisition.receipt.downloaded_at_ms
+            or self.acquisition_evidence.completed_at_ms
+            != self.loaded_listing.receipt.downloaded_at_ms
+            or self.acquisition_evidence.completed_at_ms
+            != self.committed_listing.listing_observed_at_ms
+            or self.loaded_acquisition.receipt.entitlement_receipt_sha256
+            != self.loaded_listing.receipt.entitlement_receipt_sha256
+        ):
+            raise MassiveFlatFileListingAcquisitionError(
+                "acquisition and listing chronology/entitlement differ"
+            )
+        listing_inventory = tuple(
+            {
+                "dataset_id": entry.dataset_id,
+                "source_object_key": entry.source_object_key,
+                "etag": entry.etag,
+                "content_length": entry.content_length,
+                "last_modified_at_ms": entry.vendor_last_modified_at_ms,
+            }
+            for entry in self.committed_listing.entries
+        )
+        listing_prefixes = {
+            entry.source_object_key.rsplit("/", 1)[0] + "/"
+            for entry in self.committed_listing.entries
+        }
+        if (
+            self.acquisition_evidence.object_count != len(listing_inventory)
+            or self.acquisition_evidence.object_inventory_sha256
+            != semantic_sha256(listing_inventory)
+            or listing_prefixes != {self.acquisition_evidence.prefix}
+        ):
+            raise MassiveFlatFileListingAcquisitionError(
+                "acquisition and committed-listing inventories differ"
+            )
+
+
+def parse_massive_flat_file_listing_acquisition_v0(
+    *,
+    root: str | Path,
+    loaded_acquisition: LoadedMassiveSourceObject,
+) -> MassiveFlatFileListingAcquisitionEvidenceV0:
+    """Reload one acquisition receipt from its committed canonical bytes."""
+
+    loaded_acquisition.validate()
+    if (
+        loaded_acquisition.receipt.dataset_id
+        != MASSIVE_FLAT_FILE_LISTING_ACQUISITION_DATASET_ID
+        or loaded_acquisition.receipt.schema_sha256
+        != MASSIVE_FLAT_FILE_LISTING_ACQUISITION_SCHEMA_SHA256
+    ):
+        raise MassiveFlatFileListingAcquisitionError(
+            "acquisition source dataset/schema differ"
+        )
+    payload_bytes = read_loaded_massive_source_bytes(
+        root=root, loaded_source=loaded_acquisition
+    )
+    try:
+        payload = json.loads(payload_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MassiveFlatFileListingAcquisitionError(
+            "acquisition source is not valid JSON"
+        ) from exc
+    if not isinstance(payload, dict) or canonical_json_file_bytes(payload) != payload_bytes:
+        raise MassiveFlatFileListingAcquisitionError(
+            "acquisition source must use exact canonical JSON bytes"
+        )
+    expected_fields = {
+        "schema",
+        "endpoint_url",
+        "bucket",
+        "prefix",
+        "requested_at_ms",
+        "completed_at_ms",
+        "page_count",
+        "provider_request_ids",
+        "page_metadata",
+        "page_metadata_inventory_sha256",
+        "object_count",
+        "object_inventory_sha256",
+        "access_key_environment_variable",
+        "secret_key_environment_variable",
+        "signature_version",
+        "receipt_sha256",
+    }
+    if set(payload) != expected_fields:
+        raise MassiveFlatFileListingAcquisitionError(
+            "acquisition source field inventory drifted"
+        )
+    raw_pages = payload["page_metadata"]
+    if not isinstance(raw_pages, list):
+        raise MassiveFlatFileListingAcquisitionError(
+            "acquisition page metadata is malformed"
+        )
+    try:
+        page_metadata = tuple(
+            MassiveFlatFileListingPageEvidenceV0(**row) for row in raw_pages
+        )
+        evidence = MassiveFlatFileListingAcquisitionEvidenceV0(
+            schema=payload["schema"],
+            endpoint_url=payload["endpoint_url"],
+            bucket=payload["bucket"],
+            prefix=payload["prefix"],
+            requested_at_ms=payload["requested_at_ms"],
+            completed_at_ms=payload["completed_at_ms"],
+            page_count=payload["page_count"],
+            provider_request_ids=tuple(payload["provider_request_ids"]),
+            page_metadata=page_metadata,
+            page_metadata_inventory_sha256=payload[
+                "page_metadata_inventory_sha256"
+            ],
+            object_count=payload["object_count"],
+            object_inventory_sha256=payload["object_inventory_sha256"],
+            access_key_environment_variable=payload[
+                "access_key_environment_variable"
+            ],
+            secret_key_environment_variable=payload[
+                "secret_key_environment_variable"
+            ],
+            signature_version=payload["signature_version"],
+            receipt_sha256=payload["receipt_sha256"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MassiveFlatFileListingAcquisitionError(
+            "acquisition source values are malformed"
+        ) from exc
+    evidence.validate()
+    if evidence.completed_at_ms != loaded_acquisition.receipt.downloaded_at_ms:
+        raise MassiveFlatFileListingAcquisitionError(
+            "acquisition completion differs from committed download"
+        )
+    return evidence
+
+
+def validate_massive_captured_flat_file_listing_v0(
+    *, root: str | Path, captured_listing: MassiveCapturedFlatFileListingV0
+) -> None:
+    """Independently rederive both sides of an authenticated listing capture."""
+
+    captured_listing.validate()
+    expected_acquisition = parse_massive_flat_file_listing_acquisition_v0(
+        root=root, loaded_acquisition=captured_listing.loaded_acquisition
+    )
+    expected_listing = parse_massive_flat_file_listing_v0(
+        root=root, loaded_listing=captured_listing.loaded_listing
+    )
+    if (
+        expected_acquisition != captured_listing.acquisition_evidence
+        or expected_listing != captured_listing.committed_listing
+    ):
+        raise MassiveFlatFileListingAcquisitionError(
+            "captured listing was not derived from committed acquisition bytes"
+        )
+    captured_listing.validate()
 
 
 def _last_modified_ms(value: object) -> int:
@@ -383,7 +544,9 @@ def capture_massive_flat_file_listing_v0(
         loaded_listing=loaded_listing,
         committed_listing=committed_listing,
     )
-    result.validate()
+    validate_massive_captured_flat_file_listing_v0(
+        root=root_path, captured_listing=result
+    )
     return result
 
 
@@ -398,4 +561,6 @@ __all__ = [
     "MassiveFlatFileListingAcquisitionEvidenceV0",
     "MassiveFlatFileListingPageEvidenceV0",
     "capture_massive_flat_file_listing_v0",
+    "parse_massive_flat_file_listing_acquisition_v0",
+    "validate_massive_captured_flat_file_listing_v0",
 ]

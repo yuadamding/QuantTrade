@@ -122,6 +122,12 @@ class MassiveFinalizedProcessingBenchmarkV0:
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveFinalizedProcessingCapabilityError("benchmark receipt differs")
 
+    @property
+    def readiness_authorizing(self) -> bool:
+        """Caller-supplied scan/partition timings are development evidence only."""
+
+        return False
+
 
 def build_massive_finalized_processing_benchmark_v0(
     *,
@@ -304,6 +310,12 @@ class MassiveFinalizedProcessingCapabilityV0:
             and scan.source_row_count <= self.maximum_decompressed_rows
             and scan.parser_source_sha256 == self.parser_source_sha256
         )
+
+    @property
+    def readiness_authorizing(self) -> bool:
+        """This legacy capability excludes the feature-to-order path."""
+
+        return False
 
 
 def build_massive_finalized_processing_capability_v0(

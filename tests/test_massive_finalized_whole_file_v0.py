@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 import gzip
+import inspect
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,11 +28,7 @@ from rl_quant.data_sources.massive.finalized_daily_scan import (
     scan_massive_daily_trade_file_v0,
 )
 from rl_quant.data_sources.massive.finalized_listing import (
-    MASSIVE_FLAT_FILE_LISTING_CAPTURE_SCHEMA,
-    MASSIVE_FLAT_FILE_LISTING_CAPTURE_SCHEMA_SHA256,
-    MASSIVE_FLAT_FILE_LISTING_DATASET_ID,
     canonical_massive_trade_object_key,
-    parse_massive_flat_file_listing_v0,
 )
 from rl_quant.data_sources.massive.finalized_listing_acquisition import (
     MASSIVE_FLAT_FILE_BUCKET,
@@ -40,7 +37,6 @@ from rl_quant.data_sources.massive.finalized_listing_acquisition import (
 )
 from rl_quant.data_sources.massive.finalized_origin import (
     MASSIVE_FINALIZED_PROCESSING_ALLOWANCE_MS,
-    build_massive_vendor_object_metadata_from_listing_v0,
 )
 from rl_quant.data_sources.massive.finalized_origin_authority import (
     MassiveQualifiedFinalizedOriginError,
@@ -50,11 +46,21 @@ from rl_quant.data_sources.massive.finalized_origin_authority import (
 from rl_quant.data_sources.massive.finalized_origin_policy import (
     MASSIVE_FINALIZED_ORIGIN_POLICY_V0,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V0_RECEIPT_SHA256,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V1,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V1_RECEIPT_SHA256,
     MassiveFinalizedOriginPolicyError,
 )
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
     MassiveDailyTradePartitionError,
     build_massive_finalized_feature_domain_spec_v0,
+)
+from rl_quant.data_sources.massive.finalized_readiness import (
+    MASSIVE_FINALIZED_MINIMUM_READINESS_SESSIONS_V0,
+    MassiveFinalizedReadinessError,
+    build_massive_finalized_readiness_capability_v0,
+    build_massive_finalized_readiness_panel_spec_v0,
+    build_massive_finalized_readiness_stage_artifact_v0,
+    measure_massive_finalized_full_readiness_v0,
 )
 from rl_quant.data_sources.massive.processing_capability import (
     build_massive_finalized_processing_capability_v0,
@@ -74,7 +80,7 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_COLUMNS,
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
 )
-from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes, semantic_sha256
+from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 
 EASTERN = ZoneInfo("America/New_York")
@@ -332,26 +338,43 @@ def _qualified_sources(
                 "last_modified_at_ms": last_modified[day],
             }
         )
-    listing_payload = canonical_json_file_bytes(
+    pages = (
         {
-            "schema": MASSIVE_FLAT_FILE_LISTING_CAPTURE_SCHEMA,
-            "observed_at_ms": observed_at_ms,
-            "entries": listing_entries,
-        }
+            "ResponseMetadata": {"RequestId": "qualified-listing-request"},
+            "IsTruncated": False,
+            "Contents": [
+                {
+                    "Key": row["source_object_key"],
+                    "ETag": f'"{row["etag"]}"',
+                    "Size": row["content_length"],
+                    "LastModified": datetime.fromtimestamp(
+                        row["last_modified_at_ms"] / 1_000, tz=UTC
+                    ),
+                }
+                for row in listing_entries
+            ],
+        },
     )
-    listing_key = "massive-flat-file-listing-v0/2026/08/28/listing.json"
-    loaded_listing = _publish(
+
+    class FakePaginator:
+        def paginate(self, **kwargs):
+            return pages
+
+    class FakeClient:
+        def get_paginator(self, operation: str):
+            return FakePaginator()
+
+    (tmp_path / "listing").mkdir(parents=True, exist_ok=True)
+    capture_times = iter((observed_at_ms - 1, observed_at_ms))
+    captured_listing = capture_massive_flat_file_listing_v0(
+        s3_client=FakeClient(),
         root=tmp_path / "listing",
-        key=listing_key,
-        payload=listing_payload,
-        dataset_id=MASSIVE_FLAT_FILE_LISTING_DATASET_ID,
-        schema_sha256=MASSIVE_FLAT_FILE_LISTING_CAPTURE_SCHEMA_SHA256,
-        downloaded_at_ms=observed_at_ms,
-        etag="listing-etag",
+        year=int(min(source_rows)[:4]),
+        month=int(min(source_rows)[5:7]),
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        now_ms=lambda: next(capture_times),
     )
-    listing = parse_massive_flat_file_listing_v0(
-        root=tmp_path / "listing", loaded_listing=loaded_listing
-    )
+    listing = captured_listing.committed_listing
     stacks = []
     benchmarks = []
     for day, loaded in sorted(loaded_by_day.items()):
@@ -372,25 +395,92 @@ def _qualified_sources(
         )
         stacks.append((day, loaded, session, scan, partition))
         benchmarks.append(benchmark)
-    capability = build_massive_finalized_processing_capability_v0(benchmarks)
+    legacy_capability = build_massive_finalized_processing_capability_v0(benchmarks)
+    assert legacy_capability.readiness_authorizing is False
+
+    def stage_runner(stage_id: str, inputs: tuple[str, ...]):
+        output = _publish(
+            root=tmp_path / "readiness",
+            key=f"readiness-v0/{stage_id}.json",
+            payload=(semantic_sha256((stage_id, inputs)) + "\n").encode(),
+            dataset_id=f"massive-finalized-readiness-{stage_id}-v0",
+            schema_sha256=semantic_sha256(("readiness-stage-schema", stage_id)),
+            downloaded_at_ms=observed_at_ms + 20,
+            etag=f"readiness-{stage_id}",
+        )
+        return build_massive_finalized_readiness_stage_artifact_v0(
+            stage_id=stage_id,
+            input_artifact_receipts=inputs,
+            output_loaded_source=output,
+            implementation_source_sha256=semantic_sha256(
+                ("readiness-implementation", stage_id)
+            ),
+        )
+
+    monotonic_values = iter((1_000_000_000, 1_010_000_000))
+    wall_values = iter((observed_at_ms, observed_at_ms + 10))
+    base_run = measure_massive_finalized_full_readiness_v0(
+        scan_evidence=stacks[0][3],
+        partition_manifest=stacks[0][4],
+        listing_acquisition_receipt_sha256=(
+            captured_listing.acquisition_evidence.receipt_sha256
+        ),
+        hardware_contract_receipt_sha256=HARDWARE_RECEIPT,
+        software_commit_sha256=SOFTWARE_COMMIT,
+        pipeline_implementation_source_sha256=semantic_sha256(
+            "test-full-readiness-pipeline"
+        ),
+        stage_runner=stage_runner,
+        monotonic_ns=lambda: next(monotonic_values),
+        wall_ms=lambda: next(wall_values),
+    )
+    readiness_dates = tuple(
+        f"{year}-{month:02d}-{day:02d}"
+        for year in (2024, 2025, 2026)
+        for month, day in ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8))
+    )[:20]
+    readiness_runs = []
+    for index, session_date in enumerate(readiness_dates):
+        run = replace(
+            base_run,
+            source_session_date=session_date,
+            source_object_receipt_sha256=semantic_sha256(
+                ("readiness-source", session_date)
+            ),
+            compressed_bytes=base_run.compressed_bytes + index,
+            source_row_count=base_run.source_row_count + index,
+            ticker_count=base_run.ticker_count + index,
+            post_close_correction_row_count=1 if index == 19 else 0,
+        )
+        run = replace(run, receipt_sha256=semantic_sha256(run.unsigned()))
+        run.validate()
+        readiness_runs.append(run)
+    largest_run = readiness_runs[-1]
+    panel_spec = build_massive_finalized_readiness_panel_spec_v0(
+        source_session_dates=readiness_dates,
+        largest_compressed_source_receipt_sha256=(
+            largest_run.source_object_receipt_sha256
+        ),
+        largest_row_count_source_receipt_sha256=(
+            largest_run.source_object_receipt_sha256
+        ),
+        correction_activity_session_dates=(largest_run.source_session_date,),
+        high_ticker_count_session_dates=(largest_run.source_session_date,),
+    )
+    capability = build_massive_finalized_readiness_capability_v0(
+        panel_spec=panel_spec, runs=readiness_runs
+    )
     qualified = []
     for day, loaded, session, scan, partition in stacks:
-        listing_entry = listing.resolve(source_object_key=loaded.receipt.source_object_key)
-        metadata = build_massive_vendor_object_metadata_from_listing_v0(
-            committed_listing=listing,
-            listing_entry=listing_entry,
-            loaded_source=loaded,
-        )
         qualified.append(
             build_massive_qualified_finalized_daily_source_v0(
+                listing_root=tmp_path / "listing",
                 loaded_source=loaded,
-                committed_listing=listing,
-                listing_entry=listing_entry,
-                metadata=metadata,
+                captured_listing=captured_listing,
                 scan_evidence=scan,
                 partition_manifest=partition,
                 feature_domain_spec=feature_spec,
-                processing_capability=capability,
+                readiness_capability=capability,
                 session_authority=session_authority,
                 source_session=session,
             )
@@ -402,9 +492,11 @@ def _qualified_sources(
         "feature_spec": feature_spec,
         "identity": identity,
         "listing": listing,
+        "captured_listing": captured_listing,
         "loaded": loaded_by_day,
         "stacks": stacks,
         "benchmarks": tuple(benchmarks),
+        "legacy_capability": legacy_capability,
         "capability": capability,
         "qualified": tuple(qualified),
     }
@@ -525,6 +617,20 @@ def test_authenticated_listing_capture_exhausts_pages_and_persists_no_secrets(
     assert b"TEST_ACCESS_KEY_ENV" in acquisition_bytes
     assert b"real-access-secret" not in acquisition_bytes
     result.validate()
+    tampered_acquisition = replace(
+        result.acquisition_evidence,
+        object_inventory_sha256=semantic_sha256("substituted-object-inventory"),
+    )
+    tampered_acquisition = replace(
+        tampered_acquisition,
+        receipt_sha256=semantic_sha256(tampered_acquisition.unsigned()),
+    )
+    tampered_acquisition.validate()
+    with pytest.raises(
+        MassiveFlatFileListingAcquisitionError,
+        match="committed-listing inventories differ",
+    ):
+        replace(result, acquisition_evidence=tampered_acquisition).validate()
 
 
 def test_listing_capture_rejects_incomplete_pagination(tmp_path: Path) -> None:
@@ -590,6 +696,15 @@ def test_participant_time_domain_retains_late_corrections_and_excludes_after_hou
     assert partition.source_row_count == 4
     assert partition.active_regular_session_row_count == 2
     assert partition.after_hours_row_count == 1
+    qualified = stack["qualified"][0]
+    assert qualified.listing_acquisition_receipt_sha256 == (
+        stack["captured_listing"].acquisition_evidence.receipt_sha256
+    )
+    assert qualified.measured_feature_ready_upper_bound_at_ms == (
+        qualified.vendor_last_modified_at_ms
+        + qualified.publication_safety_margin_ms
+        + stack["capability"].maximum_runtime_ms
+    )
     assert not hasattr(stack["qualified"][0], "panel_materialization_authorized")
     _, repeated_scan, repeated_partition, _ = (
         measure_massive_finalized_source_processing_v0(
@@ -622,20 +737,15 @@ def test_fake_partition_receipt_cannot_enter_qualified_source(tmp_path: Path) ->
     )
     _, loaded, session, scan, partition = stack["stacks"][0]
     forged = replace(partition, receipt_sha256="0" * 64)
-    listing_entry = stack["listing"].resolve(source_object_key=loaded.receipt.source_object_key)
-    metadata = build_massive_vendor_object_metadata_from_listing_v0(
-        committed_listing=stack["listing"], listing_entry=listing_entry, loaded_source=loaded
-    )
     with pytest.raises(MassiveDailyTradePartitionError, match="receipt differs"):
         build_massive_qualified_finalized_daily_source_v0(
+            listing_root=tmp_path / "listing",
             loaded_source=loaded,
-            committed_listing=stack["listing"],
-            listing_entry=listing_entry,
-            metadata=metadata,
+            captured_listing=stack["captured_listing"],
             scan_evidence=scan,
             partition_manifest=forged,
             feature_domain_spec=stack["feature_spec"],
-            processing_capability=stack["capability"],
+            readiness_capability=stack["capability"],
             session_authority=stack["session_authority"],
             source_session=session,
         )
@@ -651,31 +761,34 @@ def test_processing_over_55_minutes_blocks_source(tmp_path: Path) -> None:
         last_modified={day: _ms("2026-08-21", time(11, 0))},
     )
     too_slow = MASSIVE_FINALIZED_PROCESSING_ALLOWANCE_MS + 1
-    capability = replace(
-        stack["capability"],
-        observed_runtime_ms=(too_slow,),
-        p95_runtime_ms=too_slow,
-        p99_runtime_ms=too_slow,
-        maximum_runtime_ms=too_slow,
-        capability_passed=False,
+    slow_runs = list(stack["capability"].runs)
+    slow_run = replace(
+        slow_runs[-1],
+        monotonic_finished_ns=(
+            slow_runs[-1].monotonic_started_ns + too_slow * 1_000_000
+        ),
+        observed_full_pipeline_runtime_ms=too_slow,
     )
-    capability = replace(capability, receipt_sha256=semantic_sha256(capability.unsigned()))
-    capability.validate()
+    slow_run = replace(
+        slow_run, receipt_sha256=semantic_sha256(slow_run.unsigned())
+    )
+    slow_run.validate()
+    slow_runs[-1] = slow_run
+    capability = build_massive_finalized_readiness_capability_v0(
+        panel_spec=stack["capability"].panel_spec,
+        runs=slow_runs,
+    )
+    assert capability.capability_passed is False
     _, loaded, session, scan, partition = stack["stacks"][0]
-    listing_entry = stack["listing"].resolve(source_object_key=loaded.receipt.source_object_key)
-    metadata = build_massive_vendor_object_metadata_from_listing_v0(
-        committed_listing=stack["listing"], listing_entry=listing_entry, loaded_source=loaded
-    )
     with pytest.raises(MassiveQualifiedFinalizedOriginError, match="does not cover"):
         build_massive_qualified_finalized_daily_source_v0(
+            listing_root=tmp_path / "listing",
             loaded_source=loaded,
-            committed_listing=stack["listing"],
-            listing_entry=listing_entry,
-            metadata=metadata,
+            captured_listing=stack["captured_listing"],
             scan_evidence=scan,
             partition_manifest=partition,
             feature_domain_spec=stack["feature_spec"],
-            processing_capability=capability,
+            readiness_capability=capability,
             session_authority=stack["session_authority"],
             source_session=session,
         )
@@ -762,6 +875,14 @@ def test_origin_policy_receipt_rejects_staleness_drift() -> None:
         MASSIVE_FINALIZED_ORIGIN_POLICY_V0.receipt_sha256
         == MASSIVE_FINALIZED_ORIGIN_POLICY_V0_RECEIPT_SHA256
     )
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V1.receipt_sha256
+        == MASSIVE_FINALIZED_ORIGIN_POLICY_V1_RECEIPT_SHA256
+    )
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V1.readiness_capability_scope
+        == "full-feature-to-order-readiness"
+    )
     drifted = replace(
         MASSIVE_FINALIZED_ORIGIN_POLICY_V0,
         maximum_source_staleness_sessions=5,
@@ -769,3 +890,68 @@ def test_origin_policy_receipt_rejects_staleness_drift() -> None:
     drifted = replace(drifted, receipt_sha256=semantic_sha256(drifted.unsigned()))
     with pytest.raises(MassiveFinalizedOriginPolicyError, match="staleness"):
         drifted.validate()
+
+
+def test_manual_listing_and_partition_timing_paths_are_nonauthorizing() -> None:
+    parameters = inspect.signature(
+        build_massive_qualified_finalized_daily_source_v0
+    ).parameters
+    assert "captured_listing" in parameters
+    assert "listing_root" in parameters
+    assert "committed_listing" not in parameters
+    assert "listing_entry" not in parameters
+    assert "metadata" not in parameters
+    assert "readiness_capability" in parameters
+    assert "processing_capability" not in parameters
+
+
+def test_legacy_partition_timing_cannot_authorize_qualified_source(
+    tmp_path: Path,
+) -> None:
+    day = "2026-08-20"
+    stack = _qualified_sources(
+        tmp_path,
+        sessions=(_session(day), _session("2026-08-21")),
+        source_rows={
+            day: (
+                _trade_row(
+                    ticker="AAA",
+                    trade_id="A1",
+                    participant_ns=_ns(day, time(15, 59)),
+                    sip_ns=_ns(day, time(15, 59)),
+                ),
+            )
+        },
+        last_modified={day: _ms("2026-08-21", time(11, 0))},
+    )
+    _, loaded, session, scan, partition = stack["stacks"][0]
+    with pytest.raises(
+        MassiveQualifiedFinalizedOriginError,
+        match="full feature-to-order readiness",
+    ):
+        build_massive_qualified_finalized_daily_source_v0(
+            listing_root=tmp_path / "listing",
+            loaded_source=loaded,
+            captured_listing=stack["captured_listing"],
+            scan_evidence=scan,
+            partition_manifest=partition,
+            feature_domain_spec=stack["feature_spec"],
+            readiness_capability=stack["legacy_capability"],
+            session_authority=stack["session_authority"],
+            source_session=session,
+        )
+
+
+def test_readiness_panel_requires_twenty_sessions_across_three_years() -> None:
+    too_small = tuple(
+        f"2026-01-{day:02d}"
+        for day in range(1, MASSIVE_FINALIZED_MINIMUM_READINESS_SESSIONS_V0)
+    )
+    with pytest.raises(MassiveFinalizedReadinessError, match="session minimum"):
+        build_massive_finalized_readiness_panel_spec_v0(
+            source_session_dates=too_small,
+            largest_compressed_source_receipt_sha256="1" * 64,
+            largest_row_count_source_receipt_sha256="2" * 64,
+            correction_activity_session_dates=(too_small[0],),
+            high_ticker_count_session_dates=(too_small[-1],),
+        )
