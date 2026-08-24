@@ -31,6 +31,7 @@ from rl_quant.data_sources.massive.finalized_listing_acquisition import (
 )
 from rl_quant.data_sources.massive.finalized_origin_policy import (
     MASSIVE_FINALIZED_ORIGIN_POLICY_V3,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V5,
 )
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
     MassiveFinalizedFeatureDomainSpecV0,
@@ -124,18 +125,12 @@ MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256 = semantic_sha256(
         "implementation_inventory": (
             MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
         ),
-        "origin_policy": "frozen-v4-receipt-field",
+        "origin_policy": "frozen-v5-receipt-field",
         "maximum_runtime_ms": 55 * 60 * 1_000,
         "historical_capability": False,
         "performance_authorization": False,
     }
 )
-# Filled from the immutable V4 policy after its independent receipt is frozen.
-MASSIVE_PRODUCTION_ORIGIN_POLICY_V4_RECEIPT_SHA256_FROZEN = (
-    "90a24c87e91e3488f8e534887b70f475220b80a8c493d5346504d1577ee89c6e"
-)
-
-
 class MassiveProductionTypedRunV2Error(ValueError):
     """Production timing evidence differs from real-clock committed inputs."""
 
@@ -681,6 +676,40 @@ class MassiveProductionTypedRunV3Error(ValueError):
     """Source-derived production host, clock, or environment evidence differs."""
 
 
+def validate_massive_production_clock_interval_v3(
+    *,
+    clock_authority: MassiveExecutionClockAuthorityV2,
+    outer_started_at_ms: int,
+    outer_finished_at_ms: int,
+    host_capture_finished_at_ms: int,
+    environment_capture_finished_at_ms: int,
+    clock_source_verified_at_ms: int,
+    input_inventory_verified_at_ms: int,
+    decision_at_ms: int,
+) -> tuple[int, int]:
+    """Validate the full run against two-sided wall-clock uncertainty bounds."""
+
+    clock_authority.validate()
+    earliest_start = clock_authority.utc_lower_bound_ms(outer_started_at_ms)
+    latest_finish = clock_authority.utc_upper_bound_ms(outer_finished_at_ms)
+    if (
+        clock_authority.measurement_utc_upper_bound_ms > earliest_start
+        or latest_finish > clock_authority.qualification_end_utc_lower_bound_ms
+        or latest_finish > decision_at_ms
+        or clock_authority.utc_upper_bound_ms(host_capture_finished_at_ms)
+        > earliest_start
+        or clock_authority.utc_upper_bound_ms(environment_capture_finished_at_ms)
+        > earliest_start
+        or clock_authority.utc_upper_bound_ms(clock_source_verified_at_ms)
+        > earliest_start
+        or input_inventory_verified_at_ms > earliest_start
+    ):
+        raise MassiveProductionTypedRunV3Error(
+            "source-derived timing evidence escaped the qualified interval"
+        )
+    return earliest_start, latest_finish
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveProductionTypedRunV3:
     development_engine_run: MassiveMeasuredTypedRunV1
@@ -727,7 +756,7 @@ class MassiveProductionTypedRunV3:
             or self.production_run_spec_receipt_sha256
             != MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256
             or self.origin_policy_receipt_sha256
-            != MASSIVE_PRODUCTION_ORIGIN_POLICY_V4_RECEIPT_SHA256_FROZEN
+            != MASSIVE_FINALIZED_ORIGIN_POLICY_V5.receipt_sha256
             or self.execution_environment.pipeline_implementation_inventory_sha256
             != MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
             or not self.host_authority.captured_by_fixed_runtime
@@ -755,25 +784,22 @@ class MassiveProductionTypedRunV3:
             raise MassiveProductionTypedRunV3Error(
                 "production typed run v3 qualification differs"
             )
-        earliest_start = self.clock_authority.utc_lower_bound_ms(
-            self.outer_started_at_ms
+        validate_massive_production_clock_interval_v3(
+            clock_authority=self.clock_authority,
+            outer_started_at_ms=self.outer_started_at_ms,
+            outer_finished_at_ms=self.outer_finished_at_ms,
+            host_capture_finished_at_ms=self.host_authority.capture_finished_at_ms,
+            environment_capture_finished_at_ms=(
+                self.execution_environment.capture_finished_at_ms
+            ),
+            clock_source_verified_at_ms=(
+                self.clock_authority.loaded_source.verified_at_ms
+            ),
+            input_inventory_verified_at_ms=(
+                self.input_availability_authority.loaded_source.verified_at_ms
+            ),
+            decision_at_ms=engine.decision_origin.decision_at_ms,
         )
-        latest_finish = self.clock_authority.utc_upper_bound_ms(
-            self.outer_finished_at_ms
-        )
-        if (
-            earliest_start < self.clock_authority.measurement_observed_at_ms
-            or latest_finish > self.clock_authority.qualification_valid_until_ms
-            or latest_finish > engine.decision_origin.decision_at_ms
-            or self.host_authority.capture_finished_at_ms > earliest_start
-            or self.execution_environment.capture_finished_at_ms > earliest_start
-            or self.clock_authority.loaded_source.verified_at_ms > earliest_start
-            or self.input_availability_authority.loaded_source.verified_at_ms
-            > earliest_start
-        ):
-            raise MassiveProductionTypedRunV3Error(
-                "source-derived timing evidence escaped the qualified interval"
-            )
         expected_stage_inventory = semantic_sha256(
             tuple(
                 (
@@ -843,8 +869,6 @@ def measure_massive_typed_finalized_run_production_v3(
     host_capture_root: str | Path,
     clock_capture_root: str | Path,
     environment_capture_root: str | Path,
-    repository_root: str | Path,
-    container_image_digest_file: str | Path,
     storage_roots: dict[str, str | Path],
     source_root: str | Path,
     spool_root: str | Path,
@@ -862,8 +886,6 @@ def measure_massive_typed_finalized_run_production_v3(
         root=environment_capture_root,
         host_authority=host_authority,
         host_root=host_capture_root,
-        repository_root=repository_root,
-        container_image_digest_file=container_image_digest_file,
         s3_client=s3_client,
         storage_roots=storage_roots,
         pipeline_implementation_inventory_sha256=(
@@ -970,7 +992,7 @@ def measure_massive_typed_finalized_run_production_v3(
         // 1_000_000,
         "timing_source_kind": "fixed-host-chrony-and-runtime-environment-capture",
         "origin_policy_receipt_sha256": (
-            MASSIVE_PRODUCTION_ORIGIN_POLICY_V4_RECEIPT_SHA256_FROZEN
+            MASSIVE_FINALIZED_ORIGIN_POLICY_V5.receipt_sha256
         ),
         "production_run_spec_receipt_sha256": (
             MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256
@@ -1005,4 +1027,5 @@ __all__ = [
     "MassiveProductionTypedRunV3Error",
     "measure_massive_typed_finalized_run_production_v2",
     "measure_massive_typed_finalized_run_production_v3",
+    "validate_massive_production_clock_interval_v3",
 ]

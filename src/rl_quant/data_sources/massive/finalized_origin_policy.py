@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from rl_quant.data_sources.massive.finalized_archive_scope import (
     MASSIVE_FINALIZED_ARCHIVE_SCOPE_V1_SPEC_SHA256,
@@ -54,7 +55,7 @@ from rl_quant.data_sources.massive.finalized_readiness import (
 from rl_quant.data_sources.massive.finalized_typed_decision_origin import (
     MASSIVE_TYPED_DECISION_ORIGIN_V1_SPEC_SHA256,
 )
-from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 
 MASSIVE_FINALIZED_ORIGIN_POLICY_V0_SCHEMA = (
     "rl-quant.massive-finalized-origin-policy-v0"
@@ -70,6 +71,9 @@ MASSIVE_FINALIZED_ORIGIN_POLICY_V3_SCHEMA = (
 )
 MASSIVE_FINALIZED_ORIGIN_POLICY_V4_SCHEMA = (
     "rl-quant.massive-finalized-origin-policy-v4"
+)
+MASSIVE_FINALIZED_ORIGIN_POLICY_V5_SCHEMA = (
+    "rl-quant.massive-finalized-origin-policy-v5"
 )
 MASSIVE_TYPED_PIPELINE_STAGE_IDS_V0 = (
     "daily-features",
@@ -115,6 +119,35 @@ MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256_FROZEN = (
 )
 MASSIVE_PRODUCTION_TYPED_IMPLEMENTATION_INVENTORY_V3_FROZEN = (
     "7a2738d8c321f5c87efb54745e1c9cdea6daa98336e45b42d46f44248fcccf76"
+)
+MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256_PREDECESSOR_FROZEN = (
+    "89e3afd74af3e263f441fc535ac395f8a0d021e54f26cf11737e93224363694d"
+)
+MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256_PREDECESSOR_FROZEN = (
+    "25ccff5ad3623bf9acc18f5cf5ffeb41a9078b139d5a4ceeae799ce3c819ba71"
+)
+MASSIVE_PRODUCTION_TYPED_RUN_V3_HARDENED_SPEC_SHA256_FROZEN = (
+    "a64c7475c162e86120083abf77f162bbd44e44c1a5d9880823815d8cc1c5e668"
+)
+MASSIVE_PRODUCTION_TYPED_IMPLEMENTATION_INVENTORY_V3_HARDENED_FROZEN = (
+    "c95eebbd60ac04460765383c9d88a9906e4144ffed3f2772396065a6b05b9e4f"
+)
+MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_RELATIVE_PATHS_V5 = (
+    "src/rl_quant/data_sources/massive/finalized_runtime_authority.py",
+    "src/rl_quant/workflows/massive_production_typed_run_v2.py",
+    "src/rl_quant/data_sources/massive/finalized_typed_decision_origin.py",
+    "src/rl_quant/data_sources/massive/finalized_archive_scope.py",
+    "src/rl_quant/workflows/massive_historical_readiness_v1.py",
+)
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_INVENTORY_V5 = semantic_sha256(
+    tuple(
+        (
+            relative_path,
+            file_sha256(_REPOSITORY_ROOT / relative_path),
+        )
+        for relative_path in MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_RELATIVE_PATHS_V5
+    )
 )
 
 
@@ -403,8 +436,8 @@ class MassiveFinalizedOriginPolicyV4:
             "production_typed_run_spec_sha256": MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256_FROZEN,
             "production_implementation_inventory_sha256": MASSIVE_PRODUCTION_TYPED_IMPLEMENTATION_INVENTORY_V3_FROZEN,
             "host_execution_spec_sha256": MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
-            "execution_clock_spec_sha256": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
-            "execution_environment_spec_sha256": MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+            "execution_clock_spec_sha256": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256_PREDECESSOR_FROZEN,
+            "execution_environment_spec_sha256": MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256_PREDECESSOR_FROZEN,
             "input_availability_spec_sha256": MASSIVE_INPUT_AVAILABILITY_V1_SPEC_SHA256,
             "timing_source_kind": "fixed-host-chrony-and-runtime-environment-capture",
             "historical_capability_authorized": False,
@@ -425,6 +458,74 @@ class MassiveFinalizedOriginPolicyV4:
         if self.receipt_sha256 != MASSIVE_FINALIZED_ORIGIN_POLICY_V4_RECEIPT_SHA256:
             raise MassiveFinalizedOriginPolicyError(
                 "origin policy v4 frozen receipt drifted"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class MassiveFinalizedOriginPolicyV5:
+    authenticated_object_get_spec_sha256: str
+    archive_scope_spec_sha256: str
+    typed_decision_origin_spec_sha256: str
+    production_typed_run_spec_sha256: str
+    production_implementation_inventory_sha256: str
+    runtime_implementation_source_inventory_sha256: str
+    host_execution_spec_sha256: str
+    execution_clock_spec_sha256: str
+    execution_environment_spec_sha256: str
+    input_availability_spec_sha256: str
+    timing_source_kind: str
+    clock_interval_rule: str
+    container_identity_rule: str
+    imported_source_rule: str
+    historical_capability_authorized: bool
+    source_selection_rule: str
+    decision_local_time: str
+    fill_window: str
+    panel_materialization_authorized: bool
+    predictive_training_authorized: bool
+    portfolio_evaluation_authorized: bool
+    receipt_sha256: str
+    schema: str = MASSIVE_FINALIZED_ORIGIN_POLICY_V5_SCHEMA
+
+    def unsigned(self) -> dict[str, object]:
+        return {
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
+        }
+
+    def validate(self) -> None:
+        expected: dict[str, object] = {
+            "authenticated_object_get_spec_sha256": MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256,
+            "archive_scope_spec_sha256": MASSIVE_FINALIZED_ARCHIVE_SCOPE_V2_SPEC_SHA256,
+            "typed_decision_origin_spec_sha256": MASSIVE_TYPED_DECISION_ORIGIN_V1_SPEC_SHA256,
+            "production_typed_run_spec_sha256": MASSIVE_PRODUCTION_TYPED_RUN_V3_HARDENED_SPEC_SHA256_FROZEN,
+            "production_implementation_inventory_sha256": MASSIVE_PRODUCTION_TYPED_IMPLEMENTATION_INVENTORY_V3_HARDENED_FROZEN,
+            "runtime_implementation_source_inventory_sha256": MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_INVENTORY_V5,
+            "host_execution_spec_sha256": MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
+            "execution_clock_spec_sha256": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
+            "execution_environment_spec_sha256": MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+            "input_availability_spec_sha256": MASSIVE_INPUT_AVAILABILITY_V1_SPEC_SHA256,
+            "timing_source_kind": "fixed-host-chrony-and-runtime-environment-capture",
+            "clock_interval_rule": "measurement-upper<=run-start-lower;run-finish-upper<=qualification-end-lower",
+            "container_identity_rule": "fixed-read-only-runtime-metadata-cross-checked-to-proc-cgroup",
+            "imported_source_rule": "executing-module-root+HEAD-blob-equality",
+            "historical_capability_authorized": False,
+            "source_selection_rule": "immediately-prior-exchange-session",
+            "decision_local_time": "12:30:00-America/New_York",
+            "fill_window": "[15:50:00,16:00:00)-America/New_York",
+            "panel_materialization_authorized": False,
+            "predictive_training_authorized": False,
+            "portfolio_evaluation_authorized": False,
+        }
+        if self.schema != MASSIVE_FINALIZED_ORIGIN_POLICY_V5_SCHEMA:
+            raise MassiveFinalizedOriginPolicyError("origin policy v5 schema drifted")
+        for name, value in expected.items():
+            if getattr(self, name) != value:
+                raise MassiveFinalizedOriginPolicyError(f"{name} drifted")
+        if self.receipt_sha256 != semantic_sha256(self.unsigned()):
+            raise MassiveFinalizedOriginPolicyError("origin policy v5 receipt differs")
+        if self.receipt_sha256 != MASSIVE_FINALIZED_ORIGIN_POLICY_V5_RECEIPT_SHA256:
+            raise MassiveFinalizedOriginPolicyError(
+                "origin policy v5 frozen receipt drifted"
             )
 
 
@@ -548,8 +649,8 @@ def _build_policy_v4() -> MassiveFinalizedOriginPolicyV4:
         "production_typed_run_spec_sha256": MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256_FROZEN,
         "production_implementation_inventory_sha256": MASSIVE_PRODUCTION_TYPED_IMPLEMENTATION_INVENTORY_V3_FROZEN,
         "host_execution_spec_sha256": MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
-        "execution_clock_spec_sha256": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
-        "execution_environment_spec_sha256": MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+        "execution_clock_spec_sha256": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256_PREDECESSOR_FROZEN,
+        "execution_environment_spec_sha256": MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256_PREDECESSOR_FROZEN,
         "input_availability_spec_sha256": MASSIVE_INPUT_AVAILABILITY_V1_SPEC_SHA256,
         "timing_source_kind": "fixed-host-chrony-and-runtime-environment-capture",
         "historical_capability_authorized": False,
@@ -561,6 +662,37 @@ def _build_policy_v4() -> MassiveFinalizedOriginPolicyV4:
         "portfolio_evaluation_authorized": False,
     }
     return MassiveFinalizedOriginPolicyV4(
+        **body,
+        receipt_sha256=semantic_sha256(body),  # type: ignore[arg-type]
+    )
+
+
+def _build_policy_v5() -> MassiveFinalizedOriginPolicyV5:
+    body: dict[str, object] = {
+        "schema": MASSIVE_FINALIZED_ORIGIN_POLICY_V5_SCHEMA,
+        "authenticated_object_get_spec_sha256": MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256,
+        "archive_scope_spec_sha256": MASSIVE_FINALIZED_ARCHIVE_SCOPE_V2_SPEC_SHA256,
+        "typed_decision_origin_spec_sha256": MASSIVE_TYPED_DECISION_ORIGIN_V1_SPEC_SHA256,
+        "production_typed_run_spec_sha256": MASSIVE_PRODUCTION_TYPED_RUN_V3_HARDENED_SPEC_SHA256_FROZEN,
+        "production_implementation_inventory_sha256": MASSIVE_PRODUCTION_TYPED_IMPLEMENTATION_INVENTORY_V3_HARDENED_FROZEN,
+        "runtime_implementation_source_inventory_sha256": MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_INVENTORY_V5,
+        "host_execution_spec_sha256": MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
+        "execution_clock_spec_sha256": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
+        "execution_environment_spec_sha256": MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+        "input_availability_spec_sha256": MASSIVE_INPUT_AVAILABILITY_V1_SPEC_SHA256,
+        "timing_source_kind": "fixed-host-chrony-and-runtime-environment-capture",
+        "clock_interval_rule": "measurement-upper<=run-start-lower;run-finish-upper<=qualification-end-lower",
+        "container_identity_rule": "fixed-read-only-runtime-metadata-cross-checked-to-proc-cgroup",
+        "imported_source_rule": "executing-module-root+HEAD-blob-equality",
+        "historical_capability_authorized": False,
+        "source_selection_rule": "immediately-prior-exchange-session",
+        "decision_local_time": "12:30:00-America/New_York",
+        "fill_window": "[15:50:00,16:00:00)-America/New_York",
+        "panel_materialization_authorized": False,
+        "predictive_training_authorized": False,
+        "portfolio_evaluation_authorized": False,
+    }
+    return MassiveFinalizedOriginPolicyV5(
         **body,
         receipt_sha256=semantic_sha256(body),  # type: ignore[arg-type]
     )
@@ -596,6 +728,11 @@ MASSIVE_FINALIZED_ORIGIN_POLICY_V4_RECEIPT_SHA256 = (
 )
 MASSIVE_FINALIZED_ORIGIN_POLICY_V4 = _build_policy_v4()
 MASSIVE_FINALIZED_ORIGIN_POLICY_V4.validate()
+MASSIVE_FINALIZED_ORIGIN_POLICY_V5_RECEIPT_SHA256 = (
+    "6e8655c150dbb61bf608332c6bb1892c91b2e2c78cb630c1819967501f318dc3"
+)
+MASSIVE_FINALIZED_ORIGIN_POLICY_V5 = _build_policy_v5()
+MASSIVE_FINALIZED_ORIGIN_POLICY_V5.validate()
 
 
 __all__ = [
@@ -614,10 +751,15 @@ __all__ = [
     "MASSIVE_FINALIZED_ORIGIN_POLICY_V4",
     "MASSIVE_FINALIZED_ORIGIN_POLICY_V4_RECEIPT_SHA256",
     "MASSIVE_FINALIZED_ORIGIN_POLICY_V4_SCHEMA",
+    "MASSIVE_FINALIZED_ORIGIN_POLICY_V5",
+    "MASSIVE_FINALIZED_ORIGIN_POLICY_V5_RECEIPT_SHA256",
+    "MASSIVE_FINALIZED_ORIGIN_POLICY_V5_SCHEMA",
+    "MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_INVENTORY_V5",
     "MassiveFinalizedOriginPolicyError",
     "MassiveFinalizedOriginPolicyV0",
     "MassiveFinalizedOriginPolicyV1",
     "MassiveFinalizedOriginPolicyV2",
     "MassiveFinalizedOriginPolicyV3",
     "MassiveFinalizedOriginPolicyV4",
+    "MassiveFinalizedOriginPolicyV5",
 ]

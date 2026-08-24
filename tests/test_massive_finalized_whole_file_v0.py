@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import inspect
 import subprocess
 from dataclasses import replace
@@ -10,6 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+import rl_quant.data_sources.massive.finalized_runtime_authority as runtime_authority
 
 from rl_quant.alpha.massive_universe_adapter import checked_pit_universe_rule
 from rl_quant.alpha.pit_universe import (
@@ -85,6 +87,9 @@ from rl_quant.data_sources.massive.finalized_origin_policy import (
     MASSIVE_FINALIZED_ORIGIN_POLICY_V3_RECEIPT_SHA256,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V4,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V4_RECEIPT_SHA256,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V5,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V5_RECEIPT_SHA256,
+    MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_INVENTORY_V5,
     MassiveFinalizedOriginPolicyError,
 )
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
@@ -115,6 +120,7 @@ from rl_quant.data_sources.massive.finalized_runtime_authority import (
     capture_massive_execution_clock_authority_v2,
     capture_massive_host_execution_authority_v2,
     capture_massive_runtime_execution_environment_v2,
+    conservative_chrony_seconds_to_ns_v2,
     parse_massive_execution_clock_authority_v2,
     parse_massive_host_execution_authority_v2,
     parse_massive_runtime_execution_environment_v2,
@@ -185,8 +191,10 @@ from rl_quant.workflows.massive_production_typed_run_v2 import (
     MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3,
     MASSIVE_PRODUCTION_TYPED_RUN_V2_SPEC_SHA256,
     MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256,
+    MassiveProductionTypedRunV3Error,
     measure_massive_typed_finalized_run_production_v2,
     measure_massive_typed_finalized_run_production_v3,
+    validate_massive_production_clock_interval_v3,
 )
 
 EASTERN = ZoneInfo("America/New_York")
@@ -1507,20 +1515,33 @@ def test_origin_policy_v4_binds_raw_host_clock_and_runtime_capture() -> None:
     assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.host_execution_spec_sha256 == (
         MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256
     )
-    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.execution_clock_spec_sha256 == (
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.execution_clock_spec_sha256 != (
         MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256
     )
-    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.execution_environment_spec_sha256 == (
+    assert not MASSIVE_FINALIZED_ORIGIN_POLICY_V4.historical_capability_authorized
+
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V5.validate()
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V5.receipt_sha256 == (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V5_RECEIPT_SHA256
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V5.execution_clock_spec_sha256 == (
+        MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V5.execution_environment_spec_sha256 == (
         MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256
     )
-    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.production_typed_run_spec_sha256 == (
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V5.production_typed_run_spec_sha256 == (
         MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256
     )
     assert (
-        MASSIVE_FINALIZED_ORIGIN_POLICY_V4.production_implementation_inventory_sha256
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V5.production_implementation_inventory_sha256
         == MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
     )
-    assert not MASSIVE_FINALIZED_ORIGIN_POLICY_V4.historical_capability_authorized
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V5.runtime_implementation_source_inventory_sha256
+        == MASSIVE_RUNTIME_IMPLEMENTATION_SOURCE_INVENTORY_V5
+    )
+    assert not MASSIVE_FINALIZED_ORIGIN_POLICY_V5.historical_capability_authorized
     production_parameters = inspect.signature(
         measure_massive_typed_finalized_run_production_v3
     ).parameters
@@ -1530,8 +1551,26 @@ def test_origin_policy_v4_binds_raw_host_clock_and_runtime_capture() -> None:
         "host_authority",
         "clock_authority",
         "execution_environment",
+        "repository_root",
+        "container_image_digest_file",
     ):
         assert forbidden not in production_parameters
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected_ns"),
+    (
+        ("-0.0000000001", -1),
+        ("-0.0000000011", -2),
+        ("0.0000000001", 1),
+        ("0.0000000011", 2),
+    ),
+)
+def test_chrony_seconds_round_away_from_zero(
+    seconds: str,
+    expected_ns: int,
+) -> None:
+    assert conservative_chrony_seconds_to_ns_v2(seconds) == expected_ns
 
 
 def test_committed_execution_clock_environment_and_input_inventory(
@@ -1677,10 +1716,11 @@ def test_raw_chrony_capture_is_host_bound_and_generic_parse_is_nonauthorizing(
         argv: tuple[str, ...],
         **_: object,
     ) -> subprocess.CompletedProcess[bytes]:
+        reference_time = f"{datetime.now(UTC).timestamp():.9f}".encode("ascii")
         outputs = {
             ("/usr/bin/chronyc", "--version"): b"chronyc (chrony) version 4.6\n",
             ("/usr/bin/chronyc", "-c", "tracking"): (
-                b"AABBCCDD,2,1700000000.000000000,0.000000100,"
+                b"AABBCCDD,2," + reference_time + b",0.000000100,"
                 b"-0.000000050,0.000000200,1.0,0.0,0.5,0.001,"
                 b"0.000000300,1.0,Normal\n"
             ),
@@ -1717,6 +1757,45 @@ def test_raw_chrony_capture_is_host_bound_and_generic_parse_is_nonauthorizing(
     assert clock.maximum_clock_error_ns == 1_800_300
     assert clock.leap_status == "Normal"
     assert clock.selected_source_count == 1
+    assert clock.reference_age_ms <= clock.reference_freshness_limit_ms
+    assert clock.selected_source_last_rx_ms <= (
+        clock.selected_source_freshness_limit_ms
+    )
+    safe_start = (
+        max(
+            clock.measurement_observed_at_ms,
+            clock.loaded_source.verified_at_ms,
+        )
+        + 2 * clock.maximum_clock_error_ms
+        + 1
+    )
+    safe_finish = safe_start + 1_000
+    earliest_start, latest_finish = validate_massive_production_clock_interval_v3(
+        clock_authority=clock,
+        outer_started_at_ms=safe_start,
+        outer_finished_at_ms=safe_finish,
+        host_capture_finished_at_ms=host.capture_finished_at_ms,
+        environment_capture_finished_at_ms=host.capture_finished_at_ms,
+        clock_source_verified_at_ms=clock.loaded_source.verified_at_ms,
+        input_inventory_verified_at_ms=host.capture_finished_at_ms,
+        decision_at_ms=clock.qualification_end_utc_lower_bound_ms,
+    )
+    assert earliest_start == clock.utc_lower_bound_ms(safe_start)
+    assert latest_finish == clock.utc_upper_bound_ms(safe_finish)
+    with pytest.raises(
+        MassiveProductionTypedRunV3Error,
+        match="escaped the qualified interval",
+    ):
+        validate_massive_production_clock_interval_v3(
+            clock_authority=clock,
+            outer_started_at_ms=clock.measurement_observed_at_ms,
+            outer_finished_at_ms=safe_finish,
+            host_capture_finished_at_ms=host.capture_finished_at_ms,
+            environment_capture_finished_at_ms=host.capture_finished_at_ms,
+            clock_source_verified_at_ms=clock.loaded_source.verified_at_ms,
+            input_inventory_verified_at_ms=host.capture_finished_at_ms,
+            decision_at_ms=clock.qualification_end_utc_lower_bound_ms,
+        )
 
     forged_host = replace(host, boot_id_sha256="f" * 64, receipt_sha256="0" * 64)
     forged_host = replace(
@@ -1743,6 +1822,50 @@ def test_raw_chrony_capture_is_host_bound_and_generic_parse_is_nonauthorizing(
     with pytest.raises(MassiveRuntimeAuthorityError, match="not synchronized"):
         capture_massive_execution_clock_authority_v2(
             root=tmp_path / "clock-unsynchronized",
+            host_authority=host,
+            host_root=host_root,
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        )
+
+    def stale_source_chrony(
+        argv: tuple[str, ...],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = fixed_chrony(argv, **kwargs)
+        if argv[-1] == "sources":
+            completed.stdout = completed.stdout.replace(b",10,-", b",1000,-")
+        return completed
+
+    monkeypatch.setattr(
+        "rl_quant.data_sources.massive.finalized_runtime_authority.subprocess.run",
+        stale_source_chrony,
+    )
+    with pytest.raises(MassiveRuntimeAuthorityError, match="source is stale"):
+        capture_massive_execution_clock_authority_v2(
+            root=tmp_path / "clock-stale-source",
+            host_authority=host,
+            host_root=host_root,
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        )
+
+    def stale_reference_chrony(
+        argv: tuple[str, ...],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = fixed_chrony(argv, **kwargs)
+        if argv[-1] == "tracking":
+            fields = completed.stdout.rstrip(b"\n").split(b",")
+            fields[2] = b"1.000000000"
+            completed.stdout = b",".join(fields) + b"\n"
+        return completed
+
+    monkeypatch.setattr(
+        "rl_quant.data_sources.massive.finalized_runtime_authority.subprocess.run",
+        stale_reference_chrony,
+    )
+    with pytest.raises(MassiveRuntimeAuthorityError, match="reference is stale"):
+        capture_massive_execution_clock_authority_v2(
+            root=tmp_path / "clock-stale-reference",
             host_authority=host,
             host_root=host_root,
             entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
@@ -1781,6 +1904,16 @@ def test_runtime_environment_is_captured_from_process_and_clean_source(
     )
     image_digest = tmp_path / "container-image-digest"
     image_digest.write_text("sha256:" + "a" * 64 + "\n", encoding="ascii")
+    runtime_metadata = tmp_path / "container-runtime.json"
+    runtime_metadata.write_bytes(
+        canonical_json_file_bytes(
+            {
+                "container_id": "test-container-id",
+                "image_digest": "sha256:" + "a" * 64,
+                "runtime_kind": "container",
+            }
+        )
+    )
 
     class ClientMeta:
         endpoint_url = "https://files.massive.com"
@@ -1792,6 +1925,44 @@ def test_runtime_environment_is_captured_from_process_and_clean_source(
         "rl_quant.data_sources.massive.finalized_runtime_authority._runtime_kind",
         lambda _cgroup, _mountinfo: "container",
     )
+    monkeypatch.setattr(
+        runtime_authority,
+        "MASSIVE_CONTAINER_IMAGE_DIGEST_PATH",
+        image_digest,
+    )
+    monkeypatch.setattr(
+        runtime_authority,
+        "MASSIVE_CONTAINER_RUNTIME_METADATA_PATH",
+        runtime_metadata,
+    )
+    monkeypatch.setattr(
+        runtime_authority,
+        "MASSIVE_IMPORTED_PIPELINE_SOURCE_RELATIVE_PATHS",
+        ("module.py",),
+    )
+    monkeypatch.setattr(
+        runtime_authority,
+        "_discover_quanttrade_repository_root",
+        lambda: repository_root,
+    )
+    monkeypatch.setattr(
+        runtime_authority,
+        "_mount_provenance",
+        lambda _path, _mountinfo: {
+            "mount_point": str(tmp_path),
+            "filesystem_type": "tmpfs",
+            "mount_source_sha256": "9" * 64,
+            "read_only": True,
+        },
+    )
+    original_read_required = runtime_authority._read_required
+
+    def read_runtime_source(path: Path) -> bytes:
+        if path == Path("/proc/self/cgroup"):
+            return b"0::/test-container-id\n"
+        return original_read_required(path)
+
+    monkeypatch.setattr(runtime_authority, "_read_required", read_runtime_source)
     host = capture_massive_host_execution_authority_v2(
         root=host_root,
         entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
@@ -1800,8 +1971,6 @@ def test_runtime_environment_is_captured_from_process_and_clean_source(
         root=environment_root,
         host_authority=host,
         host_root=host_root,
-        repository_root=repository_root,
-        container_image_digest_file=image_digest,
         s3_client=FixedS3Client(),
         storage_roots={"artifacts": tmp_path},
         pipeline_implementation_inventory_sha256=(
@@ -1820,11 +1989,59 @@ def test_runtime_environment_is_captured_from_process_and_clean_source(
     assert environment.host_authority_receipt_sha256 == host.receipt_sha256
     assert environment.source_archive.tracked_worktree_clean
     assert environment.container_runtime.container_image_digest_sha256 == "a" * 64
+    assert environment.container_runtime.container_id_sha256 == hashlib.sha256(
+        b"test-container-id"
+    ).hexdigest()
     assert environment.python_environment.distribution_count > 0
     assert environment.network_acquisition.runtime_endpoint == (
         "https://files.massive.com"
     )
     assert tuple(row.role for row in environment.storage_roots) == ("artifacts",)
+
+    runtime_metadata.write_bytes(
+        canonical_json_file_bytes(
+            {
+                "container_id": "another-container-id",
+                "image_digest": "sha256:" + "a" * 64,
+                "runtime_kind": "container",
+            }
+        )
+    )
+    with pytest.raises(MassiveRuntimeAuthorityError, match="not bound"):
+        capture_massive_runtime_execution_environment_v2(
+            root=tmp_path / "environment-wrong-container",
+            host_authority=host,
+            host_root=host_root,
+            s3_client=FixedS3Client(),
+            storage_roots={"artifacts": tmp_path},
+            pipeline_implementation_inventory_sha256=(
+                MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
+            ),
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        )
+
+    runtime_metadata.write_bytes(
+        canonical_json_file_bytes(
+            {
+                "container_id": "test-container-id",
+                "image_digest": "sha256:" + "a" * 64,
+                "runtime_kind": "container",
+            }
+        )
+    )
+    (repository_root / "module.py").write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(MassiveRuntimeAuthorityError, match="differs from Git HEAD"):
+        capture_massive_runtime_execution_environment_v2(
+            root=tmp_path / "environment-dirty-import",
+            host_authority=host,
+            host_root=host_root,
+            s3_client=FixedS3Client(),
+            storage_roots={"artifacts": tmp_path},
+            pipeline_implementation_inventory_sha256=(
+                MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
+            ),
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        )
 
 
 def test_authenticated_get_archive_scope_and_typed_pipeline_v0(tmp_path: Path) -> None:

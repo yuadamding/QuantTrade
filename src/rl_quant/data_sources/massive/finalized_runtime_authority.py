@@ -86,6 +86,11 @@ MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256 = semantic_sha256(
         "required_leap_state": "Normal",
         "allowed_stratum": "1..15",
         "selected_source_required": True,
+        "signed_conversion": "decimal-nanoseconds-away-from-zero",
+        "freshness": "reference-age-and-selected-last-rx",
+        "freshness_floor_ms": 5 * 60 * 1_000,
+        "freshness_ceiling_ms": 15 * 60 * 1_000,
+        "maximum_root_delay_ns": 1_000_000_000,
         "error_bound": "max(abs(system-time),abs(last),rms,root-dispersion)+frequency-drift",
         "host_binding": MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
         "generic_manifest_authorizing": False,
@@ -115,8 +120,8 @@ MASSIVE_RUNTIME_ENVIRONMENT_V2_SOURCE_SCHEMA_SHA256 = semantic_sha256(
 MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256 = semantic_sha256(
     {
         "host": MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
-        "source_archive": "clean-git-HEAD-tree-and-archive",
-        "container": "proc-cgroup+mountinfo+mounted-image-digest",
+        "source_archive": "discovered-import-root+clean-git-HEAD-tree-and-imported-blobs",
+        "container": "proc-cgroup+read-only-runtime-metadata+image-digest",
         "python": "executable-bytes+version+installed-distributions",
         "network": "official-endpoint+bucket+runtime-client-type",
         "storage": "resolved-roots+device+statvfs",
@@ -126,6 +131,23 @@ MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256 = semantic_sha256(
 
 MASSIVE_CHRONYC_BINARY = "/usr/bin/chronyc"
 MASSIVE_CLOCK_QUALIFICATION_WINDOW_MS = 60 * 60 * 1_000
+MASSIVE_CLOCK_FRESHNESS_FLOOR_MS = 5 * 60 * 1_000
+MASSIVE_CLOCK_FRESHNESS_CEILING_MS = 15 * 60 * 1_000
+MASSIVE_CLOCK_MAXIMUM_ROOT_DELAY_NS = 1_000_000_000
+MASSIVE_CLOCK_ALLOWED_SOURCE_MODES = ("#", "=", "^")
+MASSIVE_CONTAINER_IMAGE_DIGEST_PATH = Path(
+    "/run/quanttrade/container-image-digest"
+)
+MASSIVE_CONTAINER_RUNTIME_METADATA_PATH = Path(
+    "/run/quanttrade/container-runtime.json"
+)
+MASSIVE_IMPORTED_PIPELINE_SOURCE_RELATIVE_PATHS = (
+    "src/rl_quant/data_sources/massive/finalized_runtime_authority.py",
+    "src/rl_quant/data_sources/massive/finalized_archive_scope.py",
+    "src/rl_quant/data_sources/massive/finalized_typed_decision_origin.py",
+    "src/rl_quant/workflows/massive_historical_readiness_v1.py",
+    "src/rl_quant/workflows/massive_production_typed_run_v2.py",
+)
 MASSIVE_RUNTIME_AUTHORITY_SOURCE_SHA256 = file_sha256(Path(__file__))
 
 
@@ -511,10 +533,14 @@ def _command_from_payload(value: object) -> MassiveRawCommandEvidenceV2:
     return result
 
 
-def _seconds_to_ns(value: str) -> int:
+def conservative_chrony_seconds_to_ns_v2(value: str) -> int:
     try:
-        return int((Decimal(value) * Decimal(1_000_000_000)).to_integral_value(rounding=ROUND_CEILING))
-    except (InvalidOperation, ValueError) as exc:
+        seconds = Decimal(value)
+        magnitude = (
+            abs(seconds) * Decimal(1_000_000_000)
+        ).to_integral_value(rounding=ROUND_CEILING)
+        return int(magnitude if seconds >= 0 else -magnitude)
+    except (InvalidOperation, OverflowError, ValueError) as exc:
         raise MassiveRuntimeAuthorityError("chrony seconds value is malformed") from exc
 
 
@@ -527,46 +553,81 @@ def _tracking_fields(stdout_text: str) -> dict[str, object]:
         stratum = int(row[1])
         reference_time_unix_seconds = Decimal(row[2])
         frequency_skew_ppm = float(row[8])
+        update_interval_seconds = Decimal(row[11])
     except (InvalidOperation, ValueError) as exc:
         raise MassiveRuntimeAuthorityError("chrony tracking values are malformed") from exc
     if (
         not row[0]
         or row[0] == "00000000"
         or not 1 <= stratum <= 15
+        or not reference_time_unix_seconds.is_finite()
         or reference_time_unix_seconds <= 0
         or not math.isfinite(frequency_skew_ppm)
         or frequency_skew_ppm < 0
+        or not update_interval_seconds.is_finite()
+        or update_interval_seconds <= 0
         or row[12] != "Normal"
     ):
         raise MassiveRuntimeAuthorityError("chrony is not synchronized")
     return {
         "reference_id": row[0],
         "stratum": stratum,
-        "reference_time_unix_ns": _seconds_to_ns(row[2]),
-        "system_time_offset_ns": _seconds_to_ns(row[3]),
-        "last_offset_ns": _seconds_to_ns(row[4]),
-        "rms_offset_ns": abs(_seconds_to_ns(row[5])),
+        "reference_time_unix_ns": conservative_chrony_seconds_to_ns_v2(row[2]),
+        "system_time_offset_ns": conservative_chrony_seconds_to_ns_v2(row[3]),
+        "last_offset_ns": conservative_chrony_seconds_to_ns_v2(row[4]),
+        "rms_offset_ns": abs(conservative_chrony_seconds_to_ns_v2(row[5])),
         "frequency_skew_ppm": frequency_skew_ppm,
-        "root_dispersion_ns": abs(_seconds_to_ns(row[10])),
+        "root_delay_ns": abs(conservative_chrony_seconds_to_ns_v2(row[9])),
+        "root_dispersion_ns": abs(conservative_chrony_seconds_to_ns_v2(row[10])),
+        "tracking_update_interval_ms": int(
+            (update_interval_seconds * Decimal(1_000)).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        ),
         "leap_status": row[12],
     }
 
 
-def _selected_source_count(stdout_text: str) -> int:
+def _selected_source_fields(stdout_text: str) -> dict[str, object]:
     rows = tuple(row for row in csv.reader(StringIO(stdout_text)) if row)
-    selected = 0
+    selected: list[dict[str, object]] = []
     for row in rows:
-        if len(row) < 7:
+        if len(row) != 8:
             raise MassiveRuntimeAuthorityError("chrony sources CSV shape differs")
         try:
             reachability = int(row[5], 8)
-        except ValueError as exc:
+            source_stratum = int(row[3])
+            poll_exponent = int(row[4])
+            last_rx_seconds = Decimal(row[6])
+            last_rx_ms = int(
+                (last_rx_seconds * Decimal(1_000)).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            )
+        except (InvalidOperation, OverflowError, ValueError) as exc:
             raise MassiveRuntimeAuthorityError("chrony source reachability is malformed") from exc
         if row[1] == "*" and reachability > 0:
-            selected += 1
-    if selected != 1:
+            if (
+                row[0] not in MASSIVE_CLOCK_ALLOWED_SOURCE_MODES
+                or not 0 <= source_stratum <= 15
+                or not 0 <= poll_exponent <= 24
+                or not last_rx_seconds.is_finite()
+                or last_rx_ms < 0
+            ):
+                raise MassiveRuntimeAuthorityError(
+                    "selected chrony source fields are unqualified"
+                )
+            selected.append(
+                {
+                    "selected_source_mode": row[0],
+                    "selected_source_stratum": source_stratum,
+                    "selected_source_poll_interval_ms": (2**poll_exponent) * 1_000,
+                    "selected_source_last_rx_ms": last_rx_ms,
+                }
+            )
+    if len(selected) != 1:
         raise MassiveRuntimeAuthorityError("chrony must have exactly one selected reachable source")
-    return selected
+    return selected[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -583,10 +644,19 @@ class MassiveExecutionClockAuthorityV2:
     system_time_offset_ns: int
     last_offset_ns: int
     rms_offset_ns: int
+    root_delay_ns: int
     root_dispersion_ns: int
     frequency_skew_ppm: float
+    tracking_update_interval_ms: int
     leap_status: str
     selected_source_count: int
+    selected_source_mode: str
+    selected_source_stratum: int
+    selected_source_poll_interval_ms: int
+    selected_source_last_rx_ms: int
+    selected_source_freshness_limit_ms: int
+    reference_age_ms: int
+    reference_freshness_limit_ms: int
     maximum_clock_error_ns: int
     loaded_source: LoadedMassiveSourceObject
     clock_spec_receipt_sha256: str
@@ -610,6 +680,18 @@ class MassiveExecutionClockAuthorityV2:
         self.validate()
         return timestamp_ms + self.maximum_clock_error_ms
 
+    @property
+    def measurement_utc_lower_bound_ms(self) -> int:
+        return self.measurement_observed_at_ms - self.maximum_clock_error_ms
+
+    @property
+    def measurement_utc_upper_bound_ms(self) -> int:
+        return self.measurement_observed_at_ms + self.maximum_clock_error_ms
+
+    @property
+    def qualification_end_utc_lower_bound_ms(self) -> int:
+        return self.measurement_utc_lower_bound_ms + MASSIVE_CLOCK_QUALIFICATION_WINDOW_MS
+
     def validate(self) -> None:
         for command in (self.version_command, self.tracking_command, self.sources_command):
             command.validate()
@@ -629,6 +711,9 @@ class MassiveExecutionClockAuthorityV2:
             or self.leap_status != "Normal"
             or not 1 <= self.stratum <= 15
             or self.selected_source_count != 1
+            or self.selected_source_mode not in MASSIVE_CLOCK_ALLOWED_SOURCE_MODES
+            or not 0 <= self.selected_source_stratum <= 15
+            or self.root_delay_ns > MASSIVE_CLOCK_MAXIMUM_ROOT_DELAY_NS
             or self.loaded_source.receipt.dataset_id != MASSIVE_RAW_CHRONY_V2_DATASET
             or self.loaded_source.receipt.schema_sha256 != MASSIVE_RAW_CHRONY_V2_SOURCE_SCHEMA_SHA256
             or self.loaded_source.receipt.requested_at_ms
@@ -659,8 +744,46 @@ class MassiveExecutionClockAuthorityV2:
             self.rms_offset_ns,
             self.root_dispersion_ns,
         ) + drift_ns
-        if self.maximum_clock_error_ns != expected_error or self.receipt_sha256 != semantic_sha256(self.unsigned()):
+        reference_age_ns = max(
+            0,
+            self.measurement_observed_at_ms * 1_000_000
+            - self.reference_time_unix_ns,
+        )
+        expected_reference_age_ms = (reference_age_ns + 999_999) // 1_000_000
+        expected_reference_limit_ms = max(
+            3 * self.tracking_update_interval_ms,
+            MASSIVE_CLOCK_FRESHNESS_FLOOR_MS,
+        )
+        expected_reference_limit_ms = min(
+            expected_reference_limit_ms,
+            MASSIVE_CLOCK_FRESHNESS_CEILING_MS,
+        )
+        expected_source_limit_ms = max(
+            3 * self.selected_source_poll_interval_ms,
+            MASSIVE_CLOCK_FRESHNESS_FLOOR_MS,
+        )
+        expected_source_limit_ms = min(
+            expected_source_limit_ms,
+            MASSIVE_CLOCK_FRESHNESS_CEILING_MS,
+        )
+        if (
+            self.maximum_clock_error_ns != expected_error
+            or self.reference_age_ms != expected_reference_age_ms
+            or self.reference_freshness_limit_ms != expected_reference_limit_ms
+            or self.selected_source_freshness_limit_ms != expected_source_limit_ms
+            or self.reference_time_unix_ns
+            > self.measurement_observed_at_ms * 1_000_000
+            + self.maximum_clock_error_ns
+            or self.receipt_sha256 != semantic_sha256(self.unsigned())
+        ):
             raise MassiveRuntimeAuthorityError("execution clock v2 receipt differs")
+        if self.reference_age_ms > self.reference_freshness_limit_ms:
+            raise MassiveRuntimeAuthorityError("chrony tracking reference is stale")
+        if (
+            self.selected_source_last_rx_ms
+            > self.selected_source_freshness_limit_ms
+        ):
+            raise MassiveRuntimeAuthorityError("selected chrony source is stale")
 
 
 def parse_massive_execution_clock_authority_v2(
@@ -695,7 +818,7 @@ def parse_massive_execution_clock_authority_v2(
         raise MassiveRuntimeAuthorityError("raw chrony host binding differs")
     version, tracking, sources = commands
     fields = _tracking_fields(tracking.stdout_text)
-    selected_count = _selected_source_count(sources.stdout_text)
+    selected_fields = _selected_source_fields(sources.stdout_text)
     measurement_at_ms = tracking.finished_at_ms
     validity_ns = MASSIVE_CLOCK_QUALIFICATION_WINDOW_MS * 1_000_000
     drift_ns = math.ceil(validity_ns * cast(float, fields["frequency_skew_ppm"]) / 1_000_000)
@@ -705,6 +828,28 @@ def parse_massive_execution_clock_authority_v2(
         cast(int, fields["rms_offset_ns"]),
         cast(int, fields["root_dispersion_ns"]),
     ) + drift_ns
+    reference_age_ns = max(
+        0,
+        measurement_at_ms * 1_000_000
+        - cast(int, fields["reference_time_unix_ns"]),
+    )
+    reference_age_ms = (reference_age_ns + 999_999) // 1_000_000
+    reference_freshness_limit_ms = max(
+        3 * cast(int, fields["tracking_update_interval_ms"]),
+        MASSIVE_CLOCK_FRESHNESS_FLOOR_MS,
+    )
+    reference_freshness_limit_ms = min(
+        reference_freshness_limit_ms,
+        MASSIVE_CLOCK_FRESHNESS_CEILING_MS,
+    )
+    source_freshness_limit_ms = max(
+        3 * cast(int, selected_fields["selected_source_poll_interval_ms"]),
+        MASSIVE_CLOCK_FRESHNESS_FLOOR_MS,
+    )
+    source_freshness_limit_ms = min(
+        source_freshness_limit_ms,
+        MASSIVE_CLOCK_FRESHNESS_CEILING_MS,
+    )
     body = {
         "schema": MASSIVE_RAW_CHRONY_V2_SCHEMA,
         "host_authority_receipt_sha256": host_authority.receipt_sha256,
@@ -714,7 +859,11 @@ def parse_massive_execution_clock_authority_v2(
         "measurement_observed_at_ms": measurement_at_ms,
         "qualification_valid_until_ms": measurement_at_ms + MASSIVE_CLOCK_QUALIFICATION_WINDOW_MS,
         **fields,
-        "selected_source_count": selected_count,
+        "selected_source_count": 1,
+        **selected_fields,
+        "selected_source_freshness_limit_ms": source_freshness_limit_ms,
+        "reference_age_ms": reference_age_ms,
+        "reference_freshness_limit_ms": reference_freshness_limit_ms,
         "maximum_clock_error_ns": maximum_error,
         "loaded_source": loaded_source,
         "clock_spec_receipt_sha256": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
@@ -820,6 +969,8 @@ class MassiveSourceArchiveAuthorityV2:
     git_tree: str
     git_archive_sha256: str
     tracked_worktree_clean: bool
+    imported_source_count: int
+    imported_source_inventory_sha256: str
     receipt_sha256: str
 
     def unsigned(self) -> dict[str, object]:
@@ -831,9 +982,12 @@ class MassiveSourceArchiveAuthorityV2:
             or len(self.git_tree) != 40
             or any(character not in "0123456789abcdef" for character in self.git_commit + self.git_tree)
             or not self.tracked_worktree_clean
+            or self.imported_source_count
+            != len(MASSIVE_IMPORTED_PIPELINE_SOURCE_RELATIVE_PATHS)
         ):
             raise MassiveRuntimeAuthorityError("source archive authority differs")
         _digest("git archive", self.git_archive_sha256)
+        _digest("imported source inventory", self.imported_source_inventory_sha256)
         _digest("source archive receipt", self.receipt_sha256)
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveRuntimeAuthorityError("source archive receipt differs")
@@ -844,8 +998,11 @@ class MassiveContainerRuntimeAuthorityV2:
     runtime_kind: str
     cgroup_sha256: str
     mountinfo_sha256: str
+    container_id_sha256: str
     container_image_digest_sha256: str
     image_digest_source_sha256: str
+    runtime_metadata_sha256: str
+    runtime_mount_receipt_sha256: str
     receipt_sha256: str
 
     def unsigned(self) -> dict[str, object]:
@@ -854,7 +1011,16 @@ class MassiveContainerRuntimeAuthorityV2:
     def validate(self) -> None:
         if self.runtime_kind not in {"docker", "podman", "kubernetes", "container"}:
             raise MassiveRuntimeAuthorityError("container runtime kind is unqualified")
-        for name in ("cgroup_sha256", "mountinfo_sha256", "container_image_digest_sha256", "image_digest_source_sha256", "receipt_sha256"):
+        for name in (
+            "cgroup_sha256",
+            "mountinfo_sha256",
+            "container_id_sha256",
+            "container_image_digest_sha256",
+            "image_digest_source_sha256",
+            "runtime_metadata_sha256",
+            "runtime_mount_receipt_sha256",
+            "receipt_sha256",
+        ):
             _digest(name, getattr(self, name))
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveRuntimeAuthorityError("container runtime receipt differs")
@@ -988,7 +1154,31 @@ def _receipt_dataclass(cls: type[Any], body: dict[str, object]) -> Any:
     return result
 
 
-def _source_archive_payload(repository_root: Path) -> dict[str, object]:
+def _discover_quanttrade_repository_root() -> Path:
+    import rl_quant
+
+    module_file = Path(cast(str, rl_quant.__file__)).resolve(strict=True)
+    try:
+        completed = subprocess.run(
+            ("/usr/bin/git", "-C", str(module_file.parent), "rev-parse", "--show-toplevel"),
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MassiveRuntimeAuthorityError("executing source root discovery failed") from exc
+    if completed.returncode != 0:
+        raise MassiveRuntimeAuthorityError("executing source is not in a Git repository")
+    root = Path(completed.stdout.decode("utf-8").strip()).resolve(strict=True)
+    if not module_file.is_relative_to(root):
+        raise MassiveRuntimeAuthorityError("imported rl_quant is outside the discovered source root")
+    return root
+
+
+def _source_archive_payload() -> dict[str, object]:
+    repository_root = _discover_quanttrade_repository_root()
+
     def run_git(*args: str) -> bytes:
         try:
             completed = subprocess.run(
@@ -1008,11 +1198,105 @@ def _source_archive_payload(repository_root: Path) -> dict[str, object]:
     tree = run_git("rev-parse", "HEAD^{tree}").decode("ascii").strip()
     status = run_git("status", "--porcelain=v1", "--untracked-files=no")
     archive = run_git("archive", "--format=tar", "HEAD")
+    imported_inventory: list[tuple[str, str]] = []
+    for relative_path in MASSIVE_IMPORTED_PIPELINE_SOURCE_RELATIVE_PATHS:
+        source_path = (repository_root / relative_path).resolve(strict=True)
+        if not source_path.is_relative_to(repository_root):
+            raise MassiveRuntimeAuthorityError("imported source escaped the Git root")
+        tracked_blob = run_git("rev-parse", f"HEAD:{relative_path}").decode("ascii").strip()
+        current_blob = run_git("hash-object", str(source_path)).decode("ascii").strip()
+        if tracked_blob != current_blob:
+            raise MassiveRuntimeAuthorityError("imported pipeline source differs from Git HEAD")
+        imported_inventory.append((relative_path, file_sha256(source_path)))
     return {
         "git_commit": commit,
         "git_tree": tree,
         "git_archive_sha256": _sha256_bytes(archive),
         "tracked_worktree_clean": status == b"",
+        "imported_source_count": len(imported_inventory),
+        "imported_source_inventory_sha256": semantic_sha256(
+            tuple(imported_inventory)
+        ),
+    }
+
+
+def _mount_provenance(path: Path, mountinfo: bytes) -> dict[str, object]:
+    resolved = path.resolve(strict=True)
+    candidates: list[tuple[int, dict[str, object]]] = []
+    for raw_line in mountinfo.decode("utf-8").splitlines():
+        before, separator, after = raw_line.partition(" - ")
+        if not separator:
+            continue
+        left = before.split()
+        right = after.split()
+        if len(left) < 6 or len(right) < 3:
+            continue
+        mount_point = Path(left[4].replace("\\040", " ")).resolve()
+        if resolved != mount_point and not resolved.is_relative_to(mount_point):
+            continue
+        options = set(left[5].split(",")) | set(right[2].split(","))
+        candidates.append(
+            (
+                len(mount_point.parts),
+                {
+                    "mount_point": str(mount_point),
+                    "filesystem_type": right[0],
+                    "mount_source_sha256": _sha256_bytes(right[1].encode("utf-8")),
+                    "read_only": "ro" in options,
+                },
+            )
+        )
+    if not candidates:
+        raise MassiveRuntimeAuthorityError("runtime metadata mount was not resolved")
+    result = max(candidates, key=lambda item: item[0])[1]
+    if not result["read_only"]:
+        raise MassiveRuntimeAuthorityError("runtime metadata mount is not read-only")
+    return result
+
+
+def _container_runtime_payload(cgroup: bytes, mountinfo: bytes) -> dict[str, object]:
+    image_bytes = _read_required(MASSIVE_CONTAINER_IMAGE_DIGEST_PATH).strip()
+    metadata_bytes = _read_required(MASSIVE_CONTAINER_RUNTIME_METADATA_PATH)
+    try:
+        image_text = image_bytes.decode("ascii")
+        metadata = json.loads(metadata_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MassiveRuntimeAuthorityError("container runtime metadata is malformed") from exc
+    if canonical_json_file_bytes(metadata) != metadata_bytes:
+        raise MassiveRuntimeAuthorityError("container runtime metadata is not canonical")
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "container_id",
+        "image_digest",
+        "runtime_kind",
+    }:
+        raise MassiveRuntimeAuthorityError("container runtime metadata fields differ")
+    runtime_kind = _text("runtime kind", metadata["runtime_kind"])
+    container_id = _text("container ID", metadata["container_id"])
+    metadata_digest = _text("container image digest", metadata["image_digest"])
+    if runtime_kind != _runtime_kind(cgroup, mountinfo):
+        raise MassiveRuntimeAuthorityError("container runtime metadata kind differs")
+    try:
+        container_id_bytes = container_id.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise MassiveRuntimeAuthorityError("container ID is not ASCII") from exc
+    if container_id_bytes not in cgroup:
+        raise MassiveRuntimeAuthorityError("container ID is not bound to this process")
+    if not image_text.startswith("sha256:") or metadata_digest != image_text:
+        raise MassiveRuntimeAuthorityError("container image digest evidence differs")
+    image_digest = _digest("container image digest", image_text.removeprefix("sha256:"))
+    mount_inventory = (
+        _mount_provenance(MASSIVE_CONTAINER_IMAGE_DIGEST_PATH, mountinfo),
+        _mount_provenance(MASSIVE_CONTAINER_RUNTIME_METADATA_PATH, mountinfo),
+    )
+    return {
+        "runtime_kind": runtime_kind,
+        "cgroup_sha256": _sha256_bytes(cgroup),
+        "mountinfo_sha256": _sha256_bytes(mountinfo),
+        "container_id_sha256": _sha256_bytes(container_id_bytes),
+        "container_image_digest_sha256": image_digest,
+        "image_digest_source_sha256": _sha256_bytes(image_bytes),
+        "runtime_metadata_sha256": _sha256_bytes(metadata_bytes),
+        "runtime_mount_receipt_sha256": semantic_sha256(mount_inventory),
     }
 
 
@@ -1061,21 +1345,11 @@ def _storage_payload(storage_roots: dict[str, str | Path]) -> list[dict[str, obj
 def _environment_payload(
     *,
     host_authority: MassiveHostExecutionAuthorityV2,
-    repository_root: Path,
-    container_image_digest_file: Path,
     s3_client: Any,
     storage_roots: dict[str, str | Path],
     pipeline_implementation_inventory_sha256: str,
     started_at_ms: int,
 ) -> dict[str, object]:
-    image_bytes = _read_required(container_image_digest_file).strip()
-    try:
-        image_text = image_bytes.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise MassiveRuntimeAuthorityError("container image digest is not ASCII") from exc
-    if not image_text.startswith("sha256:"):
-        raise MassiveRuntimeAuthorityError("container image digest is not immutable")
-    image_digest = _digest("container image digest", image_text.removeprefix("sha256:"))
     cgroup = _read_required(Path("/proc/self/cgroup"))
     mountinfo = _read_required(Path("/proc/self/mountinfo"))
     executable = Path(sys.executable).resolve(strict=True)
@@ -1090,14 +1364,8 @@ def _environment_payload(
         "host_authority_receipt_sha256": host_authority.receipt_sha256,
         "capture_started_at_ms": started_at_ms,
         "capture_finished_at_ms": _wall_ms(),
-        "source_archive": _source_archive_payload(repository_root),
-        "container_runtime": {
-            "runtime_kind": _runtime_kind(cgroup, mountinfo),
-            "cgroup_sha256": _sha256_bytes(cgroup),
-            "mountinfo_sha256": _sha256_bytes(mountinfo),
-            "container_image_digest_sha256": image_digest,
-            "image_digest_source_sha256": _sha256_bytes(image_bytes),
-        },
+        "source_archive": _source_archive_payload(),
+        "container_runtime": _container_runtime_payload(cgroup, mountinfo),
         "python_environment": {
             "implementation": platform.python_implementation(),
             "version": platform.python_version(),
@@ -1157,8 +1425,8 @@ def parse_massive_runtime_execution_environment_v2(
     if set(payload) != expected or payload["host_authority_receipt_sha256"] != host_authority.receipt_sha256:
         raise MassiveRuntimeAuthorityError("runtime environment fields differ")
     component_specs: tuple[tuple[str, type[Any], set[str]], ...] = (
-        ("source_archive", MassiveSourceArchiveAuthorityV2, {"git_commit", "git_tree", "git_archive_sha256", "tracked_worktree_clean"}),
-        ("container_runtime", MassiveContainerRuntimeAuthorityV2, {"runtime_kind", "cgroup_sha256", "mountinfo_sha256", "container_image_digest_sha256", "image_digest_source_sha256"}),
+        ("source_archive", MassiveSourceArchiveAuthorityV2, {"git_commit", "git_tree", "git_archive_sha256", "tracked_worktree_clean", "imported_source_count", "imported_source_inventory_sha256"}),
+        ("container_runtime", MassiveContainerRuntimeAuthorityV2, {"runtime_kind", "cgroup_sha256", "mountinfo_sha256", "container_id_sha256", "container_image_digest_sha256", "image_digest_source_sha256", "runtime_metadata_sha256", "runtime_mount_receipt_sha256"}),
         ("python_environment", MassivePythonEnvironmentAuthorityV2, {"implementation", "version", "executable_path", "executable_sha256", "distribution_count", "distribution_inventory_sha256"}),
         ("network_acquisition", MassiveNetworkAcquisitionAuthorityV2, {"endpoint", "bucket", "client_module", "client_qualname", "runtime_endpoint"}),
     )
@@ -1203,8 +1471,6 @@ def capture_massive_runtime_execution_environment_v2(
     root: str | Path,
     host_authority: MassiveHostExecutionAuthorityV2,
     host_root: str | Path,
-    repository_root: str | Path,
-    container_image_digest_file: str | Path,
     s3_client: Any,
     storage_roots: dict[str, str | Path],
     pipeline_implementation_inventory_sha256: str,
@@ -1227,8 +1493,6 @@ def capture_massive_runtime_execution_environment_v2(
     started_at_ms = _wall_ms()
     payload = _environment_payload(
         host_authority=host_authority,
-        repository_root=Path(repository_root).resolve(strict=True),
-        container_image_digest_file=Path(container_image_digest_file).resolve(strict=True),
         s3_client=s3_client,
         storage_roots=storage_roots,
         pipeline_implementation_inventory_sha256=pipeline_implementation_inventory_sha256,
@@ -1285,6 +1549,7 @@ __all__ = [
     "capture_massive_execution_clock_authority_v2",
     "capture_massive_host_execution_authority_v2",
     "capture_massive_runtime_execution_environment_v2",
+    "conservative_chrony_seconds_to_ns_v2",
     "parse_massive_execution_clock_authority_v2",
     "parse_massive_host_execution_authority_v2",
     "parse_massive_runtime_execution_environment_v2",
