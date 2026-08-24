@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import inspect
+import subprocess
 from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from io import BytesIO
@@ -82,6 +83,8 @@ from rl_quant.data_sources.massive.finalized_origin_policy import (
     MASSIVE_FINALIZED_ORIGIN_POLICY_V2_RECEIPT_SHA256,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V3,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V3_RECEIPT_SHA256,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V4,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V4_RECEIPT_SHA256,
     MassiveFinalizedOriginPolicyError,
 )
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
@@ -103,6 +106,19 @@ from rl_quant.data_sources.massive.finalized_readiness import (
     build_massive_finalized_readiness_panel_spec_v0,
     build_massive_finalized_readiness_stage_artifact_v0,
     measure_massive_finalized_full_readiness_v0,
+)
+from rl_quant.data_sources.massive.finalized_runtime_authority import (
+    MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
+    MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
+    MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+    MassiveRuntimeAuthorityError,
+    capture_massive_execution_clock_authority_v2,
+    capture_massive_host_execution_authority_v2,
+    capture_massive_runtime_execution_environment_v2,
+    parse_massive_execution_clock_authority_v2,
+    parse_massive_host_execution_authority_v2,
+    parse_massive_runtime_execution_environment_v2,
+    verify_current_execution_host_v2,
 )
 from rl_quant.data_sources.massive.processing_capability import (
     build_massive_finalized_processing_capability_v0,
@@ -166,8 +182,11 @@ from rl_quant.workflows.massive_measured_typed_run_v1 import (
 )
 from rl_quant.workflows.massive_production_typed_run_v2 import (
     MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V2,
+    MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3,
     MASSIVE_PRODUCTION_TYPED_RUN_V2_SPEC_SHA256,
+    MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256,
     measure_massive_typed_finalized_run_production_v2,
+    measure_massive_typed_finalized_run_production_v3,
 )
 
 EASTERN = ZoneInfo("America/New_York")
@@ -1475,9 +1494,44 @@ def test_origin_policy_v3_binds_production_clock_and_historical_readiness() -> N
     assert "monotonic_ns" not in production_parameters
     with pytest.raises(
         MassiveHistoricalReadinessV1Error,
-        match="production-clock runs only",
+        match="superseded by source-derived runtime authorities",
     ):
         build_massive_typed_readiness_capability_v1((object(),) * 20)  # type: ignore[arg-type]
+
+
+def test_origin_policy_v4_binds_raw_host_clock_and_runtime_capture() -> None:
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V4.validate()
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.receipt_sha256 == (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V4_RECEIPT_SHA256
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.host_execution_spec_sha256 == (
+        MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.execution_clock_spec_sha256 == (
+        MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.execution_environment_spec_sha256 == (
+        MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V4.production_typed_run_spec_sha256 == (
+        MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256
+    )
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V4.production_implementation_inventory_sha256
+        == MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
+    )
+    assert not MASSIVE_FINALIZED_ORIGIN_POLICY_V4.historical_capability_authorized
+    production_parameters = inspect.signature(
+        measure_massive_typed_finalized_run_production_v3
+    ).parameters
+    for forbidden in (
+        "now_ms",
+        "monotonic_ns",
+        "host_authority",
+        "clock_authority",
+        "execution_environment",
+    ):
+        assert forbidden not in production_parameters
 
 
 def test_committed_execution_clock_environment_and_input_inventory(
@@ -1598,6 +1652,179 @@ def test_committed_execution_clock_environment_and_input_inventory(
         parse_massive_input_availability_authority_v1(
             root=tmp_path / "inputs-unsorted", loaded_source=unsorted_loaded
         )
+
+
+def test_raw_chrony_capture_is_host_bound_and_generic_parse_is_nonauthorizing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_root = tmp_path / "host"
+    clock_root = tmp_path / "clock-v2"
+    host = capture_massive_host_execution_authority_v2(
+        root=host_root,
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+    )
+    parsed_host = parse_massive_host_execution_authority_v2(
+        root=host_root,
+        loaded_source=host.loaded_source,
+    )
+    assert host.captured_by_fixed_runtime
+    assert not parsed_host.captured_by_fixed_runtime
+    assert parsed_host.host_id == host.host_id
+    verify_current_execution_host_v2(host)
+
+    def fixed_chrony(
+        argv: tuple[str, ...],
+        **_: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        outputs = {
+            ("/usr/bin/chronyc", "--version"): b"chronyc (chrony) version 4.6\n",
+            ("/usr/bin/chronyc", "-c", "tracking"): (
+                b"AABBCCDD,2,1700000000.000000000,0.000000100,"
+                b"-0.000000050,0.000000200,1.0,0.0,0.5,0.001,"
+                b"0.000000300,1.0,Normal\n"
+            ),
+            ("/usr/bin/chronyc", "-c", "sources"): (
+                b"^,*,time.example,2,6,377,10,-0.000001\n"
+            ),
+        }
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=outputs[argv],
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        "rl_quant.data_sources.massive.finalized_runtime_authority.subprocess.run",
+        fixed_chrony,
+    )
+    clock = capture_massive_execution_clock_authority_v2(
+        root=clock_root,
+        host_authority=host,
+        host_root=host_root,
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+    )
+    parsed_clock = parse_massive_execution_clock_authority_v2(
+        root=clock_root,
+        loaded_source=clock.loaded_source,
+        host_authority=host,
+        host_root=host_root,
+    )
+    assert clock.captured_by_fixed_runtime
+    assert not parsed_clock.captured_by_fixed_runtime
+    assert clock.host_authority_receipt_sha256 == host.receipt_sha256
+    assert clock.maximum_clock_error_ns == 1_800_300
+    assert clock.leap_status == "Normal"
+    assert clock.selected_source_count == 1
+
+    forged_host = replace(host, boot_id_sha256="f" * 64, receipt_sha256="0" * 64)
+    forged_host = replace(
+        forged_host,
+        receipt_sha256=semantic_sha256(forged_host.unsigned()),
+    )
+    forged_host.validate()
+    with pytest.raises(MassiveRuntimeAuthorityError, match="execution host differs"):
+        verify_current_execution_host_v2(forged_host)
+
+    def unsynchronized_chrony(
+        argv: tuple[str, ...],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = fixed_chrony(argv, **kwargs)
+        if argv[-1] == "tracking":
+            completed.stdout = completed.stdout.replace(b",Normal\n", b",Not synchronised\n")
+        return completed
+
+    monkeypatch.setattr(
+        "rl_quant.data_sources.massive.finalized_runtime_authority.subprocess.run",
+        unsynchronized_chrony,
+    )
+    with pytest.raises(MassiveRuntimeAuthorityError, match="not synchronized"):
+        capture_massive_execution_clock_authority_v2(
+            root=tmp_path / "clock-unsynchronized",
+            host_authority=host,
+            host_root=host_root,
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        )
+
+
+def test_runtime_environment_is_captured_from_process_and_clean_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_root = tmp_path / "host"
+    environment_root = tmp_path / "environment-v2"
+    repository_root = tmp_path / "source"
+    repository_root.mkdir()
+    (repository_root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(("/usr/bin/git", "init", "-q"), cwd=repository_root, check=True)
+    subprocess.run(
+        ("/usr/bin/git", "add", "module.py"),
+        cwd=repository_root,
+        check=True,
+    )
+    subprocess.run(
+        (
+            "/usr/bin/git",
+            "-c",
+            "user.name=QuantTrade Test",
+            "-c",
+            "user.email=quanttrade@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "test source",
+        ),
+        cwd=repository_root,
+        check=True,
+    )
+    image_digest = tmp_path / "container-image-digest"
+    image_digest.write_text("sha256:" + "a" * 64 + "\n", encoding="ascii")
+
+    class ClientMeta:
+        endpoint_url = "https://files.massive.com"
+
+    class FixedS3Client:
+        meta = ClientMeta()
+
+    monkeypatch.setattr(
+        "rl_quant.data_sources.massive.finalized_runtime_authority._runtime_kind",
+        lambda _cgroup, _mountinfo: "container",
+    )
+    host = capture_massive_host_execution_authority_v2(
+        root=host_root,
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+    )
+    environment = capture_massive_runtime_execution_environment_v2(
+        root=environment_root,
+        host_authority=host,
+        host_root=host_root,
+        repository_root=repository_root,
+        container_image_digest_file=image_digest,
+        s3_client=FixedS3Client(),
+        storage_roots={"artifacts": tmp_path},
+        pipeline_implementation_inventory_sha256=(
+            MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
+        ),
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+    )
+    parsed = parse_massive_runtime_execution_environment_v2(
+        root=environment_root,
+        loaded_source=environment.loaded_source,
+        host_authority=host,
+        host_root=host_root,
+    )
+    assert environment.captured_by_fixed_runtime
+    assert not parsed.captured_by_fixed_runtime
+    assert environment.host_authority_receipt_sha256 == host.receipt_sha256
+    assert environment.source_archive.tracked_worktree_clean
+    assert environment.container_runtime.container_image_digest_sha256 == "a" * 64
+    assert environment.python_environment.distribution_count > 0
+    assert environment.network_acquisition.runtime_endpoint == (
+        "https://files.massive.com"
+    )
+    assert tuple(row.role for row in environment.storage_roots) == ("artifacts",)
 
 
 def test_authenticated_get_archive_scope_and_typed_pipeline_v0(tmp_path: Path) -> None:

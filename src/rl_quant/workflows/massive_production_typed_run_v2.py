@@ -35,6 +35,17 @@ from rl_quant.data_sources.massive.finalized_origin_policy import (
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
     MassiveFinalizedFeatureDomainSpecV0,
 )
+from rl_quant.data_sources.massive.finalized_runtime_authority import (
+    MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
+    MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
+    MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+    MassiveExecutionClockAuthorityV2,
+    MassiveHostExecutionAuthorityV2,
+    MassiveRuntimeExecutionEnvironmentAuthorityV2,
+    capture_massive_execution_clock_authority_v2,
+    capture_massive_host_execution_authority_v2,
+    capture_massive_runtime_execution_environment_v2,
+)
 from rl_quant.data_sources.massive.session_calendar import (
     MassiveExchangeSession,
     MassiveSessionAuthority,
@@ -84,6 +95,44 @@ MASSIVE_PRODUCTION_TYPED_RUN_V2_SPEC_SHA256 = semantic_sha256(
         "maximum_runtime_ms": 55 * 60 * 1_000,
         "performance_authorization": False,
     }
+)
+MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3 = semantic_sha256(
+    (
+        MASSIVE_MEASURED_TYPED_STAGE_IDS_V1,
+        MASSIVE_MEASURED_TYPED_STAGE_IMPLEMENTATIONS_V1,
+        MASSIVE_MEASURED_TYPED_STAGE_CONFIGURATION_V1,
+        MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
+        MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
+        MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+    )
+)
+MASSIVE_PRODUCTION_TYPED_RUN_V3_SCHEMA = "rl-quant.massive-production-typed-run-v3"
+MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256 = semantic_sha256(
+    {
+        "protocol_receipt": MASSIVE_FINALIZED_VALIDATION_V0_RECEIPT_SHA256,
+        "engine": "measured-typed-run-v1-development-engine",
+        "host_authority": MASSIVE_HOST_EXECUTION_V2_SPEC_SHA256,
+        "clock_authority": MASSIVE_EXECUTION_CLOCK_V2_SPEC_SHA256,
+        "execution_environment": MASSIVE_RUNTIME_ENVIRONMENT_V2_SPEC_SHA256,
+        "authority_capture": "fixed-runtime-entry-point-before-outer-timer",
+        "wall_clock": "non-injectable-time.time_ns",
+        "monotonic_clock": "non-injectable-time.perf_counter_ns",
+        "input_availability": MASSIVE_INPUT_AVAILABILITY_V1_SPEC_SHA256,
+        "clock_deadline_rule": "utc-upper-bound-at-finish<=decision",
+        "host_rule": "clock-host==environment-host==executing-host",
+        "checkpoint": "independently-reparsed-from-committed-bytes",
+        "implementation_inventory": (
+            MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
+        ),
+        "origin_policy": "frozen-v4-receipt-field",
+        "maximum_runtime_ms": 55 * 60 * 1_000,
+        "historical_capability": False,
+        "performance_authorization": False,
+    }
+)
+# Filled from the immutable V4 policy after its independent receipt is frozen.
+MASSIVE_PRODUCTION_ORIGIN_POLICY_V4_RECEIPT_SHA256_FROZEN = (
+    "90a24c87e91e3488f8e534887b70f475220b80a8c493d5346504d1577ee89c6e"
 )
 
 
@@ -255,6 +304,101 @@ def _validate_input_inventory(
             raise MassiveProductionTypedRunV2Error(
                 f"pre-existing input availability differs for {row.input_kind}"
             )
+
+
+def _required_input_rows_v3(
+    *,
+    captured_listing: MassiveCapturedFlatFileListingV0,
+    archive_scope: MassiveFinalizedArchiveScopeV2,
+    session_authority: MassiveSessionAuthority,
+    identity_authority: PITSecurityUniverseAuthority,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+    feature_domain_spec: MassiveFinalizedFeatureDomainSpecV0,
+    prior_daily_bars: Sequence[MassiveDailyBarsArtifactV0],
+    prior_daily_tape: Sequence[MassiveDailyTapeArtifactV0],
+    checkpoint: MassiveValidationCheckpointV1,
+) -> dict[str, tuple[str, str, int | None]]:
+    """Inputs that must predate V3; host, clock, and environment are captured inside it."""
+
+    expected: dict[str, tuple[str, str, int | None]] = {
+        "archive-scope": (
+            archive_scope.receipt_sha256,
+            semantic_sha256(archive_scope.captured_listing_receipts),
+            max(
+                captured_listing.loaded_acquisition.verified_at_ms,
+                captured_listing.loaded_listing.verified_at_ms,
+            ),
+        ),
+        "captured-listing-acquisition": (
+            captured_listing.acquisition_evidence.receipt_sha256,
+            captured_listing.loaded_acquisition.receipt.receipt_sha256,
+            captured_listing.loaded_acquisition.verified_at_ms,
+        ),
+        "captured-listing": (
+            captured_listing.committed_listing.receipt_sha256,
+            captured_listing.loaded_listing.receipt.receipt_sha256,
+            captured_listing.loaded_listing.verified_at_ms,
+        ),
+        "checkpoint": (
+            checkpoint.receipt_sha256,
+            checkpoint.loaded_source.receipt.receipt_sha256,
+            checkpoint.loaded_source.verified_at_ms,
+        ),
+        "condition-authority": (
+            condition_authority.receipt_sha256,
+            condition_authority.source_object_receipt_sha256,
+            None,
+        ),
+        "correction-authority": (
+            correction_authority.receipt_sha256,
+            correction_authority.canary_receipt_sha256,
+            None,
+        ),
+        "feature-domain": (
+            feature_domain_spec.receipt_sha256,
+            semantic_sha256(
+                (
+                    feature_domain_spec.condition_authority_receipt_sha256,
+                    feature_domain_spec.correction_authority_receipt_sha256,
+                )
+            ),
+            None,
+        ),
+        "identity-authority": (
+            identity_authority.receipt_sha256,
+            identity_authority.receipt_sha256,
+            _authority_available_at_ms(identity_authority),
+        ),
+        "session-authority": (
+            session_authority.receipt_sha256,
+            session_authority.calendar_source_receipt_sha256,
+            None,
+        ),
+    }
+    for bars_artifact in prior_daily_bars:
+        key = f"prior-daily-bars:{bars_artifact.source_session_date}"
+        if key in expected:
+            raise MassiveProductionTypedRunV2Error(
+                "prior daily bars contain a duplicate source session"
+            )
+        expected[key] = (
+            bars_artifact.receipt_sha256,
+            bars_artifact.loaded_source.receipt.receipt_sha256,
+            bars_artifact.loaded_source.verified_at_ms,
+        )
+    for tape_artifact in prior_daily_tape:
+        key = f"prior-daily-tape:{tape_artifact.source_session_date}"
+        if key in expected:
+            raise MassiveProductionTypedRunV2Error(
+                "prior daily tape contains a duplicate source session"
+            )
+        expected[key] = (
+            tape_artifact.receipt_sha256,
+            tape_artifact.loaded_source.receipt.receipt_sha256,
+            tape_artifact.loaded_source.verified_at_ms,
+        )
+    return expected
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,10 +677,332 @@ def measure_massive_typed_finalized_run_production_v2(
     return result
 
 
+class MassiveProductionTypedRunV3Error(ValueError):
+    """Source-derived production host, clock, or environment evidence differs."""
+
+
+@dataclass(frozen=True, slots=True)
+class MassiveProductionTypedRunV3:
+    development_engine_run: MassiveMeasuredTypedRunV1
+    host_authority: MassiveHostExecutionAuthorityV2
+    clock_authority: MassiveExecutionClockAuthorityV2
+    execution_environment: MassiveRuntimeExecutionEnvironmentAuthorityV2
+    input_availability_authority: MassiveInputAvailabilityAuthorityV1
+    checkpoint_receipt_sha256: str
+    stage_authority_inventory_sha256: str
+    outer_started_at_ms: int
+    outer_finished_at_ms: int
+    outer_started_monotonic_ns: int
+    outer_finished_monotonic_ns: int
+    runtime_ms: int
+    timing_source_kind: str
+    origin_policy_receipt_sha256: str
+    production_run_spec_receipt_sha256: str
+    production_timing_qualified: bool
+    historical_capability_authorized: bool
+    historical_availability_qualified: bool
+    panel_materialization_authorized: bool
+    predictive_training_authorized: bool
+    portfolio_evaluation_authorized: bool
+    receipt_sha256: str
+    schema: str = MASSIVE_PRODUCTION_TYPED_RUN_V3_SCHEMA
+
+    def unsigned(self) -> dict[str, object]:
+        return {
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
+        }
+
+    def validate(self) -> None:
+        self.development_engine_run.validate()
+        self.host_authority.validate()
+        self.clock_authority.validate()
+        self.execution_environment.validate()
+        self.input_availability_authority.validate()
+        engine = self.development_engine_run
+        if (
+            self.schema != MASSIVE_PRODUCTION_TYPED_RUN_V3_SCHEMA
+            or engine.typed_timing_qualified
+            or self.timing_source_kind
+            != "fixed-host-chrony-and-runtime-environment-capture"
+            or self.production_run_spec_receipt_sha256
+            != MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256
+            or self.origin_policy_receipt_sha256
+            != MASSIVE_PRODUCTION_ORIGIN_POLICY_V4_RECEIPT_SHA256_FROZEN
+            or self.execution_environment.pipeline_implementation_inventory_sha256
+            != MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
+            or not self.host_authority.captured_by_fixed_runtime
+            or not self.clock_authority.captured_by_fixed_runtime
+            or not self.execution_environment.captured_by_fixed_runtime
+            or self.clock_authority.host_authority_receipt_sha256
+            != self.host_authority.receipt_sha256
+            or self.execution_environment.host_authority_receipt_sha256
+            != self.host_authority.receipt_sha256
+            or self.outer_started_at_ms > engine.outer_started_at_ms
+            or self.outer_finished_at_ms < engine.outer_finished_at_ms
+            or self.outer_started_monotonic_ns > engine.outer_started_monotonic_ns
+            or self.outer_finished_monotonic_ns < engine.outer_finished_monotonic_ns
+            or self.runtime_ms
+            != (self.outer_finished_monotonic_ns - self.outer_started_monotonic_ns)
+            // 1_000_000
+            or self.runtime_ms > 55 * 60 * 1_000
+            or not self.production_timing_qualified
+            or self.historical_capability_authorized
+            or self.historical_availability_qualified
+            or self.panel_materialization_authorized
+            or self.predictive_training_authorized
+            or self.portfolio_evaluation_authorized
+        ):
+            raise MassiveProductionTypedRunV3Error(
+                "production typed run v3 qualification differs"
+            )
+        earliest_start = self.clock_authority.utc_lower_bound_ms(
+            self.outer_started_at_ms
+        )
+        latest_finish = self.clock_authority.utc_upper_bound_ms(
+            self.outer_finished_at_ms
+        )
+        if (
+            earliest_start < self.clock_authority.measurement_observed_at_ms
+            or latest_finish > self.clock_authority.qualification_valid_until_ms
+            or latest_finish > engine.decision_origin.decision_at_ms
+            or self.host_authority.capture_finished_at_ms > earliest_start
+            or self.execution_environment.capture_finished_at_ms > earliest_start
+            or self.clock_authority.loaded_source.verified_at_ms > earliest_start
+            or self.input_availability_authority.loaded_source.verified_at_ms
+            > earliest_start
+        ):
+            raise MassiveProductionTypedRunV3Error(
+                "source-derived timing evidence escaped the qualified interval"
+            )
+        expected_stage_inventory = semantic_sha256(
+            tuple(
+                (
+                    stage.receipt_sha256,
+                    self.host_authority.receipt_sha256,
+                    self.clock_authority.receipt_sha256,
+                    self.execution_environment.receipt_sha256,
+                )
+                for stage in engine.stages
+            )
+        )
+        if self.stage_authority_inventory_sha256 != expected_stage_inventory:
+            raise MassiveProductionTypedRunV3Error(
+                "production v3 stage authority inventory differs"
+            )
+        if (
+            self.checkpoint_receipt_sha256 != engine.checkpoint.receipt_sha256
+            or engine.inference.setting_id != engine.checkpoint.setting_id
+            or engine.inference.seed != engine.checkpoint.seed
+            or engine.requested_orders.setting_id != engine.inference.setting_id
+            or engine.requested_orders.seed != engine.inference.seed
+            or engine.requested_orders.tensor_receipt_sha256
+            != engine.decision_tensor.receipt_sha256
+            or engine.requested_orders.decision_origin_receipt_sha256
+            != engine.decision_origin.receipt_sha256
+            or engine.requested_orders.decision_session_date
+            != engine.decision_origin.decision_session_date
+            or engine.requested_orders.decision_at_ms
+            != engine.decision_origin.decision_at_ms
+        ):
+            raise MassiveProductionTypedRunV3Error(
+                "production v3 typed output chain differs"
+            )
+        for name in (
+            "checkpoint_receipt_sha256",
+            "stage_authority_inventory_sha256",
+            "origin_policy_receipt_sha256",
+            "production_run_spec_receipt_sha256",
+            "receipt_sha256",
+        ):
+            _digest(name, getattr(self, name))
+        if self.receipt_sha256 != semantic_sha256(self.unsigned()):
+            raise MassiveProductionTypedRunV3Error(
+                "production typed run v3 receipt differs"
+            )
+
+
+def measure_massive_typed_finalized_run_production_v3(
+    *,
+    s3_client: Any,
+    captured_listing: MassiveCapturedFlatFileListingV0,
+    listing_root: str | Path,
+    archive_scope: MassiveFinalizedArchiveScopeV2,
+    session_authority: MassiveSessionAuthority,
+    source_session: MassiveExchangeSession,
+    decision_session: MassiveExchangeSession,
+    identity_authority: PITSecurityUniverseAuthority,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+    feature_domain_spec: MassiveFinalizedFeatureDomainSpecV0,
+    prior_daily_bars: Sequence[MassiveDailyBarsArtifactV0],
+    prior_daily_tape: Sequence[MassiveDailyTapeArtifactV0],
+    checkpoint: MassiveValidationCheckpointV1,
+    checkpoint_root: str | Path,
+    input_availability_authority: MassiveInputAvailabilityAuthorityV1,
+    input_availability_root: str | Path,
+    host_capture_root: str | Path,
+    clock_capture_root: str | Path,
+    environment_capture_root: str | Path,
+    repository_root: str | Path,
+    container_image_digest_file: str | Path,
+    storage_roots: dict[str, str | Path],
+    source_root: str | Path,
+    spool_root: str | Path,
+    persisted_root: str | Path,
+    artifact_root: str | Path,
+    entitlement_receipt_sha256: str,
+) -> MassiveProductionTypedRunV3:
+    """Capture this host and chrony directly, then time the exact typed pipeline."""
+
+    host_authority = capture_massive_host_execution_authority_v2(
+        root=host_capture_root,
+        entitlement_receipt_sha256=entitlement_receipt_sha256,
+    )
+    execution_environment = capture_massive_runtime_execution_environment_v2(
+        root=environment_capture_root,
+        host_authority=host_authority,
+        host_root=host_capture_root,
+        repository_root=repository_root,
+        container_image_digest_file=container_image_digest_file,
+        s3_client=s3_client,
+        storage_roots=storage_roots,
+        pipeline_implementation_inventory_sha256=(
+            MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3
+        ),
+        entitlement_receipt_sha256=entitlement_receipt_sha256,
+    )
+    clock_authority = capture_massive_execution_clock_authority_v2(
+        root=clock_capture_root,
+        host_authority=host_authority,
+        host_root=host_capture_root,
+        entitlement_receipt_sha256=entitlement_receipt_sha256,
+    )
+    outer_started_at_ms = _wall_ms()
+    outer_started_monotonic_ns = time.perf_counter_ns()
+    expected_availability = parse_massive_input_availability_authority_v1(
+        root=input_availability_root,
+        loaded_source=input_availability_authority.loaded_source,
+    )
+    expected_checkpoint = parse_massive_validation_checkpoint_v1(
+        root=checkpoint_root,
+        loaded_source=checkpoint.loaded_source,
+    )
+    if (
+        expected_availability != input_availability_authority
+        or expected_checkpoint != checkpoint
+    ):
+        raise MassiveProductionTypedRunV3Error(
+            "production v3 input was not rederived from committed bytes"
+        )
+    validate_massive_captured_flat_file_listing_v0(
+        root=listing_root,
+        captured_listing=captured_listing,
+    )
+    earliest_start_at_ms = clock_authority.utc_lower_bound_ms(outer_started_at_ms)
+    expected_inputs = _required_input_rows_v3(
+        captured_listing=captured_listing,
+        archive_scope=archive_scope,
+        session_authority=session_authority,
+        identity_authority=identity_authority,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+        feature_domain_spec=feature_domain_spec,
+        prior_daily_bars=prior_daily_bars,
+        prior_daily_tape=prior_daily_tape,
+        checkpoint=checkpoint,
+    )
+    _validate_input_inventory(
+        authority=input_availability_authority,
+        expected=expected_inputs,
+        latest_allowed_at_ms=earliest_start_at_ms,
+    )
+    engine = measure_massive_typed_finalized_run_for_test_v1(
+        s3_client=s3_client,
+        captured_listing=captured_listing,
+        archive_scope=archive_scope,
+        session_authority=session_authority,
+        source_session=source_session,
+        decision_session=decision_session,
+        identity_authority=identity_authority,
+        condition_authority=condition_authority,
+        correction_authority=correction_authority,
+        feature_domain_spec=feature_domain_spec,
+        prior_daily_bars=prior_daily_bars,
+        prior_daily_tape=prior_daily_tape,
+        checkpoint=checkpoint,
+        source_root=source_root,
+        spool_root=spool_root,
+        persisted_root=persisted_root,
+        artifact_root=artifact_root,
+        entitlement_receipt_sha256=entitlement_receipt_sha256,
+        now_ms=_wall_ms,
+        monotonic_ns=time.perf_counter_ns,
+    )
+    outer_finished_at_ms = _wall_ms()
+    outer_finished_monotonic_ns = time.perf_counter_ns()
+    stage_inventory = semantic_sha256(
+        tuple(
+            (
+                stage.receipt_sha256,
+                host_authority.receipt_sha256,
+                clock_authority.receipt_sha256,
+                execution_environment.receipt_sha256,
+            )
+            for stage in engine.stages
+        )
+    )
+    body = {
+        "schema": MASSIVE_PRODUCTION_TYPED_RUN_V3_SCHEMA,
+        "development_engine_run": engine,
+        "host_authority": host_authority,
+        "clock_authority": clock_authority,
+        "execution_environment": execution_environment,
+        "input_availability_authority": input_availability_authority,
+        "checkpoint_receipt_sha256": checkpoint.receipt_sha256,
+        "stage_authority_inventory_sha256": stage_inventory,
+        "outer_started_at_ms": outer_started_at_ms,
+        "outer_finished_at_ms": outer_finished_at_ms,
+        "outer_started_monotonic_ns": outer_started_monotonic_ns,
+        "outer_finished_monotonic_ns": outer_finished_monotonic_ns,
+        "runtime_ms": (
+            outer_finished_monotonic_ns - outer_started_monotonic_ns
+        )
+        // 1_000_000,
+        "timing_source_kind": "fixed-host-chrony-and-runtime-environment-capture",
+        "origin_policy_receipt_sha256": (
+            MASSIVE_PRODUCTION_ORIGIN_POLICY_V4_RECEIPT_SHA256_FROZEN
+        ),
+        "production_run_spec_receipt_sha256": (
+            MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256
+        ),
+        "production_timing_qualified": True,
+        "historical_capability_authorized": False,
+        "historical_availability_qualified": False,
+        "panel_materialization_authorized": False,
+        "predictive_training_authorized": False,
+        "portfolio_evaluation_authorized": False,
+    }
+    provisional = MassiveProductionTypedRunV3(
+        **body,  # type: ignore[arg-type]
+        receipt_sha256="0" * 64,
+    )
+    result = replace(
+        provisional,
+        receipt_sha256=semantic_sha256(provisional.unsigned()),
+    )
+    result.validate()
+    return result
+
+
 __all__ = [
     "MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V2",
+    "MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V3",
     "MASSIVE_PRODUCTION_TYPED_RUN_V2_SPEC_SHA256",
+    "MASSIVE_PRODUCTION_TYPED_RUN_V3_SPEC_SHA256",
     "MassiveProductionTypedRunV2",
     "MassiveProductionTypedRunV2Error",
+    "MassiveProductionTypedRunV3",
+    "MassiveProductionTypedRunV3Error",
     "measure_massive_typed_finalized_run_production_v2",
+    "measure_massive_typed_finalized_run_production_v3",
 ]

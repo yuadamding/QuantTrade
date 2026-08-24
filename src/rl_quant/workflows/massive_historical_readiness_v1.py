@@ -33,6 +33,7 @@ from rl_quant.workflows.massive_production_typed_run_v2 import (
 )
 
 MASSIVE_TYPED_READINESS_MINIMUM_RUNS_V1 = 20
+MASSIVE_TYPED_READINESS_CAPABILITY_V1_AUTHORIZING = False
 MASSIVE_TYPED_READINESS_PUBLICATION_SAFETY_MS_V1 = 5 * 60 * 1_000
 MASSIVE_TYPED_READINESS_CAPABILITY_V1_SCHEMA = (
     "rl-quant.massive-typed-readiness-capability-v1"
@@ -176,6 +177,8 @@ class MassiveTypedReadinessCapabilityV1:
 
     def validate(self) -> None:
         if (
+            not MASSIVE_TYPED_READINESS_CAPABILITY_V1_AUTHORIZING
+            or
             self.schema != MASSIVE_TYPED_READINESS_CAPABILITY_V1_SCHEMA
             or len(self.archive_runs) < MASSIVE_TYPED_READINESS_MINIMUM_RUNS_V1
             or tuple(run.receipt_sha256 for run in self.archive_runs)
@@ -264,6 +267,10 @@ class MassiveTypedReadinessCapabilityV1:
 def build_massive_typed_readiness_capability_v1(
     archive_runs: Sequence[MassiveProductionTypedRunV2],
 ) -> MassiveTypedReadinessCapabilityV1:
+    if not MASSIVE_TYPED_READINESS_CAPABILITY_V1_AUTHORIZING:
+        raise MassiveHistoricalReadinessV1Error(
+            "typed readiness v1 is superseded by source-derived runtime authorities"
+        )
     if any(not isinstance(run, MassiveProductionTypedRunV2) for run in archive_runs):
         raise MassiveHistoricalReadinessV1Error(
             "typed readiness accepts production-clock runs only"
