@@ -986,6 +986,286 @@ def validate_massive_persisted_partitions_v1(
             raise MassivePersistedPartitionError("persisted partition bytes differ")
 
 
+def _parse_extracted_trade_row_v2(value: object) -> MassiveExtractedTradeRow:
+    """Reconstruct one extracted row rather than trusting nested receipt text."""
+
+    if not isinstance(value, dict):
+        raise MassivePersistedPartitionError("persisted event row is not an object")
+    expected = {
+        "schema",
+        "source_row_number",
+        "raw_row_sha256",
+        "canonical_record",
+        "receipt_sha256",
+    }
+    if set(value) != expected or not isinstance(value["canonical_record"], dict):
+        raise MassivePersistedPartitionError("persisted event field inventory drifted")
+    raw_record = dict(value["canonical_record"])
+    raw_record["conditions"] = tuple(raw_record.get("conditions", ()))
+    try:
+        canonical = MassiveCanonicalTradeSourceRecord(**raw_record)
+        row = MassiveExtractedTradeRow(
+            schema=value["schema"],
+            source_row_number=value["source_row_number"],
+            raw_row_sha256=value["raw_row_sha256"],
+            canonical_record=canonical,
+            receipt_sha256=value["receipt_sha256"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MassivePersistedPartitionError(
+            "persisted event values are malformed"
+        ) from exc
+    row.validate()
+    return row
+
+
+def _parse_canonical_jsonl_v2(raw: bytes) -> tuple[object, ...]:
+    if raw and not raw.endswith(b"\n"):
+        raise MassivePersistedPartitionError("persisted JSONL lacks a final newline")
+    try:
+        rows = tuple(json.loads(line) for line in raw.splitlines())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MassivePersistedPartitionError("persisted JSONL is malformed") from exc
+    if raw != _jsonl(rows):
+        raise MassivePersistedPartitionError("persisted JSONL is not canonical")
+    return rows
+
+
+def _parse_correction_row_v2(value: object) -> dict[str, object]:
+    expected = {
+        "source_row_number",
+        "correction_kind",
+        "event_key",
+        "canonical_record_receipt_sha256",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected
+        or not isinstance(value["event_key"], list)
+        or len(value["event_key"]) != 4
+    ):
+        raise MassivePersistedPartitionError(
+            "persisted correction field inventory drifted"
+        )
+    result = dict(value)
+    result["event_key"] = tuple(value["event_key"])
+    return result
+
+
+def validate_massive_persisted_partitions_semantically_v2(
+    *,
+    root: str | Path,
+    manifest: MassivePersistedPartitionManifestV1,
+    scan_evidence: MassiveDailyTradeFileScanEvidenceV0,
+    semantic_partition_manifest: MassiveDailyTradePartitionManifestV0,
+    identity_authority: PITSecurityUniverseAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+) -> None:
+    """Reparse event bytes and independently rederive every cached partition.
+
+    V1's physical validator remains immutable.  This V2 qualification treats
+    the event timeline as the sole authority and regards the active/correction
+    files as deterministic caches.
+    """
+
+    manifest.validate()
+    scan_evidence.validate()
+    semantic_partition_manifest.validate()
+    identity_authority.validate()
+    correction_authority.validate()
+    if (
+        manifest.source_file_scan_receipt_sha256 != scan_evidence.receipt_sha256
+        or manifest.semantic_partition_manifest_receipt_sha256
+        != semantic_partition_manifest.receipt_sha256
+        or manifest.identity_authority_receipt_sha256
+        != identity_authority.receipt_sha256
+        or manifest.correction_authority_receipt_sha256
+        != correction_authority.receipt_sha256
+    ):
+        raise MassivePersistedPartitionError(
+            "semantic persisted-partition authorities differ"
+        )
+    semantic_by_security = {
+        row.security_id: row for row in semantic_partition_manifest.security_partitions
+    }
+    if set(semantic_by_security) != {row.security_id for row in manifest.partitions}:
+        raise MassivePersistedPartitionError(
+            "semantic and persisted security inventories differ"
+        )
+    identity_index = _identity_index(identity_authority)
+    global_source_rows: set[int] = set()
+    for partition in manifest.partitions:
+        event_raw = read_loaded_massive_source_bytes(
+            root=root, loaded_source=partition.event_timeline
+        )
+        active_raw = read_loaded_massive_source_bytes(
+            root=root, loaded_source=partition.active_regular
+        )
+        correction_raw = read_loaded_massive_source_bytes(
+            root=root, loaded_source=partition.correction_timeline
+        )
+        event_values = _parse_canonical_jsonl_v2(event_raw)
+        active_values = _parse_canonical_jsonl_v2(active_raw)
+        correction_values = tuple(
+            _parse_correction_row_v2(value)
+            for value in _parse_canonical_jsonl_v2(correction_raw)
+        )
+        events = tuple(_parse_extracted_trade_row_v2(value) for value in event_values)
+        active_rows = tuple(
+            _parse_extracted_trade_row_v2(value) for value in active_values
+        )
+        if events != tuple(sorted(events, key=_order_key)):
+            raise MassivePersistedPartitionError("persisted event order differs")
+        source_rows = tuple(row.source_row_number for row in events)
+        if len(set(source_rows)) != len(source_rows) or global_source_rows.intersection(
+            source_rows
+        ):
+            raise MassivePersistedPartitionError(
+                "persisted source-row provenance is not unique"
+            )
+        global_source_rows.update(source_rows)
+        for row in events:
+            if (
+                _resolve_security(identity_index, row.canonical_record)
+                != partition.security_id
+            ):
+                raise MassivePersistedPartitionError(
+                    "persisted event is routed to the wrong security"
+                )
+
+        active: dict[tuple[str, int, int, str], MassiveExtractedTradeRow] = {}
+        cancelled: set[tuple[str, int, int, str]] = set()
+        expected_corrections: list[dict[str, object]] = []
+        for row in events:
+            record = row.canonical_record
+            code = 0 if record.correction_code is None else record.correction_code
+            kind = correction_authority.resolve(code)
+            key = _event_key(row)
+            if kind in {"new-trade", "late-report"}:
+                previous = active.get(key)
+                if (
+                    previous is not None
+                    and previous.receipt_sha256 != row.receipt_sha256
+                ):
+                    raise MassivePersistedPartitionError(
+                        "persisted event timeline has a conflicting duplicate"
+                    )
+                active[key] = row
+                cancelled.discard(key)
+            elif kind == "replacement":
+                if key not in active:
+                    raise MassivePersistedPartitionError(
+                        "persisted replacement lacks a predecessor"
+                    )
+                active[key] = row
+                cancelled.discard(key)
+            elif kind == "cancellation":
+                if key not in active:
+                    raise MassivePersistedPartitionError(
+                        "persisted cancellation lacks a predecessor"
+                    )
+                del active[key]
+                cancelled.add(key)
+            if kind in {"replacement", "cancellation", "late-report"}:
+                expected_corrections.append(
+                    {
+                        "source_row_number": row.source_row_number,
+                        "correction_kind": kind,
+                        "event_key": key,
+                        "canonical_record_receipt_sha256": record.receipt_sha256,
+                    }
+                )
+        expected_active = tuple(
+            sorted(
+                (
+                    row
+                    for row in active.values()
+                    if scan_evidence.regular_open_ns
+                    <= row.canonical_record.participant_timestamp_ns
+                    < scan_evidence.regular_close_ns
+                ),
+                key=_event_key,
+            )
+        )
+        expected_correction_rows = tuple(expected_corrections)
+        if (
+            active_rows != expected_active
+            or correction_values != expected_correction_rows
+            or event_raw != _jsonl(tuple(asdict(row) for row in events))
+            or active_raw != _jsonl(tuple(asdict(row) for row in expected_active))
+            or correction_raw != _jsonl(expected_correction_rows)
+        ):
+            raise MassivePersistedPartitionError(
+                "persisted derived caches differ from the event timeline"
+            )
+        semantic = semantic_by_security[partition.security_id]
+        regular_input_count = sum(
+            scan_evidence.regular_open_ns
+            <= row.canonical_record.participant_timestamp_ns
+            < scan_evidence.regular_close_ns
+            for row in events
+        )
+        if (
+            partition.event_row_count != len(events)
+            or partition.active_regular_row_count != len(expected_active)
+            or partition.correction_event_count != len(expected_correction_rows)
+            or partition.event_inventory_sha256
+            != semantic_sha256(tuple(row.receipt_sha256 for row in events))
+            or partition.active_inventory_sha256
+            != semantic_sha256(tuple(row.receipt_sha256 for row in expected_active))
+            or partition.correction_inventory_sha256
+            != semantic_sha256(expected_correction_rows)
+            or semantic.source_row_count != len(events)
+            or semantic.regular_session_input_row_count != regular_input_count
+            or semantic.active_regular_session_row_count != len(expected_active)
+            or semantic.cancelled_event_count != len(cancelled)
+        ):
+            raise MassivePersistedPartitionError(
+                "persisted rows do not reconcile to the semantic partition"
+            )
+    if len(global_source_rows) != scan_evidence.source_row_count:
+        raise MassivePersistedPartitionError(
+            "persisted global source-row inventory is incomplete"
+        )
+
+
+def load_massive_persisted_security_rows_v2(
+    *,
+    root: str | Path,
+    partition: MassivePersistedSecurityPartitionV1,
+) -> tuple[
+    tuple[MassiveExtractedTradeRow, ...],
+    tuple[MassiveExtractedTradeRow, ...],
+    tuple[dict[str, object], ...],
+]:
+    """Reload the three canonical security artifacts with nested validation."""
+
+    partition.validate()
+    event_values = _parse_canonical_jsonl_v2(
+        read_loaded_massive_source_bytes(
+            root=root, loaded_source=partition.event_timeline
+        )
+    )
+    active_values = _parse_canonical_jsonl_v2(
+        read_loaded_massive_source_bytes(
+            root=root, loaded_source=partition.active_regular
+        )
+    )
+    correction_values = tuple(
+        _parse_correction_row_v2(value)
+        for value in _parse_canonical_jsonl_v2(
+            read_loaded_massive_source_bytes(
+                root=root, loaded_source=partition.correction_timeline
+            )
+        )
+    )
+    return (
+        tuple(_parse_extracted_trade_row_v2(value) for value in event_values),
+        tuple(_parse_extracted_trade_row_v2(value) for value in active_values),
+        correction_values,
+    )
+
+
 __all__ = [
     "MASSIVE_PERSISTED_ACTIVE_DATASET_V1",
     "MASSIVE_PERSISTED_CORRECTIONS_DATASET_V1",
@@ -998,6 +1278,8 @@ __all__ = [
     "MassivePersistedSecurityPartitionV1",
     "MassiveDiskTradeRowSpoolV1",
     "persist_massive_daily_trade_partitions_v1",
+    "load_massive_persisted_security_rows_v2",
     "stream_and_persist_massive_daily_trade_partitions_v1",
     "validate_massive_persisted_partitions_v1",
+    "validate_massive_persisted_partitions_semantically_v2",
 ]

@@ -67,6 +67,12 @@ from rl_quant.data_sources.massive.finalized_artifact_origin_authority import (
     MassiveArtifactQualifiedOriginError,
     build_massive_artifact_qualified_daily_source_v1,
 )
+from rl_quant.data_sources.massive.finalized_archive_scope import (
+    MASSIVE_FINALIZED_ARCHIVE_SCOPE_V1_SPEC_SHA256,
+    MassiveFinalizedArchiveScopeError,
+    MassiveFinalizedArchiveScopeV1,
+    build_massive_finalized_archive_scope_v1,
+)
 from rl_quant.data_sources.massive.finalized_artifact_readiness import (
     MASSIVE_ARTIFACT_EXECUTION_DATASET_V1,
     MASSIVE_ARTIFACT_EXECUTION_SOURCE_SCHEMA_SHA256,
@@ -140,9 +146,18 @@ from rl_quant.data_sources.massive.finalized_origin_policy import (
     MASSIVE_FINALIZED_ORIGIN_POLICY_V0_RECEIPT_SHA256,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V1,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V1_RECEIPT_SHA256,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V2,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V2_RECEIPT_SHA256,
     MassiveFinalizedOriginPolicyError,
     MassiveFinalizedOriginPolicyV0,
     MassiveFinalizedOriginPolicyV1,
+    MassiveFinalizedOriginPolicyV2,
+)
+from rl_quant.data_sources.massive.finalized_object_acquisition import (
+    MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256,
+    MassiveAuthenticatedFlatFileDownloadV1,
+    MassiveAuthenticatedObjectGetError,
+    download_massive_flat_file_object_v1,
 )
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
     MASSIVE_DAILY_TRADE_PARTITION_SPEC_SHA256,
@@ -160,8 +175,10 @@ from rl_quant.data_sources.massive.finalized_persisted_partitions import (
     MassivePersistedPartitionManifestV1,
     MassivePersistedSecurityPartitionV1,
     persist_massive_daily_trade_partitions_v1,
+    load_massive_persisted_security_rows_v2,
     stream_and_persist_massive_daily_trade_partitions_v1,
     validate_massive_persisted_partitions_v1,
+    validate_massive_persisted_partitions_semantically_v2,
 )
 from rl_quant.data_sources.massive.processing_capability import (
     MassiveFinalizedProcessingBenchmarkV0,
@@ -259,6 +276,7 @@ __all__ = [
     "MASSIVE_ARTIFACT_EXECUTION_DATASET_V1",
     "MASSIVE_ARTIFACT_EXECUTION_SOURCE_SCHEMA_SHA256",
     "MASSIVE_ARTIFACT_READINESS_STAGE_IDS_V1",
+    "MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256",
     "MASSIVE_ENTITLEMENT_AUTHORITY_SCHEMA",
     "MASSIVE_ENTITLEMENT_EVIDENCE_KINDS",
     "MASSIVE_ENTITLEMENT_OBSERVATION_SCHEMA",
@@ -272,6 +290,9 @@ __all__ = [
     "MASSIVE_FINALIZED_ORIGIN_POLICY_V0_RECEIPT_SHA256",
     "MASSIVE_FINALIZED_ORIGIN_POLICY_V1",
     "MASSIVE_FINALIZED_ORIGIN_POLICY_V1_RECEIPT_SHA256",
+    "MASSIVE_FINALIZED_ORIGIN_POLICY_V2",
+    "MASSIVE_FINALIZED_ORIGIN_POLICY_V2_RECEIPT_SHA256",
+    "MASSIVE_FINALIZED_ARCHIVE_SCOPE_V1_SPEC_SHA256",
     "MASSIVE_FINALIZED_MAXIMUM_SOURCE_STALENESS_SESSIONS",
     "MASSIVE_FINALIZED_MINIMUM_READINESS_SESSIONS_V0",
     "MASSIVE_FINALIZED_MINIMUM_READINESS_YEARS_V0",
@@ -315,6 +336,8 @@ __all__ = [
     "MassiveArtifactReadinessPanelV1",
     "MassiveArtifactReadinessRunV1",
     "MassiveArtifactReadinessStageV1",
+    "MassiveAuthenticatedFlatFileDownloadV1",
+    "MassiveAuthenticatedObjectGetError",
     "MassiveConditionAuthority",
     "MassiveConditionError",
     "MassiveCorrectionAuthority",
@@ -339,6 +362,8 @@ __all__ = [
     "MassiveExtractedWebSocketTradeRow",
     "MassiveFeatureInputCutoffEvidenceV0",
     "MassiveFinalizedAvailabilityError",
+    "MassiveFinalizedArchiveScopeError",
+    "MassiveFinalizedArchiveScopeV1",
     "MassiveFinalizedDailySourceEvidenceV0",
     "MassiveFinalizedDecisionOriginPlanV0",
     "MassiveFinalizedDecisionOriginV0",
@@ -350,6 +375,7 @@ __all__ = [
     "MassiveFinalizedOriginPolicyError",
     "MassiveFinalizedOriginPolicyV0",
     "MassiveFinalizedOriginPolicyV1",
+    "MassiveFinalizedOriginPolicyV2",
     "MassiveFinalizedOriginAvailabilityAuthorityV0",
     "MassiveFinalizedProcessingSpecV0",
     "MassiveFinalizedProcessingBenchmarkV0",
@@ -403,6 +429,7 @@ __all__ = [
     "build_massive_artifact_qualified_daily_source_v1",
     "build_massive_artifact_readiness_capability_v1",
     "build_massive_artifact_readiness_panel_v1",
+    "build_massive_finalized_archive_scope_v1",
     "build_massive_correction_authority",
     "build_massive_decision_clock_authority",
     "build_massive_delayed_websocket_capture_authority",
@@ -435,6 +462,7 @@ __all__ = [
     "load_massive_source_object",
     "extract_massive_flat_file_security_session",
     "extract_massive_websocket_trade_rows",
+    "download_massive_flat_file_object_v1",
     "coverage_session_from_massive_trade_key",
     "normalize_massive_canonical_trade_event",
     "normalize_massive_delayed_websocket_trade",
@@ -445,6 +473,7 @@ __all__ = [
     "open_loaded_massive_source_stream",
     "publish_massive_source_object",
     "persist_massive_daily_trade_partitions_v1",
+    "load_massive_persisted_security_rows_v2",
     "stream_and_persist_massive_daily_trade_partitions_v1",
     "read_loaded_massive_source_bytes",
     "reconcile_massive_aggregate_bars",
@@ -458,4 +487,5 @@ __all__ = [
     "parse_massive_flat_file_listing_acquisition_v0",
     "validate_massive_captured_flat_file_listing_v0",
     "validate_massive_persisted_partitions_v1",
+    "validate_massive_persisted_partitions_semantically_v2",
 ]

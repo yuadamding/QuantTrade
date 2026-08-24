@@ -1170,6 +1170,11 @@ def build_massive_artifact_readiness_capability_v1(
     archive_runs: Sequence[MassiveArtifactReadinessRunV1],
 ) -> MassiveArtifactReadinessCapabilityV1:
     panel.validate()
+    expected_panel = build_massive_artifact_readiness_panel_v1(archive_runs)
+    if panel != expected_panel:
+        raise MassiveArtifactReadinessError(
+            "capability panel was not deterministically derived"
+        )
     by_receipt = {run.receipt_sha256: run for run in archive_runs}
     if set(by_receipt) != set(panel.archive_run_receipts):
         raise MassiveArtifactReadinessError(

@@ -18,6 +18,10 @@ from rl_quant.alpha.pit_universe import (
     SourcedTickerHistoryRecord,
     UniverseRankInputRecord,
 )
+from rl_quant.alpha.massive_universe_adapter import checked_pit_universe_rule
+from rl_quant.data_sources.massive.finalized_archive_scope import (
+    build_massive_finalized_archive_scope_v1,
+)
 from rl_quant.data_sources.massive.conditions import (
     MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     build_massive_condition_authority,
@@ -44,6 +48,9 @@ from rl_quant.data_sources.massive.finalized_listing_acquisition import (
     MassiveFlatFileListingAcquisitionError,
     capture_massive_flat_file_listing_v0,
 )
+from rl_quant.data_sources.massive.finalized_object_acquisition import (
+    download_massive_flat_file_object_v1,
+)
 from rl_quant.data_sources.massive.finalized_origin import (
     MASSIVE_FINALIZED_PROCESSING_ALLOWANCE_MS,
 )
@@ -57,6 +64,8 @@ from rl_quant.data_sources.massive.finalized_origin_policy import (
     MASSIVE_FINALIZED_ORIGIN_POLICY_V0_RECEIPT_SHA256,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V1,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V1_RECEIPT_SHA256,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V2,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V2_RECEIPT_SHA256,
     MassiveFinalizedOriginPolicyError,
 )
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
@@ -64,9 +73,26 @@ from rl_quant.data_sources.massive.finalized_partition_manifest import (
     build_massive_finalized_feature_domain_spec_v0,
 )
 from rl_quant.data_sources.massive.finalized_persisted_partitions import (
+    MASSIVE_PERSISTED_ACTIVE_DATASET_V1,
+    MASSIVE_PERSISTED_JSONL_SCHEMA_SHA256,
     persist_massive_daily_trade_partitions_v1,
     stream_and_persist_massive_daily_trade_partitions_v1,
     validate_massive_persisted_partitions_v1,
+    validate_massive_persisted_partitions_semantically_v2,
+)
+from rl_quant.workflows.massive_finalized_typed_pipeline import (
+    MASSIVE_TYPED_STAGE_IMPLEMENTATION_INVENTORY_SHA256,
+    materialize_massive_finalized_typed_pipeline_v0,
+    validate_massive_finalized_typed_pipeline_v0,
+)
+from rl_quant.evaluation.massive_validation_inference_v0 import (
+    MASSIVE_VALIDATION_CHECKPOINT_V0_DATASET,
+    MASSIVE_VALIDATION_CHECKPOINT_V0_SOURCE_SCHEMA_SHA256,
+    parse_massive_validation_checkpoint_v0,
+)
+from rl_quant.features.massive_rolling_features_v0 import (
+    MASSIVE_ROLLING_BARS_V0_FIELDS,
+    MASSIVE_ROLLING_TAPE_V0_FIELDS,
 )
 from rl_quant.data_sources.massive.finalized_readiness import (
     MASSIVE_FINALIZED_MINIMUM_READINESS_SESSIONS_V0,
@@ -97,6 +123,8 @@ from rl_quant.data_sources.massive.trade_extraction import (
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes
 from rl_quant.protocol.massive_finalized_validation_v0 import (
+    MASSIVE_FINALIZED_VALIDATION_V0_HORIZONS,
+    MASSIVE_FINALIZED_VALIDATION_V0_PROTOCOL,
     MASSIVE_FINALIZED_VALIDATION_V0_RECEIPT_SHA256,
 )
 
@@ -316,12 +344,85 @@ def _identity_authority(source_day: str, tickers: tuple[str, ...]):
     )
 
 
+def _v0_identity_authority(source_day: str, tickers: tuple[str, ...]):
+    listed = _ms(source_day, time(0, 0)) - 100 * 86_400_000
+    effective = _ms(source_day, time(9, 0))
+    rule = checked_pit_universe_rule(
+        MASSIVE_FINALIZED_VALIDATION_V0_PROTOCOL.universe_rule
+    )
+    masters = tuple(
+        SourcedSecurityMasterRecord(
+            f"SEC-{ticker}",
+            f"ISS-{ticker}",
+            "XNYS",
+            "COMMON",
+            "common-stock",
+            listed,
+            None,
+            None,
+            None,
+            semantic_sha256((ticker, "v0-master")),
+        )
+        for ticker in tickers
+    )
+    histories = tuple(
+        SourcedTickerHistoryRecord(
+            f"SEC-{ticker}",
+            ticker,
+            listed,
+            None,
+            listed,
+            "XNYS",
+            semantic_sha256((ticker, "v0-history")),
+        )
+        for ticker in tickers
+    )
+    listings = tuple(
+        ListingEventRecord(
+            f"LIST-V0-{ticker}",
+            f"SEC-{ticker}",
+            listed,
+            listed,
+            "XNYS",
+            ticker,
+            semantic_sha256((ticker, "v0-listing")),
+        )
+        for ticker in tickers
+    )
+    rank_inputs = tuple(
+        UniverseRankInputRecord(
+            security_id=f"SEC-{ticker}",
+            effective_at_ms=effective,
+            effective_session_index=100,
+            available_at_ms=effective - 1,
+            observation_start_ms=listed,
+            observation_end_ms=effective - 2,
+            observation_start_session_index=37,
+            observation_end_session_index=99,
+            observed_session_count=63,
+            average_dollar_volume=10_000_000.0,
+            close_price=10.0,
+            source_receipt_sha256=semantic_sha256((ticker, "v0-rank")),
+        )
+        for ticker in tickers
+    )
+    return PITSecurityUniverseAuthority.build(
+        rule=rule,
+        security_master=masters,
+        ticker_history=histories,
+        listing_events=listings,
+        delisting_events=(),
+        rank_inputs=rank_inputs,
+    )
+
+
 def _qualified_sources(
     tmp_path: Path,
     *,
     sessions: tuple[MassiveExchangeSession, ...],
     source_rows: dict[str, tuple[tuple[str, ...], ...]],
     last_modified: dict[str, int],
+    identity_authority: PITSecurityUniverseAuthority | None = None,
 ):
     session_authority = build_massive_session_authority(
         sessions, calendar_source_receipt_sha256=CALENDAR_RECEIPT
@@ -332,7 +433,7 @@ def _qualified_sources(
         condition_authority=conditions, correction_authority=corrections
     )
     tickers = tuple(sorted({row[0] for rows in source_rows.values() for row in rows}))
-    identity = _identity_authority(min(source_rows), tickers)
+    identity = identity_authority or _identity_authority(min(source_rows), tickers)
     observed_at_ms = max(last_modified.values()) + 7_200_000
     loaded_by_day = {}
     listing_entries = []
@@ -1280,3 +1381,230 @@ def test_artifact_readiness_v1_measures_source_through_orders(
         match="not created and verified inside",
     ):
         preexisting.validate()
+
+
+def test_origin_policy_v2_binds_typed_artifact_generation() -> None:
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V2.validate()
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V2.typed_stage_implementation_inventory_sha256
+        == MASSIVE_TYPED_STAGE_IMPLEMENTATION_INVENTORY_SHA256
+    )
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V2.receipt_sha256
+        == MASSIVE_FINALIZED_ORIGIN_POLICY_V2_RECEIPT_SHA256
+    )
+    drifted = replace(
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V2,
+        panel_materialization_authorized=True,
+    )
+    drifted = replace(drifted, receipt_sha256=semantic_sha256(drifted.unsigned()))
+    with pytest.raises(MassiveFinalizedOriginPolicyError, match="authorized"):
+        drifted.validate()
+
+
+def test_authenticated_get_archive_scope_and_typed_pipeline_v0(tmp_path: Path) -> None:
+    source_day = "2026-08-20"
+    decision_day = "2026-08-21"
+    source_rows = {
+        source_day: (
+            _trade_row(
+                ticker="AAA",
+                trade_id="A1",
+                participant_ns=_ns(source_day, time(15, 55)),
+                sip_ns=_ns(source_day, time(15, 55)),
+                price="9.00",
+                size="100",
+                sequence=1,
+            ),
+            _trade_row(
+                ticker="AAA",
+                trade_id="A1",
+                participant_ns=_ns(source_day, time(15, 55)),
+                sip_ns=_ns(source_day, time(16, 5)),
+                price="10.00",
+                size="125",
+                correction=1,
+                sequence=2,
+            ),
+        )
+    }
+    identity = _v0_identity_authority(source_day, ("AAA",))
+    stack = _qualified_sources(
+        tmp_path,
+        sessions=(_session(source_day), _session(decision_day)),
+        source_rows=source_rows,
+        last_modified={source_day: _ms(decision_day, time(11, 0))},
+        identity_authority=identity,
+    )
+    loaded = stack["loaded"][source_day]
+    source_payload = read_loaded_massive_source_bytes(
+        root=tmp_path / "trades", loaded_source=loaded
+    )
+
+    class FakeGetClient:
+        def get_object(self, **kwargs):
+            assert kwargs == {
+                "Bucket": MASSIVE_FLAT_FILE_BUCKET,
+                "Key": loaded.receipt.source_object_key,
+            }
+            return {
+                "ResponseMetadata": {"RequestId": "authenticated-get-request"},
+                "Body": BytesIO(source_payload),
+                "ETag": f'"{loaded.receipt.etag}"',
+                "ContentLength": len(source_payload),
+                "VersionId": "version-1",
+            }
+
+    get_times = iter((_ms(decision_day, time(11, 1)), _ms(decision_day, time(11, 2))))
+    download = download_massive_flat_file_object_v1(
+        s3_client=FakeGetClient(),
+        captured_listing=stack["captured_listing"],
+        source_object_key=loaded.receipt.source_object_key,
+        destination_root=tmp_path / "authenticated-get",
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        now_ms=lambda: next(get_times),
+    )
+    download.validate()
+    scope = build_massive_finalized_archive_scope_v1(
+        session_authority=stack["session_authority"],
+        captured_listings=(stack["captured_listing"],),
+        start_session_date=source_day,
+        end_session_date=source_day,
+    )
+    assert scope.qualification_complete is True
+
+    _, _, _, scan, semantic_partition = stack["stacks"][0]
+    scanned_rows, repeated_scan = scan_massive_daily_trade_file_v0(
+        root=tmp_path / "trades",
+        loaded_source=loaded,
+        session_authority=stack["session_authority"],
+        session=stack["session_authority"].resolve(
+            exchange="XNYS", session_date=source_day
+        ),
+        correction_authority=stack["corrections"],
+    )
+    assert repeated_scan == scan
+    persisted = persist_massive_daily_trade_partitions_v1(
+        root=tmp_path / "typed-persisted",
+        rows=scanned_rows,
+        scan_evidence=scan,
+        semantic_partition_manifest=semantic_partition,
+        identity_authority=identity,
+        correction_authority=stack["corrections"],
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        published_at_ms=_ms(decision_day, time(11, 3)),
+    )
+    validate_massive_persisted_partitions_semantically_v2(
+        root=tmp_path / "typed-persisted",
+        manifest=persisted,
+        scan_evidence=scan,
+        semantic_partition_manifest=semantic_partition,
+        identity_authority=identity,
+        correction_authority=stack["corrections"],
+    )
+
+    feature_names = MASSIVE_ROLLING_BARS_V0_FIELDS + MASSIVE_ROLLING_TAPE_V0_FIELDS
+    checkpoint_payload = {
+        "schema": "rl-quant.massive-validation-checkpoint-v0",
+        "setting_id": "MV04",
+        "feature_set_id": "BARS_PLUS_TAPE_V0",
+        "seed": 0,
+        "feature_names": feature_names,
+        "horizon_ids": tuple(
+            row.horizon_id for row in MASSIVE_FINALIZED_VALIDATION_V0_HORIZONS
+        ),
+        "normalization_mean": (0.0,) * len(feature_names),
+        "normalization_scale": (1.0,) * len(feature_names),
+        "weights": tuple(
+            (0.001,) + (0.0,) * (len(feature_names) - 1)
+            for _ in MASSIVE_FINALIZED_VALIDATION_V0_HORIZONS
+        ),
+        "biases": (0.001, 0.002, 0.003, 0.004),
+        "quantile_offsets": (0.01, 0.01, 0.02, 0.03),
+        "predictive_scales": (0.01, 0.02, 0.03, 0.04),
+    }
+    checkpoint_loaded = _publish(
+        root=tmp_path / "checkpoint",
+        key="massive-finalized-v0/checkpoints/mv04-seed0.json",
+        payload=canonical_json_file_bytes(checkpoint_payload),
+        dataset_id=MASSIVE_VALIDATION_CHECKPOINT_V0_DATASET,
+        schema_sha256=MASSIVE_VALIDATION_CHECKPOINT_V0_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=_ms(decision_day, time(11, 4)),
+        etag="checkpoint-mv04-seed0",
+    )
+    checkpoint = parse_massive_validation_checkpoint_v0(
+        root=tmp_path / "checkpoint", loaded_source=checkpoint_loaded
+    )
+    pipeline = materialize_massive_finalized_typed_pipeline_v0(
+        persisted_root=tmp_path / "typed-persisted",
+        output_root=tmp_path / "typed-output",
+        checkpoint_root=tmp_path / "checkpoint",
+        scan_evidence=scan,
+        semantic_partition_manifest=semantic_partition,
+        persisted_partition_manifest=persisted,
+        identity_authority=identity,
+        condition_authority=stack["conditions"],
+        correction_authority=stack["corrections"],
+        prior_daily_bars=(),
+        prior_daily_tape=(),
+        checkpoint=checkpoint,
+        decision_session_date=decision_day,
+        decision_at_ms=_ms(decision_day, time(12, 30)),
+        source_staleness_sessions=1,
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+    )
+    validate_massive_finalized_typed_pipeline_v0(
+        output_root=tmp_path / "typed-output", result=pipeline
+    )
+    assert len(pipeline.daily_bars.rows) == 1
+    assert len(pipeline.daily_tape.rows) == 1
+    assert pipeline.decision_tensor.security_ids == ("SEC-AAA",)
+    assert len(pipeline.inference.rows) == 4
+    assert tuple(row.security_id for row in pipeline.requested_orders.rows) == (
+        "CASH",
+        "SEC-AAA",
+    )
+    assert pipeline.panel_materialization_authorized is False
+    assert pipeline.predictive_training_authorized is False
+    assert pipeline.portfolio_evaluation_authorized is False
+
+    original_partition = persisted.partitions[0]
+    empty_active = _publish(
+        root=tmp_path / "typed-persisted",
+        key="massive-finalized-v1/forged/active_regular.jsonl",
+        payload=b"",
+        dataset_id=MASSIVE_PERSISTED_ACTIVE_DATASET_V1,
+        schema_sha256=MASSIVE_PERSISTED_JSONL_SCHEMA_SHA256,
+        downloaded_at_ms=_ms(decision_day, time(11, 6)),
+        etag="forged-empty-active",
+    )
+    forged_partition = replace(
+        original_partition,
+        active_regular=empty_active,
+        active_regular_row_count=0,
+        active_inventory_sha256=semantic_sha256(()),
+    )
+    forged_partition = replace(
+        forged_partition,
+        receipt_sha256=semantic_sha256(forged_partition.unsigned()),
+    )
+    forged_manifest = replace(
+        persisted,
+        partitions=(forged_partition,),
+        active_event_key_count=0,
+        partition_inventory_sha256=semantic_sha256((forged_partition.receipt_sha256,)),
+    )
+    forged_manifest = replace(
+        forged_manifest,
+        receipt_sha256=semantic_sha256(forged_manifest.unsigned()),
+    )
+    forged_manifest.validate()
+    with pytest.raises(Exception, match="derived caches|semantic partition"):
+        validate_massive_persisted_partitions_semantically_v2(
+            root=tmp_path / "typed-persisted",
+            manifest=forged_manifest,
+            scan_evidence=scan,
+            semantic_partition_manifest=semantic_partition,
+            identity_authority=identity,
+            correction_authority=stack["corrections"],
+        )
