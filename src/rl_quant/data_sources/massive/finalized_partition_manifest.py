@@ -127,7 +127,8 @@ def build_massive_finalized_feature_domain_spec_v0(
         "correction_authority_receipt_sha256": correction_authority.receipt_sha256,
     }
     result = MassiveFinalizedFeatureDomainSpecV0(
-        **body, receipt_sha256=semantic_sha256(body)  # type: ignore[arg-type]
+        **body,
+        receipt_sha256=semantic_sha256(body),  # type: ignore[arg-type]
     )
     result.validate()
     return result
@@ -155,8 +156,12 @@ class MassiveDailyTradeSecurityPartitionV0:
         if self.schema != MASSIVE_DAILY_TRADE_SECURITY_PARTITION_V0_SCHEMA:
             raise MassiveDailyTradePartitionError("security partition schema drifted")
         if not self.security_id:
-            raise MassiveDailyTradePartitionError("security partition identity is absent")
-        if not self.source_tickers or self.source_tickers != tuple(sorted(set(self.source_tickers))):
+            raise MassiveDailyTradePartitionError(
+                "security partition identity is absent"
+            )
+        if not self.source_tickers or self.source_tickers != tuple(
+            sorted(set(self.source_tickers))
+        ):
             raise MassiveDailyTradePartitionError("partition tickers are not canonical")
         for name in (
             "source_row_count",
@@ -172,7 +177,9 @@ class MassiveDailyTradeSecurityPartitionV0:
             + self.regular_session_input_row_count
             + self.after_hours_row_count
         ):
-            raise MassiveDailyTradePartitionError("partition row domains do not reconcile")
+            raise MassiveDailyTradePartitionError(
+                "partition row domains do not reconcile"
+            )
         if self.active_regular_session_row_count > self.regular_session_input_row_count:
             raise MassiveDailyTradePartitionError("active regular rows exceed inputs")
         for name in (
@@ -234,7 +241,10 @@ class MassiveDailyTradePartitionManifestV0:
             "receipt_sha256",
         ):
             _digest(name, getattr(self, name))
-        if self.partition_spec_receipt_sha256 != MASSIVE_DAILY_TRADE_PARTITION_SPEC_SHA256:
+        if (
+            self.partition_spec_receipt_sha256
+            != MASSIVE_DAILY_TRADE_PARTITION_SPEC_SHA256
+        ):
             raise MassiveDailyTradePartitionError("partition specification drifted")
         if self.partition_source_sha256 != MASSIVE_DAILY_TRADE_PARTITION_SOURCE_SHA256:
             raise MassiveDailyTradePartitionError("partition implementation drifted")
@@ -247,16 +257,30 @@ class MassiveDailyTradePartitionManifestV0:
         if self.global_row_count <= 0 or self.global_row_count != (
             self.partitioned_row_count + self.rejected_row_count
         ):
-            raise MassiveDailyTradePartitionError("global partition rows do not reconcile")
-        if self.rejected_row_count != 0 or self.partitioned_row_count != self.global_row_count:
-            raise MassiveDailyTradePartitionError("every source row must be partitioned")
+            raise MassiveDailyTradePartitionError(
+                "global partition rows do not reconcile"
+            )
+        if (
+            self.rejected_row_count != 0
+            or self.partitioned_row_count != self.global_row_count
+        ):
+            raise MassiveDailyTradePartitionError(
+                "every source row must be partitioned"
+            )
         keys = tuple(row.security_id for row in self.security_partitions)
         if not keys or keys != tuple(sorted(set(keys))):
-            raise MassiveDailyTradePartitionError("security partitions are not sorted and unique")
+            raise MassiveDailyTradePartitionError(
+                "security partitions are not sorted and unique"
+            )
         for row in self.security_partitions:
             row.validate()
-        if sum(row.source_row_count for row in self.security_partitions) != self.global_row_count:
-            raise MassiveDailyTradePartitionError("partition counts differ from global count")
+        if (
+            sum(row.source_row_count for row in self.security_partitions)
+            != self.global_row_count
+        ):
+            raise MassiveDailyTradePartitionError(
+                "partition counts differ from global count"
+            )
         expected_inventory = semantic_sha256(
             tuple(row.partition_receipt_sha256 for row in self.security_partitions)
         )
@@ -333,7 +357,11 @@ def build_massive_daily_trade_partition_manifest_v0(
     )
     provenance_inventory = semantic_sha256(
         tuple(
-            (row.source_row_number, row.raw_row_sha256, row.canonical_record.receipt_sha256)
+            (
+                row.source_row_number,
+                row.raw_row_sha256,
+                row.canonical_record.receipt_sha256,
+            )
             for row in source_rows
         )
     )
@@ -341,7 +369,9 @@ def build_massive_daily_trade_partition_manifest_v0(
         canonical_inventory != scan_evidence.all_row_canonical_inventory_sha256
         or provenance_inventory != scan_evidence.all_row_provenance_inventory_sha256
     ):
-        raise MassiveDailyTradePartitionError("partition rows differ from whole-file scan")
+        raise MassiveDailyTradePartitionError(
+            "partition rows differ from whole-file scan"
+        )
 
     by_security: dict[str, list[MassiveExtractedTradeRow]] = defaultdict(list)
     for row in source_rows:
@@ -362,7 +392,9 @@ def build_massive_daily_trade_partition_manifest_v0(
                     row.canonical_record.sip_timestamp_ns,
                     row.canonical_record.sequence_number,
                     row.canonical_record.exchange_id,
-                    -1 if row.canonical_record.trf_id is None else row.canonical_record.trf_id,
+                    -1
+                    if row.canonical_record.trf_id is None
+                    else row.canonical_record.trf_id,
                     row.canonical_record.trade_id,
                     row.source_row_number,
                 ),
@@ -378,18 +410,28 @@ def build_massive_daily_trade_partition_manifest_v0(
             key = _event_key(row)
             if kind in {"new-trade", "late-report"}:
                 existing = active.get(key)
-                if existing is not None and existing.canonical_record.receipt_sha256 != record.receipt_sha256:
-                    raise MassiveDailyTradePartitionError("conflicting duplicate finalized trade")
+                if (
+                    existing is not None
+                    and existing.canonical_record.receipt_sha256
+                    != record.receipt_sha256
+                ):
+                    raise MassiveDailyTradePartitionError(
+                        "conflicting duplicate finalized trade"
+                    )
                 active[key] = row
                 cancelled.discard(key)
             elif kind == "replacement":
                 if key not in active:
-                    raise MassiveDailyTradePartitionError("replacement lacks predecessor")
+                    raise MassiveDailyTradePartitionError(
+                        "replacement lacks predecessor"
+                    )
                 active[key] = row
                 cancelled.discard(key)
             elif kind == "cancellation":
                 if key not in active:
-                    raise MassiveDailyTradePartitionError("cancellation lacks predecessor")
+                    raise MassiveDailyTradePartitionError(
+                        "cancellation lacks predecessor"
+                    )
                 del active[key]
                 cancelled.add(key)
         regular_inputs = tuple(
@@ -412,17 +454,21 @@ def build_massive_daily_trade_partition_manifest_v0(
             )
         )
         premarket = sum(
-            row.canonical_record.participant_timestamp_ns < scan_evidence.regular_open_ns
+            row.canonical_record.participant_timestamp_ns
+            < scan_evidence.regular_open_ns
             for row in ordered
         )
         after_hours = sum(
-            row.canonical_record.participant_timestamp_ns >= scan_evidence.regular_close_ns
+            row.canonical_record.participant_timestamp_ns
+            >= scan_evidence.regular_close_ns
             for row in ordered
         )
         partition_body: dict[str, object] = {
             "schema": MASSIVE_DAILY_TRADE_SECURITY_PARTITION_V0_SCHEMA,
             "security_id": security_id,
-            "source_tickers": tuple(sorted({row.canonical_record.ticker for row in ordered})),
+            "source_tickers": tuple(
+                sorted({row.canonical_record.ticker for row in ordered})
+            ),
             "source_row_count": len(ordered),
             "premarket_row_count": premarket,
             "regular_session_input_row_count": len(regular_inputs),
@@ -431,8 +477,14 @@ def build_massive_daily_trade_partition_manifest_v0(
             "cancelled_event_count": len(cancelled),
             "all_row_inventory_sha256": semantic_sha256(
                 tuple(
-                    (row.source_row_number, row.raw_row_sha256, row.canonical_record.receipt_sha256)
-                    for row in sorted(ordered, key=lambda value: value.source_row_number)
+                    (
+                        row.source_row_number,
+                        row.raw_row_sha256,
+                        row.canonical_record.receipt_sha256,
+                    )
+                    for row in sorted(
+                        ordered, key=lambda value: value.source_row_number
+                    )
                 )
             ),
             "active_regular_row_inventory_sha256": semantic_sha256(
@@ -466,7 +518,78 @@ def build_massive_daily_trade_partition_manifest_v0(
         ),
     }
     provisional = MassiveDailyTradePartitionManifestV0(
-        **body, receipt_sha256="0" * 64  # type: ignore[arg-type]
+        **body,
+        receipt_sha256="0" * 64,  # type: ignore[arg-type]
+    )
+    result = MassiveDailyTradePartitionManifestV0(
+        **body,  # type: ignore[arg-type]
+        receipt_sha256=semantic_sha256(provisional.unsigned()),
+    )
+    result.validate()
+    return result
+
+
+def build_massive_daily_trade_partition_manifest_from_security_partitions_v0(
+    *,
+    scan_evidence: MassiveDailyTradeFileScanEvidenceV0,
+    identity_authority: PITSecurityUniverseAuthority,
+    condition_authority: MassiveConditionAuthority,
+    correction_authority: MassiveCorrectionAuthority,
+    feature_domain_spec: MassiveFinalizedFeatureDomainSpecV0,
+    security_partitions: Sequence[MassiveDailyTradeSecurityPartitionV0],
+) -> MassiveDailyTradePartitionManifestV0:
+    """Build the V0 manifest from independently replayed security partitions."""
+
+    scan_evidence.validate()
+    identity_authority.validate()
+    condition_authority.validate()
+    correction_authority.validate()
+    feature_domain_spec.validate()
+    if (
+        feature_domain_spec.condition_authority_receipt_sha256
+        != condition_authority.receipt_sha256
+        or feature_domain_spec.correction_authority_receipt_sha256
+        != correction_authority.receipt_sha256
+        or scan_evidence.correction_authority_receipt_sha256
+        != correction_authority.receipt_sha256
+    ):
+        raise MassiveDailyTradePartitionError(
+            "security-partition authorities differ from scan"
+        )
+    partitions = tuple(sorted(security_partitions, key=lambda row: row.security_id))
+    if not partitions:
+        raise MassiveDailyTradePartitionError("security partitions are absent")
+    for partition in partitions:
+        partition.validate()
+    partitioned = sum(row.source_row_count for row in partitions)
+    if partitioned != scan_evidence.source_row_count:
+        raise MassiveDailyTradePartitionError(
+            "security partition rows differ from whole-file scan"
+        )
+    body: dict[str, object] = {
+        "schema": MASSIVE_DAILY_TRADE_PARTITION_MANIFEST_V0_SCHEMA,
+        "source_session_date": scan_evidence.source_session_date,
+        "source_file_scan_receipt_sha256": scan_evidence.receipt_sha256,
+        "identity_authority_receipt_sha256": identity_authority.receipt_sha256,
+        "condition_authority_receipt_sha256": condition_authority.receipt_sha256,
+        "correction_authority_receipt_sha256": correction_authority.receipt_sha256,
+        "feature_domain_spec_receipt_sha256": feature_domain_spec.receipt_sha256,
+        "partition_spec_receipt_sha256": MASSIVE_DAILY_TRADE_PARTITION_SPEC_SHA256,
+        "partition_source_sha256": MASSIVE_DAILY_TRADE_PARTITION_SOURCE_SHA256,
+        "security_partitions": partitions,
+        "global_row_count": scan_evidence.source_row_count,
+        "partitioned_row_count": partitioned,
+        "rejected_row_count": 0,
+        "global_row_inventory_sha256": (
+            scan_evidence.all_row_provenance_inventory_sha256
+        ),
+        "global_partition_inventory_sha256": semantic_sha256(
+            tuple(row.partition_receipt_sha256 for row in partitions)
+        ),
+    }
+    provisional = MassiveDailyTradePartitionManifestV0(
+        **body,
+        receipt_sha256="0" * 64,  # type: ignore[arg-type]
     )
     result = MassiveDailyTradePartitionManifestV0(
         **body,  # type: ignore[arg-type]
@@ -487,5 +610,6 @@ __all__ = [
     "MassiveDailyTradeSecurityPartitionV0",
     "MassiveFinalizedFeatureDomainSpecV0",
     "build_massive_daily_trade_partition_manifest_v0",
+    "build_massive_daily_trade_partition_manifest_from_security_partitions_v0",
     "build_massive_finalized_feature_domain_spec_v0",
 ]

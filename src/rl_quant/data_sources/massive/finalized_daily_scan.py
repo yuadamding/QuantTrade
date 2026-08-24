@@ -9,7 +9,7 @@ import gzip
 import hashlib
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 from zoneinfo import ZoneInfo
 
 from rl_quant.data_sources.massive.corrections import MassiveCorrectionAuthority
@@ -33,13 +33,15 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
     MassiveExtractedTradeRow,
 )
-from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_payload,
+    file_sha256,
+    semantic_sha256,
+)
 
 
 EASTERN = ZoneInfo("America/New_York")
-MASSIVE_DAILY_TRADE_FILE_SCAN_V0_SCHEMA = (
-    "rl-quant.massive-daily-trade-file-scan-v0"
-)
+MASSIVE_DAILY_TRADE_FILE_SCAN_V0_SCHEMA = "rl-quant.massive-daily-trade-file-scan-v0"
 MASSIVE_DAILY_TRADE_FILE_SCAN_SPEC_SHA256 = semantic_sha256(
     {
         "dataset": MASSIVE_FLAT_TRADES_DATASET_ID,
@@ -77,7 +79,11 @@ def _count(name: str, value: object) -> int:
 
 
 def _timestamp_date(timestamp_ns: int) -> str:
-    return datetime.fromtimestamp(timestamp_ns / 1_000_000_000, tz=EASTERN).date().isoformat()
+    return (
+        datetime.fromtimestamp(timestamp_ns / 1_000_000_000, tz=EASTERN)
+        .date()
+        .isoformat()
+    )
 
 
 def _parse_conditions(value: str) -> tuple[int, ...]:
@@ -111,6 +117,30 @@ def _parse_row(raw_line: str, *, source_row_number: int) -> list[str]:
             f"flat-file row {source_row_number} has the wrong field count"
         )
     return parsed[0]
+
+
+class _CanonicalSequenceDigest:
+    """Incrementally hash the exact canonical JSON representation of a sequence."""
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._digest.update(b"[")
+        self._count = 0
+        self._finished = False
+
+    def add(self, value: object) -> None:
+        if self._finished:
+            raise MassiveDailyTradeFileScanError("sequence digest is already finished")
+        if self._count:
+            self._digest.update(b",")
+        self._digest.update(canonical_json_payload(value))
+        self._count += 1
+
+    def hexdigest(self) -> str:
+        if not self._finished:
+            self._digest.update(b"]")
+            self._finished = True
+        return self._digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,18 +203,27 @@ class MassiveDailyTradeFileScanEvidenceV0:
             _count(name, getattr(self, name))
         if self.source_row_count <= 0 or self.ticker_count <= 0:
             raise MassiveDailyTradeFileScanError("daily scan is empty")
-        if self.minimum_participant_timestamp_ns > self.maximum_participant_timestamp_ns:
-            raise MassiveDailyTradeFileScanError("participant timestamp range is inverted")
+        if (
+            self.minimum_participant_timestamp_ns
+            > self.maximum_participant_timestamp_ns
+        ):
+            raise MassiveDailyTradeFileScanError(
+                "participant timestamp range is inverted"
+            )
         if self.minimum_sip_timestamp_ns > self.maximum_sip_timestamp_ns:
             raise MassiveDailyTradeFileScanError("SIP timestamp range is inverted")
         if self.regular_close_ns <= self.regular_open_ns:
-            raise MassiveDailyTradeFileScanError("daily scan session bounds are invalid")
+            raise MassiveDailyTradeFileScanError(
+                "daily scan session bounds are invalid"
+            )
         if self.source_row_count != (
             self.regular_session_row_count
             + self.premarket_row_count
             + self.after_hours_row_count
         ):
-            raise MassiveDailyTradeFileScanError("daily scan event domains do not reconcile")
+            raise MassiveDailyTradeFileScanError(
+                "daily scan event domains do not reconcile"
+            )
         expected_dates = (self.source_session_date,)
         if (
             self.observed_participant_calendar_dates != expected_dates
@@ -212,7 +251,9 @@ class MassiveDailyTradeFileScanEvidenceV0:
         if self.parser_spec_sha256 != MASSIVE_DAILY_TRADE_FILE_SCAN_SPEC_SHA256:
             raise MassiveDailyTradeFileScanError("daily scan specification drifted")
         if self.parser_source_sha256 != MASSIVE_DAILY_TRADE_FILE_SCAN_SOURCE_SHA256:
-            raise MassiveDailyTradeFileScanError("daily scan source implementation drifted")
+            raise MassiveDailyTradeFileScanError(
+                "daily scan source implementation drifted"
+            )
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveDailyTradeFileScanError("daily scan receipt differs")
 
@@ -224,6 +265,8 @@ def scan_massive_daily_trade_file_v0(
     session_authority: MassiveSessionAuthority,
     session: MassiveExchangeSession,
     correction_authority: MassiveCorrectionAuthority,
+    row_sink: Callable[[MassiveExtractedTradeRow], None] | None = None,
+    retain_rows: bool = True,
 ) -> tuple[tuple[MassiveExtractedTradeRow, ...], MassiveDailyTradeFileScanEvidenceV0]:
     """Stream, canonicalize, and certify every row in one finalized trade file."""
 
@@ -239,15 +282,32 @@ def scan_massive_daily_trade_file_v0(
     if loaded_source.receipt.schema_sha256 != MASSIVE_FLAT_TRADE_SCHEMA_SHA256:
         raise MassiveDailyTradeFileScanError("daily scan source schema differs")
     if source_date != session.session_date:
-        raise MassiveDailyTradeFileScanError("daily scan source and session dates differ")
-    if session_authority.resolve(exchange=session.exchange, session_date=source_date) != session:
-        raise MassiveDailyTradeFileScanError("daily scan session was not authority-resolved")
+        raise MassiveDailyTradeFileScanError(
+            "daily scan source and session dates differ"
+        )
+    if (
+        session_authority.resolve(exchange=session.exchange, session_date=source_date)
+        != session
+    ):
+        raise MassiveDailyTradeFileScanError(
+            "daily scan session was not authority-resolved"
+        )
 
     rows: list[MassiveExtractedTradeRow] = []
+    canonical_inventory = _CanonicalSequenceDigest()
+    provenance_inventory = _CanonicalSequenceDigest()
+    source_row_count = 0
+    minimum_participant_timestamp_ns: int | None = None
+    maximum_participant_timestamp_ns: int | None = None
+    minimum_sip_timestamp_ns: int | None = None
+    maximum_sip_timestamp_ns: int | None = None
+    tickers: set[str] = set()
     participant_dates: set[str] = set()
     sip_dates: set[str] = set()
     regular = premarket = after_hours = late_reports = post_close_corrections = 0
-    with open_loaded_massive_source_stream(root=root, loaded_source=loaded_source) as raw:
+    with open_loaded_massive_source_stream(
+        root=root, loaded_source=loaded_source
+    ) as raw:
         with gzip.GzipFile(fileobj=raw, mode="rb") as decompressed:
             with TextIOWrapper(decompressed, encoding="utf-8", newline="") as text:
                 header_line = text.readline()
@@ -271,9 +331,13 @@ def scan_massive_daily_trade_file_v0(
                         source, raw_source_record_sha256=raw_sha
                     )
                     correction_kind = correction_authority.resolve(
-                        0 if canonical.correction_code is None else canonical.correction_code
+                        0
+                        if canonical.correction_code is None
+                        else canonical.correction_code
                     )
-                    participant_date = _timestamp_date(canonical.participant_timestamp_ns)
+                    participant_date = _timestamp_date(
+                        canonical.participant_timestamp_ns
+                    )
                     sip_date = _timestamp_date(canonical.sip_timestamp_ns)
                     participant_dates.add(participant_date)
                     sip_dates.add(sip_date)
@@ -287,12 +351,9 @@ def scan_massive_daily_trade_file_v0(
                         regular += 1
                     else:
                         after_hours += 1
-                    if (
-                        correction_kind == "late-report"
-                        or (
-                            session.is_regular(canonical.participant_timestamp_ns)
-                            and canonical.sip_timestamp_ns >= session.regular_close_ns
-                        )
+                    if correction_kind == "late-report" or (
+                        session.is_regular(canonical.participant_timestamp_ns)
+                        and canonical.sip_timestamp_ns >= session.regular_close_ns
                     ):
                         late_reports += 1
                     if (
@@ -300,41 +361,76 @@ def scan_massive_daily_trade_file_v0(
                         and canonical.sip_timestamp_ns >= session.regular_close_ns
                     ):
                         post_close_corrections += 1
-                    rows.append(
-                        MassiveExtractedTradeRow.build(
-                            source_row_number=source_row_number,
-                            raw_row_sha256=raw_sha,
-                            canonical_record=canonical,
+                    extracted = MassiveExtractedTradeRow.build(
+                        source_row_number=source_row_number,
+                        raw_row_sha256=raw_sha,
+                        canonical_record=canonical,
+                    )
+                    source_row_count += 1
+                    tickers.add(canonical.ticker)
+                    minimum_participant_timestamp_ns = (
+                        canonical.participant_timestamp_ns
+                        if minimum_participant_timestamp_ns is None
+                        else min(
+                            minimum_participant_timestamp_ns,
+                            canonical.participant_timestamp_ns,
                         )
                     )
-    if not rows:
+                    maximum_participant_timestamp_ns = (
+                        canonical.participant_timestamp_ns
+                        if maximum_participant_timestamp_ns is None
+                        else max(
+                            maximum_participant_timestamp_ns,
+                            canonical.participant_timestamp_ns,
+                        )
+                    )
+                    minimum_sip_timestamp_ns = (
+                        canonical.sip_timestamp_ns
+                        if minimum_sip_timestamp_ns is None
+                        else min(minimum_sip_timestamp_ns, canonical.sip_timestamp_ns)
+                    )
+                    maximum_sip_timestamp_ns = (
+                        canonical.sip_timestamp_ns
+                        if maximum_sip_timestamp_ns is None
+                        else max(maximum_sip_timestamp_ns, canonical.sip_timestamp_ns)
+                    )
+                    canonical_inventory.add(canonical.receipt_sha256)
+                    provenance_inventory.add(
+                        (
+                            extracted.source_row_number,
+                            extracted.raw_row_sha256,
+                            canonical.receipt_sha256,
+                        )
+                    )
+                    if row_sink is not None:
+                        row_sink(extracted)
+                    if retain_rows:
+                        rows.append(extracted)
+    if source_row_count <= 0:
         raise MassiveDailyTradeFileScanError("daily trade source has no rows")
     source_rows = tuple(sorted(rows, key=lambda row: row.source_row_number))
-    participant_times = tuple(row.canonical_record.participant_timestamp_ns for row in source_rows)
-    sip_times = tuple(row.canonical_record.sip_timestamp_ns for row in source_rows)
+    if retain_rows and len(source_rows) != source_row_count:
+        raise MassiveDailyTradeFileScanError("retained scan rows do not reconcile")
+    assert minimum_participant_timestamp_ns is not None
+    assert maximum_participant_timestamp_ns is not None
+    assert minimum_sip_timestamp_ns is not None
+    assert maximum_sip_timestamp_ns is not None
     body: dict[str, object] = {
         "schema": MASSIVE_DAILY_TRADE_FILE_SCAN_V0_SCHEMA,
         "source_session_date": source_date,
         "exchange": session.exchange,
         "regular_open_ns": session.regular_open_ns,
         "regular_close_ns": session.regular_close_ns,
-        "source_row_count": len(source_rows),
-        "minimum_participant_timestamp_ns": min(participant_times),
-        "maximum_participant_timestamp_ns": max(participant_times),
-        "minimum_sip_timestamp_ns": min(sip_times),
-        "maximum_sip_timestamp_ns": max(sip_times),
+        "source_row_count": source_row_count,
+        "minimum_participant_timestamp_ns": minimum_participant_timestamp_ns,
+        "maximum_participant_timestamp_ns": maximum_participant_timestamp_ns,
+        "minimum_sip_timestamp_ns": minimum_sip_timestamp_ns,
+        "maximum_sip_timestamp_ns": maximum_sip_timestamp_ns,
         "observed_participant_calendar_dates": tuple(sorted(participant_dates)),
         "observed_sip_calendar_dates": tuple(sorted(sip_dates)),
-        "ticker_count": len({row.canonical_record.ticker for row in source_rows}),
-        "all_row_canonical_inventory_sha256": semantic_sha256(
-            tuple(row.canonical_record.receipt_sha256 for row in source_rows)
-        ),
-        "all_row_provenance_inventory_sha256": semantic_sha256(
-            tuple(
-                (row.source_row_number, row.raw_row_sha256, row.canonical_record.receipt_sha256)
-                for row in source_rows
-            )
-        ),
+        "ticker_count": len(tickers),
+        "all_row_canonical_inventory_sha256": canonical_inventory.hexdigest(),
+        "all_row_provenance_inventory_sha256": provenance_inventory.hexdigest(),
         "regular_session_row_count": regular,
         "premarket_row_count": premarket,
         "after_hours_row_count": after_hours,
@@ -351,7 +447,8 @@ def scan_massive_daily_trade_file_v0(
         "compressed_bytes": loaded_source.receipt.content_length,
     }
     evidence = MassiveDailyTradeFileScanEvidenceV0(
-        **body, receipt_sha256=semantic_sha256(body)  # type: ignore[arg-type]
+        **body,
+        receipt_sha256=semantic_sha256(body),  # type: ignore[arg-type]
     )
     evidence.validate()
     return source_rows, evidence

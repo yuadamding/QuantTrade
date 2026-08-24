@@ -27,6 +27,15 @@ from rl_quant.data_sources.massive.finalized_daily_scan import (
     MassiveDailyTradeFileScanError,
     scan_massive_daily_trade_file_v0,
 )
+from rl_quant.data_sources.massive.finalized_artifact_readiness import (
+    MASSIVE_ARTIFACT_EXECUTION_DATASET_V1,
+    MASSIVE_ARTIFACT_EXECUTION_SOURCE_SCHEMA_SHA256,
+    MASSIVE_ARTIFACT_READINESS_SOURCE_SHA256,
+    MASSIVE_ARTIFACT_READINESS_STAGE_CONTRACTS_V1,
+    MassiveArtifactReadinessError,
+    measure_massive_artifact_readiness_v1,
+    parse_massive_artifact_execution_authority_v1,
+)
 from rl_quant.data_sources.massive.finalized_listing import (
     canonical_massive_trade_object_key,
 )
@@ -53,6 +62,11 @@ from rl_quant.data_sources.massive.finalized_origin_policy import (
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
     MassiveDailyTradePartitionError,
     build_massive_finalized_feature_domain_spec_v0,
+)
+from rl_quant.data_sources.massive.finalized_persisted_partitions import (
+    persist_massive_daily_trade_partitions_v1,
+    stream_and_persist_massive_daily_trade_partitions_v1,
+    validate_massive_persisted_partitions_v1,
 )
 from rl_quant.data_sources.massive.finalized_readiness import (
     MASSIVE_FINALIZED_MINIMUM_READINESS_SESSIONS_V0,
@@ -81,6 +95,10 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes
+from rl_quant.protocol.massive_finalized_validation_v0 import (
+    MASSIVE_FINALIZED_VALIDATION_V0_RECEIPT_SHA256,
+)
 
 
 EASTERN = ZoneInfo("America/New_York")
@@ -94,7 +112,9 @@ SOFTWARE_COMMIT = "f" * 64
 
 def _ns(day: str, local_time: time) -> int:
     return int(
-        datetime.combine(date.fromisoformat(day), local_time, tzinfo=EASTERN).timestamp()
+        datetime.combine(
+            date.fromisoformat(day), local_time, tzinfo=EASTERN
+        ).timestamp()
         * 1_000_000_000
     )
 
@@ -379,8 +399,7 @@ def _qualified_sources(
     benchmarks = []
     for day, loaded in sorted(loaded_by_day.items()):
         session = session_authority.resolve(exchange="XNYS", session_date=day)
-        _, scan, partition, benchmark = (
-            measure_massive_finalized_source_processing_v0(
+        _, scan, partition, benchmark = measure_massive_finalized_source_processing_v0(
             root=tmp_path / "trades",
             loaded_source=loaded,
             session_authority=session_authority,
@@ -391,7 +410,6 @@ def _qualified_sources(
             feature_domain_spec=feature_spec,
             hardware_contract_receipt_sha256=HARDWARE_RECEIPT,
             software_commit_sha256=SOFTWARE_COMMIT,
-            )
         )
         stacks.append((day, loaded, session, scan, partition))
         benchmarks.append(benchmark)
@@ -665,20 +683,35 @@ def test_participant_time_domain_retains_late_corrections_and_excludes_after_hou
     day = "2026-08-20"
     rows = (
         _trade_row(
-            ticker="AAA", trade_id="A1", participant_ns=_ns(day, time(15, 58)),
-            sip_ns=_ns(day, time(15, 58)), sequence=1,
+            ticker="AAA",
+            trade_id="A1",
+            participant_ns=_ns(day, time(15, 58)),
+            sip_ns=_ns(day, time(15, 58)),
+            sequence=1,
         ),
         _trade_row(
-            ticker="AAA", trade_id="A1", participant_ns=_ns(day, time(15, 58)),
-            sip_ns=_ns(day, time(16, 5)), price="11.00", correction=1, sequence=2,
+            ticker="AAA",
+            trade_id="A1",
+            participant_ns=_ns(day, time(15, 58)),
+            sip_ns=_ns(day, time(16, 5)),
+            price="11.00",
+            correction=1,
+            sequence=2,
         ),
         _trade_row(
-            ticker="AAA", trade_id="A2", participant_ns=_ns(day, time(15, 59)),
-            sip_ns=_ns(day, time(16, 6)), correction=3, sequence=3,
+            ticker="AAA",
+            trade_id="A2",
+            participant_ns=_ns(day, time(15, 59)),
+            sip_ns=_ns(day, time(16, 6)),
+            correction=3,
+            sequence=3,
         ),
         _trade_row(
-            ticker="AAA", trade_id="A3", participant_ns=_ns(day, time(18, 0)),
-            sip_ns=_ns(day, time(18, 0)), sequence=4,
+            ticker="AAA",
+            trade_id="A3",
+            participant_ns=_ns(day, time(18, 0)),
+            sip_ns=_ns(day, time(18, 0)),
+            sequence=4,
         ),
     )
     stack = _qualified_sources(
@@ -728,7 +761,14 @@ def test_participant_time_domain_retains_late_corrections_and_excludes_after_hou
 
 def test_fake_partition_receipt_cannot_enter_qualified_source(tmp_path: Path) -> None:
     day = "2026-08-20"
-    rows = (_trade_row(ticker="AAA", trade_id="A1", participant_ns=_ns(day, time(15, 59)), sip_ns=_ns(day, time(15, 59))),)
+    rows = (
+        _trade_row(
+            ticker="AAA",
+            trade_id="A1",
+            participant_ns=_ns(day, time(15, 59)),
+            sip_ns=_ns(day, time(15, 59)),
+        ),
+    )
     stack = _qualified_sources(
         tmp_path,
         sessions=(_session(day), _session("2026-08-21")),
@@ -753,7 +793,14 @@ def test_fake_partition_receipt_cannot_enter_qualified_source(tmp_path: Path) ->
 
 def test_processing_over_55_minutes_blocks_source(tmp_path: Path) -> None:
     day = "2026-08-20"
-    rows = (_trade_row(ticker="AAA", trade_id="A1", participant_ns=_ns(day, time(15, 59)), sip_ns=_ns(day, time(15, 59))),)
+    rows = (
+        _trade_row(
+            ticker="AAA",
+            trade_id="A1",
+            participant_ns=_ns(day, time(15, 59)),
+            sip_ns=_ns(day, time(15, 59)),
+        ),
+    )
     stack = _qualified_sources(
         tmp_path,
         sessions=(_session(day), _session("2026-08-21")),
@@ -769,9 +816,7 @@ def test_processing_over_55_minutes_blocks_source(tmp_path: Path) -> None:
         ),
         observed_full_pipeline_runtime_ms=too_slow,
     )
-    slow_run = replace(
-        slow_run, receipt_sha256=semantic_sha256(slow_run.unsigned())
-    )
+    slow_run = replace(slow_run, receipt_sha256=semantic_sha256(slow_run.unsigned()))
     slow_run.validate()
     slow_runs[-1] = slow_run
     capability = build_massive_finalized_readiness_capability_v0(
@@ -798,7 +843,14 @@ def test_plan_skips_early_close_and_late_open_but_accepts_fill_at_close(
     tmp_path: Path,
 ) -> None:
     source_day = "2026-08-20"
-    rows = (_trade_row(ticker="AAA", trade_id="A1", participant_ns=_ns(source_day, time(15, 59)), sip_ns=_ns(source_day, time(15, 59))),)
+    rows = (
+        _trade_row(
+            ticker="AAA",
+            trade_id="A1",
+            participant_ns=_ns(source_day, time(15, 59)),
+            sip_ns=_ns(source_day, time(15, 59)),
+        ),
+    )
     sessions = (
         _session(source_day),
         _session("2026-08-21", closed=time(13, 0), reason="early-close"),
@@ -845,7 +897,14 @@ def test_plan_skips_early_close_and_late_open_but_accepts_fill_at_close(
 def test_different_feature_spec_receipts_across_dates_fail_plan(tmp_path: Path) -> None:
     days = ("2026-08-20", "2026-08-21")
     source_rows = {
-        day: (_trade_row(ticker="AAA", trade_id=f"A-{day}", participant_ns=_ns(day, time(15, 59)), sip_ns=_ns(day, time(15, 59))),)
+        day: (
+            _trade_row(
+                ticker="AAA",
+                trade_id=f"A-{day}",
+                participant_ns=_ns(day, time(15, 59)),
+                sip_ns=_ns(day, time(15, 59)),
+            ),
+        )
         for day in days
     }
     stack = _qualified_sources(
@@ -857,7 +916,9 @@ def test_different_feature_spec_receipts_across_dates_fail_plan(tmp_path: Path) 
             days[1]: _ms("2026-08-22", time(10, 0)),
         },
     )
-    changed = replace(stack["qualified"][1], feature_domain_spec_receipt_sha256="9" * 64)
+    changed = replace(
+        stack["qualified"][1], feature_domain_spec_receipt_sha256="9" * 64
+    )
     changed = replace(changed, receipt_sha256=semantic_sha256(changed.unsigned()))
     changed.validate()
     with pytest.raises(MassiveQualifiedFinalizedOriginError, match="feature-domain"):
@@ -955,3 +1016,267 @@ def test_readiness_panel_requires_twenty_sessions_across_three_years() -> None:
             correction_activity_session_dates=(too_small[0],),
             high_ticker_count_session_dates=(too_small[-1],),
         )
+
+
+def test_persisted_partition_v1_reloads_event_active_and_correction_bytes(
+    tmp_path: Path,
+) -> None:
+    day = "2026-08-20"
+    rows = (
+        _trade_row(
+            ticker="AAA",
+            trade_id="A1",
+            participant_ns=_ns(day, time(15, 55)),
+            sip_ns=_ns(day, time(15, 55)),
+            price="9.00",
+            sequence=1,
+        ),
+        _trade_row(
+            ticker="AAA",
+            trade_id="A1",
+            participant_ns=_ns(day, time(15, 55)),
+            sip_ns=_ns(day, time(16, 5)),
+            price="10.00",
+            correction=1,
+            sequence=2,
+        ),
+    )
+    stack = _qualified_sources(
+        tmp_path,
+        sessions=(_session(day), _session("2026-08-21")),
+        source_rows={day: rows},
+        last_modified={day: _ms("2026-08-21", time(11, 0))},
+    )
+    _, _, _, scan, semantic_partition = stack["stacks"][0]
+    scanned_rows, repeated_scan = scan_massive_daily_trade_file_v0(
+        root=tmp_path / "trades",
+        loaded_source=stack["loaded"][day],
+        session_authority=stack["session_authority"],
+        session=stack["session_authority"].resolve(exchange="XNYS", session_date=day),
+        correction_authority=stack["corrections"],
+    )
+    assert repeated_scan == scan
+    streamed_rows = []
+    omitted_rows, streamed_scan = scan_massive_daily_trade_file_v0(
+        root=tmp_path / "trades",
+        loaded_source=stack["loaded"][day],
+        session_authority=stack["session_authority"],
+        session=stack["session_authority"].resolve(exchange="XNYS", session_date=day),
+        correction_authority=stack["corrections"],
+        row_sink=streamed_rows.append,
+        retain_rows=False,
+    )
+    assert omitted_rows == ()
+    assert tuple(streamed_rows) == scanned_rows
+    assert streamed_scan == repeated_scan
+    persisted = persist_massive_daily_trade_partitions_v1(
+        root=tmp_path / "persisted",
+        rows=scanned_rows,
+        scan_evidence=scan,
+        semantic_partition_manifest=semantic_partition,
+        identity_authority=stack["identity"],
+        correction_authority=stack["corrections"],
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        published_at_ms=_ms("2026-08-21", time(11, 5)),
+    )
+    validate_massive_persisted_partitions_v1(
+        root=tmp_path / "persisted", manifest=persisted
+    )
+    assert persisted.source_row_count == 2
+    assert persisted.active_event_key_count == 1
+    assert persisted.correction_event_count == 1
+    assert persisted.partitions[0].active_regular_row_count == 1
+    bounded_scan, bounded_semantic, bounded_persisted = (
+        stream_and_persist_massive_daily_trade_partitions_v1(
+            source_root=tmp_path / "trades",
+            loaded_source=stack["loaded"][day],
+            spool_root=tmp_path / "spool",
+            persisted_root=tmp_path / "bounded-persisted",
+            session_authority=stack["session_authority"],
+            session=stack["session_authority"].resolve(
+                exchange="XNYS", session_date=day
+            ),
+            identity_authority=stack["identity"],
+            condition_authority=stack["conditions"],
+            correction_authority=stack["corrections"],
+            feature_domain_spec=stack["feature_spec"],
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+            published_at_ms=_ms("2026-08-21", time(11, 6)),
+        )
+    )
+    assert bounded_scan == scan
+    assert bounded_semantic == semantic_partition
+    assert bounded_persisted.source_row_count == persisted.source_row_count
+    assert bounded_persisted.active_event_key_count == persisted.active_event_key_count
+    assert bounded_persisted.correction_event_count == persisted.correction_event_count
+    validate_massive_persisted_partitions_v1(
+        root=tmp_path / "bounded-persisted", manifest=bounded_persisted
+    )
+    active_path = (
+        tmp_path
+        / "persisted"
+        / persisted.partitions[0].active_regular.payload_relative_path
+    )
+    active_path.chmod(0o644)
+    active_path.write_text("{}\n")
+    with pytest.raises(Exception):
+        validate_massive_persisted_partitions_v1(
+            root=tmp_path / "persisted", manifest=persisted
+        )
+
+
+def test_artifact_readiness_v1_measures_source_through_orders(
+    tmp_path: Path,
+) -> None:
+    day = "2026-08-20"
+    stack = _qualified_sources(
+        tmp_path,
+        sessions=(_session(day), _session("2026-08-21")),
+        source_rows={
+            day: (
+                _trade_row(
+                    ticker="AAA",
+                    trade_id="A1",
+                    participant_ns=_ns(day, time(15, 59)),
+                    sip_ns=_ns(day, time(15, 59)),
+                ),
+            )
+        },
+        last_modified={day: _ms("2026-08-21", time(11, 0))},
+    )
+    listing_loaded = stack["loaded"][day]
+    execution_payload = {
+        "hardware_contract_receipt_sha256": HARDWARE_RECEIPT,
+        "software_source_archive_sha256": SOFTWARE_COMMIT,
+        "container_image_receipt_sha256": "1" * 64,
+        "python_environment_receipt_sha256": "2" * 64,
+    }
+    execution_loaded = _publish(
+        root=tmp_path / "execution",
+        key="artifact-readiness-v1/execution-environment.json",
+        payload=canonical_json_file_bytes(execution_payload),
+        dataset_id=MASSIVE_ARTIFACT_EXECUTION_DATASET_V1,
+        schema_sha256=MASSIVE_ARTIFACT_EXECUTION_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=listing_loaded.receipt.requested_at_ms - 20,
+        etag="execution-environment",
+    )
+    execution_authority = parse_massive_artifact_execution_authority_v1(
+        root=tmp_path / "execution", loaded_source=execution_loaded
+    )
+    source_payload = read_loaded_massive_source_bytes(
+        root=tmp_path / "trades", loaded_source=listing_loaded
+    )
+
+    def source_loader(stage_started_at_ms: int):
+        root = tmp_path / "measured-source"
+        root.mkdir(parents=True, exist_ok=True)
+        publish_massive_source_object(
+            stream=BytesIO(source_payload),
+            root=root,
+            relative_payload_path=listing_loaded.receipt.source_object_key,
+            dataset_id=listing_loaded.receipt.dataset_id,
+            source_object_key=listing_loaded.receipt.source_object_key,
+            requested_at_ms=stage_started_at_ms,
+            downloaded_at_ms=stage_started_at_ms,
+            schema_sha256=listing_loaded.receipt.schema_sha256,
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+            committed_at_ms=stage_started_at_ms,
+            etag=listing_loaded.receipt.etag,
+        )
+        measured = load_massive_source_bundle(
+            root=root,
+            relative_payload_path=listing_loaded.receipt.source_object_key,
+            verified_at_ms=stage_started_at_ms,
+        )
+        return root, measured
+
+    def downstream_runner(
+        stage_id: str,
+        inputs: tuple[str, ...],
+        source_session_date: str,
+        stage_started_at_ms: int,
+    ):
+        semantic_receipt = semantic_sha256((stage_id, inputs, source_session_date))
+        output_rows = 1
+        payload = {
+            "schema": "rl-quant.massive-finalized-readiness-stage-output-v1",
+            "stage_id": stage_id,
+            "source_session_date": source_session_date,
+            "input_artifact_receipts": inputs,
+            "semantic_output_receipt_sha256": semantic_receipt,
+            "output_row_count": output_rows,
+            "implementation_source_sha256": MASSIVE_ARTIFACT_READINESS_SOURCE_SHA256,
+            "protocol_receipt_sha256": MASSIVE_FINALIZED_VALIDATION_V0_RECEIPT_SHA256,
+        }
+        contract = MASSIVE_ARTIFACT_READINESS_STAGE_CONTRACTS_V1[stage_id]
+        root = tmp_path / "downstream"
+        root.mkdir(parents=True, exist_ok=True)
+        key = f"artifact-v1/{stage_id}.json"
+        publish_massive_source_object(
+            stream=BytesIO(canonical_json_file_bytes(payload)),
+            root=root,
+            relative_payload_path=key,
+            dataset_id=contract["dataset_id"],
+            source_object_key=key,
+            requested_at_ms=stage_started_at_ms,
+            downloaded_at_ms=stage_started_at_ms,
+            schema_sha256=contract["schema_sha256"],
+            entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+            committed_at_ms=stage_started_at_ms,
+        )
+        output = load_massive_source_bundle(
+            root=root,
+            relative_payload_path=key,
+            verified_at_ms=stage_started_at_ms,
+        )
+        return root, output, semantic_receipt, output_rows
+
+    run = measure_massive_artifact_readiness_v1(
+        source_loader=source_loader,
+        artifact_root=tmp_path / "artifact-evidence",
+        persisted_partition_root=tmp_path / "artifact-partitions",
+        execution_authority_root=tmp_path / "execution",
+        execution_authority=execution_authority,
+        captured_listing=stack["captured_listing"],
+        session_authority=stack["session_authority"],
+        source_session=stack["session_authority"].resolve(
+            exchange="XNYS", session_date=day
+        ),
+        identity_authority=stack["identity"],
+        condition_authority=stack["conditions"],
+        correction_authority=stack["corrections"],
+        feature_domain_spec=stack["feature_spec"],
+        downstream_stage_runner=downstream_runner,
+    )
+    run.validate()
+    assert tuple(stage.stage_id for stage in run.stages) == (
+        "source-download-and-commit",
+        "whole-file-scan",
+        "pit-route-and-finalized-replay",
+        "persisted-trade-partitions",
+        "daily-features",
+        "rolling-features",
+        "pit500-decision-tensor",
+        "frozen-model-inference",
+        "requested-orders",
+    )
+    assert run.wall_started_at_ms <= run.loaded_source.receipt.requested_at_ms
+    assert run.wall_finished_at_ms >= run.stages[-1].stage_finished_at_ms
+    cloned = replace(run, source_session=_session("2026-08-19"))
+    cloned = replace(cloned, receipt_sha256=semantic_sha256(cloned.unsigned()))
+    with pytest.raises(MassiveArtifactReadinessError, match="authorities differ"):
+        cloned.validate()
+    preexisting = replace(
+        run.stages[4],
+        stage_started_at_ms=(
+            run.stages[4].output_loaded_source.receipt.requested_at_ms + 1
+        ),
+    )
+    preexisting = replace(
+        preexisting, receipt_sha256=semantic_sha256(preexisting.unsigned())
+    )
+    with pytest.raises(
+        MassiveArtifactReadinessError,
+        match="not created and verified inside",
+    ):
+        preexisting.validate()
