@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import UTC, date, datetime, time
 import gzip
 import inspect
+from dataclasses import replace
+from datetime import UTC, date, datetime, time
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from rl_quant.alpha.massive_universe_adapter import checked_pit_universe_rule
 from rl_quant.alpha.pit_universe import (
     ListingEventRecord,
     PITSecurityUniverseAuthority,
@@ -18,18 +19,14 @@ from rl_quant.alpha.pit_universe import (
     SourcedTickerHistoryRecord,
     UniverseRankInputRecord,
 )
-from rl_quant.alpha.massive_universe_adapter import checked_pit_universe_rule
-from rl_quant.data_sources.massive.finalized_archive_scope import (
-    build_massive_finalized_archive_scope_v1,
-)
 from rl_quant.data_sources.massive.conditions import (
     MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     build_massive_condition_authority,
 )
 from rl_quant.data_sources.massive.corrections import build_massive_correction_authority
-from rl_quant.data_sources.massive.finalized_daily_scan import (
-    MassiveDailyTradeFileScanError,
-    scan_massive_daily_trade_file_v0,
+from rl_quant.data_sources.massive.finalized_archive_scope import (
+    build_massive_finalized_archive_scope_v1,
+    build_massive_finalized_archive_scope_v2,
 )
 from rl_quant.data_sources.massive.finalized_artifact_readiness import (
     MASSIVE_ARTIFACT_EXECUTION_DATASET_V1,
@@ -39,6 +36,10 @@ from rl_quant.data_sources.massive.finalized_artifact_readiness import (
     MassiveArtifactReadinessError,
     measure_massive_artifact_readiness_v1,
     parse_massive_artifact_execution_authority_v1,
+)
+from rl_quant.data_sources.massive.finalized_daily_scan import (
+    MassiveDailyTradeFileScanError,
+    scan_massive_daily_trade_file_v0,
 )
 from rl_quant.data_sources.massive.finalized_listing import (
     canonical_massive_trade_object_key,
@@ -77,22 +78,8 @@ from rl_quant.data_sources.massive.finalized_persisted_partitions import (
     MASSIVE_PERSISTED_JSONL_SCHEMA_SHA256,
     persist_massive_daily_trade_partitions_v1,
     stream_and_persist_massive_daily_trade_partitions_v1,
-    validate_massive_persisted_partitions_v1,
     validate_massive_persisted_partitions_semantically_v2,
-)
-from rl_quant.workflows.massive_finalized_typed_pipeline import (
-    MASSIVE_TYPED_STAGE_IMPLEMENTATION_INVENTORY_SHA256,
-    materialize_massive_finalized_typed_pipeline_v0,
-    validate_massive_finalized_typed_pipeline_v0,
-)
-from rl_quant.evaluation.massive_validation_inference_v0 import (
-    MASSIVE_VALIDATION_CHECKPOINT_V0_DATASET,
-    MASSIVE_VALIDATION_CHECKPOINT_V0_SOURCE_SCHEMA_SHA256,
-    parse_massive_validation_checkpoint_v0,
-)
-from rl_quant.features.massive_rolling_features_v0 import (
-    MASSIVE_ROLLING_BARS_V0_FIELDS,
-    MASSIVE_ROLLING_TAPE_V0_FIELDS,
+    validate_massive_persisted_partitions_v1,
 )
 from rl_quant.data_sources.massive.finalized_readiness import (
     MASSIVE_FINALIZED_MINIMUM_READINESS_SESSIONS_V0,
@@ -116,18 +103,44 @@ from rl_quant.data_sources.massive.source_receipts import (
     read_loaded_massive_source_bytes,
 )
 from rl_quant.data_sources.massive.trade_extraction import (
-    MASSIVE_FLAT_TRADES_DATASET_ID,
     MASSIVE_FLAT_TRADE_COLUMNS,
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
+    MASSIVE_FLAT_TRADES_DATASET_ID,
 )
-from rl_quant.protocol.canonical_artifact import semantic_sha256
-from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes
+from rl_quant.evaluation.massive_validation_inference_v0 import (
+    MASSIVE_VALIDATION_CHECKPOINT_V0_DATASET,
+    MASSIVE_VALIDATION_CHECKPOINT_V0_SOURCE_SCHEMA_SHA256,
+    parse_massive_validation_checkpoint_v0,
+)
+from rl_quant.evaluation.massive_validation_inference_v1 import (
+    MASSIVE_VALIDATION_CHECKPOINT_V1_DATASET,
+    MASSIVE_VALIDATION_CHECKPOINT_V1_SOURCE_SCHEMA_SHA256,
+    massive_validation_input_names_v1,
+    parse_massive_validation_checkpoint_v1,
+)
+from rl_quant.features.massive_rolling_features_v0 import (
+    MASSIVE_ROLLING_BARS_V0_FIELDS,
+    MASSIVE_ROLLING_TAPE_V0_FIELDS,
+)
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    semantic_sha256,
+)
 from rl_quant.protocol.massive_finalized_validation_v0 import (
     MASSIVE_FINALIZED_VALIDATION_V0_HORIZONS,
     MASSIVE_FINALIZED_VALIDATION_V0_PROTOCOL,
     MASSIVE_FINALIZED_VALIDATION_V0_RECEIPT_SHA256,
 )
-
+from rl_quant.workflows.massive_finalized_typed_pipeline import (
+    MASSIVE_TYPED_STAGE_IMPLEMENTATION_INVENTORY_SHA256,
+    materialize_massive_finalized_typed_pipeline_v0,
+    validate_massive_finalized_typed_pipeline_v0,
+)
+from rl_quant.workflows.massive_measured_typed_run_v1 import (
+    MASSIVE_MEASURED_TYPED_STAGE_IDS_V1,
+    MassiveMeasuredTypedRunV1Error,
+    measure_massive_typed_finalized_run_v1,
+)
 
 EASTERN = ZoneInfo("America/New_York")
 CALENDAR_RECEIPT = "a" * 64
@@ -1608,3 +1621,221 @@ def test_authenticated_get_archive_scope_and_typed_pipeline_v0(tmp_path: Path) -
             identity_authority=identity,
             correction_authority=stack["corrections"],
         )
+
+
+def test_archive_scope_v2_accepts_normal_partial_month_listing(tmp_path: Path) -> None:
+    earlier_day = "2026-08-19"
+    source_day = "2026-08-20"
+    rows = {
+        day: (
+            _trade_row(
+                ticker="AAA",
+                trade_id=f"A-{day}",
+                participant_ns=_ns(day, time(15, 55)),
+                sip_ns=_ns(day, time(15, 55)),
+            ),
+        )
+        for day in (earlier_day, source_day)
+    }
+    stack = _qualified_sources(
+        tmp_path,
+        sessions=(_session(earlier_day), _session(source_day)),
+        source_rows=rows,
+        last_modified={
+            earlier_day: _ms(source_day, time(10, 0)),
+            source_day: _ms(source_day, time(11, 0)),
+        },
+    )
+    scope = build_massive_finalized_archive_scope_v2(
+        session_authority=stack["session_authority"],
+        captured_listings=(stack["captured_listing"],),
+        start_session_date=source_day,
+        end_session_date=source_day,
+    )
+    assert scope.qualification_complete is True
+    assert scope.observed_in_scope_object_keys == (
+        canonical_massive_trade_object_key(source_day),
+    )
+    assert scope.observed_out_of_scope_object_keys == (
+        canonical_massive_trade_object_key(earlier_day),
+    )
+
+
+def test_measured_typed_run_v1_binds_origin_masks_staleness_and_seed(
+    tmp_path: Path,
+) -> None:
+    source_day = "2026-08-20"
+    decision_day = "2026-08-21"
+    source_rows = {
+        source_day: (
+            _trade_row(
+                ticker="AAA",
+                trade_id="A1",
+                participant_ns=_ns(source_day, time(15, 55)),
+                sip_ns=_ns(source_day, time(15, 55)),
+                price="9.00",
+                size="100",
+                sequence=1,
+            ),
+            _trade_row(
+                ticker="AAA",
+                trade_id="A1",
+                participant_ns=_ns(source_day, time(15, 55)),
+                sip_ns=_ns(source_day, time(16, 5)),
+                price="10.00",
+                size="125",
+                correction=1,
+                sequence=2,
+            ),
+        )
+    }
+    identity = _v0_identity_authority(source_day, ("AAA",))
+    stack = _qualified_sources(
+        tmp_path / "fixture",
+        sessions=(_session(source_day), _session(decision_day)),
+        source_rows=source_rows,
+        last_modified={source_day: _ms(decision_day, time(11, 0))},
+        identity_authority=identity,
+    )
+    source_payload = read_loaded_massive_source_bytes(
+        root=tmp_path / "fixture" / "trades",
+        loaded_source=stack["loaded"][source_day],
+    )
+
+    class FakeGetClient:
+        def get_object(self, **kwargs):
+            assert kwargs == {
+                "Bucket": MASSIVE_FLAT_FILE_BUCKET,
+                "Key": canonical_massive_trade_object_key(source_day),
+            }
+            return {
+                "ResponseMetadata": {"RequestId": "measured-v1-get"},
+                "Body": BytesIO(source_payload),
+                "ETag": '"trade-etag-0"',
+                "ContentLength": len(source_payload),
+                "VersionId": "measured-v1",
+            }
+
+    scope = build_massive_finalized_archive_scope_v2(
+        session_authority=stack["session_authority"],
+        captured_listings=(stack["captured_listing"],),
+        start_session_date=source_day,
+        end_session_date=source_day,
+    )
+    feature_names = massive_validation_input_names_v1("MV04")
+    checkpoint_payload = {
+        "schema": "rl-quant.massive-validation-checkpoint-v1",
+        "setting_id": "MV04",
+        "feature_set_id": "BARS_TAPE_MASKS_STALENESS_V1",
+        "seed": 3,
+        "feature_names": feature_names,
+        "horizon_ids": tuple(
+            row.horizon_id for row in MASSIVE_FINALIZED_VALIDATION_V0_HORIZONS
+        ),
+        "normalization_mean": (0.0,) * len(feature_names),
+        "normalization_scale": (1.0,) * len(feature_names),
+        "weights": tuple(
+            (0.0,) * (len(feature_names) - 1) + (0.01,)
+            for _ in MASSIVE_FINALIZED_VALIDATION_V0_HORIZONS
+        ),
+        "biases": (0.001, 0.002, 0.003, 0.004),
+        "quantile_offsets": (0.01, 0.01, 0.02, 0.03),
+        "predictive_scales": (0.01, 0.02, 0.03, 0.04),
+    }
+    checkpoint_loaded = _publish(
+        root=tmp_path / "checkpoint-v1",
+        key="massive-finalized-v1/checkpoints/mv04-seed3.json",
+        payload=canonical_json_file_bytes(checkpoint_payload),
+        dataset_id=MASSIVE_VALIDATION_CHECKPOINT_V1_DATASET,
+        schema_sha256=MASSIVE_VALIDATION_CHECKPOINT_V1_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=_ms(decision_day, time(10, 55)),
+        etag="checkpoint-v1-mv04-seed3",
+    )
+    checkpoint = parse_massive_validation_checkpoint_v1(
+        root=tmp_path / "checkpoint-v1", loaded_source=checkpoint_loaded
+    )
+
+    class StepClock:
+        def __init__(self, value: int, step: int) -> None:
+            self.value = value
+            self.step = step
+
+        def __call__(self) -> int:
+            result = self.value
+            self.value += self.step
+            return result
+
+    wall = StepClock(_ms(decision_day, time(11, 1)), 1)
+    monotonic = StepClock(1_000_000_000, 1_000_000)
+    run = measure_massive_typed_finalized_run_v1(
+        s3_client=FakeGetClient(),
+        captured_listing=stack["captured_listing"],
+        archive_scope=scope,
+        session_authority=stack["session_authority"],
+        source_session=stack["session_authority"].resolve(
+            exchange="XNYS", session_date=source_day
+        ),
+        decision_session=stack["session_authority"].resolve(
+            exchange="XNYS", session_date=decision_day
+        ),
+        identity_authority=identity,
+        condition_authority=stack["conditions"],
+        correction_authority=stack["corrections"],
+        feature_domain_spec=stack["feature_spec"],
+        prior_daily_bars=(),
+        prior_daily_tape=(),
+        checkpoint=checkpoint,
+        source_root=tmp_path / "measured-source",
+        spool_root=tmp_path / "measured-spool",
+        persisted_root=tmp_path / "measured-persisted",
+        artifact_root=tmp_path / "measured-artifacts",
+        entitlement_receipt_sha256=ENTITLEMENT_RECEIPT,
+        now_ms=wall,
+        monotonic_ns=monotonic,
+    )
+    run.validate()
+    assert tuple(stage.stage_id for stage in run.stages) == (
+        MASSIVE_MEASURED_TYPED_STAGE_IDS_V1
+    )
+    assert run.decision_origin.source_staleness_sessions == 1
+    assert run.decision_tensor.source_staleness_sessions == (1.0,)
+    assert run.decision_tensor.staleness_valid == (True,)
+    assert any(":valid:" in name for name in run.inference.input_feature_names)
+    assert run.inference.input_feature_names[-1] == (
+        "context:source_staleness_sessions"
+    )
+    assert run.inference.rows[0].mean == pytest.approx(0.011)
+    assert run.requested_orders.seed == 3
+    assert "seed3" in run.requested_orders.loaded_source.payload_relative_path
+    assert run.outer_finished_at_ms <= run.decision_origin.decision_at_ms
+    assert run.panel_materialization_authorized is False
+    assert run.predictive_training_authorized is False
+    assert run.portfolio_evaluation_authorized is False
+
+    forged_stage = replace(
+        run.stages[-1], output_artifact_receipts=("f" * 64,)
+    )
+    forged_stage = replace(
+        forged_stage, receipt_sha256=semantic_sha256(forged_stage.unsigned())
+    )
+    forged = replace(run, stages=run.stages[:-1] + (forged_stage,))
+    forged = replace(forged, receipt_sha256=semantic_sha256(forged.unsigned()))
+    with pytest.raises(MassiveMeasuredTypedRunV1Error, match="stage bindings"):
+        forged.validate()
+
+    forged_commit_stage = replace(
+        run.stages[-1], output_commit_receipts=("e" * 64,)
+    )
+    forged_commit_stage = replace(
+        forged_commit_stage,
+        receipt_sha256=semantic_sha256(forged_commit_stage.unsigned()),
+    )
+    forged_commit_run = replace(
+        run, stages=run.stages[:-1] + (forged_commit_stage,)
+    )
+    forged_commit_run = replace(
+        forged_commit_run,
+        receipt_sha256=semantic_sha256(forged_commit_run.unsigned()),
+    )
+    with pytest.raises(MassiveMeasuredTypedRunV1Error, match="commit inventory"):
+        forged_commit_run.validate()

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from pathlib import Path
 import shutil
 import tempfile
 import time
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
 
 from rl_quant.data_sources.massive.finalized_listing_acquisition import (
     MASSIVE_FLAT_FILE_BUCKET,
@@ -23,8 +24,7 @@ from rl_quant.data_sources.massive.trade_extraction import (
     MASSIVE_FLAT_TRADE_SCHEMA_SHA256,
     MASSIVE_FLAT_TRADES_DATASET_ID,
 )
-from rl_quant.protocol.canonical_artifact import semantic_sha256
-
+from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 
 MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SCHEMA = (
     "rl-quant.massive-authenticated-flat-file-object-get-v1"
@@ -39,6 +39,7 @@ MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256 = semantic_sha256(
         "request_evidence": ("provider-request-id", "version-id-if-present"),
     }
 )
+MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
 
 
 class MassiveAuthenticatedObjectGetError(ValueError):
@@ -233,6 +234,7 @@ def download_massive_flat_file_object_v1(
 
 
 __all__ = [
+    "MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SOURCE_SHA256",
     "MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256",
     "MassiveAuthenticatedFlatFileDownloadV1",
     "MassiveAuthenticatedObjectGetError",
