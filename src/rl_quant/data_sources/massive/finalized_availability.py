@@ -1,9 +1,10 @@
-"""Vendor-metadata chronology for finalized-file validation V0.
+"""Initial development-only chronology for finalized-file validation V0.
 
 The authority deliberately uses vendor ``LastModified`` metadata rather than
-the later time at which a researcher downloaded an object.  It evaluates one
-candidate decision session at a time; callers may then select the first
-eligible session without rewriting or backdating the source evidence.
+the later time at which a researcher downloaded an object.  Its timestamps
+were caller supplied, so these immutable predecessor schemas can never
+authorize training.  The committed-listing, row-derived, decision-centric
+authority lives in :mod:`rl_quant.data_sources.massive.finalized_origin`.
 """
 
 from __future__ import annotations
@@ -96,7 +97,7 @@ def _session_timestamp_ms(name: str, timestamp_ns: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class MassiveVendorObjectMetadataV0:
-    """One source object joined to vendor listing metadata."""
+    """Development-only caller-supplied metadata from the initial V0 slice."""
 
     dataset_id: str
     source_object_key: str
@@ -109,6 +110,12 @@ class MassiveVendorObjectMetadataV0:
     listing_source_receipt_sha256: str
     receipt_sha256: str
     schema: str = MASSIVE_VENDOR_OBJECT_METADATA_V0_SCHEMA
+
+    @property
+    def training_gate_eligible(self) -> bool:
+        """Caller-supplied timestamps can never authorize panel training."""
+
+        return False
 
     def unsigned(self) -> dict[str, object]:
         return {
@@ -226,6 +233,12 @@ class MassiveFinalizedSourceAvailabilityAuthorityV0:
     ineligibility_reason: str | None
     availability_authority_receipt_sha256: str
     schema: str = MASSIVE_FINALIZED_SOURCE_AVAILABILITY_V0_SCHEMA
+
+    @property
+    def training_gate_eligible(self) -> bool:
+        """Only committed-listing decision-origin plans may reach a data gate."""
+
+        return False
 
     def unsigned(self) -> dict[str, object]:
         return {
@@ -523,6 +536,12 @@ class MassiveFinalizedOriginAvailabilityAuthorityV0:
     receipt_sha256: str
     schema: str = MASSIVE_FINALIZED_ORIGIN_AVAILABILITY_V0_SCHEMA
 
+    @property
+    def training_gate_eligible(self) -> bool:
+        """The source-centric predecessor remains development-only evidence."""
+
+        return False
+
     def unsigned(self) -> dict[str, object]:
         return {
             key: value for key, value in asdict(self).items() if key != "receipt_sha256"
@@ -624,7 +643,7 @@ def build_massive_finalized_origin_availability_authority_v0(
 def select_first_eligible_massive_finalized_origin_v0(
     candidates: Sequence[MassiveFinalizedOriginAvailabilityAuthorityV0],
 ) -> MassiveFinalizedOriginAvailabilityAuthorityV0:
-    """Return the first eligible candidate without backdating vendor metadata."""
+    """Select a development-only predecessor candidate; never authorize training."""
 
     rows = tuple(candidates)
     if not rows:

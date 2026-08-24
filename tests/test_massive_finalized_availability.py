@@ -128,6 +128,8 @@ def test_vendor_available_at_1129_is_eligible_for_1230_decision() -> None:
     assert row.fill_start_at_ms == _ms("2026-08-21", time(15, 50))
     assert row.fill_end_at_ms == _ms("2026-08-21", time(16, 0))
     row.validate()
+    assert row.training_gate_eligible is False
+    assert metadata.training_gate_eligible is False
 
 
 def test_vendor_available_at_1131_skips_origin_and_moves_to_next_session() -> None:
