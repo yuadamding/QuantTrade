@@ -41,6 +41,18 @@ from rl_quant.data_sources.massive.finalized_daily_scan import (
     MassiveDailyTradeFileScanError,
     scan_massive_daily_trade_file_v0,
 )
+from rl_quant.data_sources.massive.finalized_execution_authority import (
+    MASSIVE_EXECUTION_CLOCK_V1_DATASET,
+    MASSIVE_EXECUTION_CLOCK_V1_SOURCE_SCHEMA_SHA256,
+    MASSIVE_EXECUTION_ENVIRONMENT_V1_DATASET,
+    MASSIVE_EXECUTION_ENVIRONMENT_V1_SOURCE_SCHEMA_SHA256,
+    MASSIVE_INPUT_AVAILABILITY_V1_DATASET,
+    MASSIVE_INPUT_AVAILABILITY_V1_SOURCE_SCHEMA_SHA256,
+    MassiveFinalizedExecutionAuthorityError,
+    parse_massive_execution_clock_authority_v1,
+    parse_massive_input_availability_authority_v1,
+    parse_massive_typed_execution_environment_v1,
+)
 from rl_quant.data_sources.massive.finalized_listing import (
     canonical_massive_trade_object_key,
 )
@@ -50,6 +62,7 @@ from rl_quant.data_sources.massive.finalized_listing_acquisition import (
     capture_massive_flat_file_listing_v0,
 )
 from rl_quant.data_sources.massive.finalized_object_acquisition import (
+    MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256,
     download_massive_flat_file_object_v1,
 )
 from rl_quant.data_sources.massive.finalized_origin import (
@@ -67,6 +80,8 @@ from rl_quant.data_sources.massive.finalized_origin_policy import (
     MASSIVE_FINALIZED_ORIGIN_POLICY_V1_RECEIPT_SHA256,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V2,
     MASSIVE_FINALIZED_ORIGIN_POLICY_V2_RECEIPT_SHA256,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V3,
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V3_RECEIPT_SHA256,
     MassiveFinalizedOriginPolicyError,
 )
 from rl_quant.data_sources.massive.finalized_partition_manifest import (
@@ -136,10 +151,23 @@ from rl_quant.workflows.massive_finalized_typed_pipeline import (
     materialize_massive_finalized_typed_pipeline_v0,
     validate_massive_finalized_typed_pipeline_v0,
 )
+from rl_quant.workflows.massive_historical_readiness_v1 import (
+    MASSIVE_HISTORICAL_READINESS_V1_SPEC_SHA256,
+    MASSIVE_TYPED_READINESS_CAPABILITY_V1_SPEC_SHA256,
+    MASSIVE_TYPED_READINESS_PANEL_SELECTION_V1_SPEC_SHA256,
+    MassiveHistoricalReadinessV1Error,
+    build_massive_typed_readiness_capability_v1,
+)
 from rl_quant.workflows.massive_measured_typed_run_v1 import (
+    MASSIVE_MEASURED_TYPED_STAGE_CONFIGURATION_V1,
     MASSIVE_MEASURED_TYPED_STAGE_IDS_V1,
     MassiveMeasuredTypedRunV1Error,
     measure_massive_typed_finalized_run_v1,
+)
+from rl_quant.workflows.massive_production_typed_run_v2 import (
+    MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V2,
+    MASSIVE_PRODUCTION_TYPED_RUN_V2_SPEC_SHA256,
+    measure_massive_typed_finalized_run_production_v2,
 )
 
 EASTERN = ZoneInfo("America/New_York")
@@ -1415,6 +1443,163 @@ def test_origin_policy_v2_binds_typed_artifact_generation() -> None:
         drifted.validate()
 
 
+def test_origin_policy_v3_binds_production_clock_and_historical_readiness() -> None:
+    MASSIVE_FINALIZED_ORIGIN_POLICY_V3.validate()
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V3.receipt_sha256 == (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V3_RECEIPT_SHA256
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V3.production_typed_run_spec_sha256 == (
+        MASSIVE_PRODUCTION_TYPED_RUN_V2_SPEC_SHA256
+    )
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V3.production_implementation_inventory_sha256
+        == MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V2
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V3.historical_readiness_spec_sha256 == (
+        MASSIVE_HISTORICAL_READINESS_V1_SPEC_SHA256
+    )
+    assert (
+        MASSIVE_FINALIZED_ORIGIN_POLICY_V3.typed_readiness_capability_spec_sha256
+        == (MASSIVE_TYPED_READINESS_CAPABILITY_V1_SPEC_SHA256)
+    )
+    assert MASSIVE_FINALIZED_ORIGIN_POLICY_V3.typed_readiness_panel_spec_sha256 == (
+        MASSIVE_TYPED_READINESS_PANEL_SELECTION_V1_SPEC_SHA256
+    )
+    assert MASSIVE_MEASURED_TYPED_STAGE_CONFIGURATION_V1[0] == (
+        MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256
+    )
+    production_parameters = inspect.signature(
+        measure_massive_typed_finalized_run_production_v2
+    ).parameters
+    assert "now_ms" not in production_parameters
+    assert "monotonic_ns" not in production_parameters
+    with pytest.raises(
+        MassiveHistoricalReadinessV1Error,
+        match="production-clock runs only",
+    ):
+        build_massive_typed_readiness_capability_v1((object(),) * 20)  # type: ignore[arg-type]
+
+
+def test_committed_execution_clock_environment_and_input_inventory(
+    tmp_path: Path,
+) -> None:
+    clock_payload = {
+        "host_id": "qualified-host-01",
+        "clock_source": "chrony-tracking",
+        "synchronization_protocol": "NTP",
+        "measurement_observed_at_ms": 1_200,
+        "qualification_valid_until_ms": 2_000,
+        "last_offset_ns": -100,
+        "rms_offset_ns": 200,
+        "root_dispersion_ns": 300,
+        "frequency_skew_ppm": 1.0,
+    }
+    clock_loaded = _publish(
+        root=tmp_path / "clock",
+        key="execution/clock.json",
+        payload=canonical_json_file_bytes(clock_payload),
+        dataset_id=MASSIVE_EXECUTION_CLOCK_V1_DATASET,
+        schema_sha256=MASSIVE_EXECUTION_CLOCK_V1_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=1_100,
+        etag="clock",
+    )
+    clock = parse_massive_execution_clock_authority_v1(
+        root=tmp_path / "clock", loaded_source=clock_loaded
+    )
+    assert clock.maximum_clock_error_ns == 1_100
+    assert clock.utc_upper_bound_ms(1_500) == 1_501
+    forged_clock_payload = dict(clock_payload) | {"measurement_observed_at_ms": "1200"}
+    forged_clock_loaded = _publish(
+        root=tmp_path / "clock-forged",
+        key="execution/clock-forged.json",
+        payload=canonical_json_file_bytes(forged_clock_payload),
+        dataset_id=MASSIVE_EXECUTION_CLOCK_V1_DATASET,
+        schema_sha256=MASSIVE_EXECUTION_CLOCK_V1_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=1_100,
+        etag="clock-forged",
+    )
+    with pytest.raises(MassiveFinalizedExecutionAuthorityError, match="types"):
+        parse_massive_execution_clock_authority_v1(
+            root=tmp_path / "clock-forged", loaded_source=forged_clock_loaded
+        )
+
+    environment_payload = {
+        "hardware_authority_receipt_sha256": semantic_sha256("hardware"),
+        "software_source_archive_sha256": semantic_sha256("source"),
+        "container_image_receipt_sha256": semantic_sha256("container"),
+        "python_environment_receipt_sha256": semantic_sha256("python"),
+        "network_contract_receipt_sha256": semantic_sha256("network"),
+        "storage_contract_receipt_sha256": semantic_sha256("storage"),
+        "pipeline_implementation_inventory_sha256": (
+            MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V2
+        ),
+    }
+    environment_loaded = _publish(
+        root=tmp_path / "environment",
+        key="execution/environment.json",
+        payload=canonical_json_file_bytes(environment_payload),
+        dataset_id=MASSIVE_EXECUTION_ENVIRONMENT_V1_DATASET,
+        schema_sha256=MASSIVE_EXECUTION_ENVIRONMENT_V1_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=1_100,
+        etag="environment",
+    )
+    environment = parse_massive_typed_execution_environment_v1(
+        root=tmp_path / "environment", loaded_source=environment_loaded
+    )
+    assert environment.pipeline_implementation_inventory_sha256 == (
+        MASSIVE_PRODUCTION_TYPED_PIPELINE_IMPLEMENTATION_INVENTORY_V2
+    )
+
+    input_payload = {
+        "rows": [
+            {
+                "input_kind": "checkpoint",
+                "artifact_receipt_sha256": semantic_sha256("checkpoint"),
+                "evidence_receipt_sha256": semantic_sha256("checkpoint-source"),
+                "available_at_ms": 1_000,
+            },
+            {
+                "input_kind": "clock-authority",
+                "artifact_receipt_sha256": clock.receipt_sha256,
+                "evidence_receipt_sha256": clock_loaded.receipt.receipt_sha256,
+                "available_at_ms": clock_loaded.verified_at_ms,
+            },
+        ]
+    }
+    input_loaded = _publish(
+        root=tmp_path / "inputs",
+        key="execution/inputs.json",
+        payload=canonical_json_file_bytes(input_payload),
+        dataset_id=MASSIVE_INPUT_AVAILABILITY_V1_DATASET,
+        schema_sha256=MASSIVE_INPUT_AVAILABILITY_V1_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=1_100,
+        etag="inputs",
+    )
+    inputs = parse_massive_input_availability_authority_v1(
+        root=tmp_path / "inputs", loaded_source=input_loaded
+    )
+    assert inputs.resolve("clock-authority").artifact_receipt_sha256 == (
+        clock.receipt_sha256
+    )
+    unsorted_payload = {"rows": list(reversed(input_payload["rows"]))}
+    unsorted_loaded = _publish(
+        root=tmp_path / "inputs-unsorted",
+        key="execution/inputs-unsorted.json",
+        payload=canonical_json_file_bytes(unsorted_payload),
+        dataset_id=MASSIVE_INPUT_AVAILABILITY_V1_DATASET,
+        schema_sha256=MASSIVE_INPUT_AVAILABILITY_V1_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=1_100,
+        etag="inputs-unsorted",
+    )
+    with pytest.raises(
+        MassiveFinalizedExecutionAuthorityError,
+        match="not canonical",
+    ):
+        parse_massive_input_availability_authority_v1(
+            root=tmp_path / "inputs-unsorted", loaded_source=unsorted_loaded
+        )
+
+
 def test_authenticated_get_archive_scope_and_typed_pipeline_v0(tmp_path: Path) -> None:
     source_day = "2026-08-20"
     decision_day = "2026-08-21"
@@ -1754,6 +1939,21 @@ def test_measured_typed_run_v1_binds_origin_masks_staleness_and_seed(
     checkpoint = parse_massive_validation_checkpoint_v1(
         root=tmp_path / "checkpoint-v1", loaded_source=checkpoint_loaded
     )
+    extra_checkpoint_payload = dict(checkpoint_payload) | {"unbound": "forbidden"}
+    extra_checkpoint_loaded = _publish(
+        root=tmp_path / "checkpoint-v1-extra",
+        key="massive-finalized-v1/checkpoints/mv04-seed3-extra.json",
+        payload=canonical_json_file_bytes(extra_checkpoint_payload),
+        dataset_id=MASSIVE_VALIDATION_CHECKPOINT_V1_DATASET,
+        schema_sha256=MASSIVE_VALIDATION_CHECKPOINT_V1_SOURCE_SCHEMA_SHA256,
+        downloaded_at_ms=_ms(decision_day, time(10, 56)),
+        etag="checkpoint-v1-mv04-seed3-extra",
+    )
+    with pytest.raises(ValueError, match="field inventory"):
+        parse_massive_validation_checkpoint_v1(
+            root=tmp_path / "checkpoint-v1-extra",
+            loaded_source=extra_checkpoint_loaded,
+        )
 
     class StepClock:
         def __init__(self, value: int, step: int) -> None:
@@ -1794,6 +1994,7 @@ def test_measured_typed_run_v1_binds_origin_masks_staleness_and_seed(
         monotonic_ns=monotonic,
     )
     run.validate()
+    assert run.typed_timing_qualified is False
     assert tuple(stage.stage_id for stage in run.stages) == (
         MASSIVE_MEASURED_TYPED_STAGE_IDS_V1
     )
@@ -1812,9 +2013,7 @@ def test_measured_typed_run_v1_binds_origin_masks_staleness_and_seed(
     assert run.predictive_training_authorized is False
     assert run.portfolio_evaluation_authorized is False
 
-    forged_stage = replace(
-        run.stages[-1], output_artifact_receipts=("f" * 64,)
-    )
+    forged_stage = replace(run.stages[-1], output_artifact_receipts=("f" * 64,))
     forged_stage = replace(
         forged_stage, receipt_sha256=semantic_sha256(forged_stage.unsigned())
     )
@@ -1823,16 +2022,12 @@ def test_measured_typed_run_v1_binds_origin_masks_staleness_and_seed(
     with pytest.raises(MassiveMeasuredTypedRunV1Error, match="stage bindings"):
         forged.validate()
 
-    forged_commit_stage = replace(
-        run.stages[-1], output_commit_receipts=("e" * 64,)
-    )
+    forged_commit_stage = replace(run.stages[-1], output_commit_receipts=("e" * 64,))
     forged_commit_stage = replace(
         forged_commit_stage,
         receipt_sha256=semantic_sha256(forged_commit_stage.unsigned()),
     )
-    forged_commit_run = replace(
-        run, stages=run.stages[:-1] + (forged_commit_stage,)
-    )
+    forged_commit_run = replace(run, stages=run.stages[:-1] + (forged_commit_stage,))
     forged_commit_run = replace(
         forged_commit_run,
         receipt_sha256=semantic_sha256(forged_commit_run.unsigned()),

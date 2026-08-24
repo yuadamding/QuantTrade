@@ -1,8 +1,8 @@
 """One measured authenticated source-to-order typed run for validation V1.
 
-This workflow is deliberately fixed and package-owned.  Its evidence can
-qualify timing canaries, but cannot authorize panel construction, training, or
-performance reporting.
+This workflow is deliberately fixed and package-owned, but its injectable
+clocks make it development evidence only.  Production timing qualification is
+issued exclusively by the V2 production wrapper.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from rl_quant.alpha.pit_universe import PITSecurityUniverseAuthority
 from rl_quant.data_sources.massive.conditions import MassiveConditionAuthority
 from rl_quant.data_sources.massive.corrections import MassiveCorrectionAuthority
 from rl_quant.data_sources.massive.finalized_archive_scope import (
-    MASSIVE_FINALIZED_ARCHIVE_SCOPE_V2_SPEC_SHA256,
     MassiveFinalizedArchiveScopeV2,
 )
 from rl_quant.data_sources.massive.finalized_daily_scan import (
@@ -33,6 +32,7 @@ from rl_quant.data_sources.massive.finalized_listing_acquisition import (
 )
 from rl_quant.data_sources.massive.finalized_object_acquisition import (
     MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SOURCE_SHA256,
+    MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256,
     MassiveAuthenticatedFlatFileDownloadV1,
     download_massive_flat_file_object_v1,
 )
@@ -133,7 +133,7 @@ MASSIVE_MEASURED_TYPED_STAGE_IMPLEMENTATIONS_V1 = (
     MASSIVE_VALIDATION_ORDERS_V1_SOURCE_SHA256,
 )
 MASSIVE_MEASURED_TYPED_STAGE_CONFIGURATION_V1 = (
-    MASSIVE_FINALIZED_ARCHIVE_SCOPE_V2_SPEC_SHA256,
+    MASSIVE_AUTHENTICATED_OBJECT_GET_V1_SPEC_SHA256,
     semantic_sha256(
         (
             MASSIVE_DAILY_TRADE_FILE_SCAN_SPEC_SHA256,
@@ -141,7 +141,9 @@ MASSIVE_MEASURED_TYPED_STAGE_CONFIGURATION_V1 = (
             MASSIVE_PERSISTED_PARTITION_SPEC_SHA256,
         )
     ),
-    semantic_sha256((MASSIVE_DAILY_BARS_V0_SPEC_SHA256, MASSIVE_DAILY_TAPE_V0_SPEC_SHA256)),
+    semantic_sha256(
+        (MASSIVE_DAILY_BARS_V0_SPEC_SHA256, MASSIVE_DAILY_TAPE_V0_SPEC_SHA256)
+    ),
     MASSIVE_ROLLING_FEATURES_V0_SPEC_SHA256,
     MASSIVE_PIT500_TENSOR_V1_SPEC_SHA256,
     MASSIVE_VALIDATION_INFERENCE_V1_SPEC_SHA256,
@@ -157,6 +159,8 @@ MASSIVE_MEASURED_TYPED_RUN_V1_SPEC_SHA256 = semantic_sha256(
         "outer_timer": "before-authenticated-get-through-requested-orders",
         "maximum_runtime_ms": 55 * 60 * 1_000,
         "decision_origin_spec": MASSIVE_TYPED_DECISION_ORIGIN_V1_SPEC_SHA256,
+        "timing_source": "injectable-development-clock",
+        "timing_qualification": False,
         "output_commits": "created-and-verified-inside-stage-wall-interval",
         "performance_authorization": False,
     }
@@ -248,8 +252,12 @@ def _stage(
     body = {
         "schema": "rl-quant.massive-measured-typed-stage-v1",
         "stage_id": stage_id,
-        "implementation_source_sha256": MASSIVE_MEASURED_TYPED_STAGE_IMPLEMENTATIONS_V1[index],
-        "configuration_receipt_sha256": MASSIVE_MEASURED_TYPED_STAGE_CONFIGURATION_V1[index],
+        "implementation_source_sha256": MASSIVE_MEASURED_TYPED_STAGE_IMPLEMENTATIONS_V1[
+            index
+        ],
+        "configuration_receipt_sha256": MASSIVE_MEASURED_TYPED_STAGE_CONFIGURATION_V1[
+            index
+        ],
         "input_artifact_receipts": tuple(inputs),
         "output_artifact_receipts": tuple(outputs),
         "output_commit_receipts": tuple(value[0] for value in commits),
@@ -320,9 +328,11 @@ class MassiveMeasuredTypedRunV1:
             // 1_000_000
             or self.runtime_ms > 55 * 60 * 1_000
             or self.outer_finished_at_ms > self.decision_origin.decision_at_ms
-            or not self.typed_timing_qualified
+            or self.typed_timing_qualified
         ):
-            raise MassiveMeasuredTypedRunV1Error("measured typed run chronology differs")
+            raise MassiveMeasuredTypedRunV1Error(
+                "measured typed run chronology differs"
+            )
         self.archive_scope.validate()
         self.authenticated_download.validate()
         self.decision_origin.validate()
@@ -350,8 +360,13 @@ class MassiveMeasuredTypedRunV1:
         self.checkpoint.validate()
         self.inference.validate()
         self.requested_orders.validate()
-        if tuple(stage.stage_id for stage in self.stages) != MASSIVE_MEASURED_TYPED_STAGE_IDS_V1:
-            raise MassiveMeasuredTypedRunV1Error("measured typed stage inventory differs")
+        if (
+            tuple(stage.stage_id for stage in self.stages)
+            != MASSIVE_MEASURED_TYPED_STAGE_IDS_V1
+        ):
+            raise MassiveMeasuredTypedRunV1Error(
+                "measured typed stage inventory differs"
+            )
         for stage in self.stages:
             stage.validate()
         if any(
@@ -421,7 +436,9 @@ class MassiveMeasuredTypedRunV1:
         )
         if any(
             (stage.input_artifact_receipts, stage.output_artifact_receipts) != expected
-            for stage, expected in zip(self.stages, expected_inputs_outputs, strict=True)
+            for stage, expected in zip(
+                self.stages, expected_inputs_outputs, strict=True
+            )
         ):
             raise MassiveMeasuredTypedRunV1Error("measured typed stage bindings differ")
         expected_loaded_outputs = (
@@ -445,11 +462,10 @@ class MassiveMeasuredTypedRunV1:
             self.stages, expected_loaded_outputs, strict=True
         ):
             expected_commits = tuple(_commit(value) for value in loaded_outputs)
-            if (
-                stage.output_commit_receipts
-                != tuple(value[0] for value in expected_commits)
-                or stage.output_committed_at_ms
-                != tuple(value[1] for value in expected_commits)
+            if stage.output_commit_receipts != tuple(
+                value[0] for value in expected_commits
+            ) or stage.output_committed_at_ms != tuple(
+                value[1] for value in expected_commits
             ):
                 raise MassiveMeasuredTypedRunV1Error(
                     "measured typed stage commit inventory differs"
@@ -483,12 +499,28 @@ class MassiveMeasuredTypedRunV1:
             != self.rolling_features.receipt_sha256
             or self.decision_tensor.decision_origin_receipt_sha256
             != self.decision_origin.receipt_sha256
-            or self.inference.tensor_receipt_sha256 != self.decision_tensor.receipt_sha256
-            or self.inference.checkpoint_receipt_sha256 != self.checkpoint.receipt_sha256
-            or self.requested_orders.inference_receipt_sha256 != self.inference.receipt_sha256
+            or self.inference.tensor_receipt_sha256
+            != self.decision_tensor.receipt_sha256
+            or self.inference.checkpoint_receipt_sha256
+            != self.checkpoint.receipt_sha256
+            or self.inference.setting_id != self.checkpoint.setting_id
+            or self.inference.seed != self.checkpoint.seed
+            or self.requested_orders.inference_receipt_sha256
+            != self.inference.receipt_sha256
+            or self.requested_orders.tensor_receipt_sha256
+            != self.decision_tensor.receipt_sha256
+            or self.requested_orders.decision_origin_receipt_sha256
+            != self.decision_origin.receipt_sha256
+            or self.requested_orders.setting_id != self.inference.setting_id
             or self.requested_orders.seed != self.checkpoint.seed
+            or self.requested_orders.decision_session_date
+            != self.decision_origin.decision_session_date
+            or self.requested_orders.decision_at_ms
+            != self.decision_origin.decision_at_ms
         ):
-            raise MassiveMeasuredTypedRunV1Error("measured typed authority chain differs")
+            raise MassiveMeasuredTypedRunV1Error(
+                "measured typed authority chain differs"
+            )
         if (
             self.panel_materialization_authorized
             or self.predictive_training_authorized
@@ -530,7 +562,7 @@ def measure_massive_typed_finalized_run_v1(
     now_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     monotonic_ns: Callable[[], int] = time.perf_counter_ns,
 ) -> MassiveMeasuredTypedRunV1:
-    """Measure the fixed authenticated source-to-order implementation once."""
+    """Measure a development run; injected clocks can never authorize timing."""
 
     checkpoint.validate()
     captured_listing.validate()
@@ -544,7 +576,9 @@ def measure_massive_typed_finalized_run_v1(
     download = download_massive_flat_file_object_v1(
         s3_client=s3_client,
         captured_listing=captured_listing,
-        source_object_key=canonical_massive_trade_object_key(source_session.session_date),
+        source_object_key=canonical_massive_trade_object_key(
+            source_session.session_date
+        ),
         destination_root=source_root,
         entitlement_receipt_sha256=entitlement_receipt_sha256,
         now_ms=now_ms,
@@ -554,7 +588,10 @@ def measure_massive_typed_finalized_run_v1(
         _stage(
             stage_id="authenticated-object-get",
             inputs=(captured_listing.acquisition_evidence.receipt_sha256,),
-            outputs=(download.receipt_sha256, download.loaded_source.receipt.receipt_sha256),
+            outputs=(
+                download.receipt_sha256,
+                download.loaded_source.receipt.receipt_sha256,
+            ),
             commits=(_commit(download.loaded_source),),
             started_at_ms=started_at_ms,
             finished_at_ms=finished_at_ms,
@@ -609,8 +646,15 @@ def measure_massive_typed_finalized_run_v1(
     stages.append(
         _stage(
             stage_id="source-scan-route-replay-persist",
-            inputs=(download.receipt_sha256, download.loaded_source.receipt.receipt_sha256),
-            outputs=(scan.receipt_sha256, semantic_partition.receipt_sha256, persisted.receipt_sha256),
+            inputs=(
+                download.receipt_sha256,
+                download.loaded_source.receipt.receipt_sha256,
+            ),
+            outputs=(
+                scan.receipt_sha256,
+                semantic_partition.receipt_sha256,
+                persisted.receipt_sha256,
+            ),
             commits=partition_commits,
             started_at_ms=started_at_ms,
             finished_at_ms=finished_at_ms,
@@ -668,7 +712,8 @@ def measure_massive_typed_finalized_run_v1(
     stages.append(
         _stage(
             stage_id="rolling-features",
-            inputs=rolling.daily_bars_artifact_receipts + rolling.daily_tape_artifact_receipts,
+            inputs=rolling.daily_bars_artifact_receipts
+            + rolling.daily_tape_artifact_receipts,
             outputs=(rolling.receipt_sha256,),
             commits=(_commit(rolling.loaded_source),),
             started_at_ms=started_at_ms,
@@ -693,7 +738,11 @@ def measure_massive_typed_finalized_run_v1(
     stages.append(
         _stage(
             stage_id="pit500-decision-tensor",
-            inputs=(rolling.receipt_sha256, decision_origin.receipt_sha256, identity_authority.receipt_sha256),
+            inputs=(
+                rolling.receipt_sha256,
+                decision_origin.receipt_sha256,
+                identity_authority.receipt_sha256,
+            ),
             outputs=(tensor.receipt_sha256,),
             commits=(_commit(tensor.loaded_source),),
             started_at_ms=started_at_ms,
@@ -743,7 +792,11 @@ def measure_massive_typed_finalized_run_v1(
     stages.append(
         _stage(
             stage_id="requested-orders",
-            inputs=(tensor.receipt_sha256, inference.receipt_sha256, decision_origin.receipt_sha256),
+            inputs=(
+                tensor.receipt_sha256,
+                inference.receipt_sha256,
+                decision_origin.receipt_sha256,
+            ),
             outputs=(orders.receipt_sha256,),
             commits=(_commit(orders.loaded_source),),
             started_at_ms=started_at_ms,
@@ -761,9 +814,7 @@ def measure_massive_typed_finalized_run_v1(
     validate_massive_requested_orders_v1(root=artifact_root, artifact=orders)
     outer_finished_at_ms = now_ms()
     outer_finished_monotonic_ns = monotonic_ns()
-    runtime_ms = (
-        outer_finished_monotonic_ns - outer_started_monotonic_ns
-    ) // 1_000_000
+    runtime_ms = (outer_finished_monotonic_ns - outer_started_monotonic_ns) // 1_000_000
     body = {
         "schema": MASSIVE_MEASURED_TYPED_RUN_V1_SCHEMA,
         "source_session_date": source_session.session_date,
@@ -792,7 +843,7 @@ def measure_massive_typed_finalized_run_v1(
         "outer_finished_monotonic_ns": outer_finished_monotonic_ns,
         "runtime_ms": runtime_ms,
         "run_spec_receipt_sha256": MASSIVE_MEASURED_TYPED_RUN_V1_SPEC_SHA256,
-        "typed_timing_qualified": True,
+        "typed_timing_qualified": False,
         "panel_materialization_authorized": False,
         "predictive_training_authorized": False,
         "portfolio_evaluation_authorized": False,
@@ -809,11 +860,15 @@ def measure_massive_typed_finalized_run_v1(
     return result
 
 
+measure_massive_typed_finalized_run_for_test_v1 = measure_massive_typed_finalized_run_v1
+
+
 __all__ = [
     "MASSIVE_MEASURED_TYPED_RUN_V1_SPEC_SHA256",
     "MASSIVE_MEASURED_TYPED_STAGE_IDS_V1",
     "MassiveMeasuredTypedRunV1",
     "MassiveMeasuredTypedRunV1Error",
     "MassiveMeasuredTypedStageV1",
+    "measure_massive_typed_finalized_run_for_test_v1",
     "measure_massive_typed_finalized_run_v1",
 ]

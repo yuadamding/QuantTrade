@@ -184,6 +184,24 @@ def parse_massive_validation_checkpoint_v1(
     raw = read_loaded_massive_source_bytes(root=root, loaded_source=loaded_source)
     try:
         payload = json.loads(raw)
+        expected_keys = {
+            "schema",
+            "setting_id",
+            "feature_set_id",
+            "seed",
+            "feature_names",
+            "horizon_ids",
+            "normalization_mean",
+            "normalization_scale",
+            "weights",
+            "biases",
+            "quantile_offsets",
+            "predictive_scales",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected_keys:
+            raise MassiveValidationInferenceV1Error(
+                "checkpoint v1 field inventory differs"
+            )
         body = {
             "schema": payload["schema"],
             "setting_id": payload["setting_id"],
@@ -200,14 +218,23 @@ def parse_massive_validation_checkpoint_v1(
             "loaded_source": loaded_source,
         }
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise MassiveValidationInferenceV1Error("checkpoint v1 bytes are malformed") from exc
-    if not isinstance(payload, dict) or raw != canonical_json_file_bytes(payload):
+        raise MassiveValidationInferenceV1Error(
+            "checkpoint v1 bytes are malformed"
+        ) from exc
+    if raw != canonical_json_file_bytes(payload):
         raise MassiveValidationInferenceV1Error("checkpoint v1 source is not canonical")
     provisional = MassiveValidationCheckpointV1(**body, receipt_sha256="0" * 64)
     result = replace(
         provisional, receipt_sha256=semantic_sha256(provisional.unsigned())
     )
     result.validate()
+    expected_payload = {
+        key: value for key, value in result.unsigned().items() if key != "loaded_source"
+    }
+    if raw != canonical_json_file_bytes(expected_payload):
+        raise MassiveValidationInferenceV1Error(
+            "checkpoint v1 bytes differ from the parsed checkpoint"
+        )
     return result
 
 
@@ -280,7 +307,9 @@ def _inference_payload(
     artifact: MassiveValidationInferenceArtifactV1,
 ) -> dict[str, object]:
     return {
-        key: value for key, value in artifact.unsigned().items() if key != "loaded_source"
+        key: value
+        for key, value in artifact.unsigned().items()
+        if key != "loaded_source"
     }
 
 
@@ -414,11 +443,15 @@ def validate_massive_validation_inference_v1(
     *, root: str | Path, artifact: MassiveValidationInferenceArtifactV1
 ) -> None:
     artifact.validate()
-    raw = read_loaded_massive_source_bytes(root=root, loaded_source=artifact.loaded_source)
+    raw = read_loaded_massive_source_bytes(
+        root=root, loaded_source=artifact.loaded_source
+    )
     try:
         payload = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise MassiveValidationInferenceV1Error("inference v1 source is not JSON") from exc
+        raise MassiveValidationInferenceV1Error(
+            "inference v1 source is not JSON"
+        ) from exc
     if raw != canonical_json_file_bytes(payload) or raw != canonical_json_file_bytes(
         _inference_payload(artifact)
     ):
