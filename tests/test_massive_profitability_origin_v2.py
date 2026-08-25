@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import inspect
 from dataclasses import asdict
 from datetime import UTC, date, datetime, time, timedelta
@@ -16,11 +17,28 @@ from rl_quant.alpha.pit_universe import (
     SourcedTickerHistoryRecord,
     UniverseRankInputRecord,
 )
+from rl_quant.data_sources.massive.conditions import (
+    MASSIVE_STOCK_TRADE_CONDITION_QUERY,
+    build_massive_condition_authority,
+)
+from rl_quant.data_sources.massive.corrections import (
+    build_massive_correction_authority,
+)
+from rl_quant.data_sources.massive.finalized_daily_scan import (
+    scan_massive_daily_trade_file_v0,
+)
 from rl_quant.data_sources.massive.finalized_listing import (
     canonical_massive_trade_object_key,
 )
 from rl_quant.data_sources.massive.finalized_listing_acquisition import (
     MASSIVE_FLAT_FILE_BUCKET,
+)
+from rl_quant.data_sources.massive.finalized_partition_manifest import (
+    build_massive_daily_trade_partition_manifest_v0,
+    build_massive_finalized_feature_domain_spec_v0,
+)
+from rl_quant.data_sources.massive.finalized_persisted_partitions import (
+    persist_massive_daily_trade_partitions_v1,
 )
 from rl_quant.data_sources.massive.session_calendar import (
     MassiveExchangeSession,
@@ -31,6 +49,7 @@ from rl_quant.data_sources.massive.source_receipts import (
     load_massive_source_bundle,
     publish_massive_source_object,
 )
+from rl_quant.data_sources.massive.trade_extraction import MASSIVE_FLAT_TRADE_COLUMNS
 from rl_quant.features import massive_profitability_origin_v2 as origin_v2
 from rl_quant.features.massive_daily_bars_v0 import (
     MASSIVE_DAILY_BARS_V0_DATASET,
@@ -41,7 +60,13 @@ from rl_quant.features.massive_daily_bars_v0 import (
     MASSIVE_DAILY_BARS_V0_SPEC_SHA256,
     MassiveDailyBarsArtifactV0,
     MassiveDailyBarsRowV0,
+    materialize_massive_daily_bars_v0,
     validate_massive_daily_bars_v0,
+)
+from rl_quant.features.massive_monthly_rank_bar_authority_v1 import (
+    MassiveMonthlyRankBarAuthorityV1Error,
+    build_massive_monthly_rank_bar_authority_for_test_v1,
+    build_massive_monthly_rank_bar_authority_v1,
 )
 from rl_quant.features.massive_profitability_origin_v2 import (
     MASSIVE_PROFITABILITY_ORIGIN_V2_LOCKBOX_ACCESS_AUTHORIZED,
@@ -152,45 +177,143 @@ class _S3Client:
         }
 
 
-def _bar_artifact(
-    *, root: Path, session_date: str, ordinal: int
-) -> MassiveDailyBarsArtifactV0:
-    values = (
-        100.0 + ordinal,
-        101.0 + ordinal,
-        99.0 + ordinal,
-        100.0 + ordinal,
-        10_000.0,
-        10_000_000.0 + ordinal,
-        0.02,
-        0.5,
+def _flat_trade_payload(*, session_date: str, ordinal: int) -> bytes:
+    participant = _ms(session_date, time(15, 59)) * 1_000_000
+    row = (
+        "AAA",
+        "[1]",
+        "0",
+        "4",
+        f"TRADE-{ordinal}",
+        str(participant),
+        f"{100 + ordinal}.00",
+        "1",
+        str(participant),
+        "100000",
+        "1",
+        "12",
+        str(participant),
     )
+    text = ",".join(MASSIVE_FLAT_TRADE_COLUMNS) + "\n" + ",".join(row) + "\n"
+    return gzip.compress(text.encode(), mtime=0)
+
+
+def _routing_identity(
+    sessions: MassiveSessionAuthority,
+) -> PITSecurityUniverseAuthority:
+    """Identity-only authority used by persisted partition routing."""
+
+    rule = MASSIVE_FINALIZED_VALIDATION_V0_PROTOCOL.universe_rule
+    effective_index = next(
+        index
+        for index, row in enumerate(sessions.sessions)
+        if row.session_date == "2020-05-01"
+    )
+    effective = sessions.sessions[effective_index]
+    end_index = effective_index - rule.ranking_lag_sessions
+    start_index = end_index - rule.ranking_lookback_sessions + 1
+    listing_at = sessions.sessions[0].regular_open_ns // 1_000_000
+    rank = UniverseRankInputRecord(
+        security_id="SEC-A",
+        effective_at_ms=effective.regular_open_ns // 1_000_000,
+        effective_session_index=effective_index,
+        available_at_ms=effective.regular_open_ns // 1_000_000 - 1,
+        observation_start_ms=(
+            sessions.sessions[start_index].regular_close_ns // 1_000_000
+        ),
+        observation_end_ms=(sessions.sessions[end_index].regular_close_ns // 1_000_000),
+        observation_start_session_index=start_index,
+        observation_end_session_index=end_index,
+        observed_session_count=rule.ranking_lookback_sessions,
+        average_dollar_volume=10_000_000.0,
+        close_price=100.0,
+        source_receipt_sha256=semantic_sha256("routing-rank-input"),
+    )
+    return PITSecurityUniverseAuthority.build(
+        rule=rule,
+        security_master=(
+            SourcedSecurityMasterRecord(
+                security_id="SEC-A",
+                issuer_id="ISS-A",
+                primary_exchange="XNYS",
+                share_class="COMMON",
+                security_type="common-stock",
+                listing_at_ms=listing_at,
+                delisting_at_ms=None,
+                successor_security_id=None,
+                corporate_action_chain_id="CHAIN-A",
+                identity_source_receipt_sha256=semantic_sha256("routing-master-a"),
+            ),
+        ),
+        ticker_history=(
+            SourcedTickerHistoryRecord(
+                security_id="SEC-A",
+                ticker="AAA",
+                valid_from_ms=listing_at,
+                valid_to_ms=None,
+                available_at_ms=listing_at,
+                primary_exchange="XNYS",
+                source_receipt_sha256=semantic_sha256("routing-ticker-a"),
+            ),
+        ),
+        listing_events=(
+            ListingEventRecord(
+                event_id="LIST-A",
+                security_id="SEC-A",
+                effective_at_ms=listing_at,
+                available_at_ms=listing_at,
+                primary_exchange="XNYS",
+                ticker="AAA",
+                source_receipt_sha256=semantic_sha256("routing-listing-a"),
+            ),
+        ),
+        delisting_events=(),
+        rank_inputs=(rank,),
+    )
+
+
+def _republish_bar_artifact(
+    *,
+    root: Path,
+    artifact: MassiveDailyBarsArtifactV0,
+    ordinal: int,
+    mutate_dollar_volume: bool,
+) -> MassiveDailyBarsArtifactV0:
+    source_row = artifact.rows[0]
+    values = list(source_row.values)
+    if mutate_dollar_volume:
+        values[MASSIVE_DAILY_BARS_V0_FIELDS.index("dollar_volume")] += 1_000_000.0
     row_body = {
-        "security_id": "SEC-A",
-        "values": values,
-        "valid": (True,) * len(MASSIVE_DAILY_BARS_V0_FIELDS),
-        "source_active_inventory_sha256": semantic_sha256(("active", session_date)),
+        "security_id": source_row.security_id,
+        "values": tuple(values),
+        "valid": source_row.valid,
+        "source_active_inventory_sha256": (source_row.source_active_inventory_sha256),
     }
     row = MassiveDailyBarsRowV0(
         **row_body,
         receipt_sha256=semantic_sha256(row_body),
     )
-    persisted_receipt = semantic_sha256(("persisted", session_date))
-    condition_receipt = semantic_sha256("condition-authority")
     row_inventory = semantic_sha256((row.receipt_sha256,))
     payload = {
         "schema": MASSIVE_DAILY_BARS_V0_SCHEMA,
-        "source_session_date": session_date,
-        "persisted_partition_manifest_receipt_sha256": persisted_receipt,
-        "condition_authority_receipt_sha256": condition_receipt,
+        "source_session_date": artifact.source_session_date,
+        "persisted_partition_manifest_receipt_sha256": (
+            artifact.persisted_partition_manifest_receipt_sha256
+        ),
+        "condition_authority_receipt_sha256": (
+            artifact.condition_authority_receipt_sha256
+        ),
         "feature_spec_receipt_sha256": MASSIVE_DAILY_BARS_V0_SPEC_SHA256,
         "feature_source_sha256": MASSIVE_DAILY_BARS_V0_SOURCE_SHA256,
         "feature_names": MASSIVE_DAILY_BARS_V0_FIELDS,
         "rows": (asdict(row),),
         "row_inventory_sha256": row_inventory,
     }
-    relative = f"massive-finalized-v0/session={session_date}/daily-bars.json"
-    published = _ms("2026-08-25", time(12, 0)) + ordinal
+    relative = (
+        "massive-finalized-v0-tampered/"
+        f"session={artifact.source_session_date}/daily-bars.json"
+    )
+    published = _ms("2026-08-25", time(14, 0)) + ordinal
     publish_massive_source_object(
         stream=BytesIO(canonical_json_file_bytes(payload)),
         root=root,
@@ -207,9 +330,13 @@ def _bar_artifact(
         root=root, relative_payload_path=relative, verified_at_ms=published
     )
     body = {
-        "source_session_date": session_date,
-        "persisted_partition_manifest_receipt_sha256": persisted_receipt,
-        "condition_authority_receipt_sha256": condition_receipt,
+        "source_session_date": artifact.source_session_date,
+        "persisted_partition_manifest_receipt_sha256": (
+            artifact.persisted_partition_manifest_receipt_sha256
+        ),
+        "condition_authority_receipt_sha256": (
+            artifact.condition_authority_receipt_sha256
+        ),
         "feature_spec_receipt_sha256": MASSIVE_DAILY_BARS_V0_SPEC_SHA256,
         "feature_source_sha256": MASSIVE_DAILY_BARS_V0_SOURCE_SHA256,
         "rows": (row,),
@@ -217,10 +344,7 @@ def _bar_artifact(
         "loaded_source": loaded,
         "schema": MASSIVE_DAILY_BARS_V0_SCHEMA,
     }
-    provisional = MassiveDailyBarsArtifactV0(
-        **body,
-        receipt_sha256="0" * 64,
-    )
+    provisional = MassiveDailyBarsArtifactV0(**body, receipt_sha256="0" * 64)
     result = MassiveDailyBarsArtifactV0(
         **body,
         receipt_sha256=semantic_sha256(provisional.unsigned()),
@@ -394,8 +518,10 @@ def stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         row.session_date for row in sessions.sessions[start_index : end_index + 1]
     )
     payloads = {
-        canonical_massive_trade_object_key(day): f"source-{day}".encode()
-        for day in window_dates
+        canonical_massive_trade_object_key(day): _flat_trade_payload(
+            session_date=day, ordinal=index
+        )
+        for index, day in enumerate(window_dates)
     }
     client = _S3Client(payloads)
     monkeypatch.setattr(
@@ -408,10 +534,87 @@ def stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         source_object_keys=tuple(payloads),
         entitlement_receipt_sha256=_ENTITLEMENT,
     )
-    bars = tuple(
-        _bar_artifact(root=tmp_path, session_date=day, ordinal=index)
-        for index, day in enumerate(window_dates)
+    routing_identity = _routing_identity(sessions)
+    conditions = build_massive_condition_authority(
+        (
+            {
+                "id": 1,
+                "name": "Regular",
+                "asset_class": "stocks",
+                "data_types": ["trade"],
+                "update_rules": {
+                    "consolidated": {
+                        "updates_high_low": True,
+                        "updates_open_close": True,
+                        "updates_volume": True,
+                    }
+                },
+            },
+        ),
+        source_object_receipt_sha256=semantic_sha256("rank-condition-source"),
+        source_query_path=MASSIVE_STOCK_TRADE_CONDITION_QUERY,
     )
+    corrections = build_massive_correction_authority(
+        (
+            (0, "new-trade"),
+            (1, "replacement"),
+            (2, "cancellation"),
+            (3, "late-report"),
+        ),
+        canary_receipt_sha256=semantic_sha256("rank-correction-canary"),
+    )
+    feature_domain = build_massive_finalized_feature_domain_spec_v0(
+        condition_authority=conditions,
+        correction_authority=corrections,
+    )
+    download_by_date = {
+        row.source_object_key.rsplit("/", 1)[-1].removesuffix(".csv.gz"): row
+        for row in acquisition.authenticated_downloads
+    }
+    scans = []
+    semantic_manifests = []
+    persisted_manifests = []
+    bars_list = []
+    for index, day in enumerate(window_dates):
+        session = sessions.resolve(exchange="XNYS", session_date=day)
+        rows, scan = scan_massive_daily_trade_file_v0(
+            root=tmp_path,
+            loaded_source=download_by_date[day].loaded_source,
+            session_authority=sessions,
+            session=session,
+            correction_authority=corrections,
+        )
+        semantic_manifest = build_massive_daily_trade_partition_manifest_v0(
+            rows=rows,
+            scan_evidence=scan,
+            identity_authority=routing_identity,
+            condition_authority=conditions,
+            correction_authority=corrections,
+            feature_domain_spec=feature_domain,
+        )
+        persisted = persist_massive_daily_trade_partitions_v1(
+            root=tmp_path,
+            rows=rows,
+            scan_evidence=scan,
+            semantic_partition_manifest=semantic_manifest,
+            identity_authority=routing_identity,
+            correction_authority=corrections,
+            entitlement_receipt_sha256=_ENTITLEMENT,
+            published_at_ms=_ms("2026-08-25", time(12, 0)) + index,
+        )
+        bar = materialize_massive_daily_bars_v0(
+            persisted_root=tmp_path,
+            output_root=tmp_path,
+            manifest=persisted,
+            condition_authority=conditions,
+            entitlement_receipt_sha256=_ENTITLEMENT,
+            published_at_ms=_ms("2026-08-25", time(13, 0)) + index,
+        )
+        scans.append(scan)
+        semantic_manifests.append(semantic_manifest)
+        persisted_manifests.append(persisted)
+        bars_list.append(bar)
+    bars = tuple(bars_list)
     identity = _identity(
         sessions=sessions,
         bars=bars,
@@ -432,6 +635,12 @@ def stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         "acquisition": acquisition,
         "bars": bars,
         "identity": identity,
+        "routing_identity": routing_identity,
+        "conditions": conditions,
+        "corrections": corrections,
+        "scans": tuple(scans),
+        "semantic_manifests": tuple(semantic_manifests),
+        "persisted_manifests": tuple(persisted_manifests),
         "rank_authority": rank_authority,
     }
 
@@ -470,6 +679,96 @@ def test_exact_t_minus_one_rank_authority_reparses_bars_and_sources(
     assert group.observation_session_dates == stack["window_dates"]
     assert row.observed_session_count == 63
     assert authority.source_data_qualified is True
+
+
+def test_rank_bar_authority_rederives_authenticated_partitions(
+    stack: dict[str, object], tmp_path: Path
+) -> None:
+    authority = build_massive_monthly_rank_bar_authority_v1(
+        source_root=tmp_path,
+        persisted_root=tmp_path,
+        daily_bars_root=tmp_path,
+        session_authority=stack["sessions"],
+        identity_authority=stack["routing_identity"],
+        condition_authority=stack["conditions"],
+        correction_authority=stack["corrections"],
+        acquisition=stack["acquisition"],
+        rank_input_authority=stack["rank_authority"],
+        scan_evidence=stack["scans"],
+        semantic_partition_manifests=stack["semantic_manifests"],
+        persisted_partition_manifests=stack["persisted_manifests"],
+        daily_bars=stack["bars"],
+    )
+    assert len(authority.sessions) == 63
+    assert authority.source_transport_qualified is True
+    assert authority.rank_bar_data_qualified is True
+    assert authority.panel_materialization_authorized is False
+    assert authority.predictive_training_authorized is False
+
+    nonauthorizing = build_massive_monthly_rank_bar_authority_for_test_v1(
+        source_root=tmp_path,
+        persisted_root=tmp_path,
+        daily_bars_root=tmp_path,
+        session_authority=stack["sessions"],
+        identity_authority=stack["routing_identity"],
+        condition_authority=stack["conditions"],
+        correction_authority=stack["corrections"],
+        acquisition=stack["acquisition"],
+        rank_input_authority=stack["rank_authority"],
+        scan_evidence=stack["scans"],
+        semantic_partition_manifests=stack["semantic_manifests"],
+        persisted_partition_manifests=stack["persisted_manifests"],
+        daily_bars=stack["bars"],
+    )
+    assert nonauthorizing.source_transport_qualified is False
+    assert nonauthorizing.rank_bar_data_qualified is False
+
+
+def test_rank_bar_authority_rejects_self_consistent_fake_dollar_volume(
+    stack: dict[str, object], tmp_path: Path
+) -> None:
+    tampered_bars = tuple(
+        _republish_bar_artifact(
+            root=tmp_path,
+            artifact=artifact,
+            ordinal=index,
+            mutate_dollar_volume=index == 0,
+        )
+        for index, artifact in enumerate(stack["bars"])
+    )
+    tampered_identity = _identity(
+        sessions=stack["sessions"],
+        bars=tampered_bars,
+        acquisition=stack["acquisition"],
+    )
+    tampered_rank = build_massive_monthly_rank_input_authority_v2(
+        root=tmp_path,
+        session_authority=stack["sessions"],
+        identity_authority=tampered_identity,
+        acquisition=stack["acquisition"],
+        daily_bars=tampered_bars,
+        first_candidate_decision_session_date="2020-05-01",
+        last_candidate_decision_session_date="2020-05-01",
+    )
+    with pytest.raises(
+        MassiveMonthlyRankBarAuthorityV1Error,
+        match="daily bars differ from authenticated partition rederivation",
+    ):
+        build_massive_monthly_rank_bar_authority_v1(
+            source_root=tmp_path,
+            persisted_root=tmp_path,
+            daily_bars_root=tmp_path,
+            session_authority=stack["sessions"],
+            identity_authority=stack["routing_identity"],
+            condition_authority=stack["conditions"],
+            correction_authority=stack["corrections"],
+            acquisition=stack["acquisition"],
+            rank_input_authority=tampered_rank,
+            scan_evidence=stack["scans"],
+            semantic_partition_manifests=stack["semantic_manifests"],
+            persisted_partition_manifests=stack["persisted_manifests"],
+            daily_bars=tampered_bars,
+        )
 
 
 def test_causal_but_staler_rank_window_is_rejected(
