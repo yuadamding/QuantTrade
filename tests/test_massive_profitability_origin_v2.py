@@ -68,6 +68,17 @@ from rl_quant.features.massive_monthly_rank_bar_authority_v1 import (
     build_massive_monthly_rank_bar_authority_for_test_v1,
     build_massive_monthly_rank_bar_authority_v1,
 )
+from rl_quant.features.massive_profitability_experiment_coverage_v2 import (
+    massive_profitability_identity_semantic_receipt_v2,
+    materialize_massive_profitability_security_support_v2,
+    parse_massive_profitability_security_support_v2,
+)
+from rl_quant.features.massive_profitability_frozen_authorities_v1 import (
+    materialize_massive_monthly_rank_bar_authority_v1,
+    materialize_massive_monthly_rank_input_authority_v2,
+    materialize_massive_profitability_origin_plan_v2,
+    parse_massive_profitability_frozen_authority_v1,
+)
 from rl_quant.features.massive_profitability_origin_v2 import (
     MASSIVE_PROFITABILITY_ORIGIN_V2_LOCKBOX_ACCESS_AUTHORIZED,
     MASSIVE_PROFITABILITY_ORIGIN_V2_PANEL_MATERIALIZATION_AUTHORIZED,
@@ -876,6 +887,117 @@ def test_production_acquisition_and_exact_ranks_bind_v2_origin_plan(
     )
     assert plan.panel_materialization_authorized is False
     assert plan.predictive_training_authorized is False
+
+
+def test_v2_origin_rank_and_rank_bar_authorities_freeze_and_support_round_trip(
+    stack: dict[str, object], tmp_path: Path
+) -> None:
+    sessions = stack["sessions"]
+    candidate_index = next(
+        index
+        for index, row in enumerate(sessions.sessions)
+        if row.session_date == "2020-05-01"
+    )
+    source_date = sessions.sessions[candidate_index - 2].session_date
+    source_artifact = (
+        materialize_massive_profitability_acquired_source_evidence_from_acquisition_v2(
+            root=tmp_path,
+            acquisition=stack["acquisition"],
+            source_session_dates=(source_date,),
+            artifact_id="frozen-origin-source",
+            committed_at_ms=_ms("2026-08-25", time(13, 30)),
+        )
+    )
+    origin_plan = build_massive_profitability_decision_origin_plan_v2(
+        root=tmp_path,
+        session_authority=sessions,
+        identity_authority=stack["identity"],
+        acquisition=stack["acquisition"],
+        source_evidence_artifact=source_artifact,
+        monthly_rank_authority=stack["rank_authority"],
+        daily_bars=stack["bars"],
+        first_candidate_decision_session_date="2020-05-01",
+        last_candidate_decision_session_date="2020-05-01",
+    )
+    rank_bar = build_massive_monthly_rank_bar_authority_v1(
+        source_root=tmp_path,
+        persisted_root=tmp_path,
+        daily_bars_root=tmp_path,
+        session_authority=sessions,
+        identity_authority=stack["routing_identity"],
+        condition_authority=stack["conditions"],
+        correction_authority=stack["corrections"],
+        acquisition=stack["acquisition"],
+        rank_input_authority=stack["rank_authority"],
+        scan_evidence=stack["scans"],
+        semantic_partition_manifests=stack["semantic_manifests"],
+        persisted_partition_manifests=stack["persisted_manifests"],
+        daily_bars=stack["bars"],
+    )
+    origin_frozen = materialize_massive_profitability_origin_plan_v2(
+        root=tmp_path,
+        authority=origin_plan,
+        acquisition=stack["acquisition"],
+        monthly_rank_authority=stack["rank_authority"],
+        artifact_id="origin",
+        committed_at_ms=_ms("2026-08-25", time(14, 0)),
+        entitlement_receipt_sha256=_ENTITLEMENT,
+    )
+    rank_frozen = materialize_massive_monthly_rank_input_authority_v2(
+        root=tmp_path,
+        authority=stack["rank_authority"],
+        acquisition=stack["acquisition"],
+        artifact_id="rank",
+        committed_at_ms=_ms("2026-08-25", time(14, 1)),
+        entitlement_receipt_sha256=_ENTITLEMENT,
+    )
+    rank_bar_frozen = materialize_massive_monthly_rank_bar_authority_v1(
+        root=tmp_path,
+        authority=rank_bar,
+        acquisition=stack["acquisition"],
+        artifact_id="rank-bar",
+        committed_at_ms=_ms("2026-08-25", time(14, 2)),
+        entitlement_receipt_sha256=_ENTITLEMENT,
+    )
+
+    assert origin_frozen.runtime_qualified is True
+    assert rank_frozen.runtime_qualified is True
+    assert rank_bar_frozen.runtime_qualified is True
+    assert origin_frozen.authority_semantic_payload_sha256 != (
+        origin_frozen.authority_semantic_receipt_sha256
+    )
+    assert (
+        parse_massive_profitability_frozen_authority_v1(
+            root=tmp_path, loaded_source=rank_bar_frozen.loaded_source
+        ).runtime_qualified
+        is False
+    )
+    assert massive_profitability_identity_semantic_receipt_v2(
+        stack["routing_identity"]
+    ) == massive_profitability_identity_semantic_receipt_v2(stack["identity"])
+
+    support = materialize_massive_profitability_security_support_v2(
+        root=tmp_path,
+        origin_plan=origin_plan,
+        monthly_rank_authority=stack["rank_authority"],
+        monthly_rank_bar_authority=rank_bar,
+        routing_identity_authority=stack["routing_identity"],
+        rank_identity_authority=stack["identity"],
+        frozen_origin_artifact=origin_frozen,
+        frozen_rank_artifact=rank_frozen,
+        frozen_rank_bar_artifact=rank_bar_frozen,
+        artifact_id="support",
+        committed_at_ms=_ms("2026-08-25", time(14, 3)),
+        entitlement_receipt_sha256=_ENTITLEMENT,
+    )
+    assert support.decision_member_security_ids == ("SEC-A",)
+    assert support.all_supported_security_ids == ("SEC-A",)
+    assert support.components_runtime_qualified is True
+    reloaded = parse_massive_profitability_security_support_v2(
+        root=tmp_path, loaded_source=support.loaded_source
+    )
+    assert reloaded.semantic_receipt_sha256 == support.semantic_receipt_sha256
+    assert reloaded.components_runtime_qualified is False
 
 
 def test_performance_authorizations_remain_false() -> None:
