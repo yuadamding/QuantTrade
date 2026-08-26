@@ -851,6 +851,9 @@ def test_daily_input_authority_rederives_bar_tape_and_population(
     bars = tuple(
         row for row in stack["bars"] if row.source_session_date in set(dates)
     )
+    data_freeze_at_ms = max(
+        row.completed_at_ms for row in stack["acquisition"].authenticated_downloads
+    )
     daily = build_massive_profitability_daily_input_authority_for_test_v1(
         source_root=tmp_path,
         persisted_root=tmp_path,
@@ -863,7 +866,7 @@ def test_daily_input_authority_rederives_bar_tape_and_population(
         acquisition=stack["acquisition"],
         required_session_dates=dates,
         supported_security_ids=("SEC-A",),
-        data_freeze_at_ms=_ms("2026-08-25", time(14, 0)),
+        data_freeze_at_ms=data_freeze_at_ms,
         scan_evidence=stack["scans"],
         semantic_partition_manifests=stack["semantic_manifests"],
         persisted_partition_manifests=stack["persisted_manifests"],
@@ -876,6 +879,30 @@ def test_daily_input_authority_rederives_bar_tape_and_population(
     assert all(row.daily_tape_row_receipt_sha256 for row in daily.rows)
     assert daily.source_transport_qualified is False
     assert daily.daily_input_data_qualified is False
+
+    with pytest.raises(
+        MassiveProfitabilityDailyInputAuthorityV1Error,
+        match="authenticated GET completed after the archive freeze",
+    ):
+        build_massive_profitability_daily_input_authority_for_test_v1(
+            source_root=tmp_path,
+            persisted_root=tmp_path,
+            daily_bars_root=tmp_path,
+            daily_tape_root=tmp_path,
+            session_authority=stack["sessions"],
+            identity_authority=stack["routing_identity"],
+            condition_authority=stack["conditions"],
+            correction_authority=stack["corrections"],
+            acquisition=stack["acquisition"],
+            required_session_dates=dates,
+            supported_security_ids=("SEC-A",),
+            data_freeze_at_ms=data_freeze_at_ms - 1,
+            scan_evidence=stack["scans"],
+            semantic_partition_manifests=stack["semantic_manifests"],
+            persisted_partition_manifests=stack["persisted_manifests"],
+            daily_bars=bars,
+            daily_tape=tapes,
+        )
 
     with pytest.raises(
         MassiveProfitabilityDailyInputAuthorityV1Error,
@@ -893,7 +920,7 @@ def test_daily_input_authority_rederives_bar_tape_and_population(
             acquisition=stack["acquisition"],
             required_session_dates=dates,
             supported_security_ids=("SEC-A",),
-            data_freeze_at_ms=_ms("2026-08-25", time(14, 0)),
+            data_freeze_at_ms=data_freeze_at_ms,
             scan_evidence=stack["scans"],
             semantic_partition_manifests=stack["semantic_manifests"],
             persisted_partition_manifests=stack["persisted_manifests"],

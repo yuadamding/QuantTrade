@@ -175,7 +175,9 @@ class MassiveProfitabilityTerminalCoverageAuthorityV1:
     supported_security_ids: tuple[str, ...]
     rows: tuple[MassiveProfitabilityTerminalSupportRowV1, ...]
     known_disposition_count: int
+    exact_provider_disposition_count: int
     conservative_total_loss_count: int
+    terminal_accounting_mode: str
     support_semantic_receipt_sha256: str
     normalized_identity_semantic_receipt_sha256: str
     terminal_source_semantic_receipt_sha256: str
@@ -183,6 +185,8 @@ class MassiveProfitabilityTerminalCoverageAuthorityV1:
     structural_terminal_coverage_complete: bool
     terminal_source_runtime_qualified: bool
     terminal_evidence_data_qualified: bool
+    conservative_lower_bound_complete: bool
+    terminal_accounting_data_qualified: bool
     protocol_receipt_sha256: str
     specification_sha256: str
     implementation_source_sha256: str
@@ -236,9 +240,19 @@ class MassiveProfitabilityTerminalCoverageAuthorityV1:
             for row in self.rows
         )
         fallback = sum(row.conservative_total_loss for row in self.rows)
+        exact = sum(
+            row.provider_disposition_receipt_sha256 is not None for row in self.rows
+        )
+        expected_mode = (
+            "exact-provider"
+            if self.terminal_source_runtime_qualified and fallback == 0
+            else "conservative-lower-bound"
+        )
         if (
             self.known_disposition_count != known
+            or self.exact_provider_disposition_count != exact
             or self.conservative_total_loss_count != fallback
+            or self.terminal_accounting_mode != expected_mode
             or self.row_inventory_sha256
             != semantic_sha256(tuple(row.receipt_sha256 for row in self.rows))
             or self.structural_terminal_coverage_complete is not True
@@ -246,6 +260,9 @@ class MassiveProfitabilityTerminalCoverageAuthorityV1:
             or not isinstance(self.terminal_evidence_data_qualified, bool)
             or self.terminal_evidence_data_qualified
             != self.terminal_source_runtime_qualified
+            or self.conservative_lower_bound_complete
+            != (self.terminal_accounting_mode == "conservative-lower-bound")
+            or self.terminal_accounting_data_qualified is not True
             or any(
                 (
                     self.predictive_training_authorized,
@@ -372,17 +389,27 @@ def build_massive_profitability_terminal_coverage_authority_v1(
         raise MassiveProfitabilityTerminalCoverageAuthorityV1Error(
             "identity contains multiple delistings for one permanent security"
         )
-    dispositions = {row.security_id: row for row in reloaded.dispositions}
+    source_dispositions = {row.security_id: row for row in reloaded.dispositions}
     support_set = set(security_support.all_supported_security_ids)
+    if any(
+        security_id in support_set and security_id not in delistings_by_security
+        for security_id in source_dispositions
+    ):
+        raise MassiveProfitabilityTerminalCoverageAuthorityV1Error(
+            "provider terminal disposition lacks one identity delisting"
+        )
     if any(
         row.successor_security_id is not None
         and row.successor_security_id not in support_set
-        for row in dispositions.values()
+        for row in source_dispositions.values()
         if row.security_id in support_set
     ):
         raise MassiveProfitabilityTerminalCoverageAuthorityV1Error(
             "terminal successor lies outside experiment accounting support"
         )
+    dispositions = (
+        source_dispositions if terminal_source.fixed_runtime_captured else {}
+    )
     rows: list[MassiveProfitabilityTerminalSupportRowV1] = []
     for security_id in security_support.all_supported_security_ids:
         delisting_rows = delistings_by_security.get(security_id, [])
@@ -447,6 +474,14 @@ def build_massive_profitability_terminal_coverage_authority_v1(
         not in {"live-through-coverage", "conservative-total-loss"} for row in rows
     )
     fallback = sum(row.conservative_total_loss for row in rows)
+    exact = sum(
+        row.provider_disposition_receipt_sha256 is not None for row in rows
+    )
+    accounting_mode = (
+        "exact-provider"
+        if terminal_source.fixed_runtime_captured and fallback == 0
+        else "conservative-lower-bound"
+    )
     semantic: dict[str, object] = {
         "schema": MASSIVE_PROFITABILITY_TERMINAL_COVERAGE_AUTHORITY_V1_SCHEMA,
         "coverage_start_date": daily_input_authority.coverage_start_session_date,
@@ -454,7 +489,9 @@ def build_massive_profitability_terminal_coverage_authority_v1(
         "supported_security_ids": security_support.all_supported_security_ids,
         "rows": tuple(asdict(row) for row in rows),
         "known_disposition_count": known,
+        "exact_provider_disposition_count": exact,
         "conservative_total_loss_count": fallback,
+        "terminal_accounting_mode": accounting_mode,
         "support_semantic_receipt_sha256": security_support.semantic_receipt_sha256,
         "normalized_identity_semantic_receipt_sha256": identity_semantics,
         "terminal_source_semantic_receipt_sha256": reloaded.receipt_sha256,
@@ -464,6 +501,10 @@ def build_massive_profitability_terminal_coverage_authority_v1(
         "structural_terminal_coverage_complete": True,
         "terminal_source_runtime_qualified": terminal_source.fixed_runtime_captured,
         "terminal_evidence_data_qualified": terminal_source.fixed_runtime_captured,
+        "conservative_lower_bound_complete": (
+            accounting_mode == "conservative-lower-bound"
+        ),
+        "terminal_accounting_data_qualified": True,
         "protocol_receipt_sha256": MASSIVE_FINALIZED_PROFITABILITY_P0_RECEIPT_SHA256,
         "specification_sha256": (
             MASSIVE_PROFITABILITY_TERMINAL_COVERAGE_AUTHORITY_V1_SPEC_SHA256
@@ -483,7 +524,9 @@ def build_massive_profitability_terminal_coverage_authority_v1(
         supported_security_ids=security_support.all_supported_security_ids,
         rows=tuple(rows),
         known_disposition_count=known,
+        exact_provider_disposition_count=exact,
         conservative_total_loss_count=fallback,
+        terminal_accounting_mode=accounting_mode,
         support_semantic_receipt_sha256=security_support.semantic_receipt_sha256,
         normalized_identity_semantic_receipt_sha256=identity_semantics,
         terminal_source_semantic_receipt_sha256=reloaded.receipt_sha256,
@@ -491,6 +534,10 @@ def build_massive_profitability_terminal_coverage_authority_v1(
         structural_terminal_coverage_complete=True,
         terminal_source_runtime_qualified=terminal_source.fixed_runtime_captured,
         terminal_evidence_data_qualified=terminal_source.fixed_runtime_captured,
+        conservative_lower_bound_complete=(
+            accounting_mode == "conservative-lower-bound"
+        ),
+        terminal_accounting_data_qualified=True,
         protocol_receipt_sha256=MASSIVE_FINALIZED_PROFITABILITY_P0_RECEIPT_SHA256,
         specification_sha256=MASSIVE_PROFITABILITY_TERMINAL_COVERAGE_AUTHORITY_V1_SPEC_SHA256,
         implementation_source_sha256=MASSIVE_PROFITABILITY_TERMINAL_COVERAGE_AUTHORITY_V1_SOURCE_SHA256,

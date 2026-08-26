@@ -47,6 +47,9 @@ from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
     MassiveProfitabilityDailyInputSessionV1,
     MassiveProfitabilityDailySecurityInputV1,
 )
+from rl_quant.features.massive_profitability_accounting_freeze_v1 import (
+    materialize_massive_profitability_accounting_freeze_for_test_v1,
+)
 from rl_quant.features.massive_profitability_feature_accounting_authority_v2 import (
     build_massive_profitability_feature_accounting_authority_v2,
 )
@@ -70,8 +73,14 @@ from rl_quant.features.massive_profitability_origin_v2 import (
     MASSIVE_PROFITABILITY_ORIGIN_V2_SPEC_SHA256,
     MassiveProfitabilityDecisionOriginPlanV2,
 )
+from rl_quant.features.massive_profitability_origin_features_v3 import (
+    build_massive_profitability_origin_features_v3,
+)
 from rl_quant.features.massive_profitability_target_accounting_authority_v2 import (
     build_massive_profitability_target_accounting_authority_v2,
+)
+from rl_quant.features.massive_profitability_targets_v2 import (
+    build_massive_profitability_targets_v2,
 )
 from rl_quant.features.massive_profitability_terminal_coverage_authority_v1 import (
     MASSIVE_PROFITABILITY_TERMINAL_COVERAGE_AUTHORITY_V1_SOURCE_SHA256,
@@ -388,6 +397,9 @@ def _daily(
             "regular_open_at_ms": session.regular_open_ns // 1_000_000,
             "regular_close_at_ms": session.regular_close_ns // 1_000_000,
             "vendor_last_modified_at_ms": session.regular_close_ns // 1_000_000,
+            "authenticated_get_completed_at_ms": (
+                session.regular_close_ns // 1_000_000
+            ),
             "authenticated_download_receipt_sha256": semantic_sha256(
                 (session.session_date, "download")
             ),
@@ -422,7 +434,7 @@ def _daily(
         supported_security_ids=("SEC-A",),
         sessions=tuple(session_rows),
         rows=tuple(rows),
-        archive_freeze_semantic_receipt_sha256=None,
+        archive_freeze_semantic_receipt_sha256=semantic_sha256("archive-freeze"),
         security_support_semantic_receipt_sha256=None,
         session_authority_receipt_sha256=sessions.receipt_sha256,
         normalized_identity_semantic_receipt_sha256=(
@@ -493,7 +505,9 @@ def _terminal(
         supported_security_ids=("SEC-A",),
         rows=(row,),
         known_disposition_count=0,
+        exact_provider_disposition_count=0,
         conservative_total_loss_count=1,
+        terminal_accounting_mode="conservative-lower-bound",
         support_semantic_receipt_sha256=semantic_sha256("support"),
         normalized_identity_semantic_receipt_sha256=(
             massive_profitability_identity_semantic_receipt_v2(identity)
@@ -503,6 +517,8 @@ def _terminal(
         structural_terminal_coverage_complete=True,
         terminal_source_runtime_qualified=False,
         terminal_evidence_data_qualified=False,
+        conservative_lower_bound_complete=True,
+        terminal_accounting_data_qualified=True,
         protocol_receipt_sha256=MASSIVE_FINALIZED_PROFITABILITY_P0_RECEIPT_SHA256,
         specification_sha256=(
             MASSIVE_PROFITABILITY_TERMINAL_COVERAGE_AUTHORITY_V1_SPEC_SHA256
@@ -616,12 +632,17 @@ def _fills(
     return result
 
 
-def _event(*, sessions: MassiveSessionAuthority) -> MassiveNativeEconomicObservationV8:
-    effective = sessions.sessions[66].regular_open_ns // 1_000_000
+def _event(
+    *,
+    sessions: MassiveSessionAuthority,
+    session_index: int = 66,
+    provider_event_key: str = "DIV-A",
+) -> MassiveNativeEconomicObservationV8:
+    effective = sessions.sessions[session_index].regular_open_ns // 1_000_000
     body = {
         "surface_id": "massive-dividends-v1",
-        "provider_event_key": "DIV-A",
-        "logical_event_key": semantic_sha256("DIV-A"),
+        "provider_event_key": provider_event_key,
+        "logical_event_key": semantic_sha256(provider_event_key),
         "security_id": "SEC-A",
         "ticker": "AAA",
         "kind": "cash-dividend",
@@ -637,7 +658,9 @@ def _event(*, sessions: MassiveSessionAuthority) -> MassiveNativeEconomicObserva
         "historical_adjustment_factor": 1.0,
         "raw_provider_request_id": "REQ",
         "raw_provider_row_locator": "page=0/results=0",
-        "raw_provider_row_sha256": semantic_sha256("raw-dividend"),
+        "raw_provider_row_sha256": semantic_sha256(
+            ("raw-dividend", provider_event_key)
+        ),
         "identity_mapping_receipt_sha256": semantic_sha256("map-dividend"),
     }
     result = MassiveNativeEconomicObservationV8(
@@ -833,3 +856,152 @@ def test_target_replay_preserves_cash_then_conservatively_loses_security(
         terminal_authority=terminal,
     )
     assert no_cash.target(security_id="SEC-A", horizon_sessions=5) == -1.0
+
+
+def test_target_semantics_exclude_events_after_h63(tmp_path: Path) -> None:
+    sessions = _sessions()
+    identity = _identity(sessions)
+    origin = _origin(sessions)
+    plan = _origin_plan(origin)
+    daily = _daily(sessions, identity)
+    fills = _fills(sessions=sessions, origin=origin, daily=daily)
+    terminal = _terminal(sessions, identity)
+    without_future = _coverage(
+        root=tmp_path,
+        sessions=sessions,
+        terminal=terminal,
+        origin=origin,
+        events=(),
+        artifact_id="target-without-post-h63",
+    )
+    with_future = _coverage(
+        root=tmp_path,
+        sessions=sessions,
+        terminal=terminal,
+        origin=origin,
+        events=(
+            _event(
+                sessions=sessions,
+                session_index=129,
+                provider_event_key="DIV-POST-H63",
+            ),
+        ),
+        artifact_id="target-with-post-h63",
+    )
+    first = build_massive_profitability_target_accounting_authority_v2(
+        root=tmp_path,
+        origin=origin,
+        origin_plan=plan,
+        session_authority=sessions,
+        identity_authority=identity,
+        daily_input_authority=daily,
+        fill_source_authority=fills,
+        economic_coverage=without_future,
+        terminal_authority=terminal,
+    )
+    second = build_massive_profitability_target_accounting_authority_v2(
+        root=tmp_path,
+        origin=origin,
+        origin_plan=plan,
+        session_authority=sessions,
+        identity_authority=identity,
+        daily_input_authority=daily,
+        fill_source_authority=fills,
+        economic_coverage=with_future,
+        terminal_authority=terminal,
+    )
+    assert first.semantic_receipt_sha256 == second.semantic_receipt_sha256
+    assert first.audit_receipt_sha256 != second.audit_receipt_sha256
+
+
+def test_source_owned_accounting_drives_v3_features_and_v2_targets(
+    tmp_path: Path,
+) -> None:
+    sessions = _sessions()
+    identity = _identity(sessions)
+    origin = _origin(sessions)
+    plan = _origin_plan(origin)
+    daily = _daily(sessions, identity)
+    terminal = _terminal(sessions, identity)
+    fills = _fills(sessions=sessions, origin=origin, daily=daily)
+    coverage = _coverage(
+        root=tmp_path,
+        sessions=sessions,
+        terminal=terminal,
+        origin=origin,
+        events=(_event(sessions=sessions),),
+        artifact_id="integrated-source-owned",
+    )
+    accounting_freeze = (
+        materialize_massive_profitability_accounting_freeze_for_test_v1(
+            root=tmp_path,
+            archive_freeze_semantic_receipt_sha256=(
+                daily.archive_freeze_semantic_receipt_sha256
+            ),
+            origin_plan=plan,
+            terminal_authority=terminal,
+            economic_coverages=(coverage,),
+            accounting_freeze_at_ms=origin.decision_at_ms + 1_000,
+            entitlement_receipt_sha256=_ENTITLEMENT,
+            artifact_id="integrated-source-owned",
+        )
+    )
+    feature_accounting = build_massive_profitability_feature_accounting_authority_v2(
+        root=tmp_path,
+        origin=origin,
+        origin_plan=plan,
+        session_authority=sessions,
+        identity_authority=identity,
+        daily_input_authority=daily,
+        economic_coverage=coverage,
+        terminal_authority=terminal,
+    )
+    features = build_massive_profitability_origin_features_v3(
+        origin=origin,
+        origin_plan=plan,
+        session_authority=sessions,
+        identity_authority=identity,
+        daily_input_authority=daily,
+        feature_accounting=feature_accounting,
+        accounting_freeze=accounting_freeze,
+        terminal_authority=terminal,
+    )
+    assert features.input_session_dates == tuple(
+        row.session_date for row in sessions.sessions[:64]
+    )
+    assert len(features.rows) == 1
+    assert features.maximum_economic_input_at_ms == origin.feature_cutoff_at_ms
+    assert features.source_inputs_data_qualified is False
+    assert "rl-quant.massive-session-panel-v1" not in features.input_schemas
+    assert "rl-quant.massive-profitability-feature-accounting-v1" not in (
+        features.input_schemas
+    )
+
+    target_accounting = build_massive_profitability_target_accounting_authority_v2(
+        root=tmp_path,
+        origin=origin,
+        origin_plan=plan,
+        session_authority=sessions,
+        identity_authority=identity,
+        daily_input_authority=daily,
+        fill_source_authority=fills,
+        economic_coverage=coverage,
+        terminal_authority=terminal,
+    )
+    targets = build_massive_profitability_targets_v2(
+        accounting=target_accounting,
+        origin_plan=plan,
+        accounting_freeze=accounting_freeze,
+        terminal_authority=terminal,
+    )
+    assert targets.rows[0].simple_returns[0] == pytest.approx(
+        (166.0 + 1.0) / 165.0 - 1.0
+    )
+    assert targets.rows[0].simple_returns[1] == pytest.approx(1.0 / 165.0 - 1.0)
+    assert targets.terminal_accounting_mode == "conservative-lower-bound"
+    assert targets.exact_provider_disposition_count == 0
+    assert targets.conservative_total_loss_count == 1
+    assert targets.source_inputs_data_qualified is False
+    assert "rl-quant.massive-profitability-target-accounting-v1" not in (
+        targets.input_schemas
+    )

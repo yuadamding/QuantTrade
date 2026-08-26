@@ -451,6 +451,7 @@ class MassiveProfitabilityDailyInputSessionV1:
     regular_open_at_ms: int
     regular_close_at_ms: int
     vendor_last_modified_at_ms: int
+    authenticated_get_completed_at_ms: int
     authenticated_download_receipt_sha256: str
     whole_file_scan_receipt_sha256: str
     semantic_partition_manifest_receipt_sha256: str
@@ -471,6 +472,8 @@ class MassiveProfitabilityDailyInputSessionV1:
             or self.regular_open_at_ms < 0
             or self.regular_close_at_ms <= self.regular_open_at_ms
             or not self.regular_close_at_ms <= self.vendor_last_modified_at_ms
+            or self.authenticated_get_completed_at_ms
+            < self.vendor_last_modified_at_ms
         ):
             raise MassiveProfitabilityDailyInputAuthorityV1Error(
                 "daily input session chronology differs"
@@ -564,9 +567,13 @@ class MassiveProfitabilityDailyInputAuthorityV1:
             )
         for session_row in self.sessions:
             session_row.validate()
-            if session_row.vendor_last_modified_at_ms > self.data_freeze_at_ms:
+            if (
+                session_row.vendor_last_modified_at_ms > self.data_freeze_at_ms
+                or session_row.authenticated_get_completed_at_ms
+                > self.data_freeze_at_ms
+            ):
                 raise MassiveProfitabilityDailyInputAuthorityV1Error(
-                    "daily source became available after the archive freeze"
+                    "daily source or authenticated GET completed after the archive freeze"
                 )
         keys = tuple((row.source_session_date, row.security_id) for row in self.rows)
         expected = tuple(
@@ -801,6 +808,10 @@ def _build_massive_profitability_daily_input_authority_v1(
             raise MassiveProfitabilityDailyInputAuthorityV1Error(
                 "daily source availability lies outside session close and archive freeze"
             )
+        if download.completed_at_ms > data_freeze_at_ms:
+            raise MassiveProfitabilityDailyInputAuthorityV1Error(
+                "daily authenticated GET completed after the archive freeze"
+            )
         rescanned_rows, rescanned = scan_massive_daily_trade_file_v0(
             root=source_root,
             loaded_source=download.loaded_source,
@@ -987,6 +998,7 @@ def _build_massive_profitability_daily_input_authority_v1(
             "regular_open_at_ms": session.regular_open_ns // 1_000_000,
             "regular_close_at_ms": close_ms,
             "vendor_last_modified_at_ms": listing_entry.vendor_last_modified_at_ms,
+            "authenticated_get_completed_at_ms": download.completed_at_ms,
             "authenticated_download_receipt_sha256": download.receipt_sha256,
             "whole_file_scan_receipt_sha256": scan.receipt_sha256,
             "semantic_partition_manifest_receipt_sha256": (
@@ -1004,6 +1016,7 @@ def _build_massive_profitability_daily_input_authority_v1(
             regular_open_at_ms=session.regular_open_ns // 1_000_000,
             regular_close_at_ms=close_ms,
             vendor_last_modified_at_ms=listing_entry.vendor_last_modified_at_ms,
+            authenticated_get_completed_at_ms=download.completed_at_ms,
             authenticated_download_receipt_sha256=download.receipt_sha256,
             whole_file_scan_receipt_sha256=scan.receipt_sha256,
             semantic_partition_manifest_receipt_sha256=(
@@ -1127,6 +1140,43 @@ def build_massive_profitability_daily_input_authority_v1(
 
     archive_freeze.validate()
     security_support.validate()
+    if (
+        archive_freeze.acquisition_semantic_receipt_sha256
+        != acquisition.receipt_sha256
+        or archive_freeze.authenticated_download_inventory_sha256
+        != acquisition.download_inventory_sha256
+    ):
+        raise MassiveProfitabilityDailyInputAuthorityV1Error(
+            "daily acquisition differs from the exact archive freeze"
+        )
+    frozen_sources = {
+        row.source_session_date: row for row in archive_freeze.source_sessions
+    }
+    acquired_downloads = {
+        coverage_session_from_massive_trade_key(row.source_object_key): row
+        for row in acquisition.authenticated_downloads
+    }
+    if (
+        len(frozen_sources) != len(archive_freeze.source_sessions)
+        or len(acquired_downloads) != len(acquisition.authenticated_downloads)
+        or set(frozen_sources) != set(acquired_downloads)
+    ):
+        raise MassiveProfitabilityDailyInputAuthorityV1Error(
+            "daily acquisition inventory differs from the frozen source inventory"
+        )
+    for session_date, frozen in frozen_sources.items():
+        download = acquired_downloads[session_date]
+        if (
+            frozen.authenticated_download_receipt_sha256
+            != download.receipt_sha256
+            or frozen.loaded_source_receipt_sha256
+            != download.loaded_source.receipt_sha256
+            or frozen.authenticated_get_completed_at_ms != download.completed_at_ms
+            or download.completed_at_ms > archive_freeze.data_freeze_at_ms
+        ):
+            raise MassiveProfitabilityDailyInputAuthorityV1Error(
+                "daily authenticated download differs from the frozen source row"
+            )
     dates = _session_dates_between(
         session_authority=session_authority,
         start=archive_freeze.earliest_feature_base_session_date,

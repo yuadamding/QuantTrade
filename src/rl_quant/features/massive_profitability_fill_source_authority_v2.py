@@ -273,6 +273,15 @@ def _build_massive_profitability_fill_source_authority_v2(
     session_authority.validate()
     condition_authority.validate()
     daily_input_authority.validate()
+    if (
+        session_authority.receipt_sha256
+        != daily_input_authority.session_authority_receipt_sha256
+        or condition_authority.receipt_sha256
+        != daily_input_authority.condition_authority_receipt_sha256
+    ):
+        raise MassiveProfitabilityFillSourceAuthorityV2Error(
+            "fill session or condition authority differs from daily inputs"
+        )
     dates = tuple(sorted(set(required_session_dates)))
     support = tuple(sorted(set(supported_security_ids)))
     if not dates or not support or not set(dates) <= {
@@ -442,6 +451,20 @@ def build_massive_profitability_fill_source_authority_v2(
 
     origin_plan.validate()
     security_support.validate()
+    if (
+        daily_input_authority.archive_freeze_semantic_receipt_sha256 is None
+        or daily_input_authority.security_support_semantic_receipt_sha256
+        != security_support.semantic_receipt_sha256
+        or security_support.origin_plan_semantic_receipt_sha256
+        != origin_plan.semantic_receipt_sha256
+        or daily_input_authority.supported_security_ids
+        != security_support.all_supported_security_ids
+        or daily_input_authority.normalized_identity_semantic_receipt_sha256
+        != security_support.normalized_identity_semantic_receipt_sha256
+    ):
+        raise MassiveProfitabilityFillSourceAuthorityV2Error(
+            "fill origin, support, identity, or frozen daily input binding differs"
+        )
     by_date = {
         row.session_date: index for index, row in enumerate(session_authority.sessions)
     }

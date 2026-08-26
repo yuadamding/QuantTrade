@@ -294,6 +294,7 @@ class MassiveProfitabilityFeatureAccountingAuthorityV2:
     accounting: MassiveProfitabilityFeatureAccountingV1
     daily_input_authority_semantic_receipt_sha256: str
     terminal_authority_semantic_receipt_sha256: str
+    economic_coverage_semantic_receipt_sha256: str
     scoped_economic_event_inventory_sha256: str
     maximum_actual_input_at_ms: int
     economic_values_data_qualified: bool
@@ -354,6 +355,7 @@ class MassiveProfitabilityFeatureAccountingAuthorityV2:
             "origin_plan_semantic_receipt_sha256",
             "daily_input_authority_semantic_receipt_sha256",
             "terminal_authority_semantic_receipt_sha256",
+            "economic_coverage_semantic_receipt_sha256",
             "scoped_economic_event_inventory_sha256",
             "protocol_receipt_sha256",
             "specification_sha256",
@@ -500,7 +502,7 @@ def build_massive_profitability_feature_accounting_authority_v2(
     data_qualified = (
         daily_input_authority.daily_input_data_qualified
         and reloaded_coverage.coverage_qualified
-        and terminal_authority.structural_terminal_coverage_complete
+        and terminal_authority.terminal_accounting_data_qualified
     )
     semantic: dict[str, object] = {
         "schema": MASSIVE_PROFITABILITY_FEATURE_ACCOUNTING_AUTHORITY_V2_SCHEMA,
@@ -513,6 +515,9 @@ def build_massive_profitability_feature_accounting_authority_v2(
         ),
         "terminal_authority_semantic_receipt_sha256": (
             terminal_authority.semantic_receipt_sha256
+        ),
+        "economic_coverage_semantic_receipt_sha256": (
+            scoped_coverage_receipt
         ),
         "scoped_economic_event_inventory_sha256": semantic_sha256(
             scoped_event_receipts
@@ -540,6 +545,9 @@ def build_massive_profitability_feature_accounting_authority_v2(
         ),
         terminal_authority_semantic_receipt_sha256=(
             terminal_authority.semantic_receipt_sha256
+        ),
+        economic_coverage_semantic_receipt_sha256=(
+            scoped_coverage_receipt
         ),
         scoped_economic_event_inventory_sha256=semantic[
             "scoped_economic_event_inventory_sha256"

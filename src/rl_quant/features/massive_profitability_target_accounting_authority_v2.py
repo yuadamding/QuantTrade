@@ -121,6 +121,11 @@ def _path_for_security(
     receipts: list[str] = []
     terminal_offset: int | None = None
     conservative_fallback = False
+    latest_event_available_at_ms = 0
+    session_sources = {
+        row.source_session_date: row for row in daily_input_authority.sessions
+    }
+    available_at: list[int] = []
     for offset, session in enumerate(selected_sessions):
         session_date = session.session_date
         at_ms = session.regular_close_ns // 1_000_000
@@ -130,6 +135,9 @@ def _path_for_security(
                 if event.security_id in position.as_mapping():
                     position = apply_corporate_action(position, event)
                     applied.append(event.event_id)
+                    latest_event_available_at_ms = max(
+                        latest_event_available_at_ms, event.available_at_ms
+                    )
                     if event.event_id.startswith("FALLBACK:"):
                         conservative_fallback = True
                 else:
@@ -201,15 +209,20 @@ def _path_for_security(
                 }
             )
         )
+        available_at.append(
+            max(
+                at_ms,
+                session_sources[session_date].vendor_last_modified_at_ms,
+                latest_event_available_at_ms,
+            )
+        )
     fallback_offset = terminal_offset if conservative_fallback else None
     body: dict[str, object] = {
         "security_id": origin_security_id,
         "economic_at_ms": tuple(
             session.regular_close_ns // 1_000_000 for session in selected_sessions
         ),
-        "available_at_ms": tuple(
-            session.regular_close_ns // 1_000_000 for session in selected_sessions
-        ),
+        "available_at_ms": tuple(available_at),
         "values": tuple(values),
         "valid": tuple(valid),
         "terminal": tuple(terminal),
@@ -236,6 +249,7 @@ class MassiveProfitabilityTargetAccountingAuthorityV2:
     daily_input_authority_semantic_receipt_sha256: str
     fill_source_authority_semantic_receipt_sha256: str
     terminal_authority_semantic_receipt_sha256: str
+    economic_coverage_semantic_receipt_sha256: str
     scoped_economic_event_inventory_sha256: str
     row_inventory_sha256: str
     fill_sources_qualified: bool
@@ -316,6 +330,7 @@ class MassiveProfitabilityTargetAccountingAuthorityV2:
             "daily_input_authority_semantic_receipt_sha256",
             "fill_source_authority_semantic_receipt_sha256",
             "terminal_authority_semantic_receipt_sha256",
+            "economic_coverage_semantic_receipt_sha256",
             "scoped_economic_event_inventory_sha256",
             "row_inventory_sha256",
             "protocol_receipt_sha256",
@@ -462,11 +477,25 @@ def build_massive_profitability_target_accounting_authority_v2(
             for event in events
         )
     )
+    scoped_coverage_receipt = semantic_sha256(
+        {
+            "origin_receipt_sha256": origin.receipt_sha256,
+            "accounting_lane": reloaded_coverage.accounting_lane,
+            "event_receipts": scoped_event_receipts,
+            "terminal_authority_semantic_receipt_sha256": (
+                terminal_authority.semantic_receipt_sha256
+            ),
+            "cash_policy_receipt_sha256": (
+                reloaded_coverage.cash_policy.receipt_sha256
+            ),
+            "target_end_session_date": session_dates[-1],
+        }
+    )
     fill_qualified = fill_source_authority.fill_source_data_qualified
     economic_qualified = (
         daily_input_authority.daily_input_data_qualified
         and reloaded_coverage.coverage_qualified
-        and terminal_authority.structural_terminal_coverage_complete
+        and terminal_authority.terminal_accounting_data_qualified
     )
     fallback_count = sum(row.conservative_total_loss_fallback for row in rows)
     semantic: dict[str, object] = {
@@ -485,6 +514,9 @@ def build_massive_profitability_target_accounting_authority_v2(
         ),
         "terminal_authority_semantic_receipt_sha256": (
             terminal_authority.semantic_receipt_sha256
+        ),
+        "economic_coverage_semantic_receipt_sha256": (
+            scoped_coverage_receipt
         ),
         "scoped_economic_event_inventory_sha256": semantic_sha256(
             scoped_event_receipts
@@ -523,6 +555,9 @@ def build_massive_profitability_target_accounting_authority_v2(
         ),
         terminal_authority_semantic_receipt_sha256=(
             terminal_authority.semantic_receipt_sha256
+        ),
+        economic_coverage_semantic_receipt_sha256=(
+            scoped_coverage_receipt
         ),
         scoped_economic_event_inventory_sha256=semantic[
             "scoped_economic_event_inventory_sha256"
