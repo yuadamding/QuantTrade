@@ -28,6 +28,11 @@ from rl_quant.data_sources.massive.source_receipts import (
     load_massive_source_bundle,
     publish_massive_source_object,
 )
+from rl_quant.evaluation.massive_profitability_selection_guard_v1 import (
+    MassiveProfitabilitySelectedPositionV1,
+    MassiveProfitabilitySelectionGuardV1Error,
+    guard_massive_profitability_selected_positions_v1,
+)
 from rl_quant.features.massive_daily_bars_v0 import MASSIVE_DAILY_BARS_V0_FIELDS
 from rl_quant.features.massive_daily_tape_v0 import MASSIVE_DAILY_TAPE_V0_FIELDS
 from rl_quant.features.massive_economic_coverage_v8 import (
@@ -40,6 +45,9 @@ from rl_quant.features.massive_economic_coverage_v8 import (
     MassiveZeroCashPolicyV8,
     parse_massive_economic_origin_coverage_v8,
 )
+from rl_quant.features.massive_profitability_accounting_freeze_v1 import (
+    materialize_massive_profitability_accounting_freeze_for_test_v1,
+)
 from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
     MASSIVE_PROFITABILITY_DAILY_INPUT_AUTHORITY_V1_SOURCE_SHA256,
     MASSIVE_PROFITABILITY_DAILY_INPUT_AUTHORITY_V1_SPEC_SHA256,
@@ -47,8 +55,8 @@ from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
     MassiveProfitabilityDailyInputSessionV1,
     MassiveProfitabilityDailySecurityInputV1,
 )
-from rl_quant.features.massive_profitability_accounting_freeze_v1 import (
-    materialize_massive_profitability_accounting_freeze_for_test_v1,
+from rl_quant.features.massive_profitability_experiment_coverage_v2 import (
+    massive_profitability_identity_semantic_receipt_v2,
 )
 from rl_quant.features.massive_profitability_feature_accounting_authority_v2 import (
     build_massive_profitability_feature_accounting_authority_v2,
@@ -58,6 +66,9 @@ from rl_quant.features.massive_profitability_fill_source_authority_v2 import (
     MASSIVE_PROFITABILITY_FILL_SOURCE_AUTHORITY_V2_SPEC_SHA256,
     MassiveProfitabilityFillSourceAuthorityV2,
     MassiveProfitabilityFillSourceRowV2,
+)
+from rl_quant.features.massive_profitability_origin_features_v3 import (
+    build_massive_profitability_origin_features_v3,
 )
 from rl_quant.features.massive_profitability_origin_v1 import (
     MASSIVE_PROFITABILITY_DECISION_ORIGIN_V1_SCHEMA,
@@ -73,9 +84,6 @@ from rl_quant.features.massive_profitability_origin_v2 import (
     MASSIVE_PROFITABILITY_ORIGIN_V2_SPEC_SHA256,
     MassiveProfitabilityDecisionOriginPlanV2,
 )
-from rl_quant.features.massive_profitability_origin_features_v3 import (
-    build_massive_profitability_origin_features_v3,
-)
 from rl_quant.features.massive_profitability_target_accounting_authority_v2 import (
     build_massive_profitability_target_accounting_authority_v2,
 )
@@ -87,9 +95,6 @@ from rl_quant.features.massive_profitability_terminal_coverage_authority_v1 impo
     MASSIVE_PROFITABILITY_TERMINAL_COVERAGE_AUTHORITY_V1_SPEC_SHA256,
     MassiveProfitabilityTerminalCoverageAuthorityV1,
     MassiveProfitabilityTerminalSupportRowV1,
-)
-from rl_quant.features.massive_profitability_experiment_coverage_v2 import (
-    massive_profitability_identity_semantic_receipt_v2,
 )
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
@@ -1005,3 +1010,119 @@ def test_source_owned_accounting_drives_v3_features_and_v2_targets(
     assert "rl-quant.massive-profitability-target-accounting-v1" not in (
         targets.input_schemas
     )
+
+
+def test_selected_positions_fail_on_missing_exit_and_short_terminal_windfall(
+    tmp_path: Path,
+) -> None:
+    sessions = _sessions()
+    identity = _identity(sessions)
+    origin = _origin(sessions)
+    plan = _origin_plan(origin)
+    daily = _daily(sessions, identity)
+    terminal = _terminal(sessions, identity)
+    fills = _fills(sessions=sessions, origin=origin, daily=daily)
+    coverage = _coverage(
+        root=tmp_path,
+        sessions=sessions,
+        terminal=terminal,
+        origin=origin,
+        events=(),
+        artifact_id="selection-guard",
+    )
+    accounting_freeze = materialize_massive_profitability_accounting_freeze_for_test_v1(
+        root=tmp_path,
+        archive_freeze_semantic_receipt_sha256=(
+            daily.archive_freeze_semantic_receipt_sha256
+        ),
+        origin_plan=plan,
+        terminal_authority=terminal,
+        economic_coverages=(coverage,),
+        accounting_freeze_at_ms=origin.decision_at_ms + 1_000,
+        entitlement_receipt_sha256=_ENTITLEMENT,
+        artifact_id="selection-guard",
+    )
+    accounting = build_massive_profitability_target_accounting_authority_v2(
+        root=tmp_path,
+        origin=origin,
+        origin_plan=plan,
+        session_authority=sessions,
+        identity_authority=identity,
+        daily_input_authority=daily,
+        fill_source_authority=fills,
+        economic_coverage=coverage,
+        terminal_authority=terminal,
+    )
+    targets = build_massive_profitability_targets_v2(
+        accounting=accounting,
+        origin_plan=plan,
+        accounting_freeze=accounting_freeze,
+        terminal_authority=terminal,
+    )
+    selected_long = MassiveProfitabilitySelectedPositionV1(
+        decision_session_date=origin.decision_session_date,
+        security_id="SEC-A",
+        horizon_sessions=5,
+        side="long",
+    )
+    support = guard_massive_profitability_selected_positions_v1(
+        selected_positions=(selected_long,), targets=(targets,)
+    )
+    assert support.selected_exit_support_complete is True
+    assert support.direction_safe_terminal_support_complete is True
+    assert support.profitability_reporting_authorized is False
+
+    selected_short = replace(selected_long, side="short")
+    with pytest.raises(
+        MassiveProfitabilitySelectionGuardV1Error,
+        match="cannot credit a selected short",
+    ):
+        guard_massive_profitability_selected_positions_v1(
+            selected_positions=(selected_short,), targets=(targets,)
+        )
+
+    original_row = targets.rows[0]
+    missing_body = original_row.unsigned()
+    simple_returns = list(original_row.simple_returns)
+    valid = list(original_row.valid)
+    terminal_zero = list(original_row.terminal_zero_value)
+    simple_returns[0] = 0.0
+    valid[0] = False
+    terminal_zero[0] = False
+    missing_body.update(
+        simple_returns=tuple(simple_returns),
+        valid=tuple(valid),
+        terminal_zero_value=tuple(terminal_zero),
+    )
+    missing_row = replace(
+        original_row,
+        simple_returns=tuple(simple_returns),
+        valid=tuple(valid),
+        terminal_zero_value=tuple(terminal_zero),
+        receipt_sha256=semantic_sha256(missing_body),
+    )
+    missing_artifact = replace(
+        targets,
+        rows=(missing_row,),
+        valid_counts_by_horizon=tuple(int(value) for value in missing_row.valid),
+        row_inventory_sha256=semantic_sha256((missing_row.receipt_sha256,)),
+        semantic_receipt_sha256="0" * 64,
+    )
+    missing_artifact = replace(
+        missing_artifact,
+        semantic_receipt_sha256=semantic_sha256(missing_artifact.semantic_unsigned()),
+    )
+    missing_artifact.validate()
+
+    # Missing support for an unselected horizon is retained as missingness.
+    guard_massive_profitability_selected_positions_v1(
+        selected_positions=(selected_long,), targets=(missing_artifact,)
+    )
+    selected_missing = replace(selected_long, horizon_sessions=1)
+    with pytest.raises(
+        MassiveProfitabilitySelectionGuardV1Error,
+        match="lacks its scheduled exit fill",
+    ):
+        guard_massive_profitability_selected_positions_v1(
+            selected_positions=(selected_missing,), targets=(missing_artifact,)
+        )

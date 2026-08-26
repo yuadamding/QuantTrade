@@ -8,6 +8,7 @@ import torch
 
 from rl_quant.data_sources.massive.source_receipts import MassiveSourceObjectError
 from rl_quant.evaluation.massive_profitability_predictions_v1 import (
+    build_massive_profitability_recovery_predictions_for_test_v1,
     parse_massive_profitability_outer_predictions_v1,
     publish_massive_profitability_mv00_outer_predictions_v1,
 )
@@ -25,6 +26,7 @@ from rl_quant.features.massive_profitability_phase_plan_v1 import (
 from rl_quant.models.massive_profitability_tabular_v1 import (
     MASSIVE_PROFITABILITY_TOURNAMENT_SETTINGS_V1,
     MassiveProfitabilityTabularModelV1,
+    massive_profitability_mv00_scores_v1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.training.massive_profitability_tournament_v1 import (
@@ -113,6 +115,108 @@ def _dataset(indices: tuple[int, ...]) -> MassiveProfitabilityTournamentDatasetV
     )
     result.validate()
     return result
+
+
+def _planted_date_tensor(
+    index: int, *, asset_count: int = 16
+) -> MassiveProfitabilityDateTensorV1:
+    session_date = f"d{index:04d}"
+    security_ids = tuple(f"SEC-{asset:03d}" for asset in range(asset_count))
+    bars = torch.zeros((asset_count, len(BARS_MIN_V2_FIELDS)), dtype=torch.float32)
+    tape = torch.zeros((asset_count, len(TAPE_MIN_V2_FIELDS)), dtype=torch.float32)
+    bar_signal = torch.tensor(
+        tuple(
+            (((asset * 7 + index * 3) % 17) - 8) / 8.0 for asset in range(asset_count)
+        ),
+        dtype=torch.float32,
+    )
+    tape_signal = torch.tensor(
+        tuple(
+            (((asset * 11 + index * 5) % 19) - 9) / 9.0 for asset in range(asset_count)
+        ),
+        dtype=torch.float32,
+    )
+    bars[:, 0] = bar_signal
+    tape[:, 0] = tape_signal
+    bars_valid = torch.ones_like(bars, dtype=torch.bool)
+    tape_valid = torch.ones_like(tape, dtype=torch.bool)
+    alpha = 0.50 * bar_signal + 0.50 * tape_signal
+    target = torch.stack((alpha, alpha * 1.2, alpha * 1.5, alpha * 2.0), dim=-1)
+    target_valid = torch.ones_like(target, dtype=torch.bool)
+    feature_receipt = semantic_sha256(("planted-feature", session_date))
+    target_receipt = semantic_sha256(("planted-target", session_date))
+    identity = {
+        "decision_session_date": session_date,
+        "security_ids": security_ids,
+        "bars_values": _tensor_sha256(bars),
+        "bars_valid": _tensor_sha256(bars_valid),
+        "tape_values": _tensor_sha256(tape),
+        "tape_valid": _tensor_sha256(tape_valid),
+        "target_values": _tensor_sha256(target),
+        "target_valid": _tensor_sha256(target_valid),
+        "feature_receipt": feature_receipt,
+        "target_receipt": target_receipt,
+    }
+    result = MassiveProfitabilityDateTensorV1(
+        decision_session_date=session_date,
+        security_ids=security_ids,
+        bars_values=bars,
+        bars_valid=bars_valid,
+        tape_values=tape,
+        tape_valid=tape_valid,
+        target_values=target,
+        target_valid=target_valid,
+        feature_semantic_receipt_sha256=feature_receipt,
+        target_semantic_receipt_sha256=target_receipt,
+        source_array_sha256=semantic_sha256(identity),
+    )
+    result.validate()
+    return result
+
+
+def _planted_dataset(
+    indices: tuple[int, ...],
+) -> MassiveProfitabilityTournamentDatasetV1:
+    rows = tuple(_planted_date_tensor(index) for index in indices)
+    body = {
+        "dates": tuple(row.source_array_sha256 for row in rows),
+        "data_gate": _DIGEST,
+        "phase_plan": "b" * 64,
+    }
+    result = MassiveProfitabilityTournamentDatasetV1(
+        dates=rows,
+        data_gate_semantic_receipt_sha256=_DIGEST,
+        phase_plan_semantic_receipt_sha256="b" * 64,
+        dataset_receipt_sha256=semantic_sha256(body),
+    )
+    result.validate()
+    return result
+
+
+def _average_outer_rank_ic(
+    *,
+    scores: dict[tuple[str, str], tuple[float, ...]],
+    dataset: MassiveProfitabilityTournamentDatasetV1,
+    session_dates: tuple[str, ...],
+) -> float:
+    by_date = dataset.by_date()
+    values: list[float] = []
+    for session_date in session_dates:
+        row = by_date[session_date]
+        prediction = torch.tensor(
+            [scores[(session_date, security_id)][0] for security_id in row.security_ids]
+        )
+        target = row.target_values[:, 0]
+        prediction_rank = torch.argsort(
+            torch.argsort(prediction, stable=True), stable=True
+        ).float()
+        target_rank = torch.argsort(
+            torch.argsort(target, stable=True), stable=True
+        ).float()
+        values.append(
+            float(torch.corrcoef(torch.stack((prediction_rank, target_rank)))[0, 1])
+        )
+    return sum(values) / len(values)
 
 
 def _fold() -> MassiveProfitabilityOuterFoldPlanV1:
@@ -335,6 +439,83 @@ def test_mv00_outer_predictions_are_create_only_and_round_trip(tmp_path: Path) -
             fold=fold,
             committed_at_ms=1001,
         )
+
+
+def test_planted_incremental_tape_alpha_recovers_in_five_seed_canary() -> None:
+    fold_source = _fold()
+    fold = adapt_massive_profitability_training_fold_v1(fold_source)
+    plan = _plan(fold_source)
+    dataset = _planted_dataset(
+        tuple(range(756)) + tuple(range(819, 945)) + tuple(range(1008, 1134))
+    )
+    config = MassiveProfitabilityTrainingConfigV1(
+        learning_rate=2e-2,
+        maximum_epochs=6,
+        early_stopping_patience=2,
+        complete_dates_per_batch=189,
+    )
+    ensemble_scores: dict[str, dict[tuple[str, str], tuple[float, ...]]] = {}
+    for setting_id in ("MV02", "MV04", "MV04-SHUFFLE"):
+        seed_scores: list[dict[tuple[str, str], tuple[float, ...]]] = []
+        for seed in MASSIVE_PROFITABILITY_CONFIRMATION_SEEDS_V1:
+            run = train_massive_profitability_fold_v1(
+                dataset=dataset,
+                tournament_plan=plan,
+                fold=fold,
+                setting_id=setting_id,
+                seed=seed,
+                config=config,
+            )
+            assert run.outer_prediction_authorized is False
+            rows = build_massive_profitability_recovery_predictions_for_test_v1(
+                dataset=dataset,
+                tournament_plan=plan,
+                fold=fold_source,
+                run=run,
+            )
+            seed_scores.append(
+                {(row.decision_session_date, row.security_id): row.mean for row in rows}
+            )
+        keys = tuple(seed_scores[0])
+        ensemble_scores[setting_id] = {
+            key: tuple(
+                sum(values[key][horizon] for values in seed_scores) / len(seed_scores)
+                for horizon in range(4)
+            )
+            for key in keys
+        }
+
+    mv00_scores: dict[tuple[str, str], tuple[float, ...]] = {}
+    mapping = dataset.by_date()
+    for session_date in fold_source.outer_test_session_dates:
+        row = mapping[session_date]
+        score = massive_profitability_mv00_scores_v1(
+            bars_values=row.bars_values, bars_valid=row.bars_valid
+        )
+        mv00_scores.update(
+            {
+                (session_date, security_id): tuple(
+                    float(value) for value in score[index]
+                )
+                for index, security_id in enumerate(row.security_ids)
+            }
+        )
+    rank_ic = {
+        setting_id: _average_outer_rank_ic(
+            scores=scores,
+            dataset=dataset,
+            session_dates=fold_source.outer_test_session_dates,
+        )
+        for setting_id, scores in ensemble_scores.items()
+    }
+    rank_ic["MV00"] = _average_outer_rank_ic(
+        scores=mv00_scores,
+        dataset=dataset,
+        session_dates=fold_source.outer_test_session_dates,
+    )
+    assert rank_ic["MV04"] > rank_ic["MV02"] > rank_ic["MV00"], rank_ic
+    assert abs(rank_ic["MV04-SHUFFLE"] - rank_ic["MV02"]) < 0.15
+    assert rank_ic["MV04"] - rank_ic["MV04-SHUFFLE"] > 0.25
 
 
 def test_tournament_plan_and_runs_never_authorize_profit_reporting() -> None:

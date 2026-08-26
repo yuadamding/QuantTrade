@@ -568,6 +568,47 @@ def publish_massive_profitability_outer_predictions_v1(
     )
 
 
+def build_massive_profitability_recovery_predictions_for_test_v1(
+    *,
+    dataset: MassiveProfitabilityTournamentDatasetV1,
+    tournament_plan: MassiveProfitabilityTournamentPlanV1,
+    fold: MassiveProfitabilityOuterFoldPlanV1,
+    run: MassiveProfitabilityTrainedRunV1,
+    device: str | torch.device = "cpu",
+) -> tuple[MassiveProfitabilityPredictionRowV1, ...]:
+    """Return target-blind rows for a deliberately nonauthorizing recovery run.
+
+    The engineering recovery canary uses a shortened training configuration,
+    so its run must never be published as an authorized outer prediction.  The
+    same model-loading and target-blind inference path is exercised here, but
+    no artifact or performance authorization is created.
+    """
+
+    dataset.validate()
+    tournament_plan.validate()
+    fold.validate()
+    run.validate()
+    if (
+        run.outer_prediction_authorized
+        or run.fold_index != fold.fold_index
+        or run.tournament_plan_receipt_sha256 != tournament_plan.receipt_sha256
+        or dataset.data_gate_semantic_receipt_sha256
+        != tournament_plan.data_gate_semantic_receipt_sha256
+        or dataset.phase_plan_semantic_receipt_sha256
+        != tournament_plan.phase_plan_semantic_receipt_sha256
+        or fold.receipt_sha256 != tournament_plan.fold_receipts[fold.fold_index]
+    ):
+        raise MassiveProfitabilityPredictionsV1Error(
+            "recovery prediction run is not the expected nonauthorizing canary"
+        )
+    return _rows_from_model(
+        dataset=dataset,
+        fold=fold,
+        run=run,
+        device=torch.device(device),
+    )
+
+
 def publish_massive_profitability_mv00_outer_predictions_v1(
     *,
     root: str | Path,
@@ -748,6 +789,7 @@ __all__ = [
     "MassiveProfitabilityOuterPredictionsV1",
     "MassiveProfitabilityPredictionRowV1",
     "MassiveProfitabilityPredictionsV1Error",
+    "build_massive_profitability_recovery_predictions_for_test_v1",
     "parse_massive_profitability_outer_predictions_v1",
     "publish_massive_profitability_mv00_outer_predictions_v1",
     "publish_massive_profitability_outer_predictions_v1",
