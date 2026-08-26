@@ -63,10 +63,26 @@ from rl_quant.features.massive_daily_bars_v0 import (
     materialize_massive_daily_bars_v0,
     validate_massive_daily_bars_v0,
 )
+from rl_quant.features.massive_daily_tape_v0 import (
+    MASSIVE_DAILY_TAPE_V0_DATASET,
+    MASSIVE_DAILY_TAPE_V0_FIELDS,
+    MASSIVE_DAILY_TAPE_V0_SCHEMA,
+    MASSIVE_DAILY_TAPE_V0_SOURCE_SCHEMA_SHA256,
+    MASSIVE_DAILY_TAPE_V0_SOURCE_SHA256,
+    MASSIVE_DAILY_TAPE_V0_SPEC_SHA256,
+    MassiveDailyTapeArtifactV0,
+    MassiveDailyTapeRowV0,
+    materialize_massive_daily_tape_v0,
+    validate_massive_daily_tape_v0,
+)
 from rl_quant.features.massive_monthly_rank_bar_authority_v1 import (
     MassiveMonthlyRankBarAuthorityV1Error,
     build_massive_monthly_rank_bar_authority_for_test_v1,
     build_massive_monthly_rank_bar_authority_v1,
+)
+from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
+    MassiveProfitabilityDailyInputAuthorityV1Error,
+    build_massive_profitability_daily_input_authority_for_test_v1,
 )
 from rl_quant.features.massive_profitability_experiment_coverage_v2 import (
     massive_profitability_identity_semantic_receipt_v2,
@@ -361,6 +377,85 @@ def _republish_bar_artifact(
         receipt_sha256=semantic_sha256(provisional.unsigned()),
     )
     validate_massive_daily_bars_v0(root=root, artifact=result)
+    return result
+
+
+def _republish_tape_artifact(
+    *, root: Path, artifact: MassiveDailyTapeArtifactV0
+) -> MassiveDailyTapeArtifactV0:
+    source_row = artifact.rows[0]
+    values = list(source_row.values)
+    values[MASSIVE_DAILY_TAPE_V0_FIELDS.index("median_trade_size")] += 1.0
+    row_body = {
+        "security_id": source_row.security_id,
+        "values": tuple(values),
+        "valid": source_row.valid,
+        "source_active_inventory_sha256": (
+            source_row.source_active_inventory_sha256
+        ),
+        "source_correction_inventory_sha256": (
+            source_row.source_correction_inventory_sha256
+        ),
+    }
+    row = MassiveDailyTapeRowV0(
+        **row_body, receipt_sha256=semantic_sha256(row_body)
+    )
+    row_inventory = semantic_sha256((row.receipt_sha256,))
+    payload = {
+        "schema": MASSIVE_DAILY_TAPE_V0_SCHEMA,
+        "source_session_date": artifact.source_session_date,
+        "persisted_partition_manifest_receipt_sha256": (
+            artifact.persisted_partition_manifest_receipt_sha256
+        ),
+        "condition_authority_receipt_sha256": (
+            artifact.condition_authority_receipt_sha256
+        ),
+        "feature_spec_receipt_sha256": MASSIVE_DAILY_TAPE_V0_SPEC_SHA256,
+        "feature_source_sha256": MASSIVE_DAILY_TAPE_V0_SOURCE_SHA256,
+        "feature_names": MASSIVE_DAILY_TAPE_V0_FIELDS,
+        "rows": (asdict(row),),
+        "row_inventory_sha256": row_inventory,
+    }
+    relative = (
+        "massive-finalized-v0-tampered/"
+        f"session={artifact.source_session_date}/daily-tape.json"
+    )
+    published = _ms("2026-08-25", time(13, 59))
+    publish_massive_source_object(
+        stream=BytesIO(canonical_json_file_bytes(payload)),
+        root=root,
+        relative_payload_path=relative,
+        dataset_id=MASSIVE_DAILY_TAPE_V0_DATASET,
+        source_object_key=relative,
+        requested_at_ms=published,
+        downloaded_at_ms=published,
+        schema_sha256=MASSIVE_DAILY_TAPE_V0_SOURCE_SCHEMA_SHA256,
+        entitlement_receipt_sha256=_ENTITLEMENT,
+        committed_at_ms=published,
+    )
+    loaded = load_massive_source_bundle(
+        root=root, relative_payload_path=relative, verified_at_ms=published
+    )
+    body = {
+        "source_session_date": artifact.source_session_date,
+        "persisted_partition_manifest_receipt_sha256": (
+            artifact.persisted_partition_manifest_receipt_sha256
+        ),
+        "condition_authority_receipt_sha256": (
+            artifact.condition_authority_receipt_sha256
+        ),
+        "feature_spec_receipt_sha256": MASSIVE_DAILY_TAPE_V0_SPEC_SHA256,
+        "feature_source_sha256": MASSIVE_DAILY_TAPE_V0_SOURCE_SHA256,
+        "rows": (row,),
+        "row_inventory_sha256": row_inventory,
+        "loaded_source": loaded,
+        "schema": MASSIVE_DAILY_TAPE_V0_SCHEMA,
+    }
+    provisional = MassiveDailyTapeArtifactV0(**body, receipt_sha256="0" * 64)
+    result = MassiveDailyTapeArtifactV0(
+        **body, receipt_sha256=semantic_sha256(provisional.unsigned())
+    )
+    validate_massive_daily_tape_v0(root=root, artifact=result)
     return result
 
 
@@ -733,6 +828,78 @@ def test_rank_bar_authority_rederives_authenticated_partitions(
     )
     assert nonauthorizing.source_transport_qualified is False
     assert nonauthorizing.rank_bar_data_qualified is False
+
+
+def test_daily_input_authority_rederives_bar_tape_and_population(
+    stack: dict[str, object], tmp_path: Path
+) -> None:
+    dates = stack["window_dates"][-2:]
+    manifests = {
+        row.source_session_date: row for row in stack["persisted_manifests"]
+    }
+    tapes = tuple(
+        materialize_massive_daily_tape_v0(
+            persisted_root=tmp_path,
+            output_root=tmp_path,
+            manifest=manifests[session_date],
+            condition_authority=stack["conditions"],
+            entitlement_receipt_sha256=_ENTITLEMENT,
+            published_at_ms=_ms("2026-08-25", time(13, 30)) + index,
+        )
+        for index, session_date in enumerate(dates)
+    )
+    bars = tuple(
+        row for row in stack["bars"] if row.source_session_date in set(dates)
+    )
+    daily = build_massive_profitability_daily_input_authority_for_test_v1(
+        source_root=tmp_path,
+        persisted_root=tmp_path,
+        daily_bars_root=tmp_path,
+        daily_tape_root=tmp_path,
+        session_authority=stack["sessions"],
+        identity_authority=stack["routing_identity"],
+        condition_authority=stack["conditions"],
+        correction_authority=stack["corrections"],
+        acquisition=stack["acquisition"],
+        required_session_dates=dates,
+        supported_security_ids=("SEC-A",),
+        data_freeze_at_ms=_ms("2026-08-25", time(14, 0)),
+        scan_evidence=stack["scans"],
+        semantic_partition_manifests=stack["semantic_manifests"],
+        persisted_partition_manifests=stack["persisted_manifests"],
+        daily_bars=bars,
+        daily_tape=tapes,
+    )
+    assert len(daily.rows) == 2
+    assert all(row.same_population_valid for row in daily.rows)
+    assert all(row.daily_bar_row_receipt_sha256 for row in daily.rows)
+    assert all(row.daily_tape_row_receipt_sha256 for row in daily.rows)
+    assert daily.source_transport_qualified is False
+    assert daily.daily_input_data_qualified is False
+
+    with pytest.raises(
+        MassiveProfitabilityDailyInputAuthorityV1Error,
+        match="daily tape differs",
+    ):
+        build_massive_profitability_daily_input_authority_for_test_v1(
+            source_root=tmp_path,
+            persisted_root=tmp_path,
+            daily_bars_root=tmp_path,
+            daily_tape_root=tmp_path,
+            session_authority=stack["sessions"],
+            identity_authority=stack["routing_identity"],
+            condition_authority=stack["conditions"],
+            correction_authority=stack["corrections"],
+            acquisition=stack["acquisition"],
+            required_session_dates=dates,
+            supported_security_ids=("SEC-A",),
+            data_freeze_at_ms=_ms("2026-08-25", time(14, 0)),
+            scan_evidence=stack["scans"],
+            semantic_partition_manifests=stack["semantic_manifests"],
+            persisted_partition_manifests=stack["persisted_manifests"],
+            daily_bars=bars,
+            daily_tape=(_republish_tape_artifact(root=tmp_path, artifact=tapes[0]), tapes[1]),
+        )
 
 
 def test_rank_bar_authority_rejects_self_consistent_fake_dollar_volume(
