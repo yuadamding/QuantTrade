@@ -17,7 +17,6 @@ from rl_quant.evaluation.massive_profitability_evaluation_plan_v1 import (
     MASSIVE_PROFITABILITY_EVALUATION_HORIZONS_V1,
     MASSIVE_PROFITABILITY_EVALUATION_PLAN_V1_SCHEMA,
     MassiveProfitabilityEvaluationPlanV1,
-    parse_massive_profitability_evaluation_plan_v1,
 )
 from rl_quant.evaluation.massive_profitability_predictions_v1 import (
     MassiveProfitabilityOuterPredictionsV1,
@@ -256,43 +255,19 @@ def build_massive_profitability_residual_scores_v1(
     evaluation_plan_root: str | Path | None = None,
     prediction: MassiveProfitabilityOuterPredictionsV1 | None = None,
 ) -> MassiveProfitabilityResidualScoresV1:
-    """Residualize all settings through one target-free deterministic operator."""
+    """Residualize caller rows as a nonauthorizing research utility.
+
+    Source-authorized outer evaluation is deliberately unavailable through this
+    row-based API.  The V2 entry point derives every row from frozen predictions
+    and source authorities before invoking the same deterministic operator.
+    """
 
     authorizing = False
     optional_authority = (evaluation_plan, evaluation_plan_root, prediction)
     if any(value is not None for value in optional_authority):
-        if any(value is None for value in optional_authority):
-            raise MassiveFixedHorizonTranchesV1Error(
-                "authorizing residualization requires the complete frozen plan root"
-            )
-        assert evaluation_plan is not None
-        assert evaluation_plan_root is not None
-        assert prediction is not None
-        evaluation_plan.validate()
-        prediction.validate()
-        reloaded = parse_massive_profitability_evaluation_plan_v1(
-            root=evaluation_plan_root,
-            loaded_source=evaluation_plan.loaded_source,
+        raise MassiveFixedHorizonTranchesV1Error(
+            "caller-supplied residual rows cannot authorize outer evaluation"
         )
-        registered = next(
-            (
-                row
-                for row in reloaded.predictions
-                if row.fold_index == fold_index and row.setting_id == setting_id
-            ),
-            None,
-        )
-        if (
-            reloaded.semantic_receipt_sha256 != evaluation_plan_semantic_receipt_sha256
-            or prediction.semantic_receipt_sha256 != prediction_semantic_receipt_sha256
-            or registered is None
-            or registered.prediction_semantic_receipt_sha256
-            != prediction.semantic_receipt_sha256
-        ):
-            raise MassiveFixedHorizonTranchesV1Error(
-                "residualization is detached from the frozen evaluation plan"
-            )
-        authorizing = True
     ordered = tuple(
         sorted(rows, key=lambda row: (row.decision_session_date, row.security_id))
     )

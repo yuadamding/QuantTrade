@@ -67,6 +67,19 @@ MASSIVE_PROFITABILITY_EVALUATION_CAPITAL_V1 = (
     50_000_000.0,
 )
 MASSIVE_PROFITABILITY_EVALUATION_BOOTSTRAP_SEED_V1 = 26082026
+MASSIVE_PROFITABILITY_FIXED_HORIZON_WEIGHTS_V2 = (0.25, 0.25, 0.25, 0.25)
+MASSIVE_PROFITABILITY_FIXED_HORIZON_SCALING_RECEIPTS_V2 = tuple(
+    semantic_sha256(
+        {
+            "schema": "rl-quant.massive-profitability-fixed-horizon-scaling-v2",
+            "fold_index": fold_index,
+            "horizons": MASSIVE_PROFITABILITY_EVALUATION_HORIZONS_V1,
+            "weights": MASSIVE_PROFITABILITY_FIXED_HORIZON_WEIGHTS_V2,
+            "source": "pre-registered-constant-no-outcome-input",
+        }
+    )
+    for fold_index in range(4)
+)
 MASSIVE_PROFITABILITY_EVALUATION_PLAN_V1_SPEC_SHA256 = semantic_sha256(
     {
         "protocol": MASSIVE_FINALIZED_PROFITABILITY_P0_RECEIPT_SHA256,
@@ -492,6 +505,8 @@ __all__ = [
     "MASSIVE_PROFITABILITY_EVALUATION_HORIZONS_V1",
     "MASSIVE_PROFITABILITY_EVALUATION_PLAN_V1_SCHEMA",
     "MASSIVE_PROFITABILITY_EVALUATION_SETTINGS_V1",
+    "MASSIVE_PROFITABILITY_FIXED_HORIZON_SCALING_RECEIPTS_V2",
+    "MASSIVE_PROFITABILITY_FIXED_HORIZON_WEIGHTS_V2",
     "MassiveProfitabilityEvaluationPlanV1",
     "MassiveProfitabilityEvaluationPlanV1Error",
     "MassiveProfitabilityEvaluationPredictionV1",
