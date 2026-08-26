@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import asdict
 from datetime import date, timedelta
 
@@ -15,6 +16,10 @@ from rl_quant.evaluation.massive_fixed_horizon_tranches_v1 import (
 from rl_quant.evaluation.massive_profitability_evaluation_plan_v1 import (
     MASSIVE_PROFITABILITY_FIXED_HORIZON_SCALING_RECEIPTS_V2,
     MASSIVE_PROFITABILITY_FIXED_HORIZON_WEIGHTS_V2,
+)
+from rl_quant.evaluation.massive_profitability_evaluation_plan_v2 import (
+    MASSIVE_PROFITABILITY_EVALUATION_PLAN_V2_SPEC_SHA256,
+    materialize_massive_profitability_evaluation_plan_v2,
 )
 from rl_quant.evaluation.massive_profitability_outer_evidence_v2 import (
     MassiveProfitabilityCausalEligibilityDateV2,
@@ -225,6 +230,13 @@ def test_caller_rows_cannot_authorize_residual_scores(tmp_path) -> None:
 def test_fixed_horizon_weights_and_causal_threshold_are_frozen() -> None:
     assert MASSIVE_PROFITABILITY_FIXED_HORIZON_WEIGHTS_V2 == (0.25,) * 4
     assert len(set(MASSIVE_PROFITABILITY_FIXED_HORIZON_SCALING_RECEIPTS_V2)) == 4
+    assert len(MASSIVE_PROFITABILITY_EVALUATION_PLAN_V2_SPEC_SHA256) == 64
+    assert (
+        "horizon_risk_scaling_receipts"
+        not in inspect.signature(
+            materialize_massive_profitability_evaluation_plan_v2
+        ).parameters
+    )
     eligible = tuple(f"SEC{index:03d}" for index in range(400))
     body = {
         "decision_session_date": "2024-01-02",
@@ -268,7 +280,8 @@ def test_capacity_reports_intended_and_executed_participation() -> None:
         target_accounting=authorities,
     )
     large = next(row for row in panel.rows if row.capital_usd == 50_000_000.0)
-    assert large.maximum_intended_participation > 0.02
+    # 25% of total composite capital belongs to the H5 sleeve before clipping.
+    assert large.maximum_intended_participation == pytest.approx(1.25)
     assert large.maximum_executed_participation == pytest.approx(0.02)
     assert large.clipped_order_count == large.intended_order_count
     assert large.lost_intended_notional_fraction > 0.0

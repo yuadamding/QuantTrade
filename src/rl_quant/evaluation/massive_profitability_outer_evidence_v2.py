@@ -1192,7 +1192,13 @@ def evaluate_massive_profitability_stitched_capacity_v2(
         clipped = 0
         daily_horizon_net: defaultdict[tuple[str, int], float] = defaultdict(float)
         for position in positions:
-            intended = abs(position.signed_entry_weight) * capital
+            horizon_index = MASSIVE_PROFITABILITY_EVALUATION_HORIZONS_V1.index(
+                position.horizon_sessions
+            )
+            horizon_weight = MASSIVE_PROFITABILITY_FIXED_HORIZON_WEIGHTS_V2[
+                horizon_index
+            ]
+            intended = horizon_weight * abs(position.signed_entry_weight) * capital
             limit = 0.02 * position.trailing_63_session_adv
             executed = min(intended, limit)
             scale = executed / intended

@@ -52,6 +52,12 @@ from rl_quant.features.massive_profitability_phase_plan_v1 import (
     materialize_massive_profitability_phase_plan_v1,
     parse_massive_profitability_phase_plan_v1,
 )
+from rl_quant.features.massive_profitability_phase_plan_v2 import (
+    MASSIVE_PROFITABILITY_MINIMUM_CANDIDATE_SESSIONS_V2,
+    MASSIVE_PROFITABILITY_OUTER_LOCKBOX_EMBARGO_SESSIONS_V2,
+    materialize_massive_profitability_phase_plan_v2,
+    parse_massive_profitability_phase_plan_v2,
+)
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.massive_finalized_validation_v0 import (
     MASSIVE_FINALIZED_VALIDATION_V0_PROTOCOL,
@@ -59,7 +65,7 @@ from rl_quant.protocol.massive_finalized_validation_v0 import (
 
 _EASTERN = ZoneInfo("America/New_York")
 _ENTITLEMENT = "a" * 64
-_SESSION_COUNT = 1_900
+_SESSION_COUNT = 2_000
 
 
 def _ms(day: str, value: time) -> int:
@@ -188,6 +194,50 @@ def test_archive_freeze_derives_fixed_candidate_phases_and_round_trips(
     assert reloaded.semantic_receipt_sha256 == freeze.semantic_receipt_sha256
     assert reloaded.source_transport_qualified is False
     assert reloaded.rank_bar_data_qualified is False
+
+
+def test_phase_plan_v2_inserts_fixed_outer_to_lockbox_embargo(
+    tmp_path: Path,
+) -> None:
+    freeze = _freeze(tmp_path)
+    phase = materialize_massive_profitability_phase_plan_v2(
+        root=tmp_path,
+        archive_freeze=freeze,
+        artifact_id="embargoed",
+        committed_at_ms=freeze.data_freeze_at_ms + 2,
+        entitlement_receipt_sha256=_ENTITLEMENT,
+    )
+    outer = tuple(
+        value for fold in phase.outer_folds for value in fold.outer_test_session_dates
+    )
+
+    assert len(phase.candidate_session_dates) >= (
+        MASSIVE_PROFITABILITY_MINIMUM_CANDIDATE_SESSIONS_V2
+    )
+    assert len(phase.outer_to_lockbox_embargo_session_dates) == (
+        MASSIVE_PROFITABILITY_OUTER_LOCKBOX_EMBARGO_SESSIONS_V2
+    )
+    assert (
+        outer
+        + phase.outer_to_lockbox_embargo_session_dates
+        + phase.lockbox_session_dates
+        == phase.candidate_session_dates[-(4 * 126 + 63 + 252) :]
+    )
+    assert not set(outer) & set(phase.outer_to_lockbox_embargo_session_dates)
+    assert not set(phase.outer_to_lockbox_embargo_session_dates) & set(
+        phase.lockbox_session_dates
+    )
+    assert phase.outer_evaluation_authorized is False
+    assert phase.profitability_reporting_authorized is False
+    assert phase.lockbox_access_authorized is False
+    assert phase.evaluator_retuning_authorized is False
+
+    reloaded = parse_massive_profitability_phase_plan_v2(
+        root=tmp_path, loaded_source=phase.loaded_source
+    )
+    assert reloaded.semantic_receipt_sha256 == phase.semantic_receipt_sha256
+    assert reloaded.archive_source_transport_qualified is False
+    assert reloaded.archive_rank_bar_data_qualified is False
 
 
 def test_archive_freeze_prohibits_caller_dates_and_requires_complete_inputs(

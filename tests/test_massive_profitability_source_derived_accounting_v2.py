@@ -28,6 +28,10 @@ from rl_quant.data_sources.massive.source_receipts import (
     load_massive_source_bundle,
     publish_massive_source_object,
 )
+from rl_quant.evaluation.massive_profitability_evaluation_source_bundle_v3 import (
+    MassiveProfitabilityEvaluationSourceBundleV3Error,
+    reconcile_massive_profitability_evaluation_source_date_v3,
+)
 from rl_quant.evaluation.massive_profitability_selection_guard_v1 import (
     MassiveProfitabilitySelectedPositionV1,
     MassiveProfitabilitySelectionGuardV1Error,
@@ -1010,6 +1014,58 @@ def test_source_owned_accounting_drives_v3_features_and_v2_targets(
     assert "rl-quant.massive-profitability-target-accounting-v1" not in (
         targets.input_schemas
     )
+
+    source_row = reconcile_massive_profitability_evaluation_source_date_v3(
+        expected_feature_receipt_sha256=features.semantic_receipt_sha256,
+        expected_target_receipt_sha256=targets.semantic_receipt_sha256,
+        feature=features,
+        target=targets,
+        feature_accounting=feature_accounting,
+        target_accounting=target_accounting,
+        accounting_freeze=accounting_freeze,
+        origin_plan=plan,
+        daily_input_authority=daily,
+        fill_source_authority=fills,
+        terminal_authority=terminal,
+    )
+    assert source_row.decision_session_date == origin.decision_session_date
+
+    changed_path = replace(
+        target_accounting,
+        daily_input_authority_semantic_receipt_sha256="9" * 64,
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed_semantic = semantic_sha256(changed_path.semantic_unsigned())
+    changed_path = replace(
+        changed_path,
+        semantic_receipt_sha256=changed_semantic,
+        audit_receipt_sha256=semantic_sha256(
+            {
+                "semantic_receipt_sha256": changed_semantic,
+                "economic_archive_audit_receipt_sha256": (
+                    changed_path.economic_archive_audit_receipt_sha256
+                ),
+            }
+        ),
+    )
+    changed_path.validate()
+    with pytest.raises(
+        MassiveProfitabilityEvaluationSourceBundleV3Error,
+        match="detached from its exact frozen sources",
+    ):
+        reconcile_massive_profitability_evaluation_source_date_v3(
+            expected_feature_receipt_sha256=features.semantic_receipt_sha256,
+            expected_target_receipt_sha256=targets.semantic_receipt_sha256,
+            feature=features,
+            target=targets,
+            feature_accounting=feature_accounting,
+            target_accounting=changed_path,
+            accounting_freeze=accounting_freeze,
+            origin_plan=plan,
+            daily_input_authority=daily,
+            fill_source_authority=fills,
+            terminal_authority=terminal,
+        )
 
 
 def test_selected_positions_fail_on_missing_exit_and_short_terminal_windfall(
