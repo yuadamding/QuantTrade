@@ -8,9 +8,23 @@ import torch
 
 from rl_quant.data_sources.massive.source_receipts import MassiveSourceObjectError
 from rl_quant.evaluation.massive_profitability_predictions_v1 import (
+    MassiveProfitabilityPredictionRowV1,
     build_massive_profitability_recovery_predictions_for_test_v1,
     parse_massive_profitability_outer_predictions_v1,
     publish_massive_profitability_mv00_outer_predictions_v1,
+)
+from rl_quant.evaluation.massive_fixed_horizon_tranches_v1 import (
+    MassiveProfitabilityResidualInputRowV1,
+    MassiveProfitabilityResidualScoreRowV1,
+    MassiveProfitabilityResidualScoresV1,
+    MassiveProfitabilitySelectedTranchePositionV1,
+    MassiveProfitabilitySelectedTranchesV1,
+    build_massive_profitability_residual_scores_v1,
+    evaluate_massive_profitability_fixed_tranches_v1,
+)
+from rl_quant.evaluation.massive_profitability_inference_v1 import (
+    MassiveProfitabilityHorizonRiskScalingV1,
+    build_massive_profitability_composite_pnl_v1,
 )
 from rl_quant.evaluation.massive_profitability_tournament_inputs_v1 import (
     MASSIVE_PROFITABILITY_TOURNAMENT_INPUTS_V1_SOURCE_SHA256,
@@ -23,12 +37,24 @@ from rl_quant.features.massive_profitability_origin_features_v2 import (
 from rl_quant.features.massive_profitability_phase_plan_v1 import (
     MassiveProfitabilityOuterFoldPlanV1,
 )
+from rl_quant.features.massive_profitability_target_accounting_authority_v2 import (
+    MASSIVE_PROFITABILITY_TARGET_ACCOUNTING_AUTHORITY_V2_HORIZONS,
+    MASSIVE_PROFITABILITY_TARGET_ACCOUNTING_AUTHORITY_V2_SOURCE_SHA256,
+    MASSIVE_PROFITABILITY_TARGET_ACCOUNTING_AUTHORITY_V2_SPEC_SHA256,
+    MassiveProfitabilityTargetAccountingAuthorityV2,
+)
+from rl_quant.features.massive_profitability_target_accounting_v1 import (
+    MassiveProfitabilityTargetEconomicPathRowV1,
+)
 from rl_quant.models.massive_profitability_tabular_v1 import (
     MASSIVE_PROFITABILITY_TOURNAMENT_SETTINGS_V1,
     MassiveProfitabilityTabularModelV1,
     massive_profitability_mv00_scores_v1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.protocol.massive_finalized_profitability_p0 import (
+    MASSIVE_FINALIZED_PROFITABILITY_P0_RECEIPT_SHA256,
+)
 from rl_quant.training.massive_profitability_tournament_v1 import (
     MASSIVE_PROFITABILITY_CONFIRMATION_SEEDS_V1,
     MASSIVE_PROFITABILITY_DEVELOPMENT_SEEDS_V1,
@@ -37,6 +63,7 @@ from rl_quant.training.massive_profitability_tournament_v1 import (
     MassiveProfitabilityDateTensorV1,
     MassiveProfitabilityTournamentDatasetV1,
     MassiveProfitabilityTournamentPlanV1,
+    MassiveProfitabilityTrainedRunV1,
     MassiveProfitabilityTrainingConfigV1,
     _tensor_sha256,
     fit_massive_profitability_normalization_v1,
@@ -49,7 +76,9 @@ from rl_quant.training.massive_profitability_tournament_v1 import (
 _DIGEST = "a" * 64
 
 
-def _date_tensor(index: int, *, tape_shift: float = 0.0) -> MassiveProfitabilityDateTensorV1:
+def _date_tensor(
+    index: int, *, tape_shift: float = 0.0
+) -> MassiveProfitabilityDateTensorV1:
     session_date = f"d{index:04d}"
     security_ids = ("SEC-A", "SEC-B")
     bars = torch.zeros((2, len(BARS_MIN_V2_FIELDS)), dtype=torch.float32)
@@ -174,6 +203,284 @@ def _planted_date_tensor(
     return result
 
 
+def _planted_alpha(index: int, asset: int) -> float:
+    bar_signal = (((asset * 7 + index * 3) % 17) - 8) / 8.0
+    tape_signal = (((asset * 11 + index * 5) % 19) - 9) / 9.0
+    return 0.50 * bar_signal + 0.50 * tape_signal
+
+
+def _planted_target_authority(
+    *, index: int, asset_count: int = 16
+) -> MassiveProfitabilityTargetAccountingAuthorityV2:
+    decision_session_date = f"d{index:04d}"
+    session_dates = tuple(f"d{index + offset:04d}" for offset in range(64))
+    paths = []
+    for asset in range(asset_count):
+        security_id = f"SEC-{asset:03d}"
+        economic_return = 0.05 * _planted_alpha(index, asset)
+        values = (100.0,) + (100.0 * (1.0 + economic_return),) * 63
+        path_body = {
+            "security_id": security_id,
+            "economic_at_ms": tuple(1_000 + offset for offset in range(64)),
+            "available_at_ms": tuple(1_000 + offset for offset in range(64)),
+            "values": values,
+            "valid": (True,) * 64,
+            "terminal": (False,) * 64,
+            "mark_kinds": ("market",) * 64,
+            "mark_receipts": tuple(
+                semantic_sha256((decision_session_date, security_id, offset))
+                for offset in range(64)
+            ),
+            "unresolved_terminal_fallback_session_offset": None,
+            "conservative_total_loss_fallback": False,
+        }
+        paths.append(
+            MassiveProfitabilityTargetEconomicPathRowV1(
+                **path_body,  # type: ignore[arg-type]
+                receipt_sha256=semantic_sha256(path_body),
+            )
+        )
+    row_inventory = semantic_sha256(tuple(row.receipt_sha256 for row in paths))
+    semantic = {
+        "schema": "rl-quant.massive-profitability-target-accounting-authority-v2",
+        "origin_receipt_sha256": semantic_sha256(
+            ("planted-origin", decision_session_date)
+        ),
+        "origin_plan_semantic_receipt_sha256": "b" * 64,
+        "decision_session_date": decision_session_date,
+        "session_dates": session_dates,
+        "rows": tuple(asdict(row) for row in paths),
+        "horizons": MASSIVE_PROFITABILITY_TARGET_ACCOUNTING_AUTHORITY_V2_HORIZONS,
+        "daily_input_authority_semantic_receipt_sha256": "c" * 64,
+        "fill_source_authority_semantic_receipt_sha256": "d" * 64,
+        "terminal_authority_semantic_receipt_sha256": "e" * 64,
+        "economic_coverage_semantic_receipt_sha256": "f" * 64,
+        "scoped_economic_event_inventory_sha256": semantic_sha256(()),
+        "row_inventory_sha256": row_inventory,
+        "fill_sources_qualified": True,
+        "economic_values_data_qualified": True,
+        "terminal_accounting_complete": True,
+        "conservative_total_loss_target_count": 0,
+        "protocol_receipt_sha256": MASSIVE_FINALIZED_PROFITABILITY_P0_RECEIPT_SHA256,
+        "specification_sha256": MASSIVE_PROFITABILITY_TARGET_ACCOUNTING_AUTHORITY_V2_SPEC_SHA256,
+        "implementation_source_sha256": MASSIVE_PROFITABILITY_TARGET_ACCOUNTING_AUTHORITY_V2_SOURCE_SHA256,
+        "predictive_training_authorized": False,
+        "profitability_reporting_authorized": False,
+        "lockbox_access_authorized": False,
+    }
+    semantic_receipt = semantic_sha256(semantic)
+    economic_audit = semantic_sha256(("planted-economic-audit", semantic_receipt))
+    result = MassiveProfitabilityTargetAccountingAuthorityV2(
+        **{**semantic, "rows": tuple(paths)},  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_receipt,
+        economic_archive_audit_receipt_sha256=economic_audit,
+        audit_receipt_sha256=semantic_sha256(
+            {
+                "semantic_receipt_sha256": semantic_receipt,
+                "economic_archive_audit_receipt_sha256": economic_audit,
+            }
+        ),
+    )
+    result.validate()
+    return result
+
+
+def _planted_residual_scores(
+    *,
+    setting_id: str,
+    scores: dict[tuple[str, str], tuple[float, ...]],
+) -> MassiveProfitabilityResidualScoresV1:
+    inputs = []
+    for (session_date, security_id), raw_scores in sorted(scores.items()):
+        body = {
+            "decision_session_date": session_date,
+            "security_id": security_id,
+            "raw_scores": raw_scores,
+            # Constant causal exposures make this a pure numerical test of the
+            # frozen residual operator without planting another return signal.
+            "exposures": (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            "trailing_63_session_adv": 100_000_000.0,
+            "prediction_row_receipt_sha256": semantic_sha256(
+                ("planted-prediction", setting_id, session_date, security_id)
+            ),
+            "feature_row_receipt_sha256": semantic_sha256(
+                ("planted-feature-row", session_date, security_id)
+            ),
+            "feature_accounting_row_inventory_sha256": semantic_sha256(
+                ("planted-accounting", session_date)
+            ),
+        }
+        inputs.append(
+            MassiveProfitabilityResidualInputRowV1(
+                **body,  # type: ignore[arg-type]
+                receipt_sha256=semantic_sha256(body),
+            )
+        )
+    result = build_massive_profitability_residual_scores_v1(
+        setting_id=setting_id,
+        fold_index=0,
+        evaluation_plan_semantic_receipt_sha256=semantic_sha256(
+            "planted-nonauthorizing-evaluation-plan"
+        ),
+        prediction_semantic_receipt_sha256=semantic_sha256(
+            ("planted-prediction-inventory", setting_id)
+        ),
+        rows=inputs,
+    )
+    assert result.outer_evaluation_authorized is False
+    return result
+
+
+def _planted_selected_tranches(
+    *,
+    residual: MassiveProfitabilityResidualScoresV1,
+    target_accounting: tuple[MassiveProfitabilityTargetAccountingAuthorityV2, ...],
+) -> MassiveProfitabilitySelectedTranchesV1:
+    paths = {
+        (authority.decision_session_date, row.security_id): row
+        for authority in target_accounting
+        for row in authority.rows
+    }
+    target_inventory = semantic_sha256(
+        tuple(sorted(row.semantic_receipt_sha256 for row in target_accounting))
+    )
+    grouped: dict[str, list[MassiveProfitabilityResidualScoreRowV1]] = {}
+    for row in residual.rows:
+        grouped.setdefault(row.decision_session_date, []).append(row)
+    positions = []
+    horizons = (1, 5, 21, 63)
+    for session_date, raw_rows in sorted(grouped.items()):
+        rows = list(raw_rows)
+        tail_count = len(rows) // 5
+        for horizon_index, horizon in enumerate(horizons):
+            sides = (
+                (
+                    "short",
+                    sorted(
+                        rows,
+                        key=lambda row: (
+                            row.residual_scores[horizon_index],
+                            row.security_id,
+                        ),
+                    )[:tail_count],
+                ),
+                (
+                    "long",
+                    sorted(
+                        rows,
+                        key=lambda row: (
+                            -row.residual_scores[horizon_index],
+                            row.security_id,
+                        ),
+                    )[:tail_count],
+                ),
+            )
+            for side, selected_rows in sides:
+                for tail_rank, score in enumerate(selected_rows, start=1):
+                    path = paths[(session_date, score.security_id)]
+                    weight = (0.5 if side == "long" else -0.5) / (horizon * tail_count)
+                    body = {
+                        "decision_session_date": session_date,
+                        "security_id": score.security_id,
+                        "horizon_sessions": horizon,
+                        "side": side,
+                        "tail_rank": tail_rank,
+                        "signed_entry_weight": weight,
+                        "residual_score": score.residual_scores[horizon_index],
+                        "trailing_63_session_adv": score.trailing_63_session_adv,
+                        "residual_score_row_receipt_sha256": score.receipt_sha256,
+                        "target_path_receipt_sha256": path.receipt_sha256,
+                        "unresolved_terminal_fallback_session_offset": None,
+                    }
+                    positions.append(
+                        MassiveProfitabilitySelectedTranchePositionV1(
+                            **body,  # type: ignore[arg-type]
+                            receipt_sha256=semantic_sha256(body),
+                        )
+                    )
+    ordered = tuple(
+        sorted(
+            positions,
+            key=lambda row: (
+                row.decision_session_date,
+                row.horizon_sessions,
+                row.side,
+                row.tail_rank,
+            ),
+        )
+    )
+    position_inventory = semantic_sha256(tuple(row.receipt_sha256 for row in ordered))
+    body = {
+        "setting_id": residual.setting_id,
+        "fold_index": residual.fold_index,
+        "positions": tuple(asdict(row) for row in ordered),
+        "residual_scores_semantic_receipt_sha256": residual.semantic_receipt_sha256,
+        "target_accounting_inventory_sha256": target_inventory,
+        "position_inventory_sha256": position_inventory,
+        "path_support_complete": True,
+        "direction_safe_terminal_support_complete": True,
+        "outer_evaluation_authorized": True,
+        "profitability_reporting_authorized": False,
+        "lockbox_access_authorized": False,
+        "reinforcement_learning_authorized": False,
+    }
+    result = MassiveProfitabilitySelectedTranchesV1(
+        setting_id=residual.setting_id,
+        fold_index=residual.fold_index,
+        positions=ordered,
+        residual_scores_semantic_receipt_sha256=residual.semantic_receipt_sha256,
+        target_accounting_inventory_sha256=target_inventory,
+        position_inventory_sha256=position_inventory,
+        path_support_complete=True,
+        direction_safe_terminal_support_complete=True,
+        semantic_receipt_sha256=semantic_sha256(body),
+        outer_evaluation_authorized=True,
+        profitability_reporting_authorized=False,
+        lockbox_access_authorized=False,
+        reinforcement_learning_authorized=False,
+    )
+    result.validate()
+    return result
+
+
+def _planted_composite_mean_net_20bp(
+    *,
+    setting_id: str,
+    scores: dict[tuple[str, str], tuple[float, ...]],
+    target_accounting: tuple[MassiveProfitabilityTargetAccountingAuthorityV2, ...],
+) -> tuple[float, tuple[float, float, float]]:
+    residual = _planted_residual_scores(setting_id=setting_id, scores=scores)
+    selected = _planted_selected_tranches(
+        residual=residual, target_accounting=target_accounting
+    )
+    pnl = evaluate_massive_profitability_fixed_tranches_v1(
+        selected=selected, target_accounting=target_accounting
+    )
+    scaling_body = {
+        "fold_index": 0,
+        "horizon_volatility": (1.0, 1.0, 1.0, 1.0),
+        "horizon_weights": (0.25, 0.25, 0.25, 0.25),
+        "fit_source_receipt_sha256": semantic_sha256("planted-fixed-horizon-weights"),
+    }
+    scaling = MassiveProfitabilityHorizonRiskScalingV1(
+        fold_index=0,
+        horizon_volatility=(1.0, 1.0, 1.0, 1.0),
+        horizon_weights=(0.25, 0.25, 0.25, 0.25),
+        fit_source_receipt_sha256=semantic_sha256("planted-fixed-horizon-weights"),
+        receipt_sha256=semantic_sha256(scaling_body),
+    )
+    composite = build_massive_profitability_composite_pnl_v1(
+        pnl=pnl, risk_scaling=scaling
+    )
+    means = tuple(
+        sum(row.net_returns[index] for row in composite.rows) / len(composite.rows)
+        for index in range(3)
+    )
+    assert composite.profitability_reporting_authorized is False
+    assert composite.lockbox_access_authorized is False
+    return means[1], (means[0], means[1], means[2])
+
+
 def _planted_dataset(
     indices: tuple[int, ...],
 ) -> MassiveProfitabilityTournamentDatasetV1:
@@ -237,13 +544,16 @@ def _fold() -> MassiveProfitabilityOuterFoldPlanV1:
         "outer_test_inventory_sha256": semantic_sha256(outer),
     }
     result = MassiveProfitabilityOuterFoldPlanV1(
-        **body, receipt_sha256=semantic_sha256(body)  # type: ignore[arg-type]
+        **body,  # type: ignore[arg-type]
+        receipt_sha256=semantic_sha256(body),
     )
     result.validate()
     return result
 
 
-def _plan(fold: MassiveProfitabilityOuterFoldPlanV1) -> MassiveProfitabilityTournamentPlanV1:
+def _plan(
+    fold: MassiveProfitabilityOuterFoldPlanV1,
+) -> MassiveProfitabilityTournamentPlanV1:
     body = {
         "data_gate_semantic_receipt_sha256": _DIGEST,
         "phase_plan_semantic_receipt_sha256": "b" * 64,
@@ -264,7 +574,8 @@ def _plan(fold: MassiveProfitabilityOuterFoldPlanV1) -> MassiveProfitabilityTour
         "schema": "rl-quant.massive-profitability-tournament-v1",
     }
     result = MassiveProfitabilityTournamentPlanV1(
-        **body, receipt_sha256=semantic_sha256(body)  # type: ignore[arg-type]
+        **body,  # type: ignore[arg-type]
+        receipt_sha256=semantic_sha256(body),
     )
     result.validate()
     return result
@@ -441,7 +752,7 @@ def test_mv00_outer_predictions_are_create_only_and_round_trip(tmp_path: Path) -
         )
 
 
-def test_planted_incremental_tape_alpha_recovers_in_five_seed_canary() -> None:
+def test_planted_incremental_tape_alpha_recovers_through_net_pnl_canary() -> None:
     fold_source = _fold()
     fold = adapt_massive_profitability_training_fold_v1(fold_source)
     plan = _plan(fold_source)
@@ -455,6 +766,10 @@ def test_planted_incremental_tape_alpha_recovers_in_five_seed_canary() -> None:
         complete_dates_per_batch=189,
     )
     ensemble_scores: dict[str, dict[tuple[str, str], tuple[float, ...]]] = {}
+    recovery_runs: dict[tuple[str, int], MassiveProfitabilityTrainedRunV1] = {}
+    recovery_prediction_rows: dict[
+        tuple[str, int], tuple[MassiveProfitabilityPredictionRowV1, ...]
+    ] = {}
     for setting_id in ("MV02", "MV04", "MV04-SHUFFLE"):
         seed_scores: list[dict[tuple[str, str], tuple[float, ...]]] = []
         for seed in MASSIVE_PROFITABILITY_CONFIRMATION_SEEDS_V1:
@@ -473,6 +788,8 @@ def test_planted_incremental_tape_alpha_recovers_in_five_seed_canary() -> None:
                 fold=fold_source,
                 run=run,
             )
+            recovery_runs[(setting_id, seed)] = run
+            recovery_prediction_rows[(setting_id, seed)] = rows
             seed_scores.append(
                 {(row.decision_session_date, row.security_id): row.mean for row in rows}
             )
@@ -484,6 +801,36 @@ def test_planted_incremental_tape_alpha_recovers_in_five_seed_canary() -> None:
             )
             for key in keys
         }
+
+    replayed_run = train_massive_profitability_fold_v1(
+        dataset=dataset,
+        tournament_plan=plan,
+        fold=fold,
+        setting_id="MV04",
+        seed=0,
+        config=config,
+    )
+    committed_run = recovery_runs[("MV04", 0)]
+    assert replayed_run.run_receipt_sha256 == committed_run.run_receipt_sha256
+    assert replayed_run.model_state_sha256 == committed_run.model_state_sha256
+    assert tuple(name for name, _ in replayed_run.model_state) == tuple(
+        name for name, _ in committed_run.model_state
+    )
+    assert all(
+        torch.equal(replayed, committed)
+        for (_, replayed), (_, committed) in zip(
+            replayed_run.model_state, committed_run.model_state, strict=True
+        )
+    )
+    assert (
+        build_massive_profitability_recovery_predictions_for_test_v1(
+            dataset=dataset,
+            tournament_plan=plan,
+            fold=fold_source,
+            run=replayed_run,
+        )
+        == recovery_prediction_rows[("MV04", 0)]
+    )
 
     mv00_scores: dict[tuple[str, str], tuple[float, ...]] = {}
     mapping = dataset.by_date()
@@ -516,6 +863,38 @@ def test_planted_incremental_tape_alpha_recovers_in_five_seed_canary() -> None:
     assert rank_ic["MV04"] > rank_ic["MV02"] > rank_ic["MV00"], rank_ic
     assert abs(rank_ic["MV04-SHUFFLE"] - rank_ic["MV02"]) < 0.15
     assert rank_ic["MV04"] - rank_ic["MV04-SHUFFLE"] > 0.25
+
+    target_accounting = tuple(
+        _planted_target_authority(index=index) for index in range(1008, 1134)
+    )
+    pnl_scores = {**ensemble_scores, "MV00": mv00_scores}
+    pnl = {
+        setting_id: _planted_composite_mean_net_20bp(
+            setting_id=setting_id,
+            scores=scores,
+            target_accounting=target_accounting,
+        )
+        for setting_id, scores in pnl_scores.items()
+    }
+    mean_net_20bp = {setting_id: value[0] for setting_id, value in pnl.items()}
+    assert mean_net_20bp["MV04"] > mean_net_20bp["MV02"] > mean_net_20bp["MV00"], (
+        mean_net_20bp
+    )
+    assert abs(mean_net_20bp["MV04-SHUFFLE"] - mean_net_20bp["MV02"]) < 1e-4
+    assert mean_net_20bp["MV04"] - mean_net_20bp["MV04-SHUFFLE"] > 1e-4
+    for _, cost_ladder in pnl.values():
+        assert cost_ladder[0] > cost_ladder[1] > cost_ladder[2]
+
+    reversed_mv04 = {
+        key: tuple(-value for value in scores)
+        for key, scores in ensemble_scores["MV04"].items()
+    }
+    reversed_net, _ = _planted_composite_mean_net_20bp(
+        setting_id="MV04",
+        scores=reversed_mv04,
+        target_accounting=target_accounting,
+    )
+    assert reversed_net < 0.0 < mean_net_20bp["MV04"]
 
 
 def test_tournament_plan_and_runs_never_authorize_profit_reporting() -> None:
