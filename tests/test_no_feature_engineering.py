@@ -43,13 +43,26 @@ AUDITED_IMPORTS = [
     "rl_quant.evaluation.statistical",
 ]
 
-# Source files that constitute the audited path (whole datasets/models/training packages + statistical.py).
+# Source files that constitute the exact Phase-1 import surface named above.
+# Unrelated Massive adaptive-training modules intentionally live in the same
+# top-level package but are a separate protocol generation and are not imported
+# by the audited Phase-1 driver.  Runtime transitive leakage is still caught by
+# ``test_audited_imports_pull_in_no_engineered_feature_module``.
 def _audited_files() -> list[pathlib.Path]:
-    files: list[pathlib.Path] = []
-    for pkg in ("datasets", "models", "training"):
-        files += sorted((_PKG / pkg).rglob("*.py"))
-    files.append(_PKG / "evaluation" / "statistical.py")
-    return [f for f in files if "__pycache__" not in f.parts]
+    return [
+        _PKG / "datasets" / "__init__.py",
+        _PKG / "datasets" / "raw_window.py",
+        _PKG / "datasets" / "daily.py",
+        _PKG / "datasets" / "splits.py",
+        _PKG / "models" / "__init__.py",
+        _PKG / "models" / "context_encoder.py",
+        _PKG / "models" / "decision_policy.py",
+        _PKG / "training" / "__init__.py",
+        _PKG / "training" / "context_pretrain.py",
+        _PKG / "training" / "decision_policy.py",
+        _PKG / "training" / "designs.py",
+        _PKG / "evaluation" / "statistical.py",
+    ]
 
 
 # Engineered-feature artifact names that must NEVER appear in the audited path (from the audit's remediation #13).

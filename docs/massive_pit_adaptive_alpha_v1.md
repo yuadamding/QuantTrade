@@ -131,19 +131,47 @@ staleness channel, and binds exact float32 per-decision array hashes. A generic
 reload has no tensors and no model-input authority; package promotion rebuilds
 all arrays from the exact Feature V3 and adaptive-origin inventories.
 
-`build_massive_adaptive_alpha_training_batch_v2()` then maps source-derived
-targets from each changing PIT action set onto that stable context axis. It
+`build_massive_adaptive_alpha_training_batch_v2()` remains the nonauthorizing
+component adapter that maps bare target rows from each changing PIT action set
+onto that stable context axis. It
 derives the action-mask benchmark and B01 benchmark return internally and
 leaves context-only securities explicitly target-missing. This removes the V1
 assumption that context and action security axes are identical.
 
-This closes direct caller-supplied model-input tensor substitution relative to
-those committed roots, but deliberately does not authorize training. Historical
-adaptive training still requires a source-reconciled dual-universe inventory,
-target/split authority with a
-126-session purge, a package-owned optimizer/checkpoint path, and the
-chronological compiler/economic simulator. Intraday path tensors are not yet
-materialized by this V1 artifact.
+The authorizing training boundary is separate. A
+`MassiveAdaptiveContextOriginAuthorityV1` proves the exact PIT-1500 feature
+support, and `MassiveAdaptiveDecisionRootV1` reconciles it with the PIT-500
+action origin, decision timestamp, decision clock, session authority, and
+Feature V3 inventory. `MassiveAdaptiveSplitPlanV1` freezes 126-session inner
+and outer purges plus a 126-session outer-to-lockbox embargo. A package-derived
+`MassiveAdaptiveWindowPlanV1` owns the tensor and candidate indices; callers
+cannot provide an origin index or free split receipt. The historical builder
+must reopen the create-only archive freeze and reproduce its candidate
+inventory; the direct calendar builder is engineering-only and cannot qualify
+training.
+
+`MassiveAdaptiveTrainingAuthorityV1` then requires one replayed
+`MassiveAdaptiveSourceTargetsV1` for every eligible window origin. The
+package-owned supervised trainer reopens the decision tensor, rebuilds all
+decision roots and the split/window plans, performs the model forward itself,
+and publishes a create-only exact-resume checkpoint. The checkpoint binds the
+model, optimizer, scheduler, gradient-scaler placeholder, CPU/CUDA/data-order
+RNG state, epoch/update/window cursor, window permutation, and loss trace. A
+generic checkpoint reload has no runtime state or training authority.
+
+The synthetic qualification path is deliberately named a canary and cannot
+promote itself. The historical entry point requires qualified context roots,
+rebuilds them from the live PIT-1500 identity authority and decision-clock
+inventory, and also requires the canonical AD11 model specification and frozen
+training configuration.
+Neither path authorizes profitability reporting, lockbox access, or RL.
+
+This closes source-to-optimizer and exact-restart wiring. It does **not** yet
+close checkpoint-to-forecast replay, compiler-input materialization, or the
+chronological compiler/economic simulator. Intraday path tensors are also not
+yet materialized by the V1 tensor artifact. Those deterministic profitability
+boundaries remain prerequisites for an H100 historical launch and for any RL
+work.
 
 ## Evidence boundary
 

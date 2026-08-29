@@ -410,7 +410,8 @@ class MassiveAdaptiveDecisionTensorV1:
                 }
             )
             or self.runtime_source_replayed != runtime_present
-            or self.model_input_authorized != runtime_present
+            or self.model_input_authorized
+            != (runtime_present and self.committed_source_data_qualified)
             or self.development_training_authorized
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
@@ -626,7 +627,7 @@ def authorize_massive_adaptive_decision_tensor_v1(
         parsed,
         runtime_tensor=rebuilt,
         runtime_source_replayed=True,
-        model_input_authorized=True,
+        model_input_authorized=parsed.committed_source_data_qualified,
     )
     result.validate()
     return result

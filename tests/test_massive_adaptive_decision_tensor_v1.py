@@ -101,7 +101,12 @@ def _feature(day_index: int):
     return result
 
 
-def _origin(feature, *, action_ids: tuple[str, ...] = _SECURITIES[:7]):
+def _origin(
+    feature,
+    *,
+    action_ids: tuple[str, ...] = _SECURITIES[:7],
+    session_authority_receipt_sha256: str | None = None,
+):
     rows = []
     for rank, security_id in enumerate(action_ids, start=1):
         body = {
@@ -157,7 +162,11 @@ def _origin(feature, *, action_ids: tuple[str, ...] = _SECURITIES[:7]):
         decision_clock_receipt_sha256=semantic_sha256(
             (feature.decision_session_date, "clock")
         ),
-        session_authority_receipt_sha256=semantic_sha256("sessions"),
+        session_authority_receipt_sha256=(
+            semantic_sha256("sessions")
+            if session_authority_receipt_sha256 is None
+            else session_authority_receipt_sha256
+        ),
         action_universe_rule_receipt_sha256=(
             MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL.action_universe_rule.receipt_sha256
         ),
@@ -197,7 +206,7 @@ def _origin(feature, *, action_ids: tuple[str, ...] = _SECURITIES[:7]):
     return result
 
 
-def _targets(origin):
+def _paths(origin):
     paths = []
     for asset_index, security_id in enumerate(origin.security_ids):
         alpha = 0.0005 * (asset_index + 1)
@@ -233,6 +242,11 @@ def _targets(origin):
                 **body, receipt_sha256=semantic_sha256(body)  # type: ignore[arg-type]
             )
         )
+    return tuple(paths)
+
+
+def _targets(origin):
+    paths = _paths(origin)
     return build_massive_adaptive_alpha_targets_v1(
         decision_session_date=origin.decision_session_date,
         built_at_ms=paths[0].available_at_ms[-1] + 1,

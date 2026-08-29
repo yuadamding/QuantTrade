@@ -55,6 +55,7 @@ jobs:
           tests/test_massive_adaptive_origin_authority_v1.py
           tests/test_massive_adaptive_source_targets_v1.py
           tests/test_massive_adaptive_decision_tensor_v1.py
+          tests/test_massive_adaptive_source_authorized_training_v1.py
           tests/test_adaptive_alpha_supervised_v1.py
           tests/test_massive_adaptive_portfolio_compiler_v1.py
           tests/test_adaptive_alpha_profit_checkpoint_selection_v1.py
