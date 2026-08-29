@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from io import BytesIO
 from math import sqrt
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 import torch
 
@@ -34,7 +34,6 @@ from rl_quant.evaluation.massive_adaptive_forecast_eligibility_authority_v2 impo
 )
 from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
     MassiveAdaptiveInferencePlanV1,
-    MassiveAdaptiveInferenceRowV1,
 )
 from rl_quant.features.massive_adaptive_decision_root_v1 import (
     MassiveAdaptiveDecisionRootV1,
@@ -98,6 +97,27 @@ class MassiveAdaptiveForecastArchiveV2Error(ValueError):
     """Out-of-sample adaptive forecasts differ from their eligible roots."""
 
 
+class MassiveAdaptiveForecastPlanRowV2(Protocol):
+    """Minimum target-free schedule surface required by model replay."""
+
+    @property
+    def decision_session_date(self) -> str: ...
+
+    @property
+    def context_tensor_indices(self) -> tuple[int, ...]: ...
+
+    @property
+    def origin_output_position(self) -> int: ...
+
+    @property
+    def decision_root_receipt_sha256(self) -> str: ...
+
+    @property
+    def receipt_sha256(self) -> str: ...
+
+    def validate(self, *, maximum_context_sessions: int) -> None: ...
+
+
 def _artifact_id(value: object) -> str:
     if (
         not isinstance(value, str)
@@ -131,7 +151,7 @@ def _tensor_receipt(value: torch.Tensor) -> str:
     return digest.hexdigest()
 
 
-_FLOAT_ARRAY_NAMES = (
+MASSIVE_ADAPTIVE_FORECAST_V2_FLOAT_ARRAY_NAMES = (
     "residual_mean",
     "residual_downside_quantile",
     "residual_median",
@@ -207,7 +227,8 @@ class MassiveAdaptiveForecastRowV2:
             or self.stock_context.ndim != 2
             or self.stock_context.shape[0] != assets
             or self.market_context.ndim != 2
-            or len(self.array_receipts) != len(_FLOAT_ARRAY_NAMES) + 1
+            or len(self.array_receipts)
+            != len(MASSIVE_ADAPTIVE_FORECAST_V2_FLOAT_ARRAY_NAMES) + 1
         ):
             raise MassiveAdaptiveForecastArchiveV2Error(
                 "adaptive forecast v2 row shape or identity differs"
@@ -230,7 +251,10 @@ class MassiveAdaptiveForecastRowV2:
                 raise MassiveAdaptiveForecastArchiveV2Error(
                     "adaptive forecast v2 distribution shape differs"
                 )
-        tensors = tuple(getattr(self, name) for name in _FLOAT_ARRAY_NAMES)
+        tensors = tuple(
+            getattr(self, name)
+            for name in MASSIVE_ADAPTIVE_FORECAST_V2_FLOAT_ARRAY_NAMES
+        )
         if any(
             value.device.type != "cpu"
             or value.dtype != torch.float32
@@ -272,7 +296,10 @@ class MassiveAdaptiveForecastRowV2:
     def payload(self) -> dict[str, object]:
         return {
             **self.unsigned(),
-            **{name: getattr(self, name) for name in _FLOAT_ARRAY_NAMES},
+            **{
+                name: getattr(self, name)
+                for name in MASSIVE_ADAPTIVE_FORECAST_V2_FLOAT_ARRAY_NAMES
+            },
             "valid": self.valid,
             "receipt_sha256": self.receipt_sha256,
         }
@@ -447,7 +474,7 @@ def _forecast_row(
     *,
     model: MassiveAdaptiveAlphaTermStructureModelV1,
     decision_tensor: MassiveAdaptiveDecisionTensorV1,
-    inference_row: MassiveAdaptiveInferenceRowV1,
+    inference_row: MassiveAdaptiveForecastPlanRowV2,
 ) -> MassiveAdaptiveForecastRowV2:
     runtime = decision_tensor.runtime_tensor
     if runtime is None:
@@ -505,7 +532,8 @@ def _forecast_row(
     }
     valid = output.valid[0, position].detach().cpu().to(torch.bool).contiguous()
     array_receipts = tuple(
-        _tensor_receipt(arrays[name]) for name in _FLOAT_ARRAY_NAMES
+        _tensor_receipt(arrays[name])
+        for name in MASSIVE_ADAPTIVE_FORECAST_V2_FLOAT_ARRAY_NAMES
     ) + (_tensor_receipt(valid),)
     body = {
         "decision_session_date": inference_row.decision_session_date,
@@ -522,6 +550,41 @@ def _forecast_row(
     )
     result.validate()
     return result
+
+
+def replay_massive_adaptive_forecast_rows_v2(
+    *,
+    checkpoint: MassiveAdaptiveCheckpointV1,
+    decision_tensor: MassiveAdaptiveDecisionTensorV1,
+    plan_rows: Sequence[MassiveAdaptiveForecastPlanRowV2],
+    model_spec: MassiveAdaptiveAlphaModelSpecV1,
+) -> tuple[MassiveAdaptiveForecastRowV2, ...]:
+    """Run exact target-free inference for an already-authorized schedule."""
+
+    checkpoint.validate()
+    decision_tensor.validate()
+    model_spec.validate()
+    if (
+        checkpoint.runtime_state is None
+        or not checkpoint.runtime_checkpoint_replayed
+        or decision_tensor.runtime_tensor is None
+        or not decision_tensor.runtime_source_replayed
+        or checkpoint.model_spec_receipt_sha256 != model_spec.receipt_sha256
+    ):
+        raise MassiveAdaptiveForecastArchiveV2Error(
+            "forecast row replay requires a replayed checkpoint and tensor"
+        )
+    model = MassiveAdaptiveAlphaTermStructureModelV1(model_spec)
+    model.load_state_dict(checkpoint.runtime_state.model_state, strict=True)
+    model.eval()
+    return tuple(
+        _forecast_row(
+            model=model,
+            decision_tensor=decision_tensor,
+            inference_row=row,
+        )
+        for row in plan_rows
+    )
 
 
 def _eligibility_and_rows(
@@ -544,17 +607,11 @@ def _eligibility_and_rows(
         inference_plan=inference_plan,
         model_spec=model_spec,
     )
-    assert checkpoint.runtime_state is not None
-    model = MassiveAdaptiveAlphaTermStructureModelV1(model_spec)
-    model.load_state_dict(checkpoint.runtime_state.model_state, strict=True)
-    model.eval()
-    rows = tuple(
-        _forecast_row(
-            model=model,
-            decision_tensor=inference_tensor,
-            inference_row=row,
-        )
-        for row in inference_plan.rows
+    rows = replay_massive_adaptive_forecast_rows_v2(
+        checkpoint=checkpoint,
+        decision_tensor=inference_tensor,
+        plan_rows=inference_plan.rows,
+        model_spec=model_spec,
     )
     return eligibility, rows
 
@@ -794,7 +851,10 @@ def authorize_massive_adaptive_forecast_archive_v2(
                     cast(torch.Tensor, getattr(committed, name)),
                     cast(torch.Tensor, getattr(rebuilt, name)),
                 )
-                for name in (*_FLOAT_ARRAY_NAMES, "valid")
+                for name in (
+                    *MASSIVE_ADAPTIVE_FORECAST_V2_FLOAT_ARRAY_NAMES,
+                    "valid",
+                )
             )
             or committed.unsigned() != rebuilt.unsigned()
             or committed.receipt_sha256 != rebuilt.receipt_sha256
@@ -816,10 +876,12 @@ def authorize_massive_adaptive_forecast_archive_v2(
 
 __all__ = [
     "MASSIVE_ADAPTIVE_FORECAST_ARCHIVE_V2_SCHEMA",
+    "MASSIVE_ADAPTIVE_FORECAST_V2_FLOAT_ARRAY_NAMES",
     "MassiveAdaptiveForecastArchiveV2",
     "MassiveAdaptiveForecastArchiveV2Error",
     "MassiveAdaptiveForecastRowV2",
     "authorize_massive_adaptive_forecast_archive_v2",
     "materialize_massive_adaptive_forecast_archive_v2",
     "parse_massive_adaptive_forecast_archive_v2",
+    "replay_massive_adaptive_forecast_rows_v2",
 ]

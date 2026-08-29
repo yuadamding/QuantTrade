@@ -135,6 +135,10 @@ def build_massive_adaptive_profitability_authority_v1(
     """Reexecute the complete transition kernel before granting development use."""
 
     trace.validate()
+    if trace.evaluation_role != "inner_validation":
+        raise MassiveAdaptiveProfitabilityAuthorityV1Error(
+            "development profitability authority accepts inner validation only"
+        )
     rebuilt = build_massive_adaptive_profit_trace_v1(
         forecast_archive=forecast_archive,
         calibration=calibration,

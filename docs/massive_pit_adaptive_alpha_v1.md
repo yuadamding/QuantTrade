@@ -253,6 +253,32 @@ accruals are therefore part of the same replayed share ledger used by both the
 strategy and benchmark. Omitting the provider archive keeps the engineering
 path nonqualifying, and changing the archive invalidates trace replay.
 
+Inner-validation checkpoint choice is derived from a frozen-action 10/20/40
+basis-point ladder. The selection value itself remains nonauthorizing. A
+separate create-only selection authority reopens the committed choice and
+recomputes the winner from the exact candidate inventory before restoring
+runtime selection state. Consequently, an in-memory selection object cannot
+open the outer chronology. The outer inference plan additionally requires the
+replayed selection authority, its selected training checkpoint, a qualified
+outer decision tensor, and qualified decision roots before it will enumerate
+any outer-test date. A separate create-only outer forecast archive then binds
+that selection authority, the selected checkpoint, the outer plan, the outer
+tensor, and both training and outer root inventories. Promotion reruns every
+target-free outer forecast exactly; the archive still grants no profitability
+reporting, lockbox, or RL authority.
+
+Outer economic traces reuse the same compiler, next-morning execution,
+corporate/terminal-event transition, and continuous cash/share book as inner
+validation. Each fold is evaluated at $10M under a frozen-action 10/20/40
+basis-point ladder. Four-fold evidence applies a deterministic fold-cluster,
+nonwrapping 63-session moving-block bootstrap with 2,000 replicates to both
+primary net return and benchmark-relative active log return. The evidence
+must also retain nonnegative 40-bp mean performance, positive primary profit
+in at least three folds, and a monotone cost ladder. The value artifact itself
+is nonauthorizing; a create-only evidence authority reopens it and recomputes
+all four folds before it can authorize a development outer conclusion. Final
+profitability reporting, lockbox access, and RL remain false.
+
 This closes source-to-optimizer, exact restart, same-plan replay, target-free
 inner-validation inference, and the first forecast-to-book engineering slice.
 It does **not** yet qualify historical profitability: the present kernel still

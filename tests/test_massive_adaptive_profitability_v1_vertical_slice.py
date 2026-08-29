@@ -37,6 +37,10 @@ from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
     MassiveAdaptiveOuterInferencePlanV1Error,
     build_massive_adaptive_outer_inference_plan_v1,
 )
+from rl_quant.evaluation.massive_adaptive_outer_forecast_archive_v1 import (
+    MassiveAdaptiveOuterForecastArchiveV1Error,
+    materialize_massive_adaptive_outer_forecast_archive_v1,
+)
 from rl_quant.features.massive_daily_bars_v0 import MASSIVE_DAILY_BARS_V0_FIELDS
 from rl_quant.features.massive_adaptive_fill_source_v1 import adaptive_fill_clock_v1
 from rl_quant.features.massive_economic_authority_v6 import (
@@ -55,6 +59,12 @@ from rl_quant.protocol.canonical_artifact import (
 from rl_quant.training.massive_adaptive_profit_checkpoint_selection_v2 import (
     build_massive_adaptive_profit_checkpoint_candidate_v2,
     select_massive_adaptive_profit_checkpoint_v2,
+)
+from rl_quant.training.massive_adaptive_profit_checkpoint_selection_authority_v2 import (
+    MassiveAdaptiveProfitCheckpointSelectionAuthorityV2Error,
+    authorize_massive_adaptive_profit_checkpoint_selection_authority_v2,
+    materialize_massive_adaptive_profit_checkpoint_selection_authority_v2,
+    parse_massive_adaptive_profit_checkpoint_selection_authority_v2,
 )
 
 
@@ -384,6 +394,7 @@ def _fixture():
     )
     inference_plan = SimpleNamespace(
         validate=lambda: None,
+        inference_role="inner_validation",
         rows=tuple(plan_rows),
         semantic_receipt_sha256=_digest("inference-plan"),
     )
@@ -596,7 +607,7 @@ def test_provider_archive_qualifies_event_complete_book_transition(tmp_path) -> 
         )
 
 
-def test_checkpoint_selection_v2_derives_frozen_action_economics() -> None:
+def test_checkpoint_selection_v2_derives_frozen_action_economics(tmp_path) -> None:
     fixture = _fixture()
     primary = _trace(fixture, cost=20.0)
     low = _trace(fixture, cost=10.0, frozen_decision_trace=primary)
@@ -672,18 +683,68 @@ def test_checkpoint_selection_v2_derives_frozen_action_economics() -> None:
     assert selection.selected_epoch_index == 3
     assert not selection.development_checkpoint_selection_authorized
     assert not selection.outer_evaluation_authorized
+    authority = materialize_massive_adaptive_profit_checkpoint_selection_authority_v2(
+        root=tmp_path,
+        artifact_id="synthetic-selection",
+        candidates=(candidate,),
+        committed_at_ms=1,
+    )
+    assert authority.runtime_selection_replayed
+    assert not authority.development_checkpoint_selection_authorized
+    generic = parse_massive_adaptive_profit_checkpoint_selection_authority_v2(
+        root=tmp_path,
+        loaded_source=authority.loaded_source,
+    )
+    assert not generic.runtime_selection_replayed
+    assert generic.runtime_candidates is None
+    replayed = authorize_massive_adaptive_profit_checkpoint_selection_authority_v2(
+        root=tmp_path,
+        authority=generic,
+        candidates=(candidate,),
+    )
+    assert replayed.semantic_receipt_sha256 == authority.semantic_receipt_sha256
+    changed = replace(candidate, primary_dollar_net_profit=123.0)
+    changed = replace(
+        changed,
+        semantic_receipt_sha256=semantic_sha256(changed.semantic_unsigned()),
+    )
+    with pytest.raises(
+        MassiveAdaptiveProfitCheckpointSelectionAuthorityV2Error,
+        match="does not replay",
+    ):
+        authorize_massive_adaptive_profit_checkpoint_selection_authority_v2(
+            root=tmp_path,
+            authority=generic,
+            candidates=(changed,),
+        )
     with pytest.raises(
         MassiveAdaptiveOuterInferencePlanV1Error,
         match="source-qualified checkpoint selection",
     ):
         build_massive_adaptive_outer_inference_plan_v1(
-            checkpoint_selection=selection,
+            checkpoint_selection=authority,
             selected_checkpoint=checkpoint,
             decision_tensor=SimpleNamespace(validate=lambda: None),
             decision_roots=(),
             split_plan=SimpleNamespace(validate=lambda: None),
             fold_index=0,
             model_spec=SimpleNamespace(validate=lambda: None),
+        )
+    with pytest.raises(
+        MassiveAdaptiveOuterForecastArchiveV1Error,
+        match="frozen qualified selection",
+    ):
+        materialize_massive_adaptive_outer_forecast_archive_v1(
+            root=tmp_path,
+            artifact_id="forbidden-outer",
+            checkpoint_selection=authority,
+            selected_checkpoint=checkpoint,
+            training_window_plan=SimpleNamespace(validate=lambda: None),
+            outer_tensor=SimpleNamespace(validate=lambda: None),
+            outer_decision_roots=(),
+            outer_plan=SimpleNamespace(validate=lambda: None),
+            model_spec=SimpleNamespace(validate=lambda: None),
+            committed_at_ms=2,
         )
 
 

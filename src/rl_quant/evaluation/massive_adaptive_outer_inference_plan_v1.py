@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rl_quant.features.massive_adaptive_decision_root_v1 import (
     MassiveAdaptiveDecisionRootV1,
@@ -21,13 +22,15 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     assert_no_adaptive_hold_semantics,
 )
 from rl_quant.training.massive_adaptive_checkpoint_v1 import MassiveAdaptiveCheckpointV1
-from rl_quant.training.massive_adaptive_profit_checkpoint_selection_v2 import (
-    MassiveAdaptiveProfitCheckpointSelectionV2,
-)
 from rl_quant.training.massive_adaptive_split_plan_v1 import (
     MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
     MassiveAdaptiveSplitPlanV1,
 )
+
+if TYPE_CHECKING:
+    from rl_quant.training.massive_adaptive_profit_checkpoint_selection_authority_v2 import (
+        MassiveAdaptiveProfitCheckpointSelectionAuthorityV2,
+    )
 
 MASSIVE_ADAPTIVE_OUTER_INFERENCE_PLAN_V1_SCHEMA = (
     "rl-quant.massive-adaptive-outer-inference-plan-v1"
@@ -59,6 +62,7 @@ class MassiveAdaptiveOuterInferenceRowV1:
     tensor_origin_index: int
     context_session_dates: tuple[str, ...]
     context_tensor_indices: tuple[int, ...]
+    origin_output_position: int
     decision_root_receipt_sha256: str
     next_session_date: str
     next_session_schedule_receipt_sha256: str
@@ -85,6 +89,7 @@ class MassiveAdaptiveOuterInferenceRowV1:
                 )
             )
             or self.context_tensor_indices[-1] != self.tensor_origin_index
+            or self.origin_output_position != maximum_context_sessions - 1
             or self.next_session_date <= self.decision_session_date
             or self.receipt_sha256 != semantic_sha256(self.unsigned())
         ):
@@ -166,7 +171,7 @@ class MassiveAdaptiveOuterInferencePlanV1:
 
 def build_massive_adaptive_outer_inference_plan_v1(
     *,
-    checkpoint_selection: MassiveAdaptiveProfitCheckpointSelectionV2,
+    checkpoint_selection: MassiveAdaptiveProfitCheckpointSelectionAuthorityV2,
     selected_checkpoint: MassiveAdaptiveCheckpointV1,
     decision_tensor: MassiveAdaptiveDecisionTensorV1,
     decision_roots: Sequence[MassiveAdaptiveDecisionRootV1],
@@ -177,13 +182,15 @@ def build_massive_adaptive_outer_inference_plan_v1(
     """Open the complete outer chronology only after inner selection freezes."""
 
     checkpoint_selection.validate()
+    selection = checkpoint_selection.selection
     selected_checkpoint.validate()
     decision_tensor.validate()
     split_plan.validate()
     model_spec.validate()
     if (
-        not checkpoint_selection.development_checkpoint_selection_authorized
-        or checkpoint_selection.selected_checkpoint_receipt_sha256
+        not checkpoint_selection.runtime_selection_replayed
+        or not checkpoint_selection.development_checkpoint_selection_authorized
+        or selection.selected_checkpoint_receipt_sha256
         != selected_checkpoint.semantic_receipt_sha256
         or not selected_checkpoint.development_training_authorized
         or selected_checkpoint.split_plan_receipt_sha256
@@ -258,6 +265,7 @@ def build_massive_adaptive_outer_inference_plan_v1(
             "tensor_origin_index": origin,
             "context_session_dates": context_dates,
             "context_tensor_indices": context_indices,
+            "origin_output_position": maximum_context - 1,
             "decision_root_receipt_sha256": root_by_date[
                 session_date
             ].semantic_receipt_sha256,

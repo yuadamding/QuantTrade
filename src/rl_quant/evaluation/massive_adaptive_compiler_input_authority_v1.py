@@ -17,6 +17,12 @@ from rl_quant.evaluation.massive_adaptive_forecast_calibration_v1 import (
 from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
     MassiveAdaptiveInferenceRowV1,
 )
+from rl_quant.evaluation.massive_adaptive_outer_forecast_archive_v1 import (
+    MassiveAdaptiveOuterForecastArchiveV1,
+)
+from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
+    MassiveAdaptiveOuterInferenceRowV1,
+)
 from rl_quant.execution.massive_adaptive_economic_book_v1 import (
     MassiveAdaptiveEconomicBookV1,
 )
@@ -45,7 +51,10 @@ MASSIVE_ADAPTIVE_COMPILER_INPUT_AUTHORITY_V1_SCHEMA = (
 )
 MASSIVE_ADAPTIVE_COMPILER_INPUT_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
     {
-        "forecast": "replayed-inner-validation-v2-plus-training-calibration-v1",
+        "forecast": (
+            "replayed-inner-validation-v2-or-selection-gated-outer-v1"
+            "-plus-training-calibration-v1"
+        ),
         "book": "continuous-cash-share-book-v1",
         "risk": "causal-63-session-shrunk-close-return-covariance",
         "liquidity": "causal-63-session-mean-dollar-volume",
@@ -227,12 +236,14 @@ def _causal_risk_and_liquidity(
 
 def build_massive_adaptive_compiler_input_authority_v1(
     *,
-    forecast_archive: MassiveAdaptiveForecastArchiveV2,
+    forecast_archive: (
+        MassiveAdaptiveForecastArchiveV2 | MassiveAdaptiveOuterForecastArchiveV1
+    ),
     forecast_row: MassiveAdaptiveForecastRowV2,
     calibration: MassiveAdaptiveForecastCalibrationV1,
     decision_root: MassiveAdaptiveDecisionRootV1,
     context_origin: MassiveAdaptiveContextOriginAuthorityV1,
-    inference_row: MassiveAdaptiveInferenceRowV1,
+    inference_row: MassiveAdaptiveInferenceRowV1 | MassiveAdaptiveOuterInferenceRowV1,
     book: MassiveAdaptiveEconomicBookV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
@@ -384,18 +395,26 @@ def build_massive_adaptive_compiler_input_authority_v1(
             identity_authority.receipt_sha256,
         )
     )
-    source_qualified = bool(
+    archive_qualified = bool(
         isinstance(forecast_archive, MassiveAdaptiveForecastArchiveV2)
+        and forecast_archive.development_forecast_authorized
+        or isinstance(forecast_archive, MassiveAdaptiveOuterForecastArchiveV1)
+        and forecast_archive.outer_forecast_authorized
+    )
+    source_qualified = bool(
+        archive_qualified
         and isinstance(calibration, MassiveAdaptiveForecastCalibrationV1)
         and isinstance(decision_root, MassiveAdaptiveDecisionRootV1)
         and isinstance(context_origin, MassiveAdaptiveContextOriginAuthorityV1)
-        and isinstance(inference_row, MassiveAdaptiveInferenceRowV1)
+        and isinstance(
+            inference_row,
+            (MassiveAdaptiveInferenceRowV1, MassiveAdaptiveOuterInferenceRowV1),
+        )
         and isinstance(book, MassiveAdaptiveEconomicBookV1)
         and isinstance(
             daily_input_authority, MassiveProfitabilityDailyInputAuthorityV1
         )
         and isinstance(identity_authority, PITSecurityUniverseAuthority)
-        and forecast_archive.development_forecast_authorized
         and calibration.development_calibration_authorized
         and decision_root.source_data_qualified
         and daily_input_authority.daily_input_data_qualified

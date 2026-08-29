@@ -19,6 +19,12 @@ from rl_quant.evaluation.massive_adaptive_forecast_calibration_v1 import (
 from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
     MassiveAdaptiveInferencePlanV1,
 )
+from rl_quant.evaluation.massive_adaptive_outer_forecast_archive_v1 import (
+    MassiveAdaptiveOuterForecastArchiveV1,
+)
+from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
+    MassiveAdaptiveOuterInferencePlanV1,
+)
 from rl_quant.evaluation.massive_adaptive_compiler_input_authority_v1 import (
     build_massive_adaptive_compiler_input_authority_v1,
 )
@@ -87,7 +93,8 @@ MASSIVE_ADAPTIVE_PROFIT_TRACE_V1_SPEC_SHA256 = semantic_sha256(
         "caller_returns": False,
         "target_access": False,
         "reporting": False,
-        "outer": False,
+        "roles": ("inner_validation", "outer_test"),
+        "outer": "trace-only-no-reporting-authority",
         "lockbox": False,
         "rl": False,
     }
@@ -187,6 +194,7 @@ class MassiveAdaptiveProfitTraceRowV1:
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveProfitTraceV1:
     rows: tuple[MassiveAdaptiveProfitTraceRowV1, ...]
+    evaluation_role: str
     forecast_archive_receipt_sha256: str
     calibration_receipt_sha256: str
     inference_plan_receipt_sha256: str
@@ -234,6 +242,7 @@ class MassiveAdaptiveProfitTraceV1:
         if (
             self.schema != MASSIVE_ADAPTIVE_PROFIT_TRACE_V1_SCHEMA
             or not self.rows
+            or self.evaluation_role not in {"inner_validation", "outer_test"}
             or tuple(row.decision_session_date for row in self.rows)
             != tuple(sorted(set(row.decision_session_date for row in self.rows)))
             or self.row_inventory_sha256
@@ -314,9 +323,11 @@ def _decision_marks(
 
 def build_massive_adaptive_profit_trace_v1(
     *,
-    forecast_archive: MassiveAdaptiveForecastArchiveV2,
+    forecast_archive: (
+        MassiveAdaptiveForecastArchiveV2 | MassiveAdaptiveOuterForecastArchiveV1
+    ),
     calibration: MassiveAdaptiveForecastCalibrationV1,
-    inference_plan: MassiveAdaptiveInferencePlanV1,
+    inference_plan: MassiveAdaptiveInferencePlanV1 | MassiveAdaptiveOuterInferencePlanV1,
     decision_roots: Sequence[MassiveAdaptiveDecisionRootV1],
     context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
     fill_source: MassiveAdaptiveFillSourceV1,
@@ -339,10 +350,29 @@ def build_massive_adaptive_profit_trace_v1(
     identity_authority.validate()
     if economic_event_archive is not None:
         economic_event_archive.validate()
+    if isinstance(inference_plan, MassiveAdaptiveOuterInferencePlanV1):
+        evaluation_role = "outer_test"
+        compatible_forecast = isinstance(
+            forecast_archive, MassiveAdaptiveOuterForecastArchiveV1
+        )
+    elif getattr(inference_plan, "inference_role", None) == "inner_validation":
+        evaluation_role = "inner_validation"
+        compatible_forecast = not isinstance(
+            forecast_archive, MassiveAdaptiveOuterForecastArchiveV1
+        )
+    else:  # pragma: no cover - closed by the annotated public surface
+        raise MassiveAdaptiveProfitTraceV1Error(
+            "adaptive profit inference plan type is unsupported"
+        )
+    if not compatible_forecast:
+        raise MassiveAdaptiveProfitTraceV1Error(
+            "forecast archive and economic evaluation role differ"
+        )
     if frozen_decision_trace is not None:
         frozen_decision_trace.validate()
         if (
             frozen_decision_trace.frozen_actions_replayed
+            or frozen_decision_trace.evaluation_role != evaluation_role
             or frozen_decision_trace.inference_plan_receipt_sha256
             != inference_plan.semantic_receipt_sha256
             or frozen_decision_trace.fill_source_receipt_sha256
@@ -632,10 +662,18 @@ def build_massive_adaptive_profit_trace_v1(
         book = execution.posttrade_book
         benchmark_book = benchmark_execution.posttrade_book
     economic_event_transition_qualified = all_event_qualified
-    source_qualified = bool(
+    archive_and_plan_qualified = bool(
         isinstance(forecast_archive, MassiveAdaptiveForecastArchiveV2)
-        and isinstance(calibration, MassiveAdaptiveForecastCalibrationV1)
         and isinstance(inference_plan, MassiveAdaptiveInferencePlanV1)
+        and forecast_archive.development_forecast_authorized
+        or isinstance(forecast_archive, MassiveAdaptiveOuterForecastArchiveV1)
+        and isinstance(inference_plan, MassiveAdaptiveOuterInferencePlanV1)
+        and forecast_archive.outer_forecast_authorized
+        and inference_plan.outer_inference_authorized
+    )
+    source_qualified = bool(
+        archive_and_plan_qualified
+        and isinstance(calibration, MassiveAdaptiveForecastCalibrationV1)
         and all(isinstance(root, MassiveAdaptiveDecisionRootV1) for root in decision_roots)
         and all(
             isinstance(context, MassiveAdaptiveContextOriginAuthorityV1)
@@ -679,6 +717,7 @@ def build_massive_adaptive_profit_trace_v1(
     body = {
         "schema": MASSIVE_ADAPTIVE_PROFIT_TRACE_V1_SCHEMA,
         "rows": tuple(rows),
+        "evaluation_role": evaluation_role,
         "forecast_archive_receipt_sha256": forecast_archive.semantic_receipt_sha256,
         "calibration_receipt_sha256": calibration.semantic_receipt_sha256,
         "inference_plan_receipt_sha256": inference_plan.semantic_receipt_sha256,
@@ -781,9 +820,11 @@ def authorize_massive_adaptive_profit_trace_v1(
     *,
     root: str | Path,
     trace: MassiveAdaptiveProfitTraceV1,
-    forecast_archive: MassiveAdaptiveForecastArchiveV2,
+    forecast_archive: (
+        MassiveAdaptiveForecastArchiveV2 | MassiveAdaptiveOuterForecastArchiveV1
+    ),
     calibration: MassiveAdaptiveForecastCalibrationV1,
-    inference_plan: MassiveAdaptiveInferencePlanV1,
+    inference_plan: MassiveAdaptiveInferencePlanV1 | MassiveAdaptiveOuterInferencePlanV1,
     decision_roots: Sequence[MassiveAdaptiveDecisionRootV1],
     context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
     fill_source: MassiveAdaptiveFillSourceV1,
@@ -838,9 +879,11 @@ def materialize_massive_adaptive_profit_trace_v1(
     *,
     root: str | Path,
     artifact_id: str,
-    forecast_archive: MassiveAdaptiveForecastArchiveV2,
+    forecast_archive: (
+        MassiveAdaptiveForecastArchiveV2 | MassiveAdaptiveOuterForecastArchiveV1
+    ),
     calibration: MassiveAdaptiveForecastCalibrationV1,
-    inference_plan: MassiveAdaptiveInferencePlanV1,
+    inference_plan: MassiveAdaptiveInferencePlanV1 | MassiveAdaptiveOuterInferencePlanV1,
     decision_roots: Sequence[MassiveAdaptiveDecisionRootV1],
     context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
     fill_source: MassiveAdaptiveFillSourceV1,

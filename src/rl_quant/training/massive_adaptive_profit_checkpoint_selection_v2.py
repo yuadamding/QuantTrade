@@ -170,6 +170,7 @@ def build_massive_adaptive_profit_checkpoint_candidate_v2(
             != forecast_archive.semantic_receipt_sha256
             for trace in traces
         )
+        or any(trace.evaluation_role != "inner_validation" for trace in traces)
         or len({trace.inference_plan_receipt_sha256 for trace in traces}) != 1
         or len({trace.fill_source_receipt_sha256 for trace in traces}) != 1
         or len({trace.daily_input_receipt_sha256 for trace in traces}) != 1
@@ -318,7 +319,6 @@ class MassiveAdaptiveProfitCheckpointSelectionV2:
             or self.selected_epoch_index not in self.eligible_epoch_indices
             or not isinstance(self.source_data_qualified, bool)
             or self.development_checkpoint_selection_authorized
-            != self.source_data_qualified
             or self.outer_evaluation_authorized
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
@@ -379,7 +379,7 @@ def select_massive_adaptive_profit_checkpoint_v2(
     result = MassiveAdaptiveProfitCheckpointSelectionV2(
         **body,  # type: ignore[arg-type]
         semantic_receipt_sha256=semantic_sha256(body),
-        development_checkpoint_selection_authorized=source_qualified,
+        development_checkpoint_selection_authorized=False,
     )
     result.validate()
     return result
