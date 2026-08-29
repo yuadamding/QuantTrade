@@ -33,20 +33,29 @@ jobs:
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2
 
-  llm-imports:
+  adaptive-components:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install CPU + LLM dependencies (no model download)
+      - name: Install CPU test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[dev,llm]"
-      - name: Import-only smoke for LLM scripts (no model weights fetched)
-        run: |
-          python -m compileall -q scripts
-          python scripts/generate_qwen_news_precomputed.py --help
-          python scripts/build_news_llm_features.py --help
+          python -m pip install -e ".[dev,data]"
+      - name: Adaptive alpha and compiler qualification
+        run: >-
+          python -m pytest -q
+          tests/test_massive_adaptive_alpha_protocol.py
+          tests/test_adaptive_alpha_no_hold_dependency.py
+          tests/test_adaptive_alpha_term_structure_v1.py
+          tests/test_massive_adaptive_alpha_targets_v1.py
+          tests/test_massive_adaptive_origin_authority_v1.py
+          tests/test_massive_adaptive_source_targets_v1.py
+          tests/test_massive_adaptive_decision_tensor_v1.py
+          tests/test_adaptive_alpha_supervised_v1.py
+          tests/test_massive_adaptive_portfolio_compiler_v1.py
+          tests/test_adaptive_alpha_profit_checkpoint_selection_v1.py
+          tests/test_no_feature_engineering.py

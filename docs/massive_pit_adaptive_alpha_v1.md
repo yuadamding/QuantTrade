@@ -120,6 +120,31 @@ expert, router, pretraining, and long-context components. Only `AD11` is
 initially promotion eligible. Elastic net, histogram gradient boosting,
 momentum/reversal, and bars-only models remain mandatory external baselines.
 
+## Current implementation boundary
+
+The package now includes a create-only
+`MassiveAdaptiveDecisionTensorV1` model-input commitment. It constructs one
+deterministic permanent-security axis from committed Feature V3 rows,
+separates context membership from the package-owned action mask, preserves
+bars and tape missingness independently, carries the committed source
+staleness channel, and binds exact float32 per-decision array hashes. A generic
+reload has no tensors and no model-input authority; package promotion rebuilds
+all arrays from the exact Feature V3 and adaptive-origin inventories.
+
+`build_massive_adaptive_alpha_training_batch_v2()` then maps source-derived
+targets from each changing PIT action set onto that stable context axis. It
+derives the action-mask benchmark and B01 benchmark return internally and
+leaves context-only securities explicitly target-missing. This removes the V1
+assumption that context and action security axes are identical.
+
+This closes direct caller-supplied model-input tensor substitution relative to
+those committed roots, but deliberately does not authorize training. Historical
+adaptive training still requires a source-reconciled dual-universe inventory,
+target/split authority with a
+126-session purge, a package-owned optimizer/checkpoint path, and the
+chronological compiler/economic simulator. Intraday path tensors are not yet
+materialized by this V1 artifact.
+
 ## Evidence boundary
 
 Documentation and local tests are design evidence only. A reportable result
