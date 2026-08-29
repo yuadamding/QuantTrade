@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from rl_quant.alpha.contracts import CorporateActionKind
+from rl_quant.alpha.contracts import CorporateActionKind, TerminalEventKind
 from rl_quant.alpha.pit_universe import (
     ListingEventRecord,
     PITSecurityUniverseAuthority,
@@ -20,6 +21,13 @@ from rl_quant.data_sources.massive.source_receipts import (
     load_massive_source_bundle,
     publish_massive_source_object,
 )
+from rl_quant.evaluation.massive_adaptive_economic_event_transition_v1 import (
+    MassiveAdaptiveEconomicEventTransitionV1Error,
+    apply_massive_adaptive_postfill_events_v1,
+    apply_massive_adaptive_prefill_events_v1,
+    build_massive_adaptive_economic_event_transition_v1,
+)
+from rl_quant.features.massive_adaptive_fill_source_v1 import adaptive_fill_clock_v1
 from rl_quant.features.massive_economic_authority_v6 import (
     MASSIVE_ECONOMIC_AUTHORITY_V6_HISTORICAL_PANEL_AUTHORIZED,
     MASSIVE_ECONOMIC_AUTHORITY_V6_PREDICTIVE_TRAINING_AUTHORIZED,
@@ -145,12 +153,19 @@ def _corporate(
     status: str = "active",
     successor_security_id: str | None = None,
     successor_ratio: float = 0.0,
+    kind: CorporateActionKind | None = None,
+    share_ratio: float = 1.0,
 ) -> dict[str, object]:
-    kind = (
-        CorporateActionKind.SPIN_OFF.value
+    resolved_kind = kind or (
+        CorporateActionKind.SPIN_OFF
         if successor_security_id is not None
-        else CorporateActionKind.CASH_DIVIDEND.value
+        else CorporateActionKind.CASH_DIVIDEND
     )
+    effective_field = {
+        CorporateActionKind.CASH_DIVIDEND: "ex_dividend_at_ms",
+        CorporateActionKind.SPIN_OFF: "entitlement_at_ms",
+        CorporateActionKind.SPLIT: "execution_at_ms",
+    }[resolved_kind]
     return {
         "provider_request_id": "request-corporate",
         "provider_event_key": provider_event_key,
@@ -160,15 +175,11 @@ def _corporate(
         "provider_available_at_ms": available_at_ms,
         "provider_row_locator": f"corporate/{provider_event_key}/{provider_revision_id}",
         "provider_record": {
-            "kind": kind,
+            "kind": resolved_kind.value,
             "security_id": security_id,
-            (
-                "entitlement_at_ms"
-                if successor_security_id is not None
-                else "ex_dividend_at_ms"
-            ): effective_at_ms,
+            effective_field: effective_at_ms,
             "cash_per_share": cash_per_share,
-            "share_ratio": 1.0,
+            "share_ratio": share_ratio,
             "successor_security_id": successor_security_id,
             "successor_ratio": successor_ratio,
             "affected_fraction": 1.0,
@@ -194,6 +205,49 @@ def _order(
     }
 
 
+def _terminal(
+    *,
+    provider_event_key: str,
+    security_id: str,
+    effective_at_ms: int,
+    available_at_ms: int,
+) -> dict[str, object]:
+    return {
+        "provider_request_id": "request-terminal",
+        "provider_event_key": provider_event_key,
+        "provider_revision_id": "r0",
+        "supersedes_provider_revision_id": None,
+        "revision_status": "active",
+        "provider_available_at_ms": available_at_ms,
+        "provider_row_locator": f"terminal/{provider_event_key}/r0",
+        "provider_record": {
+            "kind": TerminalEventKind.WORTHLESS.value,
+            "security_id": security_id,
+            "zero_value_effective_at_ms": effective_at_ms,
+            "cash_per_share": 0.0,
+            "successor_security_id": None,
+            "successor_ratio": 0.0,
+        },
+    }
+
+
+def _cash_return(*, effective_at_ms: int, available_at_ms: int) -> dict[str, object]:
+    return {
+        "provider_request_id": "request-cash",
+        "provider_event_key": "CASH-RETURN-1",
+        "provider_revision_id": "r0",
+        "supersedes_provider_revision_id": None,
+        "revision_status": "active",
+        "provider_available_at_ms": available_at_ms,
+        "provider_row_locator": "cash/CASH-RETURN-1/r0",
+        "provider_record": {
+            "kind": "cash-return",
+            "accrual_period_end_at_ms": effective_at_ms,
+            "one_step_return": 0.01,
+        },
+    }
+
+
 def _publish(
     root: Path,
     *,
@@ -207,6 +261,16 @@ def _publish(
         "cash-returns": "request-cash",
         "economic-order-observations": "request-order",
     }[source_kind]
+    availability = tuple(
+        int(
+            row.get(
+                "provider_available_at_ms",
+                row.get("provider_order_available_at_ms", 0),
+            )
+        )
+        for row in records
+    )
+    observed_at_ms = max((OBSERVED_AT_MS, *availability))
     payload = {
         "schema": MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_SCHEMA,
         "source_kind": source_kind,
@@ -215,7 +279,7 @@ def _publish(
         "provider_endpoint": "https://api.massive.example/reference",
         "query_start_at_ms": 0,
         "query_end_at_ms": 9_000,
-        "provider_observed_at_ms": OBSERVED_AT_MS,
+        "provider_observed_at_ms": observed_at_ms,
         "provider_request_ids": [request_id],
         "pagination_complete": True,
         "page_count": 1,
@@ -231,18 +295,18 @@ def _publish(
         relative_payload_path=relative,
         dataset_id=MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_DATASETS[source_kind],
         source_object_key=relative,
-        requested_at_ms=OBSERVED_AT_MS - 1,
-        downloaded_at_ms=OBSERVED_AT_MS,
+        requested_at_ms=observed_at_ms - 1,
+        downloaded_at_ms=observed_at_ms,
         schema_sha256=MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_SOURCE_SCHEMA_SHA256,
         entitlement_receipt_sha256=DIGEST,
-        committed_at_ms=OBSERVED_AT_MS,
+        committed_at_ms=observed_at_ms,
         etag=semantic_sha256((source_kind, suffix, records)),
         request_id=request_id,
     )
     return load_massive_source_bundle(
         root=root,
         relative_payload_path=relative,
-        verified_at_ms=OBSERVED_AT_MS,
+        verified_at_ms=observed_at_ms,
     )
 
 
@@ -250,6 +314,8 @@ def _archive(
     root: Path,
     *,
     corporate: list[dict[str, object]],
+    terminal: list[dict[str, object]] | None = None,
+    cash: list[dict[str, object]] | None = None,
     orders: list[dict[str, object]] | None = None,
     suffix: str = "base",
     reverse_rows: bool = False,
@@ -258,8 +324,8 @@ def _archive(
     identity = _identity()
     by_role = {
         "corporate-actions": list(corporate),
-        "terminal-outcomes": [],
-        "cash-returns": [],
+        "terminal-outcomes": list(terminal or []),
+        "cash-returns": list(cash or []),
         "economic-order-observations": list(orders or []),
     }
     if reverse_rows:
@@ -714,3 +780,108 @@ def test_order_receipt_substitution_fails(tmp_path: Path) -> None:
     )
     with pytest.raises(MassiveEconomicAuthorityV6Error, match="order evidence receipt"):
         tampered.validate()
+
+
+def test_adaptive_event_transition_repairs_split_dividend_terminal_and_cash(
+    tmp_path: Path,
+) -> None:
+    fill_date = "2024-01-03"
+    prior_date = "2024-01-02"
+    fill_start, fill_end = adaptive_fill_clock_v1(fill_date)
+    prior_close = fill_start - 18 * 60 * 60 * 1_000
+    fill_close = fill_end + 6 * 60 * 60 * 1_000
+    corporate = [
+        _corporate(
+            provider_event_key="SPLIT-A",
+            provider_revision_id="r0",
+            security_id="SEC-A",
+            effective_at_ms=fill_start - 1_000,
+            available_at_ms=fill_start - 2_000,
+            cash_per_share=0.0,
+            kind=CorporateActionKind.SPLIT,
+            share_ratio=2.0,
+        ),
+        _corporate(
+            provider_event_key="DIV-A",
+            provider_revision_id="r0",
+            security_id="SEC-A",
+            effective_at_ms=fill_end + 1_000,
+            available_at_ms=fill_end,
+            cash_per_share=1.0,
+        ),
+    ]
+    terminal = [
+        _terminal(
+            provider_event_key="WORTHLESS-C",
+            security_id="SEC-C",
+            effective_at_ms=fill_end + 2_000,
+            available_at_ms=fill_end + 1_000,
+        )
+    ]
+    cash = [
+        _cash_return(
+            effective_at_ms=fill_end + 3_000,
+            available_at_ms=fill_end + 2_000,
+        )
+    ]
+    identity, archive, _ = _archive(
+        tmp_path,
+        corporate=corporate,
+        terminal=terminal,
+        cash=cash,
+        suffix="adaptive-transition",
+    )
+    daily = SimpleNamespace(
+        validate=lambda: None,
+        sessions=(
+            SimpleNamespace(
+                source_session_date=prior_date,
+                regular_close_at_ms=prior_close,
+            ),
+            SimpleNamespace(
+                source_session_date=fill_date,
+                regular_close_at_ms=fill_close,
+            ),
+        ),
+    )
+    transition = build_massive_adaptive_economic_event_transition_v1(
+        prior_session_date=prior_date,
+        fill_session_date=fill_date,
+        provider_archive=archive,
+        daily_input_authority=daily,
+        identity_authority=identity,
+    )
+    assert len(transition.prefill_events) == 1
+    assert len(transition.postfill_events) == 3
+
+    shares, cash_after_prefill, requested = (
+        apply_massive_adaptive_prefill_events_v1(
+            transition=transition,
+            existing_shares={"SEC-A": 10.0, "SEC-C": 5.0},
+            cash=100.0,
+            requested_shares={"SEC-A": 5.0, "SEC-C": -5.0},
+        )
+    )
+    assert shares == {"SEC-A": 20.0, "SEC-C": 5.0}
+    assert cash_after_prefill == 100.0
+    assert requested == {"SEC-A": 10.0, "SEC-C": -5.0}
+
+    final_shares, final_cash = apply_massive_adaptive_postfill_events_v1(
+        transition=transition,
+        shares={"SEC-A": 30.0, "SEC-C": 5.0},
+        cash=100.0,
+    )
+    assert final_shares == {"SEC-A": 30.0}
+    assert final_cash == pytest.approx(131.3)
+
+    with pytest.raises(
+        MassiveAdaptiveEconomicEventTransitionV1Error,
+        match="archive|authority|receipt",
+    ):
+        build_massive_adaptive_economic_event_transition_v1(
+            prior_session_date=prior_date,
+            fill_session_date=fill_date,
+            provider_archive=replace(archive, receipt_sha256="f" * 64),
+            daily_input_authority=daily,
+            identity_authority=identity,
+        )

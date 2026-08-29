@@ -385,7 +385,17 @@ def build_massive_adaptive_compiler_input_authority_v1(
         )
     )
     source_qualified = bool(
-        forecast_archive.development_forecast_authorized
+        isinstance(forecast_archive, MassiveAdaptiveForecastArchiveV2)
+        and isinstance(calibration, MassiveAdaptiveForecastCalibrationV1)
+        and isinstance(decision_root, MassiveAdaptiveDecisionRootV1)
+        and isinstance(context_origin, MassiveAdaptiveContextOriginAuthorityV1)
+        and isinstance(inference_row, MassiveAdaptiveInferenceRowV1)
+        and isinstance(book, MassiveAdaptiveEconomicBookV1)
+        and isinstance(
+            daily_input_authority, MassiveProfitabilityDailyInputAuthorityV1
+        )
+        and isinstance(identity_authority, PITSecurityUniverseAuthority)
+        and forecast_archive.development_forecast_authorized
         and calibration.development_calibration_authorized
         and decision_root.source_data_qualified
         and daily_input_authority.daily_input_data_qualified

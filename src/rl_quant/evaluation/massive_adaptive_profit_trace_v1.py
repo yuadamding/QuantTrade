@@ -22,6 +22,9 @@ from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
 from rl_quant.evaluation.massive_adaptive_compiler_input_authority_v1 import (
     build_massive_adaptive_compiler_input_authority_v1,
 )
+from rl_quant.evaluation.massive_adaptive_economic_event_transition_v1 import (
+    build_massive_adaptive_economic_event_transition_v1,
+)
 from rl_quant.execution.massive_adaptive_economic_book_v1 import (
     build_massive_adaptive_economic_book_v1,
     build_massive_adaptive_holding_v1,
@@ -47,6 +50,9 @@ from rl_quant.features.massive_adaptive_fill_source_v1 import (
     MassiveAdaptiveFillSourceV1,
 )
 from rl_quant.features.massive_daily_bars_v0 import MASSIVE_DAILY_BARS_V0_FIELDS
+from rl_quant.features.massive_economic_authority_v6 import (
+    MassiveProviderEconomicArchiveAuthorityV6,
+)
 from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
     MassiveProfitabilityDailyInputAuthorityV1,
 )
@@ -99,6 +105,9 @@ class MassiveAdaptiveProfitTraceRowV1:
     forecast_row_receipt_sha256: str
     compiler_input_authority_receipt_sha256: str
     compiler_decision_receipt_sha256: str
+    decision_security_ids: tuple[str, ...]
+    decision_target_weights: tuple[float, ...]
+    decision_target_receipt_sha256: str
     order_intent_receipt_sha256: str
     execution_receipt_sha256: str
     benchmark_order_intent_receipt_sha256: str
@@ -146,6 +155,18 @@ class MassiveAdaptiveProfitTraceRowV1:
             not self.decision_session_date
             or self.fill_session_date <= self.decision_session_date
             or any(not math.isfinite(value) for value in values)
+            or self.decision_security_ids
+            != tuple(sorted(set(self.decision_security_ids)))
+            or len(self.decision_security_ids) != len(self.decision_target_weights)
+            or any(
+                not math.isfinite(value) or value < 0.0
+                for value in self.decision_target_weights
+            )
+            or sum(self.decision_target_weights) > 1.0 + 1.0e-8
+            or self.decision_target_receipt_sha256
+            != semantic_sha256(
+                (self.decision_security_ids, self.decision_target_weights)
+            )
             or min(
                 self.pretrade_equity,
                 self.posttrade_equity,
@@ -172,6 +193,9 @@ class MassiveAdaptiveProfitTraceV1:
     fill_source_receipt_sha256: str
     daily_input_receipt_sha256: str
     identity_authority_receipt_sha256: str
+    economic_event_authority_inventory_sha256: str
+    frozen_decision_trace_receipt_sha256: str | None
+    frozen_actions_replayed: bool
     compiler_config_receipt_sha256: str
     initial_capital: float
     transaction_cost_basis_points: float
@@ -214,9 +238,13 @@ class MassiveAdaptiveProfitTraceV1:
             != tuple(sorted(set(row.decision_session_date for row in self.rows)))
             or self.row_inventory_sha256
             != semantic_sha256(tuple(row.receipt_sha256 for row in self.rows))
+            or not isinstance(self.economic_event_transition_qualified, bool)
+            or not isinstance(self.frozen_actions_replayed, bool)
+            or self.frozen_actions_replayed
+            != (self.frozen_decision_trace_receipt_sha256 is not None)
             or not isinstance(self.source_data_qualified, bool)
-            or self.economic_event_transition_qualified
             or self.source_data_qualified
+            and not self.economic_event_transition_qualified
             or not isinstance(self.deterministic_profitability_replayed, bool)
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
@@ -294,6 +322,8 @@ def build_massive_adaptive_profit_trace_v1(
     fill_source: MassiveAdaptiveFillSourceV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    economic_event_archive: MassiveProviderEconomicArchiveAuthorityV6 | None = None,
+    frozen_decision_trace: MassiveAdaptiveProfitTraceV1 | None = None,
     initial_capital: float,
     transaction_cost_basis_points: float = 20.0,
     maximum_fill_participation: float = 0.02,
@@ -307,6 +337,27 @@ def build_massive_adaptive_profit_trace_v1(
     fill_source.validate()
     daily_input_authority.validate()
     identity_authority.validate()
+    if economic_event_archive is not None:
+        economic_event_archive.validate()
+    if frozen_decision_trace is not None:
+        frozen_decision_trace.validate()
+        if (
+            frozen_decision_trace.frozen_actions_replayed
+            or frozen_decision_trace.inference_plan_receipt_sha256
+            != inference_plan.semantic_receipt_sha256
+            or frozen_decision_trace.fill_source_receipt_sha256
+            != fill_source.semantic_receipt_sha256
+            or frozen_decision_trace.daily_input_receipt_sha256
+            != daily_input_authority.semantic_receipt_sha256
+            or frozen_decision_trace.identity_authority_receipt_sha256
+            != identity_authority.receipt_sha256
+            or frozen_decision_trace.initial_capital != initial_capital
+            or transaction_cost_basis_points
+            == frozen_decision_trace.transaction_cost_basis_points
+        ):
+            raise MassiveAdaptiveProfitTraceV1Error(
+                "frozen action trace has incompatible economic roots or cost rung"
+            )
     if (
         forecast_archive.runtime_rows is None
         or not forecast_archive.runtime_forecasts_replayed
@@ -319,6 +370,11 @@ def build_massive_adaptive_profit_trace_v1(
     forecast_by_date = {
         row.decision_session_date: row for row in forecast_archive.runtime_rows
     }
+    frozen_by_date = (
+        {}
+        if frozen_decision_trace is None
+        else {row.decision_session_date: row for row in frozen_decision_trace.rows}
+    )
     if tuple(forecast_by_date) != tuple(
         row.decision_session_date for row in inference_plan.rows
     ):
@@ -382,6 +438,7 @@ def build_massive_adaptive_profit_trace_v1(
     )
     rows: list[MassiveAdaptiveProfitTraceRowV1] = []
     all_compiler_qualified = True
+    all_event_qualified = economic_event_archive is not None
     for plan_row in inference_plan.rows:
         forecast_row = forecast_by_date[plan_row.decision_session_date]
         root = root_by_date[plan_row.decision_session_date]
@@ -399,15 +456,31 @@ def build_massive_adaptive_profit_trace_v1(
         )
         assert authority.runtime_inputs is not None
         all_compiler_qualified &= authority.development_compiler_authorized
-        decision = compile_massive_adaptive_portfolio_v1(
-            authority.runtime_inputs, config=config
+        decision = (
+            compile_massive_adaptive_portfolio_v1(authority.runtime_inputs, config=config)
+            if frozen_decision_trace is None
+            else None
         )
+        if decision is None:
+            try:
+                frozen_row = frozen_by_date[plan_row.decision_session_date]
+            except KeyError as exc:
+                raise MassiveAdaptiveProfitTraceV1Error(
+                    "frozen action trace does not cover the profit chronology"
+                ) from exc
+            decision_security_ids = frozen_row.decision_security_ids
+            decision_target_weights = frozen_row.decision_target_weights
+            compiler_decision_receipt = frozen_row.compiler_decision_receipt_sha256
+        else:
+            decision_security_ids = decision.security_ids
+            decision_target_weights = decision.target_weights
+            compiler_decision_receipt = decision.semantic_receipt_sha256
         required = tuple(
             security_id
             for security_id, target, current in zip(
-                decision.security_ids,
-                decision.target_weights,
-                authority.runtime_inputs.pretrade_weights,
+                decision_security_ids,
+                decision_target_weights,
+                book.weights(decision_security_ids),
                 strict=True,
             )
             if target > 1.0e-12 or current > 1.0e-12
@@ -421,19 +494,42 @@ def build_massive_adaptive_profit_trace_v1(
             raise MassiveAdaptiveProfitTraceV1Error(
                 "a requested or held security lacks a decision-close mark"
             )
-        intent = build_massive_adaptive_order_intent_v1(
-            book=book,
-            decision=decision,
-            scheduled_fill_session_date=plan_row.next_session_date,
-            decision_marks=marks,
-            decision_mark_receipts=mark_receipts,
+        intent = (
+            build_massive_adaptive_order_intent_v1(
+                book=book,
+                decision=decision,
+                scheduled_fill_session_date=plan_row.next_session_date,
+                decision_marks=marks,
+                decision_mark_receipts=mark_receipts,
+            )
+            if decision is not None
+            else build_massive_adaptive_target_order_intent_v1(
+                decision_session_date=plan_row.decision_session_date,
+                scheduled_fill_session_date=plan_row.next_session_date,
+                book=book,
+                security_ids=decision_security_ids,
+                target_weights=decision_target_weights,
+                target_receipt_sha256=compiler_decision_receipt,
+                decision_marks=marks,
+                decision_mark_receipts=mark_receipts,
+            )
         )
+        transition = None
+        if economic_event_archive is not None:
+            transition = build_massive_adaptive_economic_event_transition_v1(
+                prior_session_date=plan_row.decision_session_date,
+                fill_session_date=plan_row.next_session_date,
+                provider_archive=economic_event_archive,
+                daily_input_authority=daily_input_authority,
+                identity_authority=identity_authority,
+            )
         execution = execute_massive_adaptive_order_intent_v1(
             order_intent=intent,
             book=book,
             fill_source=fill_source,
             daily_input_authority=daily_input_authority,
             identity_authority=identity_authority,
+            economic_event_transition=transition,
             transaction_cost_basis_points=transaction_cost_basis_points,
             maximum_fill_participation=maximum_fill_participation,
         )
@@ -480,6 +576,7 @@ def build_massive_adaptive_profit_trace_v1(
             fill_source=fill_source,
             daily_input_authority=daily_input_authority,
             identity_authority=identity_authority,
+            economic_event_transition=transition,
             transaction_cost_basis_points=transaction_cost_basis_points,
             maximum_fill_participation=maximum_fill_participation,
         )
@@ -497,7 +594,12 @@ def build_massive_adaptive_profit_trace_v1(
             "fill_session_date": plan_row.next_session_date,
             "forecast_row_receipt_sha256": forecast_row.receipt_sha256,
             "compiler_input_authority_receipt_sha256": authority.semantic_receipt_sha256,
-            "compiler_decision_receipt_sha256": decision.semantic_receipt_sha256,
+            "compiler_decision_receipt_sha256": compiler_decision_receipt,
+            "decision_security_ids": decision_security_ids,
+            "decision_target_weights": decision_target_weights,
+            "decision_target_receipt_sha256": semantic_sha256(
+                (decision_security_ids, decision_target_weights)
+            ),
             "order_intent_receipt_sha256": intent.semantic_receipt_sha256,
             "execution_receipt_sha256": execution.semantic_receipt_sha256,
             "benchmark_order_intent_receipt_sha256": benchmark_intent.semantic_receipt_sha256,
@@ -523,14 +625,35 @@ def build_massive_adaptive_profit_trace_v1(
         )
         trace_row.validate()
         rows.append(trace_row)
+        all_event_qualified &= bool(
+            execution.economic_event_transition_qualified
+            and benchmark_execution.economic_event_transition_qualified
+        )
         book = execution.posttrade_book
         benchmark_book = benchmark_execution.posttrade_book
-    # V1 deliberately fails closed until the global corporate/terminal-event
-    # panel is connected to the share ledger.  Daily marks alone are not an
-    # economic-event qualification.
-    economic_event_transition_qualified = False
+    economic_event_transition_qualified = all_event_qualified
     source_qualified = bool(
-        all_compiler_qualified
+        isinstance(forecast_archive, MassiveAdaptiveForecastArchiveV2)
+        and isinstance(calibration, MassiveAdaptiveForecastCalibrationV1)
+        and isinstance(inference_plan, MassiveAdaptiveInferencePlanV1)
+        and all(isinstance(root, MassiveAdaptiveDecisionRootV1) for root in decision_roots)
+        and all(
+            isinstance(context, MassiveAdaptiveContextOriginAuthorityV1)
+            for context in context_origins
+        )
+        and isinstance(fill_source, MassiveAdaptiveFillSourceV1)
+        and isinstance(
+            daily_input_authority, MassiveProfitabilityDailyInputAuthorityV1
+        )
+        and isinstance(identity_authority, PITSecurityUniverseAuthority)
+        and isinstance(
+            economic_event_archive, MassiveProviderEconomicArchiveAuthorityV6
+        )
+        and (
+            frozen_decision_trace is None
+            or frozen_decision_trace.source_data_qualified
+        )
+        and all_compiler_qualified
         and fill_source.source_data_qualified
         and daily_input_authority.daily_input_data_qualified
         and economic_event_transition_qualified
@@ -545,6 +668,12 @@ def build_massive_adaptive_profit_trace_v1(
             identity_authority.receipt_sha256,
             tuple(root.semantic_receipt_sha256 for root in decision_roots),
             tuple(context.semantic_receipt_sha256 for context in context_origins),
+            None
+            if economic_event_archive is None
+            else economic_event_archive.receipt_sha256,
+            None
+            if frozen_decision_trace is None
+            else frozen_decision_trace.semantic_receipt_sha256,
         )
     )
     body = {
@@ -556,6 +685,15 @@ def build_massive_adaptive_profit_trace_v1(
         "fill_source_receipt_sha256": fill_source.semantic_receipt_sha256,
         "daily_input_receipt_sha256": daily_input_authority.semantic_receipt_sha256,
         "identity_authority_receipt_sha256": identity_authority.receipt_sha256,
+        "economic_event_authority_inventory_sha256": semantic_sha256(
+            ()
+            if economic_event_archive is None
+            else (economic_event_archive.receipt_sha256,)
+        ),
+        "frozen_decision_trace_receipt_sha256": None
+        if frozen_decision_trace is None
+        else frozen_decision_trace.semantic_receipt_sha256,
+        "frozen_actions_replayed": frozen_decision_trace is not None,
         "compiler_config_receipt_sha256": config.receipt_sha256,
         "initial_capital": initial_capital,
         "transaction_cost_basis_points": transaction_cost_basis_points,
@@ -619,7 +757,16 @@ def parse_massive_adaptive_profit_trace_v1(
         raise MassiveAdaptiveProfitTraceV1Error(
             "adaptive profit trace payload is not canonical JSON"
         )
-    rows = tuple(MassiveAdaptiveProfitTraceRowV1(**row) for row in payload.pop("rows"))
+    rows = tuple(
+        MassiveAdaptiveProfitTraceRowV1(
+            **{
+                **row,
+                "decision_security_ids": tuple(row["decision_security_ids"]),
+                "decision_target_weights": tuple(row["decision_target_weights"]),
+            }
+        )
+        for row in payload.pop("rows")
+    )
     result = MassiveAdaptiveProfitTraceV1(
         **payload,
         rows=rows,
@@ -642,6 +789,8 @@ def authorize_massive_adaptive_profit_trace_v1(
     fill_source: MassiveAdaptiveFillSourceV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    economic_event_archive: MassiveProviderEconomicArchiveAuthorityV6 | None = None,
+    frozen_decision_trace: MassiveAdaptiveProfitTraceV1 | None = None,
     compiler_config: MassiveAdaptivePortfolioCompilerConfigV1 | None = None,
 ) -> MassiveAdaptiveProfitTraceV1:
     """Rebuild every decision, fill, and book before restoring replay status."""
@@ -662,6 +811,8 @@ def authorize_massive_adaptive_profit_trace_v1(
         fill_source=fill_source,
         daily_input_authority=daily_input_authority,
         identity_authority=identity_authority,
+        economic_event_archive=economic_event_archive,
+        frozen_decision_trace=frozen_decision_trace,
         initial_capital=parsed.initial_capital,
         transaction_cost_basis_points=parsed.transaction_cost_basis_points,
         maximum_fill_participation=parsed.maximum_fill_participation,
@@ -695,6 +846,8 @@ def materialize_massive_adaptive_profit_trace_v1(
     fill_source: MassiveAdaptiveFillSourceV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    economic_event_archive: MassiveProviderEconomicArchiveAuthorityV6 | None = None,
+    frozen_decision_trace: MassiveAdaptiveProfitTraceV1 | None = None,
     initial_capital: float,
     committed_at_ms: int,
     transaction_cost_basis_points: float = 20.0,
@@ -713,6 +866,8 @@ def materialize_massive_adaptive_profit_trace_v1(
         fill_source=fill_source,
         daily_input_authority=daily_input_authority,
         identity_authority=identity_authority,
+        economic_event_archive=economic_event_archive,
+        frozen_decision_trace=frozen_decision_trace,
         initial_capital=initial_capital,
         transaction_cost_basis_points=transaction_cost_basis_points,
         maximum_fill_participation=maximum_fill_participation,
@@ -749,6 +904,8 @@ def materialize_massive_adaptive_profit_trace_v1(
         fill_source=fill_source,
         daily_input_authority=daily_input_authority,
         identity_authority=identity_authority,
+        economic_event_archive=economic_event_archive,
+        frozen_decision_trace=frozen_decision_trace,
         compiler_config=compiler_config,
     )
 

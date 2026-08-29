@@ -6,6 +6,11 @@ from dataclasses import asdict, dataclass, replace
 import math
 
 from rl_quant.alpha.pit_universe import PITSecurityUniverseAuthority
+from rl_quant.evaluation.massive_adaptive_economic_event_transition_v1 import (
+    MassiveAdaptiveEconomicEventTransitionV1,
+    apply_massive_adaptive_postfill_events_v1,
+    apply_massive_adaptive_prefill_events_v1,
+)
 from rl_quant.execution.massive_adaptive_economic_book_v1 import (
     MassiveAdaptiveEconomicBookV1,
     revalue_massive_adaptive_economic_book_v1,
@@ -91,6 +96,8 @@ class MassiveAdaptiveExecutionResultV1:
     daily_input_receipt_sha256: str
     identity_authority_receipt_sha256: str
     event_inventory_receipt_sha256: str
+    event_transition_receipt_sha256: str | None
+    economic_event_transition_qualified: bool
     row_inventory_sha256: str
     semantic_receipt_sha256: str
     protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -123,6 +130,9 @@ class MassiveAdaptiveExecutionResultV1:
             < 0.0
             or self.posttrade_book.decision_session_date != self.fill_session_date
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or not isinstance(self.economic_event_transition_qualified, bool)
+            or self.economic_event_transition_qualified
+            != (self.event_transition_receipt_sha256 is not None)
             or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveExecutionResultV1Error(
@@ -141,6 +151,7 @@ def execute_massive_adaptive_order_intent_v1(
     fill_source: MassiveAdaptiveFillSourceV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    economic_event_transition: MassiveAdaptiveEconomicEventTransitionV1 | None = None,
     transaction_cost_basis_points: float = 20.0,
     maximum_fill_participation: float = 0.02,
 ) -> MassiveAdaptiveExecutionResultV1:
@@ -151,6 +162,8 @@ def execute_massive_adaptive_order_intent_v1(
     fill_source.validate()
     daily_input_authority.validate()
     identity_authority.validate()
+    if economic_event_transition is not None:
+        economic_event_transition.validate()
     if (
         order_intent.pretrade_book_receipt_sha256 != book.semantic_receipt_sha256
         or order_intent.decision_session_date != book.decision_session_date
@@ -159,30 +172,49 @@ def execute_massive_adaptive_order_intent_v1(
         or not math.isfinite(transaction_cost_basis_points)
         or transaction_cost_basis_points < 0.0
         or not 0.0 < maximum_fill_participation <= 1.0
+        or (
+            economic_event_transition is not None
+            and (
+                economic_event_transition.prior_session_date
+                != order_intent.decision_session_date
+                or economic_event_transition.fill_session_date
+                != order_intent.scheduled_fill_session_date
+            )
+        )
     ):
         raise MassiveAdaptiveExecutionResultV1Error("execution roots or policy differ")
     masters = {row.security_id: row for row in identity_authority.security_master}
     existing = book.shares_by_security()
+    requested = {row.security_id: row.requested_shares for row in order_intent.rows}
+    cash = book.cash
+    if economic_event_transition is not None:
+        existing, cash, requested = apply_massive_adaptive_prefill_events_v1(
+            transition=economic_event_transition,
+            existing_shares=existing,
+            cash=cash,
+            requested_shares=requested,
+        )
     tentative: dict[str, float] = {}
     fill_rows = {}
-    for order in order_intent.rows:
-        if order.security_id not in masters:
+    for security_id, requested_shares in sorted(requested.items()):
+        if security_id not in masters:
             raise MassiveAdaptiveExecutionResultV1Error("order identity is unknown")
         fill = fill_source.row(
             session_date=order_intent.scheduled_fill_session_date,
-            security_id=order.security_id,
+            security_id=security_id,
         )
-        fill_rows[order.security_id] = fill
+        fill_rows[security_id] = fill
         capacity = maximum_fill_participation * fill.qualifying_share_volume
-        requested = order.requested_shares
         quantity = (
             0.0
             if not fill.valid
-            else math.copysign(min(abs(requested), capacity), requested)
+            else math.copysign(
+                min(abs(requested_shares), capacity), requested_shares
+            )
         )
         if quantity < 0.0:
-            quantity = -min(abs(quantity), existing.get(order.security_id, 0.0))
-        tentative[order.security_id] = quantity
+            quantity = -min(abs(quantity), existing.get(security_id, 0.0))
+        tentative[security_id] = quantity
 
     cost_rate = transaction_cost_basis_points / 10_000.0
     sell_cash = sum(
@@ -190,7 +222,7 @@ def execute_massive_adaptive_order_intent_v1(
         for security_id, quantity in tentative.items()
         if quantity < 0.0
     )
-    available_cash = book.cash + sell_cash
+    available_cash = cash + sell_cash
     requested_buy_cash = sum(
         quantity * fill_rows[security_id].fill_vwap * (1.0 + cost_rate)
         for security_id, quantity in tentative.items()
@@ -209,9 +241,7 @@ def execute_massive_adaptive_order_intent_v1(
     gross_notional = 0.0
     total_cost = 0.0
     shares = dict(existing)
-    cash = book.cash
-    for order in order_intent.rows:
-        security_id = order.security_id
+    for security_id, requested_shares in sorted(requested.items()):
         fill = fill_rows[security_id]
         quantity = executed[security_id]
         notional = abs(quantity) * fill.fill_vwap
@@ -224,9 +254,9 @@ def execute_massive_adaptive_order_intent_v1(
         total_cost += cost
         body = {
             "security_id": security_id,
-            "requested_shares": order.requested_shares,
+            "requested_shares": requested_shares,
             "filled_shares": quantity,
-            "unfilled_shares": order.requested_shares - quantity,
+            "unfilled_shares": requested_shares - quantity,
             "fill_price": fill.fill_vwap if fill.valid else 0.0,
             "executed_notional": notional,
             "transaction_cost": cost,
@@ -241,6 +271,12 @@ def execute_massive_adaptive_order_intent_v1(
     if cash < -1.0e-7:
         raise MassiveAdaptiveExecutionResultV1Error("execution spent unavailable cash")
     cash = max(0.0, cash)
+    if economic_event_transition is not None:
+        shares, cash = apply_massive_adaptive_postfill_events_v1(
+            transition=economic_event_transition,
+            shares=shares,
+            cash=cash,
+        )
     close_index = MASSIVE_DAILY_BARS_V0_FIELDS.index("close")
     marks: dict[str, float] = {}
     mark_receipts: dict[str, str] = {}
@@ -260,7 +296,11 @@ def execute_massive_adaptive_order_intent_v1(
         mark_receipts[security_id] = daily.receipt_sha256
         issuer_ids[security_id] = master.issuer_id
         identity_receipts[security_id] = master.identity_source_receipt_sha256
-    event_inventory = semantic_sha256(())
+    event_inventory = (
+        semantic_sha256(())
+        if economic_event_transition is None
+        else economic_event_transition.applied_event_inventory_sha256
+    )
     source_state = semantic_sha256(
         {
             "order": order_intent.semantic_receipt_sha256,
@@ -268,6 +308,9 @@ def execute_massive_adaptive_order_intent_v1(
             "daily_input": daily_input_authority.semantic_receipt_sha256,
             "identity": identity_authority.receipt_sha256,
             "events": event_inventory,
+            "event_transition": None
+            if economic_event_transition is None
+            else economic_event_transition.semantic_receipt_sha256,
         }
     )
     posttrade = revalue_massive_adaptive_economic_book_v1(
@@ -297,6 +340,13 @@ def execute_massive_adaptive_order_intent_v1(
         "daily_input_receipt_sha256": daily_input_authority.semantic_receipt_sha256,
         "identity_authority_receipt_sha256": identity_authority.receipt_sha256,
         "event_inventory_receipt_sha256": event_inventory,
+        "event_transition_receipt_sha256": None
+        if economic_event_transition is None
+        else economic_event_transition.semantic_receipt_sha256,
+        "economic_event_transition_qualified": (
+            economic_event_transition is not None
+            and economic_event_transition.source_data_qualified
+        ),
         "row_inventory_sha256": row_inventory,
         "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     }

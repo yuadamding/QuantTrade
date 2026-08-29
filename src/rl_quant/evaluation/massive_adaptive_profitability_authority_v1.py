@@ -31,6 +31,9 @@ from rl_quant.features.massive_adaptive_decision_root_v1 import (
 from rl_quant.features.massive_adaptive_fill_source_v1 import (
     MassiveAdaptiveFillSourceV1,
 )
+from rl_quant.features.massive_economic_authority_v6 import (
+    MassiveProviderEconomicArchiveAuthorityV6,
+)
 from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
     MassiveProfitabilityDailyInputAuthorityV1,
 )
@@ -125,6 +128,8 @@ def build_massive_adaptive_profitability_authority_v1(
     fill_source: MassiveAdaptiveFillSourceV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
+    economic_event_archive: MassiveProviderEconomicArchiveAuthorityV6 | None = None,
+    frozen_decision_trace: MassiveAdaptiveProfitTraceV1 | None = None,
     compiler_config: MassiveAdaptivePortfolioCompilerConfigV1 | None = None,
 ) -> MassiveAdaptiveProfitabilityAuthorityV1:
     """Reexecute the complete transition kernel before granting development use."""
@@ -139,6 +144,8 @@ def build_massive_adaptive_profitability_authority_v1(
         fill_source=fill_source,
         daily_input_authority=daily_input_authority,
         identity_authority=identity_authority,
+        economic_event_archive=economic_event_archive,
+        frozen_decision_trace=frozen_decision_trace,
         initial_capital=trace.initial_capital,
         transaction_cost_basis_points=trace.transaction_cost_basis_points,
         maximum_fill_participation=trace.maximum_fill_participation,

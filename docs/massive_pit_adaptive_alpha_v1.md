@@ -242,12 +242,22 @@ wealth, benchmark wealth, and active log return. The composite development
 authority grants no reporting, outer-test, lockbox, or RL capability and
 reexecutes the entire trace before accepting it.
 
+Corporate, terminal, successor, and cash-return transitions are now bound to
+the complete raw-provider V6 economic archive rather than a caller-supplied
+resolved event list. Each fill-date close resolves revisions and interaction
+order from that archive. Events between the prior close and morning fill
+repair both the carried holdings and pending target; events after the fill are
+applied to the executed book before the close mark. Splits, cash
+distributions, worthless dispositions, successor holdings, and causal cash
+accruals are therefore part of the same replayed share ledger used by both the
+strategy and benchmark. Omitting the provider archive keeps the engineering
+path nonqualifying, and changing the archive invalidates trace replay.
+
 This closes source-to-optimizer, exact restart, same-plan replay, target-free
 inner-validation inference, and the first forecast-to-book engineering slice.
 It does **not** yet qualify historical profitability: the present kernel still
-needs a source-qualified production canary, corporate/terminal-event
-transition support beyond fail-closed missing marks, frozen outer-test
-checkpoint eligibility, and statistical outer evidence. The current trace is
+needs a source-qualified production canary, frozen outer-test checkpoint
+eligibility, and statistical outer evidence. The current trace is
 published create-only; generic reload withholds replay status and promotion
 reexecutes the complete transition sequence.
 Intraday path tensors are also not yet materialized by the V1 tensor artifact.

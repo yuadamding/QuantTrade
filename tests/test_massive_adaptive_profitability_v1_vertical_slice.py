@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from rl_quant.alpha.pit_universe import (
+    ListingEventRecord,
+    PITSecurityUniverseAuthority,
+    PITUniverseRuleSpec,
+    SourcedSecurityMasterRecord,
+    SourcedTickerHistoryRecord,
+    UniverseRankInputRecord,
+)
+from rl_quant.data_sources.massive.source_receipts import (
+    load_massive_source_bundle,
+    publish_massive_source_object,
+)
 from rl_quant.evaluation.massive_adaptive_forecast_calibration_v1 import (
     build_massive_adaptive_forecast_calibration_v1,
     materialize_massive_adaptive_forecast_calibration_v1,
@@ -19,8 +33,29 @@ from rl_quant.evaluation.massive_adaptive_profitability_authority_v1 import (
     MassiveAdaptiveProfitabilityAuthorityV1Error,
     build_massive_adaptive_profitability_authority_v1,
 )
+from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
+    MassiveAdaptiveOuterInferencePlanV1Error,
+    build_massive_adaptive_outer_inference_plan_v1,
+)
 from rl_quant.features.massive_daily_bars_v0 import MASSIVE_DAILY_BARS_V0_FIELDS
-from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.features.massive_adaptive_fill_source_v1 import adaptive_fill_clock_v1
+from rl_quant.features.massive_economic_authority_v6 import (
+    MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_DATASETS,
+    MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_KINDS,
+    MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_OBJECT_PREFIX,
+    MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_SCHEMA,
+    MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_SOURCE_SCHEMA_SHA256,
+    MassiveEconomicAuthorityV6Error,
+    build_massive_provider_economic_archive_authority_v6,
+)
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    semantic_sha256,
+)
+from rl_quant.training.massive_adaptive_profit_checkpoint_selection_v2 import (
+    build_massive_adaptive_profit_checkpoint_candidate_v2,
+    select_massive_adaptive_profit_checkpoint_v2,
+)
 
 
 def _digest(value: object) -> str:
@@ -98,23 +133,140 @@ def _calibration(security_ids: tuple[str, ...], *, root=None):
     )
 
 
-def _fixture():
-    dates = ("2024-01-02", "2024-01-03", "2024-01-04")
-    security_ids = tuple(f"SEC-{index:03d}" for index in range(100))
-    identity_receipt = _digest("pit-identity")
+def _identity(security_ids: tuple[str, ...]) -> PITSecurityUniverseAuthority:
+    rule = PITUniverseRuleSpec.build(
+        rule_id="adaptive-profitability-v1-test",
+        target_size=len(security_ids),
+        ranking_lookback_sessions=3,
+        ranking_lag_sessions=1,
+        minimum_observed_sessions=2,
+        minimum_close_price=1.0,
+        minimum_average_dollar_volume=0.0,
+        rebalance_frequency="monthly",
+    )
     masters = tuple(
-        SimpleNamespace(
+        SourcedSecurityMasterRecord(
             security_id=security_id,
             issuer_id=f"ISSUER-{index:03d}",
-            identity_source_receipt_sha256=_digest(("identity", security_id)),
+            primary_exchange="XNYS",
+            share_class="COMMON",
+            security_type="common-stock",
+            listing_at_ms=1,
+            delisting_at_ms=None,
+            successor_security_id=None,
+            corporate_action_chain_id=f"CHAIN-{index:03d}",
+            identity_source_receipt_sha256=_digest((security_id, "master")),
         )
         for index, security_id in enumerate(security_ids)
     )
-    identity = SimpleNamespace(
-        validate=lambda: None,
-        receipt_sha256=identity_receipt,
-        security_master=masters,
+    tickers = tuple(
+        SourcedTickerHistoryRecord(
+            security_id=security_id,
+            ticker=f"T{index:03d}",
+            valid_from_ms=1,
+            valid_to_ms=None,
+            available_at_ms=1,
+            primary_exchange="XNYS",
+            source_receipt_sha256=_digest((security_id, "ticker")),
+        )
+        for index, security_id in enumerate(security_ids)
     )
+    listings = tuple(
+        ListingEventRecord(
+            event_id=f"LIST-{security_id}",
+            security_id=security_id,
+            effective_at_ms=1,
+            available_at_ms=1,
+            primary_exchange="XNYS",
+            ticker=f"T{index:03d}",
+            source_receipt_sha256=_digest((security_id, "listing")),
+        )
+        for index, security_id in enumerate(security_ids)
+    )
+    ranks = tuple(
+        UniverseRankInputRecord(
+            security_id=security_id,
+            effective_at_ms=100,
+            effective_session_index=10,
+            available_at_ms=99,
+            observation_start_ms=1,
+            observation_end_ms=98,
+            observation_start_session_index=7,
+            observation_end_session_index=9,
+            observed_session_count=3,
+            average_dollar_volume=1_000_000.0,
+            close_price=100.0,
+            source_receipt_sha256=_digest((security_id, "rank")),
+        )
+        for security_id in security_ids
+    )
+    return PITSecurityUniverseAuthority.build(
+        rule=rule,
+        security_master=masters,
+        ticker_history=tickers,
+        listing_events=listings,
+        delisting_events=(),
+        rank_inputs=ranks,
+    )
+
+
+def _empty_event_archive(tmp_path, *, identity, observed_at_ms: int):
+    loaded = []
+    for role in MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_KINDS:
+        request_id = f"request-{role}"
+        payload = {
+            "schema": MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_SCHEMA,
+            "source_kind": role,
+            "provider_id": "massive",
+            "provider_dataset": f"provider-{role}",
+            "provider_endpoint": "https://api.massive.example/reference",
+            "query_start_at_ms": 0,
+            "query_end_at_ms": observed_at_ms - 1,
+            "provider_observed_at_ms": observed_at_ms,
+            "provider_request_ids": [request_id],
+            "pagination_complete": True,
+            "page_count": 1,
+            "records": [],
+        }
+        relative = (
+            f"{MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_OBJECT_PREFIX}"
+            f"{role}-adaptive-profitability.json"
+        )
+        publish_massive_source_object(
+            stream=BytesIO(canonical_json_file_bytes(payload)),
+            root=tmp_path,
+            relative_payload_path=relative,
+            dataset_id=MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_DATASETS[role],
+            source_object_key=relative,
+            requested_at_ms=observed_at_ms - 1,
+            downloaded_at_ms=observed_at_ms,
+            schema_sha256=(
+                MASSIVE_RAW_PROVIDER_ECONOMIC_SOURCE_V6_SOURCE_SCHEMA_SHA256
+            ),
+            entitlement_receipt_sha256=_digest("event-entitlement"),
+            committed_at_ms=observed_at_ms,
+            etag=_digest((role, "empty")),
+            request_id=request_id,
+        )
+        loaded.append(
+            load_massive_source_bundle(
+                root=tmp_path,
+                relative_payload_path=relative,
+                verified_at_ms=observed_at_ms,
+            )
+        )
+    return build_massive_provider_economic_archive_authority_v6(
+        root=tmp_path,
+        loaded_sources=tuple(loaded),
+        identity_authority=identity,
+    )
+
+
+def _fixture():
+    dates = ("2024-01-02", "2024-01-03", "2024-01-04")
+    security_ids = tuple(f"SEC-{index:03d}" for index in range(100))
+    identity = _identity(security_ids)
+    identity_receipt = identity.receipt_sha256
     bars_rows = {}
     close_index = MASSIVE_DAILY_BARS_V0_FIELDS.index("close")
     dollar_index = MASSIVE_DAILY_BARS_V0_FIELDS.index("dollar_volume")
@@ -136,7 +288,14 @@ def _fixture():
     daily_receipt = _digest("daily-input")
     daily = SimpleNamespace(
         validate=lambda: None,
-        sessions=tuple(SimpleNamespace(source_session_date=value) for value in dates),
+        sessions=tuple(
+            SimpleNamespace(
+                source_session_date=value,
+                regular_close_at_ms=adaptive_fill_clock_v1(value)[1]
+                + 6 * 60 * 60 * 1_000,
+            )
+            for value in dates
+        ),
         row=lambda *, session_date, security_id: bars_rows[(session_date, security_id)],
         semantic_receipt_sha256=daily_receipt,
         daily_input_data_qualified=False,
@@ -241,7 +400,13 @@ def _fixture():
     )
 
 
-def _trace(fixture, *, cost: float = 20.0):
+def _trace(
+    fixture,
+    *,
+    cost: float = 20.0,
+    economic_event_archive=None,
+    frozen_decision_trace=None,
+):
     return build_massive_adaptive_profit_trace_v1(
         forecast_archive=fixture.forecast_archive,
         calibration=fixture.calibration,
@@ -251,6 +416,8 @@ def _trace(fixture, *, cost: float = 20.0):
         fill_source=fixture.fill_source,
         daily_input_authority=fixture.daily,
         identity_authority=fixture.identity,
+        economic_event_archive=economic_event_archive,
+        frozen_decision_trace=frozen_decision_trace,
         initial_capital=10_000_000.0,
         transaction_cost_basis_points=cost,
     )
@@ -312,10 +479,43 @@ def test_forecast_to_compiler_to_fill_to_continuous_book_replays(tmp_path) -> No
 
 def test_cost_ladder_and_fill_mutation_are_economically_visible() -> None:
     fixture = _fixture()
-    low = _trace(fixture, cost=10.0)
     primary = _trace(fixture, cost=20.0)
-    high = _trace(fixture, cost=40.0)
+    low = _trace(fixture, cost=10.0, frozen_decision_trace=primary)
+    high = _trace(fixture, cost=40.0, frozen_decision_trace=primary)
     assert low.final_equity > primary.final_equity > high.final_equity
+    assert low.frozen_actions_replayed
+    assert high.frozen_actions_replayed
+    assert tuple(row.decision_target_receipt_sha256 for row in low.rows) == tuple(
+        row.decision_target_receipt_sha256 for row in primary.rows
+    )
+    assert tuple(row.decision_target_receipt_sha256 for row in high.rows) == tuple(
+        row.decision_target_receipt_sha256 for row in primary.rows
+    )
+    stress_authority = build_massive_adaptive_profitability_authority_v1(
+        trace=high,
+        forecast_archive=fixture.forecast_archive,
+        calibration=fixture.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        frozen_decision_trace=primary,
+    )
+    assert stress_authority.deterministic_trace_replayed
+    with pytest.raises(MassiveAdaptiveProfitabilityAuthorityV1Error):
+        build_massive_adaptive_profitability_authority_v1(
+            trace=high,
+            forecast_archive=fixture.forecast_archive,
+            calibration=fixture.calibration,
+            inference_plan=fixture.inference_plan,
+            decision_roots=fixture.roots,
+            context_origins=fixture.contexts,
+            fill_source=fixture.fill_source,
+            daily_input_authority=fixture.daily,
+            identity_authority=fixture.identity,
+        )
 
     original = primary
     key = next(iter(fixture.fill_rows))
@@ -347,6 +547,143 @@ def test_cost_ladder_and_fill_mutation_are_economically_visible() -> None:
             fill_source=changed_fill,
             daily_input_authority=fixture.daily,
             identity_authority=fixture.identity,
+        )
+
+
+def test_provider_archive_qualifies_event_complete_book_transition(tmp_path) -> None:
+    fixture = _fixture()
+    observed_at_ms = max(
+        row.regular_close_at_ms for row in fixture.daily.sessions
+    )
+    archive = _empty_event_archive(
+        tmp_path,
+        identity=fixture.identity,
+        observed_at_ms=observed_at_ms,
+    )
+    trace = _trace(fixture, economic_event_archive=archive)
+    assert trace.economic_event_transition_qualified
+    assert trace.economic_event_authority_inventory_sha256 == semantic_sha256(
+        (archive.receipt_sha256,)
+    )
+    assert not trace.source_data_qualified
+
+    authority = build_massive_adaptive_profitability_authority_v1(
+        trace=trace,
+        forecast_archive=fixture.forecast_archive,
+        calibration=fixture.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        economic_event_archive=archive,
+    )
+    assert authority.deterministic_trace_replayed
+
+    with pytest.raises(MassiveEconomicAuthorityV6Error, match="archive|receipt"):
+        build_massive_adaptive_profitability_authority_v1(
+            trace=trace,
+            forecast_archive=fixture.forecast_archive,
+            calibration=fixture.calibration,
+            inference_plan=fixture.inference_plan,
+            decision_roots=fixture.roots,
+            context_origins=fixture.contexts,
+            fill_source=fixture.fill_source,
+            daily_input_authority=fixture.daily,
+            identity_authority=fixture.identity,
+            economic_event_archive=replace(archive, receipt_sha256="f" * 64),
+        )
+
+
+def test_checkpoint_selection_v2_derives_frozen_action_economics() -> None:
+    fixture = _fixture()
+    primary = _trace(fixture, cost=20.0)
+    low = _trace(fixture, cost=10.0, frozen_decision_trace=primary)
+    high = _trace(fixture, cost=40.0, frozen_decision_trace=primary)
+    primary_authority = build_massive_adaptive_profitability_authority_v1(
+        trace=primary,
+        forecast_archive=fixture.forecast_archive,
+        calibration=fixture.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+    )
+    low_authority = build_massive_adaptive_profitability_authority_v1(
+        trace=low,
+        forecast_archive=fixture.forecast_archive,
+        calibration=fixture.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        frozen_decision_trace=primary,
+    )
+    high_authority = build_massive_adaptive_profitability_authority_v1(
+        trace=high,
+        forecast_archive=fixture.forecast_archive,
+        calibration=fixture.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        frozen_decision_trace=primary,
+    )
+    checkpoint_receipt = _digest("candidate-checkpoint")
+    checkpoint_source = _digest("candidate-checkpoint-source")
+    model_state = _digest("candidate-model-state")
+    checkpoint = SimpleNamespace(
+        validate=lambda: None,
+        epoch_index=3,
+        semantic_receipt_sha256=checkpoint_receipt,
+        loaded_source=SimpleNamespace(receipt_sha256=checkpoint_source),
+        model_state_receipt_sha256=model_state,
+        development_training_authorized=False,
+    )
+    fixture.forecast_archive.checkpoint_receipt_sha256 = checkpoint_receipt
+    fixture.forecast_archive.checkpoint_source_receipt_sha256 = checkpoint_source
+    fixture.forecast_archive.model_state_receipt_sha256 = model_state
+    candidate = build_massive_adaptive_profit_checkpoint_candidate_v2(
+        checkpoint=checkpoint,
+        forecast_archive=fixture.forecast_archive,
+        primary_trace=primary,
+        low_cost_trace=low,
+        high_cost_trace=high,
+        primary_authority=primary_authority,
+        low_cost_authority=low_authority,
+        high_cost_authority=high_authority,
+    )
+    assert candidate.economically_eligible
+    assert not candidate.source_data_qualified
+    assert candidate.low_cost_terminal_net_return > (
+        candidate.primary_terminal_net_return
+    )
+    assert candidate.primary_terminal_net_return > (
+        candidate.high_cost_terminal_net_return
+    )
+    selection = select_massive_adaptive_profit_checkpoint_v2((candidate,))
+    assert selection.selected_epoch_index == 3
+    assert not selection.development_checkpoint_selection_authorized
+    assert not selection.outer_evaluation_authorized
+    with pytest.raises(
+        MassiveAdaptiveOuterInferencePlanV1Error,
+        match="source-qualified checkpoint selection",
+    ):
+        build_massive_adaptive_outer_inference_plan_v1(
+            checkpoint_selection=selection,
+            selected_checkpoint=checkpoint,
+            decision_tensor=SimpleNamespace(validate=lambda: None),
+            decision_roots=(),
+            split_plan=SimpleNamespace(validate=lambda: None),
+            fold_index=0,
+            model_spec=SimpleNamespace(validate=lambda: None),
         )
 
 
