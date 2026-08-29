@@ -191,8 +191,8 @@ inventory, and also requires the canonical AD11 model specification and frozen
 training configuration.
 Neither path authorizes profitability reporting, lockbox access, or RL.
 
-`MassiveAdaptiveForecastArchiveV1` now closes checkpoint-to-forecast replay for
-every package-selected origin. It runs the exact promoted checkpoint in
+`MassiveAdaptiveForecastArchiveV1` closes same-plan checkpoint-to-forecast
+replay for every package-selected training origin. It runs the exact promoted checkpoint in
 deterministic evaluation mode over the promoted decision tensor and window
 plan, commits every distribution, routing, context, score, validity, and
 positive-probability array by content hash, and binds both full-chronology and
@@ -204,8 +204,34 @@ already committed Feature V3 representation and the current forecast outputs
 remain explicitly uncalibrated, so calibration is still a downstream
 training-only artifact rather than an implied profitability qualification.
 
-This closes source-to-optimizer, exact restart, and checkpoint-to-forecast
-wiring. It does **not** yet close forecast calibration, compiler-input
+Role-separated inference is a distinct V2 boundary.
+`MassiveAdaptiveInferencePlanV1` derives every decision in one complete
+inner-validation chronology from a replayed tensor and decision-root
+inventory. Unlike the supervised window plan, it opens no target archive and
+does not require a 126-session target to mature. It binds causal model context
+and the next exchange-session schedule identity, but deliberately does not
+claim that a qualifying fill exists.
+
+`MassiveAdaptiveForecastEligibilityAuthorityV2` reconciles the replayed
+training checkpoint and its training window with a disjoint inference tensor,
+root inventory, and plan. It requires the same fold, split family, model
+specification, protocol, and source semantics while explicitly rejecting the
+old equality between training and inference tensors, roots, and origins. V1
+currently authorizes only the legal training-to-inner-validation transition;
+outer-test and lockbox roles remain unavailable until checkpoint selection is
+frozen.
+
+`MassiveAdaptiveForecastArchiveV2` and its replay authority then rerun the
+training checkpoint over all target-free inner-validation origins, persist the
+same distribution, routing, score, context, validity, and array receipts, and
+rebuild compatibility plus inference before restoring runtime forecasts. A
+generic V2 reload remains nonauthorizing. Raw V2 forecasts retain the explicit
+uncalibrated identity and cannot authorize profitability, lockbox access, or
+RL.
+
+This closes source-to-optimizer, exact restart, same-plan replay, and
+target-free inner-validation checkpoint inference. It does **not** yet close
+outer-test checkpoint eligibility, forecast calibration, compiler-input
 materialization, or the chronological compiler/economic simulator. Intraday
 path tensors are also not yet materialized by the V1 tensor artifact. Those
 deterministic profitability boundaries remain prerequisites for an H100
