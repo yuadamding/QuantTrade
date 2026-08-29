@@ -41,7 +41,7 @@ from rl_quant.training.adaptive_alpha_supervised_v1 import (
 from rl_quant.workflows.adaptive_alpha_training_inputs_v2 import (
     build_massive_adaptive_alpha_training_batch_v2,
 )
-from tests.test_massive_profitability_v6_vertical_slice import (
+from test_massive_profitability_v6_vertical_slice import (
     _feature_and_target,
 )
 

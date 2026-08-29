@@ -64,13 +64,13 @@ from rl_quant.training.massive_adaptive_window_plan_v1 import (
     MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
     build_massive_adaptive_window_plan_v1,
 )
-from tests.test_massive_adaptive_decision_tensor_v1 import (
+from test_massive_adaptive_decision_tensor_v1 import (
     _feature,
     _origin,
     _paths,
     _targets,
 )
-from tests.test_massive_profitability_v6_vertical_slice import (
+from test_massive_profitability_v6_vertical_slice import (
     _feature_and_target,
 )
 

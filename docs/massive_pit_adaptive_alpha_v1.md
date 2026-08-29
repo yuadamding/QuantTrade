@@ -191,12 +191,25 @@ inventory, and also requires the canonical AD11 model specification and frozen
 training configuration.
 Neither path authorizes profitability reporting, lockbox access, or RL.
 
-This closes source-to-optimizer and exact-restart wiring. It does **not** yet
-close checkpoint-to-forecast replay, compiler-input materialization, or the
-chronological compiler/economic simulator. Intraday path tensors are also not
-yet materialized by the V1 tensor artifact. Those deterministic profitability
-boundaries remain prerequisites for an H100 historical launch and for any RL
-work.
+`MassiveAdaptiveForecastArchiveV1` now closes checkpoint-to-forecast replay for
+every package-selected origin. It runs the exact promoted checkpoint in
+deterministic evaluation mode over the promoted decision tensor and window
+plan, commits every distribution, routing, context, score, validity, and
+positive-probability array by content hash, and binds both full-chronology and
+origin-only decision-root inventories. Generic reloads expose metadata only.
+`MassiveAdaptiveForecastReplayAuthorityV1` reruns the checkpoint/tensor/root
+calculation before exposing runtime forecast authority; it cannot authorize
+profitability, lockbox access, or RL. The current normalization identity is the
+already committed Feature V3 representation and the current forecast outputs
+remain explicitly uncalibrated, so calibration is still a downstream
+training-only artifact rather than an implied profitability qualification.
+
+This closes source-to-optimizer, exact restart, and checkpoint-to-forecast
+wiring. It does **not** yet close forecast calibration, compiler-input
+materialization, or the chronological compiler/economic simulator. Intraday
+path tensors are also not yet materialized by the V1 tensor artifact. Those
+deterministic profitability boundaries remain prerequisites for an H100
+historical launch and for any RL work.
 
 ## Evidence boundary
 

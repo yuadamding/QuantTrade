@@ -118,7 +118,7 @@ from rl_quant.training.massive_profitability_trained_run_v2 import (
     bind_massive_profitability_trained_run_v2,
 )
 from rl_quant.training.top2000_m03r_v9_pretraining_step import state_dict_sha256
-from tests.test_massive_profitability_archive_freeze_v1 import _freeze, _inputs
+from test_massive_profitability_archive_freeze_v1 import _freeze, _inputs
 
 _SECURITY_IDS = tuple(f"SEC-{index:02d}" for index in range(5))
 _DIGESTS = tuple(semantic_sha256(("v6-vertical-slice", index)) for index in range(16))
