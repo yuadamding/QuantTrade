@@ -229,13 +229,30 @@ generic V2 reload remains nonauthorizing. Raw V2 forecasts retain the explicit
 uncalibrated identity and cannot authorize profitability, lockbox access, or
 RL.
 
-This closes source-to-optimizer, exact restart, same-plan replay, and
-target-free inner-validation checkpoint inference. It does **not** yet close
-outer-test checkpoint eligibility, forecast calibration, compiler-input
-materialization, or the chronological compiler/economic simulator. Intraday
-path tensors are also not yet materialized by the V1 tensor artifact. Those
-deterministic profitability boundaries remain prerequisites for an H100
-historical launch and for any RL work.
+The first deterministic inner-validation profitability kernel now continues
+from V2 forecasts through a training-only calibration, causal compiler-input
+authority, the existing no-duration compiler, decision-close share intents,
+next-session source VWAP execution, and a continuous cash/share book marked at
+the next qualified close. The compiler-input authority derives its 63-session
+risk/liquidity state without opening the future fill; realized fill price and
+volume enter only the execution transition. Strategy and equal-weight
+buy-and-drift shadow books use the same fill and cost kernel. Profit traces
+reconcile requested, filled, and unfilled shares, costs, book receipts, net
+wealth, benchmark wealth, and active log return. The composite development
+authority grants no reporting, outer-test, lockbox, or RL capability and
+reexecutes the entire trace before accepting it.
+
+This closes source-to-optimizer, exact restart, same-plan replay, target-free
+inner-validation inference, and the first forecast-to-book engineering slice.
+It does **not** yet qualify historical profitability: the present kernel still
+needs a source-qualified production canary, corporate/terminal-event
+transition support beyond fail-closed missing marks, frozen outer-test
+checkpoint eligibility, and statistical outer evidence. The current trace is
+published create-only; generic reload withholds replay status and promotion
+reexecutes the complete transition sequence.
+Intraday path tensors are also not yet materialized by the V1 tensor artifact.
+Those boundaries remain prerequisites for an H100 historical launch and for
+any RL work.
 
 ## Evidence boundary
 
