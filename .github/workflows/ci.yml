@@ -59,6 +59,7 @@ jobs:
           tests/test_massive_adaptive_forecast_archive_v1.py
           tests/test_massive_adaptive_forecast_archive_v2.py
           tests/test_massive_adaptive_prequential_forecast_v1.py
+          tests/test_massive_adaptive_rl_action_v1.py
           tests/test_adaptive_alpha_supervised_v1.py
           tests/test_massive_adaptive_portfolio_compiler_v1.py
           tests/test_massive_economic_authority_v6.py

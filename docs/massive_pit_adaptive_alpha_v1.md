@@ -290,6 +290,17 @@ This artifact proves chronological forecast availability only. It does not
 authorize how a checkpoint was selected, profitability, outer access,
 lockbox access, or RL.
 
+The first adaptive RL-facing surface is now limited to a bounded compiler
+control action. Seven controls rescale the forecast buckets; three additional
+controls adjust uncertainty aversion, risk aversion, and the fraction of the
+frozen discretionary-turnover ceiling. Security, issuer, tracking-error,
+active-beta, and ADV limits cannot be loosened, and the controller never emits
+security weights. The unique zero action returns the original compiler inputs
+and configuration unchanged, so the compiler decision and all of its receipts
+are exactly identical to the deterministic baseline. This is a mechanical
+neutral-equivalence canary only; it grants no rollout, optimizer, P&L, outer,
+lockbox, or RL-training authority.
+
 This closes source-to-optimizer, exact restart, target-free validation and
 outer inference, deterministic forecast-to-book replay, frozen checkpoint
 selection, and nonreportable four-fold outer evidence at the engineering
