@@ -33,6 +33,15 @@ from rl_quant.execution.leg import (
     SymbolQuote,
     simulate_action_transition,
 )
+from rl_quant.execution.massive_adaptive_portfolio_compiler_v1 import (
+    MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SCHEMA,
+    MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SOLVER,
+    MassiveAdaptivePortfolioCompilerConfigV1,
+    MassiveAdaptivePortfolioCompilerError,
+    MassiveAdaptivePortfolioCompilerInputsV1,
+    MassiveAdaptivePortfolioDecisionV1,
+    compile_massive_adaptive_portfolio_v1,
+)
 from rl_quant.execution.impact_model import (
     AlphaExecutionCostError,
     CapacityEstimate,
@@ -95,7 +104,13 @@ __all__ = [
     "ImpactModel",
     "ImmediateTargetWeightExecution",
     "LegSide",
+    "MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SCHEMA",
+    "MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SOLVER",
     "MarketSnapshot",
+    "MassiveAdaptivePortfolioCompilerConfigV1",
+    "MassiveAdaptivePortfolioCompilerError",
+    "MassiveAdaptivePortfolioCompilerInputsV1",
+    "MassiveAdaptivePortfolioDecisionV1",
     "PositionState",
     "ReplacementDecision",
     "SquareRootImpactConfig",
@@ -108,6 +123,7 @@ __all__ = [
     "WeightExecutionCostConfig",
     "coerce_finite_nonnegative",
     "coerce_finite_positive",
+    "compile_massive_adaptive_portfolio_v1",
     "fill_index",
     "fill_indices",
     "fixed_turnover_cost",

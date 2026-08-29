@@ -1,6 +1,7 @@
 # QuantTrade
 
-QuantTrade is a non-PHI research library for reinforcement-learning and direct
+QuantTrade is a non-PHI research library for supervised alpha modeling,
+fixed-portfolio profitability evaluation, reinforcement learning, and direct
 portfolio-policy experiments. It is not a live-trading service, investment
 product, or business-production system.
 
@@ -8,6 +9,15 @@ product, or business-production system.
 
 - Read [the documentation index](docs/README.md) before changing a Hold-30 or
   M03R contract.
+- Read [the Massive P0 profitability execution boundary](docs/massive_profitability_p0_execution.md)
+  before Massive archive acquisition, feature/target materialization, model
+  training, profitability evaluation, or lockbox work. Commit `bd54cda` is the
+  minimum engineering framework, not historical profitability evidence. Do
+  not allocate training compute until the exact archive, DataGate V2, and
+  promoted Dataset V3 receipts pass and the V6 vertical slice passes in the
+  pinned environment. The frozen P0 authorizing trainer is deterministic
+  one-thread CPU; H100 fits are exploratory and nonauthorizing unless a new
+  protocol generation is explicitly approved.
 - Read [the QuantTrade training knowledge base](docs/quanttrade_training_knowledge_base.md)
   before packaging, launching, recovering, evaluating, or interpreting an
   M03R training run.
@@ -81,6 +91,10 @@ Use the Python 3.11 `quanttrade` environment. Focus tests on the changed
 boundary before running the full suite.
 
 ```bash
+# Massive P0 dataset-to-costed-P&L replay boundary
+PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
+  tests/test_massive_profitability_v6_vertical_slice.py
+
 # V11 predecessor and a15 evidence boundary
 PYTHONPATH=src conda run -n quanttrade python -m pytest -q \
   tests/test_hold30_alpha_m03r_v11_top2000_dev_protocol.py \
@@ -173,7 +187,8 @@ treat the quarantined scripts under `legacy/` as runnable package entrypoints.
   sentinel and a later qualification phase. Consume an existing receipt by
   exact hash or use a disjoint phase output identity.
 
-Remote GPU work is never authorized by this file. Use the environment's
-approved Seadragon/Kubernetes research runbook, exact Job/run identity, and
-receipt-gated lifecycle. Do not record live Job status, cluster credentials,
-or machine-specific secrets in repository documentation.
+Remote compute is never authorized by this file. Use the environment's
+approved Seadragon LSF or Kubernetes research runbook, exact job/run identity,
+and receipt-gated lifecycle. Do not substitute schedulers or record live job
+status, cluster credentials, or machine-specific secrets in repository
+documentation.

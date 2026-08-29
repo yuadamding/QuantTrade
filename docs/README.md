@@ -111,6 +111,11 @@ tests are not launch or performance evidence.
 
 ## Shared architecture and data contracts
 
+- [Massive P0 profitability execution boundary](massive_profitability_p0_execution.md)
+  — implemented archive-to-costed-P&L authority chain, embargoed historical
+  geometry, deterministic training/prediction replay, data-first launch gate,
+  and the exact boundary between engineering evidence, outer development, and
+  sealed lockbox evidence.
 - [Massive PIT adaptive-alpha V1](massive_pit_adaptive_alpha_v1.md) — fresh
   no-duration generation for a seven-bucket factor-residual return term
   structure, delayed-replay qualification, and daily cost-aware receding-horizon

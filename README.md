@@ -8,6 +8,12 @@ application, not the definition of the framework.
 The repository also retains the older two-stage **Phase-1 direct portfolio optimizer**. That workflow is useful
 as a baseline, but it is not PPO and is not yet wired through the new environment/trajectory interfaces.
 
+QuantTrade also contains a separate research-only **Massive P0 supervised profitability path**. It compares a
+bars-only model with a bars-plus-finalized-tape model and a within-date shuffled-tape placebo, then evaluates
+fixed H1/H5/H21/H63 tranches under frozen costs, capacity, chronology, and replay authorities. Read the
+[Massive P0 execution boundary](docs/massive_profitability_p0_execution.md) before any archive, training,
+profitability, or lockbox work. Its engineering tests are not historical profitability evidence.
+
 > **Implementation snapshot (2026-07).** The tested library now includes recurrent PPO with masked simplex actions,
 > on-policy and replay rollout coordinators, schema-locked replay, offline training, twin-critic IQL, regime
 > mixtures, uncertainty abstention, market stress transforms, a purged/embargoed walk-forward splitter, and the
