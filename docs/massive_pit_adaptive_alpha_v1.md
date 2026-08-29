@@ -279,16 +279,28 @@ is nonauthorizing; a create-only evidence authority reopens it and recomputes
 all four folds before it can authorize a development outer conclusion. Final
 profitability reporting, lockbox access, and RL remain false.
 
-This closes source-to-optimizer, exact restart, same-plan replay, target-free
-inner-validation inference, and the first forecast-to-book engineering slice.
-It does **not** yet qualify historical profitability: the present kernel still
-needs a source-qualified production canary, frozen outer-test checkpoint
-eligibility, and statistical outer evidence. The current trace is
-published create-only; generic reload withholds replay status and promotion
-reexecutes the complete transition sequence.
-Intraday path tensors are also not yet materialized by the V1 tensor artifact.
-Those boundaries remain prerequisites for an H100 historical launch and for
-any RL work.
+RL-training forecasts have a separate leakage boundary.
+`MassiveAdaptivePrequentialForecastPlanV1` accepts only an exact prefix of
+already replayed V2 inner-validation blocks. For every block it binds the
+training-window cutoff, checkpoint, source archive, and row inventory, and
+requires the cutoff to precede the forecast chronology. The create-only
+prequential archive copies those exact forecast tensors and withholds runtime
+access on generic reload; promotion reconciles every child archive and tensor.
+This artifact proves chronological forecast availability only. It does not
+authorize how a checkpoint was selected, profitability, outer access,
+lockbox access, or RL.
+
+This closes source-to-optimizer, exact restart, target-free validation and
+outer inference, deterministic forecast-to-book replay, frozen checkpoint
+selection, and nonreportable four-fold outer evidence at the engineering
+level. It does **not** yet qualify historical profitability: the synthetic
+canaries do not replace a source-qualified production run, and final reporting
+still requires real acquired payloads, partitions, features, targets, and
+replayed authorities. Intraday path tensors are also not yet materialized by
+the V1 tensor artifact. Before RL, a downstream training authority must bind
+the prequential forecast package, exact environment/reward semantics, neutral
+compiler equivalence, rollout state, optimizer state, and checkpoint replay.
+Those boundaries remain prerequisites for an H100 launch.
 
 ## Evidence boundary
 
