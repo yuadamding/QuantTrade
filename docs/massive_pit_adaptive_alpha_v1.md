@@ -151,13 +151,25 @@ inventory; the direct calendar builder is engineering-only and cannot qualify
 training.
 
 `MassiveAdaptiveTrainingAuthorityV1` then requires one replayed
-`MassiveAdaptiveSourceTargetsV1` for every eligible window origin. The
-package-owned supervised trainer reopens the decision tensor, rebuilds all
-decision roots and the split/window plans, performs the model forward itself,
-and publishes a create-only exact-resume checkpoint. The checkpoint binds the
-model, optimizer, scheduler, gradient-scaler placeholder, CPU/CUDA/data-order
-RNG state, epoch/update/window cursor, window permutation, and loss trace. A
-generic checkpoint reload has no runtime state or training authority.
+`MassiveAdaptiveSourceTargetsV1` for every eligible window origin through a
+create-only `MassiveAdaptiveTargetArchiveV1`. Each per-decision
+`MassiveAdaptiveTargetRootV1` reexecutes the complete target path from the live
+decision clock, session calendar, action identity, daily-input, fill, terminal,
+and economic-coverage authorities and reconciles it with the exact
+dual-universe decision root. Generic archive reload has neither runtime target
+objects nor training authority. The synthetic binder is explicitly
+nonqualifying.
+
+The package-owned supervised trainer reopens the decision tensor, rebuilds all
+decision and target roots plus the split/window plans, performs the model
+forward itself, and publishes a create-only exact-resume checkpoint. The
+training authority and checkpoint bind the target-archive, target-root, and
+experiment-source inventories in addition to the model, optimizer, scheduler,
+gradient-scaler placeholder, CPU/CUDA/data-order RNG state,
+epoch/update/window cursor, window permutation, and loss trace. A generic
+checkpoint reload has no runtime state or training authority. Substituting an
+independently valid identity, daily-input, fill, terminal, or coverage receipt
+after archive commitment is rejected.
 
 The synthetic qualification path is deliberately named a canary and cannot
 promote itself. The historical entry point requires qualified context roots,

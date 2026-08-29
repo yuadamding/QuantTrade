@@ -174,6 +174,9 @@ class MassiveAdaptiveCheckpointStateV1:
 class MassiveAdaptiveCheckpointV1:
     training_authority_receipt_sha256: str
     decision_tensor_receipt_sha256: str
+    target_archive_receipt_sha256: str
+    target_root_inventory_sha256: str
+    target_experiment_inventory_sha256: str
     split_plan_receipt_sha256: str
     window_plan_receipt_sha256: str
     model_spec_receipt_sha256: str
@@ -209,6 +212,11 @@ class MassiveAdaptiveCheckpointV1:
                 self.training_authority_receipt_sha256
             ),
             "decision_tensor_receipt_sha256": self.decision_tensor_receipt_sha256,
+            "target_archive_receipt_sha256": self.target_archive_receipt_sha256,
+            "target_root_inventory_sha256": self.target_root_inventory_sha256,
+            "target_experiment_inventory_sha256": (
+                self.target_experiment_inventory_sha256
+            ),
             "split_plan_receipt_sha256": self.split_plan_receipt_sha256,
             "window_plan_receipt_sha256": self.window_plan_receipt_sha256,
             "model_spec_receipt_sha256": self.model_spec_receipt_sha256,
@@ -431,6 +439,15 @@ def _metadata(
             training_authority.semantic_receipt_sha256
         ),
         "decision_tensor_receipt_sha256": decision_tensor_receipt_sha256,
+        "target_archive_receipt_sha256": (
+            training_authority.target_archive_receipt_sha256
+        ),
+        "target_root_inventory_sha256": (
+            training_authority.target_root_inventory_sha256
+        ),
+        "target_experiment_inventory_sha256": (
+            training_authority.target_experiment_inventory_sha256
+        ),
         "split_plan_receipt_sha256": split_plan_receipt_sha256,
         "window_plan_receipt_sha256": window_plan_receipt_sha256,
         "model_spec_receipt_sha256": model_spec_receipt_sha256,
@@ -592,6 +609,12 @@ def authorize_massive_adaptive_checkpoint_v1(
         != training_authority.semantic_receipt_sha256
         or parsed.decision_tensor_receipt_sha256
         != decision_tensor_receipt_sha256
+        or parsed.target_archive_receipt_sha256
+        != training_authority.target_archive_receipt_sha256
+        or parsed.target_root_inventory_sha256
+        != training_authority.target_root_inventory_sha256
+        or parsed.target_experiment_inventory_sha256
+        != training_authority.target_experiment_inventory_sha256
         or parsed.split_plan_receipt_sha256 != split_plan_receipt_sha256
         or parsed.window_plan_receipt_sha256 != window_plan_receipt_sha256
         or parsed.model_spec_receipt_sha256 != model_spec_receipt_sha256

@@ -29,6 +29,11 @@ from rl_quant.features.massive_adaptive_source_targets_v1 import (
     MASSIVE_ADAPTIVE_SOURCE_TARGETS_V1_SPEC_SHA256,
     MassiveAdaptiveSourceTargetsV1,
 )
+from rl_quant.features.massive_adaptive_target_archive_v1 import (
+    MassiveAdaptiveTargetArchiveV1Error,
+    materialize_massive_adaptive_target_archive_canary_v1,
+    parse_massive_adaptive_target_archive_v1,
+)
 from rl_quant.models.adaptive_alpha_term_structure_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_MODEL_SPEC_V1,
 )
@@ -302,6 +307,95 @@ def test_decision_root_rejects_cross_clock_substitution(tmp_path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "receipt_field",
+    (
+        "identity_authority_receipt_sha256",
+        "daily_input_authority_receipt_sha256",
+        "fill_source_receipt_sha256",
+        "terminal_authority_receipt_sha256",
+        "economic_coverage_receipt_sha256",
+    ),
+)
+def test_target_archive_rejects_cross_experiment_substitution(
+    tmp_path, receipt_field: str
+) -> None:
+    (
+        _session_authority,
+        _split,
+        features,
+        contexts,
+        origins,
+        source_targets,
+        _tensor,
+    ) = _fixture(tmp_path)
+    decision_roots = tuple(
+        build_massive_adaptive_decision_root_v1(
+            context_origin=context,
+            action_origin=origin,
+            features=feature,
+        )
+        for context, origin, feature in zip(
+            contexts, origins, features, strict=True
+        )
+    )
+    archive = materialize_massive_adaptive_target_archive_canary_v1(
+        root=tmp_path,
+        artifact_id=f"cross-experiment-{receipt_field}",
+        decision_roots=decision_roots,
+        source_targets=source_targets,
+        committed_at_ms=25_000,
+    )
+    generic = parse_massive_adaptive_target_archive_v1(
+        root=tmp_path, loaded_source=archive.loaded_source
+    )
+    assert generic.runtime_target_roots is None
+    assert generic.runtime_source_targets is None
+    assert not generic.runtime_roots_replayed
+    assert not generic.development_training_authorized
+
+    replacement_receipt = semantic_sha256((receipt_field, "experiment-b"))
+    changed_target = source_targets[0].targets
+    if receipt_field in {
+        "fill_source_receipt_sha256",
+        "terminal_authority_receipt_sha256",
+        "economic_coverage_receipt_sha256",
+    }:
+        changed_target = replace(
+            changed_target,
+            **{receipt_field: replacement_receipt},
+            semantic_receipt_sha256="0" * 64,
+        )
+        changed_target = replace(
+            changed_target,
+            semantic_receipt_sha256=semantic_sha256(
+                changed_target.semantic_unsigned()
+            ),
+        )
+        changed_target.validate()
+    changed_source = replace(
+        source_targets[0],
+        targets=changed_target,
+        target_receipt_sha256=changed_target.semantic_receipt_sha256,
+        **{receipt_field: replacement_receipt},
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed_source = replace(
+        changed_source,
+        semantic_receipt_sha256=semantic_sha256(changed_source.semantic_unsigned()),
+    )
+    changed_source.validate()
+    substituted = replace(
+        archive,
+        runtime_source_targets=(changed_source, source_targets[1]),
+    )
+    with pytest.raises(
+        MassiveAdaptiveTargetArchiveV1Error,
+        match="runtime target inventory differs",
+    ):
+        substituted.validate()
+
+
 def test_canary_trainer_owns_forward_and_exact_resume(tmp_path) -> None:
     (
         session_authority,
@@ -377,6 +471,9 @@ def test_canary_trainer_owns_forward_and_exact_resume(tmp_path) -> None:
         == resumed.optimizer_state_receipt_sha256
     )
     assert uninterrupted.runtime_state.loss_trace == resumed.runtime_state.loss_trace
+    assert uninterrupted.target_archive_receipt_sha256
+    assert uninterrupted.target_root_inventory_sha256
+    assert uninterrupted.target_experiment_inventory_sha256
 
     generic = parse_massive_adaptive_checkpoint_v1(
         root=tmp_path, loaded_source=uninterrupted.loaded_source
@@ -391,6 +488,8 @@ def test_canary_trainer_owns_forward_and_exact_resume(tmp_path) -> None:
     assert "archive_freeze" in historical_parameters
     assert "decision_clocks" in historical_parameters
     assert "context_identity_authority" in historical_parameters
+    assert "target_archive" in historical_parameters
+    assert "target_source_runtimes" in historical_parameters
     assert "context_origins" not in historical_parameters
 
     bare_target_call = {

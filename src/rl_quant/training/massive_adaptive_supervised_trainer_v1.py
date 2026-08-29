@@ -41,6 +41,14 @@ from rl_quant.features.massive_adaptive_origin_authority_v1 import (
 from rl_quant.features.massive_adaptive_source_targets_v1 import (
     MassiveAdaptiveSourceTargetsV1,
 )
+from rl_quant.features.massive_adaptive_target_archive_v1 import (
+    MassiveAdaptiveTargetArchiveV1,
+    authorize_massive_adaptive_target_archive_v1,
+    materialize_massive_adaptive_target_archive_canary_v1,
+)
+from rl_quant.features.massive_adaptive_target_root_v1 import (
+    MassiveAdaptiveTargetSourceRuntimeV1,
+)
 from rl_quant.features.massive_profitability_archive_freeze_v1 import (
     MassiveProfitabilityArchiveFreezeV1,
 )
@@ -73,6 +81,7 @@ from rl_quant.training.massive_adaptive_split_plan_v1 import (
 )
 from rl_quant.training.massive_adaptive_training_authority_v1 import (
     MassiveAdaptiveTrainingAuthorityV1,
+    MassiveAdaptiveTrainingAuthorityV1Error,
     build_massive_adaptive_training_authority_v1,
 )
 from rl_quant.training.massive_adaptive_window_plan_v1 import (
@@ -178,6 +187,7 @@ class _PreparedTrainingV1:
     decision_tensor: MassiveAdaptiveDecisionTensorV1
     decision_roots: tuple[MassiveAdaptiveDecisionRootV1, ...]
     source_targets: tuple[MassiveAdaptiveSourceTargetsV1, ...]
+    target_archive: MassiveAdaptiveTargetArchiveV1
     split_plan: MassiveAdaptiveSplitPlanV1
     window_plan: MassiveAdaptiveWindowPlanV1
     training_authority: MassiveAdaptiveTrainingAuthorityV1
@@ -229,11 +239,14 @@ def _clone_model_state(model: nn.Module) -> dict[str, torch.Tensor]:
 def _prepare_training(
     *,
     root: str | Path,
+    artifact_id: str,
     decision_tensor: MassiveAdaptiveDecisionTensorV1,
     features: Sequence[MassiveProfitabilityOriginFeaturesV3],
     context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
     action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
     source_targets: Sequence[MassiveAdaptiveSourceTargetsV1],
+    target_archive: MassiveAdaptiveTargetArchiveV1 | None,
+    target_source_runtimes: Sequence[MassiveAdaptiveTargetSourceRuntimeV1],
     session_authority: MassiveSessionAuthority,
     split_plan: MassiveAdaptiveSplitPlanV1,
     fold_index: int,
@@ -296,17 +309,46 @@ def _prepare_training(
     ordered_targets = tuple(
         sorted(source_targets, key=lambda row: row.decision_session_date)
     )
+    if any(
+        not isinstance(row, MassiveAdaptiveSourceTargetsV1)
+        for row in ordered_targets
+    ):
+        raise MassiveAdaptiveTrainingAuthorityV1Error(
+            "adaptive training requires source-target wrappers"
+        )
+    promoted_target_archive = (
+        materialize_massive_adaptive_target_archive_canary_v1(
+            root=root,
+            artifact_id=f"{artifact_id}-targets",
+            decision_roots=roots,
+            source_targets=ordered_targets,
+            committed_at_ms=max(row.targets.built_at_ms for row in ordered_targets),
+        )
+        if target_archive is None
+        else authorize_massive_adaptive_target_archive_v1(
+            root=root,
+            archive=target_archive,
+            decision_roots=roots,
+            source_targets=ordered_targets,
+            source_runtimes=target_source_runtimes,
+        )
+    )
     authority = build_massive_adaptive_training_authority_v1(
         decision_tensor=promoted_tensor,
         decision_roots=roots,
-        source_targets=ordered_targets,
+        target_archive=promoted_target_archive,
         split_plan=replayed_split,
         window_plan=window_plan,
     )
+    if promoted_target_archive.runtime_source_targets is None:
+        raise MassiveAdaptiveSupervisedTrainerV1Error(
+            "adaptive target archive replay did not recover source targets"
+        )
     return _PreparedTrainingV1(
         decision_tensor=promoted_tensor,
         decision_roots=roots,
-        source_targets=ordered_targets,
+        source_targets=promoted_target_archive.runtime_source_targets,
+        target_archive=promoted_target_archive,
         split_plan=replayed_split,
         window_plan=window_plan,
         training_authority=authority,
@@ -620,6 +662,8 @@ def train_and_publish_massive_adaptive_alpha_v1(
     context_identity_authority: PITSecurityUniverseAuthority,
     action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
     source_targets: Sequence[MassiveAdaptiveSourceTargetsV1],
+    target_archive: MassiveAdaptiveTargetArchiveV1,
+    target_source_runtimes: Sequence[MassiveAdaptiveTargetSourceRuntimeV1],
     session_authority: MassiveSessionAuthority,
     archive_freeze: MassiveProfitabilityArchiveFreezeV1,
     split_plan: MassiveAdaptiveSplitPlanV1,
@@ -659,11 +703,14 @@ def train_and_publish_massive_adaptive_alpha_v1(
     )
     prepared = _prepare_training(
         root=root,
+        artifact_id=artifact_id,
         decision_tensor=decision_tensor,
         features=ordered_features,
         context_origins=context_origins,
         action_origins=action_origins,
         source_targets=source_targets,
+        target_archive=target_archive,
+        target_source_runtimes=target_source_runtimes,
         session_authority=session_authority,
         split_plan=split_plan,
         fold_index=fold_index,
@@ -710,11 +757,14 @@ def train_and_publish_massive_adaptive_alpha_canary_v1(
 
     prepared = _prepare_training(
         root=root,
+        artifact_id=artifact_id,
         decision_tensor=decision_tensor,
         features=features,
         context_origins=context_origins,
         action_origins=action_origins,
         source_targets=source_targets,
+        target_archive=None,
+        target_source_runtimes=(),
         session_authority=session_authority,
         split_plan=split_plan,
         fold_index=fold_index,

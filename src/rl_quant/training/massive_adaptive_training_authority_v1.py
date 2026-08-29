@@ -18,8 +18,8 @@ from rl_quant.features.massive_adaptive_decision_root_v1 import (
 from rl_quant.features.massive_adaptive_decision_tensor_v1 import (
     MassiveAdaptiveDecisionTensorV1,
 )
-from rl_quant.features.massive_adaptive_source_targets_v1 import (
-    MassiveAdaptiveSourceTargetsV1,
+from rl_quant.features.massive_adaptive_target_archive_v1 import (
+    MassiveAdaptiveTargetArchiveV1,
 )
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -43,7 +43,7 @@ MASSIVE_ADAPTIVE_TRAINING_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "protocol": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
         "model_inputs": "runtime-replayed-decision-tensor-v1",
         "decision_roots": "exact-context-action-feature-root-inventory",
-        "targets": "exact-source-target-v1-inventory-for-every-window-origin",
+        "targets": "promoted-target-archive-v1-and-exact-target-root-inventory",
         "split": "frozen-126-session-split-plan-v1",
         "windows": "package-derived-window-plan-v1",
         "promotion": "trainer-rebuilds-authority-from-live-roots",
@@ -65,7 +65,10 @@ class MassiveAdaptiveTrainingAuthorityV1:
     origin_session_dates: tuple[str, ...]
     decision_tensor_receipt_sha256: str
     decision_root_inventory_sha256: str
+    target_archive_receipt_sha256: str
+    target_root_inventory_sha256: str
     source_target_inventory_sha256: str
+    target_experiment_inventory_sha256: str
     split_plan_receipt_sha256: str
     window_plan_receipt_sha256: str
     source_inventory_sha256: str
@@ -125,13 +128,14 @@ def build_massive_adaptive_training_authority_v1(
     *,
     decision_tensor: MassiveAdaptiveDecisionTensorV1,
     decision_roots: Sequence[MassiveAdaptiveDecisionRootV1],
-    source_targets: Sequence[MassiveAdaptiveSourceTargetsV1],
+    target_archive: MassiveAdaptiveTargetArchiveV1,
     split_plan: MassiveAdaptiveSplitPlanV1,
     window_plan: MassiveAdaptiveWindowPlanV1,
 ) -> MassiveAdaptiveTrainingAuthorityV1:
     """Reconcile every root required for one fold/role training inventory."""
 
     decision_tensor.validate()
+    target_archive.validate()
     split_plan.validate()
     window_plan.validate()
     if decision_tensor.runtime_tensor is None or not decision_tensor.runtime_source_replayed:
@@ -141,23 +145,25 @@ def build_massive_adaptive_training_authority_v1(
     ordered_roots = tuple(
         sorted(decision_roots, key=lambda row: row.decision_session_date)
     )
-    ordered_targets = tuple(
-        sorted(source_targets, key=lambda row: row.decision_session_date)
-    )
     if any(
         not isinstance(row, MassiveAdaptiveDecisionRootV1)
         for row in ordered_roots
-    ) or any(
-        not isinstance(row, MassiveAdaptiveSourceTargetsV1)
-        for row in ordered_targets
     ):
         raise MassiveAdaptiveTrainingAuthorityV1Error(
-            "adaptive training requires decision roots and source-target wrappers"
+            "adaptive training requires decision roots and a target archive"
         )
     for decision_root in ordered_roots:
         decision_root.validate()
-    for source_target in ordered_targets:
-        source_target.validate()
+    if (
+        not target_archive.runtime_roots_replayed
+        or target_archive.runtime_target_roots is None
+        or target_archive.runtime_source_targets is None
+    ):
+        raise MassiveAdaptiveTrainingAuthorityV1Error(
+            "adaptive target archive has not been package replayed"
+        )
+    ordered_target_roots = target_archive.runtime_target_roots
+    ordered_targets = target_archive.runtime_source_targets
     root_by_date = {row.decision_session_date: row for row in ordered_roots}
     target_by_date = {row.decision_session_date: row for row in ordered_targets}
     expected_dates = tuple(row.origin_session_date for row in window_plan.rows)
@@ -169,6 +175,13 @@ def build_massive_adaptive_training_authority_v1(
         != decision_tensor.feature_semantic_receipts
         or tuple(row.action_origin_receipt_sha256 for row in ordered_roots)
         != decision_tensor.action_origin_receipts
+        or target_archive.decision_root_receipts
+        != tuple(row.semantic_receipt_sha256 for row in ordered_roots)
+        or target_archive.decision_session_dates != tuple(root_by_date)
+        or target_archive.source_target_receipts
+        != tuple(row.semantic_receipt_sha256 for row in ordered_targets)
+        or target_archive.target_root_receipts
+        != tuple(row.semantic_receipt_sha256 for row in ordered_target_roots)
         or tuple(target_by_date) != expected_dates
         or window_plan.decision_tensor_receipt_sha256
         != decision_tensor.semantic_receipt_sha256
@@ -182,6 +195,12 @@ def build_massive_adaptive_training_authority_v1(
             != root_by_date[date].decision_clock_receipt_sha256
             or target.session_authority_receipt_sha256
             != root_by_date[date].session_authority_receipt_sha256
+            or target_by_date[date].semantic_receipt_sha256
+            != next(
+                row.source_target_receipt_sha256
+                for row in ordered_target_roots
+                if row.decision_session_date == date
+            )
             or not target.source_paths_replayed
             for date, target in target_by_date.items()
         )
@@ -199,7 +218,10 @@ def build_massive_adaptive_training_authority_v1(
         {
             "decision_tensor": decision_tensor.semantic_receipt_sha256,
             "decision_roots": root_inventory,
+            "target_archive": target_archive.semantic_receipt_sha256,
+            "target_roots": target_archive.target_root_inventory_sha256,
             "source_targets": target_inventory,
+            "target_experiments": target_archive.experiment_inventory_sha256,
             "split_plan": split_plan.semantic_receipt_sha256,
             "window_plan": window_plan.semantic_receipt_sha256,
         }
@@ -207,6 +229,8 @@ def build_massive_adaptive_training_authority_v1(
     qualified = (
         decision_tensor.committed_source_data_qualified
         and split_plan.candidate_source_data_qualified
+        and target_archive.committed_source_data_qualified
+        and target_archive.development_training_authorized
         and all(row.source_data_qualified for row in ordered_roots)
     )
     body = {
@@ -216,7 +240,12 @@ def build_massive_adaptive_training_authority_v1(
         "origin_session_dates": expected_dates,
         "decision_tensor_receipt_sha256": decision_tensor.semantic_receipt_sha256,
         "decision_root_inventory_sha256": root_inventory,
+        "target_archive_receipt_sha256": target_archive.semantic_receipt_sha256,
+        "target_root_inventory_sha256": target_archive.target_root_inventory_sha256,
         "source_target_inventory_sha256": target_inventory,
+        "target_experiment_inventory_sha256": (
+            target_archive.experiment_inventory_sha256
+        ),
         "split_plan_receipt_sha256": split_plan.semantic_receipt_sha256,
         "window_plan_receipt_sha256": window_plan.semantic_receipt_sha256,
         "source_inventory_sha256": source_inventory,
