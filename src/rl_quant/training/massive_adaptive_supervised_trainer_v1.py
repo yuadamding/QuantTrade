@@ -306,6 +306,9 @@ def _prepare_training(
         fold_index=fold_index,
         split_role=split_role,
     )
+    root_by_date = {row.decision_session_date: row for row in roots}
+    origin_dates = tuple(row.origin_session_date for row in window_plan.rows)
+    origin_roots = tuple(root_by_date[date] for date in origin_dates)
     ordered_targets = tuple(
         sorted(source_targets, key=lambda row: row.decision_session_date)
     )
@@ -316,11 +319,15 @@ def _prepare_training(
         raise MassiveAdaptiveTrainingAuthorityV1Error(
             "adaptive training requires source-target wrappers"
         )
+    if tuple(row.decision_session_date for row in ordered_targets) != origin_dates:
+        raise MassiveAdaptiveTrainingAuthorityV1Error(
+            "adaptive source targets must equal the eligible window origins"
+        )
     promoted_target_archive = (
         materialize_massive_adaptive_target_archive_canary_v1(
             root=root,
             artifact_id=f"{artifact_id}-targets",
-            decision_roots=roots,
+            decision_roots=origin_roots,
             source_targets=ordered_targets,
             committed_at_ms=max(row.targets.built_at_ms for row in ordered_targets),
         )
@@ -328,7 +335,7 @@ def _prepare_training(
         else authorize_massive_adaptive_target_archive_v1(
             root=root,
             archive=target_archive,
-            decision_roots=roots,
+            decision_roots=origin_roots,
             source_targets=ordered_targets,
             source_runtimes=target_source_runtimes,
         )

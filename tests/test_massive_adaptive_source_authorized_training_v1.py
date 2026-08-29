@@ -58,12 +58,20 @@ from rl_quant.training.massive_adaptive_supervised_trainer_v1 import (
 )
 from rl_quant.training.massive_adaptive_training_authority_v1 import (
     MassiveAdaptiveTrainingAuthorityV1Error,
+    build_massive_adaptive_training_authority_v1,
+)
+from rl_quant.training.massive_adaptive_window_plan_v1 import (
+    MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
+    build_massive_adaptive_window_plan_v1,
 )
 from tests.test_massive_adaptive_decision_tensor_v1 import (
     _feature,
     _origin,
     _paths,
     _targets,
+)
+from tests.test_massive_profitability_v6_vertical_slice import (
+    _feature_and_target,
 )
 
 
@@ -288,6 +296,7 @@ def test_decision_root_rejects_cross_clock_substitution(tmp_path) -> None:
     )
     assert root.action_security_ids == origins[0].security_ids
     assert set(root.action_security_ids) < set(root.context_security_ids)
+    assert root.action_identity_source_data_qualified
 
     changed = replace(
         contexts[0],
@@ -305,6 +314,56 @@ def test_decision_root_rejects_cross_clock_substitution(tmp_path) -> None:
             action_origin=origins[0],
             features=features[0],
         )
+
+
+def test_action_identity_qualification_is_an_explicit_root_gate(tmp_path) -> None:
+    (
+        _sessions_root,
+        _split,
+        features,
+        contexts,
+        origins,
+        _targets_root,
+        _tensor,
+    ) = _fixture(tmp_path)
+    qualified_context = replace(
+        contexts[0],
+        source_data_qualified=True,
+        semantic_receipt_sha256="0" * 64,
+    )
+    qualified_context = replace(
+        qualified_context,
+        semantic_receipt_sha256=semantic_sha256(
+            qualified_context.semantic_unsigned()
+        ),
+    )
+    qualified_context.validate()
+    qualified = build_massive_adaptive_decision_root_v1(
+        context_origin=qualified_context,
+        action_origin=origins[0],
+        features=features[0],
+    )
+    assert qualified.source_data_qualified
+
+    unqualified_action = replace(
+        origins[0],
+        action_identity_source_data_qualified=False,
+        semantic_receipt_sha256="0" * 64,
+    )
+    unqualified_action = replace(
+        unqualified_action,
+        semantic_receipt_sha256=semantic_sha256(
+            unqualified_action.semantic_unsigned()
+        ),
+    )
+    unqualified_action.validate()
+    rejected = build_massive_adaptive_decision_root_v1(
+        context_origin=qualified_context,
+        action_origin=unqualified_action,
+        features=features[0],
+    )
+    assert not rejected.action_identity_source_data_qualified
+    assert not rejected.source_data_qualified
 
 
 @pytest.mark.parametrize(
@@ -396,6 +455,165 @@ def test_target_archive_rejects_cross_experiment_substitution(
         substituted.validate()
 
 
+def test_long_context_uses_origin_only_target_inventory(tmp_path) -> None:
+    session_authority = _sessions()
+    candidate_dates = tuple(row.session_date for row in session_authority.sessions)
+    split_plan = build_massive_adaptive_split_plan_v1(
+        candidate_session_dates=candidate_dates,
+        session_authority=session_authority,
+    )
+    fold = split_plan.outer_folds[0]
+    validation_start = candidate_dates.index(
+        fold.inner_validation_session_dates[0]
+    )
+    tensor_dates = candidate_dates[
+        validation_start - MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1 :
+        validation_start + 1
+    ]
+    features = []
+    origins = []
+    contexts = []
+    for date_index, session_date in enumerate(tensor_dates):
+        decision_day = date.fromisoformat(session_date)
+        history = tuple(
+            (decision_day - timedelta(days=offset)).isoformat()
+            for offset in range(64, 0, -1)
+        )
+        feature, _unused_target = _feature_and_target(
+            decision_session_date=session_date,
+            source_session_date=history[-1],
+            input_session_dates=history,
+            date_index=date_index,
+        )
+        expanded_rows = list(feature.rows)
+        template = feature.rows[0]
+        for asset_index in range(len(feature.rows), 8):
+            security_id = f"SEC-{asset_index:02d}"
+            bars = list(template.bars_values)
+            bars[0] += float(asset_index)
+            body = template.unsigned() | {
+                "security_id": security_id,
+                "decision_membership_rank": asset_index + 1,
+                "bars_values": tuple(bars),
+                "source_panel_row_receipt_sha256": semantic_sha256(
+                    (session_date, security_id, "panel")
+                ),
+                "feature_accounting_security_inventory_sha256": semantic_sha256(
+                    (session_date, security_id, "feature-accounting")
+                ),
+                "tape_population_row_receipt_sha256": semantic_sha256(
+                    (session_date, security_id, "tape-population")
+                ),
+            }
+            expanded_rows.append(
+                type(template)(
+                    **body, receipt_sha256=semantic_sha256(body)
+                )
+            )
+        expanded = replace(
+            feature,
+            rows=tuple(expanded_rows),
+            row_inventory_sha256=semantic_sha256(
+                tuple(row.receipt_sha256 for row in expanded_rows)
+            ),
+            semantic_receipt_sha256="0" * 64,
+            audit_receipt_sha256=semantic_sha256(
+                (session_date, "long-context-feature-audit")
+            ),
+        )
+        feature = replace(
+            expanded,
+            semantic_receipt_sha256=semantic_sha256(
+                expanded.semantic_unsigned()
+            ),
+        )
+        feature.validate()
+        action_ids = tuple(row.security_id for row in feature.rows)
+        origin = _origin(
+            feature,
+            action_ids=action_ids,
+            session_authority_receipt_sha256=session_authority.receipt_sha256,
+        )
+        features.append(feature)
+        origins.append(origin)
+        contexts.append(_context(feature, origin))
+    committed_tensor = materialize_massive_adaptive_decision_tensor_v1(
+        root=tmp_path,
+        artifact_id="long-context-subset",
+        features=features,
+        action_origins=origins,
+        committed_at_ms=40_000,
+    )
+    decision_roots = tuple(
+        build_massive_adaptive_decision_root_v1(
+            context_origin=context,
+            action_origin=origin,
+            features=feature,
+        )
+        for context, origin, feature in zip(
+            contexts, origins, features, strict=True
+        )
+    )
+    window_plan = build_massive_adaptive_window_plan_v1(
+        decision_tensor=committed_tensor,
+        decision_roots=decision_roots,
+        split_plan=split_plan,
+        fold_index=0,
+        split_role="inner_validation",
+    )
+    origin_dates = tuple(row.origin_session_date for row in window_plan.rows)
+    assert len(tensor_dates) > MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1
+    assert origin_dates == (fold.inner_validation_session_dates[0],)
+    assert len(window_plan.rows[0].context_session_dates) == 504
+    assert set(window_plan.rows[0].context_session_dates) & set(
+        fold.fit_session_dates
+    )
+    assert set(window_plan.rows[0].context_session_dates) & set(
+        fold.inner_purge_session_dates
+    )
+
+    root_by_date = {
+        row.decision_session_date: row for row in decision_roots
+    }
+    origin_by_date = {
+        row.decision_session_date: row for row in origins
+    }
+    origin_roots = tuple(root_by_date[value] for value in origin_dates)
+    source_targets = tuple(
+        _source_target(origin_by_date[value]) for value in origin_dates
+    )
+    target_archive = materialize_massive_adaptive_target_archive_canary_v1(
+        root=tmp_path,
+        artifact_id="long-context-origin-targets",
+        decision_roots=origin_roots,
+        source_targets=source_targets,
+        committed_at_ms=41_000,
+    )
+    authority = build_massive_adaptive_training_authority_v1(
+        decision_tensor=committed_tensor,
+        decision_roots=decision_roots,
+        target_archive=target_archive,
+        split_plan=split_plan,
+        window_plan=window_plan,
+    )
+
+    assert target_archive.decision_session_dates == origin_dates
+    assert len(target_archive.decision_session_dates) < len(tensor_dates)
+    assert authority.origin_session_dates == origin_dates
+    assert (
+        authority.full_decision_root_inventory_sha256
+        == window_plan.full_decision_root_inventory_sha256
+    )
+    assert (
+        authority.origin_decision_root_inventory_sha256
+        == target_archive.origin_decision_root_inventory_sha256
+    )
+    assert (
+        authority.full_decision_root_inventory_sha256
+        != authority.origin_decision_root_inventory_sha256
+    )
+
+
 def test_canary_trainer_owns_forward_and_exact_resume(tmp_path) -> None:
     (
         session_authority,
@@ -474,6 +692,8 @@ def test_canary_trainer_owns_forward_and_exact_resume(tmp_path) -> None:
     assert uninterrupted.target_archive_receipt_sha256
     assert uninterrupted.target_root_inventory_sha256
     assert uninterrupted.target_experiment_inventory_sha256
+    assert uninterrupted.full_decision_root_inventory_sha256
+    assert uninterrupted.origin_decision_root_inventory_sha256
 
     generic = parse_massive_adaptive_checkpoint_v1(
         root=tmp_path, loaded_source=uninterrupted.loaded_source

@@ -162,6 +162,7 @@ class MassiveAdaptiveOriginAuthorityV1:
     implementation_source_sha256: str
     semantic_receipt_sha256: str
     source_paths_replayed: bool
+    action_identity_source_data_qualified: bool
     predictive_training_authorized: bool
     profitability_reporting_authorized: bool
     lockbox_access_authorized: bool
@@ -205,6 +206,7 @@ class MassiveAdaptiveOriginAuthorityV1:
             or self.membership_available_at_ms > self.decision_at_ms
             or self.membership_effective_at_ms > self.decision_at_ms
             or not self.source_paths_replayed
+            or not isinstance(self.action_identity_source_data_qualified, bool)
         ):
             raise MassiveAdaptiveOriginAuthorityV1Error(
                 "adaptive origin identity or replay differs"
@@ -452,6 +454,9 @@ def build_massive_adaptive_origin_authority_v1(
         "specification_sha256": MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SPEC_SHA256,
         "implementation_source_sha256": MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SOURCE_SHA256,
         "source_paths_replayed": True,
+        # PITSecurityUniverseAuthority.validate() independently reconstructs
+        # the complete membership inventory under the frozen action rule.
+        "action_identity_source_data_qualified": True,
         "predictive_training_authorized": False,
         "profitability_reporting_authorized": False,
         "lockbox_access_authorized": False,
@@ -481,6 +486,7 @@ def build_massive_adaptive_origin_authority_v1(
         implementation_source_sha256=MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SOURCE_SHA256,
         semantic_receipt_sha256=semantic_sha256(semantic),
         source_paths_replayed=True,
+        action_identity_source_data_qualified=True,
         predictive_training_authorized=False,
         profitability_reporting_authorized=False,
         lockbox_access_authorized=False,

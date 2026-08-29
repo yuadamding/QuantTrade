@@ -42,6 +42,9 @@ MASSIVE_ADAPTIVE_DECISION_ROOT_V1_SPEC_SHA256 = semantic_sha256(
         "session": "one-identical-session-authority-receipt",
         "support": "action-security-ids-strict-subset-or-equal-context-security-ids",
         "history": "feature-input-inventory-bound-explicitly",
+        "action_identity_qualification": (
+            "package-derived-from-reconstructed-pit500-membership"
+        ),
         "duration_prior": False,
         "downstream_authorization": False,
     }
@@ -88,6 +91,7 @@ class MassiveAdaptiveDecisionRootV1:
     implementation_source_sha256: str
     semantic_receipt_sha256: str
     source_paths_replayed: bool
+    action_identity_source_data_qualified: bool
     source_data_qualified: bool
     development_training_authorized: bool
     profitability_reporting_authorized: bool = False
@@ -129,7 +133,12 @@ class MassiveAdaptiveDecisionRootV1:
             or not self.action_security_ids
             or not set(self.action_security_ids) <= set(self.context_security_ids)
             or not self.source_paths_replayed
+            or not isinstance(self.action_identity_source_data_qualified, bool)
             or not isinstance(self.source_data_qualified, bool)
+            or (
+                self.source_data_qualified
+                and not self.action_identity_source_data_qualified
+            )
             or self.development_training_authorized
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
@@ -253,9 +262,13 @@ def build_massive_adaptive_decision_root_v1(
         "specification_sha256": MASSIVE_ADAPTIVE_DECISION_ROOT_V1_SPEC_SHA256,
         "implementation_source_sha256": MASSIVE_ADAPTIVE_DECISION_ROOT_V1_SOURCE_SHA256,
         "source_paths_replayed": True,
+        "action_identity_source_data_qualified": (
+            action_origin.action_identity_source_data_qualified
+        ),
         "source_data_qualified": (
             context_origin.source_data_qualified
             and features.source_inputs_data_qualified
+            and action_origin.action_identity_source_data_qualified
         ),
         "development_training_authorized": False,
         "profitability_reporting_authorized": False,

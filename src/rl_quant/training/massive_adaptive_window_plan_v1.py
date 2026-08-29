@@ -104,7 +104,8 @@ class MassiveAdaptiveWindowPlanV1:
     split_role: str
     rows: tuple[MassiveAdaptiveWindowRowV1, ...]
     decision_tensor_receipt_sha256: str
-    decision_root_inventory_sha256: str
+    full_decision_root_inventory_sha256: str
+    origin_decision_root_inventory_sha256: str
     split_plan_receipt_sha256: str
     row_inventory_sha256: str
     protocol_receipt_sha256: str
@@ -289,13 +290,17 @@ def build_massive_adaptive_window_plan_v1(
     root_inventory = semantic_sha256(
         tuple(row.semantic_receipt_sha256 for row in ordered_roots)
     )
+    origin_root_inventory = semantic_sha256(
+        tuple(row.decision_root_receipt_sha256 for row in rows)
+    )
     body = {
         "schema": MASSIVE_ADAPTIVE_WINDOW_PLAN_V1_SCHEMA,
         "fold_index": fold_index,
         "split_role": split_role,
         "rows": tuple(rows),
         "decision_tensor_receipt_sha256": decision_tensor.semantic_receipt_sha256,
-        "decision_root_inventory_sha256": root_inventory,
+        "full_decision_root_inventory_sha256": root_inventory,
+        "origin_decision_root_inventory_sha256": origin_root_inventory,
         "split_plan_receipt_sha256": split_plan.semantic_receipt_sha256,
         "row_inventory_sha256": semantic_sha256(
             tuple(row.receipt_sha256 for row in rows)

@@ -42,8 +42,12 @@ MASSIVE_ADAPTIVE_TRAINING_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
     {
         "protocol": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
         "model_inputs": "runtime-replayed-decision-tensor-v1",
-        "decision_roots": "exact-context-action-feature-root-inventory",
-        "targets": "promoted-target-archive-v1-and-exact-target-root-inventory",
+        "decision_roots": (
+            "separate-full-chronology-and-target-bearing-origin-inventories"
+        ),
+        "targets": (
+            "promoted-target-archive-v1-over-eligible-window-origins-only"
+        ),
         "split": "frozen-126-session-split-plan-v1",
         "windows": "package-derived-window-plan-v1",
         "promotion": "trainer-rebuilds-authority-from-live-roots",
@@ -64,7 +68,8 @@ class MassiveAdaptiveTrainingAuthorityV1:
     split_role: str
     origin_session_dates: tuple[str, ...]
     decision_tensor_receipt_sha256: str
-    decision_root_inventory_sha256: str
+    full_decision_root_inventory_sha256: str
+    origin_decision_root_inventory_sha256: str
     target_archive_receipt_sha256: str
     target_root_inventory_sha256: str
     source_target_inventory_sha256: str
@@ -167,6 +172,14 @@ def build_massive_adaptive_training_authority_v1(
     root_by_date = {row.decision_session_date: row for row in ordered_roots}
     target_by_date = {row.decision_session_date: row for row in ordered_targets}
     expected_dates = tuple(row.origin_session_date for row in window_plan.rows)
+    if not set(expected_dates) <= set(root_by_date):
+        raise MassiveAdaptiveTrainingAuthorityV1Error(
+            "adaptive window origin is absent from the full decision roots"
+        )
+    origin_roots = tuple(root_by_date[date] for date in expected_dates)
+    origin_root_receipts = tuple(
+        row.semantic_receipt_sha256 for row in origin_roots
+    )
     if (
         len(root_by_date) != len(ordered_roots)
         or len(target_by_date) != len(ordered_targets)
@@ -175,16 +188,25 @@ def build_massive_adaptive_training_authority_v1(
         != decision_tensor.feature_semantic_receipts
         or tuple(row.action_origin_receipt_sha256 for row in ordered_roots)
         != decision_tensor.action_origin_receipts
-        or target_archive.decision_root_receipts
-        != tuple(row.semantic_receipt_sha256 for row in ordered_roots)
-        or target_archive.decision_session_dates != tuple(root_by_date)
+        or target_archive.origin_decision_root_receipts != origin_root_receipts
+        or target_archive.decision_session_dates != expected_dates
         or target_archive.source_target_receipts
         != tuple(row.semantic_receipt_sha256 for row in ordered_targets)
         or target_archive.target_root_receipts
         != tuple(row.semantic_receipt_sha256 for row in ordered_target_roots)
         or tuple(target_by_date) != expected_dates
+        or tuple(
+            row.decision_session_date for row in ordered_target_roots
+        )
+        != expected_dates
         or window_plan.decision_tensor_receipt_sha256
         != decision_tensor.semantic_receipt_sha256
+        or window_plan.full_decision_root_inventory_sha256
+        != semantic_sha256(
+            tuple(row.semantic_receipt_sha256 for row in ordered_roots)
+        )
+        or window_plan.origin_decision_root_inventory_sha256
+        != semantic_sha256(origin_root_receipts)
         or window_plan.split_plan_receipt_sha256
         != split_plan.semantic_receipt_sha256
         or any(
@@ -208,16 +230,18 @@ def build_massive_adaptive_training_authority_v1(
         raise MassiveAdaptiveTrainingAuthorityV1Error(
             "adaptive training root, target, split, or window inventories differ"
         )
-    root_inventory = semantic_sha256(
+    full_root_inventory = semantic_sha256(
         tuple(row.semantic_receipt_sha256 for row in ordered_roots)
     )
+    origin_root_inventory = semantic_sha256(origin_root_receipts)
     target_inventory = semantic_sha256(
         tuple(row.semantic_receipt_sha256 for row in ordered_targets)
     )
     source_inventory = semantic_sha256(
         {
             "decision_tensor": decision_tensor.semantic_receipt_sha256,
-            "decision_roots": root_inventory,
+            "full_decision_roots": full_root_inventory,
+            "origin_decision_roots": origin_root_inventory,
             "target_archive": target_archive.semantic_receipt_sha256,
             "target_roots": target_archive.target_root_inventory_sha256,
             "source_targets": target_inventory,
@@ -239,7 +263,8 @@ def build_massive_adaptive_training_authority_v1(
         "split_role": window_plan.split_role,
         "origin_session_dates": expected_dates,
         "decision_tensor_receipt_sha256": decision_tensor.semantic_receipt_sha256,
-        "decision_root_inventory_sha256": root_inventory,
+        "full_decision_root_inventory_sha256": full_root_inventory,
+        "origin_decision_root_inventory_sha256": origin_root_inventory,
         "target_archive_receipt_sha256": target_archive.semantic_receipt_sha256,
         "target_root_inventory_sha256": target_archive.target_root_inventory_sha256,
         "source_target_inventory_sha256": target_inventory,

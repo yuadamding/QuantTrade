@@ -58,7 +58,7 @@ MASSIVE_ADAPTIVE_TARGET_ARCHIVE_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_TARGET_ARCHIVE_V1_SPEC_SHA256 = semantic_sha256(
     {
         "protocol": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
-        "rows": "one-target-root-per-decision",
+        "rows": "one-target-root-per-eligible-window-origin",
         "generic_reload": "nonauthorizing-without-runtime-targets",
         "promotion": "rebuild-every-target-from-live-source-roots",
         "canary": "runtime-replay-permitted-but-always-unqualified",
@@ -100,11 +100,11 @@ def _digest(name: str, value: object) -> str:
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveTargetArchiveV1:
     decision_session_dates: tuple[str, ...]
-    decision_root_receipts: tuple[str, ...]
+    origin_decision_root_receipts: tuple[str, ...]
     target_root_receipts: tuple[str, ...]
     source_target_receipts: tuple[str, ...]
     experiment_source_receipts: tuple[str, ...]
-    decision_root_inventory_sha256: str
+    origin_decision_root_inventory_sha256: str
     target_root_inventory_sha256: str
     source_target_inventory_sha256: str
     experiment_inventory_sha256: str
@@ -127,11 +127,13 @@ class MassiveAdaptiveTargetArchiveV1:
         return {
             "schema": self.schema,
             "decision_session_dates": self.decision_session_dates,
-            "decision_root_receipts": self.decision_root_receipts,
+            "origin_decision_root_receipts": self.origin_decision_root_receipts,
             "target_root_receipts": self.target_root_receipts,
             "source_target_receipts": self.source_target_receipts,
             "experiment_source_receipts": self.experiment_source_receipts,
-            "decision_root_inventory_sha256": self.decision_root_inventory_sha256,
+            "origin_decision_root_inventory_sha256": (
+                self.origin_decision_root_inventory_sha256
+            ),
             "target_root_inventory_sha256": self.target_root_inventory_sha256,
             "source_target_inventory_sha256": self.source_target_inventory_sha256,
             "experiment_inventory_sha256": self.experiment_inventory_sha256,
@@ -163,14 +165,14 @@ class MassiveAdaptiveTargetArchiveV1:
             or any(
                 len(values) != len(self.decision_session_dates)
                 for values in (
-                    self.decision_root_receipts,
+                    self.origin_decision_root_receipts,
                     self.target_root_receipts,
                     self.source_target_receipts,
                     self.experiment_source_receipts,
                 )
             )
-            or self.decision_root_inventory_sha256
-            != semantic_sha256(self.decision_root_receipts)
+            or self.origin_decision_root_inventory_sha256
+            != semantic_sha256(self.origin_decision_root_receipts)
             or self.target_root_inventory_sha256
             != semantic_sha256(self.target_root_receipts)
             or self.source_target_inventory_sha256
@@ -197,7 +199,7 @@ class MassiveAdaptiveTargetArchiveV1:
                 "adaptive target archive identity or authorization differs"
             )
         for values in (
-            self.decision_root_receipts,
+            self.origin_decision_root_receipts,
             self.target_root_receipts,
             self.source_target_receipts,
             self.experiment_source_receipts,
@@ -205,7 +207,7 @@ class MassiveAdaptiveTargetArchiveV1:
             for value in values:
                 _digest("adaptive target archive row", value)
         for name in (
-            "decision_root_inventory_sha256",
+            "origin_decision_root_inventory_sha256",
             "target_root_inventory_sha256",
             "source_target_inventory_sha256",
             "experiment_inventory_sha256",
@@ -228,6 +230,11 @@ class MassiveAdaptiveTargetArchiveV1:
                 )
                 != self.decision_session_dates
                 or tuple(
+                    row.decision_root_receipt_sha256
+                    for row in self.runtime_target_roots
+                )
+                != self.origin_decision_root_receipts
+                or tuple(
                     row.semantic_receipt_sha256 for row in self.runtime_target_roots
                 )
                 != self.target_root_receipts
@@ -246,7 +253,7 @@ class MassiveAdaptiveTargetArchiveV1:
             or self.loaded_source.receipt.schema_sha256
             != MASSIVE_ADAPTIVE_TARGET_ARCHIVE_V1_SOURCE_SCHEMA_SHA256
             or self.loaded_source.receipt.entitlement_receipt_sha256
-            != self.decision_root_inventory_sha256
+            != self.origin_decision_root_inventory_sha256
         ):
             raise MassiveAdaptiveTargetArchiveV1Error(
                 "adaptive target archive source transaction differs"
@@ -303,11 +310,13 @@ def _body(
     return {
         "schema": MASSIVE_ADAPTIVE_TARGET_ARCHIVE_V1_SCHEMA,
         "decision_session_dates": dates,
-        "decision_root_receipts": decision_receipts,
+        "origin_decision_root_receipts": decision_receipts,
         "target_root_receipts": target_receipts,
         "source_target_receipts": source_receipts,
         "experiment_source_receipts": experiment_receipts,
-        "decision_root_inventory_sha256": semantic_sha256(decision_receipts),
+        "origin_decision_root_inventory_sha256": semantic_sha256(
+            decision_receipts
+        ),
         "target_root_inventory_sha256": semantic_sha256(target_receipts),
         "source_target_inventory_sha256": semantic_sha256(source_receipts),
         "experiment_inventory_sha256": semantic_sha256(experiment_receipts),
@@ -343,7 +352,9 @@ def _publish(
         requested_at_ms=committed_at_ms,
         downloaded_at_ms=committed_at_ms,
         schema_sha256=MASSIVE_ADAPTIVE_TARGET_ARCHIVE_V1_SOURCE_SCHEMA_SHA256,
-        entitlement_receipt_sha256=str(body["decision_root_inventory_sha256"]),
+        entitlement_receipt_sha256=str(
+            body["origin_decision_root_inventory_sha256"]
+        ),
         committed_at_ms=committed_at_ms,
         request_id=f"ADAPTIVE-TARGET-ARCHIVE-V1-{identifier}",
     )
@@ -463,7 +474,7 @@ def parse_massive_adaptive_target_archive_v1(
         )
     for name in (
         "decision_session_dates",
-        "decision_root_receipts",
+        "origin_decision_root_receipts",
         "target_root_receipts",
         "source_target_receipts",
         "experiment_source_receipts",

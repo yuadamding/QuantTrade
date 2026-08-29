@@ -51,6 +51,7 @@ MASSIVE_ADAPTIVE_CHECKPOINT_V1_SPEC_SHA256 = semantic_sha256(
         "resume": "exact-next-update",
         "generic_reload": "nonauthorizing",
         "promotion": "root-derived-training-authority-and-state-receipts",
+        "decision_roots": "full-chronology-and-target-origin-inventories",
         "pickle_execution": False,
         "profitability_reporting": False,
         "lockbox": False,
@@ -174,6 +175,8 @@ class MassiveAdaptiveCheckpointStateV1:
 class MassiveAdaptiveCheckpointV1:
     training_authority_receipt_sha256: str
     decision_tensor_receipt_sha256: str
+    full_decision_root_inventory_sha256: str
+    origin_decision_root_inventory_sha256: str
     target_archive_receipt_sha256: str
     target_root_inventory_sha256: str
     target_experiment_inventory_sha256: str
@@ -212,6 +215,12 @@ class MassiveAdaptiveCheckpointV1:
                 self.training_authority_receipt_sha256
             ),
             "decision_tensor_receipt_sha256": self.decision_tensor_receipt_sha256,
+            "full_decision_root_inventory_sha256": (
+                self.full_decision_root_inventory_sha256
+            ),
+            "origin_decision_root_inventory_sha256": (
+                self.origin_decision_root_inventory_sha256
+            ),
             "target_archive_receipt_sha256": self.target_archive_receipt_sha256,
             "target_root_inventory_sha256": self.target_root_inventory_sha256,
             "target_experiment_inventory_sha256": (
@@ -439,6 +448,12 @@ def _metadata(
             training_authority.semantic_receipt_sha256
         ),
         "decision_tensor_receipt_sha256": decision_tensor_receipt_sha256,
+        "full_decision_root_inventory_sha256": (
+            training_authority.full_decision_root_inventory_sha256
+        ),
+        "origin_decision_root_inventory_sha256": (
+            training_authority.origin_decision_root_inventory_sha256
+        ),
         "target_archive_receipt_sha256": (
             training_authority.target_archive_receipt_sha256
         ),
@@ -609,6 +624,10 @@ def authorize_massive_adaptive_checkpoint_v1(
         != training_authority.semantic_receipt_sha256
         or parsed.decision_tensor_receipt_sha256
         != decision_tensor_receipt_sha256
+        or parsed.full_decision_root_inventory_sha256
+        != training_authority.full_decision_root_inventory_sha256
+        or parsed.origin_decision_root_inventory_sha256
+        != training_authority.origin_decision_root_inventory_sha256
         or parsed.target_archive_receipt_sha256
         != training_authority.target_archive_receipt_sha256
         or parsed.target_root_inventory_sha256

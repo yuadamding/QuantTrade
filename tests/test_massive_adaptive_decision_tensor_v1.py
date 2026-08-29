@@ -193,6 +193,7 @@ def _origin(
         implementation_source_sha256=MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SOURCE_SHA256,
         semantic_receipt_sha256="0" * 64,
         source_paths_replayed=True,
+        action_identity_source_data_qualified=True,
         predictive_training_authorized=False,
         profitability_reporting_authorized=False,
         lockbox_access_authorized=False,

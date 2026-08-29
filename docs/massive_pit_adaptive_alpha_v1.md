@@ -160,12 +160,25 @@ dual-universe decision root. Generic archive reload has neither runtime target
 objects nor training authority. The synthetic binder is explicitly
 nonqualifying.
 
+The full decision chronology and the target-bearing origin inventory are
+separate commitments. Context-only, purge, and not-yet-mature rows may remain
+in the decision tensor without requiring target artifacts. The window plan
+derives the eligible origin subset, the target archive contains exactly that
+subset, and both the full and origin-only decision-root inventories are bound
+through the training authority and checkpoint. A 505-date regression fixture
+exercises a 504-session validation context spanning fit and purge dates while
+opening a target for only the validation origin. The decision root also
+records an explicit package-derived PIT-500 action-identity qualification;
+binding the action identity without qualifying its reconstructed membership is
+not sufficient for training qualification.
+
 The package-owned supervised trainer reopens the decision tensor, rebuilds all
 decision and target roots plus the split/window plans, performs the model
 forward itself, and publishes a create-only exact-resume checkpoint. The
 training authority and checkpoint bind the target-archive, target-root, and
-experiment-source inventories in addition to the model, optimizer, scheduler,
-gradient-scaler placeholder, CPU/CUDA/data-order RNG state,
+experiment-source inventories plus the separate full-chronology and
+target-origin decision-root inventories in addition to the model, optimizer,
+scheduler, gradient-scaler placeholder, CPU/CUDA/data-order RNG state,
 epoch/update/window cursor, window permutation, and loss trace. A generic
 checkpoint reload has no runtime state or training authority. Substituting an
 independently valid identity, daily-input, fill, terminal, or coverage receipt
