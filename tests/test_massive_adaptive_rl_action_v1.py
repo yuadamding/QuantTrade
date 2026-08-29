@@ -9,6 +9,10 @@ import rl_quant.rl.massive_adaptive_rl_action_v1 as action_module
 from rl_quant.execution.massive_adaptive_portfolio_compiler_v1 import (
     compile_massive_adaptive_portfolio_v1,
 )
+from rl_quant.execution.massive_adaptive_rl_compiler_control_v1 import (
+    apply_massive_adaptive_rl_action_v1,
+    compile_massive_adaptive_rl_control_v1,
+)
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     assert_adaptive_import_firewall,
     assert_no_adaptive_hold_semantics,
@@ -16,9 +20,7 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 from rl_quant.rl.massive_adaptive_rl_action_v1 import (
     MassiveAdaptiveRLActionV1,
     MassiveAdaptiveRLActionV1Error,
-    apply_massive_adaptive_rl_action_v1,
     build_massive_adaptive_rl_action_v1,
-    compile_massive_adaptive_rl_control_v1,
     neutral_massive_adaptive_rl_action_v1,
 )
 from test_massive_adaptive_portfolio_compiler_v1 import _config, _inputs
