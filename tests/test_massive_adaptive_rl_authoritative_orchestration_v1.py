@@ -12,6 +12,11 @@ from rl_quant.evaluation.massive_adaptive_rl_fixed_control_outer_rollout_v1 impo
     materialize_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1,
     parse_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_fixed_control_outer_cost_ladder_v1 import (
+    authorize_massive_adaptive_rl_fixed_control_outer_cost_ladder_authority_v1,
+    materialize_massive_adaptive_rl_fixed_control_outer_cost_ladder_authority_v1,
+    parse_massive_adaptive_rl_fixed_control_outer_cost_ladder_authority_v1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_outer_rollout_v1 import (
     authorize_massive_adaptive_rl_outer_rollout_authority_v1,
     materialize_massive_adaptive_rl_outer_rollout_authority_v1,
@@ -32,11 +37,20 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v3 import (
     build_massive_adaptive_authenticated_rl_outer_fold_v3,
     build_massive_adaptive_rl_outer_evidence_v3,
 )
+from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v4 import (
+    build_massive_adaptive_authenticated_rl_outer_fold_v4,
+    build_massive_adaptive_rl_outer_evidence_v4,
+)
 from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_authority_v3 import (
     MassiveAdaptiveRLOuterEvidenceAuthorityV3Error,
     authorize_massive_adaptive_rl_outer_evidence_authority_v3,
     materialize_massive_adaptive_rl_outer_evidence_authority_v3,
     parse_massive_adaptive_rl_outer_evidence_authority_v3,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_authority_v4 import (
+    authorize_massive_adaptive_rl_outer_evidence_authority_v4,
+    materialize_massive_adaptive_rl_outer_evidence_authority_v4,
+    parse_massive_adaptive_rl_outer_evidence_authority_v4,
 )
 from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v2 import (
     MassiveAdaptiveRLOuterPlanV2,
@@ -943,6 +957,54 @@ def test_frozen_outer_actions_replay_from_attached_policy(tmp_path) -> None:
         == fixed_authority.outer_rollout_receipt_sha256
     )
 
+    fixed_low_environment = _environment_at_cost(fixture, calibration_values, 10.0)
+    fixed_high_environment = _environment_at_cost(fixture, calibration_values, 40.0)
+    fixed_low_environment.inference_plan = environment.inference_plan
+    fixed_high_environment.inference_plan = environment.inference_plan
+    fixed_cost_authority = (
+        materialize_massive_adaptive_rl_fixed_control_outer_cost_ladder_authority_v1(
+            root=tmp_path,
+            artifact_id="fit-selected-fixed-outer-cost-ladder",
+            rollout_authority=fixed_authority,
+            primary_environment=fixed_environment,
+            low_cost_environment=fixed_low_environment,
+            high_cost_environment=fixed_high_environment,
+            committed_at_ms=9,
+        )
+    )
+    assert fixed_cost_authority.runtime_ladder_replayed
+    assert fixed_cost_authority.runtime_ladder is not None
+    assert fixed_cost_authority.runtime_ladder.low_cost_trace.frozen_targets_replayed
+    assert (
+        fixed_cost_authority.runtime_ladder.low_cost_trace.decision_target_inventory_sha256
+        == fixed_cost_authority.runtime_ladder.primary_trace.decision_target_inventory_sha256
+        == fixed_cost_authority.runtime_ladder.high_cost_trace.decision_target_inventory_sha256
+    )
+    generic_fixed_cost = (
+        parse_massive_adaptive_rl_fixed_control_outer_cost_ladder_authority_v1(
+            root=tmp_path,
+            loaded_source=fixed_cost_authority.loaded_source,
+        )
+    )
+    replayed_fixed_cost = (
+        authorize_massive_adaptive_rl_fixed_control_outer_cost_ladder_authority_v1(
+            root=tmp_path,
+            authority=generic_fixed_cost,
+            rollout_authority=fixed_authority,
+            primary_environment=fixed_environment,
+            low_cost_environment=_environment_at_cost(
+                fixture, calibration_values, 10.0
+            ),
+            high_cost_environment=_environment_at_cost(
+                fixture, calibration_values, 40.0
+            ),
+        )
+    )
+    assert (
+        replayed_fixed_cost.fixed_control_outer_cost_ladder_receipt_sha256
+        == fixed_cost_authority.fixed_control_outer_cost_ladder_receipt_sha256
+    )
+
     low_environment = _environment_at_cost(fixture, calibration_values, 10.0)
     high_environment = _environment_at_cost(fixture, calibration_values, 40.0)
     low_environment.inference_plan = environment.inference_plan
@@ -1226,6 +1288,115 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) ->
     )
     assert not evidence_v3.profitability_reporting_authorized
 
+    authenticated_v4 = []
+    outer_plans_v3 = []
+    ppo_cost_authorities = []
+    fixed_cost_authorities = []
+    for index, (fold_v3, plan_v2, fixed_authority) in enumerate(
+        zip(
+            authenticated_v3,
+            outer_plans_v2,
+            fixed_authorities,
+            strict=True,
+        )
+    ):
+        cost_fold = fold_v3.authenticated_fold_v2.cost_fold
+        dates = fixed_authority.runtime_rollout.policy_trace.decision_session_dates
+        forecast_receipt = (
+            fixed_authority.runtime_rollout.policy_trace.forecast_archive_receipt_sha256
+        )
+        inference_receipt = (
+            fixed_authority.runtime_rollout.policy_trace.inference_plan_receipt_sha256
+        )
+        calibration_receipt = (
+            fixed_authority.runtime_rollout.policy_trace.calibration_receipt_sha256
+        )
+        ppo_high = SimpleNamespace(
+            semantic_receipt_sha256=cost_fold.high_cost_trace_receipt_sha256,
+            decision_session_dates=dates,
+            forecast_archive_receipt_sha256=forecast_receipt,
+            inference_plan_receipt_sha256=inference_receipt,
+            calibration_receipt_sha256=calibration_receipt,
+            initial_capital=10_000_000.0,
+            incremental_rl_log_returns=(0.002,) * len(dates),
+        )
+        ppo_ladder = SimpleNamespace(
+            high_cost_trace=ppo_high,
+            semantic_receipt_sha256=(
+                fold_v3.authenticated_fold_v2.outer_cost_ladder_receipt_sha256
+            ),
+        )
+        ppo_cost_authority = SimpleNamespace(
+            validate=lambda: None,
+            runtime_ladder=ppo_ladder,
+            runtime_ladder_replayed=True,
+            outer_evaluation_authorized=False,
+            semantic_receipt_sha256=(
+                fold_v3.authenticated_fold_v2.outer_cost_ladder_authority_receipt_sha256
+            ),
+        )
+        fixed_high = SimpleNamespace(
+            semantic_receipt_sha256=_digest(("fixed-high-trace", index)),
+            decision_session_dates=dates,
+            forecast_archive_receipt_sha256=forecast_receipt,
+            inference_plan_receipt_sha256=inference_receipt,
+            calibration_receipt_sha256=calibration_receipt,
+            initial_capital=10_000_000.0,
+            incremental_rl_log_returns=(0.001,) * len(dates),
+        )
+        fixed_ladder = SimpleNamespace(
+            fixed_control_outer_rollout_authority_receipt_sha256=(
+                fold_v3.fixed_control_outer_authority_receipt_sha256
+            ),
+            fixed_control_outer_rollout_receipt_sha256=(
+                fold_v3.fixed_control_outer_rollout_receipt_sha256
+            ),
+            primary_trace=fixed_authority.runtime_rollout.policy_trace,
+            high_cost_trace=fixed_high,
+            selected_control_id=plan_v2.selected_fixed_control_id,
+            selected_action_receipt_sha256=(
+                plan_v2.selected_fixed_action_receipt_sha256
+            ),
+            semantic_receipt_sha256=_digest(("fixed-cost-ladder", index)),
+        )
+        fixed_cost_authority = SimpleNamespace(
+            validate=lambda: None,
+            runtime_ladder=fixed_ladder,
+            runtime_ladder_replayed=True,
+            outer_evaluation_authorized=False,
+            semantic_receipt_sha256=_digest(("fixed-cost-authority", index)),
+        )
+        plan_v3 = SimpleNamespace(
+            validate=lambda: None,
+            fold_index=index,
+            outer_plan_v2=plan_v2,
+            outer_access_commitment_receipt_sha256=_digest(
+                ("outer-access-commitment", index)
+            ),
+            source_data_qualified=False,
+            outer_evaluation_authorized=False,
+            semantic_receipt_sha256=_digest(("outer-plan-v3", index)),
+        )
+        outer_plans_v3.append(plan_v3)
+        ppo_cost_authorities.append(ppo_cost_authority)
+        fixed_cost_authorities.append(fixed_cost_authority)
+        authenticated_v4.append(
+            build_massive_adaptive_authenticated_rl_outer_fold_v4(
+                authenticated_fold_v3=fold_v3,
+                outer_plan_v3=plan_v3,  # type: ignore[arg-type]
+                ppo_cost_ladder_authority=ppo_cost_authority,  # type: ignore[arg-type]
+                fixed_control_cost_ladder_authority=(
+                    fixed_cost_authority  # type: ignore[arg-type]
+                ),
+            )
+        )
+    evidence_v4 = build_massive_adaptive_rl_outer_evidence_v4(authenticated_v4)
+    assert evidence_v4.high_cost_ppo_minus_fixed_control_nonnegative
+    assert evidence_v4.mean_high_cost_ppo_minus_fixed_control_log_return == pytest.approx(
+        0.001
+    )
+    assert not evidence_v4.profitability_reporting_authorized
+
     durable = materialize_massive_adaptive_rl_outer_evidence_authority_v3(
         root=tmp_path,
         artifact_id="authenticated-v3-evidence",
@@ -1240,6 +1411,38 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) ->
     assert durable.runtime_evidence.semantic_receipt_sha256 == (
         evidence_v3.semantic_receipt_sha256
     )
+    durable_v4 = materialize_massive_adaptive_rl_outer_evidence_authority_v4(
+        root=tmp_path,
+        artifact_id="authenticated-v4-evidence",
+        evidence_v3_authority=durable,
+        outer_plans_v3=outer_plans_v3,  # type: ignore[arg-type]
+        ppo_cost_ladder_authorities=ppo_cost_authorities,  # type: ignore[arg-type]
+        fixed_control_cost_ladder_authorities=(
+            fixed_cost_authorities  # type: ignore[arg-type]
+        ),
+        committed_at_ms=11,
+    )
+    assert durable_v4.runtime_evidence_replayed
+    assert durable_v4.runtime_evidence is not None
+    assert durable_v4.runtime_evidence.semantic_receipt_sha256 == (
+        evidence_v4.semantic_receipt_sha256
+    )
+    generic_v4 = parse_massive_adaptive_rl_outer_evidence_authority_v4(
+        root=tmp_path,
+        loaded_source=durable_v4.loaded_source,
+    )
+    assert not generic_v4.runtime_evidence_replayed
+    reopened_v4 = authorize_massive_adaptive_rl_outer_evidence_authority_v4(
+        root=tmp_path,
+        authority=generic_v4,
+        evidence_v3_authority=durable,
+        outer_plans_v3=outer_plans_v3,  # type: ignore[arg-type]
+        ppo_cost_ladder_authorities=ppo_cost_authorities,  # type: ignore[arg-type]
+        fixed_control_cost_ladder_authorities=(
+            fixed_cost_authorities  # type: ignore[arg-type]
+        ),
+    )
+    assert reopened_v4.semantic_receipt_sha256 == durable_v4.semantic_receipt_sha256
     generic = parse_massive_adaptive_rl_outer_evidence_authority_v3(
         root=tmp_path,
         loaded_source=durable.loaded_source,
