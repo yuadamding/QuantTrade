@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, replace
 
 import pytest
@@ -167,6 +168,32 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
         row.primary_trace_receipt_sha256
         for row in validation.cost_ladder_authorities
     )
+    assert validation.validation_context_receipt_sha256 == (
+        primary.validation_context_receipt_sha256
+    )
+
+    mismatched = copy.copy(primary)
+    mismatched.validation_context_receipt_sha256 = semantic_sha256(
+        "different-validation-context"
+    )
+    with pytest.raises(MassiveAdaptiveRLWorkflowV1Error, match="validation context"):
+        run_massive_adaptive_rl_validation_workflow_v1(
+            manifest=manifest,
+            training_workflow=result,
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            environments={
+                authority.semantic_receipt_sha256: (
+                    cost_environments
+                    if index
+                    else (cost_environments[0], mismatched, cost_environments[2])
+                )
+                for index, authority in enumerate(
+                    result.policy_checkpoint_authorities
+                )
+            },
+            artifact_root=tmp_path / "mismatched",
+            committed_at_ms=700,
+        )
 
 
 def test_package_workflow_rejects_unreached_candidate_update(tmp_path) -> None:

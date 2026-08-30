@@ -364,10 +364,21 @@ quanttrade-adaptive-rl validate \
 
 The manifest freezes the four folds, causal block size, candidate-update
 schedule, seeds, PPO configuration, $10 million capital, 10/20/40-bp ladder,
-two-percent participation limit, complete FC00--FC07 comparator inventory,
+two-percent participation limit, complete FC00--FC06 comparator inventory,
 observation/action/reward identities, all-cash initialization, shared
 benchmark, drawdown cap, and outer gates. It contains no outcomes and is
 nonauthorizing by itself.
+
+FC00--FC05 are the immutable constant-action fitting grid. FC06 is not a
+caller-supplied extra action: it is the package-derived winner of that complete
+grid on the RL-fit chronology only. The selection binds one common fit-origin
+inventory and economic context across every grid member. A package-owned FC06
+evaluator resolves the selected action from the sealed grid and generates its
+inner-validation transitions itself; the registry-aware PPO-candidate builder
+does not accept an independently assembled fixed-control trace. The previously
+reserved FC07 label is not part of V1 evidence because V1 does not yet contain
+a fitted and replay-authorized contextual baseline; a label alone is not a
+comparator.
 
 `run_massive_adaptive_rl_training_workflow_v1()` owns every authorized block
 and publishes each scheduled update twice from the same state: an exact
@@ -390,6 +401,23 @@ first bind fit, validation, and outer date inventories directly from the split
 plan, without opening a selected-checkpoint outer forecast. Only after policy
 selection may the actual outer inference plan bind to those precommitted fold
 dates. The three origin inventories are pairwise disjoint.
+
+Prequential forecast refits do not end the economic episode. A dedicated
+continuity authority permits a forecast archive and calibration to change only
+when the previous block's next-session close is the next block's first
+decision close and execution, identity, accounting, benchmark, capital, cost,
+and participation semantics match exactly. Strategy, neutral, and benchmark
+books, high-water marks, trailing returns, and the previous action carry into
+the next archive. The internal boundary is non-liquidating and PPO bootstraps
+its value estimate from the first causal observation under the next refit.
+Nonconsecutive blocks remain separate economic episodes.
+
+All PPO checkpoint candidates are evaluated against one committed validation
+context receipt. Forecasts, calibration, chronology, roots, fills, events,
+identity, compiler configuration, capital, participation, initialization, and
+benchmark semantics cannot vary by candidate; only the attached actor state
+may differ. The 10/20/40-bp rungs share that context while excluding only the
+cost value from the shared-context identity.
 
 Inner-validation policy economics are derived from complete environment
 transitions rather than caller return arrays. A create-only policy-selection

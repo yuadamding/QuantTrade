@@ -92,6 +92,7 @@ MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256 = semantic_sha256(
         "caller_actions": False,
         "caller_transitions": False,
         "caller_returns": False,
+        "validation_context": "one-shared-receipt-for-all-candidates-and-controls",
         "validation_access_during_fit": False,
         "outer_access": False,
         "lockbox_access": False,
@@ -341,7 +342,7 @@ def load_massive_adaptive_rl_experiment_manifest_v1(
     ):
         payload[name] = tuple(cast(list[object], payload[name]))
     payload["ppo_config"] = MassiveAdaptivePPOConfigV1(
-        **cast(dict[str, object], payload["ppo_config"])
+        **cast(dict[str, object], payload["ppo_config"])  # type: ignore[arg-type]
     )
     result = MassiveAdaptiveRLExperimentManifestV1(**payload)  # type: ignore[arg-type]
     result.validate()
@@ -420,10 +421,10 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
 
     def validate(self) -> None:
         self.training_run.validate()
-        for authority in self.runner_checkpoint_authorities:
-            authority.validate()
-        for authority in self.policy_checkpoint_authorities:
-            authority.validate()
+        for runner_authority in self.runner_checkpoint_authorities:
+            runner_authority.validate()
+        for policy_authority in self.policy_checkpoint_authorities:
+            policy_authority.validate()
         runner_updates = tuple(
             authority.runtime_checkpoint.ppo_checkpoint.update_index
             for authority in self.runner_checkpoint_authorities
@@ -488,6 +489,7 @@ class MassiveAdaptiveRLValidationWorkflowV1:
     training_workflow_receipt_sha256: str
     fold_index: int
     checkpoint_authority_receipts: tuple[str, ...]
+    validation_context_receipt_sha256: str
     policy_trace_authorities: tuple[MassiveAdaptiveRLPolicyTraceAuthorityV1, ...]
     cost_ladder_authorities: tuple[MassiveAdaptiveRLCostLadderAuthorityV1, ...]
     policy_trace_authority_inventory_sha256: str
@@ -513,6 +515,9 @@ class MassiveAdaptiveRLValidationWorkflowV1:
             ),
             "fold_index": self.fold_index,
             "checkpoint_authority_receipts": self.checkpoint_authority_receipts,
+            "validation_context_receipt_sha256": (
+                self.validation_context_receipt_sha256
+            ),
             "policy_trace_authority_inventory_sha256": (
                 self.policy_trace_authority_inventory_sha256
             ),
@@ -528,10 +533,14 @@ class MassiveAdaptiveRLValidationWorkflowV1:
         }
 
     def validate(self) -> None:
-        for authority in self.policy_trace_authorities:
-            authority.validate()
-        for authority in self.cost_ladder_authorities:
-            authority.validate()
+        for trace_authority in self.policy_trace_authorities:
+            trace_authority.validate()
+        for ladder_authority in self.cost_ladder_authorities:
+            ladder_authority.validate()
+        _digest(
+            "adaptive RL validation context",
+            self.validation_context_receipt_sha256,
+        )
         expected = self.source_data_qualified
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_VALIDATION_WORKFLOW_V1_SCHEMA
@@ -764,10 +773,25 @@ def run_massive_adaptive_rl_validation_workflow_v1(
         )
     traces: list[MassiveAdaptiveRLPolicyTraceAuthorityV1] = []
     ladders: list[MassiveAdaptiveRLCostLadderAuthorityV1] = []
+    shared_validation_context: str | None = None
     for index, checkpoint_authority in enumerate(
         training_workflow.policy_checkpoint_authorities
     ):
         low, primary, high = environments[checkpoint_authority.semantic_receipt_sha256]
+        context_receipts = {
+            row.validation_context_receipt_sha256 for row in (low, primary, high)
+        }
+        if len(context_receipts) != 1:
+            raise MassiveAdaptiveRLWorkflowV1Error(
+                "adaptive RL cost rungs do not share one validation context"
+            )
+        candidate_context = next(iter(context_receipts))
+        if shared_validation_context is None:
+            shared_validation_context = candidate_context
+        elif candidate_context != shared_validation_context:
+            raise MassiveAdaptiveRLWorkflowV1Error(
+                "adaptive RL candidates do not share one validation context"
+            )
         if (
             tuple(
                 row.transaction_cost_basis_points for row in (low, primary, high)
@@ -820,6 +844,10 @@ def run_massive_adaptive_rl_validation_workflow_v1(
         and all(row.development_policy_evaluation_authorized for row in traces)
         and all(row.development_policy_selection_authorized for row in ladders)
     )
+    if shared_validation_context is None:
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL validation context is absent"
+        )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_VALIDATION_WORKFLOW_V1_SCHEMA,
         "experiment_manifest_receipt_sha256": manifest.semantic_receipt_sha256,
@@ -829,6 +857,7 @@ def run_massive_adaptive_rl_validation_workflow_v1(
             row.semantic_receipt_sha256
             for row in training_workflow.policy_checkpoint_authorities
         ),
+        "validation_context_receipt_sha256": shared_validation_context,
         "policy_trace_authorities": tuple(traces),
         "cost_ladder_authorities": tuple(ladders),
         "policy_trace_authority_inventory_sha256": semantic_sha256(

@@ -72,3 +72,15 @@ jobs:
           tests/test_massive_adaptive_outer_evidence_v1.py
           tests/test_adaptive_alpha_profit_checkpoint_selection_v1.py
           tests/test_no_feature_engineering.py
+      - name: Adaptive RL focused type check
+        run: >-
+          python -m mypy
+          src/rl_quant/evaluation/massive_adaptive_profitability_env_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_evaluator_v1.py
+          src/rl_quant/training/massive_adaptive_ppo_v1.py
+          src/rl_quant/training/massive_adaptive_economic_continuity_authority_v1.py
+          src/rl_quant/training/massive_adaptive_prequential_ppo_runner_v1.py
+          src/rl_quant/training/massive_adaptive_prequential_ppo_checkpoint_authority_v1.py
+          src/rl_quant/training/massive_adaptive_rl_fixed_control_selection_v1.py
+          src/rl_quant/training/massive_adaptive_rl_fixed_control_registry_v1.py
+          src/rl_quant/workflows/massive_adaptive_rl_v1.py

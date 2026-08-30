@@ -96,7 +96,11 @@ def _parse_runner_checkpoint(
 ) -> MassiveAdaptivePrequentialPPOCheckpointV1:
     metadata = dict(cast(Mapping[str, object], payload["metadata"]))
     metadata.pop("ppo_checkpoint_receipt_sha256", None)
-    for name in ("completed_block_receipts", "transition_receipts"):
+    for name in (
+        "continuity_authority_receipts",
+        "completed_block_receipts",
+        "transition_receipts",
+    ):
         metadata[name] = tuple(cast(list[str] | tuple[str, ...], metadata[name]))
     ppo_checkpoint = _parse_checkpoint(
         cast(Mapping[str, object], payload["ppo_checkpoint"])

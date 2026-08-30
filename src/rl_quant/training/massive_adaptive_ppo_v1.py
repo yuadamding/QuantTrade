@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import math
 import random
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ import torch
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvStateV1,
     MassiveAdaptiveProfitabilityEnvV1,
+    MassiveAdaptiveRLTransitionV1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -310,7 +311,7 @@ class MassiveAdaptiveRLCheckpointV1:
             != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptivePPOV1Error("adaptive RL checkpoint differs")
-        digests = (
+        digests: tuple[str, ...] = (
             self.model_state_receipt_sha256,
             self.actor_optimizer_state_receipt_sha256,
             self.critic_optimizer_state_receipt_sha256,
@@ -414,9 +415,14 @@ class MassiveAdaptivePPOTrainerV1:
             self._observation, _ = self.environment.reset()
         return self._observation
 
-    def collect_rollout(self, *, steps: int | None = None) -> MassiveAdaptivePPORolloutV1:
+    def collect_rollout(
+        self,
+        *,
+        steps: int | None = None,
+        continue_economic_episode_at_end: bool = False,
+    ) -> MassiveAdaptivePPORolloutV1:
         count = self.config.rollout_length if steps is None else steps
-        if count <= 0:
+        if count <= 0 or not isinstance(continue_economic_episode_at_end, bool):
             raise MassiveAdaptivePPOV1Error("rollout length must be positive")
         observations: list[torch.Tensor] = []
         actions: list[torch.Tensor] = []
@@ -427,7 +433,7 @@ class MassiveAdaptivePPOTrainerV1:
         terminated_rows: list[bool] = []
         observation_receipts: list[str] = []
         transition_receipts: list[str] = []
-        for _ in range(count):
+        for step_index in range(count):
             observation = self._ensure_observation()
             tensor = self._observation_tensor(observation)
             with torch.no_grad():
@@ -442,13 +448,19 @@ class MassiveAdaptivePPOTrainerV1:
                 turnover_control=float(action_values[9]),
             )
             next_observation, reward, terminated, truncated, info = (
-                self.environment.step(action)
-            )
-            if truncated:
-                raise MassiveAdaptivePPOV1Error(
-                    "environment cannot truncate an economic transition"
+                self.environment.step(
+                    action,
+                    continue_economic_episode=(
+                        continue_economic_episode_at_end
+                        and step_index == count - 1
+                    ),
                 )
-            if terminated:
+            )
+            if truncated and not continue_economic_episode_at_end:
+                raise MassiveAdaptivePPOV1Error(
+                    "environment produced an unregistered economic truncation"
+                )
+            if terminated or truncated:
                 next_value = torch.zeros((), dtype=torch.float32, device=self.device)
             else:
                 assert next_observation is not None
@@ -456,7 +468,7 @@ class MassiveAdaptivePPOTrainerV1:
                     next_value = self.model(
                         {"adaptive_state": self._observation_tensor(next_observation)}
                     ).value[0]
-            transition = info["transition"]
+            transition = cast(MassiveAdaptiveRLTransitionV1, info["transition"])
             observations.append(tensor[0])
             actions.append(sampled[0].detach())
             log_probabilities.append(log_probability[0].detach())
@@ -467,6 +479,10 @@ class MassiveAdaptivePPOTrainerV1:
             observation_receipts.append(observation.semantic_receipt_sha256)
             transition_receipts.append(transition.semantic_receipt_sha256)
             self._observation = next_observation
+            if truncated and len(observations) < count:
+                raise MassiveAdaptivePPOV1Error(
+                    "economic continuation occurred before the rollout boundary"
+                )
             if terminated and len(observations) < count:
                 self._observation, _ = self.environment.reset()
         reward_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)

@@ -77,6 +77,8 @@ class MassiveAdaptiveRLFixedControlCandidateV1:
     control_id: str
     action_receipt_sha256: str
     training_trace_receipt_sha256: str
+    training_origin_inventory_sha256: str
+    training_context_receipt_sha256: str
     training_incremental_log_wealth: float
     source_data_qualified: bool
     semantic_receipt_sha256: str
@@ -109,6 +111,8 @@ class MassiveAdaptiveRLFixedControlCandidateV1:
         for value in (
             self.action_receipt_sha256,
             self.training_trace_receipt_sha256,
+            self.training_origin_inventory_sha256,
+            self.training_context_receipt_sha256,
             self.protocol_receipt_sha256,
             self.semantic_receipt_sha256,
         ):
@@ -142,6 +146,21 @@ def build_massive_adaptive_rl_fixed_control_candidate_v1(
         "control_id": control_id,
         "action_receipt_sha256": action.semantic_receipt_sha256,
         "training_trace_receipt_sha256": training_trace.semantic_receipt_sha256,
+        "training_origin_inventory_sha256": semantic_sha256(
+            training_trace.decision_session_dates
+        ),
+        "training_context_receipt_sha256": semantic_sha256(
+            (
+                training_trace.fold_index,
+                training_trace.evaluation_role,
+                training_trace.forecast_archive_receipt_sha256,
+                training_trace.inference_plan_receipt_sha256,
+                training_trace.calibration_receipt_sha256,
+                training_trace.transaction_cost_basis_points,
+                training_trace.initial_capital,
+                training_trace.economic_source_inventory_sha256,
+            )
+        ),
         "training_incremental_log_wealth": (
             training_trace.cumulative_incremental_rl_log_return
         ),
@@ -164,6 +183,8 @@ class MassiveAdaptiveRLFixedControlSelectionV1:
     selected_candidate_receipt_sha256: str
     selected_training_trace_receipt_sha256: str
     selected_training_incremental_log_wealth: float
+    training_origin_inventory_sha256: str
+    training_context_receipt_sha256: str
     candidate_inventory_sha256: str
     candidate_count: int
     source_data_qualified: bool
@@ -204,6 +225,8 @@ class MassiveAdaptiveRLFixedControlSelectionV1:
             self.selected_action_receipt_sha256,
             self.selected_candidate_receipt_sha256,
             self.selected_training_trace_receipt_sha256,
+            self.training_origin_inventory_sha256,
+            self.training_context_receipt_sha256,
             self.candidate_inventory_sha256,
             self.protocol_receipt_sha256,
             self.semantic_receipt_sha256,
@@ -227,6 +250,10 @@ def select_massive_adaptive_rl_fixed_control_v1(
         or len({candidate.control_id for candidate in ordered}) != len(ordered)
         or len({candidate.action_receipt_sha256 for candidate in ordered})
         != len(ordered)
+        or len({candidate.training_origin_inventory_sha256 for candidate in ordered})
+        != 1
+        or len({candidate.training_context_receipt_sha256 for candidate in ordered})
+        != 1
     ):
         raise MassiveAdaptiveRLFixedControlSelectionV1Error(
             "adaptive RL fixed controls span folds or are duplicated"
@@ -249,6 +276,12 @@ def select_massive_adaptive_rl_fixed_control_v1(
         ),
         "selected_training_incremental_log_wealth": (
             selected.training_incremental_log_wealth
+        ),
+        "training_origin_inventory_sha256": (
+            selected.training_origin_inventory_sha256
+        ),
+        "training_context_receipt_sha256": (
+            selected.training_context_receipt_sha256
         ),
         "candidate_inventory_sha256": semantic_sha256(
             tuple(candidate.semantic_receipt_sha256 for candidate in ordered)

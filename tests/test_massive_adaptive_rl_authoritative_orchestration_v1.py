@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -44,12 +45,18 @@ from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
     MassiveAdaptivePPOActorCriticV1,
 )
+from rl_quant.rl.massive_adaptive_rl_action_v1 import (
+    neutral_massive_adaptive_rl_action_v1,
+)
 from rl_quant.training.massive_adaptive_ppo_v1 import (
     MassiveAdaptivePPOConfigV1,
     MassiveAdaptivePPOTrainerV1,
 )
 from rl_quant.training.massive_adaptive_prequential_ppo_runner_v1 import (
     MassiveAdaptivePrequentialPPORunnerV1,
+)
+from rl_quant.training.massive_adaptive_economic_continuity_authority_v1 import (
+    build_massive_adaptive_economic_continuity_authority_v1,
 )
 from rl_quant.training.massive_adaptive_prequential_ppo_checkpoint_authority_v1 import (
     authorize_massive_adaptive_prequential_ppo_checkpoint_authority_v1,
@@ -177,6 +184,197 @@ def _environment_at_cost(fixture, calibration_values, cost_basis_points: float):
         initial_capital=10_000_000.0,
         transaction_cost_basis_points=cost_basis_points,
     )
+
+
+class _ReceiptProxy:
+    def __init__(self, target, receipt: str, **overrides) -> None:
+        self._target = target
+        self.semantic_receipt_sha256 = receipt
+        self._overrides = overrides
+
+    def validate(self) -> None:
+        self._target.validate()
+
+    def __getattr__(self, name: str):
+        try:
+            return self._overrides[name]
+        except KeyError:
+            return getattr(self._target, name)
+
+
+def _distinct_consecutive_archive_environments():
+    _, _, base = _adaptive_env_fixture()
+    dates = tuple(row.decision_session_date for row in base.inference_plan.rows)
+    assert len(dates) == 2
+    environments = []
+    for index, date in enumerate(dates):
+        environment = copy.copy(base)
+        archive_receipt = _digest(("distinct-archive", index))
+        calibration_receipt = _digest(("distinct-calibration", index))
+        plan_receipt = _digest(("distinct-plan", index))
+        row = base.inference_plan.rows[index]
+        environment.forecast_archive = _ReceiptProxy(
+            base.forecast_archive,
+            archive_receipt,
+        )
+        environment.calibration = _ReceiptProxy(
+            base.calibration,
+            calibration_receipt,
+        )
+        environment.inference_plan = _ReceiptProxy(
+            base.inference_plan,
+            plan_receipt,
+            rows=(row,),
+        )
+        environment.forecasts = {date: base.forecasts[date]}
+        environment.roots = {date: base.roots[date]}
+        environment.contexts = {date: base.contexts[date]}
+        environment.source_inventory_sha256 = _digest(
+            (
+                archive_receipt,
+                calibration_receipt,
+                plan_receipt,
+                base.source_inventory_sha256,
+            )
+        )
+        environment._state = None
+        environment._prepared = None
+        environment._observation = None
+        environments.append(environment)
+    return tuple(environments)
+
+
+def test_prequential_ppo_carries_books_across_distinct_consecutive_archives() -> None:
+    first, second = _distinct_consecutive_archive_environments()
+    dates = (
+        first.inference_plan.rows[0].decision_session_date,
+        second.inference_plan.rows[0].decision_session_date,
+    )
+    blocks = tuple(
+        SimpleNamespace(
+            block_index=index,
+            semantic_receipt_sha256=_digest(("distinct-block", index)),
+            source_forecast_archive_receipt_sha256=(
+                environment.forecast_archive.semantic_receipt_sha256
+            ),
+            calibration_receipt_sha256=(
+                environment.calibration.semantic_receipt_sha256
+            ),
+            forecast_session_dates=(dates[index],),
+        )
+        for index, environment in enumerate((first, second))
+    )
+    authority_receipt = _digest("distinct-training-authority")
+    training_authority = SimpleNamespace(
+        validate=lambda: None,
+        blocks=blocks,
+        block_inventory_sha256=_digest(
+            tuple(block.semantic_receipt_sha256 for block in blocks)
+        ),
+        origin_session_dates=dates,
+        semantic_receipt_sha256=authority_receipt,
+        reinforcement_learning_authorized=True,
+        source_data_qualified=True,
+        outer_fold_index=0,
+    )
+    chronology = SimpleNamespace(
+        validate=lambda: None,
+        semantic_receipt_sha256=_digest("distinct-chronology"),
+        fold_index=0,
+        training_forecast_authority_receipt_sha256=authority_receipt,
+        rl_fit_origin_dates=dates,
+        development_rl_training_authorized=True,
+    )
+    continuity = build_massive_adaptive_economic_continuity_authority_v1(
+        previous_block_receipt_sha256=blocks[0].semantic_receipt_sha256,
+        next_block_receipt_sha256=blocks[1].semantic_receipt_sha256,
+        previous_environment=first,
+        next_environment=second,
+        source_data_qualified=True,
+    )
+    assert continuity.carry_books_authorized
+    assert continuity.development_continuity_authorized
+    assert (
+        continuity.previous_forecast_archive_receipt_sha256
+        != continuity.next_forecast_archive_receipt_sha256
+    )
+    assert (
+        continuity.previous_calibration_receipt_sha256
+        != continuity.next_calibration_receipt_sha256
+    )
+
+    first.reset()
+    _, _, terminated, truncated, info = first.step(
+        neutral_massive_adaptive_rl_action_v1(),
+        continue_economic_episode=True,
+    )
+    transition = info["transition"]
+    assert not terminated
+    assert truncated
+    assert transition.strategy_terminal_liquidation_cost == 0.0
+    assert transition.neutral_terminal_liquidation_cost == 0.0
+    assert transition.benchmark_terminal_liquidation_cost == 0.0
+    second.restore_continuation(first.state)
+    assert second.state.strategy_book == first.state.strategy_book
+
+    runner = MassiveAdaptivePrequentialPPORunnerV1(
+        training_authority=training_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environments={
+            first.forecast_archive.semantic_receipt_sha256: first,
+            second.forecast_archive.semantic_receipt_sha256: second,
+        },
+        model=MassiveAdaptivePPOActorCriticV1(observation_dim=90),
+        config=MassiveAdaptivePPOConfigV1(
+            epochs_per_rollout=1,
+            rollout_length=1,
+            minibatch_size=1,
+        ),
+    )
+    runner.run_next_update()
+    prior_state = first.state
+    carried_state = second.state
+    assert prior_state.done
+    assert carried_state.chronology_cursor == 0
+    assert carried_state.strategy_book == prior_state.strategy_book
+    assert carried_state.neutral_book == prior_state.neutral_book
+    assert carried_state.benchmark_book == prior_state.benchmark_book
+    assert carried_state.trailing_state == prior_state.trailing_state
+    assert carried_state.previous_action == prior_state.previous_action
+    assert carried_state.strategy_book.holdings
+    assert runner.checkpoint().continuity_authority_receipts == (
+        continuity.semantic_receipt_sha256,
+    )
+
+    boundary = runner.checkpoint()
+    runner.run_next_update()
+    assert runner.training_complete
+    uninterrupted = runner.checkpoint()
+    assert (
+        second.state.strategy_book.high_water_mark
+        >= prior_state.strategy_book.high_water_mark
+    )
+
+    resumed_first, resumed_second = _distinct_consecutive_archive_environments()
+    resumed = MassiveAdaptivePrequentialPPORunnerV1(
+        training_authority=training_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environments={
+            resumed_first.forecast_archive.semantic_receipt_sha256: resumed_first,
+            resumed_second.forecast_archive.semantic_receipt_sha256: resumed_second,
+        },
+        model=MassiveAdaptivePPOActorCriticV1(observation_dim=90),
+        config=MassiveAdaptivePPOConfigV1(
+            epochs_per_rollout=1,
+            rollout_length=1,
+            minibatch_size=1,
+        ),
+    )
+    resumed.restore(boundary)
+    resumed.run_next_update()
+    restarted = resumed.checkpoint()
+    assert uninterrupted.semantic_receipt_sha256 == restarted.semantic_receipt_sha256
+    assert uninterrupted.transition_receipts == restarted.transition_receipts
 
 
 def test_prequential_ppo_uses_every_block_and_resumes_across_boundary(
@@ -573,7 +771,7 @@ def test_rl_chronology_and_fixed_control_registry_fail_closed() -> None:
         overlap.validate()
 
     registry = build_massive_adaptive_rl_fixed_control_registry_v1()
-    assert registry.control_ids == tuple(f"FC{index:02d}" for index in range(8))
+    assert registry.control_ids == tuple(f"FC{index:02d}" for index in range(7))
     incomplete = SimpleNamespace(
         validate=lambda: None,
         runtime_selection_replayed=True,
@@ -586,6 +784,7 @@ def test_rl_chronology_and_fixed_control_registry_fail_closed() -> None:
         validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
             registry=registry,
             selection_authority=incomplete,  # type: ignore[arg-type]
+            chronology_authority=chronology,
         )
 
 

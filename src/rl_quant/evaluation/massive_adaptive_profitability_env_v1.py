@@ -87,6 +87,7 @@ MASSIVE_ADAPTIVE_PROFITABILITY_ENV_V1_SPEC_SHA256 = semantic_sha256(
         "reported_returns": "unpenalized-economic-log-wealth",
         "terminal_accounting": "liquidation-cost-adjustment-at-true-end-only",
         "rollout_boundary": "state-preserving-truncation",
+        "forecast_refit_boundary": "state-carry-without-liquidation",
         "target_access": False,
     }
 )
@@ -202,7 +203,11 @@ class MassiveAdaptiveRLTransitionV1:
             or not isinstance(self.source_data_qualified, bool)
             or self.source_data_qualified != self.economic_step.source_data_qualified
             or not isinstance(self.terminated, bool)
-            or self.truncated
+            or (self.terminated and self.truncated)
+            or (
+                self.truncated
+                and any(abs(value) > 1.0e-12 for value in values[4:7])
+            )
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
@@ -326,6 +331,44 @@ class MassiveAdaptiveProfitabilityEnvV1:
         self.maximum_fill_participation = float(maximum_fill_participation)
         self.compiler_config = compiler_config or MassiveAdaptivePortfolioCompilerConfigV1()
         self.compiler_config.validate()
+        self.economic_compatibility_receipt_sha256 = semantic_sha256(
+            (
+                fill_source.semantic_receipt_sha256,
+                daily_input_authority.semantic_receipt_sha256,
+                identity_authority.receipt_sha256,
+                None
+                if economic_event_archive is None
+                else economic_event_archive.receipt_sha256,
+                self.compiler_config.receipt_sha256,
+                self.initial_capital,
+                self.transaction_cost_basis_points,
+                self.maximum_fill_participation,
+                "pit-equal-weight-staged-entry-then-buy-and-drift",
+            )
+        )
+        self.validation_context_receipt_sha256 = semantic_sha256(
+            (
+                forecast_archive.semantic_receipt_sha256,
+                calibration.semantic_receipt_sha256,
+                inference_plan.semantic_receipt_sha256,
+                tuple(
+                    self.roots[date].semantic_receipt_sha256 for date in plan_dates
+                ),
+                tuple(
+                    self.contexts[date].semantic_receipt_sha256 for date in plan_dates
+                ),
+                fill_source.semantic_receipt_sha256,
+                daily_input_authority.semantic_receipt_sha256,
+                identity_authority.receipt_sha256,
+                None
+                if economic_event_archive is None
+                else economic_event_archive.receipt_sha256,
+                self.compiler_config.receipt_sha256,
+                self.initial_capital,
+                self.maximum_fill_participation,
+                "pit-equal-weight-staged-entry-then-buy-and-drift",
+            )
+        )
         self.source_inventory_sha256 = semantic_sha256(
             (
                 forecast_archive.semantic_receipt_sha256,
@@ -406,6 +449,14 @@ class MassiveAdaptiveProfitabilityEnvV1:
             raise MassiveAdaptiveProfitabilityEnvV1Error("environment is not reset")
         return self._state
 
+    @property
+    def current_observation(self) -> MassiveAdaptiveRLObservationV1:
+        if self._observation is None:
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "adaptive environment has no current observation"
+            )
+        return self._observation
+
     def restore(self, state: MassiveAdaptiveProfitabilityEnvStateV1) -> None:
         state.validate()
         if (
@@ -422,6 +473,41 @@ class MassiveAdaptiveProfitabilityEnvV1:
         if not state.done:
             self._prepare_observation()
 
+    def restore_continuation(
+        self, state: MassiveAdaptiveProfitabilityEnvStateV1
+    ) -> None:
+        """Carry books into a new causal forecast archive at the same close.
+
+        The caller must hold a package-derived economic-continuity authority.
+        This low-level method only performs the state rebinding and therefore
+        grants no authority by itself.
+        """
+
+        state.validate()
+        first_date = self.inference_plan.rows[0].decision_session_date
+        books = (state.strategy_book, state.neutral_book, state.benchmark_book)
+        if (
+            not state.done
+            or state.chronology_cursor <= 0
+            or any(book.decision_session_date != first_date for book in books)
+        ):
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "adaptive continuation state is not aligned to the next decision"
+            )
+        self._state = _state(
+            cursor=0,
+            strategy_book=state.strategy_book,
+            neutral_book=state.neutral_book,
+            benchmark_book=state.benchmark_book,
+            previous_action=state.previous_action,
+            trailing_state=state.trailing_state,
+            done=False,
+            source_inventory_sha256=self.source_inventory_sha256,
+        )
+        self._prepared = None
+        self._observation = None
+        self._prepare_observation()
+
     def rollout_boundary_state(self) -> MassiveAdaptiveProfitabilityEnvStateV1:
         """Return an unchanged continuation; no economic liquidation occurs."""
 
@@ -437,6 +523,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
         *,
         frozen_control: MassiveAdaptiveRLCompilerControlV1 | None = None,
         frozen_decision: MassiveAdaptivePortfolioDecisionV1 | None = None,
+        continue_economic_episode: bool = False,
     ) -> tuple[
         MassiveAdaptiveRLObservationV1 | None,
         float,
@@ -449,6 +536,10 @@ class MassiveAdaptiveProfitabilityEnvV1:
             raise MassiveAdaptiveProfitabilityEnvV1Error("environment is not reset")
         if self._state.done:
             raise MassiveAdaptiveProfitabilityEnvV1Error("environment is terminal")
+        if not isinstance(continue_economic_episode, bool):
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "adaptive continuation flag is invalid"
+            )
         if (frozen_control is None) != (frozen_decision is None):
             raise MassiveAdaptiveProfitabilityEnvV1Error(
                 "frozen control and decision must be supplied together"
@@ -495,7 +586,13 @@ class MassiveAdaptiveProfitabilityEnvV1:
             frozen_targets_replayed=frozen_decision is not None,
         )
         next_cursor = self._state.chronology_cursor + 1
-        terminated = next_cursor == len(self.inference_plan.rows)
+        local_end = next_cursor == len(self.inference_plan.rows)
+        if continue_economic_episode and not local_end:
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "adaptive economic continuation is only valid at an archive end"
+            )
+        terminated = bool(local_end and not continue_economic_episode)
+        truncated = bool(local_end and continue_economic_episode)
         strategy_cost = neutral_cost = benchmark_cost = 0.0
         strategy_equity = economic_step.strategy_posttrade_book.marked_equity
         neutral_equity = economic_step.neutral_posttrade_book.marked_equity
@@ -578,7 +675,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
             benchmark_book=economic_step.benchmark_posttrade_book,
             previous_action=action,
             trailing_state=trailing,
-            done=terminated,
+            done=local_end,
             source_inventory_sha256=self.source_inventory_sha256,
         )
         body = {
@@ -601,7 +698,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
             "benchmark_liquidation_adjusted_equity": benchmark_equity,
             "source_data_qualified": economic_step.source_data_qualified,
             "terminated": terminated,
-            "truncated": False,
+            "truncated": truncated,
             "next_state_receipt_sha256": self._state.semantic_receipt_sha256,
             "profitability_reporting_authorized": False,
             "outer_evaluation_authorized": False,
@@ -618,12 +715,12 @@ class MassiveAdaptiveProfitabilityEnvV1:
             semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
         )
         transition.validate()
-        next_observation = None if terminated else self._prepare_observation()
+        next_observation = None if local_end else self._prepare_observation()
         return (
             next_observation,
             reward,
             terminated,
-            False,
+            truncated,
             {
                 "transition": transition,
                 "state_receipt_sha256": self._state.semantic_receipt_sha256,

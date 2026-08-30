@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from rl_quant.evaluation.massive_adaptive_rl_fixed_control_evaluator_v1 import (
+    evaluate_massive_adaptive_rl_fixed_control_v1,
+)
 from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
     MassiveAdaptivePPOActorCriticV1,
 )
@@ -22,6 +25,11 @@ from rl_quant.training.massive_adaptive_ppo_v1 import (
 from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
     build_massive_adaptive_rl_fixed_control_candidate_v1,
     materialize_massive_adaptive_rl_fixed_control_selection_authority_v1,
+)
+from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
+    build_massive_adaptive_rl_fixed_control_registry_v1,
+    registered_massive_adaptive_rl_constant_actions_v1,
+    validate_massive_adaptive_rl_fixed_control_registry_coverage_v1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -136,6 +144,120 @@ def _fixed_validation_trace() -> MassiveAdaptiveRLPolicyTraceV1:
         active=0.01,
         frozen=False,
     )
+
+
+def test_fc06_is_fit_only_selection_from_complete_registered_grid(tmp_path) -> None:
+    training_trace = _trace(
+        cost=20.0,
+        terminal_return=0.01,
+        incremental=0.004,
+        active=0.01,
+        frozen=False,
+        role="training_control",
+    )
+    candidates = tuple(
+        build_massive_adaptive_rl_fixed_control_candidate_v1(
+            fold_index=0,
+            control_id=control_id,
+            action=action,
+            training_trace=training_trace,
+        )
+        for control_id, action in registered_massive_adaptive_rl_constant_actions_v1()
+    )
+    authority = materialize_massive_adaptive_rl_fixed_control_selection_authority_v1(
+        root=tmp_path,
+        artifact_id="complete-fc06-selection",
+        candidates=candidates,
+        committed_at_ms=2,
+    )
+    chronology = SimpleNamespace(
+        validate=lambda: None,
+        fold_index=0,
+        rl_fit_origin_inventory_sha256=semantic_sha256(
+            training_trace.decision_session_dates
+        ),
+    )
+    validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
+        registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
+        selection_authority=authority,
+        chronology_authority=chronology,  # type: ignore[arg-type]
+    )
+    assert authority.runtime_selection is not None
+    assert authority.runtime_selection.selected_control_id == "FC05"
+    assert tuple(
+        sorted(row.control_id for row in authority.runtime_candidates or ())
+    ) == tuple(f"FC{index:02d}" for index in range(6))
+
+
+def test_fc06_validation_trace_is_generated_from_fit_selected_action(tmp_path) -> None:
+    training_trace = _trace(
+        cost=20.0,
+        terminal_return=0.01,
+        incremental=0.004,
+        active=0.01,
+        frozen=False,
+        role="training_control",
+    )
+    training_trace = replace(
+        training_trace,
+        decision_session_dates=("2023-01-03", "2023-01-04"),
+        transition_receipts=(_digest("fit-transition-0"), _digest("fit-transition-1")),
+        semantic_receipt_sha256="0" * 64,
+    )
+    training_trace = replace(
+        training_trace,
+        semantic_receipt_sha256=semantic_sha256(training_trace.semantic_unsigned()),
+    )
+    candidates = tuple(
+        build_massive_adaptive_rl_fixed_control_candidate_v1(
+            fold_index=0,
+            control_id=control_id,
+            action=action,
+            training_trace=training_trace,
+        )
+        for control_id, action in registered_massive_adaptive_rl_constant_actions_v1()
+    )
+    selection_authority = (
+        materialize_massive_adaptive_rl_fixed_control_selection_authority_v1(
+            root=tmp_path,
+            artifact_id="fc06-package-evaluation",
+            candidates=candidates,
+            committed_at_ms=3,
+        )
+    )
+    _, _, environment = _adaptive_env_fixture()
+    validation_dates = tuple(
+        row.decision_session_date for row in environment.inference_plan.rows
+    )
+    chronology = SimpleNamespace(
+        validate=lambda: None,
+        fold_index=0,
+        training_forecast_authority_receipt_sha256=_digest(
+            "rl-training-forecast-authority"
+        ),
+        rl_fit_origin_inventory_sha256=semantic_sha256(
+            training_trace.decision_session_dates
+        ),
+        rl_validation_origin_dates=validation_dates,
+        development_policy_selection_authorized=True,
+    )
+    evaluation = evaluate_massive_adaptive_rl_fixed_control_v1(
+        registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
+        selection_authority=selection_authority,
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environment=environment,
+    )
+
+    assert evaluation.policy_trace.decision_session_dates == validation_dates
+    assert evaluation.transition_receipts == (
+        evaluation.policy_trace.transition_receipts
+    )
+    assert len(evaluation.transition_receipts) == len(validation_dates)
+    assert selection_authority.runtime_selection is not None
+    assert evaluation.selected_action_receipt_sha256 == (
+        selection_authority.runtime_selection.selected_action_receipt_sha256
+    )
+    assert not evaluation.development_policy_selection_authorized
 
 
 def test_policy_selection_replays_frozen_cost_ladder_create_only(tmp_path) -> None:

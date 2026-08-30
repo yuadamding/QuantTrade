@@ -31,11 +31,16 @@ from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
 )
 from rl_quant.training.massive_adaptive_ppo_v1 import (
     MassiveAdaptivePPOConfigV1,
+    MassiveAdaptivePPORolloutV1,
     MassiveAdaptivePPOTrainerV1,
     MassiveAdaptiveRLCheckpointV1,
 )
 from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityV1,
+)
+from rl_quant.training.massive_adaptive_economic_continuity_authority_v1 import (
+    MassiveAdaptiveEconomicContinuityAuthorityV1,
+    build_massive_adaptive_economic_continuity_authority_v1,
 )
 from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
     MassiveAdaptiveRLChronologyAuthorityV1,
@@ -58,8 +63,11 @@ MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SPEC_SHA256 = semantic_sha256(
     {
         "blocks": "every-authorized-block-in-order",
         "learning_state": "carried-across-all-blocks",
-        "economic_state": "carried-only-within-one-consecutive-source-chronology",
-        "checkpoint": "block-index-cursor-completed-inventory-and-ppo-state",
+        "economic_state": "carried-across-compatible-consecutive-forecast-refits",
+        "internal_liquidation": False,
+        "checkpoint": (
+            "block-index-cursor-completed-continuity-inventory-and-ppo-state"
+        ),
         "validation_access": False,
         "outer_access": False,
         "duration_semantics": False,
@@ -138,6 +146,8 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
     rl_chronology_authority_receipt_sha256: str
     block_inventory_sha256: str
     block_runtime_inventory_sha256: str
+    continuity_authority_receipts: tuple[str, ...]
+    continuity_authority_inventory_sha256: str
     current_block_index: int
     current_block_receipt_sha256: str
     current_calibration_receipt_sha256: str
@@ -189,6 +199,8 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
             != semantic_sha256(self.completed_block_receipts)
             or self.transition_inventory_sha256
             != semantic_sha256(self.transition_receipts)
+            or self.continuity_authority_inventory_sha256
+            != semantic_sha256(self.continuity_authority_receipts)
             or self.ppo_checkpoint.training_forecast_authority_receipt_sha256
             != self.training_forecast_authority_receipt_sha256
             or self.ppo_checkpoint.environment_state.chronology_cursor
@@ -215,6 +227,8 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
             self.rl_chronology_authority_receipt_sha256,
             self.block_inventory_sha256,
             self.block_runtime_inventory_sha256,
+            *self.continuity_authority_receipts,
+            self.continuity_authority_inventory_sha256,
             self.current_block_receipt_sha256,
             self.current_calibration_receipt_sha256,
             self.current_environment_source_inventory_sha256,
@@ -236,6 +250,8 @@ class MassiveAdaptivePPOTrainingRunV1:
     training_forecast_authority_receipt_sha256: str
     rl_chronology_authority_receipt_sha256: str
     block_runtime_inventory_sha256: str
+    continuity_authority_receipts: tuple[str, ...]
+    continuity_authority_inventory_sha256: str
     completed_block_receipts: tuple[str, ...]
     completed_block_inventory_sha256: str
     transition_receipts: tuple[str, ...]
@@ -268,6 +284,8 @@ class MassiveAdaptivePPOTrainingRunV1:
             or not self.transition_receipts
             or self.transition_inventory_sha256
             != semantic_sha256(self.transition_receipts)
+            or self.continuity_authority_inventory_sha256
+            != semantic_sha256(self.continuity_authority_receipts)
             or self.update_count <= 0
             or self.development_rl_training_authorized != self.source_data_qualified
             or self.profitability_reporting_authorized
@@ -321,6 +339,13 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         self.block_runtimes = self._bind_block_runtimes()
         self.block_runtime_inventory_sha256 = semantic_sha256(
             tuple(row.semantic_receipt_sha256 for row in self.block_runtimes)
+        )
+        self.continuity_authorities = self._bind_continuity_authorities()
+        self.continuity_authority_inventory_sha256 = semantic_sha256(
+            tuple(
+                row.semantic_receipt_sha256
+                for row in self.continuity_authorities.values()
+            )
         )
         self.current_block_index = 0
         self.completed_block_receipts: list[str] = []
@@ -399,6 +424,37 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             )
         return tuple(runtimes)
 
+    def _bind_continuity_authorities(
+        self,
+    ) -> dict[int, MassiveAdaptiveEconomicContinuityAuthorityV1]:
+        """Bind every boundary whose next block uses a different archive."""
+
+        authorities: dict[int, MassiveAdaptiveEconomicContinuityAuthorityV1] = {}
+        for next_index in range(1, len(self.block_runtimes)):
+            previous = self.block_runtimes[next_index - 1]
+            current = self.block_runtimes[next_index]
+            if (
+                previous.forecast_archive_receipt_sha256
+                == current.forecast_archive_receipt_sha256
+            ):
+                continue
+            authority = build_massive_adaptive_economic_continuity_authority_v1(
+                previous_block_receipt_sha256=previous.block_receipt_sha256,
+                next_block_receipt_sha256=current.block_receipt_sha256,
+                previous_environment=self._environment_for_block(next_index - 1),
+                next_environment=self._environment_for_block(next_index),
+                source_data_qualified=self.training_authority.source_data_qualified,
+            )
+            if (
+                authority.exchange_sessions_consecutive
+                and not authority.carry_books_authorized
+            ):
+                raise MassiveAdaptivePrequentialPPORunnerV1Error(
+                    "consecutive forecast refits changed economic accounting roots"
+                )
+            authorities[next_index] = authority
+        return authorities
+
     def _new_trainer(
         self, environment: MassiveAdaptiveProfitabilityEnvV1
     ) -> MassiveAdaptivePPOTrainerV1:
@@ -409,6 +465,49 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             device=self.device,
             training_forecast_authority=self.training_authority,
         )
+
+    def _bootstrap_continuation_rollout(
+        self,
+        rollout: MassiveAdaptivePPORolloutV1,
+        *,
+        next_block_index: int,
+    ) -> MassiveAdaptivePPORolloutV1:
+        """Bootstrap GAE from the first observation under the next refit."""
+
+        preview = copy.copy(self._environment_for_block(next_block_index))
+        preview.restore_continuation(self._trainer.environment.state)
+        observation = torch.tensor(
+            preview.current_observation.values,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+        with torch.no_grad():
+            bootstrap = self.model({"adaptive_state": observation}).value[0].detach()
+        next_values = torch.cat((rollout.old_values[1:], bootstrap.unsqueeze(0)))
+        advantages = torch.zeros_like(rollout.rewards)
+        running = torch.zeros((), dtype=torch.float32, device=self.device)
+        for index in range(rollout.rewards.shape[0] - 1, -1, -1):
+            continuation = 0.0 if bool(rollout.terminated[index].item()) else 1.0
+            delta = (
+                rollout.rewards[index]
+                + self.config.gamma * next_values[index] * continuation
+                - rollout.old_values[index]
+            )
+            running = (
+                delta
+                + self.config.gamma
+                * self.config.gae_lambda
+                * continuation
+                * running
+            )
+            advantages[index] = running
+        result = replace(
+            rollout,
+            advantages=advantages,
+            returns=advantages + rollout.old_values,
+        )
+        result.validate()
+        return result
 
     @staticmethod
     def _restore_learning_state(
@@ -457,10 +556,23 @@ class MassiveAdaptivePrequentialPPORunnerV1:
                 )
             return
         environment = self._environment_for_block(self.current_block_index)
-        environment.reset()
+        continuity = self.continuity_authorities[self.current_block_index]
+        if continuity.carry_books_authorized:
+            previous_state = self._trainer.environment.state
+            if (
+                not previous_state.done
+                or previous_state.strategy_book.decision_session_date
+                != continuity.next_initial_decision_session_date
+            ):
+                raise MassiveAdaptivePrequentialPPORunnerV1Error(
+                    "consecutive forecast refit did not preserve its terminal books"
+                )
+            environment.restore_continuation(previous_state)
+        else:
+            environment.reset()
         self._trainer = self._new_trainer(environment)
         self._restore_learning_state(self._trainer, learning_checkpoint)
-        self._trainer._observation, _ = environment.reset()
+        self._trainer._observation = environment.current_observation
 
     def run_next_update(self) -> dict[str, float]:
         if self.training_complete:
@@ -477,7 +589,23 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             self.config.rollout_length,
             runtime.environment_stop_cursor - cursor,
         )
-        rollout = self._trainer.collect_rollout(steps=steps)
+        next_index = self.current_block_index + 1
+        continuity = self.continuity_authorities.get(next_index)
+        continue_economic_episode = bool(
+            next_index < len(self.block_runtimes)
+            and continuity is not None
+            and continuity.carry_books_authorized
+            and steps == runtime.environment_stop_cursor - cursor
+        )
+        rollout = self._trainer.collect_rollout(
+            steps=steps,
+            continue_economic_episode_at_end=continue_economic_episode,
+        )
+        if continue_economic_episode:
+            rollout = self._bootstrap_continuation_rollout(
+                rollout,
+                next_block_index=next_index,
+            )
         metrics = self._trainer.update(rollout)
         self.transition_receipts.extend(rollout.transition_receipts)
         if self._trainer.environment.state.chronology_cursor == runtime.environment_stop_cursor:
@@ -503,6 +631,13 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             ),
             "block_inventory_sha256": self.training_authority.block_inventory_sha256,
             "block_runtime_inventory_sha256": self.block_runtime_inventory_sha256,
+            "continuity_authority_receipts": tuple(
+                row.semantic_receipt_sha256
+                for row in self.continuity_authorities.values()
+            ),
+            "continuity_authority_inventory_sha256": (
+                self.continuity_authority_inventory_sha256
+            ),
             "current_block_index": index,
             "current_block_receipt_sha256": runtime.block_receipt_sha256,
             "current_calibration_receipt_sha256": runtime.calibration_receipt_sha256,
@@ -560,6 +695,13 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             != self.training_authority.block_inventory_sha256
             or checkpoint.block_runtime_inventory_sha256
             != self.block_runtime_inventory_sha256
+            or checkpoint.continuity_authority_inventory_sha256
+            != self.continuity_authority_inventory_sha256
+            or checkpoint.continuity_authority_receipts
+            != tuple(
+                row.semantic_receipt_sha256
+                for row in self.continuity_authorities.values()
+            )
         ):
             raise MassiveAdaptivePrequentialPPORunnerV1Error(
                 "prequential PPO checkpoint and runner roots differ"
@@ -598,6 +740,13 @@ class MassiveAdaptivePrequentialPPORunnerV1:
                 self.chronology_authority.semantic_receipt_sha256
             ),
             "block_runtime_inventory_sha256": self.block_runtime_inventory_sha256,
+            "continuity_authority_receipts": tuple(
+                row.semantic_receipt_sha256
+                for row in self.continuity_authorities.values()
+            ),
+            "continuity_authority_inventory_sha256": (
+                self.continuity_authority_inventory_sha256
+            ),
             "completed_block_receipts": tuple(self.completed_block_receipts),
             "completed_block_inventory_sha256": semantic_sha256(
                 tuple(self.completed_block_receipts)
