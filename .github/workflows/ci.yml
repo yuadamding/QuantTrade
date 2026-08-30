@@ -63,6 +63,8 @@ jobs:
           tests/test_massive_adaptive_ppo_policy_v1.py
           tests/test_massive_adaptive_rl_policy_selection_v1.py
           tests/test_massive_adaptive_rl_outer_evidence_v1.py
+          tests/test_massive_adaptive_rl_authoritative_orchestration_v1.py
+          tests/test_massive_adaptive_rl_workflow_v1.py
           tests/test_adaptive_alpha_supervised_v1.py
           tests/test_massive_adaptive_portfolio_compiler_v1.py
           tests/test_massive_economic_authority_v6.py

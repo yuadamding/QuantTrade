@@ -91,6 +91,7 @@ MASSIVE_ADAPTIVE_ECONOMIC_STEP_V1_SPEC_SHA256 = semantic_sha256(
         "books": ("strategy", "neutral", "benchmark"),
         "reward": "realized-log-wealth-only",
         "policy_constraints": "compiler-hard-envelope",
+        "cost_stress": "primary-targets-replayed-without-policy-or-compiler-rerun",
         "target_access": False,
         "future_fill_access": False,
     }
@@ -377,6 +378,65 @@ def _execute_decision(
     )
 
 
+def _execute_frozen_target(
+    *,
+    prepared: MassiveAdaptivePreparedStepV1,
+    book: MassiveAdaptiveEconomicBookV1,
+    decision: MassiveAdaptivePortfolioDecisionV1,
+    fill_source: MassiveAdaptiveFillSourceV1,
+    transition: MassiveAdaptiveEconomicEventTransitionV2 | None,
+    daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
+    identity_authority: PITSecurityUniverseAuthority,
+    transaction_cost_basis_points: float,
+    maximum_fill_participation: float,
+) -> MassiveAdaptiveExecutionResultV1:
+    """Replay a primary target against the current cost-rung book.
+
+    The primary compiler decision is provenance for the frozen target only.  A
+    stress book naturally has a different input receipt after prior costs, so
+    it must not pretend that the original compiler consumed the stress book.
+    """
+
+    required = tuple(
+        security_id
+        for security_id, target, current in zip(
+            decision.security_ids,
+            decision.target_weights,
+            book.weights(decision.security_ids),
+            strict=True,
+        )
+        if target > 1.0e-12 or current > 1.0e-12
+    )
+    marks, receipts = _decision_marks(
+        session_date=prepared.decision_session_date,
+        security_ids=required,
+        daily=daily_input_authority,
+    )
+    target_receipt = semantic_sha256(
+        (decision.security_ids, decision.target_weights)
+    )
+    intent = build_massive_adaptive_target_order_intent_v1(
+        decision_session_date=prepared.decision_session_date,
+        scheduled_fill_session_date=prepared.fill_session_date,
+        book=book,
+        security_ids=decision.security_ids,
+        target_weights=decision.target_weights,
+        target_receipt_sha256=target_receipt,
+        decision_marks=marks,
+        decision_mark_receipts=receipts,
+    )
+    return execute_massive_adaptive_order_intent_v1(
+        order_intent=intent,
+        book=book,
+        fill_source=fill_source,
+        daily_input_authority=daily_input_authority,
+        identity_authority=identity_authority,
+        economic_event_transition=transition,  # type: ignore[arg-type]
+        transaction_cost_basis_points=transaction_cost_basis_points,
+        maximum_fill_participation=maximum_fill_participation,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveEconomicStepV1:
     prepared_step_receipt_sha256: str
@@ -398,6 +458,7 @@ class MassiveAdaptiveEconomicStepV1:
     incremental_rl_log_return: float
     optimization_reward_basis_points: float
     neutral_equivalence: bool
+    frozen_targets_replayed: bool
     economic_event_transition_receipt_sha256: str | None
     source_inventory_sha256: str
     source_data_qualified: bool
@@ -463,6 +524,7 @@ class MassiveAdaptiveEconomicStepV1:
             )
             > 1.0e-9
             or not isinstance(self.source_data_qualified, bool)
+            or not isinstance(self.frozen_targets_replayed, bool)
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
@@ -518,21 +580,29 @@ def settle_massive_adaptive_economic_step_v1(
     policy_action_receipt_sha256: str | None = None,
     policy_control_receipt_sha256: str | None = None,
     policy_control: MassiveAdaptiveRLCompilerControlV1 | None = None,
+    frozen_targets_replayed: bool = False,
 ) -> MassiveAdaptiveEconomicStepV1:
     """Settle strategy, neutral, and benchmark through one source chronology."""
 
     prepared.validate()
     policy_decision.validate()
     neutral_decision.validate()
+    if not isinstance(frozen_targets_replayed, bool):
+        raise MassiveAdaptiveEconomicStepV1Error(
+            "frozen-target replay flag is invalid"
+        )
     if policy_control is not None:
         policy_control.validate()
         if (
-            policy_control.base_input_receipt_sha256
-            != prepared.strategy_compiler_inputs.receipt_sha256
-            or policy_control.adjusted_input_receipt_sha256
+            policy_control.adjusted_input_receipt_sha256
             != policy_decision.input_receipt_sha256
             or policy_control_receipt_sha256
             != policy_control.semantic_receipt_sha256
+            or (
+                not frozen_targets_replayed
+                and policy_control.base_input_receipt_sha256
+                != prepared.strategy_compiler_inputs.receipt_sha256
+            )
         ):
             raise MassiveAdaptiveEconomicStepV1Error(
                 "policy control and prepared compiler input differ"
@@ -559,16 +629,30 @@ def settle_massive_adaptive_economic_step_v1(
             identity_authority=identity_authority,
         )
     )
-    strategy_execution = _execute_decision(
-        prepared=prepared,
-        book=prepared.strategy_pretrade_book,
-        decision=policy_decision,
-        fill_source=fill_source,
-        transition=transition,
-        daily_input_authority=daily_input_authority,
-        identity_authority=identity_authority,
-        transaction_cost_basis_points=transaction_cost_basis_points,
-        maximum_fill_participation=maximum_fill_participation,
+    strategy_execution = (
+        _execute_frozen_target(
+            prepared=prepared,
+            book=prepared.strategy_pretrade_book,
+            decision=policy_decision,
+            fill_source=fill_source,
+            transition=transition,
+            daily_input_authority=daily_input_authority,
+            identity_authority=identity_authority,
+            transaction_cost_basis_points=transaction_cost_basis_points,
+            maximum_fill_participation=maximum_fill_participation,
+        )
+        if frozen_targets_replayed
+        else _execute_decision(
+            prepared=prepared,
+            book=prepared.strategy_pretrade_book,
+            decision=policy_decision,
+            fill_source=fill_source,
+            transition=transition,
+            daily_input_authority=daily_input_authority,
+            identity_authority=identity_authority,
+            transaction_cost_basis_points=transaction_cost_basis_points,
+            maximum_fill_participation=maximum_fill_participation,
+        )
     )
     neutral_execution = _execute_decision(
         prepared=prepared,
@@ -631,6 +715,8 @@ def settle_massive_adaptive_economic_step_v1(
     )
     incremental = strategy_log - neutral_log
     neutral_equivalence = bool(
+        not frozen_targets_replayed
+        and
         policy_decision.semantic_receipt_sha256
         == neutral_decision.semantic_receipt_sha256
         and prepared.strategy_pretrade_book == prepared.neutral_pretrade_book
@@ -645,6 +731,7 @@ def settle_massive_adaptive_economic_step_v1(
             strategy_execution.semantic_receipt_sha256,
             neutral_execution.semantic_receipt_sha256,
             benchmark_execution.semantic_receipt_sha256,
+            frozen_targets_replayed,
         )
     )
     body = {
@@ -668,6 +755,7 @@ def settle_massive_adaptive_economic_step_v1(
         "incremental_rl_log_return": incremental,
         "optimization_reward_basis_points": 10_000.0 * incremental,
         "neutral_equivalence": neutral_equivalence,
+        "frozen_targets_replayed": frozen_targets_replayed,
         "economic_event_transition_receipt_sha256": None
         if transition is None
         else transition.semantic_receipt_sha256,

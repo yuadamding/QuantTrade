@@ -337,6 +337,60 @@ only and the archive must be the exact chronological prefix preceding the
 registered outer fold. Synthetic or otherwise unqualified sources continue to
 withhold RL-training authority.
 
+`MassiveAdaptivePrequentialPPORunnerV1` consumes that complete block inventory
+in its committed order. It carries actor, critic, optimizer, and RNG state
+across every block; economic books carry only across consecutive slices of one
+source chronology and otherwise restart from the registered cash state. Its
+durable checkpoint binds the current block, within-block cursor,
+completed-block inventory, calibration, environment source inventory,
+transition inventory, and nested PPO checkpoint. Generic reopening strips
+runtime state, and promotion restores the runner and reproduces every state
+receipt before training may continue.
+
+The immutable experiment configuration is available through a package-owned
+command:
+
+```bash
+quanttrade-adaptive-rl manifest \
+  --experiment-id <registered-id> \
+  --output <create-only-manifest.json> \
+  --block-sessions 21 \
+  --candidate-update <registered-update> \
+  --seed 17
+
+quanttrade-adaptive-rl validate \
+  --manifest <create-only-manifest.json>
+```
+
+The manifest freezes the four folds, causal block size, candidate-update
+schedule, seeds, PPO configuration, $10 million capital, 10/20/40-bp ladder,
+two-percent participation limit, complete FC00--FC07 comparator inventory,
+observation/action/reward identities, all-cash initialization, shared
+benchmark, drawdown cap, and outer gates. It contains no outcomes and is
+nonauthorizing by itself.
+
+`run_massive_adaptive_rl_training_workflow_v1()` owns every authorized block
+and publishes each scheduled update twice from the same state: an exact
+prequential-runner resume authority and the policy-checkpoint authority used
+by deterministic evaluation. `run_massive_adaptive_rl_validation_workflow_v1()`
+then reloads every registered policy candidate, regenerates its primary
+actions, and publishes exact frozen-target 10/40-bp stresses. Neither workflow
+accepts caller actions, transitions, returns, or P&L arrays.
+
+There is intentionally no historical `run` subcommand yet. The repository
+still lacks one persisted composite loader that can reopen the complete live
+forecast, calibration, decision-root, fill, event, and identity bundle from a
+source root. Adding a launch command that bypasses that authority would
+silently restore caller control over economic sources. Until that loader and a
+positive real-source canary exist, the command surface remains manifest and
+validation only, and profitability reporting remains false.
+
+The RL chronology is opened in two stages. PPO fitting and policy selection
+first bind fit, validation, and outer date inventories directly from the split
+plan, without opening a selected-checkpoint outer forecast. Only after policy
+selection may the actual outer inference plan bind to those precommitted fold
+dates. The three origin inventories are pairwise disjoint.
+
 Inner-validation policy economics are derived from complete environment
 transitions rather than caller return arrays. A create-only policy-selection
 authority binds the 10/20/40-bp frozen-target ladder, terminal liquidation,
@@ -345,6 +399,15 @@ selected PPO update. Static compiler controls are selected separately using
 training-only traces; the PPO candidate must then beat that committed fixed
 control on inner validation. The selected model state is published in a
 separate create-only frozen-policy artifact before any outer date is opened.
+
+Validation evaluation is checkpoint-owned: it reloads the actor, reconstructs
+every observation, emits the registered deterministic bounded action, and
+records the distribution parameters, action, compiler control, decision,
+execution, next book, and reward. Its create-only trace authority promotes
+only after rerunning the actor and complete chronology. The cost-ladder
+authority runs the actor and compiler once at 20 bp and replays that exact
+target-weight inventory at 10 and 40 bp through the same fill, event, and book
+kernel.
 
 Each outer plan binds one fold's selected supervised checkpoint, calibration,
 target-free outer forecast archive, selected frozen RL policy, compiler
@@ -355,6 +418,14 @@ control wealth. It also requires at least three positive folds for every
 load-bearing contrast, a monotone frozen-target cost ladder, nonnegative mean
 40-bp return, and no fold drawdown above 25 percent. Generic evidence reloads
 remain nonauthorizing and final reporting and lockbox access remain false.
+
+Outer evaluation is likewise actor-owned. A create-only rollout authority
+loads the selected frozen model state, forbids updates, regenerates every
+outer action, and reproduces its economic trace. A second authority replays
+the primary rollout's target weights at 10 and 40 bp without reevaluating the
+policy or compiler. Checkpoint-authenticated outer evidence accepts a fold
+only when both the frozen-policy rollout authority and frozen-target cost
+ladder authority match its policy, traces, and target inventory.
 
 Every position is reconsidered from its current net economics at every
 decision. The canonical adaptive observation, action, reward, compiler,

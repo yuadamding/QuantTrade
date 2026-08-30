@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Mapping
 
 import torch
@@ -12,9 +13,25 @@ from torch.nn import functional as F
 from rl_quant.rl.algorithm import RecurrentState
 from rl_quant.rl.ppo import PPOActorCritic, PPOModelOutput
 from rl_quant.rl.types import ObservationBatch
+from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 
 MASSIVE_ADAPTIVE_PPO_ACTION_DIMENSION_V1 = 10
 MASSIVE_ADAPTIVE_PPO_BIDIRECTIONAL_DIMENSION_V1 = 9
+MASSIVE_ADAPTIVE_PPO_POLICY_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
+MASSIVE_ADAPTIVE_PPO_POLICY_V1_SPEC_SHA256 = semantic_sha256(
+    {
+        "observation_dimension": 90,
+        "hidden_dimensions": (128, 128),
+        "action_dimension": MASSIVE_ADAPTIVE_PPO_ACTION_DIMENSION_V1,
+        "bidirectional_controls": 9,
+        "turnover_control": "beta-on-open-unit-interval",
+        "deterministic_action": "tanh-normal-mean-and-beta-mean",
+        "duration_semantics": False,
+        "implementation_source_sha256": (
+            MASSIVE_ADAPTIVE_PPO_POLICY_V1_SOURCE_SHA256
+        ),
+    }
+)
 
 
 class MassiveAdaptiveBoundedControlDistributionV1:
@@ -62,12 +79,19 @@ class MassiveAdaptiveBoundedControlDistributionV1:
         turnover = self._turnover.sample().unsqueeze(-1)
         return torch.cat((bidirectional, turnover), dim=-1)
 
-    def mode(self) -> torch.Tensor:
+    def deterministic_action(self) -> torch.Tensor:
+        """Return the registered deterministic control for replay/evaluation."""
+
         bidirectional = torch.tanh(self.mean)
         turnover = (
             self.turnover_alpha / (self.turnover_alpha + self.turnover_beta)
         ).unsqueeze(-1)
         return torch.cat((bidirectional, turnover), dim=-1)
+
+    def mode(self) -> torch.Tensor:
+        """Compatibility alias; the Beta component uses its mean, not its mode."""
+
+        return self.deterministic_action()
 
     def log_prob(self, action: torch.Tensor) -> torch.Tensor:
         if (

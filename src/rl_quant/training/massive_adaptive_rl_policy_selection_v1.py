@@ -214,10 +214,54 @@ def build_massive_adaptive_rl_policy_trace_v1(
     """Derive policy economics only from complete environment transitions."""
 
     checkpoint.validate()
+    if checkpoint.training_forecast_authority_receipt_sha256 is None:
+        raise MassiveAdaptiveRLPolicySelectionV1Error(
+            "adaptive RL checkpoint has no training forecast authority"
+        )
+    return build_massive_adaptive_rl_policy_trace_from_identities_v1(
+        fold_index=fold_index,
+        checkpoint_receipt_sha256=checkpoint.semantic_receipt_sha256,
+        model_state_receipt_sha256=checkpoint.model_state_receipt_sha256,
+        update_index=checkpoint.update_index,
+        training_forecast_authority_receipt_sha256=(
+            checkpoint.training_forecast_authority_receipt_sha256
+        ),
+        forecast_archive_receipt_sha256=forecast_archive_receipt_sha256,
+        inference_plan_receipt_sha256=inference_plan_receipt_sha256,
+        calibration_receipt_sha256=calibration_receipt_sha256,
+        transaction_cost_basis_points=transaction_cost_basis_points,
+        initial_capital=initial_capital,
+        transitions=transitions,
+        frozen_targets_replayed=frozen_targets_replayed,
+        evaluation_role=evaluation_role,
+        checkpoint_source_data_qualified=(
+            checkpoint.development_rl_training_authorized
+        ),
+    )
+
+
+def build_massive_adaptive_rl_policy_trace_from_identities_v1(
+    *,
+    fold_index: int,
+    checkpoint_receipt_sha256: str,
+    model_state_receipt_sha256: str,
+    update_index: int,
+    training_forecast_authority_receipt_sha256: str,
+    forecast_archive_receipt_sha256: str,
+    inference_plan_receipt_sha256: str,
+    calibration_receipt_sha256: str,
+    transaction_cost_basis_points: float,
+    initial_capital: float,
+    transitions: Sequence[MassiveAdaptiveRLTransitionV1],
+    frozen_targets_replayed: bool,
+    evaluation_role: str,
+    checkpoint_source_data_qualified: bool,
+) -> MassiveAdaptiveRLPolicyTraceV1:
+    """Derive one economic trace from immutable policy identities and transitions."""
+
     rows = tuple(transitions)
     if (
-        checkpoint.training_forecast_authority_receipt_sha256 is None
-        or not rows
+        not rows
         or any(row.truncated for row in rows)
         or any(row.terminated for row in rows[:-1])
         or not rows[-1].terminated
@@ -248,11 +292,16 @@ def build_massive_adaptive_rl_policy_trace_v1(
         "schema": MASSIVE_ADAPTIVE_RL_POLICY_TRACE_V1_SCHEMA,
         "fold_index": fold_index,
         "evaluation_role": evaluation_role,
-        "checkpoint_receipt_sha256": checkpoint.semantic_receipt_sha256,
-        "model_state_receipt_sha256": checkpoint.model_state_receipt_sha256,
-        "update_index": checkpoint.update_index,
-        "training_forecast_authority_receipt_sha256": (
-            checkpoint.training_forecast_authority_receipt_sha256
+        "checkpoint_receipt_sha256": _digest(
+            "RL checkpoint receipt", checkpoint_receipt_sha256
+        ),
+        "model_state_receipt_sha256": _digest(
+            "RL model-state receipt", model_state_receipt_sha256
+        ),
+        "update_index": update_index,
+        "training_forecast_authority_receipt_sha256": _digest(
+            "RL training forecast authority receipt",
+            training_forecast_authority_receipt_sha256,
         ),
         "forecast_archive_receipt_sha256": _digest(
             "forecast archive receipt", forecast_archive_receipt_sha256
@@ -287,7 +336,7 @@ def build_massive_adaptive_rl_policy_trace_v1(
         "maximum_drawdown": maximum_drawdown,
         "frozen_targets_replayed": frozen_targets_replayed,
         "source_data_qualified": bool(
-            checkpoint.development_rl_training_authorized
+            checkpoint_source_data_qualified
             and all(row.source_data_qualified for row in rows)
         ),
         "profitability_reporting_authorized": False,
@@ -868,6 +917,7 @@ __all__ = [
     "authorize_massive_adaptive_rl_policy_selection_authority_v1",
     "build_massive_adaptive_rl_policy_candidate_v1",
     "build_massive_adaptive_rl_policy_trace_v1",
+    "build_massive_adaptive_rl_policy_trace_from_identities_v1",
     "materialize_massive_adaptive_rl_policy_selection_authority_v1",
     "parse_massive_adaptive_rl_policy_selection_authority_v1",
     "select_massive_adaptive_rl_policy_v1",

@@ -302,15 +302,18 @@ class MassiveAdaptiveProfitabilityEnvV1:
         self.forecast_archive = forecast_archive
         self.calibration = calibration
         self.inference_plan = inference_plan
-        self.forecasts = {
+        all_forecasts = {
             row.decision_session_date: row for row in forecast_archive.runtime_rows
         }
         self.roots = {row.decision_session_date: row for row in decision_roots}
         self.contexts = {row.decision_session_date: row for row in context_origins}
         plan_dates = tuple(row.decision_session_date for row in inference_plan.rows)
-        if tuple(self.forecasts) != plan_dates or set(self.roots) != set(plan_dates) or set(
-            self.contexts
-        ) != set(plan_dates):
+        if any(date not in all_forecasts for date in plan_dates):
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "adaptive environment forecast inventory omits a planned decision"
+            )
+        self.forecasts = {date: all_forecasts[date] for date in plan_dates}
+        if set(self.roots) != set(plan_dates) or set(self.contexts) != set(plan_dates):
             raise MassiveAdaptiveProfitabilityEnvV1Error(
                 "adaptive environment inventories differ"
             )
@@ -335,6 +338,9 @@ class MassiveAdaptiveProfitabilityEnvV1:
                 if economic_event_archive is None
                 else economic_event_archive.receipt_sha256,
                 self.compiler_config.receipt_sha256,
+                self.initial_capital,
+                self.transaction_cost_basis_points,
+                self.maximum_fill_participation,
             )
         )
         self._state: MassiveAdaptiveProfitabilityEnvStateV1 | None = None
@@ -426,7 +432,11 @@ class MassiveAdaptiveProfitabilityEnvV1:
         return sum(row.market_value for row in book.holdings) * basis_points / 10_000.0
 
     def step(
-        self, action: MassiveAdaptiveRLActionV1
+        self,
+        action: MassiveAdaptiveRLActionV1,
+        *,
+        frozen_control: MassiveAdaptiveRLCompilerControlV1 | None = None,
+        frozen_decision: MassiveAdaptivePortfolioDecisionV1 | None = None,
     ) -> tuple[
         MassiveAdaptiveRLObservationV1 | None,
         float,
@@ -439,11 +449,32 @@ class MassiveAdaptiveProfitabilityEnvV1:
             raise MassiveAdaptiveProfitabilityEnvV1Error("environment is not reset")
         if self._state.done:
             raise MassiveAdaptiveProfitabilityEnvV1Error("environment is terminal")
-        control, policy_decision = compile_massive_adaptive_rl_control_v1(
-            inputs=self._prepared.strategy_compiler_inputs,
-            config=self.compiler_config,
-            action=action,
-        )
+        if (frozen_control is None) != (frozen_decision is None):
+            raise MassiveAdaptiveProfitabilityEnvV1Error(
+                "frozen control and decision must be supplied together"
+            )
+        if frozen_control is None or frozen_decision is None:
+            control, policy_decision = compile_massive_adaptive_rl_control_v1(
+                inputs=self._prepared.strategy_compiler_inputs,
+                config=self.compiler_config,
+                action=action,
+            )
+        else:
+            frozen_control.validate()
+            frozen_decision.validate()
+            if (
+                frozen_control.action_receipt_sha256
+                != action.semantic_receipt_sha256
+                or frozen_control.adjusted_input_receipt_sha256
+                != frozen_decision.input_receipt_sha256
+                or frozen_decision.decision_id
+                != self._prepared.decision_session_date
+            ):
+                raise MassiveAdaptiveProfitabilityEnvV1Error(
+                    "frozen target replay differs from the prepared chronology"
+                )
+            control = frozen_control
+            policy_decision = frozen_decision
         neutral_decision = compile_massive_adaptive_portfolio_v1(
             self._prepared.neutral_compiler_inputs,
             config=self.compiler_config,
@@ -461,6 +492,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
             policy_action_receipt_sha256=action.semantic_receipt_sha256,
             policy_control_receipt_sha256=control.semantic_receipt_sha256,
             policy_control=control,
+            frozen_targets_replayed=frozen_decision is not None,
         )
         next_cursor = self._state.chronology_cursor + 1
         terminated = next_cursor == len(self.inference_plan.rows)
