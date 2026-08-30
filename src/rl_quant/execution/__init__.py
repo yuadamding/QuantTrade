@@ -1,143 +1,116 @@
-"""Execution layer: transition-P&L cost/fill model + numeric validation contracts.
+"""Execution layer with lazy compatibility exports.
 
-Organized as a foundation package:
-  * ``validation`` -- numeric/integer coercion contracts (reject bool-as-float / NaN / fractional int);
-  * ``types``      -- execution config + enums (fill levels, policies, impact model, weight-bps cost);
-  * ``fills``      -- shared fill-pricing primitives (``MarketSnapshot`` + ``_fill_price``);
-  * ``scalar``     -- signed-position dollar transition-P&L path (single instrument);
-  * ``leg``        -- return-based multi-symbol leg path (ETF allocation switches).
-
-Layering: validation < types < fills < {scalar, leg}. This package re-exports the full public surface,
-so ``from rl_quant.execution import simulate_transition`` (etc.) is unchanged -- callers never need to
-know which submodule a symbol lives in.
+Lazy loading keeps independent execution generations from acquiring one
+another's runtime dependencies merely because Python initializes this package.
+The historical public import surface remains unchanged.
 """
 
 from __future__ import annotations
 
-from rl_quant.execution.age_aware_no_trade import (
-    AgeAwareNoTradeConfig,
-    AgeAwareNoTradeError,
-    ForecastDistribution,
-    ReplacementDecision,
-    evaluate_replacement,
-)
-from rl_quant.execution.fills import (
-    MarketSnapshot,
-)
-from rl_quant.execution.leg import (
-    ActionTransitionOutcome,
-    ExecutionLeg,
-    FillStatus,
-    Holdings,
-    LegSide,
-    SymbolQuote,
-    simulate_action_transition,
-)
-from rl_quant.execution.massive_adaptive_portfolio_compiler_v1 import (
-    MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SCHEMA,
-    MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SOLVER,
-    MassiveAdaptivePortfolioCompilerConfigV1,
-    MassiveAdaptivePortfolioCompilerError,
-    MassiveAdaptivePortfolioCompilerInputsV1,
-    MassiveAdaptivePortfolioDecisionV1,
-    compile_massive_adaptive_portfolio_v1,
-)
-from rl_quant.execution.impact_model import (
-    AlphaExecutionCostError,
-    CapacityEstimate,
-    ExecutionCostEstimate,
-    ExecutionCostObservation,
-    SquareRootImpactConfig,
-    estimate_execution_cost,
-    evaluate_capacity,
-)
-from rl_quant.execution.portfolio import (
-    FixedTurnoverTargetWeightExecution,
-    ImmediateTargetWeightExecution,
-    TargetWeightExecutionModel,
-    TargetWeightExecutionResult,
-    drift_weights,
-    fixed_turnover_cost,
-    force_unavailable_to_cash,
-    one_way_turnover,
-)
-from rl_quant.execution.scalar import (
-    PositionState,
-    TransitionOutcome,
-    fill_index,
-    fill_indices,
-    simulate_transition,
-    transition_pnl,
-)
-from rl_quant.execution.types import (
-    ExecutionConfig,
-    FillLevel,
-    ImpactModel,
-    SwitchFillPolicy,
-    TerminalPolicy,
-    WeightExecutionCostConfig,
-    weight_transition_cost_bps,
-)
-from rl_quant.execution.validation import (
-    coerce_finite_nonnegative,
-    coerce_finite_positive,
-    require_bool,
-    require_nonnegative_int,
-    require_positive_int,
-)
+from importlib import import_module
+from typing import Any, Final
 
-__all__ = [
-    "ActionTransitionOutcome",
-    "AgeAwareNoTradeConfig",
-    "AgeAwareNoTradeError",
-    "AlphaExecutionCostError",
-    "CapacityEstimate",
-    "ExecutionConfig",
-    "ExecutionCostEstimate",
-    "ExecutionCostObservation",
-    "ExecutionLeg",
-    "FillLevel",
-    "FillStatus",
-    "FixedTurnoverTargetWeightExecution",
-    "ForecastDistribution",
-    "Holdings",
-    "ImpactModel",
-    "ImmediateTargetWeightExecution",
-    "LegSide",
-    "MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SCHEMA",
-    "MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SOLVER",
-    "MarketSnapshot",
-    "MassiveAdaptivePortfolioCompilerConfigV1",
-    "MassiveAdaptivePortfolioCompilerError",
-    "MassiveAdaptivePortfolioCompilerInputsV1",
-    "MassiveAdaptivePortfolioDecisionV1",
-    "PositionState",
-    "ReplacementDecision",
-    "SquareRootImpactConfig",
-    "SwitchFillPolicy",
-    "SymbolQuote",
-    "TargetWeightExecutionModel",
-    "TargetWeightExecutionResult",
-    "TerminalPolicy",
-    "TransitionOutcome",
-    "WeightExecutionCostConfig",
-    "coerce_finite_nonnegative",
-    "coerce_finite_positive",
-    "compile_massive_adaptive_portfolio_v1",
-    "fill_index",
-    "fill_indices",
-    "fixed_turnover_cost",
-    "force_unavailable_to_cash",
-    "require_bool",
-    "require_nonnegative_int",
-    "require_positive_int",
-    "one_way_turnover",
-    "simulate_action_transition",
-    "simulate_transition",
-    "transition_pnl",
-    "drift_weights",
-    "estimate_execution_cost",
-    "evaluate_capacity",
-    "evaluate_replacement",
-    "weight_transition_cost_bps",
-]
+
+def _exports(module: str, *names: str) -> dict[str, tuple[str, str]]:
+    return {name: (module, name) for name in names}
+
+
+_LAZY_EXPORTS: Final[dict[str, tuple[str, str]]] = {
+    **_exports(
+        "rl_quant.execution.age_aware_no_trade",
+        "AgeAwareNoTradeConfig",
+        "AgeAwareNoTradeError",
+        "ForecastDistribution",
+        "ReplacementDecision",
+        "evaluate_replacement",
+    ),
+    **_exports("rl_quant.execution.fills", "MarketSnapshot"),
+    **_exports(
+        "rl_quant.execution.leg",
+        "ActionTransitionOutcome",
+        "ExecutionLeg",
+        "FillStatus",
+        "Holdings",
+        "LegSide",
+        "SymbolQuote",
+        "simulate_action_transition",
+    ),
+    **_exports(
+        "rl_quant.execution.massive_adaptive_portfolio_compiler_v1",
+        "MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SCHEMA",
+        "MASSIVE_ADAPTIVE_PORTFOLIO_COMPILER_V1_SOLVER",
+        "MassiveAdaptivePortfolioCompilerConfigV1",
+        "MassiveAdaptivePortfolioCompilerError",
+        "MassiveAdaptivePortfolioCompilerInputsV1",
+        "MassiveAdaptivePortfolioDecisionV1",
+        "compile_massive_adaptive_portfolio_v1",
+    ),
+    **_exports(
+        "rl_quant.execution.impact_model",
+        "AlphaExecutionCostError",
+        "CapacityEstimate",
+        "ExecutionCostEstimate",
+        "ExecutionCostObservation",
+        "SquareRootImpactConfig",
+        "estimate_execution_cost",
+        "evaluate_capacity",
+    ),
+    **_exports(
+        "rl_quant.execution.portfolio",
+        "FixedTurnoverTargetWeightExecution",
+        "ImmediateTargetWeightExecution",
+        "TargetWeightExecutionModel",
+        "TargetWeightExecutionResult",
+        "drift_weights",
+        "fixed_turnover_cost",
+        "force_unavailable_to_cash",
+        "one_way_turnover",
+    ),
+    **_exports(
+        "rl_quant.execution.scalar",
+        "PositionState",
+        "TransitionOutcome",
+        "fill_index",
+        "fill_indices",
+        "simulate_transition",
+        "transition_pnl",
+    ),
+    **_exports(
+        "rl_quant.execution.types",
+        "ExecutionConfig",
+        "FillLevel",
+        "ImpactModel",
+        "SwitchFillPolicy",
+        "TerminalPolicy",
+        "WeightExecutionCostConfig",
+        "weight_transition_cost_bps",
+    ),
+    **_exports(
+        "rl_quant.execution.validation",
+        "coerce_finite_nonnegative",
+        "coerce_finite_positive",
+        "require_bool",
+        "require_nonnegative_int",
+        "require_positive_int",
+    ),
+}
+
+__all__ = sorted(_LAZY_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Load one compatibility export only when it is requested."""
+
+    try:
+        module_name, attribute_name = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose lazy public names to introspection."""
+
+    return sorted(set(globals()) | set(__all__))

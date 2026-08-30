@@ -27,6 +27,9 @@ from rl_quant.evaluation.massive_adaptive_economic_event_transition_v1 import (
     apply_massive_adaptive_prefill_events_v1,
     build_massive_adaptive_economic_event_transition_v1,
 )
+from rl_quant.evaluation.massive_adaptive_economic_event_transition_v2 import (
+    build_massive_adaptive_economic_event_transition_v2,
+)
 from rl_quant.features.massive_adaptive_fill_source_v1 import adaptive_fill_clock_v1
 from rl_quant.features.massive_economic_authority_v6 import (
     MASSIVE_ECONOMIC_AUTHORITY_V6_HISTORICAL_PANEL_AUTHORIZED,
@@ -885,3 +888,53 @@ def test_adaptive_event_transition_repairs_split_dividend_terminal_and_cash(
             daily_input_authority=daily,
             identity_authority=identity,
         )
+
+
+def test_adaptive_event_transition_v2_does_not_backdate_late_news(
+    tmp_path: Path,
+) -> None:
+    fill_date = "2024-01-03"
+    prior_date = "2024-01-02"
+    fill_start, fill_end = adaptive_fill_clock_v1(fill_date)
+    prior_close = fill_start - 18 * 60 * 60 * 1_000
+    fill_close = fill_end + 6 * 60 * 60 * 1_000
+    late = _corporate(
+        provider_event_key="LATE-DIV-A",
+        provider_revision_id="r0",
+        security_id="SEC-A",
+        effective_at_ms=fill_start - 1_000,
+        available_at_ms=fill_start + 1_000,
+        cash_per_share=1.0,
+    )
+    identity, archive, _ = _archive(
+        tmp_path,
+        corporate=[late],
+        suffix="dual-cutoff",
+    )
+    daily = SimpleNamespace(
+        validate=lambda: None,
+        sessions=(
+            SimpleNamespace(
+                source_session_date=prior_date,
+                regular_close_at_ms=prior_close,
+            ),
+            SimpleNamespace(
+                source_session_date=fill_date,
+                regular_close_at_ms=fill_close,
+            ),
+        ),
+    )
+
+    transition = build_massive_adaptive_economic_event_transition_v2(
+        prior_session_date=prior_date,
+        fill_session_date=fill_date,
+        provider_archive=archive,
+        daily_input_authority=daily,
+        identity_authority=identity,
+    )
+
+    assert not transition.prefill_events
+    assert len(transition.postfill_events) == 1
+    assert transition.prefill_resolved_authority_receipt_sha256 != (
+        transition.postfill_resolved_authority_receipt_sha256
+    )

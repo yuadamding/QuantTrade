@@ -305,6 +305,11 @@ def _validate_and_replay(
         raise MassiveAdaptiveOuterForecastArchiveV1Error(
             "outer forecast provenance is not the frozen qualified selection"
         )
+    validate_massive_adaptive_outer_fold_binding_v1(
+        selected_checkpoint=selected_checkpoint,
+        training_window_plan=training_window_plan,
+        outer_plan=outer_plan,
+    )
     ordered_roots = tuple(
         sorted(outer_decision_roots, key=lambda row: row.decision_session_date)
     )
@@ -324,6 +329,8 @@ def _validate_and_replay(
         or not selected_checkpoint.development_training_authorized
         or selected_checkpoint.window_plan_receipt_sha256
         != training_window_plan.semantic_receipt_sha256
+        or training_window_plan.split_role != "training"
+        or training_window_plan.fold_index != outer_plan.fold_index
         or outer_plan.decision_tensor_receipt_sha256
         != outer_tensor.semantic_receipt_sha256
         or outer_plan.model_spec_receipt_sha256 != model_spec.receipt_sha256
@@ -351,6 +358,28 @@ def _validate_and_replay(
         plan_rows=outer_plan.rows,
         model_spec=model_spec,
     )
+
+
+def validate_massive_adaptive_outer_fold_binding_v1(
+    *,
+    selected_checkpoint: MassiveAdaptiveCheckpointV1,
+    training_window_plan: MassiveAdaptiveWindowPlanV1,
+    outer_plan: MassiveAdaptiveOuterInferencePlanV1,
+) -> None:
+    """Fail closed when a selected checkpoint crosses outer-fold lineage."""
+
+    selected_checkpoint.validate()
+    training_window_plan.validate()
+    outer_plan.validate()
+    if (
+        training_window_plan.split_role != "training"
+        or selected_checkpoint.window_plan_receipt_sha256
+        != training_window_plan.semantic_receipt_sha256
+        or training_window_plan.fold_index != outer_plan.fold_index
+    ):
+        raise MassiveAdaptiveOuterForecastArchiveV1Error(
+            "selected checkpoint and outer fold training window differ"
+        )
 
 
 def _metadata(
@@ -641,4 +670,5 @@ __all__ = [
     "authorize_massive_adaptive_outer_forecast_archive_v1",
     "materialize_massive_adaptive_outer_forecast_archive_v1",
     "parse_massive_adaptive_outer_forecast_archive_v1",
+    "validate_massive_adaptive_outer_fold_binding_v1",
 ]

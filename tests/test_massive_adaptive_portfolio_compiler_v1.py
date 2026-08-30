@@ -137,6 +137,40 @@ def test_sunk_entry_cost_retains_only_until_replacement_is_better() -> None:
     assert replaced.discretionary_one_way_turnover == pytest.approx(1.0)
 
 
+def test_policy_can_exit_after_one_session() -> None:
+    reversal = _inputs(
+        expected_first_bucket=(-0.05, 0.04),
+        pretrade=(1.0, 0.0),
+        benchmark=(0.0, 0.0),
+        entry_cost_bps=(0.0, 0.0),
+        current_exit_cost_bps=(0.0, 0.0),
+    )
+    decision = compile_massive_adaptive_portfolio_v1(reversal, config=_config())
+
+    assert decision.target_weights == pytest.approx((0.0, 1.0), abs=2.0e-7)
+    assert decision.discretionary_sell_weights[0] == pytest.approx(1.0)
+
+
+def test_policy_can_hold_indefinitely_when_alpha_remains_positive() -> None:
+    inputs = _inputs(
+        expected_first_bucket=(0.03, -0.02),
+        pretrade=(1.0, 0.0),
+        benchmark=(1.0, 0.0),
+        entry_cost_bps=(0.0, 50.0),
+        current_exit_cost_bps=(20.0, 0.0),
+    )
+    for session_index in range(64):
+        decision = compile_massive_adaptive_portfolio_v1(inputs, config=_config())
+        assert decision.target_weights == pytest.approx((1.0, 0.0), abs=2.0e-7)
+        inputs = replace(
+            inputs,
+            pretrade_weights=decision.target_weights,
+            portfolio_state_receipt_sha256=semantic_sha256(
+                ("persistent-positive-alpha", session_index)
+            ),
+        )
+
+
 def test_capacity_is_in_the_optimizer_and_reallocates_to_next_best_name() -> None:
     inputs = _inputs(
         expected_first_bucket=(0.10, 0.08, -0.10),
@@ -237,7 +271,7 @@ def test_receipt_is_deterministic_and_engineering_result_is_nonauthorizing() -> 
         replace(first, target_weights=(0.0, 0.0)).validate()
 
 
-def test_adaptive_compiler_has_no_duration_configuration_or_forbidden_import() -> None:
+def test_no_minimum_holding_period_in_compiler() -> None:
     config = _config()
     assert_no_adaptive_hold_semantics(config)
     assert_adaptive_import_firewall([Path(compiler_module.__file__)])

@@ -290,28 +290,90 @@ This artifact proves chronological forecast availability only. It does not
 authorize how a checkpoint was selected, profitability, outer access,
 lockbox access, or RL.
 
-The first adaptive RL-facing surface is now limited to a bounded compiler
-control action. Seven controls rescale the forecast buckets; three additional
-controls adjust uncertainty aversion, risk aversion, and the fraction of the
-frozen discretionary-turnover ceiling. Security, issuer, tracking-error,
+The adaptive RL-facing surface is a bounded compiler-control action. Seven
+controls rescale the forecast buckets, uncertainty and portfolio-risk controls
+are bidirectional within frozen ranges, and a one-sided control can only
+tighten the discretionary-turnover ceiling. Security, issuer, tracking-error,
 active-beta, and ADV limits cannot be loosened, and the controller never emits
 security weights. The unique zero action returns the original compiler inputs
-and configuration unchanged, so the compiler decision and all of its receipts
-are exactly identical to the deterministic baseline. This is a mechanical
-neutral-equivalence canary only; it grants no rollout, optimizer, P&L, outer,
-lockbox, or RL-training authority.
+and configuration unchanged.
 
-This closes source-to-optimizer, exact restart, target-free validation and
-outer inference, deterministic forecast-to-book replay, frozen checkpoint
-selection, and nonreportable four-fold outer evidence at the engineering
-level. It does **not** yet qualify historical profitability: the synthetic
-canaries do not replace a source-qualified production run, and final reporting
-still requires real acquired payloads, partitions, features, targets, and
-replayed authorities. Intraday path tensors are also not yet materialized by
-the V1 tensor artifact. Before RL, a downstream training authority must bind
-the prequential forecast package, exact environment/reward semantics, neutral
-compiler equivalence, rollout state, optimizer state, and checkpoint replay.
-Those boundaries remain prerequisites for an H100 launch.
+The corrected engineering path adds checkpoint/fold-bound calibration,
+all-cash initialization, one shared buy-and-drift benchmark authority,
+fill-start/close event snapshots, and compiler inputs derived from the current
+three-book state. `MassiveAdaptiveEconomicStepV1` is the sole prepare/settle
+kernel for both deterministic and policy-controlled transitions. Strategy,
+neutral compiler, and benchmark books pass through the same order, fill,
+capacity, cost, event, and next-close accounting. The zero action is tested
+through the complete transition: decision, orders, fills, costs, posttrade
+books, wealth, reward, and semantic receipts are identical.
+
+`MassiveAdaptiveProfitabilityEnvV1` carries those three books continuously and
+reports unpenalized strategy and neutral active log returns plus the
+basis-point-scaled incremental strategy-minus-neutral reward. Its observation
+is a fixed 90-value summary of the seven forecast buckets, compiler risk and
+liquidity inputs, current books, recent realized economics, and the previous
+bounded action. True episode termination includes a conservative liquidation
+adjustment; a rollout boundary preserves the exact books and chronology.
+
+The first PPO canary uses separate two-layer actor and critic networks. Nine
+controls use transformed-Normal distributions and the turnover-tightening
+control uses a Beta distribution, so no post-sampling clip invalidates the PPO
+log probability. The trainer implements GAE, clipped actor and value losses,
+and update-boundary checkpoints containing model, optimizer, RNG, economic
+environment, and chronology state. A split-run regression reproduces the next
+actions, transitions, losses, model tensors, and checkpoint receipt exactly.
+The create-only durable checkpoint authority publishes only safe tensor and
+primitive state, strips runtime state on a generic reload, and restores the
+actor, critic, both optimizers, every RNG, all three books, and the chronology
+cursor only after its causal training-forecast authority is replayed.
+
+`MassiveAdaptiveRLTrainingForecastAuthorityV1` closes the prequential
+selection boundary. It admits rolling 21- or 63-session blocks only when the
+supervised training cutoff, 126-session target-maturity cutoff, training-loss
+checkpoint-choice cutoff, and checkpoint-bound calibration cutoff all precede
+the first forecast in the block. Checkpoint choice uses final training loss
+only and the archive must be the exact chronological prefix preceding the
+registered outer fold. Synthetic or otherwise unqualified sources continue to
+withhold RL-training authority.
+
+Inner-validation policy economics are derived from complete environment
+transitions rather than caller return arrays. A create-only policy-selection
+authority binds the 10/20/40-bp frozen-target ladder, terminal liquidation,
+drawdown, active wealth, incremental strategy-minus-neutral wealth, and the
+selected PPO update. Static compiler controls are selected separately using
+training-only traces; the PPO candidate must then beat that committed fixed
+control on inner validation. The selected model state is published in a
+separate create-only frozen-policy artifact before any outer date is opened.
+
+Each outer plan binds one fold's selected supervised checkpoint, calibration,
+target-free outer forecast archive, selected frozen RL policy, compiler
+configuration, all-cash initialization, and shared benchmark. Four-fold RL
+evidence uses the same 126-session, nonwrapping fold-cluster bootstrap for
+strategy active wealth, strategy-minus-neutral wealth, and PPO-minus-fixed-
+control wealth. It also requires at least three positive folds for every
+load-bearing contrast, a monotone frozen-target cost ladder, nonnegative mean
+40-bp return, and no fold drawdown above 25 percent. Generic evidence reloads
+remain nonauthorizing and final reporting and lockbox access remain false.
+
+Every position is reconsidered from its current net economics at every
+decision. The canonical adaptive observation, action, reward, compiler,
+environment, and checkpoint-selection surfaces contain no entry-clock state,
+release schedule, persistence incentive, or selection threshold based on time
+in the book. A planted reversal exits after one session, while a persistent
+positive forecast retains a position for more than 30 sessions with no special
+reward. Time in the book is permitted only as retrospective reporting.
+
+This closes the minimum package-owned engineering path from causal
+prequential forecasts through bounded PPO, exact durable resume,
+inner-validation policy selection, a frozen fold-bound policy, and paired
+four-fold outer evidence. It does **not** manufacture historical authority:
+the synthetic canaries remain nonauthorizing, final reporting stays false,
+and a real run still requires acquired payloads, partitions, features,
+targets, source-qualified prequential blocks, and replayed fold authorities.
+Intraday path tensors are also not yet materialized by the V1 tensor artifact.
+Those data-first boundaries remain prerequisites for an H100 launch or any
+profitability claim.
 
 ## Evidence boundary
 

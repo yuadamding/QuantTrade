@@ -32,7 +32,7 @@ MASSIVE_ADAPTIVE_RL_COMPILER_CONTROL_V1_SPEC_SHA256 = semantic_sha256(
         "bucket_multiplier": "one-plus-one-half-control",
         "uncertainty_multiplier": "exp-point-seven-control",
         "risk_multiplier": "exp-point-seven-control",
-        "turnover_multiplier": "one-minus-one-half-absolute-control",
+        "turnover_multiplier": "one-minus-one-half-one-sided-control",
         "hard_constraints": "never-relaxed",
         "neutral_action": "exact-original-input-config-and-decision",
         "profitability_reporting": False,
@@ -171,7 +171,7 @@ def apply_massive_adaptive_rl_action_v1(
     bucket_multipliers = tuple(1.0 + 0.5 * value for value in action.bucket_controls)
     uncertainty_multiplier = math.exp(0.7 * action.uncertainty_control)
     risk_multiplier = math.exp(0.7 * action.risk_control)
-    turnover_multiplier = 1.0 - 0.5 * abs(action.turnover_control)
+    turnover_multiplier = 1.0 - 0.5 * action.turnover_control
     if action.is_neutral:
         adjusted_inputs = inputs
         adjusted_config = config

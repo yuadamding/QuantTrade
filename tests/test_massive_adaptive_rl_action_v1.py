@@ -133,6 +133,13 @@ def test_action_range_authority_and_no_duration_firewall_fail_closed() -> None:
             risk_control=0.0,
             turnover_control=0.0,
         )
+    with pytest.raises(MassiveAdaptiveRLActionV1Error, match=r"\[0, 1\]"):
+        build_massive_adaptive_rl_action_v1(
+            bucket_controls=(0.0,) * 7,
+            uncertainty_control=0.0,
+            risk_control=0.0,
+            turnover_control=-0.5,
+        )
     neutral = neutral_massive_adaptive_rl_action_v1()
     corrupted = replace(
         neutral,

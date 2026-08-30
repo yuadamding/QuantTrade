@@ -27,16 +27,37 @@ FORBIDDEN_ADAPTIVE_CONFIGURATION_FIELDS = frozenset(
     {
         "preferred_holding_sessions",
         "minimum_holding_sessions",
+        "maximum_holding_sessions",
+        "target_holding_sessions",
+        "mandatory_exit_session",
         "holding_age",
         "age_bin",
         "age_bins",
         "age_distribution",
+        "position_age",
+        "position_age_summary",
+        "sessions_since_entry",
         "persistence_coefficient",
+        "persistence_bonus",
         "young_sale_penalty",
+        "young_position_sale_penalty",
         "age_penalty",
+        "early_exit_penalty",
         "fixed_exit_hazard",
+        "age_conditioned_hazard",
+        "scheduled_exit",
+        "scheduled_exit_session",
         "duration_reward",
+        "holding_period_reward",
+        "position_age_reward",
+        "duration_regularization",
         "duration_selection_metric",
+        "holding_duration_promotion_gate",
+        "holding_period_checkpoint_metric",
+        "survival_constraint",
+        "duration_conditioned_action_mask",
+        "age_conditioned_release_rule",
+        "cohort_age_constraint",
         "target_turnover_as_holding_proxy",
     }
 )
@@ -44,6 +65,7 @@ FORBIDDEN_ADAPTIVE_CONFIGURATION_FIELDS = frozenset(
 FORBIDDEN_ADAPTIVE_IMPORT_PREFIXES = (
     "rl_quant.execution.age_aware_no_trade",
     "rl_quant.execution.hold30",
+    "rl_quant.envs.hold30",
     "rl_quant.models.hold30",
     "rl_quant.training.hold30",
     "rl_quant.protocol.hold30",
@@ -215,7 +237,9 @@ def assert_adaptive_import_firewall(paths: Sequence[str | Path]) -> None:
                 imported = (node.module,)
             for module in imported:
                 if any(
-                    module == prefix or module.startswith(prefix + ".")
+                    module == prefix
+                    or module.startswith(prefix + ".")
+                    or module.startswith(prefix + "_")
                     for prefix in FORBIDDEN_ADAPTIVE_IMPORT_PREFIXES
                 ):
                     raise MassiveAdaptiveAlphaProtocolError(

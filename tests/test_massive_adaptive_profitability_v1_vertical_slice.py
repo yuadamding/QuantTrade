@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+import rl_quant.evaluation.massive_adaptive_profitability_env_v1 as adaptive_env_module
 
 from rl_quant.alpha.pit_universe import (
     ListingEventRecord,
@@ -24,14 +27,42 @@ from rl_quant.evaluation.massive_adaptive_forecast_calibration_v1 import (
     materialize_massive_adaptive_forecast_calibration_v1,
     parse_massive_adaptive_forecast_calibration_v1,
 )
+from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
+    MASSIVE_ADAPTIVE_PROFITABILITY_ENV_V1_SPEC_SHA256,
+    MassiveAdaptiveProfitabilityEnvStateV1,
+    MassiveAdaptiveProfitabilityEnvV1,
+    MassiveAdaptiveRLTransitionV1,
+)
+from rl_quant.evaluation.massive_adaptive_forecast_calibration_v2 import (
+    MassiveAdaptiveForecastCalibrationV2Error,
+    build_massive_adaptive_forecast_calibration_v2,
+)
 from rl_quant.evaluation.massive_adaptive_profit_trace_v1 import (
     build_massive_adaptive_profit_trace_v1,
     materialize_massive_adaptive_profit_trace_v1,
     parse_massive_adaptive_profit_trace_v1,
 )
+from rl_quant.evaluation.massive_adaptive_profit_trace_v2 import (
+    build_massive_adaptive_profit_trace_v2,
+    full_portfolio_one_way_turnover_v2,
+)
 from rl_quant.evaluation.massive_adaptive_profitability_authority_v1 import (
     MassiveAdaptiveProfitabilityAuthorityV1Error,
     build_massive_adaptive_profitability_authority_v1,
+)
+from rl_quant.evaluation.massive_adaptive_initial_book_authority_v1 import (
+    build_massive_adaptive_initial_book_authority_v1,
+)
+from rl_quant.evaluation.massive_adaptive_economic_step_v1 import (
+    prepare_massive_adaptive_economic_step_v1,
+    settle_massive_adaptive_economic_step_v1,
+)
+from rl_quant.execution.massive_adaptive_portfolio_compiler_v1 import (
+    MassiveAdaptivePortfolioCompilerConfigV1,
+    compile_massive_adaptive_portfolio_v1,
+)
+from rl_quant.execution.massive_adaptive_rl_compiler_control_v1 import (
+    compile_massive_adaptive_rl_control_v1,
 )
 from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
     MassiveAdaptiveOuterInferencePlanV1Error,
@@ -40,6 +71,7 @@ from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
 from rl_quant.evaluation.massive_adaptive_outer_forecast_archive_v1 import (
     MassiveAdaptiveOuterForecastArchiveV1Error,
     materialize_massive_adaptive_outer_forecast_archive_v1,
+    validate_massive_adaptive_outer_fold_binding_v1,
 )
 from rl_quant.features.massive_daily_bars_v0 import MASSIVE_DAILY_BARS_V0_FIELDS
 from rl_quant.features.massive_adaptive_fill_source_v1 import adaptive_fill_clock_v1
@@ -55,6 +87,29 @@ from rl_quant.features.massive_economic_authority_v6 import (
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
     semantic_sha256,
+)
+from rl_quant.rl.massive_adaptive_rl_action_v1 import (
+    neutral_massive_adaptive_rl_action_v1,
+)
+from rl_quant.rl.massive_adaptive_rl_observation_v1 import (
+    MassiveAdaptiveRLObservationV1,
+    MassiveAdaptiveRLTrailingStateV1,
+    build_massive_adaptive_rl_observation_v1,
+)
+from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
+    MassiveAdaptivePPOActorCriticV1,
+)
+from rl_quant.training.massive_adaptive_ppo_v1 import (
+    MassiveAdaptivePPOConfigV1,
+    MassiveAdaptivePPOTrainerV1,
+)
+from rl_quant.training.massive_adaptive_rl_checkpoint_authority_v1 import (
+    authorize_massive_adaptive_rl_checkpoint_authority_v1,
+    materialize_massive_adaptive_rl_checkpoint_authority_v1,
+    parse_massive_adaptive_rl_checkpoint_authority_v1,
+)
+from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
+    build_massive_adaptive_rl_policy_trace_v1,
 )
 from rl_quant.training.massive_adaptive_profit_checkpoint_selection_v2 import (
     build_massive_adaptive_profit_checkpoint_candidate_v2,
@@ -140,6 +195,86 @@ def _calibration(security_ids: tuple[str, ...], *, root=None):
         training_forecasts=training_forecasts,
         training_targets=training_targets,
         training_window_plan=training_window_plan,
+    )
+
+
+def _calibration_v2(security_ids: tuple[str, ...]):
+    window_receipt = _digest("training-window-plan-v2")
+    checkpoint_receipt = _digest("training-checkpoint-v2")
+    checkpoint_source = _digest("training-checkpoint-source-v2")
+    model_state = _digest("training-model-state-v2")
+    valid = torch.ones(len(security_ids), dtype=torch.bool)
+    prediction = torch.zeros((len(security_ids), 7), dtype=torch.float32)
+    forecast_row = SimpleNamespace(
+        decision_session_date="2023-12-29",
+        security_ids=security_ids,
+        residual_mean=prediction,
+        residual_scale=torch.full_like(prediction, 0.01),
+        valid=valid,
+        receipt_sha256=_digest("training-forecast-row-v2"),
+    )
+    target_rows = tuple(
+        SimpleNamespace(
+            security_id=security_id,
+            residual_bucket_returns=tuple(
+                0.001 * (bucket + 1) * (1.0 + index / len(security_ids))
+                for bucket in range(7)
+            ),
+            training_valid_by_bucket=(True,) * 7,
+            receipt_sha256=_digest(("training-target-v2", security_id)),
+        )
+        for index, security_id in enumerate(security_ids)
+    )
+    source_target = SimpleNamespace(
+        decision_session_date="2023-12-29",
+        targets=SimpleNamespace(security_ids=security_ids, rows=target_rows),
+    )
+    training_forecasts = SimpleNamespace(
+        validate=lambda: None,
+        runtime_rows=(forecast_row,),
+        runtime_forecasts_replayed=True,
+        origin_session_dates=("2023-12-29",),
+        semantic_receipt_sha256=_digest("training-forecast-archive-v2"),
+        committed_source_data_qualified=False,
+        window_plan_receipt_sha256=window_receipt,
+        checkpoint_receipt_sha256=checkpoint_receipt,
+        model_state_receipt_sha256=model_state,
+    )
+    training_targets = SimpleNamespace(
+        validate=lambda: None,
+        runtime_source_targets=(source_target,),
+        runtime_roots_replayed=True,
+        decision_session_dates=("2023-12-29",),
+        semantic_receipt_sha256=_digest("training-target-archive-v2"),
+        committed_source_data_qualified=False,
+    )
+    training_window = SimpleNamespace(
+        validate=lambda: None,
+        split_role="training",
+        fold_index=0,
+        semantic_receipt_sha256=window_receipt,
+        rows=(SimpleNamespace(origin_session_date="2023-12-29"),),
+    )
+    checkpoint = SimpleNamespace(
+        validate=lambda: None,
+        window_plan_receipt_sha256=window_receipt,
+        semantic_receipt_sha256=checkpoint_receipt,
+        model_state_receipt_sha256=model_state,
+        loaded_source=SimpleNamespace(receipt_sha256=checkpoint_source),
+        development_training_authorized=False,
+    )
+    calibration = build_massive_adaptive_forecast_calibration_v2(
+        checkpoint=checkpoint,
+        training_forecasts=training_forecasts,
+        training_targets=training_targets,
+        training_window_plan=training_window,
+    )
+    return SimpleNamespace(
+        calibration=calibration,
+        checkpoint=checkpoint,
+        training_forecasts=training_forecasts,
+        training_targets=training_targets,
+        training_window=training_window,
     )
 
 
@@ -774,3 +909,510 @@ def test_training_calibration_generic_reload_is_nonauthorizing(tmp_path) -> None
     )
     assert not generic.runtime_calibration_replayed
     assert not generic.development_calibration_authorized
+
+
+def test_calibration_v2_is_checkpoint_and_fold_bound() -> None:
+    security_ids = tuple(f"SEC-{index:03d}" for index in range(100))
+    values = _calibration_v2(security_ids)
+    calibration = values.calibration
+
+    assert calibration.fold_index == 0
+    assert calibration.checkpoint_receipt_sha256 == (
+        values.checkpoint.semantic_receipt_sha256
+    )
+    assert calibration.model_state_receipt_sha256 == (
+        values.checkpoint.model_state_receipt_sha256
+    )
+    assert calibration.calibration_fit_stop_session_date == "2023-12-29"
+    assert not calibration.development_calibration_authorized
+
+    wrong_fold = SimpleNamespace(**values.training_window.__dict__)
+    wrong_fold.fold_index = 1
+    wrong_fold.semantic_receipt_sha256 = _digest("wrong-fold-window")
+    with pytest.raises(
+        MassiveAdaptiveForecastCalibrationV2Error,
+        match="checkpoint, forecast, or training fold|identity",
+    ):
+        build_massive_adaptive_forecast_calibration_v2(
+            checkpoint=values.checkpoint,
+            training_forecasts=values.training_forecasts,
+            training_targets=values.training_targets,
+            training_window_plan=wrong_fold,
+        )
+
+
+def test_profit_trace_v2_starts_from_cash_and_uses_one_benchmark() -> None:
+    fixture = _fixture()
+    calibration_values = _calibration_v2(fixture.forecast_archive.runtime_rows[0].security_ids)
+    fixture.forecast_archive.fold_index = 0
+    fixture.forecast_archive.checkpoint_receipt_sha256 = (
+        calibration_values.checkpoint.semantic_receipt_sha256
+    )
+    fixture.forecast_archive.model_state_receipt_sha256 = (
+        calibration_values.checkpoint.model_state_receipt_sha256
+    )
+    fixture.forecast_archive.training_window_plan_receipt_sha256 = (
+        calibration_values.training_window.semantic_receipt_sha256
+    )
+    fixture.inference_plan.fold_index = 0
+
+    trace = build_massive_adaptive_profit_trace_v2(
+        forecast_archive=fixture.forecast_archive,
+        calibration=calibration_values.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        initial_capital=10_000_000.0,
+    )
+
+    assert trace.rows[0].pretrade_equity == 10_000_000.0
+    assert trace.rows[0].benchmark_pretrade_equity == 10_000_000.0
+    assert trace.rows[0].transaction_cost > 0.0
+    assert trace.rows[0].turnover > 0.0
+    assert len(trace.benchmark_authority_receipts) == len(trace.rows)
+    assert trace.rows[1].pretrade_book_receipt_sha256 == (
+        trace.rows[0].posttrade_book_receipt_sha256
+    )
+    assert trace.rows[1].benchmark_pretrade_book_receipt_sha256 == (
+        trace.rows[0].benchmark_posttrade_book_receipt_sha256
+    )
+    assert not trace.source_data_qualified
+    assert not trace.reinforcement_learning_authorized
+
+
+def test_zero_rl_action_matches_deterministic_execution_and_reward() -> None:
+    fixture = _fixture()
+    calibration_values = _calibration_v2(
+        fixture.forecast_archive.runtime_rows[0].security_ids
+    )
+    fixture.forecast_archive.fold_index = 0
+    fixture.forecast_archive.checkpoint_receipt_sha256 = (
+        calibration_values.checkpoint.semantic_receipt_sha256
+    )
+    fixture.forecast_archive.model_state_receipt_sha256 = (
+        calibration_values.checkpoint.model_state_receipt_sha256
+    )
+    fixture.forecast_archive.training_window_plan_receipt_sha256 = (
+        calibration_values.training_window.semantic_receipt_sha256
+    )
+    fixture.inference_plan.fold_index = 0
+    plan_row = fixture.inference_plan.rows[0]
+    forecast_row = fixture.forecast_archive.runtime_rows[0]
+    initial = build_massive_adaptive_initial_book_authority_v1(
+        decision_session_date=plan_row.decision_session_date,
+        initial_capital=10_000_000.0,
+        forecast_archive_receipt_sha256=fixture.forecast_archive.semantic_receipt_sha256,
+        inference_plan_receipt_sha256=fixture.inference_plan.semantic_receipt_sha256,
+        source_data_qualified=False,
+    )
+    prepared = prepare_massive_adaptive_economic_step_v1(
+        forecast_archive=fixture.forecast_archive,
+        forecast_row=forecast_row,
+        calibration=calibration_values.calibration,
+        inference_row=plan_row,
+        decision_root=fixture.roots[0],
+        context_origin=fixture.contexts[0],
+        strategy_book=initial.strategy_book,
+        neutral_book=initial.neutral_book,
+        benchmark_book=initial.benchmark_book,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+    )
+    config = MassiveAdaptivePortfolioCompilerConfigV1()
+    neutral_decision = compile_massive_adaptive_portfolio_v1(
+        prepared.neutral_compiler_inputs,
+        config=config,
+    )
+    action = neutral_massive_adaptive_rl_action_v1()
+    control, policy_decision = compile_massive_adaptive_rl_control_v1(
+        inputs=prepared.strategy_compiler_inputs,
+        config=config,
+        action=action,
+    )
+    step = settle_massive_adaptive_economic_step_v1(
+        prepared=prepared,
+        policy_decision=policy_decision,
+        neutral_decision=neutral_decision,
+        fill_source=fixture.fill_source,
+        economic_event_archive=None,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        transaction_cost_basis_points=20.0,
+        maximum_fill_participation=0.02,
+        policy_action_receipt_sha256=action.semantic_receipt_sha256,
+        policy_control_receipt_sha256=control.semantic_receipt_sha256,
+    )
+
+    assert step.neutral_equivalence
+    assert policy_decision == neutral_decision
+    assert step.strategy_execution == step.neutral_execution
+    assert step.strategy_posttrade_book == step.neutral_posttrade_book
+    assert step.incremental_rl_log_return == 0.0
+    assert step.optimization_reward_basis_points == 0.0
+
+
+def test_no_position_age_in_baseline_observation() -> None:
+    fixture = _fixture()
+    calibration_values = _calibration_v2(
+        fixture.forecast_archive.runtime_rows[0].security_ids
+    )
+    fixture.forecast_archive.fold_index = 0
+    fixture.forecast_archive.checkpoint_receipt_sha256 = (
+        calibration_values.checkpoint.semantic_receipt_sha256
+    )
+    fixture.forecast_archive.model_state_receipt_sha256 = (
+        calibration_values.checkpoint.model_state_receipt_sha256
+    )
+    fixture.forecast_archive.training_window_plan_receipt_sha256 = (
+        calibration_values.training_window.semantic_receipt_sha256
+    )
+    fixture.inference_plan.fold_index = 0
+    plan_row = fixture.inference_plan.rows[0]
+    initial = build_massive_adaptive_initial_book_authority_v1(
+        decision_session_date=plan_row.decision_session_date,
+        initial_capital=10_000_000.0,
+        forecast_archive_receipt_sha256=fixture.forecast_archive.semantic_receipt_sha256,
+        inference_plan_receipt_sha256=fixture.inference_plan.semantic_receipt_sha256,
+        source_data_qualified=False,
+    )
+    prepared = prepare_massive_adaptive_economic_step_v1(
+        forecast_archive=fixture.forecast_archive,
+        forecast_row=fixture.forecast_archive.runtime_rows[0],
+        calibration=calibration_values.calibration,
+        inference_row=plan_row,
+        decision_root=fixture.roots[0],
+        context_origin=fixture.contexts[0],
+        strategy_book=initial.strategy_book,
+        neutral_book=initial.neutral_book,
+        benchmark_book=initial.benchmark_book,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+    )
+    observation = build_massive_adaptive_rl_observation_v1(
+        prepared=prepared,
+        previous_action=neutral_massive_adaptive_rl_action_v1(),
+        trailing_state=MassiveAdaptiveRLTrailingStateV1(),
+    )
+
+    forbidden = ("age", "duration", "persistence", "hazard", "scheduled_exit")
+    assert len(observation.values) <= 128
+    assert all(
+        not any(fragment in name for fragment in forbidden)
+        for name in observation.feature_names
+    )
+    assert all(
+        not any(fragment in field.name for fragment in forbidden)
+        for field in fields(MassiveAdaptiveRLObservationV1)
+    )
+
+
+def _adaptive_env_fixture():
+    fixture = _fixture()
+    calibration_values = _calibration_v2(
+        fixture.forecast_archive.runtime_rows[0].security_ids
+    )
+    fixture.forecast_archive.fold_index = 0
+    fixture.forecast_archive.checkpoint_receipt_sha256 = (
+        calibration_values.checkpoint.semantic_receipt_sha256
+    )
+    fixture.forecast_archive.model_state_receipt_sha256 = (
+        calibration_values.checkpoint.model_state_receipt_sha256
+    )
+    fixture.forecast_archive.training_window_plan_receipt_sha256 = (
+        calibration_values.training_window.semantic_receipt_sha256
+    )
+    fixture.inference_plan.fold_index = 0
+    environment = MassiveAdaptiveProfitabilityEnvV1(
+        forecast_archive=fixture.forecast_archive,
+        calibration=calibration_values.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        economic_event_archive=None,
+        initial_capital=10_000_000.0,
+    )
+    return fixture, calibration_values, environment
+
+
+def test_rl_rollout_truncation_preserves_all_books_and_resume() -> None:
+    fixture, calibration_values, environment = _adaptive_env_fixture()
+    observation, _ = environment.reset()
+    action = neutral_massive_adaptive_rl_action_v1()
+    next_observation, reward, terminated, truncated, info = environment.step(action)
+    assert observation.values
+    assert next_observation is not None
+    assert reward == 0.0
+    assert not terminated
+    assert not truncated
+    transition = info["transition"]
+    assert isinstance(transition, MassiveAdaptiveRLTransitionV1)
+    continuation = environment.rollout_boundary_state()
+    assert continuation == environment.state
+
+    resumed = MassiveAdaptiveProfitabilityEnvV1(
+        forecast_archive=fixture.forecast_archive,
+        calibration=calibration_values.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        economic_event_archive=None,
+        initial_capital=10_000_000.0,
+    )
+    resumed.restore(continuation)
+    uninterrupted_result = environment.step(action)
+    resumed_result = resumed.step(action)
+    assert uninterrupted_result == resumed_result
+    assert uninterrupted_result[2]
+    terminal_transition = uninterrupted_result[4]["transition"]
+    assert terminal_transition.strategy_terminal_liquidation_cost > 0.0
+    assert terminal_transition.incremental_rl_log_return == 0.0
+
+
+def test_no_scheduled_exit_in_environment() -> None:
+    forbidden = (
+        "position_age",
+        "holding_period",
+        "duration_reward",
+        "persistence_bonus",
+        "scheduled_exit",
+        "hazard",
+        "cohort",
+    )
+    for record_type in (
+        MassiveAdaptiveProfitabilityEnvStateV1,
+        MassiveAdaptiveRLTransitionV1,
+    ):
+        assert all(
+            not any(fragment in field.name for fragment in forbidden)
+            for field in fields(record_type)
+        )
+    source = adaptive_env_module.__file__
+    assert source is not None
+    source_text = Path(source).read_text(encoding="utf-8")
+    assert not any(fragment in source_text for fragment in forbidden)
+
+
+def test_no_duration_term_in_reward() -> None:
+    assert (
+        MASSIVE_ADAPTIVE_PROFITABILITY_ENV_V1_SPEC_SHA256
+        == adaptive_env_module.MASSIVE_ADAPTIVE_PROFITABILITY_ENV_V1_SPEC_SHA256
+    )
+    source = adaptive_env_module.__file__
+    assert source is not None
+    source_text = Path(source).read_text(encoding="utf-8")
+    forbidden = (
+        "holding_reward",
+        "persistence_bonus",
+        "early_sale_penalty",
+        "completion_bonus",
+        "duration_regularization",
+    )
+    assert not any(fragment in source_text for fragment in forbidden)
+
+
+def test_adaptive_ppo_checkpoint_resume_is_exact() -> None:
+    _, _, environment = _adaptive_env_fixture()
+    config = MassiveAdaptivePPOConfigV1(
+        rollout_length=2,
+        minibatch_size=2,
+        epochs_per_rollout=2,
+        seed=71,
+    )
+    trainer = MassiveAdaptivePPOTrainerV1(
+        environment=environment,
+        model=MassiveAdaptivePPOActorCriticV1(observation_dim=90),
+        config=config,
+    )
+    first_rollout = trainer.collect_rollout()
+    trainer.update(first_rollout)
+    checkpoint = trainer.checkpoint()
+    uninterrupted_rollout = trainer.collect_rollout()
+    uninterrupted_metrics = trainer.update(uninterrupted_rollout)
+    uninterrupted_checkpoint = trainer.checkpoint()
+
+    _, _, resumed_environment = _adaptive_env_fixture()
+    resumed = MassiveAdaptivePPOTrainerV1(
+        environment=resumed_environment,
+        model=MassiveAdaptivePPOActorCriticV1(observation_dim=90),
+        config=config,
+    )
+    resumed.restore(checkpoint)
+    resumed_rollout = resumed.collect_rollout()
+    resumed_metrics = resumed.update(resumed_rollout)
+    resumed_checkpoint = resumed.checkpoint()
+
+    assert torch.equal(uninterrupted_rollout.actions, resumed_rollout.actions)
+    assert uninterrupted_rollout.transition_receipts == (
+        resumed_rollout.transition_receipts
+    )
+    assert uninterrupted_metrics == resumed_metrics
+    assert uninterrupted_checkpoint.semantic_receipt_sha256 == (
+        resumed_checkpoint.semantic_receipt_sha256
+    )
+    assert all(
+        torch.equal(value, resumed_checkpoint.model_state[name])
+        for name, value in uninterrupted_checkpoint.model_state.items()
+    )
+
+
+def test_adaptive_ppo_checkpoint_is_durable_and_runtime_stripped(tmp_path) -> None:
+    _, _, environment = _adaptive_env_fixture()
+    config = MassiveAdaptivePPOConfigV1(
+        rollout_length=2,
+        minibatch_size=2,
+        epochs_per_rollout=1,
+        seed=73,
+    )
+    trainer = MassiveAdaptivePPOTrainerV1(
+        environment=environment,
+        model=MassiveAdaptivePPOActorCriticV1(observation_dim=90),
+        config=config,
+    )
+    trainer.update(trainer.collect_rollout())
+    checkpoint = trainer.checkpoint()
+    training_receipt = _digest("durable-rl-training-forecast-authority")
+    checkpoint = replace(
+        checkpoint,
+        training_forecast_authority_receipt_sha256=training_receipt,
+        development_rl_training_authorized=True,
+        semantic_receipt_sha256="0" * 64,
+    )
+    checkpoint = replace(
+        checkpoint,
+        semantic_receipt_sha256=semantic_sha256(checkpoint.semantic_unsigned()),
+    )
+    checkpoint.validate()
+    training_authority = SimpleNamespace(
+        validate=lambda: None,
+        semantic_receipt_sha256=training_receipt,
+        source_data_qualified=False,
+        reinforcement_learning_authorized=False,
+    )
+
+    authority = materialize_massive_adaptive_rl_checkpoint_authority_v1(
+        root=tmp_path,
+        artifact_id="durable-rl-checkpoint",
+        checkpoint=checkpoint,
+        training_forecast_authority=training_authority,
+        committed_at_ms=90_000,
+    )
+    assert authority.runtime_checkpoint_replayed
+    assert authority.runtime_checkpoint is not None
+    assert authority.runtime_checkpoint.semantic_receipt_sha256 == (
+        checkpoint.semantic_receipt_sha256
+    )
+    assert not authority.exact_resume_authorized
+
+    generic = parse_massive_adaptive_rl_checkpoint_authority_v1(
+        root=tmp_path,
+        loaded_source=authority.loaded_source,
+    )
+    assert generic.runtime_checkpoint is None
+    assert not generic.runtime_checkpoint_replayed
+    replayed = authorize_massive_adaptive_rl_checkpoint_authority_v1(
+        root=tmp_path,
+        authority=generic,
+        training_forecast_authority=training_authority,
+    )
+    assert replayed.semantic_receipt_sha256 == authority.semantic_receipt_sha256
+    assert replayed.runtime_checkpoint is not None
+    assert replayed.runtime_checkpoint.semantic_receipt_sha256 == (
+        checkpoint.semantic_receipt_sha256
+    )
+
+
+def test_policy_trace_is_derived_from_complete_economic_transitions() -> None:
+    fixture, calibration_values, environment = _adaptive_env_fixture()
+    environment.reset()
+    transitions = []
+    terminated = False
+    while not terminated:
+        _, _, terminated, _, info = environment.step(
+            neutral_massive_adaptive_rl_action_v1()
+        )
+        transitions.append(info["transition"])
+
+    trainer_environment = _adaptive_env_fixture()[2]
+    trainer_environment.reset()
+    trainer = MassiveAdaptivePPOTrainerV1(
+        environment=trainer_environment,
+        model=MassiveAdaptivePPOActorCriticV1(observation_dim=90),
+    )
+    checkpoint = trainer.checkpoint()
+    training_receipt = _digest("trace-rl-training-forecast-authority")
+    checkpoint = replace(
+        checkpoint,
+        training_forecast_authority_receipt_sha256=training_receipt,
+        development_rl_training_authorized=True,
+        semantic_receipt_sha256="0" * 64,
+    )
+    checkpoint = replace(
+        checkpoint,
+        semantic_receipt_sha256=semantic_sha256(checkpoint.semantic_unsigned()),
+    )
+    trace = build_massive_adaptive_rl_policy_trace_v1(
+        fold_index=0,
+        checkpoint=checkpoint,
+        forecast_archive_receipt_sha256=(
+            fixture.forecast_archive.semantic_receipt_sha256
+        ),
+        inference_plan_receipt_sha256=fixture.inference_plan.semantic_receipt_sha256,
+        calibration_receipt_sha256=(
+            calibration_values.calibration.semantic_receipt_sha256
+        ),
+        transaction_cost_basis_points=20.0,
+        initial_capital=10_000_000.0,
+        transitions=transitions,
+        frozen_targets_replayed=False,
+    )
+
+    assert trace.transition_receipts == tuple(
+        transition.semantic_receipt_sha256 for transition in transitions
+    )
+    assert trace.cumulative_incremental_rl_log_return == 0.0
+    assert trace.terminal_liquidation_adjusted_return < 0.0
+    assert not trace.source_data_qualified
+    assert not trace.profitability_reporting_authorized
+
+
+def test_full_portfolio_turnover_includes_cash_leg() -> None:
+    execution = SimpleNamespace(
+        rows=(
+            SimpleNamespace(filled_shares=1.0, executed_notional=80.0),
+            SimpleNamespace(filled_shares=-1.0, executed_notional=20.0),
+        )
+    )
+    assert full_portfolio_one_way_turnover_v2(execution, 1_000.0) == 0.08
+
+
+def test_outer_forecast_rejects_checkpoint_from_another_fold() -> None:
+    checkpoint = SimpleNamespace(
+        validate=lambda: None,
+        window_plan_receipt_sha256=_digest("fold-zero-training-window"),
+    )
+    training_window = SimpleNamespace(
+        validate=lambda: None,
+        split_role="training",
+        fold_index=0,
+        semantic_receipt_sha256=_digest("fold-zero-training-window"),
+    )
+    outer_plan = SimpleNamespace(validate=lambda: None, fold_index=1)
+
+    with pytest.raises(
+        MassiveAdaptiveOuterForecastArchiveV1Error,
+        match="outer fold training window differ",
+    ):
+        validate_massive_adaptive_outer_fold_binding_v1(
+            selected_checkpoint=checkpoint,
+            training_window_plan=training_window,
+            outer_plan=outer_plan,
+        )

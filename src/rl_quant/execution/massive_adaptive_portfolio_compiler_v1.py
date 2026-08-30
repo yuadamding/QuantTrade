@@ -7,10 +7,9 @@ compiler owns one integrated trade vector, so recommendations from different
 forecast buckets are netted before costs, liquidity, and risk constraints are
 applied.
 
-The state variable is the current economic book.  There is deliberately no
-position-age input, scheduled exit, persistence term, or duration criterion.
-An existing position differs from a new purchase only because its entry cost
-is already sunk.  The complete forecast curve is reconsidered on every call.
+The state variable is the current economic book.  An existing position differs
+from a new purchase only because its entry cost is already sunk.  The complete
+forecast curve is reconsidered on every call.
 """
 
 from __future__ import annotations
@@ -860,7 +859,7 @@ def compile_massive_adaptive_portfolio_v1(
     *,
     config: MassiveAdaptivePortfolioCompilerConfigV1 | None = None,
 ) -> MassiveAdaptivePortfolioDecisionV1:
-    """Compile one feasible first action from the current no-duration state.
+    """Compile one feasible first action from the current economic state.
 
     Capacity constraints enter the optimization itself.  Capital that cannot
     reach the highest-value security can therefore move to another feasible
@@ -995,7 +994,16 @@ def compile_massive_adaptive_portfolio_v1(
         candidate_components = components
         accepted = False
         for _ in range(24):
-            candidate, used = projector.project(weights + local_step * gradient)
+            try:
+                candidate, used = projector.project(weights + local_step * gradient)
+            except MassiveAdaptivePortfolioCompilerError:
+                # Dykstra projection can fail to settle at the frozen tolerance
+                # for a large trial step even when the current feasible point and
+                # a smaller projected-gradient step are both well defined.  Treat
+                # that as a line-search rejection, not as proof that the feasible
+                # set is empty.
+                local_step *= 0.5
+                continue
             projection_iterations += used
             candidate_components = _objective_components(
                 candidate,
@@ -1050,6 +1058,13 @@ def compile_massive_adaptive_portfolio_v1(
                 "simplex roundoff cannot be reconciled without crossing a lower bound"
             )
         weights[slack_index] -= excess_risky_mass
+    # Snapping many tiny lower-bound residues at once can accumulate into a
+    # material turnover or risk residual even though each coordinate move is
+    # individually below tolerance.  Reproject the canonicalized vector so the
+    # published decision satisfies the complete constraint intersection.
+    weights, used = projector.project(weights)
+    projection_iterations += used
+    weights = np.maximum(weights, lower)
     components = _objective_components(
         weights,
         anchor=anchor,
@@ -1078,19 +1093,36 @@ def compile_massive_adaptive_portfolio_v1(
         tail_confidence=resolved.tail_confidence,
         tolerance=resolved.numerical_tolerance,
     )
-    fixed_point, used = projector.project(
-        weights + resolved.solver_step_size * final_gradient
-    )
+    fixed_step = resolved.solver_step_size
+    fixed_point = weights
+    used = 0
+    for _ in range(24):
+        try:
+            fixed_point, used = projector.project(
+                weights + fixed_step * final_gradient
+            )
+            break
+        except MassiveAdaptivePortfolioCompilerError:
+            fixed_step *= 0.5
+    else:
+        raise MassiveAdaptivePortfolioCompilerError(
+            "portfolio fixed-point projection did not converge during backoff"
+        )
     projection_iterations += used
     dual_residual = float(
         np.max(np.abs(fixed_point - weights), initial=0.0)
-        / resolved.solver_step_size
+        / fixed_step
     )
     primal_residual = projector.primal_residual(weights)
     kkt_residual = max(primal_residual, dual_residual)
-    if primal_residual > max(resolved.numerical_tolerance * 20.0, 2.0e-8):
+    constraint_tolerance = max(
+        resolved.numerical_tolerance * max(count, 20),
+        2.0e-8,
+    )
+    if primal_residual > constraint_tolerance:
         raise MassiveAdaptivePortfolioCompilerError(
-            "compiled portfolio violates a hard feasibility constraint"
+            "compiled portfolio violates a hard feasibility constraint "
+            f"(residual={primal_residual:.12g})"
         )
 
     delta = weights - anchor

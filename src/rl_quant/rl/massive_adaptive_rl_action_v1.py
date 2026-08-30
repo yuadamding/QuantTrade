@@ -1,8 +1,8 @@
 """Bounded adaptive RL controls with exact neutral compiler equivalence.
 
 This module defines the policy-facing action surface only.  The action may
-rescale forecast buckets and make uncertainty, risk, or discretionary
-turnover more conservative.  It cannot relax any frozen hard compiler limit,
+rescale forecast buckets, change uncertainty/risk aversion bidirectionally,
+or tighten discretionary turnover.  It cannot relax any frozen hard compiler limit,
 emit security weights, execute trades, or authorize RL training.
 """
 
@@ -25,7 +25,8 @@ MASSIVE_ADAPTIVE_RL_ACTION_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_RL_ACTION_V1_SPEC_SHA256 = semantic_sha256(
     {
         "bucket_controls": "seven-values-in-minus-one-to-one",
-        "scalar_controls": ("uncertainty", "risk", "turnover"),
+        "bidirectional_scalar_controls": ("uncertainty", "risk"),
+        "one_sided_scalar_controls": ("turnover-tightening",),
         "neutral_action": "all-controls-exactly-zero",
         "security_weights": False,
         "profitability_reporting": False,
@@ -46,6 +47,15 @@ def _bounded(name: str, value: object) -> float:
     result = float(value)
     if not math.isfinite(result) or not -1.0 <= result <= 1.0:
         raise MassiveAdaptiveRLActionV1Error(f"{name} must lie in [-1, 1]")
+    return result
+
+
+def _unit_interval(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MassiveAdaptiveRLActionV1Error(f"{name} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise MassiveAdaptiveRLActionV1Error(f"{name} must lie in [0, 1]")
     return result
 
 
@@ -119,9 +129,9 @@ class MassiveAdaptiveRLActionV1:
             *self.bucket_controls,
             self.uncertainty_control,
             self.risk_control,
-            self.turnover_control,
         ):
             _bounded("adaptive RL control", value)
+        _unit_interval("adaptive RL turnover control", self.turnover_control)
         for digest_value in (
             self.protocol_receipt_sha256,
             self.specification_sha256,
