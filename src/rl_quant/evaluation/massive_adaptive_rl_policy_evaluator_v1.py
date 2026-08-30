@@ -145,8 +145,7 @@ class MassiveAdaptiveRLPolicyActionEvidenceV1:
             self.schema != MASSIVE_ADAPTIVE_RL_POLICY_ACTION_EVIDENCE_V1_SCHEMA
             or not self.decision_session_date
             or len(self.action_values) != 10
-            or any(not -1.0 <= value <= 1.0 for value in self.action_values[:9])
-            or not 0.0 <= self.action_values[9] <= 1.0
+            or any(not -1.0 <= value <= 1.0 for value in self.action_values)
             or self.action_specification_sha256
             != MASSIVE_ADAPTIVE_RL_ACTION_SPECIFICATION_V1_SHA256
             or self.reward_specification_sha256
@@ -223,10 +222,10 @@ class MassiveAdaptiveRLCheckpointPolicyTraceV1:
 
     def validate(self) -> None:
         self.policy_trace.validate()
-        for row in self.action_evidence:
-            row.validate()
-        for row in self.transitions:
-            row.validate()
+        for evidence_row in self.action_evidence:
+            evidence_row.validate()
+        for transition_row in self.transitions:
+            transition_row.validate()
         runtime = bool(self.action_evidence and self.transitions)
         expected = runtime and self.source_data_qualified
         if (
@@ -283,8 +282,6 @@ def _action_evidence(
         (
             _tensor_receipt(distribution.mean),
             _tensor_receipt(distribution.log_std),
-            _tensor_receipt(distribution.turnover_alpha),
-            _tensor_receipt(distribution.turnover_beta),
         )
     )
     body = {
@@ -406,7 +403,7 @@ def evaluate_massive_adaptive_rl_checkpoint_v1(
                 bucket_controls=values[:7],
                 uncertainty_control=values[7],
                 risk_control=values[8],
-                turnover_control=values[9],
+                trade_cost_control=values[9],
             )
             row = environment.inference_plan.rows[environment.state.chronology_cursor]
             evidence.append(

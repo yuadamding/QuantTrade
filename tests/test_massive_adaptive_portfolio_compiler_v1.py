@@ -151,7 +151,7 @@ def test_policy_can_exit_after_one_session() -> None:
     assert decision.discretionary_sell_weights[0] == pytest.approx(1.0)
 
 
-def test_policy_can_hold_indefinitely_when_alpha_remains_positive() -> None:
+def test_policy_can_hold_beyond_any_fixed_horizon() -> None:
     inputs = _inputs(
         expected_first_bucket=(0.03, -0.02),
         pretrade=(1.0, 0.0),
@@ -169,6 +169,30 @@ def test_policy_can_hold_indefinitely_when_alpha_remains_positive() -> None:
                 ("persistent-positive-alpha", session_index)
             ),
         )
+
+
+def test_forecast_horizon_does_not_schedule_exit() -> None:
+    persistent = np.zeros((2, _BUCKETS), dtype=np.float64)
+    persistent[0, -1] = 0.05
+    persistent[1, -1] = -0.05
+    current = _inputs(
+        expected_first_bucket=(0.0, 0.0),
+        expected_buckets=persistent,
+        pretrade=(1.0, 0.0),
+        benchmark=(0.0, 0.0),
+    )
+    retained = compile_massive_adaptive_portfolio_v1(current, config=_config())
+    assert retained.target_weights == pytest.approx((1.0, 0.0), abs=2.0e-7)
+
+    reversed_forecast = persistent[::-1].copy()
+    changed = replace(
+        current,
+        bucket_expected_residual_returns=_matrix_tuple(reversed_forecast),
+        forecast_receipt_sha256=semantic_sha256("reversed-long-horizon-forecast"),
+    )
+    exited = compile_massive_adaptive_portfolio_v1(changed, config=_config())
+    assert exited.target_weights == pytest.approx((0.0, 1.0), abs=2.0e-7)
+    assert exited.discretionary_sell_weights[0] == pytest.approx(1.0)
 
 
 def test_capacity_is_in_the_optimizer_and_reallocates_to_next_best_name() -> None:
@@ -271,7 +295,7 @@ def test_receipt_is_deterministic_and_engineering_result_is_nonauthorizing() -> 
         replace(first, target_weights=(0.0, 0.0)).validate()
 
 
-def test_no_minimum_holding_period_in_compiler() -> None:
+def test_no_minimum_or_maximum_holding_constraint() -> None:
     config = _config()
     assert_no_adaptive_hold_semantics(config)
     assert_adaptive_import_firewall([Path(compiler_module.__file__)])

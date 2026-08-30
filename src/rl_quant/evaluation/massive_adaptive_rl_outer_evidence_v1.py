@@ -40,9 +40,7 @@ from rl_quant.training.massive_adaptive_split_plan_v1 import (
 )
 
 
-MASSIVE_ADAPTIVE_RL_OUTER_PLAN_V1_SCHEMA = (
-    "rl-quant.massive-adaptive-rl-outer-plan-v1"
-)
+MASSIVE_ADAPTIVE_RL_OUTER_PLAN_V1_SCHEMA = "rl-quant.massive-adaptive-rl-outer-plan-v1"
 MASSIVE_ADAPTIVE_RL_OUTER_COST_FOLD_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-outer-cost-fold-v1"
 )
@@ -132,10 +130,8 @@ class MassiveAdaptiveRLOuterPlanV1:
             or self.outer_evaluation_authorized != self.source_data_qualified
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLOuterEvidenceV1Error(
                 "adaptive RL outer plan differs"
@@ -321,10 +317,8 @@ class MassiveAdaptiveRLOuterCostFoldV1:
             >= self.high_cost_terminal_return
             or not 0.0 <= self.maximum_drawdown <= 1.0
             or not isinstance(self.source_data_qualified, bool)
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLOuterEvidenceV1Error(
                 "adaptive RL outer cost fold differs"
@@ -387,8 +381,6 @@ def build_massive_adaptive_rl_outer_cost_fold_v1(
         != primary_trace.inference_plan_receipt_sha256
         or best_fixed_control_trace.calibration_receipt_sha256
         != primary_trace.calibration_receipt_sha256
-        or best_fixed_control_trace.economic_source_inventory_sha256
-        != primary_trace.economic_source_inventory_sha256
         or best_fixed_control_trace.decision_session_dates
         != primary_trace.decision_session_dates
     ):
@@ -424,9 +416,7 @@ def build_massive_adaptive_rl_outer_cost_fold_v1(
             )
         ),
         "low_cost_terminal_return": low_cost_trace.terminal_liquidation_adjusted_return,
-        "primary_terminal_return": (
-            primary_trace.terminal_liquidation_adjusted_return
-        ),
+        "primary_terminal_return": (primary_trace.terminal_liquidation_adjusted_return),
         "high_cost_terminal_return": (
             high_cost_trace.terminal_liquidation_adjusted_return
         ),
@@ -478,7 +468,11 @@ class MassiveAdaptiveRLOuterEvidenceV1:
         return {
             key: value
             for key, value in asdict(self).items()
-            if key not in {"semantic_receipt_sha256", "outer_development_conclusion_authorized"}
+            if key
+            not in {
+                "semantic_receipt_sha256",
+                "outer_development_conclusion_authorized",
+            }
         }
 
     def validate(self) -> None:
@@ -488,9 +482,12 @@ class MassiveAdaptiveRLOuterEvidenceV1:
             "ppo-minus-fixed-control-lcb-positive": (
                 self.ppo_minus_fixed_control_log_return_lcb95 > 0.0
             ),
-            "high-cost-mean-return-nonnegative": self.mean_high_cost_terminal_return >= 0.0,
-            "positive-strategy-folds-at-least-three": self.positive_strategy_fold_count >= 3,
-            "positive-incremental-folds-at-least-three": self.positive_incremental_fold_count >= 3,
+            "high-cost-mean-return-nonnegative": self.mean_high_cost_terminal_return
+            >= 0.0,
+            "positive-strategy-folds-at-least-three": self.positive_strategy_fold_count
+            >= 3,
+            "positive-incremental-folds-at-least-three": self.positive_incremental_fold_count
+            >= 3,
             "positive-ppo-minus-fixed-folds-at-least-three": (
                 self.positive_ppo_minus_fixed_control_fold_count >= 3
             ),
@@ -523,8 +520,7 @@ class MassiveAdaptiveRLOuterEvidenceV1:
             or self.lockbox_access_authorized
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_V1_SPEC_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLOuterEvidenceV1Error(
                 "adaptive RL outer evidence differs"
@@ -562,17 +558,14 @@ def build_massive_adaptive_rl_outer_evidence_v1(
     ppo_minus_fixed_lcb = _nonwrapping_fold_cluster_lcb(ppo_minus_fixed)
     mean_active = mean(value for fold in active for value in fold)
     mean_incremental = mean(value for fold in incremental for value in fold)
-    mean_ppo_minus_fixed = mean(
-        value for fold in ppo_minus_fixed for value in fold
-    )
+    mean_ppo_minus_fixed = mean(value for fold in ppo_minus_fixed for value in fold)
     mean_high = mean(fold.high_cost_terminal_return for fold in ordered)
     positive_strategy = sum(fold.primary_terminal_return > 0.0 for fold in ordered)
     positive_incremental = sum(
         sum(fold.primary_incremental_rl_log_returns) > 0.0 for fold in ordered
     )
     positive_ppo_minus_fixed = sum(
-        sum(fold.primary_ppo_minus_fixed_control_log_returns) > 0.0
-        for fold in ordered
+        sum(fold.primary_ppo_minus_fixed_control_log_returns) > 0.0 for fold in ordered
     )
     ladder = all(
         fold.low_cost_terminal_return
@@ -613,8 +606,12 @@ def build_massive_adaptive_rl_outer_evidence_v1(
         "positive_ppo_minus_fixed_control_fold_count": positive_ppo_minus_fixed,
         "cost_ladder_monotone": ladder,
         "maximum_fold_drawdown": maximum_drawdown,
-        "passed_gate_names": tuple(sorted(name for name, passed in gates.items() if passed)),
-        "failed_gate_names": tuple(sorted(name for name, passed in gates.items() if not passed)),
+        "passed_gate_names": tuple(
+            sorted(name for name, passed in gates.items() if passed)
+        ),
+        "failed_gate_names": tuple(
+            sorted(name for name, passed in gates.items() if not passed)
+        ),
         "source_data_qualified": all(fold.source_data_qualified for fold in ordered),
         "profitability_reporting_authorized": False,
         "lockbox_access_authorized": False,

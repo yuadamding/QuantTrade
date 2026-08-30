@@ -33,12 +33,17 @@ if TYPE_CHECKING:
     from rl_quant.evaluation.massive_adaptive_rl_fixed_control_evaluator_v1 import (
         MassiveAdaptiveRLFixedControlEvaluationV1,
     )
+    from rl_quant.training.massive_adaptive_rl_fixed_control_fit_runner_v1 import (
+        MassiveAdaptiveRLFixedControlFitAuthorityV1,
+    )
 
 
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_REGISTRY_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-fixed-control-registry-v1"
 )
-MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_REGISTRY_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
+MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_REGISTRY_V1_SOURCE_SHA256 = file_sha256(
+    Path(__file__)
+)
 
 
 class MassiveAdaptiveRLFixedControlRegistryV1Error(ValueError):
@@ -67,8 +72,7 @@ class MassiveAdaptiveRLFixedControlSpecV1:
             or not self.description
             or (self.controller_kind == "constant")
             != (self.registered_action_receipt_sha256 is not None)
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLFixedControlRegistryV1Error(
                 "adaptive RL fixed-control specification differs"
@@ -109,8 +113,7 @@ class MassiveAdaptiveRLFixedControlRegistryV1:
             != semantic_sha256(
                 tuple(row.semantic_receipt_sha256 for row in self.controls)
             )
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLFixedControlRegistryV1Error(
                 "adaptive RL fixed-control registry differs"
@@ -141,8 +144,9 @@ def _spec(
     return result
 
 
-def registered_massive_adaptive_rl_constant_actions_v1(
-) -> tuple[tuple[str, MassiveAdaptiveRLActionV1], ...]:
+def registered_massive_adaptive_rl_constant_actions_v1() -> tuple[
+    tuple[str, MassiveAdaptiveRLActionV1], ...
+]:
     """Return the complete immutable FC00--FC05 fitting grid."""
 
     neutral = neutral_massive_adaptive_rl_action_v1()
@@ -150,31 +154,31 @@ def registered_massive_adaptive_rl_constant_actions_v1(
         bucket_controls=(0.75, 0.50, 0.25, 0.0, -0.25, -0.50, -0.75),
         uncertainty_control=0.0,
         risk_control=0.0,
-        turnover_control=0.0,
+        trade_cost_control=0.0,
     )
     long = build_massive_adaptive_rl_action_v1(
         bucket_controls=(-0.75, -0.50, -0.25, 0.0, 0.25, 0.50, 0.75),
         uncertainty_control=0.0,
         risk_control=0.0,
-        turnover_control=0.0,
+        trade_cost_control=0.0,
     )
     uncertain = build_massive_adaptive_rl_action_v1(
         bucket_controls=(0.0,) * 7,
         uncertainty_control=0.75,
         risk_control=0.0,
-        turnover_control=0.0,
+        trade_cost_control=0.0,
     )
     risky = build_massive_adaptive_rl_action_v1(
         bucket_controls=(0.0,) * 7,
         uncertainty_control=0.0,
         risk_control=0.75,
-        turnover_control=0.0,
+        trade_cost_control=0.0,
     )
     low_turnover = build_massive_adaptive_rl_action_v1(
         bucket_controls=(0.0,) * 7,
         uncertainty_control=0.0,
         risk_control=0.0,
-        turnover_control=1.0,
+        trade_cost_control=1.0,
     )
     return (
         ("FC00", neutral),
@@ -186,17 +190,53 @@ def registered_massive_adaptive_rl_constant_actions_v1(
     )
 
 
-def build_massive_adaptive_rl_fixed_control_registry_v1(
-) -> MassiveAdaptiveRLFixedControlRegistryV1:
+def build_massive_adaptive_rl_fixed_control_registry_v1() -> (
+    MassiveAdaptiveRLFixedControlRegistryV1
+):
     actions = dict(registered_massive_adaptive_rl_constant_actions_v1())
     controls = (
-        _spec("FC00", "constant", actions["FC00"].semantic_receipt_sha256, "neutral action"),
-        _spec("FC01", "constant", actions["FC01"].semantic_receipt_sha256, "short-horizon emphasis"),
-        _spec("FC02", "constant", actions["FC02"].semantic_receipt_sha256, "long-horizon emphasis"),
-        _spec("FC03", "constant", actions["FC03"].semantic_receipt_sha256, "increased uncertainty aversion"),
-        _spec("FC04", "constant", actions["FC04"].semantic_receipt_sha256, "increased portfolio-risk aversion"),
-        _spec("FC05", "constant", actions["FC05"].semantic_receipt_sha256, "strong turnover tightening"),
-        _spec("FC06", "training-selected-constant", None, "best constant action selected on RL-fit only"),
+        _spec(
+            "FC00",
+            "constant",
+            actions["FC00"].semantic_receipt_sha256,
+            "neutral action",
+        ),
+        _spec(
+            "FC01",
+            "constant",
+            actions["FC01"].semantic_receipt_sha256,
+            "short-horizon emphasis",
+        ),
+        _spec(
+            "FC02",
+            "constant",
+            actions["FC02"].semantic_receipt_sha256,
+            "long-horizon emphasis",
+        ),
+        _spec(
+            "FC03",
+            "constant",
+            actions["FC03"].semantic_receipt_sha256,
+            "increased uncertainty aversion",
+        ),
+        _spec(
+            "FC04",
+            "constant",
+            actions["FC04"].semantic_receipt_sha256,
+            "increased portfolio-risk aversion",
+        ),
+        _spec(
+            "FC05",
+            "constant",
+            actions["FC05"].semantic_receipt_sha256,
+            "high soft trade-cost hurdle",
+        ),
+        _spec(
+            "FC06",
+            "training-selected-constant",
+            None,
+            "best constant action selected on RL-fit only",
+        ),
     )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_REGISTRY_V1_SCHEMA,
@@ -223,27 +263,40 @@ def build_massive_adaptive_rl_fixed_control_registry_v1(
 def validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
     *,
     registry: MassiveAdaptiveRLFixedControlRegistryV1,
+    fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
     selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
 ) -> None:
     registry.validate()
+    fit_authority.validate()
     selection_authority.validate()
     chronology_authority.validate()
+    fit_run = getattr(fit_authority, "runtime_fit_run", None)
     candidates = getattr(selection_authority, "runtime_candidates", None)
     selection = getattr(selection_authority, "runtime_selection", None)
     registered_constants = tuple(
         row.control_id for row in registry.controls if row.controller_kind == "constant"
     )
     if (
-        candidates is None
+        fit_run is None
+        or not fit_authority.runtime_fit_replayed
+        or candidates is None
         or selection is None
         or not selection_authority.runtime_selection_replayed
-        or tuple(sorted(row.control_id for row in candidates))
-        != registered_constants
+        or tuple(sorted(row.control_id for row in candidates)) != registered_constants
         or selection.fold_index != chronology_authority.fold_index
         or selection.training_origin_inventory_sha256
         != chronology_authority.rl_fit_origin_inventory_sha256
         or selection.selected_control_id not in registered_constants
+        or fit_run.fixed_control_registry_receipt_sha256
+        != registry.semantic_receipt_sha256
+        or fit_run.chronology_authority_receipt_sha256
+        != chronology_authority.semantic_receipt_sha256
+        or fit_run.training_origin_inventory_sha256
+        != chronology_authority.rl_fit_origin_inventory_sha256
+        or selection.candidate_inventory_sha256 != fit_run.candidate_inventory_sha256
+        or tuple(sorted(row.semantic_receipt_sha256 for row in candidates))
+        != tuple(sorted(row.semantic_receipt_sha256 for row in fit_run.candidates))
     ):
         raise MassiveAdaptiveRLFixedControlRegistryV1Error(
             "adaptive RL comparator registry is incomplete"
@@ -254,7 +307,10 @@ def validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
         if row.controller_kind == "constant"
     }
     supplied = {row.control_id: row.action_receipt_sha256 for row in candidates}
-    if any(supplied[control_id] != receipt for control_id, receipt in constant_receipts.items()):
+    if any(
+        supplied[control_id] != receipt
+        for control_id, receipt in constant_receipts.items()
+    ):
         raise MassiveAdaptiveRLFixedControlRegistryV1Error(
             "adaptive RL registered constant control was substituted"
         )
@@ -267,14 +323,17 @@ def build_massive_adaptive_rl_policy_candidate_with_registry_v1(
     low_cost_trace: MassiveAdaptiveRLPolicyTraceV1,
     high_cost_trace: MassiveAdaptiveRLPolicyTraceV1,
     fixed_control_registry: MassiveAdaptiveRLFixedControlRegistryV1,
+    fixed_control_fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
     fixed_control_selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
     fixed_control_evaluation: MassiveAdaptiveRLFixedControlEvaluationV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    shared_validation_context_receipt_sha256: str,
 ) -> MassiveAdaptiveRLPolicyCandidateV1:
     """Build a PPO candidate only from the package-generated FC06 trace."""
 
     validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
         registry=fixed_control_registry,
+        fit_authority=fixed_control_fit_authority,
         selection_authority=fixed_control_selection_authority,
         chronology_authority=chronology_authority,
     )
@@ -282,8 +341,12 @@ def build_massive_adaptive_rl_policy_candidate_with_registry_v1(
     if (
         fixed_control_evaluation.fixed_control_registry_receipt_sha256
         != fixed_control_registry.semantic_receipt_sha256
+        or fixed_control_evaluation.fixed_control_fit_authority_receipt_sha256
+        != fixed_control_fit_authority.semantic_receipt_sha256
         or fixed_control_evaluation.fixed_control_selection_authority_receipt_sha256
         != fixed_control_selection_authority.semantic_receipt_sha256
+        or fixed_control_evaluation.validation_context_receipt_sha256
+        != shared_validation_context_receipt_sha256
         or fixed_control_evaluation.fold_index != chronology_authority.fold_index
     ):
         raise MassiveAdaptiveRLFixedControlRegistryV1Error(

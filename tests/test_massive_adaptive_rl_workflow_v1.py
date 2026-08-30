@@ -113,6 +113,8 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
     )
     assert len(result.runner_checkpoint_authorities) == 2
     assert len(result.policy_checkpoint_authorities) == 2
+    assert result.fixed_control_fit_authority.runtime_fit_replayed
+    assert result.fixed_control_selection_authority.runtime_selection_replayed
     for runner_authority, policy_authority in zip(
         result.runner_checkpoint_authorities,
         result.policy_checkpoint_authorities,
@@ -138,9 +140,9 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
     assert evaluated.checkpoint_receipt_sha256 == (
         result.policy_checkpoint_authorities[-1].checkpoint_receipt_sha256
     )
-    assert tuple(row.action_receipt_sha256 for row in evaluated.action_evidence) == tuple(
-        row.action_receipt_sha256 for row in evaluated.transitions
-    )
+    assert tuple(
+        row.action_receipt_sha256 for row in evaluated.action_evidence
+    ) == tuple(row.action_receipt_sha256 for row in evaluated.transitions)
 
     fixture, calibration, primary = _adaptive_env_fixture()
     cost_environments = (
@@ -156,20 +158,22 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
             authority.semantic_receipt_sha256: cost_environments
             for authority in result.policy_checkpoint_authorities
         },
+        fixed_control_environment=_environment_at_cost(fixture, calibration, 20.0),
         artifact_root=tmp_path,
         committed_at_ms=500,
     )
     assert len(validation.policy_trace_authorities) == 2
     assert len(validation.cost_ladder_authorities) == 2
     assert tuple(
-        row.policy_trace_receipt_sha256
-        for row in validation.policy_trace_authorities
+        row.policy_trace_receipt_sha256 for row in validation.policy_trace_authorities
     ) == tuple(
-        row.primary_trace_receipt_sha256
-        for row in validation.cost_ladder_authorities
+        row.primary_trace_receipt_sha256 for row in validation.cost_ladder_authorities
     )
     assert validation.validation_context_receipt_sha256 == (
         primary.validation_context_receipt_sha256
+    )
+    assert validation.fixed_control_evaluation.policy_trace.evaluation_role == (
+        "inner_validation"
     )
 
     mismatched = copy.copy(primary)
@@ -187,10 +191,9 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
                     if index
                     else (cost_environments[0], mismatched, cost_environments[2])
                 )
-                for index, authority in enumerate(
-                    result.policy_checkpoint_authorities
-                )
+                for index, authority in enumerate(result.policy_checkpoint_authorities)
             },
+            fixed_control_environment=_environment_at_cost(fixture, calibration, 20.0),
             artifact_root=tmp_path / "mismatched",
             committed_at_ms=700,
         )

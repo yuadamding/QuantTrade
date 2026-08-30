@@ -146,6 +146,29 @@ def _fixed_validation_trace() -> MassiveAdaptiveRLPolicyTraceV1:
     )
 
 
+def _fit_authority_for_selection(*, registry, selection_authority, chronology):
+    selection = selection_authority.runtime_selection
+    candidates = selection_authority.runtime_candidates
+    assert selection is not None
+    assert candidates is not None
+    fit_run = SimpleNamespace(
+        fixed_control_registry_receipt_sha256=registry.semantic_receipt_sha256,
+        chronology_authority_receipt_sha256=chronology.semantic_receipt_sha256,
+        training_origin_inventory_sha256=(chronology.rl_fit_origin_inventory_sha256),
+        candidate_inventory_sha256=selection.candidate_inventory_sha256,
+        candidates=candidates,
+    )
+    return SimpleNamespace(
+        validate=lambda: None,
+        runtime_fit_run=fit_run,
+        runtime_fit_replayed=True,
+        development_control_fit_authorized=False,
+        semantic_receipt_sha256=_digest(
+            ("fixed-control-fit-authority", selection.semantic_receipt_sha256)
+        ),
+    )
+
+
 def test_fc06_is_fit_only_selection_from_complete_registered_grid(tmp_path) -> None:
     training_trace = _trace(
         cost=20.0,
@@ -176,9 +199,17 @@ def test_fc06_is_fit_only_selection_from_complete_registered_grid(tmp_path) -> N
         rl_fit_origin_inventory_sha256=semantic_sha256(
             training_trace.decision_session_dates
         ),
+        semantic_receipt_sha256=_digest("complete-fc06-chronology"),
+    )
+    registry = build_massive_adaptive_rl_fixed_control_registry_v1()
+    fit_authority = _fit_authority_for_selection(
+        registry=registry,
+        selection_authority=authority,
+        chronology=chronology,
     )
     validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
-        registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
+        registry=registry,
+        fit_authority=fit_authority,  # type: ignore[arg-type]
         selection_authority=authority,
         chronology_authority=chronology,  # type: ignore[arg-type]
     )
@@ -240,9 +271,17 @@ def test_fc06_validation_trace_is_generated_from_fit_selected_action(tmp_path) -
         ),
         rl_validation_origin_dates=validation_dates,
         development_policy_selection_authorized=True,
+        semantic_receipt_sha256=_digest("fc06-validation-chronology"),
+    )
+    registry = build_massive_adaptive_rl_fixed_control_registry_v1()
+    fit_authority = _fit_authority_for_selection(
+        registry=registry,
+        selection_authority=selection_authority,
+        chronology=chronology,
     )
     evaluation = evaluate_massive_adaptive_rl_fixed_control_v1(
-        registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
+        registry=registry,
+        fit_authority=fit_authority,  # type: ignore[arg-type]
         selection_authority=selection_authority,
         chronology_authority=chronology,  # type: ignore[arg-type]
         environment=environment,
@@ -261,7 +300,9 @@ def test_fc06_validation_trace_is_generated_from_fit_selected_action(tmp_path) -
 
 
 def test_policy_selection_replays_frozen_cost_ladder_create_only(tmp_path) -> None:
-    low = _trace(cost=10.0, terminal_return=0.12, incremental=0.025, active=0.04, frozen=True)
+    low = _trace(
+        cost=10.0, terminal_return=0.12, incremental=0.025, active=0.04, frozen=True
+    )
     primary = _trace(
         cost=20.0,
         terminal_return=0.08,
@@ -269,7 +310,9 @@ def test_policy_selection_replays_frozen_cost_ladder_create_only(tmp_path) -> No
         active=0.03,
         frozen=False,
     )
-    high = _trace(cost=40.0, terminal_return=0.01, incremental=0.01, active=0.02, frozen=True)
+    high = _trace(
+        cost=40.0, terminal_return=0.01, incremental=0.01, active=0.02, frozen=True
+    )
     candidate = build_massive_adaptive_rl_policy_candidate_v1(
         checkpoint=_checkpoint(),  # type: ignore[arg-type]
         primary_trace=primary,
@@ -313,7 +356,9 @@ def test_policy_selection_replays_frozen_cost_ladder_create_only(tmp_path) -> No
         changed,
         semantic_receipt_sha256=semantic_sha256(changed.semantic_unsigned()),
     )
-    with pytest.raises(MassiveAdaptiveRLPolicySelectionV1Error, match="does not replay"):
+    with pytest.raises(
+        MassiveAdaptiveRLPolicySelectionV1Error, match="does not replay"
+    ):
         authorize_massive_adaptive_rl_policy_selection_authority_v1(
             root=tmp_path,
             authority=generic,
@@ -330,7 +375,9 @@ def test_policy_candidate_rejects_reoptimized_cost_stress(tmp_path) -> None:
         frozen=False,
     )
     low = replace(
-        _trace(cost=10.0, terminal_return=0.12, incremental=0.025, active=0.04, frozen=True),
+        _trace(
+            cost=10.0, terminal_return=0.12, incremental=0.025, active=0.04, frozen=True
+        ),
         decision_target_inventory_sha256=_digest("different-targets"),
         semantic_receipt_sha256="0" * 64,
     )
@@ -406,7 +453,9 @@ def test_selected_policy_model_state_is_create_only_and_exact(tmp_path) -> None:
     )
     checkpoint.validate()
 
-    def trace(cost: float, terminal: float, *, frozen: bool) -> MassiveAdaptiveRLPolicyTraceV1:
+    def trace(
+        cost: float, terminal: float, *, frozen: bool
+    ) -> MassiveAdaptiveRLPolicyTraceV1:
         value = _trace(
             cost=cost,
             terminal_return=terminal,

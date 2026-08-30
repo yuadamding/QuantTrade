@@ -32,7 +32,8 @@ MASSIVE_ADAPTIVE_RL_COMPILER_CONTROL_V1_SPEC_SHA256 = semantic_sha256(
         "bucket_multiplier": "one-plus-one-half-control",
         "uncertainty_multiplier": "exp-point-seven-control",
         "risk_multiplier": "exp-point-seven-control",
-        "turnover_multiplier": "one-minus-one-half-one-sided-control",
+        "trade_cost_multiplier": "exp-log-two-times-bidirectional-control",
+        "hard_turnover_limit_control": False,
         "hard_constraints": "never-relaxed",
         "neutral_action": "exact-original-input-config-and-decision",
         "profitability_reporting": False,
@@ -69,7 +70,7 @@ class MassiveAdaptiveRLCompilerControlV1:
     bucket_multipliers: tuple[float, ...]
     uncertainty_multiplier: float
     risk_multiplier: float
-    turnover_multiplier: float
+    trade_cost_multiplier: float
     neutral_equivalence: bool
     hard_constraints_unchanged: bool
     semantic_receipt_sha256: str
@@ -99,7 +100,7 @@ class MassiveAdaptiveRLCompilerControlV1:
             *self.bucket_multipliers,
             self.uncertainty_multiplier,
             self.risk_multiplier,
-            self.turnover_multiplier,
+            self.trade_cost_multiplier,
         )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_COMPILER_CONTROL_V1_SCHEMA
@@ -111,7 +112,7 @@ class MassiveAdaptiveRLCompilerControlV1:
             <= self.uncertainty_multiplier
             <= math.exp(0.7)
             or not math.exp(-0.7) <= self.risk_multiplier <= math.exp(0.7)
-            or not 0.5 <= self.turnover_multiplier <= 1.0
+            or not 0.5 <= self.trade_cost_multiplier <= 2.0
             or not self.hard_constraints_unchanged
             or self.compiler_control_authorized
             or self.profitability_reporting_authorized
@@ -171,7 +172,7 @@ def apply_massive_adaptive_rl_action_v1(
     bucket_multipliers = tuple(1.0 + 0.5 * value for value in action.bucket_controls)
     uncertainty_multiplier = math.exp(0.7 * action.uncertainty_control)
     risk_multiplier = math.exp(0.7 * action.risk_control)
-    turnover_multiplier = 1.0 - 0.5 * action.turnover_control
+    trade_cost_multiplier = math.exp(math.log(2.0) * action.trade_cost_control)
     if action.is_neutral:
         adjusted_inputs = inputs
         adjusted_config = config
@@ -182,16 +183,47 @@ def apply_massive_adaptive_rl_action_v1(
         expected_values = tuple(
             tuple(float(value) for value in row) for row in expected.tolist()
         )
-        adjusted_inputs = replace(
-            inputs,
-            bucket_expected_residual_returns=expected_values,
-            forecast_receipt_sha256=semantic_sha256(
+        entry_cost_values = tuple(
+            float(value) * trade_cost_multiplier
+            for value in inputs.entry_cost_basis_points
+        )
+        current_exit_cost_values = tuple(
+            float(value) * trade_cost_multiplier
+            for value in inputs.current_exit_cost_basis_points
+        )
+        future_exit_cost_values = tuple(
+            tuple(float(value) * trade_cost_multiplier for value in row)
+            for row in inputs.expected_future_exit_cost_basis_points
+        )
+        adjusted_forecast_receipt = inputs.forecast_receipt_sha256
+        if any(value != 1.0 for value in bucket_multipliers):
+            adjusted_forecast_receipt = semantic_sha256(
                 {
                     "base_forecast": inputs.forecast_receipt_sha256,
                     "rl_action": action.semantic_receipt_sha256,
                     "adjusted_bucket_expected_residual_returns": expected_values,
                 }
-            ),
+            )
+        adjusted_cost_receipt = inputs.cost_receipt_sha256
+        if trade_cost_multiplier != 1.0:
+            adjusted_cost_receipt = semantic_sha256(
+                {
+                    "base_cost": inputs.cost_receipt_sha256,
+                    "rl_action": action.semantic_receipt_sha256,
+                    "trade_cost_multiplier": trade_cost_multiplier,
+                    "entry_cost_basis_points": entry_cost_values,
+                    "current_exit_cost_basis_points": current_exit_cost_values,
+                    "expected_future_exit_cost_basis_points": future_exit_cost_values,
+                }
+            )
+        adjusted_inputs = replace(
+            inputs,
+            bucket_expected_residual_returns=expected_values,
+            entry_cost_basis_points=entry_cost_values,
+            current_exit_cost_basis_points=current_exit_cost_values,
+            expected_future_exit_cost_basis_points=future_exit_cost_values,
+            forecast_receipt_sha256=adjusted_forecast_receipt,
+            cost_receipt_sha256=adjusted_cost_receipt,
         )
         adjusted_config = replace(
             config,
@@ -199,9 +231,6 @@ def apply_massive_adaptive_rl_action_v1(
                 config.uncertainty_standard_deviations * uncertainty_multiplier
             ),
             risk_aversion=config.risk_aversion * risk_multiplier,
-            maximum_daily_one_way_turnover=(
-                config.maximum_daily_one_way_turnover * turnover_multiplier
-            ),
         )
         adjusted_inputs.validate()
         adjusted_config.validate()
@@ -210,13 +239,11 @@ def apply_massive_adaptive_rl_action_v1(
         "maximum_issuer_weight",
         "tracking_error_limit_annualized",
         "absolute_active_beta_limit",
+        "maximum_daily_one_way_turnover",
         "maximum_adv_participation",
     )
     hard_unchanged = all(
         getattr(config, name) == getattr(adjusted_config, name) for name in hard_names
-    ) and (
-        adjusted_config.maximum_daily_one_way_turnover
-        <= config.maximum_daily_one_way_turnover
     )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_COMPILER_CONTROL_V1_SCHEMA,
@@ -228,7 +255,7 @@ def apply_massive_adaptive_rl_action_v1(
         "bucket_multipliers": bucket_multipliers,
         "uncertainty_multiplier": uncertainty_multiplier,
         "risk_multiplier": risk_multiplier,
-        "turnover_multiplier": turnover_multiplier,
+        "trade_cost_multiplier": trade_cost_multiplier,
         "neutral_equivalence": action.is_neutral,
         "hard_constraints_unchanged": hard_unchanged,
         "compiler_control_authorized": False,

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 import json
 from pathlib import Path
+from typing import cast
 
 import torch
 
@@ -128,8 +129,7 @@ class MassiveAdaptiveFrozenRLActionEvidenceV1:
             self.schema != MASSIVE_ADAPTIVE_FROZEN_RL_ACTION_EVIDENCE_V1_SCHEMA
             or not self.decision_session_date
             or len(self.action_values) != 10
-            or any(not -1.0 <= value <= 1.0 for value in self.action_values[:9])
-            or not 0.0 <= self.action_values[9] <= 1.0
+            or any(not -1.0 <= value <= 1.0 for value in self.action_values)
             or self.protocol_receipt_sha256
             != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.semantic_receipt_sha256
@@ -193,10 +193,10 @@ class MassiveAdaptiveRLOuterRolloutV1:
 
     def validate(self) -> None:
         self.policy_trace.validate()
-        for row in self.action_evidence:
-            row.validate()
-        for row in self.transitions:
-            row.validate()
+        for evidence_row in self.action_evidence:
+            evidence_row.validate()
+        for transition_row in self.transitions:
+            transition_row.validate()
         runtime = bool(self.action_evidence and self.transitions)
         expected = runtime and self.source_data_qualified
         if (
@@ -306,7 +306,7 @@ def run_massive_adaptive_rl_outer_rollout_v1(
                 bucket_controls=values[:7],
                 uncertainty_control=values[7],
                 risk_control=values[8],
-                turnover_control=values[9],
+                trade_cost_control=values[9],
             )
             decision_date = environment.inference_plan.rows[
                 environment.state.chronology_cursor
@@ -315,8 +315,6 @@ def run_massive_adaptive_rl_outer_rollout_v1(
                 (
                     _tensor_receipt(distribution.mean),
                     _tensor_receipt(distribution.log_std),
-                    _tensor_receipt(distribution.turnover_alpha),
-                    _tensor_receipt(distribution.turnover_beta),
                 )
             )
             evidence_body = {
@@ -563,12 +561,14 @@ def parse_massive_adaptive_rl_outer_rollout_authority_v1(
     payload = _load_payload(root=root, loaded_source=loaded_source)
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_OUTER_ROLLOUT_AUTHORITY_V1_SCHEMA,
-        "fold_index": int(payload["fold_index"]),
+        "fold_index": int(cast(int, payload["fold_index"])),
         "outer_plan_receipt_sha256": str(payload["outer_plan_receipt_sha256"]),
         "frozen_policy_receipt_sha256": str(payload["frozen_policy_receipt_sha256"]),
         "outer_rollout_receipt_sha256": str(payload["outer_rollout_receipt_sha256"]),
         "policy_trace_receipt_sha256": str(
-            dict(payload["policy_trace"])["semantic_receipt_sha256"]  # type: ignore[arg-type]
+            dict(cast(Mapping[str, object], payload["policy_trace"]))[
+                "semantic_receipt_sha256"
+            ]
         ),
         "action_inventory_sha256": str(payload["action_inventory_sha256"]),
         "transition_inventory_sha256": str(payload["transition_inventory_sha256"]),

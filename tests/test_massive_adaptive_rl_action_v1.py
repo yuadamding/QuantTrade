@@ -90,7 +90,7 @@ def test_nonzero_action_is_bounded_and_cannot_loosen_hard_constraints() -> None:
         bucket_controls=(0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0),
         uncertainty_control=0.5,
         risk_control=-0.5,
-        turnover_control=1.0,
+        trade_cost_control=1.0,
     )
     adjusted_inputs, adjusted_config, application = (
         apply_massive_adaptive_rl_action_v1(
@@ -105,7 +105,14 @@ def test_nonzero_action_is_bounded_and_cannot_loosen_hard_constraints() -> None:
     assert adjusted_inputs.bucket_expected_residual_returns[0][0] == pytest.approx(
         inputs.bucket_expected_residual_returns[0][0] * 1.25
     )
-    assert adjusted_config.maximum_daily_one_way_turnover == pytest.approx(0.2)
+    assert adjusted_config.maximum_daily_one_way_turnover == pytest.approx(0.4)
+    assert adjusted_inputs.entry_cost_basis_points == pytest.approx(
+        tuple(2.0 * value for value in inputs.entry_cost_basis_points)
+    )
+    assert adjusted_inputs.current_exit_cost_basis_points == pytest.approx(
+        tuple(2.0 * value for value in inputs.current_exit_cost_basis_points)
+    )
+    assert application.trade_cost_multiplier == pytest.approx(2.0)
     assert adjusted_config.maximum_security_weight == config.maximum_security_weight
     assert adjusted_config.maximum_issuer_weight == config.maximum_issuer_weight
     assert adjusted_config.tracking_error_limit_annualized == (
@@ -131,14 +138,14 @@ def test_action_range_authority_and_no_duration_firewall_fail_closed() -> None:
             bucket_controls=(2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             uncertainty_control=0.0,
             risk_control=0.0,
-            turnover_control=0.0,
+            trade_cost_control=0.0,
         )
-    with pytest.raises(MassiveAdaptiveRLActionV1Error, match=r"\[0, 1\]"):
+    with pytest.raises(MassiveAdaptiveRLActionV1Error, match=r"\[-1, 1\]"):
         build_massive_adaptive_rl_action_v1(
             bucket_controls=(0.0,) * 7,
             uncertainty_control=0.0,
             risk_control=0.0,
-            turnover_control=-0.5,
+            trade_cost_control=-1.5,
         )
     neutral = neutral_massive_adaptive_rl_action_v1()
     corrupted = replace(
@@ -156,3 +163,64 @@ def test_action_range_authority_and_no_duration_firewall_fail_closed() -> None:
         not any(fragment in field.name for fragment in forbidden_fragments)
         for field in fields(MassiveAdaptiveRLActionV1)
     )
+
+
+def test_turnover_control_allows_more_and_less_aggressive_trading() -> None:
+    inputs = _inputs(
+        expected_first_bucket=(0.04, 0.02),
+        pretrade=(0.5, 0.2),
+        benchmark=(0.5, 0.2),
+    )
+    config = _config(maximum_daily_one_way_turnover=0.4)
+    low_hurdle = build_massive_adaptive_rl_action_v1(
+        bucket_controls=(0.0,) * 7,
+        uncertainty_control=0.0,
+        risk_control=0.0,
+        trade_cost_control=-1.0,
+    )
+    high_hurdle = build_massive_adaptive_rl_action_v1(
+        bucket_controls=(0.0,) * 7,
+        uncertainty_control=0.0,
+        risk_control=0.0,
+        trade_cost_control=1.0,
+    )
+
+    low_inputs, low_config, low_control = apply_massive_adaptive_rl_action_v1(
+        inputs=inputs,
+        config=config,
+        action=low_hurdle,
+    )
+    high_inputs, high_config, high_control = apply_massive_adaptive_rl_action_v1(
+        inputs=inputs,
+        config=config,
+        action=high_hurdle,
+    )
+
+    assert low_control.trade_cost_multiplier == pytest.approx(0.5)
+    assert high_control.trade_cost_multiplier == pytest.approx(2.0)
+    assert low_inputs.entry_cost_basis_points == pytest.approx(
+        tuple(0.5 * value for value in inputs.entry_cost_basis_points)
+    )
+    assert high_inputs.entry_cost_basis_points == pytest.approx(
+        tuple(2.0 * value for value in inputs.entry_cost_basis_points)
+    )
+    assert low_inputs.expected_future_exit_cost_basis_points[0] == pytest.approx(
+        tuple(
+            0.5 * value
+            for value in inputs.expected_future_exit_cost_basis_points[0]
+        )
+    )
+    assert high_inputs.expected_future_exit_cost_basis_points[0] == pytest.approx(
+        tuple(
+            2.0 * value
+            for value in inputs.expected_future_exit_cost_basis_points[0]
+        )
+    )
+    assert low_config.maximum_daily_one_way_turnover == (
+        config.maximum_daily_one_way_turnover
+    )
+    assert high_config.maximum_daily_one_way_turnover == (
+        config.maximum_daily_one_way_turnover
+    )
+    assert low_control.hard_constraints_unchanged
+    assert high_control.hard_constraints_unchanged

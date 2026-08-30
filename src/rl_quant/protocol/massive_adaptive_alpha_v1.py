@@ -1,9 +1,13 @@
 """Immutable contract for the Massive PIT adaptive-alpha generation.
 
-This generation predicts a bucketed factor-residual return term structure.
-Portfolio duration is an outcome of daily cost-aware re-optimization and is
-never an input, target, loss term, reward, checkpoint criterion, or promotion
-gate.
+Endogenous holding duration.  The adaptive RL system has no mandatory,
+preferred, minimum, maximum, or rewarded holding period.  At every decision
+date, all positions are reconsidered using current causal forecasts,
+uncertainty, portfolio risk, liquidity, trading costs, and alternative
+investment opportunities.  A position persists only while retaining it remains
+economically optimal.  Realized holding duration is an output of the learned
+policy and deterministic feasibility compiler, not an input constraint or
+evaluation target.
 """
 
 from __future__ import annotations
@@ -25,10 +29,17 @@ MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256 = (
 
 FORBIDDEN_ADAPTIVE_CONFIGURATION_FIELDS = frozenset(
     {
+        "hold_action",
+        "hold_duration",
         "preferred_holding_sessions",
         "minimum_holding_sessions",
         "maximum_holding_sessions",
         "target_holding_sessions",
+        "minimum_hold",
+        "min_hold",
+        "mandatory_hold",
+        "target_hold",
+        "holding_period_target",
         "mandatory_exit_session",
         "holding_age",
         "age_bin",
@@ -48,6 +59,7 @@ FORBIDDEN_ADAPTIVE_CONFIGURATION_FIELDS = frozenset(
         "scheduled_exit",
         "scheduled_exit_session",
         "duration_reward",
+        "duration_bonus",
         "holding_period_reward",
         "position_age_reward",
         "duration_regularization",
@@ -62,13 +74,44 @@ FORBIDDEN_ADAPTIVE_CONFIGURATION_FIELDS = frozenset(
     }
 )
 
+PROHIBITED_ADAPTIVE_HOLD_TOKENS = (
+    "hold30",
+    "hold-30",
+    "hold_30",
+    "holdxx",
+    "hold-xx",
+    "hold_xx",
+    "minimum-hold",
+    "minimum_hold",
+    "min-hold",
+    "min_hold",
+    "target-hold",
+    "target_hold",
+    "holding-period-target",
+    "holding_period_target",
+    "position-age",
+    "position_age",
+    "duration-bonus",
+    "duration_bonus",
+    "early-exit-penalty",
+    "early_exit_penalty",
+    "mandatory-hold",
+    "mandatory_hold",
+    "fixed-horizon-tranche",
+    "fixed_horizon_tranche",
+)
+
 FORBIDDEN_ADAPTIVE_IMPORT_PREFIXES = (
+    "rl_quant.datasets.hold30",
     "rl_quant.execution.age_aware_no_trade",
     "rl_quant.execution.hold30",
     "rl_quant.envs.hold30",
+    "rl_quant.evaluation.hold30",
+    "rl_quant.evaluation.massive_fixed_horizon_tranches_v1",
     "rl_quant.models.hold30",
     "rl_quant.training.hold30",
     "rl_quant.protocol.hold30",
+    "rl_quant.workflows.hold30",
 )
 
 
@@ -217,6 +260,17 @@ def assert_no_adaptive_hold_semantics(value: object, *, path: str = "root") -> N
                     f"forbidden adaptive duration field at {path}.{key}"
                 )
             assert_no_adaptive_hold_semantics(child, path=f"{path}.{key}")
+        return
+    if isinstance(value, str):
+        normalized = value.lower()
+        match = next(
+            (token for token in PROHIBITED_ADAPTIVE_HOLD_TOKENS if token in normalized),
+            None,
+        )
+        if match is not None:
+            raise MassiveAdaptiveAlphaProtocolError(
+                f"forbidden adaptive hold token {match!r} at {path}"
+            )
         return
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, child in enumerate(value):
@@ -492,6 +546,7 @@ MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL = build_massive_adaptive_alpha_v1_protocol()
 __all__ = [
     "FORBIDDEN_ADAPTIVE_CONFIGURATION_FIELDS",
     "FORBIDDEN_ADAPTIVE_IMPORT_PREFIXES",
+    "PROHIBITED_ADAPTIVE_HOLD_TOKENS",
     "MASSIVE_ADAPTIVE_ALPHA_V1_BUCKETS",
     "MASSIVE_ADAPTIVE_ALPHA_V1_DATASET_ID",
     "MASSIVE_ADAPTIVE_ALPHA_V1_PROTOCOL",

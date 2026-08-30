@@ -12,16 +12,13 @@ from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
 
 def test_mixed_action_distribution_respects_registered_support() -> None:
     distribution = MassiveAdaptiveBoundedControlDistributionV1(
-        mean=torch.zeros((32, 9)),
-        log_std=torch.full((32, 9), -1.5),
-        turnover_alpha=torch.full((32,), 0.5),
-        turnover_beta=torch.full((32,), 4.0),
+        mean=torch.zeros((32, 10)),
+        log_std=torch.full((32, 10), -1.5),
     )
     action = distribution.sample()
 
     assert action.shape == (32, 10)
-    assert torch.all(action[:, :9].abs() < 1.0)
-    assert torch.all((action[:, 9] > 0.0) & (action[:, 9] < 1.0))
+    assert torch.all(action.abs() < 1.0)
     assert torch.isfinite(distribution.log_prob(action)).all()
     assert torch.isfinite(distribution.entropy()).all()
 
@@ -33,8 +30,7 @@ def test_actor_critic_is_small_stateless_and_neutral_initialized() -> None:
 
     assert output.value.shape == (4,)
     assert output.recurrent_state == {}
-    assert torch.equal(mode[:, :9], torch.zeros((4, 9)))
-    assert torch.all(mode[:, 9] < 0.1)
+    assert torch.equal(mode, torch.zeros((4, 10)))
     assert model.actor is not model.critic
     assert sum(parameter.numel() for parameter in model.parameters()) < 100_000
 

@@ -26,6 +26,9 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
 from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
     MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
 )
+from rl_quant.training.massive_adaptive_rl_fixed_control_fit_runner_v1 import (
+    MassiveAdaptiveRLFixedControlFitAuthorityV1,
+)
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
     build_massive_adaptive_rl_policy_trace_from_identities_v1,
@@ -70,6 +73,7 @@ def _digest(name: str, value: object) -> str:
 class MassiveAdaptiveRLFixedControlEvaluationV1:
     fold_index: int
     fixed_control_registry_receipt_sha256: str
+    fixed_control_fit_authority_receipt_sha256: str
     fixed_control_selection_authority_receipt_sha256: str
     selected_fit_control_id: str
     selected_action_receipt_sha256: str
@@ -99,6 +103,9 @@ class MassiveAdaptiveRLFixedControlEvaluationV1:
             "fixed_control_registry_receipt_sha256": (
                 self.fixed_control_registry_receipt_sha256
             ),
+            "fixed_control_fit_authority_receipt_sha256": (
+                self.fixed_control_fit_authority_receipt_sha256
+            ),
             "fixed_control_selection_authority_receipt_sha256": (
                 self.fixed_control_selection_authority_receipt_sha256
             ),
@@ -123,6 +130,7 @@ class MassiveAdaptiveRLFixedControlEvaluationV1:
         self.policy_trace.validate()
         for value in (
             self.fixed_control_registry_receipt_sha256,
+            self.fixed_control_fit_authority_receipt_sha256,
             self.fixed_control_selection_authority_receipt_sha256,
             self.selected_action_receipt_sha256,
             self.validation_context_receipt_sha256,
@@ -148,8 +156,7 @@ class MassiveAdaptiveRLFixedControlEvaluationV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLFixedControlEvaluationV1Error(
                 "adaptive RL FC06 validation evaluation differs"
@@ -160,6 +167,7 @@ class MassiveAdaptiveRLFixedControlEvaluationV1:
 def evaluate_massive_adaptive_rl_fixed_control_v1(
     *,
     registry: MassiveAdaptiveRLFixedControlRegistryV1,
+    fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
     selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environment: MassiveAdaptiveProfitabilityEnvV1,
@@ -168,6 +176,7 @@ def evaluate_massive_adaptive_rl_fixed_control_v1(
 
     validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
         registry=registry,
+        fit_authority=fit_authority,
         selection_authority=selection_authority,
         chronology_authority=chronology_authority,
     )
@@ -188,9 +197,7 @@ def evaluate_massive_adaptive_rl_fixed_control_v1(
         raise MassiveAdaptiveRLFixedControlEvaluationV1Error(
             "adaptive RL FC06 selected an action outside the frozen grid"
         ) from error
-    dates = tuple(
-        row.decision_session_date for row in environment.inference_plan.rows
-    )
+    dates = tuple(row.decision_session_date for row in environment.inference_plan.rows)
     if (
         dates != chronology_authority.rl_validation_origin_dates
         or environment.transaction_cost_basis_points != 20.0
@@ -216,6 +223,7 @@ def evaluate_massive_adaptive_rl_fixed_control_v1(
         (
             "FC06",
             registry.semantic_receipt_sha256,
+            fit_authority.semantic_receipt_sha256,
             selection_authority.semantic_receipt_sha256,
             selection.selected_action_receipt_sha256,
         )
@@ -242,15 +250,17 @@ def evaluate_massive_adaptive_rl_fixed_control_v1(
         evaluation_role="inner_validation",
         checkpoint_source_data_qualified=bool(
             selection_authority.development_control_selection_authorized
+            and fit_authority.development_control_fit_authorized
             and chronology_authority.development_policy_selection_authorized
         ),
     )
-    transition_receipts = tuple(
-        row.semantic_receipt_sha256 for row in transitions
-    )
+    transition_receipts = tuple(row.semantic_receipt_sha256 for row in transitions)
     provisional = MassiveAdaptiveRLFixedControlEvaluationV1(
         fold_index=chronology_authority.fold_index,
         fixed_control_registry_receipt_sha256=registry.semantic_receipt_sha256,
+        fixed_control_fit_authority_receipt_sha256=(
+            fit_authority.semantic_receipt_sha256
+        ),
         fixed_control_selection_authority_receipt_sha256=(
             selection_authority.semantic_receipt_sha256
         ),

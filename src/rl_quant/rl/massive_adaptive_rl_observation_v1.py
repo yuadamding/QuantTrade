@@ -299,14 +299,14 @@ def build_massive_adaptive_rl_observation_v1(
         *previous_action.bucket_controls,
         previous_action.uncertainty_control,
         previous_action.risk_control,
-        previous_action.turnover_control,
+        previous_action.trade_cost_control,
     )
     feature_names.extend(
         (
             *(f"previous_bucket_control_{index}" for index in range(7)),
             "previous_uncertainty_control",
             "previous_risk_control",
-            "previous_turnover_control",
+            "previous_trade_cost_control",
         )
     )
     values.extend(action_values)

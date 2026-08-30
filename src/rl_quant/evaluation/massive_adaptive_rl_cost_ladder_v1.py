@@ -118,7 +118,7 @@ def replay_massive_adaptive_rl_frozen_target_transitions_v1(
             bucket_controls=values[:7],
             uncertainty_control=values[7],
             risk_control=values[8],
-            turnover_control=values[9],
+            trade_cost_control=values[9],
         )
         next_observation, _reward, terminated, truncated, info = environment.step(
             action,

@@ -126,6 +126,7 @@ def build_massive_adaptive_rl_fixed_control_candidate_v1(
     control_id: str,
     action: MassiveAdaptiveRLActionV1,
     training_trace: MassiveAdaptiveRLPolicyTraceV1,
+    training_context_receipt_sha256: str | None = None,
 ) -> MassiveAdaptiveRLFixedControlCandidateV1:
     """Bind one constant action to its complete training-only economic trace."""
 
@@ -149,7 +150,8 @@ def build_massive_adaptive_rl_fixed_control_candidate_v1(
         "training_origin_inventory_sha256": semantic_sha256(
             training_trace.decision_session_dates
         ),
-        "training_context_receipt_sha256": semantic_sha256(
+        "training_context_receipt_sha256": training_context_receipt_sha256
+        or semantic_sha256(
             (
                 training_trace.fold_index,
                 training_trace.evaluation_role,

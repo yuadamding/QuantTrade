@@ -174,10 +174,8 @@ class MassiveAdaptiveRLPolicyTraceV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLPolicySelectionV1Error(
                 "adaptive RL policy trace differs"
@@ -260,9 +258,12 @@ def build_massive_adaptive_rl_policy_trace_from_identities_v1(
     """Derive one economic trace from immutable policy identities and transitions."""
 
     rows = tuple(transitions)
+    training_control = evaluation_role == "training_control"
     if (
         not rows
-        or any(row.truncated for row in rows)
+        or any(row.terminated and row.truncated for row in rows)
+        or (not training_control and any(row.truncated for row in rows))
+        or rows[-1].truncated
         or any(row.terminated for row in rows[:-1])
         or not rows[-1].terminated
     ):
@@ -271,7 +272,9 @@ def build_massive_adaptive_rl_policy_trace_from_identities_v1(
         )
     for row in rows:
         row.validate()
-    dates = tuple(row.economic_step.strategy_execution.decision_session_date for row in rows)
+    dates = tuple(
+        row.economic_step.strategy_execution.decision_session_date for row in rows
+    )
     final_equity = rows[-1].strategy_liquidation_adjusted_equity
     running_peak = initial_capital
     maximum_drawdown = 0.0
@@ -407,8 +410,7 @@ class MassiveAdaptiveRLPolicyCandidateV1:
             != tuple(sorted(set(self.eligibility_failures)))
             or self.economically_eligible != (not self.eligibility_failures)
             or not isinstance(self.source_data_qualified, bool)
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLPolicySelectionV1Error(
                 "adaptive RL policy candidate differs"
@@ -462,7 +464,10 @@ def build_massive_adaptive_rl_policy_candidate_v1(
     if (
         tuple(trace.transaction_cost_basis_points for trace in traces)
         != (10.0, 20.0, 40.0)
-        or any(trace.checkpoint_receipt_sha256 != checkpoint.semantic_receipt_sha256 for trace in traces)
+        or any(
+            trace.checkpoint_receipt_sha256 != checkpoint.semantic_receipt_sha256
+            for trace in traces
+        )
         or len({trace.fold_index for trace in traces}) != 1
         or len({trace.forecast_archive_receipt_sha256 for trace in traces}) != 1
         or len({trace.inference_plan_receipt_sha256 for trace in traces}) != 1
@@ -485,8 +490,6 @@ def build_massive_adaptive_rl_policy_candidate_v1(
         != primary_trace.inference_plan_receipt_sha256
         or fixed_control_validation_trace.calibration_receipt_sha256
         != primary_trace.calibration_receipt_sha256
-        or fixed_control_validation_trace.economic_source_inventory_sha256
-        != primary_trace.economic_source_inventory_sha256
     ):
         raise MassiveAdaptiveRLPolicySelectionV1Error(
             "adaptive RL policy cost ladder or checkpoint differs"
@@ -601,12 +604,10 @@ class MassiveAdaptiveRLPolicySelectionV1:
             or self.outer_evaluation_authorized
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V1_SPEC_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLPolicySelectionV1Error(
                 "adaptive RL policy selection differs"
@@ -642,7 +643,9 @@ def select_massive_adaptive_rl_policy_v1(
         )
         for candidate in ordered
     }
-    eligible = tuple(candidate for candidate in ordered if candidate.economically_eligible)
+    eligible = tuple(
+        candidate for candidate in ordered if candidate.economically_eligible
+    )
     if len(lineage) != 1 or not eligible:
         raise MassiveAdaptiveRLPolicySelectionV1Error(
             "RL policy candidates span folds or none is eligible"
@@ -665,7 +668,9 @@ def select_massive_adaptive_rl_policy_v1(
             tuple(candidate.semantic_receipt_sha256 for candidate in ordered)
         ),
         "candidate_count": len(ordered),
-        "source_data_qualified": all(candidate.source_data_qualified for candidate in ordered),
+        "source_data_qualified": all(
+            candidate.source_data_qualified for candidate in ordered
+        ),
         "outer_evaluation_authorized": False,
         "profitability_reporting_authorized": False,
         "lockbox_access_authorized": False,
@@ -710,11 +715,12 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV1:
         }
 
     def validate(self) -> None:
-        runtime = self.runtime_selection is not None and self.runtime_candidates is not None
+        runtime = (
+            self.runtime_selection is not None and self.runtime_candidates is not None
+        )
         expected_authorized = runtime and self.source_data_qualified
         if (
-            self.schema
-            != MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_SCHEMA
+            self.schema != MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_SCHEMA
             or not isinstance(self.source_data_qualified, bool)
             or self.runtime_selection_replayed != runtime
             or self.development_policy_selection_authorized != expected_authorized
@@ -722,8 +728,7 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV1:
             or self.reinforcement_learning_authorized != expected_authorized
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLPolicySelectionV1Error(
                 "adaptive RL policy selection authority differs"
@@ -771,7 +776,9 @@ def _authority_payload(
 
 def _load_authority_payload(
     *, root: str | Path, loaded_source: LoadedMassiveSourceObject
-) -> tuple[MassiveAdaptiveRLPolicySelectionV1, tuple[MassiveAdaptiveRLPolicyCandidateV1, ...]]:
+) -> tuple[
+    MassiveAdaptiveRLPolicySelectionV1, tuple[MassiveAdaptiveRLPolicyCandidateV1, ...]
+]:
     raw = read_loaded_massive_source_bytes(root=root, loaded_source=loaded_source)
     payload = json.loads(raw)
     if not isinstance(payload, Mapping) or raw != canonical_json_file_bytes(payload):

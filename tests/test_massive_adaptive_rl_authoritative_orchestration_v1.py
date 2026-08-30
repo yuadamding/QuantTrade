@@ -7,6 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from rl_quant.evaluation.massive_adaptive_rl_fixed_control_outer_rollout_v1 import (
+    authorize_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1,
+    materialize_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1,
+    parse_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_outer_rollout_v1 import (
     authorize_massive_adaptive_rl_outer_rollout_authority_v1,
     materialize_massive_adaptive_rl_outer_rollout_authority_v1,
@@ -21,6 +26,11 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v2 import (
     MassiveAdaptiveRLOuterEvidenceV2Error,
     build_massive_adaptive_authenticated_rl_outer_fold_v2,
     build_massive_adaptive_rl_outer_evidence_v2,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v3 import (
+    MassiveAdaptiveRLOuterEvidenceV3Error,
+    build_massive_adaptive_authenticated_rl_outer_fold_v3,
+    build_massive_adaptive_rl_outer_evidence_v3,
 )
 from rl_quant.evaluation.massive_adaptive_rl_policy_evaluator_v1 import (
     evaluate_massive_adaptive_rl_checkpoint_v1,
@@ -74,7 +84,21 @@ from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
 from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
     MassiveAdaptiveRLFixedControlRegistryV1Error,
     build_massive_adaptive_rl_fixed_control_registry_v1,
+    registered_massive_adaptive_rl_constant_actions_v1,
     validate_massive_adaptive_rl_fixed_control_registry_coverage_v1,
+)
+from rl_quant.training.massive_adaptive_rl_fixed_control_fit_runner_v1 import (
+    authorize_massive_adaptive_rl_fixed_control_fit_authority_v1,
+    materialize_massive_adaptive_rl_fixed_control_fit_authority_v1,
+    materialize_massive_adaptive_rl_fixed_control_selection_from_fit_v1,
+    parse_massive_adaptive_rl_fixed_control_fit_authority_v1,
+)
+from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
+    build_massive_adaptive_rl_fixed_control_candidate_v1,
+    materialize_massive_adaptive_rl_fixed_control_selection_authority_v1,
+)
+from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
+    build_massive_adaptive_rl_policy_trace_from_identities_v1,
 )
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
@@ -128,6 +152,7 @@ def _chronology(environment, training_authority):
             training_authority.semantic_receipt_sha256
         ),
         rl_fit_origin_dates=dates,
+        rl_fit_origin_inventory_sha256=semantic_sha256(dates),
         rl_validation_origin_dates=dates,
         outer_origin_dates=dates,
         validation_inference_plan_receipt_sha256=(
@@ -139,7 +164,90 @@ def _chronology(environment, training_authority):
         development_rl_training_authorized=True,
         development_policy_selection_authorized=True,
         outer_evaluation_authorized=True,
+        source_data_qualified=True,
     )
+
+
+def _fixed_selection_fixture(tmp_path, environment, chronology):
+    fit_environment = copy.copy(environment)
+    fit_environment._state = None
+    fit_environment._prepared = None
+    fit_environment._observation = None
+    fit_environment.reset()
+    transitions = []
+    neutral = neutral_massive_adaptive_rl_action_v1()
+    while True:
+        _next, _reward, terminated, truncated, info = fit_environment.step(neutral)
+        assert not truncated
+        transitions.append(info["transition"])
+        if terminated:
+            break
+    training_trace = build_massive_adaptive_rl_policy_trace_from_identities_v1(
+        fold_index=chronology.fold_index,
+        checkpoint_receipt_sha256=_digest("fixed-fit-controller"),
+        model_state_receipt_sha256=neutral.semantic_receipt_sha256,
+        update_index=0,
+        training_forecast_authority_receipt_sha256=(
+            chronology.training_forecast_authority_receipt_sha256
+        ),
+        forecast_archive_receipt_sha256=(
+            fit_environment.forecast_archive.semantic_receipt_sha256
+        ),
+        inference_plan_receipt_sha256=(
+            fit_environment.inference_plan.semantic_receipt_sha256
+        ),
+        calibration_receipt_sha256=(
+            fit_environment.calibration.semantic_receipt_sha256
+        ),
+        transaction_cost_basis_points=20.0,
+        initial_capital=fit_environment.initial_capital,
+        transitions=tuple(transitions),
+        frozen_targets_replayed=False,
+        evaluation_role="training_control",
+        checkpoint_source_data_qualified=False,
+    )
+    context_receipt = _digest("shared-fixed-fit-context")
+    candidates = tuple(
+        build_massive_adaptive_rl_fixed_control_candidate_v1(
+            fold_index=chronology.fold_index,
+            control_id=control_id,
+            action=action,
+            training_trace=training_trace,
+            training_context_receipt_sha256=context_receipt,
+        )
+        for control_id, action in registered_massive_adaptive_rl_constant_actions_v1()
+    )
+    selection_authority = (
+        materialize_massive_adaptive_rl_fixed_control_selection_authority_v1(
+            root=tmp_path,
+            artifact_id="outer-fixed-selection",
+            candidates=candidates,
+            committed_at_ms=7,
+        )
+    )
+    assert selection_authority.runtime_selection is not None
+    fit_run = SimpleNamespace(
+        fixed_control_registry_receipt_sha256=(
+            build_massive_adaptive_rl_fixed_control_registry_v1().semantic_receipt_sha256
+        ),
+        chronology_authority_receipt_sha256=chronology.semantic_receipt_sha256,
+        training_origin_inventory_sha256=(chronology.rl_fit_origin_inventory_sha256),
+        training_forecast_authority_receipt_sha256=(
+            chronology.training_forecast_authority_receipt_sha256
+        ),
+        candidate_inventory_sha256=(
+            selection_authority.runtime_selection.candidate_inventory_sha256
+        ),
+        candidates=candidates,
+    )
+    fit_authority = SimpleNamespace(
+        validate=lambda: None,
+        runtime_fit_run=fit_run,
+        runtime_fit_replayed=True,
+        development_control_fit_authorized=False,
+        semantic_receipt_sha256=_digest("fixed-fit-authority"),
+    )
+    return fit_authority, selection_authority
 
 
 def _checkpoint_authority(environment):
@@ -244,7 +352,7 @@ def _distinct_consecutive_archive_environments():
     return tuple(environments)
 
 
-def test_prequential_ppo_carries_books_across_distinct_consecutive_archives() -> None:
+def test_forecast_refit_preserves_book_but_not_position_lock() -> None:
     first, second = _distinct_consecutive_archive_environments()
     dates = (
         first.inference_plan.rows[0].decision_session_date,
@@ -377,6 +485,100 @@ def test_prequential_ppo_carries_books_across_distinct_consecutive_archives() ->
     assert uninterrupted.transition_receipts == restarted.transition_receipts
 
 
+def test_fixed_controls_are_replayed_over_complete_continuous_fit_tape(
+    tmp_path,
+) -> None:
+    first, second = _distinct_consecutive_archive_environments()
+    dates = (
+        first.inference_plan.rows[0].decision_session_date,
+        second.inference_plan.rows[0].decision_session_date,
+    )
+    blocks = tuple(
+        SimpleNamespace(
+            block_index=index,
+            semantic_receipt_sha256=_digest(("fixed-fit-block", index)),
+            source_forecast_archive_receipt_sha256=(
+                environment.forecast_archive.semantic_receipt_sha256
+            ),
+            calibration_receipt_sha256=(
+                environment.calibration.semantic_receipt_sha256
+            ),
+            forecast_session_dates=(dates[index],),
+        )
+        for index, environment in enumerate((first, second))
+    )
+    authority_receipt = _digest("fixed-fit-training-authority")
+    training_authority = SimpleNamespace(
+        validate=lambda: None,
+        blocks=blocks,
+        block_inventory_sha256=_digest(
+            tuple(block.semantic_receipt_sha256 for block in blocks)
+        ),
+        origin_session_dates=dates,
+        semantic_receipt_sha256=authority_receipt,
+        reinforcement_learning_authorized=True,
+        source_data_qualified=True,
+        outer_fold_index=0,
+    )
+    chronology = SimpleNamespace(
+        validate=lambda: None,
+        semantic_receipt_sha256=_digest("fixed-fit-chronology"),
+        fold_index=0,
+        training_forecast_authority_receipt_sha256=authority_receipt,
+        rl_fit_origin_dates=dates,
+        rl_fit_origin_inventory_sha256=semantic_sha256(dates),
+        source_data_qualified=True,
+        development_rl_training_authorized=True,
+    )
+    environments = {
+        first.forecast_archive.semantic_receipt_sha256: first,
+        second.forecast_archive.semantic_receipt_sha256: second,
+    }
+    durable = materialize_massive_adaptive_rl_fixed_control_fit_authority_v1(
+        root=tmp_path,
+        artifact_id="complete-fixed-grid",
+        training_authority=training_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environments=environments,
+        committed_at_ms=20,
+    )
+    fit = durable.runtime_fit_run
+    assert fit is not None
+    assert durable.runtime_fit_replayed
+    assert len(fit.traces) == 6
+    assert len(fit.candidates) == 6
+    assert all(row.decision_session_dates == dates for row in fit.traces)
+    assert all(row.transition_receipts for row in fit.traces)
+    assert len(fit.continuity_authority_receipts) == 1
+    selection = materialize_massive_adaptive_rl_fixed_control_selection_from_fit_v1(
+        root=tmp_path,
+        artifact_id="complete-fixed-grid-selection",
+        fit_authority=durable,
+        committed_at_ms=21,
+    )
+    validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
+        registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
+        fit_authority=durable,
+        selection_authority=selection,
+        chronology_authority=chronology,  # type: ignore[arg-type]
+    )
+
+    generic = parse_massive_adaptive_rl_fixed_control_fit_authority_v1(
+        root=tmp_path,
+        loaded_source=durable.loaded_source,
+    )
+    assert generic.runtime_fit_run is None
+    assert not generic.development_control_fit_authorized
+    replayed = authorize_massive_adaptive_rl_fixed_control_fit_authority_v1(
+        root=tmp_path,
+        authority=generic,
+        training_authority=training_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environments=environments,
+    )
+    assert replayed.semantic_receipt_sha256 == durable.semantic_receipt_sha256
+
+
 def test_prequential_ppo_uses_every_block_and_resumes_across_boundary(
     tmp_path,
 ) -> None:
@@ -470,9 +672,9 @@ def test_checkpoint_drives_validation_actions_and_trace_replay(tmp_path) -> None
         evaluation_role="inner_validation",
     )
     assert len(evaluated.action_evidence) == len(environment.inference_plan.rows)
-    assert tuple(row.action_receipt_sha256 for row in evaluated.action_evidence) == tuple(
-        row.action_receipt_sha256 for row in evaluated.transitions
-    )
+    assert tuple(
+        row.action_receipt_sha256 for row in evaluated.action_evidence
+    ) == tuple(row.action_receipt_sha256 for row in evaluated.transitions)
 
     authority = materialize_massive_adaptive_rl_policy_trace_authority_v1(
         root=tmp_path,
@@ -509,12 +711,8 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 10.0
-        ),
-        high_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 40.0
-        ),
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
         fold_index=0,
         evaluation_role="inner_validation",
     )
@@ -525,13 +723,16 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         row.economic_step.frozen_targets_replayed
         for row in (*ladder.low_cost_transitions, *ladder.high_cost_transitions)
     )
-    assert len(
-        {
-            ladder.low_cost_trace.decision_target_inventory_sha256,
-            ladder.primary.policy_trace.decision_target_inventory_sha256,
-            ladder.high_cost_trace.decision_target_inventory_sha256,
-        }
-    ) == 1
+    assert (
+        len(
+            {
+                ladder.low_cost_trace.decision_target_inventory_sha256,
+                ladder.primary.policy_trace.decision_target_inventory_sha256,
+                ladder.high_cost_trace.decision_target_inventory_sha256,
+            }
+        )
+        == 1
+    )
 
     authority = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
         root=tmp_path,
@@ -539,12 +740,8 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 10.0
-        ),
-        high_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 40.0
-        ),
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
         fold_index=0,
         evaluation_role="inner_validation",
         committed_at_ms=2,
@@ -561,12 +758,8 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 10.0
-        ),
-        high_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 40.0
-        ),
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
     )
     assert reopened.cost_ladder_receipt_sha256 == ladder.semantic_receipt_sha256
 
@@ -636,8 +829,7 @@ def test_frozen_outer_actions_replay_from_attached_policy(tmp_path) -> None:
     assert authority.runtime_rollout_replayed
     assert authority.runtime_rollout is not None
     assert tuple(
-        row.action_receipt_sha256
-        for row in authority.runtime_rollout.action_evidence
+        row.action_receipt_sha256 for row in authority.runtime_rollout.action_evidence
     ) == tuple(
         row.action_receipt_sha256 for row in authority.runtime_rollout.transitions
     )
@@ -654,22 +846,69 @@ def test_frozen_outer_actions_replay_from_attached_policy(tmp_path) -> None:
         chronology_authority=chronology,  # type: ignore[arg-type]
         environment=environment,
     )
-    assert replayed.outer_rollout_receipt_sha256 == authority.outer_rollout_receipt_sha256
+    assert (
+        replayed.outer_rollout_receipt_sha256 == authority.outer_rollout_receipt_sha256
+    )
+
+    registry = build_massive_adaptive_rl_fixed_control_registry_v1()
+    fit_authority, selection_authority = _fixed_selection_fixture(
+        tmp_path,
+        environment,
+        chronology,
+    )
+    fixed_environment = _environment_at_cost(fixture, calibration_values, 20.0)
+    fixed_environment.inference_plan = environment.inference_plan
+    fixed_authority = (
+        materialize_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1(
+            root=tmp_path,
+            artifact_id="fit-selected-fixed-outer-rollout",
+            outer_plan=outer_plan,  # type: ignore[arg-type]
+            registry=registry,
+            fit_authority=fit_authority,  # type: ignore[arg-type]
+            selection_authority=selection_authority,
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            environment=fixed_environment,
+            committed_at_ms=8,
+        )
+    )
+    assert fixed_authority.runtime_rollout_replayed
+    assert fixed_authority.runtime_rollout is not None
+    assert fixed_authority.runtime_rollout.environment_source_inventory_sha256 == (
+        authority.runtime_rollout.environment_source_inventory_sha256
+    )
+    generic_fixed = parse_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1(
+        root=tmp_path,
+        loaded_source=fixed_authority.loaded_source,
+    )
+    reopened_fixed = (
+        authorize_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1(
+            root=tmp_path,
+            authority=generic_fixed,
+            outer_plan=outer_plan,  # type: ignore[arg-type]
+            registry=registry,
+            fit_authority=fit_authority,  # type: ignore[arg-type]
+            selection_authority=selection_authority,
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            environment=fixed_environment,
+        )
+    )
+    assert (
+        reopened_fixed.outer_rollout_receipt_sha256
+        == fixed_authority.outer_rollout_receipt_sha256
+    )
 
     low_environment = _environment_at_cost(fixture, calibration_values, 10.0)
     high_environment = _environment_at_cost(fixture, calibration_values, 40.0)
     low_environment.inference_plan = environment.inference_plan
     high_environment.inference_plan = environment.inference_plan
-    cost_authority = (
-        materialize_massive_adaptive_rl_outer_cost_ladder_authority_v1(
-            root=tmp_path,
-            artifact_id="frozen-outer-cost-ladder",
-            rollout_authority=authority,
-            primary_environment=environment,
-            low_cost_environment=low_environment,
-            high_cost_environment=high_environment,
-            committed_at_ms=3,
-        )
+    cost_authority = materialize_massive_adaptive_rl_outer_cost_ladder_authority_v1(
+        root=tmp_path,
+        artifact_id="frozen-outer-cost-ladder",
+        rollout_authority=authority,
+        primary_environment=environment,
+        low_cost_environment=low_environment,
+        high_cost_environment=high_environment,
+        committed_at_ms=3,
     )
     assert cost_authority.runtime_ladder_replayed
     assert cost_authority.runtime_ladder is not None
@@ -683,12 +922,8 @@ def test_frozen_outer_actions_replay_from_attached_policy(tmp_path) -> None:
         authority=generic_cost,
         rollout_authority=authority,
         primary_environment=environment,
-        low_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 10.0
-        ),
-        high_cost_environment=_environment_at_cost(
-            fixture, calibration_values, 40.0
-        ),
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
     )
     assert (
         reopened_cost.outer_cost_ladder_receipt_sha256
@@ -754,9 +989,7 @@ def test_rl_chronology_and_fixed_control_registry_fail_closed() -> None:
         ),  # type: ignore[arg-type]
     )
     assert rebound.outer_evaluation_authorized
-    assert rebound.outer_inference_plan_receipt_sha256 == _digest(
-        "reopened-outer-plan"
-    )
+    assert rebound.outer_inference_plan_receipt_sha256 == _digest("reopened-outer-plan")
     overlap = replace(
         chronology,
         rl_validation_origin_dates=chronology.rl_fit_origin_dates,
@@ -777,12 +1010,18 @@ def test_rl_chronology_and_fixed_control_registry_fail_closed() -> None:
         runtime_selection_replayed=True,
         runtime_candidates=(),
     )
+    incomplete_fit = SimpleNamespace(
+        validate=lambda: None,
+        runtime_fit_run=None,
+        runtime_fit_replayed=False,
+    )
     with pytest.raises(
         MassiveAdaptiveRLFixedControlRegistryV1Error,
         match="incomplete",
     ):
         validate_massive_adaptive_rl_fixed_control_registry_coverage_v1(
             registry=registry,
+            fit_authority=incomplete_fit,  # type: ignore[arg-type]
             selection_authority=incomplete,  # type: ignore[arg-type]
             chronology_authority=chronology,
         )
@@ -790,20 +1029,33 @@ def test_rl_chronology_and_fixed_control_registry_fail_closed() -> None:
 
 def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
     authenticated = []
+    rollout_authorities = []
+    fixed_authorities = []
     for index in range(4):
         cost_fold = _fold(index)
+        decision_dates = tuple(
+            f"2024-{index + 1:02d}-{day + 1:02d}" for day in range(126)
+        )
+        forecast_receipt = _digest(("outer-forecast", index))
+        plan_receipt = _digest(("outer-inference", index))
+        calibration_receipt = _digest(("outer-calibration", index))
+        environment_receipt = _digest(("outer-environment", index))
         rollout = SimpleNamespace(
             validate=lambda: None,
             fold_index=index,
-            frozen_policy_receipt_sha256=(
-                cost_fold.frozen_rl_policy_receipt_sha256
-            ),
+            frozen_policy_receipt_sha256=(cost_fold.frozen_rl_policy_receipt_sha256),
             policy_trace=SimpleNamespace(
-                semantic_receipt_sha256=cost_fold.primary_trace_receipt_sha256
+                semantic_receipt_sha256=cost_fold.primary_trace_receipt_sha256,
+                decision_session_dates=decision_dates,
+                forecast_archive_receipt_sha256=forecast_receipt,
+                inference_plan_receipt_sha256=plan_receipt,
+                calibration_receipt_sha256=calibration_receipt,
+                initial_capital=10_000_000.0,
             ),
             decision_target_inventory_sha256=(
                 cost_fold.decision_target_inventory_sha256
             ),
+            environment_source_inventory_sha256=environment_receipt,
             semantic_receipt_sha256=_digest(("rollout", index)),
         )
         authority = SimpleNamespace(
@@ -813,14 +1065,11 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
             outer_evaluation_authorized=False,
             semantic_receipt_sha256=_digest(("rollout-authority", index)),
         )
+        rollout_authorities.append(authority)
         cost_ladder = SimpleNamespace(
-            outer_rollout_authority_receipt_sha256=(
-                authority.semantic_receipt_sha256
-            ),
+            outer_rollout_authority_receipt_sha256=(authority.semantic_receipt_sha256),
             outer_rollout_receipt_sha256=rollout.semantic_receipt_sha256,
-            frozen_policy_receipt_sha256=(
-                cost_fold.frozen_rl_policy_receipt_sha256
-            ),
+            frozen_policy_receipt_sha256=(cost_fold.frozen_rl_policy_receipt_sha256),
             primary_trace=rollout.policy_trace,
             low_cost_trace=SimpleNamespace(
                 semantic_receipt_sha256=cost_fold.low_cost_trace_receipt_sha256
@@ -840,16 +1089,85 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
             outer_evaluation_authorized=False,
             semantic_receipt_sha256=_digest(("cost-authority", index)),
         )
-        authenticated.append(
-            build_massive_adaptive_authenticated_rl_outer_fold_v2(
-                cost_fold=cost_fold,
-                rollout_authority=authority,  # type: ignore[arg-type]
-                cost_ladder_authority=cost_authority,  # type: ignore[arg-type]
+        authenticated_fold = build_massive_adaptive_authenticated_rl_outer_fold_v2(
+            cost_fold=cost_fold,
+            rollout_authority=authority,  # type: ignore[arg-type]
+            cost_ladder_authority=cost_authority,  # type: ignore[arg-type]
+        )
+        authenticated.append(authenticated_fold)
+        fixed_rollout = SimpleNamespace(
+            fold_index=index,
+            outer_plan_receipt_sha256=cost_fold.outer_plan_receipt_sha256,
+            fixed_control_fit_authority_receipt_sha256=_digest(("fit", index)),
+            fixed_control_selection_authority_receipt_sha256=_digest(
+                ("fixed-selection", index)
+            ),
+            policy_trace=SimpleNamespace(
+                semantic_receipt_sha256=(
+                    cost_fold.best_fixed_control_trace_receipt_sha256
+                ),
+                evaluation_role="outer_test",
+                transaction_cost_basis_points=20.0,
+                frozen_targets_replayed=False,
+                decision_session_dates=decision_dates,
+                forecast_archive_receipt_sha256=forecast_receipt,
+                inference_plan_receipt_sha256=plan_receipt,
+                calibration_receipt_sha256=calibration_receipt,
+                initial_capital=10_000_000.0,
+            ),
+            environment_source_inventory_sha256=environment_receipt,
+            semantic_receipt_sha256=_digest(("fixed-rollout", index)),
+        )
+        fixed_authorities.append(
+            SimpleNamespace(
+                validate=lambda: None,
+                runtime_rollout=fixed_rollout,
+                runtime_rollout_replayed=True,
+                outer_evaluation_authorized=False,
+                environment_source_inventory_sha256=environment_receipt,
+                semantic_receipt_sha256=_digest(("fixed-authority", index)),
             )
         )
     evidence = build_massive_adaptive_rl_outer_evidence_v2(authenticated)
     assert evidence.evidence_v1.incremental_rl_log_return_lcb95 > 0.0
     assert not evidence.source_data_qualified
+
+    authenticated_v3 = tuple(
+        build_massive_adaptive_authenticated_rl_outer_fold_v3(
+            authenticated_fold_v2=fold,
+            ppo_outer_rollout_authority=rollout_authority,  # type: ignore[arg-type]
+            fixed_control_outer_authority=fixed_authority,  # type: ignore[arg-type]
+        )
+        for fold, rollout_authority, fixed_authority in zip(
+            authenticated,
+            rollout_authorities,
+            fixed_authorities,
+            strict=True,
+        )
+    )
+    evidence_v3 = build_massive_adaptive_rl_outer_evidence_v3(authenticated_v3)
+    assert evidence_v3.evidence_v2.semantic_receipt_sha256 == (
+        evidence.semantic_receipt_sha256
+    )
+    assert not evidence_v3.profitability_reporting_authorized
+
+    mismatched_rollout_values = vars(fixed_authorities[0].runtime_rollout).copy()
+    mismatched_rollout_values["environment_source_inventory_sha256"] = _digest(
+        "wrong-outer-environment"
+    )
+    mismatched_fixed = SimpleNamespace(
+        validate=lambda: None,
+        runtime_rollout=SimpleNamespace(**mismatched_rollout_values),
+        runtime_rollout_replayed=True,
+        outer_evaluation_authorized=False,
+        environment_source_inventory_sha256=_digest("wrong-outer-environment"),
+    )
+    with pytest.raises(MassiveAdaptiveRLOuterEvidenceV3Error, match="market context"):
+        build_massive_adaptive_authenticated_rl_outer_fold_v3(
+            authenticated_fold_v2=authenticated[0],
+            ppo_outer_rollout_authority=rollout_authorities[0],  # type: ignore[arg-type]
+            fixed_control_outer_authority=mismatched_fixed,  # type: ignore[arg-type]
+        )
 
     changed_rollout = replace(
         authenticated[0].cost_fold,

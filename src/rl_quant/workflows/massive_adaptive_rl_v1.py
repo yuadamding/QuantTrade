@@ -27,6 +27,10 @@ from rl_quant.data_sources.massive.source_receipts import canonical_json_file_by
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_fixed_control_evaluator_v1 import (
+    MassiveAdaptiveRLFixedControlEvaluationV1,
+    evaluate_massive_adaptive_rl_fixed_control_v1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_authority_v1 import (
     MassiveAdaptiveRLCostLadderAuthorityV1,
     materialize_massive_adaptive_rl_cost_ladder_authority_v1,
@@ -66,6 +70,14 @@ from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
     build_massive_adaptive_rl_fixed_control_registry_v1,
+)
+from rl_quant.training.massive_adaptive_rl_fixed_control_fit_runner_v1 import (
+    MassiveAdaptiveRLFixedControlFitAuthorityV1,
+    materialize_massive_adaptive_rl_fixed_control_fit_authority_v1,
+    materialize_massive_adaptive_rl_fixed_control_selection_from_fit_v1,
+)
+from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
+    MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
 )
 from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityV1,
@@ -122,9 +134,7 @@ def _digest(name: str, value: object) -> str:
         or len(value) != 64
         or any(character not in "0123456789abcdef" for character in value)
     ):
-        raise MassiveAdaptiveRLWorkflowV1Error(
-            f"{name} must be a lowercase SHA-256"
-        )
+        raise MassiveAdaptiveRLWorkflowV1Error(f"{name} must be a lowercase SHA-256")
     return value
 
 
@@ -236,14 +246,12 @@ class MassiveAdaptiveRLExperimentManifestV1:
             or self.outer_gate_names != MASSIVE_ADAPTIVE_RL_OUTER_GATE_NAMES_V1
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.workflow_specification_sha256
             != MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256
             or self.workflow_implementation_source_sha256
             != MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLWorkflowV1Error(
                 "adaptive RL experiment manifest differs"
@@ -270,9 +278,7 @@ def build_massive_adaptive_rl_experiment_manifest_v1(
     seeds: tuple[int, ...] = (17,),
     ppo_config: MassiveAdaptivePPOConfigV1 | None = None,
 ) -> MassiveAdaptiveRLExperimentManifestV1:
-    config = ppo_config or MassiveAdaptivePPOConfigV1(
-        seed=seeds[0] if seeds else 0
-    )
+    config = ppo_config or MassiveAdaptivePPOConfigV1(seed=seeds[0] if seeds else 0)
     registry = build_massive_adaptive_rl_fixed_control_registry_v1()
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V1_SCHEMA,
@@ -313,9 +319,7 @@ def build_massive_adaptive_rl_experiment_manifest_v1(
     result = MassiveAdaptiveRLExperimentManifestV1(
         **{
             **body,
-            "semantic_receipt_sha256": semantic_sha256(
-                provisional.semantic_unsigned()
-            ),
+            "semantic_receipt_sha256": semantic_sha256(provisional.semantic_unsigned()),
         }  # type: ignore[arg-type]
     )
     result.validate()
@@ -371,6 +375,8 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
     seed: int
     training_forecast_authority_receipt_sha256: str
     chronology_authority_receipt_sha256: str
+    fixed_control_fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1
+    fixed_control_selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1
     training_run: MassiveAdaptivePPOTrainingRunV1
     runner_checkpoint_authorities: tuple[
         MassiveAdaptivePrequentialPPOCheckpointAuthorityV1, ...
@@ -403,6 +409,12 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
             "chronology_authority_receipt_sha256": (
                 self.chronology_authority_receipt_sha256
             ),
+            "fixed_control_fit_authority_receipt_sha256": (
+                self.fixed_control_fit_authority.semantic_receipt_sha256
+            ),
+            "fixed_control_selection_authority_receipt_sha256": (
+                self.fixed_control_selection_authority.semantic_receipt_sha256
+            ),
             "training_run_receipt_sha256": self.training_run.semantic_receipt_sha256,
             "candidate_update_indices": self.candidate_update_indices,
             "runner_checkpoint_inventory_sha256": (
@@ -420,6 +432,8 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
         }
 
     def validate(self) -> None:
+        self.fixed_control_fit_authority.validate()
+        self.fixed_control_selection_authority.validate()
         self.training_run.validate()
         for runner_authority in self.runner_checkpoint_authorities:
             runner_authority.validate()
@@ -466,16 +480,23 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
             != self.training_forecast_authority_receipt_sha256
             or self.training_run.rl_chronology_authority_receipt_sha256
             != self.chronology_authority_receipt_sha256
+            or self.fixed_control_fit_authority.training_forecast_authority_receipt_sha256
+            != self.training_forecast_authority_receipt_sha256
+            or self.fixed_control_fit_authority.chronology_authority_receipt_sha256
+            != self.chronology_authority_receipt_sha256
+            or not self.fixed_control_fit_authority.runtime_fit_replayed
+            or not self.fixed_control_selection_authority.runtime_selection_replayed
+            or self.fixed_control_selection_authority.runtime_selection is None
+            or self.fixed_control_selection_authority.runtime_selection.candidate_inventory_sha256
+            != self.fixed_control_fit_authority.candidate_inventory_sha256
             or self.training_run.update_count != self.candidate_update_indices[-1]
             or self.development_rl_training_authorized != expected
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256 != MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLWorkflowV1Error(
                 "adaptive RL training workflow differs"
@@ -490,6 +511,7 @@ class MassiveAdaptiveRLValidationWorkflowV1:
     fold_index: int
     checkpoint_authority_receipts: tuple[str, ...]
     validation_context_receipt_sha256: str
+    fixed_control_evaluation: MassiveAdaptiveRLFixedControlEvaluationV1
     policy_trace_authorities: tuple[MassiveAdaptiveRLPolicyTraceAuthorityV1, ...]
     cost_ladder_authorities: tuple[MassiveAdaptiveRLCostLadderAuthorityV1, ...]
     policy_trace_authority_inventory_sha256: str
@@ -510,13 +532,14 @@ class MassiveAdaptiveRLValidationWorkflowV1:
             "experiment_manifest_receipt_sha256": (
                 self.experiment_manifest_receipt_sha256
             ),
-            "training_workflow_receipt_sha256": (
-                self.training_workflow_receipt_sha256
-            ),
+            "training_workflow_receipt_sha256": (self.training_workflow_receipt_sha256),
             "fold_index": self.fold_index,
             "checkpoint_authority_receipts": self.checkpoint_authority_receipts,
             "validation_context_receipt_sha256": (
                 self.validation_context_receipt_sha256
+            ),
+            "fixed_control_evaluation_receipt_sha256": (
+                self.fixed_control_evaluation.semantic_receipt_sha256
             ),
             "policy_trace_authority_inventory_sha256": (
                 self.policy_trace_authority_inventory_sha256
@@ -533,6 +556,7 @@ class MassiveAdaptiveRLValidationWorkflowV1:
         }
 
     def validate(self) -> None:
+        self.fixed_control_evaluation.validate()
         for trace_authority in self.policy_trace_authorities:
             trace_authority.validate()
         for ladder_authority in self.cost_ladder_authorities:
@@ -570,34 +594,32 @@ class MassiveAdaptiveRLValidationWorkflowV1:
                 or row.fold_index != self.fold_index
                 for row in self.cost_ladder_authorities
             )
+            or self.fixed_control_evaluation.fold_index != self.fold_index
+            or self.fixed_control_evaluation.validation_context_receipt_sha256
+            != self.validation_context_receipt_sha256
             or tuple(
-                row.policy_trace_receipt_sha256
-                for row in self.policy_trace_authorities
+                row.policy_trace_receipt_sha256 for row in self.policy_trace_authorities
             )
             != tuple(
-                row.primary_trace_receipt_sha256
-                for row in self.cost_ladder_authorities
+                row.primary_trace_receipt_sha256 for row in self.cost_ladder_authorities
             )
             or self.policy_trace_authority_inventory_sha256
             != semantic_sha256(
                 tuple(
-                    row.semantic_receipt_sha256
-                    for row in self.policy_trace_authorities
+                    row.semantic_receipt_sha256 for row in self.policy_trace_authorities
                 )
             )
             or self.cost_ladder_authority_inventory_sha256
             != semantic_sha256(
                 tuple(
-                    row.semantic_receipt_sha256
-                    for row in self.cost_ladder_authorities
+                    row.semantic_receipt_sha256 for row in self.cost_ladder_authorities
                 )
             )
             or self.development_policy_evaluation_authorized != expected
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLWorkflowV1Error(
                 "adaptive RL validation workflow differs"
@@ -684,10 +706,42 @@ def run_massive_adaptive_rl_training_workflow_v1(
         raise MassiveAdaptiveRLWorkflowV1Error(
             "registered candidate update was not reached exactly once"
         )
+    registry = build_massive_adaptive_rl_fixed_control_registry_v1()
+    fixed_control_fit_authority = (
+        materialize_massive_adaptive_rl_fixed_control_fit_authority_v1(
+            root=artifact_root,
+            artifact_id=(
+                f"{manifest.experiment_id}-fold{fold_index}-seed{seed}-fixed-fit"
+            ),
+            training_authority=training_authority,
+            chronology_authority=chronology_authority,
+            environments=environments,
+            committed_at_ms=committed_at_ms + observed_updates[-1] * 2 + 2,
+            registry=registry,
+        )
+    )
+    fixed_control_selection_authority = (
+        materialize_massive_adaptive_rl_fixed_control_selection_from_fit_v1(
+            root=artifact_root,
+            artifact_id=(
+                f"{manifest.experiment_id}-fold{fold_index}-seed{seed}-fixed-selection"
+            ),
+            fit_authority=fixed_control_fit_authority,
+            committed_at_ms=committed_at_ms + observed_updates[-1] * 2 + 3,
+        )
+    )
     source_qualified = bool(
         training_run.development_rl_training_authorized
-        and all(authority.development_rl_training_authorized for authority in runner_authorities)
-        and all(authority.development_rl_training_authorized for authority in policy_authorities)
+        and all(
+            authority.development_rl_training_authorized
+            for authority in runner_authorities
+        )
+        and all(
+            authority.development_rl_training_authorized
+            for authority in policy_authorities
+        )
+        and fixed_control_fit_authority.development_control_fit_authorized
+        and fixed_control_selection_authority.development_control_selection_authorized
     )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_TRAINING_WORKFLOW_V1_SCHEMA,
@@ -700,6 +754,8 @@ def run_massive_adaptive_rl_training_workflow_v1(
         "chronology_authority_receipt_sha256": (
             chronology_authority.semantic_receipt_sha256
         ),
+        "fixed_control_fit_authority": fixed_control_fit_authority,
+        "fixed_control_selection_authority": fixed_control_selection_authority,
         "training_run": training_run,
         "runner_checkpoint_authorities": tuple(runner_authorities),
         "policy_checkpoint_authorities": tuple(policy_authorities),
@@ -725,9 +781,7 @@ def run_massive_adaptive_rl_training_workflow_v1(
     result = MassiveAdaptiveRLTrainingWorkflowV1(
         **{
             **body,
-            "semantic_receipt_sha256": semantic_sha256(
-                provisional.semantic_unsigned()
-            ),
+            "semantic_receipt_sha256": semantic_sha256(provisional.semantic_unsigned()),
             "development_rl_training_authorized": source_qualified,
         }  # type: ignore[arg-type]
     )
@@ -748,6 +802,7 @@ def run_massive_adaptive_rl_validation_workflow_v1(
             MassiveAdaptiveProfitabilityEnvV1,
         ],
     ],
+    fixed_control_environment: MassiveAdaptiveProfitabilityEnvV1,
     artifact_root: str | Path,
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLValidationWorkflowV1:
@@ -793,14 +848,11 @@ def run_massive_adaptive_rl_validation_workflow_v1(
                 "adaptive RL candidates do not share one validation context"
             )
         if (
-            tuple(
-                row.transaction_cost_basis_points for row in (low, primary, high)
-            )
+            tuple(row.transaction_cost_basis_points for row in (low, primary, high))
             != manifest.cost_ladder_basis_points
             or primary.initial_capital != manifest.primary_capital
             or any(
-                row.maximum_fill_participation
-                != manifest.maximum_fill_participation
+                row.maximum_fill_participation != manifest.maximum_fill_participation
                 for row in (low, primary, high)
             )
         ):
@@ -839,15 +891,30 @@ def run_massive_adaptive_rl_validation_workflow_v1(
             )
         traces.append(trace)
         ladders.append(ladder)
-    source_qualified = bool(
-        training_workflow.development_rl_training_authorized
-        and all(row.development_policy_evaluation_authorized for row in traces)
-        and all(row.development_policy_selection_authorized for row in ladders)
-    )
     if shared_validation_context is None:
         raise MassiveAdaptiveRLWorkflowV1Error(
             "adaptive RL validation context is absent"
         )
+    fixed_control_evaluation = evaluate_massive_adaptive_rl_fixed_control_v1(
+        registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
+        fit_authority=training_workflow.fixed_control_fit_authority,
+        selection_authority=training_workflow.fixed_control_selection_authority,
+        chronology_authority=chronology_authority,
+        environment=fixed_control_environment,
+    )
+    if (
+        fixed_control_evaluation.validation_context_receipt_sha256
+        != shared_validation_context
+    ):
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL fixed control does not share the validation context"
+        )
+    source_qualified = bool(
+        training_workflow.development_rl_training_authorized
+        and all(row.development_policy_evaluation_authorized for row in traces)
+        and all(row.development_policy_selection_authorized for row in ladders)
+        and fixed_control_evaluation.development_policy_selection_authorized
+    )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_VALIDATION_WORKFLOW_V1_SCHEMA,
         "experiment_manifest_receipt_sha256": manifest.semantic_receipt_sha256,
@@ -858,6 +925,7 @@ def run_massive_adaptive_rl_validation_workflow_v1(
             for row in training_workflow.policy_checkpoint_authorities
         ),
         "validation_context_receipt_sha256": shared_validation_context,
+        "fixed_control_evaluation": fixed_control_evaluation,
         "policy_trace_authorities": tuple(traces),
         "cost_ladder_authorities": tuple(ladders),
         "policy_trace_authority_inventory_sha256": semantic_sha256(
@@ -881,9 +949,7 @@ def run_massive_adaptive_rl_validation_workflow_v1(
     result = MassiveAdaptiveRLValidationWorkflowV1(
         **{
             **body,
-            "semantic_receipt_sha256": semantic_sha256(
-                provisional.semantic_unsigned()
-            ),
+            "semantic_receipt_sha256": semantic_sha256(provisional.semantic_unsigned()),
             "development_policy_evaluation_authorized": source_qualified,
         }  # type: ignore[arg-type]
     )

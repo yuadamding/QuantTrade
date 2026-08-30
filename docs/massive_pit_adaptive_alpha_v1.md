@@ -32,12 +32,23 @@ No bucket is primary. Each produces a mean residual return, q10, median, q90,
 predictive scale, and positive-return probability. Training-only robust scales
 give every bucket equal scientific weight.
 
-## No-duration rule
+## Endogenous holding duration
 
-The adaptive generation contains no minimum or preferred duration, position-age
-input, persistence coefficient, young-sale penalty, fixed exit hazard, duration
-reward, duration checkpoint score, or duration promotion gate. Position age may
-be computed only after execution as descriptive telemetry.
+> **Endogenous holding duration.** The adaptive RL system has no mandatory,
+> preferred, minimum, maximum, or rewarded holding period. At every decision
+> date, all positions are reconsidered using current causal forecasts,
+> uncertainty, portfolio risk, liquidity, trading costs, and alternative
+> investment opportunities. A position persists only while retaining it remains
+> economically optimal. Realized holding duration is an output of the learned
+> policy and deterministic feasibility compiler, not an input constraint or
+> evaluation target.
+
+The adaptive generation therefore contains no entry clock, persistence
+coefficient, young-sale penalty, fixed exit schedule, duration reward,
+duration checkpoint score, or duration promotion gate. Post-experiment
+duration diagnostics may describe behavior, but they cannot affect training,
+checkpoint or seed selection, policy freezing, outer pass/fail, or
+profitability authorization.
 
 The package enforces both a configuration-key firewall and an AST import
 firewall. New adaptive modules cannot import historical Hold-30 or age-aware
@@ -292,11 +303,12 @@ lockbox access, or RL.
 
 The adaptive RL-facing surface is a bounded compiler-control action. Seven
 controls rescale the forecast buckets, uncertainty and portfolio-risk controls
-are bidirectional within frozen ranges, and a one-sided control can only
-tighten the discretionary-turnover ceiling. Security, issuer, tracking-error,
-active-beta, and ADV limits cannot be loosened, and the controller never emits
-security weights. The unique zero action returns the original compiler inputs
-and configuration unchanged.
+are bidirectional within frozen ranges, and a bidirectional trade-cost control
+scales only the compiler's soft entry, exit, and replacement hurdles from 0.5
+to 2.0 times their source-derived values. The hard turnover ceiling is never
+changed. Security, issuer, tracking-error, active-beta, and ADV limits cannot
+be loosened, and the controller never emits security weights. The unique zero
+action returns the original compiler inputs and configuration unchanged.
 
 The corrected engineering path adds checkpoint/fold-bound calibration,
 all-cash initialization, one shared buy-and-drift benchmark authority,
@@ -316,13 +328,13 @@ liquidity inputs, current books, recent realized economics, and the previous
 bounded action. True episode termination includes a conservative liquidation
 adjustment; a rollout boundary preserves the exact books and chronology.
 
-The first PPO canary uses separate two-layer actor and critic networks. Nine
-controls use transformed-Normal distributions and the turnover-tightening
-control uses a Beta distribution, so no post-sampling clip invalidates the PPO
-log probability. The trainer implements GAE, clipped actor and value losses,
-and update-boundary checkpoints containing model, optimizer, RNG, economic
-environment, and chronology state. A split-run regression reproduces the next
-actions, transitions, losses, model tensors, and checkpoint receipt exactly.
+The first PPO canary uses separate two-layer actor and critic networks. All ten
+controls use transformed-Normal distributions over the open interval from -1
+to 1, so no post-sampling clip invalidates the PPO log probability. The trainer
+implements GAE, clipped actor and value losses, and update-boundary checkpoints
+containing model, optimizer, RNG, economic environment, and chronology state.
+A split-run regression reproduces the next actions, transitions, losses, model
+tensors, and checkpoint receipt exactly.
 The create-only durable checkpoint authority publishes only safe tensor and
 primitive state, strips runtime state on a generic reload, and restores the
 actor, critic, both optimizers, every RNG, all three books, and the chronology
@@ -339,8 +351,10 @@ withhold RL-training authority.
 
 `MassiveAdaptivePrequentialPPORunnerV1` consumes that complete block inventory
 in its committed order. It carries actor, critic, optimizer, and RNG state
-across every block; economic books carry only across consecutive slices of one
-source chronology and otherwise restart from the registered cash state. Its
+across every block. Distinct forecast archives and calibrations may replace the
+model state at a source-authorized refit boundary while the strategy, neutral,
+and benchmark books remain continuous; only nonconsecutive economic episodes
+restart from the registered cash state. Its
 durable checkpoint binds the current block, within-block cursor,
 completed-block inventory, calibration, environment source inventory,
 transition inventory, and nested PPO checkpoint. Generic reopening strips
@@ -372,7 +386,11 @@ nonauthorizing by itself.
 FC00--FC05 are the immutable constant-action fitting grid. FC06 is not a
 caller-supplied extra action: it is the package-derived winner of that complete
 grid on the RL-fit chronology only. The selection binds one common fit-origin
-inventory and economic context across every grid member. A package-owned FC06
+inventory and economic context across every grid member. A create-only fit
+authority executes every registered action over the complete prequential tape,
+carries all three books through forecast refits, and promotes only after
+rerunning every transition. FC06 selection consumes only those replayed
+candidates. A package-owned FC06
 evaluator resolves the selected action from the sealed grid and generates its
 inner-validation transitions itself; the registry-aware PPO-candidate builder
 does not accept an independently assembled fixed-control trace. The previously
@@ -383,10 +401,13 @@ comparator.
 `run_massive_adaptive_rl_training_workflow_v1()` owns every authorized block
 and publishes each scheduled update twice from the same state: an exact
 prequential-runner resume authority and the policy-checkpoint authority used
-by deterministic evaluation. `run_massive_adaptive_rl_validation_workflow_v1()`
-then reloads every registered policy candidate, regenerates its primary
-actions, and publishes exact frozen-target 10/40-bp stresses. Neither workflow
-accepts caller actions, transitions, returns, or P&L arrays.
+by deterministic evaluation. The same training workflow executes FC00--FC05
+over that complete fit tape and publishes the replayed FC06 selection.
+`run_massive_adaptive_rl_validation_workflow_v1()` then reloads every
+registered policy candidate, regenerates its primary actions, publishes exact
+frozen-target 10/40-bp stresses, and regenerates FC06 on the identical shared
+validation context. Neither workflow accepts caller actions, transitions,
+returns, or P&L arrays.
 
 There is intentionally no historical `run` subcommand yet. The repository
 still lacks one persisted composite loader that can reopen the complete live
@@ -453,20 +474,36 @@ outer action, and reproduces its economic trace. A second authority replays
 the primary rollout's target weights at 10 and 40 bp without reevaluating the
 policy or compiler. Checkpoint-authenticated outer evidence accepts a fold
 only when both the frozen-policy rollout authority and frozen-target cost
-ladder authority match its policy, traces, and target inventory.
+ladder authority match its policy, traces, and target inventory. The selected
+FC06 comparator has a separate create-only outer authority: it reopens the
+fit and selection authorities, recovers the registered constant action, and
+reruns it on the same sealed outer environment. V3 evidence admits the
+PPO-minus-FC06 contrast only when both outer authorities share the exact
+environment source inventory, chronology, forecast, calibration, and capital.
 
 Every position is reconsidered from its current net economics at every
 decision. The canonical adaptive observation, action, reward, compiler,
 environment, and checkpoint-selection surfaces contain no entry-clock state,
 release schedule, persistence incentive, or selection threshold based on time
-in the book. A planted reversal exits after one session, while a persistent
-positive forecast retains a position for more than 30 sessions with no special
-reward. Time in the book is permitted only as retrospective reporting.
+in the book. Forecast-model refits preserve the economic books because a refit
+is not a market event, but they confer no requirement that any position remain.
 
-This closes the minimum package-owned engineering path from causal
+Trade-cost control is strictly an economic replacement-hurdle control. It may
+make economically justified trading more or less aggressive by scaling soft
+cost estimates, while the registered hard turnover and liquidity limits remain
+fixed. It is tuned against realized net profitability and may never be
+calibrated, described, or reported as a proxy for a target holding interval.
+Likewise, the seven forecast horizons describe return information available to
+the optimizer; they do not define or schedule how long a resulting position
+should remain in the portfolio.
+
+This closes the minimum package-owned library path from causal
 prequential forecasts through bounded PPO, exact durable resume,
 inner-validation policy selection, a frozen fold-bound policy, and paired
-four-fold outer evidence. It does **not** manufacture historical authority:
+four-fold outer evidence. The remaining experiment-level boundary is one
+persisted source loader and state machine that owns all four folds without
+accepting selected identifiers, actions, transitions, or statistics from an
+external driver. It does **not** manufacture historical authority:
 the synthetic canaries remain nonauthorizing, final reporting stays false,
 and a real run still requires acquired payloads, partitions, features,
 targets, source-qualified prequential blocks, and replayed fold authorities.

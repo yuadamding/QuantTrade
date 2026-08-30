@@ -42,8 +42,9 @@ MASSIVE_ADAPTIVE_RL_CHECKPOINT_V1_SCHEMA = (
 )
 MASSIVE_ADAPTIVE_RL_ACTION_SPECIFICATION_V1_SHA256 = semantic_sha256(
     {
-        "bidirectional": "nine-tanh-normal-controls",
-        "turnover": "one-beta-control",
+        "bidirectional": "ten-tanh-normal-controls",
+        "trade_cost": "soft-cost-hurdle-only",
+        "hard_turnover_limit_control": False,
         "hard_constraints": "compiler-owned",
     }
 )
@@ -377,8 +378,6 @@ class MassiveAdaptivePPOTrainerV1:
             *self.model.actor.parameters(),
             *self.model.actor_mean.parameters(),
             self.model.actor_log_std,
-            *self.model.turnover_alpha.parameters(),
-            *self.model.turnover_beta.parameters(),
         ]
         critic_parameters = [
             *self.model.critic.parameters(),
@@ -445,7 +444,7 @@ class MassiveAdaptivePPOTrainerV1:
                 bucket_controls=tuple(float(value) for value in action_values[:7]),
                 uncertainty_control=float(action_values[7]),
                 risk_control=float(action_values[8]),
-                turnover_control=float(action_values[9]),
+                trade_cost_control=float(action_values[9]),
             )
             next_observation, reward, terminated, truncated, info = (
                 self.environment.step(

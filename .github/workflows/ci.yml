@@ -77,10 +77,13 @@ jobs:
           python -m mypy
           src/rl_quant/evaluation/massive_adaptive_profitability_env_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_evaluator_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_rollout_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v3.py
           src/rl_quant/training/massive_adaptive_ppo_v1.py
           src/rl_quant/training/massive_adaptive_economic_continuity_authority_v1.py
           src/rl_quant/training/massive_adaptive_prequential_ppo_runner_v1.py
           src/rl_quant/training/massive_adaptive_prequential_ppo_checkpoint_authority_v1.py
           src/rl_quant/training/massive_adaptive_rl_fixed_control_selection_v1.py
           src/rl_quant/training/massive_adaptive_rl_fixed_control_registry_v1.py
+          src/rl_quant/training/massive_adaptive_rl_fixed_control_fit_runner_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_v1.py
