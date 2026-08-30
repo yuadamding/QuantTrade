@@ -22,6 +22,9 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v2 import (
 from rl_quant.evaluation.massive_adaptive_rl_outer_rollout_v1 import (
     MassiveAdaptiveRLOuterRolloutAuthorityV1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v2 import (
+    MassiveAdaptiveRLOuterPlanV2,
+)
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
@@ -40,6 +43,7 @@ MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_V3_SPEC_SHA256 = semantic_sha256(
     {
         "ppo_primary_and_stress": "authenticated-outer-fold-v2",
         "fixed_control": "fit-selection-authenticated-FC06-outer-rollout-v1",
+        "outer_plan": "comparator-frozen-before-outer-access-v2",
         "market_context": "same-environment-source-inventory-and-dates",
         "caller_fixed_trace": False,
         "profitability_reporting": False,
@@ -68,6 +72,7 @@ def _digest(name: str, value: object) -> str:
 class MassiveAdaptiveAuthenticatedRLOuterFoldV3:
     fold_index: int
     authenticated_fold_v2: MassiveAdaptiveAuthenticatedRLOuterFoldV2
+    outer_plan_v2_receipt_sha256: str
     fixed_control_outer_authority_receipt_sha256: str
     fixed_control_outer_rollout_receipt_sha256: str
     fixed_control_fit_authority_receipt_sha256: str
@@ -87,6 +92,7 @@ class MassiveAdaptiveAuthenticatedRLOuterFoldV3:
             "authenticated_fold_v2_receipt_sha256": (
                 self.authenticated_fold_v2.semantic_receipt_sha256
             ),
+            "outer_plan_v2_receipt_sha256": self.outer_plan_v2_receipt_sha256,
             "fixed_control_outer_authority_receipt_sha256": (
                 self.fixed_control_outer_authority_receipt_sha256
             ),
@@ -130,6 +136,7 @@ class MassiveAdaptiveAuthenticatedRLOuterFoldV3:
                 "fixed-control-authenticated outer fold differs"
             )
         for value in (
+            self.outer_plan_v2_receipt_sha256,
             self.fixed_control_outer_authority_receipt_sha256,
             self.fixed_control_outer_rollout_receipt_sha256,
             self.fixed_control_fit_authority_receipt_sha256,
@@ -145,6 +152,7 @@ class MassiveAdaptiveAuthenticatedRLOuterFoldV3:
 def build_massive_adaptive_authenticated_rl_outer_fold_v3(
     *,
     authenticated_fold_v2: MassiveAdaptiveAuthenticatedRLOuterFoldV2,
+    outer_plan_v2: MassiveAdaptiveRLOuterPlanV2,
     ppo_outer_rollout_authority: MassiveAdaptiveRLOuterRolloutAuthorityV1,
     fixed_control_outer_authority: (
         MassiveAdaptiveRLFixedControlOuterRolloutAuthorityV1
@@ -153,6 +161,7 @@ def build_massive_adaptive_authenticated_rl_outer_fold_v3(
     """Bind one V2 PPO fold to its replayed fit-selected FC06 comparator."""
 
     authenticated_fold_v2.validate()
+    outer_plan_v2.validate()
     ppo_outer_rollout_authority.validate()
     fixed_control_outer_authority.validate()
     ppo_rollout = ppo_outer_rollout_authority.runtime_rollout
@@ -165,6 +174,9 @@ def build_massive_adaptive_authenticated_rl_outer_fold_v3(
         != authenticated_fold_v2.outer_rollout_authority_receipt_sha256
         or ppo_rollout.semantic_receipt_sha256
         != authenticated_fold_v2.outer_rollout_receipt_sha256
+        or outer_plan_v2.outer_plan_v1.semantic_receipt_sha256
+        != cost_fold.outer_plan_receipt_sha256
+        or outer_plan_v2.fold_index != authenticated_fold_v2.fold_index
         or fixed_rollout is None
         or not fixed_control_outer_authority.runtime_rollout_replayed
         or fixed_rollout.fold_index != authenticated_fold_v2.fold_index
@@ -175,6 +187,14 @@ def build_massive_adaptive_authenticated_rl_outer_fold_v3(
         or fixed_rollout.policy_trace.evaluation_role != "outer_test"
         or fixed_rollout.policy_trace.transaction_cost_basis_points != 20.0
         or fixed_rollout.policy_trace.frozen_targets_replayed
+        or fixed_rollout.fixed_control_fit_authority_receipt_sha256
+        != outer_plan_v2.fixed_control_fit_authority_receipt_sha256
+        or fixed_rollout.fixed_control_selection_authority_receipt_sha256
+        != outer_plan_v2.fixed_control_selection_authority_receipt_sha256
+        or fixed_rollout.selected_control_id
+        != outer_plan_v2.selected_fixed_control_id
+        or fixed_rollout.selected_action_receipt_sha256
+        != outer_plan_v2.selected_fixed_action_receipt_sha256
     ):
         raise MassiveAdaptiveRLOuterEvidenceV3Error(
             "outer fixed-control trace is not derived from its fit selection"
@@ -200,6 +220,7 @@ def build_massive_adaptive_authenticated_rl_outer_fold_v3(
         "schema": MASSIVE_ADAPTIVE_AUTHENTICATED_RL_OUTER_FOLD_V3_SCHEMA,
         "fold_index": authenticated_fold_v2.fold_index,
         "authenticated_fold_v2": authenticated_fold_v2,
+        "outer_plan_v2_receipt_sha256": outer_plan_v2.semantic_receipt_sha256,
         "fixed_control_outer_authority_receipt_sha256": (
             fixed_control_outer_authority.semantic_receipt_sha256
         ),

@@ -43,7 +43,7 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_EVALUATION_V1_SOURCE_SHA256 = file_sha256(
 )
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_EVALUATION_V1_SPEC_SHA256 = semantic_sha256(
     {
-        "controller": "FC06-fit-selected-FC00-through-FC05-constant",
+        "controller": "FC06-fit-selected-symmetric-grid-constant",
         "fit_role": "rl-fit-only",
         "evaluation_role": "inner-validation",
         "action_generation": "same-selected-bounded-action-every-decision",

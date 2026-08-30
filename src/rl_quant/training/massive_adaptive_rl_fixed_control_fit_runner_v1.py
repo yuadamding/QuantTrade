@@ -1,4 +1,4 @@
-"""Package-owned prequential fitting of the FC00--FC05 controls.
+"""Package-owned prequential fitting of the protocol constant-control grid.
 
 Every registered constant control traverses the same causal forecast blocks,
 with the same source-derived execution tape and the same cross-refit economic
@@ -77,7 +77,7 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_FIT_AUTHORITY_V1_DATASET = (
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_FIT_RUN_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_FIT_RUN_V1_SPEC_SHA256 = semantic_sha256(
     {
-        "controls": "complete-protocol-owned-FC00-through-FC05-grid",
+        "controls": "complete-protocol-owned-symmetric-constant-grid",
         "chronology": "all-RL-fit-prequential-blocks-in-authorized-order",
         "economics": "continuous-three-book-source-derived-transitions",
         "forecast_refits": "authorized-state-carry-without-liquidation",

@@ -54,7 +54,7 @@ def test_adaptive_rl_manifest_is_canonical_create_only_and_duration_free(
     manifest = build_massive_adaptive_rl_experiment_manifest_v1(
         experiment_id="adaptive-rl-canary",
         candidate_update_indices=(1, 2),
-        seeds=(17, 23),
+        seeds=(17,),
         ppo_config=_config(),
     )
     path = tmp_path / "manifest.json"
@@ -64,7 +64,8 @@ def test_adaptive_rl_manifest_is_canonical_create_only_and_duration_free(
     assert reopened == manifest
     assert not reopened.profitability_reporting_authorized
     assert not reopened.lockbox_access_authorized
-    assert reopened.seeds == (17, 23)
+    assert reopened.seeds == (17,)
+    assert reopened.seed_policy == "canonical-fixed-seed-v1"
     forbidden = ("hold30", "position_age", "duration", "scheduled_exit")
     payload = repr(asdict(reopened)).lower()
     assert not any(value in payload for value in forbidden)
@@ -85,6 +86,13 @@ def test_adaptive_rl_manifest_is_canonical_create_only_and_duration_free(
     )
     with pytest.raises(MassiveAdaptiveRLWorkflowV1Error, match="manifest differs"):
         changed.validate()
+
+    with pytest.raises(MassiveAdaptiveRLWorkflowV1Error, match="manifest differs"):
+        build_massive_adaptive_rl_experiment_manifest_v1(
+            experiment_id="adaptive-rl-multiple-seeds",
+            seeds=(17, 23),
+            ppo_config=_config(),
+        )
 
 
 def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> None:

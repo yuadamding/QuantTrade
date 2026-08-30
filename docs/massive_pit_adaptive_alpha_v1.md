@@ -377,15 +377,17 @@ quanttrade-adaptive-rl validate \
 ```
 
 The manifest freezes the four folds, causal block size, candidate-update
-schedule, seeds, PPO configuration, $10 million capital, 10/20/40-bp ladder,
-two-percent participation limit, complete FC00--FC06 comparator inventory,
+schedule, one canonical seed, PPO configuration, $10 million capital,
+10/20/40-bp ladder, two-percent participation limit, the complete registered
+constant comparator inventory and fit-selected FC06,
 observation/action/reward identities, all-cash initialization, shared
 benchmark, drawdown cap, and outer gates. It contains no outcomes and is
 nonauthorizing by itself.
 
-FC00--FC05 are the immutable constant-action fitting grid. FC06 is not a
-caller-supplied extra action: it is the package-derived winner of that complete
-grid on the RL-fit chronology only. The selection binds one common fit-origin
+FC00--FC05 and FC07--FC12 are the immutable symmetric constant-action fitting
+grid. FC06 is not a caller-supplied extra action: it is the package-derived
+winner of that complete grid on the RL-fit chronology only. The selection
+binds one common fit-origin
 inventory and economic context across every grid member. A create-only fit
 authority executes every registered action over the complete prequential tape,
 carries all three books through forecast refits, and promotes only after
@@ -393,15 +395,15 @@ rerunning every transition. FC06 selection consumes only those replayed
 candidates. A package-owned FC06
 evaluator resolves the selected action from the sealed grid and generates its
 inner-validation transitions itself; the registry-aware PPO-candidate builder
-does not accept an independently assembled fixed-control trace. The previously
-reserved FC07 label is not part of V1 evidence because V1 does not yet contain
-a fitted and replay-authorized contextual baseline; a label alone is not a
-comparator.
+does not accept an independently assembled fixed-control trace. V1 does not
+yet contain a fitted and replay-authorized contextual baseline; a label alone
+would not be a comparator.
 
 `run_massive_adaptive_rl_training_workflow_v1()` owns every authorized block
 and publishes each scheduled update twice from the same state: an exact
 prequential-runner resume authority and the policy-checkpoint authority used
-by deterministic evaluation. The same training workflow executes FC00--FC05
+by deterministic evaluation. The same training workflow executes the complete
+registered constant grid
 over that complete fit tape and publishes the replayed FC06 selection.
 `run_massive_adaptive_rl_validation_workflow_v1()` then reloads every
 registered policy candidate, regenerates its primary actions, publishes exact
@@ -448,6 +450,13 @@ selected PPO update. Static compiler controls are selected separately using
 training-only traces; the PPO candidate must then beat that committed fixed
 control on inner validation. The selected model state is published in a
 separate create-only frozen-policy artifact before any outer date is opened.
+The immutable constant grid is symmetric in uncertainty aversion, portfolio
+risk aversion, and soft trading aggressiveness and also includes registered
+short/long-horizon combinations. FC06 is selected only after every registered
+constant traverses the same complete RL-fit economic tape. This is a stronger
+static baseline, but it is not yet a fit-optimized continuous 10-dimensional
+constant or a contextual linear controller; claims requiring those contrasts
+remain unauthorized.
 
 Validation evaluation is checkpoint-owned: it reloads the actor, reconstructs
 every observation, emits the registered deterministic bounded action, and
@@ -480,6 +489,15 @@ fit and selection authorities, recovers the registered constant action, and
 reruns it on the same sealed outer environment. V3 evidence admits the
 PPO-minus-FC06 contrast only when both outer authorities share the exact
 environment source inventory, chronology, forecast, calibration, and capital.
+Outer-plan V2 commits the fit authority, FC06 selection, selected control, and
+selected action before the outer forecast archive is committed. Its create-only
+V3 evidence authority generically reopens without conclusion authority and
+restores development authority only after replaying every PPO and FC06 fold.
+
+The V1 manifest uses one canonical predeclared seed. It permits neither
+validation-selected seeds nor seed ensembling, and seeds are never treated as
+additional market observations. A later multi-seed protocol requires a new,
+explicit selection or shared-book ensemble authority.
 
 Every position is reconsidered from its current net economics at every
 decision. The canonical adaptive observation, action, reward, compiler,

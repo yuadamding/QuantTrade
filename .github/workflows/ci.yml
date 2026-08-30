@@ -78,7 +78,9 @@ jobs:
           src/rl_quant/evaluation/massive_adaptive_profitability_env_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_evaluator_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_rollout_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_outer_plan_v2.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v3.py
+          src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_authority_v3.py
           src/rl_quant/training/massive_adaptive_ppo_v1.py
           src/rl_quant/training/massive_adaptive_economic_continuity_authority_v1.py
           src/rl_quant/training/massive_adaptive_prequential_ppo_runner_v1.py

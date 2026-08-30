@@ -107,7 +107,21 @@ class MassiveAdaptiveRLFixedControlRegistryV1:
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_REGISTRY_V1_SCHEMA
             or self.control_ids
-            != ("FC00", "FC01", "FC02", "FC03", "FC04", "FC05", "FC06")
+            != (
+                "FC00",
+                "FC01",
+                "FC02",
+                "FC03",
+                "FC04",
+                "FC05",
+                "FC07",
+                "FC08",
+                "FC09",
+                "FC10",
+                "FC11",
+                "FC12",
+                "FC06",
+            )
             or self.control_ids != tuple(row.control_id for row in self.controls)
             or self.control_inventory_sha256
             != semantic_sha256(
@@ -147,7 +161,7 @@ def _spec(
 def registered_massive_adaptive_rl_constant_actions_v1() -> tuple[
     tuple[str, MassiveAdaptiveRLActionV1], ...
 ]:
-    """Return the complete immutable FC00--FC05 fitting grid."""
+    """Return the complete immutable symmetric constant-action fitting grid."""
 
     neutral = neutral_massive_adaptive_rl_action_v1()
     short = build_massive_adaptive_rl_action_v1(
@@ -174,11 +188,47 @@ def registered_massive_adaptive_rl_constant_actions_v1() -> tuple[
         risk_control=0.75,
         trade_cost_control=0.0,
     )
-    low_turnover = build_massive_adaptive_rl_action_v1(
+    high_trade_hurdle = build_massive_adaptive_rl_action_v1(
         bucket_controls=(0.0,) * 7,
         uncertainty_control=0.0,
         risk_control=0.0,
         trade_cost_control=1.0,
+    )
+    low_uncertainty_aversion = build_massive_adaptive_rl_action_v1(
+        bucket_controls=(0.0,) * 7,
+        uncertainty_control=-0.75,
+        risk_control=0.0,
+        trade_cost_control=0.0,
+    )
+    low_risk_aversion = build_massive_adaptive_rl_action_v1(
+        bucket_controls=(0.0,) * 7,
+        uncertainty_control=0.0,
+        risk_control=-0.75,
+        trade_cost_control=0.0,
+    )
+    low_trade_hurdle = build_massive_adaptive_rl_action_v1(
+        bucket_controls=(0.0,) * 7,
+        uncertainty_control=0.0,
+        risk_control=0.0,
+        trade_cost_control=-1.0,
+    )
+    short_low_hurdle = build_massive_adaptive_rl_action_v1(
+        bucket_controls=short.bucket_controls,
+        uncertainty_control=0.0,
+        risk_control=0.0,
+        trade_cost_control=-1.0,
+    )
+    long_high_hurdle = build_massive_adaptive_rl_action_v1(
+        bucket_controls=long.bucket_controls,
+        uncertainty_control=0.0,
+        risk_control=0.0,
+        trade_cost_control=1.0,
+    )
+    low_risk_low_hurdle = build_massive_adaptive_rl_action_v1(
+        bucket_controls=(0.0,) * 7,
+        uncertainty_control=0.0,
+        risk_control=-0.75,
+        trade_cost_control=-1.0,
     )
     return (
         ("FC00", neutral),
@@ -186,7 +236,13 @@ def registered_massive_adaptive_rl_constant_actions_v1() -> tuple[
         ("FC02", long),
         ("FC03", uncertain),
         ("FC04", risky),
-        ("FC05", low_turnover),
+        ("FC05", high_trade_hurdle),
+        ("FC07", low_uncertainty_aversion),
+        ("FC08", low_risk_aversion),
+        ("FC09", low_trade_hurdle),
+        ("FC10", short_low_hurdle),
+        ("FC11", long_high_hurdle),
+        ("FC12", low_risk_low_hurdle),
     )
 
 
@@ -232,10 +288,46 @@ def build_massive_adaptive_rl_fixed_control_registry_v1() -> (
             "high soft trade-cost hurdle",
         ),
         _spec(
+            "FC07",
+            "constant",
+            actions["FC07"].semantic_receipt_sha256,
+            "decreased uncertainty aversion",
+        ),
+        _spec(
+            "FC08",
+            "constant",
+            actions["FC08"].semantic_receipt_sha256,
+            "decreased portfolio-risk aversion",
+        ),
+        _spec(
+            "FC09",
+            "constant",
+            actions["FC09"].semantic_receipt_sha256,
+            "low soft trade-cost hurdle",
+        ),
+        _spec(
+            "FC10",
+            "constant",
+            actions["FC10"].semantic_receipt_sha256,
+            "short-horizon emphasis with low trade hurdle",
+        ),
+        _spec(
+            "FC11",
+            "constant",
+            actions["FC11"].semantic_receipt_sha256,
+            "long-horizon emphasis with high trade hurdle",
+        ),
+        _spec(
+            "FC12",
+            "constant",
+            actions["FC12"].semantic_receipt_sha256,
+            "lower risk aversion with low trade hurdle",
+        ),
+        _spec(
             "FC06",
             "training-selected-constant",
             None,
-            "best constant action selected on RL-fit only",
+            "best symmetric-grid constant action selected on RL-fit only",
         ),
     )
     body = {

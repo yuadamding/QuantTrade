@@ -66,7 +66,7 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_OUTER_ROLLOUT_V1_SOURCE_SHA256 = file_sha256(
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_OUTER_ROLLOUT_V1_SPEC_SHA256 = semantic_sha256(
     {
         "controller": "fit-selected-FC06-constant",
-        "selection": "package-replayed-FC00-through-FC05-fit-authority",
+        "selection": "package-replayed-symmetric-constant-grid-fit-authority",
         "outer_action": "registered-selected-action-every-decision",
         "updates": False,
         "primary_cost_basis_points": 20.0,

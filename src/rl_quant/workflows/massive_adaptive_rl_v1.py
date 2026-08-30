@@ -105,6 +105,7 @@ MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256 = semantic_sha256(
         "caller_transitions": False,
         "caller_returns": False,
         "validation_context": "one-shared-receipt-for-all-candidates-and-controls",
+        "seed_policy": "one-canonical-predeclared-seed-no-selection",
         "validation_access_during_fit": False,
         "outer_access": False,
         "lockbox_access": False,
@@ -157,6 +158,7 @@ class MassiveAdaptiveRLExperimentManifestV1:
     prequential_block_sessions: int
     candidate_update_indices: tuple[int, ...]
     seeds: tuple[int, ...]
+    seed_policy: str
     ppo_config: MassiveAdaptivePPOConfigV1
     primary_capital: float
     cost_ladder_basis_points: tuple[float, ...]
@@ -188,6 +190,7 @@ class MassiveAdaptiveRLExperimentManifestV1:
             "prequential_block_sessions": self.prequential_block_sessions,
             "candidate_update_indices": self.candidate_update_indices,
             "seeds": self.seeds,
+            "seed_policy": self.seed_policy,
             "ppo_config": asdict(self.ppo_config),
             "primary_capital": self.primary_capital,
             "cost_ladder_basis_points": self.cost_ladder_basis_points,
@@ -224,9 +227,10 @@ class MassiveAdaptiveRLExperimentManifestV1:
             or self.candidate_update_indices
             != tuple(sorted(set(self.candidate_update_indices)))
             or any(value <= 0 for value in self.candidate_update_indices)
-            or not self.seeds
+            or len(self.seeds) != 1
             or self.seeds != tuple(sorted(set(self.seeds)))
             or any(isinstance(value, bool) or value < 0 for value in self.seeds)
+            or self.seed_policy != "canonical-fixed-seed-v1"
             or self.ppo_config.seed != self.seeds[0]
             or self.primary_capital != 10_000_000.0
             or self.cost_ladder_basis_points != (10.0, 20.0, 40.0)
@@ -287,6 +291,7 @@ def build_massive_adaptive_rl_experiment_manifest_v1(
         "prequential_block_sessions": prequential_block_sessions,
         "candidate_update_indices": candidate_update_indices,
         "seeds": seeds,
+        "seed_policy": "canonical-fixed-seed-v1",
         "ppo_config": config,
         "primary_capital": 10_000_000.0,
         "cost_ladder_basis_points": (10.0, 20.0, 40.0),

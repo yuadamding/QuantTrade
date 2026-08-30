@@ -5,6 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v2 import (
+    MassiveAdaptiveRLOuterPlanV2Error,
+    build_massive_adaptive_rl_outer_plan_v2,
+)
 from rl_quant.evaluation.massive_adaptive_rl_fixed_control_evaluator_v1 import (
     evaluate_massive_adaptive_rl_fixed_control_v1,
 )
@@ -163,6 +167,9 @@ def _fit_authority_for_selection(*, registry, selection_authority, chronology):
         runtime_fit_run=fit_run,
         runtime_fit_replayed=True,
         development_control_fit_authorized=False,
+        loaded_source=SimpleNamespace(
+            commit=SimpleNamespace(committed_at_ms=1),
+        ),
         semantic_receipt_sha256=_digest(
             ("fixed-control-fit-authority", selection.semantic_receipt_sha256)
         ),
@@ -214,10 +221,55 @@ def test_fc06_is_fit_only_selection_from_complete_registered_grid(tmp_path) -> N
         chronology_authority=chronology,  # type: ignore[arg-type]
     )
     assert authority.runtime_selection is not None
-    assert authority.runtime_selection.selected_control_id == "FC05"
+    assert authority.runtime_selection.selected_control_id == "FC12"
     assert tuple(
         sorted(row.control_id for row in authority.runtime_candidates or ())
-    ) == tuple(f"FC{index:02d}" for index in range(6))
+    ) == tuple(
+        sorted(
+            control_id
+            for control_id, _action in (
+                registered_massive_adaptive_rl_constant_actions_v1()
+            )
+        )
+    )
+
+    outer_plan_v1 = SimpleNamespace(
+        validate=lambda: None,
+        fold_index=0,
+        semantic_receipt_sha256=_digest("outer-plan-v1"),
+        outer_forecast_archive_receipt_sha256=_digest("outer-forecast-v1"),
+        source_data_qualified=False,
+        outer_evaluation_authorized=False,
+    )
+    outer_forecast = SimpleNamespace(
+        validate=lambda: None,
+        semantic_receipt_sha256=outer_plan_v1.outer_forecast_archive_receipt_sha256,
+        loaded_source=SimpleNamespace(
+            commit=SimpleNamespace(committed_at_ms=3),
+        ),
+    )
+    bound_outer = build_massive_adaptive_rl_outer_plan_v2(
+        outer_plan_v1=outer_plan_v1,  # type: ignore[arg-type]
+        outer_forecast_archive=outer_forecast,  # type: ignore[arg-type]
+        fixed_control_registry=registry,
+        fixed_control_fit_authority=fit_authority,  # type: ignore[arg-type]
+        fixed_control_selection_authority=authority,
+        chronology_authority=chronology,  # type: ignore[arg-type]
+    )
+    assert bound_outer.selected_fixed_control_id == "FC12"
+    assert bound_outer.comparator_frozen_at_ms == 2
+    assert bound_outer.outer_forecast_committed_at_ms == 3
+
+    outer_forecast.loaded_source.commit.committed_at_ms = 2
+    with pytest.raises(MassiveAdaptiveRLOuterPlanV2Error, match="before outer"):
+        build_massive_adaptive_rl_outer_plan_v2(
+            outer_plan_v1=outer_plan_v1,  # type: ignore[arg-type]
+            outer_forecast_archive=outer_forecast,  # type: ignore[arg-type]
+            fixed_control_registry=registry,
+            fixed_control_fit_authority=fit_authority,  # type: ignore[arg-type]
+            fixed_control_selection_authority=authority,
+            chronology_authority=chronology,  # type: ignore[arg-type]
+        )
 
 
 def test_fc06_validation_trace_is_generated_from_fit_selected_action(tmp_path) -> None:

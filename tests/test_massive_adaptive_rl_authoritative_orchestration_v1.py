@@ -32,6 +32,15 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v3 import (
     build_massive_adaptive_authenticated_rl_outer_fold_v3,
     build_massive_adaptive_rl_outer_evidence_v3,
 )
+from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_authority_v3 import (
+    MassiveAdaptiveRLOuterEvidenceAuthorityV3Error,
+    authorize_massive_adaptive_rl_outer_evidence_authority_v3,
+    materialize_massive_adaptive_rl_outer_evidence_authority_v3,
+    parse_massive_adaptive_rl_outer_evidence_authority_v3,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v2 import (
+    MassiveAdaptiveRLOuterPlanV2,
+)
 from rl_quant.evaluation.massive_adaptive_rl_policy_evaluator_v1 import (
     evaluate_massive_adaptive_rl_checkpoint_v1,
 )
@@ -111,6 +120,40 @@ from test_massive_adaptive_rl_outer_evidence_v1 import _fold
 
 def _digest(value: object) -> str:
     return semantic_sha256(value)
+
+
+def _outer_plan_v2_for_test(*, cost_fold, fixed_rollout):
+    outer_plan_v1 = SimpleNamespace(
+        validate=lambda: None,
+        fold_index=cost_fold.fold_index,
+        semantic_receipt_sha256=cost_fold.outer_plan_receipt_sha256,
+        source_data_qualified=False,
+    )
+    provisional = MassiveAdaptiveRLOuterPlanV2(
+        outer_plan_v1=outer_plan_v1,  # type: ignore[arg-type]
+        fixed_control_registry_receipt_sha256=_digest("fixed-registry"),
+        fixed_control_fit_authority_receipt_sha256=(
+            fixed_rollout.fixed_control_fit_authority_receipt_sha256
+        ),
+        fixed_control_selection_authority_receipt_sha256=(
+            fixed_rollout.fixed_control_selection_authority_receipt_sha256
+        ),
+        selected_fixed_control_id=fixed_rollout.selected_control_id,
+        selected_fixed_action_receipt_sha256=(
+            fixed_rollout.selected_action_receipt_sha256
+        ),
+        comparator_frozen_at_ms=1,
+        outer_forecast_committed_at_ms=2,
+        source_data_qualified=False,
+        semantic_receipt_sha256="0" * 64,
+        outer_evaluation_authorized=False,
+    )
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
 
 
 def _training_authority(environment):
@@ -545,8 +588,11 @@ def test_fixed_controls_are_replayed_over_complete_continuous_fit_tape(
     fit = durable.runtime_fit_run
     assert fit is not None
     assert durable.runtime_fit_replayed
-    assert len(fit.traces) == 6
-    assert len(fit.candidates) == 6
+    registered_control_count = len(
+        registered_massive_adaptive_rl_constant_actions_v1()
+    )
+    assert len(fit.traces) == registered_control_count
+    assert len(fit.candidates) == registered_control_count
     assert all(row.decision_session_dates == dates for row in fit.traces)
     assert all(row.transition_receipts for row in fit.traces)
     assert len(fit.continuity_authority_receipts) == 1
@@ -1004,7 +1050,25 @@ def test_rl_chronology_and_fixed_control_registry_fail_closed() -> None:
         overlap.validate()
 
     registry = build_massive_adaptive_rl_fixed_control_registry_v1()
-    assert registry.control_ids == tuple(f"FC{index:02d}" for index in range(7))
+    assert registry.control_ids == (
+        "FC00",
+        "FC01",
+        "FC02",
+        "FC03",
+        "FC04",
+        "FC05",
+        "FC07",
+        "FC08",
+        "FC09",
+        "FC10",
+        "FC11",
+        "FC12",
+        "FC06",
+    )
+    actions = dict(registered_massive_adaptive_rl_constant_actions_v1())
+    assert actions["FC03"].uncertainty_control == -actions["FC07"].uncertainty_control
+    assert actions["FC04"].risk_control == -actions["FC08"].risk_control
+    assert actions["FC05"].trade_cost_control == -actions["FC09"].trade_cost_control
     incomplete = SimpleNamespace(
         validate=lambda: None,
         runtime_selection_replayed=True,
@@ -1027,10 +1091,11 @@ def test_rl_chronology_and_fixed_control_registry_fail_closed() -> None:
         )
 
 
-def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
+def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) -> None:
     authenticated = []
     rollout_authorities = []
     fixed_authorities = []
+    outer_plans_v2 = []
     for index in range(4):
         cost_fold = _fold(index)
         decision_dates = tuple(
@@ -1102,6 +1167,8 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
             fixed_control_selection_authority_receipt_sha256=_digest(
                 ("fixed-selection", index)
             ),
+            selected_control_id="FC06",
+            selected_action_receipt_sha256=_digest(("fixed-action", index)),
             policy_trace=SimpleNamespace(
                 semantic_receipt_sha256=(
                     cost_fold.best_fixed_control_trace_receipt_sha256
@@ -1128,6 +1195,12 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
                 semantic_receipt_sha256=_digest(("fixed-authority", index)),
             )
         )
+        outer_plans_v2.append(
+            _outer_plan_v2_for_test(
+                cost_fold=cost_fold,
+                fixed_rollout=fixed_rollout,
+            )
+        )
     evidence = build_massive_adaptive_rl_outer_evidence_v2(authenticated)
     assert evidence.evidence_v1.incremental_rl_log_return_lcb95 > 0.0
     assert not evidence.source_data_qualified
@@ -1135,11 +1208,13 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
     authenticated_v3 = tuple(
         build_massive_adaptive_authenticated_rl_outer_fold_v3(
             authenticated_fold_v2=fold,
+            outer_plan_v2=outer_plan_v2,
             ppo_outer_rollout_authority=rollout_authority,  # type: ignore[arg-type]
             fixed_control_outer_authority=fixed_authority,  # type: ignore[arg-type]
         )
-        for fold, rollout_authority, fixed_authority in zip(
+        for fold, outer_plan_v2, rollout_authority, fixed_authority in zip(
             authenticated,
+            outer_plans_v2,
             rollout_authorities,
             fixed_authorities,
             strict=True,
@@ -1150,6 +1225,47 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
         evidence.semantic_receipt_sha256
     )
     assert not evidence_v3.profitability_reporting_authorized
+
+    durable = materialize_massive_adaptive_rl_outer_evidence_authority_v3(
+        root=tmp_path,
+        artifact_id="authenticated-v3-evidence",
+        outer_plans_v2=outer_plans_v2,
+        authenticated_folds_v2=authenticated,
+        ppo_outer_rollout_authorities=rollout_authorities,  # type: ignore[arg-type]
+        fixed_control_outer_authorities=fixed_authorities,  # type: ignore[arg-type]
+        committed_at_ms=10,
+    )
+    assert durable.runtime_evidence_replayed
+    assert durable.runtime_evidence is not None
+    assert durable.runtime_evidence.semantic_receipt_sha256 == (
+        evidence_v3.semantic_receipt_sha256
+    )
+    generic = parse_massive_adaptive_rl_outer_evidence_authority_v3(
+        root=tmp_path,
+        loaded_source=durable.loaded_source,
+    )
+    assert generic.runtime_evidence is None
+    assert not generic.outer_development_conclusion_authorized
+
+    substituted = replace(
+        outer_plans_v2[0],
+        selected_fixed_action_receipt_sha256=_digest("substituted-fixed-action"),
+        semantic_receipt_sha256="0" * 64,
+    )
+    substituted = replace(
+        substituted,
+        semantic_receipt_sha256=semantic_sha256(substituted.semantic_unsigned()),
+    )
+    substituted.validate()
+    with pytest.raises(MassiveAdaptiveRLOuterEvidenceAuthorityV3Error):
+        authorize_massive_adaptive_rl_outer_evidence_authority_v3(
+            root=tmp_path,
+            authority=generic,
+            outer_plans_v2=(substituted, *outer_plans_v2[1:]),
+            authenticated_folds_v2=authenticated,
+            ppo_outer_rollout_authorities=rollout_authorities,  # type: ignore[arg-type]
+            fixed_control_outer_authorities=fixed_authorities,  # type: ignore[arg-type]
+        )
 
     mismatched_rollout_values = vars(fixed_authorities[0].runtime_rollout).copy()
     mismatched_rollout_values["environment_source_inventory_sha256"] = _digest(
@@ -1165,6 +1281,7 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority() -> None:
     with pytest.raises(MassiveAdaptiveRLOuterEvidenceV3Error, match="market context"):
         build_massive_adaptive_authenticated_rl_outer_fold_v3(
             authenticated_fold_v2=authenticated[0],
+            outer_plan_v2=outer_plans_v2[0],
             ppo_outer_rollout_authority=rollout_authorities[0],  # type: ignore[arg-type]
             fixed_control_outer_authority=mismatched_fixed,  # type: ignore[arg-type]
         )
