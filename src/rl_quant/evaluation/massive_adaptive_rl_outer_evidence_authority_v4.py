@@ -14,6 +14,9 @@ from rl_quant.data_sources.massive.source_receipts import (
     publish_massive_source_object,
     read_loaded_massive_source_bytes,
 )
+from rl_quant.evaluation.massive_adaptive_outer_access_commitment_v1 import (
+    MassiveAdaptiveOuterAccessCommitmentV1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_fixed_control_outer_cost_ladder_v1 import (
     MassiveAdaptiveRLFixedControlOuterCostLadderAuthorityV1,
 )
@@ -29,8 +32,16 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v4 import (
     build_massive_adaptive_authenticated_rl_outer_fold_v4,
     build_massive_adaptive_rl_outer_evidence_v4,
 )
+from rl_quant.evaluation.massive_adaptive_rl_outer_forecast_archive_v1 import (
+    MassiveAdaptiveRLOuterForecastArchiveV1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v2 import (
+    MassiveAdaptiveRLOuterPlanV2,
+)
 from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v3 import (
     MassiveAdaptiveRLOuterPlanV3,
+    MassiveAdaptiveRLOuterPlanV3Error,
+    build_massive_adaptive_rl_outer_plan_v3,
 )
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
@@ -52,20 +63,18 @@ MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_AUTHORITY_V4_DATASET = (
 MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_AUTHORITY_V4_SOURCE_SHA256 = file_sha256(
     Path(__file__)
 )
-MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_AUTHORITY_V4_SOURCE_SCHEMA_SHA256 = (
-    semantic_sha256(
-        {
-            "schema": MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_AUTHORITY_V4_SCHEMA,
-            "publication": "create-only-source-transaction",
-            "generic_reload": "nonauthorizing",
-            "replay": "hard-access-and-both-outer-cost-ladders",
-        }
-    )
+MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_AUTHORITY_V4_SOURCE_SCHEMA_SHA256 = semantic_sha256(
+    {
+        "schema": MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_AUTHORITY_V4_SCHEMA,
+        "publication": "create-only-source-transaction",
+        "generic_reload": "nonauthorizing",
+        "replay": "hard-access-and-both-outer-cost-ladders",
+    }
 )
 MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_AUTHORITY_V4_SPEC_SHA256 = semantic_sha256(
     {
         "primary": "replayed-outer-evidence-authority-v3",
-        "outer_plan": "hard-access-gated-v3",
+        "outer_plan": "rebuilt-from-v2-commitment-and-gated-forecast",
         "ppo_cost_ladder": "replayed-frozen-target-authority",
         "static_cost_ladder": "replayed-frozen-target-authority",
         "additional_gate": "40bp-ppo-minus-static-nonnegative",
@@ -109,6 +118,9 @@ class MassiveAdaptiveRLOuterEvidenceRecordV4:
     evidence_v3_authority_receipt_sha256: str
     authenticated_fold_inventory_sha256: str
     authenticated_fold_receipts: tuple[str, ...]
+    outer_plan_v2_receipts: tuple[str, ...]
+    outer_access_commitment_receipts: tuple[str, ...]
+    gated_outer_forecast_archive_receipts: tuple[str, ...]
     outer_plan_v3_receipts: tuple[str, ...]
     ppo_cost_ladder_authority_receipts: tuple[str, ...]
     fixed_control_cost_ladder_authority_receipts: tuple[str, ...]
@@ -133,6 +145,9 @@ class MassiveAdaptiveRLOuterEvidenceRecordV4:
             or any(
                 len(values) != count
                 for values in (
+                    self.outer_plan_v2_receipts,
+                    self.outer_access_commitment_receipts,
+                    self.gated_outer_forecast_archive_receipts,
                     self.outer_plan_v3_receipts,
                     self.ppo_cost_ladder_authority_receipts,
                     self.fixed_control_cost_ladder_authority_receipts,
@@ -142,16 +157,17 @@ class MassiveAdaptiveRLOuterEvidenceRecordV4:
                 len(set(values)) != count
                 for values in (
                     self.authenticated_fold_receipts,
+                    self.outer_plan_v2_receipts,
+                    self.outer_access_commitment_receipts,
+                    self.gated_outer_forecast_archive_receipts,
                     self.outer_plan_v3_receipts,
                     self.ppo_cost_ladder_authority_receipts,
                     self.fixed_control_cost_ladder_authority_receipts,
                 )
             )
             or set(self.passed_gate_names) & set(self.failed_gate_names)
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLOuterEvidenceAuthorityV4Error(
                 "adaptive RL V4 outer evidence record differs"
@@ -161,6 +177,9 @@ class MassiveAdaptiveRLOuterEvidenceRecordV4:
             self.evidence_v3_authority_receipt_sha256,
             self.authenticated_fold_inventory_sha256,
             *self.authenticated_fold_receipts,
+            *self.outer_plan_v2_receipts,
+            *self.outer_access_commitment_receipts,
+            *self.gated_outer_forecast_archive_receipts,
             *self.outer_plan_v3_receipts,
             *self.ppo_cost_ladder_authority_receipts,
             *self.fixed_control_cost_ladder_authority_receipts,
@@ -208,7 +227,9 @@ class MassiveAdaptiveRLOuterEvidenceAuthorityV4:
     def validate(self) -> None:
         self.record.validate()
         self.loaded_source.validate()
-        runtime_present = self.runtime_evidence is not None and self.runtime_folds is not None
+        runtime_present = (
+            self.runtime_evidence is not None and self.runtime_folds is not None
+        )
         expected_authorized = bool(
             runtime_present
             and self.source_data_qualified
@@ -229,8 +250,7 @@ class MassiveAdaptiveRLOuterEvidenceAuthorityV4:
             or self.outer_development_conclusion_authorized != expected_authorized
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLOuterEvidenceAuthorityV4Error(
                 "adaptive RL V4 outer evidence authority differs"
@@ -246,6 +266,13 @@ class MassiveAdaptiveRLOuterEvidenceAuthorityV4:
                     evidence=rebuilt,
                     evidence_v3_authority_receipt_sha256=(
                         self.record.evidence_v3_authority_receipt_sha256
+                    ),
+                    outer_plan_v2_receipts=self.record.outer_plan_v2_receipts,
+                    outer_access_commitment_receipts=(
+                        self.record.outer_access_commitment_receipts
+                    ),
+                    gated_outer_forecast_archive_receipts=(
+                        self.record.gated_outer_forecast_archive_receipts
                     ),
                     outer_plan_v3_receipts=self.record.outer_plan_v3_receipts,
                     ppo_cost_ladder_authority_receipts=(
@@ -267,20 +294,26 @@ def _record(
     *,
     evidence: MassiveAdaptiveRLOuterEvidenceV4,
     evidence_v3_authority_receipt_sha256: str,
+    outer_plan_v2_receipts: tuple[str, ...],
+    outer_access_commitment_receipts: tuple[str, ...],
+    gated_outer_forecast_archive_receipts: tuple[str, ...],
     outer_plan_v3_receipts: tuple[str, ...],
     ppo_cost_ladder_authority_receipts: tuple[str, ...],
     fixed_control_cost_ladder_authority_receipts: tuple[str, ...],
 ) -> MassiveAdaptiveRLOuterEvidenceRecordV4:
     body = {
         "evidence_receipt_sha256": evidence.semantic_receipt_sha256,
-        "evidence_v3_authority_receipt_sha256": (
-            evidence_v3_authority_receipt_sha256
-        ),
+        "evidence_v3_authority_receipt_sha256": (evidence_v3_authority_receipt_sha256),
         "authenticated_fold_inventory_sha256": (
             evidence.authenticated_fold_inventory_sha256
         ),
         "authenticated_fold_receipts": tuple(
             fold.semantic_receipt_sha256 for fold in evidence.authenticated_folds
+        ),
+        "outer_plan_v2_receipts": outer_plan_v2_receipts,
+        "outer_access_commitment_receipts": outer_access_commitment_receipts,
+        "gated_outer_forecast_archive_receipts": (
+            gated_outer_forecast_archive_receipts
         ),
         "outer_plan_v3_receipts": outer_plan_v3_receipts,
         "ppo_cost_ladder_authority_receipts": ppo_cost_ladder_authority_receipts,
@@ -309,7 +342,10 @@ def _record(
 
 def _payload(record: MassiveAdaptiveRLOuterEvidenceRecordV4) -> dict[str, object]:
     record.validate()
-    return {**record.semantic_unsigned(), "semantic_receipt_sha256": record.semantic_receipt_sha256}
+    return {
+        **record.semantic_unsigned(),
+        "semantic_receipt_sha256": record.semantic_receipt_sha256,
+    }
 
 
 def _load_payload(
@@ -346,6 +382,13 @@ def parse_massive_adaptive_rl_outer_evidence_authority_v4(
         ),
         "authenticated_fold_receipts": _tuple_strings(
             payload["authenticated_fold_receipts"]
+        ),
+        "outer_plan_v2_receipts": _tuple_strings(payload["outer_plan_v2_receipts"]),
+        "outer_access_commitment_receipts": _tuple_strings(
+            payload["outer_access_commitment_receipts"]
+        ),
+        "gated_outer_forecast_archive_receipts": _tuple_strings(
+            payload["gated_outer_forecast_archive_receipts"]
         ),
         "outer_plan_v3_receipts": _tuple_strings(payload["outer_plan_v3_receipts"]),
         "ppo_cost_ladder_authority_receipts": _tuple_strings(
@@ -399,9 +442,22 @@ def parse_massive_adaptive_rl_outer_evidence_authority_v4(
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class _ReplayedOuterPlanInputsV4:
+    outer_plan_v2: MassiveAdaptiveRLOuterPlanV2
+    outer_access_commitment: MassiveAdaptiveOuterAccessCommitmentV1
+    gated_outer_forecast_archive: MassiveAdaptiveRLOuterForecastArchiveV1
+    outer_plan_v3: MassiveAdaptiveRLOuterPlanV3
+    ppo_cost_ladder_authority_receipt_sha256: str
+    fixed_control_cost_ladder_authority_receipt_sha256: str
+
+
 def _build(
     *,
     evidence_v3_authority: MassiveAdaptiveRLOuterEvidenceAuthorityV3,
+    outer_plans_v2: Sequence[MassiveAdaptiveRLOuterPlanV2],
+    outer_access_commitments: Sequence[MassiveAdaptiveOuterAccessCommitmentV1],
+    gated_outer_forecast_archives: Sequence[MassiveAdaptiveRLOuterForecastArchiveV1],
     outer_plans_v3: Sequence[MassiveAdaptiveRLOuterPlanV3],
     ppo_cost_ladder_authorities: Sequence[MassiveAdaptiveRLOuterCostLadderAuthorityV1],
     fixed_control_cost_ladder_authorities: Sequence[
@@ -410,6 +466,7 @@ def _build(
 ) -> tuple[
     MassiveAdaptiveRLOuterEvidenceV4,
     tuple[MassiveAdaptiveAuthenticatedRLOuterFoldV4, ...],
+    tuple[_ReplayedOuterPlanInputsV4, ...],
 ]:
     evidence_v3_authority.validate()
     evidence_v3 = evidence_v3_authority.runtime_evidence
@@ -420,6 +477,9 @@ def _build(
         or not evidence_v3_authority.runtime_evidence_replayed
         or not (
             len(folds_v3)
+            == len(outer_plans_v2)
+            == len(outer_access_commitments)
+            == len(gated_outer_forecast_archives)
             == len(outer_plans_v3)
             == len(ppo_cost_ladder_authorities)
             == len(fixed_control_cost_ladder_authorities)
@@ -431,6 +491,9 @@ def _build(
     tuples = sorted(
         zip(
             folds_v3,
+            outer_plans_v2,
+            outer_access_commitments,
+            gated_outer_forecast_archives,
             outer_plans_v3,
             ppo_cost_ladder_authorities,
             fixed_control_cost_ladder_authorities,
@@ -438,6 +501,54 @@ def _build(
         ),
         key=lambda values: values[0].fold_index,
     )
+    replayed_inputs: list[_ReplayedOuterPlanInputsV4] = []
+    fold_inputs = []
+    for (
+        fold,
+        outer_plan_v2,
+        commitment,
+        gated_archive,
+        supplied_plan_v3,
+        ppo_ladder,
+        fixed_ladder,
+    ) in tuples:
+        outer_plan_v2.validate()
+        commitment.validate()
+        gated_archive.validate()
+        supplied_plan_v3.validate()
+        try:
+            rebuilt_plan_v3 = build_massive_adaptive_rl_outer_plan_v3(
+                outer_plan_v2=outer_plan_v2,
+                outer_access_commitment=commitment,
+                gated_outer_forecast_archive=gated_archive,
+            )
+        except MassiveAdaptiveRLOuterPlanV3Error as error:
+            raise MassiveAdaptiveRLOuterEvidenceAuthorityV4Error(
+                "outer plan V3 did not replay from its access commitment"
+            ) from error
+        if (
+            supplied_plan_v3.semantic_receipt_sha256
+            != rebuilt_plan_v3.semantic_receipt_sha256
+            or supplied_plan_v3.semantic_unsigned()
+            != rebuilt_plan_v3.semantic_unsigned()
+        ):
+            raise MassiveAdaptiveRLOuterEvidenceAuthorityV4Error(
+                "supplied outer plan V3 differs from the committed access path"
+            )
+        replayed = _ReplayedOuterPlanInputsV4(
+            outer_plan_v2=outer_plan_v2,
+            outer_access_commitment=commitment,
+            gated_outer_forecast_archive=gated_archive,
+            outer_plan_v3=rebuilt_plan_v3,
+            ppo_cost_ladder_authority_receipt_sha256=(
+                ppo_ladder.semantic_receipt_sha256
+            ),
+            fixed_control_cost_ladder_authority_receipt_sha256=(
+                fixed_ladder.semantic_receipt_sha256
+            ),
+        )
+        replayed_inputs.append(replayed)
+        fold_inputs.append((fold, rebuilt_plan_v3, ppo_ladder, fixed_ladder))
     folds = tuple(
         build_massive_adaptive_authenticated_rl_outer_fold_v4(
             authenticated_fold_v3=fold,
@@ -445,14 +556,17 @@ def _build(
             ppo_cost_ladder_authority=ppo_ladder,
             fixed_control_cost_ladder_authority=fixed_ladder,
         )
-        for fold, plan, ppo_ladder, fixed_ladder in tuples
+        for fold, plan, ppo_ladder, fixed_ladder in fold_inputs
     )
     result = build_massive_adaptive_rl_outer_evidence_v4(folds)
-    if result.evidence_v3.semantic_receipt_sha256 != evidence_v3.semantic_receipt_sha256:
+    if (
+        result.evidence_v3.semantic_receipt_sha256
+        != evidence_v3.semantic_receipt_sha256
+    ):
         raise MassiveAdaptiveRLOuterEvidenceAuthorityV4Error(
             "V4 did not preserve its replay-authorized V3 evidence"
         )
-    return result, folds
+    return result, folds, tuple(replayed_inputs)
 
 
 def authorize_massive_adaptive_rl_outer_evidence_authority_v4(
@@ -460,6 +574,9 @@ def authorize_massive_adaptive_rl_outer_evidence_authority_v4(
     root: str | Path,
     authority: MassiveAdaptiveRLOuterEvidenceAuthorityV4,
     evidence_v3_authority: MassiveAdaptiveRLOuterEvidenceAuthorityV3,
+    outer_plans_v2: Sequence[MassiveAdaptiveRLOuterPlanV2],
+    outer_access_commitments: Sequence[MassiveAdaptiveOuterAccessCommitmentV1],
+    gated_outer_forecast_archives: Sequence[MassiveAdaptiveRLOuterForecastArchiveV1],
     outer_plans_v3: Sequence[MassiveAdaptiveRLOuterPlanV3],
     ppo_cost_ladder_authorities: Sequence[MassiveAdaptiveRLOuterCostLadderAuthorityV1],
     fixed_control_cost_ladder_authorities: Sequence[
@@ -469,8 +586,11 @@ def authorize_massive_adaptive_rl_outer_evidence_authority_v4(
     parsed = parse_massive_adaptive_rl_outer_evidence_authority_v4(
         root=root, loaded_source=authority.loaded_source
     )
-    evidence, folds = _build(
+    evidence, folds, replayed_inputs = _build(
         evidence_v3_authority=evidence_v3_authority,
+        outer_plans_v2=outer_plans_v2,
+        outer_access_commitments=outer_access_commitments,
+        gated_outer_forecast_archives=gated_outer_forecast_archives,
         outer_plans_v3=outer_plans_v3,
         ppo_cost_ladder_authorities=ppo_cost_ladder_authorities,
         fixed_control_cost_ladder_authorities=fixed_control_cost_ladder_authorities,
@@ -480,15 +600,26 @@ def authorize_massive_adaptive_rl_outer_evidence_authority_v4(
         evidence_v3_authority_receipt_sha256=(
             evidence_v3_authority.semantic_receipt_sha256
         ),
+        outer_plan_v2_receipts=tuple(
+            value.outer_plan_v2.semantic_receipt_sha256 for value in replayed_inputs
+        ),
+        outer_access_commitment_receipts=tuple(
+            value.outer_access_commitment.semantic_receipt_sha256
+            for value in replayed_inputs
+        ),
+        gated_outer_forecast_archive_receipts=tuple(
+            value.gated_outer_forecast_archive.semantic_receipt_sha256
+            for value in replayed_inputs
+        ),
         outer_plan_v3_receipts=tuple(
-            value.semantic_receipt_sha256 for value in outer_plans_v3
+            value.outer_plan_v3.semantic_receipt_sha256 for value in replayed_inputs
         ),
         ppo_cost_ladder_authority_receipts=tuple(
-            value.semantic_receipt_sha256 for value in ppo_cost_ladder_authorities
+            value.ppo_cost_ladder_authority_receipt_sha256 for value in replayed_inputs
         ),
         fixed_control_cost_ladder_authority_receipts=tuple(
-            value.semantic_receipt_sha256
-            for value in fixed_control_cost_ladder_authorities
+            value.fixed_control_cost_ladder_authority_receipt_sha256
+            for value in replayed_inputs
         ),
     )
     if record.semantic_unsigned() != parsed.record.semantic_unsigned():
@@ -513,6 +644,9 @@ def materialize_massive_adaptive_rl_outer_evidence_authority_v4(
     root: str | Path,
     artifact_id: str,
     evidence_v3_authority: MassiveAdaptiveRLOuterEvidenceAuthorityV3,
+    outer_plans_v2: Sequence[MassiveAdaptiveRLOuterPlanV2],
+    outer_access_commitments: Sequence[MassiveAdaptiveOuterAccessCommitmentV1],
+    gated_outer_forecast_archives: Sequence[MassiveAdaptiveRLOuterForecastArchiveV1],
     outer_plans_v3: Sequence[MassiveAdaptiveRLOuterPlanV3],
     ppo_cost_ladder_authorities: Sequence[MassiveAdaptiveRLOuterCostLadderAuthorityV1],
     fixed_control_cost_ladder_authorities: Sequence[
@@ -521,8 +655,11 @@ def materialize_massive_adaptive_rl_outer_evidence_authority_v4(
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLOuterEvidenceAuthorityV4:
     artifact = _artifact_id(artifact_id)
-    evidence, _ = _build(
+    evidence, _, replayed_inputs = _build(
         evidence_v3_authority=evidence_v3_authority,
+        outer_plans_v2=outer_plans_v2,
+        outer_access_commitments=outer_access_commitments,
+        gated_outer_forecast_archives=gated_outer_forecast_archives,
         outer_plans_v3=outer_plans_v3,
         ppo_cost_ladder_authorities=ppo_cost_ladder_authorities,
         fixed_control_cost_ladder_authorities=fixed_control_cost_ladder_authorities,
@@ -532,15 +669,26 @@ def materialize_massive_adaptive_rl_outer_evidence_authority_v4(
         evidence_v3_authority_receipt_sha256=(
             evidence_v3_authority.semantic_receipt_sha256
         ),
+        outer_plan_v2_receipts=tuple(
+            value.outer_plan_v2.semantic_receipt_sha256 for value in replayed_inputs
+        ),
+        outer_access_commitment_receipts=tuple(
+            value.outer_access_commitment.semantic_receipt_sha256
+            for value in replayed_inputs
+        ),
+        gated_outer_forecast_archive_receipts=tuple(
+            value.gated_outer_forecast_archive.semantic_receipt_sha256
+            for value in replayed_inputs
+        ),
         outer_plan_v3_receipts=tuple(
-            value.semantic_receipt_sha256 for value in outer_plans_v3
+            value.outer_plan_v3.semantic_receipt_sha256 for value in replayed_inputs
         ),
         ppo_cost_ladder_authority_receipts=tuple(
-            value.semantic_receipt_sha256 for value in ppo_cost_ladder_authorities
+            value.ppo_cost_ladder_authority_receipt_sha256 for value in replayed_inputs
         ),
         fixed_control_cost_ladder_authority_receipts=tuple(
-            value.semantic_receipt_sha256
-            for value in fixed_control_cost_ladder_authorities
+            value.fixed_control_cost_ladder_authority_receipt_sha256
+            for value in replayed_inputs
         ),
     )
     relative = f"massive-adaptive/rl-outer-evidence-authority-v4/{artifact}.json"
@@ -568,11 +716,12 @@ def materialize_massive_adaptive_rl_outer_evidence_authority_v4(
             root=root, loaded_source=loaded
         ),
         evidence_v3_authority=evidence_v3_authority,
+        outer_plans_v2=outer_plans_v2,
+        outer_access_commitments=outer_access_commitments,
+        gated_outer_forecast_archives=gated_outer_forecast_archives,
         outer_plans_v3=outer_plans_v3,
         ppo_cost_ladder_authorities=ppo_cost_ladder_authorities,
-        fixed_control_cost_ladder_authorities=(
-            fixed_control_cost_ladder_authorities
-        ),
+        fixed_control_cost_ladder_authorities=(fixed_control_cost_ladder_authorities),
     )
 
 

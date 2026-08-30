@@ -19,6 +19,9 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityV1,
 )
+from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityV2,
+)
 from rl_quant.training.massive_adaptive_split_plan_v1 import (
     MassiveAdaptiveSplitPlanV1,
 )
@@ -66,9 +69,7 @@ class MassiveAdaptiveRLChronologyAuthorityV1:
     profitability_reporting_authorized: bool = False
     lockbox_access_authorized: bool = False
     protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-    specification_sha256: str = (
-        MASSIVE_ADAPTIVE_RL_CHRONOLOGY_AUTHORITY_V1_SPEC_SHA256
-    )
+    specification_sha256: str = MASSIVE_ADAPTIVE_RL_CHRONOLOGY_AUTHORITY_V1_SPEC_SHA256
     implementation_source_sha256: str = (
         MASSIVE_ADAPTIVE_RL_CHRONOLOGY_AUTHORITY_V1_SOURCE_SHA256
     )
@@ -102,12 +103,10 @@ class MassiveAdaptiveRLChronologyAuthorityV1:
             or fit & validation
             or fit & outer
             or validation & outer
-            or self.rl_fit_origin_dates
-            != tuple(sorted(set(self.rl_fit_origin_dates)))
+            or self.rl_fit_origin_dates != tuple(sorted(set(self.rl_fit_origin_dates)))
             or self.rl_validation_origin_dates
             != tuple(sorted(set(self.rl_validation_origin_dates)))
-            or self.outer_origin_dates
-            != tuple(sorted(set(self.outer_origin_dates)))
+            or self.outer_origin_dates != tuple(sorted(set(self.outer_origin_dates)))
             or self.rl_fit_origin_dates[-1] >= self.rl_validation_origin_dates[0]
             or self.rl_validation_origin_dates[-1] >= self.outer_origin_dates[0]
             or self.rl_fit_origin_inventory_sha256
@@ -121,8 +120,7 @@ class MassiveAdaptiveRLChronologyAuthorityV1:
             or self.outer_evaluation_authorized != (expected and outer_bound)
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLChronologyAuthorityV1Error(
                 "adaptive RL chronology authority differs"
@@ -132,7 +130,10 @@ class MassiveAdaptiveRLChronologyAuthorityV1:
 
 def build_massive_adaptive_rl_chronology_authority_v1(
     *,
-    training_forecast_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_forecast_authority: (
+        MassiveAdaptiveRLTrainingForecastAuthorityV1
+        | MassiveAdaptiveRLTrainingForecastAuthorityV2
+    ),
     validation_inference_plan: MassiveAdaptiveInferencePlanV1,
     split_plan: MassiveAdaptiveSplitPlanV1,
 ) -> MassiveAdaptiveRLChronologyAuthorityV1:
@@ -162,10 +163,9 @@ def build_massive_adaptive_rl_chronology_authority_v1(
         row.decision_session_date for row in validation_inference_plan.rows
     )
     outer_dates = fold.outer_test_session_dates
-    if (
-        validation_dates != fold.inner_validation_session_dates
-        or not set(fit_dates).issubset(fold.fit_session_dates)
-    ):
+    if validation_dates != fold.inner_validation_session_dates or not set(
+        fit_dates
+    ).issubset(fold.fit_session_dates):
         raise MassiveAdaptiveRLChronologyAuthorityV1Error(
             "adaptive RL fit or validation dates differ from the split fold"
         )
@@ -229,9 +229,7 @@ def bind_massive_adaptive_rl_outer_chronology_v1(
         or outer_inference_plan.fold_index != chronology_authority.fold_index
         or outer_inference_plan.split_plan_receipt_sha256
         != chronology_authority.split_plan_receipt_sha256
-        or tuple(
-            row.decision_session_date for row in outer_inference_plan.rows
-        )
+        or tuple(row.decision_session_date for row in outer_inference_plan.rows)
         != chronology_authority.outer_origin_dates
     ):
         raise MassiveAdaptiveRLChronologyAuthorityV1Error(

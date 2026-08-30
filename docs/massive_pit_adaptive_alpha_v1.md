@@ -290,16 +290,23 @@ is nonauthorizing; a create-only evidence authority reopens it and recomputes
 all four folds before it can authorize a development outer conclusion. Final
 profitability reporting, lockbox access, and RL remain false.
 
-RL-training forecasts have a separate leakage boundary.
-`MassiveAdaptivePrequentialForecastPlanV1` accepts only an exact prefix of
-already replayed V2 inner-validation blocks. For every block it binds the
-training-window cutoff, checkpoint, source archive, and row inventory, and
-requires the cutoff to precede the forecast chronology. The create-only
-prequential archive copies those exact forecast tensors and withholds runtime
-access on generic reload; promotion reconciles every child archive and tensor.
-This artifact proves chronological forecast availability only. It does not
-authorize how a checkpoint was selected, profitability, outer access,
-lockbox access, or RL.
+RL-training forecasts have a separate leakage boundary. The frozen V1
+prequential artifact remains readable for earlier synthetic canaries, but it
+uses inner-validation forecast blocks and is not the historical RL-fit source.
+`MassiveAdaptiveRLFitInferencePlanV1` is the production-facing correction. It
+derives an expanding fit-only prefix of exactly `126 * (fold_index + 1)`
+sessions from the split plan, partitions that prefix into 21- or 63-session
+blocks, and accepts no caller dates or inference role. Every row is target-free
+and binds only its causal model context and following exchange-session
+identity.
+
+`MassiveAdaptiveRLFitForecastArchiveV1` binds one of those blocks to a replayed
+training checkpoint and training window. Both the supervised training cutoff
+and the maximum target-maturity cutoff must precede the first forecast. A
+generic reload exposes metadata only; promotion reconstructs compatibility and
+reruns every committed output array. RL permission remains downstream of the
+checkpoint-choice, calibration, complete-block, and chronology composite
+authority.
 
 The adaptive RL-facing surface is a bounded compiler-control action. Seven
 controls rescale the forecast buckets, uncertainty and portfolio-risk controls
@@ -340,14 +347,17 @@ primitive state, strips runtime state on a generic reload, and restores the
 actor, critic, both optimizers, every RNG, all three books, and the chronology
 cursor only after its causal training-forecast authority is replayed.
 
-`MassiveAdaptiveRLTrainingForecastAuthorityV1` closes the prequential
-selection boundary. It admits rolling 21- or 63-session blocks only when the
+`MassiveAdaptiveRLTrainingForecastAuthorityV2` closes the historical
+prequential selection boundary over the fit-only archives. It requires the
+complete package-derived 126/252/378/504-session prefix and admits rolling 21-
+or 63-session blocks only when the
 supervised training cutoff, 126-session target-maturity cutoff, training-loss
 checkpoint-choice cutoff, and checkpoint-bound calibration cutoff all precede
-the first forecast in the block. Checkpoint choice uses final training loss
-only and the archive must be the exact chronological prefix preceding the
-registered outer fold. Synthetic or otherwise unqualified sources continue to
-withhold RL-training authority.
+the first forecast in every block. Checkpoint choice uses final training loss
+only; missing, duplicated, reordered, validation-role, or caller-dated blocks
+fail closed. Synthetic or otherwise unqualified sources continue to withhold
+RL-training authority. V1 remains the compatibility surface for earlier
+synthetic artifacts and is not the historical launch authority.
 
 `MassiveAdaptivePrequentialPPORunnerV1` consumes that complete block inventory
 in its committed order. It carries actor, critic, optimizer, and RNG state
@@ -368,21 +378,24 @@ command:
 quanttrade-adaptive-rl manifest \
   --experiment-id <registered-id> \
   --output <create-only-manifest.json> \
-  --block-sessions 21 \
-  --candidate-update <registered-update> \
+  --block-sessions 63 \
   --seed 17
 
 quanttrade-adaptive-rl validate \
   --manifest <create-only-manifest.json>
 ```
 
-The manifest freezes the four folds, causal block size, candidate-update
-schedule, one canonical seed, PPO configuration, $10 million capital,
+The V2 manifest freezes the four folds, causal block size, elapsed-session
+checkpoint schedule `(126, 252, 378, 504)`, one canonical seed, PPO
+configuration, $10 million capital,
 10/20/40-bp ladder, two-percent participation limit, the complete registered
 constant comparator inventory and fit-selected FC06,
 observation/action/reward identities, all-cash initialization, shared
 benchmark, drawdown cap, and outer gates. It contains no outcomes and is
-nonauthorizing by itself.
+nonauthorizing by itself. Fold-local update indices are replay-derived from the
+block size: `(2)`, `(2,4)`, `(2,4,6)`, and `(2,4,6,8)` for 63-session blocks,
+or `(6)`, `(6,12)`, `(6,12,18)`, and `(6,12,18,24)` for 21-session blocks.
+Callers cannot register a global update-index tuple.
 
 FC00--FC05 and FC07--FC12 are the immutable symmetric constant-action fitting
 grid. FC06 is not a caller-supplied extra action: it is the package-derived
@@ -489,12 +502,25 @@ fit and selection authorities, recovers the registered constant action, and
 reruns it on the same sealed outer environment. V3 evidence admits the
 PPO-minus-FC06 contrast only when both outer authorities share the exact
 environment source inventory, chronology, forecast, calibration, and capital.
-Outer-plan V2 commits the fit authority, FC06 selection, selected control, and
-selected action before the outer forecast archive is committed. Its create-only
-V3 evidence authority generically reopens without conclusion authority and
-restores development authority only after replaying every PPO and FC06 fold.
+The create-only outer-access commitment freezes the selected PPO policy, fit
+authority, FC06 selection, selected action, compiler, benchmark, capital, cost
+ladder, and chronology before the package-owned outer forecast may be
+materialized. The resulting gated forecast archive binds that commitment as
+its entitlement. Outer-plan V3 can then be built only from the comparator-bound
+V2 plan, replay-authorized commitment, and replay-authorized gated forecast.
+The static comparator receives its own frozen-target 10/20/40-bp outer ladder.
+V4 adds a paired 40-bp PPO-minus-FC06 gate.
 
-The V1 manifest uses one canonical predeclared seed. It permits neither
+The durable V4 evidence record binds each fold's V2 plan, outer-access
+commitment, gated forecast archive, rebuilt V3 plan, PPO ladder, and static
+ladder. Generic reload remains nonauthorizing. Promotion validates the
+authorized commitment and gated forecast, rebuilds V3 from those dependencies,
+and rejects even a self-consistent V3 object whose receipt strings were
+invented and rehashed. It then rebuilds every fold and the aggregate evidence
+before restoring a development conclusion. Profitability reporting and
+lockbox access remain false.
+
+The V2 manifest uses one canonical predeclared seed. It permits neither
 validation-selected seeds nor seed ensembling, and seeds are never treated as
 additional market observations. A later multi-seed protocol requires a new,
 explicit selection or shared-book ensemble authority.

@@ -48,12 +48,16 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_authority_v3 import 
     parse_massive_adaptive_rl_outer_evidence_authority_v3,
 )
 from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_authority_v4 import (
+    MassiveAdaptiveRLOuterEvidenceAuthorityV4Error,
     authorize_massive_adaptive_rl_outer_evidence_authority_v4,
     materialize_massive_adaptive_rl_outer_evidence_authority_v4,
     parse_massive_adaptive_rl_outer_evidence_authority_v4,
 )
 from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v2 import (
     MassiveAdaptiveRLOuterPlanV2,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_plan_v3 import (
+    build_massive_adaptive_rl_outer_plan_v3,
 )
 from rl_quant.evaluation.massive_adaptive_rl_policy_evaluator_v1 import (
     evaluate_massive_adaptive_rl_checkpoint_v1,
@@ -141,6 +145,12 @@ def _outer_plan_v2_for_test(*, cost_fold, fixed_rollout):
         validate=lambda: None,
         fold_index=cost_fold.fold_index,
         semantic_receipt_sha256=cost_fold.outer_plan_receipt_sha256,
+        outer_forecast_archive_receipt_sha256=(
+            fixed_rollout.policy_trace.forecast_archive_receipt_sha256
+        ),
+        outer_inference_plan_receipt_sha256=(
+            fixed_rollout.policy_trace.inference_plan_receipt_sha256
+        ),
         source_data_qualified=False,
     )
     provisional = MassiveAdaptiveRLOuterPlanV2(
@@ -602,9 +612,7 @@ def test_fixed_controls_are_replayed_over_complete_continuous_fit_tape(
     fit = durable.runtime_fit_run
     assert fit is not None
     assert durable.runtime_fit_replayed
-    registered_control_count = len(
-        registered_massive_adaptive_rl_constant_actions_v1()
-    )
+    registered_control_count = len(registered_massive_adaptive_rl_constant_actions_v1())
     assert len(fit.traces) == registered_control_count
     assert len(fit.candidates) == registered_control_count
     assert all(row.decision_session_dates == dates for row in fit.traces)
@@ -1289,6 +1297,8 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) ->
     assert not evidence_v3.profitability_reporting_authorized
 
     authenticated_v4 = []
+    outer_access_commitments = []
+    gated_outer_forecast_archives = []
     outer_plans_v3 = []
     ppo_cost_authorities = []
     fixed_cost_authorities = []
@@ -1366,17 +1376,47 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) ->
             outer_evaluation_authorized=False,
             semantic_receipt_sha256=_digest(("fixed-cost-authority", index)),
         )
-        plan_v3 = SimpleNamespace(
+        outer_access_commitment = SimpleNamespace(
             validate=lambda: None,
             fold_index=index,
-            outer_plan_v2=plan_v2,
-            outer_access_commitment_receipt_sha256=_digest(
-                ("outer-access-commitment", index)
+            outer_forecast_access_authorized=True,
+            outer_inference_plan_receipt_sha256=(
+                plan_v2.outer_plan_v1.outer_inference_plan_receipt_sha256
             ),
-            source_data_qualified=False,
-            outer_evaluation_authorized=False,
-            semantic_receipt_sha256=_digest(("outer-plan-v3", index)),
+            fixed_control_fit_authority_receipt_sha256=(
+                plan_v2.fixed_control_fit_authority_receipt_sha256
+            ),
+            fixed_control_selection_authority_receipt_sha256=(
+                plan_v2.fixed_control_selection_authority_receipt_sha256
+            ),
+            selected_fixed_action_receipt_sha256=(
+                plan_v2.selected_fixed_action_receipt_sha256
+            ),
+            semantic_receipt_sha256=_digest(("outer-access-commitment", index)),
         )
+        gated_outer_forecast_archive = SimpleNamespace(
+            validate=lambda: None,
+            fold_index=index,
+            outer_forecast_authorized=True,
+            outer_access_commitment_receipt_sha256=(
+                outer_access_commitment.semantic_receipt_sha256
+            ),
+            raw_outer_forecast_archive_receipt_sha256=(
+                plan_v2.outer_plan_v1.outer_forecast_archive_receipt_sha256
+            ),
+            semantic_receipt_sha256=_digest(("gated-outer-forecast", index)),
+        )
+        plan_v3 = build_massive_adaptive_rl_outer_plan_v3(
+            outer_plan_v2=plan_v2,
+            outer_access_commitment=outer_access_commitment,  # type: ignore[arg-type]
+            gated_outer_forecast_archive=(
+                gated_outer_forecast_archive  # type: ignore[arg-type]
+            ),
+        )
+        assert not plan_v3.source_data_qualified
+        assert not plan_v3.outer_evaluation_authorized
+        outer_access_commitments.append(outer_access_commitment)
+        gated_outer_forecast_archives.append(gated_outer_forecast_archive)
         outer_plans_v3.append(plan_v3)
         ppo_cost_authorities.append(ppo_cost_authority)
         fixed_cost_authorities.append(fixed_cost_authority)
@@ -1392,8 +1432,9 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) ->
         )
     evidence_v4 = build_massive_adaptive_rl_outer_evidence_v4(authenticated_v4)
     assert evidence_v4.high_cost_ppo_minus_fixed_control_nonnegative
-    assert evidence_v4.mean_high_cost_ppo_minus_fixed_control_log_return == pytest.approx(
-        0.001
+    assert (
+        evidence_v4.mean_high_cost_ppo_minus_fixed_control_log_return
+        == pytest.approx(0.001)
     )
     assert not evidence_v4.profitability_reporting_authorized
 
@@ -1415,6 +1456,13 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) ->
         root=tmp_path,
         artifact_id="authenticated-v4-evidence",
         evidence_v3_authority=durable,
+        outer_plans_v2=outer_plans_v2,
+        outer_access_commitments=(
+            outer_access_commitments  # type: ignore[arg-type]
+        ),
+        gated_outer_forecast_archives=(
+            gated_outer_forecast_archives  # type: ignore[arg-type]
+        ),
         outer_plans_v3=outer_plans_v3,  # type: ignore[arg-type]
         ppo_cost_ladder_authorities=ppo_cost_authorities,  # type: ignore[arg-type]
         fixed_control_cost_ladder_authorities=(
@@ -1432,10 +1480,55 @@ def test_outer_evidence_v2_requires_frozen_policy_rollout_authority(tmp_path) ->
         loaded_source=durable_v4.loaded_source,
     )
     assert not generic_v4.runtime_evidence_replayed
+    invented_plan_v3 = replace(
+        outer_plans_v3[0],
+        outer_access_commitment_receipt_sha256=_digest(
+            "invented-outer-access-commitment"
+        ),
+        gated_outer_forecast_archive_receipt_sha256=_digest(
+            "invented-gated-outer-forecast"
+        ),
+        semantic_receipt_sha256="0" * 64,
+    )
+    invented_plan_v3 = replace(
+        invented_plan_v3,
+        semantic_receipt_sha256=semantic_sha256(invented_plan_v3.semantic_unsigned()),
+    )
+    invented_plan_v3.validate()
+    with pytest.raises(
+        MassiveAdaptiveRLOuterEvidenceAuthorityV4Error,
+        match="differs from the committed access path",
+    ):
+        authorize_massive_adaptive_rl_outer_evidence_authority_v4(
+            root=tmp_path,
+            authority=generic_v4,
+            evidence_v3_authority=durable,
+            outer_plans_v2=outer_plans_v2,
+            outer_access_commitments=(
+                outer_access_commitments  # type: ignore[arg-type]
+            ),
+            gated_outer_forecast_archives=(
+                gated_outer_forecast_archives  # type: ignore[arg-type]
+            ),
+            outer_plans_v3=(invented_plan_v3, *outer_plans_v3[1:]),
+            ppo_cost_ladder_authorities=(
+                ppo_cost_authorities  # type: ignore[arg-type]
+            ),
+            fixed_control_cost_ladder_authorities=(
+                fixed_cost_authorities  # type: ignore[arg-type]
+            ),
+        )
     reopened_v4 = authorize_massive_adaptive_rl_outer_evidence_authority_v4(
         root=tmp_path,
         authority=generic_v4,
         evidence_v3_authority=durable,
+        outer_plans_v2=outer_plans_v2,
+        outer_access_commitments=(
+            outer_access_commitments  # type: ignore[arg-type]
+        ),
+        gated_outer_forecast_archives=(
+            gated_outer_forecast_archives  # type: ignore[arg-type]
+        ),
         outer_plans_v3=outer_plans_v3,  # type: ignore[arg-type]
         ppo_cost_ladder_authorities=ppo_cost_authorities,  # type: ignore[arg-type]
         fixed_control_cost_ladder_authorities=(
