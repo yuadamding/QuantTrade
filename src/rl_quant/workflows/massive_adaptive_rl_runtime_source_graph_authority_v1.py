@@ -71,6 +71,7 @@ from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import
     MassiveAdaptiveCausalCheckpointChoiceV1,
 )
 from rl_quant.training.massive_adaptive_split_plan_v1 import (
+    MASSIVE_ADAPTIVE_MAXIMUM_TARGET_SESSIONS_V1,
     MASSIVE_ADAPTIVE_SPLIT_PLAN_V1_SPEC_SHA256,
     MassiveAdaptiveSplitPlanV1,
 )
@@ -81,6 +82,9 @@ from rl_quant.training.massive_adaptive_window_plan_v1 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
+)
+from rl_quant.workflows.massive_adaptive_rl_v2 import (
+    build_massive_adaptive_rl_candidate_schedule_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MASSIVE_ADAPTIVE_RL_SOURCE_ROLE_REGISTRY_V1,
@@ -111,7 +115,9 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SPEC_SHA256 = semantic_sha
         "qualification": "explicit-role-specific-domain-authority-contracts",
         "implementation_identity": "every-domain-type-source-sha256",
         "inventory_coverage": "logical-keys-and-exact-rl-fit-prefix",
-        "graph_edges": "cross-authority-lineage-reconciled",
+        "fit_schedule": "manifest-block-size-and-fold-schedule-bound",
+        "graph_edges": "outer-fold-archives-to-exact-source-fold-lineage",
+        "lineage_cardinality": "one-window-checkpoint-calibration-per-source-fold",
         "publication": "fsync-atomic-create-only-no-symlink-ancestors",
         "profitability_reporting": False,
         "lockbox_access": False,
@@ -314,6 +320,27 @@ def _item_specification(item: object) -> str | None:
     )
 
 
+def _item_fold_matches_inventory(
+    *, role: str, inventory_fold_index: int | None, item: object
+) -> bool:
+    """Distinguish an outer-fold inventory from its causal source-fold roots."""
+
+    if inventory_fold_index is None or not hasattr(item, "fold_index"):
+        return True
+    item_fold_index = getattr(item, "fold_index")
+    if role in {
+        "training-window-inventory",
+        "supervised-checkpoint-inventory",
+        "calibration-inventory",
+    }:
+        return (
+            isinstance(item_fold_index, int)
+            and not isinstance(item_fold_index, bool)
+            and item_fold_index in range(inventory_fold_index + 1)
+        )
+    return bool(item_fold_index == inventory_fold_index)
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveRLTypedAuthorityInventoryV1:
     """Concrete, role-scoped inventory for source roles containing many objects."""
@@ -415,10 +442,10 @@ class MassiveAdaptiveRLTypedAuthorityInventoryV1:
                     raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                         "adaptive RL typed source inventory item specification differs"
                     )
-                if (
-                    self.fold_index is not None
-                    and hasattr(item, "fold_index")
-                    and getattr(item, "fold_index") != self.fold_index
+                if not _item_fold_matches_inventory(
+                    role=self.role,
+                    inventory_fold_index=self.fold_index,
+                    item=item,
                 ):
                     raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                         "adaptive RL typed source inventory item fold differs"
@@ -624,6 +651,9 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
     manifest_v3_receipt_sha256: str
     base_manifest_receipt_sha256: str
     source_bundle_receipt_sha256: str
+    prequential_block_sessions: int
+    fold_fit_session_counts: tuple[int, ...]
+    fold_candidate_schedule_receipts: tuple[str, ...]
     rows: tuple[MassiveAdaptiveRLRuntimeSourceGraphRowV1, ...]
     row_inventory_sha256: str
     global_authority_receipts: tuple[str, ...]
@@ -731,6 +761,17 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
         }
 
     def validate(self) -> None:
+        schedules = (
+            tuple(
+                build_massive_adaptive_rl_candidate_schedule_v1(
+                    fold_index=fold_index,
+                    prequential_block_sessions=self.prequential_block_sessions,
+                )
+                for fold_index in range(4)
+            )
+            if self.prequential_block_sessions in {21, 63}
+            else ()
+        )
         runtime_present = (
             self._runtime_source_bundle is not None
             and self._runtime_sources is not None
@@ -756,6 +797,11 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
         )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SCHEMA
+            or self.prequential_block_sessions not in {21, 63}
+            or self.fold_fit_session_counts
+            != tuple(schedule.rl_fit_session_count for schedule in schedules)
+            or self.fold_candidate_schedule_receipts
+            != tuple(schedule.semantic_receipt_sha256 for schedule in schedules)
             or keys != expected_keys
             or len(set(keys)) != len(keys)
             or self.row_inventory_sha256
@@ -844,7 +890,12 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
                     "adaptive RL runtime source graph witness does not replay"
                 )
             coverage, edges = _validate_runtime_graph_contract(
-                runtime_sources=runtime_sources
+                runtime_sources=runtime_sources,
+                prequential_block_sessions=self.prequential_block_sessions,
+                fold_fit_session_counts=self.fold_fit_session_counts,
+                fold_candidate_schedule_receipts=(
+                    self.fold_candidate_schedule_receipts
+                ),
             )
             if self.logical_coverage_inventory_sha256 != semantic_sha256(
                 coverage
@@ -856,6 +907,7 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
             self.manifest_v3_receipt_sha256,
             self.base_manifest_receipt_sha256,
             self.source_bundle_receipt_sha256,
+            *self.fold_candidate_schedule_receipts,
             self.row_inventory_sha256,
             *self.global_authority_receipts,
             *(value for rows in self.fold_authority_receipts for value in rows),
@@ -1025,13 +1077,56 @@ def _edge(
     edges.append((name, observed, str(expected)))
 
 
+def _items_by_source_fold(
+    *, items: Sequence[object], expected_source_folds: tuple[int, ...], label: str
+) -> dict[int, object]:
+    rows: dict[int, object] = {}
+    for item in items:
+        source_fold_index = getattr(item, "fold_index", None)
+        if (
+            not isinstance(source_fold_index, int)
+            or isinstance(source_fold_index, bool)
+            or source_fold_index in rows
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                f"adaptive RL {label} source-fold lineage is duplicated or absent"
+            )
+        rows[source_fold_index] = item
+    if tuple(sorted(rows)) != expected_source_folds:
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            f"adaptive RL {label} source-fold coverage differs"
+        )
+    return rows
+
+
 def _validate_runtime_graph_contract(
     *,
     runtime_sources: Mapping[
         tuple[str, int | None], MassiveAdaptiveRLSourceAuthorityProtocol
     ],
+    prequential_block_sessions: int,
+    fold_fit_session_counts: tuple[int, ...],
+    fold_candidate_schedule_receipts: tuple[str, ...],
 ) -> tuple[tuple[object, ...], tuple[tuple[str, str, str], ...]]:
     """Validate exact RL-fit coverage and the load-bearing source graph edges."""
+
+    schedules = tuple(
+        build_massive_adaptive_rl_candidate_schedule_v1(
+            fold_index=fold_index,
+            prequential_block_sessions=prequential_block_sessions,
+        )
+        for fold_index in range(4)
+    )
+    if (
+        prequential_block_sessions not in {21, 63}
+        or fold_fit_session_counts
+        != tuple(schedule.rl_fit_session_count for schedule in schedules)
+        or fold_candidate_schedule_receipts
+        != tuple(schedule.semantic_receipt_sha256 for schedule in schedules)
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL runtime graph schedule differs from Manifest V3"
+        )
 
     split_plan = _direct_authority(
         runtime_sources=runtime_sources,
@@ -1144,13 +1239,20 @@ def _validate_runtime_graph_contract(
 
     coverage: list[object] = [
         (
+            "manifest-fit-schedule",
+            prequential_block_sessions,
+            fold_fit_session_counts,
+            fold_candidate_schedule_receipts,
+        ),
+        (
             "persisted-partition-session-dates",
             partition_dates,
-        )
+        ),
     ]
     for fold_index in range(4):
         fold = split_plan.outer_folds[fold_index]
-        expected_dates = fold.fit_session_dates[-126 * (fold_index + 1) :]
+        fit_session_count = fold_fit_session_counts[fold_index]
+        expected_dates = fold.fit_session_dates[-fit_session_count:]
         archives = cast(
             tuple[MassiveAdaptiveRLFitForecastArchiveV1, ...],
             _inventory_items(
@@ -1160,24 +1262,35 @@ def _validate_runtime_graph_contract(
             ),
         )
         ordered_archives = tuple(sorted(archives, key=lambda row: row.block_index))
-        block_sizes = {archive.block_sessions for archive in ordered_archives}
-        if len(block_sizes) != 1:
+        if not ordered_archives:
             raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
-                "adaptive RL fit forecast block size differs within a fold"
+                "adaptive RL fit forecast inventory is empty"
             )
-        block_sessions = next(iter(block_sizes))
-        expected_block_count = len(expected_dates) // block_sessions
+        block_sizes = {archive.block_sessions for archive in ordered_archives}
+        if block_sizes != {prequential_block_sessions}:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL fit forecast block size differs from Manifest V3"
+            )
+        block_sessions = prequential_block_sessions
+        expected_block_count = fit_session_count // block_sessions
+        blocks_per_source_fold = (
+            MASSIVE_ADAPTIVE_MAXIMUM_TARGET_SESSIONS_V1 // block_sessions
+        )
+        expected_source_fold_indices = tuple(
+            block_index // blocks_per_source_fold
+            for block_index in range(expected_block_count)
+        )
+        observed_source_fold_indices = tuple(
+            archive.source_fold_index for archive in ordered_archives
+        )
         if (
-            tuple(archive.block_index for archive in ordered_archives)
+            fit_session_count % block_sessions
+            or tuple(archive.block_index for archive in ordered_archives)
             != tuple(range(expected_block_count))
             or any(
                 archive.outer_fold_index != fold_index for archive in ordered_archives
             )
-            or any(
-                archive.source_fold_index
-                != archive.block_index // (126 // block_sessions)
-                for archive in ordered_archives
-            )
+            or observed_source_fold_indices != expected_source_fold_indices
             or tuple(
                 date
                 for archive in ordered_archives
@@ -1241,43 +1354,115 @@ def _validate_runtime_graph_contract(
                 fold_index=fold_index,
             ),
         )
-        window_receipts = {row.semantic_receipt_sha256 for row in windows}
-        archive_window_receipts = {
-            row.training_window_plan_receipt_sha256 for row in ordered_archives
-        }
-        selected_checkpoint_receipts = {
-            row.selected_checkpoint_receipt_sha256 for row in checkpoints
-        }
-        archive_checkpoint_receipts = {
-            row.checkpoint_receipt_sha256 for row in ordered_archives
-        }
-        calibration_pairs = {
-            (
-                row.checkpoint_receipt_sha256,
-                row.training_window_plan_receipt_sha256,
+        expected_source_folds = tuple(range(fold_index + 1))
+        windows_by_source = _items_by_source_fold(
+            items=windows,
+            expected_source_folds=expected_source_folds,
+            label="training-window",
+        )
+        checkpoints_by_source = _items_by_source_fold(
+            items=checkpoints,
+            expected_source_folds=expected_source_folds,
+            label="checkpoint",
+        )
+        calibrations_by_source = _items_by_source_fold(
+            items=calibrations,
+            expected_source_folds=expected_source_folds,
+            label="calibration",
+        )
+
+        window_receipts: list[str] = []
+        selected_checkpoint_receipts: list[str] = []
+        for source_fold_index in expected_source_folds:
+            window = cast(
+                MassiveAdaptiveWindowPlanV1,
+                windows_by_source[source_fold_index],
             )
-            for row in calibrations
-        }
-        archive_pairs = {
-            (
-                row.checkpoint_receipt_sha256,
-                row.training_window_plan_receipt_sha256,
+            checkpoint = cast(
+                MassiveAdaptiveCausalCheckpointChoiceV1,
+                checkpoints_by_source[source_fold_index],
             )
-            for row in ordered_archives
-        }
-        if (
-            window_receipts != archive_window_receipts
-            or selected_checkpoint_receipts != archive_checkpoint_receipts
-            or calibration_pairs != archive_pairs
-            or any(
-                row.fold_index != fold_index or row.split_role != "training"
-                for row in windows
+            calibration = cast(
+                MassiveAdaptiveForecastCalibrationV2,
+                calibrations_by_source[source_fold_index],
             )
-            or any(row.fold_index != fold_index for row in checkpoints)
-            or any(row.fold_index != fold_index for row in calibrations)
-        ):
-            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
-                "adaptive RL training, checkpoint, calibration, and forecast coverage differs"
+            source_archives = tuple(
+                archive
+                for archive in ordered_archives
+                if archive.source_fold_index == source_fold_index
+            )
+            training_cutoff = max(row.origin_session_date for row in window.rows)
+            if (
+                len(source_archives) != blocks_per_source_fold
+                or window.split_role != "training"
+                or window.fold_index != source_fold_index
+                or checkpoint.fold_index != source_fold_index
+                or calibration.fold_index != source_fold_index
+                or checkpoint.training_window_plan_receipt_sha256
+                != window.semantic_receipt_sha256
+                or calibration.training_window_plan_receipt_sha256
+                != window.semantic_receipt_sha256
+                or checkpoint.selected_checkpoint_receipt_sha256
+                != calibration.checkpoint_receipt_sha256
+                or checkpoint.selected_checkpoint_source_receipt_sha256
+                != calibration.checkpoint_source_receipt_sha256
+                or checkpoint.selected_model_state_receipt_sha256
+                != calibration.model_state_receipt_sha256
+                or checkpoint.selection_cutoff_session_date != training_cutoff
+                or calibration.calibration_fit_stop_session_date != training_cutoff
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL source-fold training lineage differs"
+                )
+            for archive in source_archives:
+                if (
+                    archive.training_window_plan_receipt_sha256
+                    != window.semantic_receipt_sha256
+                    or archive.checkpoint_receipt_sha256
+                    != checkpoint.selected_checkpoint_receipt_sha256
+                    or archive.checkpoint_source_receipt_sha256
+                    != checkpoint.selected_checkpoint_source_receipt_sha256
+                    or archive.model_state_receipt_sha256
+                    != checkpoint.selected_model_state_receipt_sha256
+                    or archive.supervised_training_cutoff_session_date
+                    != training_cutoff
+                    or max(
+                        checkpoint.selection_cutoff_session_date,
+                        calibration.calibration_fit_stop_session_date,
+                    )
+                    >= archive.origin_session_dates[0]
+                ):
+                    raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                        "adaptive RL forecast archive source-fold lineage differs"
+                    )
+                edge_suffix = f"{fold_index}/{archive.block_index}/{source_fold_index}"
+                _edge(
+                    edges,
+                    name=f"fit-forecast/training-window/{edge_suffix}",
+                    observed=archive.training_window_plan_receipt_sha256,
+                    expected=window.semantic_receipt_sha256,
+                )
+                _edge(
+                    edges,
+                    name=f"fit-forecast/checkpoint/{edge_suffix}",
+                    observed=archive.checkpoint_receipt_sha256,
+                    expected=checkpoint.selected_checkpoint_receipt_sha256,
+                )
+                _edge(
+                    edges,
+                    name=f"fit-forecast/checkpoint-source/{edge_suffix}",
+                    observed=archive.checkpoint_source_receipt_sha256,
+                    expected=(calibration.checkpoint_source_receipt_sha256),
+                )
+                _edge(
+                    edges,
+                    name=f"fit-forecast/model-state/{edge_suffix}",
+                    observed=archive.model_state_receipt_sha256,
+                    expected=calibration.model_state_receipt_sha256,
+                )
+            window_receipts.append(window.semantic_receipt_sha256)
+            selected_checkpoint_receipts.append(
+                checkpoint.selected_checkpoint_receipt_sha256
             )
 
         full_decision_inventory = semantic_sha256(
@@ -1318,20 +1503,6 @@ def _validate_runtime_graph_contract(
                 observed=window.split_plan_receipt_sha256,
                 expected=split_plan.semantic_receipt_sha256,
             )
-        for checkpoint in checkpoints:
-            if checkpoint.training_window_plan_receipt_sha256 not in window_receipts:
-                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
-                    "adaptive RL checkpoint references another training-window graph"
-                )
-        for calibration in calibrations:
-            if (
-                calibration.training_window_plan_receipt_sha256 not in window_receipts
-                or calibration.checkpoint_receipt_sha256
-                not in selected_checkpoint_receipts
-            ):
-                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
-                    "adaptive RL calibration references another fit graph"
-                )
         for date in expected_dates:
             context = contexts_by_date[date]
             decision = decisions_by_date[date]
@@ -1365,8 +1536,8 @@ def _validate_runtime_graph_contract(
                 fold_index,
                 expected_dates,
                 tuple(archive.block_index for archive in ordered_archives),
-                tuple(sorted(window_receipts)),
-                tuple(sorted(selected_checkpoint_receipts)),
+                tuple(window_receipts),
+                tuple(selected_checkpoint_receipts),
             )
         )
     return tuple(coverage), tuple(edges)
@@ -1393,6 +1564,16 @@ def _build_authority(
         "manifest_v3_receipt_sha256": manifest.semantic_receipt_sha256,
         "base_manifest_receipt_sha256": manifest.base_manifest.semantic_receipt_sha256,
         "source_bundle_receipt_sha256": source_bundle.semantic_receipt_sha256,
+        "prequential_block_sessions": (
+            manifest.base_manifest.prequential_block_sessions
+        ),
+        "fold_fit_session_counts": tuple(
+            manifest.base_manifest.schedule(fold_index).rl_fit_session_count
+            for fold_index in manifest.base_manifest.fold_indices
+        ),
+        "fold_candidate_schedule_receipts": (
+            manifest.base_manifest.fold_candidate_schedule_receipts
+        ),
         "rows": rows,
         "row_inventory_sha256": semantic_sha256(
             tuple(row.receipt_sha256 for row in rows)
@@ -1541,7 +1722,15 @@ def materialize_massive_adaptive_rl_runtime_source_graph_authority_v1(
         )
     rows = _rows(source_bundle=source_bundle, runtime_sources=runtime_sources)
     logical_coverage, graph_edges = _validate_runtime_graph_contract(
-        runtime_sources=runtime_sources
+        runtime_sources=runtime_sources,
+        prequential_block_sessions=(manifest.base_manifest.prequential_block_sessions),
+        fold_fit_session_counts=tuple(
+            manifest.base_manifest.schedule(fold_index).rl_fit_session_count
+            for fold_index in manifest.base_manifest.fold_indices
+        ),
+        fold_candidate_schedule_receipts=(
+            manifest.base_manifest.fold_candidate_schedule_receipts
+        ),
     )
     result = _build_authority(
         manifest=manifest,
@@ -1618,6 +1807,12 @@ def load_massive_adaptive_rl_runtime_source_graph_authority_v1(
     payload["fold_authority_receipts"] = tuple(
         tuple(cast(list[str], current)) for current in fold_receipts
     )
+    payload["fold_fit_session_counts"] = tuple(
+        cast(list[int], payload["fold_fit_session_counts"])
+    )
+    payload["fold_candidate_schedule_receipts"] = tuple(
+        cast(list[str], payload["fold_candidate_schedule_receipts"])
+    )
     committed = MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1(**payload)
     committed.validate()
     if (
@@ -1627,6 +1822,15 @@ def load_massive_adaptive_rl_runtime_source_graph_authority_v1(
         != manifest.base_manifest.semantic_receipt_sha256
         or committed.source_bundle_receipt_sha256
         != source_bundle.semantic_receipt_sha256
+        or committed.prequential_block_sessions
+        != manifest.base_manifest.prequential_block_sessions
+        or committed.fold_fit_session_counts
+        != tuple(
+            manifest.base_manifest.schedule(fold_index).rl_fit_session_count
+            for fold_index in manifest.base_manifest.fold_indices
+        )
+        or committed.fold_candidate_schedule_receipts
+        != manifest.base_manifest.fold_candidate_schedule_receipts
         or not source_bundle.persisted_source_replayed
     ):
         raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
