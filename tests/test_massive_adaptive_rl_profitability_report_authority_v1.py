@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +35,14 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     build_massive_adaptive_rl_experiment_manifest_v3,
     write_massive_adaptive_rl_experiment_manifest_v3,
 )
+from rl_quant.workflows import (
+    massive_adaptive_rl_runtime_source_graph_authority_v1 as graph_module,
+)
+from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
+    authorize_massive_adaptive_rl_runtime_source_graph_authority_v1,
+    load_massive_adaptive_rl_runtime_source_graph_authority_v1,
+    materialize_massive_adaptive_rl_runtime_source_graph_authority_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     authorize_massive_adaptive_rl_source_bundle_v1,
     bind_massive_adaptive_rl_source_authority_v1,
@@ -66,6 +74,12 @@ _FOLD_SOURCE_PATHS = {
 @dataclass(frozen=True)
 class _SyntheticRuntimeSource:
     semantic_receipt_sha256: str
+    source_transport_qualified: bool = True
+    daily_input_data_qualified: bool = True
+    source_data_qualified: bool = True
+    source_paths_replayed: bool = True
+    candidate_source_data_qualified: bool = True
+    source_geometry_replayed: bool = True
 
     def validate(self) -> None:
         assert len(self.semantic_receipt_sha256) == 64
@@ -75,7 +89,7 @@ def _digest(value: object) -> str:
     return semantic_sha256(value)
 
 
-def _authorized_source_bundle(root, manifest):
+def _authorized_source_bundle(root, manifest, monkeypatch):
     root.mkdir()
     runtime_sources = {}
     relative_paths = {
@@ -112,10 +126,37 @@ def _authorized_source_bundle(root, manifest):
         source_root=root,
         manifest=manifest.base_manifest,
     )
-    return authorize_massive_adaptive_rl_source_bundle_v1(
+    source_bundle = authorize_massive_adaptive_rl_source_bundle_v1(
         source_bundle=generic,
         runtime_sources=runtime_sources,
     )
+    monkeypatch.setattr(
+        graph_module,
+        "_DOMAIN_RUNTIME_TYPES",
+        {role: _SyntheticRuntimeSource for role in graph_module._DOMAIN_RUNTIME_TYPES},
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "_DIRECT_DOMAIN_SPECIFICATIONS",
+        {role: None for role in graph_module._DIRECT_DOMAIN_SPECIFICATIONS},
+    )
+    materialize_massive_adaptive_rl_runtime_source_graph_authority_v1(
+        source_root=root,
+        manifest=manifest,
+        source_bundle=source_bundle,
+        runtime_sources=runtime_sources,
+    )
+    generic_graph = load_massive_adaptive_rl_runtime_source_graph_authority_v1(
+        source_root=root,
+        manifest=manifest,
+        source_bundle=generic,
+    )
+    runtime_graph = authorize_massive_adaptive_rl_runtime_source_graph_authority_v1(
+        authority=generic_graph,
+        source_bundle=generic,
+        runtime_sources=runtime_sources,
+    )
+    return source_bundle, runtime_graph
 
 
 def _report_inputs(*, daily_mean: float) -> tuple[object, tuple[object, ...]]:
@@ -288,7 +329,7 @@ def test_profitability_report_rejects_nonreconciling_daily_economics(tmp_path) -
     ((0.001, True), (-0.001, False)),
 )
 def test_terminal_state_is_derived_from_manifest_bound_report_authority(
-    tmp_path, daily_mean: float, authorized: bool
+    tmp_path, monkeypatch, daily_mean: float, authorized: bool
 ) -> None:
     experiment_id = f"manifest-bound-report-{str(authorized).lower()}"
     manifest = build_massive_adaptive_rl_experiment_manifest_v3(
@@ -299,7 +340,9 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
         path=manifest_path,
         manifest=manifest,
     )
-    source_bundle = _authorized_source_bundle(tmp_path / "source", manifest)
+    source_bundle, runtime_graph = _authorized_source_bundle(
+        tmp_path / "source", manifest, monkeypatch
+    )
     outer_authority, rollout_authorities = _report_inputs(daily_mean=daily_mean)
     outer_authority.runtime_evidence.passed_gate_names = tuple(
         gate
@@ -322,11 +365,14 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
         manifest_receipt_sha256=manifest.semantic_receipt_sha256,
     )
     for stage in MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[1:-1]:
-        stage_receipt = (
-            authority.report.outer_evidence_authority_v4_receipt_sha256
-            if stage.value == "four-fold-v4-evidence-completed"
-            else _digest(stage.value)
-        )
+        if stage is MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED:
+            stage_receipt = source_bundle.semantic_receipt_sha256
+        elif (
+            stage is MassiveAdaptiveRLExperimentStageV2.FOUR_FOLD_V4_EVIDENCE_COMPLETED
+        ):
+            stage_receipt = authority.report.outer_evidence_authority_v4_receipt_sha256
+        else:
+            stage_receipt = _digest(stage.value)
         state = advance_massive_adaptive_rl_experiment_state_v2(
             artifact_root=artifact_root,
             previous=state,
@@ -348,6 +394,26 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
             manifest=manifest,
             report_authority=authority,
             source_bundle=generic_source_bundle,
+            runtime_source_graph_authority=runtime_graph,
+        )
+
+    generic_runtime_graph = replace(
+        runtime_graph,
+        runtime_graph_replayed=False,
+        source_data_qualified=False,
+    )
+    generic_runtime_graph.validate()
+    with pytest.raises(
+        MassiveAdaptiveRLExperimentStateV2Error,
+        match="runtime source graph is not replay authorized",
+    ):
+        publish_massive_adaptive_rl_development_report_state_v3(
+            artifact_root=artifact_root,
+            previous=evidence_state,
+            manifest=manifest,
+            report_authority=authority,
+            source_bundle=source_bundle,
+            runtime_source_graph_authority=generic_runtime_graph,
         )
 
     if authorized:
@@ -379,6 +445,7 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
                 manifest=manifest,
                 report_authority=other_authority,
                 source_bundle=source_bundle,
+                runtime_source_graph_authority=runtime_graph,
             )
 
     state = block_massive_adaptive_rl_experiment_state_v2(
@@ -394,6 +461,7 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
         manifest=manifest,
         report_authority=authority,
         source_bundle=source_bundle,
+        runtime_source_graph_authority=runtime_graph,
     )
     assert published.execution_complete
     assert published.development_profitability_reporting_authorized is authorized
@@ -413,6 +481,10 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
         published.source_bundle_receipt_sha256 == source_bundle.semantic_receipt_sha256
     )
     assert published.source_data_qualified
+    assert (
+        published.runtime_source_graph_authority_receipt_sha256
+        == runtime_graph.semantic_receipt_sha256
+    )
     assert (
         published.last_completed_stage
         is MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
@@ -488,6 +560,7 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
             manifest=other_manifest,
             report_authority=authority,
             source_bundle=source_bundle,
+            runtime_source_graph_authority=runtime_graph,
         )
 
     mismatched_root = tmp_path / "mismatched-evidence-states"
@@ -497,11 +570,16 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
         manifest_receipt_sha256=manifest.semantic_receipt_sha256,
     )
     for stage in MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[1:-1]:
+        stage_receipt = (
+            source_bundle.semantic_receipt_sha256
+            if stage is MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED
+            else _digest((stage.value, "other-evidence"))
+        )
         mismatched = advance_massive_adaptive_rl_experiment_state_v2(
             artifact_root=mismatched_root,
             previous=mismatched,
             stage=stage,
-            stage_artifact_receipt_sha256=_digest((stage.value, "other-evidence")),
+            stage_artifact_receipt_sha256=stage_receipt,
         )
     with pytest.raises(
         MassiveAdaptiveRLExperimentStateV2Error,
@@ -513,6 +591,39 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
             manifest=manifest,
             report_authority=authority,
             source_bundle=source_bundle,
+            runtime_source_graph_authority=runtime_graph,
+        )
+
+    mismatched_source_root = tmp_path / "mismatched-source-states"
+    mismatched_source = register_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=mismatched_source_root,
+        experiment_id=manifest.experiment_id,
+        manifest_receipt_sha256=manifest.semantic_receipt_sha256,
+    )
+    for stage in MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[1:-1]:
+        stage_receipt = (
+            authority.report.outer_evidence_authority_v4_receipt_sha256
+            if stage
+            is MassiveAdaptiveRLExperimentStageV2.FOUR_FOLD_V4_EVIDENCE_COMPLETED
+            else _digest((stage.value, "substituted-source"))
+        )
+        mismatched_source = advance_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=mismatched_source_root,
+            previous=mismatched_source,
+            stage=stage,
+            stage_artifact_receipt_sha256=stage_receipt,
+        )
+    with pytest.raises(
+        MassiveAdaptiveRLExperimentStateV2Error,
+        match="differs from the source replay stage",
+    ):
+        publish_massive_adaptive_rl_development_report_state_v3(
+            artifact_root=mismatched_source_root,
+            previous=mismatched_source,
+            manifest=manifest,
+            report_authority=authority,
+            source_bundle=source_bundle,
+            runtime_source_graph_authority=runtime_graph,
         )
 
     assert evidence_state.last_completed_stage_artifact_receipt_sha256 == (

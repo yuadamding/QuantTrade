@@ -729,14 +729,15 @@ def _verify_ledger_command(args: argparse.Namespace) -> int:
     if _manifest_schema(args.manifest) != (
         "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
     ):
-        return _verify_run_command(args)
+        raise MassiveAdaptiveRLWorkflowV2Error(
+            "ledger-only verification requires Manifest V3"
+        )
     from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
-        verify_massive_adaptive_rl_experiment_v2,
+        verify_massive_adaptive_rl_experiment_ledger_v1,
     )
 
-    result = verify_massive_adaptive_rl_experiment_v2(
+    result = verify_massive_adaptive_rl_experiment_ledger_v1(
         manifest_path=args.manifest,
-        source_root=args.source_root,
         artifact_root=args.artifact_root,
     )
     print(canonical_json_file_bytes(asdict(result)).decode("utf-8"), end="")
@@ -801,7 +802,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Replay only the persisted state ledger without claiming deep verification.",
     )
     verify_ledger.add_argument("--manifest", required=True)
-    verify_ledger.add_argument("--source-root", required=True)
     verify_ledger.add_argument("--artifact-root", required=True)
     verify_ledger.set_defaults(handler=_verify_ledger_command)
     return parser

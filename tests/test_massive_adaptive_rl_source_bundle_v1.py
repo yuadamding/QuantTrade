@@ -338,9 +338,17 @@ def test_runner_v2_binds_device_and_persists_retryable_runtime_blocker(
     deep = json.loads(capsys.readouterr().out)
     assert deep["ledger_replayed"]
     assert not deep["full_verification_complete"]
-    assert main(["verify-ledger", *common]) == 0
+    ledger_args = [
+        "--manifest",
+        str(manifest_path),
+        "--artifact-root",
+        str(artifact_root),
+    ]
+    assert main(["verify-ledger", *ledger_args]) == 0
     ledger = json.loads(capsys.readouterr().out)
-    assert ledger["semantic_receipt_sha256"] == deep["semantic_receipt_sha256"]
+    assert ledger["state_receipts"] == deep["state_receipts"]
+    assert ledger["current_stage"] == deep["current_stage"]
+    assert ledger["source_bundle_receipt_sha256"] is None
 
     with pytest.raises(MassiveAdaptiveRLExperimentRunnerV2Error, match="device"):
         run_massive_adaptive_rl_experiment_v2(
@@ -389,6 +397,61 @@ def test_runner_v2_source_absence_is_blocked_and_resumable(tmp_path: Path) -> No
     assert resumed.blocker_code == "typed-runtime-source-replay-required"
     assert resumed.next_required_stage is not None
     assert resumed.next_required_stage.value == "fit-forecasts-authorized"
+
+
+def test_ledger_verification_does_not_open_corrupt_source_graph(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="ledger-only-source-independent"
+    )
+    manifest_path = tmp_path / "manifest-v3.json"
+    write_massive_adaptive_rl_experiment_manifest_v3(
+        path=manifest_path,
+        manifest=manifest,
+    )
+    runtimes = _persist_synthetic_source_graph(tmp_path)
+    materialize_massive_adaptive_rl_source_bundle_v1(
+        source_root=tmp_path,
+        manifest=manifest.base_manifest,
+        runtime_sources=runtimes,
+    )
+    artifact_root = tmp_path / "artifacts"
+    run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=False,
+    )
+
+    source_path = tmp_path / _GLOBAL["session-authority"]
+    payload = json.loads(source_path.read_bytes())
+    payload["tampered"] = True
+    source_path.write_bytes(canonical_json_file_bytes(payload))
+
+    assert (
+        main(
+            [
+                "verify-ledger",
+                "--manifest",
+                str(manifest_path),
+                "--artifact-root",
+                str(artifact_root),
+            ]
+        )
+        == 0
+    )
+    ledger = json.loads(capsys.readouterr().out)
+    assert ledger["ledger_replayed"]
+    assert ledger["source_bundle_receipt_sha256"] is None
+    with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="changed"):
+        verify_massive_adaptive_rl_experiment_v2(
+            manifest_path=manifest_path,
+            source_root=tmp_path,
+            artifact_root=artifact_root,
+        )
 
 
 def test_runner_v2_does_not_regress_stage_when_replayed_source_disappears(

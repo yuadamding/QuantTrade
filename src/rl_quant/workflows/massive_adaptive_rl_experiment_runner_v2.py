@@ -30,6 +30,12 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
     load_massive_adaptive_rl_experiment_manifest_v3,
 )
+from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
+    MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1,
+    MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
+    load_massive_adaptive_rl_runtime_source_graph_authority_v1,
+    runtime_source_graph_authority_path_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MassiveAdaptiveRLSourceBundleV1,
     MassiveAdaptiveRLSourceBundleV1Error,
@@ -45,6 +51,7 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
     {
         "manifest": "v3-final-profitability-preregistered",
         "source_bundle": "v1-byte-and-runtime-replay-separated",
+        "runtime_source_graph": "v1-persisted-generic-reload-nonauthorizing",
         "state": "create-only-blocked-failed-and-report-ledger-v2",
         "device": "manifest-bound",
         "current_runtime_boundary": "typed-persisted-composite-loader-required",
@@ -70,6 +77,7 @@ class MassiveAdaptiveRLEndToEndRunV2:
     manifest_receipt_sha256: str
     execution_device_specification: str
     source_bundle_receipt_sha256: str | None
+    runtime_source_graph_authority_receipt_sha256: str | None
     state_receipts: tuple[str, ...]
     current_stage: MassiveAdaptiveRLExperimentStageV2
     next_required_stage: MassiveAdaptiveRLExperimentStageV2 | None
@@ -130,9 +138,16 @@ class MassiveAdaptiveRLEndToEndRunV2:
             or failed
             and self.blocker_code is None
             or self.source_data_qualified
-            and self.source_bundle_receipt_sha256 is None
+            and (
+                self.source_bundle_receipt_sha256 is None
+                or self.runtime_source_graph_authority_receipt_sha256 is None
+            )
+            or self.runtime_source_graph_replayed
+            and self.runtime_source_graph_authority_receipt_sha256 is None
             or published
             and not self.source_data_qualified
+            or published
+            and self.runtime_source_graph_authority_receipt_sha256 is None
             or not self.ledger_replayed
             or self.full_verification_complete != expected_full_verification
             or self.full_verification_complete
@@ -170,6 +185,7 @@ def _result(
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     states: tuple[MassiveAdaptiveRLExperimentStateV2, ...],
     source_bundle: MassiveAdaptiveRLSourceBundleV1 | None,
+    runtime_source_graph: MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1 | None = None,
 ) -> MassiveAdaptiveRLEndToEndRunV2:
     if any(
         state.experiment_id != manifest.experiment_id
@@ -201,7 +217,16 @@ def _result(
     )
     source_data_qualified = (
         bool(source_bundle is not None and source_bundle.source_data_qualified)
+        or bool(
+            runtime_source_graph is not None
+            and runtime_source_graph.source_data_qualified
+        )
         or current.source_data_qualified
+    )
+    runtime_source_graph_receipt = (
+        runtime_source_graph.semantic_receipt_sha256
+        if runtime_source_graph is not None
+        else current.runtime_source_graph_authority_receipt_sha256
     )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_END_TO_END_RUN_V2_SCHEMA,
@@ -209,6 +234,7 @@ def _result(
         "manifest_receipt_sha256": manifest.semantic_receipt_sha256,
         "execution_device_specification": manifest.execution_device_specification,
         "source_bundle_receipt_sha256": source_bundle_receipt,
+        "runtime_source_graph_authority_receipt_sha256": (runtime_source_graph_receipt),
         "state_receipts": tuple(row.semantic_receipt_sha256 for row in states),
         "current_stage": current.stage,
         "next_required_stage": next_stage,
@@ -219,7 +245,11 @@ def _result(
         "completion_authority_replayed": False,
         "report_replayed": False,
         "outer_evidence_replayed": False,
-        "runtime_source_graph_replayed": False,
+        "runtime_source_graph_replayed": bool(
+            runtime_source_graph is not None
+            and runtime_source_graph.runtime_graph_replayed
+            and runtime_source_graph.source_data_qualified
+        ),
         "full_verification_complete": False,
         "profitability_report_authority_receipt_sha256": (
             current.profitability_report_authority_receipt_sha256
@@ -379,7 +409,11 @@ def run_massive_adaptive_rl_experiment_v2(
             stage_artifact_receipt_sha256=source_bundle.semantic_receipt_sha256,
         )
         states = (*states, replayed)
-    if not source_bundle.source_data_qualified:
+    runtime_graph_path = runtime_source_graph_authority_path_v1(
+        source_root=source_root,
+        experiment_id=manifest.experiment_id,
+    )
+    if not runtime_graph_path.is_file():
         if not (
             states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
             and states[-1].blocker_code == "typed-runtime-source-replay-required"
@@ -398,6 +432,56 @@ def run_massive_adaptive_rl_experiment_v2(
             )
             states = (*states, blocked)
         return _result(manifest=manifest, states=states, source_bundle=source_bundle)
+    try:
+        runtime_source_graph = (
+            load_massive_adaptive_rl_runtime_source_graph_authority_v1(
+                source_root=source_root,
+                manifest=manifest,
+                source_bundle=source_bundle,
+            )
+        )
+    except MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error:
+        failure = fail_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            failed_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+            failure_code="runtime-source-graph-integrity-failed",
+            failure_evidence_receipt_sha256=semantic_sha256(
+                {
+                    "manifest": manifest.semantic_receipt_sha256,
+                    "failure_code": "runtime-source-graph-integrity-failed",
+                }
+            ),
+        )
+        states = (*states, failure)
+        return _result(manifest=manifest, states=states, source_bundle=source_bundle)
+    if not runtime_source_graph.source_data_qualified:
+        if not (
+            states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
+            and states[-1].blocker_code == "runtime-source-graph-replay-required"
+        ):
+            blocked = block_massive_adaptive_rl_experiment_state_v2(
+                artifact_root=artifact_root,
+                previous=states[-1],
+                blocked_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+                blocker_code="runtime-source-graph-replay-required",
+                blocker_evidence_receipt_sha256=semantic_sha256(
+                    {
+                        "manifest": manifest.semantic_receipt_sha256,
+                        "source_bundle": source_bundle.semantic_receipt_sha256,
+                        "runtime_source_graph": (
+                            runtime_source_graph.semantic_receipt_sha256
+                        ),
+                    }
+                ),
+            )
+            states = (*states, blocked)
+        return _result(
+            manifest=manifest,
+            states=states,
+            source_bundle=source_bundle,
+            runtime_source_graph=runtime_source_graph,
+        )
     raise MassiveAdaptiveRLExperimentRunnerV2Error(
         "typed source replay exists but the four-fold execution backend is not installed"
     )
@@ -426,17 +510,56 @@ def verify_massive_adaptive_rl_experiment_v2(
             "adaptive RL V2 verification manifest differs"
         )
     source_bundle = None
+    runtime_source_graph = None
     if _source_bundle_path(source_root=source_root, manifest=manifest).is_file():
         source_bundle = load_massive_adaptive_rl_source_bundle_v1(
             source_root=source_root,
             manifest=manifest.base_manifest,
         )
-    return _result(manifest=manifest, states=states, source_bundle=source_bundle)
+        if runtime_source_graph_authority_path_v1(
+            source_root=source_root,
+            experiment_id=manifest.experiment_id,
+        ).is_file():
+            runtime_source_graph = (
+                load_massive_adaptive_rl_runtime_source_graph_authority_v1(
+                    source_root=source_root,
+                    manifest=manifest,
+                    source_bundle=source_bundle,
+                )
+            )
+    return _result(
+        manifest=manifest,
+        states=states,
+        source_bundle=source_bundle,
+        runtime_source_graph=runtime_source_graph,
+    )
+
+
+def verify_massive_adaptive_rl_experiment_ledger_v1(
+    *, manifest_path: str | Path, artifact_root: str | Path
+) -> MassiveAdaptiveRLEndToEndRunV2:
+    """Replay only Manifest V3 and the canonical state chain.
+
+    This intentionally does not inspect the source root or claim that any
+    runtime, report, or outer-evidence authority replayed.
+    """
+
+    manifest = load_massive_adaptive_rl_experiment_manifest_v3(manifest_path)
+    states = load_massive_adaptive_rl_experiment_states_v2(
+        artifact_root=artifact_root,
+        experiment_id=manifest.experiment_id,
+    )
+    if not states:
+        raise MassiveAdaptiveRLExperimentRunnerV2Error(
+            "adaptive RL V2 experiment has no persisted state"
+        )
+    return _result(manifest=manifest, states=states, source_bundle=None)
 
 
 __all__ = [
     "MassiveAdaptiveRLEndToEndRunV2",
     "MassiveAdaptiveRLExperimentRunnerV2Error",
     "run_massive_adaptive_rl_experiment_v2",
+    "verify_massive_adaptive_rl_experiment_ledger_v1",
     "verify_massive_adaptive_rl_experiment_v2",
 ]

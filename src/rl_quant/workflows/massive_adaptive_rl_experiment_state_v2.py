@@ -28,6 +28,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
     validate_massive_adaptive_rl_report_against_manifest_v3,
 )
+from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
+    MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1,
+)
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MassiveAdaptiveRLSourceBundleV1,
 )
@@ -45,8 +48,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_STATE_V2_SPEC_SHA256 = semantic_sha256(
         "negative_result": "development-report-published-not-authorized",
         "positive_result": "development-report-published-authorized",
         "authorizing_report_api": (
-            "manifest-v3-source-bundle-and-replayed-report-derived-terminal-values"
+            "manifest-v3-runtime-source-graph-and-replayed-report-derived-terminal-values"
         ),
+        "source_lineage": "source-replay-stage-and-runtime-graph-reconciled",
         "terminal_state": "failed-or-completed-is-immutable",
         "blocked_resume": "last-completed-stage-lineage-preserved",
         "state_write": "same-directory-fsync-and-atomic-no-clobber-install",
@@ -153,6 +157,7 @@ class MassiveAdaptiveRLExperimentStateV2:
     profitability_report_receipt_sha256: str | None
     outer_evidence_authority_receipt_sha256: str | None
     source_bundle_receipt_sha256: str | None
+    runtime_source_graph_authority_receipt_sha256: str | None
     source_data_qualified: bool
     terminal_binding_schema: str | None
     manifest_report_binding_receipt_sha256: str | None
@@ -189,6 +194,9 @@ class MassiveAdaptiveRLExperimentStateV2:
             "experiment_id": self.experiment_id,
             "manifest_receipt_sha256": self.manifest_receipt_sha256,
             "source_bundle_receipt_sha256": self.source_bundle_receipt_sha256,
+            "runtime_source_graph_authority_receipt_sha256": (
+                self.runtime_source_graph_authority_receipt_sha256
+            ),
             "outer_evidence_authority_receipt_sha256": (
                 self.outer_evidence_authority_receipt_sha256
             ),
@@ -249,6 +257,7 @@ class MassiveAdaptiveRLExperimentStateV2:
                 and self.profitability_report_receipt_sha256 is not None
                 and self.outer_evidence_authority_receipt_sha256 is not None
                 and self.source_bundle_receipt_sha256 is not None
+                and self.runtime_source_graph_authority_receipt_sha256 is not None
                 and self.source_data_qualified
                 and self.terminal_binding_schema
                 == MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA
@@ -262,6 +271,7 @@ class MassiveAdaptiveRLExperimentStateV2:
                 or self.development_profitability_reporting_authorized
                 or self.outer_evidence_authority_receipt_sha256 is not None
                 or self.source_bundle_receipt_sha256 is not None
+                or self.runtime_source_graph_authority_receipt_sha256 is not None
                 or self.source_data_qualified
                 or self.terminal_binding_schema is not None
                 or self.manifest_report_binding_receipt_sha256 is not None
@@ -304,6 +314,7 @@ class MassiveAdaptiveRLExperimentStateV2:
             self.profitability_report_receipt_sha256,
             self.outer_evidence_authority_receipt_sha256,
             self.source_bundle_receipt_sha256,
+            self.runtime_source_graph_authority_receipt_sha256,
             self.manifest_report_binding_receipt_sha256,
         ):
             if linked_value is not None:
@@ -382,6 +393,7 @@ def _build_state(
     profitability_report_receipt_sha256: str | None = None,
     outer_evidence_authority_receipt_sha256: str | None = None,
     source_bundle_receipt_sha256: str | None = None,
+    runtime_source_graph_authority_receipt_sha256: str | None = None,
     source_data_qualified: bool = False,
     terminal_binding_schema: str | None = None,
     manifest_report_binding_receipt_sha256: str | None = None,
@@ -435,6 +447,9 @@ def _build_state(
             outer_evidence_authority_receipt_sha256
         ),
         "source_bundle_receipt_sha256": source_bundle_receipt_sha256,
+        "runtime_source_graph_authority_receipt_sha256": (
+            runtime_source_graph_authority_receipt_sha256
+        ),
         "source_data_qualified": source_data_qualified,
         "terminal_binding_schema": terminal_binding_schema,
         "manifest_report_binding_receipt_sha256": (
@@ -570,6 +585,7 @@ def _publish_massive_adaptive_rl_development_report_state_v2(
     profitability_report_receipt_sha256: str,
     outer_evidence_authority_receipt_sha256: str,
     source_bundle_receipt_sha256: str,
+    runtime_source_graph_authority_receipt_sha256: str,
     manifest_report_binding_receipt_sha256: str,
     failed_gate_names: Sequence[str],
     development_profitability_reporting_authorized: bool,
@@ -607,6 +623,10 @@ def _publish_massive_adaptive_rl_development_report_state_v2(
         source_bundle_receipt_sha256=_digest(
             "adaptive RL source bundle", source_bundle_receipt_sha256
         ),
+        runtime_source_graph_authority_receipt_sha256=_digest(
+            "adaptive RL runtime source graph authority",
+            runtime_source_graph_authority_receipt_sha256,
+        ),
         source_data_qualified=True,
         terminal_binding_schema=MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA,
         manifest_report_binding_receipt_sha256=_digest(
@@ -628,6 +648,7 @@ def publish_massive_adaptive_rl_development_report_state_v3(
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     report_authority: MassiveAdaptiveRLProfitabilityReportAuthorityV1,
     source_bundle: MassiveAdaptiveRLSourceBundleV1,
+    runtime_source_graph_authority: MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1,
 ) -> MassiveAdaptiveRLExperimentStateV2:
     """Publish a terminal state from a replayed, manifest-bound report.
 
@@ -641,6 +662,7 @@ def publish_massive_adaptive_rl_development_report_state_v3(
     previous.validate()
     manifest.validate()
     source_bundle.validate()
+    runtime_source_graph_authority.validate()
     if (
         previous.manifest_receipt_sha256 != manifest.semantic_receipt_sha256
         or previous.experiment_id != manifest.experiment_id
@@ -695,12 +717,50 @@ def publish_massive_adaptive_rl_development_report_state_v3(
         raise MassiveAdaptiveRLExperimentStateV2Error(
             "adaptive RL profitability report source bundle is not replay authorized"
         )
+    states = load_massive_adaptive_rl_experiment_states_v2(
+        artifact_root=artifact_root,
+        experiment_id=manifest.experiment_id,
+    )
+    source_replay_states = tuple(
+        state
+        for state in states
+        if state.stage is MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED
+    )
+    if not states or states[-1] != previous or len(source_replay_states) != 1:
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL report predecessor does not match its persisted state chain"
+        )
+    if (
+        source_replay_states[0].stage_artifact_receipt_sha256
+        != source_bundle.semantic_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL report source bundle differs from the source replay stage"
+        )
+    if (
+        runtime_source_graph_authority.experiment_id != manifest.experiment_id
+        or runtime_source_graph_authority.manifest_v3_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or runtime_source_graph_authority.base_manifest_receipt_sha256
+        != manifest.base_manifest.semantic_receipt_sha256
+        or runtime_source_graph_authority.source_bundle_receipt_sha256
+        != source_bundle.semantic_receipt_sha256
+        or not runtime_source_graph_authority.persisted_graph_replayed
+        or not runtime_source_graph_authority.runtime_graph_replayed
+        or not runtime_source_graph_authority.source_data_qualified
+    ):
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL profitability report runtime source graph is not replay authorized"
+        )
     terminal_binding = semantic_sha256(
         {
             "schema": MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA,
             "experiment_id": manifest.experiment_id,
             "manifest_receipt_sha256": manifest.semantic_receipt_sha256,
             "source_bundle_receipt_sha256": source_bundle.semantic_receipt_sha256,
+            "runtime_source_graph_authority_receipt_sha256": (
+                runtime_source_graph_authority.semantic_receipt_sha256
+            ),
             "outer_evidence_authority_receipt_sha256": (
                 report_authority.report.outer_evidence_authority_v4_receipt_sha256
             ),
@@ -729,6 +789,9 @@ def publish_massive_adaptive_rl_development_report_state_v3(
             report_authority.report.outer_evidence_authority_v4_receipt_sha256
         ),
         source_bundle_receipt_sha256=source_bundle.semantic_receipt_sha256,
+        runtime_source_graph_authority_receipt_sha256=(
+            runtime_source_graph_authority.semantic_receipt_sha256
+        ),
         manifest_report_binding_receipt_sha256=terminal_binding,
         failed_gate_names=report_authority.report.failed_gate_names,
         development_profitability_reporting_authorized=(
