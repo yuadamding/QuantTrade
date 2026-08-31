@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from rl_quant.protocol.canonical_artifact import semantic_sha256
+import rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 as state_module
 from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2,
     MassiveAdaptiveRLExperimentStageV2,
@@ -13,7 +14,6 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     block_massive_adaptive_rl_experiment_state_v2,
     fail_massive_adaptive_rl_experiment_state_v2,
     load_massive_adaptive_rl_experiment_states_v2,
-    publish_massive_adaptive_rl_development_report_state_v2,
     register_massive_adaptive_rl_experiment_state_v2,
 )
 
@@ -65,32 +65,49 @@ def test_blocked_state_can_resume_from_last_completed_stage(tmp_path: Path) -> N
     ) == (registered, blocked, replayed)
 
 
-@pytest.mark.parametrize(
-    ("authorized", "failed_gates"),
-    ((True, ()), (False, ("incremental-rl-lcb-positive",))),
-)
-def test_positive_and_negative_reports_are_both_completed_experiments(
-    tmp_path: Path,
-    authorized: bool,
-    failed_gates: tuple[str, ...],
+def test_raw_v2_report_publisher_is_not_public() -> None:
+    assert "publish_massive_adaptive_rl_development_report_state_v2" not in (
+        state_module.__all__
+    )
+
+
+def test_interrupted_state_install_leaves_no_partial_final_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    experiment_id = "positive-report" if authorized else "negative-report"
-    evidence = _advance_to_evidence(tmp_path, experiment_id)
-    published = publish_massive_adaptive_rl_development_report_state_v2(
+    def _interrupt_install(_source, _destination) -> None:
+        raise RuntimeError("simulated interruption before atomic install")
+
+    monkeypatch.setattr(state_module.os, "link", _interrupt_install)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        register_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=tmp_path,
+            experiment_id="interrupted-state-install",
+            manifest_receipt_sha256=_receipt("manifest"),
+        )
+    directory = tmp_path / "adaptive-rl" / "interrupted-state-install" / "state-v2"
+    assert tuple(directory.iterdir()) == ()
+
+
+def test_atomic_state_install_is_create_only_and_cleans_collision_temp(
+    tmp_path: Path,
+) -> None:
+    register_massive_adaptive_rl_experiment_state_v2(
         artifact_root=tmp_path,
-        previous=evidence,
-        profitability_report_authority_receipt_sha256=_receipt("authority"),
-        profitability_report_receipt_sha256=_receipt("report"),
-        failed_gate_names=failed_gates,
-        development_profitability_reporting_authorized=authorized,
+        experiment_id="state-install-collision",
+        manifest_receipt_sha256=_receipt("manifest"),
     )
-    assert published.execution_complete
-    assert (
-        published.stage
-        is MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
+    with pytest.raises(MassiveAdaptiveRLExperimentStateV2Error, match="create-only"):
+        register_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=tmp_path,
+            experiment_id="state-install-collision",
+            manifest_receipt_sha256=_receipt("manifest"),
+        )
+    directory = tmp_path / "adaptive-rl" / "state-install-collision" / "state-v2"
+    assert tuple(path.name for path in directory.iterdir()) == ("000-registered.json",)
+    assert not hasattr(
+        state_module,
+        "publish_massive_adaptive_rl_development_report_state_v2",
     )
-    assert published.development_profitability_reporting_authorized is authorized
-    assert not published.live_trading_authorized
 
 
 def test_integrity_failure_remains_terminal(tmp_path: Path) -> None:
@@ -112,4 +129,38 @@ def test_integrity_failure_remains_terminal(tmp_path: Path) -> None:
             previous=failed,
             stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
             stage_artifact_receipt_sha256=_receipt("source"),
+        )
+
+
+def test_loader_rejects_any_state_after_a_terminal_failure(tmp_path: Path) -> None:
+    registered = register_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=tmp_path,
+        experiment_id="trailing-terminal-state",
+        manifest_receipt_sha256=_receipt("manifest"),
+    )
+    failed = fail_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=tmp_path,
+        previous=registered,
+        failed_stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
+        failure_code="source-receipt-mismatch",
+        failure_evidence_receipt_sha256=_receipt("mismatch"),
+    )
+    planted = state_module._build_state(
+        previous=failed,
+        experiment_id=failed.experiment_id,
+        manifest_receipt_sha256=failed.manifest_receipt_sha256,
+        stage=MassiveAdaptiveRLExperimentStageV2.BLOCKED,
+        completed_stage_index=failed.completed_stage_index,
+        stage_artifact_receipt_sha256=_receipt("planted-blocker"),
+        blocked_stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
+        blocker_code="planted-after-terminal",
+    )
+    state_module._write_state(artifact_root=tmp_path, state=planted)
+    with pytest.raises(
+        MassiveAdaptiveRLExperimentStateV2Error,
+        match="follows a terminal state",
+    ):
+        load_massive_adaptive_rl_experiment_states_v2(
+            artifact_root=tmp_path,
+            experiment_id=registered.experiment_id,
         )

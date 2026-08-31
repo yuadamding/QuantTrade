@@ -6,7 +6,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from enum import Enum
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import cast
 
 from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v1 import (
@@ -26,6 +28,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
     validate_massive_adaptive_rl_report_against_manifest_v3,
 )
+from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
+    MassiveAdaptiveRLSourceBundleV1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_STATE_V2_SCHEMA = (
@@ -40,11 +45,17 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_STATE_V2_SPEC_SHA256 = semantic_sha256(
         "negative_result": "development-report-published-not-authorized",
         "positive_result": "development-report-published-authorized",
         "authorizing_report_api": (
-            "manifest-v3-and-replayed-report-derived-terminal-values"
+            "manifest-v3-source-bundle-and-replayed-report-derived-terminal-values"
         ),
+        "terminal_state": "failed-or-completed-is-immutable",
+        "blocked_resume": "last-completed-stage-lineage-preserved",
+        "state_write": "same-directory-fsync-and-atomic-no-clobber-install",
         "live_trading": False,
         "lockbox_access": False,
     }
+)
+MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-terminal-binding-v1"
 )
 
 
@@ -76,6 +87,12 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2 = (
     MassiveAdaptiveRLExperimentStageV2.PPO_AND_FC06_OUTER_LADDERS_COMPLETED,
     MassiveAdaptiveRLExperimentStageV2.FOUR_FOLD_V4_EVIDENCE_COMPLETED,
     MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED,
+)
+_TERMINAL_STAGES = frozenset(
+    {
+        MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED,
+        MassiveAdaptiveRLExperimentStageV2.FAILED,
+    }
 )
 
 
@@ -123,6 +140,8 @@ class MassiveAdaptiveRLExperimentStateV2:
     sequence_index: int
     stage: MassiveAdaptiveRLExperimentStageV2
     completed_stage_index: int
+    last_completed_stage: MassiveAdaptiveRLExperimentStageV2
+    last_completed_stage_artifact_receipt_sha256: str
     previous_state_receipt_sha256: str | None
     stage_artifact_receipt_sha256: str
     blocked_stage: MassiveAdaptiveRLExperimentStageV2 | None
@@ -132,6 +151,11 @@ class MassiveAdaptiveRLExperimentStateV2:
     execution_complete: bool
     profitability_report_authority_receipt_sha256: str | None
     profitability_report_receipt_sha256: str | None
+    outer_evidence_authority_receipt_sha256: str | None
+    source_bundle_receipt_sha256: str | None
+    source_data_qualified: bool
+    terminal_binding_schema: str | None
+    manifest_report_binding_receipt_sha256: str | None
     failed_gate_names: tuple[str, ...]
     development_profitability_reporting_authorized: bool
     semantic_receipt_sha256: str
@@ -160,6 +184,25 @@ class MassiveAdaptiveRLExperimentStateV2:
         )
         ordinary = not blocked and not failed
         next_index = self.completed_stage_index + 1
+        terminal_binding_body = {
+            "schema": self.terminal_binding_schema,
+            "experiment_id": self.experiment_id,
+            "manifest_receipt_sha256": self.manifest_receipt_sha256,
+            "source_bundle_receipt_sha256": self.source_bundle_receipt_sha256,
+            "outer_evidence_authority_receipt_sha256": (
+                self.outer_evidence_authority_receipt_sha256
+            ),
+            "profitability_report_authority_receipt_sha256": (
+                self.profitability_report_authority_receipt_sha256
+            ),
+            "profitability_report_receipt_sha256": (
+                self.profitability_report_receipt_sha256
+            ),
+            "failed_gate_names": self.failed_gate_names,
+            "development_profitability_reporting_authorized": (
+                self.development_profitability_reporting_authorized
+            ),
+        }
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_EXPERIMENT_STATE_V2_SCHEMA
             or _identifier("experiment state ID", self.experiment_id)
@@ -170,6 +213,10 @@ class MassiveAdaptiveRLExperimentStateV2:
             or not -1
             <= self.completed_stage_index
             < len(MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2)
+            or self.last_completed_stage
+            is not MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[
+                self.completed_stage_index
+            ]
             or (self.sequence_index == 0)
             != (self.previous_state_receipt_sha256 is None)
             or blocked != (self.blocked_stage is not None)
@@ -181,6 +228,12 @@ class MassiveAdaptiveRLExperimentStateV2:
             is not MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[
                 self.completed_stage_index
             ]
+            or ordinary
+            and (
+                self.last_completed_stage is not self.stage
+                or self.last_completed_stage_artifact_receipt_sha256
+                != self.stage_artifact_receipt_sha256
+            )
             or blocked
             and (
                 next_index >= len(MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2)
@@ -194,15 +247,31 @@ class MassiveAdaptiveRLExperimentStateV2:
             != (
                 self.profitability_report_authority_receipt_sha256 is not None
                 and self.profitability_report_receipt_sha256 is not None
+                and self.outer_evidence_authority_receipt_sha256 is not None
+                and self.source_bundle_receipt_sha256 is not None
+                and self.source_data_qualified
+                and self.terminal_binding_schema
+                == MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA
+                and self.manifest_report_binding_receipt_sha256 is not None
             )
             or not published
             and (
-                self.failed_gate_names
+                self.profitability_report_authority_receipt_sha256 is not None
+                or self.profitability_report_receipt_sha256 is not None
+                or self.failed_gate_names
                 or self.development_profitability_reporting_authorized
+                or self.outer_evidence_authority_receipt_sha256 is not None
+                or self.source_bundle_receipt_sha256 is not None
+                or self.source_data_qualified
+                or self.terminal_binding_schema is not None
+                or self.manifest_report_binding_receipt_sha256 is not None
             )
             or published
             and self.development_profitability_reporting_authorized
             == bool(self.failed_gate_names)
+            or published
+            and self.manifest_report_binding_receipt_sha256
+            != semantic_sha256(terminal_binding_body)
             or self.live_trading_authorized
             or self.lockbox_access_authorized
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -221,6 +290,7 @@ class MassiveAdaptiveRLExperimentStateV2:
                 _identifier("state code", code)
         for value in (
             self.manifest_receipt_sha256,
+            self.last_completed_stage_artifact_receipt_sha256,
             self.stage_artifact_receipt_sha256,
             self.protocol_receipt_sha256,
             self.specification_sha256,
@@ -232,6 +302,9 @@ class MassiveAdaptiveRLExperimentStateV2:
             self.previous_state_receipt_sha256,
             self.profitability_report_authority_receipt_sha256,
             self.profitability_report_receipt_sha256,
+            self.outer_evidence_authority_receipt_sha256,
+            self.source_bundle_receipt_sha256,
+            self.manifest_report_binding_receipt_sha256,
         ):
             if linked_value is not None:
                 _digest("adaptive RL V2 linked state", linked_value)
@@ -256,13 +329,40 @@ def _write_state(
     state.validate()
     output = _state_path(artifact_root, state)
     output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    temporary = Path(temporary_name)
     try:
-        with output.open("xb") as stream:
+        with os.fdopen(descriptor, "wb") as stream:
             stream.write(canonical_json_file_bytes(asdict(state)))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, output)
+        directory_descriptor = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        with output.open("rb") as stream:
+            installed_payload = json.load(stream)
+        if not isinstance(installed_payload, Mapping):
+            raise MassiveAdaptiveRLExperimentStateV2Error(
+                "installed adaptive RL V2 experiment state is not a mapping"
+            )
+        installed = _parse_state(cast(Mapping[str, object], installed_payload))
+        if installed != state:
+            raise MassiveAdaptiveRLExperimentStateV2Error(
+                "installed adaptive RL V2 experiment state differs"
+            )
     except FileExistsError as error:
         raise MassiveAdaptiveRLExperimentStateV2Error(
             "adaptive RL V2 experiment state is create-only"
         ) from error
+    finally:
+        temporary.unlink(missing_ok=True)
     return state
 
 
@@ -280,9 +380,31 @@ def _build_state(
     failure_code: str | None = None,
     profitability_report_authority_receipt_sha256: str | None = None,
     profitability_report_receipt_sha256: str | None = None,
+    outer_evidence_authority_receipt_sha256: str | None = None,
+    source_bundle_receipt_sha256: str | None = None,
+    source_data_qualified: bool = False,
+    terminal_binding_schema: str | None = None,
+    manifest_report_binding_receipt_sha256: str | None = None,
     failed_gate_names: tuple[str, ...] = (),
     development_profitability_reporting_authorized: bool = False,
 ) -> MassiveAdaptiveRLExperimentStateV2:
+    completed = stage not in {
+        MassiveAdaptiveRLExperimentStageV2.BLOCKED,
+        MassiveAdaptiveRLExperimentStageV2.FAILED,
+    }
+    if not completed and previous is None:
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL blocked or failed state has no completed predecessor"
+        )
+    completed_previous = cast(MassiveAdaptiveRLExperimentStateV2, previous)
+    last_completed_stage = (
+        stage if completed else completed_previous.last_completed_stage
+    )
+    last_completed_stage_artifact_receipt_sha256 = (
+        stage_artifact_receipt_sha256
+        if completed
+        else completed_previous.last_completed_stage_artifact_receipt_sha256
+    )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_EXPERIMENT_STATE_V2_SCHEMA,
         "experiment_id": experiment_id,
@@ -290,6 +412,10 @@ def _build_state(
         "sequence_index": 0 if previous is None else previous.sequence_index + 1,
         "stage": stage,
         "completed_stage_index": completed_stage_index,
+        "last_completed_stage": last_completed_stage,
+        "last_completed_stage_artifact_receipt_sha256": (
+            last_completed_stage_artifact_receipt_sha256
+        ),
         "previous_state_receipt_sha256": (
             None if previous is None else previous.semantic_receipt_sha256
         ),
@@ -305,6 +431,15 @@ def _build_state(
             profitability_report_authority_receipt_sha256
         ),
         "profitability_report_receipt_sha256": profitability_report_receipt_sha256,
+        "outer_evidence_authority_receipt_sha256": (
+            outer_evidence_authority_receipt_sha256
+        ),
+        "source_bundle_receipt_sha256": source_bundle_receipt_sha256,
+        "source_data_qualified": source_data_qualified,
+        "terminal_binding_schema": terminal_binding_schema,
+        "manifest_report_binding_receipt_sha256": (
+            manifest_report_binding_receipt_sha256
+        ),
         "failed_gate_names": _gate_names(failed_gate_names),
         "development_profitability_reporting_authorized": (
             development_profitability_reporting_authorized
@@ -341,6 +476,14 @@ def register_massive_adaptive_rl_experiment_state_v2(
     return _write_state(artifact_root=artifact_root, state=result)
 
 
+def _ensure_state_is_mutable(previous: MassiveAdaptiveRLExperimentStateV2) -> None:
+    previous.validate()
+    if previous.stage in _TERMINAL_STAGES:
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL V2 experiment state is terminal"
+        )
+
+
 def advance_massive_adaptive_rl_experiment_state_v2(
     *,
     artifact_root: str | Path,
@@ -348,11 +491,7 @@ def advance_massive_adaptive_rl_experiment_state_v2(
     stage: MassiveAdaptiveRLExperimentStageV2,
     stage_artifact_receipt_sha256: str,
 ) -> MassiveAdaptiveRLExperimentStateV2:
-    previous.validate()
-    if previous.stage is MassiveAdaptiveRLExperimentStageV2.FAILED:
-        raise MassiveAdaptiveRLExperimentStateV2Error(
-            "failed adaptive RL V2 experiment state is terminal"
-        )
+    _ensure_state_is_mutable(previous)
     expected_index = previous.completed_stage_index + 1
     if (
         stage is MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
@@ -383,11 +522,7 @@ def block_massive_adaptive_rl_experiment_state_v2(
     blocker_code: str,
     blocker_evidence_receipt_sha256: str,
 ) -> MassiveAdaptiveRLExperimentStateV2:
-    previous.validate()
-    if previous.stage is MassiveAdaptiveRLExperimentStageV2.FAILED:
-        raise MassiveAdaptiveRLExperimentStateV2Error(
-            "failed adaptive RL V2 experiment state is terminal"
-        )
+    _ensure_state_is_mutable(previous)
     result = _build_state(
         previous=previous,
         experiment_id=previous.experiment_id,
@@ -411,11 +546,7 @@ def fail_massive_adaptive_rl_experiment_state_v2(
     failure_code: str,
     failure_evidence_receipt_sha256: str,
 ) -> MassiveAdaptiveRLExperimentStateV2:
-    previous.validate()
-    if previous.stage is MassiveAdaptiveRLExperimentStageV2.FAILED:
-        raise MassiveAdaptiveRLExperimentStateV2Error(
-            "failed adaptive RL V2 experiment state is terminal"
-        )
+    _ensure_state_is_mutable(previous)
     result = _build_state(
         previous=previous,
         experiment_id=previous.experiment_id,
@@ -431,20 +562,22 @@ def fail_massive_adaptive_rl_experiment_state_v2(
     return _write_state(artifact_root=artifact_root, state=result)
 
 
-def publish_massive_adaptive_rl_development_report_state_v2(
+def _publish_massive_adaptive_rl_development_report_state_v2(
     *,
     artifact_root: str | Path,
     previous: MassiveAdaptiveRLExperimentStateV2,
     profitability_report_authority_receipt_sha256: str,
     profitability_report_receipt_sha256: str,
+    outer_evidence_authority_receipt_sha256: str,
+    source_bundle_receipt_sha256: str,
+    manifest_report_binding_receipt_sha256: str,
     failed_gate_names: Sequence[str],
     development_profitability_reporting_authorized: bool,
 ) -> MassiveAdaptiveRLExperimentStateV2:
-    previous.validate()
+    _ensure_state_is_mutable(previous)
     expected_index = previous.completed_stage_index + 1
     if (
-        previous.stage is MassiveAdaptiveRLExperimentStageV2.FAILED
-        or expected_index != len(MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2) - 1
+        expected_index != len(MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2) - 1
         or MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[expected_index]
         is not MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
     ):
@@ -467,6 +600,19 @@ def publish_massive_adaptive_rl_development_report_state_v2(
         stage_artifact_receipt_sha256=authority_receipt,
         profitability_report_authority_receipt_sha256=authority_receipt,
         profitability_report_receipt_sha256=report_receipt,
+        outer_evidence_authority_receipt_sha256=_digest(
+            "adaptive RL outer evidence authority",
+            outer_evidence_authority_receipt_sha256,
+        ),
+        source_bundle_receipt_sha256=_digest(
+            "adaptive RL source bundle", source_bundle_receipt_sha256
+        ),
+        source_data_qualified=True,
+        terminal_binding_schema=MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA,
+        manifest_report_binding_receipt_sha256=_digest(
+            "adaptive RL manifest-report binding",
+            manifest_report_binding_receipt_sha256,
+        ),
         failed_gate_names=tuple(failed_gate_names),
         development_profitability_reporting_authorized=(
             development_profitability_reporting_authorized
@@ -481,6 +627,7 @@ def publish_massive_adaptive_rl_development_report_state_v3(
     previous: MassiveAdaptiveRLExperimentStateV2,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     report_authority: MassiveAdaptiveRLProfitabilityReportAuthorityV1,
+    source_bundle: MassiveAdaptiveRLSourceBundleV1,
 ) -> MassiveAdaptiveRLExperimentStateV2:
     """Publish a terminal state from a replayed, manifest-bound report.
 
@@ -493,6 +640,7 @@ def publish_massive_adaptive_rl_development_report_state_v3(
 
     previous.validate()
     manifest.validate()
+    source_bundle.validate()
     if (
         previous.manifest_receipt_sha256 != manifest.semantic_receipt_sha256
         or previous.experiment_id != manifest.experiment_id
@@ -505,11 +653,25 @@ def publish_massive_adaptive_rl_development_report_state_v3(
         manifest=manifest,
         report_authority=report_authority,
     )
+    expected_report_object_key = (
+        "massive-adaptive/rl-profitability-report-authority-v1/"
+        f"{manifest.experiment_id}.json"
+    )
     if (
-        previous.stage
+        report_authority.loaded_source.receipt.source_object_key
+        != expected_report_object_key
+    ):
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL profitability report belongs to another experiment"
+        )
+    if (
+        previous.last_completed_stage
         is not MassiveAdaptiveRLExperimentStageV2.FOUR_FOLD_V4_EVIDENCE_COMPLETED
-        or previous.stage_artifact_receipt_sha256
+        or previous.last_completed_stage_artifact_receipt_sha256
         != report_authority.report.outer_evidence_authority_v4_receipt_sha256
+        or previous.stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
+        and previous.blocked_stage
+        is not MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
     ):
         raise MassiveAdaptiveRLExperimentStateV2Error(
             "adaptive RL report does not descend from the completed V4 evidence"
@@ -522,7 +684,39 @@ def publish_massive_adaptive_rl_development_report_state_v3(
         raise MassiveAdaptiveRLExperimentStateV2Error(
             "adaptive RL profitability report is not replay authorized"
         )
-    return publish_massive_adaptive_rl_development_report_state_v2(
+    if (
+        source_bundle.experiment_id != manifest.experiment_id
+        or source_bundle.manifest_receipt_sha256
+        != manifest.base_manifest.semantic_receipt_sha256
+        or not source_bundle.persisted_source_replayed
+        or not source_bundle.runtime_source_replayed
+        or not source_bundle.source_data_qualified
+    ):
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL profitability report source bundle is not replay authorized"
+        )
+    terminal_binding = semantic_sha256(
+        {
+            "schema": MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA,
+            "experiment_id": manifest.experiment_id,
+            "manifest_receipt_sha256": manifest.semantic_receipt_sha256,
+            "source_bundle_receipt_sha256": source_bundle.semantic_receipt_sha256,
+            "outer_evidence_authority_receipt_sha256": (
+                report_authority.report.outer_evidence_authority_v4_receipt_sha256
+            ),
+            "profitability_report_authority_receipt_sha256": (
+                report_authority.semantic_receipt_sha256
+            ),
+            "profitability_report_receipt_sha256": (
+                report_authority.report.semantic_receipt_sha256
+            ),
+            "failed_gate_names": report_authority.report.failed_gate_names,
+            "development_profitability_reporting_authorized": (
+                report_authority.development_profitability_reporting_authorized
+            ),
+        }
+    )
+    return _publish_massive_adaptive_rl_development_report_state_v2(
         artifact_root=artifact_root,
         previous=previous,
         profitability_report_authority_receipt_sha256=(
@@ -531,6 +725,11 @@ def publish_massive_adaptive_rl_development_report_state_v3(
         profitability_report_receipt_sha256=(
             report_authority.report.semantic_receipt_sha256
         ),
+        outer_evidence_authority_receipt_sha256=(
+            report_authority.report.outer_evidence_authority_v4_receipt_sha256
+        ),
+        source_bundle_receipt_sha256=source_bundle.semantic_receipt_sha256,
+        manifest_report_binding_receipt_sha256=terminal_binding,
         failed_gate_names=report_authority.report.failed_gate_names,
         development_profitability_reporting_authorized=(
             report_authority.development_profitability_reporting_authorized
@@ -541,6 +740,9 @@ def publish_massive_adaptive_rl_development_report_state_v3(
 def _parse_state(payload: Mapping[str, object]) -> MassiveAdaptiveRLExperimentStateV2:
     values = dict(payload)
     values["stage"] = MassiveAdaptiveRLExperimentStageV2(str(values["stage"]))
+    values["last_completed_stage"] = MassiveAdaptiveRLExperimentStageV2(
+        str(values["last_completed_stage"])
+    )
     for name in ("blocked_stage", "failed_stage"):
         if values.get(name) is not None:
             values[name] = MassiveAdaptiveRLExperimentStageV2(str(values[name]))
@@ -574,6 +776,10 @@ def load_massive_adaptive_rl_experiment_states_v2(
         states.append(_parse_state(cast(Mapping[str, object], value)))
     result = tuple(states)
     for index, state in enumerate(result):
+        if index > 0 and result[index - 1].stage in _TERMINAL_STAGES:
+            raise MassiveAdaptiveRLExperimentStateV2Error(
+                "adaptive RL V2 experiment state follows a terminal state"
+            )
         if state.sequence_index != index or (
             index > 0
             and state.previous_state_receipt_sha256
@@ -598,7 +804,6 @@ __all__ = [
     "block_massive_adaptive_rl_experiment_state_v2",
     "fail_massive_adaptive_rl_experiment_state_v2",
     "load_massive_adaptive_rl_experiment_states_v2",
-    "publish_massive_adaptive_rl_development_report_state_v2",
     "publish_massive_adaptive_rl_development_report_state_v3",
     "register_massive_adaptive_rl_experiment_state_v2",
 ]

@@ -722,7 +722,25 @@ def _verify_run_command(args: argparse.Namespace) -> int:
         print(canonical_json_file_bytes(asdict(result_v1)).decode("utf-8"), end="")
         return 0
     print(canonical_json_file_bytes(asdict(result_v2)).decode("utf-8"), end="")
-    return 0
+    return 0 if result_v2.full_verification_complete else 2
+
+
+def _verify_ledger_command(args: argparse.Namespace) -> int:
+    if _manifest_schema(args.manifest) != (
+        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
+    ):
+        return _verify_run_command(args)
+    from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
+        verify_massive_adaptive_rl_experiment_v2,
+    )
+
+    result = verify_massive_adaptive_rl_experiment_v2(
+        manifest_path=args.manifest,
+        source_root=args.source_root,
+        artifact_root=args.artifact_root,
+    )
+    print(canonical_json_file_bytes(asdict(result)).decode("utf-8"), end="")
+    return 0 if result.ledger_replayed else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -746,9 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     manifest_v3.add_argument("--experiment-id", required=True)
     manifest_v3.add_argument("--output", required=True)
-    manifest_v3.add_argument(
-        "--block-sessions", type=int, choices=(21, 63), default=63
-    )
+    manifest_v3.add_argument("--block-sessions", type=int, choices=(21, 63), default=63)
     manifest_v3.add_argument("--seed", type=int, default=17)
     manifest_v3.add_argument("--device", default="cpu")
     manifest_v3.set_defaults(handler=_manifest_v3_command)
@@ -774,12 +790,20 @@ def build_parser() -> argparse.ArgumentParser:
         command.set_defaults(handler=_run_command, resume=resume)
     verify = commands.add_parser(
         "verify",
-        help="Replay the current persisted run ledger without advancing it.",
+        help="Deeply verify the completed experiment without advancing it.",
     )
     verify.add_argument("--manifest", required=True)
     verify.add_argument("--source-root", required=True)
     verify.add_argument("--artifact-root", required=True)
     verify.set_defaults(handler=_verify_run_command)
+    verify_ledger = commands.add_parser(
+        "verify-ledger",
+        help="Replay only the persisted state ledger without claiming deep verification.",
+    )
+    verify_ledger.add_argument("--manifest", required=True)
+    verify_ledger.add_argument("--source-root", required=True)
+    verify_ledger.add_argument("--artifact-root", required=True)
+    verify_ledger.set_defaults(handler=_verify_ledger_command)
     return parser
 
 

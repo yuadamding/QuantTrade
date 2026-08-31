@@ -50,6 +50,7 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
         "current_runtime_boundary": "typed-persisted-composite-loader-required",
         "completed_resume": "terminal-idempotent",
         "state_verification": "entire-chain-manifest-bound",
+        "verification_surface": "ledger-replay-distinct-from-deep-verification",
         "source_disappearance": "block-current-next-stage-without-regression",
         "valid_negative_result": "execution-complete-report-not-authorized",
         "valid_positive_result": "execution-complete-report-authorized",
@@ -75,6 +76,12 @@ class MassiveAdaptiveRLEndToEndRunV2:
     blocker_code: str | None
     execution_complete: bool
     source_data_qualified: bool
+    ledger_replayed: bool
+    completion_authority_replayed: bool
+    report_replayed: bool
+    outer_evidence_replayed: bool
+    runtime_source_graph_replayed: bool
+    full_verification_complete: bool
     profitability_report_authority_receipt_sha256: str | None
     profitability_report_receipt_sha256: str | None
     failed_gate_names: tuple[str, ...]
@@ -103,6 +110,13 @@ class MassiveAdaptiveRLEndToEndRunV2:
             self.current_stage
             is MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
         )
+        expected_full_verification = bool(
+            self.ledger_replayed
+            and self.completion_authority_replayed
+            and self.report_replayed
+            and self.outer_evidence_replayed
+            and self.runtime_source_graph_replayed
+        )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_END_TO_END_RUN_V2_SCHEMA
             or not self.experiment_id
@@ -117,6 +131,12 @@ class MassiveAdaptiveRLEndToEndRunV2:
             and self.blocker_code is None
             or self.source_data_qualified
             and self.source_bundle_receipt_sha256 is None
+            or published
+            and not self.source_data_qualified
+            or not self.ledger_replayed
+            or self.full_verification_complete != expected_full_verification
+            or self.full_verification_complete
+            and (not self.execution_complete or not self.source_data_qualified)
             or published
             != (
                 self.profitability_report_authority_receipt_sha256 is not None
@@ -174,22 +194,33 @@ def _result(
             current.completed_stage_index + 1
         ]
         blocker = None
+    source_bundle_receipt = (
+        source_bundle.semantic_receipt_sha256
+        if source_bundle is not None
+        else current.source_bundle_receipt_sha256
+    )
+    source_data_qualified = (
+        bool(source_bundle is not None and source_bundle.source_data_qualified)
+        or current.source_data_qualified
+    )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_END_TO_END_RUN_V2_SCHEMA,
         "experiment_id": manifest.experiment_id,
         "manifest_receipt_sha256": manifest.semantic_receipt_sha256,
         "execution_device_specification": manifest.execution_device_specification,
-        "source_bundle_receipt_sha256": (
-            None if source_bundle is None else source_bundle.semantic_receipt_sha256
-        ),
+        "source_bundle_receipt_sha256": source_bundle_receipt,
         "state_receipts": tuple(row.semantic_receipt_sha256 for row in states),
         "current_stage": current.stage,
         "next_required_stage": next_stage,
         "blocker_code": blocker,
         "execution_complete": current.execution_complete,
-        "source_data_qualified": bool(
-            source_bundle is not None and source_bundle.source_data_qualified
-        ),
+        "source_data_qualified": source_data_qualified,
+        "ledger_replayed": True,
+        "completion_authority_replayed": False,
+        "report_replayed": False,
+        "outer_evidence_replayed": False,
+        "runtime_source_graph_replayed": False,
+        "full_verification_complete": False,
         "profitability_report_authority_receipt_sha256": (
             current.profitability_report_authority_receipt_sha256
         ),

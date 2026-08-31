@@ -21,12 +21,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
     verify_massive_adaptive_rl_experiment_v2,
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
-    MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2,
     MassiveAdaptiveRLExperimentStageV2,
-    advance_massive_adaptive_rl_experiment_state_v2,
-    load_massive_adaptive_rl_experiment_states_v2,
-    publish_massive_adaptive_rl_development_report_state_v2,
-    register_massive_adaptive_rl_experiment_state_v2,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     build_massive_adaptive_rl_experiment_manifest_v3,
@@ -280,6 +275,7 @@ def test_run_cli_persists_source_replay_failure(tmp_path: Path, capsys) -> None:
 
 def test_runner_v2_binds_device_and_persists_retryable_runtime_blocker(
     tmp_path: Path,
+    capsys,
 ) -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v3(
         experiment_id="runner-v2-source-boundary",
@@ -309,6 +305,8 @@ def test_runner_v2_binds_device_and_persists_retryable_runtime_blocker(
     assert first.next_required_stage.value == "fit-forecasts-authorized"
     assert first.blocker_code == "typed-runtime-source-replay-required"
     assert not first.execution_complete
+    assert first.ledger_replayed
+    assert not first.full_verification_complete
     assert len(first.state_receipts) == 3
 
     resumed = run_massive_adaptive_rl_experiment_v2(
@@ -327,6 +325,22 @@ def test_runner_v2_binds_device_and_persists_retryable_runtime_blocker(
         ).semantic_receipt_sha256
         == first.semantic_receipt_sha256
     )
+
+    common = [
+        "--manifest",
+        str(manifest_path),
+        "--source-root",
+        str(tmp_path),
+        "--artifact-root",
+        str(artifact_root),
+    ]
+    assert main(["verify", *common]) == 2
+    deep = json.loads(capsys.readouterr().out)
+    assert deep["ledger_replayed"]
+    assert not deep["full_verification_complete"]
+    assert main(["verify-ledger", *common]) == 0
+    ledger = json.loads(capsys.readouterr().out)
+    assert ledger["semantic_receipt_sha256"] == deep["semantic_receipt_sha256"]
 
     with pytest.raises(MassiveAdaptiveRLExperimentRunnerV2Error, match="device"):
         run_massive_adaptive_rl_experiment_v2(
@@ -425,60 +439,6 @@ def test_runner_v2_does_not_regress_stage_when_replayed_source_disappears(
         resumed.next_required_stage
         is MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
     )
-
-
-def test_runner_v2_completed_resume_is_terminal_and_idempotent(tmp_path: Path) -> None:
-    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
-        experiment_id="runner-v2-completed-resume"
-    )
-    manifest_path = tmp_path / "manifest-v3.json"
-    write_massive_adaptive_rl_experiment_manifest_v3(
-        path=manifest_path,
-        manifest=manifest,
-    )
-    artifact_root = tmp_path / "artifacts"
-    state = register_massive_adaptive_rl_experiment_state_v2(
-        artifact_root=artifact_root,
-        experiment_id=manifest.experiment_id,
-        manifest_receipt_sha256=manifest.semantic_receipt_sha256,
-    )
-    for stage in MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[1:-1]:
-        state = advance_massive_adaptive_rl_experiment_state_v2(
-            artifact_root=artifact_root,
-            previous=state,
-            stage=stage,
-            stage_artifact_receipt_sha256=semantic_sha256(stage.value),
-        )
-    state = publish_massive_adaptive_rl_development_report_state_v2(
-        artifact_root=artifact_root,
-        previous=state,
-        profitability_report_authority_receipt_sha256=semantic_sha256("authority"),
-        profitability_report_receipt_sha256=semantic_sha256("report"),
-        failed_gate_names=("incremental-rl-lcb-positive",),
-        development_profitability_reporting_authorized=False,
-    )
-    before = load_massive_adaptive_rl_experiment_states_v2(
-        artifact_root=artifact_root,
-        experiment_id=manifest.experiment_id,
-    )
-    resumed = run_massive_adaptive_rl_experiment_v2(
-        manifest_path=manifest_path,
-        source_root=tmp_path / "unavailable-source",
-        artifact_root=artifact_root,
-        device="cpu",
-        resume=True,
-    )
-    after = load_massive_adaptive_rl_experiment_states_v2(
-        artifact_root=artifact_root,
-        experiment_id=manifest.experiment_id,
-    )
-    assert resumed.execution_complete
-    assert (
-        resumed.current_stage
-        is MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
-    )
-    assert resumed.state_receipts[-1] == state.semantic_receipt_sha256
-    assert after == before
 
 
 def test_runner_v2_verify_rejects_another_manifest(tmp_path: Path) -> None:

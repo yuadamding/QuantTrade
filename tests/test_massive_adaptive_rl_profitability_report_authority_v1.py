@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -10,22 +11,111 @@ from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v1 i
     materialize_massive_adaptive_rl_profitability_report_authority_v1,
     parse_massive_adaptive_rl_profitability_report_authority_v1,
 )
-from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    semantic_sha256,
+)
+from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
+    run_massive_adaptive_rl_experiment_v2,
+    verify_massive_adaptive_rl_experiment_v2,
+)
 from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2,
+    MassiveAdaptiveRLExperimentStageV2,
     MassiveAdaptiveRLExperimentStateV2Error,
     advance_massive_adaptive_rl_experiment_state_v2,
+    block_massive_adaptive_rl_experiment_state_v2,
+    fail_massive_adaptive_rl_experiment_state_v2,
+    load_massive_adaptive_rl_experiment_states_v2,
     publish_massive_adaptive_rl_development_report_state_v3,
     register_massive_adaptive_rl_experiment_state_v2,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MASSIVE_ADAPTIVE_RL_FINAL_GATE_NAMES_V3,
     build_massive_adaptive_rl_experiment_manifest_v3,
+    write_massive_adaptive_rl_experiment_manifest_v3,
 )
+from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
+    authorize_massive_adaptive_rl_source_bundle_v1,
+    bind_massive_adaptive_rl_source_authority_v1,
+    load_massive_adaptive_rl_source_bundle_v1,
+    materialize_massive_adaptive_rl_source_bundle_v1,
+)
+
+
+_GLOBAL_SOURCE_PATHS = {
+    "session-authority": "authorities/session-authority.json",
+    "condition-authority": "authorities/condition-authority.json",
+    "persisted-partition-inventory": "authorities/persisted-partition-inventory.json",
+    "identity-authority": "authorities/identity-authority.json",
+    "economic-event-archive": "authorities/economic-event-archive.json",
+    "daily-input-authority": "authorities/daily-input-authority.json",
+    "fill-source-authority": "authorities/fill-source-authority.json",
+    "split-plan": "authorities/adaptive-split-plan.json",
+}
+_FOLD_SOURCE_PATHS = {
+    "training-window-inventory": "training-window-inventory.json",
+    "supervised-checkpoint-inventory": "supervised-checkpoint-inventory.json",
+    "calibration-inventory": "calibration-inventory.json",
+    "fit-forecast-archive-inventory": "fit-forecast-archive-inventory.json",
+    "decision-root-inventory": "decision-root-inventory.json",
+    "context-origin-inventory": "context-origin-inventory.json",
+}
+
+
+@dataclass(frozen=True)
+class _SyntheticRuntimeSource:
+    semantic_receipt_sha256: str
+
+    def validate(self) -> None:
+        assert len(self.semantic_receipt_sha256) == 64
 
 
 def _digest(value: object) -> str:
     return semantic_sha256(value)
+
+
+def _authorized_source_bundle(root, manifest):
+    root.mkdir()
+    runtime_sources = {}
+    relative_paths = {
+        (role, None): relative_path
+        for role, relative_path in _GLOBAL_SOURCE_PATHS.items()
+    }
+    for fold_index in range(4):
+        relative_paths.update(
+            {
+                (role, fold_index): f"folds/fold-{fold_index}/{name}"
+                for role, name in _FOLD_SOURCE_PATHS.items()
+            }
+        )
+    for key, relative_path in relative_paths.items():
+        receipt = _digest({"role": key[0], "fold_index": key[1]})
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(
+            canonical_json_file_bytes({"semantic_receipt_sha256": receipt})
+        )
+        runtime_sources[key] = bind_massive_adaptive_rl_source_authority_v1(
+            role=key[0],
+            fold_index=key[1],
+            authority=_SyntheticRuntimeSource(receipt),
+            source_data_qualified=True,
+            runtime_source_replayed=True,
+        )
+    materialize_massive_adaptive_rl_source_bundle_v1(
+        source_root=root,
+        manifest=manifest.base_manifest,
+        runtime_sources=runtime_sources,
+    )
+    generic = load_massive_adaptive_rl_source_bundle_v1(
+        source_root=root,
+        manifest=manifest.base_manifest,
+    )
+    return authorize_massive_adaptive_rl_source_bundle_v1(
+        source_bundle=generic,
+        runtime_sources=runtime_sources,
+    )
 
 
 def _report_inputs(*, daily_mean: float) -> tuple[object, tuple[object, ...]]:
@@ -204,6 +294,12 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
     manifest = build_massive_adaptive_rl_experiment_manifest_v3(
         experiment_id=experiment_id
     )
+    manifest_path = tmp_path / "manifest-v3.json"
+    write_massive_adaptive_rl_experiment_manifest_v3(
+        path=manifest_path,
+        manifest=manifest,
+    )
+    source_bundle = _authorized_source_bundle(tmp_path / "source", manifest)
     outer_authority, rollout_authorities = _report_inputs(daily_mean=daily_mean)
     outer_authority.runtime_evidence.passed_gate_names = tuple(
         gate
@@ -237,11 +333,67 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
             stage=stage,
             stage_artifact_receipt_sha256=stage_receipt,
         )
+    evidence_state = state
+    generic_source_bundle = load_massive_adaptive_rl_source_bundle_v1(
+        source_root=tmp_path / "source",
+        manifest=manifest.base_manifest,
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLExperimentStateV2Error,
+        match="source bundle is not replay authorized",
+    ):
+        publish_massive_adaptive_rl_development_report_state_v3(
+            artifact_root=tmp_path / "unqualified-source-states",
+            previous=evidence_state,
+            manifest=manifest,
+            report_authority=authority,
+            source_bundle=generic_source_bundle,
+        )
+
+    if authorized:
+        other_outer_authority, other_rollout_authorities = _report_inputs(
+            daily_mean=daily_mean
+        )
+        other_outer_authority.runtime_evidence.passed_gate_names = tuple(
+            gate
+            for gate in MASSIVE_ADAPTIVE_RL_FINAL_GATE_NAMES_V3
+            if gate != "primary-net-log-return-lcb-positive"
+        )
+        (tmp_path / "other-reports").mkdir()
+        other_authority = (
+            materialize_massive_adaptive_rl_profitability_report_authority_v1(
+                root=tmp_path / "other-reports",
+                artifact_id="another-experiment",
+                outer_evidence_authority_v4=other_outer_authority,  # type: ignore[arg-type]
+                ppo_outer_rollout_authorities=other_rollout_authorities,  # type: ignore[arg-type]
+                committed_at_ms=1,
+            )
+        )
+        with pytest.raises(
+            MassiveAdaptiveRLExperimentStateV2Error,
+            match="belongs to another experiment",
+        ):
+            publish_massive_adaptive_rl_development_report_state_v3(
+                artifact_root=tmp_path / "cross-experiment-report-states",
+                previous=evidence_state,
+                manifest=manifest,
+                report_authority=other_authority,
+                source_bundle=source_bundle,
+            )
+
+    state = block_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=artifact_root,
+        previous=state,
+        blocked_stage=MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED,
+        blocker_code="report-storage-temporarily-unavailable",
+        blocker_evidence_receipt_sha256=_digest("report-storage-blocker"),
+    )
     published = publish_massive_adaptive_rl_development_report_state_v3(
         artifact_root=artifact_root,
         previous=state,
         manifest=manifest,
         report_authority=authority,
+        source_bundle=source_bundle,
     )
     assert published.execution_complete
     assert published.development_profitability_reporting_authorized is authorized
@@ -257,6 +409,70 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
         published.profitability_report_receipt_sha256
         == authority.report.semantic_receipt_sha256
     )
+    assert (
+        published.source_bundle_receipt_sha256 == source_bundle.semantic_receipt_sha256
+    )
+    assert published.source_data_qualified
+    assert (
+        published.last_completed_stage
+        is MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
+    )
+
+    for mutation in (
+        lambda: advance_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=published,
+            stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
+            stage_artifact_receipt_sha256=_digest("late-advance"),
+        ),
+        lambda: block_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=published,
+            blocked_stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
+            blocker_code="late-blocker",
+            blocker_evidence_receipt_sha256=_digest("late-blocker"),
+        ),
+        lambda: fail_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=published,
+            failed_stage=MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED,
+            failure_code="late-failure",
+            failure_evidence_receipt_sha256=_digest("late-failure"),
+        ),
+    ):
+        with pytest.raises(MassiveAdaptiveRLExperimentStateV2Error, match="terminal"):
+            mutation()
+
+    before_resume = load_massive_adaptive_rl_experiment_states_v2(
+        artifact_root=artifact_root,
+        experiment_id=manifest.experiment_id,
+    )
+    resumed = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path / "source-is-not-mounted",
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+    verified = verify_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path / "source-is-not-mounted",
+        artifact_root=artifact_root,
+    )
+    assert resumed.semantic_receipt_sha256 == verified.semantic_receipt_sha256
+    assert resumed.execution_complete
+    assert resumed.source_data_qualified
+    assert resumed.ledger_replayed
+    assert not resumed.completion_authority_replayed
+    assert not resumed.full_verification_complete
+    assert resumed.source_bundle_receipt_sha256 == source_bundle.semantic_receipt_sha256
+    assert (
+        load_massive_adaptive_rl_experiment_states_v2(
+            artifact_root=artifact_root,
+            experiment_id=manifest.experiment_id,
+        )
+        == before_resume
+    )
 
     other_manifest = build_massive_adaptive_rl_experiment_manifest_v3(
         experiment_id=manifest.experiment_id,
@@ -271,6 +487,7 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
             previous=state,
             manifest=other_manifest,
             report_authority=authority,
+            source_bundle=source_bundle,
         )
 
     mismatched_root = tmp_path / "mismatched-evidence-states"
@@ -295,4 +512,9 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
             previous=mismatched,
             manifest=manifest,
             report_authority=authority,
+            source_bundle=source_bundle,
         )
+
+    assert evidence_state.last_completed_stage_artifact_receipt_sha256 == (
+        authority.report.outer_evidence_authority_v4_receipt_sha256
+    )
