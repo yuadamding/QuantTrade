@@ -9,9 +9,11 @@ authorities have independently replayed and validated the same receipts.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
+import os
 from pathlib import Path, PurePosixPath
+import tempfile
 from typing import Protocol, runtime_checkable
 
 from rl_quant.protocol.canonical_artifact import (
@@ -36,7 +38,8 @@ MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V1_SPEC_SHA256 = semantic_sha256(
     {
         "layout": "package-fixed-relative-paths",
         "generic_reload": "byte-replayed-nonauthorizing",
-        "runtime_promotion": "typed-authority-replay-required",
+        "runtime_promotion": "typed-authority-replay-witness-retained",
+        "publication": "fsync-atomic-create-only-no-symlink-ancestors",
         "caller_dates": False,
         "caller_checkpoint_selection": False,
         "caller_actions_or_economics": False,
@@ -174,15 +177,11 @@ _SOURCE_ROLE_SCHEMAS = {
     "supervised-checkpoint-inventory": (
         "rl-quant.massive-adaptive-supervised-checkpoint-inventory-v1"
     ),
-    "calibration-inventory": (
-        "rl-quant.massive-adaptive-calibration-inventory-v1"
-    ),
+    "calibration-inventory": ("rl-quant.massive-adaptive-calibration-inventory-v1"),
     "fit-forecast-archive-inventory": (
         "rl-quant.massive-adaptive-rl-fit-forecast-archive-inventory-v1"
     ),
-    "decision-root-inventory": (
-        "rl-quant.massive-adaptive-decision-root-inventory-v1"
-    ),
+    "decision-root-inventory": ("rl-quant.massive-adaptive-decision-root-inventory-v1"),
     "context-origin-inventory": (
         "rl-quant.massive-adaptive-context-origin-inventory-v1"
     ),
@@ -309,11 +308,16 @@ class MassiveAdaptiveRLSourceBundleV1:
         MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V1_SOURCE_SHA256
     )
     schema: str = MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V1_SCHEMA
+    _runtime_sources: tuple[MassiveAdaptiveRLRoleBoundSourceAuthorityV1, ...] | None = (
+        field(default=None, repr=False, compare=False)
+    )
 
     def semantic_unsigned(self) -> dict[str, object]:
+        payload = asdict(replace(self, _runtime_sources=None))
+        payload.pop("_runtime_sources")
         return {
             key: value
-            for key, value in asdict(self).items()
+            for key, value in payload.items()
             if key
             not in {
                 "semantic_receipt_sha256",
@@ -326,6 +330,7 @@ class MassiveAdaptiveRLSourceBundleV1:
     def validate(self) -> None:
         expected = _expected_paths()
         keys = tuple((row.role, row.fold_index) for row in self.artifacts)
+        runtime_present = self._runtime_sources is not None
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V1_SCHEMA
             or keys
@@ -339,10 +344,11 @@ class MassiveAdaptiveRLSourceBundleV1:
             or self.artifact_inventory_sha256
             != semantic_sha256(tuple(row.receipt_sha256 for row in self.artifacts))
             or not self.committed_source_data_qualified
-            or self.runtime_source_replayed
+            or self.runtime_source_replayed != runtime_present
+            or runtime_present
             and not self.persisted_source_replayed
             or self.source_data_qualified
-            != (self.persisted_source_replayed and self.runtime_source_replayed)
+            != (self.persisted_source_replayed and runtime_present)
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -357,6 +363,30 @@ class MassiveAdaptiveRLSourceBundleV1:
             )
         for row in self.artifacts:
             row.validate()
+        if self._runtime_sources is not None:
+            runtime_by_key = {
+                (runtime.role, runtime.fold_index): runtime
+                for runtime in self._runtime_sources
+            }
+            if len(runtime_by_key) != len(self._runtime_sources) or set(
+                runtime_by_key
+            ) != set(expected):
+                raise MassiveAdaptiveRLSourceBundleV1Error(
+                    "adaptive RL source-bundle runtime witness is incomplete"
+                )
+            artifacts = {
+                (artifact.role, artifact.fold_index): artifact
+                for artifact in self.artifacts
+            }
+            for key, runtime in runtime_by_key.items():
+                bound = _validate_runtime_source_for_role(key=key, value=runtime)
+                if (
+                    _runtime_receipt(bound.authority)
+                    != artifacts[key].semantic_receipt_sha256
+                ):
+                    raise MassiveAdaptiveRLSourceBundleV1Error(
+                        "adaptive RL source-bundle runtime witness differs"
+                    )
         for value in (
             self.manifest_receipt_sha256,
             self.artifact_inventory_sha256,
@@ -416,10 +446,7 @@ class MassiveAdaptiveRLRoleBoundSourceAuthorityV1:
             not isinstance(self.authority, MassiveAdaptiveRLSourceAuthorityProtocol)
             or expected_fold_scope != spec.fold_scoped
             or self.fold_index is not None
-            and (
-                isinstance(self.fold_index, bool)
-                or self.fold_index not in range(4)
-            )
+            and (isinstance(self.fold_index, bool) or self.fold_index not in range(4))
             or self.runtime_schema != spec.runtime_schema
             or self.role_specification_sha256 != spec.specification_sha256
             or self.semantic_receipt_sha256 != _runtime_receipt(self.authority)
@@ -467,24 +494,6 @@ def _runtime_receipt(value: MassiveAdaptiveRLSourceAuthorityProtocol) -> str:
     )
 
 
-def _runtime_is_source_qualified(
-    value: MassiveAdaptiveRLSourceAuthorityProtocol,
-) -> bool:
-    qualification_fields = tuple(
-        bool(getattr(value, name))
-        for name in (
-            "source_transport_qualified",
-            "source_data_qualified",
-            "daily_input_data_qualified",
-            "fill_source_data_qualified",
-            "source_windows_replayed",
-            "runtime_source_replayed",
-        )
-        if hasattr(value, name)
-    )
-    return bool(qualification_fields) and all(qualification_fields)
-
-
 def _validate_runtime_source_for_role(
     *,
     key: tuple[str, int | None],
@@ -495,7 +504,11 @@ def _validate_runtime_source_for_role(
             "adaptive RL runtime source is not package role-bound"
         )
     value.validate()
-    if (value.role, value.fold_index) != key or not _runtime_is_source_qualified(value):
+    if (
+        (value.role, value.fold_index) != key
+        or value.source_data_qualified is not True
+        or value.runtime_source_replayed is not True
+    ):
         raise MassiveAdaptiveRLSourceBundleV1Error(
             "adaptive RL runtime source role, fold, or qualification differs"
         )
@@ -541,6 +554,52 @@ def _bundle_path(source_root: str | Path, experiment_id: str) -> Path:
     )
 
 
+def _create_only_bundle_path(*, root: Path, experiment_id: str) -> Path:
+    output = _bundle_path(root, experiment_id)
+    cursor = output
+    while cursor != root:
+        if root not in cursor.parents:
+            raise MassiveAdaptiveRLSourceBundleV1Error(
+                "adaptive RL composite source bundle escapes its source root"
+            )
+        if cursor.is_symlink():
+            raise MassiveAdaptiveRLSourceBundleV1Error(
+                "adaptive RL composite source bundle path contains a symlink"
+            )
+        cursor = cursor.parent
+    return output
+
+
+def _write_create_only_atomic(*, output: Path, payload: Mapping[str, object]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_json_file_bytes(payload))
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary_path, output)
+        except FileExistsError as error:
+            raise MassiveAdaptiveRLSourceBundleV1Error(
+                "adaptive RL composite source bundle is create-only"
+            ) from error
+        directory_descriptor = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def materialize_massive_adaptive_rl_source_bundle_v1(
     *,
     source_root: str | Path,
@@ -581,9 +640,7 @@ def materialize_massive_adaptive_rl_source_bundle_v1(
             description="adaptive RL fixed source artifact",
         )
         runtime_receipt = _runtime_receipt(runtime)
-        if (
-            _receipt_from_payload(value) != runtime_receipt
-        ):
+        if _receipt_from_payload(value) != runtime_receipt:
             raise MassiveAdaptiveRLSourceBundleV1Error(
                 "adaptive RL fixed source artifact differs from runtime authority"
             )
@@ -673,15 +730,13 @@ def materialize_massive_adaptive_rl_source_bundle_v1(
         semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
     )
     result.validate()
-    output = _bundle_path(root, manifest.experiment_id)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with output.open("xb") as stream:
-            stream.write(canonical_json_file_bytes(asdict(result)))
-    except FileExistsError as error:
-        raise MassiveAdaptiveRLSourceBundleV1Error(
-            "adaptive RL composite source bundle is create-only"
-        ) from error
+    output = _create_only_bundle_path(
+        root=root,
+        experiment_id=manifest.experiment_id,
+    )
+    payload = asdict(replace(result, _runtime_sources=None))
+    payload.pop("_runtime_sources")
+    _write_create_only_atomic(output=output, payload=payload)
     return result
 
 
@@ -699,9 +754,7 @@ def load_massive_adaptive_rl_source_bundle_v1(
 
     manifest.validate()
     root = Path(source_root).resolve()
-    bundle_relative_path = _bundle_path(
-        Path("."), manifest.experiment_id
-    ).as_posix()
+    bundle_relative_path = _bundle_path(Path("."), manifest.experiment_id).as_posix()
     path = _resolve_regular_source_file(
         root=root,
         relative_path=bundle_relative_path,
@@ -733,9 +786,7 @@ def load_massive_adaptive_rl_source_bundle_v1(
             artifact_path,
             description="adaptive RL referenced source artifact",
         )
-        if (
-            _receipt_from_payload(artifact_value) != row.semantic_receipt_sha256
-        ):
+        if _receipt_from_payload(artifact_value) != row.semantic_receipt_sha256:
             raise MassiveAdaptiveRLSourceBundleV1Error(
                 "adaptive RL referenced source artifact does not replay"
             )
@@ -768,9 +819,11 @@ def authorize_massive_adaptive_rl_source_bundle_v1(
         )
     for key, runtime in runtime_sources.items():
         bound = _validate_runtime_source_for_role(key=key, value=runtime)
-        if _runtime_receipt(runtime) != expected[
-            key
-        ].semantic_receipt_sha256 or not _runtime_is_source_qualified(bound):
+        if (
+            _runtime_receipt(bound.authority) != expected[key].semantic_receipt_sha256
+            or bound.source_data_qualified is not True
+            or bound.runtime_source_replayed is not True
+        ):
             raise MassiveAdaptiveRLSourceBundleV1Error(
                 "adaptive RL runtime source is unqualified or differs from persisted inventory"
             )
@@ -778,6 +831,20 @@ def authorize_massive_adaptive_rl_source_bundle_v1(
         source_bundle,
         runtime_source_replayed=True,
         source_data_qualified=True,
+        _runtime_sources=tuple(
+            _validate_runtime_source_for_role(
+                key=key,
+                value=runtime_sources[key],
+            )
+            for key in sorted(
+                runtime_sources,
+                key=lambda value: (
+                    value[1] is not None,
+                    value[1] or -1,
+                    value[0],
+                ),
+            )
+        ),
     )
     result.validate()
     return result

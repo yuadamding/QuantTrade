@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -17,6 +17,7 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
     MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
     authorize_massive_adaptive_rl_runtime_source_graph_authority_v1,
+    build_massive_adaptive_rl_typed_authority_inventory_v1,
     load_massive_adaptive_rl_runtime_source_graph_authority_v1,
     materialize_massive_adaptive_rl_runtime_source_graph_authority_v1,
     runtime_source_graph_authority_path_v1,
@@ -65,6 +66,18 @@ class _SyntheticRuntimeSource:
 
     def validate(self) -> None:
         assert len(self.semantic_receipt_sha256) == 64
+
+
+@dataclass(frozen=True)
+class _SyntheticPartition:
+    source_session_date: str
+    receipt_sha256: str
+    schema: str = "synthetic-partition-v1"
+    partition_spec_sha256: str = semantic_sha256("synthetic-partition-spec-v1")
+
+    def validate(self) -> None:
+        assert self.source_session_date
+        assert len(self.receipt_sha256) == 64
 
 
 def _persist_synthetic_source_graph(root: Path):
@@ -129,6 +142,14 @@ def _allow_synthetic_domain_types(monkeypatch: pytest.MonkeyPatch) -> None:
         "_DIRECT_DOMAIN_SPECIFICATIONS",
         {role: None for role in graph_module._DIRECT_DOMAIN_SPECIFICATIONS},
     )
+    monkeypatch.setattr(
+        graph_module,
+        "_validate_runtime_graph_contract",
+        lambda **_kwargs: (
+            (("synthetic-runtime-coverage",),),
+            (("synthetic-runtime-edge", "test", "test"),),
+        ),
+    )
 
 
 def test_runtime_source_graph_generic_reload_is_nonauthorizing_and_replayable(
@@ -162,6 +183,20 @@ def test_runtime_source_graph_generic_reload_is_nonauthorizing_and_replayable(
     assert generic.persisted_graph_replayed
     assert not generic.runtime_graph_replayed
     assert not generic.source_data_qualified
+    assert generic.runtime_authority_receipt_sha256 is None
+    with pytest.raises(
+        MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
+        match="concrete replay witness",
+    ):
+        generic.runtime_authority(role="session-authority", fold_index=None)
+
+    forged = replace(
+        generic,
+        runtime_graph_replayed=True,
+        source_data_qualified=True,
+    )
+    with pytest.raises(MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error):
+        forged.validate()
 
     authorized = authorize_massive_adaptive_rl_runtime_source_graph_authority_v1(
         authority=generic,
@@ -170,6 +205,18 @@ def test_runtime_source_graph_generic_reload_is_nonauthorizing_and_replayable(
     )
     assert authorized.runtime_graph_replayed
     assert authorized.source_data_qualified
+    assert authorized.runtime_authority_receipt_sha256 is not None
+    assert (
+        authorized.runtime_authority_receipt_sha256
+        != authorized.semantic_receipt_sha256
+    )
+    assert (
+        authorized.runtime_authority(
+            role="session-authority",
+            fold_index=None,
+        )
+        is runtimes[("session-authority", None)].authority
+    )
     assert (
         authorized.source_bundle_receipt_sha256 == source_bundle.semantic_receipt_sha256
     )
@@ -211,12 +258,13 @@ def test_runtime_source_graph_generic_reload_is_nonauthorizing_and_replayable(
         source_root=tmp_path,
         experiment_id=manifest.experiment_id,
     )
+    assert not tuple(graph_path.parent.glob(f".{graph_path.name}.*.tmp"))
     backing_path = graph_path.with_name("runtime-source-graph-backing.json")
     graph_path.rename(backing_path)
     graph_path.symlink_to(backing_path.name)
     with pytest.raises(
         MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
-        match="absent or not regular",
+        match="symlink",
     ):
         load_massive_adaptive_rl_runtime_source_graph_authority_v1(
             source_root=tmp_path,
@@ -242,6 +290,71 @@ def test_runtime_source_graph_rejects_old_arbitrary_role_wrappers(
             source_bundle=source_bundle,
             runtime_sources=runtimes,
         )
+
+
+def test_typed_inventory_rejects_duplicate_logical_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    role = "persisted-partition-inventory"
+    monkeypatch.setitem(
+        graph_module._DOMAIN_INVENTORY_ITEM_TYPES,
+        role,
+        _SyntheticPartition,
+    )
+    monkeypatch.setitem(
+        graph_module._DOMAIN_INVENTORY_ITEM_SCHEMAS,
+        role,
+        _SyntheticPartition.schema,
+    )
+    monkeypatch.setitem(
+        graph_module._DOMAIN_INVENTORY_ITEM_SPECIFICATIONS,
+        role,
+        _SyntheticPartition.partition_spec_sha256,
+    )
+    first = _SyntheticPartition(
+        source_session_date="2020-01-02",
+        receipt_sha256=semantic_sha256("first"),
+    )
+    duplicate = _SyntheticPartition(
+        source_session_date=first.source_session_date,
+        receipt_sha256=semantic_sha256("duplicate"),
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
+        match="identity or replay",
+    ):
+        build_massive_adaptive_rl_typed_authority_inventory_v1(
+            role=role,
+            fold_index=None,
+            items=(first, duplicate),
+        )
+
+    second = _SyntheticPartition(
+        source_session_date="2020-01-03",
+        receipt_sha256=semantic_sha256("second"),
+    )
+    valid = build_massive_adaptive_rl_typed_authority_inventory_v1(
+        role=role,
+        fold_index=None,
+        items=(first, second),
+    )
+    swapped = replace(
+        valid,
+        item_bindings=(
+            (valid.item_bindings[0][0], valid.item_bindings[1][1]),
+            (valid.item_bindings[1][0], valid.item_bindings[0][1]),
+        ),
+        semantic_receipt_sha256="0" * 64,
+    )
+    swapped = replace(
+        swapped,
+        semantic_receipt_sha256=semantic_sha256(swapped.semantic_unsigned()),
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
+        match="key bindings",
+    ):
+        swapped.validate()
 
 
 def test_runtime_source_graph_rejects_incomplete_and_changed_runtime_replay(

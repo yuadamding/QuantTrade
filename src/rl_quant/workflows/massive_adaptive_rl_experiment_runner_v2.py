@@ -224,7 +224,10 @@ def _result(
         or current.source_data_qualified
     )
     runtime_source_graph_receipt = (
-        runtime_source_graph.semantic_receipt_sha256
+        (
+            runtime_source_graph.runtime_authority_receipt_sha256
+            or runtime_source_graph.semantic_receipt_sha256
+        )
         if runtime_source_graph is not None
         else current.runtime_source_graph_authority_receipt_sha256
     )

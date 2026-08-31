@@ -110,6 +110,13 @@ def test_source_bundle_generic_reload_is_nonauthorizing_and_tamper_evident(
     assert generic.persisted_source_replayed
     assert not generic.runtime_source_replayed
     assert not generic.source_data_qualified
+    forged = replace(
+        generic,
+        runtime_source_replayed=True,
+        source_data_qualified=True,
+    )
+    with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error):
+        forged.validate()
     authorized = authorize_massive_adaptive_rl_source_bundle_v1(
         source_bundle=generic,
         runtime_sources=runtimes,
@@ -117,6 +124,17 @@ def test_source_bundle_generic_reload_is_nonauthorizing_and_tamper_evident(
     assert authorized.source_data_qualified
     assert not authorized.profitability_reporting_authorized
     assert not authorized.lockbox_access_authorized
+
+    with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="create-only"):
+        materialize_massive_adaptive_rl_source_bundle_v1(
+            source_root=tmp_path,
+            manifest=manifest,
+            runtime_sources=runtimes,
+        )
+    bundle_path = (
+        tmp_path / "adaptive-rl" / "source-bundle-v1" / f"{manifest.experiment_id}.json"
+    )
+    assert not tuple(bundle_path.parent.glob(f".{bundle_path.name}.*.tmp"))
 
     first_key = next(iter(runtimes))
     unqualified = dict(runtimes)
@@ -200,6 +218,23 @@ def test_source_bundle_rejects_symlinked_source_artifact(tmp_path: Path) -> None
     backing = target.with_name("session-authority-backing.json")
     target.rename(backing)
     target.symlink_to(backing.name)
+
+    with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="symlink"):
+        materialize_massive_adaptive_rl_source_bundle_v1(
+            source_root=tmp_path,
+            manifest=manifest,
+            runtime_sources=runtimes,
+        )
+
+
+def test_source_bundle_rejects_symlinked_output_ancestor(tmp_path: Path) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v2(
+        experiment_id="symlinked-source-bundle-output"
+    )
+    runtimes = _persist_synthetic_source_graph(tmp_path)
+    redirected = tmp_path / "redirected-adaptive-rl"
+    redirected.mkdir()
+    (tmp_path / "adaptive-rl").symlink_to(redirected.name)
 
     with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="symlink"):
         materialize_massive_adaptive_rl_source_bundle_v1(

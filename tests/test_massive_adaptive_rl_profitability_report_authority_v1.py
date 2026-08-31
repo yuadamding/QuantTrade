@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -139,6 +139,14 @@ def _authorized_source_bundle(root, manifest, monkeypatch):
         graph_module,
         "_DIRECT_DOMAIN_SPECIFICATIONS",
         {role: None for role in graph_module._DIRECT_DOMAIN_SPECIFICATIONS},
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "_validate_runtime_graph_contract",
+        lambda **_kwargs: (
+            (("synthetic-runtime-coverage",),),
+            (("synthetic-runtime-edge", "test", "test"),),
+        ),
     )
     materialize_massive_adaptive_rl_runtime_source_graph_authority_v1(
         source_root=root,
@@ -397,10 +405,10 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
             runtime_source_graph_authority=runtime_graph,
         )
 
-    generic_runtime_graph = replace(
-        runtime_graph,
-        runtime_graph_replayed=False,
-        source_data_qualified=False,
+    generic_runtime_graph = load_massive_adaptive_rl_runtime_source_graph_authority_v1(
+        source_root=tmp_path / "source",
+        manifest=manifest,
+        source_bundle=generic_source_bundle,
     )
     generic_runtime_graph.validate()
     with pytest.raises(
@@ -483,7 +491,7 @@ def test_terminal_state_is_derived_from_manifest_bound_report_authority(
     assert published.source_data_qualified
     assert (
         published.runtime_source_graph_authority_receipt_sha256
-        == runtime_graph.semantic_receipt_sha256
+        == runtime_graph.runtime_authority_receipt_sha256
     )
     assert (
         published.last_completed_stage

@@ -752,6 +752,13 @@ def publish_massive_adaptive_rl_development_report_state_v3(
         raise MassiveAdaptiveRLExperimentStateV2Error(
             "adaptive RL profitability report runtime source graph is not replay authorized"
         )
+    runtime_graph_authority_receipt = (
+        runtime_source_graph_authority.runtime_authority_receipt_sha256
+    )
+    if runtime_graph_authority_receipt is None:
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL profitability report runtime source witness is absent"
+        )
     terminal_binding = semantic_sha256(
         {
             "schema": MASSIVE_ADAPTIVE_RL_TERMINAL_BINDING_V1_SCHEMA,
@@ -759,7 +766,7 @@ def publish_massive_adaptive_rl_development_report_state_v3(
             "manifest_receipt_sha256": manifest.semantic_receipt_sha256,
             "source_bundle_receipt_sha256": source_bundle.semantic_receipt_sha256,
             "runtime_source_graph_authority_receipt_sha256": (
-                runtime_source_graph_authority.semantic_receipt_sha256
+                runtime_graph_authority_receipt
             ),
             "outer_evidence_authority_receipt_sha256": (
                 report_authority.report.outer_evidence_authority_v4_receipt_sha256
@@ -789,9 +796,7 @@ def publish_massive_adaptive_rl_development_report_state_v3(
             report_authority.report.outer_evidence_authority_v4_receipt_sha256
         ),
         source_bundle_receipt_sha256=source_bundle.semantic_receipt_sha256,
-        runtime_source_graph_authority_receipt_sha256=(
-            runtime_source_graph_authority.semantic_receipt_sha256
-        ),
+        runtime_source_graph_authority_receipt_sha256=(runtime_graph_authority_receipt),
         manifest_report_binding_receipt_sha256=terminal_binding,
         failed_gate_names=report_authority.report.failed_gate_names,
         development_profitability_reporting_authorized=(

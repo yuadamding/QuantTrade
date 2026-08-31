@@ -9,9 +9,12 @@ promotion requires the same complete role-bound runtime graph again.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+import inspect
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import cast
 
 from rl_quant.alpha.pit_universe import PITSecurityUniverseAuthority
@@ -92,6 +95,9 @@ from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
 MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-runtime-source-graph-authority-v1"
 )
+MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_REPLAY_WITNESS_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-runtime-source-graph-replay-witness-v1"
+)
 MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SOURCE_SHA256 = file_sha256(
     Path(__file__)
 )
@@ -101,8 +107,12 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SPEC_SHA256 = semantic_sha
         "roles": "complete-package-owned-role-and-fold-inventory",
         "domain_types": "package-registered-concrete-runtime-types",
         "generic_reload": "persisted-graph-replayed-nonauthorizing",
-        "promotion": "complete-concrete-runtime-graph-replay",
-        "qualification": "derived-from-concrete-domain-authorities",
+        "promotion": "complete-concrete-runtime-graph-witness-retained",
+        "qualification": "explicit-role-specific-domain-authority-contracts",
+        "implementation_identity": "every-domain-type-source-sha256",
+        "inventory_coverage": "logical-keys-and-exact-rl-fit-prefix",
+        "graph_edges": "cross-authority-lineage-reconciled",
+        "publication": "fsync-atomic-create-only-no-symlink-ancestors",
         "profitability_reporting": False,
         "lockbox_access": False,
     }
@@ -128,6 +138,15 @@ def _digest(name: str, value: object) -> str:
 def _type_name(value: type[object] | object) -> str:
     runtime_type = value if isinstance(value, type) else type(value)
     return f"{runtime_type.__module__}.{runtime_type.__qualname__}"
+
+
+def _type_implementation_source_sha256(value: type[object]) -> str:
+    source_path = inspect.getsourcefile(value)
+    if source_path is None:
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL runtime authority implementation source is absent"
+        )
+    return file_sha256(source_path)
 
 
 def _runtime_receipt(value: object) -> str:
@@ -180,7 +199,18 @@ _DOMAIN_INVENTORY_ITEM_SPECIFICATIONS: dict[str, str | None] = {
 
 
 def _authority_is_qualified(*, role: str, authority: object) -> bool:
-    required_fields = {
+    required_fields: tuple[str, ...] | None = {
+        "session-authority": (),
+        "condition-authority": (),
+        "identity-authority": (),
+        "economic-event-archive": (),
+        "persisted-partition-inventory": ("source_data_qualified",),
+        "training-window-inventory": ("source_data_qualified",),
+        "supervised-checkpoint-inventory": ("source_data_qualified",),
+        "calibration-inventory": ("source_data_qualified",),
+        "fit-forecast-archive-inventory": ("source_data_qualified",),
+        "decision-root-inventory": ("source_data_qualified",),
+        "context-origin-inventory": ("source_data_qualified",),
         "daily-input-authority": (
             "source_transport_qualified",
             "daily_input_data_qualified",
@@ -193,39 +223,86 @@ def _authority_is_qualified(*, role: str, authority: object) -> bool:
             "candidate_source_data_qualified",
             "source_geometry_replayed",
         ),
-    }.get(role, ())
-    observed_fields = tuple(
-        name
-        for name in (
-            "source_transport_qualified",
-            "source_data_qualified",
-            "daily_input_data_qualified",
-            "source_paths_replayed",
-            "source_geometry_replayed",
-            "candidate_source_data_qualified",
-        )
-        if hasattr(authority, name)
+    }.get(role)
+    return required_fields is not None and all(
+        getattr(authority, name, None) is True for name in required_fields
     )
-    fields = tuple(sorted(set((*required_fields, *observed_fields))))
-    return all(getattr(authority, name, None) is True for name in fields)
 
 
-def _item_is_qualified(item: object) -> bool:
-    observed = tuple(
-        getattr(item, name)
-        for name in (
-            "source_transport_qualified",
-            "source_data_qualified",
-            "daily_input_data_qualified",
-            "source_paths_replayed",
-            "source_windows_replayed",
-            "runtime_calibration_replayed",
-            "runtime_forecasts_replayed",
-            "committed_source_data_qualified",
+_INVENTORY_QUALIFICATION_FIELDS = {
+    "persisted-partition-inventory": (),
+    "training-window-inventory": ("source_windows_replayed",),
+    "supervised-checkpoint-inventory": ("source_data_qualified",),
+    "calibration-inventory": (
+        "source_data_qualified",
+        "runtime_calibration_replayed",
+    ),
+    "fit-forecast-archive-inventory": (
+        "committed_source_data_qualified",
+        "runtime_forecasts_replayed",
+    ),
+    "decision-root-inventory": (
+        "source_data_qualified",
+        "source_paths_replayed",
+    ),
+    "context-origin-inventory": (
+        "source_data_qualified",
+        "source_paths_replayed",
+    ),
+}
+
+
+def _item_is_qualified(*, role: str, item: object) -> bool:
+    fields = _INVENTORY_QUALIFICATION_FIELDS.get(role)
+    if fields is None:
+        return False
+    return all(getattr(item, name, None) is True for name in fields)
+
+
+def _item_logical_key(*, role: str, item: object) -> str:
+    if role == "persisted-partition-inventory":
+        value: object = getattr(item, "source_session_date", None)
+    elif role == "training-window-inventory":
+        rows = getattr(item, "rows", ())
+        value = (
+            getattr(item, "fold_index", None),
+            getattr(item, "split_role", None),
+            getattr(rows[0], "origin_session_date", None) if rows else None,
+            getattr(rows[-1], "origin_session_date", None) if rows else None,
         )
-        if hasattr(item, name)
-    )
-    return not observed or all(value is True for value in observed)
+    elif role == "supervised-checkpoint-inventory":
+        value = (
+            getattr(item, "fold_index", None),
+            getattr(item, "selection_cutoff_session_date", None),
+            getattr(item, "training_window_plan_receipt_sha256", None),
+        )
+    elif role == "calibration-inventory":
+        value = (
+            getattr(item, "fold_index", None),
+            getattr(item, "checkpoint_receipt_sha256", None),
+            getattr(item, "calibration_fit_stop_session_date", None),
+        )
+    elif role == "fit-forecast-archive-inventory":
+        value = (
+            getattr(item, "outer_fold_index", None),
+            getattr(item, "source_fold_index", None),
+            getattr(item, "block_index", None),
+        )
+    elif role in {"decision-root-inventory", "context-origin-inventory"}:
+        value = getattr(item, "decision_session_date", None)
+    else:
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL typed source inventory has no logical-key contract"
+        )
+    if (
+        value is None
+        or isinstance(value, tuple)
+        and any(part is None for part in value)
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL typed source inventory logical key is absent"
+        )
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
 
 
 def _item_specification(item: object) -> str | None:
@@ -245,8 +322,11 @@ class MassiveAdaptiveRLTypedAuthorityInventoryV1:
     fold_index: int | None
     runtime_schema: str
     item_type_name: str
+    item_implementation_source_sha256: str
     item_schema: str
     item_specification_sha256: str | None
+    item_bindings: tuple[tuple[str, str], ...]
+    item_logical_keys: tuple[str, ...]
     item_receipts: tuple[str, ...]
     semantic_receipt_sha256: str
     runtime_items: tuple[MassiveAdaptiveRLSourceAuthorityProtocol, ...] | None
@@ -259,8 +339,13 @@ class MassiveAdaptiveRLTypedAuthorityInventoryV1:
             "fold_index": self.fold_index,
             "runtime_schema": self.runtime_schema,
             "item_type_name": self.item_type_name,
+            "item_implementation_source_sha256": (
+                self.item_implementation_source_sha256
+            ),
             "item_schema": self.item_schema,
             "item_specification_sha256": self.item_specification_sha256,
+            "item_bindings": self.item_bindings,
+            "item_logical_keys": self.item_logical_keys,
             "item_receipts": self.item_receipts,
         }
 
@@ -273,9 +358,20 @@ class MassiveAdaptiveRLTypedAuthorityInventoryV1:
             or spec is None
             or self.runtime_schema != spec.runtime_schema
             or self.item_type_name != _type_name(expected_type)
+            or self.item_implementation_source_sha256
+            != _type_implementation_source_sha256(expected_type)
             or self.item_schema != _DOMAIN_INVENTORY_ITEM_SCHEMAS.get(self.role)
             or self.item_specification_sha256
             != _DOMAIN_INVENTORY_ITEM_SPECIFICATIONS.get(self.role)
+            or not self.item_bindings
+            or self.item_bindings
+            != tuple(sorted(self.item_bindings, key=lambda value: value[0]))
+            or tuple(binding[0] for binding in self.item_bindings)
+            != self.item_logical_keys
+            or tuple(sorted(binding[1] for binding in self.item_bindings))
+            != self.item_receipts
+            or not self.item_logical_keys
+            or self.item_logical_keys != tuple(sorted(set(self.item_logical_keys)))
             or not self.item_receipts
             or len(set(self.item_receipts)) != len(self.item_receipts)
             or self.item_receipts != tuple(sorted(self.item_receipts))
@@ -294,6 +390,10 @@ class MassiveAdaptiveRLTypedAuthorityInventoryV1:
             )
         for value in (*self.item_receipts, self.semantic_receipt_sha256):
             _digest("adaptive RL typed source inventory", value)
+        _digest(
+            "adaptive RL typed source inventory implementation",
+            self.item_implementation_source_sha256,
+        )
         if self.item_specification_sha256 is not None:
             _digest(
                 "adaptive RL typed source inventory item specification",
@@ -323,11 +423,26 @@ class MassiveAdaptiveRLTypedAuthorityInventoryV1:
                     raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                         "adaptive RL typed source inventory item fold differs"
                     )
-                if not _item_is_qualified(item):
+                if not _item_is_qualified(role=self.role, item=item):
                     raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                         "adaptive RL typed source inventory item is unqualified"
                     )
                 receipts.append(_runtime_receipt(item))
+            if (
+                tuple(
+                    sorted(
+                        (
+                            _item_logical_key(role=self.role, item=item),
+                            _runtime_receipt(item),
+                        )
+                        for item in self.runtime_items
+                    )
+                )
+                != self.item_bindings
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL typed source inventory key bindings do not replay"
+                )
             if tuple(sorted(receipts)) != self.item_receipts:
                 raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                     "adaptive RL typed source inventory items do not replay"
@@ -353,17 +468,31 @@ def build_massive_adaptive_rl_typed_authority_inventory_v1(
                 "adaptive RL typed source inventory item type differs"
             )
         item.validate()
-        if not _item_is_qualified(item):
+        if not _item_is_qualified(role=role, item=item):
             raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                 "adaptive RL typed source inventory item is unqualified"
             )
+    item_bindings = tuple(
+        sorted(
+            (
+                _item_logical_key(role=role, item=item),
+                _runtime_receipt(item),
+            )
+            for item in runtime_items
+        )
+    )
     body = {
         "role": role,
         "fold_index": fold_index,
         "runtime_schema": spec.runtime_schema,
         "item_type_name": _type_name(expected_type),
+        "item_implementation_source_sha256": (
+            _type_implementation_source_sha256(expected_type)
+        ),
         "item_schema": _DOMAIN_INVENTORY_ITEM_SCHEMAS[role],
         "item_specification_sha256": _DOMAIN_INVENTORY_ITEM_SPECIFICATIONS[role],
+        "item_bindings": item_bindings,
+        "item_logical_keys": tuple(binding[0] for binding in item_bindings),
         "item_receipts": tuple(
             sorted(_runtime_receipt(item) for item in runtime_items)
         ),
@@ -415,11 +544,19 @@ def _domain_specification(role: str) -> str:
     if role in _DOMAIN_INVENTORY_ITEM_TYPES:
         contract: object = {
             "item_type": _type_name(_DOMAIN_INVENTORY_ITEM_TYPES[role]),
+            "item_implementation_source_sha256": (
+                _type_implementation_source_sha256(_DOMAIN_INVENTORY_ITEM_TYPES[role])
+            ),
             "item_schema": _DOMAIN_INVENTORY_ITEM_SCHEMAS[role],
             "item_specification_sha256": (_DOMAIN_INVENTORY_ITEM_SPECIFICATIONS[role]),
         }
     else:
-        contract = _DIRECT_DOMAIN_SPECIFICATIONS[role]
+        contract = {
+            "specification_sha256": _DIRECT_DOMAIN_SPECIFICATIONS[role],
+            "implementation_source_sha256": (
+                _type_implementation_source_sha256(expected_type)
+            ),
+        }
     return semantic_sha256(
         {
             "role": role,
@@ -495,6 +632,8 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
     role_specification_inventory_sha256: str
     domain_type_inventory_sha256: str
     domain_specification_inventory_sha256: str
+    logical_coverage_inventory_sha256: str
+    graph_edge_inventory_sha256: str
     committed_source_data_qualified: bool
     persisted_graph_replayed: bool
     runtime_graph_replayed: bool
@@ -510,11 +649,78 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
         MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SOURCE_SHA256
     )
     schema: str = MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SCHEMA
+    _runtime_source_bundle: MassiveAdaptiveRLSourceBundleV1 | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _runtime_sources: tuple[MassiveAdaptiveRLRoleBoundSourceAuthorityV1, ...] | None = (
+        field(default=None, repr=False, compare=False)
+    )
+
+    @property
+    def runtime_authority_receipt_sha256(self) -> str | None:
+        self.validate()
+        if self._runtime_source_bundle is None or self._runtime_sources is None:
+            return None
+        return semantic_sha256(
+            {
+                "schema": (
+                    MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_REPLAY_WITNESS_V1_SCHEMA
+                ),
+                "persisted_graph_receipt_sha256": self.semantic_receipt_sha256,
+                "source_bundle_receipt_sha256": (
+                    self._runtime_source_bundle.semantic_receipt_sha256
+                ),
+                "runtime_authority_receipts": tuple(
+                    (
+                        runtime.role,
+                        runtime.fold_index,
+                        _runtime_receipt(runtime.authority),
+                    )
+                    for runtime in self._runtime_sources
+                ),
+                "logical_coverage_inventory_sha256": (
+                    self.logical_coverage_inventory_sha256
+                ),
+                "graph_edge_inventory_sha256": self.graph_edge_inventory_sha256,
+            }
+        )
+
+    def runtime_authority(
+        self, *, role: str, fold_index: int | None
+    ) -> MassiveAdaptiveRLSourceAuthorityProtocol:
+        """Return one concrete witness only after the complete graph replays."""
+
+        self.validate()
+        if self._runtime_sources is None:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL runtime source graph has no concrete replay witness"
+            )
+        matches = tuple(
+            runtime.authority
+            for runtime in self._runtime_sources
+            if runtime.role == role and runtime.fold_index == fold_index
+        )
+        if len(matches) != 1:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL runtime source graph role is absent or duplicated"
+            )
+        return matches[0]
 
     def semantic_unsigned(self) -> dict[str, object]:
+        payload = asdict(
+            replace(
+                self,
+                _runtime_source_bundle=None,
+                _runtime_sources=None,
+            )
+        )
+        payload.pop("_runtime_source_bundle")
+        payload.pop("_runtime_sources")
         return {
             key: value
-            for key, value in asdict(self).items()
+            for key, value in payload.items()
             if key
             not in {
                 "semantic_receipt_sha256",
@@ -525,6 +731,13 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
         }
 
     def validate(self) -> None:
+        runtime_present = (
+            self._runtime_source_bundle is not None
+            and self._runtime_sources is not None
+        )
+        partial_runtime_witness = (self._runtime_source_bundle is None) != (
+            self._runtime_sources is None
+        )
         expected_keys = tuple(
             sorted(
                 (
@@ -581,11 +794,15 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
                     for row in self.rows
                 )
             )
+            or not isinstance(self.logical_coverage_inventory_sha256, str)
+            or not isinstance(self.graph_edge_inventory_sha256, str)
             or self.committed_source_data_qualified is not True
-            or self.runtime_graph_replayed
+            or partial_runtime_witness
+            or self.runtime_graph_replayed != runtime_present
+            or runtime_present
             and not self.persisted_graph_replayed
             or self.source_data_qualified
-            != (self.persisted_graph_replayed and self.runtime_graph_replayed)
+            != (self.persisted_graph_replayed and runtime_present)
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -600,6 +817,41 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
             )
         for row in self.rows:
             row.validate()
+        if runtime_present:
+            assert self._runtime_source_bundle is not None
+            assert self._runtime_sources is not None
+            self._runtime_source_bundle.validate()
+            runtime_sources = {
+                (runtime.role, runtime.fold_index): runtime
+                for runtime in self._runtime_sources
+            }
+            if len(runtime_sources) != len(self._runtime_sources):
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL runtime source graph witness contains duplicate roles"
+                )
+            if (
+                not self._runtime_source_bundle.runtime_source_replayed
+                or not self._runtime_source_bundle.source_data_qualified
+                or self._runtime_source_bundle.semantic_receipt_sha256
+                != self.source_bundle_receipt_sha256
+                or _rows(
+                    source_bundle=self._runtime_source_bundle,
+                    runtime_sources=runtime_sources,
+                )
+                != self.rows
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL runtime source graph witness does not replay"
+                )
+            coverage, edges = _validate_runtime_graph_contract(
+                runtime_sources=runtime_sources
+            )
+            if self.logical_coverage_inventory_sha256 != semantic_sha256(
+                coverage
+            ) or self.graph_edge_inventory_sha256 != semantic_sha256(edges):
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL runtime graph coverage or edges do not replay"
+                )
         for value in (
             self.manifest_v3_receipt_sha256,
             self.base_manifest_receipt_sha256,
@@ -611,6 +863,8 @@ class MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
             self.role_specification_inventory_sha256,
             self.domain_type_inventory_sha256,
             self.domain_specification_inventory_sha256,
+            self.logical_coverage_inventory_sha256,
+            self.graph_edge_inventory_sha256,
             self.protocol_receipt_sha256,
             self.specification_sha256,
             self.implementation_source_sha256,
@@ -720,11 +974,411 @@ def _rows(
     return tuple(rows)
 
 
+def _inventory_items(
+    *,
+    runtime_sources: Mapping[
+        tuple[str, int | None], MassiveAdaptiveRLSourceAuthorityProtocol
+    ],
+    role: str,
+    fold_index: int | None,
+) -> tuple[object, ...]:
+    bound = runtime_sources[(role, fold_index)]
+    if not isinstance(
+        bound, MassiveAdaptiveRLRoleBoundSourceAuthorityV1
+    ) or not isinstance(bound.authority, MassiveAdaptiveRLTypedAuthorityInventoryV1):
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL runtime graph inventory witness is absent"
+        )
+    if bound.authority.runtime_items is None:
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL runtime graph inventory was not replayed"
+        )
+    return tuple(bound.authority.runtime_items)
+
+
+def _direct_authority(
+    *,
+    runtime_sources: Mapping[
+        tuple[str, int | None], MassiveAdaptiveRLSourceAuthorityProtocol
+    ],
+    role: str,
+) -> object:
+    bound = runtime_sources[(role, None)]
+    if not isinstance(bound, MassiveAdaptiveRLRoleBoundSourceAuthorityV1):
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL runtime graph direct witness is absent"
+        )
+    return bound.authority
+
+
+def _edge(
+    edges: list[tuple[str, str, str]],
+    *,
+    name: str,
+    observed: object,
+    expected: object,
+) -> None:
+    if observed != expected or not isinstance(observed, str):
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            f"adaptive RL runtime graph edge differs: {name}"
+        )
+    edges.append((name, observed, str(expected)))
+
+
+def _validate_runtime_graph_contract(
+    *,
+    runtime_sources: Mapping[
+        tuple[str, int | None], MassiveAdaptiveRLSourceAuthorityProtocol
+    ],
+) -> tuple[tuple[object, ...], tuple[tuple[str, str, str], ...]]:
+    """Validate exact RL-fit coverage and the load-bearing source graph edges."""
+
+    split_plan = _direct_authority(
+        runtime_sources=runtime_sources,
+        role="split-plan",
+    )
+    if type(split_plan) is not MassiveAdaptiveSplitPlanV1:
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL runtime graph requires the concrete split-plan authority"
+        )
+
+    session = cast(
+        MassiveSessionAuthority,
+        _direct_authority(runtime_sources=runtime_sources, role="session-authority"),
+    )
+    condition = cast(
+        MassiveConditionAuthority,
+        _direct_authority(runtime_sources=runtime_sources, role="condition-authority"),
+    )
+    identity = cast(
+        PITSecurityUniverseAuthority,
+        _direct_authority(runtime_sources=runtime_sources, role="identity-authority"),
+    )
+    economic = cast(
+        MassiveProviderEconomicArchiveAuthorityV6,
+        _direct_authority(
+            runtime_sources=runtime_sources,
+            role="economic-event-archive",
+        ),
+    )
+    daily = cast(
+        MassiveProfitabilityDailyInputAuthorityV1,
+        _direct_authority(
+            runtime_sources=runtime_sources, role="daily-input-authority"
+        ),
+    )
+    fills = cast(
+        MassiveAdaptiveFillSourceV1,
+        _direct_authority(
+            runtime_sources=runtime_sources, role="fill-source-authority"
+        ),
+    )
+
+    edges: list[tuple[str, str, str]] = []
+    _edge(
+        edges,
+        name="split-plan/session-authority",
+        observed=split_plan.session_authority_receipt_sha256,
+        expected=session.receipt_sha256,
+    )
+    _edge(
+        edges,
+        name="economic-event-archive/identity-authority",
+        observed=economic.identity_authority_receipt_sha256,
+        expected=identity.receipt_sha256,
+    )
+    _edge(
+        edges,
+        name="daily-input/session-authority",
+        observed=daily.session_authority_receipt_sha256,
+        expected=session.receipt_sha256,
+    )
+    _edge(
+        edges,
+        name="daily-input/condition-authority",
+        observed=daily.condition_authority_receipt_sha256,
+        expected=condition.receipt_sha256,
+    )
+    _edge(
+        edges,
+        name="fill-source/daily-input",
+        observed=fills.daily_input_authority_semantic_receipt_sha256,
+        expected=daily.semantic_receipt_sha256,
+    )
+    _edge(
+        edges,
+        name="fill-source/session-authority",
+        observed=fills.session_authority_receipt_sha256,
+        expected=session.receipt_sha256,
+    )
+    _edge(
+        edges,
+        name="fill-source/condition-authority",
+        observed=fills.condition_authority_receipt_sha256,
+        expected=condition.receipt_sha256,
+    )
+
+    persisted_partitions = _inventory_items(
+        runtime_sources=runtime_sources,
+        role="persisted-partition-inventory",
+        fold_index=None,
+    )
+    partition_dates = tuple(
+        getattr(partition, "source_session_date") for partition in persisted_partitions
+    )
+    daily_dates = tuple(row.source_session_date for row in daily.sessions)
+    if partition_dates != daily_dates:
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL persisted partitions do not cover the daily-input sessions"
+        )
+    for partition in persisted_partitions:
+        _edge(
+            edges,
+            name=(
+                "persisted-partition/identity-authority/"
+                f"{getattr(partition, 'source_session_date', '')}"
+            ),
+            observed=getattr(partition, "identity_authority_receipt_sha256", None),
+            expected=identity.receipt_sha256,
+        )
+
+    coverage: list[object] = [
+        (
+            "persisted-partition-session-dates",
+            partition_dates,
+        )
+    ]
+    for fold_index in range(4):
+        fold = split_plan.outer_folds[fold_index]
+        expected_dates = fold.fit_session_dates[-126 * (fold_index + 1) :]
+        archives = cast(
+            tuple[MassiveAdaptiveRLFitForecastArchiveV1, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="fit-forecast-archive-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        ordered_archives = tuple(sorted(archives, key=lambda row: row.block_index))
+        block_sizes = {archive.block_sessions for archive in ordered_archives}
+        if len(block_sizes) != 1:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL fit forecast block size differs within a fold"
+            )
+        block_sessions = next(iter(block_sizes))
+        expected_block_count = len(expected_dates) // block_sessions
+        if (
+            tuple(archive.block_index for archive in ordered_archives)
+            != tuple(range(expected_block_count))
+            or any(
+                archive.outer_fold_index != fold_index for archive in ordered_archives
+            )
+            or any(
+                archive.source_fold_index
+                != archive.block_index // (126 // block_sessions)
+                for archive in ordered_archives
+            )
+            or tuple(
+                date
+                for archive in ordered_archives
+                for date in archive.origin_session_dates
+            )
+            != expected_dates
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL fit forecast inventory does not cover the exact fit prefix"
+            )
+
+        decision_roots = cast(
+            tuple[MassiveAdaptiveDecisionRootV1, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="decision-root-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        contexts = cast(
+            tuple[MassiveAdaptiveContextOriginAuthorityV1, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="context-origin-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        decisions_by_date = {row.decision_session_date: row for row in decision_roots}
+        contexts_by_date = {row.decision_session_date: row for row in contexts}
+        if (
+            tuple(sorted(decisions_by_date)) != expected_dates
+            or len(decisions_by_date) != len(decision_roots)
+            or tuple(sorted(contexts_by_date)) != expected_dates
+            or len(contexts_by_date) != len(contexts)
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL decision or context inventory does not cover the fit prefix"
+            )
+
+        windows = cast(
+            tuple[MassiveAdaptiveWindowPlanV1, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="training-window-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        checkpoints = cast(
+            tuple[MassiveAdaptiveCausalCheckpointChoiceV1, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="supervised-checkpoint-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        calibrations = cast(
+            tuple[MassiveAdaptiveForecastCalibrationV2, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="calibration-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        window_receipts = {row.semantic_receipt_sha256 for row in windows}
+        archive_window_receipts = {
+            row.training_window_plan_receipt_sha256 for row in ordered_archives
+        }
+        selected_checkpoint_receipts = {
+            row.selected_checkpoint_receipt_sha256 for row in checkpoints
+        }
+        archive_checkpoint_receipts = {
+            row.checkpoint_receipt_sha256 for row in ordered_archives
+        }
+        calibration_pairs = {
+            (
+                row.checkpoint_receipt_sha256,
+                row.training_window_plan_receipt_sha256,
+            )
+            for row in calibrations
+        }
+        archive_pairs = {
+            (
+                row.checkpoint_receipt_sha256,
+                row.training_window_plan_receipt_sha256,
+            )
+            for row in ordered_archives
+        }
+        if (
+            window_receipts != archive_window_receipts
+            or selected_checkpoint_receipts != archive_checkpoint_receipts
+            or calibration_pairs != archive_pairs
+            or any(
+                row.fold_index != fold_index or row.split_role != "training"
+                for row in windows
+            )
+            or any(row.fold_index != fold_index for row in checkpoints)
+            or any(row.fold_index != fold_index for row in calibrations)
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL training, checkpoint, calibration, and forecast coverage differs"
+            )
+
+        full_decision_inventory = semantic_sha256(
+            tuple(
+                decisions_by_date[date].semantic_receipt_sha256
+                for date in expected_dates
+            )
+        )
+        for archive in ordered_archives:
+            origin_inventory = semantic_sha256(
+                tuple(
+                    decisions_by_date[date].semantic_receipt_sha256
+                    for date in archive.origin_session_dates
+                )
+            )
+            _edge(
+                edges,
+                name=f"fit-forecast/split-plan/{fold_index}/{archive.block_index}",
+                observed=archive.split_plan_receipt_sha256,
+                expected=split_plan.semantic_receipt_sha256,
+            )
+            _edge(
+                edges,
+                name=f"fit-forecast/full-decision-roots/{fold_index}/{archive.block_index}",
+                observed=archive.inference_full_decision_root_inventory_sha256,
+                expected=full_decision_inventory,
+            )
+            _edge(
+                edges,
+                name=f"fit-forecast/origin-decision-roots/{fold_index}/{archive.block_index}",
+                observed=archive.inference_origin_decision_root_inventory_sha256,
+                expected=origin_inventory,
+            )
+        for window in windows:
+            _edge(
+                edges,
+                name=f"training-window/split-plan/{fold_index}/{window.semantic_receipt_sha256}",
+                observed=window.split_plan_receipt_sha256,
+                expected=split_plan.semantic_receipt_sha256,
+            )
+        for checkpoint in checkpoints:
+            if checkpoint.training_window_plan_receipt_sha256 not in window_receipts:
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL checkpoint references another training-window graph"
+                )
+        for calibration in calibrations:
+            if (
+                calibration.training_window_plan_receipt_sha256 not in window_receipts
+                or calibration.checkpoint_receipt_sha256
+                not in selected_checkpoint_receipts
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL calibration references another fit graph"
+                )
+        for date in expected_dates:
+            context = contexts_by_date[date]
+            decision = decisions_by_date[date]
+            _edge(
+                edges,
+                name=f"context/session-authority/{fold_index}/{date}",
+                observed=context.session_authority_receipt_sha256,
+                expected=session.receipt_sha256,
+            )
+            _edge(
+                edges,
+                name=f"context/identity-authority/{fold_index}/{date}",
+                observed=context.identity_authority_receipt_sha256,
+                expected=identity.receipt_sha256,
+            )
+            _edge(
+                edges,
+                name=f"decision/session-authority/{fold_index}/{date}",
+                observed=decision.session_authority_receipt_sha256,
+                expected=session.receipt_sha256,
+            )
+            _edge(
+                edges,
+                name=f"decision/context-origin/{fold_index}/{date}",
+                observed=decision.context_origin_receipt_sha256,
+                expected=context.semantic_receipt_sha256,
+            )
+        coverage.append(
+            (
+                "rl-fit-fold",
+                fold_index,
+                expected_dates,
+                tuple(archive.block_index for archive in ordered_archives),
+                tuple(sorted(window_receipts)),
+                tuple(sorted(selected_checkpoint_receipts)),
+            )
+        )
+    return tuple(coverage), tuple(edges)
+
+
 def _build_authority(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     source_bundle: MassiveAdaptiveRLSourceBundleV1,
     rows: tuple[MassiveAdaptiveRLRuntimeSourceGraphRowV1, ...],
+    logical_coverage: tuple[object, ...],
+    graph_edges: tuple[tuple[str, str, str], ...],
     persisted_graph_replayed: bool,
     runtime_graph_replayed: bool,
 ) -> MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
@@ -768,6 +1422,8 @@ def _build_authority(
                 for row in rows
             )
         ),
+        "logical_coverage_inventory_sha256": semantic_sha256(logical_coverage),
+        "graph_edge_inventory_sha256": semantic_sha256(graph_edges),
         "committed_source_data_qualified": True,
         "persisted_graph_replayed": persisted_graph_replayed,
         "runtime_graph_replayed": runtime_graph_replayed,
@@ -805,6 +1461,62 @@ def runtime_source_graph_authority_path_v1(
     )
 
 
+def _checked_graph_path(
+    *, source_root: str | Path, experiment_id: str, require_file: bool
+) -> Path:
+    root = Path(source_root).resolve()
+    output = runtime_source_graph_authority_path_v1(
+        source_root=root,
+        experiment_id=experiment_id,
+    )
+    cursor = output
+    while cursor != root:
+        if root not in cursor.parents:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL runtime source graph escapes its source root"
+            )
+        if cursor.is_symlink():
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL runtime source graph path contains a symlink"
+            )
+        cursor = cursor.parent
+    if require_file and not output.is_file():
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL runtime source graph authority is absent or not regular"
+        )
+    return output
+
+
+def _write_create_only_atomic(*, output: Path, payload: Mapping[str, object]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_json_file_bytes(payload))
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary_path, output)
+        except FileExistsError as error:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL runtime source graph authority is create-only"
+            ) from error
+        directory_descriptor = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def materialize_massive_adaptive_rl_runtime_source_graph_authority_v1(
     *,
     source_root: str | Path,
@@ -828,24 +1540,33 @@ def materialize_massive_adaptive_rl_runtime_source_graph_authority_v1(
             "adaptive RL runtime source graph source bundle is not authorized"
         )
     rows = _rows(source_bundle=source_bundle, runtime_sources=runtime_sources)
+    logical_coverage, graph_edges = _validate_runtime_graph_contract(
+        runtime_sources=runtime_sources
+    )
     result = _build_authority(
         manifest=manifest,
         source_bundle=source_bundle,
         rows=rows,
+        logical_coverage=logical_coverage,
+        graph_edges=graph_edges,
         persisted_graph_replayed=False,
         runtime_graph_replayed=False,
     )
-    output = runtime_source_graph_authority_path_v1(
-        source_root=source_root, experiment_id=manifest.experiment_id
+    output = _checked_graph_path(
+        source_root=source_root,
+        experiment_id=manifest.experiment_id,
+        require_file=False,
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with output.open("xb") as stream:
-            stream.write(canonical_json_file_bytes(asdict(result)))
-    except FileExistsError as error:
-        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
-            "adaptive RL runtime source graph authority is create-only"
-        ) from error
+    payload = asdict(
+        replace(
+            result,
+            _runtime_source_bundle=None,
+            _runtime_sources=None,
+        )
+    )
+    payload.pop("_runtime_source_bundle")
+    payload.pop("_runtime_sources")
+    _write_create_only_atomic(output=output, payload=payload)
     return result
 
 
@@ -867,13 +1588,11 @@ def load_massive_adaptive_rl_runtime_source_graph_authority_v1(
 ) -> MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1:
     manifest.validate()
     source_bundle.validate()
-    path = runtime_source_graph_authority_path_v1(
-        source_root=source_root, experiment_id=manifest.experiment_id
+    path = _checked_graph_path(
+        source_root=source_root,
+        experiment_id=manifest.experiment_id,
+        require_file=True,
     )
-    if path.is_symlink() or not path.is_file():
-        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
-            "adaptive RL runtime source graph authority is absent or not regular"
-        )
     try:
         raw = path.read_bytes()
         value = json.loads(raw)
@@ -962,6 +1681,21 @@ def authorize_massive_adaptive_rl_runtime_source_graph_authority_v1(
         authority,
         runtime_graph_replayed=True,
         source_data_qualified=True,
+        _runtime_source_bundle=authorized_bundle,
+        _runtime_sources=tuple(
+            _validate_domain_runtime(
+                key=key,
+                runtime=runtime_sources[key],
+            )
+            for key in sorted(
+                runtime_sources,
+                key=lambda value: (
+                    value[1] is not None,
+                    value[1] or -1,
+                    value[0],
+                ),
+            )
+        ),
     )
     result.validate()
     return result
@@ -970,6 +1704,7 @@ def authorize_massive_adaptive_rl_runtime_source_graph_authority_v1(
 __all__ = [
     "MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SPEC_SHA256",
+    "MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_REPLAY_WITNESS_V1_SCHEMA",
     "MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1",
     "MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error",
     "MassiveAdaptiveRLRuntimeSourceGraphRowV1",
