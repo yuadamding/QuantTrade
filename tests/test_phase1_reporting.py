@@ -13,12 +13,17 @@ import torch
 
 
 DRIVER_PATH = Path(__file__).resolve().parents[2] / "training" / "train_phase1.py"
+SWEEP_PATH = Path(__file__).resolve().parents[2] / "training" / "sweep_phase1.py"
+if not DRIVER_PATH.is_file() or not SWEEP_PATH.is_file():
+    pytest.skip(
+        "external Phase-1 reporting drivers are not packaged in a clean checkout",
+        allow_module_level=True,
+    )
 SPEC = importlib.util.spec_from_file_location("phase1_reporting_driver", DRIVER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 driver = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(driver)
 
-SWEEP_PATH = Path(__file__).resolve().parents[2] / "training" / "sweep_phase1.py"
 SWEEP_SPEC = importlib.util.spec_from_file_location("phase1_sweep_driver", SWEEP_PATH)
 assert SWEEP_SPEC is not None and SWEEP_SPEC.loader is not None
 sweep = importlib.util.module_from_spec(SWEEP_SPEC)

@@ -36,8 +36,8 @@ from rl_quant.rl.massive_adaptive_rl_observation_v1 import (
 from rl_quant.training.massive_adaptive_ppo_v1 import (
     MassiveAdaptiveRLCheckpointV1,
 )
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV1,
+from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
 
 
@@ -47,9 +47,7 @@ MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_DATASET = (
     "massive-adaptive-rl-checkpoint-authority-v1"
 )
-MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SOURCE_SHA256 = file_sha256(
-    Path(__file__)
-)
+MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 = semantic_sha256(
     {
         "schema": MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SCHEMA,
@@ -187,7 +185,9 @@ def _parse_book(value: Mapping[str, object]) -> MassiveAdaptiveEconomicBookV1:
 
 def _parse_action(value: Mapping[str, object]) -> MassiveAdaptiveRLActionV1:
     payload = dict(value)
-    payload["bucket_controls"] = tuple(cast(tuple[float, ...], payload["bucket_controls"]))
+    payload["bucket_controls"] = tuple(
+        cast(tuple[float, ...], payload["bucket_controls"])
+    )
     result = MassiveAdaptiveRLActionV1(**payload)  # type: ignore[arg-type]
     result.validate()
     return result
@@ -227,8 +227,8 @@ def _parse_environment(
     payload["trailing_state"] = _parse_trailing(
         cast(Mapping[str, object], payload["trailing_state"])
     )
-    result = MassiveAdaptiveProfitabilityEnvStateV1(  # type: ignore[arg-type]
-        **payload
+    result = MassiveAdaptiveProfitabilityEnvStateV1(
+        **payload  # type: ignore[arg-type]
     )
     result.validate()
     return result
@@ -294,9 +294,7 @@ class MassiveAdaptiveRLCheckpointAuthorityV1:
     outer_evaluation_authorized: bool = False
     lockbox_access_authorized: bool = False
     protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-    specification_sha256: str = (
-        MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SPEC_SHA256
-    )
+    specification_sha256: str = MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SPEC_SHA256
     implementation_source_sha256: str = (
         MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SOURCE_SHA256
     )
@@ -310,12 +308,8 @@ class MassiveAdaptiveRLCheckpointAuthorityV1:
             "training_forecast_authority_receipt_sha256": (
                 self.training_forecast_authority_receipt_sha256
             ),
-            "training_source_inventory_sha256": (
-                self.training_source_inventory_sha256
-            ),
-            "checkpoint_source_receipt_sha256": (
-                self.checkpoint_source_receipt_sha256
-            ),
+            "training_source_inventory_sha256": (self.training_source_inventory_sha256),
+            "checkpoint_source_receipt_sha256": (self.checkpoint_source_receipt_sha256),
             "source_data_qualified": self.source_data_qualified,
             "profitability_reporting_authorized": False,
             "outer_evaluation_authorized": False,
@@ -347,14 +341,12 @@ class MassiveAdaptiveRLCheckpointAuthorityV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLCheckpointAuthorityV1Error(
                 "adaptive RL checkpoint replay authority differs"
@@ -447,7 +439,7 @@ def materialize_massive_adaptive_rl_checkpoint_authority_v1(
     root: str | Path,
     artifact_id: str,
     checkpoint: MassiveAdaptiveRLCheckpointV1,
-    training_forecast_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_forecast_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLCheckpointAuthorityV1:
     """Publish one complete PPO update boundary and replay it immediately."""
@@ -503,7 +495,7 @@ def authorize_massive_adaptive_rl_checkpoint_authority_v1(
     *,
     root: str | Path,
     authority: MassiveAdaptiveRLCheckpointAuthorityV1,
-    training_forecast_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_forecast_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 ) -> MassiveAdaptiveRLCheckpointAuthorityV1:
     """Restore runtime checkpoint state only after source and root replay."""
 
@@ -526,8 +518,7 @@ def authorize_massive_adaptive_rl_checkpoint_authority_v1(
         != training_forecast_authority.source_data_qualified
         or parsed.source_data_qualified
         != training_forecast_authority.reinforcement_learning_authorized
-        or checkpoint.semantic_receipt_sha256
-        != parsed.checkpoint_receipt_sha256
+        or checkpoint.semantic_receipt_sha256 != parsed.checkpoint_receipt_sha256
     ):
         raise MassiveAdaptiveRLCheckpointAuthorityV1Error(
             "committed adaptive RL checkpoint does not replay"

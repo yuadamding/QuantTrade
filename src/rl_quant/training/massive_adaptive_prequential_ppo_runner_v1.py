@@ -35,8 +35,8 @@ from rl_quant.training.massive_adaptive_ppo_v1 import (
     MassiveAdaptivePPOTrainerV1,
     MassiveAdaptiveRLCheckpointV1,
 )
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV1,
+from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
 from rl_quant.training.massive_adaptive_economic_continuity_authority_v1 import (
     MassiveAdaptiveEconomicContinuityAuthorityV1,
@@ -56,9 +56,7 @@ MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_CHECKPOINT_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_PPO_TRAINING_RUN_V1_SCHEMA = (
     "rl-quant.massive-adaptive-ppo-training-run-v1"
 )
-MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SOURCE_SHA256 = file_sha256(
-    __file__
-)
+MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SOURCE_SHA256 = file_sha256(__file__)
 MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SPEC_SHA256 = semantic_sha256(
     {
         "blocks": "every-authorized-block-in-order",
@@ -122,8 +120,7 @@ class MassiveAdaptivePPOBlockRuntimeV1:
             or self.environment_start_cursor < 0
             or self.environment_stop_cursor
             != self.environment_start_cursor + len(self.forecast_session_dates)
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptivePrequentialPPORunnerV1Error(
                 "adaptive PPO block runtime differs"
@@ -167,9 +164,7 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
     outer_evaluation_authorized: bool = False
     lockbox_access_authorized: bool = False
     protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-    specification_sha256: str = (
-        MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SPEC_SHA256
-    )
+    specification_sha256: str = MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SPEC_SHA256
     implementation_source_sha256: str = (
         MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SOURCE_SHA256
     )
@@ -186,7 +181,9 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
                 "exact_resume_authorized",
                 "development_rl_training_authorized",
             }
-        } | {"ppo_checkpoint_receipt_sha256": self.ppo_checkpoint.semantic_receipt_sha256}
+        } | {
+            "ppo_checkpoint_receipt_sha256": self.ppo_checkpoint.semantic_receipt_sha256
+        }
 
     def validate(self) -> None:
         self.ppo_checkpoint.validate()
@@ -210,14 +207,12 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_RUNNER_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptivePrequentialPPORunnerV1Error(
                 "adaptive prequential PPO checkpoint differs"
@@ -291,8 +286,7 @@ class MassiveAdaptivePPOTrainingRunV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptivePrequentialPPORunnerV1Error(
                 "adaptive PPO training run differs"
@@ -306,7 +300,7 @@ class MassiveAdaptivePrequentialPPORunnerV1:
     def __init__(
         self,
         *,
-        training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+        training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
         chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
         environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
         model: MassiveAdaptivePPOActorCriticV1,
@@ -354,7 +348,9 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         self._trainer._ensure_observation()
 
     def _environment_for_block(self, index: int) -> MassiveAdaptiveProfitabilityEnvV1:
-        receipt = self.training_authority.blocks[index].source_forecast_archive_receipt_sha256
+        receipt = self.training_authority.blocks[
+            index
+        ].source_forecast_archive_receipt_sha256
         try:
             return self.environments[receipt]
         except KeyError as error:
@@ -495,10 +491,7 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             )
             running = (
                 delta
-                + self.config.gamma
-                * self.config.gae_lambda
-                * continuation
-                * running
+                + self.config.gamma * self.config.gae_lambda * continuation * running
             )
             advantages[index] = running
         result = replace(
@@ -540,7 +533,9 @@ class MassiveAdaptivePrequentialPPORunnerV1:
     def training_complete(self) -> bool:
         return len(self.completed_block_receipts) == len(self.block_runtimes)
 
-    def _advance_block(self, learning_checkpoint: MassiveAdaptiveRLCheckpointV1) -> None:
+    def _advance_block(
+        self, learning_checkpoint: MassiveAdaptiveRLCheckpointV1
+    ) -> None:
         self.current_block_index += 1
         if self.current_block_index >= len(self.block_runtimes):
             return
@@ -550,7 +545,10 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             current.forecast_archive_receipt_sha256
             == previous.forecast_archive_receipt_sha256
         ):
-            if self._trainer.environment.state.chronology_cursor != current.environment_start_cursor:
+            if (
+                self._trainer.environment.state.chronology_cursor
+                != current.environment_start_cursor
+            ):
                 raise MassiveAdaptivePrequentialPPORunnerV1Error(
                     "consecutive PPO block did not preserve its economic cursor"
                 )
@@ -581,7 +579,11 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             )
         runtime = self.block_runtimes[self.current_block_index]
         cursor = self._trainer.environment.state.chronology_cursor
-        if not runtime.environment_start_cursor <= cursor < runtime.environment_stop_cursor:
+        if (
+            not runtime.environment_start_cursor
+            <= cursor
+            < runtime.environment_stop_cursor
+        ):
             raise MassiveAdaptivePrequentialPPORunnerV1Error(
                 "PPO trainer cursor lies outside its authorized block"
             )
@@ -608,7 +610,10 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             )
         metrics = self._trainer.update(rollout)
         self.transition_receipts.extend(rollout.transition_receipts)
-        if self._trainer.environment.state.chronology_cursor == runtime.environment_stop_cursor:
+        if (
+            self._trainer.environment.state.chronology_cursor
+            == runtime.environment_stop_cursor
+        ):
             self.completed_block_receipts.append(runtime.block_receipt_sha256)
             learning_checkpoint = self._trainer.checkpoint()
             self._advance_block(learning_checkpoint)
@@ -715,7 +720,12 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             or checkpoint.current_environment_source_inventory_sha256
             != runtime.environment_source_inventory_sha256
             or checkpoint.completed_block_receipts
-            != tuple(row.block_receipt_sha256 for row in self.block_runtimes[: len(checkpoint.completed_block_receipts)])
+            != tuple(
+                row.block_receipt_sha256
+                for row in self.block_runtimes[
+                    : len(checkpoint.completed_block_receipts)
+                ]
+            )
         ):
             raise MassiveAdaptivePrequentialPPORunnerV1Error(
                 "prequential PPO checkpoint block lineage differs"
@@ -780,7 +790,7 @@ class MassiveAdaptivePrequentialPPORunnerV1:
 
 def train_massive_adaptive_prequential_ppo_v1(
     *,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     policy: MassiveAdaptivePPOActorCriticV1,

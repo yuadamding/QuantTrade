@@ -41,6 +41,13 @@ llm = [
 dev = [
     "pytest>=8,<9",
     "pytest-cov>=5,<7",
+    # The default CI command collects the complete repository test suite.
+    # A large part of that suite imports the persisted-data authorities at
+    # collection time, so a developer test environment must be able to open
+    # Arrow-backed artifacts even when the narrower `data` extra was not
+    # requested explicitly.
+    "pandas>=2.2,<3",
+    "pyarrow>=16,<23",
     # Keep CI and developer lint semantics identical. Ruff 0.16 changed the
     # effective default rule surface and turned a routine dependency refresh
     # into hundreds of unrelated failures.

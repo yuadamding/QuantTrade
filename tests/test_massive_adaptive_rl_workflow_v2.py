@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
+import torch
 
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.training.massive_adaptive_ppo_v1 import MassiveAdaptivePPOConfigV1
+import rl_quant.workflows.massive_adaptive_rl_v2 as workflow_v2
 from rl_quant.workflows.massive_adaptive_rl_v2 import (
     MassiveAdaptiveRLWorkflowV2Error,
     build_massive_adaptive_rl_candidate_schedule_v1,
     build_massive_adaptive_rl_experiment_manifest_v2,
     load_massive_adaptive_rl_experiment_manifest_v2,
     main,
+    run_massive_adaptive_rl_training_workflow_v2,
     write_massive_adaptive_rl_experiment_manifest_v2,
 )
 
@@ -114,3 +119,60 @@ def test_v2_cli_derives_schedule_without_update_arguments(tmp_path, capsys) -> N
     assert manifest.schedule(3).candidate_update_indices == (2, 4, 6, 8)
     assert main(["validate", "--manifest", str(path)]) == 0
     assert capsys.readouterr().out.strip() == receipt
+
+
+def test_v2_training_workflow_passes_fit_authority_through_shared_protocol(
+    tmp_path, monkeypatch
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v2(
+        experiment_id="direct-v2-workflow"
+    )
+    schedule = manifest.schedule(0)
+    training_authority = SimpleNamespace(
+        outer_fold_index=0,
+        block_sessions=63,
+        blocks=(object(), object()),
+        origin_session_dates=tuple(f"fit-{index:03d}" for index in range(126)),
+        block_inventory_sha256=semantic_sha256("blocks"),
+        source_data_qualified=True,
+        semantic_receipt_sha256=semantic_sha256("v2-training-authority"),
+        reinforcement_learning_authorized=True,
+        validate=lambda: None,
+    )
+    observed: dict[str, object] = {}
+
+    def fake_v1_runner(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            fold_index=0,
+            candidate_update_indices=schedule.candidate_update_indices,
+            training_run=SimpleNamespace(
+                update_count=schedule.candidate_update_indices[-1]
+            ),
+            source_data_qualified=True,
+            development_rl_training_authorized=True,
+            semantic_receipt_sha256=semantic_sha256("runtime-v1-workflow"),
+            validate=lambda: None,
+        )
+
+    monkeypatch.setattr(
+        workflow_v2,
+        "run_massive_adaptive_rl_training_workflow_v1",
+        fake_v1_runner,
+    )
+    result = run_massive_adaptive_rl_training_workflow_v2(
+        manifest=manifest,
+        fold_index=0,
+        seed=17,
+        training_authority=cast(Any, training_authority),
+        chronology_authority=cast(Any, SimpleNamespace()),
+        environments=cast(Any, {}),
+        artifact_root=tmp_path,
+        committed_at_ms=1,
+        device=torch.device("cpu"),
+    )
+
+    assert observed["training_authority"] is training_authority
+    assert result.candidate_schedule == schedule
+    assert result.development_rl_training_authorized
+    assert not result.profitability_reporting_authorized

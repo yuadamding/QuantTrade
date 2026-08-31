@@ -32,14 +32,12 @@ from rl_quant.rl.massive_adaptive_rl_observation_v1 import (
     MASSIVE_ADAPTIVE_RL_OBSERVATION_V1_SPEC_SHA256,
     MassiveAdaptiveRLObservationV1,
 )
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV1,
+from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
 
 MASSIVE_ADAPTIVE_PPO_V1_SCHEMA = "rl-quant.massive-adaptive-ppo-v1"
-MASSIVE_ADAPTIVE_RL_CHECKPOINT_V1_SCHEMA = (
-    "rl-quant.massive-adaptive-rl-checkpoint-v1"
-)
+MASSIVE_ADAPTIVE_RL_CHECKPOINT_V1_SCHEMA = "rl-quant.massive-adaptive-rl-checkpoint-v1"
 MASSIVE_ADAPTIVE_RL_ACTION_SPECIFICATION_V1_SHA256 = semantic_sha256(
     {
         "bidirectional": "ten-tanh-normal-controls",
@@ -306,10 +304,8 @@ class MassiveAdaptiveRLCheckpointV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptivePPOV1Error("adaptive RL checkpoint differs")
         digests: tuple[str, ...] = (
@@ -334,9 +330,7 @@ class MassiveAdaptiveRLCheckpointV1:
             or any(character not in "0123456789abcdef" for character in value)
             for value in digests
         ):
-            raise MassiveAdaptivePPOV1Error(
-                "adaptive RL checkpoint digest differs"
-            )
+            raise MassiveAdaptivePPOV1Error("adaptive RL checkpoint digest differs")
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
@@ -351,7 +345,7 @@ class MassiveAdaptivePPOTrainerV1:
         config: MassiveAdaptivePPOConfigV1 | None = None,
         device: torch.device | str = "cpu",
         training_forecast_authority: (
-            MassiveAdaptiveRLTrainingForecastAuthorityV1 | None
+            MassiveAdaptiveRLTrainingForecastAuthorityProtocol | None
         ) = None,
     ) -> None:
         self.environment = environment
@@ -450,8 +444,7 @@ class MassiveAdaptivePPOTrainerV1:
                 self.environment.step(
                     action,
                     continue_economic_episode=(
-                        continue_economic_episode_at_end
-                        and step_index == count - 1
+                        continue_economic_episode_at_end and step_index == count - 1
                     ),
                 )
             )
@@ -501,10 +494,7 @@ class MassiveAdaptivePPOTrainerV1:
             )
             running = (
                 delta
-                + self.config.gamma
-                * self.config.gae_lambda
-                * continuation
-                * running
+                + self.config.gamma * self.config.gae_lambda * continuation * running
             )
             advantages[index] = running
         result = MassiveAdaptivePPORolloutV1(
@@ -540,9 +530,7 @@ class MassiveAdaptivePPOTrainerV1:
                 indices = order[start : start + self.config.minibatch_size].to(
                     device=self.device
                 )
-                output = self.model(
-                    {"adaptive_state": rollout.observations[indices]}
-                )
+                output = self.model({"adaptive_state": rollout.observations[indices]})
                 log_probability = output.distribution.log_prob(rollout.actions[indices])
                 ratio = torch.exp(
                     (log_probability - rollout.old_log_probabilities[indices]).clamp(
@@ -564,10 +552,13 @@ class MassiveAdaptivePPOTrainerV1:
                     -self.config.value_clip_range,
                     self.config.value_clip_range,
                 )
-                value_loss = 0.5 * torch.maximum(
-                    (output.value - rollout.returns[indices]).square(),
-                    (clipped_value - rollout.returns[indices]).square(),
-                ).mean()
+                value_loss = (
+                    0.5
+                    * torch.maximum(
+                        (output.value - rollout.returns[indices]).square(),
+                        (clipped_value - rollout.returns[indices]).square(),
+                    ).mean()
+                )
                 loss = (
                     policy_loss
                     - self.config.entropy_coefficient * entropy
@@ -599,7 +590,13 @@ class MassiveAdaptivePPOTrainerV1:
         metrics = {
             name: float(metrics_tensor[index])
             for index, name in enumerate(
-                ("policy_loss", "value_loss", "entropy", "approximate_kl", "gradient_norm")
+                (
+                    "policy_loss",
+                    "value_loss",
+                    "entropy",
+                    "approximate_kl",
+                    "gradient_norm",
+                )
             )
         }
         self.update_index += 1

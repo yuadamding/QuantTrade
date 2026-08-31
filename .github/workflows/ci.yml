@@ -66,8 +66,11 @@ jobs:
           tests/test_massive_adaptive_rl_outer_evidence_v1.py
           tests/test_massive_adaptive_outer_access_commitment_v1.py
           tests/test_massive_adaptive_rl_authoritative_orchestration_v1.py
+          tests/test_massive_adaptive_rl_profitability_report_authority_v1.py
           tests/test_massive_adaptive_rl_workflow_v1.py
           tests/test_massive_adaptive_rl_workflow_v2.py
+          tests/test_massive_adaptive_rl_source_bundle_v1.py
+          tests/test_massive_adaptive_rl_experiment_state_v1.py
           tests/test_adaptive_alpha_supervised_v1.py
           tests/test_massive_adaptive_portfolio_compiler_v1.py
           tests/test_massive_economic_authority_v6.py
@@ -88,10 +91,15 @@ jobs:
           src/rl_quant/evaluation/massive_adaptive_rl_outer_plan_v2.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_plan_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_forecast_archive_v1.py
+          src/rl_quant/training/massive_adaptive_rl_training_forecast_protocol_v1.py
+          src/rl_quant/workflows/massive_adaptive_rl_source_bundle_v1.py
+          src/rl_quant/workflows/massive_adaptive_rl_experiment_state_v1.py
+          src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_authority_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v4.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_authority_v4.py
+          src/rl_quant/evaluation/massive_adaptive_rl_profitability_report_authority_v1.py
           src/rl_quant/training/massive_adaptive_ppo_v1.py
           src/rl_quant/training/massive_adaptive_economic_continuity_authority_v1.py
           src/rl_quant/training/massive_adaptive_prequential_ppo_runner_v1.py

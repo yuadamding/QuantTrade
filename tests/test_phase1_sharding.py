@@ -16,6 +16,11 @@ import torch.multiprocessing as mp
 
 
 DRIVER_PATH = Path(__file__).resolve().parents[2] / "training" / "train_phase1.py"
+if not DRIVER_PATH.is_file():
+    pytest.skip(
+        "external Phase-1 distributed driver is not packaged in a clean checkout",
+        allow_module_level=True,
+    )
 SPEC = importlib.util.spec_from_file_location("phase1_sharding_driver", DRIVER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 driver = importlib.util.module_from_spec(SPEC)

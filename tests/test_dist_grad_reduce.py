@@ -16,6 +16,11 @@ import torch.multiprocessing as mp
 
 
 DIST_UTILS_PATH = Path(__file__).resolve().parents[2] / "training" / "dist_utils.py"
+if not DIST_UTILS_PATH.is_file():
+    pytest.skip(
+        "external Phase-1 gradient reducer is not packaged in a clean checkout",
+        allow_module_level=True,
+    )
 SPEC = importlib.util.spec_from_file_location("phase1_dist_utils", DIST_UTILS_PATH)
 assert SPEC is not None and SPEC.loader is not None
 dist_utils = importlib.util.module_from_spec(SPEC)

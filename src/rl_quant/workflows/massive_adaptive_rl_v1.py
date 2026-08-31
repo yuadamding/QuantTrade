@@ -79,8 +79,8 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_fit_runner_v1 import (
 from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
     MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
 )
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV1,
+from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
 
 
@@ -637,7 +637,7 @@ def run_massive_adaptive_rl_training_workflow_v1(
     manifest: MassiveAdaptiveRLExperimentManifestV1,
     fold_index: int,
     seed: int,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     artifact_root: str | Path,

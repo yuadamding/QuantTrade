@@ -60,8 +60,8 @@ from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
     build_massive_adaptive_rl_policy_trace_from_identities_v1,
 )
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV1,
+from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
 
 
@@ -283,7 +283,7 @@ def _fresh_environment(
 
 def _bind_block_runtimes(
     *,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
 ) -> tuple[MassiveAdaptivePPOBlockRuntimeV1, ...]:
     grouped_dates: dict[str, list[str]] = {}
@@ -357,7 +357,7 @@ def _bind_block_runtimes(
 
 def _bind_continuity(
     *,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     runtimes: tuple[MassiveAdaptivePPOBlockRuntimeV1, ...],
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
 ) -> dict[int, MassiveAdaptiveEconomicContinuityAuthorityV1]:
@@ -389,7 +389,7 @@ def _run_action(
     *,
     control_id: str,
     action: MassiveAdaptiveRLActionV1,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     runtimes: tuple[MassiveAdaptivePPOBlockRuntimeV1, ...],
     continuity: Mapping[int, MassiveAdaptiveEconomicContinuityAuthorityV1],
@@ -497,7 +497,7 @@ def _run_action(
 
 def run_massive_adaptive_rl_fixed_control_fit_v1(
     *,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     registry: MassiveAdaptiveRLFixedControlRegistryV1 | None = None,
@@ -805,7 +805,7 @@ def authorize_massive_adaptive_rl_fixed_control_fit_authority_v1(
     *,
     root: str | Path,
     authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     registry: MassiveAdaptiveRLFixedControlRegistryV1 | None = None,
@@ -840,7 +840,7 @@ def materialize_massive_adaptive_rl_fixed_control_fit_authority_v1(
     *,
     root: str | Path,
     artifact_id: str,
-    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV1,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     committed_at_ms: int,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
 import torch
 
 from rl_quant.models import DailyCrossSectionConfig, DailyCrossSectionPolicy
@@ -11,6 +12,11 @@ from rl_quant.training.designs import DESIGNS
 
 
 DRIVER_PATH = Path(__file__).resolve().parents[2] / "training" / "train_phase1.py"
+if not DRIVER_PATH.is_file():
+    pytest.skip(
+        "external Phase-1 training driver is not packaged in a clean checkout",
+        allow_module_level=True,
+    )
 SPEC = importlib.util.spec_from_file_location("phase1_training_rng_driver", DRIVER_PATH)
 assert SPEC is not None and SPEC.loader is not None
 driver = importlib.util.module_from_spec(SPEC)
@@ -78,4 +84,3 @@ def _stage1_draw_after_construction(width: int) -> list[int]:
 
 def test_stage1_sampling_is_independent_of_initialization_rng_consumption() -> None:
     assert _stage1_draw_after_construction(8) == _stage1_draw_after_construction(128)
-

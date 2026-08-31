@@ -16,11 +16,8 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
 )
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV1,
-)
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV2,
+from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
 from rl_quant.training.massive_adaptive_split_plan_v1 import (
     MassiveAdaptiveSplitPlanV1,
@@ -130,10 +127,7 @@ class MassiveAdaptiveRLChronologyAuthorityV1:
 
 def build_massive_adaptive_rl_chronology_authority_v1(
     *,
-    training_forecast_authority: (
-        MassiveAdaptiveRLTrainingForecastAuthorityV1
-        | MassiveAdaptiveRLTrainingForecastAuthorityV2
-    ),
+    training_forecast_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     validation_inference_plan: MassiveAdaptiveInferencePlanV1,
     split_plan: MassiveAdaptiveSplitPlanV1,
 ) -> MassiveAdaptiveRLChronologyAuthorityV1:

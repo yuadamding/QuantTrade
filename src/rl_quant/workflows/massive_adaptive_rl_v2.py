@@ -41,9 +41,6 @@ from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
 from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
     build_massive_adaptive_rl_fixed_control_registry_v1,
 )
-from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
-    MassiveAdaptiveRLTrainingForecastAuthorityV1,
-)
 from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import (
     MassiveAdaptiveRLTrainingForecastAuthorityV2,
 )
@@ -552,10 +549,7 @@ def run_massive_adaptive_rl_training_workflow_v2(
         manifest=compatibility_manifest,
         fold_index=fold_index,
         seed=seed,
-        training_authority=cast(
-            MassiveAdaptiveRLTrainingForecastAuthorityV1,
-            training_authority,
-        ),
+        training_authority=training_authority,
         chronology_authority=chronology_authority,
         environments=environments,
         artifact_root=artifact_root,
@@ -619,6 +613,36 @@ def _validate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_command(args: argparse.Namespace) -> int:
+    from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v1 import (
+        run_massive_adaptive_rl_experiment_v1,
+    )
+
+    result = run_massive_adaptive_rl_experiment_v1(
+        manifest_path=args.manifest,
+        source_root=args.source_root,
+        artifact_root=args.artifact_root,
+        device=args.device,
+        resume=args.resume,
+    )
+    print(canonical_json_file_bytes(asdict(result)).decode("utf-8"), end="")
+    return 0 if result.execution_complete else 2
+
+
+def _verify_run_command(args: argparse.Namespace) -> int:
+    from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v1 import (
+        verify_massive_adaptive_rl_experiment_v1,
+    )
+
+    result = verify_massive_adaptive_rl_experiment_v1(
+        manifest_path=args.manifest,
+        source_root=args.source_root,
+        artifact_root=args.artifact_root,
+    )
+    print(canonical_json_file_bytes(asdict(result)).decode("utf-8"), end="")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quanttrade-adaptive-rl",
@@ -640,6 +664,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--manifest", required=True)
     validate.set_defaults(handler=_validate_command)
+    for name, resume in (("run", False), ("resume", True)):
+        command = commands.add_parser(
+            name,
+            help=(
+                "Start the persisted four-fold state machine."
+                if not resume
+                else "Resume the persisted four-fold state machine."
+            ),
+        )
+        command.add_argument("--manifest", required=True)
+        command.add_argument("--source-root", required=True)
+        command.add_argument("--artifact-root", required=True)
+        command.add_argument("--device", default="cpu")
+        command.set_defaults(handler=_run_command, resume=resume)
+    verify = commands.add_parser(
+        "verify",
+        help="Replay the current persisted run ledger without advancing it.",
+    )
+    verify.add_argument("--manifest", required=True)
+    verify.add_argument("--source-root", required=True)
+    verify.add_argument("--artifact-root", required=True)
+    verify.set_defaults(handler=_verify_run_command)
     return parser
 
 

@@ -424,13 +424,17 @@ frozen-target 10/40-bp stresses, and regenerates FC06 on the identical shared
 validation context. Neither workflow accepts caller actions, transitions,
 returns, or P&L arrays.
 
-There is intentionally no historical `run` subcommand yet. The repository
-still lacks one persisted composite loader that can reopen the complete live
-forecast, calibration, decision-root, fill, event, and identity bundle from a
-source root. Adding a launch command that bypasses that authority would
-silently restore caller control over economic sources. Until that loader and a
-positive real-source canary exist, the command surface remains manifest and
-validation only, and profitability reporting remains false.
+The command surface now includes fail-closed `run`, `resume`, and `verify`
+operations backed by a create-only stage ledger. The composite source index
+uses fixed package-owned roles and relative paths, rehashes every canonical
+artifact, and accepts no caller dates, selected checkpoints, actions,
+transitions, returns, or P&L. Generic JSON replay is deliberately
+nonauthorizing: the run stops at `source-bundle-replayed` until typed runtime
+authorities independently validate the same receipts. The persisted typed
+Dataset-V3/runtime reconstructor and the remaining all-fold execution backend
+do not exist yet, so this command is an auditable readiness boundary rather
+than a historical training launcher. The root command cannot authorize
+profitability reporting.
 
 The RL chronology is opened in two stages. PPO fitting and policy selection
 first bind fit, validation, and outer date inventories directly from the split
@@ -520,6 +524,18 @@ invented and rehashed. It then rebuilds every fold and the aggregate evidence
 before restoring a development conclusion. Profitability reporting and
 lockbox access remain false.
 
+A separate create-only profitability-report authority is the only artifact
+that may authorize a development profitability report. It reopens the
+replay-authorized V4 evidence and all four primary PPO rollout authorities,
+derives daily strategy net log returns from the economic transitions, applies
+the terminal liquidation adjustment, and reconciles their sum to each fold's
+terminal wealth. It adds a one-sided 95-percent absolute net-return lower-bound
+gate using the registered fold-cluster bootstrap. Generic report reloads are
+diagnostic-only; failed relative or absolute gates still produce a sealed
+diagnostic report but grant no reporting authority. Live-trading and lockbox
+authority remain false unconditionally. The report contains no holding-time
+metric or gate.
+
 The V2 manifest uses one canonical predeclared seed. It permits neither
 validation-selected seeds nor seed ensembling, and seeds are never treated as
 additional market observations. A later multi-seed protocol requires a new,
@@ -544,11 +560,15 @@ should remain in the portfolio.
 This closes the minimum package-owned library path from causal
 prequential forecasts through bounded PPO, exact durable resume,
 inner-validation policy selection, a frozen fold-bound policy, and paired
-four-fold outer evidence. The remaining experiment-level boundary is one
-persisted source loader and state machine that owns all four folds without
-accepting selected identifiers, actions, transitions, or statistics from an
-external driver. It does **not** manufacture historical authority:
-the synthetic canaries remain nonauthorizing, final reporting stays false,
+four-fold outer evidence. A fixed-layout composite source index and resumable
+create-only experiment ledger now exist. The remaining experiment-level
+boundary is typed reconstruction of that complete persisted graph plus the
+backend that advances every fold from authorized fit forecasts through V4
+evidence without accepting selected identifiers, actions, transitions, or
+statistics from an external driver. The current root command does **not**
+manufacture historical authority:
+the synthetic canaries remain nonauthorizing, development reporting cannot be
+reached from the incomplete root run,
 and a real run still requires acquired payloads, partitions, features,
 targets, source-qualified prequential blocks, and replayed fold authorities.
 Intraday path tensors are also not yet materialized by the V1 tensor artifact.
