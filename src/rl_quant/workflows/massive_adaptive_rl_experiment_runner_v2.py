@@ -48,6 +48,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
         "state": "create-only-blocked-failed-and-report-ledger-v2",
         "device": "manifest-bound",
         "current_runtime_boundary": "typed-persisted-composite-loader-required",
+        "completed_resume": "terminal-idempotent",
+        "state_verification": "entire-chain-manifest-bound",
+        "source_disappearance": "block-current-next-stage-without-regression",
         "valid_negative_result": "execution-complete-report-not-authorized",
         "valid_positive_result": "execution-complete-report-authorized",
         "caller_actions_or_economics": False,
@@ -107,9 +110,11 @@ class MassiveAdaptiveRLEndToEndRunV2:
             or not self.state_receipts
             or self.execution_complete != published
             or (published or failed) != (self.next_required_stage is None)
-            or published and self.blocker_code is not None
+            or published
+            and self.blocker_code is not None
             or (blocked or failed) != (self.blocker_code is not None)
-            or failed and self.blocker_code is None
+            or failed
+            and self.blocker_code is None
             or self.source_data_qualified
             and self.source_bundle_receipt_sha256 is None
             or published
@@ -146,6 +151,14 @@ def _result(
     states: tuple[MassiveAdaptiveRLExperimentStateV2, ...],
     source_bundle: MassiveAdaptiveRLSourceBundleV1 | None,
 ) -> MassiveAdaptiveRLEndToEndRunV2:
+    if any(
+        state.experiment_id != manifest.experiment_id
+        or state.manifest_receipt_sha256 != manifest.semantic_receipt_sha256
+        for state in states
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV2Error(
+            "adaptive RL V2 state chain belongs to another manifest"
+        )
     current = states[-1]
     if current.stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED:
         next_stage = current.blocked_stage
@@ -264,21 +277,44 @@ def run_massive_adaptive_rl_experiment_v2(
     )
     if states[-1].stage is MassiveAdaptiveRLExperimentStageV2.FAILED:
         return _result(manifest=manifest, states=states, source_bundle=None)
+    if (
+        states[-1].stage
+        is MassiveAdaptiveRLExperimentStageV2.DEVELOPMENT_REPORT_PUBLISHED
+    ):
+        return _result(manifest=manifest, states=states, source_bundle=None)
     bundle_path = _source_bundle_path(source_root=source_root, manifest=manifest)
     if not bundle_path.is_file():
+        source_replay_completed = states[-1].completed_stage_index >= (
+            MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2.index(
+                MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED
+            )
+        )
+        blocked_stage = (
+            MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[
+                states[-1].completed_stage_index + 1
+            ]
+            if source_replay_completed
+            else MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED
+        )
+        blocker_code = (
+            "previously-replayed-source-temporarily-unavailable"
+            if source_replay_completed
+            else "source-bundle-temporarily-absent"
+        )
         if not (
             states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
-            and states[-1].blocker_code == "source-bundle-temporarily-absent"
+            and states[-1].blocker_code == blocker_code
         ):
             blocked = block_massive_adaptive_rl_experiment_state_v2(
                 artifact_root=artifact_root,
                 previous=states[-1],
-                blocked_stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
-                blocker_code="source-bundle-temporarily-absent",
+                blocked_stage=blocked_stage,
+                blocker_code=blocker_code,
                 blocker_evidence_receipt_sha256=semantic_sha256(
                     {
                         "manifest": manifest.semantic_receipt_sha256,
                         "source_bundle_path": bundle_path.as_posix(),
+                        "completed_stage_index": states[-1].completed_stage_index,
                     }
                 ),
             )
@@ -349,6 +385,14 @@ def verify_massive_adaptive_rl_experiment_v2(
     if not states:
         raise MassiveAdaptiveRLExperimentRunnerV2Error(
             "adaptive RL V2 experiment has no persisted state"
+        )
+    if any(
+        state.experiment_id != manifest.experiment_id
+        or state.manifest_receipt_sha256 != manifest.semantic_receipt_sha256
+        for state in states
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV2Error(
+            "adaptive RL V2 verification manifest differs"
         )
     source_bundle = None
     if _source_bundle_path(source_root=source_root, manifest=manifest).is_file():

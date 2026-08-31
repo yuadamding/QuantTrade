@@ -9,6 +9,10 @@ import json
 from pathlib import Path
 from typing import cast
 
+from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v1 import (
+    MassiveAdaptiveRLProfitabilityReportAuthorityV1,
+)
+
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
     file_sha256,
@@ -17,6 +21,10 @@ from rl_quant.protocol.canonical_artifact import (
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
+    MassiveAdaptiveRLExperimentManifestV3,
+    validate_massive_adaptive_rl_report_against_manifest_v3,
 )
 
 
@@ -31,6 +39,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_STATE_V2_SPEC_SHA256 = semantic_sha256(
         "failure": "integrity-failure-is-terminal",
         "negative_result": "development-report-published-not-authorized",
         "positive_result": "development-report-published-authorized",
+        "authorizing_report_api": (
+            "manifest-v3-and-replayed-report-derived-terminal-values"
+        ),
         "live_trading": False,
         "lockbox_access": False,
     }
@@ -176,7 +187,8 @@ class MassiveAdaptiveRLExperimentStateV2:
                 or self.blocked_stage
                 is not MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[next_index]
             )
-            or failed and self.failed_stage is MassiveAdaptiveRLExperimentStageV2.FAILED
+            or failed
+            and self.failed_stage is MassiveAdaptiveRLExperimentStageV2.FAILED
             or self.execution_complete != published
             or published
             != (
@@ -463,6 +475,69 @@ def publish_massive_adaptive_rl_development_report_state_v2(
     return _write_state(artifact_root=artifact_root, state=result)
 
 
+def publish_massive_adaptive_rl_development_report_state_v3(
+    *,
+    artifact_root: str | Path,
+    previous: MassiveAdaptiveRLExperimentStateV2,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    report_authority: MassiveAdaptiveRLProfitabilityReportAuthorityV1,
+) -> MassiveAdaptiveRLExperimentStateV2:
+    """Publish a terminal state from a replayed, manifest-bound report.
+
+    Unlike the V2 ledger primitive, this authorizing API accepts no caller
+    gate inventory, report receipt, or authorization Boolean.  It derives all
+    terminal values from the replayed report authority and requires the
+    preceding four-fold evidence receipt to be the report's own V4 evidence
+    authority.
+    """
+
+    previous.validate()
+    manifest.validate()
+    if (
+        previous.manifest_receipt_sha256 != manifest.semantic_receipt_sha256
+        or previous.experiment_id != manifest.experiment_id
+    ):
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL report state belongs to another manifest"
+        )
+    report_authority.validate()
+    validate_massive_adaptive_rl_report_against_manifest_v3(
+        manifest=manifest,
+        report_authority=report_authority,
+    )
+    if (
+        previous.stage
+        is not MassiveAdaptiveRLExperimentStageV2.FOUR_FOLD_V4_EVIDENCE_COMPLETED
+        or previous.stage_artifact_receipt_sha256
+        != report_authority.report.outer_evidence_authority_v4_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL report does not descend from the completed V4 evidence"
+        )
+    if (
+        report_authority.runtime_report is None
+        or not report_authority.runtime_report_replayed
+        or not report_authority.source_data_qualified
+    ):
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL profitability report is not replay authorized"
+        )
+    return publish_massive_adaptive_rl_development_report_state_v2(
+        artifact_root=artifact_root,
+        previous=previous,
+        profitability_report_authority_receipt_sha256=(
+            report_authority.semantic_receipt_sha256
+        ),
+        profitability_report_receipt_sha256=(
+            report_authority.report.semantic_receipt_sha256
+        ),
+        failed_gate_names=report_authority.report.failed_gate_names,
+        development_profitability_reporting_authorized=(
+            report_authority.development_profitability_reporting_authorized
+        ),
+    )
+
+
 def _parse_state(payload: Mapping[str, object]) -> MassiveAdaptiveRLExperimentStateV2:
     values = dict(payload)
     values["stage"] = MassiveAdaptiveRLExperimentStageV2(str(values["stage"]))
@@ -478,7 +553,9 @@ def _parse_state(payload: Mapping[str, object]) -> MassiveAdaptiveRLExperimentSt
 def load_massive_adaptive_rl_experiment_states_v2(
     *, artifact_root: str | Path, experiment_id: str
 ) -> tuple[MassiveAdaptiveRLExperimentStateV2, ...]:
-    directory = _state_directory(artifact_root, _identifier("experiment ID", experiment_id))
+    directory = _state_directory(
+        artifact_root, _identifier("experiment ID", experiment_id)
+    )
     paths = tuple(sorted(directory.glob("*.json"))) if directory.is_dir() else ()
     if not paths:
         return ()
@@ -522,5 +599,6 @@ __all__ = [
     "fail_massive_adaptive_rl_experiment_state_v2",
     "load_massive_adaptive_rl_experiment_states_v2",
     "publish_massive_adaptive_rl_development_report_state_v2",
+    "publish_massive_adaptive_rl_development_report_state_v3",
     "register_massive_adaptive_rl_experiment_state_v2",
 ]

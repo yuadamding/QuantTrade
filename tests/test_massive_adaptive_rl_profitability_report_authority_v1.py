@@ -11,6 +11,17 @@ from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v1 i
     parse_massive_adaptive_rl_profitability_report_authority_v1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
+    MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2,
+    MassiveAdaptiveRLExperimentStateV2Error,
+    advance_massive_adaptive_rl_experiment_state_v2,
+    publish_massive_adaptive_rl_development_report_state_v3,
+    register_massive_adaptive_rl_experiment_state_v2,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
+    MASSIVE_ADAPTIVE_RL_FINAL_GATE_NAMES_V3,
+    build_massive_adaptive_rl_experiment_manifest_v3,
+)
 
 
 def _digest(value: object) -> str:
@@ -22,8 +33,7 @@ def _report_inputs(*, daily_mean: float) -> tuple[object, tuple[object, ...]]:
     authorities = []
     for fold_index in range(4):
         rows = tuple(
-            daily_mean + (0.0001 if index % 2 == 0 else -0.0001)
-            for index in range(126)
+            daily_mean + (0.0001 if index % 2 == 0 else -0.0001) for index in range(126)
         )
         dates = tuple(f"F{fold_index}-{index:03d}" for index in range(126))
         terminal_return = __import__("math").expm1(sum(rows))
@@ -56,9 +66,7 @@ def _report_inputs(*, daily_mean: float) -> tuple[object, tuple[object, ...]]:
                 terminal_liquidation_adjusted_return=terminal_return,
             ),
             transitions=transitions,
-            transition_inventory_sha256=_digest(
-                ("transition-inventory", fold_index)
-            ),
+            transition_inventory_sha256=_digest(("transition-inventory", fold_index)),
             source_data_qualified=True,
         )
         authority = SimpleNamespace(
@@ -167,7 +175,9 @@ def test_absolute_loss_remains_diagnostic_and_blocks_reporting(tmp_path) -> None
 
 def test_profitability_report_rejects_nonreconciling_daily_economics(tmp_path) -> None:
     outer_authority, rollout_authorities = _report_inputs(daily_mean=0.001)
-    rollout_authorities[0].runtime_rollout.policy_trace.terminal_liquidation_adjusted_return = 0.0
+    rollout_authorities[
+        0
+    ].runtime_rollout.policy_trace.terminal_liquidation_adjusted_return = 0.0
     with pytest.raises(
         MassiveAdaptiveRLProfitabilityReportAuthorityV1Error,
         match="do not reconcile",
@@ -180,4 +190,109 @@ def test_profitability_report_rejects_nonreconciling_daily_economics(tmp_path) -
                 rollout_authorities
             ),
             committed_at_ms=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("daily_mean", "authorized"),
+    ((0.001, True), (-0.001, False)),
+)
+def test_terminal_state_is_derived_from_manifest_bound_report_authority(
+    tmp_path, daily_mean: float, authorized: bool
+) -> None:
+    experiment_id = f"manifest-bound-report-{str(authorized).lower()}"
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id=experiment_id
+    )
+    outer_authority, rollout_authorities = _report_inputs(daily_mean=daily_mean)
+    outer_authority.runtime_evidence.passed_gate_names = tuple(
+        gate
+        for gate in MASSIVE_ADAPTIVE_RL_FINAL_GATE_NAMES_V3
+        if gate != "primary-net-log-return-lcb-positive"
+    )
+    (tmp_path / "reports").mkdir()
+    authority = materialize_massive_adaptive_rl_profitability_report_authority_v1(
+        root=tmp_path / "reports",
+        artifact_id=experiment_id,
+        outer_evidence_authority_v4=outer_authority,  # type: ignore[arg-type]
+        ppo_outer_rollout_authorities=rollout_authorities,  # type: ignore[arg-type]
+        committed_at_ms=1,
+    )
+
+    artifact_root = tmp_path / "states"
+    state = register_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=artifact_root,
+        experiment_id=manifest.experiment_id,
+        manifest_receipt_sha256=manifest.semantic_receipt_sha256,
+    )
+    for stage in MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[1:-1]:
+        stage_receipt = (
+            authority.report.outer_evidence_authority_v4_receipt_sha256
+            if stage.value == "four-fold-v4-evidence-completed"
+            else _digest(stage.value)
+        )
+        state = advance_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=state,
+            stage=stage,
+            stage_artifact_receipt_sha256=stage_receipt,
+        )
+    published = publish_massive_adaptive_rl_development_report_state_v3(
+        artifact_root=artifact_root,
+        previous=state,
+        manifest=manifest,
+        report_authority=authority,
+    )
+    assert published.execution_complete
+    assert published.development_profitability_reporting_authorized is authorized
+    assert published.failed_gate_names == authority.report.failed_gate_names
+    assert ("primary-net-log-return-lcb-positive" in published.failed_gate_names) is (
+        not authorized
+    )
+    assert (
+        published.profitability_report_authority_receipt_sha256
+        == authority.semantic_receipt_sha256
+    )
+    assert (
+        published.profitability_report_receipt_sha256
+        == authority.report.semantic_receipt_sha256
+    )
+
+    other_manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id=manifest.experiment_id,
+        execution_device_specification="cuda:0",
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLExperimentStateV2Error,
+        match="another manifest",
+    ):
+        publish_massive_adaptive_rl_development_report_state_v3(
+            artifact_root=tmp_path / "cross-manifest-states",
+            previous=state,
+            manifest=other_manifest,
+            report_authority=authority,
+        )
+
+    mismatched_root = tmp_path / "mismatched-evidence-states"
+    mismatched = register_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=mismatched_root,
+        experiment_id=manifest.experiment_id,
+        manifest_receipt_sha256=manifest.semantic_receipt_sha256,
+    )
+    for stage in MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[1:-1]:
+        mismatched = advance_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=mismatched_root,
+            previous=mismatched,
+            stage=stage,
+            stage_artifact_receipt_sha256=_digest((stage.value, "other-evidence")),
+        )
+    with pytest.raises(
+        MassiveAdaptiveRLExperimentStateV2Error,
+        match="does not descend",
+    ):
+        publish_massive_adaptive_rl_development_report_state_v3(
+            artifact_root=mismatched_root,
+            previous=mismatched,
+            manifest=manifest,
+            report_authority=authority,
         )
