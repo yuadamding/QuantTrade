@@ -18,11 +18,14 @@ from typing import cast
 
 import torch
 
-from rl_quant.data_sources.massive.source_receipts import canonical_json_file_bytes
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
 )
-from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256,
+)
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
@@ -419,7 +422,7 @@ def load_massive_adaptive_rl_experiment_manifest_v2(
     payload["ppo_config"] = MassiveAdaptivePPOConfigV1(
         **cast(dict[str, object], payload["ppo_config"])  # type: ignore[arg-type]
     )
-    result = MassiveAdaptiveRLExperimentManifestV2(**payload)  # type: ignore[arg-type]
+    result = MassiveAdaptiveRLExperimentManifestV2(**payload)
     result.validate()
     return result
 
@@ -607,39 +610,118 @@ def _manifest_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_command(args: argparse.Namespace) -> int:
-    manifest = load_massive_adaptive_rl_experiment_manifest_v2(args.manifest)
+def _manifest_v3_command(args: argparse.Namespace) -> int:
+    from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
+        build_massive_adaptive_rl_experiment_manifest_v3,
+        write_massive_adaptive_rl_experiment_manifest_v3,
+    )
+
+    config = MassiveAdaptivePPOConfigV1(
+        rollout_length=args.block_sessions,
+        minibatch_size=args.block_sessions,
+        seed=args.seed,
+    )
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id=args.experiment_id,
+        prequential_block_sessions=args.block_sessions,
+        seeds=(args.seed,),
+        ppo_config=config,
+        execution_device_specification=args.device,
+    )
+    write_massive_adaptive_rl_experiment_manifest_v3(
+        path=args.output,
+        manifest=manifest,
+    )
     print(manifest.semantic_receipt_sha256)
     return 0
 
 
-def _run_command(args: argparse.Namespace) -> int:
-    from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v1 import (
-        run_massive_adaptive_rl_experiment_v1,
-    )
+def _manifest_schema(path: str | Path) -> str:
+    raw = Path(path).read_bytes()
+    value = json.loads(raw)
+    if not isinstance(value, Mapping) or raw != canonical_json_file_bytes(value):
+        raise MassiveAdaptiveRLWorkflowV2Error(
+            "adaptive RL experiment manifest is not canonical JSON"
+        )
+    return str(value.get("schema", ""))
 
-    result = run_massive_adaptive_rl_experiment_v1(
-        manifest_path=args.manifest,
-        source_root=args.source_root,
-        artifact_root=args.artifact_root,
-        device=args.device,
-        resume=args.resume,
-    )
-    print(canonical_json_file_bytes(asdict(result)).decode("utf-8"), end="")
-    return 0 if result.execution_complete else 2
+
+def _validate_command(args: argparse.Namespace) -> int:
+    if _manifest_schema(args.manifest) == (
+        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
+    ):
+        from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
+            load_massive_adaptive_rl_experiment_manifest_v3,
+        )
+
+        manifest_v3 = load_massive_adaptive_rl_experiment_manifest_v3(args.manifest)
+        receipt = manifest_v3.semantic_receipt_sha256
+    else:
+        manifest_v2 = load_massive_adaptive_rl_experiment_manifest_v2(args.manifest)
+        receipt = manifest_v2.semantic_receipt_sha256
+    print(receipt)
+    return 0
+
+
+def _run_command(args: argparse.Namespace) -> int:
+    if _manifest_schema(args.manifest) == (
+        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
+    ):
+        from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
+            run_massive_adaptive_rl_experiment_v2,
+        )
+
+        result_v2 = run_massive_adaptive_rl_experiment_v2(
+            manifest_path=args.manifest,
+            source_root=args.source_root,
+            artifact_root=args.artifact_root,
+            device=args.device,
+            resume=args.resume,
+        )
+    else:
+        from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v1 import (
+            run_massive_adaptive_rl_experiment_v1,
+        )
+
+        result_v1 = run_massive_adaptive_rl_experiment_v1(
+            manifest_path=args.manifest,
+            source_root=args.source_root,
+            artifact_root=args.artifact_root,
+            device=args.device,
+            resume=args.resume,
+        )
+        print(canonical_json_file_bytes(asdict(result_v1)).decode("utf-8"), end="")
+        return 0 if result_v1.execution_complete else 2
+    print(canonical_json_file_bytes(asdict(result_v2)).decode("utf-8"), end="")
+    return 0 if result_v2.execution_complete else 2
 
 
 def _verify_run_command(args: argparse.Namespace) -> int:
-    from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v1 import (
-        verify_massive_adaptive_rl_experiment_v1,
-    )
+    if _manifest_schema(args.manifest) == (
+        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
+    ):
+        from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
+            verify_massive_adaptive_rl_experiment_v2,
+        )
 
-    result = verify_massive_adaptive_rl_experiment_v1(
-        manifest_path=args.manifest,
-        source_root=args.source_root,
-        artifact_root=args.artifact_root,
-    )
-    print(canonical_json_file_bytes(asdict(result)).decode("utf-8"), end="")
+        result_v2 = verify_massive_adaptive_rl_experiment_v2(
+            manifest_path=args.manifest,
+            source_root=args.source_root,
+            artifact_root=args.artifact_root,
+        )
+    else:
+        from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v1 import (
+            verify_massive_adaptive_rl_experiment_v1,
+        )
+
+        result_v1 = verify_massive_adaptive_rl_experiment_v1(
+            manifest_path=args.manifest,
+            source_root=args.source_root,
+            artifact_root=args.artifact_root,
+        )
+        print(canonical_json_file_bytes(asdict(result_v1)).decode("utf-8"), end="")
+        return 0
+    print(canonical_json_file_bytes(asdict(result_v2)).decode("utf-8"), end="")
     return 0
 
 
@@ -658,6 +740,18 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--block-sessions", type=int, choices=(21, 63), default=63)
     manifest.add_argument("--seed", type=int, default=17)
     manifest.set_defaults(handler=_manifest_command)
+    manifest_v3 = commands.add_parser(
+        "manifest-v3",
+        help="Create the preregistered final-profitability experiment manifest.",
+    )
+    manifest_v3.add_argument("--experiment-id", required=True)
+    manifest_v3.add_argument("--output", required=True)
+    manifest_v3.add_argument(
+        "--block-sessions", type=int, choices=(21, 63), default=63
+    )
+    manifest_v3.add_argument("--seed", type=int, default=17)
+    manifest_v3.add_argument("--device", default="cpu")
+    manifest_v3.set_defaults(handler=_manifest_v3_command)
     validate = commands.add_parser(
         "validate",
         help="Validate an immutable V2 manifest without opening outcomes.",

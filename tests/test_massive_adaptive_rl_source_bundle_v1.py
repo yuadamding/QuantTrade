@@ -11,8 +11,18 @@ from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MassiveAdaptiveRLSourceBundleV1Error,
     authorize_massive_adaptive_rl_source_bundle_v1,
+    bind_massive_adaptive_rl_source_authority_v1,
     load_massive_adaptive_rl_source_bundle_v1,
     materialize_massive_adaptive_rl_source_bundle_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
+    MassiveAdaptiveRLExperimentRunnerV2Error,
+    run_massive_adaptive_rl_experiment_v2,
+    verify_massive_adaptive_rl_experiment_v2,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
+    build_massive_adaptive_rl_experiment_manifest_v3,
+    write_massive_adaptive_rl_experiment_manifest_v3,
 )
 from rl_quant.workflows.massive_adaptive_rl_v2 import (
     build_massive_adaptive_rl_experiment_manifest_v2,
@@ -44,7 +54,6 @@ _FOLD = {
 @dataclass(frozen=True)
 class _SyntheticRuntimeSource:
     semantic_receipt_sha256: str
-    source_data_qualified: bool = True
 
     def validate(self) -> None:
         assert len(self.semantic_receipt_sha256) == 64
@@ -66,7 +75,13 @@ def _persist_synthetic_source_graph(root: Path):
         path = root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(canonical_json_file_bytes(payload))
-        runtimes[key] = _SyntheticRuntimeSource(receipt)
+        runtimes[key] = bind_massive_adaptive_rl_source_authority_v1(
+            role=key[0],
+            fold_index=key[1],
+            authority=_SyntheticRuntimeSource(receipt),
+            source_data_qualified=True,
+            runtime_source_replayed=True,
+        )
     return runtimes
 
 
@@ -105,7 +120,10 @@ def test_source_bundle_generic_reload_is_nonauthorizing_and_tamper_evident(
     unqualified[first_key] = replace(
         unqualified[first_key], source_data_qualified=False
     )
-    with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="unqualified"):
+    with pytest.raises(
+        MassiveAdaptiveRLSourceBundleV1Error,
+        match="unqualified|role-bound",
+    ):
         authorize_massive_adaptive_rl_source_bundle_v1(
             source_bundle=generic,
             runtime_sources=unqualified,
@@ -129,6 +147,58 @@ def test_source_bundle_rejects_incomplete_runtime_graph(tmp_path: Path) -> None:
     runtimes = _persist_synthetic_source_graph(tmp_path)
     runtimes.pop(next(iter(runtimes)))
     with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="complete"):
+        materialize_massive_adaptive_rl_source_bundle_v1(
+            source_root=tmp_path,
+            manifest=manifest,
+            runtime_sources=runtimes,
+        )
+
+
+def test_source_bundle_rejects_unbound_and_role_substituted_runtime_sources(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v2(
+        experiment_id="role-bound-source-bundle"
+    )
+    runtimes = _persist_synthetic_source_graph(tmp_path)
+    first_key = next(iter(runtimes))
+    unbound = dict(runtimes)
+    unbound[first_key] = _SyntheticRuntimeSource(
+        runtimes[first_key].semantic_receipt_sha256
+    )
+    with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="role-bound"):
+        materialize_massive_adaptive_rl_source_bundle_v1(
+            source_root=tmp_path,
+            manifest=manifest,
+            runtime_sources=unbound,
+        )
+
+    identity_key = ("identity-authority", None)
+    fill_key = ("fill-source-authority", None)
+    substituted = dict(runtimes)
+    substituted[identity_key] = runtimes[fill_key]
+    with pytest.raises(
+        MassiveAdaptiveRLSourceBundleV1Error,
+        match="role, fold, or qualification",
+    ):
+        materialize_massive_adaptive_rl_source_bundle_v1(
+            source_root=tmp_path,
+            manifest=manifest,
+            runtime_sources=substituted,
+        )
+
+
+def test_source_bundle_rejects_symlinked_source_artifact(tmp_path: Path) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v2(
+        experiment_id="symlinked-source-bundle"
+    )
+    runtimes = _persist_synthetic_source_graph(tmp_path)
+    target = tmp_path / _GLOBAL["session-authority"]
+    backing = target.with_name("session-authority-backing.json")
+    target.rename(backing)
+    target.symlink_to(backing.name)
+
+    with pytest.raises(MassiveAdaptiveRLSourceBundleV1Error, match="symlink"):
         materialize_massive_adaptive_rl_source_bundle_v1(
             source_root=tmp_path,
             manifest=manifest,
@@ -198,3 +268,131 @@ def test_run_cli_persists_source_replay_failure(tmp_path: Path, capsys) -> None:
     assert main(["verify", *common]) == 0
     verified = json.loads(capsys.readouterr().out)
     assert verified["semantic_receipt_sha256"] == failed["semantic_receipt_sha256"]
+
+
+def test_runner_v2_binds_device_and_persists_retryable_runtime_blocker(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="runner-v2-source-boundary",
+        execution_device_specification="cpu",
+    )
+    manifest_path = tmp_path / "manifest-v3.json"
+    write_massive_adaptive_rl_experiment_manifest_v3(
+        path=manifest_path,
+        manifest=manifest,
+    )
+    runtimes = _persist_synthetic_source_graph(tmp_path)
+    materialize_massive_adaptive_rl_source_bundle_v1(
+        source_root=tmp_path,
+        manifest=manifest.base_manifest,
+        runtime_sources=runtimes,
+    )
+    artifact_root = tmp_path / "artifacts"
+    first = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=False,
+    )
+    assert first.current_stage.value == "blocked"
+    assert first.next_required_stage is not None
+    assert first.next_required_stage.value == "fit-forecasts-authorized"
+    assert first.blocker_code == "typed-runtime-source-replay-required"
+    assert not first.execution_complete
+    assert len(first.state_receipts) == 3
+
+    resumed = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+    assert resumed.semantic_receipt_sha256 == first.semantic_receipt_sha256
+    assert verify_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+    ).semantic_receipt_sha256 == first.semantic_receipt_sha256
+
+    with pytest.raises(MassiveAdaptiveRLExperimentRunnerV2Error, match="device"):
+        run_massive_adaptive_rl_experiment_v2(
+            manifest_path=manifest_path,
+            source_root=tmp_path,
+            artifact_root=artifact_root,
+            device="cuda:0",
+            resume=True,
+        )
+
+
+def test_runner_v2_source_absence_is_blocked_and_resumable(tmp_path: Path) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="runner-v2-delayed-source"
+    )
+    manifest_path = tmp_path / "manifest-v3.json"
+    write_massive_adaptive_rl_experiment_manifest_v3(
+        path=manifest_path,
+        manifest=manifest,
+    )
+    artifact_root = tmp_path / "artifacts"
+    blocked = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=False,
+    )
+    assert blocked.blocker_code == "source-bundle-temporarily-absent"
+    assert blocked.next_required_stage is not None
+    assert blocked.next_required_stage.value == "source-bundle-replayed"
+
+    runtimes = _persist_synthetic_source_graph(tmp_path)
+    materialize_massive_adaptive_rl_source_bundle_v1(
+        source_root=tmp_path,
+        manifest=manifest.base_manifest,
+        runtime_sources=runtimes,
+    )
+    resumed = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+    assert resumed.blocker_code == "typed-runtime-source-replay-required"
+    assert resumed.next_required_stage is not None
+    assert resumed.next_required_stage.value == "fit-forecasts-authorized"
+
+
+def test_runner_v2_classifies_malformed_bundle_as_integrity_failure(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="runner-v2-malformed-source"
+    )
+    manifest_path = tmp_path / "manifest-v3.json"
+    write_massive_adaptive_rl_experiment_manifest_v3(
+        path=manifest_path,
+        manifest=manifest,
+    )
+    bundle_path = (
+        tmp_path
+        / "adaptive-rl"
+        / "source-bundle-v1"
+        / f"{manifest.experiment_id}.json"
+    )
+    bundle_path.parent.mkdir(parents=True)
+    bundle_path.write_bytes(b"not-json\n")
+
+    result = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=tmp_path / "artifacts",
+        device="cpu",
+        resume=False,
+    )
+    assert result.current_stage.value == "failed"
+    assert result.blocker_code == "source-bundle-integrity-failed"
+    assert not result.execution_complete
