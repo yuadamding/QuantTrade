@@ -533,7 +533,7 @@ def test_runtime_source_graph_generic_reload_is_nonauthorizing_and_replayable(
         device="cpu",
         resume=False,
     )
-    assert run.blocker_code == "runtime-source-graph-replay-required"
+    assert run.blocker_code == "runtime-source-replay-dependency-index-required"
     assert (
         run.runtime_source_graph_authority_receipt_sha256
         == authorized.semantic_receipt_sha256

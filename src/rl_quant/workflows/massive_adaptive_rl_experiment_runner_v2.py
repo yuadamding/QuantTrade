@@ -2,8 +2,9 @@
 
 This generation binds the requested execution device, distinguishes retryable
 source absence from integrity failure, and can represent positive or negative
-completed reports.  It still stops at the typed runtime reconstruction seam;
-that explicit blocker prevents a byte-only source index from authorizing PPO.
+completed reports.  When the package-owned replay-dependency index exists it
+reconstructs and authorizes the typed runtime graph without caller objects.  It
+still stops before the not-yet-installed four-fold execution backend.
 """
 
 from __future__ import annotations
@@ -36,6 +37,11 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 im
     load_massive_adaptive_rl_runtime_source_graph_authority_v1,
     runtime_source_graph_authority_path_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
+    MassiveAdaptiveRLRuntimeSourceReconstructionV1Error,
+    reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1,
+    replay_dependency_index_path_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MassiveAdaptiveRLSourceBundleV1,
     MassiveAdaptiveRLSourceBundleV1Error,
@@ -54,7 +60,8 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
         "runtime_source_graph": "v1-persisted-generic-reload-nonauthorizing",
         "state": "create-only-blocked-failed-and-report-ledger-v2",
         "device": "manifest-bound",
-        "current_runtime_boundary": "typed-persisted-composite-loader-required",
+        "runtime_reconstruction": "package-owned-dependency-index-v1",
+        "current_runtime_boundary": "four-fold-execution-backend-required",
         "completed_resume": "terminal-idempotent",
         "state_verification": "entire-chain-manifest-bound",
         "verification_surface": "ledger-replay-distinct-from-deep-verification",
@@ -327,7 +334,7 @@ def run_massive_adaptive_rl_experiment_v2(
     device: object,
     resume: bool = True,
 ) -> MassiveAdaptiveRLEndToEndRunV2:
-    """Advance through byte replay and stop at the typed runtime seam."""
+    """Advance through package-owned runtime replay and stop before execution."""
 
     manifest = load_massive_adaptive_rl_experiment_manifest_v3(manifest_path)
     if str(device) != manifest.execution_device_specification:
@@ -459,15 +466,56 @@ def run_massive_adaptive_rl_experiment_v2(
         states = (*states, failure)
         return _result(manifest=manifest, states=states, source_bundle=source_bundle)
     if not runtime_source_graph.source_data_qualified:
+        dependency_index_path = replay_dependency_index_path_v1(
+            source_root=source_root,
+            experiment_id=manifest.experiment_id,
+        )
+        if dependency_index_path.is_file():
+            try:
+                runtime_sources = (
+                    reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
+                        source_root=source_root,
+                        manifest=manifest,
+                    )
+                )
+            except MassiveAdaptiveRLRuntimeSourceReconstructionV1Error:
+                failure = fail_massive_adaptive_rl_experiment_state_v2(
+                    artifact_root=artifact_root,
+                    previous=states[-1],
+                    failed_stage=(
+                        MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
+                    ),
+                    failure_code="runtime-source-reconstruction-failed",
+                    failure_evidence_receipt_sha256=semantic_sha256(
+                        {
+                            "manifest": manifest.semantic_receipt_sha256,
+                            "failure_code": "runtime-source-reconstruction-failed",
+                        }
+                    ),
+                )
+                states = (*states, failure)
+                return _result(
+                    manifest=manifest,
+                    states=states,
+                    source_bundle=source_bundle,
+                    runtime_source_graph=runtime_source_graph,
+                )
+            runtime_source_graph = runtime_sources.runtime_source_graph_authority
+        else:
+            runtime_sources = None
+    else:
+        runtime_sources = None
+    if not runtime_source_graph.source_data_qualified:
         if not (
             states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
-            and states[-1].blocker_code == "runtime-source-graph-replay-required"
+            and states[-1].blocker_code
+            == "runtime-source-replay-dependency-index-required"
         ):
             blocked = block_massive_adaptive_rl_experiment_state_v2(
                 artifact_root=artifact_root,
                 previous=states[-1],
                 blocked_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
-                blocker_code="runtime-source-graph-replay-required",
+                blocker_code="runtime-source-replay-dependency-index-required",
                 blocker_evidence_receipt_sha256=semantic_sha256(
                     {
                         "manifest": manifest.semantic_receipt_sha256,
@@ -485,8 +533,36 @@ def run_massive_adaptive_rl_experiment_v2(
             source_bundle=source_bundle,
             runtime_source_graph=runtime_source_graph,
         )
-    raise MassiveAdaptiveRLExperimentRunnerV2Error(
-        "typed source replay exists but the four-fold execution backend is not installed"
+    if not (
+        states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
+        and states[-1].blocker_code == "four-fold-execution-backend-required"
+    ):
+        blocked = block_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            blocked_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+            blocker_code="four-fold-execution-backend-required",
+            blocker_evidence_receipt_sha256=semantic_sha256(
+                {
+                    "manifest": manifest.semantic_receipt_sha256,
+                    "source_bundle": source_bundle.semantic_receipt_sha256,
+                    "runtime_source_graph": (
+                        runtime_source_graph.runtime_authority_receipt_sha256
+                    ),
+                    "runtime_sources": (
+                        None
+                        if runtime_sources is None
+                        else runtime_sources.semantic_receipt_sha256
+                    ),
+                }
+            ),
+        )
+        states = (*states, blocked)
+    return _result(
+        manifest=manifest,
+        states=states,
+        source_bundle=source_bundle,
+        runtime_source_graph=runtime_source_graph,
     )
 
 
@@ -523,13 +599,25 @@ def verify_massive_adaptive_rl_experiment_v2(
             source_root=source_root,
             experiment_id=manifest.experiment_id,
         ).is_file():
-            runtime_source_graph = (
-                load_massive_adaptive_rl_runtime_source_graph_authority_v1(
-                    source_root=source_root,
-                    manifest=manifest,
-                    source_bundle=source_bundle,
-                )
+            dependency_index = replay_dependency_index_path_v1(
+                source_root=source_root,
+                experiment_id=manifest.experiment_id,
             )
+            if dependency_index.is_file():
+                runtime_source_graph = (
+                    reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
+                        source_root=source_root,
+                        manifest=manifest,
+                    ).runtime_source_graph_authority
+                )
+            else:
+                runtime_source_graph = (
+                    load_massive_adaptive_rl_runtime_source_graph_authority_v1(
+                        source_root=source_root,
+                        manifest=manifest,
+                        source_bundle=source_bundle,
+                    )
+                )
     return _result(
         manifest=manifest,
         states=states,

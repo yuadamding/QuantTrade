@@ -429,12 +429,18 @@ operations backed by a create-only stage ledger. The composite source index
 uses fixed package-owned roles and relative paths, rehashes every canonical
 artifact, and accepts no caller dates, selected checkpoints, actions,
 transitions, returns, or P&L. Generic JSON replay is deliberately
-nonauthorizing: the run stops at `source-bundle-replayed` until typed runtime
-authorities independently validate the same receipts. The persisted typed
-Dataset-V3/runtime reconstructor and the remaining all-fold execution backend
-do not exist yet, so this command is an auditable readiness boundary rather
-than a historical training launcher. The root command cannot authorize
-profitability reporting.
+nonauthorizing. Source preparation may now publish a create-only replay-
+dependency index only from an already witnessed runtime graph. That index
+binds package-owned object paths, file hashes, concrete types, schemas,
+specifications, implementation sources, logical role keys, and dependency
+edges. On restart, the package reconstructs the typed role graph from that
+index, replays tensors, checkpoints, training-loss checkpoint choice,
+calibration, and fit forecasts, and requires the original runtime-witness
+receipt. No runtime mapping or qualification Boolean is accepted by the root
+runner. The remaining all-fold execution backend does not exist yet, so a
+successfully reconstructed run stops at
+`four-fold-execution-backend-required` rather than launching PPO. The root
+command cannot authorize profitability reporting.
 
 The RL chronology is opened in two stages. PPO fitting and policy selection
 first bind fit, validation, and outer date inventories directly from the split
@@ -561,12 +567,14 @@ This closes the minimum package-owned library path from causal
 prequential forecasts through bounded PPO, exact durable resume,
 inner-validation policy selection, a frozen fold-bound policy, and paired
 four-fold outer evidence. A fixed-layout composite source index and resumable
-create-only experiment ledger now exist. The remaining experiment-level
-boundary is typed reconstruction of that complete persisted graph plus the
-backend that advances every fold from authorized fit forecasts through V4
-evidence without accepting selected identifiers, actions, transitions, or
-statistics from an external driver. The current root command does **not**
-manufacture historical authority:
+create-only experiment ledger now exist. A dependency-closed, package-owned
+runtime reconstruction boundary also exists and can recover the witnessed
+typed graph without caller runtime objects. The remaining experiment-level
+boundary is the backend that advances every fold from those reconstructed
+sources through authorized fit forecasts and V4 evidence without accepting
+selected identifiers, environments, actions, transitions, or statistics from
+an external driver. The current root command does **not** manufacture
+historical authority:
 the synthetic canaries remain nonauthorizing, development reporting cannot be
 reached from the incomplete root run,
 and a real run still requires acquired payloads, partitions, features,
