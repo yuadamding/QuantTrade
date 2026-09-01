@@ -154,6 +154,9 @@ def _checkpoint_payload(
             checkpoint.fit_environment_authority_receipts
         ),
         "transition_receipts": checkpoint.transition_receipts,
+        "transition_decision_session_dates": (
+            checkpoint.transition_decision_session_dates
+        ),
         "transition_source_data_qualified": (
             checkpoint.transition_source_data_qualified
         ),
@@ -288,6 +291,12 @@ def _parse_checkpoint(payload: Mapping[str, object]) -> MassiveAdaptiveRLCheckpo
     )
     value["transition_receipts"] = tuple(
         cast(tuple[str, ...] | list[str], value["transition_receipts"])
+    )
+    value["transition_decision_session_dates"] = tuple(
+        cast(
+            tuple[str, ...] | list[str],
+            value["transition_decision_session_dates"],
+        )
     )
     value["transition_source_data_qualified"] = tuple(
         bool(item)

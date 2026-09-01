@@ -142,6 +142,7 @@ class MassiveAdaptivePPORolloutV1:
     terminated: torch.Tensor
     observation_receipts: tuple[str, ...]
     transition_receipts: tuple[str, ...]
+    transition_decision_session_dates: tuple[str, ...]
     transition_source_data_qualified: tuple[bool, ...]
     source_data_qualified: bool
     final_environment_state_receipt_sha256: str
@@ -159,7 +160,9 @@ class MassiveAdaptivePPORolloutV1:
             or self.terminated.dtype != torch.bool
             or len(self.observation_receipts) != length
             or len(self.transition_receipts) != length
+            or len(self.transition_decision_session_dates) != length
             or len(self.transition_source_data_qualified) != length
+            or any(not value for value in self.transition_decision_session_dates)
             or any(
                 not isinstance(value, bool)
                 for value in self.transition_source_data_qualified
@@ -244,6 +247,7 @@ class MassiveAdaptiveRLCheckpointV1:
     training_forecast_authority_receipt_sha256: str | None
     fit_environment_authority_receipts: tuple[str, ...]
     transition_receipts: tuple[str, ...]
+    transition_decision_session_dates: tuple[str, ...]
     transition_source_data_qualified: tuple[bool, ...]
     transition_inventory_sha256: str
     source_data_qualified: bool
@@ -278,6 +282,9 @@ class MassiveAdaptiveRLCheckpointV1:
                 self.fit_environment_authority_receipts
             ),
             "transition_receipts": self.transition_receipts,
+            "transition_decision_session_dates": (
+                self.transition_decision_session_dates
+            ),
             "transition_source_data_qualified": (
                 self.transition_source_data_qualified
             ),
@@ -303,6 +310,8 @@ class MassiveAdaptiveRLCheckpointV1:
             self.training_forecast_authority_receipt_sha256 is not None
             and self.fit_environment_authority_receipts
             and self.transition_receipts
+            and len(self.transition_receipts)
+            == len(self.transition_decision_session_dates)
             and len(self.transition_receipts)
             == len(self.transition_source_data_qualified)
             and all(self.transition_source_data_qualified)
@@ -330,6 +339,8 @@ class MassiveAdaptiveRLCheckpointV1:
             or self.loss_trace_receipt_sha256 != semantic_sha256(self.loss_trace)
             or self.transition_inventory_sha256
             != semantic_sha256(self.transition_receipts)
+            or self.transition_decision_session_dates
+            != tuple(sorted(set(self.transition_decision_session_dates)))
             or self.fit_environment_authority_receipts
             != tuple(dict.fromkeys(self.fit_environment_authority_receipts))
             or any(
@@ -464,11 +475,8 @@ class MassiveAdaptivePPOTrainerV1:
         self.update_index = 0
         self.loss_trace: list[tuple[float, ...]] = []
         self.fit_environment_authority_receipts: list[str] = []
-        if fit_environment_authority is not None:
-            self.fit_environment_authority_receipts.append(
-                fit_environment_authority.semantic_receipt_sha256
-            )
         self.transition_receipts: list[str] = []
+        self.transition_decision_session_dates: list[str] = []
         self.transition_source_data_qualified: list[bool] = []
         self._observation: MassiveAdaptiveRLObservationV1 | None = None
 
@@ -504,6 +512,7 @@ class MassiveAdaptivePPOTrainerV1:
         terminated_rows: list[bool] = []
         observation_receipts: list[str] = []
         transition_receipts: list[str] = []
+        transition_decision_session_dates: list[str] = []
         transition_source_data_qualified: list[bool] = []
         for step_index in range(count):
             observation = self._ensure_observation()
@@ -548,6 +557,17 @@ class MassiveAdaptivePPOTrainerV1:
                 raise MassiveAdaptivePPOV1Error(
                     "authorizing PPO rollout contains an unqualified economic transition"
                 )
+            if self.fit_environment_authority is not None:
+                environment_authority_receipt = (
+                    self.fit_environment_authority.semantic_receipt_sha256
+                )
+                if (
+                    environment_authority_receipt
+                    not in self.fit_environment_authority_receipts
+                ):
+                    self.fit_environment_authority_receipts.append(
+                        environment_authority_receipt
+                    )
             observations.append(tensor[0])
             actions.append(sampled[0].detach())
             log_probabilities.append(log_probability[0].detach())
@@ -557,6 +577,9 @@ class MassiveAdaptivePPOTrainerV1:
             terminated_rows.append(terminated)
             observation_receipts.append(observation.semantic_receipt_sha256)
             transition_receipts.append(transition.semantic_receipt_sha256)
+            transition_decision_session_dates.append(
+                transition.economic_step.strategy_execution.decision_session_date
+            )
             transition_source_data_qualified.append(
                 transition.source_data_qualified
             )
@@ -598,6 +621,9 @@ class MassiveAdaptivePPOTrainerV1:
             terminated=terminated_tensor,
             observation_receipts=tuple(observation_receipts),
             transition_receipts=tuple(transition_receipts),
+            transition_decision_session_dates=tuple(
+                transition_decision_session_dates
+            ),
             transition_source_data_qualified=tuple(
                 transition_source_data_qualified
             ),
@@ -608,6 +634,9 @@ class MassiveAdaptivePPOTrainerV1:
         )
         result.validate()
         self.transition_receipts.extend(result.transition_receipts)
+        self.transition_decision_session_dates.extend(
+            result.transition_decision_session_dates
+        )
         self.transition_source_data_qualified.extend(
             result.transition_source_data_qualified
         )
@@ -727,6 +756,8 @@ class MassiveAdaptivePPOTrainerV1:
             and self.fit_environment_authority_receipts
             and self.transition_receipts
             and len(self.transition_receipts)
+            == len(self.transition_decision_session_dates)
+            and len(self.transition_receipts)
             == len(self.transition_source_data_qualified)
             and all(self.transition_source_data_qualified)
         )
@@ -759,6 +790,9 @@ class MassiveAdaptivePPOTrainerV1:
                 self.fit_environment_authority_receipts
             ),
             "transition_receipts": tuple(self.transition_receipts),
+            "transition_decision_session_dates": tuple(
+                self.transition_decision_session_dates
+            ),
             "transition_source_data_qualified": tuple(
                 self.transition_source_data_qualified
             ),
@@ -814,6 +848,8 @@ class MassiveAdaptivePPOTrainerV1:
             )
             or (
                 current_environment_authority_receipt is not None
+                and checkpoint.transition_receipts
+                and checkpoint.environment_state.chronology_cursor != 0
                 and current_environment_authority_receipt
                 not in checkpoint.fit_environment_authority_receipts
             )
@@ -834,6 +870,9 @@ class MassiveAdaptivePPOTrainerV1:
         self.update_index = checkpoint.update_index
         self.loss_trace = list(checkpoint.loss_trace)
         self.transition_receipts = list(checkpoint.transition_receipts)
+        self.transition_decision_session_dates = list(
+            checkpoint.transition_decision_session_dates
+        )
         self.transition_source_data_qualified = list(
             checkpoint.transition_source_data_qualified
         )

@@ -43,7 +43,8 @@ from rl_quant.training.massive_adaptive_prequential_ppo_runner_v1 import (
     MassiveAdaptivePPOBlockRuntimeV1,
 )
 from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
-    MassiveAdaptiveRLChronologyAuthorityV1,
+    MassiveAdaptiveRLFitChronologyAuthorityProtocol,
+    is_package_owned_massive_adaptive_rl_fit_chronology_authority_v1,
 )
 from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
     MassiveAdaptiveRLFixedControlRegistryV1,
@@ -444,7 +445,7 @@ def _run_action(
     control_id: str,
     action: MassiveAdaptiveRLActionV1,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
     runtimes: tuple[MassiveAdaptivePPOBlockRuntimeV1, ...],
     continuity: Mapping[int, MassiveAdaptiveEconomicContinuityAuthorityV1],
     environment_templates: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
@@ -555,7 +556,7 @@ def _run_action(
 def run_massive_adaptive_rl_fixed_control_fit_v1(
     *,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     fit_environment_authorities: (
         Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
@@ -599,7 +600,9 @@ def run_massive_adaptive_rl_fixed_control_fit_v1(
     )
     source_inputs_qualified = bool(
         type(training_authority) is MassiveAdaptiveRLTrainingForecastAuthorityV2
-        and type(chronology_authority) is MassiveAdaptiveRLChronologyAuthorityV1
+        and is_package_owned_massive_adaptive_rl_fit_chronology_authority_v1(
+            chronology_authority
+        )
         and len(environment_authority_receipts) == len(runtimes)
         and all(
             row.fit_environment_authority_receipt_sha256 is not None
@@ -885,7 +888,7 @@ def authorize_massive_adaptive_rl_fixed_control_fit_authority_v1(
     root: str | Path,
     authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     fit_environment_authorities: (
         Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
@@ -924,7 +927,7 @@ def materialize_massive_adaptive_rl_fixed_control_fit_authority_v1(
     root: str | Path,
     artifact_id: str,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     fit_environment_authorities: (
         Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None

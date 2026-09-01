@@ -67,6 +67,7 @@ from rl_quant.training.massive_adaptive_rl_checkpoint_authority_v1 import (
 )
 from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
     MassiveAdaptiveRLChronologyAuthorityV1,
+    MassiveAdaptiveRLFitChronologyAuthorityProtocol,
 )
 from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
     build_massive_adaptive_rl_fixed_control_registry_v1,
@@ -641,7 +642,7 @@ def run_massive_adaptive_rl_training_workflow_v1(
     fold_index: int,
     seed: int,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     fit_environment_authorities: (
         Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None

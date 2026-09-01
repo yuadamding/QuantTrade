@@ -100,6 +100,7 @@ def _parse_runner_checkpoint(
         "continuity_authority_receipts",
         "completed_block_receipts",
         "transition_receipts",
+        "transition_decision_session_dates",
         "transition_source_data_qualified",
         "fit_environment_authority_receipts",
     ):

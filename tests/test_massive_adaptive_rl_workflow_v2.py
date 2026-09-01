@@ -97,6 +97,40 @@ def test_manifest_v2_rejects_caller_changed_elapsed_schedule() -> None:
         changed.validate()
 
 
+@pytest.mark.parametrize(
+    "changed_config",
+    (
+        MassiveAdaptivePPOConfigV1(
+            rollout_length=21,
+            minibatch_size=63,
+            seed=17,
+        ),
+        MassiveAdaptivePPOConfigV1(
+            rollout_length=63,
+            minibatch_size=21,
+            seed=17,
+        ),
+    ),
+)
+def test_manifest_v2_rejects_ppo_geometry_that_breaks_candidate_schedule(
+    changed_config: MassiveAdaptivePPOConfigV1,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v2(
+        experiment_id="invalid-ppo-candidate-geometry"
+    )
+    changed = replace(
+        manifest,
+        ppo_config=changed_config,
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed = replace(
+        changed,
+        semantic_receipt_sha256=semantic_sha256(changed.semantic_unsigned()),
+    )
+    with pytest.raises(MassiveAdaptiveRLWorkflowV2Error, match="manifest V2"):
+        changed.validate()
+
+
 def test_v2_cli_derives_schedule_without_update_arguments(tmp_path, capsys) -> None:
     path = tmp_path / "cli-manifest-v2.json"
     assert (

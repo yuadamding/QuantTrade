@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
     MassiveAdaptiveInferencePlanV1,
@@ -42,6 +43,45 @@ MASSIVE_ADAPTIVE_RL_CHRONOLOGY_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
 
 class MassiveAdaptiveRLChronologyAuthorityV1Error(ValueError):
     """RL fitting, selection, and outer decision inventories overlap."""
+
+
+@runtime_checkable
+class MassiveAdaptiveRLFitChronologyAuthorityProtocol(Protocol):
+    """Minimum chronology contract consumed by fit-only executors."""
+
+    @property
+    def fold_index(self) -> int: ...
+
+    @property
+    def training_forecast_authority_receipt_sha256(self) -> str: ...
+
+    @property
+    def rl_fit_origin_dates(self) -> tuple[str, ...]: ...
+
+    @property
+    def source_data_qualified(self) -> bool: ...
+
+    @property
+    def semantic_receipt_sha256(self) -> str: ...
+
+    @property
+    def development_rl_training_authorized(self) -> bool: ...
+
+    def validate(self) -> None: ...
+
+
+def is_package_owned_massive_adaptive_rl_fit_chronology_authority_v1(
+    value: object,
+) -> bool:
+    """Return whether *value* is one of the two package-issued fit authorities."""
+
+    if type(value) is MassiveAdaptiveRLChronologyAuthorityV1:
+        return True
+    from rl_quant.training.massive_adaptive_rl_fold_fit_chronology_authority_v1 import (
+        MassiveAdaptiveRLFoldFitChronologyAuthorityV1,
+    )
+
+    return type(value) is MassiveAdaptiveRLFoldFitChronologyAuthorityV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +288,8 @@ def bind_massive_adaptive_rl_outer_chronology_v1(
 __all__ = [
     "MassiveAdaptiveRLChronologyAuthorityV1",
     "MassiveAdaptiveRLChronologyAuthorityV1Error",
+    "MassiveAdaptiveRLFitChronologyAuthorityProtocol",
     "bind_massive_adaptive_rl_outer_chronology_v1",
     "build_massive_adaptive_rl_chronology_authority_v1",
+    "is_package_owned_massive_adaptive_rl_fit_chronology_authority_v1",
 ]

@@ -125,13 +125,18 @@ def _reseal(value, **changes):
     return result
 
 
-def _qualified_fit_block(tmp_path: Path):
+def _qualified_fit_block(
+    tmp_path: Path,
+    *,
+    block_index: int = 0,
+    block_sessions: int = 21,
+):
     checkpoint, window, tensor, _roots, _plan, split_plan, model_spec = (
         _rl_fit_fixture(
             tmp_path / "fit",
             outer_fold_index=0,
-            block_index=0,
-            block_sessions=21,
+            block_index=block_index,
+            block_sessions=block_sessions,
         )
     )
     split_plan = _reseal(split_plan, candidate_source_data_qualified=True)
@@ -194,13 +199,13 @@ def _qualified_fit_block(tmp_path: Path):
         decision_roots=roots,
         split_plan=split_plan,
         outer_fold_index=0,
-        block_index=0,
-        block_sessions=21,
+        block_index=block_index,
+        block_sessions=block_sessions,
         model_spec=model_spec,
     )
     archive = materialize_massive_adaptive_rl_fit_forecast_archive_v1(
         root=tmp_path,
-        artifact_id="qualified-fit-environment",
+        artifact_id=f"qualified-fit-environment-{block_index}-{block_sessions}",
         checkpoint=checkpoint,
         training_window_plan=window,
         inference_tensor=tensor,
@@ -472,6 +477,7 @@ def _fill_source(
     daily,
     sessions,
     conditions,
+    qualifying_shares: float = 1_000_000.0,
 ) -> MassiveAdaptiveFillSourceV1:
     dates = tuple(
         dict.fromkeys(row.next_session_date for row in block.inference_plan.rows)
@@ -482,7 +488,7 @@ def _fill_source(
         for security_index, security_id in enumerate(security_ids):
             start, end = adaptive_fill_clock_v1(session_date)
             price = 100.005 + security_index
-            shares = 1_000_000.0
+            shares = qualifying_shares
             body = {
                 "session_date": session_date,
                 "security_id": security_id,

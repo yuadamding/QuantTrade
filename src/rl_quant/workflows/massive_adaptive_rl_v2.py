@@ -39,7 +39,7 @@ from rl_quant.training.massive_adaptive_ppo_v1 import (
     MassiveAdaptivePPOConfigV1,
 )
 from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
-    MassiveAdaptiveRLChronologyAuthorityV1,
+    MassiveAdaptiveRLFitChronologyAuthorityProtocol,
 )
 from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
     build_massive_adaptive_rl_fixed_control_registry_v1,
@@ -287,6 +287,8 @@ class MassiveAdaptiveRLExperimentManifestV2:
             or any(isinstance(value, bool) or value < 0 for value in self.seeds)
             or self.seed_policy != "canonical-fixed-seed-v1"
             or self.ppo_config.seed != self.seeds[0]
+            or self.ppo_config.rollout_length != self.prequential_block_sessions
+            or self.ppo_config.minibatch_size != self.prequential_block_sessions
             or self.primary_capital != 10_000_000.0
             or self.cost_ladder_basis_points != (10.0, 20.0, 40.0)
             or self.primary_cost_basis_points != 20.0
@@ -524,7 +526,7 @@ def run_massive_adaptive_rl_training_workflow_v2(
     fold_index: int,
     seed: int,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV2,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
     fit_environment_authorities: (
         Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
