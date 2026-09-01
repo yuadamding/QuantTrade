@@ -123,6 +123,11 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
     assert len(result.policy_checkpoint_authorities) == 2
     assert result.fixed_control_fit_authority.runtime_fit_replayed
     assert result.fixed_control_selection_authority.runtime_selection_replayed
+    assert tuple(
+        row.runtime_checkpoint.ppo_checkpoint.update_index
+        for row in result.operational_checkpoint_authorities
+        if row.runtime_checkpoint is not None
+    ) == (1, 2)
     for runner_authority, policy_authority in zip(
         result.runner_checkpoint_authorities,
         result.policy_checkpoint_authorities,
@@ -134,6 +139,34 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
             runner_authority.runtime_checkpoint.ppo_checkpoint.semantic_receipt_sha256
             == policy_authority.runtime_checkpoint.semantic_receipt_sha256
         )
+
+    resumed_environment, resumed_training, resumed_chronology = _roots()
+    resumed = run_massive_adaptive_rl_training_workflow_v1(
+        manifest=manifest,
+        fold_index=0,
+        seed=17,
+        training_authority=resumed_training,
+        chronology_authority=resumed_chronology,
+        environments={
+            resumed_environment.forecast_archive.semantic_receipt_sha256: (
+                resumed_environment
+            )
+        },
+        artifact_root=tmp_path,
+        committed_at_ms=100,
+        resume=True,
+    )
+    assert resumed.semantic_receipt_sha256 == result.semantic_receipt_sha256
+    assert resumed.operational_checkpoint_inventory_sha256 == (
+        result.operational_checkpoint_inventory_sha256
+    )
+    assert tuple(
+        row.semantic_receipt_sha256
+        for row in resumed.operational_checkpoint_authorities
+    ) == tuple(
+        row.semantic_receipt_sha256
+        for row in result.operational_checkpoint_authorities
+    )
 
     # Validation consumes the workflow-published policy authority, not an
     # independently assembled checkpoint or action sequence.

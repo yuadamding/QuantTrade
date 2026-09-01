@@ -45,8 +45,19 @@ from rl_quant.workflows import (
     massive_adaptive_rl_runtime_source_reconstruction_v1 as reconstruction,
 )
 from rl_quant.workflows.massive_adaptive_rl_fold_fit_v1 import (
+    MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable,
     MassiveAdaptiveRLFoldFitV1Error,
+    _fold_fit_execution_lease,
+    run_or_resume_massive_adaptive_rl_fold_fit_v1,
     run_massive_adaptive_rl_fold_fit_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_execution_environment_v1 import (
+    capture_massive_adaptive_rl_execution_environment_v1,
+    massive_adaptive_rl_deterministic_execution_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_fold_fit_inputs_v1 import (
+    load_massive_adaptive_rl_fold_fit_inputs_authority_v1,
+    materialize_massive_adaptive_rl_fold_fit_inputs_authority_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     build_massive_adaptive_rl_experiment_manifest_v3,
@@ -435,6 +446,69 @@ def test_manifest_v3_registry_executes_genuine_prefix_ppo_update(
     ]
 
 
+def test_fold_fit_inputs_materialize_and_replay_before_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime_sources = _fold_fit_runtime_sources(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    initial = massive_adaptive_ppo_model_state_receipt_v1(
+        build_seeded_massive_adaptive_ppo_model_v1(
+            seed=manifest.base_manifest.seeds[0]
+        )
+    )
+    with massive_adaptive_rl_deterministic_execution_v1(device="cpu"):
+        execution = capture_massive_adaptive_rl_execution_environment_v1(
+            manifest=manifest,
+            initial_model_state_receipt_sha256=initial,
+            device="cpu",
+        )
+        materialized = materialize_massive_adaptive_rl_fold_fit_inputs_authority_v1(
+            root=tmp_path / "fit-input-artifacts",
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            execution_environment_authority=execution,
+            outer_fold_index=0,
+            committed_at_ms=95_000,
+        )
+        replayed = load_massive_adaptive_rl_fold_fit_inputs_authority_v1(
+            root=tmp_path / "fit-input-artifacts",
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            execution_environment_authority=execution,
+            outer_fold_index=0,
+            verified_at_ms=95_001,
+        )
+
+    assert materialized.semantic_receipt_sha256 == replayed.semantic_receipt_sha256
+    assert replayed.runtime_inputs_replayed
+    assert replayed.development_rl_training_inputs_authorized
+    assert replayed.training_forecast_authority.origin_session_dates == (
+        runtime_sources.fold(0).fit_blocks[0].inference_plan.origin_session_dates
+        + runtime_sources.fold(0).fit_blocks[1].inference_plan.origin_session_dates
+    )
+
+
+def test_fold_fit_execution_lease_rejects_a_concurrent_owner(tmp_path: Path) -> None:
+    with _fold_fit_execution_lease(
+        root=tmp_path,
+        experiment_id="lease-canary",
+        fold_index=0,
+    ):
+        with pytest.raises(
+            MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable,
+            match="already held",
+        ):
+            with _fold_fit_execution_lease(
+                root=tmp_path,
+                experiment_id="lease-canary",
+                fold_index=0,
+            ):
+                raise AssertionError("concurrent lease unexpectedly acquired")
+
+
 def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -444,7 +518,7 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
         monkeypatch=monkeypatch,
     )
 
-    result = run_massive_adaptive_rl_fold_fit_v1(
+    result = run_or_resume_massive_adaptive_rl_fold_fit_v1(
         manifest=manifest,
         runtime_sources=runtime_sources,
         outer_fold_index=0,
@@ -455,6 +529,8 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
 
     result.validate()
     assert result.source_data_qualified
+    assert result.fit_inputs_authority.runtime_inputs_replayed
+    assert result.execution_environment_authority.source_data_qualified
     assert result.development_rl_training_authorized
     assert not result.profitability_reporting_authorized
     assert result.training_seed == manifest.base_manifest.seeds[0]
@@ -469,6 +545,11 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
     assert result.training_workflow.runtime_workflow.initial_model_state_receipt_sha256 == (
         result.initial_model_state_receipt_sha256
     )
+    assert tuple(
+        row.runtime_checkpoint.ppo_checkpoint.update_index
+        for row in result.training_workflow.runtime_workflow.operational_checkpoint_authorities
+        if row.runtime_checkpoint is not None
+    ) == (1, 2)
     assert result.transition_decision_session_dates == (
         result.training_forecast_authority.origin_session_dates
     )

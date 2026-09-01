@@ -534,6 +534,7 @@ def run_massive_adaptive_rl_training_workflow_v2(
     artifact_root: str | Path,
     committed_at_ms: int,
     device: torch.device | str = "cpu",
+    resume: bool = False,
 ) -> MassiveAdaptiveRLTrainingWorkflowV2:
     """Run one fold using only its session-derived candidate schedule."""
 
@@ -567,6 +568,7 @@ def run_massive_adaptive_rl_training_workflow_v2(
         artifact_root=artifact_root,
         committed_at_ms=committed_at_ms,
         device=device,
+        resume=resume,
     )
     qualified = runtime.development_rl_training_authorized
     body = {

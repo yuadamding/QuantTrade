@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
@@ -46,6 +45,8 @@ MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256 = semantic_sha256(
         "value_head_initialization": "zeros",
         "seed_source": "experiment-manifest-canonical-seed",
         "rng_scope": "forked-cpu-default-generator-restored",
+        "initialization_device": "cpu",
+        "parameter_dtype": "float32",
         "implementation_source_sha256": (
             MASSIVE_ADAPTIVE_PPO_POLICY_V1_SOURCE_SHA256
         ),
@@ -113,11 +114,17 @@ class MassiveAdaptiveBoundedControlDistributionV1:
         return self._normal.entropy().sum(dim=-1)
 
 
-def _mlp(input_dim: int, hidden_dim: int) -> nn.Sequential:
+def _mlp(
+    input_dim: int,
+    hidden_dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> nn.Sequential:
     return nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
+        nn.Linear(input_dim, hidden_dim, device=device, dtype=dtype),
         nn.SiLU(),
-        nn.Linear(hidden_dim, hidden_dim),
+        nn.Linear(hidden_dim, hidden_dim, device=device, dtype=dtype),
         nn.SiLU(),
     )
 
@@ -131,22 +138,53 @@ class MassiveAdaptivePPOActorCriticV1(PPOActorCritic):
         observation_dim: int,
         hidden_dim: int = 128,
         observation_key: str = "adaptive_state",
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
-        if observation_dim <= 0 or hidden_dim <= 0 or not observation_key:
+        resolved_device = torch.device(device)
+        if (
+            observation_dim <= 0
+            or hidden_dim <= 0
+            or not observation_key
+            or not dtype.is_floating_point
+        ):
             raise ValueError("adaptive PPO model dimensions are invalid")
         self.observation_dim = int(observation_dim)
         self.hidden_dim = int(hidden_dim)
         self.observation_key = observation_key
-        self.actor = _mlp(observation_dim, hidden_dim)
-        self.critic = _mlp(observation_dim, hidden_dim)
+        self.actor = _mlp(
+            observation_dim,
+            hidden_dim,
+            device=resolved_device,
+            dtype=dtype,
+        )
+        self.critic = _mlp(
+            observation_dim,
+            hidden_dim,
+            device=resolved_device,
+            dtype=dtype,
+        )
         self.actor_mean = nn.Linear(
-            hidden_dim, MASSIVE_ADAPTIVE_PPO_BIDIRECTIONAL_DIMENSION_V1
+            hidden_dim,
+            MASSIVE_ADAPTIVE_PPO_BIDIRECTIONAL_DIMENSION_V1,
+            device=resolved_device,
+            dtype=dtype,
         )
         self.actor_log_std = nn.Parameter(
-            torch.full((MASSIVE_ADAPTIVE_PPO_BIDIRECTIONAL_DIMENSION_V1,), -2.0)
+            torch.full(
+                (MASSIVE_ADAPTIVE_PPO_BIDIRECTIONAL_DIMENSION_V1,),
+                -2.0,
+                device=resolved_device,
+                dtype=dtype,
+            )
         )
-        self.value_head = nn.Linear(hidden_dim, 1)
+        self.value_head = nn.Linear(
+            hidden_dim,
+            1,
+            device=resolved_device,
+            dtype=dtype,
+        )
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -245,13 +283,21 @@ def build_seeded_massive_adaptive_ppo_model_v1(
         raise ValueError("adaptive PPO model initialization seed differs") from error
     with torch.random.fork_rng(devices=[], enabled=True):
         torch.set_rng_state(generator.get_state())
-        model = MassiveAdaptivePPOActorCriticV1(observation_dim=90)
+        model = MassiveAdaptivePPOActorCriticV1(
+            observation_dim=90,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+    if any(
+        parameter.device.type != "cpu" or parameter.dtype != torch.float32
+        for parameter in model.parameters()
+    ):
+        raise ValueError("adaptive PPO initial model device or dtype differs")
     return model
 
 
-@lru_cache(maxsize=64, typed=True)
 def massive_adaptive_ppo_initial_model_state_receipt_v1(*, seed: int) -> str:
-    """Replay the registered seeded initial state once per process and seed."""
+    """Replay the registered seeded initial state without process-local caching."""
 
     return massive_adaptive_ppo_model_state_receipt_v1(
         build_seeded_massive_adaptive_ppo_model_v1(seed=seed)
