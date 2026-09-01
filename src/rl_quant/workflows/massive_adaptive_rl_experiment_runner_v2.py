@@ -1,10 +1,11 @@
 """Manifest-V3 and state-V2 root runner for persisted adaptive RL experiments.
 
 This generation binds the requested execution device, distinguishes retryable
-source absence from integrity failure, and can represent positive or negative
-completed reports.  When the package-owned replay-dependency index exists it
-reconstructs and authorizes the typed runtime graph without caller objects.  It
-still stops before the not-yet-installed four-fold execution backend.
+source or replay-dependency unavailability from integrity failure, and can
+represent positive or negative completed reports.  When the package-owned
+replay-dependency index exists it reconstructs and authorizes the typed runtime
+graph without caller objects.  It still stops before the not-yet-installed
+four-fold execution backend.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 im
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLRuntimeSourceReconstructionV1Error,
+    MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable,
     reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1,
     replay_dependency_index_path_v1,
 )
@@ -61,6 +63,7 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
         "state": "create-only-blocked-failed-and-report-ledger-v2",
         "device": "manifest-bound",
         "runtime_reconstruction": "package-owned-dependency-index-v1",
+        "runtime_reconstruction_unavailability": "retryable-blocker",
         "current_runtime_boundary": "four-fold-execution-backend-required",
         "completed_resume": "terminal-idempotent",
         "state_verification": "entire-chain-manifest-bound",
@@ -477,6 +480,39 @@ def run_massive_adaptive_rl_experiment_v2(
                         source_root=source_root,
                         manifest=manifest,
                     )
+                )
+            except MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable:
+                blocker_code = "runtime-source-temporarily-unavailable"
+                if not (
+                    states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
+                    and states[-1].blocker_code == blocker_code
+                ):
+                    blocked = block_massive_adaptive_rl_experiment_state_v2(
+                        artifact_root=artifact_root,
+                        previous=states[-1],
+                        blocked_stage=(
+                            MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
+                        ),
+                        blocker_code=blocker_code,
+                        blocker_evidence_receipt_sha256=semantic_sha256(
+                            {
+                                "manifest": manifest.semantic_receipt_sha256,
+                                "source_bundle": source_bundle.semantic_receipt_sha256,
+                                "runtime_source_graph": (
+                                    runtime_source_graph.semantic_receipt_sha256
+                                ),
+                                "failure_class": (
+                                    "runtime-source-temporarily-unavailable"
+                                ),
+                            }
+                        ),
+                    )
+                    states = (*states, blocked)
+                return _result(
+                    manifest=manifest,
+                    states=states,
+                    source_bundle=source_bundle,
+                    runtime_source_graph=runtime_source_graph,
                 )
             except MassiveAdaptiveRLRuntimeSourceReconstructionV1Error:
                 failure = fail_massive_adaptive_rl_experiment_state_v2(

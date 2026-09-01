@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, is_dataclass
+from enum import Enum
 import importlib
 import inspect
 import json
@@ -156,7 +157,8 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256 = semantic_sha2
     {
         "input": "manifest-v3-source-bundle-v1-witnessed-runtime-graph-v1",
         "index": "create-only-path-hash-schema-specification-and-dependency-closed",
-        "codec": "restricted-rl-quant-dataclass-and-tensor-json-v1",
+        "codec": "restricted-rl-quant-dataclass-enum-and-tensor-json-v2",
+        "mapping_order": "canonical-encoded-key-order",
         "caller_runtime_mapping": False,
         "qualification_flags": "package-derived-only",
         "checkpoint_dependencies": "training-authority-tensor-window-model-config",
@@ -165,6 +167,8 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256 = semantic_sha2
             "checkpoint-training-and-inference-tensors-plan-roots-model"
         ),
         "native_replay": "tensor-checkpoint-training-forecast-calibration-fit-forecast",
+        "reconstruction_dependency_closure": "independently-recomputed",
+        "temporary_source_unavailability": "retryable-blocker",
         "publication": "fsync-atomic-content-addressed-and-create-only-index",
         "profitability_reporting": False,
         "lockbox_access": False,
@@ -173,11 +177,35 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256 = semantic_sha2
 
 _DEPENDENCY_ROLE = "replay-dependency"
 _ROOT_LOGICAL_KEY = "root"
-_CODEC_ID = "restricted-rl-quant-dataclass-and-tensor-json-v1"
+_CODEC_ID = "restricted-rl-quant-dataclass-enum-and-tensor-json-v2"
 
 
 class MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(ValueError):
     """The persisted runtime-source reconstruction graph is incomplete."""
+
+
+class MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(
+    MassiveAdaptiveRLRuntimeSourceReconstructionV1Error
+):
+    """A replay dependency cannot currently be reached and may be retried."""
+
+
+class MassiveAdaptiveRLRuntimeSourceIntegrityError(
+    MassiveAdaptiveRLRuntimeSourceReconstructionV1Error
+):
+    """Persisted runtime-source bytes or semantic lineage are invalid."""
+
+
+class MassiveAdaptiveRLRuntimeSourceImplementationMismatch(
+    MassiveAdaptiveRLRuntimeSourceIntegrityError
+):
+    """Persisted runtime-source code identity differs from this package."""
+
+
+class MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+    MassiveAdaptiveRLRuntimeSourceIntegrityError
+):
+    """The persisted runtime-source dependency closure differs."""
 
 
 def _digest(name: str, value: object) -> str:
@@ -243,14 +271,18 @@ def _resolve_regular_file(*, root: Path, relative_path: str) -> Path:
                 "runtime-source reconstruction path escapes the source root"
             )
         if cursor.is_symlink():
-            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+            raise MassiveAdaptiveRLRuntimeSourceIntegrityError(
                 "runtime-source reconstruction path contains a symlink"
             )
         cursor = cursor.parent
+    if not candidate.exists():
+        raise MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(
+            "runtime-source reconstruction file is temporarily absent"
+        )
     resolved = candidate.resolve()
     if root not in resolved.parents or not resolved.is_file():
-        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
-            "runtime-source reconstruction file is absent or not regular"
+        raise MassiveAdaptiveRLRuntimeSourceIntegrityError(
+            "runtime-source reconstruction file is not regular"
         )
     return resolved
 
@@ -336,7 +368,21 @@ _TORCH_DTYPES: dict[str, torch.dtype] = {
 
 
 def _encode_value(value: object) -> object:
-    if value is None or isinstance(value, (str, bool, int)):
+    if isinstance(value, Enum):
+        enum_type = type(value)
+        if not enum_type.__module__.startswith("rl_quant."):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "runtime-source snapshot enum is outside rl_quant"
+            )
+        return {
+            "kind": "enum",
+            "module": enum_type.__module__,
+            "qualname": enum_type.__qualname__,
+            "implementation_source_sha256": (_implementation_source_sha256(enum_type)),
+            "member_name": value.name,
+            "member_value": _encode_value(value.value),
+        }
+    if value is None or type(value) in {str, bool, int}:
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -388,8 +434,8 @@ def _encode_value(value: object) -> object:
     if isinstance(value, np.generic):
         return _encode_value(value.item())
     if is_dataclass(value) and not isinstance(value, type):
-        runtime_type = type(value)
-        if not runtime_type.__module__.startswith("rl_quant."):
+        dataclass_type = type(value)
+        if not dataclass_type.__module__.startswith("rl_quant."):
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "runtime-source snapshot dataclass is outside rl_quant"
             )
@@ -402,10 +448,10 @@ def _encode_value(value: object) -> object:
             )
         return {
             "kind": "dataclass",
-            "module": runtime_type.__module__,
-            "qualname": runtime_type.__qualname__,
+            "module": dataclass_type.__module__,
+            "qualname": dataclass_type.__qualname__,
             "implementation_source_sha256": (
-                _implementation_source_sha256(runtime_type)
+                _implementation_source_sha256(dataclass_type)
             ),
             "fields": tuple(encoded_fields),
         }
@@ -414,11 +460,22 @@ def _encode_value(value: object) -> object:
     if isinstance(value, list):
         return {"kind": "list", "items": tuple(_encode_value(row) for row in value)}
     if isinstance(value, Mapping):
+        encoded_items = tuple(
+            (_encode_value(key), _encode_value(current))
+            for key, current in value.items()
+        )
         return {
             "kind": "mapping",
             "items": tuple(
-                (_encode_value(key), _encode_value(current))
-                for key, current in value.items()
+                sorted(
+                    encoded_items,
+                    key=lambda row: json.dumps(
+                        row[0],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ),
+                )
             ),
         }
     if isinstance(value, (set, frozenset)):
@@ -465,8 +522,39 @@ def _resolve_dataclass_type(
         or _implementation_source_sha256(value)
         != _digest("snapshot implementation", expected_source_sha256)
     ):
-        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+        raise MassiveAdaptiveRLRuntimeSourceImplementationMismatch(
             "runtime-source snapshot implementation differs"
+        )
+    return value
+
+
+def _resolve_enum_type(
+    *, module_name: object, qualname: object, expected_source_sha256: object
+) -> type[Enum]:
+    if (
+        not isinstance(module_name, str)
+        or not module_name.startswith("rl_quant.")
+        or not isinstance(qualname, str)
+        or not qualname
+        or "<locals>" in qualname
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+            "runtime-source snapshot enum type is not package-owned"
+        )
+    module = importlib.import_module(module_name)
+    value: object = module
+    for part in qualname.split("."):
+        value = getattr(value, part, None)
+        if value is None:
+            break
+    if (
+        not isinstance(value, type)
+        or not issubclass(value, Enum)
+        or _implementation_source_sha256(value)
+        != _digest("snapshot enum implementation", expected_source_sha256)
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceImplementationMismatch(
+            "runtime-source snapshot enum implementation differs"
         )
     return value
 
@@ -494,6 +582,29 @@ def _decode_value(value: object) -> object:
             "runtime-source snapshot value is malformed"
         )
     kind = value.get("kind")
+    if kind == "enum":
+        enum_type = _resolve_enum_type(
+            module_name=value.get("module"),
+            qualname=value.get("qualname"),
+            expected_source_sha256=value.get("implementation_source_sha256"),
+        )
+        member_name = value.get("member_name")
+        if not isinstance(member_name, str):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "runtime-source snapshot enum member is malformed"
+            )
+        try:
+            member = enum_type.__members__[member_name]
+            member_value = _decode_value(value.get("member_value"))
+        except (KeyError, TypeError, ValueError) as error:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "runtime-source snapshot enum member is unsupported"
+            ) from error
+        if type(member.value) is not type(member_value) or member.value != member_value:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "runtime-source snapshot enum name and value differ"
+            )
+        return member
     if kind == "complex":
         return complex(float(value["real"]), float(value["imag"]))
     if kind == "bytes":
@@ -566,7 +677,7 @@ def _decode_value(value: object) -> object:
             mapping_result[key] = _decode_value(row_values[1])
         return mapping_result
     if kind == "dataclass":
-        runtime_type = _resolve_dataclass_type(
+        dataclass_type = _resolve_dataclass_type(
             module_name=value.get("module"),
             qualname=value.get("qualname"),
             expected_source_sha256=value.get("implementation_source_sha256"),
@@ -593,14 +704,16 @@ def _decode_value(value: object) -> object:
                 )
             kwargs[name] = _decode_value(row[1])
         field_names = {
-            current.name for current in fields(cast(Any, runtime_type)) if current.init
+            current.name
+            for current in fields(cast(Any, dataclass_type))
+            if current.init
         }
         if not set(kwargs) <= field_names:
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "runtime-source snapshot dataclass field inventory differs"
             )
         if "_issuer" in field_names:
-            module = sys.modules[runtime_type.__module__]
+            module = sys.modules[dataclass_type.__module__]
             issuer = getattr(module, "_ISSUER", None)
             if issuer is None:
                 raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
@@ -608,7 +721,7 @@ def _decode_value(value: object) -> object:
                 )
             kwargs["_issuer"] = issuer
         try:
-            return runtime_type(**kwargs)
+            return dataclass_type(**kwargs)
         except (TypeError, ValueError) as error:
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "runtime-source snapshot dataclass cannot be reconstructed"
@@ -1685,8 +1798,12 @@ def load_massive_adaptive_rl_replay_dependency_index_v1(
     try:
         raw = resolved.read_bytes()
         value = json.loads(raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+    except OSError as error:
+        raise MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(
+            "adaptive RL replay-dependency index is temporarily unavailable"
+        ) from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MassiveAdaptiveRLRuntimeSourceIntegrityError(
             "adaptive RL replay-dependency index cannot be decoded"
         ) from error
     if not isinstance(value, Mapping) or raw != canonical_json_file_bytes(value):
@@ -1734,8 +1851,12 @@ def _load_snapshot_objects(
         try:
             raw = path.read_bytes()
             value = json.loads(raw)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+        except OSError as error:
+            raise MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(
+                "runtime-source object snapshot is temporarily unavailable"
+            ) from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise MassiveAdaptiveRLRuntimeSourceIntegrityError(
                 "runtime-source object snapshot cannot be decoded"
             ) from error
         if not isinstance(value, Mapping) or raw != canonical_json_file_bytes(value):
@@ -1754,6 +1875,76 @@ def _load_snapshot_objects(
             )
         result[row.semantic_receipt_sha256] = parsed
     return result
+
+
+def _verify_reconstructed_dependency_closure(
+    *,
+    index: MassiveAdaptiveRLReplayDependencyIndexV1,
+    objects: Mapping[str, object],
+) -> None:
+    primary_rows = tuple(row for row in index.rows if row.role != _DEPENDENCY_ROLE)
+    primary = tuple(
+        (
+            row.role,
+            row.fold_index,
+            row.logical_key,
+            row.role_authority_receipt_sha256,
+            objects[row.semantic_receipt_sha256],
+        )
+        for row in primary_rows
+    )
+    dependency_receipts = tuple(
+        sorted(
+            {
+                row.semantic_receipt_sha256
+                for row in index.rows
+                if row.role == _DEPENDENCY_ROLE
+            }
+        )
+    )
+    reconstructed, dependency_edges = _complete_object_graph(
+        primary=primary,
+        dependencies=tuple(objects[receipt] for receipt in dependency_receipts),
+    )
+    if set(reconstructed) != set(objects) or any(
+        row.dependency_receipts != dependency_edges.get(row.semantic_receipt_sha256, ())
+        for row in index.rows
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+            "runtime-source dependency closure differs after reconstruction"
+        )
+
+
+def _decision_root_views(
+    *,
+    objects: Mapping[str, object],
+    primary_rows: Sequence[MassiveAdaptiveRLReplayDependencyV1],
+) -> tuple[
+    dict[int, tuple[MassiveAdaptiveDecisionRootV1, ...]],
+    dict[str, MassiveAdaptiveDecisionRootV1],
+]:
+    all_decisions: dict[str, MassiveAdaptiveDecisionRootV1] = {}
+    for value in objects.values():
+        if type(value) is not MassiveAdaptiveDecisionRootV1:
+            continue
+        decision = cast(MassiveAdaptiveDecisionRootV1, value)
+        previous = all_decisions.setdefault(decision.decision_session_date, decision)
+        if previous.semantic_receipt_sha256 != decision.semantic_receipt_sha256:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "runtime-source decision date resolves to different roots"
+            )
+
+    decisions_by_fold: dict[int, tuple[MassiveAdaptiveDecisionRootV1, ...]] = {}
+    for fold_index in range(4):
+        current = tuple(
+            cast(MassiveAdaptiveDecisionRootV1, objects[row.semantic_receipt_sha256])
+            for row in primary_rows
+            if row.role == "decision-root-inventory" and row.fold_index == fold_index
+        )
+        decisions_by_fold[fold_index] = tuple(
+            sorted(current, key=lambda row: row.decision_session_date)
+        )
+    return decisions_by_fold, all_decisions
 
 
 def _objects_of_type(
@@ -2053,24 +2244,11 @@ def _reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
         )
     objects = _load_snapshot_objects(root=root, index=index)
     primary_rows = tuple(row for row in index.rows if row.role != _DEPENDENCY_ROLE)
-    decisions_by_fold: dict[int, tuple[MassiveAdaptiveDecisionRootV1, ...]] = {}
-    all_decisions: dict[str, MassiveAdaptiveDecisionRootV1] = {}
-    for fold_index in range(4):
-        current = tuple(
-            cast(MassiveAdaptiveDecisionRootV1, objects[row.semantic_receipt_sha256])
-            for row in primary_rows
-            if row.role == "decision-root-inventory" and row.fold_index == fold_index
-        )
-        ordered = tuple(sorted(current, key=lambda row: row.decision_session_date))
-        decisions_by_fold[fold_index] = ordered
-        for decision in ordered:
-            previous = all_decisions.setdefault(
-                decision.decision_session_date, decision
-            )
-            if previous.semantic_receipt_sha256 != decision.semantic_receipt_sha256:
-                raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
-                    "runtime-source decision date resolves to different roots"
-                )
+    _verify_reconstructed_dependency_closure(index=index, objects=objects)
+    decisions_by_fold, all_decisions = _decision_root_views(
+        objects=objects,
+        primary_rows=primary_rows,
+    )
     _reauthorize_dependencies(
         root=root,
         objects=objects,
@@ -2268,8 +2446,12 @@ def reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
         )
     except MassiveAdaptiveRLRuntimeSourceReconstructionV1Error:
         raise
-    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
-        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+    except OSError as error:
+        raise MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(
+            "persisted runtime-source dependencies are temporarily unavailable"
+        ) from error
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise MassiveAdaptiveRLRuntimeSourceIntegrityError(
             "persisted runtime-source dependencies do not reconstruct"
         ) from error
 
@@ -2283,7 +2465,11 @@ __all__ = [
     "MassiveAdaptiveRLFoldRuntimeSourcesV1",
     "MassiveAdaptiveRLReplayDependencyIndexV1",
     "MassiveAdaptiveRLReplayDependencyV1",
+    "MassiveAdaptiveRLRuntimeSourceDependencyMismatch",
+    "MassiveAdaptiveRLRuntimeSourceImplementationMismatch",
+    "MassiveAdaptiveRLRuntimeSourceIntegrityError",
     "MassiveAdaptiveRLRuntimeSourceReconstructionV1Error",
+    "MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable",
     "MassiveAdaptiveRLRuntimeSourcesV1",
     "load_massive_adaptive_rl_replay_dependency_index_v1",
     "materialize_massive_adaptive_rl_replay_dependency_index_v1",

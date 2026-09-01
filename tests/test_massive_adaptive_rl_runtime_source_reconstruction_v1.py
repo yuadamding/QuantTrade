@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from rl_quant.alpha.contracts import CorporateActionKind, TerminalEventKind
 from rl_quant.data_sources.massive.source_receipts import canonical_json_file_bytes
 from rl_quant.evaluation.massive_adaptive_rl_fit_forecast_archive_v1 import (
     materialize_massive_adaptive_rl_fit_forecast_archive_v1,
@@ -34,6 +37,7 @@ from test_massive_adaptive_rl_runtime_source_graph_authority_v1 import (
     _authorized_source_bundle,
 )
 from test_massive_adaptive_source_authorized_training_v1 import _sessions
+from test_massive_economic_authority_v6 import _archive, _corporate, _terminal
 from test_massive_trade_replay import _conditions
 
 
@@ -53,6 +57,51 @@ def test_package_snapshot_round_trips_production_authority_and_arrays() -> None:
     assert isinstance(decoded, dict)
     assert torch.equal(decoded["tensor"], torch.tensor([[1.25, -2.5]]))
     assert np.array_equal(decoded["array"], np.asarray([[3, 4]], dtype=np.int64))
+
+
+def test_package_snapshot_round_trips_economic_event_enums_through_json(
+    tmp_path: Path,
+) -> None:
+    _identity, archive, _loaded = _archive(
+        tmp_path,
+        corporate=[
+            _corporate(
+                provider_event_key="DIV-ENUM",
+                provider_revision_id="r0",
+                security_id="SEC-A",
+                effective_at_ms=2_000,
+                available_at_ms=1_500,
+                cash_per_share=1.0,
+            )
+        ],
+        terminal=[
+            _terminal(
+                provider_event_key="WORTHLESS-ENUM",
+                security_id="SEC-C",
+                effective_at_ms=3_000,
+                available_at_ms=2_500,
+            )
+        ],
+        suffix="snapshot-enums",
+    )
+    payload = reconstruction._snapshot_payload(archive)
+    persisted = json.loads(canonical_json_file_bytes(payload))
+    restored = reconstruction._parse_snapshot(persisted)
+
+    assert restored == archive
+    kinds = tuple(row.source_event.event.kind for row in restored.event_observations)
+    assert CorporateActionKind.CASH_DIVIDEND in kinds
+    assert TerminalEventKind.WORTHLESS in kinds
+    assert all(
+        isinstance(kind, CorporateActionKind | TerminalEventKind) for kind in kinds
+    )
+
+
+def test_snapshot_mapping_encoding_is_insertion_order_independent() -> None:
+    forward = reconstruction._encode_value({"b": 2, "a": 1})
+    reverse = reconstruction._encode_value({"a": 1, "b": 2})
+
+    assert forward == reverse
 
 
 def test_package_snapshot_rejects_changed_implementation_identity() -> None:
@@ -133,6 +182,11 @@ def test_dependency_index_is_create_only_and_rehashes_snapshots(
         source_root=tmp_path,
         manifest=manifest,
     )
+    objects = reconstruction._load_snapshot_objects(root=tmp_path, index=loaded)
+    reconstruction._verify_reconstructed_dependency_closure(
+        index=loaded,
+        objects=objects,
+    )
 
     assert loaded == committed
     assert len(loaded.rows) == 1
@@ -146,6 +200,19 @@ def test_dependency_index_is_create_only_and_rehashes_snapshots(
             manifest=manifest,
             runtime_source_graph_authority=graph,
             replay_dependencies=(),
+        )
+
+    changed_edge = replace(
+        loaded.rows[0],
+        dependency_receipts=(semantic_sha256("unexpected-dependency"),),
+    )
+    with pytest.raises(
+        reconstruction.MassiveAdaptiveRLRuntimeSourceDependencyMismatch,
+        match="closure differs",
+    ):
+        reconstruction._verify_reconstructed_dependency_closure(
+            index=replace(loaded, rows=(changed_edge,)),
+            objects=objects,
         )
 
     snapshot = tmp_path / loaded.rows[0].relative_path
@@ -207,6 +274,46 @@ def test_rl_fit_dependency_closure_includes_full_tensor_root_inventory(
     assert len(expected_root_receipts) > len(archive.origin_session_dates)
 
 
+def test_reconstruction_uses_auxiliary_decision_roots_for_native_replay(
+    tmp_path: Path,
+) -> None:
+    _checkpoint, _window, tensor, roots, plan, _split_plan, _model_spec = (
+        _rl_fit_fixture(
+            tmp_path,
+            outer_fold_index=0,
+            block_index=0,
+            block_sessions=21,
+        )
+    )
+    primary_roots = tuple(
+        row
+        for row in roots
+        if row.decision_session_date in plan.rl_fit_prefix_session_dates
+    )
+    primary_rows = tuple(
+        SimpleNamespace(
+            role="decision-root-inventory",
+            fold_index=0,
+            semantic_receipt_sha256=row.semantic_receipt_sha256,
+        )
+        for row in primary_roots
+    )
+    objects = {row.semantic_receipt_sha256: row for row in roots}
+
+    by_fold, all_by_date = reconstruction._decision_root_views(
+        objects=objects,
+        primary_rows=primary_rows,
+    )
+
+    assert by_fold[0] == tuple(
+        sorted(primary_roots, key=lambda row: row.decision_session_date)
+    )
+    assert set(tensor.decision_session_dates) <= set(all_by_date)
+    assert set(tensor.decision_session_dates) - {
+        row.decision_session_date for row in by_fold[0]
+    }
+
+
 def test_dependency_snapshot_path_rejects_symlink(tmp_path: Path) -> None:
     target = tmp_path / "target.json"
     target.write_bytes(canonical_json_file_bytes({"receipt": semantic_sha256("x")}))
@@ -233,6 +340,17 @@ def test_dependency_snapshot_path_rejects_symlink(tmp_path: Path) -> None:
         reconstruction._create_only_output_path(
             root=tmp_path.resolve(),
             relative_path="reconstruction/object.json",
+        )
+
+
+def test_missing_reconstruction_file_is_retryable(tmp_path: Path) -> None:
+    with pytest.raises(
+        reconstruction.MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable,
+        match="temporarily absent",
+    ):
+        reconstruction._resolve_regular_file(
+            root=tmp_path.resolve(),
+            relative_path="missing/object.json",
         )
 
 
@@ -311,3 +429,34 @@ def test_runner_reconstructs_before_stopping_at_execution_backend(
     assert result.blocker_code == "four-fold-execution-backend-required"
     assert result.runtime_source_graph_replayed
     assert result.source_data_qualified
+
+    def temporarily_unavailable(**_kwargs: object) -> object:
+        raise reconstruction.MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(
+            "test mount unavailable"
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1",
+        temporarily_unavailable,
+    )
+    temporarily_blocked = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+    repeated = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+
+    assert temporarily_blocked.blocker_code == "runtime-source-temporarily-unavailable"
+    assert temporarily_blocked.current_stage.value == "blocked"
+    assert repeated.semantic_receipt_sha256 == (
+        temporarily_blocked.semantic_receipt_sha256
+    )
