@@ -78,6 +78,10 @@ from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
     MassiveAdaptiveRLFitEnvironmentAuthorityV1Error,
     _ISSUER,
 )
+from rl_quant.training.massive_adaptive_rl_fit_environment_registry_v1 import (
+    MassiveAdaptiveRLFitEnvironmentRegistryV1Error,
+    build_massive_adaptive_rl_fit_environment_registry_v1,
+)
 from rl_quant.training.massive_adaptive_rl_fixed_control_fit_runner_v1 import (
     MassiveAdaptiveRLFixedControlFitRunnerV1Error,
     _bind_block_runtimes,
@@ -87,6 +91,12 @@ from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import
 )
 from rl_quant.workflows import (
     massive_adaptive_rl_runtime_source_reconstruction_v1 as reconstruction,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
+    build_massive_adaptive_rl_experiment_manifest_v3,
+)
+from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
+    MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
 )
 from test_massive_adaptive_decision_tensor_v1 import _origin
 from test_massive_adaptive_forecast_archive_v2 import _expand_context_feature
@@ -286,7 +296,7 @@ def _qualified_fit_block(tmp_path: Path):
         },
     )
     assert block.source_data_qualified
-    return block, identity, sessions
+    return block, lineage, identity, sessions, split_plan
 
 
 def _daily_input(
@@ -511,7 +521,14 @@ def _fill_source(
         "session_authority_receipt_sha256": sessions.receipt_sha256,
         "condition_authority_receipt_sha256": conditions.receipt_sha256,
         "persisted_manifest_inventory_sha256": semantic_sha256(
-            tuple(("persisted-partition", date) for date in dates)
+            tuple(
+                next(
+                    row.persisted_partition_manifest_receipt_sha256
+                    for row in daily.sessions
+                    if row.source_session_date == date
+                )
+                for date in dates
+            )
         ),
         "row_inventory_sha256": semantic_sha256(
             tuple(row.receipt_sha256 for row in rows)
@@ -551,7 +568,7 @@ def _fill_source(
 
 
 def _qualified_environment(tmp_path: Path):
-    block, identity, sessions = _qualified_fit_block(tmp_path)
+    block, lineage, identity, sessions, split_plan = _qualified_fit_block(tmp_path)
     conditions = _conditions()
     daily = _daily_input(
         block=block,
@@ -584,7 +601,146 @@ def _qualified_environment(tmp_path: Path):
         economic_event_archive=events,
         initial_capital=10_000_000.0,
     )
-    return block, environment
+    return block, environment, SimpleNamespace(
+        session_authority=sessions,
+        condition_authority=conditions,
+        split_plan=split_plan,
+        supervised_lineage=lineage,
+    )
+
+
+class _ExactRoleRuntimeGraph:
+    def __init__(self, authorities: dict[str, object]) -> None:
+        self._authorities = authorities
+        self.runtime_authority_receipt_sha256 = semantic_sha256(
+            "public-fit-registry-runtime-witness"
+        )
+
+    def runtime_authority(self, *, role: str, fold_index: int | None) -> object:
+        if fold_index is not None or role not in self._authorities:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL runtime source graph role is absent or duplicated"
+            )
+        return self._authorities[role]
+
+
+def _runtime_sources_for_public_registry(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest,
+    block,
+    environment,
+    roots,
+    daily_input=None,
+    fill_source=None,
+):
+    daily = environment.daily_input_authority if daily_input is None else daily_input
+    fill = environment.fill_source if fill_source is None else fill_source
+    lineage = roots.supervised_lineage
+    fold = reconstruction.MassiveAdaptiveRLFoldRuntimeSourcesV1(
+        outer_fold_index=0,
+        training_windows=(lineage.training_window,),
+        checkpoint_choices=(lineage.checkpoint_choice,),
+        calibrations=(lineage.calibration,),
+        fit_forecast_archives=(block.forecast_archive,),
+        decision_roots=block.decision_roots,
+        context_origins=block.context_origins,
+        supervised_lineages=(lineage,),
+        fit_blocks=(block,),
+    )
+    fold.validate()
+    partitions = tuple(
+        SimpleNamespace(
+            source_session_date=row.source_session_date,
+            receipt_sha256=row.persisted_partition_manifest_receipt_sha256,
+        )
+        for row in daily.sessions
+    )
+    graph = _ExactRoleRuntimeGraph(
+        {
+            "session-authority": roots.session_authority,
+            "condition-authority": roots.condition_authority,
+            "identity-authority": environment.identity_authority,
+            "economic-event-archive": environment.economic_event_archive,
+            "daily-input-authority": daily,
+            "fill-source-authority": fill,
+            "split-plan": roots.split_plan,
+        }
+    )
+    monkeypatch.setattr(
+        reconstruction.MassiveAdaptiveRLRuntimeSourcesV1,
+        "validate",
+        lambda _self: None,
+    )
+    return reconstruction.MassiveAdaptiveRLRuntimeSourcesV1(
+        experiment_id=manifest.experiment_id,
+        manifest_v3_receipt_sha256=manifest.semantic_receipt_sha256,
+        source_bundle_receipt_sha256=semantic_sha256("public-fit-source-bundle"),
+        replay_dependency_index_receipt_sha256=semantic_sha256(
+            "public-fit-dependency-index"
+        ),
+        runtime_source_graph_authority=graph,  # type: ignore[arg-type]
+        session_authority=roots.session_authority,
+        condition_authority=roots.condition_authority,
+        persisted_partition_manifests=partitions,  # type: ignore[arg-type]
+        identity_authority=environment.identity_authority,
+        economic_event_archive=environment.economic_event_archive,
+        daily_input_authority=daily,
+        fill_source=fill,
+        split_plan=roots.split_plan,
+        folds=(fold,),
+        replay_dependency_receipts=(semantic_sha256("public-fit-dependency"),),
+        source_data_qualified=True,
+        semantic_receipt_sha256=semantic_sha256("public-fit-runtime-sources"),
+    )
+
+
+def _reseal_daily_input(daily_input, **changes):
+    provisional = replace(
+        daily_input,
+        **changes,
+        semantic_receipt_sha256="0" * 64,
+        audit_receipt_sha256="0" * 64,
+    )
+    semantic = semantic_sha256(provisional.semantic_unsigned())
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic,
+        audit_receipt_sha256=semantic_sha256(
+            {
+                "semantic_receipt_sha256": semantic,
+                "acquisition_audit_receipt_sha256": (
+                    provisional.acquisition_audit_receipt_sha256
+                ),
+            }
+        ),
+    )
+    result.validate()
+    return result
+
+
+def _reseal_fill_source(fill_source, **changes):
+    provisional = replace(
+        fill_source,
+        **changes,
+        semantic_receipt_sha256="0" * 64,
+        audit_receipt_sha256="0" * 64,
+    )
+    semantic = semantic_sha256(provisional.semantic_unsigned())
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic,
+        audit_receipt_sha256=semantic_sha256(
+            {
+                "semantic_receipt_sha256": semantic,
+                "daily_input_audit_receipt_sha256": (
+                    provisional.daily_input_authority_semantic_receipt_sha256
+                ),
+            }
+        ),
+    )
+    result.validate()
+    return result
 
 
 def _environment_authority(block, environment):
@@ -689,7 +845,7 @@ def _training_authority(environment):
 def test_source_qualified_fit_environment_executes_economic_transition(
     tmp_path: Path,
 ) -> None:
-    _block, environment = _qualified_environment(tmp_path)
+    _block, environment, _runtime_roots = _qualified_environment(tmp_path)
 
     observation, _info = environment.reset()
     next_observation, reward, terminated, truncated, info = environment.step(
@@ -714,10 +870,124 @@ def test_source_qualified_fit_environment_executes_economic_transition(
     assert not transition.profitability_reporting_authorized
 
 
+def test_public_fit_environment_registry_replays_exact_runtime_roles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block, environment, roots = _qualified_environment(tmp_path)
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="public-fit-environment-registry",
+        prequential_block_sessions=21,
+    )
+    runtime_sources = _runtime_sources_for_public_registry(
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        block=block,
+        environment=environment,
+        roots=roots,
+    )
+
+    registry = build_massive_adaptive_rl_fit_environment_registry_v1(
+        manifest=manifest,
+        runtime_sources=runtime_sources,
+        outer_fold_index=0,
+    )
+    first = registry.build_environments()
+    second = registry.build_environments()
+
+    assert tuple(first) == registry.forecast_archive_receipts
+    assert tuple(second) == registry.forecast_archive_receipts
+    assert all(first[receipt] is not second[receipt] for receipt in first)
+    assert all(
+        registry.authority(receipt).source_data_qualified
+        for receipt in registry.forecast_archive_receipts
+    )
+    assert (
+        runtime_sources.runtime_source_graph_authority.runtime_authority(
+            role="split-plan",
+            fold_index=None,
+        )
+        is runtime_sources.split_plan
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
+        match="role is absent or duplicated",
+    ):
+        runtime_sources.runtime_source_graph_authority.runtime_authority(
+            role="split-plan-authority",
+            fold_index=None,
+        )
+
+
+def test_public_fit_registry_rejects_detached_identity_and_partition_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block, environment, roots = _qualified_environment(tmp_path)
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="public-fit-environment-root-rejection",
+        prequential_block_sessions=21,
+    )
+    changed_daily = _reseal_daily_input(
+        environment.daily_input_authority,
+        normalized_identity_semantic_receipt_sha256=semantic_sha256(
+            "detached-daily-identity"
+        ),
+    )
+    changed_fill = _reseal_fill_source(
+        environment.fill_source,
+        daily_input_authority_semantic_receipt_sha256=(
+            changed_daily.semantic_receipt_sha256
+        ),
+    )
+    detached_identity_sources = _runtime_sources_for_public_registry(
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        block=block,
+        environment=environment,
+        roots=roots,
+        daily_input=changed_daily,
+        fill_source=changed_fill,
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLFitEnvironmentRegistryV1Error,
+        match="global source edges differ",
+    ):
+        build_massive_adaptive_rl_fit_environment_registry_v1(
+            manifest=manifest,
+            runtime_sources=detached_identity_sources,
+            outer_fold_index=0,
+        )
+
+    detached_fill = _reseal_fill_source(
+        environment.fill_source,
+        persisted_manifest_inventory_sha256=semantic_sha256(
+            "detached-fill-manifest-inventory"
+        ),
+    )
+    detached_partition_sources = _runtime_sources_for_public_registry(
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        block=block,
+        environment=environment,
+        roots=roots,
+        fill_source=detached_fill,
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLFitEnvironmentRegistryV1Error,
+        match="global source edges differ",
+    ):
+        build_massive_adaptive_rl_fit_environment_registry_v1(
+            manifest=manifest,
+            runtime_sources=detached_partition_sources,
+            outer_fold_index=0,
+        )
+
+
 def test_fit_environment_authority_requires_concrete_runtime_witness(
     tmp_path: Path,
 ) -> None:
-    block, environment = _qualified_environment(tmp_path)
+    block, environment, _runtime_roots = _qualified_environment(tmp_path)
     authority = _environment_authority(block, environment)
 
     with pytest.raises(
@@ -734,7 +1004,7 @@ def test_fit_environment_authority_requires_concrete_runtime_witness(
 def test_fixed_controls_bind_the_same_fit_environment_authority(
     tmp_path: Path,
 ) -> None:
-    block, environment = _qualified_environment(tmp_path)
+    block, environment, _runtime_roots = _qualified_environment(tmp_path)
     authority = _environment_authority(block, environment)
     dates = tuple(
         row.decision_session_date for row in environment.inference_plan.rows
@@ -779,7 +1049,7 @@ def test_fixed_controls_bind_the_same_fit_environment_authority(
 def test_ppo_rejects_unqualified_transition_after_environment_mutation(
     tmp_path: Path,
 ) -> None:
-    block, environment = _qualified_environment(tmp_path)
+    block, environment, _runtime_roots = _qualified_environment(tmp_path)
     authority = _environment_authority(block, environment)
     trainer = MassiveAdaptivePPOTrainerV1(
         environment=environment,

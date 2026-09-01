@@ -199,7 +199,14 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
 
     def validate(self) -> None:
         self.ppo_checkpoint.validate()
-        expected_authorized = self.source_data_qualified
+        expected_source_qualified = bool(
+            self.ppo_checkpoint.source_data_qualified
+            and self.fit_environment_authority_receipts
+            and self.transition_receipts
+            and len(self.transition_receipts)
+            == len(self.transition_source_data_qualified)
+            and all(self.transition_source_data_qualified)
+        )
         if (
             self.schema != MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_CHECKPOINT_V1_SCHEMA
             or self.current_block_index < 0
@@ -222,10 +229,19 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
             != semantic_sha256(self.continuity_authority_receipts)
             or self.ppo_checkpoint.training_forecast_authority_receipt_sha256
             != self.training_forecast_authority_receipt_sha256
+            or self.ppo_checkpoint.transition_receipts != self.transition_receipts
+            or self.ppo_checkpoint.transition_source_data_qualified
+            != self.transition_source_data_qualified
+            or self.ppo_checkpoint.fit_environment_authority_receipts
+            != self.fit_environment_authority_receipts
+            or self.ppo_checkpoint.transition_inventory_sha256
+            != self.transition_inventory_sha256
             or self.ppo_checkpoint.environment_state.chronology_cursor
             != self.within_block_chronology_cursor
-            or self.exact_resume_authorized != expected_authorized
-            or self.development_rl_training_authorized != expected_authorized
+            or self.source_data_qualified != expected_source_qualified
+            or self.exact_resume_authorized != expected_source_qualified
+            or self.development_rl_training_authorized
+            != expected_source_qualified
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
@@ -298,6 +314,13 @@ class MassiveAdaptivePPOTrainingRunV1:
         }
 
     def validate(self) -> None:
+        expected_source_qualified = bool(
+            self.fit_environment_authority_receipts
+            and self.transition_receipts
+            and len(self.transition_receipts)
+            == len(self.transition_source_data_qualified)
+            and all(self.transition_source_data_qualified)
+        )
         if (
             self.schema != MASSIVE_ADAPTIVE_PPO_TRAINING_RUN_V1_SCHEMA
             or not self.completed_block_receipts
@@ -319,7 +342,9 @@ class MassiveAdaptivePPOTrainingRunV1:
             or self.continuity_authority_inventory_sha256
             != semantic_sha256(self.continuity_authority_receipts)
             or self.update_count <= 0
-            or self.development_rl_training_authorized != self.source_data_qualified
+            or self.source_data_qualified != expected_source_qualified
+            or self.development_rl_training_authorized
+            != expected_source_qualified
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
@@ -533,7 +558,7 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         self, environment: MassiveAdaptiveProfitabilityEnvV1
     ) -> MassiveAdaptivePPOTrainerV1:
         forecast_receipt = environment.forecast_archive.semantic_receipt_sha256
-        return MassiveAdaptivePPOTrainerV1(
+        trainer = MassiveAdaptivePPOTrainerV1(
             environment=environment,
             model=self.model,
             config=self.config,
@@ -543,6 +568,14 @@ class MassiveAdaptivePrequentialPPORunnerV1:
                 forecast_receipt
             ),
         )
+        trainer.fit_environment_authority_receipts = list(
+            dict.fromkeys(
+                row.fit_environment_authority_receipt_sha256
+                for row in self.block_runtimes
+                if row.fit_environment_authority_receipt_sha256 is not None
+            )
+        )
+        return trainer
 
     def _bootstrap_continuation_rollout(
         self,

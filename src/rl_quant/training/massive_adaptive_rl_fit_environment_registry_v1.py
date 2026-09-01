@@ -22,6 +22,9 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
 )
+from rl_quant.features.massive_profitability_experiment_coverage_v2 import (
+    massive_profitability_identity_semantic_receipt_v2,
+)
 from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
     MASSIVE_ADAPTIVE_RL_FIT_ENVIRONMENT_AUTHORITY_V1_SCHEMA,
     MASSIVE_ADAPTIVE_RL_FIT_ENVIRONMENT_AUTHORITY_V1_SOURCE_SHA256,
@@ -107,7 +110,7 @@ def _validate_global_runtime_roots(
         "economic-event-archive": runtime_sources.economic_event_archive,
         "daily-input-authority": runtime_sources.daily_input_authority,
         "fill-source-authority": runtime_sources.fill_source,
-        "split-plan-authority": runtime_sources.split_plan,
+        "split-plan": runtime_sources.split_plan,
     }
     for role, value in expected.items():
         witnessed = _graph_runtime_authority(runtime_sources=runtime_sources, role=role)
@@ -121,6 +124,18 @@ def _validate_global_runtime_roots(
     fill = runtime_sources.fill_source
     identity = runtime_sources.identity_authority
     events = runtime_sources.economic_event_archive
+    partitions = runtime_sources.persisted_partition_manifests
+    partition_by_date = {row.source_session_date: row for row in partitions}
+    daily_session_by_date = {
+        row.source_session_date: row for row in daily.sessions
+    }
+    fill_manifest_inventory = semantic_sha256(
+        tuple(
+            partition_by_date[session_date].receipt_sha256
+            for session_date in fill.session_dates
+            if session_date in partition_by_date
+        )
+    )
     if (
         fill.daily_input_authority_semantic_receipt_sha256
         != daily.semantic_receipt_sha256
@@ -132,7 +147,18 @@ def _validate_global_runtime_roots(
         != runtime_sources.session_authority.receipt_sha256
         or daily.condition_authority_receipt_sha256
         != runtime_sources.condition_authority.receipt_sha256
+        or daily.normalized_identity_semantic_receipt_sha256
+        != massive_profitability_identity_semantic_receipt_v2(identity)
         or events.identity_authority_receipt_sha256 != identity.receipt_sha256
+        or len(partition_by_date) != len(partitions)
+        or tuple(partition_by_date) != tuple(daily_session_by_date)
+        or any(
+            partition_by_date[session_date].receipt_sha256
+            != daily_session.persisted_partition_manifest_receipt_sha256
+            for session_date, daily_session in daily_session_by_date.items()
+        )
+        or not set(fill.session_dates) <= set(partition_by_date)
+        or fill.persisted_manifest_inventory_sha256 != fill_manifest_inventory
     ):
         raise MassiveAdaptiveRLFitEnvironmentRegistryV1Error(
             "adaptive RL fit environment global source edges differ"

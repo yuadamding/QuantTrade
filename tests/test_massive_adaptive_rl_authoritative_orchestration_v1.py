@@ -91,6 +91,7 @@ from rl_quant.training.massive_adaptive_ppo_v1 import (
 )
 from rl_quant.training.massive_adaptive_prequential_ppo_runner_v1 import (
     MassiveAdaptivePrequentialPPORunnerV1,
+    MassiveAdaptivePrequentialPPORunnerV1Error,
 )
 from rl_quant.training.massive_adaptive_economic_continuity_authority_v1 import (
     build_massive_adaptive_economic_continuity_authority_v1,
@@ -724,6 +725,145 @@ def test_prequential_ppo_uses_every_block_and_resumes_across_boundary(
     assert uninterrupted.semantic_receipt_sha256 == restarted.semantic_receipt_sha256
     for name, tensor in uninterrupted.ppo_checkpoint.model_state.items():
         assert torch.equal(tensor, restarted.ppo_checkpoint.model_state[name])
+
+
+def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch(
+) -> None:
+    _, _, environment = _adaptive_env_fixture()
+    training_authority = _training_authority(environment)
+    chronology = _chronology(environment, training_authority)
+    runner = MassiveAdaptivePrequentialPPORunnerV1(
+        training_authority=training_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environments={
+            environment.forecast_archive.semantic_receipt_sha256: environment
+        },
+        model=MassiveAdaptivePPOActorCriticV1(observation_dim=90),
+        config=MassiveAdaptivePPOConfigV1(
+            epochs_per_rollout=1,
+            rollout_length=1,
+            minibatch_size=1,
+        ),
+    )
+    runner.run_next_update()
+    checkpoint = runner.checkpoint()
+    assert checkpoint.transition_receipts
+    assert (
+        checkpoint.transition_receipts
+        == checkpoint.ppo_checkpoint.transition_receipts
+    )
+    assert (
+        checkpoint.transition_source_data_qualified
+        == checkpoint.ppo_checkpoint.transition_source_data_qualified
+    )
+    assert (
+        checkpoint.fit_environment_authority_receipts
+        == checkpoint.ppo_checkpoint.fit_environment_authority_receipts
+    )
+
+    def reseal_outer(value):
+        provisional = replace(value, semantic_receipt_sha256="0" * 64)
+        return replace(
+            provisional,
+            semantic_receipt_sha256=semantic_sha256(
+                provisional.semantic_unsigned()
+            ),
+        )
+
+    def reseal_embedded(value):
+        provisional = replace(value, semantic_receipt_sha256="0" * 64)
+        result = replace(
+            provisional,
+            semantic_receipt_sha256=semantic_sha256(
+                provisional.semantic_unsigned()
+            ),
+        )
+        result.validate()
+        return result
+
+    changed_outer_transition = (
+        semantic_sha256("changed-outer-transition"),
+        *checkpoint.transition_receipts[1:],
+    )
+    outer_transition_tamper = reseal_outer(
+        replace(
+            checkpoint,
+            transition_receipts=changed_outer_transition,
+            transition_inventory_sha256=semantic_sha256(
+                changed_outer_transition
+            ),
+        )
+    )
+    changed_qualification = (
+        not checkpoint.ppo_checkpoint.transition_source_data_qualified[0],
+        *checkpoint.ppo_checkpoint.transition_source_data_qualified[1:],
+    )
+    embedded_qualification_tamper = reseal_outer(
+        replace(
+            checkpoint,
+            ppo_checkpoint=reseal_embedded(
+                replace(
+                    checkpoint.ppo_checkpoint,
+                    transition_source_data_qualified=changed_qualification,
+                )
+            ),
+        )
+    )
+    outer_environment_tamper = reseal_outer(
+        replace(
+            checkpoint,
+            fit_environment_authority_receipts=(
+                semantic_sha256("changed-outer-fit-environment"),
+            ),
+            fit_environment_authority_inventory_sha256=semantic_sha256(
+                (semantic_sha256("changed-outer-fit-environment"),)
+            ),
+        )
+    )
+    embedded_environment_tamper = reseal_outer(
+        replace(
+            checkpoint,
+            ppo_checkpoint=reseal_embedded(
+                replace(
+                    checkpoint.ppo_checkpoint,
+                    fit_environment_authority_receipts=(
+                        semantic_sha256("changed-embedded-fit-environment"),
+                    ),
+                )
+            ),
+        )
+    )
+
+    for tampered in (
+        outer_transition_tamper,
+        embedded_qualification_tamper,
+        outer_environment_tamper,
+        embedded_environment_tamper,
+    ):
+        with pytest.raises(
+            MassiveAdaptivePrequentialPPORunnerV1Error,
+            match="checkpoint differs",
+        ):
+            tampered.validate()
+
+    training_run = runner.run_to_completion()
+    promoted_run = replace(
+        training_run,
+        source_data_qualified=True,
+        development_rl_training_authorized=True,
+        semantic_receipt_sha256="0" * 64,
+    )
+    promoted_run = replace(
+        promoted_run,
+        semantic_receipt_sha256=semantic_sha256(
+            promoted_run.semantic_unsigned()
+        ),
+    )
+    with pytest.raises(
+        MassiveAdaptivePrequentialPPORunnerV1Error,
+        match="training run differs",
+    ):
+        promoted_run.validate()
 
 
 def test_checkpoint_drives_validation_actions_and_trace_replay(tmp_path) -> None:
