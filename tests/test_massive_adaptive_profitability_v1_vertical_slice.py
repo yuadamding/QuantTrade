@@ -1283,7 +1283,6 @@ def test_adaptive_ppo_checkpoint_is_durable_and_runtime_stripped(tmp_path) -> No
     checkpoint = replace(
         checkpoint,
         training_forecast_authority_receipt_sha256=training_receipt,
-        development_rl_training_authorized=True,
         semantic_receipt_sha256="0" * 64,
     )
     checkpoint = replace(
@@ -1352,7 +1351,6 @@ def test_policy_trace_is_derived_from_complete_economic_transitions() -> None:
     checkpoint = replace(
         checkpoint,
         training_forecast_authority_receipt_sha256=training_receipt,
-        development_rl_training_authorized=True,
         semantic_receipt_sha256="0" * 64,
     )
     checkpoint = replace(

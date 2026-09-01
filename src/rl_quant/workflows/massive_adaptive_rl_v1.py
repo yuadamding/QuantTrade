@@ -82,6 +82,9 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
 from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
+from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
+    MassiveAdaptiveRLFitEnvironmentAuthorityV1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V1_SCHEMA = (
@@ -640,6 +643,9 @@ def run_massive_adaptive_rl_training_workflow_v1(
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
     artifact_root: str | Path,
     committed_at_ms: int,
     device: torch.device | str = "cpu",
@@ -668,6 +674,7 @@ def run_massive_adaptive_rl_training_workflow_v1(
         training_authority=training_authority,
         chronology_authority=chronology_authority,
         environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
         model=model,
         config=config,
         device=device,
@@ -721,6 +728,7 @@ def run_massive_adaptive_rl_training_workflow_v1(
             training_authority=training_authority,
             chronology_authority=chronology_authority,
             environments=environments,
+            fit_environment_authorities=fit_environment_authorities,
             committed_at_ms=committed_at_ms + observed_updates[-1] * 2 + 2,
             registry=registry,
         )

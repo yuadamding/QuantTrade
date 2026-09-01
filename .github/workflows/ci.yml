@@ -72,6 +72,7 @@ jobs:
           tests/test_massive_adaptive_rl_source_bundle_v1.py
           tests/test_massive_adaptive_rl_runtime_source_graph_authority_v1.py
           tests/test_massive_adaptive_rl_runtime_source_reconstruction_v1.py
+          tests/test_massive_adaptive_rl_fit_environment_registry_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v2.py
           tests/test_massive_adaptive_rl_manifest_v3.py
@@ -110,6 +111,8 @@ jobs:
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_authority_v4.py
           src/rl_quant/evaluation/massive_adaptive_rl_profitability_report_authority_v1.py
           src/rl_quant/training/massive_adaptive_ppo_v1.py
+          src/rl_quant/training/massive_adaptive_rl_fit_environment_authority_v1.py
+          src/rl_quant/training/massive_adaptive_rl_fit_environment_registry_v1.py
           src/rl_quant/training/massive_adaptive_economic_continuity_authority_v1.py
           src/rl_quant/training/massive_adaptive_prequential_ppo_runner_v1.py
           src/rl_quant/training/massive_adaptive_prequential_ppo_checkpoint_authority_v1.py

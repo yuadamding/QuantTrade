@@ -47,6 +47,9 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
 from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import (
     MassiveAdaptiveRLTrainingForecastAuthorityV2,
 )
+from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
+    MassiveAdaptiveRLFitEnvironmentAuthorityV1,
+)
 from rl_quant.workflows.massive_adaptive_rl_v1 import (
     MASSIVE_ADAPTIVE_RL_OUTER_GATE_NAMES_V1,
     MassiveAdaptiveRLTrainingWorkflowV1,
@@ -523,6 +526,9 @@ def run_massive_adaptive_rl_training_workflow_v2(
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV2,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
     artifact_root: str | Path,
     committed_at_ms: int,
     device: torch.device | str = "cpu",
@@ -555,6 +561,7 @@ def run_massive_adaptive_rl_training_workflow_v2(
         training_authority=training_authority,
         chronology_authority=chronology_authority,
         environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
         artifact_root=artifact_root,
         committed_at_ms=committed_at_ms,
         device=device,

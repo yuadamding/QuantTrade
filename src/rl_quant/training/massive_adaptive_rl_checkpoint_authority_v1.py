@@ -39,6 +39,9 @@ from rl_quant.training.massive_adaptive_ppo_v1 import (
 from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
+from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityV2,
+)
 
 
 MASSIVE_ADAPTIVE_RL_CHECKPOINT_AUTHORITY_V1_SCHEMA = (
@@ -147,6 +150,15 @@ def _checkpoint_payload(
         "training_forecast_authority_receipt_sha256": (
             checkpoint.training_forecast_authority_receipt_sha256
         ),
+        "fit_environment_authority_receipts": (
+            checkpoint.fit_environment_authority_receipts
+        ),
+        "transition_receipts": checkpoint.transition_receipts,
+        "transition_source_data_qualified": (
+            checkpoint.transition_source_data_qualified
+        ),
+        "transition_inventory_sha256": checkpoint.transition_inventory_sha256,
+        "source_data_qualified": checkpoint.source_data_qualified,
         "ppo_config_receipt_sha256": checkpoint.ppo_config_receipt_sha256,
         "observation_specification_sha256": (
             checkpoint.observation_specification_sha256
@@ -268,6 +280,22 @@ def _parse_checkpoint(payload: Mapping[str, object]) -> MassiveAdaptiveRLCheckpo
         tuple(float(item) for item in cast(tuple[float, ...], row))
         for row in cast(tuple[object, ...], value["loss_trace"])
     )
+    value["fit_environment_authority_receipts"] = tuple(
+        cast(
+            tuple[str, ...] | list[str],
+            value["fit_environment_authority_receipts"],
+        )
+    )
+    value["transition_receipts"] = tuple(
+        cast(tuple[str, ...] | list[str], value["transition_receipts"])
+    )
+    value["transition_source_data_qualified"] = tuple(
+        bool(item)
+        for item in cast(
+            tuple[bool, ...] | list[bool],
+            value["transition_source_data_qualified"],
+        )
+    )
     value["environment_state"] = _parse_environment(
         cast(Mapping[str, object], value["environment_state"])
     )
@@ -360,6 +388,8 @@ class MassiveAdaptiveRLCheckpointAuthorityV1:
             != self.training_source_inventory_sha256
             or self.runtime_checkpoint.training_forecast_authority_receipt_sha256
             != self.training_forecast_authority_receipt_sha256
+            or self.runtime_checkpoint.source_data_qualified
+            != self.source_data_qualified
         ):
             raise MassiveAdaptiveRLCheckpointAuthorityV1Error(
                 "adaptive RL runtime checkpoint differs from authority"
@@ -450,6 +480,16 @@ def materialize_massive_adaptive_rl_checkpoint_authority_v1(
     if (
         checkpoint.training_forecast_authority_receipt_sha256
         != training_forecast_authority.semantic_receipt_sha256
+        or checkpoint.source_data_qualified
+        != bool(
+            type(training_forecast_authority)
+            is MassiveAdaptiveRLTrainingForecastAuthorityV2
+            and training_forecast_authority.source_data_qualified
+            and training_forecast_authority.reinforcement_learning_authorized
+            and checkpoint.fit_environment_authority_receipts
+            and checkpoint.transition_receipts
+            and all(checkpoint.transition_source_data_qualified)
+        )
     ):
         raise MassiveAdaptiveRLCheckpointAuthorityV1Error(
             "checkpoint and RL training forecast authority differ"
@@ -458,7 +498,7 @@ def materialize_massive_adaptive_rl_checkpoint_authority_v1(
     torch.save(
         _checkpoint_payload(
             checkpoint,
-            source_data_qualified=training_forecast_authority.source_data_qualified,
+            source_data_qualified=checkpoint.source_data_qualified,
         ),
         stream,
     )
@@ -515,9 +555,17 @@ def authorize_massive_adaptive_rl_checkpoint_authority_v1(
         or parsed.training_forecast_authority_receipt_sha256
         != training_forecast_authority.semantic_receipt_sha256
         or parsed.source_data_qualified
-        != training_forecast_authority.source_data_qualified
+        != checkpoint.source_data_qualified
         or parsed.source_data_qualified
-        != training_forecast_authority.reinforcement_learning_authorized
+        != bool(
+            type(training_forecast_authority)
+            is MassiveAdaptiveRLTrainingForecastAuthorityV2
+            and training_forecast_authority.source_data_qualified
+            and training_forecast_authority.reinforcement_learning_authorized
+            and checkpoint.fit_environment_authority_receipts
+            and checkpoint.transition_receipts
+            and all(checkpoint.transition_source_data_qualified)
+        )
         or checkpoint.semantic_receipt_sha256 != parsed.checkpoint_receipt_sha256
     ):
         raise MassiveAdaptiveRLCheckpointAuthorityV1Error(

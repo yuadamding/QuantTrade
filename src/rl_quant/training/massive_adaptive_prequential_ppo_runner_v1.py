@@ -38,6 +38,9 @@ from rl_quant.training.massive_adaptive_ppo_v1 import (
 from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
+from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
+    MassiveAdaptiveRLFitEnvironmentAuthorityV1,
+)
 from rl_quant.training.massive_adaptive_economic_continuity_authority_v1 import (
     MassiveAdaptiveEconomicContinuityAuthorityV1,
     build_massive_adaptive_economic_continuity_authority_v1,
@@ -97,6 +100,7 @@ class MassiveAdaptivePPOBlockRuntimeV1:
     inference_plan_receipt_sha256: str
     calibration_receipt_sha256: str
     environment_source_inventory_sha256: str
+    fit_environment_authority_receipt_sha256: str | None
     forecast_session_dates: tuple[str, ...]
     environment_start_cursor: int
     environment_stop_cursor: int
@@ -134,6 +138,11 @@ class MassiveAdaptivePPOBlockRuntimeV1:
             self.semantic_receipt_sha256,
         ):
             _digest("adaptive PPO block runtime", value)
+        if self.fit_environment_authority_receipt_sha256 is not None:
+            _digest(
+                "adaptive PPO fit environment authority",
+                self.fit_environment_authority_receipt_sha256,
+            )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
@@ -153,7 +162,10 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
     completed_block_receipts: tuple[str, ...]
     completed_block_inventory_sha256: str
     transition_receipts: tuple[str, ...]
+    transition_source_data_qualified: tuple[bool, ...]
     transition_inventory_sha256: str
+    fit_environment_authority_receipts: tuple[str, ...]
+    fit_environment_authority_inventory_sha256: str
     ppo_checkpoint: MassiveAdaptiveRLCheckpointV1
     training_complete: bool
     source_data_qualified: bool
@@ -196,6 +208,16 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
             != semantic_sha256(self.completed_block_receipts)
             or self.transition_inventory_sha256
             != semantic_sha256(self.transition_receipts)
+            or len(self.transition_source_data_qualified)
+            != len(self.transition_receipts)
+            or any(
+                not isinstance(value, bool)
+                for value in self.transition_source_data_qualified
+            )
+            or self.fit_environment_authority_inventory_sha256
+            != semantic_sha256(self.fit_environment_authority_receipts)
+            or self.fit_environment_authority_receipts
+            != tuple(dict.fromkeys(self.fit_environment_authority_receipts))
             or self.continuity_authority_inventory_sha256
             != semantic_sha256(self.continuity_authority_receipts)
             or self.ppo_checkpoint.training_forecast_authority_receipt_sha256
@@ -231,6 +253,8 @@ class MassiveAdaptivePrequentialPPOCheckpointV1:
             self.completed_block_inventory_sha256,
             *self.transition_receipts,
             self.transition_inventory_sha256,
+            *self.fit_environment_authority_receipts,
+            self.fit_environment_authority_inventory_sha256,
             self.protocol_receipt_sha256,
             self.specification_sha256,
             self.implementation_source_sha256,
@@ -250,7 +274,10 @@ class MassiveAdaptivePPOTrainingRunV1:
     completed_block_receipts: tuple[str, ...]
     completed_block_inventory_sha256: str
     transition_receipts: tuple[str, ...]
+    transition_source_data_qualified: tuple[bool, ...]
     transition_inventory_sha256: str
+    fit_environment_authority_receipts: tuple[str, ...]
+    fit_environment_authority_inventory_sha256: str
     final_checkpoint_receipt_sha256: str
     update_count: int
     source_data_qualified: bool
@@ -279,6 +306,16 @@ class MassiveAdaptivePPOTrainingRunV1:
             or not self.transition_receipts
             or self.transition_inventory_sha256
             != semantic_sha256(self.transition_receipts)
+            or len(self.transition_source_data_qualified)
+            != len(self.transition_receipts)
+            or any(
+                not isinstance(value, bool)
+                for value in self.transition_source_data_qualified
+            )
+            or self.fit_environment_authority_inventory_sha256
+            != semantic_sha256(self.fit_environment_authority_receipts)
+            or self.fit_environment_authority_receipts
+            != tuple(dict.fromkeys(self.fit_environment_authority_receipts))
             or self.continuity_authority_inventory_sha256
             != semantic_sha256(self.continuity_authority_receipts)
             or self.update_count <= 0
@@ -303,6 +340,9 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
         chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
         environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+        fit_environment_authorities: (
+            Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+        ) = None,
         model: MassiveAdaptivePPOActorCriticV1,
         config: MassiveAdaptivePPOConfigV1 | None = None,
         device: torch.device | str = "cpu",
@@ -326,6 +366,32 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         self.training_authority = training_authority
         self.chronology_authority = chronology_authority
         self.environments = dict(environments)
+        self.fit_environment_authorities = (
+            {} if fit_environment_authorities is None else dict(fit_environment_authorities)
+        )
+        if self.fit_environment_authorities:
+            if set(self.fit_environment_authorities) != set(self.environments):
+                raise MassiveAdaptivePrequentialPPORunnerV1Error(
+                    "PPO fit environment authority registry coverage differs"
+                )
+            for receipt, authority in self.fit_environment_authorities.items():
+                if type(authority) is not MassiveAdaptiveRLFitEnvironmentAuthorityV1:
+                    raise MassiveAdaptivePrequentialPPORunnerV1Error(
+                        "PPO fit environment authority type differs"
+                    )
+                authority.validate()
+                environment = self.environments[receipt]
+                authority.validate_environment(environment)
+                if (
+                    not authority.runtime_environment_replayed
+                    or not authority.source_data_qualified
+                    or authority.forecast_archive_receipt_sha256 != receipt
+                    or authority.environment_source_inventory_sha256
+                    != environment.source_inventory_sha256
+                ):
+                    raise MassiveAdaptivePrequentialPPORunnerV1Error(
+                        "PPO fit environment authority registry differs"
+                    )
         self.model = model
         self.config = config or MassiveAdaptivePPOConfigV1()
         self.config.validate()
@@ -344,6 +410,7 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         self.current_block_index = 0
         self.completed_block_receipts: list[str] = []
         self.transition_receipts: list[str] = []
+        self.transition_source_data_qualified: list[bool] = []
         self._trainer = self._new_trainer(self._environment_for_block(0))
         self._trainer._ensure_observation()
 
@@ -403,6 +470,13 @@ class MassiveAdaptivePrequentialPPORunnerV1:
                 "environment_source_inventory_sha256": (
                     environment.source_inventory_sha256
                 ),
+                "fit_environment_authority_receipt_sha256": (
+                    None
+                    if receipt not in self.fit_environment_authorities
+                    else self.fit_environment_authorities[
+                        receipt
+                    ].semantic_receipt_sha256
+                ),
                 "forecast_session_dates": block.forecast_session_dates,
                 "environment_start_cursor": start,
                 "environment_stop_cursor": stop,
@@ -439,7 +513,11 @@ class MassiveAdaptivePrequentialPPORunnerV1:
                 next_block_receipt_sha256=current.block_receipt_sha256,
                 previous_environment=self._environment_for_block(next_index - 1),
                 next_environment=self._environment_for_block(next_index),
-                source_data_qualified=self.training_authority.source_data_qualified,
+                source_data_qualified=bool(
+                    self.training_authority.source_data_qualified
+                    and previous.fit_environment_authority_receipt_sha256 is not None
+                    and current.fit_environment_authority_receipt_sha256 is not None
+                ),
             )
             if (
                 authority.exchange_sessions_consecutive
@@ -454,12 +532,16 @@ class MassiveAdaptivePrequentialPPORunnerV1:
     def _new_trainer(
         self, environment: MassiveAdaptiveProfitabilityEnvV1
     ) -> MassiveAdaptivePPOTrainerV1:
+        forecast_receipt = environment.forecast_archive.semantic_receipt_sha256
         return MassiveAdaptivePPOTrainerV1(
             environment=environment,
             model=self.model,
             config=self.config,
             device=self.device,
             training_forecast_authority=self.training_authority,
+            fit_environment_authority=self.fit_environment_authorities.get(
+                forecast_receipt
+            ),
         )
 
     def _bootstrap_continuation_rollout(
@@ -523,6 +605,17 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         trainer.minibatch_rng.set_state(checkpoint.minibatch_rng_state)
         trainer.update_index = checkpoint.update_index
         trainer.loss_trace = list(checkpoint.loss_trace)
+        trainer.transition_receipts = list(checkpoint.transition_receipts)
+        trainer.transition_source_data_qualified = list(
+            checkpoint.transition_source_data_qualified
+        )
+        trainer.fit_environment_authority_receipts = list(
+            checkpoint.fit_environment_authority_receipts
+        )
+        if trainer.fit_environment_authority is not None:
+            receipt = trainer.fit_environment_authority.semantic_receipt_sha256
+            if receipt not in trainer.fit_environment_authority_receipts:
+                trainer.fit_environment_authority_receipts.append(receipt)
         trainer._observation = None
 
     @property
@@ -610,6 +703,9 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             )
         metrics = self._trainer.update(rollout)
         self.transition_receipts.extend(rollout.transition_receipts)
+        self.transition_source_data_qualified.extend(
+            rollout.transition_source_data_qualified
+        )
         if (
             self._trainer.environment.state.chronology_cursor
             == runtime.environment_stop_cursor
@@ -626,6 +722,23 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             index = self.current_block_index
         runtime = self.block_runtimes[index]
         ppo_checkpoint = self._trainer.checkpoint()
+        environment_authority_receipts = tuple(
+            dict.fromkeys(
+                row.fit_environment_authority_receipt_sha256
+                for row in self.block_runtimes
+                if row.fit_environment_authority_receipt_sha256 is not None
+            )
+        )
+        source_qualified = bool(
+            self.training_authority.source_data_qualified
+            and getattr(self.chronology_authority, "source_data_qualified", False)
+            and len(environment_authority_receipts) == len(self.block_runtimes)
+            and self.transition_receipts
+            and len(self.transition_receipts)
+            == len(self.transition_source_data_qualified)
+            and all(self.transition_source_data_qualified)
+            and ppo_checkpoint.source_data_qualified
+        )
         body = {
             "schema": MASSIVE_ADAPTIVE_PREQUENTIAL_PPO_CHECKPOINT_V1_SCHEMA,
             "training_forecast_authority_receipt_sha256": (
@@ -657,12 +770,21 @@ class MassiveAdaptivePrequentialPPORunnerV1:
                 tuple(self.completed_block_receipts)
             ),
             "transition_receipts": tuple(self.transition_receipts),
+            "transition_source_data_qualified": tuple(
+                self.transition_source_data_qualified
+            ),
             "transition_inventory_sha256": semantic_sha256(
                 tuple(self.transition_receipts)
             ),
+            "fit_environment_authority_receipts": (
+                environment_authority_receipts
+            ),
+            "fit_environment_authority_inventory_sha256": semantic_sha256(
+                environment_authority_receipts
+            ),
             "ppo_checkpoint": ppo_checkpoint,
             "training_complete": self.training_complete,
-            "source_data_qualified": self.training_authority.source_data_qualified,
+            "source_data_qualified": source_qualified,
             "profitability_reporting_authorized": False,
             "outer_evaluation_authorized": False,
             "lockbox_access_authorized": False,
@@ -677,9 +799,9 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         provisional = MassiveAdaptivePrequentialPPOCheckpointV1(
             **body,  # type: ignore[arg-type]
             semantic_receipt_sha256="0" * 64,
-            exact_resume_authorized=self.training_authority.source_data_qualified,
+            exact_resume_authorized=source_qualified,
             development_rl_training_authorized=(
-                self.training_authority.source_data_qualified
+                source_qualified
             ),
         )
         result = replace(
@@ -734,6 +856,9 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         self.current_block_index = index
         self.completed_block_receipts = list(checkpoint.completed_block_receipts)
         self.transition_receipts = list(checkpoint.transition_receipts)
+        self.transition_source_data_qualified = list(
+            checkpoint.transition_source_data_qualified
+        )
         self._trainer = self._new_trainer(environment)
         self._trainer.restore(checkpoint.ppo_checkpoint)
 
@@ -741,6 +866,7 @@ class MassiveAdaptivePrequentialPPORunnerV1:
         while not self.training_complete:
             self.run_next_update()
         checkpoint = self.checkpoint()
+        source_qualified = checkpoint.source_data_qualified
         body = {
             "schema": MASSIVE_ADAPTIVE_PPO_TRAINING_RUN_V1_SCHEMA,
             "training_forecast_authority_receipt_sha256": (
@@ -762,12 +888,21 @@ class MassiveAdaptivePrequentialPPORunnerV1:
                 tuple(self.completed_block_receipts)
             ),
             "transition_receipts": tuple(self.transition_receipts),
+            "transition_source_data_qualified": tuple(
+                self.transition_source_data_qualified
+            ),
             "transition_inventory_sha256": semantic_sha256(
                 tuple(self.transition_receipts)
             ),
+            "fit_environment_authority_receipts": (
+                checkpoint.fit_environment_authority_receipts
+            ),
+            "fit_environment_authority_inventory_sha256": (
+                checkpoint.fit_environment_authority_inventory_sha256
+            ),
             "final_checkpoint_receipt_sha256": checkpoint.semantic_receipt_sha256,
             "update_count": checkpoint.ppo_checkpoint.update_index,
-            "source_data_qualified": self.training_authority.source_data_qualified,
+            "source_data_qualified": source_qualified,
             "profitability_reporting_authorized": False,
             "outer_evaluation_authorized": False,
             "lockbox_access_authorized": False,
@@ -777,7 +912,7 @@ class MassiveAdaptivePrequentialPPORunnerV1:
             **body,  # type: ignore[arg-type]
             semantic_receipt_sha256="0" * 64,
             development_rl_training_authorized=(
-                self.training_authority.source_data_qualified
+                source_qualified
             ),
         )
         result = replace(
@@ -793,6 +928,9 @@ def train_massive_adaptive_prequential_ppo_v1(
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
     policy: MassiveAdaptivePPOActorCriticV1,
     config: MassiveAdaptivePPOConfigV1 | None = None,
     device: torch.device | str = "cpu",
@@ -803,6 +941,7 @@ def train_massive_adaptive_prequential_ppo_v1(
         training_authority=training_authority,
         chronology_authority=chronology_authority,
         environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
         model=policy,
         config=config,
         device=device,

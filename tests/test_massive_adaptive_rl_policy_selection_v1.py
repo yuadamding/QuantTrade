@@ -496,7 +496,6 @@ def test_selected_policy_model_state_is_create_only_and_exact(tmp_path) -> None:
     checkpoint = replace(
         checkpoint,
         training_forecast_authority_receipt_sha256=training_authority_receipt,
-        development_rl_training_authorized=True,
         semantic_receipt_sha256="0" * 64,
     )
     checkpoint = replace(

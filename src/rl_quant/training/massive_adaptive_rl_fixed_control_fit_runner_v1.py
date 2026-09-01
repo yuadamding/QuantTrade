@@ -56,12 +56,18 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
     build_massive_adaptive_rl_fixed_control_candidate_v1,
     materialize_massive_adaptive_rl_fixed_control_selection_authority_v1,
 )
+from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
+    MassiveAdaptiveRLFitEnvironmentAuthorityV1,
+)
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
     build_massive_adaptive_rl_policy_trace_from_identities_v1,
 )
 from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
+)
+from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityV2,
 )
 
 
@@ -285,6 +291,9 @@ def _bind_block_runtimes(
     *,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
 ) -> tuple[MassiveAdaptivePPOBlockRuntimeV1, ...]:
     grouped_dates: dict[str, list[str]] = {}
     archive_sequence: list[str] = []
@@ -301,6 +310,33 @@ def _bind_block_runtimes(
         raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
             "fixed-control environment registry has missing or extra archives"
         )
+    environment_authorities = (
+        {}
+        if fit_environment_authorities is None
+        else dict(fit_environment_authorities)
+    )
+    if environment_authorities:
+        if set(environment_authorities) != set(environments):
+            raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
+                "fixed-control fit environment authority registry coverage differs"
+            )
+        for receipt, authority in environment_authorities.items():
+            if type(authority) is not MassiveAdaptiveRLFitEnvironmentAuthorityV1:
+                raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
+                    "fixed-control fit environment authority type differs"
+                )
+            authority.validate()
+            authority.validate_environment(environments[receipt])
+            if (
+                not authority.runtime_environment_replayed
+                or not authority.source_data_qualified
+                or authority.forecast_archive_receipt_sha256 != receipt
+                or authority.environment_source_inventory_sha256
+                != environments[receipt].source_inventory_sha256
+            ):
+                raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
+                    "fixed-control fit environment authority registry differs"
+                )
     runtimes: list[MassiveAdaptivePPOBlockRuntimeV1] = []
     cursors: dict[str, int] = {}
     for block in training_authority.blocks:
@@ -329,6 +365,15 @@ def _bind_block_runtimes(
             raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
                 "fixed-control block is not the next archive chronology"
             )
+        environment_authority = environment_authorities.get(receipt)
+        if environment_authority is not None and (
+            environment_authority.block_index != block.block_index
+            or environment_authority.outer_fold_index
+            != training_authority.outer_fold_index
+        ):
+            raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
+                "fixed-control block differs from its fit environment authority"
+            )
         body = {
             "schema": MASSIVE_ADAPTIVE_PPO_BLOCK_RUNTIME_V1_SCHEMA,
             "block_index": block.block_index,
@@ -340,6 +385,11 @@ def _bind_block_runtimes(
             "calibration_receipt_sha256": block.calibration_receipt_sha256,
             "environment_source_inventory_sha256": (
                 environment.source_inventory_sha256
+            ),
+            "fit_environment_authority_receipt_sha256": (
+                None
+                if environment_authority is None
+                else environment_authority.semantic_receipt_sha256
             ),
             "forecast_session_dates": block.forecast_session_dates,
             "environment_start_cursor": start,
@@ -375,7 +425,11 @@ def _bind_continuity(
             next_block_receipt_sha256=current.block_receipt_sha256,
             previous_environment=environments[previous.forecast_archive_receipt_sha256],
             next_environment=environments[current.forecast_archive_receipt_sha256],
-            source_data_qualified=training_authority.source_data_qualified,
+            source_data_qualified=bool(
+                training_authority.source_data_qualified
+                and previous.fit_environment_authority_receipt_sha256 is not None
+                and current.fit_environment_authority_receipt_sha256 is not None
+            ),
         )
         if not authority.carry_books_authorized:
             raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
@@ -394,6 +448,7 @@ def _run_action(
     runtimes: tuple[MassiveAdaptivePPOBlockRuntimeV1, ...],
     continuity: Mapping[int, MassiveAdaptiveEconomicContinuityAuthorityV1],
     environment_templates: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    source_inputs_qualified: bool,
 ) -> MassiveAdaptiveRLPolicyTraceV1:
     environments = {
         receipt: _fresh_environment(template)
@@ -435,6 +490,11 @@ def _run_action(
             if not isinstance(transition, MassiveAdaptiveRLTransitionV1):
                 raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
                     "fixed-control economic transition is absent"
+                )
+            if source_inputs_qualified and not transition.source_data_qualified:
+                raise MassiveAdaptiveRLFixedControlFitRunnerV1Error(
+                    "authorizing fixed-control fit contains an unqualified "
+                    "economic transition"
                 )
             final_transition = (
                 block_index == len(runtimes) - 1
@@ -488,10 +548,7 @@ def _run_action(
         transitions=tuple(transitions),
         frozen_targets_replayed=False,
         evaluation_role="training_control",
-        checkpoint_source_data_qualified=bool(
-            training_authority.reinforcement_learning_authorized
-            and chronology_authority.development_rl_training_authorized
-        ),
+        checkpoint_source_data_qualified=source_inputs_qualified,
     )
 
 
@@ -500,6 +557,9 @@ def run_massive_adaptive_rl_fixed_control_fit_v1(
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
     registry: MassiveAdaptiveRLFixedControlRegistryV1 | None = None,
 ) -> MassiveAdaptiveRLFixedControlFitRunV1:
     """Run the complete immutable constant-control grid on RL-fit data."""
@@ -522,6 +582,7 @@ def run_massive_adaptive_rl_fixed_control_fit_v1(
     runtimes = _bind_block_runtimes(
         training_authority=training_authority,
         environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
     )
     continuity = _bind_continuity(
         training_authority=training_authority,
@@ -529,6 +590,22 @@ def run_massive_adaptive_rl_fixed_control_fit_v1(
         environments=environments,
     )
     registered = registered_massive_adaptive_rl_constant_actions_v1()
+    environment_authority_receipts = tuple(
+        dict.fromkeys(
+            row.fit_environment_authority_receipt_sha256
+            for row in runtimes
+            if row.fit_environment_authority_receipt_sha256 is not None
+        )
+    )
+    source_inputs_qualified = bool(
+        type(training_authority) is MassiveAdaptiveRLTrainingForecastAuthorityV2
+        and type(chronology_authority) is MassiveAdaptiveRLChronologyAuthorityV1
+        and len(environment_authority_receipts) == len(runtimes)
+        and all(
+            row.fit_environment_authority_receipt_sha256 is not None
+            for row in runtimes
+        )
+    )
     training_context_receipt = semantic_sha256(
         (
             training_authority.semantic_receipt_sha256,
@@ -554,6 +631,7 @@ def run_massive_adaptive_rl_fixed_control_fit_v1(
             runtimes=runtimes,
             continuity=continuity,
             environment_templates=environments,
+            source_inputs_qualified=source_inputs_qualified,
         )
         for control_id, action in registered
     )
@@ -568,7 +646,8 @@ def run_massive_adaptive_rl_fixed_control_fit_v1(
         for (control_id, action), trace in zip(registered, traces, strict=True)
     )
     source_qualified = bool(
-        training_authority.source_data_qualified
+        source_inputs_qualified
+        and training_authority.source_data_qualified
         and chronology_authority.source_data_qualified
         and all(row.source_data_qualified for row in traces)
     )
@@ -808,6 +887,9 @@ def authorize_massive_adaptive_rl_fixed_control_fit_authority_v1(
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
     registry: MassiveAdaptiveRLFixedControlRegistryV1 | None = None,
 ) -> MassiveAdaptiveRLFixedControlFitAuthorityV1:
     parsed = parse_massive_adaptive_rl_fixed_control_fit_authority_v1(
@@ -818,6 +900,7 @@ def authorize_massive_adaptive_rl_fixed_control_fit_authority_v1(
         training_authority=training_authority,
         chronology_authority=chronology_authority,
         environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
         registry=registry,
     )
     if canonical_json_file_bytes(committed) != canonical_json_file_bytes(
@@ -843,6 +926,9 @@ def materialize_massive_adaptive_rl_fixed_control_fit_authority_v1(
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
     committed_at_ms: int,
     registry: MassiveAdaptiveRLFixedControlRegistryV1 | None = None,
 ) -> MassiveAdaptiveRLFixedControlFitAuthorityV1:
@@ -851,6 +937,7 @@ def materialize_massive_adaptive_rl_fixed_control_fit_authority_v1(
         training_authority=training_authority,
         chronology_authority=chronology_authority,
         environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
         registry=registry,
     )
     relative = f"massive-adaptive/rl-fixed-control-fit-v1/{identifier}.json"
@@ -882,6 +969,7 @@ def materialize_massive_adaptive_rl_fixed_control_fit_authority_v1(
         training_authority=training_authority,
         chronology_authority=chronology_authority,
         environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
         registry=registry,
     )
 

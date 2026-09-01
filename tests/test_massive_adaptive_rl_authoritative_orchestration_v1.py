@@ -328,7 +328,6 @@ def _checkpoint_authority(environment):
     checkpoint = replace(
         checkpoint,
         training_forecast_authority_receipt_sha256=forecast_receipt,
-        development_rl_training_authorized=True,
         semantic_receipt_sha256="0" * 64,
     )
     checkpoint = replace(
@@ -465,10 +464,10 @@ def test_forecast_refit_preserves_book_but_not_position_lock() -> None:
         next_block_receipt_sha256=blocks[1].semantic_receipt_sha256,
         previous_environment=first,
         next_environment=second,
-        source_data_qualified=True,
+        source_data_qualified=False,
     )
     assert continuity.carry_books_authorized
-    assert continuity.development_continuity_authorized
+    assert not continuity.development_continuity_authorized
     assert (
         continuity.previous_forecast_archive_receipt_sha256
         != continuity.next_forecast_archive_receipt_sha256
@@ -612,6 +611,7 @@ def test_fixed_controls_are_replayed_over_complete_continuous_fit_tape(
     fit = durable.runtime_fit_run
     assert fit is not None
     assert durable.runtime_fit_replayed
+    assert not durable.development_control_fit_authorized
     registered_control_count = len(registered_massive_adaptive_rl_constant_actions_v1())
     assert len(fit.traces) == registered_control_count
     assert len(fit.candidates) == registered_control_count

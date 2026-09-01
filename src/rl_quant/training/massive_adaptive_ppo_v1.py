@@ -35,6 +35,12 @@ from rl_quant.rl.massive_adaptive_rl_observation_v1 import (
 from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import (
     MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
 )
+from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import (
+    MassiveAdaptiveRLTrainingForecastAuthorityV2,
+)
+from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
+    MassiveAdaptiveRLFitEnvironmentAuthorityV1,
+)
 
 MASSIVE_ADAPTIVE_PPO_V1_SCHEMA = "rl-quant.massive-adaptive-ppo-v1"
 MASSIVE_ADAPTIVE_RL_CHECKPOINT_V1_SCHEMA = "rl-quant.massive-adaptive-rl-checkpoint-v1"
@@ -136,6 +142,8 @@ class MassiveAdaptivePPORolloutV1:
     terminated: torch.Tensor
     observation_receipts: tuple[str, ...]
     transition_receipts: tuple[str, ...]
+    transition_source_data_qualified: tuple[bool, ...]
+    source_data_qualified: bool
     final_environment_state_receipt_sha256: str
 
     def validate(self) -> None:
@@ -151,6 +159,13 @@ class MassiveAdaptivePPORolloutV1:
             or self.terminated.dtype != torch.bool
             or len(self.observation_receipts) != length
             or len(self.transition_receipts) != length
+            or len(self.transition_source_data_qualified) != length
+            or any(
+                not isinstance(value, bool)
+                for value in self.transition_source_data_qualified
+            )
+            or self.source_data_qualified
+            != bool(length and all(self.transition_source_data_qualified))
             or any(
                 not bool(torch.isfinite(value).all().item())
                 for value in (
@@ -227,6 +242,11 @@ class MassiveAdaptiveRLCheckpointV1:
     loss_trace_receipt_sha256: str
     training_source_inventory_sha256: str
     training_forecast_authority_receipt_sha256: str | None
+    fit_environment_authority_receipts: tuple[str, ...]
+    transition_receipts: tuple[str, ...]
+    transition_source_data_qualified: tuple[bool, ...]
+    transition_inventory_sha256: str
+    source_data_qualified: bool
     ppo_config_receipt_sha256: str
     observation_specification_sha256: str
     action_specification_sha256: str
@@ -254,6 +274,15 @@ class MassiveAdaptiveRLCheckpointV1:
             "training_forecast_authority_receipt_sha256": (
                 self.training_forecast_authority_receipt_sha256
             ),
+            "fit_environment_authority_receipts": (
+                self.fit_environment_authority_receipts
+            ),
+            "transition_receipts": self.transition_receipts,
+            "transition_source_data_qualified": (
+                self.transition_source_data_qualified
+            ),
+            "transition_inventory_sha256": self.transition_inventory_sha256,
+            "source_data_qualified": self.source_data_qualified,
             "ppo_config_receipt_sha256": self.ppo_config_receipt_sha256,
             "observation_specification_sha256": self.observation_specification_sha256,
             "action_specification_sha256": self.action_specification_sha256,
@@ -270,6 +299,14 @@ class MassiveAdaptiveRLCheckpointV1:
 
     def validate(self) -> None:
         self.environment_state.validate()
+        expected_source_qualified = bool(
+            self.training_forecast_authority_receipt_sha256 is not None
+            and self.fit_environment_authority_receipts
+            and self.transition_receipts
+            and len(self.transition_receipts)
+            == len(self.transition_source_data_qualified)
+            and all(self.transition_source_data_qualified)
+        )
         rng_receipt = _state_receipt(
             (
                 self.torch_rng_state,
@@ -291,6 +328,15 @@ class MassiveAdaptiveRLCheckpointV1:
             or self.environment_state_receipt_sha256
             != self.environment_state.semantic_receipt_sha256
             or self.loss_trace_receipt_sha256 != semantic_sha256(self.loss_trace)
+            or self.transition_inventory_sha256
+            != semantic_sha256(self.transition_receipts)
+            or self.fit_environment_authority_receipts
+            != tuple(dict.fromkeys(self.fit_environment_authority_receipts))
+            or any(
+                not isinstance(value, bool)
+                for value in self.transition_source_data_qualified
+            )
+            or self.source_data_qualified != expected_source_qualified
             or self.observation_specification_sha256
             != MASSIVE_ADAPTIVE_RL_OBSERVATION_V1_SPEC_SHA256
             or self.action_specification_sha256
@@ -300,7 +346,7 @@ class MassiveAdaptiveRLCheckpointV1:
             or not self.exact_resume_authorized
             or not isinstance(self.development_rl_training_authorized, bool)
             or self.development_rl_training_authorized
-            != (self.training_forecast_authority_receipt_sha256 is not None)
+            != self.source_data_qualified
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
@@ -316,6 +362,9 @@ class MassiveAdaptiveRLCheckpointV1:
             self.environment_state_receipt_sha256,
             self.loss_trace_receipt_sha256,
             self.training_source_inventory_sha256,
+            *self.fit_environment_authority_receipts,
+            *self.transition_receipts,
+            self.transition_inventory_sha256,
             self.ppo_config_receipt_sha256,
             self.observation_specification_sha256,
             self.action_specification_sha256,
@@ -347,6 +396,9 @@ class MassiveAdaptivePPOTrainerV1:
         training_forecast_authority: (
             MassiveAdaptiveRLTrainingForecastAuthorityProtocol | None
         ) = None,
+        fit_environment_authority: (
+            MassiveAdaptiveRLFitEnvironmentAuthorityV1 | None
+        ) = None,
     ) -> None:
         self.environment = environment
         self.model = model.to(device)
@@ -367,7 +419,26 @@ class MassiveAdaptivePPOTrainerV1:
                 raise MassiveAdaptivePPOV1Error(
                     "adaptive PPO environment is outside its RL forecast authority"
                 )
+        if fit_environment_authority is not None:
+            if type(fit_environment_authority) is not MassiveAdaptiveRLFitEnvironmentAuthorityV1:
+                raise MassiveAdaptivePPOV1Error(
+                    "adaptive PPO fit environment authority type differs"
+                )
+            fit_environment_authority.validate()
+            fit_environment_authority.validate_environment(environment)
+            if (
+                not fit_environment_authority.runtime_environment_replayed
+                or not fit_environment_authority.source_data_qualified
+                or fit_environment_authority.forecast_archive_receipt_sha256
+                != environment.forecast_archive.semantic_receipt_sha256
+                or fit_environment_authority.environment_source_inventory_sha256
+                != environment.source_inventory_sha256
+            ):
+                raise MassiveAdaptivePPOV1Error(
+                    "adaptive PPO fit environment authority differs"
+                )
         self.training_forecast_authority = training_forecast_authority
+        self.fit_environment_authority = fit_environment_authority
         actor_parameters = [
             *self.model.actor.parameters(),
             *self.model.actor_mean.parameters(),
@@ -392,6 +463,13 @@ class MassiveAdaptivePPOTrainerV1:
             torch.cuda.manual_seed_all(self.config.seed)
         self.update_index = 0
         self.loss_trace: list[tuple[float, ...]] = []
+        self.fit_environment_authority_receipts: list[str] = []
+        if fit_environment_authority is not None:
+            self.fit_environment_authority_receipts.append(
+                fit_environment_authority.semantic_receipt_sha256
+            )
+        self.transition_receipts: list[str] = []
+        self.transition_source_data_qualified: list[bool] = []
         self._observation: MassiveAdaptiveRLObservationV1 | None = None
 
     def _observation_tensor(
@@ -426,6 +504,7 @@ class MassiveAdaptivePPOTrainerV1:
         terminated_rows: list[bool] = []
         observation_receipts: list[str] = []
         transition_receipts: list[str] = []
+        transition_source_data_qualified: list[bool] = []
         for step_index in range(count):
             observation = self._ensure_observation()
             tensor = self._observation_tensor(observation)
@@ -461,6 +540,14 @@ class MassiveAdaptivePPOTrainerV1:
                         {"adaptive_state": self._observation_tensor(next_observation)}
                     ).value[0]
             transition = cast(MassiveAdaptiveRLTransitionV1, info["transition"])
+            transition.validate()
+            if (
+                self.fit_environment_authority is not None
+                and not transition.source_data_qualified
+            ):
+                raise MassiveAdaptivePPOV1Error(
+                    "authorizing PPO rollout contains an unqualified economic transition"
+                )
             observations.append(tensor[0])
             actions.append(sampled[0].detach())
             log_probabilities.append(log_probability[0].detach())
@@ -470,6 +557,9 @@ class MassiveAdaptivePPOTrainerV1:
             terminated_rows.append(terminated)
             observation_receipts.append(observation.semantic_receipt_sha256)
             transition_receipts.append(transition.semantic_receipt_sha256)
+            transition_source_data_qualified.append(
+                transition.source_data_qualified
+            )
             self._observation = next_observation
             if truncated and len(observations) < count:
                 raise MassiveAdaptivePPOV1Error(
@@ -508,15 +598,27 @@ class MassiveAdaptivePPOTrainerV1:
             terminated=terminated_tensor,
             observation_receipts=tuple(observation_receipts),
             transition_receipts=tuple(transition_receipts),
+            transition_source_data_qualified=tuple(
+                transition_source_data_qualified
+            ),
+            source_data_qualified=all(transition_source_data_qualified),
             final_environment_state_receipt_sha256=(
                 self.environment.state.semantic_receipt_sha256
             ),
         )
         result.validate()
+        self.transition_receipts.extend(result.transition_receipts)
+        self.transition_source_data_qualified.extend(
+            result.transition_source_data_qualified
+        )
         return result
 
     def update(self, rollout: MassiveAdaptivePPORolloutV1) -> dict[str, float]:
         rollout.validate()
+        if self.fit_environment_authority is not None and not rollout.source_data_qualified:
+            raise MassiveAdaptivePPOV1Error(
+                "authorizing PPO update contains an unqualified rollout"
+            )
         advantages = rollout.advantages
         advantages = (advantages - advantages.mean()) / advantages.std(
             unbiased=False
@@ -617,6 +719,17 @@ class MassiveAdaptivePPOTrainerV1:
             np.random.get_state(),
             self.minibatch_rng.get_state().clone(),
         )
+        source_qualified = bool(
+            type(self.training_forecast_authority)
+            is MassiveAdaptiveRLTrainingForecastAuthorityV2
+            and self.training_forecast_authority.source_data_qualified
+            and self.training_forecast_authority.reinforcement_learning_authorized
+            and self.fit_environment_authority_receipts
+            and self.transition_receipts
+            and len(self.transition_receipts)
+            == len(self.transition_source_data_qualified)
+            and all(self.transition_source_data_qualified)
+        )
         body = {
             "schema": MASSIVE_ADAPTIVE_RL_CHECKPOINT_V1_SCHEMA,
             "update_index": self.update_index,
@@ -642,13 +755,24 @@ class MassiveAdaptivePPOTrainerV1:
             "training_forecast_authority_receipt_sha256": None
             if self.training_forecast_authority is None
             else self.training_forecast_authority.semantic_receipt_sha256,
+            "fit_environment_authority_receipts": tuple(
+                self.fit_environment_authority_receipts
+            ),
+            "transition_receipts": tuple(self.transition_receipts),
+            "transition_source_data_qualified": tuple(
+                self.transition_source_data_qualified
+            ),
+            "transition_inventory_sha256": semantic_sha256(
+                tuple(self.transition_receipts)
+            ),
+            "source_data_qualified": source_qualified,
             "ppo_config_receipt_sha256": self.config.receipt_sha256,
             "observation_specification_sha256": MASSIVE_ADAPTIVE_RL_OBSERVATION_V1_SPEC_SHA256,
             "action_specification_sha256": MASSIVE_ADAPTIVE_RL_ACTION_SPECIFICATION_V1_SHA256,
             "reward_specification_sha256": MASSIVE_ADAPTIVE_RL_REWARD_SPECIFICATION_V1_SHA256,
             "exact_resume_authorized": True,
             "development_rl_training_authorized": (
-                self.training_forecast_authority is not None
+                source_qualified
             ),
             "profitability_reporting_authorized": False,
             "outer_evaluation_authorized": False,
@@ -673,12 +797,26 @@ class MassiveAdaptivePPOTrainerV1:
             if self.training_forecast_authority is None
             else self.training_forecast_authority.semantic_receipt_sha256
         )
+        current_environment_authority_receipt = (
+            None
+            if self.fit_environment_authority is None
+            else self.fit_environment_authority.semantic_receipt_sha256
+        )
         if (
             checkpoint.training_source_inventory_sha256
             != self.environment.source_inventory_sha256
             or checkpoint.ppo_config_receipt_sha256 != self.config.receipt_sha256
             or checkpoint.training_forecast_authority_receipt_sha256
             != expected_training_authority
+            or (
+                current_environment_authority_receipt is None
+                and checkpoint.fit_environment_authority_receipts
+            )
+            or (
+                current_environment_authority_receipt is not None
+                and current_environment_authority_receipt
+                not in checkpoint.fit_environment_authority_receipts
+            )
         ):
             raise MassiveAdaptivePPOV1Error(
                 "adaptive RL checkpoint and trainer roots differ"
@@ -695,6 +833,13 @@ class MassiveAdaptivePPOTrainerV1:
         self.environment.restore(checkpoint.environment_state)
         self.update_index = checkpoint.update_index
         self.loss_trace = list(checkpoint.loss_trace)
+        self.transition_receipts = list(checkpoint.transition_receipts)
+        self.transition_source_data_qualified = list(
+            checkpoint.transition_source_data_qualified
+        )
+        self.fit_environment_authority_receipts = list(
+            checkpoint.fit_environment_authority_receipts
+        )
         self._observation = self.environment._observation
 
 

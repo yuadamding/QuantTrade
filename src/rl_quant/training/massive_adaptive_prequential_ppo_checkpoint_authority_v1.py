@@ -100,8 +100,10 @@ def _parse_runner_checkpoint(
         "continuity_authority_receipts",
         "completed_block_receipts",
         "transition_receipts",
+        "transition_source_data_qualified",
+        "fit_environment_authority_receipts",
     ):
-        metadata[name] = tuple(cast(list[str] | tuple[str, ...], metadata[name]))
+        metadata[name] = tuple(cast(list[object] | tuple[object, ...], metadata[name]))
     ppo_checkpoint = _parse_checkpoint(
         cast(Mapping[str, object], payload["ppo_checkpoint"])
     )
