@@ -7,23 +7,15 @@ import math
 from typing import Sequence
 
 from rl_quant.alpha.pit_universe import PITSecurityUniverseAuthority
-from rl_quant.evaluation.massive_adaptive_forecast_archive_v2 import (
-    MassiveAdaptiveForecastArchiveV2,
-)
 from rl_quant.evaluation.massive_adaptive_forecast_calibration_v2 import (
     MassiveAdaptiveForecastCalibrationV2,
 )
-from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
-    MassiveAdaptiveInferencePlanV1,
+from rl_quant.evaluation.massive_adaptive_forecast_runtime_protocol_v1 import (
+    MassiveAdaptiveForecastRuntimeProtocol,
+    MassiveAdaptiveInferencePlanRuntimeProtocol,
 )
 from rl_quant.evaluation.massive_adaptive_initial_book_authority_v1 import (
     build_massive_adaptive_initial_book_authority_v1,
-)
-from rl_quant.evaluation.massive_adaptive_outer_forecast_archive_v1 import (
-    MassiveAdaptiveOuterForecastArchiveV1,
-)
-from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
-    MassiveAdaptiveOuterInferencePlanV1,
 )
 from rl_quant.execution.massive_adaptive_economic_book_v1 import (
     MassiveAdaptiveEconomicBookV1,
@@ -76,9 +68,7 @@ from rl_quant.rl.massive_adaptive_rl_observation_v1 import (
 MASSIVE_ADAPTIVE_PROFITABILITY_ENV_V1_SCHEMA = (
     "rl-quant.massive-adaptive-profitability-env-v1"
 )
-MASSIVE_ADAPTIVE_RL_TRANSITION_V1_SCHEMA = (
-    "rl-quant.massive-adaptive-rl-transition-v1"
-)
+MASSIVE_ADAPTIVE_RL_TRANSITION_V1_SCHEMA = "rl-quant.massive-adaptive-rl-transition-v1"
 MASSIVE_ADAPTIVE_PROFITABILITY_ENV_V1_SPEC_SHA256 = semantic_sha256(
     {
         "chronology": "continuous-decision-close-to-next-close",
@@ -131,10 +121,8 @@ class MassiveAdaptiveProfitabilityEnvStateV1:
             isinstance(self.chronology_cursor, bool)
             or self.chronology_cursor < 0
             or not isinstance(self.done, bool)
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveProfitabilityEnvV1Error(
                 "adaptive profitability environment state differs"
@@ -204,18 +192,13 @@ class MassiveAdaptiveRLTransitionV1:
             or self.source_data_qualified != self.economic_step.source_data_qualified
             or not isinstance(self.terminated, bool)
             or (self.terminated and self.truncated)
-            or (
-                self.truncated
-                and any(abs(value) > 1.0e-12 for value in values[4:7])
-            )
+            or (self.truncated and any(abs(value) > 1.0e-12 for value in values[4:7]))
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
             or self.reinforcement_learning_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveProfitabilityEnvV1Error(
                 "adaptive RL transition differs"
@@ -264,11 +247,9 @@ class MassiveAdaptiveProfitabilityEnvV1:
     def __init__(
         self,
         *,
-        forecast_archive: MassiveAdaptiveForecastArchiveV2
-        | MassiveAdaptiveOuterForecastArchiveV1,
+        forecast_archive: MassiveAdaptiveForecastRuntimeProtocol,
         calibration: MassiveAdaptiveForecastCalibrationV2,
-        inference_plan: MassiveAdaptiveInferencePlanV1
-        | MassiveAdaptiveOuterInferencePlanV1,
+        inference_plan: MassiveAdaptiveInferencePlanRuntimeProtocol,
         decision_roots: Sequence[MassiveAdaptiveDecisionRootV1],
         context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
         fill_source: MassiveAdaptiveFillSourceV1,
@@ -329,7 +310,9 @@ class MassiveAdaptiveProfitabilityEnvV1:
         self.initial_capital = float(initial_capital)
         self.transaction_cost_basis_points = float(transaction_cost_basis_points)
         self.maximum_fill_participation = float(maximum_fill_participation)
-        self.compiler_config = compiler_config or MassiveAdaptivePortfolioCompilerConfigV1()
+        self.compiler_config = (
+            compiler_config or MassiveAdaptivePortfolioCompilerConfigV1()
+        )
         self.compiler_config.validate()
         self.economic_compatibility_receipt_sha256 = semantic_sha256(
             (
@@ -351,9 +334,7 @@ class MassiveAdaptiveProfitabilityEnvV1:
                 forecast_archive.semantic_receipt_sha256,
                 calibration.semantic_receipt_sha256,
                 inference_plan.semantic_receipt_sha256,
-                tuple(
-                    self.roots[date].semantic_receipt_sha256 for date in plan_dates
-                ),
+                tuple(self.roots[date].semantic_receipt_sha256 for date in plan_dates),
                 tuple(
                     self.contexts[date].semantic_receipt_sha256 for date in plan_dates
                 ),
@@ -441,7 +422,9 @@ class MassiveAdaptiveProfitabilityEnvV1:
             source_inventory_sha256=self.source_inventory_sha256,
         )
         observation = self._prepare_observation()
-        return observation, {"state_receipt_sha256": self._state.semantic_receipt_sha256}
+        return observation, {
+            "state_receipt_sha256": self._state.semantic_receipt_sha256
+        }
 
     @property
     def state(self) -> MassiveAdaptiveProfitabilityEnvStateV1:
@@ -514,7 +497,9 @@ class MassiveAdaptiveProfitabilityEnvV1:
         return self.state
 
     @staticmethod
-    def _liquidation_cost(book: MassiveAdaptiveEconomicBookV1, basis_points: float) -> float:
+    def _liquidation_cost(
+        book: MassiveAdaptiveEconomicBookV1, basis_points: float
+    ) -> float:
         return sum(row.market_value for row in book.holdings) * basis_points / 10_000.0
 
     def step(
@@ -554,12 +539,10 @@ class MassiveAdaptiveProfitabilityEnvV1:
             frozen_control.validate()
             frozen_decision.validate()
             if (
-                frozen_control.action_receipt_sha256
-                != action.semantic_receipt_sha256
+                frozen_control.action_receipt_sha256 != action.semantic_receipt_sha256
                 or frozen_control.adjusted_input_receipt_sha256
                 != frozen_decision.input_receipt_sha256
-                or frozen_decision.decision_id
-                != self._prepared.decision_session_date
+                or frozen_decision.decision_id != self._prepared.decision_session_date
             ):
                 raise MassiveAdaptiveProfitabilityEnvV1Error(
                     "frozen target replay differs from the prepared chronology"
@@ -621,24 +604,28 @@ class MassiveAdaptiveProfitabilityEnvV1:
                     "terminal liquidation exhausted an economic book"
                 )
             strategy_terminal_adjustment = math.log(
-                strategy_equity
-                / economic_step.strategy_posttrade_book.marked_equity
+                strategy_equity / economic_step.strategy_posttrade_book.marked_equity
             )
             neutral_terminal_adjustment = math.log(
                 neutral_equity / economic_step.neutral_posttrade_book.marked_equity
             )
             benchmark_terminal_adjustment = math.log(
-                benchmark_equity
-                / economic_step.benchmark_posttrade_book.marked_equity
+                benchmark_equity / economic_step.benchmark_posttrade_book.marked_equity
             )
-            strategy_active += strategy_terminal_adjustment - benchmark_terminal_adjustment
-            neutral_active += neutral_terminal_adjustment - benchmark_terminal_adjustment
+            strategy_active += (
+                strategy_terminal_adjustment - benchmark_terminal_adjustment
+            )
+            neutral_active += (
+                neutral_terminal_adjustment - benchmark_terminal_adjustment
+            )
             incremental += strategy_terminal_adjustment - neutral_terminal_adjustment
         reward = 10_000.0 * incremental
         execution_rows = economic_step.strategy_execution.rows
         requested = sum(abs(row.requested_shares) for row in execution_rows)
         unfilled = sum(abs(row.unfilled_shares) for row in execution_rows)
-        fill_fraction = 1.0 if requested == 0.0 else max(0.0, 1.0 - unfilled / requested)
+        fill_fraction = (
+            1.0 if requested == 0.0 else max(0.0, 1.0 - unfilled / requested)
+        )
         buy = sum(
             row.executed_notional for row in execution_rows if row.filled_shares > 0.0
         )

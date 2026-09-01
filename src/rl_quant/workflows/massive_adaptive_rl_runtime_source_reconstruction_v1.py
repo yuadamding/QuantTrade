@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from enum import Enum
 import importlib
 import inspect
@@ -150,6 +150,12 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_OBJECT_SNAPSHOT_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-runtime-sources-v1"
 )
+MASSIVE_ADAPTIVE_RL_SUPERVISED_LINEAGE_RUNTIME_SOURCES_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-supervised-lineage-runtime-sources-v1"
+)
+MASSIVE_ADAPTIVE_RL_FIT_BLOCK_RUNTIME_SOURCES_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-fit-block-runtime-sources-v1"
+)
 MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SOURCE_SHA256 = file_sha256(
     Path(__file__)
 )
@@ -167,6 +173,9 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256 = semantic_sha2
             "checkpoint-training-and-inference-tensors-plan-roots-model"
         ),
         "native_replay": "tensor-checkpoint-training-forecast-calibration-fit-forecast",
+        "execution_view": (
+            "source-fold-supervised-lineage-and-block-local-fit-runtime-inputs"
+        ),
         "reconstruction_dependency_closure": "independently-recomputed",
         "temporary_source_unavailability": "retryable-blocker",
         "publication": "fsync-atomic-content-addressed-and-create-only-index",
@@ -951,6 +960,252 @@ class MassiveAdaptiveRLReplayDependencyIndexV1:
 
 
 @dataclass(frozen=True, slots=True)
+class MassiveAdaptiveRLSupervisedLineageSourcesV1:
+    """One exact fit-only supervised lineage available to an RL source fold."""
+
+    source_fold_index: int
+    training_window: MassiveAdaptiveWindowPlanV1
+    checkpoint_choice: MassiveAdaptiveCausalCheckpointChoiceV1
+    selected_checkpoint: MassiveAdaptiveCheckpointV1
+    model_spec: MassiveAdaptiveAlphaModelSpecV1
+    calibration: MassiveAdaptiveForecastCalibrationV2
+    source_data_qualified: bool
+    semantic_receipt_sha256: str
+    profitability_reporting_authorized: bool = False
+    outer_evaluation_authorized: bool = False
+    lockbox_access_authorized: bool = False
+    schema: str = MASSIVE_ADAPTIVE_RL_SUPERVISED_LINEAGE_RUNTIME_SOURCES_V1_SCHEMA
+
+    def semantic_unsigned(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "source_fold_index": self.source_fold_index,
+            "training_window_receipt_sha256": (
+                self.training_window.semantic_receipt_sha256
+            ),
+            "checkpoint_choice_receipt_sha256": (
+                self.checkpoint_choice.semantic_receipt_sha256
+            ),
+            "selected_checkpoint_receipt_sha256": (
+                self.selected_checkpoint.semantic_receipt_sha256
+            ),
+            "selected_checkpoint_source_receipt_sha256": (
+                self.selected_checkpoint.loaded_source.receipt_sha256
+            ),
+            "model_spec_receipt_sha256": self.model_spec.receipt_sha256,
+            "calibration_receipt_sha256": self.calibration.semantic_receipt_sha256,
+            "source_data_qualified": self.source_data_qualified,
+            "profitability_reporting_authorized": (
+                self.profitability_reporting_authorized
+            ),
+            "outer_evaluation_authorized": self.outer_evaluation_authorized,
+            "lockbox_access_authorized": self.lockbox_access_authorized,
+        }
+
+    def validate(self) -> None:
+        for authority in (
+            self.training_window,
+            self.checkpoint_choice,
+            self.selected_checkpoint,
+            self.model_spec,
+            self.calibration,
+        ):
+            authority.validate()
+        expected_qualified = bool(
+            self.training_window.source_windows_replayed
+            and self.checkpoint_choice.source_data_qualified
+            and self.selected_checkpoint.runtime_checkpoint_replayed
+            and self.selected_checkpoint.development_training_authorized
+            and self.calibration.source_data_qualified
+            and self.calibration.runtime_calibration_replayed
+            and self.calibration.development_calibration_authorized
+        )
+        if (
+            self.schema
+            != MASSIVE_ADAPTIVE_RL_SUPERVISED_LINEAGE_RUNTIME_SOURCES_V1_SCHEMA
+            or self.source_fold_index < 0
+            or self.training_window.fold_index != self.source_fold_index
+            or self.training_window.split_role != "training"
+            or self.checkpoint_choice.fold_index != self.source_fold_index
+            or self.calibration.fold_index != self.source_fold_index
+            or self.checkpoint_choice.training_window_plan_receipt_sha256
+            != self.training_window.semantic_receipt_sha256
+            or self.checkpoint_choice.selected_checkpoint_receipt_sha256
+            != self.selected_checkpoint.semantic_receipt_sha256
+            or self.checkpoint_choice.selected_checkpoint_source_receipt_sha256
+            != self.selected_checkpoint.loaded_source.receipt_sha256
+            or self.checkpoint_choice.selected_model_state_receipt_sha256
+            != self.selected_checkpoint.model_state_receipt_sha256
+            or self.checkpoint_choice.training_config_receipt_sha256
+            != self.selected_checkpoint.training_config_receipt_sha256
+            or self.selected_checkpoint.window_plan_receipt_sha256
+            != self.training_window.semantic_receipt_sha256
+            or self.selected_checkpoint.model_spec_receipt_sha256
+            != self.model_spec.receipt_sha256
+            or self.calibration.checkpoint_receipt_sha256
+            != self.selected_checkpoint.semantic_receipt_sha256
+            or self.calibration.checkpoint_source_receipt_sha256
+            != self.selected_checkpoint.loaded_source.receipt_sha256
+            or self.calibration.model_state_receipt_sha256
+            != self.selected_checkpoint.model_state_receipt_sha256
+            or self.calibration.training_window_plan_receipt_sha256
+            != self.training_window.semantic_receipt_sha256
+            or self.source_data_qualified != expected_qualified
+            or self.profitability_reporting_authorized
+            or self.outer_evaluation_authorized
+            or self.lockbox_access_authorized
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL supervised runtime lineage differs"
+            )
+        for value in (
+            self.training_window.semantic_receipt_sha256,
+            self.checkpoint_choice.semantic_receipt_sha256,
+            self.selected_checkpoint.semantic_receipt_sha256,
+            self.selected_checkpoint.loaded_source.receipt_sha256,
+            self.model_spec.receipt_sha256,
+            self.calibration.semantic_receipt_sha256,
+            self.semantic_receipt_sha256,
+        ):
+            _digest("adaptive RL supervised runtime lineage", value)
+        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+
+
+@dataclass(frozen=True, slots=True)
+class MassiveAdaptiveRLFitBlockRuntimeSourcesV1:
+    """Execution-ready sources for one causal PPO fit-forecast block."""
+
+    outer_fold_index: int
+    source_fold_index: int
+    block_index: int
+    forecast_archive: MassiveAdaptiveRLFitForecastArchiveV1
+    inference_plan: MassiveAdaptiveRLFitInferencePlanV1
+    calibration: MassiveAdaptiveForecastCalibrationV2
+    decision_roots: tuple[MassiveAdaptiveDecisionRootV1, ...]
+    context_origins: tuple[MassiveAdaptiveContextOriginAuthorityV1, ...]
+    supervised_lineage_receipt_sha256: str
+    source_data_qualified: bool
+    semantic_receipt_sha256: str
+    profitability_reporting_authorized: bool = False
+    outer_evaluation_authorized: bool = False
+    lockbox_access_authorized: bool = False
+    schema: str = MASSIVE_ADAPTIVE_RL_FIT_BLOCK_RUNTIME_SOURCES_V1_SCHEMA
+
+    def semantic_unsigned(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "outer_fold_index": self.outer_fold_index,
+            "source_fold_index": self.source_fold_index,
+            "block_index": self.block_index,
+            "forecast_archive_receipt_sha256": (
+                self.forecast_archive.semantic_receipt_sha256
+            ),
+            "inference_plan_receipt_sha256": (
+                self.inference_plan.semantic_receipt_sha256
+            ),
+            "calibration_receipt_sha256": self.calibration.semantic_receipt_sha256,
+            "decision_root_receipts": tuple(
+                row.semantic_receipt_sha256 for row in self.decision_roots
+            ),
+            "context_origin_receipts": tuple(
+                row.semantic_receipt_sha256 for row in self.context_origins
+            ),
+            "supervised_lineage_receipt_sha256": (
+                self.supervised_lineage_receipt_sha256
+            ),
+            "source_data_qualified": self.source_data_qualified,
+            "profitability_reporting_authorized": (
+                self.profitability_reporting_authorized
+            ),
+            "outer_evaluation_authorized": self.outer_evaluation_authorized,
+            "lockbox_access_authorized": self.lockbox_access_authorized,
+        }
+
+    def validate(self) -> None:
+        for authority in (
+            self.forecast_archive,
+            self.inference_plan,
+            self.calibration,
+            *self.decision_roots,
+            *self.context_origins,
+        ):
+            cast(Any, authority).validate()
+        runtime_rows = self.forecast_archive.runtime_rows
+        plan_dates = self.inference_plan.origin_session_dates
+        root_dates = tuple(row.decision_session_date for row in self.decision_roots)
+        context_dates = tuple(row.decision_session_date for row in self.context_origins)
+        expected_qualified = bool(
+            self.forecast_archive.committed_source_data_qualified
+            and self.forecast_archive.runtime_forecasts_replayed
+            and self.inference_plan.source_data_qualified
+            and self.inference_plan.source_schedule_replayed
+            and self.calibration.source_data_qualified
+            and self.calibration.runtime_calibration_replayed
+            and all(row.source_data_qualified for row in self.decision_roots)
+            and all(row.source_data_qualified for row in self.context_origins)
+        )
+        if (
+            self.schema != MASSIVE_ADAPTIVE_RL_FIT_BLOCK_RUNTIME_SOURCES_V1_SCHEMA
+            or self.outer_fold_index not in range(4)
+            or self.source_fold_index not in range(self.outer_fold_index + 1)
+            or self.block_index < 0
+            or self.forecast_archive.outer_fold_index != self.outer_fold_index
+            or self.forecast_archive.source_fold_index != self.source_fold_index
+            or self.forecast_archive.block_index != self.block_index
+            or self.inference_plan.outer_fold_index != self.outer_fold_index
+            or self.inference_plan.block_index != self.block_index
+            or self.forecast_archive.inference_plan_receipt_sha256
+            != self.inference_plan.semantic_receipt_sha256
+            or self.forecast_archive.checkpoint_receipt_sha256
+            != self.calibration.checkpoint_receipt_sha256
+            or self.forecast_archive.model_state_receipt_sha256
+            != self.calibration.model_state_receipt_sha256
+            or self.forecast_archive.training_window_plan_receipt_sha256
+            != self.calibration.training_window_plan_receipt_sha256
+            or self.calibration.fold_index != self.source_fold_index
+            or runtime_rows is None
+            or not runtime_rows
+            or self.forecast_archive.origin_session_dates != plan_dates
+            or root_dates != plan_dates
+            or context_dates != plan_dates
+            or tuple(
+                row.decision_root_receipt_sha256 for row in self.inference_plan.rows
+            )
+            != tuple(row.semantic_receipt_sha256 for row in self.decision_roots)
+            or tuple(row.decision_root_receipt_sha256 for row in runtime_rows)
+            != tuple(row.semantic_receipt_sha256 for row in self.decision_roots)
+            or tuple(row.inference_row_receipt_sha256 for row in runtime_rows)
+            != tuple(row.receipt_sha256 for row in self.inference_plan.rows)
+            or any(
+                root.context_origin_receipt_sha256 != context.semantic_receipt_sha256
+                for root, context in zip(
+                    self.decision_roots,
+                    self.context_origins,
+                    strict=True,
+                )
+            )
+            or self.source_data_qualified != expected_qualified
+            or self.profitability_reporting_authorized
+            or self.outer_evaluation_authorized
+            or self.lockbox_access_authorized
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL fit-block runtime sources differ"
+            )
+        for value in (
+            self.forecast_archive.semantic_receipt_sha256,
+            self.inference_plan.semantic_receipt_sha256,
+            self.calibration.semantic_receipt_sha256,
+            self.supervised_lineage_receipt_sha256,
+            self.semantic_receipt_sha256,
+        ):
+            _digest("adaptive RL fit-block runtime sources", value)
+        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+
+
+@dataclass(frozen=True, slots=True)
 class MassiveAdaptiveRLFoldRuntimeSourcesV1:
     outer_fold_index: int
     training_windows: tuple[MassiveAdaptiveWindowPlanV1, ...]
@@ -959,6 +1214,36 @@ class MassiveAdaptiveRLFoldRuntimeSourcesV1:
     fit_forecast_archives: tuple[MassiveAdaptiveRLFitForecastArchiveV1, ...]
     decision_roots: tuple[MassiveAdaptiveDecisionRootV1, ...]
     context_origins: tuple[MassiveAdaptiveContextOriginAuthorityV1, ...]
+    supervised_lineages: tuple[MassiveAdaptiveRLSupervisedLineageSourcesV1, ...]
+    fit_blocks: tuple[MassiveAdaptiveRLFitBlockRuntimeSourcesV1, ...]
+
+    def supervised_lineage(
+        self, source_fold_index: int
+    ) -> MassiveAdaptiveRLSupervisedLineageSourcesV1:
+        if source_fold_index not in range(len(self.supervised_lineages)):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL supervised source-fold lineage is absent"
+            )
+        result = self.supervised_lineages[source_fold_index]
+        if result.source_fold_index != source_fold_index:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL supervised source-fold lineage differs"
+            )
+        return result
+
+    def fit_block(
+        self, block_index: int
+    ) -> MassiveAdaptiveRLFitBlockRuntimeSourcesV1:
+        if block_index not in range(len(self.fit_blocks)):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL fit-block runtime sources are absent"
+            )
+        result = self.fit_blocks[block_index]
+        if result.block_index != block_index:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL fit-block runtime sources differ"
+            )
+        return result
 
     def validate(self) -> None:
         source_folds = tuple(range(self.outer_fold_index + 1))
@@ -969,6 +1254,40 @@ class MassiveAdaptiveRLFoldRuntimeSourcesV1:
             or tuple(row.fold_index for row in self.calibrations) != source_folds
             or tuple(row.block_index for row in self.fit_forecast_archives)
             != tuple(range(len(self.fit_forecast_archives)))
+            or tuple(row.source_fold_index for row in self.supervised_lineages)
+            != source_folds
+            or tuple(row.block_index for row in self.fit_blocks)
+            != tuple(range(len(self.fit_forecast_archives)))
+            or tuple(
+                row.forecast_archive.semantic_receipt_sha256 for row in self.fit_blocks
+            )
+            != tuple(row.semantic_receipt_sha256 for row in self.fit_forecast_archives)
+            or tuple(
+                row.training_window.semantic_receipt_sha256
+                for row in self.supervised_lineages
+            )
+            != tuple(row.semantic_receipt_sha256 for row in self.training_windows)
+            or tuple(
+                row.checkpoint_choice.semantic_receipt_sha256
+                for row in self.supervised_lineages
+            )
+            != tuple(row.semantic_receipt_sha256 for row in self.checkpoint_choices)
+            or tuple(
+                row.calibration.semantic_receipt_sha256
+                for row in self.supervised_lineages
+            )
+            != tuple(row.semantic_receipt_sha256 for row in self.calibrations)
+            or any(
+                block.supervised_lineage_receipt_sha256
+                != self.supervised_lineages[
+                    block.source_fold_index
+                ].semantic_receipt_sha256
+                or block.calibration.semantic_receipt_sha256
+                != self.calibrations[
+                    block.source_fold_index
+                ].semantic_receipt_sha256
+                for block in self.fit_blocks
+            )
             or tuple(row.decision_session_date for row in self.decision_roots)
             != tuple(row.decision_session_date for row in self.context_origins)
         ):
@@ -982,6 +1301,8 @@ class MassiveAdaptiveRLFoldRuntimeSourcesV1:
             self.fit_forecast_archives,
             self.decision_roots,
             self.context_origins,
+            self.supervised_lineages,
+            self.fit_blocks,
         ):
             if not inventory:
                 raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
@@ -1017,6 +1338,18 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
         MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256
     )
     schema: str = MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA
+
+    def fold(self, outer_fold_index: int) -> MassiveAdaptiveRLFoldRuntimeSourcesV1:
+        if outer_fold_index not in range(len(self.folds)):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL outer-fold runtime sources are absent"
+            )
+        result = self.folds[outer_fold_index]
+        if result.outer_fold_index != outer_fold_index:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL outer-fold runtime sources differ"
+            )
+        return result
 
     def semantic_unsigned(self) -> dict[str, object]:
         runtime_receipt = (
@@ -1058,6 +1391,15 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
                 )
                 for fold in self.folds
             ),
+            "fold_execution_view_receipts": tuple(
+                (
+                    tuple(
+                        row.semantic_receipt_sha256 for row in fold.supervised_lineages
+                    ),
+                    tuple(row.semantic_receipt_sha256 for row in fold.fit_blocks),
+                )
+                for fold in self.folds
+            ),
             "replay_dependency_receipts": self.replay_dependency_receipts,
             "source_data_qualified": self.source_data_qualified,
             "profitability_reporting_authorized": (
@@ -1084,6 +1426,12 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
             or self.runtime_source_graph_authority.source_bundle_receipt_sha256
             != self.source_bundle_receipt_sha256
             or tuple(fold.outer_fold_index for fold in self.folds) != tuple(range(4))
+            or any(
+                not row.source_data_qualified
+                for fold in self.folds
+                for inventory in (fold.supervised_lineages, fold.fit_blocks)
+                for row in inventory
+            )
             or not self.persisted_partition_manifests
             or self.replay_dependency_receipts
             != tuple(sorted(set(self.replay_dependency_receipts)))
@@ -1309,7 +1657,8 @@ def _expected_dependencies(
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "RL-fit forecast inference tensor dependency is absent"
             )
-        for date in tensor.decision_session_dates:
+        inference_tensor = cast(MassiveAdaptiveDecisionTensorV1, tensor)
+        for date in inference_tensor.decision_session_dates:
             decision = primary_decisions_by_date.get(date)
             if decision is None:
                 raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
@@ -1420,7 +1769,8 @@ def _expected_dependencies(
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "training forecast decision tensor dependency is absent"
             )
-        for date in tensor.decision_session_dates:
+        training_tensor = cast(MassiveAdaptiveDecisionTensorV1, tensor)
+        for date in training_tensor.decision_session_dates:
             training_decision = primary_decisions_by_date.get(date)
             if training_decision is None:
                 raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
@@ -1461,7 +1811,8 @@ def _expected_dependencies(
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "training authority decision tensor dependency is absent"
             )
-        for date in tensor.decision_session_dates:
+        training_tensor = cast(MassiveAdaptiveDecisionTensorV1, tensor)
+        for date in training_tensor.decision_session_dates:
             decision = primary_decisions_by_date.get(date)
             if decision is None:
                 raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
@@ -2216,6 +2567,181 @@ def _inventory_items_from_map(
     return tuple(authority.runtime_items)
 
 
+def _supervised_lineage_runtime_sources(
+    *,
+    source_fold_index: int,
+    training_window: MassiveAdaptiveWindowPlanV1,
+    checkpoint_choice: MassiveAdaptiveCausalCheckpointChoiceV1,
+    calibration: MassiveAdaptiveForecastCalibrationV2,
+    objects: Mapping[str, object],
+) -> MassiveAdaptiveRLSupervisedLineageSourcesV1:
+    selected = objects.get(checkpoint_choice.selected_checkpoint_receipt_sha256)
+    if type(selected) is not MassiveAdaptiveCheckpointV1:
+        raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+            "selected supervised checkpoint dependency is absent"
+        )
+    checkpoint = cast(MassiveAdaptiveCheckpointV1, selected)
+    model_value = objects.get(checkpoint.model_spec_receipt_sha256)
+    if type(model_value) is not MassiveAdaptiveAlphaModelSpecV1:
+        raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+            "selected supervised model specification dependency is absent"
+        )
+    model_spec = cast(MassiveAdaptiveAlphaModelSpecV1, model_value)
+    source_data_qualified = bool(
+        training_window.source_windows_replayed
+        and checkpoint_choice.source_data_qualified
+        and checkpoint.runtime_checkpoint_replayed
+        and checkpoint.development_training_authorized
+        and calibration.source_data_qualified
+        and calibration.runtime_calibration_replayed
+        and calibration.development_calibration_authorized
+    )
+    provisional = MassiveAdaptiveRLSupervisedLineageSourcesV1(
+        source_fold_index=source_fold_index,
+        training_window=training_window,
+        checkpoint_choice=checkpoint_choice,
+        selected_checkpoint=checkpoint,
+        model_spec=model_spec,
+        calibration=calibration,
+        source_data_qualified=source_data_qualified,
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
+def _fit_block_runtime_sources(
+    *,
+    outer_fold_index: int,
+    archive: MassiveAdaptiveRLFitForecastArchiveV1,
+    inference_plan: MassiveAdaptiveRLFitInferencePlanV1,
+    lineage: MassiveAdaptiveRLSupervisedLineageSourcesV1,
+    decisions_by_date: Mapping[str, MassiveAdaptiveDecisionRootV1],
+    contexts_by_date: Mapping[str, MassiveAdaptiveContextOriginAuthorityV1],
+) -> MassiveAdaptiveRLFitBlockRuntimeSourcesV1:
+    try:
+        decision_roots = tuple(
+            decisions_by_date[date] for date in archive.origin_session_dates
+        )
+        context_origins = tuple(
+            contexts_by_date[date] for date in archive.origin_session_dates
+        )
+    except KeyError as error:
+        raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+            "fit-block primary decision or context dependency is absent"
+        ) from error
+    source_data_qualified = bool(
+        archive.committed_source_data_qualified
+        and archive.runtime_forecasts_replayed
+        and inference_plan.source_data_qualified
+        and inference_plan.source_schedule_replayed
+        and lineage.calibration.source_data_qualified
+        and lineage.calibration.runtime_calibration_replayed
+        and all(row.source_data_qualified for row in decision_roots)
+        and all(row.source_data_qualified for row in context_origins)
+    )
+    provisional = MassiveAdaptiveRLFitBlockRuntimeSourcesV1(
+        outer_fold_index=outer_fold_index,
+        source_fold_index=archive.source_fold_index,
+        block_index=archive.block_index,
+        forecast_archive=archive,
+        inference_plan=inference_plan,
+        calibration=lineage.calibration,
+        decision_roots=decision_roots,
+        context_origins=context_origins,
+        supervised_lineage_receipt_sha256=lineage.semantic_receipt_sha256,
+        source_data_qualified=source_data_qualified,
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
+def _fold_execution_runtime_views(
+    *,
+    outer_fold_index: int,
+    training_windows: tuple[MassiveAdaptiveWindowPlanV1, ...],
+    checkpoint_choices: tuple[MassiveAdaptiveCausalCheckpointChoiceV1, ...],
+    calibrations: tuple[MassiveAdaptiveForecastCalibrationV2, ...],
+    fit_forecast_archives: tuple[MassiveAdaptiveRLFitForecastArchiveV1, ...],
+    decision_roots: tuple[MassiveAdaptiveDecisionRootV1, ...],
+    context_origins: tuple[MassiveAdaptiveContextOriginAuthorityV1, ...],
+    objects: Mapping[str, object],
+) -> tuple[
+    tuple[MassiveAdaptiveRLSupervisedLineageSourcesV1, ...],
+    tuple[MassiveAdaptiveRLFitBlockRuntimeSourcesV1, ...],
+]:
+    window_by_fold = {row.fold_index: row for row in training_windows}
+    choice_by_fold = {row.fold_index: row for row in checkpoint_choices}
+    calibration_by_fold = {row.fold_index: row for row in calibrations}
+    source_folds = tuple(range(outer_fold_index + 1))
+    if (
+        tuple(sorted(window_by_fold)) != source_folds
+        or tuple(sorted(choice_by_fold)) != source_folds
+        or tuple(sorted(calibration_by_fold)) != source_folds
+        or len(window_by_fold) != len(training_windows)
+        or len(choice_by_fold) != len(checkpoint_choices)
+        or len(calibration_by_fold) != len(calibrations)
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+            "fold execution lineage inventory differs"
+        )
+    lineages = tuple(
+        _supervised_lineage_runtime_sources(
+            source_fold_index=source_fold_index,
+            training_window=window_by_fold[source_fold_index],
+            checkpoint_choice=choice_by_fold[source_fold_index],
+            calibration=calibration_by_fold[source_fold_index],
+            objects=objects,
+        )
+        for source_fold_index in source_folds
+    )
+    lineage_by_fold = {row.source_fold_index: row for row in lineages}
+    decisions_by_date = {row.decision_session_date: row for row in decision_roots}
+    contexts_by_date = {row.decision_session_date: row for row in context_origins}
+    if len(decisions_by_date) != len(decision_roots) or len(contexts_by_date) != len(
+        context_origins
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+            "fold execution decision or context date is duplicated"
+        )
+    fit_blocks: list[MassiveAdaptiveRLFitBlockRuntimeSourcesV1] = []
+    for archive in fit_forecast_archives:
+        plan_value = objects.get(archive.inference_plan_receipt_sha256)
+        if type(plan_value) is not MassiveAdaptiveRLFitInferencePlanV1:
+            raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                "fit-block inference-plan dependency is absent"
+            )
+        try:
+            lineage = lineage_by_fold[archive.source_fold_index]
+        except KeyError as error:
+            raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                "fit-block supervised lineage dependency is absent"
+            ) from error
+        fit_blocks.append(
+            _fit_block_runtime_sources(
+                outer_fold_index=outer_fold_index,
+                archive=archive,
+                inference_plan=cast(
+                    MassiveAdaptiveRLFitInferencePlanV1,
+                    plan_value,
+                ),
+                lineage=lineage,
+                decisions_by_date=decisions_by_date,
+                contexts_by_date=contexts_by_date,
+            )
+        )
+    return lineages, tuple(fit_blocks)
+
+
 def _reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
     *, source_root: str | Path, manifest: MassiveAdaptiveRLExperimentManifestV3
 ) -> MassiveAdaptiveRLRuntimeSourcesV1:
@@ -2276,86 +2802,92 @@ def _reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
         )
     folds: list[MassiveAdaptiveRLFoldRuntimeSourcesV1] = []
     for fold_index in range(4):
+        training_windows = tuple(
+            sorted(
+                cast(
+                    tuple[MassiveAdaptiveWindowPlanV1, ...],
+                    _inventory_items_from_map(
+                        runtime_sources,
+                        role="training-window-inventory",
+                        fold_index=fold_index,
+                    ),
+                ),
+                key=lambda row: row.fold_index,
+            )
+        )
+        checkpoint_choices = tuple(
+            sorted(
+                cast(
+                    tuple[MassiveAdaptiveCausalCheckpointChoiceV1, ...],
+                    _inventory_items_from_map(
+                        runtime_sources,
+                        role="supervised-checkpoint-inventory",
+                        fold_index=fold_index,
+                    ),
+                ),
+                key=lambda row: row.fold_index,
+            )
+        )
+        calibrations = tuple(
+            sorted(
+                cast(
+                    tuple[MassiveAdaptiveForecastCalibrationV2, ...],
+                    _inventory_items_from_map(
+                        runtime_sources,
+                        role="calibration-inventory",
+                        fold_index=fold_index,
+                    ),
+                ),
+                key=lambda row: row.fold_index,
+            )
+        )
+        fit_forecast_archives = tuple(
+            sorted(
+                cast(
+                    tuple[MassiveAdaptiveRLFitForecastArchiveV1, ...],
+                    _inventory_items_from_map(
+                        runtime_sources,
+                        role="fit-forecast-archive-inventory",
+                        fold_index=fold_index,
+                    ),
+                ),
+                key=lambda row: row.block_index,
+            )
+        )
+        decision_roots = decisions_by_fold[fold_index]
+        context_origins = tuple(
+            sorted(
+                cast(
+                    tuple[MassiveAdaptiveContextOriginAuthorityV1, ...],
+                    _inventory_items_from_map(
+                        runtime_sources,
+                        role="context-origin-inventory",
+                        fold_index=fold_index,
+                    ),
+                ),
+                key=lambda row: row.decision_session_date,
+            )
+        )
+        supervised_lineages, fit_blocks = _fold_execution_runtime_views(
+            outer_fold_index=fold_index,
+            training_windows=training_windows,
+            checkpoint_choices=checkpoint_choices,
+            calibrations=calibrations,
+            fit_forecast_archives=fit_forecast_archives,
+            decision_roots=decision_roots,
+            context_origins=context_origins,
+            objects=objects,
+        )
         fold = MassiveAdaptiveRLFoldRuntimeSourcesV1(
             outer_fold_index=fold_index,
-            training_windows=tuple(
-                sorted(
-                    cast(
-                        tuple[MassiveAdaptiveWindowPlanV1, ...],
-                        _inventory_items_from_map(
-                            runtime_sources,
-                            role="training-window-inventory",
-                            fold_index=fold_index,
-                        ),
-                    ),
-                    key=lambda row: row.fold_index,
-                )
-            ),
-            checkpoint_choices=tuple(
-                sorted(
-                    cast(
-                        tuple[MassiveAdaptiveCausalCheckpointChoiceV1, ...],
-                        _inventory_items_from_map(
-                            runtime_sources,
-                            role="supervised-checkpoint-inventory",
-                            fold_index=fold_index,
-                        ),
-                    ),
-                    key=lambda row: row.fold_index,
-                )
-            ),
-            calibrations=tuple(
-                sorted(
-                    cast(
-                        tuple[MassiveAdaptiveForecastCalibrationV2, ...],
-                        _inventory_items_from_map(
-                            runtime_sources,
-                            role="calibration-inventory",
-                            fold_index=fold_index,
-                        ),
-                    ),
-                    key=lambda row: row.fold_index,
-                )
-            ),
-            fit_forecast_archives=tuple(
-                sorted(
-                    cast(
-                        tuple[MassiveAdaptiveRLFitForecastArchiveV1, ...],
-                        _inventory_items_from_map(
-                            runtime_sources,
-                            role="fit-forecast-archive-inventory",
-                            fold_index=fold_index,
-                        ),
-                    ),
-                    key=lambda row: row.block_index,
-                )
-            ),
-            decision_roots=tuple(
-                sorted(
-                    cast(
-                        tuple[MassiveAdaptiveDecisionRootV1, ...],
-                        _inventory_items_from_map(
-                            runtime_sources,
-                            role="decision-root-inventory",
-                            fold_index=fold_index,
-                        ),
-                    ),
-                    key=lambda row: row.decision_session_date,
-                )
-            ),
-            context_origins=tuple(
-                sorted(
-                    cast(
-                        tuple[MassiveAdaptiveContextOriginAuthorityV1, ...],
-                        _inventory_items_from_map(
-                            runtime_sources,
-                            role="context-origin-inventory",
-                            fold_index=fold_index,
-                        ),
-                    ),
-                    key=lambda row: row.decision_session_date,
-                )
-            ),
+            training_windows=training_windows,
+            checkpoint_choices=checkpoint_choices,
+            calibrations=calibrations,
+            fit_forecast_archives=fit_forecast_archives,
+            decision_roots=decision_roots,
+            context_origins=context_origins,
+            supervised_lineages=supervised_lineages,
+            fit_blocks=fit_blocks,
         )
         fold.validate()
         folds.append(fold)
@@ -2459,9 +2991,12 @@ def reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
 __all__ = [
     "MASSIVE_ADAPTIVE_RL_REPLAY_DEPENDENCY_INDEX_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_REPLAY_DEPENDENCY_V1_SCHEMA",
+    "MASSIVE_ADAPTIVE_RL_FIT_BLOCK_RUNTIME_SOURCES_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_RUNTIME_OBJECT_SNAPSHOT_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256",
+    "MASSIVE_ADAPTIVE_RL_SUPERVISED_LINEAGE_RUNTIME_SOURCES_V1_SCHEMA",
+    "MassiveAdaptiveRLFitBlockRuntimeSourcesV1",
     "MassiveAdaptiveRLFoldRuntimeSourcesV1",
     "MassiveAdaptiveRLReplayDependencyIndexV1",
     "MassiveAdaptiveRLReplayDependencyV1",
@@ -2471,6 +3006,7 @@ __all__ = [
     "MassiveAdaptiveRLRuntimeSourceReconstructionV1Error",
     "MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable",
     "MassiveAdaptiveRLRuntimeSourcesV1",
+    "MassiveAdaptiveRLSupervisedLineageSourcesV1",
     "load_massive_adaptive_rl_replay_dependency_index_v1",
     "materialize_massive_adaptive_rl_replay_dependency_index_v1",
     "reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1",

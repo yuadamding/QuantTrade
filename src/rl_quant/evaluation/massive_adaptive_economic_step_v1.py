@@ -28,20 +28,14 @@ from rl_quant.evaluation.massive_adaptive_execution_result_v1 import (
     execute_massive_adaptive_order_intent_v1,
 )
 from rl_quant.evaluation.massive_adaptive_forecast_archive_v2 import (
-    MassiveAdaptiveForecastArchiveV2,
     MassiveAdaptiveForecastRowV2,
 )
 from rl_quant.evaluation.massive_adaptive_forecast_calibration_v2 import (
     MassiveAdaptiveForecastCalibrationV2,
 )
-from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
-    MassiveAdaptiveInferenceRowV1,
-)
-from rl_quant.evaluation.massive_adaptive_outer_forecast_archive_v1 import (
-    MassiveAdaptiveOuterForecastArchiveV1,
-)
-from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
-    MassiveAdaptiveOuterInferenceRowV1,
+from rl_quant.evaluation.massive_adaptive_forecast_runtime_protocol_v1 import (
+    MassiveAdaptiveForecastRuntimeProtocol,
+    MassiveAdaptiveInferenceRowRuntimeProtocol,
 )
 from rl_quant.execution.massive_adaptive_economic_book_v1 import (
     MassiveAdaptiveEconomicBookV1,
@@ -82,9 +76,7 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 MASSIVE_ADAPTIVE_PREPARED_STEP_V1_SCHEMA = (
     "rl-quant.massive-adaptive-prepared-economic-step-v1"
 )
-MASSIVE_ADAPTIVE_ECONOMIC_STEP_V1_SCHEMA = (
-    "rl-quant.massive-adaptive-economic-step-v1"
-)
+MASSIVE_ADAPTIVE_ECONOMIC_STEP_V1_SCHEMA = "rl-quant.massive-adaptive-economic-step-v1"
 MASSIVE_ADAPTIVE_ECONOMIC_STEP_V1_SPEC_SHA256 = semantic_sha256(
     {
         "chronology": "decision-close-next-session-morning-fill-next-close-mark",
@@ -183,31 +175,28 @@ class MassiveAdaptivePreparedStepV1:
             != self.neutral_pretrade_book.semantic_receipt_sha256
             or self.benchmark_authority.benchmark_book_receipt_sha256
             != self.benchmark_pretrade_book.semantic_receipt_sha256
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveEconomicStepV1Error(
                 "prepared adaptive economic step differs"
             )
-        for value in (
+        for receipt in (
             self.forecast_row_receipt_sha256,
             self.inference_row_receipt_sha256,
             self.source_inventory_sha256,
             self.semantic_receipt_sha256,
         ):
-            _digest(value)
+            _digest(receipt)
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
 def prepare_massive_adaptive_economic_step_v1(
     *,
-    forecast_archive: MassiveAdaptiveForecastArchiveV2
-    | MassiveAdaptiveOuterForecastArchiveV1,
+    forecast_archive: MassiveAdaptiveForecastRuntimeProtocol,
     forecast_row: MassiveAdaptiveForecastRowV2,
     calibration: MassiveAdaptiveForecastCalibrationV2,
-    inference_row: MassiveAdaptiveInferenceRowV1 | MassiveAdaptiveOuterInferenceRowV1,
+    inference_row: MassiveAdaptiveInferenceRowRuntimeProtocol,
     decision_root: MassiveAdaptiveDecisionRootV1,
     context_origin: MassiveAdaptiveContextOriginAuthorityV1,
     strategy_book: MassiveAdaptiveEconomicBookV1,
@@ -240,7 +229,7 @@ def prepare_massive_adaptive_economic_step_v1(
         decision_session_date=inference_row.decision_session_date,
         security_ids=axis,
         forecast_security_ids=forecast_row.security_ids,
-        forecast_valid=forecast_row.valid,
+        forecast_valid=tuple(bool(value) for value in forecast_row.valid),
         forecast_row_receipt_sha256=forecast_row.receipt_sha256,
         benchmark_book=benchmark_book,
         source_data_qualified=archive_qualified,
@@ -412,9 +401,7 @@ def _execute_frozen_target(
         security_ids=required,
         daily=daily_input_authority,
     )
-    target_receipt = semantic_sha256(
-        (decision.security_ids, decision.target_weights)
-    )
+    target_receipt = semantic_sha256((decision.security_ids, decision.target_weights))
     intent = build_massive_adaptive_target_order_intent_v1(
         decision_session_date=prepared.decision_session_date,
         scheduled_fill_session_date=prepared.fill_session_date,
@@ -529,17 +516,15 @@ class MassiveAdaptiveEconomicStepV1:
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
             or self.reinforcement_learning_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_ECONOMIC_STEP_V1_SPEC_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveEconomicStepV1Error(
                 "settled adaptive economic step differs"
             )
-        for value in (
+        for receipt in (
             self.prepared_step_receipt_sha256,
             self.policy_action_receipt_sha256,
             self.policy_control_receipt_sha256,
@@ -550,12 +535,11 @@ class MassiveAdaptiveEconomicStepV1:
             self.semantic_receipt_sha256,
         ):
             _digest(
-                value,
-                optional=value is None,
+                receipt,
+                optional=receipt is None,
             )
         if self.neutral_equivalence and (
-            self.policy_decision_receipt_sha256
-            != self.neutral_decision_receipt_sha256
+            self.policy_decision_receipt_sha256 != self.neutral_decision_receipt_sha256
             or self.strategy_execution != self.neutral_execution
             or self.strategy_posttrade_book != self.neutral_posttrade_book
             or self.incremental_rl_log_return != 0.0
@@ -588,16 +572,13 @@ def settle_massive_adaptive_economic_step_v1(
     policy_decision.validate()
     neutral_decision.validate()
     if not isinstance(frozen_targets_replayed, bool):
-        raise MassiveAdaptiveEconomicStepV1Error(
-            "frozen-target replay flag is invalid"
-        )
+        raise MassiveAdaptiveEconomicStepV1Error("frozen-target replay flag is invalid")
     if policy_control is not None:
         policy_control.validate()
         if (
             policy_control.adjusted_input_receipt_sha256
             != policy_decision.input_receipt_sha256
-            or policy_control_receipt_sha256
-            != policy_control.semantic_receipt_sha256
+            or policy_control_receipt_sha256 != policy_control.semantic_receipt_sha256
             or (
                 not frozen_targets_replayed
                 and policy_control.base_input_receipt_sha256
@@ -614,7 +595,10 @@ def settle_massive_adaptive_economic_step_v1(
         raise MassiveAdaptiveEconomicStepV1Error(
             "policy decision did not consume the prepared compiler input"
         )
-    if neutral_decision.input_receipt_sha256 != prepared.neutral_compiler_inputs.receipt_sha256:
+    if (
+        neutral_decision.input_receipt_sha256
+        != prepared.neutral_compiler_inputs.receipt_sha256
+    ):
         raise MassiveAdaptiveEconomicStepV1Error(
             "neutral decision did not consume the prepared compiler input"
         )
@@ -716,8 +700,7 @@ def settle_massive_adaptive_economic_step_v1(
     incremental = strategy_log - neutral_log
     neutral_equivalence = bool(
         not frozen_targets_replayed
-        and
-        policy_decision.semantic_receipt_sha256
+        and policy_decision.semantic_receipt_sha256
         == neutral_decision.semantic_receipt_sha256
         and prepared.strategy_pretrade_book == prepared.neutral_pretrade_book
     )

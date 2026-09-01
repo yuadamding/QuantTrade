@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import NDArray
 
 from rl_quant.alpha.pit_universe import PITSecurityUniverseAuthority
 from rl_quant.evaluation.massive_adaptive_benchmark_authority_v1 import (
@@ -20,14 +21,12 @@ from rl_quant.evaluation.massive_adaptive_forecast_archive_v2 import (
 from rl_quant.evaluation.massive_adaptive_forecast_calibration_v2 import (
     MassiveAdaptiveForecastCalibrationV2,
 )
-from rl_quant.evaluation.massive_adaptive_inference_plan_v1 import (
-    MassiveAdaptiveInferenceRowV1,
+from rl_quant.evaluation.massive_adaptive_forecast_runtime_protocol_v1 import (
+    MassiveAdaptiveForecastRuntimeProtocol,
+    MassiveAdaptiveInferenceRowRuntimeProtocol,
 )
 from rl_quant.evaluation.massive_adaptive_outer_forecast_archive_v1 import (
     MassiveAdaptiveOuterForecastArchiveV1,
-)
-from rl_quant.evaluation.massive_adaptive_outer_inference_plan_v1 import (
-    MassiveAdaptiveOuterInferenceRowV1,
 )
 from rl_quant.execution.massive_adaptive_economic_book_v1 import (
     MassiveAdaptiveEconomicBookV1,
@@ -161,7 +160,7 @@ class MassiveAdaptiveCompilerInputAuthorityV2:
 
 
 def _forecast_lineage(
-    archive: MassiveAdaptiveForecastArchiveV2 | MassiveAdaptiveOuterForecastArchiveV1,
+    archive: MassiveAdaptiveForecastRuntimeProtocol,
 ) -> tuple[int, str, str, str, bool]:
     if isinstance(archive, MassiveAdaptiveForecastArchiveV2):
         return (
@@ -186,24 +185,28 @@ def _forecast_lineage(
         raise MassiveAdaptiveCompilerInputAuthorityV2Error(
             "compiler v2 requires checkpoint-bound forecast lineage"
         )
+    lineage_fold = getattr(archive, "source_fold_index", archive.fold_index)
     return (
-        int(getattr(archive, "fold_index")),
+        int(lineage_fold),
         str(checkpoint),
         str(getattr(archive, "model_state_receipt_sha256")),
         str(getattr(archive, "training_window_plan_receipt_sha256")),
-        False,
+        bool(
+            getattr(archive, "development_forecast_authorized", False)
+            or getattr(archive, "outer_forecast_authorized", False)
+        ),
     )
 
 
 def build_massive_adaptive_compiler_input_authority_v2(
     *,
-    forecast_archive: MassiveAdaptiveForecastArchiveV2 | MassiveAdaptiveOuterForecastArchiveV1,
+    forecast_archive: MassiveAdaptiveForecastRuntimeProtocol,
     forecast_row: MassiveAdaptiveForecastRowV2,
     calibration: MassiveAdaptiveForecastCalibrationV2,
     benchmark_authority: MassiveAdaptiveBenchmarkAuthorityV1,
     decision_root: MassiveAdaptiveDecisionRootV1,
     context_origin: MassiveAdaptiveContextOriginAuthorityV1,
-    inference_row: MassiveAdaptiveInferenceRowV1 | MassiveAdaptiveOuterInferenceRowV1,
+    inference_row: MassiveAdaptiveInferenceRowRuntimeProtocol,
     book: MassiveAdaptiveEconomicBookV1,
     daily_input_authority: MassiveProfitabilityDailyInputAuthorityV1,
     identity_authority: PITSecurityUniverseAuthority,
@@ -222,9 +225,11 @@ def build_massive_adaptive_compiler_input_authority_v2(
         identity_authority,
     ):
         value.validate()
-    inference_row.validate(maximum_context_sessions=len(inference_row.context_session_dates))
-    fold, checkpoint, model_state, training_window, archive_qualified = _forecast_lineage(
-        forecast_archive
+    inference_row.validate(
+        maximum_context_sessions=len(inference_row.context_session_dates)
+    )
+    fold, checkpoint, model_state, training_window, archive_qualified = (
+        _forecast_lineage(forecast_archive)
     )
     if (
         forecast_archive.runtime_rows is None
@@ -239,8 +244,10 @@ def build_massive_adaptive_compiler_input_authority_v2(
         or forecast_row.decision_session_date != decision_root.decision_session_date
         or forecast_row.decision_session_date != inference_row.decision_session_date
         or forecast_row.decision_session_date != book.decision_session_date
-        or benchmark_authority.decision_session_date != forecast_row.decision_session_date
-        or benchmark_authority.benchmark_book_receipt_sha256 == book.semantic_receipt_sha256
+        or benchmark_authority.decision_session_date
+        != forecast_row.decision_session_date
+        or benchmark_authority.benchmark_book_receipt_sha256
+        == book.semantic_receipt_sha256
         or forecast_row.decision_root_receipt_sha256
         != decision_root.semantic_receipt_sha256
         or forecast_row.inference_row_receipt_sha256 != inference_row.receipt_sha256
@@ -255,10 +262,7 @@ def build_massive_adaptive_compiler_input_authority_v2(
         )
     axis = benchmark_authority.security_ids
     expected_axis = tuple(
-        sorted(
-            set(forecast_row.security_ids)
-            | set(book.shares_by_security())
-        )
+        sorted(set(forecast_row.security_ids) | set(book.shares_by_security()))
     )
     if not set(expected_axis) <= set(axis):
         raise MassiveAdaptiveCompilerInputAuthorityV2Error(
@@ -273,12 +277,16 @@ def build_massive_adaptive_compiler_input_authority_v2(
     bias = np.asarray(calibration.mean_bias, dtype=np.float64)
     multiplier = np.asarray(calibration.scale_multiplier, dtype=np.float64)
     correlation = np.asarray(calibration.horizon_error_correlation, dtype=np.float64)
-    expected = np.zeros((len(axis), bucket_count), dtype=np.float64)
+    expected: NDArray[np.float64] = np.zeros(
+        (len(axis), bucket_count), dtype=np.float64
+    )
     scales = np.ones_like(expected)
-    valid = np.zeros(len(axis), dtype=bool)
+    valid: NDArray[np.bool_] = np.zeros(len(axis), dtype=np.bool_)
     index_by_security = {security_id: index for index, security_id in enumerate(axis)}
     means = forecast_row.residual_mean.numpy().astype(np.float64) + bias
-    calibrated_scales = forecast_row.residual_scale.numpy().astype(np.float64) * multiplier
+    calibrated_scales = (
+        forecast_row.residual_scale.numpy().astype(np.float64) * multiplier
+    )
     for forecast_index, security_id in enumerate(forecast_row.security_ids):
         index = index_by_security[security_id]
         expected[index] = means[forecast_index]
@@ -299,7 +307,7 @@ def build_massive_adaptive_compiler_input_authority_v2(
         [weight > 0.0 and not valid[index] for index, weight in enumerate(pretrade)],
         dtype=bool,
     )
-    cost = np.full(len(axis), 20.0, dtype=np.float64)
+    cost: NDArray[np.float64] = np.full(len(axis), 20.0, dtype=np.float64)
     risk_receipt = semantic_sha256(
         {
             "daily": daily_input_authority.semantic_receipt_sha256,
