@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
@@ -27,6 +29,23 @@ MASSIVE_ADAPTIVE_PPO_POLICY_V1_SPEC_SHA256 = semantic_sha256(
         "hard_turnover_limit_control": False,
         "deterministic_action": "tanh-normal-mean",
         "duration_semantics": False,
+        "implementation_source_sha256": (
+            MASSIVE_ADAPTIVE_PPO_POLICY_V1_SOURCE_SHA256
+        ),
+    }
+)
+MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256 = semantic_sha256(
+    {
+        "model": "massive-adaptive-ppo-actor-critic-v1",
+        "observation_dimension": 90,
+        "hidden_dimension": 128,
+        "observation_key": "adaptive_state",
+        "actor_critic_hidden_initialization": "orthogonal-gain-sqrt-two",
+        "actor_mean_initialization": "zeros",
+        "actor_log_standard_deviation_initialization": -2.0,
+        "value_head_initialization": "zeros",
+        "seed_source": "experiment-manifest-canonical-seed",
+        "rng_scope": "forked-cpu-default-generator-restored",
         "implementation_source_sha256": (
             MASSIVE_ADAPTIVE_PPO_POLICY_V1_SOURCE_SHA256
         ),
@@ -187,8 +206,64 @@ class MassiveAdaptivePPOActorCriticV1(PPOActorCritic):
         return PPOModelOutput(distribution=distribution, value=value, recurrent_state={})
 
 
+def massive_adaptive_ppo_model_state_receipt_v1(
+    model: MassiveAdaptivePPOActorCriticV1,
+) -> str:
+    """Return the canonical tensor identity of one adaptive PPO model."""
+
+    if type(model) is not MassiveAdaptivePPOActorCriticV1:
+        raise ValueError("adaptive PPO model type differs")
+    rows: list[tuple[str, str, tuple[str, tuple[int, ...], str]]] = []
+    for key, value in sorted(model.state_dict().items()):
+        tensor = value.detach().cpu().contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(tensor.dtype).encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        rows.append(
+            (
+                "str",
+                key,
+                (str(tensor.dtype), tuple(tensor.shape), digest.hexdigest()),
+            )
+        )
+    return semantic_sha256(tuple(rows))
+
+
+def build_seeded_massive_adaptive_ppo_model_v1(
+    *,
+    seed: int,
+) -> MassiveAdaptivePPOActorCriticV1:
+    """Construct the registered model without consuming ambient RNG state."""
+
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("adaptive PPO model initialization seed differs")
+    generator = torch.Generator(device="cpu")
+    try:
+        generator.manual_seed(seed)
+    except RuntimeError as error:
+        raise ValueError("adaptive PPO model initialization seed differs") from error
+    with torch.random.fork_rng(devices=[], enabled=True):
+        torch.set_rng_state(generator.get_state())
+        model = MassiveAdaptivePPOActorCriticV1(observation_dim=90)
+    return model
+
+
+@lru_cache(maxsize=64, typed=True)
+def massive_adaptive_ppo_initial_model_state_receipt_v1(*, seed: int) -> str:
+    """Replay the registered seeded initial state once per process and seed."""
+
+    return massive_adaptive_ppo_model_state_receipt_v1(
+        build_seeded_massive_adaptive_ppo_model_v1(seed=seed)
+    )
+
+
 __all__ = [
     "MASSIVE_ADAPTIVE_PPO_ACTION_DIMENSION_V1",
+    "MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256",
     "MassiveAdaptiveBoundedControlDistributionV1",
     "MassiveAdaptivePPOActorCriticV1",
+    "build_seeded_massive_adaptive_ppo_model_v1",
+    "massive_adaptive_ppo_initial_model_state_receipt_v1",
+    "massive_adaptive_ppo_model_state_receipt_v1",
 ]

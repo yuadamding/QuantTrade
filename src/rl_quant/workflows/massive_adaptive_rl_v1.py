@@ -45,8 +45,11 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     assert_no_adaptive_hold_semantics,
 )
 from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
+    MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_PPO_POLICY_V1_SPEC_SHA256,
-    MassiveAdaptivePPOActorCriticV1,
+    build_seeded_massive_adaptive_ppo_model_v1,
+    massive_adaptive_ppo_initial_model_state_receipt_v1,
+    massive_adaptive_ppo_model_state_receipt_v1,
 )
 from rl_quant.training.massive_adaptive_ppo_v1 import (
     MASSIVE_ADAPTIVE_RL_ACTION_SPECIFICATION_V1_SHA256,
@@ -110,6 +113,7 @@ MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256 = semantic_sha256(
         "caller_returns": False,
         "validation_context": "one-shared-receipt-for-all-candidates-and-controls",
         "seed_policy": "one-canonical-predeclared-seed-no-selection",
+        "model_initialization": "scoped-manifest-seed-before-construction",
         "validation_access_during_fit": False,
         "outer_access": False,
         "lockbox_access": False,
@@ -382,6 +386,8 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
     experiment_manifest_receipt_sha256: str
     fold_index: int
     seed: int
+    model_initialization_specification_sha256: str
+    initial_model_state_receipt_sha256: str
     training_forecast_authority_receipt_sha256: str
     chronology_authority_receipt_sha256: str
     fixed_control_fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1
@@ -412,6 +418,12 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
             ),
             "fold_index": self.fold_index,
             "seed": self.seed,
+            "model_initialization_specification_sha256": (
+                self.model_initialization_specification_sha256
+            ),
+            "initial_model_state_receipt_sha256": (
+                self.initial_model_state_receipt_sha256
+            ),
             "training_forecast_authority_receipt_sha256": (
                 self.training_forecast_authority_receipt_sha256
             ),
@@ -465,10 +477,24 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
             and len(policy_updates) == len(self.policy_checkpoint_authorities)
         )
         expected = runtime and self.source_data_qualified
+        seed_valid = bool(
+            not isinstance(self.seed, bool)
+            and isinstance(self.seed, int)
+            and 0 <= self.seed < 2**64
+        )
+        expected_initial_model_state_receipt = None
+        if seed_valid:
+            expected_initial_model_state_receipt = (
+                massive_adaptive_ppo_initial_model_state_receipt_v1(seed=self.seed)
+            )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_TRAINING_WORKFLOW_V1_SCHEMA
             or self.fold_index < 0
-            or self.seed < 0
+            or not seed_valid
+            or self.model_initialization_specification_sha256
+            != MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
+            or self.initial_model_state_receipt_sha256
+            != expected_initial_model_state_receipt
             or self.candidate_update_indices != runner_updates
             or self.candidate_update_indices != policy_updates
             or self.runner_checkpoint_inventory_sha256
@@ -510,6 +536,11 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
             raise MassiveAdaptiveRLWorkflowV1Error(
                 "adaptive RL training workflow differs"
             )
+        for value in (
+            self.model_initialization_specification_sha256,
+            self.initial_model_state_receipt_sha256,
+        ):
+            _digest("adaptive RL model initialization", value)
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
@@ -670,7 +701,8 @@ def run_massive_adaptive_rl_training_workflow_v1(
         )
     config = replace(manifest.ppo_config, seed=seed)
     config.validate()
-    model = MassiveAdaptivePPOActorCriticV1(observation_dim=90)
+    model = build_seeded_massive_adaptive_ppo_model_v1(seed=seed)
+    initial_model_state_receipt = massive_adaptive_ppo_model_state_receipt_v1(model)
     runner = MassiveAdaptivePrequentialPPORunnerV1(
         training_authority=training_authority,
         chronology_authority=chronology_authority,
@@ -762,6 +794,10 @@ def run_massive_adaptive_rl_training_workflow_v1(
         "experiment_manifest_receipt_sha256": manifest.semantic_receipt_sha256,
         "fold_index": fold_index,
         "seed": seed,
+        "model_initialization_specification_sha256": (
+            MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
+        ),
+        "initial_model_state_receipt_sha256": initial_model_state_receipt,
         "training_forecast_authority_receipt_sha256": (
             training_authority.semantic_receipt_sha256
         ),

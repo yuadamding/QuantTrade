@@ -18,7 +18,10 @@ from rl_quant.features.massive_adaptive_decision_root_v1 import (
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
+    MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256,
     MassiveAdaptivePPOActorCriticV1,
+    build_seeded_massive_adaptive_ppo_model_v1,
+    massive_adaptive_ppo_model_state_receipt_v1,
 )
 from rl_quant.training.massive_adaptive_prequential_ppo_runner_v1 import (
     MassiveAdaptivePrequentialPPORunnerV1,
@@ -330,7 +333,11 @@ def test_manifest_v3_registry_executes_genuine_prefix_ppo_update(
             development_rl_training_authorized=True,
         )
     )
-    model = MassiveAdaptivePPOActorCriticV1(observation_dim=90)
+    torch.manual_seed(111)
+    model = build_seeded_massive_adaptive_ppo_model_v1(
+        seed=manifest.base_manifest.seeds[0]
+    )
+    initial_model_receipt = massive_adaptive_ppo_model_state_receipt_v1(model)
     before = {
         name: value.detach().clone() for name, value in model.state_dict().items()
     }
@@ -363,6 +370,44 @@ def test_manifest_v3_registry_executes_genuine_prefix_ppo_update(
     assert any(
         not torch.equal(before[name], value)
         for name, value in model.state_dict().items()
+    )
+
+    torch.manual_seed(222)
+    repeated_model = build_seeded_massive_adaptive_ppo_model_v1(
+        seed=manifest.base_manifest.seeds[0]
+    )
+    assert (
+        massive_adaptive_ppo_model_state_receipt_v1(repeated_model)
+        == initial_model_receipt
+    )
+    repeated = MassiveAdaptivePrequentialPPORunnerV1(
+        training_authority=training,
+        chronology_authority=chronology,
+        environments=registry.build_environments(),
+        fit_environment_authorities={
+            receipt: registry.authority(receipt)
+            for receipt in registry.forecast_archive_receipts
+        },
+        model=repeated_model,
+        config=manifest.base_manifest.ppo_config,
+        device="cpu",
+    )
+    repeated.run_next_update()
+    repeated_checkpoint = repeated.checkpoint()
+    assert (
+        repeated_checkpoint.ppo_checkpoint.model_state_receipt_sha256
+        == checkpoint.ppo_checkpoint.model_state_receipt_sha256
+    )
+    assert (
+        repeated_checkpoint.ppo_checkpoint.transition_receipts
+        == checkpoint.ppo_checkpoint.transition_receipts
+    )
+    assert (
+        repeated_checkpoint.ppo_checkpoint.loss_trace
+        == checkpoint.ppo_checkpoint.loss_trace
+    )
+    assert repeated_checkpoint.semantic_receipt_sha256 == (
+        checkpoint.semantic_receipt_sha256
     )
 
     resumed = MassiveAdaptivePrequentialPPORunnerV1(
@@ -412,6 +457,18 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
     assert result.source_data_qualified
     assert result.development_rl_training_authorized
     assert not result.profitability_reporting_authorized
+    assert result.training_seed == manifest.base_manifest.seeds[0]
+    assert result.model_initialization_specification_sha256 == (
+        MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
+    )
+    assert result.initial_model_state_receipt_sha256 == (
+        massive_adaptive_ppo_model_state_receipt_v1(
+            build_seeded_massive_adaptive_ppo_model_v1(seed=result.training_seed)
+        )
+    )
+    assert result.training_workflow.runtime_workflow.initial_model_state_receipt_sha256 == (
+        result.initial_model_state_receipt_sha256
+    )
     assert result.transition_decision_session_dates == (
         result.training_forecast_authority.origin_session_dates
     )
@@ -471,3 +528,19 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
     )
     with pytest.raises(MassiveAdaptiveRLFoldFitV1Error, match="differs"):
         overstated.validate()
+
+    changed_initial_state = replace(
+        result,
+        initial_model_state_receipt_sha256=semantic_sha256(
+            "changed-initial-model-state"
+        ),
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed_initial_state = replace(
+        changed_initial_state,
+        semantic_receipt_sha256=semantic_sha256(
+            changed_initial_state.semantic_unsigned()
+        ),
+    )
+    with pytest.raises(MassiveAdaptiveRLFoldFitV1Error, match="differs"):
+        changed_initial_state.validate()

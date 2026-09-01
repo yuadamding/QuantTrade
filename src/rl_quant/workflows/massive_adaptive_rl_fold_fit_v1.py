@@ -18,6 +18,9 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
 )
+from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
+    MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256,
+)
 from rl_quant.training.massive_adaptive_rl_fit_environment_registry_v1 import (
     MassiveAdaptiveRLFitEnvironmentRegistryV1,
     build_massive_adaptive_rl_fit_environment_registry_v1,
@@ -56,6 +59,7 @@ MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "fixed_controls": "complete-registered-fit-grid-and-fc06-selection",
         "candidate_provenance": "exact-traversed-environment-prefix",
         "transition_coverage": "exact-fit-origin-dates",
+        "model_initialization": "scoped-canonical-seed-and-initial-state-receipt",
         "caller_environments": False,
         "caller_actions": False,
         "caller_transitions": False,
@@ -92,6 +96,9 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
     runtime_sources_receipt_sha256: str
     runtime_graph_witness_receipt_sha256: str
     execution_device_specification: str
+    training_seed: int
+    model_initialization_specification_sha256: str
+    initial_model_state_receipt_sha256: str
     training_forecast_authority: MassiveAdaptiveRLTrainingForecastAuthorityV2
     fit_chronology_authority: MassiveAdaptiveRLFoldFitChronologyAuthorityV1
     fit_environment_registry: MassiveAdaptiveRLFitEnvironmentRegistryV1
@@ -147,6 +154,13 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
                 self.runtime_graph_witness_receipt_sha256
             ),
             "execution_device_specification": self.execution_device_specification,
+            "training_seed": self.training_seed,
+            "model_initialization_specification_sha256": (
+                self.model_initialization_specification_sha256
+            ),
+            "initial_model_state_receipt_sha256": (
+                self.initial_model_state_receipt_sha256
+            ),
             "training_forecast_authority_receipt_sha256": (
                 self.training_forecast_authority.semantic_receipt_sha256
             ),
@@ -313,6 +327,16 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
             or self.runtime_graph_witness_receipt_sha256 != runtime_receipt
             or self.execution_device_specification
             != self._manifest.execution_device_specification
+            or isinstance(self.training_seed, bool)
+            or not isinstance(self.training_seed, int)
+            or self.training_seed != self._manifest.base_manifest.seeds[0]
+            or self.training_seed != workflow.seed
+            or self.model_initialization_specification_sha256
+            != MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
+            or self.model_initialization_specification_sha256
+            != workflow.model_initialization_specification_sha256
+            or self.initial_model_state_receipt_sha256
+            != workflow.initial_model_state_receipt_sha256
             or self.training_forecast_authority.outer_fold_index
             != self.outer_fold_index
             or self.fit_chronology_authority.fold_index != self.outer_fold_index
@@ -387,6 +411,8 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
             self.base_manifest_v2_receipt_sha256,
             self.runtime_sources_receipt_sha256,
             self.runtime_graph_witness_receipt_sha256,
+            self.model_initialization_specification_sha256,
+            self.initial_model_state_receipt_sha256,
             self.training_forecast_authority.semantic_receipt_sha256,
             self.fit_chronology_authority.semantic_receipt_sha256,
             self.fit_environment_registry_receipt_sha256,
@@ -506,6 +532,13 @@ def run_massive_adaptive_rl_fold_fit_v1(
         "runtime_sources_receipt_sha256": runtime_sources.semantic_receipt_sha256,
         "runtime_graph_witness_receipt_sha256": runtime_receipt,
         "execution_device_specification": str(selected_device),
+        "training_seed": runtime_workflow.seed,
+        "model_initialization_specification_sha256": (
+            runtime_workflow.model_initialization_specification_sha256
+        ),
+        "initial_model_state_receipt_sha256": (
+            runtime_workflow.initial_model_state_receipt_sha256
+        ),
         "training_forecast_authority": training,
         "fit_chronology_authority": chronology,
         "fit_environment_registry": fit_registry,
