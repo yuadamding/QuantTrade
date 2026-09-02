@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import random
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -42,6 +44,8 @@ from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v2 import
     build_massive_adaptive_rl_training_forecast_authority_v2,
 )
 from rl_quant.workflows import (
+    massive_adaptive_rl_execution_environment_v1 as execution_environment,
+    massive_adaptive_rl_fold_fit_v1 as fold_fit,
     massive_adaptive_rl_runtime_source_reconstruction_v1 as reconstruction,
 )
 from rl_quant.workflows.massive_adaptive_rl_fold_fit_v1 import (
@@ -53,15 +57,21 @@ from rl_quant.workflows.massive_adaptive_rl_fold_fit_v1 import (
     repair_massive_adaptive_rl_fold_fit_generation_v1,
     run_or_resume_massive_adaptive_rl_fold_fit_v1,
     run_massive_adaptive_rl_fold_fit_v1,
+    verify_massive_adaptive_rl_fold_fit_authority_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_v1 import (
     MassiveAdaptiveRLWorkflowV1Error,
 )
 from rl_quant.workflows.massive_adaptive_rl_execution_environment_v1 import (
     capture_massive_adaptive_rl_execution_environment_v1,
+    execution_environment_relative_path_v1,
     massive_adaptive_rl_deterministic_execution_v1,
+    materialize_massive_adaptive_rl_execution_environment_authority_v1,
+    verify_massive_adaptive_rl_execution_environment_replay_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_fold_fit_inputs_v1 import (
+    MassiveAdaptiveRLFoldFitInputsV1Error,
+    build_massive_adaptive_rl_fold_fit_inputs_authority_v1,
     load_massive_adaptive_rl_fold_fit_inputs_authority_v1,
     materialize_massive_adaptive_rl_fold_fit_inputs_authority_v1,
 )
@@ -194,6 +204,16 @@ def _fold_fit_runtime_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    actual_git = execution_environment._git
+
+    def clean_git(repository_root: Path, *arguments: str) -> str:
+        if arguments == ("status", "--porcelain=v1", "--untracked-files=no"):
+            return ""
+        if arguments[:2] == ("ls-files", "--others"):
+            return ""
+        return actual_git(repository_root, *arguments)
+
+    monkeypatch.setattr(execution_environment, "_git", clean_git)
     manifest = build_massive_adaptive_rl_experiment_manifest_v3(
         experiment_id="package-owned-fold-fit",
         prequential_block_sessions=63,
@@ -466,7 +486,31 @@ def test_fold_fit_inputs_materialize_and_replay_before_training(
         )
     )
     with massive_adaptive_rl_deterministic_execution_v1(device="cpu"):
-        execution = capture_massive_adaptive_rl_execution_environment_v1(
+        captured_execution = capture_massive_adaptive_rl_execution_environment_v1(
+            manifest=manifest,
+            initial_model_state_receipt_sha256=initial,
+            device="cpu",
+        )
+        with pytest.raises(
+            MassiveAdaptiveRLFoldFitInputsV1Error,
+            match="roots differ",
+        ):
+            build_massive_adaptive_rl_fold_fit_inputs_authority_v1(
+                manifest=manifest,
+                runtime_sources=runtime_sources,
+                execution_environment_authority=captured_execution,
+                outer_fold_index=0,
+            )
+        persisted_execution = (
+            materialize_massive_adaptive_rl_execution_environment_authority_v1(
+                root=tmp_path / "fit-input-artifacts",
+                artifact_id="package-owned-fold-fit-fold0",
+                authority=captured_execution,
+                committed_at_ms=94_999,
+            )
+        )
+        execution = verify_massive_adaptive_rl_execution_environment_replay_v1(
+            authority=persisted_execution,
             manifest=manifest,
             initial_model_state_receipt_sha256=initial,
             device="cpu",
@@ -489,6 +533,7 @@ def test_fold_fit_inputs_materialize_and_replay_before_training(
         )
 
     assert materialized.semantic_receipt_sha256 == replayed.semantic_receipt_sha256
+    assert replayed.execution_environment_authority.source_transaction_verified
     assert replayed.runtime_inputs_replayed
     assert replayed.development_rl_training_inputs_authorized
     assert replayed.training_forecast_authority.origin_session_dates == (
@@ -515,6 +560,101 @@ def test_fold_fit_execution_lease_rejects_a_concurrent_owner(tmp_path: Path) -> 
                 raise AssertionError("concurrent lease unexpectedly acquired")
 
 
+def test_fold_fit_verification_restores_process_rng_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="fold-verifier-rng-sandbox",
+    )
+
+    def mutate_and_fail(**_kwargs: object) -> None:
+        random.seed(801)
+        np.random.seed(802)
+        torch.manual_seed(803)
+        raise RuntimeError("injected verifier failure")
+
+    monkeypatch.setattr(
+        fold_fit,
+        "_verify_massive_adaptive_rl_fold_fit_authority_v1_unpreserved",
+        mutate_and_fail,
+    )
+    random.seed(701)
+    np.random.seed(702)
+    torch.manual_seed(703)
+    python_rng_before = random.getstate()
+    numpy_rng_before = np.random.get_state()
+    torch_rng_before = torch.get_rng_state().clone()
+
+    with pytest.raises(RuntimeError, match="injected verifier failure"):
+        verify_massive_adaptive_rl_fold_fit_authority_v1(
+            root=tmp_path,
+            loaded_source=object(),  # type: ignore[arg-type]
+            manifest=manifest,
+            runtime_sources=object(),  # type: ignore[arg-type]
+            outer_fold_index=0,
+            verified_at_ms=1,
+            device="cpu",
+        )
+
+    numpy_rng_after = np.random.get_state()
+    assert random.getstate() == python_rng_before
+    assert numpy_rng_after[0] == numpy_rng_before[0]
+    assert np.array_equal(numpy_rng_after[1], numpy_rng_before[1])
+    assert numpy_rng_after[2:] == numpy_rng_before[2:]
+    assert torch.equal(torch.get_rng_state(), torch_rng_before)
+
+
+def test_fold_fit_run_persists_and_replays_environment_before_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, runtime_sources = _fold_fit_runtime_sources(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    observed: dict[str, object] = {}
+
+    def fake_training_workflow(**_kwargs: object) -> object:
+        observed["training_called"] = True
+        return object()
+
+    def fake_assemble(**kwargs: object) -> object:
+        observed.update(kwargs)
+        return kwargs["execution_environment"]
+
+    monkeypatch.setattr(
+        fold_fit,
+        "run_massive_adaptive_rl_training_workflow_v2",
+        fake_training_workflow,
+    )
+    monkeypatch.setattr(
+        fold_fit,
+        "_assemble_massive_adaptive_rl_fold_fit_authority_v1",
+        fake_assemble,
+    )
+    artifact_root = tmp_path / "run-environment-artifacts"
+    result = run_massive_adaptive_rl_fold_fit_v1(
+        manifest=manifest,
+        runtime_sources=runtime_sources,
+        outer_fold_index=0,
+        artifact_root=artifact_root,
+        committed_at_ms=99_000,
+        device="cpu",
+    )
+
+    assert observed["training_called"] is True
+    assert result is observed["execution_environment"]
+    assert result.source_transaction_verified  # type: ignore[union-attr]
+    assert result.runtime_environment_replayed  # type: ignore[union-attr]
+    fit_inputs = observed["fit_inputs"]
+    assert fit_inputs.execution_environment_authority is result  # type: ignore[union-attr]
+    relative = execution_environment_relative_path_v1(
+        artifact_id=f"{manifest.experiment_id}-fold0"
+    )
+    assert (artifact_root / relative).is_file()
+
+
 def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -537,6 +677,7 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
     assert result.source_data_qualified
     assert result.fit_inputs_authority.runtime_inputs_replayed
     assert result.execution_environment_authority.source_data_qualified
+    assert result.execution_environment_authority.source_transaction_verified
     assert result.development_rl_training_authorized
     assert not result.profitability_reporting_authorized
     assert result.training_seed == manifest.base_manifest.seeds[0]

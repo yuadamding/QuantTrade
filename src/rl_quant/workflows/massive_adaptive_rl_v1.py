@@ -100,6 +100,9 @@ from rl_quant.training.massive_adaptive_rl_training_forecast_protocol_v1 import 
 from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
     MassiveAdaptiveRLFitEnvironmentAuthorityV1,
 )
+from rl_quant.workflows.massive_adaptive_rl_process_state_v1 import (
+    preserve_massive_adaptive_rl_process_rng_state_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V1_SCHEMA = (
@@ -127,6 +130,9 @@ MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256 = semantic_sha256(
         "model_initialization": "scoped-manifest-seed-before-construction",
         "operational_checkpoint": "every-completed-prequential-update",
         "resume": "latest-valid-prefix-and-create-only-reconciliation",
+        "completed_verification_process_state": (
+            "python-numpy-torch-and-selected-cuda-rng-restored"
+        ),
         "validation_access_during_fit": False,
         "outer_access": False,
         "lockbox_access": False,
@@ -1190,7 +1196,7 @@ def run_massive_adaptive_rl_training_workflow_v1(
     )
 
 
-def verify_massive_adaptive_rl_training_workflow_v1(
+def _verify_massive_adaptive_rl_training_workflow_v1_unpreserved(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV1,
     fold_index: int,
@@ -1367,6 +1373,40 @@ def verify_massive_adaptive_rl_training_workflow_v1(
         operational_authorities=tuple(operational_authorities),
         policy_authorities=tuple(policy_authorities),
     )
+
+
+def verify_massive_adaptive_rl_training_workflow_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV1,
+    fold_index: int,
+    seed: int,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
+    environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
+    artifact_root: str | Path,
+    verified_at_ms: int,
+    device: torch.device | str = "cpu",
+) -> MassiveAdaptiveRLTrainingWorkflowV1:
+    """Replay completed evidence while restoring every process-global RNG."""
+
+    with preserve_massive_adaptive_rl_process_rng_state_v1(
+        include_cuda=torch.device(device).type == "cuda"
+    ):
+        return _verify_massive_adaptive_rl_training_workflow_v1_unpreserved(
+            manifest=manifest,
+            fold_index=fold_index,
+            seed=seed,
+            training_authority=training_authority,
+            chronology_authority=chronology_authority,
+            environments=environments,
+            fit_environment_authorities=fit_environment_authorities,
+            artifact_root=artifact_root,
+            verified_at_ms=verified_at_ms,
+            device=device,
+        )
 
 
 def run_massive_adaptive_rl_validation_workflow_v1(

@@ -66,7 +66,7 @@ MASSIVE_ADAPTIVE_RL_FOLD_FIT_INPUTS_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "training_forecast": "package-built-authority-v2",
         "chronology": "fit-only-date-role-authority",
         "environments": "package-built-source-qualified-registry",
-        "execution_environment": "deterministic-runtime-authority-v1",
+        "execution_environment": "persisted-clean-deterministic-runtime-authority-v1",
         "publication": "create-only-source-transaction",
         "profitability_reporting": False,
         "outer_access": False,
@@ -212,6 +212,8 @@ class MassiveAdaptiveRLFoldFitInputsAuthorityV1:
         expected_qualified = bool(
             runtime_present
             and self.execution_environment_authority.source_data_qualified
+            and self.execution_environment_authority.source_transaction_verified
+            and self.execution_environment_authority.runtime_environment_replayed
             and self.training_forecast_authority.source_data_qualified
             and self.training_forecast_authority.reinforcement_learning_authorized
             and self.fit_chronology_authority.source_data_qualified
@@ -307,6 +309,9 @@ def build_massive_adaptive_rl_fold_fit_inputs_authority_v1(
         or manifest.experiment_id != runtime_sources.experiment_id
         or manifest.semantic_receipt_sha256
         != runtime_sources.manifest_v3_receipt_sha256
+        or not execution_environment_authority.source_data_qualified
+        or not execution_environment_authority.source_transaction_verified
+        or not execution_environment_authority.runtime_environment_replayed
     ):
         raise MassiveAdaptiveRLFoldFitInputsV1Error(
             "adaptive RL fold-fit input roots differ"

@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
+from io import BytesIO
+import json
 import os
 from pathlib import Path
 import platform
 import subprocess
-from typing import Iterator
+from typing import cast, Iterator
 
 import numpy as np
 import torch
 
+from rl_quant.data_sources.massive.source_receipts import (
+    LoadedMassiveSourceObject,
+    canonical_json_file_bytes,
+    load_massive_source_bundle,
+    publish_massive_source_object,
+    read_loaded_massive_source_bytes,
+)
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
@@ -29,12 +39,27 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
 MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-execution-environment-authority-v1"
 )
+MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_DATASET = (
+    "massive-adaptive-rl-execution-environment-authority-v1"
+)
 MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SHA256 = file_sha256(
     Path(__file__)
 )
+MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 = (
+    semantic_sha256(
+        {
+            "schema": MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SCHEMA,
+            "encoding": "canonical-json-receipt-envelope",
+            "integrity_verification": "portable-no-runtime-recapture",
+            "computational_replay": "exact-active-environment-comparison",
+        }
+    )
+)
 MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
     {
-        "source": "git-head-plus-current-tracked-source-inventory",
+        "source": "clean-git-head-plus-exact-runtime-source-inventories",
+        "tracked_worktree_clean": True,
+        "untracked_runtime_source_count": 0,
         "dependencies": "uv-lock-physical-sha256",
         "initialization": "explicit-cpu-float32",
         "training_device": "manifest-v3-bound",
@@ -44,6 +69,8 @@ MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SPEC_SHA256 = semantic_sh
         "cudnn_benchmark": False,
         "cuda_cublas_workspace": ":4096:8-when-cuda",
         "thread_counts": "captured-exactly",
+        "persistence": "create-only-source-transaction",
+        "verification": ("portable-integrity", "exact-computational-replay"),
         "duration_semantics": False,
     }
 )
@@ -100,21 +127,65 @@ def _tracked_source_inventory(repository_root: Path) -> tuple[tuple[str, str], .
     names = tuple(
         name
         for name in _git(repository_root, "ls-files", "src/rl_quant").splitlines()
-        if name.endswith(".py")
+        if name
     )
+    return _source_inventory(repository_root, names=names, inventory="tracked")
+
+
+def _source_inventory(
+    repository_root: Path,
+    *,
+    names: tuple[str, ...],
+    inventory: str,
+) -> tuple[tuple[str, str], ...]:
     rows: list[tuple[str, str]] = []
     for name in names:
-        path = (repository_root / name).resolve(strict=True)
-        if not path.is_relative_to(repository_root) or path.is_symlink():
+        unresolved = repository_root / name
+        if unresolved.is_symlink():
             raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
-                "adaptive RL tracked source path differs"
+                f"adaptive RL {inventory} source path differs"
+            )
+        path = unresolved.resolve(strict=True)
+        if not path.is_relative_to(repository_root) or not path.is_file():
+            raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+                f"adaptive RL {inventory} source path differs"
             )
         rows.append((name, file_sha256(path)))
-    if not rows:
+    if inventory == "tracked" and not rows:
         raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
             "adaptive RL tracked source inventory is absent"
         )
     return tuple(rows)
+
+
+def _untracked_runtime_source_inventory(
+    repository_root: Path,
+) -> tuple[tuple[str, str], ...]:
+    names = tuple(
+        name
+        for name in _git(
+            repository_root,
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "src/rl_quant",
+        ).splitlines()
+        if name
+    )
+    return _source_inventory(repository_root, names=names, inventory="untracked")
+
+
+def _artifact_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(not (character.isalnum() or character in "-_") for character in value)
+    ):
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL execution-environment artifact ID is not path safe"
+        )
+    return value
 
 
 def _driver_version() -> str:
@@ -132,7 +203,11 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
     git_commit: str
     git_tree: str
     tracked_worktree_clean: bool
+    tracked_worktree_status: tuple[str, ...]
+    tracked_source_inventory: tuple[tuple[str, str], ...]
     tracked_source_inventory_sha256: str
+    untracked_runtime_source_inventory: tuple[tuple[str, str], ...]
+    untracked_runtime_source_count: int
     dependency_lock_sha256: str
     python_version: str
     python_implementation: str
@@ -160,6 +235,7 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
     model_initialization_specification_sha256: str
     initial_model_state_receipt_sha256: str
     source_data_qualified: bool
+    source_transaction_verified: bool
     runtime_environment_replayed: bool
     semantic_receipt_sha256: str
     protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -170,17 +246,32 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
         MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SHA256
     )
     schema: str = MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SCHEMA
+    _loaded_source: LoadedMassiveSourceObject | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def semantic_unsigned(self) -> dict[str, object]:
         return {
             key: value
             for key, value in asdict(self).items()
-            if key not in {"semantic_receipt_sha256", "runtime_environment_replayed"}
+            if key
+            not in {
+                "semantic_receipt_sha256",
+                "source_transaction_verified",
+                "runtime_environment_replayed",
+                "_loaded_source",
+            }
         }
 
     def validate(self) -> None:
         expected_qualified = bool(
-            self.deterministic_algorithms
+            self.tracked_worktree_clean
+            and not self.tracked_worktree_status
+            and not self.untracked_runtime_source_inventory
+            and self.untracked_runtime_source_count == 0
+            and self.deterministic_algorithms
             and not self.deterministic_warn_only
             and not self.float32_matmul_tf32
             and not self.cudnn_tf32
@@ -192,6 +283,30 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
                 or self.cublas_workspace_config == ":4096:8"
             )
         )
+        tracked_names = tuple(row[0] for row in self.tracked_source_inventory)
+        untracked_names = tuple(
+            row[0] for row in self.untracked_runtime_source_inventory
+        )
+        source_rows_valid = bool(
+            self.tracked_source_inventory
+            and tracked_names == tuple(sorted(set(tracked_names)))
+            and untracked_names == tuple(sorted(set(untracked_names)))
+            and all(
+                name.startswith("src/rl_quant/")
+                and ".." not in Path(name).parts
+                and len(receipt) == 64
+                and all(
+                    character in "0123456789abcdef" for character in receipt
+                )
+                for name, receipt in (
+                    *self.tracked_source_inventory,
+                    *self.untracked_runtime_source_inventory,
+                )
+            )
+        )
+        loaded_present = self._loaded_source is not None
+        if self._loaded_source is not None:
+            self._loaded_source.validate()
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SCHEMA
             or not self.experiment_id
@@ -205,6 +320,13 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
             or not self.python_implementation
             or not self.pytorch_version
             or not self.numpy_version
+            or not source_rows_valid
+            or self.tracked_worktree_clean != (not self.tracked_worktree_status)
+            or self.tracked_source_inventory_sha256
+            != semantic_sha256(self.tracked_source_inventory)
+            or isinstance(self.untracked_runtime_source_count, bool)
+            or self.untracked_runtime_source_count
+            != len(self.untracked_runtime_source_inventory)
             or not self.execution_device_specification
             or self.execution_device_type not in {"cpu", "cuda"}
             or self.torch_cpu_threads <= 0
@@ -214,7 +336,8 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
             or self.model_initialization_specification_sha256
             != MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
             or self.source_data_qualified != expected_qualified
-            or not self.runtime_environment_replayed
+            or self.source_transaction_verified != loaded_present
+            or not isinstance(self.runtime_environment_replayed, bool)
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SPEC_SHA256
@@ -224,6 +347,17 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
         ):
             raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
                 "adaptive RL execution environment authority differs"
+            )
+        if self._loaded_source is not None and (
+            self._loaded_source.receipt.dataset_id
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_DATASET
+            or self._loaded_source.receipt.schema_sha256
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SCHEMA_SHA256
+            or self._loaded_source.receipt.entitlement_receipt_sha256
+            != self.semantic_receipt_sha256
+        ):
+            raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+                "adaptive RL execution-environment source transaction differs"
             )
         for value in (
             self.manifest_v3_receipt_sha256,
@@ -237,7 +371,14 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
             self.semantic_receipt_sha256,
         ):
             _digest("adaptive RL execution environment", value)
-        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        semantic_configuration = self.semantic_unsigned()
+        for implementation_inventory in (
+            "tracked_worktree_status",
+            "tracked_source_inventory",
+            "untracked_runtime_source_inventory",
+        ):
+            semantic_configuration.pop(implementation_inventory)
+        assert_no_adaptive_hold_semantics(semantic_configuration)
 
 
 def capture_massive_adaptive_rl_execution_environment_v1(
@@ -256,13 +397,20 @@ def capture_massive_adaptive_rl_execution_environment_v1(
         )
     _digest("adaptive RL initial model state", initial_model_state_receipt_sha256)
     root = _repository_root()
-    lock = (root / "uv.lock").resolve(strict=True)
-    if not lock.is_relative_to(root) or lock.is_symlink():
+    unresolved_lock = root / "uv.lock"
+    if unresolved_lock.is_symlink():
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL dependency lock path differs"
+        )
+    lock = unresolved_lock.resolve(strict=True)
+    if not lock.is_relative_to(root):
         raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
             "adaptive RL dependency lock path differs"
         )
     source_rows = _tracked_source_inventory(root)
     status = _git(root, "status", "--porcelain=v1", "--untracked-files=no")
+    status_rows = tuple(row for row in status.splitlines() if row)
+    untracked_source_rows = _untracked_runtime_source_inventory(root)
     if selected_device.type == "cuda":
         if not torch.cuda.is_available() or selected_device.index is None:
             raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
@@ -283,14 +431,32 @@ def capture_massive_adaptive_rl_execution_environment_v1(
             "NUMEXPR_NUM_THREADS",
         )
     )
+    source_qualified = bool(
+        not status_rows
+        and not untracked_source_rows
+        and torch.are_deterministic_algorithms_enabled()
+        and not torch.is_deterministic_algorithms_warn_only_enabled()
+        and not torch.backends.cuda.matmul.allow_tf32
+        and not torch.backends.cudnn.allow_tf32
+        and not torch.backends.cudnn.benchmark
+        and torch.backends.cudnn.deterministic
+        and (
+            selected_device.type != "cuda"
+            or os.environ.get("CUBLAS_WORKSPACE_CONFIG") == ":4096:8"
+        )
+    )
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SCHEMA,
         "experiment_id": manifest.experiment_id,
         "manifest_v3_receipt_sha256": manifest.semantic_receipt_sha256,
         "git_commit": _git(root, "rev-parse", "HEAD"),
         "git_tree": _git(root, "rev-parse", "HEAD^{tree}"),
-        "tracked_worktree_clean": not status,
+        "tracked_worktree_clean": not status_rows,
+        "tracked_worktree_status": status_rows,
+        "tracked_source_inventory": source_rows,
         "tracked_source_inventory_sha256": semantic_sha256(source_rows),
+        "untracked_runtime_source_inventory": untracked_source_rows,
+        "untracked_runtime_source_count": len(untracked_source_rows),
         "dependency_lock_sha256": file_sha256(lock),
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
@@ -321,7 +487,7 @@ def capture_massive_adaptive_rl_execution_environment_v1(
             MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
         ),
         "initial_model_state_receipt_sha256": initial_model_state_receipt_sha256,
-        "source_data_qualified": True,
+        "source_data_qualified": source_qualified,
         "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
         "specification_sha256": (
             MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SPEC_SHA256
@@ -332,9 +498,224 @@ def capture_massive_adaptive_rl_execution_environment_v1(
     }
     result = MassiveAdaptiveRLExecutionEnvironmentAuthorityV1(
         **body,  # type: ignore[arg-type]
+        source_transaction_verified=False,
         runtime_environment_replayed=True,
         semantic_receipt_sha256=semantic_sha256(body),
     )
+    result.validate()
+    return result
+
+
+def execution_environment_relative_path_v1(*, artifact_id: str) -> str:
+    return (
+        "massive-adaptive/rl-execution-environment-authority-v1/"
+        f"{_artifact_id(artifact_id)}.json"
+    )
+
+
+def _execution_environment_payload(
+    authority: MassiveAdaptiveRLExecutionEnvironmentAuthorityV1,
+) -> dict[str, object]:
+    authority.validate()
+    return {
+        **authority.semantic_unsigned(),
+        "semantic_receipt_sha256": authority.semantic_receipt_sha256,
+    }
+
+
+def _tuple_rows(value: object, *, name: str) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list):
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            f"adaptive RL {name} is not a JSON row inventory"
+        )
+    rows: list[tuple[str, str]] = []
+    for row in value:
+        if (
+            not isinstance(row, list)
+            or len(row) != 2
+            or not all(isinstance(item, str) for item in row)
+        ):
+            raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+                f"adaptive RL {name} row differs"
+            )
+        rows.append((row[0], row[1]))
+    return tuple(rows)
+
+
+def _parse_execution_environment_payload(
+    *,
+    root: str | Path,
+    loaded_source: LoadedMassiveSourceObject,
+) -> MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
+    raw = read_loaded_massive_source_bytes(root=root, loaded_source=loaded_source)
+    value = json.loads(raw)
+    if not isinstance(value, Mapping) or raw != canonical_json_file_bytes(value):
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL execution environment is not canonical JSON"
+        )
+    payload = dict(cast(Mapping[str, object], value))
+    for name in (
+        "tracked_worktree_status",
+        "process_thread_environment",
+    ):
+        rows = payload.get(name)
+        if name == "tracked_worktree_status":
+            if not isinstance(rows, list) or not all(
+                isinstance(item, str) for item in rows
+            ):
+                raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+                    "adaptive RL tracked worktree status differs"
+                )
+            payload[name] = tuple(rows)
+        else:
+            payload[name] = _tuple_rows(rows, name=name)
+    payload["tracked_source_inventory"] = _tuple_rows(
+        payload.get("tracked_source_inventory"),
+        name="tracked source inventory",
+    )
+    payload["untracked_runtime_source_inventory"] = _tuple_rows(
+        payload.get("untracked_runtime_source_inventory"),
+        name="untracked runtime source inventory",
+    )
+    try:
+        result = MassiveAdaptiveRLExecutionEnvironmentAuthorityV1(
+            **payload,  # type: ignore[arg-type]
+            source_transaction_verified=True,
+            runtime_environment_replayed=False,
+            _loaded_source=loaded_source,
+        )
+    except TypeError as error:
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL execution-environment payload fields differ"
+        ) from error
+    result.validate()
+    if raw != canonical_json_file_bytes(_execution_environment_payload(result)):
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL execution-environment payload did not round trip"
+        )
+    return result
+
+
+def materialize_massive_adaptive_rl_execution_environment_authority_v1(
+    *,
+    root: str | Path,
+    artifact_id: str,
+    authority: MassiveAdaptiveRLExecutionEnvironmentAuthorityV1,
+    committed_at_ms: int,
+) -> MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
+    """Publish the complete inventory and return portable integrity evidence."""
+
+    authority.validate()
+    if (
+        not authority.runtime_environment_replayed
+        or authority.source_transaction_verified
+    ):
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL materialization requires an active environment witness"
+        )
+    resolved_root = Path(root)
+    try:
+        resolved_root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL execution-environment root is unavailable"
+        ) from error
+    if resolved_root.is_symlink():
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL execution-environment root is a symlink"
+        )
+    relative = execution_environment_relative_path_v1(artifact_id=artifact_id)
+    publish_massive_source_object(
+        stream=BytesIO(
+            canonical_json_file_bytes(_execution_environment_payload(authority))
+        ),
+        root=resolved_root,
+        relative_payload_path=relative,
+        dataset_id=MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_DATASET,
+        source_object_key=relative,
+        requested_at_ms=committed_at_ms,
+        downloaded_at_ms=committed_at_ms,
+        schema_sha256=(
+            MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SCHEMA_SHA256
+        ),
+        entitlement_receipt_sha256=authority.semantic_receipt_sha256,
+        committed_at_ms=committed_at_ms,
+        request_id=f"ADAPTIVE-RL-EXECUTION-ENVIRONMENT-V1-{_artifact_id(artifact_id)}",
+    )
+    loaded = load_massive_adaptive_rl_execution_environment_authority_v1(
+        root=resolved_root,
+        artifact_id=artifact_id,
+        verified_at_ms=committed_at_ms,
+    )
+    if loaded.semantic_receipt_sha256 != authority.semantic_receipt_sha256:
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "published adaptive RL execution environment differs"
+        )
+    return loaded
+
+
+def load_massive_adaptive_rl_execution_environment_authority_v1(
+    *,
+    root: str | Path,
+    artifact_id: str,
+    verified_at_ms: int,
+) -> MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
+    """Verify persisted environment integrity without recapturing this process."""
+
+    loaded = load_massive_source_bundle(
+        root=root,
+        relative_payload_path=execution_environment_relative_path_v1(
+            artifact_id=artifact_id
+        ),
+        verified_at_ms=verified_at_ms,
+    )
+    return _parse_execution_environment_payload(
+        root=root,
+        loaded_source=loaded,
+    )
+
+
+def verify_massive_adaptive_rl_execution_environment_integrity_v1(
+    *,
+    root: str | Path,
+    artifact_id: str,
+    verified_at_ms: int,
+) -> MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
+    """Verify the persisted authority graph without inspecting this process."""
+
+    return load_massive_adaptive_rl_execution_environment_authority_v1(
+        root=root,
+        artifact_id=artifact_id,
+        verified_at_ms=verified_at_ms,
+    )
+
+
+def verify_massive_adaptive_rl_execution_environment_replay_v1(
+    *,
+    authority: MassiveAdaptiveRLExecutionEnvironmentAuthorityV1,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    initial_model_state_receipt_sha256: str,
+    device: torch.device | str,
+) -> MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
+    """Require the active process to exactly reproduce a persisted authority."""
+
+    authority.validate()
+    if not authority.source_transaction_verified:
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL replay requires persisted environment integrity"
+        )
+    active = capture_massive_adaptive_rl_execution_environment_v1(
+        manifest=manifest,
+        initial_model_state_receipt_sha256=initial_model_state_receipt_sha256,
+        device=device,
+    )
+    if canonical_json_file_bytes(
+        _execution_environment_payload(active)
+    ) != canonical_json_file_bytes(_execution_environment_payload(authority)):
+        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+            "adaptive RL active execution environment did not replay"
+        )
+    result = replace(authority, runtime_environment_replayed=True)
     result.validate()
     return result
 
@@ -378,8 +759,14 @@ def massive_adaptive_rl_deterministic_execution_v1(
 
 __all__ = [
     "MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SCHEMA",
+    "MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SCHEMA_SHA256",
     "MassiveAdaptiveRLExecutionEnvironmentAuthorityV1",
     "MassiveAdaptiveRLExecutionEnvironmentV1Error",
     "capture_massive_adaptive_rl_execution_environment_v1",
+    "execution_environment_relative_path_v1",
+    "load_massive_adaptive_rl_execution_environment_authority_v1",
     "massive_adaptive_rl_deterministic_execution_v1",
+    "materialize_massive_adaptive_rl_execution_environment_authority_v1",
+    "verify_massive_adaptive_rl_execution_environment_integrity_v1",
+    "verify_massive_adaptive_rl_execution_environment_replay_v1",
 ]

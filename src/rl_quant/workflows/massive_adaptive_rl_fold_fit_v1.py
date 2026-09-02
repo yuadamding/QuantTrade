@@ -52,7 +52,11 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
 from rl_quant.workflows.massive_adaptive_rl_execution_environment_v1 import (
     MassiveAdaptiveRLExecutionEnvironmentAuthorityV1,
     capture_massive_adaptive_rl_execution_environment_v1,
+    execution_environment_relative_path_v1,
+    load_massive_adaptive_rl_execution_environment_authority_v1,
     massive_adaptive_rl_deterministic_execution_v1,
+    materialize_massive_adaptive_rl_execution_environment_authority_v1,
+    verify_massive_adaptive_rl_execution_environment_replay_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_fold_fit_inputs_v1 import (
     MassiveAdaptiveRLFoldFitInputsAuthorityV1,
@@ -62,6 +66,9 @@ from rl_quant.workflows.massive_adaptive_rl_fold_fit_inputs_v1 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLRuntimeSourcesV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_process_state_v1 import (
+    preserve_massive_adaptive_rl_process_rng_state_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_v2 import (
     MassiveAdaptiveRLTrainingWorkflowV2,
@@ -95,8 +102,10 @@ MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "candidate_provenance": "exact-traversed-environment-prefix",
         "transition_coverage": "exact-fit-origin-dates",
         "model_initialization": "scoped-canonical-seed-and-initial-state-receipt",
-        "execution_environment": "captured-deterministic-runtime-authority-v1",
-        "completed_verification": "strictly-read-only-existing-evidence-graph",
+        "execution_environment": "persisted-clean-deterministic-runtime-authority-v1",
+        "completed_verification": (
+            "strictly-read-only-existing-evidence-graph-and-rng-sandbox"
+        ),
         "repair": "explicit-and-pre-aggregate-only",
         "caller_environments": False,
         "caller_actions": False,
@@ -123,6 +132,14 @@ class MassiveAdaptiveRLFoldFitCompletedEvidenceError(
     MassiveAdaptiveRLFoldFitV1Error
 ):
     """A completed fold cannot enter the mutable repair path."""
+
+
+def _execution_environment_artifact_id(*, experiment_id: str, fold_index: int) -> str:
+    fold_fit_authority_relative_path_v1(
+        experiment_id=experiment_id,
+        fold_index=fold_index,
+    )
+    return f"{experiment_id}-fold{fold_index}"
 
 
 def _source_transaction_exists(*, root: str | Path, relative: str) -> bool:
@@ -375,6 +392,8 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
             and self.fit_chronology_authority.source_data_qualified
             and self.fit_environment_registry.source_data_qualified
             and self.execution_environment_authority.source_data_qualified
+            and self.execution_environment_authority.source_transaction_verified
+            and self.execution_environment_authority.runtime_environment_replayed
             and self.fit_inputs_authority.source_data_qualified
             and self.training_workflow.development_rl_training_authorized
             and final_training_run.source_data_qualified
@@ -429,6 +448,7 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
             != self.training_seed
             or self.execution_environment_authority.initial_model_state_receipt_sha256
             != self.initial_model_state_receipt_sha256
+            or not self.execution_environment_authority.source_transaction_verified
             or not self.execution_environment_authority.runtime_environment_replayed
             or self.fit_inputs_authority.experiment_id != self.experiment_id
             or self.fit_inputs_authority.outer_fold_index != self.outer_fold_index
@@ -710,13 +730,65 @@ def run_massive_adaptive_rl_fold_fit_v1(
         )
     )
     with massive_adaptive_rl_deterministic_execution_v1(device=selected_device):
-        execution_environment = (
-            capture_massive_adaptive_rl_execution_environment_v1(
-                manifest=manifest,
-                initial_model_state_receipt_sha256=initial_model_state_receipt,
-                device=selected_device,
-            )
+        execution_environment_artifact_id = _execution_environment_artifact_id(
+            experiment_id=manifest.experiment_id,
+            fold_index=outer_fold_index,
         )
+        execution_environment_exists = _source_transaction_exists(
+            root=resolved_artifact_root,
+            relative=execution_environment_relative_path_v1(
+                artifact_id=execution_environment_artifact_id
+            ),
+        )
+        if resume and execution_environment_exists:
+            execution_environment = (
+                verify_massive_adaptive_rl_execution_environment_replay_v1(
+                    authority=(
+                        load_massive_adaptive_rl_execution_environment_authority_v1(
+                            root=resolved_artifact_root,
+                            artifact_id=execution_environment_artifact_id,
+                            verified_at_ms=committed_at_ms,
+                        )
+                    ),
+                    manifest=manifest,
+                    initial_model_state_receipt_sha256=(
+                        initial_model_state_receipt
+                    ),
+                    device=selected_device,
+                )
+            )
+        else:
+            captured_execution_environment = (
+                capture_massive_adaptive_rl_execution_environment_v1(
+                    manifest=manifest,
+                    initial_model_state_receipt_sha256=(
+                        initial_model_state_receipt
+                    ),
+                    device=selected_device,
+                )
+            )
+            if not captured_execution_environment.source_data_qualified:
+                raise MassiveAdaptiveRLFoldFitV1Error(
+                    "adaptive RL fold fit requires a clean qualified execution source"
+                )
+            persisted_execution_environment = (
+                materialize_massive_adaptive_rl_execution_environment_authority_v1(
+                    root=resolved_artifact_root,
+                    artifact_id=execution_environment_artifact_id,
+                    authority=captured_execution_environment,
+                    committed_at_ms=committed_at_ms,
+                )
+            )
+            execution_environment = (
+                verify_massive_adaptive_rl_execution_environment_replay_v1(
+                    authority=persisted_execution_environment,
+                    manifest=manifest,
+                    initial_model_state_receipt_sha256=(
+                        initial_model_state_receipt
+                    ),
+                    device=selected_device,
+                )
+            )
         fit_inputs_relative = fold_fit_inputs_relative_path_v1(
             experiment_id=manifest.experiment_id,
             fold_index=outer_fold_index,
@@ -869,7 +941,7 @@ def materialize_massive_adaptive_rl_fold_fit_authority_v1(
     return result
 
 
-def verify_massive_adaptive_rl_fold_fit_authority_v1(
+def _verify_massive_adaptive_rl_fold_fit_authority_v1_unpreserved(
     *,
     root: str | Path,
     loaded_source: LoadedMassiveSourceObject,
@@ -902,8 +974,19 @@ def verify_massive_adaptive_rl_fold_fit_authority_v1(
         )
     )
     with massive_adaptive_rl_deterministic_execution_v1(device=selected_device):
+        execution_environment_artifact_id = _execution_environment_artifact_id(
+            experiment_id=manifest.experiment_id,
+            fold_index=outer_fold_index,
+        )
         execution_environment = (
-            capture_massive_adaptive_rl_execution_environment_v1(
+            verify_massive_adaptive_rl_execution_environment_replay_v1(
+                authority=(
+                    load_massive_adaptive_rl_execution_environment_authority_v1(
+                        root=root,
+                        artifact_id=execution_environment_artifact_id,
+                        verified_at_ms=verified_at_ms,
+                    )
+                ),
                 manifest=manifest,
                 initial_model_state_receipt_sha256=initial_model_state_receipt,
                 device=selected_device,
@@ -956,6 +1039,35 @@ def verify_massive_adaptive_rl_fold_fit_authority_v1(
     result = replace(replayed, _loaded_source=loaded_source)
     result.validate()
     return result
+
+
+def verify_massive_adaptive_rl_fold_fit_authority_v1(
+    *,
+    root: str | Path,
+    loaded_source: LoadedMassiveSourceObject,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+    outer_fold_index: int,
+    verified_at_ms: int,
+    device: torch.device | str | None = None,
+) -> MassiveAdaptiveRLFoldFitAuthorityV1:
+    """Strictly replay a fold while preserving process-global RNG state."""
+
+    selected_device = torch.device(
+        manifest.execution_device_specification if device is None else device
+    )
+    with preserve_massive_adaptive_rl_process_rng_state_v1(
+        include_cuda=selected_device.type == "cuda"
+    ):
+        return _verify_massive_adaptive_rl_fold_fit_authority_v1_unpreserved(
+            root=root,
+            loaded_source=loaded_source,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            outer_fold_index=outer_fold_index,
+            verified_at_ms=verified_at_ms,
+            device=device,
+        )
 
 
 def authorize_massive_adaptive_rl_fold_fit_authority_v1(
