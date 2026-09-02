@@ -52,6 +52,13 @@ def test_generic_fold_validation_inventory_cannot_authorize_selection(tmp_path) 
         ),
         "fold_index": 0,
         "fold_fit_authority_receipt_sha256": _digest("fold-fit"),
+        "four_fold_fit_authority_receipt_sha256": _digest("four-fold-fit"),
+        "validation_sources_authority_receipt_sha256": _digest(
+            "validation-sources"
+        ),
+        "validation_environment_registry_receipt_sha256": _digest(
+            "validation-environment-registry"
+        ),
         "chronology_authority_receipt_sha256": _digest("chronology"),
         "expected_checkpoint_authority_receipts": (checkpoint,),
         "primary_trace_authority_receipts": (primary,),
@@ -139,6 +146,9 @@ def test_fold_validation_materializer_accepts_evidence_not_candidate_metrics() -
     assert "primary_trace_authorities" in parameters
     assert "cost_ladder_authorities" in parameters
     assert "fixed_control_validation_authority" in parameters
-    assert "chronology_authority" in parameters
+    assert "validation_sources_authority" in parameters
+    assert "validation_environment_registry" in parameters
+    assert "chronology_authority" not in parameters
+    assert "artifact_id" not in parameters
     assert "candidates" not in parameters
     assert "metrics" not in parameters

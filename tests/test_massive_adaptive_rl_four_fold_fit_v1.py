@@ -298,6 +298,7 @@ def test_four_fold_fit_aggregates_exact_order_and_one_scientific_environment(
         fit_inputs_authority=replayed_inputs,
         fold_fits=fits,
     )
+    assert fit_authority.fold_fit(2) is fits[2]
     persisted_fit = materialize_massive_adaptive_rl_four_fold_fit_authority_v1(
         root=tmp_path,
         authority=fit_authority,

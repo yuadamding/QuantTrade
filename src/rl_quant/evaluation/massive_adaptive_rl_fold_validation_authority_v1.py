@@ -29,13 +29,18 @@ from rl_quant.evaluation.massive_adaptive_rl_fixed_control_validation_authority_
 from rl_quant.evaluation.massive_adaptive_rl_policy_trace_authority_v1 import (
     MassiveAdaptiveRLPolicyTraceAuthorityV1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
+    MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    MassiveAdaptiveRLValidationSourcesAuthorityV1,
+    validation_cost_ladder_relative_path_v1,
+    validation_fixed_control_relative_path_v1,
+    validation_generation_key_v1,
+    validation_primary_trace_relative_path_v1,
+)
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
-)
-from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
-    MassiveAdaptiveRLChronologyAuthorityV1,
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
@@ -72,6 +77,8 @@ MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "primary_trace": "persisted-checkpoint-replayed-20bp",
         "cost_ladder": "persisted-primary-target-replay-10-20-40bp",
         "fixed_control": "persisted-fit-selected-fc06-20bp",
+        "validation_sources": "single-canonical-create-only-authority-v1",
+        "validation_environment": "single-canonical-create-only-registry-v1",
         "shared_tape": (
             "dates-forecast-plan-calibration-economic-sources-capital"
         ),
@@ -99,16 +106,14 @@ def _digest(name: str, value: object) -> str:
     return value
 
 
-def _artifact_id(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or any(not (character.isalnum() or character in "-_") for character in value)
-    ):
-        raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
-            "fold-validation artifact ID is not path safe"
-        )
-    return value
+def fold_validation_authority_relative_path_v1(
+    *, manifest: MassiveAdaptiveRLExperimentManifestV4, fold_index: int
+) -> str:
+    key = validation_generation_key_v1(manifest=manifest, fold_index=fold_index)
+    return (
+        "massive-adaptive/rl-fold-validation-authority-v1/"
+        f"{key}-fold-validation.json"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +123,9 @@ class _ValidationEvidenceFactsV1:
     training_manifest_v3_receipt_sha256: str
     fold_index: int
     fold_fit_authority_receipt_sha256: str
+    four_fold_fit_authority_receipt_sha256: str
+    validation_sources_authority_receipt_sha256: str
+    validation_environment_registry_receipt_sha256: str
     chronology_authority_receipt_sha256: str
     expected_checkpoint_authority_receipts: tuple[str, ...]
     primary_trace_authority_receipts: tuple[str, ...]
@@ -319,7 +327,10 @@ def _validation_evidence_facts_v1(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    validation_sources_authority: MassiveAdaptiveRLValidationSourcesAuthorityV1,
+    validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1
+    ),
     primary_trace_authorities: Sequence[MassiveAdaptiveRLPolicyTraceAuthorityV1],
     cost_ladder_authorities: Sequence[MassiveAdaptiveRLCostLadderAuthorityV1],
     fixed_control_validation_authority: (
@@ -329,7 +340,10 @@ def _validation_evidence_facts_v1(
     if (
         type(manifest) is not MassiveAdaptiveRLExperimentManifestV4
         or type(fold_fit_authority) is not MassiveAdaptiveRLFoldFitAuthorityV1
-        or type(chronology_authority) is not MassiveAdaptiveRLChronologyAuthorityV1
+        or type(validation_sources_authority)
+        is not MassiveAdaptiveRLValidationSourcesAuthorityV1
+        or type(validation_environment_registry)
+        is not MassiveAdaptiveRLValidationEnvironmentRegistryV1
     ):
         raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
             "fold-validation root authority type differs"
@@ -352,6 +366,9 @@ def _validation_evidence_facts_v1(
         )
     manifest.validate()
     fold_fit_authority.validate()
+    validation_sources_authority.validate()
+    validation_environment_registry.validate()
+    chronology_authority = validation_sources_authority.runtime_chronology_authority
     chronology_authority.validate()
     for primary_row in primary:
         primary_row.validate()
@@ -363,6 +380,18 @@ def _validation_evidence_facts_v1(
         manifest.base_manifest.semantic_receipt_sha256
         != fold_fit_authority.manifest_v3_receipt_sha256
         or manifest.experiment_id != fold_fit_authority.experiment_id
+        or not validation_sources_authority.development_stage_authorized
+        or not validation_environment_registry.development_stage_authorized
+        or validation_sources_authority.manifest_v4_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or validation_sources_authority.fold_fit_authority_receipt_sha256
+        != fold_fit_authority.semantic_receipt_sha256
+        or validation_environment_registry.manifest_v4_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or validation_environment_registry.validation_sources_authority_receipt_sha256
+        != validation_sources_authority.semantic_receipt_sha256
+        or validation_environment_registry.fold_index
+        != fold_fit_authority.outer_fold_index
         or chronology_authority.fold_index != fold_fit_authority.outer_fold_index
         or chronology_authority.training_forecast_authority_receipt_sha256
         != fold_fit_authority.training_forecast_authority.semantic_receipt_sha256
@@ -373,6 +402,33 @@ def _validation_evidence_facts_v1(
         != expected
         or tuple(row.checkpoint_authority_receipt_sha256 for row in ladders)
         != expected
+        or any(
+            row.loaded_source.payload_relative_path
+            != validation_primary_trace_relative_path_v1(
+                manifest=manifest,
+                fold_index=fold_fit_authority.outer_fold_index,
+                checkpoint_authority_receipt_sha256=(
+                    row.checkpoint_authority_receipt_sha256
+                ),
+            )
+            for row in primary
+        )
+        or any(
+            row.loaded_source.payload_relative_path
+            != validation_cost_ladder_relative_path_v1(
+                manifest=manifest,
+                fold_index=fold_fit_authority.outer_fold_index,
+                checkpoint_authority_receipt_sha256=(
+                    row.checkpoint_authority_receipt_sha256
+                ),
+            )
+            for row in ladders
+        )
+        or fixed_control_validation_authority.loaded_source.payload_relative_path
+        != validation_fixed_control_relative_path_v1(
+            manifest=manifest,
+            fold_index=fold_fit_authority.outer_fold_index,
+        )
     ):
         raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
             "fold-validation candidate coverage or training lineage differs"
@@ -384,6 +440,23 @@ def _validation_evidence_facts_v1(
     )
     fixed_runtime = fixed_control_validation_authority.runtime_evaluation
     assert fixed_runtime is not None
+    trace_values: list[MassiveAdaptiveRLPolicyTraceV1] = []
+    for authority in ladders:
+        ladder = authority.runtime_ladder
+        assert ladder is not None
+        trace_values.extend(
+            (
+                ladder.primary.policy_trace,
+                ladder.low_cost_trace,
+                ladder.high_cost_trace,
+            )
+        )
+    trace_rows = tuple(trace_values)
+    fixed_trace = fixed_runtime.policy_trace
+    environment_by_cost = {
+        row.transaction_cost_basis_points: row
+        for row in validation_environment_registry.environment_authorities
+    }
     if (
         shared.fold_index != fold_fit_authority.outer_fold_index
         or fixed_runtime.fixed_control_fit_authority_receipt_sha256
@@ -396,6 +469,27 @@ def _validation_evidence_facts_v1(
         != chronology_authority.rl_validation_origin_dates
         or shared.inference_plan_receipt_sha256
         != chronology_authority.validation_inference_plan_receipt_sha256
+        or shared.validation_decision_session_dates
+        != validation_sources_authority.validation_decision_session_dates
+        or shared.forecast_archive_receipt_sha256
+        != validation_sources_authority.validation_forecast_archive_receipt_sha256
+        or shared.inference_plan_receipt_sha256
+        != validation_sources_authority.validation_inference_plan_receipt_sha256
+        or shared.calibration_receipt_sha256
+        != validation_sources_authority.calibration_receipt_sha256
+        or shared.validation_context_receipt_sha256
+        != validation_environment_registry.validation_context_receipt_sha256
+        or shared.initial_capital
+        != validation_environment_registry.initial_capital
+        or len(trace_rows) != 3 * len(ladders)
+        or any(
+            trace.transaction_cost_basis_points not in environment_by_cost
+            or trace.economic_source_inventory_sha256
+            != environment_by_cost[
+                trace.transaction_cost_basis_points
+            ].environment_source_inventory_sha256
+            for trace in (*trace_rows, fixed_trace)
+        )
     ):
         raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
             "fold-validation traces do not share one economic tape"
@@ -407,6 +501,8 @@ def _validation_evidence_facts_v1(
     )
     source_qualified = bool(
         fold_fit_authority.development_stage_authorized
+        and validation_sources_authority.development_stage_authorized
+        and validation_environment_registry.development_stage_authorized
         and chronology_authority.development_policy_selection_authorized
         and shared.nested_source_data_qualified
     )
@@ -419,6 +515,15 @@ def _validation_evidence_facts_v1(
         fold_index=fold_fit_authority.outer_fold_index,
         fold_fit_authority_receipt_sha256=(
             fold_fit_authority.semantic_receipt_sha256
+        ),
+        four_fold_fit_authority_receipt_sha256=(
+            validation_sources_authority.four_fold_fit_authority_receipt_sha256
+        ),
+        validation_sources_authority_receipt_sha256=(
+            validation_sources_authority.semantic_receipt_sha256
+        ),
+        validation_environment_registry_receipt_sha256=(
+            validation_environment_registry.semantic_receipt_sha256
         ),
         chronology_authority_receipt_sha256=(
             chronology_authority.semantic_receipt_sha256
@@ -466,6 +571,9 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
     training_manifest_v3_receipt_sha256: str
     fold_index: int
     fold_fit_authority_receipt_sha256: str
+    four_fold_fit_authority_receipt_sha256: str
+    validation_sources_authority_receipt_sha256: str
+    validation_environment_registry_receipt_sha256: str
     chronology_authority_receipt_sha256: str
     expected_checkpoint_authority_receipts: tuple[str, ...]
     primary_trace_authority_receipts: tuple[str, ...]
@@ -492,8 +600,15 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
     runtime_fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1 | None = field(
         default=None, compare=False, repr=False
     )
-    runtime_chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1 | None = field(
-        default=None, compare=False, repr=False
+    runtime_validation_sources_authority: (
+        MassiveAdaptiveRLValidationSourcesAuthorityV1 | None
+    ) = field(default=None, compare=False, repr=False)
+    runtime_validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
+    ) = field(
+        default=None,
+        compare=False,
+        repr=False,
     )
     runtime_primary_trace_authorities: (
         tuple[MassiveAdaptiveRLPolicyTraceAuthorityV1, ...] | None
@@ -549,7 +664,8 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
         runtime_values = (
             self.runtime_manifest,
             self.runtime_fold_fit_authority,
-            self.runtime_chronology_authority,
+            self.runtime_validation_sources_authority,
+            self.runtime_validation_environment_registry,
             self.runtime_primary_trace_authorities,
             self.runtime_cost_ladder_authorities,
             self.runtime_fixed_control_validation_authority,
@@ -562,14 +678,20 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
         if runtime:
             assert self.runtime_manifest is not None
             assert self.runtime_fold_fit_authority is not None
-            assert self.runtime_chronology_authority is not None
+            assert self.runtime_validation_sources_authority is not None
+            assert self.runtime_validation_environment_registry is not None
             assert self.runtime_primary_trace_authorities is not None
             assert self.runtime_cost_ladder_authorities is not None
             assert self.runtime_fixed_control_validation_authority is not None
             facts = _validation_evidence_facts_v1(
                 manifest=self.runtime_manifest,
                 fold_fit_authority=self.runtime_fold_fit_authority,
-                chronology_authority=self.runtime_chronology_authority,
+                validation_sources_authority=(
+                    self.runtime_validation_sources_authority
+                ),
+                validation_environment_registry=(
+                    self.runtime_validation_environment_registry
+                ),
                 primary_trace_authorities=self.runtime_primary_trace_authorities,
                 cost_ladder_authorities=self.runtime_cost_ladder_authorities,
                 fixed_control_validation_authority=(
@@ -622,6 +744,9 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
             self.manifest_v4_receipt_sha256,
             self.training_manifest_v3_receipt_sha256,
             self.fold_fit_authority_receipt_sha256,
+            self.four_fold_fit_authority_receipt_sha256,
+            self.validation_sources_authority_receipt_sha256,
+            self.validation_environment_registry_receipt_sha256,
             self.chronology_authority_receipt_sha256,
             *self.expected_checkpoint_authority_receipts,
             *self.primary_trace_authority_receipts,
@@ -705,7 +830,10 @@ def authorize_massive_adaptive_rl_fold_validation_authority_v1(
     authority: MassiveAdaptiveRLFoldValidationAuthorityV1,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    validation_sources_authority: MassiveAdaptiveRLValidationSourcesAuthorityV1,
+    validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1
+    ),
     primary_trace_authorities: Sequence[MassiveAdaptiveRLPolicyTraceAuthorityV1],
     cost_ladder_authorities: Sequence[MassiveAdaptiveRLCostLadderAuthorityV1],
     fixed_control_validation_authority: (
@@ -715,12 +843,21 @@ def authorize_massive_adaptive_rl_fold_validation_authority_v1(
     parsed = parse_massive_adaptive_rl_fold_validation_authority_v1(
         root=root, loaded_source=authority.loaded_source
     )
+    expected_relative = fold_validation_authority_relative_path_v1(
+        manifest=manifest,
+        fold_index=fold_fit_authority.outer_fold_index,
+    )
+    if authority.loaded_source.payload_relative_path != expected_relative:
+        raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
+            "fold-validation authority path differs"
+        )
     primary = tuple(primary_trace_authorities)
     ladders = tuple(cost_ladder_authorities)
     facts = _validation_evidence_facts_v1(
         manifest=manifest,
         fold_fit_authority=fold_fit_authority,
-        chronology_authority=chronology_authority,
+        validation_sources_authority=validation_sources_authority,
+        validation_environment_registry=validation_environment_registry,
         primary_trace_authorities=primary,
         cost_ladder_authorities=ladders,
         fixed_control_validation_authority=fixed_control_validation_authority,
@@ -733,7 +870,8 @@ def authorize_massive_adaptive_rl_fold_validation_authority_v1(
         parsed,
         runtime_manifest=manifest,
         runtime_fold_fit_authority=fold_fit_authority,
-        runtime_chronology_authority=chronology_authority,
+        runtime_validation_sources_authority=validation_sources_authority,
+        runtime_validation_environment_registry=validation_environment_registry,
         runtime_primary_trace_authorities=primary,
         runtime_cost_ladder_authorities=ladders,
         runtime_fixed_control_validation_authority=(
@@ -749,10 +887,12 @@ def authorize_massive_adaptive_rl_fold_validation_authority_v1(
 def materialize_massive_adaptive_rl_fold_validation_authority_v1(
     *,
     root: str | Path,
-    artifact_id: str,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
-    chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
+    validation_sources_authority: MassiveAdaptiveRLValidationSourcesAuthorityV1,
+    validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1
+    ),
     primary_trace_authorities: Sequence[MassiveAdaptiveRLPolicyTraceAuthorityV1],
     cost_ladder_authorities: Sequence[MassiveAdaptiveRLCostLadderAuthorityV1],
     fixed_control_validation_authority: (
@@ -760,20 +900,23 @@ def materialize_massive_adaptive_rl_fold_validation_authority_v1(
     ),
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLFoldValidationAuthorityV1:
-    artifact = _artifact_id(artifact_id)
     primary = tuple(primary_trace_authorities)
     ladders = tuple(cost_ladder_authorities)
     facts = _validation_evidence_facts_v1(
         manifest=manifest,
         fold_fit_authority=fold_fit_authority,
-        chronology_authority=chronology_authority,
+        validation_sources_authority=validation_sources_authority,
+        validation_environment_registry=validation_environment_registry,
         primary_trace_authorities=primary,
         cost_ladder_authorities=ladders,
         fixed_control_validation_authority=fixed_control_validation_authority,
     )
     body = _authority_body(facts=facts)
     receipt = semantic_sha256(body)
-    relative = f"massive-adaptive/rl-fold-validation-authority-v1/{artifact}.json"
+    relative = fold_validation_authority_relative_path_v1(
+        manifest=manifest,
+        fold_index=fold_fit_authority.outer_fold_index,
+    )
     publish_massive_source_object(
         stream=BytesIO(canonical_json_file_bytes(body)),
         root=root,
@@ -787,7 +930,10 @@ def materialize_massive_adaptive_rl_fold_validation_authority_v1(
         ),
         entitlement_receipt_sha256=receipt,
         committed_at_ms=committed_at_ms,
-        request_id=f"ADAPTIVE-RL-FOLD-VALIDATION-V1-{artifact}",
+        request_id=(
+            f"ADAPTIVE-RL-FOLD-VALIDATION-V1-{manifest.experiment_id}-"
+            f"FOLD{fold_fit_authority.outer_fold_index}"
+        ),
     )
     loaded = load_massive_source_bundle(
         root=root,
@@ -801,7 +947,8 @@ def materialize_massive_adaptive_rl_fold_validation_authority_v1(
         ),
         manifest=manifest,
         fold_fit_authority=fold_fit_authority,
-        chronology_authority=chronology_authority,
+        validation_sources_authority=validation_sources_authority,
+        validation_environment_registry=validation_environment_registry,
         primary_trace_authorities=primary,
         cost_ladder_authorities=ladders,
         fixed_control_validation_authority=fixed_control_validation_authority,
@@ -812,6 +959,7 @@ __all__ = [
     "MassiveAdaptiveRLFoldValidationAuthorityV1",
     "MassiveAdaptiveRLFoldValidationAuthorityV1Error",
     "authorize_massive_adaptive_rl_fold_validation_authority_v1",
+    "fold_validation_authority_relative_path_v1",
     "materialize_massive_adaptive_rl_fold_validation_authority_v1",
     "parse_massive_adaptive_rl_fold_validation_authority_v1",
     "validate_massive_adaptive_rl_shared_validation_tape_v1",

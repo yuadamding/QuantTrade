@@ -64,6 +64,7 @@ jobs:
           tests/test_massive_adaptive_ppo_policy_v1.py
           tests/test_massive_adaptive_rl_policy_selection_v1.py
           tests/test_massive_adaptive_rl_policy_selection_v2.py
+          tests/test_massive_adaptive_rl_validation_inputs_v1.py
           tests/test_massive_adaptive_rl_fold_validation_authority_v1.py
           tests/test_massive_adaptive_rl_outer_evidence_v1.py
           tests/test_massive_adaptive_outer_access_commitment_v1.py
@@ -97,6 +98,7 @@ jobs:
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_validation_authority_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_policy_trace_authority_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_cost_ladder_authority_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_validation_inputs_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_authority_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_cost_ladder_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_rollout_v1.py

@@ -422,6 +422,25 @@ class MassiveAdaptiveRLFourFoldFitAuthorityV1:
             and self.source_transaction_verified
         )
 
+    def fold_fit(self, fold_index: int) -> MassiveAdaptiveRLFoldFitAuthorityV1:
+        """Return one canonical persisted fold from the replayed aggregate."""
+
+        self.validate()
+        if fold_index not in self.fold_indices:
+            raise MassiveAdaptiveRLFourFoldFitV1Error(
+                "adaptive RL four-fold fit child is absent"
+            )
+        result = self._fold_fits[fold_index]
+        if (
+            result.outer_fold_index != fold_index
+            or result.semantic_receipt_sha256
+            != self.fold_fit_authority_receipts[fold_index]
+        ):
+            raise MassiveAdaptiveRLFourFoldFitV1Error(
+                "adaptive RL four-fold fit child differs"
+            )
+        return result
+
     def validate(self) -> None:
         if type(self._fit_inputs_authority) is not (
             MassiveAdaptiveRLFourFoldFitInputsAuthorityV1
