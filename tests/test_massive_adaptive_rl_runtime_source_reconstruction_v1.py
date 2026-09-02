@@ -2,15 +2,24 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
 import torch
 
 from rl_quant.alpha.contracts import CorporateActionKind, TerminalEventKind
+from rl_quant.data_sources.massive.decision_clock import (
+    build_massive_decision_clock_authority,
+)
+from rl_quant.data_sources.massive.session_calendar import (
+    MassiveExchangeSession,
+    build_massive_session_authority,
+)
 from rl_quant.data_sources.massive.source_receipts import canonical_json_file_bytes
 from rl_quant.evaluation.massive_adaptive_rl_fit_forecast_archive_v1 import (
     materialize_massive_adaptive_rl_fit_forecast_archive_v1,
@@ -28,6 +37,9 @@ from rl_quant.features.massive_daily_bars_v0 import MASSIVE_DAILY_BARS_V0_FIELDS
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
     build_massive_adaptive_causal_checkpoint_choice_v1,
+)
+from rl_quant.training.massive_adaptive_split_plan_v1 import (
+    build_massive_adaptive_split_plan_v1,
 )
 from rl_quant.workflows import massive_adaptive_rl_experiment_runner_v2 as runner_module
 from rl_quant.workflows import (
@@ -49,6 +61,7 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 im
 )
 from test_massive_adaptive_decision_tensor_v1 import _origin
 from test_massive_adaptive_forecast_archive_v2 import _expand_context_feature
+from test_massive_adaptive_origin_authority_v1 import _identity as _origin_identity
 from test_massive_adaptive_profitability_v1_vertical_slice import (
     _calibration_v2,
     _identity,
@@ -479,6 +492,243 @@ def test_reconstruction_uses_auxiliary_decision_roots_for_native_replay(
     assert set(tensor.decision_session_dates) - {
         row.decision_session_date for row in by_fold[0]
     }
+
+
+def test_runtime_sources_rebuild_validation_origins_without_caller_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block, lineage, _fit_identity, sessions = _execution_ready_fit_block(
+        tmp_path / "fit",
+        outer_fold_index=0,
+    )
+    calendar_source = semantic_sha256("runtime-validation-session-calendar")
+    sessions = build_massive_session_authority(
+        tuple(
+            MassiveExchangeSession(
+                session_date=row.session_date,
+                exchange="XNYS",
+                regular_open_ns=int(
+                    datetime.fromisoformat(row.session_date)
+                    .replace(tzinfo=ZoneInfo("America/New_York"))
+                    .timestamp()
+                    * 1_000_000_000
+                )
+                + 60 * 60 * 1_000_000_000,
+                regular_close_ns=int(
+                    datetime.fromisoformat(row.session_date)
+                    .replace(tzinfo=ZoneInfo("America/New_York"))
+                    .timestamp()
+                    * 1_000_000_000
+                )
+                + 7 * 60 * 60 * 1_000_000_000,
+                scheduled_five_minute_intervals=72,
+                special_session_reason=None,
+                calendar_source_receipt_sha256=calendar_source,
+            )
+            for row in sessions.sessions
+        ),
+        calendar_source_receipt_sha256=calendar_source,
+    )
+    candidate_dates = tuple(row.session_date for row in sessions.sessions)
+    split_plan = build_massive_adaptive_split_plan_v1(
+        candidate_session_dates=candidate_dates,
+        session_authority=sessions,
+    )
+    validation_dates = split_plan.outer_folds[0].inner_validation_session_dates
+    validation_start = candidate_dates.index(validation_dates[0])
+    context_sessions = min(
+        lineage.model_spec.maximum_context_sessions,
+        reconstruction.MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
+    )
+    tensor_dates = candidate_dates[
+        validation_start - context_sessions + 1 : candidate_dates.index(
+            validation_dates[-1]
+        )
+        + 1
+    ]
+    daily_receipt = semantic_sha256("runtime-validation-daily")
+    features = []
+    actions = []
+    for session_date in tensor_dates:
+        candidate_index = candidate_dates.index(session_date)
+        feature, _unused_target = _feature_and_target(
+            decision_session_date=session_date,
+            source_session_date=candidate_dates[candidate_index - 1],
+            input_session_dates=candidate_dates[candidate_index - 64 : candidate_index],
+            date_index=candidate_index,
+        )
+        feature = _expand_context_feature(feature)
+        provisional_feature = replace(
+            feature,
+            daily_input_authority_semantic_receipt_sha256=daily_receipt,
+            semantic_receipt_sha256="0" * 64,
+        )
+        feature = replace(
+            provisional_feature,
+            semantic_receipt_sha256=semantic_sha256(
+                provisional_feature.semantic_unsigned()
+            ),
+        )
+        feature.validate()
+        clock = build_massive_decision_clock_authority(
+            session_authority=sessions,
+            session=next(
+                row for row in sessions.sessions if row.session_date == session_date
+            ),
+        )
+        action = _origin(
+            feature,
+            action_ids=tuple(row.security_id for row in feature.rows),
+            session_authority_receipt_sha256=sessions.receipt_sha256,
+        )
+        decision_at_ms = clock.decision_at_ns // 1_000_000
+        provisional_action = replace(
+            action,
+            decision_at_ms=decision_at_ms,
+            exposure_panel=replace(
+                action.exposure_panel,
+                origin_at_ms=decision_at_ms,
+                available_at_ms=decision_at_ms,
+            ),
+            decision_clock_receipt_sha256=clock.receipt_sha256,
+            semantic_receipt_sha256="0" * 64,
+        )
+        action = replace(
+            provisional_action,
+            semantic_receipt_sha256=semantic_sha256(
+                provisional_action.semantic_unsigned()
+            ),
+        )
+        action.validate()
+        features.append(feature)
+        actions.append(action)
+
+    context_identity = _origin_identity(
+        sessions=sessions,
+        wrong_rule=True,
+    )
+    context_identity.receipt_sha256 = semantic_sha256(
+        "runtime-validation-context-identity"
+    )
+    fold = reconstruction.MassiveAdaptiveRLFoldRuntimeSourcesV1(
+        outer_fold_index=0,
+        training_windows=(lineage.training_window,),
+        checkpoint_choices=(lineage.checkpoint_choice,),
+        calibrations=(lineage.calibration,),
+        fit_forecast_archives=(block.forecast_archive,),
+        decision_roots=block.decision_roots,
+        context_origins=block.context_origins,
+        supervised_lineages=(lineage,),
+        fit_blocks=(block,),
+    )
+    monkeypatch.setattr(
+        reconstruction.MassiveAdaptiveRLRuntimeSourcesV1,
+        "validate",
+        lambda _self: None,
+    )
+    runtime_sources = reconstruction.MassiveAdaptiveRLRuntimeSourcesV1(
+        experiment_id="runtime-validation-origins",
+        manifest_v3_receipt_sha256=semantic_sha256("manifest-v3"),
+        source_bundle_receipt_sha256=semantic_sha256("source-bundle"),
+        replay_dependency_index_receipt_sha256=semantic_sha256("dependency-index"),
+        runtime_source_graph_authority=SimpleNamespace(
+            runtime_authority_receipt_sha256=semantic_sha256("runtime-witness")
+        ),  # type: ignore[arg-type]
+        session_authority=sessions,
+        condition_authority=SimpleNamespace(
+            receipt_sha256=semantic_sha256("conditions")
+        ),  # type: ignore[arg-type]
+        persisted_partition_manifests=(),
+        identity_authority=context_identity,  # type: ignore[arg-type]
+        economic_event_archive=SimpleNamespace(
+            receipt_sha256=semantic_sha256("economic-events")
+        ),  # type: ignore[arg-type]
+        daily_input_authority=SimpleNamespace(semantic_receipt_sha256=daily_receipt),  # type: ignore[arg-type]
+        fill_source=SimpleNamespace(
+            semantic_receipt_sha256=semantic_sha256("fill-source")
+        ),  # type: ignore[arg-type]
+        split_plan=split_plan,
+        folds=(fold,),
+        replay_dependency_receipts=tuple(
+            sorted(row.semantic_receipt_sha256 for row in (*features, *actions))
+        ),
+        source_data_qualified=True,
+        semantic_receipt_sha256=semantic_sha256("runtime-sources"),
+        _replay_origin_features=tuple(features),
+        _replay_action_origins=tuple(actions),
+        _replay_context_origins=block.context_origins,
+        _replay_decision_roots=block.decision_roots,
+    )
+    runtime_sources = replace(
+        runtime_sources,
+        semantic_receipt_sha256=semantic_sha256(runtime_sources.semantic_unsigned()),
+    )
+    substituted_runtime_sources = replace(
+        runtime_sources,
+        _replay_origin_features=runtime_sources._replay_origin_features[1:],
+    )
+
+    assert substituted_runtime_sources.semantic_receipt_sha256 != semantic_sha256(
+        substituted_runtime_sources.semantic_unsigned()
+    )
+    with pytest.raises(
+        reconstruction.MassiveAdaptiveRLRuntimeSourceDependencyMismatch,
+        match="predictor dependency is absent",
+    ):
+        substituted_runtime_sources.validation_origin_inputs(0)
+
+    origin_inputs = runtime_sources.validation_origin_inputs(0)
+
+    assert origin_inputs.tensor_session_dates == tensor_dates
+    assert origin_inputs.features == tuple(features)
+    assert origin_inputs.action_origins == tuple(actions)
+    assert tuple(
+        row.decision_session_date for row in origin_inputs.context_origins
+    ) == (tensor_dates)
+    assert tuple(row.decision_session_date for row in origin_inputs.decision_roots) == (
+        tensor_dates
+    )
+    assert origin_inputs.source_data_qualified
+    with pytest.raises(
+        reconstruction.MassiveAdaptiveRLRuntimeSourceReconstructionV1Error,
+        match="validation-origin inputs differ",
+    ):
+        replace(
+            origin_inputs,
+            feature_inventory_sha256=semantic_sha256("tampered-features"),
+        ).validate()
+
+
+def test_runtime_source_reconstruction_rejects_alternate_same_date_feature() -> None:
+    history = (
+        tuple(f"2023-01-{index:02d}" for index in range(1, 29))
+        + tuple(f"2023-02-{index:02d}" for index in range(1, 29))
+        + tuple(f"2023-03-{index:02d}" for index in range(1, 9))
+    )
+    first, _unused_target = _feature_and_target(
+        decision_session_date="2023-03-09",
+        source_session_date=history[-1],
+        input_session_dates=history,
+        date_index=1,
+    )
+    second, _unused_target = _feature_and_target(
+        decision_session_date="2023-03-09",
+        source_session_date=history[-1],
+        input_session_dates=history,
+        date_index=2,
+    )
+    assert first.semantic_receipt_sha256 != second.semantic_receipt_sha256
+
+    with pytest.raises(
+        reconstruction.MassiveAdaptiveRLRuntimeSourceDependencyMismatch,
+        match="alternate roots",
+    ):
+        reconstruction._objects_by_decision_date(
+            values=(first, second),
+            expected_type=type(first),
+            description="validation feature",
+        )
 
 
 def test_fit_block_runtime_sources_reset_real_environment_with_source_fold_lineage(

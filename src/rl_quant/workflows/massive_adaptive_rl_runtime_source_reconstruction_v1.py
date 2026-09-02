@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 import importlib
 import inspect
@@ -26,14 +26,17 @@ import os
 from pathlib import Path, PurePosixPath
 import sys
 import tempfile
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import numpy as np
 import torch
 
 from rl_quant.alpha.pit_universe import PITSecurityUniverseAuthority
 from rl_quant.data_sources.massive.conditions import MassiveConditionAuthority
-from rl_quant.data_sources.massive.decision_clock import MassiveDecisionClockAuthority
+from rl_quant.data_sources.massive.decision_clock import (
+    MassiveDecisionClockAuthority,
+    build_massive_decision_clock_authority,
+)
 from rl_quant.data_sources.massive.finalized_persisted_partitions import (
     MassivePersistedPartitionManifestV1,
 )
@@ -55,9 +58,11 @@ from rl_quant.evaluation.massive_adaptive_rl_fit_inference_plan_v1 import (
 )
 from rl_quant.features.massive_adaptive_context_origin_authority_v1 import (
     MassiveAdaptiveContextOriginAuthorityV1,
+    build_massive_adaptive_context_origin_authority_v1,
 )
 from rl_quant.features.massive_adaptive_decision_root_v1 import (
     MassiveAdaptiveDecisionRootV1,
+    build_massive_adaptive_decision_root_v1,
 )
 from rl_quant.features.massive_adaptive_decision_tensor_v1 import (
     MassiveAdaptiveDecisionTensorV1,
@@ -105,6 +110,7 @@ from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import
     build_massive_adaptive_causal_checkpoint_choice_v1,
 )
 from rl_quant.training.massive_adaptive_split_plan_v1 import (
+    MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
     MassiveAdaptiveSplitPlanV1,
 )
 from rl_quant.training.massive_adaptive_supervised_trainer_v1 import (
@@ -156,6 +162,9 @@ MASSIVE_ADAPTIVE_RL_SUPERVISED_LINEAGE_RUNTIME_SOURCES_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_FIT_BLOCK_RUNTIME_SOURCES_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-fit-block-runtime-sources-v1"
 )
+MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-validation-origin-inputs-v1"
+)
 MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SOURCE_SHA256 = file_sha256(
     Path(__file__)
 )
@@ -176,11 +185,31 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256 = semantic_sha2
         "execution_view": (
             "source-fold-supervised-lineage-and-block-local-fit-runtime-inputs"
         ),
+        "validation_origin_view": (
+            "exact-split-and-model-derived-feature-action-dependencies-with-"
+            "package-rebuilt-clocks-contexts-and-decision-roots"
+        ),
+        "caller_validation_predictor_roots": False,
         "reconstruction_dependency_closure": "independently-recomputed",
         "temporary_source_unavailability": "retryable-blocker",
         "publication": "fsync-atomic-content-addressed-and-create-only-index",
         "profitability_reporting": False,
         "lockbox_access": False,
+    }
+)
+MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SPEC_SHA256 = semantic_sha256(
+    {
+        "source": "dependency-closed-persisted-runtime-source-reconstruction-v1",
+        "dates": "exact-model-context-plus-complete-inner-validation-interval",
+        "features": "exact-replayed-decision-tensor-dependencies",
+        "actions": "exact-replayed-decision-tensor-dependencies",
+        "clocks": "package-rebuilt-from-session-authority",
+        "contexts": "package-rebuilt-from-clock-session-identity-and-feature",
+        "decision_roots": "package-rebuilt-from-feature-action-and-context",
+        "same_date_alternatives": "rejected",
+        "caller_predictor_roots": False,
+        "profitability_reporting": False,
+        "outer_access": False,
     }
 )
 
@@ -215,6 +244,9 @@ class MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
     MassiveAdaptiveRLRuntimeSourceIntegrityError
 ):
     """The persisted runtime-source dependency closure differs."""
+
+
+_OriginT = TypeVar("_OriginT")
 
 
 def _digest(name: str, value: object) -> str:
@@ -1231,9 +1263,7 @@ class MassiveAdaptiveRLFoldRuntimeSourcesV1:
             )
         return result
 
-    def fit_block(
-        self, block_index: int
-    ) -> MassiveAdaptiveRLFitBlockRuntimeSourcesV1:
+    def fit_block(self, block_index: int) -> MassiveAdaptiveRLFitBlockRuntimeSourcesV1:
         if block_index not in range(len(self.fit_blocks)):
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "adaptive RL fit-block runtime sources are absent"
@@ -1283,9 +1313,7 @@ class MassiveAdaptiveRLFoldRuntimeSourcesV1:
                     block.source_fold_index
                 ].semantic_receipt_sha256
                 or block.calibration.semantic_receipt_sha256
-                != self.calibrations[
-                    block.source_fold_index
-                ].semantic_receipt_sha256
+                != self.calibrations[block.source_fold_index].semantic_receipt_sha256
                 for block in self.fit_blocks
             )
             or tuple(row.decision_session_date for row in self.decision_roots)
@@ -1310,6 +1338,171 @@ class MassiveAdaptiveRLFoldRuntimeSourcesV1:
                 )
             for row in inventory:
                 row.validate()
+
+
+@dataclass(frozen=True, slots=True)
+class MassiveAdaptiveRLValidationOriginInputsV1:
+    """Exact predictor roots reconstructed from the persisted replay graph."""
+
+    fold_index: int
+    tensor_session_dates: tuple[str, ...]
+    features: tuple[MassiveProfitabilityOriginFeaturesV3, ...]
+    action_origins: tuple[MassiveAdaptiveOriginAuthorityV1, ...]
+    context_origins: tuple[MassiveAdaptiveContextOriginAuthorityV1, ...]
+    decision_roots: tuple[MassiveAdaptiveDecisionRootV1, ...]
+    replay_dependency_index_receipt_sha256: str
+    feature_inventory_sha256: str
+    action_origin_inventory_sha256: str
+    context_origin_inventory_sha256: str
+    decision_root_inventory_sha256: str
+    source_data_qualified: bool
+    semantic_receipt_sha256: str
+    profitability_reporting_authorized: bool = False
+    outer_evaluation_authorized: bool = False
+    lockbox_access_authorized: bool = False
+    specification_sha256: str = (
+        MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SPEC_SHA256
+    )
+    schema: str = MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SCHEMA
+
+    def semantic_unsigned(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "fold_index": self.fold_index,
+            "tensor_session_dates": self.tensor_session_dates,
+            "feature_receipts": tuple(
+                row.semantic_receipt_sha256 for row in self.features
+            ),
+            "action_origin_receipts": tuple(
+                row.semantic_receipt_sha256 for row in self.action_origins
+            ),
+            "context_origin_receipts": tuple(
+                row.semantic_receipt_sha256 for row in self.context_origins
+            ),
+            "decision_root_receipts": tuple(
+                row.semantic_receipt_sha256 for row in self.decision_roots
+            ),
+            "replay_dependency_index_receipt_sha256": (
+                self.replay_dependency_index_receipt_sha256
+            ),
+            "feature_inventory_sha256": self.feature_inventory_sha256,
+            "action_origin_inventory_sha256": self.action_origin_inventory_sha256,
+            "context_origin_inventory_sha256": self.context_origin_inventory_sha256,
+            "decision_root_inventory_sha256": self.decision_root_inventory_sha256,
+            "source_data_qualified": self.source_data_qualified,
+            "profitability_reporting_authorized": (
+                self.profitability_reporting_authorized
+            ),
+            "outer_evaluation_authorized": self.outer_evaluation_authorized,
+            "lockbox_access_authorized": self.lockbox_access_authorized,
+            "specification_sha256": self.specification_sha256,
+        }
+
+    def validate(self) -> None:
+        inventories = (
+            self.features,
+            self.action_origins,
+            self.context_origins,
+            self.decision_roots,
+        )
+        for inventory in inventories:
+            if not inventory:
+                raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                    "adaptive RL validation-origin inventory is empty"
+                )
+            for row in inventory:
+                cast(Any, row).validate()
+        dates = tuple(row.decision_session_date for row in self.features)
+        expected_qualified = bool(
+            all(row.source_inputs_data_qualified for row in self.features)
+            and all(
+                row.action_identity_source_data_qualified for row in self.action_origins
+            )
+            and all(row.source_data_qualified for row in self.context_origins)
+            and all(row.source_data_qualified for row in self.decision_roots)
+        )
+        if (
+            self.schema != MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SCHEMA
+            or self.fold_index not in range(4)
+            or self.tensor_session_dates
+            != tuple(sorted(set(self.tensor_session_dates)))
+            or dates != self.tensor_session_dates
+            or tuple(row.decision_session_date for row in self.action_origins) != dates
+            or tuple(row.decision_session_date for row in self.context_origins) != dates
+            or tuple(row.decision_session_date for row in self.decision_roots) != dates
+            or any(
+                root.feature_semantic_receipt_sha256 != feature.semantic_receipt_sha256
+                or root.action_origin_receipt_sha256 != action.semantic_receipt_sha256
+                or root.context_origin_receipt_sha256 != context.semantic_receipt_sha256
+                for root, feature, action, context in zip(
+                    self.decision_roots,
+                    self.features,
+                    self.action_origins,
+                    self.context_origins,
+                    strict=True,
+                )
+            )
+            or self.feature_inventory_sha256
+            != semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in self.features)
+            )
+            or self.action_origin_inventory_sha256
+            != semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in self.action_origins)
+            )
+            or self.context_origin_inventory_sha256
+            != semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in self.context_origins)
+            )
+            or self.decision_root_inventory_sha256
+            != semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in self.decision_roots)
+            )
+            or self.source_data_qualified != expected_qualified
+            or self.profitability_reporting_authorized
+            or self.outer_evaluation_authorized
+            or self.lockbox_access_authorized
+            or self.specification_sha256
+            != MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SPEC_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL validation-origin inputs differ"
+            )
+        for name, value in self.semantic_unsigned().items():
+            if name.endswith("_sha256"):
+                _digest("adaptive RL validation-origin inputs", value)
+        _digest(
+            "adaptive RL validation-origin inputs",
+            self.semantic_receipt_sha256,
+        )
+        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+
+
+def _objects_by_decision_date(
+    *,
+    values: Sequence[_OriginT],
+    expected_type: type[_OriginT],
+    description: str,
+) -> dict[str, _OriginT]:
+    result: dict[str, _OriginT] = {}
+    for value in values:
+        if type(value) is not expected_type:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                f"adaptive RL {description} uses the wrong type"
+            )
+        cast(Any, value).validate()
+        date = getattr(value, "decision_session_date", None)
+        if not isinstance(date, str) or not date:
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                f"adaptive RL {description} date is absent"
+            )
+        previous = result.setdefault(date, value)
+        if _receipt(previous) != _receipt(value):
+            raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                f"adaptive RL {description} date resolves to alternate roots"
+            )
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -1338,6 +1531,18 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
         MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256
     )
     schema: str = MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA
+    _replay_origin_features: tuple[MassiveProfitabilityOriginFeaturesV3, ...] = field(
+        default=(), compare=False, repr=False
+    )
+    _replay_action_origins: tuple[MassiveAdaptiveOriginAuthorityV1, ...] = field(
+        default=(), compare=False, repr=False
+    )
+    _replay_context_origins: tuple[MassiveAdaptiveContextOriginAuthorityV1, ...] = (
+        field(default=(), compare=False, repr=False)
+    )
+    _replay_decision_roots: tuple[MassiveAdaptiveDecisionRootV1, ...] = field(
+        default=(), compare=False, repr=False
+    )
 
     def fold(self, outer_fold_index: int) -> MassiveAdaptiveRLFoldRuntimeSourcesV1:
         if outer_fold_index not in range(len(self.folds)):
@@ -1349,6 +1554,175 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
             raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
                 "adaptive RL outer-fold runtime sources differ"
             )
+        return result
+
+    def validation_origin_inputs(
+        self, fold_index: int
+    ) -> MassiveAdaptiveRLValidationOriginInputsV1:
+        """Rebuild one fold's validation roots from persisted replay dependencies."""
+
+        self.validate()
+        if fold_index not in range(4):
+            raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                "adaptive RL validation-origin fold is absent"
+            )
+        lineage = self.fold(fold_index).supervised_lineage(fold_index)
+        role_dates = self.split_plan.outer_folds[
+            fold_index
+        ].inner_validation_session_dates
+        candidate_dates = self.split_plan.candidate_session_dates
+        maximum_context = min(
+            lineage.model_spec.maximum_context_sessions,
+            MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
+        )
+        start = candidate_dates.index(role_dates[0])
+        stop = candidate_dates.index(role_dates[-1]) + 1
+        context_start = start - maximum_context + 1
+        if context_start < 0:
+            raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                "adaptive RL validation-origin context is unavailable"
+            )
+        expected_dates = candidate_dates[context_start:stop]
+        features_by_date = _objects_by_decision_date(
+            values=self._replay_origin_features,
+            expected_type=MassiveProfitabilityOriginFeaturesV3,
+            description="validation feature",
+        )
+        actions_by_date = _objects_by_decision_date(
+            values=self._replay_action_origins,
+            expected_type=MassiveAdaptiveOriginAuthorityV1,
+            description="validation action origin",
+        )
+        persisted_contexts_by_date = _objects_by_decision_date(
+            values=self._replay_context_origins,
+            expected_type=MassiveAdaptiveContextOriginAuthorityV1,
+            description="validation context origin",
+        )
+        persisted_roots_by_date = _objects_by_decision_date(
+            values=self._replay_decision_roots,
+            expected_type=MassiveAdaptiveDecisionRootV1,
+            description="validation decision root",
+        )
+        try:
+            features = tuple(features_by_date[date] for date in expected_dates)
+            action_origins = tuple(actions_by_date[date] for date in expected_dates)
+        except KeyError as error:
+            raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                "adaptive RL validation predictor dependency is absent"
+            ) from error
+        dependency_receipts = set(self.replay_dependency_receipts)
+        if any(
+            row.semantic_receipt_sha256 not in dependency_receipts for row in features
+        ) or any(
+            row.semantic_receipt_sha256 not in dependency_receipts
+            for row in action_origins
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                "adaptive RL validation predictor is not a persisted replay dependency"
+            )
+        sessions_by_date = {
+            row.session_date: row for row in self.session_authority.sessions
+        }
+        contexts: list[MassiveAdaptiveContextOriginAuthorityV1] = []
+        roots: list[MassiveAdaptiveDecisionRootV1] = []
+        for date, feature, action in zip(
+            expected_dates,
+            features,
+            action_origins,
+            strict=True,
+        ):
+            try:
+                session = sessions_by_date[date]
+            except KeyError as error:
+                raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                    "adaptive RL validation decision session is absent"
+                ) from error
+            clock = build_massive_decision_clock_authority(
+                session_authority=self.session_authority,
+                session=session,
+            )
+            if (
+                feature.daily_input_authority_semantic_receipt_sha256
+                != self.daily_input_authority.semantic_receipt_sha256
+                or action.session_authority_receipt_sha256
+                != self.session_authority.receipt_sha256
+                or action.decision_clock_receipt_sha256 != clock.receipt_sha256
+                or action.decision_at_ms != clock.decision_at_ns // 1_000_000
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                    "adaptive RL validation predictor source roots differ"
+                )
+            context = build_massive_adaptive_context_origin_authority_v1(
+                decision_clock=clock,
+                session_authority=self.session_authority,
+                identity_authority=self.identity_authority,
+                features=feature,
+            )
+            persisted_context = persisted_contexts_by_date.get(date)
+            if persisted_context is not None and (
+                persisted_context.semantic_receipt_sha256
+                != context.semantic_receipt_sha256
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                    "adaptive RL persisted and rebuilt validation contexts differ"
+                )
+            root = build_massive_adaptive_decision_root_v1(
+                context_origin=context,
+                action_origin=action,
+                features=feature,
+            )
+            persisted_root = persisted_roots_by_date.get(date)
+            if persisted_root is not None and (
+                persisted_root.semantic_receipt_sha256 != root.semantic_receipt_sha256
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                    "adaptive RL persisted and rebuilt validation roots differ"
+                )
+            contexts.append(context)
+            roots.append(root)
+        context_origins = tuple(contexts)
+        decision_roots = tuple(roots)
+        body = {
+            "fold_index": fold_index,
+            "tensor_session_dates": expected_dates,
+            "features": features,
+            "action_origins": action_origins,
+            "context_origins": context_origins,
+            "decision_roots": decision_roots,
+            "replay_dependency_index_receipt_sha256": (
+                self.replay_dependency_index_receipt_sha256
+            ),
+            "feature_inventory_sha256": semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in features)
+            ),
+            "action_origin_inventory_sha256": semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in action_origins)
+            ),
+            "context_origin_inventory_sha256": semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in context_origins)
+            ),
+            "decision_root_inventory_sha256": semantic_sha256(
+                tuple(row.semantic_receipt_sha256 for row in decision_roots)
+            ),
+            "source_data_qualified": bool(
+                self.source_data_qualified
+                and all(row.source_inputs_data_qualified for row in features)
+                and all(
+                    row.action_identity_source_data_qualified for row in action_origins
+                )
+                and all(row.source_data_qualified for row in context_origins)
+                and all(row.source_data_qualified for row in decision_roots)
+            ),
+        }
+        provisional = MassiveAdaptiveRLValidationOriginInputsV1(
+            **body,  # type: ignore[arg-type]
+            semantic_receipt_sha256="0" * 64,
+        )
+        result = replace(
+            provisional,
+            semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+        )
+        result.validate()
         return result
 
     def semantic_unsigned(self) -> dict[str, object]:
@@ -1400,6 +1774,24 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
                 )
                 for fold in self.folds
             ),
+            "replayed_origin_receipt_inventories": (
+                tuple(
+                    row.semantic_receipt_sha256
+                    for row in self._replay_origin_features
+                ),
+                tuple(
+                    row.semantic_receipt_sha256
+                    for row in self._replay_action_origins
+                ),
+                tuple(
+                    row.semantic_receipt_sha256
+                    for row in self._replay_context_origins
+                ),
+                tuple(
+                    row.semantic_receipt_sha256
+                    for row in self._replay_decision_roots
+                ),
+            ),
             "replay_dependency_receipts": self.replay_dependency_receipts,
             "source_data_qualified": self.source_data_qualified,
             "profitability_reporting_authorized": (
@@ -1415,6 +1807,49 @@ class MassiveAdaptiveRLRuntimeSourcesV1:
         runtime_receipt = (
             self.runtime_source_graph_authority.runtime_authority_receipt_sha256
         )
+        replay_origin_inventories = (
+            self._replay_origin_features,
+            self._replay_action_origins,
+            self._replay_context_origins,
+            self._replay_decision_roots,
+        )
+        replay_origins_present = tuple(bool(rows) for rows in replay_origin_inventories)
+        if any(replay_origins_present):
+            if not all(replay_origins_present):
+                raise MassiveAdaptiveRLRuntimeSourceReconstructionV1Error(
+                    "adaptive RL replayed origin inventories are incomplete"
+                )
+            _objects_by_decision_date(
+                values=self._replay_origin_features,
+                expected_type=MassiveProfitabilityOriginFeaturesV3,
+                description="replayed feature",
+            )
+            _objects_by_decision_date(
+                values=self._replay_action_origins,
+                expected_type=MassiveAdaptiveOriginAuthorityV1,
+                description="replayed action origin",
+            )
+            _objects_by_decision_date(
+                values=self._replay_context_origins,
+                expected_type=MassiveAdaptiveContextOriginAuthorityV1,
+                description="replayed context origin",
+            )
+            _objects_by_decision_date(
+                values=self._replay_decision_roots,
+                expected_type=MassiveAdaptiveDecisionRootV1,
+                description="replayed decision root",
+            )
+            dependency_receipts = set(self.replay_dependency_receipts)
+            if any(
+                row.semantic_receipt_sha256 not in dependency_receipts
+                for row in self._replay_origin_features
+            ) or any(
+                row.semantic_receipt_sha256 not in dependency_receipts
+                for row in self._replay_action_origins
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceDependencyMismatch(
+                    "adaptive RL replayed predictor is not dependency-index bound"
+                )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA
             or not self.experiment_id
@@ -2906,6 +3341,45 @@ def _reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
             if row.role == _DEPENDENCY_ROLE
         )
     )
+    replay_origin_features = tuple(
+        sorted(
+            cast(
+                tuple[MassiveProfitabilityOriginFeaturesV3, ...],
+                _objects_of_type(objects, MassiveProfitabilityOriginFeaturesV3),
+            ),
+            key=lambda row: row.decision_session_date,
+        )
+    )
+    replay_action_origins = tuple(
+        sorted(
+            cast(
+                tuple[MassiveAdaptiveOriginAuthorityV1, ...],
+                _objects_of_type(objects, MassiveAdaptiveOriginAuthorityV1),
+            ),
+            key=lambda row: row.decision_session_date,
+        )
+    )
+    replay_context_origins = tuple(
+        sorted(
+            cast(
+                tuple[MassiveAdaptiveContextOriginAuthorityV1, ...],
+                _objects_of_type(
+                    objects,
+                    MassiveAdaptiveContextOriginAuthorityV1,
+                ),
+            ),
+            key=lambda row: row.decision_session_date,
+        )
+    )
+    replay_decision_roots = tuple(
+        sorted(
+            cast(
+                tuple[MassiveAdaptiveDecisionRootV1, ...],
+                _objects_of_type(objects, MassiveAdaptiveDecisionRootV1),
+            ),
+            key=lambda row: row.decision_session_date,
+        )
+    )
     body = {
         "experiment_id": manifest.experiment_id,
         "manifest_v3_receipt_sha256": manifest.semantic_receipt_sha256,
@@ -2951,6 +3425,10 @@ def _reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
             MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256
         ),
         "schema": MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA,
+        "_replay_origin_features": replay_origin_features,
+        "_replay_action_origins": replay_action_origins,
+        "_replay_context_origins": replay_context_origins,
+        "_replay_decision_roots": replay_decision_roots,
     }
     provisional = MassiveAdaptiveRLRuntimeSourcesV1(
         **body,  # type: ignore[arg-type]
@@ -2996,6 +3474,8 @@ __all__ = [
     "MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCES_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V1_SPEC_SHA256",
     "MASSIVE_ADAPTIVE_RL_SUPERVISED_LINEAGE_RUNTIME_SOURCES_V1_SCHEMA",
+    "MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SCHEMA",
+    "MASSIVE_ADAPTIVE_RL_VALIDATION_ORIGIN_INPUTS_V1_SPEC_SHA256",
     "MassiveAdaptiveRLFitBlockRuntimeSourcesV1",
     "MassiveAdaptiveRLFoldRuntimeSourcesV1",
     "MassiveAdaptiveRLReplayDependencyIndexV1",
@@ -3007,6 +3487,7 @@ __all__ = [
     "MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable",
     "MassiveAdaptiveRLRuntimeSourcesV1",
     "MassiveAdaptiveRLSupervisedLineageSourcesV1",
+    "MassiveAdaptiveRLValidationOriginInputsV1",
     "load_massive_adaptive_rl_replay_dependency_index_v1",
     "materialize_massive_adaptive_rl_replay_dependency_index_v1",
     "reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1",

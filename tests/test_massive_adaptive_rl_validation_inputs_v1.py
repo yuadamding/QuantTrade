@@ -33,10 +33,12 @@ from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
     MassiveAdaptiveRLValidationEnvironmentRegistryV1,
     MassiveAdaptiveRLValidationInputsV1Error,
     MassiveAdaptiveRLValidationSourcesAuthorityV1,
+    authorize_massive_adaptive_rl_validation_sources_authority_v1,
     materialize_massive_adaptive_rl_validation_environment_registry_v1,
     materialize_massive_adaptive_rl_validation_sources_authority_v1,
     parse_massive_adaptive_rl_validation_environment_registry_v1,
     parse_massive_adaptive_rl_validation_sources_authority_v1,
+    prepare_or_resume_massive_adaptive_rl_validation_sources_v1,
     validation_decision_tensor_relative_path_v1,
     validation_cost_ladder_relative_path_v1,
     validation_environment_registry_relative_path_v1,
@@ -69,6 +71,7 @@ def _generic_sources(manifest) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
         "fold_fit_authority_receipt_sha256": _digest("fold-fit"),
         "runtime_sources_receipt_sha256": _digest("runtime-sources"),
         "runtime_graph_witness_receipt_sha256": _digest("runtime-witness"),
+        "validation_origin_inputs_receipt_sha256": _digest("validation-origin-inputs"),
         "fold_index": 0,
         "supervised_lineage_receipt_sha256": _digest("lineage"),
         "supervised_training_window_receipt_sha256": _digest("window"),
@@ -221,15 +224,23 @@ def test_validation_input_paths_are_manifest_and_fold_canonical() -> None:
     assert all(manifest.semantic_receipt_sha256 in path for path in paths)
     assert all("fold2" in path for path in paths)
 
-    source_parameters = inspect.signature(
-        materialize_massive_adaptive_rl_validation_sources_authority_v1
-    ).parameters
+    source_apis = (
+        authorize_massive_adaptive_rl_validation_sources_authority_v1,
+        materialize_massive_adaptive_rl_validation_sources_authority_v1,
+        prepare_or_resume_massive_adaptive_rl_validation_sources_v1,
+    )
+    source_parameters = inspect.signature(source_apis[1]).parameters
     registry_parameters = inspect.signature(
         materialize_massive_adaptive_rl_validation_environment_registry_v1
     ).parameters
     assert "artifact_id" not in source_parameters
     assert "checkpoint" not in source_parameters
     assert "forecast_archive" not in source_parameters
+    for source_api in source_apis:
+        parameters = inspect.signature(source_api).parameters
+        assert "features" not in parameters
+        assert "action_origins" not in parameters
+        assert "context_origins" not in parameters
     assert "artifact_id" not in registry_parameters
     assert "environment" not in registry_parameters
     assert "cost_basis_points" not in registry_parameters

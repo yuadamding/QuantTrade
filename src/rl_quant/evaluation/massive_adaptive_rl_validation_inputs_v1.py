@@ -8,10 +8,11 @@ target-free validation tensor, plan, forecast, and chronology at canonical
 paths, and then persists a registry that creates fresh mutable environments
 for the registered 10/20/40-basis-point ladder.
 
-Neither authority accepts a forecast, calibration, environment, cost, or
-artifact identifier from its caller.  Raw feature and action roots are still
-required to reconstruct the target-free tensor, but their exact dates and
-source roots are derived and checked before anything is published.
+Neither authority accepts a forecast, calibration, environment, cost,
+artifact identifier, feature, action origin, or context origin from its
+caller.  The predictor roots are selected from the dependency-closed runtime
+source reconstruction; clocks, contexts, and reconciled decision roots are
+rebuilt by the package before anything is published.
 """
 
 from __future__ import annotations
@@ -84,6 +85,7 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 import (
     MassiveAdaptiveRLSupervisedLineageSourcesV1,
     MassiveAdaptiveRLRuntimeSourcesV1,
+    MassiveAdaptiveRLValidationOriginInputsV1,
 )
 
 
@@ -115,6 +117,8 @@ MASSIVE_ADAPTIVE_RL_VALIDATION_SOURCES_AUTHORITY_V1_SPEC_SHA256 = semantic_sha25
         "paths": "manifest-and-fold-derived-create-only",
         "caller_checkpoint_or_calibration": False,
         "caller_forecast_or_plan": False,
+        "predictor_roots": "persisted-runtime-source-reconstruction-only",
+        "caller_feature_action_or_context_roots": False,
         "caller_artifact_id": False,
         "outcome_access": False,
         "profitability_reporting": False,
@@ -315,6 +319,7 @@ class _ValidationSourcesRuntimeV1:
     manifest: MassiveAdaptiveRLExperimentManifestV4
     four_fold_fit_authority: MassiveAdaptiveRLFourFoldFitAuthorityV1
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1
+    origin_inputs: MassiveAdaptiveRLValidationOriginInputsV1
     features: tuple[MassiveProfitabilityOriginFeaturesV3, ...]
     action_origins: tuple[MassiveAdaptiveOriginAuthorityV1, ...]
     context_origins: tuple[MassiveAdaptiveContextOriginAuthorityV1, ...]
@@ -334,6 +339,7 @@ class _ValidationSourcesFactsV1:
     fold_fit_authority_receipt_sha256: str
     runtime_sources_receipt_sha256: str
     runtime_graph_witness_receipt_sha256: str
+    validation_origin_inputs_receipt_sha256: str
     fold_index: int
     supervised_lineage_receipt_sha256: str
     supervised_training_window_receipt_sha256: str
@@ -380,65 +386,24 @@ def _expected_validation_tensor_dates(
     return candidate_dates[context_start:stop]
 
 
-def _ordered_source_rows(
-    *,
-    features: Sequence[MassiveProfitabilityOriginFeaturesV3],
-    action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
-    context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
-) -> tuple[
-    tuple[MassiveProfitabilityOriginFeaturesV3, ...],
-    tuple[MassiveAdaptiveOriginAuthorityV1, ...],
-    tuple[MassiveAdaptiveContextOriginAuthorityV1, ...],
-]:
-    feature_rows = tuple(sorted(features, key=lambda row: row.decision_session_date))
-    action_rows = tuple(
-        sorted(action_origins, key=lambda row: row.decision_session_date)
-    )
-    context_rows = tuple(
-        sorted(context_origins, key=lambda row: row.decision_session_date)
-    )
-    if (
-        any(
-            type(row) is not MassiveProfitabilityOriginFeaturesV3
-            for row in feature_rows
-        )
-        or any(type(row) is not MassiveAdaptiveOriginAuthorityV1 for row in action_rows)
-        or any(
-            type(row) is not MassiveAdaptiveContextOriginAuthorityV1
-            for row in context_rows
-        )
-    ):
-        raise MassiveAdaptiveRLValidationInputsV1Error(
-            "validation source root type differs"
-        )
-    return feature_rows, action_rows, context_rows
-
-
 def _validation_source_roots(
     *,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     lineage: MassiveAdaptiveRLSupervisedLineageSourcesV1,
     fold_index: int,
-    features: Sequence[MassiveProfitabilityOriginFeaturesV3],
-    action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
-    context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
 ) -> tuple[
+    MassiveAdaptiveRLValidationOriginInputsV1,
     tuple[MassiveProfitabilityOriginFeaturesV3, ...],
     tuple[MassiveAdaptiveOriginAuthorityV1, ...],
     tuple[MassiveAdaptiveContextOriginAuthorityV1, ...],
     tuple[MassiveAdaptiveDecisionRootV1, ...],
 ]:
-    feature_rows, action_rows, context_rows = _ordered_source_rows(
-        features=features,
-        action_origins=action_origins,
-        context_origins=context_origins,
-    )
-    for feature_row in feature_rows:
-        feature_row.validate()
-    for action_row in action_rows:
-        action_row.validate()
-    for context_row in context_rows:
-        context_row.validate()
+    origin_inputs = runtime_sources.validation_origin_inputs(fold_index)
+    origin_inputs.validate()
+    feature_rows = origin_inputs.features
+    action_rows = origin_inputs.action_origins
+    context_rows = origin_inputs.context_origins
+    roots = origin_inputs.decision_roots
     expected_dates = _expected_validation_tensor_dates(
         runtime_sources=runtime_sources,
         fold_index=fold_index,
@@ -449,6 +414,10 @@ def _validation_source_roots(
         dates != expected_dates
         or tuple(row.decision_session_date for row in action_rows) != expected_dates
         or tuple(row.decision_session_date for row in context_rows) != expected_dates
+        or tuple(row.decision_session_date for row in roots) != expected_dates
+        or origin_inputs.tensor_session_dates != expected_dates
+        or origin_inputs.replay_dependency_index_receipt_sha256
+        != runtime_sources.replay_dependency_index_receipt_sha256
         or any(
             row.daily_input_authority_semantic_receipt_sha256
             != runtime_sources.daily_input_authority.semantic_receipt_sha256
@@ -470,20 +439,21 @@ def _validation_source_roots(
         raise MassiveAdaptiveRLValidationInputsV1Error(
             "validation source roots do not cover the canonical source tape"
         )
-    roots = tuple(
+    expected_roots = tuple(
         build_massive_adaptive_decision_root_v1(
             context_origin=context,
             action_origin=action,
             features=feature,
         )
         for feature, action, context in zip(
-            feature_rows,
-            action_rows,
-            context_rows,
-            strict=True,
+            feature_rows, action_rows, context_rows, strict=True
         )
     )
-    return feature_rows, action_rows, context_rows, roots
+    if roots != expected_roots:
+        raise MassiveAdaptiveRLValidationInputsV1Error(
+            "validation decision roots do not replay from runtime sources"
+        )
+    return origin_inputs, feature_rows, action_rows, context_rows, roots
 
 
 def _validation_sources_facts(
@@ -496,6 +466,7 @@ def _validation_sources_facts(
         type(manifest) is not MassiveAdaptiveRLExperimentManifestV4
         or type(four_fold) is not MassiveAdaptiveRLFourFoldFitAuthorityV1
         or type(runtime_sources) is not MassiveAdaptiveRLRuntimeSourcesV1
+        or type(runtime.origin_inputs) is not MassiveAdaptiveRLValidationOriginInputsV1
     ):
         raise MassiveAdaptiveRLValidationInputsV1Error(
             "validation source authority root type differs"
@@ -503,6 +474,7 @@ def _validation_sources_facts(
     manifest.validate()
     four_fold.validate()
     runtime_sources.validate()
+    runtime.origin_inputs.validate()
     fold_index = runtime.inference_plan.fold_index
     if fold_index not in range(4):
         raise MassiveAdaptiveRLValidationInputsV1Error("validation source fold differs")
@@ -560,6 +532,13 @@ def _validation_sources_facts(
         != runtime_sources.manifest_v3_receipt_sha256
         or four_fold.runtime_sources_receipt_sha256
         != runtime_sources.semantic_receipt_sha256
+        or runtime.origin_inputs.fold_index != fold_index
+        or runtime.origin_inputs.replay_dependency_index_receipt_sha256
+        != runtime_sources.replay_dependency_index_receipt_sha256
+        or runtime.origin_inputs.features != runtime.features
+        or runtime.origin_inputs.action_origins != runtime.action_origins
+        or runtime.origin_inputs.context_origins != runtime.context_origins
+        or runtime.origin_inputs.decision_roots != runtime.decision_roots
         or runtime_witness is None
         or four_fold.runtime_graph_witness_receipt_sha256 != runtime_witness
         or not four_fold.development_stage_authorized
@@ -621,6 +600,7 @@ def _validation_sources_facts(
         )
     source_qualified = bool(
         runtime_sources.source_data_qualified
+        and runtime.origin_inputs.source_data_qualified
         and lineage.source_data_qualified
         and all(row.source_inputs_data_qualified for row in runtime.features)
         and all(
@@ -645,6 +625,9 @@ def _validation_sources_facts(
         fold_fit_authority_receipt_sha256=fold_fit.semantic_receipt_sha256,
         runtime_sources_receipt_sha256=runtime_sources.semantic_receipt_sha256,
         runtime_graph_witness_receipt_sha256=runtime_witness,
+        validation_origin_inputs_receipt_sha256=(
+            runtime.origin_inputs.semantic_receipt_sha256
+        ),
         fold_index=fold_index,
         supervised_lineage_receipt_sha256=lineage.semantic_receipt_sha256,
         supervised_training_window_receipt_sha256=(
@@ -708,6 +691,7 @@ class MassiveAdaptiveRLValidationSourcesAuthorityV1:
     fold_fit_authority_receipt_sha256: str
     runtime_sources_receipt_sha256: str
     runtime_graph_witness_receipt_sha256: str
+    validation_origin_inputs_receipt_sha256: str
     fold_index: int
     supervised_lineage_receipt_sha256: str
     supervised_training_window_receipt_sha256: str
@@ -1008,9 +992,6 @@ def _validation_sources_runtime(
     four_fold_fit_authority: MassiveAdaptiveRLFourFoldFitAuthorityV1,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     fold_index: int,
-    features: Sequence[MassiveProfitabilityOriginFeaturesV3],
-    action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
-    context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
     committed_at_ms: int,
     allow_materialize: bool,
 ) -> _ValidationSourcesRuntimeV1:
@@ -1038,13 +1019,16 @@ def _validation_sources_runtime(
             "validation source manifest or training lineage differs"
         )
     lineage = runtime_sources.fold(fold_index).supervised_lineage(fold_index)
-    feature_rows, action_rows, context_rows, decision_roots = _validation_source_roots(
+    (
+        origin_inputs,
+        feature_rows,
+        action_rows,
+        context_rows,
+        decision_roots,
+    ) = _validation_source_roots(
         runtime_sources=runtime_sources,
         lineage=lineage,
         fold_index=fold_index,
-        features=features,
-        action_origins=action_origins,
-        context_origins=context_origins,
     )
     tensor = _load_canonical_decision_tensor(
         root=root,
@@ -1085,6 +1069,7 @@ def _validation_sources_runtime(
         manifest=manifest,
         four_fold_fit_authority=four_fold_fit_authority,
         runtime_sources=runtime_sources,
+        origin_inputs=origin_inputs,
         features=feature_rows,
         action_origins=action_rows,
         context_origins=context_rows,
@@ -1160,9 +1145,6 @@ def authorize_massive_adaptive_rl_validation_sources_authority_v1(
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     four_fold_fit_authority: MassiveAdaptiveRLFourFoldFitAuthorityV1,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
-    features: Sequence[MassiveProfitabilityOriginFeaturesV3],
-    action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
-    context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
 ) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
     authority.validate()
     relative = validation_sources_authority_relative_path_v1(
@@ -1181,9 +1163,6 @@ def authorize_massive_adaptive_rl_validation_sources_authority_v1(
         four_fold_fit_authority=four_fold_fit_authority,
         runtime_sources=runtime_sources,
         fold_index=authority.fold_index,
-        features=features,
-        action_origins=action_origins,
-        context_origins=context_origins,
         committed_at_ms=authority._loaded_source.verified_at_ms,
         allow_materialize=False,
     )
@@ -1209,9 +1188,6 @@ def materialize_massive_adaptive_rl_validation_sources_authority_v1(
     four_fold_fit_authority: MassiveAdaptiveRLFourFoldFitAuthorityV1,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     fold_index: int,
-    features: Sequence[MassiveProfitabilityOriginFeaturesV3],
-    action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
-    context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
     relative = validation_sources_authority_relative_path_v1(
@@ -1228,9 +1204,6 @@ def materialize_massive_adaptive_rl_validation_sources_authority_v1(
         four_fold_fit_authority=four_fold_fit_authority,
         runtime_sources=runtime_sources,
         fold_index=fold_index,
-        features=features,
-        action_origins=action_origins,
-        context_origins=context_origins,
         committed_at_ms=committed_at_ms,
         allow_materialize=True,
     )
@@ -1266,9 +1239,6 @@ def materialize_massive_adaptive_rl_validation_sources_authority_v1(
         manifest=manifest,
         four_fold_fit_authority=four_fold_fit_authority,
         runtime_sources=runtime_sources,
-        features=features,
-        action_origins=action_origins,
-        context_origins=context_origins,
     )
 
 
@@ -1279,9 +1249,6 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v1(
     four_fold_fit_authority: MassiveAdaptiveRLFourFoldFitAuthorityV1,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     fold_index: int,
-    features: Sequence[MassiveProfitabilityOriginFeaturesV3],
-    action_origins: Sequence[MassiveAdaptiveOriginAuthorityV1],
-    context_origins: Sequence[MassiveAdaptiveContextOriginAuthorityV1],
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
     """Create the canonical validation lineage, or strictly replay it."""
@@ -1297,9 +1264,6 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v1(
             four_fold_fit_authority=four_fold_fit_authority,
             runtime_sources=runtime_sources,
             fold_index=fold_index,
-            features=features,
-            action_origins=action_origins,
-            context_origins=context_origins,
             committed_at_ms=committed_at_ms,
         )
     return authorize_massive_adaptive_rl_validation_sources_authority_v1(
@@ -1313,9 +1277,6 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v1(
         manifest=manifest,
         four_fold_fit_authority=four_fold_fit_authority,
         runtime_sources=runtime_sources,
-        features=features,
-        action_origins=action_origins,
-        context_origins=context_origins,
     )
 
 
