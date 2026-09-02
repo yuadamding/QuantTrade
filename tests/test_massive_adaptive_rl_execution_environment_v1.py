@@ -14,6 +14,7 @@ from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
     massive_adaptive_ppo_initial_model_state_receipt_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_execution_environment_v1 import (
+    MassiveAdaptiveRLActiveExecutionEnvironmentMismatch,
     MassiveAdaptiveRLExecutionEnvironmentV1Error,
     capture_massive_adaptive_rl_execution_environment_v1,
     load_massive_adaptive_rl_execution_environment_authority_v1,
@@ -201,7 +202,7 @@ def test_execution_environment_persists_integrity_and_replays_exact_process(
     monkeypatch.setattr(module, "_git", dirty_git)
     with massive_adaptive_rl_deterministic_execution_v1(device="cpu"):
         with pytest.raises(
-            MassiveAdaptiveRLExecutionEnvironmentV1Error,
+            MassiveAdaptiveRLActiveExecutionEnvironmentMismatch,
             match="did not replay",
         ):
             verify_massive_adaptive_rl_execution_environment_replay_v1(

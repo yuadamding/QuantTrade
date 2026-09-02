@@ -10,6 +10,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2,
     MassiveAdaptiveRLExperimentStageV2,
     MassiveAdaptiveRLExperimentStateV2Error,
+    MassiveAdaptiveRLStaleStateError,
     advance_massive_adaptive_rl_experiment_state_v2,
     block_massive_adaptive_rl_experiment_state_v2,
     fail_massive_adaptive_rl_experiment_state_v2,
@@ -63,6 +64,41 @@ def test_blocked_state_can_resume_from_last_completed_stage(tmp_path: Path) -> N
         artifact_root=tmp_path,
         experiment_id="blocked-source",
     ) == (registered, blocked, replayed)
+
+
+def test_state_compare_and_swap_rejects_a_stale_predecessor(tmp_path: Path) -> None:
+    registered = register_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=tmp_path,
+        experiment_id="stale-state-writer",
+        manifest_receipt_sha256=_receipt("manifest"),
+    )
+    blocked = block_massive_adaptive_rl_experiment_state_v2(
+        artifact_root=tmp_path,
+        previous=registered,
+        blocked_stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
+        blocker_code="source-temporarily-absent",
+        blocker_evidence_receipt_sha256=_receipt("absent"),
+    )
+
+    with pytest.raises(MassiveAdaptiveRLStaleStateError, match="stale"):
+        advance_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=tmp_path,
+            previous=registered,
+            stage=MassiveAdaptiveRLExperimentStageV2.SOURCE_BUNDLE_REPLAYED,
+            stage_artifact_receipt_sha256=_receipt("source"),
+        )
+
+    assert load_massive_adaptive_rl_experiment_states_v2(
+        artifact_root=tmp_path,
+        experiment_id=registered.experiment_id,
+    ) == (registered, blocked)
+    state_directory = (
+        tmp_path / "adaptive-rl" / registered.experiment_id / "state-v2"
+    )
+    assert tuple(sorted(path.name for path in state_directory.glob("*.json"))) == (
+        "000-registered.json",
+        "001-blocked.json",
+    )
 
 
 def test_raw_v2_report_publisher_is_not_public() -> None:

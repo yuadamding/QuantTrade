@@ -80,6 +80,12 @@ class MassiveAdaptiveRLExecutionEnvironmentV1Error(ValueError):
     """The adaptive-RL execution process differs from its attestation."""
 
 
+class MassiveAdaptiveRLActiveExecutionEnvironmentMismatch(
+    MassiveAdaptiveRLExecutionEnvironmentV1Error
+):
+    """The active worker cannot exactly replay a persisted environment."""
+
+
 def _digest(name: str, value: object) -> str:
     if (
         not isinstance(value, str)
@@ -770,15 +776,20 @@ def verify_massive_adaptive_rl_execution_environment_replay_v1(
         raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
             "adaptive RL replay requires persisted environment integrity"
         )
-    active = capture_massive_adaptive_rl_execution_environment_v1(
-        manifest=manifest,
-        initial_model_state_receipt_sha256=initial_model_state_receipt_sha256,
-        device=device,
-    )
+    try:
+        active = capture_massive_adaptive_rl_execution_environment_v1(
+            manifest=manifest,
+            initial_model_state_receipt_sha256=initial_model_state_receipt_sha256,
+            device=device,
+        )
+    except MassiveAdaptiveRLExecutionEnvironmentV1Error as error:
+        raise MassiveAdaptiveRLActiveExecutionEnvironmentMismatch(
+            "adaptive RL active execution environment is unavailable"
+        ) from error
     if canonical_json_file_bytes(
         _execution_environment_payload(active)
     ) != canonical_json_file_bytes(_execution_environment_payload(authority)):
-        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+        raise MassiveAdaptiveRLActiveExecutionEnvironmentMismatch(
             "adaptive RL active execution environment did not replay"
         )
     result = replace(authority, runtime_environment_replayed=True)
@@ -797,7 +808,7 @@ def massive_adaptive_rl_deterministic_execution_v1(
         selected_device.type == "cuda"
         and os.environ.get("CUBLAS_WORKSPACE_CONFIG") != ":4096:8"
     ):
-        raise MassiveAdaptiveRLExecutionEnvironmentV1Error(
+        raise MassiveAdaptiveRLActiveExecutionEnvironmentMismatch(
             "CUDA execution requires CUBLAS_WORKSPACE_CONFIG=:4096:8"
         )
     prior = (
@@ -826,6 +837,7 @@ def massive_adaptive_rl_deterministic_execution_v1(
 __all__ = [
     "MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SCHEMA_SHA256",
+    "MassiveAdaptiveRLActiveExecutionEnvironmentMismatch",
     "MassiveAdaptiveRLExecutionEnvironmentAuthorityV1",
     "MassiveAdaptiveRLExecutionEnvironmentV1Error",
     "capture_massive_adaptive_rl_execution_environment_v1",

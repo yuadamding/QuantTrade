@@ -10,9 +10,14 @@ before stopping at the not-yet-installed inner-validation backend.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+import fcntl
+import os
 from pathlib import Path
+import stat
 import time
+from typing import Iterator
 
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -28,6 +33,9 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     fail_massive_adaptive_rl_experiment_state_v2,
     load_massive_adaptive_rl_experiment_states_v2,
     register_massive_adaptive_rl_experiment_state_v2,
+)
+from rl_quant.workflows.massive_adaptive_rl_execution_environment_v1 import (
+    MassiveAdaptiveRLActiveExecutionEnvironmentMismatch,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
@@ -72,6 +80,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
         "source_bundle": "v1-byte-and-runtime-replay-separated",
         "runtime_source_graph": "v1-persisted-generic-reload-nonauthorizing",
         "state": "create-only-blocked-failed-and-report-ledger-v2",
+        "root_orchestration": "one-experiment-cross-process-exclusive-lease",
+        "lease_contention": "ephemeral-operational-response-no-ledger-mutation",
+        "state_publication": "locked-compare-and-swap",
         "device": "manifest-bound",
         "runtime_reconstruction": "package-owned-dependency-index-v1",
         "runtime_reconstruction_unavailability": "retryable-blocker",
@@ -91,6 +102,61 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
 
 class MassiveAdaptiveRLExperimentRunnerV2Error(ValueError):
     """The adaptive RL V2 root run differs or cannot advance safely."""
+
+
+class MassiveAdaptiveRLOperationallyUnavailable(RuntimeError):
+    """The root operation is retryable and did not change scientific state."""
+
+    blocker_code: str
+
+    def __init__(self, message: str, *, blocker_code: str) -> None:
+        super().__init__(message)
+        self.blocker_code = blocker_code
+
+
+class MassiveAdaptiveRLExperimentOrchestrationLeaseUnavailable(
+    MassiveAdaptiveRLOperationallyUnavailable
+):
+    """Another process owns this experiment's mutable root invocation."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            blocker_code="execution-owned-by-another-process",
+        )
+
+
+MASSIVE_ADAPTIVE_RL_OPERATIONAL_RESPONSE_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-operational-response-v1"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MassiveAdaptiveRLOperationalResponseV1:
+    """Ephemeral retry guidance that is deliberately absent from the ledger."""
+
+    experiment_id: str
+    blocker_code: str
+    retryable: bool = True
+    ledger_mutated: bool = False
+    execution_complete: bool = False
+    schema: str = MASSIVE_ADAPTIVE_RL_OPERATIONAL_RESPONSE_V1_SCHEMA
+
+    def validate(self) -> None:
+        if (
+            not self.experiment_id
+            or self.blocker_code not in {
+                "artifact-root-temporarily-unavailable",
+                "execution-owned-by-another-process",
+            }
+            or not self.retryable
+            or self.ledger_mutated
+            or self.execution_complete
+            or self.schema != MASSIVE_ADAPTIVE_RL_OPERATIONAL_RESPONSE_V1_SCHEMA
+        ):
+            raise MassiveAdaptiveRLExperimentRunnerV2Error(
+                "adaptive RL operational response differs"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,9 +441,68 @@ def _next_required_stage(
     return MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[next_index]
 
 
-def run_massive_adaptive_rl_experiment_v2(
+@contextmanager
+def _massive_adaptive_rl_experiment_orchestration_lease_v1(
+    *, artifact_root: str | Path, experiment_id: str
+) -> Iterator[None]:
+    lease_directory = (
+        Path(artifact_root)
+        / "adaptive-rl"
+        / experiment_id
+        / "orchestration-lease-v1"
+    )
+    try:
+        lease_directory.mkdir(parents=True, exist_ok=True)
+        if lease_directory.is_symlink():
+            raise MassiveAdaptiveRLExperimentRunnerV2Error(
+                "adaptive RL orchestration lease directory is a symlink"
+            )
+        descriptor = os.open(
+            lease_directory / "orchestration.lock",
+            os.O_CLOEXEC | os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR,
+            0o600,
+        )
+    except OSError as error:
+        raise MassiveAdaptiveRLOperationallyUnavailable(
+            "adaptive RL artifact root is temporarily unavailable",
+            blocker_code="artifact-root-temporarily-unavailable",
+        ) from error
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
+            raise MassiveAdaptiveRLExperimentRunnerV2Error(
+                "adaptive RL orchestration lease identity differs"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise MassiveAdaptiveRLExperimentOrchestrationLeaseUnavailable(
+                "adaptive RL experiment execution is owned by another process"
+            ) from error
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _operational_response(
     *,
-    manifest_path: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    error: MassiveAdaptiveRLOperationallyUnavailable,
+) -> MassiveAdaptiveRLOperationalResponseV1:
+    result = MassiveAdaptiveRLOperationalResponseV1(
+        experiment_id=manifest.experiment_id,
+        blocker_code=error.blocker_code,
+    )
+    result.validate()
+    return result
+
+
+def _run_massive_adaptive_rl_experiment_v2_unlocked(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
     source_root: str | Path,
     artifact_root: str | Path,
     device: object,
@@ -385,11 +510,6 @@ def run_massive_adaptive_rl_experiment_v2(
 ) -> MassiveAdaptiveRLEndToEndRunV2:
     """Replay sources, execute four fit folds, and stop before validation."""
 
-    manifest = load_massive_adaptive_rl_experiment_manifest_v3(manifest_path)
-    if str(device) != manifest.execution_device_specification:
-        raise MassiveAdaptiveRLExperimentRunnerV2Error(
-            "requested device differs from preregistered execution device"
-        )
     states = _load_or_register(
         manifest=manifest,
         artifact_root=artifact_root,
@@ -622,8 +742,12 @@ def run_massive_adaptive_rl_experiment_v2(
                 ),
             )
         )
-    except MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable:
-        blocker_code = "four-fold-fit-input-execution-lease-unavailable"
+    except MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable as error:
+        raise MassiveAdaptiveRLExperimentOrchestrationLeaseUnavailable(
+            "adaptive RL fit-input execution is owned by another process"
+        ) from error
+    except MassiveAdaptiveRLActiveExecutionEnvironmentMismatch:
+        blocker_code = "active-execution-environment-mismatch"
         if not (
             states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
             and states[-1].blocker_code == blocker_code
@@ -637,6 +761,7 @@ def run_massive_adaptive_rl_experiment_v2(
                     {
                         "manifest": manifest.semantic_receipt_sha256,
                         "runtime_sources": runtime_sources.semantic_receipt_sha256,
+                        "failure_class": blocker_code,
                     }
                 ),
             )
@@ -716,8 +841,12 @@ def run_massive_adaptive_rl_experiment_v2(
     except (
         MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable,
         MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable,
-    ):
-        blocker_code = "four-fold-fit-execution-lease-unavailable"
+    ) as error:
+        raise MassiveAdaptiveRLExperimentOrchestrationLeaseUnavailable(
+            "adaptive RL fold execution is owned by another process"
+        ) from error
+    except MassiveAdaptiveRLActiveExecutionEnvironmentMismatch:
+        blocker_code = "active-execution-environment-mismatch"
         if not (
             states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
             and states[-1].blocker_code == blocker_code
@@ -733,6 +862,7 @@ def run_massive_adaptive_rl_experiment_v2(
                         "four_fold_fit_inputs": (
                             four_fold_inputs.semantic_receipt_sha256
                         ),
+                        "failure_class": blocker_code,
                     }
                 ),
             )
@@ -827,6 +957,37 @@ def run_massive_adaptive_rl_experiment_v2(
     )
 
 
+def run_massive_adaptive_rl_experiment_v2(
+    *,
+    manifest_path: str | Path,
+    source_root: str | Path,
+    artifact_root: str | Path,
+    device: object,
+    resume: bool = True,
+) -> MassiveAdaptiveRLEndToEndRunV2 | MassiveAdaptiveRLOperationalResponseV1:
+    """Serialize one root invocation and return retryable contention ephemerally."""
+
+    manifest = load_massive_adaptive_rl_experiment_manifest_v3(manifest_path)
+    if str(device) != manifest.execution_device_specification:
+        raise MassiveAdaptiveRLExperimentRunnerV2Error(
+            "requested device differs from preregistered execution device"
+        )
+    try:
+        with _massive_adaptive_rl_experiment_orchestration_lease_v1(
+            artifact_root=artifact_root,
+            experiment_id=manifest.experiment_id,
+        ):
+            return _run_massive_adaptive_rl_experiment_v2_unlocked(
+                manifest=manifest,
+                source_root=source_root,
+                artifact_root=artifact_root,
+                device=device,
+                resume=resume,
+            )
+    except MassiveAdaptiveRLOperationallyUnavailable as error:
+        return _operational_response(manifest=manifest, error=error)
+
+
 def verify_massive_adaptive_rl_experiment_v2(
     *, manifest_path: str | Path, source_root: str | Path, artifact_root: str | Path
 ) -> MassiveAdaptiveRLEndToEndRunV2:
@@ -910,7 +1071,10 @@ def verify_massive_adaptive_rl_experiment_ledger_v1(
 
 __all__ = [
     "MassiveAdaptiveRLEndToEndRunV2",
+    "MassiveAdaptiveRLExperimentOrchestrationLeaseUnavailable",
     "MassiveAdaptiveRLExperimentRunnerV2Error",
+    "MassiveAdaptiveRLOperationalResponseV1",
+    "MassiveAdaptiveRLOperationallyUnavailable",
     "run_massive_adaptive_rl_experiment_v2",
     "verify_massive_adaptive_rl_experiment_ledger_v1",
     "verify_massive_adaptive_rl_experiment_v2",

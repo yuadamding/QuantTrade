@@ -36,6 +36,9 @@ from rl_quant.workflows import (
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
     run_massive_adaptive_rl_experiment_v2,
 )
+from rl_quant.workflows.massive_adaptive_rl_execution_environment_v1 import (
+    MassiveAdaptiveRLActiveExecutionEnvironmentMismatch,
+)
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     build_massive_adaptive_rl_experiment_manifest_v3,
     write_massive_adaptive_rl_experiment_manifest_v3,
@@ -796,6 +799,65 @@ def test_runner_reconstructs_and_executes_four_fold_fit_before_validation(
         ("inputs", False),
         ("fit", False),
     ]
+
+    ledger_before_contention = (
+        runner_module.load_massive_adaptive_rl_experiment_states_v2(
+            artifact_root=artifact_root,
+            experiment_id=manifest.experiment_id,
+        )
+    )
+
+    def fit_inputs_owned_elsewhere(**_kwargs: object) -> object:
+        raise runner_module.MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable(
+            "test fit-input owner"
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "run_or_resume_massive_adaptive_rl_four_fold_fit_inputs_v1",
+        fit_inputs_owned_elsewhere,
+    )
+    contention = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+    assert isinstance(
+        contention,
+        runner_module.MassiveAdaptiveRLOperationalResponseV1,
+    )
+    assert contention.blocker_code == "execution-owned-by-another-process"
+    assert (
+        runner_module.load_massive_adaptive_rl_experiment_states_v2(
+            artifact_root=artifact_root,
+            experiment_id=manifest.experiment_id,
+        )
+        == ledger_before_contention
+    )
+
+    def active_environment_mismatch(**_kwargs: object) -> object:
+        raise MassiveAdaptiveRLActiveExecutionEnvironmentMismatch(
+            "test active worker mismatch"
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "run_or_resume_massive_adaptive_rl_four_fold_fit_inputs_v1",
+        active_environment_mismatch,
+    )
+    wrong_worker = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+    assert wrong_worker.current_stage.value == "blocked"
+    assert wrong_worker.blocker_code == "active-execution-environment-mismatch"
+    assert wrong_worker.next_required_stage is not None
+    assert wrong_worker.next_required_stage.value == "inner-validation-completed"
 
     def temporarily_unavailable(**_kwargs: object) -> object:
         raise reconstruction.MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(

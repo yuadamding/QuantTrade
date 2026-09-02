@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import Enum
+import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
-from typing import cast
+from typing import Iterator, cast
 
 from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v1 import (
     MassiveAdaptiveRLProfitabilityReportAuthorityV1,
@@ -54,6 +57,8 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_STATE_V2_SPEC_SHA256 = semantic_sha256(
         "terminal_state": "failed-or-completed-is-immutable",
         "blocked_resume": "last-completed-stage-lineage-preserved",
         "state_write": "same-directory-fsync-and-atomic-no-clobber-install",
+        "state_publication_lock": "one-experiment-cross-process-exclusive",
+        "state_compare_and_swap": "latest-persisted-predecessor-receipt",
         "live_trading": False,
         "lockbox_access": False,
     }
@@ -102,6 +107,10 @@ _TERMINAL_STAGES = frozenset(
 
 class MassiveAdaptiveRLExperimentStateV2Error(ValueError):
     """The adaptive RL V2 experiment ledger is inconsistent."""
+
+
+class MassiveAdaptiveRLStaleStateError(MassiveAdaptiveRLExperimentStateV2Error):
+    """A writer tried to descend from a state that is no longer the ledger tip."""
 
 
 def _digest(name: str, value: object) -> str:
@@ -334,10 +343,78 @@ def _state_path(
     )
 
 
-def _write_state(
+@contextmanager
+def _state_publication_lock(
+    *, artifact_root: str | Path, experiment_id: str
+) -> Iterator[None]:
+    lock_directory = (
+        Path(artifact_root)
+        / "adaptive-rl"
+        / _identifier("experiment ID", experiment_id)
+        / "state-publication-lock-v1"
+    )
+    try:
+        lock_directory.mkdir(parents=True, exist_ok=True)
+        if lock_directory.is_symlink():
+            raise MassiveAdaptiveRLExperimentStateV2Error(
+                "adaptive RL V2 state-publication lock directory is a symlink"
+            )
+        descriptor = os.open(
+            lock_directory / "publication.lock",
+            os.O_CLOEXEC | os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR,
+            0o600,
+        )
+    except OSError as error:
+        raise MassiveAdaptiveRLExperimentStateV2Error(
+            "adaptive RL V2 state-publication lock is unavailable"
+        ) from error
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
+            raise MassiveAdaptiveRLExperimentStateV2Error(
+                "adaptive RL V2 state-publication lock identity differs"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as error:
+            raise MassiveAdaptiveRLExperimentStateV2Error(
+                "adaptive RL V2 state-publication lock failed"
+            ) from error
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _require_current_state_predecessor(
+    *, artifact_root: str | Path, state: MassiveAdaptiveRLExperimentStateV2
+) -> None:
+    states = load_massive_adaptive_rl_experiment_states_v2(
+        artifact_root=artifact_root,
+        experiment_id=state.experiment_id,
+    )
+    if state.sequence_index == 0:
+        if states:
+            raise MassiveAdaptiveRLStaleStateError(
+                "adaptive RL V2 initial state is stale or create-only"
+            )
+        return
+    if (
+        not states
+        or states[-1].sequence_index + 1 != state.sequence_index
+        or states[-1].semantic_receipt_sha256
+        != state.previous_state_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLStaleStateError(
+            "adaptive RL V2 state predecessor is stale"
+        )
+
+
+def _install_state(
     *, artifact_root: str | Path, state: MassiveAdaptiveRLExperimentStateV2
 ) -> MassiveAdaptiveRLExperimentStateV2:
-    state.validate()
     output = _state_path(artifact_root, state)
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -375,6 +452,21 @@ def _write_state(
     finally:
         temporary.unlink(missing_ok=True)
     return state
+
+
+def _write_state(
+    *, artifact_root: str | Path, state: MassiveAdaptiveRLExperimentStateV2
+) -> MassiveAdaptiveRLExperimentStateV2:
+    state.validate()
+    with _state_publication_lock(
+        artifact_root=artifact_root,
+        experiment_id=state.experiment_id,
+    ):
+        _require_current_state_predecessor(
+            artifact_root=artifact_root,
+            state=state,
+        )
+        return _install_state(artifact_root=artifact_root, state=state)
 
 
 def _build_state(
@@ -868,6 +960,7 @@ __all__ = [
     "MassiveAdaptiveRLExperimentStageV2",
     "MassiveAdaptiveRLExperimentStateV2",
     "MassiveAdaptiveRLExperimentStateV2Error",
+    "MassiveAdaptiveRLStaleStateError",
     "advance_massive_adaptive_rl_experiment_state_v2",
     "block_massive_adaptive_rl_experiment_state_v2",
     "fail_massive_adaptive_rl_experiment_state_v2",
