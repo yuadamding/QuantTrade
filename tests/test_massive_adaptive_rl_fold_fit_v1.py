@@ -45,11 +45,17 @@ from rl_quant.workflows import (
     massive_adaptive_rl_runtime_source_reconstruction_v1 as reconstruction,
 )
 from rl_quant.workflows.massive_adaptive_rl_fold_fit_v1 import (
+    MassiveAdaptiveRLFoldFitCompletedEvidenceError,
     MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable,
     MassiveAdaptiveRLFoldFitV1Error,
     _fold_fit_execution_lease,
+    load_massive_adaptive_rl_fold_fit_authority_v1,
+    repair_massive_adaptive_rl_fold_fit_generation_v1,
     run_or_resume_massive_adaptive_rl_fold_fit_v1,
     run_massive_adaptive_rl_fold_fit_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_v1 import (
+    MassiveAdaptiveRLWorkflowV1Error,
 )
 from rl_quant.workflows.massive_adaptive_rl_execution_environment_v1 import (
     capture_massive_adaptive_rl_execution_environment_v1,
@@ -625,3 +631,44 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
     )
     with pytest.raises(MassiveAdaptiveRLFoldFitV1Error, match="differs"):
         changed_initial_state.validate()
+
+    fit_artifact_root = tmp_path / "fit-artifacts"
+    completed_policy = (
+        result.training_workflow.runtime_workflow.policy_checkpoint_authorities[-1]
+    )
+    missing_policy = (
+        fit_artifact_root
+        / completed_policy.loaded_source.payload_relative_path
+    )
+    missing_policy_paths = (
+        missing_policy,
+        missing_policy.with_name(missing_policy.name + ".receipt.json"),
+        missing_policy.with_name(missing_policy.name + ".commit.json"),
+    )
+    for path in missing_policy_paths:
+        path.unlink()
+    with pytest.raises(
+        MassiveAdaptiveRLFoldFitCompletedEvidenceError,
+        match="cannot be repaired",
+    ):
+        repair_massive_adaptive_rl_fold_fit_generation_v1(
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            outer_fold_index=0,
+            artifact_root=fit_artifact_root,
+            committed_at_ms=200_000,
+            device="cpu",
+        )
+    with pytest.raises(
+        MassiveAdaptiveRLWorkflowV1Error,
+        match="missing a candidate policy checkpoint",
+    ):
+        load_massive_adaptive_rl_fold_fit_authority_v1(
+            root=fit_artifact_root,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            outer_fold_index=0,
+            committed_at_ms=200_000,
+            device="cpu",
+        )
+    assert all(not path.exists() for path in missing_policy_paths)

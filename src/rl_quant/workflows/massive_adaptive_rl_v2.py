@@ -52,9 +52,11 @@ from rl_quant.training.massive_adaptive_rl_fit_environment_authority_v1 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_v1 import (
     MASSIVE_ADAPTIVE_RL_OUTER_GATE_NAMES_V1,
+    MassiveAdaptiveRLExperimentManifestV1,
     MassiveAdaptiveRLTrainingWorkflowV1,
     build_massive_adaptive_rl_experiment_manifest_v1,
     run_massive_adaptive_rl_training_workflow_v1,
+    verify_massive_adaptive_rl_training_workflow_v1,
 )
 
 
@@ -520,24 +522,12 @@ class MassiveAdaptiveRLTrainingWorkflowV2:
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
-def run_massive_adaptive_rl_training_workflow_v2(
+def _massive_adaptive_rl_training_workflow_v2_roots(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV2,
     fold_index: int,
-    seed: int,
     training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV2,
-    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
-    environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
-    fit_environment_authorities: (
-        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
-    ) = None,
-    artifact_root: str | Path,
-    committed_at_ms: int,
-    device: torch.device | str = "cpu",
-    resume: bool = False,
-) -> MassiveAdaptiveRLTrainingWorkflowV2:
-    """Run one fold using only its session-derived candidate schedule."""
-
+) -> tuple[MassiveAdaptiveRLCandidateScheduleV1, MassiveAdaptiveRLExperimentManifestV1]:
     manifest.validate()
     schedule = manifest.schedule(fold_index)
     training_authority.validate()
@@ -557,19 +547,16 @@ def run_massive_adaptive_rl_training_workflow_v2(
         seeds=manifest.seeds,
         ppo_config=manifest.ppo_config,
     )
-    runtime = run_massive_adaptive_rl_training_workflow_v1(
-        manifest=compatibility_manifest,
-        fold_index=fold_index,
-        seed=seed,
-        training_authority=training_authority,
-        chronology_authority=chronology_authority,
-        environments=environments,
-        fit_environment_authorities=fit_environment_authorities,
-        artifact_root=artifact_root,
-        committed_at_ms=committed_at_ms,
-        device=device,
-        resume=resume,
-    )
+    return schedule, compatibility_manifest
+
+
+def _assemble_massive_adaptive_rl_training_workflow_v2(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV2,
+    schedule: MassiveAdaptiveRLCandidateScheduleV1,
+    compatibility_manifest: MassiveAdaptiveRLExperimentManifestV1,
+    runtime: MassiveAdaptiveRLTrainingWorkflowV1,
+) -> MassiveAdaptiveRLTrainingWorkflowV2:
     qualified = runtime.development_rl_training_authorized
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_TRAINING_WORKFLOW_V2_SCHEMA,
@@ -599,6 +586,92 @@ def run_massive_adaptive_rl_training_workflow_v2(
     )
     result.validate()
     return result
+
+
+def run_massive_adaptive_rl_training_workflow_v2(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV2,
+    fold_index: int,
+    seed: int,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV2,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
+    environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
+    artifact_root: str | Path,
+    committed_at_ms: int,
+    device: torch.device | str = "cpu",
+    resume: bool = False,
+) -> MassiveAdaptiveRLTrainingWorkflowV2:
+    """Run one fold using only its session-derived candidate schedule."""
+
+    schedule, compatibility_manifest = _massive_adaptive_rl_training_workflow_v2_roots(
+        manifest=manifest,
+        fold_index=fold_index,
+        training_authority=training_authority,
+    )
+    runtime = run_massive_adaptive_rl_training_workflow_v1(
+        manifest=compatibility_manifest,
+        fold_index=fold_index,
+        seed=seed,
+        training_authority=training_authority,
+        chronology_authority=chronology_authority,
+        environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
+        artifact_root=artifact_root,
+        committed_at_ms=committed_at_ms,
+        device=device,
+        resume=resume,
+    )
+    return _assemble_massive_adaptive_rl_training_workflow_v2(
+        manifest=manifest,
+        schedule=schedule,
+        compatibility_manifest=compatibility_manifest,
+        runtime=runtime,
+    )
+
+
+def verify_massive_adaptive_rl_training_workflow_v2(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV2,
+    fold_index: int,
+    seed: int,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityV2,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
+    environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
+    artifact_root: str | Path,
+    verified_at_ms: int,
+    device: torch.device | str = "cpu",
+) -> MassiveAdaptiveRLTrainingWorkflowV2:
+    """Reconstruct V2 fitting only from an already complete artifact graph."""
+
+    schedule, compatibility_manifest = _massive_adaptive_rl_training_workflow_v2_roots(
+        manifest=manifest,
+        fold_index=fold_index,
+        training_authority=training_authority,
+    )
+    runtime = verify_massive_adaptive_rl_training_workflow_v1(
+        manifest=compatibility_manifest,
+        fold_index=fold_index,
+        seed=seed,
+        training_authority=training_authority,
+        chronology_authority=chronology_authority,
+        environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
+        artifact_root=artifact_root,
+        verified_at_ms=verified_at_ms,
+        device=device,
+    )
+    return _assemble_massive_adaptive_rl_training_workflow_v2(
+        manifest=manifest,
+        schedule=schedule,
+        compatibility_manifest=compatibility_manifest,
+        runtime=runtime,
+    )
 
 
 def _manifest_command(args: argparse.Namespace) -> int:
@@ -833,6 +906,7 @@ __all__ = [
     "load_massive_adaptive_rl_experiment_manifest_v2",
     "main",
     "run_massive_adaptive_rl_training_workflow_v2",
+    "verify_massive_adaptive_rl_training_workflow_v2",
     "write_massive_adaptive_rl_experiment_manifest_v2",
 ]
 

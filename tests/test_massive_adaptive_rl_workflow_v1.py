@@ -10,6 +10,9 @@ from rl_quant.evaluation.massive_adaptive_rl_policy_evaluator_v1 import (
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.training.massive_adaptive_ppo_v1 import MassiveAdaptivePPOConfigV1
+from rl_quant.training.massive_adaptive_rl_checkpoint_authority_v1 import (
+    materialize_massive_adaptive_rl_checkpoint_authority_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_v1 import (
     MassiveAdaptiveRLWorkflowV1Error,
     build_massive_adaptive_rl_experiment_manifest_v1,
@@ -17,6 +20,7 @@ from rl_quant.workflows.massive_adaptive_rl_v1 import (
     main,
     run_massive_adaptive_rl_training_workflow_v1,
     run_massive_adaptive_rl_validation_workflow_v1,
+    verify_massive_adaptive_rl_training_workflow_v1,
     write_massive_adaptive_rl_experiment_manifest_v1,
 )
 from test_massive_adaptive_profitability_v1_vertical_slice import (
@@ -140,6 +144,67 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
             == policy_authority.runtime_checkpoint.semantic_receipt_sha256
         )
 
+    first_policy_checkpoint = result.policy_checkpoint_authorities[0].runtime_checkpoint
+    assert first_policy_checkpoint is not None
+    assert first_policy_checkpoint.loss_trace
+    changed_last_loss = list(first_policy_checkpoint.loss_trace[-1])
+    changed_last_loss[0] += 1.0
+    changed_loss_trace = (
+        *first_policy_checkpoint.loss_trace[:-1],
+        tuple(changed_last_loss),
+    )
+    changed_checkpoint = replace(
+        first_policy_checkpoint,
+        loss_trace=changed_loss_trace,
+        loss_trace_receipt_sha256=semantic_sha256(changed_loss_trace),
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed_checkpoint = replace(
+        changed_checkpoint,
+        semantic_receipt_sha256=semantic_sha256(changed_checkpoint.semantic_unsigned()),
+    )
+    changed_checkpoint.validate()
+    changed_policy = materialize_massive_adaptive_rl_checkpoint_authority_v1(
+        root=tmp_path,
+        artifact_id="same-update-different-policy",
+        checkpoint=changed_checkpoint,
+        training_forecast_authority=training,
+        committed_at_ms=120,
+    )
+    changed_policies = (
+        changed_policy,
+        *result.policy_checkpoint_authorities[1:],
+    )
+    mismatched_workflow = replace(
+        result,
+        policy_checkpoint_authorities=changed_policies,
+        policy_checkpoint_inventory_sha256=semantic_sha256(
+            tuple(row.semantic_receipt_sha256 for row in changed_policies)
+        ),
+        semantic_receipt_sha256="0" * 64,
+    )
+    mismatched_workflow = replace(
+        mismatched_workflow,
+        semantic_receipt_sha256=semantic_sha256(
+            mismatched_workflow.semantic_unsigned()
+        ),
+    )
+    with pytest.raises(MassiveAdaptiveRLWorkflowV1Error, match="workflow differs"):
+        mismatched_workflow.validate()
+
+    missing_policy = (
+        tmp_path
+        / "massive-adaptive"
+        / "rl-checkpoint-v1"
+        / "dual-checkpoint-fold0-seed17-update2-policy.pt"
+    )
+    for path in (
+        missing_policy,
+        missing_policy.with_name(missing_policy.name + ".receipt.json"),
+        missing_policy.with_name(missing_policy.name + ".commit.json"),
+    ):
+        path.unlink()
+
     resumed_environment, resumed_training, resumed_chronology = _roots()
     resumed = run_massive_adaptive_rl_training_workflow_v1(
         manifest=manifest,
@@ -156,6 +221,7 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
         committed_at_ms=100,
         resume=True,
     )
+    assert resumed.semantic_unsigned() == result.semantic_unsigned()
     assert resumed.semantic_receipt_sha256 == result.semantic_receipt_sha256
     assert resumed.operational_checkpoint_inventory_sha256 == (
         result.operational_checkpoint_inventory_sha256
@@ -167,6 +233,7 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
         row.semantic_receipt_sha256
         for row in result.operational_checkpoint_authorities
     )
+    assert missing_policy.exists()
 
     # Validation consumes the workflow-published policy authority, not an
     # independently assembled checkpoint or action sequence.
@@ -238,6 +305,37 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
             artifact_root=tmp_path / "mismatched",
             committed_at_ms=700,
         )
+
+    strictly_missing = missing_policy.with_name(
+        "dual-checkpoint-fold0-seed17-update1-policy.pt"
+    )
+    strictly_missing_paths = (
+        strictly_missing,
+        strictly_missing.with_name(strictly_missing.name + ".receipt.json"),
+        strictly_missing.with_name(strictly_missing.name + ".commit.json"),
+    )
+    for path in strictly_missing_paths:
+        path.unlink()
+    verifying_environment, verifying_training, verifying_chronology = _roots()
+    with pytest.raises(
+        MassiveAdaptiveRLWorkflowV1Error,
+        match="missing a candidate policy checkpoint",
+    ):
+        verify_massive_adaptive_rl_training_workflow_v1(
+            manifest=manifest,
+            fold_index=0,
+            seed=17,
+            training_authority=verifying_training,
+            chronology_authority=verifying_chronology,
+            environments={
+                verifying_environment.forecast_archive.semantic_receipt_sha256: (
+                    verifying_environment
+                )
+            },
+            artifact_root=tmp_path,
+            verified_at_ms=800,
+        )
+    assert all(not path.exists() for path in strictly_missing_paths)
 
 
 def test_package_workflow_rejects_unreached_candidate_update(tmp_path) -> None:

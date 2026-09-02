@@ -577,6 +577,29 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
             for authority in self.operational_checkpoint_authorities
             if authority.runtime_checkpoint is not None
         )
+        candidate_checkpoint_pairs_match = bool(
+            len(self.runner_checkpoint_authorities)
+            == len(self.policy_checkpoint_authorities)
+            and all(
+                runner.runtime_checkpoint is not None
+                and policy.runtime_checkpoint is not None
+                and runner.runtime_checkpoint.ppo_checkpoint.semantic_receipt_sha256
+                == policy.runtime_checkpoint.semantic_receipt_sha256
+                and runner.runtime_checkpoint.ppo_checkpoint.model_state_receipt_sha256
+                == policy.runtime_checkpoint.model_state_receipt_sha256
+                and runner.runtime_checkpoint.transition_inventory_sha256
+                == policy.runtime_checkpoint.transition_inventory_sha256
+                and runner.runtime_checkpoint.transition_decision_session_dates
+                == policy.runtime_checkpoint.transition_decision_session_dates
+                and runner.runtime_checkpoint.fit_environment_authority_receipts
+                == policy.runtime_checkpoint.fit_environment_authority_receipts
+                for runner, policy in zip(
+                    self.runner_checkpoint_authorities,
+                    self.policy_checkpoint_authorities,
+                    strict=True,
+                )
+            )
+        )
         runtime = bool(
             self.runner_checkpoint_authorities
             and self.policy_checkpoint_authorities
@@ -606,6 +629,7 @@ class MassiveAdaptiveRLTrainingWorkflowV1:
             != expected_initial_model_state_receipt
             or self.candidate_update_indices != runner_updates
             or self.candidate_update_indices != policy_updates
+            or not candidate_checkpoint_pairs_match
             or operational_updates
             != tuple(range(1, self.training_run.update_count + 1))
             or tuple(
@@ -794,6 +818,108 @@ class MassiveAdaptiveRLValidationWorkflowV1:
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
+def _assemble_massive_adaptive_rl_training_workflow_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV1,
+    fold_index: int,
+    seed: int,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
+    initial_model_state_receipt: str,
+    fixed_control_fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
+    fixed_control_selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
+    training_run: MassiveAdaptivePPOTrainingRunV1,
+    runner_authorities: tuple[
+        MassiveAdaptivePrequentialPPOCheckpointAuthorityV1, ...
+    ],
+    operational_authorities: tuple[
+        MassiveAdaptivePrequentialPPOCheckpointAuthorityV1, ...
+    ],
+    policy_authorities: tuple[MassiveAdaptiveRLCheckpointAuthorityV1, ...],
+) -> MassiveAdaptiveRLTrainingWorkflowV1:
+    observed_updates = tuple(
+        authority.runtime_checkpoint.ppo_checkpoint.update_index
+        for authority in runner_authorities
+        if authority.runtime_checkpoint is not None
+    )
+    if observed_updates != manifest.candidate_update_indices:
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "registered candidate update was not reached exactly once"
+        )
+    source_qualified = bool(
+        training_run.development_rl_training_authorized
+        and all(
+            authority.development_rl_training_authorized
+            for authority in runner_authorities
+        )
+        and all(
+            authority.development_rl_training_authorized
+            for authority in operational_authorities
+        )
+        and all(
+            authority.development_rl_training_authorized
+            for authority in policy_authorities
+        )
+        and fixed_control_fit_authority.development_control_fit_authorized
+        and fixed_control_selection_authority.development_control_selection_authorized
+    )
+    body = {
+        "schema": MASSIVE_ADAPTIVE_RL_TRAINING_WORKFLOW_V1_SCHEMA,
+        "experiment_manifest_receipt_sha256": manifest.semantic_receipt_sha256,
+        "fold_index": fold_index,
+        "seed": seed,
+        "model_initialization_specification_sha256": (
+            MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
+        ),
+        "initial_model_state_receipt_sha256": initial_model_state_receipt,
+        "training_forecast_authority_receipt_sha256": (
+            training_authority.semantic_receipt_sha256
+        ),
+        "chronology_authority_receipt_sha256": (
+            chronology_authority.semantic_receipt_sha256
+        ),
+        "fixed_control_fit_authority": fixed_control_fit_authority,
+        "fixed_control_selection_authority": fixed_control_selection_authority,
+        "training_run": training_run,
+        "runner_checkpoint_authorities": runner_authorities,
+        "operational_checkpoint_authorities": operational_authorities,
+        "policy_checkpoint_authorities": policy_authorities,
+        "candidate_update_indices": observed_updates,
+        "runner_checkpoint_inventory_sha256": semantic_sha256(
+            tuple(authority.semantic_receipt_sha256 for authority in runner_authorities)
+        ),
+        "operational_checkpoint_inventory_sha256": semantic_sha256(
+            tuple(
+                authority.semantic_receipt_sha256
+                for authority in operational_authorities
+            )
+        ),
+        "policy_checkpoint_inventory_sha256": semantic_sha256(
+            tuple(authority.semantic_receipt_sha256 for authority in policy_authorities)
+        ),
+        "source_data_qualified": source_qualified,
+        "profitability_reporting_authorized": False,
+        "outer_evaluation_authorized": False,
+        "lockbox_access_authorized": False,
+        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
+        "specification_sha256": MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256,
+    }
+    provisional = MassiveAdaptiveRLTrainingWorkflowV1(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+        development_rl_training_authorized=source_qualified,
+    )
+    result = MassiveAdaptiveRLTrainingWorkflowV1(
+        **{
+            **body,
+            "semantic_receipt_sha256": semantic_sha256(provisional.semantic_unsigned()),
+            "development_rl_training_authorized": source_qualified,
+        }  # type: ignore[arg-type]
+    )
+    result.validate()
+    return result
+
+
 def run_massive_adaptive_rl_training_workflow_v1(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV1,
@@ -947,14 +1073,17 @@ def run_massive_adaptive_rl_training_workflow_v1(
         operational_authorities.append(runner_authority)
         if update_index not in schedule:
             continue
-        runner_authorities.append(
-            runner_authority
-        )
+        canonical_runner_checkpoint = runner_authority.runtime_checkpoint
+        if canonical_runner_checkpoint is None:
+            raise MassiveAdaptiveRLWorkflowV1Error(
+                "adaptive RL candidate runner checkpoint has no runtime witness"
+            )
+        runner_authorities.append(runner_authority)
         policy_authorities.append(
             materialize_massive_adaptive_rl_checkpoint_authority_v1(
                 root=artifact_root,
                 artifact_id=f"{identifier}-policy",
-                checkpoint=snapshot.ppo_checkpoint,
+                checkpoint=canonical_runner_checkpoint.ppo_checkpoint,
                 training_forecast_authority=training_authority,
                 committed_at_ms=committed_at_ms + update_index * 3 + 1,
             )
@@ -1045,78 +1174,199 @@ def run_massive_adaptive_rl_training_workflow_v1(
                 committed_at_ms=committed_at_ms + final_update_index * 3 + 3,
             )
         )
-    source_qualified = bool(
-        training_run.development_rl_training_authorized
-        and all(
-            authority.development_rl_training_authorized
-            for authority in runner_authorities
-        )
-        and all(
-            authority.development_rl_training_authorized
-            for authority in operational_authorities
-        )
-        and all(
-            authority.development_rl_training_authorized
-            for authority in policy_authorities
-        )
-        and fixed_control_fit_authority.development_control_fit_authorized
-        and fixed_control_selection_authority.development_control_selection_authorized
+    return _assemble_massive_adaptive_rl_training_workflow_v1(
+        manifest=manifest,
+        fold_index=fold_index,
+        seed=seed,
+        training_authority=training_authority,
+        chronology_authority=chronology_authority,
+        initial_model_state_receipt=initial_model_state_receipt,
+        fixed_control_fit_authority=fixed_control_fit_authority,
+        fixed_control_selection_authority=fixed_control_selection_authority,
+        training_run=training_run,
+        runner_authorities=tuple(runner_authorities),
+        operational_authorities=tuple(operational_authorities),
+        policy_authorities=tuple(policy_authorities),
     )
-    body = {
-        "schema": MASSIVE_ADAPTIVE_RL_TRAINING_WORKFLOW_V1_SCHEMA,
-        "experiment_manifest_receipt_sha256": manifest.semantic_receipt_sha256,
-        "fold_index": fold_index,
-        "seed": seed,
-        "model_initialization_specification_sha256": (
-            MASSIVE_ADAPTIVE_PPO_MODEL_INITIALIZATION_V1_SPEC_SHA256
-        ),
-        "initial_model_state_receipt_sha256": initial_model_state_receipt,
-        "training_forecast_authority_receipt_sha256": (
-            training_authority.semantic_receipt_sha256
-        ),
-        "chronology_authority_receipt_sha256": (
-            chronology_authority.semantic_receipt_sha256
-        ),
-        "fixed_control_fit_authority": fixed_control_fit_authority,
-        "fixed_control_selection_authority": fixed_control_selection_authority,
-        "training_run": training_run,
-        "runner_checkpoint_authorities": tuple(runner_authorities),
-        "operational_checkpoint_authorities": tuple(operational_authorities),
-        "policy_checkpoint_authorities": tuple(policy_authorities),
-        "candidate_update_indices": observed_updates,
-        "runner_checkpoint_inventory_sha256": semantic_sha256(
-            tuple(authority.semantic_receipt_sha256 for authority in runner_authorities)
-        ),
-        "operational_checkpoint_inventory_sha256": semantic_sha256(
-            tuple(
-                authority.semantic_receipt_sha256
-                for authority in operational_authorities
+
+
+def verify_massive_adaptive_rl_training_workflow_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV1,
+    fold_index: int,
+    seed: int,
+    training_authority: MassiveAdaptiveRLTrainingForecastAuthorityProtocol,
+    chronology_authority: MassiveAdaptiveRLFitChronologyAuthorityProtocol,
+    environments: Mapping[str, MassiveAdaptiveProfitabilityEnvV1],
+    fit_environment_authorities: (
+        Mapping[str, MassiveAdaptiveRLFitEnvironmentAuthorityV1] | None
+    ) = None,
+    artifact_root: str | Path,
+    verified_at_ms: int,
+    device: torch.device | str = "cpu",
+) -> MassiveAdaptiveRLTrainingWorkflowV1:
+    """Reconstruct one completed workflow without creating or repairing evidence."""
+
+    manifest.validate()
+    training_authority.validate()
+    chronology_authority.validate()
+    if (
+        fold_index not in manifest.fold_indices
+        or seed not in manifest.seeds
+        or training_authority.outer_fold_index != fold_index
+        or chronology_authority.fold_index != fold_index
+        or training_authority.block_sessions != manifest.prequential_block_sessions
+        or not training_authority.reinforcement_learning_authorized
+        or not chronology_authority.development_rl_training_authorized
+    ):
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL verification inputs differ from the experiment manifest"
+        )
+    config = replace(manifest.ppo_config, seed=seed)
+    config.validate()
+    model = build_seeded_massive_adaptive_ppo_model_v1(seed=seed)
+    initial_model_state_receipt = massive_adaptive_ppo_model_state_receipt_v1(model)
+    runner = MassiveAdaptivePrequentialPPORunnerV1(
+        training_authority=training_authority,
+        chronology_authority=chronology_authority,
+        environments=environments,
+        fit_environment_authorities=fit_environment_authorities,
+        model=model,
+        config=config,
+        device=device,
+    )
+    artifact_prefix = f"{manifest.experiment_id}-fold{fold_index}-seed{seed}"
+
+    def update_identifier(update_index: int) -> str:
+        return f"{artifact_prefix}-update{update_index}"
+
+    final_update_index = manifest.candidate_update_indices[-1]
+    operational_authorities: list[
+        MassiveAdaptivePrequentialPPOCheckpointAuthorityV1
+    ] = []
+    for update_index in range(1, final_update_index + 1):
+        artifact_id = f"{update_identifier(update_index)}-runner"
+        if not _source_transaction_exists(
+            root=artifact_root,
+            relative=_runner_checkpoint_relative(artifact_id),
+        ):
+            raise MassiveAdaptiveRLWorkflowV1Error(
+                "adaptive RL verification is missing an operational checkpoint"
             )
-        ),
-        "policy_checkpoint_inventory_sha256": semantic_sha256(
-            tuple(authority.semantic_receipt_sha256 for authority in policy_authorities)
-        ),
-        "source_data_qualified": source_qualified,
-        "profitability_reporting_authorized": False,
-        "outer_evaluation_authorized": False,
-        "lockbox_access_authorized": False,
-        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
-        "specification_sha256": MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256,
+        operational_authorities.append(
+            _load_runner_checkpoint_authority(
+                root=artifact_root,
+                artifact_id=artifact_id,
+                runner=runner,
+                verified_at_ms=verified_at_ms + update_index * 3,
+            )
+        )
+    if not runner.training_complete:
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL verification did not reach the completed fit boundary"
+        )
+    operational_by_update = {
+        authority.runtime_checkpoint.ppo_checkpoint.update_index: authority
+        for authority in operational_authorities
+        if authority.runtime_checkpoint is not None
     }
-    provisional = MassiveAdaptiveRLTrainingWorkflowV1(
-        **body,  # type: ignore[arg-type]
-        semantic_receipt_sha256="0" * 64,
-        development_rl_training_authorized=source_qualified,
+    if tuple(operational_by_update) != tuple(range(1, final_update_index + 1)):
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL verification checkpoint inventory differs"
+        )
+    runner_authorities: list[
+        MassiveAdaptivePrequentialPPOCheckpointAuthorityV1
+    ] = []
+    policy_authorities: list[MassiveAdaptiveRLCheckpointAuthorityV1] = []
+    for update_index in manifest.candidate_update_indices:
+        policy_id = f"{update_identifier(update_index)}-policy"
+        if not _source_transaction_exists(
+            root=artifact_root,
+            relative=_policy_checkpoint_relative(policy_id),
+        ):
+            raise MassiveAdaptiveRLWorkflowV1Error(
+                "adaptive RL verification is missing a candidate policy checkpoint"
+            )
+        runner_authorities.append(operational_by_update[update_index])
+        policy_authorities.append(
+            _load_policy_checkpoint_authority(
+                root=artifact_root,
+                artifact_id=policy_id,
+                training_authority=training_authority,
+                verified_at_ms=verified_at_ms + update_index * 3 + 1,
+            )
+        )
+    training_run = runner.run_to_completion()
+    registry = build_massive_adaptive_rl_fixed_control_registry_v1()
+    fixed_fit_id = f"{artifact_prefix}-fixed-fit"
+    if not _source_transaction_exists(
+        root=artifact_root,
+        relative=_fixed_fit_relative(fixed_fit_id),
+    ):
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL verification is missing the fixed-control fit"
+        )
+    fixed_fit_loaded = load_massive_source_bundle(
+        root=artifact_root,
+        relative_payload_path=_fixed_fit_relative(fixed_fit_id),
+        verified_at_ms=verified_at_ms + final_update_index * 3 + 2,
     )
-    result = MassiveAdaptiveRLTrainingWorkflowV1(
-        **{
-            **body,
-            "semantic_receipt_sha256": semantic_sha256(provisional.semantic_unsigned()),
-            "development_rl_training_authorized": source_qualified,
-        }  # type: ignore[arg-type]
+    fixed_control_fit_authority = (
+        authorize_massive_adaptive_rl_fixed_control_fit_authority_v1(
+            root=artifact_root,
+            authority=parse_massive_adaptive_rl_fixed_control_fit_authority_v1(
+                root=artifact_root,
+                loaded_source=fixed_fit_loaded,
+            ),
+            training_authority=training_authority,
+            chronology_authority=chronology_authority,
+            environments=environments,
+            fit_environment_authorities=fit_environment_authorities,
+            registry=registry,
+        )
     )
-    result.validate()
-    return result
+    fixed_run = fixed_control_fit_authority.runtime_fit_run
+    if fixed_run is None:
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL verification fixed-control witness is absent"
+        )
+    fixed_selection_id = f"{artifact_prefix}-fixed-selection"
+    if not _source_transaction_exists(
+        root=artifact_root,
+        relative=_fixed_selection_relative(fixed_selection_id),
+    ):
+        raise MassiveAdaptiveRLWorkflowV1Error(
+            "adaptive RL verification is missing the fixed-control selection"
+        )
+    fixed_selection_loaded = load_massive_source_bundle(
+        root=artifact_root,
+        relative_payload_path=_fixed_selection_relative(fixed_selection_id),
+        verified_at_ms=verified_at_ms + final_update_index * 3 + 3,
+    )
+    fixed_control_selection_authority = (
+        authorize_massive_adaptive_rl_fixed_control_selection_authority_v1(
+            root=artifact_root,
+            authority=parse_massive_adaptive_rl_fixed_control_selection_authority_v1(
+                root=artifact_root,
+                loaded_source=fixed_selection_loaded,
+            ),
+            candidates=fixed_run.candidates,
+        )
+    )
+    return _assemble_massive_adaptive_rl_training_workflow_v1(
+        manifest=manifest,
+        fold_index=fold_index,
+        seed=seed,
+        training_authority=training_authority,
+        chronology_authority=chronology_authority,
+        initial_model_state_receipt=initial_model_state_receipt,
+        fixed_control_fit_authority=fixed_control_fit_authority,
+        fixed_control_selection_authority=fixed_control_selection_authority,
+        training_run=training_run,
+        runner_authorities=tuple(runner_authorities),
+        operational_authorities=tuple(operational_authorities),
+        policy_authorities=tuple(policy_authorities),
+    )
 
 
 def run_massive_adaptive_rl_validation_workflow_v1(
@@ -1352,6 +1602,7 @@ __all__ = [
     "main",
     "run_massive_adaptive_rl_training_workflow_v1",
     "run_massive_adaptive_rl_validation_workflow_v1",
+    "verify_massive_adaptive_rl_training_workflow_v1",
     "write_massive_adaptive_rl_experiment_manifest_v1",
 ]
 

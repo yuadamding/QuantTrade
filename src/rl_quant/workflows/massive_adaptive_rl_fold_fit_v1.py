@@ -66,6 +66,7 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 imp
 from rl_quant.workflows.massive_adaptive_rl_v2 import (
     MassiveAdaptiveRLTrainingWorkflowV2,
     run_massive_adaptive_rl_training_workflow_v2,
+    verify_massive_adaptive_rl_training_workflow_v2,
 )
 
 
@@ -95,6 +96,8 @@ MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "transition_coverage": "exact-fit-origin-dates",
         "model_initialization": "scoped-canonical-seed-and-initial-state-receipt",
         "execution_environment": "captured-deterministic-runtime-authority-v1",
+        "completed_verification": "strictly-read-only-existing-evidence-graph",
+        "repair": "explicit-and-pre-aggregate-only",
         "caller_environments": False,
         "caller_actions": False,
         "caller_transitions": False,
@@ -114,6 +117,12 @@ class MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable(
     MassiveAdaptiveRLFoldFitV1Error
 ):
     """Another process owns this fold's expensive execution stage."""
+
+
+class MassiveAdaptiveRLFoldFitCompletedEvidenceError(
+    MassiveAdaptiveRLFoldFitV1Error
+):
+    """A completed fold cannot enter the mutable repair path."""
 
 
 def _source_transaction_exists(*, root: str | Path, relative: str) -> bool:
@@ -549,6 +558,118 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
+def _assemble_massive_adaptive_rl_fold_fit_authority_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+    outer_fold_index: int,
+    selected_device: torch.device,
+    execution_environment: MassiveAdaptiveRLExecutionEnvironmentAuthorityV1,
+    fit_inputs: MassiveAdaptiveRLFoldFitInputsAuthorityV1,
+    workflow: MassiveAdaptiveRLTrainingWorkflowV2,
+) -> MassiveAdaptiveRLFoldFitAuthorityV1:
+    runtime_workflow = workflow.runtime_workflow
+    policy_authorities = runtime_workflow.policy_checkpoint_authorities
+    traversed = tuple(
+        tuple(
+            checkpoint.runtime_checkpoint.fit_environment_authority_receipts
+            if checkpoint.runtime_checkpoint is not None
+            else ()
+        )
+        for checkpoint in policy_authorities
+    )
+    runtime_receipt = (
+        runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
+    )
+    if runtime_receipt is None or not policy_authorities:
+        raise MassiveAdaptiveRLFoldFitV1Error(
+            "adaptive RL fold-fit runtime evidence is incomplete"
+        )
+    training = fit_inputs.training_forecast_authority
+    fit_registry = fit_inputs.fit_environment_registry
+    chronology = fit_inputs.fit_chronology_authority
+    training_run = runtime_workflow.training_run
+    body = {
+        "schema": MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SCHEMA,
+        "experiment_id": manifest.experiment_id,
+        "outer_fold_index": outer_fold_index,
+        "manifest_v3_receipt_sha256": manifest.semantic_receipt_sha256,
+        "base_manifest_v2_receipt_sha256": (
+            manifest.base_manifest.semantic_receipt_sha256
+        ),
+        "runtime_sources_receipt_sha256": runtime_sources.semantic_receipt_sha256,
+        "runtime_graph_witness_receipt_sha256": runtime_receipt,
+        "execution_device_specification": str(selected_device),
+        "training_seed": runtime_workflow.seed,
+        "model_initialization_specification_sha256": (
+            runtime_workflow.model_initialization_specification_sha256
+        ),
+        "initial_model_state_receipt_sha256": (
+            runtime_workflow.initial_model_state_receipt_sha256
+        ),
+        "execution_environment_authority": execution_environment,
+        "fit_inputs_authority": fit_inputs,
+        "training_forecast_authority": training,
+        "fit_chronology_authority": chronology,
+        "fit_environment_registry": fit_registry,
+        "training_workflow": workflow,
+        "fit_environment_registry_receipt_sha256": (
+            fit_registry.semantic_receipt_sha256
+        ),
+        "fit_environment_mapping_receipt_sha256": (
+            fit_registry.environment_registry_receipt_sha256
+        ),
+        "ppo_training_workflow_receipt_sha256": workflow.semantic_receipt_sha256,
+        "fixed_control_fit_authority_receipt_sha256": (
+            runtime_workflow.fixed_control_fit_authority.semantic_receipt_sha256
+        ),
+        "fixed_control_selection_authority_receipt_sha256": (
+            runtime_workflow.fixed_control_selection_authority.semantic_receipt_sha256
+        ),
+        "candidate_checkpoint_authority_receipts": tuple(
+            row.semantic_receipt_sha256 for row in policy_authorities
+        ),
+        "candidate_checkpoint_inventory_sha256": semantic_sha256(
+            tuple(row.semantic_receipt_sha256 for row in policy_authorities)
+        ),
+        "candidate_traversed_environment_receipts": traversed,
+        "candidate_traversed_environment_inventory_sha256": semantic_sha256(
+            traversed
+        ),
+        "final_training_checkpoint_authority_receipt_sha256": (
+            policy_authorities[-1].semantic_receipt_sha256
+        ),
+        "transition_decision_session_dates": (
+            training_run.transition_decision_session_dates
+        ),
+        "transition_inventory_sha256": training_run.transition_inventory_sha256,
+        "fit_origin_inventory_sha256": training.rl_fit_prefix_inventory_sha256,
+        "source_data_qualified": True,
+        "runtime_fit_replayed": True,
+        "profitability_reporting_authorized": False,
+        "outer_evaluation_authorized": False,
+        "lockbox_access_authorized": False,
+        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
+        "specification_sha256": MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SPEC_SHA256,
+        "implementation_source_sha256": (
+            MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SOURCE_SHA256
+        ),
+    }
+    provisional = MassiveAdaptiveRLFoldFitAuthorityV1(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+        development_rl_training_authorized=True,
+        _manifest=manifest,
+        _runtime_sources=runtime_sources,
+    )
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
 def run_massive_adaptive_rl_fold_fit_v1(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
@@ -643,101 +764,15 @@ def run_massive_adaptive_rl_fold_fit_v1(
             device=selected_device,
             resume=resume,
         )
-    runtime_workflow = workflow.runtime_workflow
-    policy_authorities = runtime_workflow.policy_checkpoint_authorities
-    traversed = tuple(
-        tuple(
-            checkpoint.runtime_checkpoint.fit_environment_authority_receipts
-            if checkpoint.runtime_checkpoint is not None
-            else ()
-        )
-        for checkpoint in policy_authorities
+    return _assemble_massive_adaptive_rl_fold_fit_authority_v1(
+        manifest=manifest,
+        runtime_sources=runtime_sources,
+        outer_fold_index=outer_fold_index,
+        selected_device=selected_device,
+        execution_environment=execution_environment,
+        fit_inputs=fit_inputs,
+        workflow=workflow,
     )
-    runtime_receipt = runtime_sources.runtime_source_graph_authority.runtime_authority_receipt_sha256
-    if runtime_receipt is None or not policy_authorities:
-        raise MassiveAdaptiveRLFoldFitV1Error(
-            "adaptive RL fold-fit runtime evidence is incomplete"
-        )
-    training_run = runtime_workflow.training_run
-    body = {
-        "schema": MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SCHEMA,
-        "experiment_id": manifest.experiment_id,
-        "outer_fold_index": outer_fold_index,
-        "manifest_v3_receipt_sha256": manifest.semantic_receipt_sha256,
-        "base_manifest_v2_receipt_sha256": (
-            manifest.base_manifest.semantic_receipt_sha256
-        ),
-        "runtime_sources_receipt_sha256": runtime_sources.semantic_receipt_sha256,
-        "runtime_graph_witness_receipt_sha256": runtime_receipt,
-        "execution_device_specification": str(selected_device),
-        "training_seed": runtime_workflow.seed,
-        "model_initialization_specification_sha256": (
-            runtime_workflow.model_initialization_specification_sha256
-        ),
-        "initial_model_state_receipt_sha256": (
-            runtime_workflow.initial_model_state_receipt_sha256
-        ),
-        "execution_environment_authority": execution_environment,
-        "fit_inputs_authority": fit_inputs,
-        "training_forecast_authority": training,
-        "fit_chronology_authority": chronology,
-        "fit_environment_registry": fit_registry,
-        "training_workflow": workflow,
-        "fit_environment_registry_receipt_sha256": (
-            fit_registry.semantic_receipt_sha256
-        ),
-        "fit_environment_mapping_receipt_sha256": (
-            fit_registry.environment_registry_receipt_sha256
-        ),
-        "ppo_training_workflow_receipt_sha256": workflow.semantic_receipt_sha256,
-        "fixed_control_fit_authority_receipt_sha256": (
-            runtime_workflow.fixed_control_fit_authority.semantic_receipt_sha256
-        ),
-        "fixed_control_selection_authority_receipt_sha256": (
-            runtime_workflow.fixed_control_selection_authority.semantic_receipt_sha256
-        ),
-        "candidate_checkpoint_authority_receipts": tuple(
-            row.semantic_receipt_sha256 for row in policy_authorities
-        ),
-        "candidate_checkpoint_inventory_sha256": semantic_sha256(
-            tuple(row.semantic_receipt_sha256 for row in policy_authorities)
-        ),
-        "candidate_traversed_environment_receipts": traversed,
-        "candidate_traversed_environment_inventory_sha256": semantic_sha256(
-            traversed
-        ),
-        "final_training_checkpoint_authority_receipt_sha256": (
-            policy_authorities[-1].semantic_receipt_sha256
-        ),
-        "transition_decision_session_dates": (
-            training_run.transition_decision_session_dates
-        ),
-        "transition_inventory_sha256": training_run.transition_inventory_sha256,
-        "fit_origin_inventory_sha256": training.rl_fit_prefix_inventory_sha256,
-        "source_data_qualified": True,
-        "runtime_fit_replayed": True,
-        "profitability_reporting_authorized": False,
-        "outer_evaluation_authorized": False,
-        "lockbox_access_authorized": False,
-        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
-        "specification_sha256": MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SPEC_SHA256,
-        "implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SOURCE_SHA256
-        ),
-    }
-    provisional = MassiveAdaptiveRLFoldFitAuthorityV1(
-        **body,  # type: ignore[arg-type]
-        semantic_receipt_sha256="0" * 64,
-        development_rl_training_authorized=True,
-        _manifest=manifest,
-        _runtime_sources=runtime_sources,
-    )
-    result = replace(
-        provisional,
-        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
-    )
-    result.validate()
-    return result
 
 
 def fold_fit_authority_relative_path_v1(
@@ -834,26 +869,82 @@ def materialize_massive_adaptive_rl_fold_fit_authority_v1(
     return result
 
 
-def authorize_massive_adaptive_rl_fold_fit_authority_v1(
+def verify_massive_adaptive_rl_fold_fit_authority_v1(
     *,
     root: str | Path,
     loaded_source: LoadedMassiveSourceObject,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     outer_fold_index: int,
-    committed_at_ms: int,
+    verified_at_ms: int,
     device: torch.device | str | None = None,
 ) -> MassiveAdaptiveRLFoldFitAuthorityV1:
-    """Replay a completed fold through its exact nested recovery paths."""
+    """Reconstruct a completed fold strictly from existing immutable evidence."""
 
-    replayed = run_massive_adaptive_rl_fold_fit_v1(
+    manifest.validate()
+    runtime_sources.validate()
+    selected_device = torch.device(
+        manifest.execution_device_specification if device is None else device
+    )
+    if (
+        outer_fold_index not in manifest.base_manifest.fold_indices
+        or manifest.experiment_id != runtime_sources.experiment_id
+        or manifest.semantic_receipt_sha256
+        != runtime_sources.manifest_v3_receipt_sha256
+        or str(selected_device) != manifest.execution_device_specification
+    ):
+        raise MassiveAdaptiveRLFoldFitV1Error(
+            "adaptive RL fold-fit verification roots differ"
+        )
+    initial_model_state_receipt = (
+        massive_adaptive_ppo_initial_model_state_receipt_v1(
+            seed=manifest.base_manifest.seeds[0]
+        )
+    )
+    with massive_adaptive_rl_deterministic_execution_v1(device=selected_device):
+        execution_environment = (
+            capture_massive_adaptive_rl_execution_environment_v1(
+                manifest=manifest,
+                initial_model_state_receipt_sha256=initial_model_state_receipt,
+                device=selected_device,
+            )
+        )
+        fit_inputs = load_massive_adaptive_rl_fold_fit_inputs_authority_v1(
+            root=root,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            execution_environment_authority=execution_environment,
+            outer_fold_index=outer_fold_index,
+            verified_at_ms=verified_at_ms,
+        )
+        training = fit_inputs.training_forecast_authority
+        fit_registry = fit_inputs.fit_environment_registry
+        chronology = fit_inputs.fit_chronology_authority
+        environments = fit_registry.build_environments()
+        environment_authorities = {
+            receipt: fit_registry.authority(receipt)
+            for receipt in fit_registry.forecast_archive_receipts
+        }
+        workflow = verify_massive_adaptive_rl_training_workflow_v2(
+            manifest=manifest.base_manifest,
+            fold_index=outer_fold_index,
+            seed=manifest.base_manifest.seeds[0],
+            training_authority=training,
+            chronology_authority=chronology,
+            environments=environments,
+            fit_environment_authorities=environment_authorities,
+            artifact_root=root,
+            verified_at_ms=verified_at_ms,
+            device=selected_device,
+        )
+    replayed = _assemble_massive_adaptive_rl_fold_fit_authority_v1(
         manifest=manifest,
         runtime_sources=runtime_sources,
         outer_fold_index=outer_fold_index,
-        artifact_root=root,
-        committed_at_ms=committed_at_ms,
-        device=device,
-        resume=True,
+        selected_device=selected_device,
+        execution_environment=execution_environment,
+        fit_inputs=fit_inputs,
+        workflow=workflow,
     )
     committed = _load_fold_fit_payload(root=root, loaded_source=loaded_source)
     if canonical_json_file_bytes(committed) != canonical_json_file_bytes(
@@ -865,6 +956,29 @@ def authorize_massive_adaptive_rl_fold_fit_authority_v1(
     result = replace(replayed, _loaded_source=loaded_source)
     result.validate()
     return result
+
+
+def authorize_massive_adaptive_rl_fold_fit_authority_v1(
+    *,
+    root: str | Path,
+    loaded_source: LoadedMassiveSourceObject,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+    outer_fold_index: int,
+    committed_at_ms: int,
+    device: torch.device | str | None = None,
+) -> MassiveAdaptiveRLFoldFitAuthorityV1:
+    """Compatibility alias for strict, read-only completed-fold verification."""
+
+    return verify_massive_adaptive_rl_fold_fit_authority_v1(
+        root=root,
+        loaded_source=loaded_source,
+        manifest=manifest,
+        runtime_sources=runtime_sources,
+        outer_fold_index=outer_fold_index,
+        verified_at_ms=committed_at_ms,
+        device=device,
+    )
 
 
 def load_massive_adaptive_rl_fold_fit_authority_v1(
@@ -884,13 +998,13 @@ def load_massive_adaptive_rl_fold_fit_authority_v1(
         ),
         verified_at_ms=committed_at_ms,
     )
-    return authorize_massive_adaptive_rl_fold_fit_authority_v1(
+    return verify_massive_adaptive_rl_fold_fit_authority_v1(
         root=root,
         loaded_source=loaded,
         manifest=manifest,
         runtime_sources=runtime_sources,
         outer_fold_index=outer_fold_index,
-        committed_at_ms=committed_at_ms,
+        verified_at_ms=committed_at_ms,
         device=device,
     )
 
@@ -948,6 +1062,68 @@ def _fold_fit_execution_lease(
             os.close(descriptor)
 
 
+def _repair_massive_adaptive_rl_fold_fit_generation_v1_unlocked(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+    outer_fold_index: int,
+    artifact_root: str | Path,
+    committed_at_ms: int,
+    device: torch.device | str | None,
+) -> MassiveAdaptiveRLFoldFitAuthorityV1:
+    relative = fold_fit_authority_relative_path_v1(
+        experiment_id=manifest.experiment_id,
+        fold_index=outer_fold_index,
+    )
+    if _source_transaction_exists(root=artifact_root, relative=relative):
+        raise MassiveAdaptiveRLFoldFitCompletedEvidenceError(
+            "completed adaptive RL fold-fit evidence cannot be repaired"
+        )
+    result = run_massive_adaptive_rl_fold_fit_v1(
+        manifest=manifest,
+        runtime_sources=runtime_sources,
+        outer_fold_index=outer_fold_index,
+        artifact_root=artifact_root,
+        committed_at_ms=committed_at_ms,
+        device=device,
+        resume=True,
+    )
+    final_update = result.training_workflow.candidate_schedule.candidate_update_indices[
+        -1
+    ]
+    return materialize_massive_adaptive_rl_fold_fit_authority_v1(
+        root=artifact_root,
+        authority=result,
+        committed_at_ms=committed_at_ms + final_update * 3 + 4,
+    )
+
+
+def repair_massive_adaptive_rl_fold_fit_generation_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+    outer_fold_index: int,
+    artifact_root: str | Path,
+    committed_at_ms: int,
+    device: torch.device | str | None = None,
+) -> MassiveAdaptiveRLFoldFitAuthorityV1:
+    """Resume an incomplete generation; refuse to mutate a completed fold graph."""
+
+    with _fold_fit_execution_lease(
+        root=artifact_root,
+        experiment_id=manifest.experiment_id,
+        fold_index=outer_fold_index,
+    ):
+        return _repair_massive_adaptive_rl_fold_fit_generation_v1_unlocked(
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            outer_fold_index=outer_fold_index,
+            artifact_root=artifact_root,
+            committed_at_ms=committed_at_ms,
+            device=device,
+        )
+
+
 def run_or_resume_massive_adaptive_rl_fold_fit_v1(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
@@ -977,22 +1153,13 @@ def run_or_resume_massive_adaptive_rl_fold_fit_v1(
                 committed_at_ms=committed_at_ms,
                 device=device,
             )
-        result = run_massive_adaptive_rl_fold_fit_v1(
+        return _repair_massive_adaptive_rl_fold_fit_generation_v1_unlocked(
             manifest=manifest,
             runtime_sources=runtime_sources,
             outer_fold_index=outer_fold_index,
             artifact_root=artifact_root,
             committed_at_ms=committed_at_ms,
             device=device,
-            resume=True,
-        )
-        final_update = (
-            result.training_workflow.candidate_schedule.candidate_update_indices[-1]
-        )
-        return materialize_massive_adaptive_rl_fold_fit_authority_v1(
-            root=artifact_root,
-            authority=result,
-            committed_at_ms=committed_at_ms + final_update * 3 + 4,
         )
 
 
@@ -1001,12 +1168,15 @@ __all__ = [
     "MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SOURCE_SHA256",
     "MASSIVE_ADAPTIVE_RL_FOLD_FIT_AUTHORITY_V1_SPEC_SHA256",
     "MassiveAdaptiveRLFoldFitAuthorityV1",
+    "MassiveAdaptiveRLFoldFitCompletedEvidenceError",
     "MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable",
     "MassiveAdaptiveRLFoldFitV1Error",
     "authorize_massive_adaptive_rl_fold_fit_authority_v1",
     "fold_fit_authority_relative_path_v1",
     "load_massive_adaptive_rl_fold_fit_authority_v1",
     "materialize_massive_adaptive_rl_fold_fit_authority_v1",
+    "repair_massive_adaptive_rl_fold_fit_generation_v1",
     "run_or_resume_massive_adaptive_rl_fold_fit_v1",
     "run_massive_adaptive_rl_fold_fit_v1",
+    "verify_massive_adaptive_rl_fold_fit_authority_v1",
 ]
