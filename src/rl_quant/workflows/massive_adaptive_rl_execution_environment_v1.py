@@ -265,6 +265,72 @@ class MassiveAdaptiveRLExecutionEnvironmentAuthorityV1:
             }
         }
 
+    @property
+    def development_execution_authorized(self) -> bool:
+        """Whether this persisted environment can authorize development execution."""
+
+        return bool(
+            self.source_data_qualified
+            and self.source_transaction_verified
+            and self.runtime_environment_replayed
+        )
+
+    @property
+    def scientific_execution_fingerprint_sha256(self) -> str:
+        """Hash the cross-worker scientific settings, excluding physical identity."""
+
+        return semantic_sha256(
+            {
+                "git_commit": self.git_commit,
+                "git_tree": self.git_tree,
+                "tracked_source_inventory_sha256": (
+                    self.tracked_source_inventory_sha256
+                ),
+                "dependency_lock_sha256": self.dependency_lock_sha256,
+                "python_version": self.python_version,
+                "python_implementation": self.python_implementation,
+                "pytorch_version": self.pytorch_version,
+                "numpy_version": self.numpy_version,
+                "cuda_runtime_version": self.cuda_runtime_version,
+                "cudnn_version": self.cudnn_version,
+                "execution_device_type": self.execution_device_type,
+                "parameter_dtype": self.parameter_dtype,
+                "deterministic_algorithms": self.deterministic_algorithms,
+                "deterministic_warn_only": self.deterministic_warn_only,
+                "float32_matmul_tf32": self.float32_matmul_tf32,
+                "cudnn_tf32": self.cudnn_tf32,
+                "cudnn_benchmark": self.cudnn_benchmark,
+                "cudnn_deterministic": self.cudnn_deterministic,
+                "cublas_workspace_config": self.cublas_workspace_config,
+                "torch_cpu_threads": self.torch_cpu_threads,
+                "torch_interop_threads": self.torch_interop_threads,
+                "process_thread_environment": self.process_thread_environment,
+                "training_seed": self.training_seed,
+                "model_initialization_specification_sha256": (
+                    self.model_initialization_specification_sha256
+                ),
+                "initial_model_state_receipt_sha256": (
+                    self.initial_model_state_receipt_sha256
+                ),
+            }
+        )
+
+    @property
+    def physical_worker_compatibility_sha256(self) -> str:
+        """Hash the minimum physical-worker class shared by all four folds."""
+
+        return semantic_sha256(
+            {
+                "execution_device_type": self.execution_device_type,
+                "gpu_name": self.gpu_name,
+                "gpu_compute_capability": self.gpu_compute_capability,
+                "cuda_runtime_version": self.cuda_runtime_version,
+                "cudnn_version": self.cudnn_version,
+                "nvidia_driver_version": self.nvidia_driver_version,
+                "parameter_dtype": self.parameter_dtype,
+            }
+        )
+
     def validate(self) -> None:
         expected_qualified = bool(
             self.tracked_worktree_clean

@@ -437,10 +437,14 @@ edges. On restart, the package reconstructs the typed role graph from that
 index, replays tensors, checkpoints, training-loss checkpoint choice,
 calibration, and fit forecasts, and requires the original runtime-witness
 receipt. No runtime mapping or qualification Boolean is accepted by the root
-runner. The remaining all-fold execution backend does not exist yet, so a
-successfully reconstructed run stops at
-`four-fold-execution-backend-required` rather than launching PPO. The root
-command cannot authorize profitability reporting.
+runner. The V2 root now authorizes all four fold-input inventories before any
+PPO execution, runs or strictly replays folds 0–3, requires one scientific and
+physical-worker compatibility fingerprint, and binds the two aggregate
+authorities to `FIT_FORECASTS_AUTHORIZED` and
+`PPO_AND_FIXED_CONTROLS_TRAINED`. It then stops at
+`inner-validation-backend-required`. The root command still cannot authorize
+profitability reporting because shared validation, freezing, and sealed outer
+execution are not connected yet.
 
 The RL chronology is opened in two stages. PPO fitting and policy selection
 first bind fit, validation, and outer date inventories directly from the split

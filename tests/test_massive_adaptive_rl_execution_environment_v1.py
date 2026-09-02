@@ -90,6 +90,13 @@ def test_execution_environment_captures_and_restores_deterministic_switches(
     assert first.source_data_qualified
     assert not first.source_transaction_verified
     assert first.runtime_environment_replayed
+    assert not first.development_execution_authorized
+    assert first.scientific_execution_fingerprint_sha256 == (
+        second.scientific_execution_fingerprint_sha256
+    )
+    assert first.physical_worker_compatibility_sha256 == (
+        second.physical_worker_compatibility_sha256
+    )
     assert first.execution_device_type == "cpu"
     assert first.parameter_dtype == "torch.float32"
     assert first.deterministic_algorithms
@@ -149,6 +156,7 @@ def test_execution_environment_persists_integrity_and_replays_exact_process(
 
     assert materialized.source_transaction_verified
     assert not materialized.runtime_environment_replayed
+    assert not materialized.development_execution_authorized
     assert materialized.tracked_source_inventory == captured.tracked_source_inventory
 
     def forbidden_git(*_args: object, **_kwargs: object) -> str:
@@ -180,6 +188,7 @@ def test_execution_environment_persists_integrity_and_replays_exact_process(
         )
     assert replayed.source_transaction_verified
     assert replayed.runtime_environment_replayed
+    assert replayed.development_execution_authorized
     assert replayed.semantic_receipt_sha256 == captured.semantic_receipt_sha256
 
     clean_git = module._git

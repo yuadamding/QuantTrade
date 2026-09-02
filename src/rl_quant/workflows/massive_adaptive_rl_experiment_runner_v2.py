@@ -4,14 +4,15 @@ This generation binds the requested execution device, distinguishes retryable
 source or replay-dependency unavailability from integrity failure, and can
 represent positive or negative completed reports.  When the package-owned
 replay-dependency index exists it reconstructs and authorizes the typed runtime
-graph without caller objects.  It still stops before the not-yet-installed
-four-fold execution backend.
+graph without caller objects.  It now executes or replays all four fit folds
+before stopping at the not-yet-installed inner-validation backend.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import time
 
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -31,6 +32,16 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
     load_massive_adaptive_rl_experiment_manifest_v3,
+)
+from rl_quant.workflows.massive_adaptive_rl_four_fold_fit_v1 import (
+    MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable,
+    advance_massive_adaptive_rl_four_fold_fit_inputs_state_v1,
+    advance_massive_adaptive_rl_four_fold_fit_state_v1,
+    run_or_resume_massive_adaptive_rl_four_fold_fit_inputs_v1,
+    run_or_resume_massive_adaptive_rl_four_fold_fit_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_fold_fit_v1 import (
+    MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable,
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
     MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1,
@@ -64,7 +75,8 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
         "device": "manifest-bound",
         "runtime_reconstruction": "package-owned-dependency-index-v1",
         "runtime_reconstruction_unavailability": "retryable-blocker",
-        "current_runtime_boundary": "four-fold-execution-backend-required",
+        "four_fold_fit": "package-owned-input-first-run-or-resume-v1",
+        "current_runtime_boundary": "inner-validation-backend-required",
         "completed_resume": "terminal-idempotent",
         "state_verification": "entire-chain-manifest-bound",
         "verification_surface": "ledger-replay-distinct-from-deep-verification",
@@ -88,6 +100,8 @@ class MassiveAdaptiveRLEndToEndRunV2:
     execution_device_specification: str
     source_bundle_receipt_sha256: str | None
     runtime_source_graph_authority_receipt_sha256: str | None
+    four_fold_fit_inputs_authority_receipt_sha256: str | None
+    four_fold_fit_authority_receipt_sha256: str | None
     state_receipts: tuple[str, ...]
     current_stage: MassiveAdaptiveRLExperimentStageV2
     next_required_stage: MassiveAdaptiveRLExperimentStageV2 | None
@@ -154,6 +168,8 @@ class MassiveAdaptiveRLEndToEndRunV2:
             )
             or self.runtime_source_graph_replayed
             and self.runtime_source_graph_authority_receipt_sha256 is None
+            or self.four_fold_fit_authority_receipt_sha256 is not None
+            and self.four_fold_fit_inputs_authority_receipt_sha256 is None
             or published
             and not self.source_data_qualified
             or published
@@ -241,6 +257,15 @@ def _result(
         if runtime_source_graph is not None
         else current.runtime_source_graph_authority_receipt_sha256
     )
+    stage_artifact_receipts = {
+        state.stage: state.stage_artifact_receipt_sha256
+        for state in states
+        if state.stage
+        in {
+            MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+            MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED,
+        }
+    }
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_END_TO_END_RUN_V2_SCHEMA,
         "experiment_id": manifest.experiment_id,
@@ -248,6 +273,16 @@ def _result(
         "execution_device_specification": manifest.execution_device_specification,
         "source_bundle_receipt_sha256": source_bundle_receipt,
         "runtime_source_graph_authority_receipt_sha256": (runtime_source_graph_receipt),
+        "four_fold_fit_inputs_authority_receipt_sha256": (
+            stage_artifact_receipts.get(
+                MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
+            )
+        ),
+        "four_fold_fit_authority_receipt_sha256": (
+            stage_artifact_receipts.get(
+                MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED
+            )
+        ),
         "state_receipts": tuple(row.semantic_receipt_sha256 for row in states),
         "current_stage": current.stage,
         "next_required_stage": next_stage,
@@ -329,6 +364,17 @@ def _source_bundle_path(
     )
 
 
+def _next_required_stage(
+    state: MassiveAdaptiveRLExperimentStateV2,
+) -> MassiveAdaptiveRLExperimentStageV2:
+    next_index = state.completed_stage_index + 1
+    if next_index >= len(MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2):
+        raise MassiveAdaptiveRLExperimentRunnerV2Error(
+            "adaptive RL V2 experiment has no next executable stage"
+        )
+    return MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2[next_index]
+
+
 def run_massive_adaptive_rl_experiment_v2(
     *,
     manifest_path: str | Path,
@@ -337,7 +383,7 @@ def run_massive_adaptive_rl_experiment_v2(
     device: object,
     resume: bool = True,
 ) -> MassiveAdaptiveRLEndToEndRunV2:
-    """Advance through package-owned runtime replay and stop before execution."""
+    """Replay sources, execute four fit folds, and stop before validation."""
 
     manifest = load_massive_adaptive_rl_experiment_manifest_v3(manifest_path)
     if str(device) != manifest.execution_device_specification:
@@ -434,7 +480,7 @@ def run_massive_adaptive_rl_experiment_v2(
             blocked = block_massive_adaptive_rl_experiment_state_v2(
                 artifact_root=artifact_root,
                 previous=states[-1],
-                blocked_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+                blocked_stage=_next_required_stage(states[-1]),
                 blocker_code="typed-runtime-source-replay-required",
                 blocker_evidence_receipt_sha256=semantic_sha256(
                     {
@@ -468,80 +514,70 @@ def run_massive_adaptive_rl_experiment_v2(
         )
         states = (*states, failure)
         return _result(manifest=manifest, states=states, source_bundle=source_bundle)
-    if not runtime_source_graph.source_data_qualified:
-        dependency_index_path = replay_dependency_index_path_v1(
-            source_root=source_root,
-            experiment_id=manifest.experiment_id,
-        )
-        if dependency_index_path.is_file():
-            try:
-                runtime_sources = (
-                    reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
-                        source_root=source_root,
-                        manifest=manifest,
-                    )
-                )
-            except MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable:
-                blocker_code = "runtime-source-temporarily-unavailable"
-                if not (
-                    states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
-                    and states[-1].blocker_code == blocker_code
-                ):
-                    blocked = block_massive_adaptive_rl_experiment_state_v2(
-                        artifact_root=artifact_root,
-                        previous=states[-1],
-                        blocked_stage=(
-                            MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
-                        ),
-                        blocker_code=blocker_code,
-                        blocker_evidence_receipt_sha256=semantic_sha256(
-                            {
-                                "manifest": manifest.semantic_receipt_sha256,
-                                "source_bundle": source_bundle.semantic_receipt_sha256,
-                                "runtime_source_graph": (
-                                    runtime_source_graph.semantic_receipt_sha256
-                                ),
-                                "failure_class": (
-                                    "runtime-source-temporarily-unavailable"
-                                ),
-                            }
-                        ),
-                    )
-                    states = (*states, blocked)
-                return _result(
+    dependency_index_path = replay_dependency_index_path_v1(
+        source_root=source_root,
+        experiment_id=manifest.experiment_id,
+    )
+    runtime_sources = None
+    if dependency_index_path.is_file():
+        try:
+            runtime_sources = (
+                reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1(
+                    source_root=source_root,
                     manifest=manifest,
-                    states=states,
-                    source_bundle=source_bundle,
-                    runtime_source_graph=runtime_source_graph,
                 )
-            except MassiveAdaptiveRLRuntimeSourceReconstructionV1Error:
-                failure = fail_massive_adaptive_rl_experiment_state_v2(
+            )
+        except MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable:
+            blocker_code = "runtime-source-temporarily-unavailable"
+            if not (
+                states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
+                and states[-1].blocker_code == blocker_code
+            ):
+                blocked = block_massive_adaptive_rl_experiment_state_v2(
                     artifact_root=artifact_root,
                     previous=states[-1],
-                    failed_stage=(
-                        MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
-                    ),
-                    failure_code="runtime-source-reconstruction-failed",
-                    failure_evidence_receipt_sha256=semantic_sha256(
+                    blocked_stage=_next_required_stage(states[-1]),
+                    blocker_code=blocker_code,
+                    blocker_evidence_receipt_sha256=semantic_sha256(
                         {
                             "manifest": manifest.semantic_receipt_sha256,
-                            "failure_code": "runtime-source-reconstruction-failed",
+                            "source_bundle": source_bundle.semantic_receipt_sha256,
+                            "runtime_source_graph": (
+                                runtime_source_graph.semantic_receipt_sha256
+                            ),
+                            "failure_class": "runtime-source-temporarily-unavailable",
                         }
                     ),
                 )
-                states = (*states, failure)
-                return _result(
-                    manifest=manifest,
-                    states=states,
-                    source_bundle=source_bundle,
-                    runtime_source_graph=runtime_source_graph,
-                )
-            runtime_source_graph = runtime_sources.runtime_source_graph_authority
-        else:
-            runtime_sources = None
-    else:
-        runtime_sources = None
-    if not runtime_source_graph.source_data_qualified:
+                states = (*states, blocked)
+            return _result(
+                manifest=manifest,
+                states=states,
+                source_bundle=source_bundle,
+                runtime_source_graph=runtime_source_graph,
+            )
+        except MassiveAdaptiveRLRuntimeSourceReconstructionV1Error:
+            failure = fail_massive_adaptive_rl_experiment_state_v2(
+                artifact_root=artifact_root,
+                previous=states[-1],
+                failed_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+                failure_code="runtime-source-reconstruction-failed",
+                failure_evidence_receipt_sha256=semantic_sha256(
+                    {
+                        "manifest": manifest.semantic_receipt_sha256,
+                        "failure_code": "runtime-source-reconstruction-failed",
+                    }
+                ),
+            )
+            states = (*states, failure)
+            return _result(
+                manifest=manifest,
+                states=states,
+                source_bundle=source_bundle,
+                runtime_source_graph=runtime_source_graph,
+            )
+        runtime_source_graph = runtime_sources.runtime_source_graph_authority
+    if runtime_sources is None or not runtime_source_graph.source_data_qualified:
         if not (
             states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
             and states[-1].blocker_code
@@ -550,7 +586,7 @@ def run_massive_adaptive_rl_experiment_v2(
             blocked = block_massive_adaptive_rl_experiment_state_v2(
                 artifact_root=artifact_root,
                 previous=states[-1],
-                blocked_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+                blocked_stage=_next_required_stage(states[-1]),
                 blocker_code="runtime-source-replay-dependency-index-required",
                 blocker_evidence_receipt_sha256=semantic_sha256(
                     {
@@ -569,27 +605,216 @@ def run_massive_adaptive_rl_experiment_v2(
             source_bundle=source_bundle,
             runtime_source_graph=runtime_source_graph,
         )
-    if not (
+    fit_inputs_stage_index = MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2.index(
+        MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
+    )
+    committed_at_ms = time.time_ns() // 1_000_000
+    try:
+        four_fold_inputs = (
+            run_or_resume_massive_adaptive_rl_four_fold_fit_inputs_v1(
+                manifest=manifest,
+                runtime_sources=runtime_sources,
+                artifact_root=artifact_root,
+                committed_at_ms=committed_at_ms,
+                device=str(device),
+                allow_materialize=(
+                    states[-1].completed_stage_index < fit_inputs_stage_index
+                ),
+            )
+        )
+    except MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable:
+        blocker_code = "four-fold-fit-input-execution-lease-unavailable"
+        if not (
+            states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
+            and states[-1].blocker_code == blocker_code
+        ):
+            blocked = block_massive_adaptive_rl_experiment_state_v2(
+                artifact_root=artifact_root,
+                previous=states[-1],
+                blocked_stage=_next_required_stage(states[-1]),
+                blocker_code=blocker_code,
+                blocker_evidence_receipt_sha256=semantic_sha256(
+                    {
+                        "manifest": manifest.semantic_receipt_sha256,
+                        "runtime_sources": runtime_sources.semantic_receipt_sha256,
+                    }
+                ),
+            )
+            states = (*states, blocked)
+        return _result(
+            manifest=manifest,
+            states=states,
+            source_bundle=source_bundle,
+            runtime_source_graph=runtime_source_graph,
+        )
+    except (ValueError, RuntimeError):
+        failure = fail_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            failed_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+            failure_code="four-fold-fit-input-authorization-failed",
+            failure_evidence_receipt_sha256=semantic_sha256(
+                {
+                    "manifest": manifest.semantic_receipt_sha256,
+                    "runtime_sources": runtime_sources.semantic_receipt_sha256,
+                    "failure_code": "four-fold-fit-input-authorization-failed",
+                }
+            ),
+        )
+        states = (*states, failure)
+        return _result(
+            manifest=manifest,
+            states=states,
+            source_bundle=source_bundle,
+            runtime_source_graph=runtime_source_graph,
+        )
+    if states[-1].completed_stage_index < fit_inputs_stage_index:
+        advanced = advance_massive_adaptive_rl_four_fold_fit_inputs_state_v1(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            authority=four_fold_inputs,
+        )
+        states = (*states, advanced)
+    elif not any(
+        state.stage is MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED
+        and state.stage_artifact_receipt_sha256
+        == four_fold_inputs.semantic_receipt_sha256
+        for state in states
+    ):
+        failure = fail_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            failed_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
+            failure_code="four-fold-fit-input-state-binding-failed",
+            failure_evidence_receipt_sha256=semantic_sha256(
+                {
+                    "manifest": manifest.semantic_receipt_sha256,
+                    "four_fold_fit_inputs": four_fold_inputs.semantic_receipt_sha256,
+                }
+            ),
+        )
+        states = (*states, failure)
+        return _result(
+            manifest=manifest,
+            states=states,
+            source_bundle=source_bundle,
+            runtime_source_graph=runtime_source_graph,
+        )
+    fit_stage_index = MASSIVE_ADAPTIVE_RL_EXPERIMENT_STAGE_ORDER_V2.index(
+        MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED
+    )
+    try:
+        four_fold_fit = run_or_resume_massive_adaptive_rl_four_fold_fit_v1(
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            fit_inputs_authority=four_fold_inputs,
+            artifact_root=artifact_root,
+            committed_at_ms=committed_at_ms + 10_000,
+            device=str(device),
+            allow_materialize=(states[-1].completed_stage_index < fit_stage_index),
+        )
+    except (
+        MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable,
+        MassiveAdaptiveRLFoldFitExecutionLeaseUnavailable,
+    ):
+        blocker_code = "four-fold-fit-execution-lease-unavailable"
+        if not (
+            states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
+            and states[-1].blocker_code == blocker_code
+        ):
+            blocked = block_massive_adaptive_rl_experiment_state_v2(
+                artifact_root=artifact_root,
+                previous=states[-1],
+                blocked_stage=_next_required_stage(states[-1]),
+                blocker_code=blocker_code,
+                blocker_evidence_receipt_sha256=semantic_sha256(
+                    {
+                        "manifest": manifest.semantic_receipt_sha256,
+                        "four_fold_fit_inputs": (
+                            four_fold_inputs.semantic_receipt_sha256
+                        ),
+                    }
+                ),
+            )
+            states = (*states, blocked)
+        return _result(
+            manifest=manifest,
+            states=states,
+            source_bundle=source_bundle,
+            runtime_source_graph=runtime_source_graph,
+        )
+    except (ValueError, RuntimeError):
+        failure = fail_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            failed_stage=(
+                MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED
+            ),
+            failure_code="four-fold-fit-execution-failed",
+            failure_evidence_receipt_sha256=semantic_sha256(
+                {
+                    "manifest": manifest.semantic_receipt_sha256,
+                    "four_fold_fit_inputs": four_fold_inputs.semantic_receipt_sha256,
+                    "failure_code": "four-fold-fit-execution-failed",
+                }
+            ),
+        )
+        states = (*states, failure)
+        return _result(
+            manifest=manifest,
+            states=states,
+            source_bundle=source_bundle,
+            runtime_source_graph=runtime_source_graph,
+        )
+    if states[-1].completed_stage_index < fit_stage_index:
+        advanced = advance_massive_adaptive_rl_four_fold_fit_state_v1(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            authority=four_fold_fit,
+        )
+        states = (*states, advanced)
+    elif not any(
+        state.stage
+        is MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED
+        and state.stage_artifact_receipt_sha256
+        == four_fold_fit.semantic_receipt_sha256
+        for state in states
+    ):
+        failure = fail_massive_adaptive_rl_experiment_state_v2(
+            artifact_root=artifact_root,
+            previous=states[-1],
+            failed_stage=(
+                MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED
+            ),
+            failure_code="four-fold-fit-state-binding-failed",
+            failure_evidence_receipt_sha256=semantic_sha256(
+                {
+                    "manifest": manifest.semantic_receipt_sha256,
+                    "four_fold_fit": four_fold_fit.semantic_receipt_sha256,
+                }
+            ),
+        )
+        states = (*states, failure)
+        return _result(
+            manifest=manifest,
+            states=states,
+            source_bundle=source_bundle,
+            runtime_source_graph=runtime_source_graph,
+        )
+    if states[-1].completed_stage_index == fit_stage_index and not (
         states[-1].stage is MassiveAdaptiveRLExperimentStageV2.BLOCKED
-        and states[-1].blocker_code == "four-fold-execution-backend-required"
+        and states[-1].blocker_code == "inner-validation-backend-required"
     ):
         blocked = block_massive_adaptive_rl_experiment_state_v2(
             artifact_root=artifact_root,
             previous=states[-1],
-            blocked_stage=MassiveAdaptiveRLExperimentStageV2.FIT_FORECASTS_AUTHORIZED,
-            blocker_code="four-fold-execution-backend-required",
+            blocked_stage=MassiveAdaptiveRLExperimentStageV2.INNER_VALIDATION_COMPLETED,
+            blocker_code="inner-validation-backend-required",
             blocker_evidence_receipt_sha256=semantic_sha256(
                 {
                     "manifest": manifest.semantic_receipt_sha256,
-                    "source_bundle": source_bundle.semantic_receipt_sha256,
-                    "runtime_source_graph": (
-                        runtime_source_graph.runtime_authority_receipt_sha256
-                    ),
-                    "runtime_sources": (
-                        None
-                        if runtime_sources is None
-                        else runtime_sources.semantic_receipt_sha256
-                    ),
+                    "four_fold_fit_inputs": four_fold_inputs.semantic_receipt_sha256,
+                    "four_fold_fit": four_fold_fit.semantic_receipt_sha256,
                 }
             ),
         )

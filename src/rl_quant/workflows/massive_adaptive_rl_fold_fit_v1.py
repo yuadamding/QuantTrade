@@ -391,9 +391,7 @@ class MassiveAdaptiveRLFoldFitAuthorityV1:
             and self.training_forecast_authority.source_data_qualified
             and self.fit_chronology_authority.source_data_qualified
             and self.fit_environment_registry.source_data_qualified
-            and self.execution_environment_authority.source_data_qualified
-            and self.execution_environment_authority.source_transaction_verified
-            and self.execution_environment_authority.runtime_environment_replayed
+            and self.execution_environment_authority.development_execution_authorized
             and self.fit_inputs_authority.source_data_qualified
             and self.training_workflow.development_rl_training_authorized
             and final_training_run.source_data_qualified
@@ -690,7 +688,7 @@ def _assemble_massive_adaptive_rl_fold_fit_authority_v1(
     return result
 
 
-def run_massive_adaptive_rl_fold_fit_v1(
+def prepare_massive_adaptive_rl_fold_fit_inputs_v1(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
@@ -699,8 +697,9 @@ def run_massive_adaptive_rl_fold_fit_v1(
     committed_at_ms: int,
     device: torch.device | str | None = None,
     resume: bool = False,
-) -> MassiveAdaptiveRLFoldFitAuthorityV1:
-    """Execute one complete PPO and fixed-control fit from reconstructed sources."""
+    allow_materialize: bool = True,
+) -> MassiveAdaptiveRLFoldFitInputsAuthorityV1:
+    """Persist or replay one fold's complete inputs before PPO execution."""
 
     manifest.validate()
     runtime_sources.validate()
@@ -757,7 +756,7 @@ def run_massive_adaptive_rl_fold_fit_v1(
                     device=selected_device,
                 )
             )
-        else:
+        elif allow_materialize:
             captured_execution_environment = (
                 capture_massive_adaptive_rl_execution_environment_v1(
                     manifest=manifest,
@@ -789,6 +788,10 @@ def run_massive_adaptive_rl_fold_fit_v1(
                     device=selected_device,
                 )
             )
+        else:
+            raise MassiveAdaptiveRLFoldFitCompletedEvidenceError(
+                "completed adaptive RL fold-fit execution environment is absent"
+            )
         fit_inputs_relative = fold_fit_inputs_relative_path_v1(
             experiment_id=manifest.experiment_id,
             fold_index=outer_fold_index,
@@ -806,7 +809,7 @@ def run_massive_adaptive_rl_fold_fit_v1(
                 outer_fold_index=outer_fold_index,
                 verified_at_ms=committed_at_ms,
             )
-        else:
+        elif allow_materialize:
             fit_inputs = materialize_massive_adaptive_rl_fold_fit_inputs_authority_v1(
                 root=resolved_artifact_root,
                 manifest=manifest,
@@ -815,6 +818,40 @@ def run_massive_adaptive_rl_fold_fit_v1(
                 outer_fold_index=outer_fold_index,
                 committed_at_ms=committed_at_ms,
             )
+        else:
+            raise MassiveAdaptiveRLFoldFitCompletedEvidenceError(
+                "completed adaptive RL fold-fit inputs are absent"
+            )
+    return fit_inputs
+
+
+def run_massive_adaptive_rl_fold_fit_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+    outer_fold_index: int,
+    artifact_root: str | Path,
+    committed_at_ms: int,
+    device: torch.device | str | None = None,
+    resume: bool = False,
+) -> MassiveAdaptiveRLFoldFitAuthorityV1:
+    """Execute one complete PPO and fixed-control fit from reconstructed sources."""
+
+    fit_inputs = prepare_massive_adaptive_rl_fold_fit_inputs_v1(
+        manifest=manifest,
+        runtime_sources=runtime_sources,
+        outer_fold_index=outer_fold_index,
+        artifact_root=artifact_root,
+        committed_at_ms=committed_at_ms,
+        device=device,
+        resume=resume,
+    )
+    selected_device = torch.device(
+        manifest.execution_device_specification if device is None else device
+    )
+    resolved_artifact_root = Path(artifact_root)
+    execution_environment = fit_inputs.execution_environment_authority
+    with massive_adaptive_rl_deterministic_execution_v1(device=selected_device):
         training = fit_inputs.training_forecast_authority
         fit_registry = fit_inputs.fit_environment_registry
         chronology = fit_inputs.fit_chronology_authority
@@ -1236,6 +1273,35 @@ def repair_massive_adaptive_rl_fold_fit_generation_v1(
         )
 
 
+def prepare_or_resume_massive_adaptive_rl_fold_fit_inputs_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV3,
+    runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
+    outer_fold_index: int,
+    artifact_root: str | Path,
+    committed_at_ms: int,
+    device: torch.device | str | None = None,
+    allow_materialize: bool = True,
+) -> MassiveAdaptiveRLFoldFitInputsAuthorityV1:
+    """Prepare or strictly replay fold inputs under the fold execution lease."""
+
+    with _fold_fit_execution_lease(
+        root=artifact_root,
+        experiment_id=manifest.experiment_id,
+        fold_index=outer_fold_index,
+    ):
+        return prepare_massive_adaptive_rl_fold_fit_inputs_v1(
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            outer_fold_index=outer_fold_index,
+            artifact_root=artifact_root,
+            committed_at_ms=committed_at_ms,
+            device=device,
+            resume=True,
+            allow_materialize=allow_materialize,
+        )
+
+
 def run_or_resume_massive_adaptive_rl_fold_fit_v1(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
@@ -1287,6 +1353,8 @@ __all__ = [
     "fold_fit_authority_relative_path_v1",
     "load_massive_adaptive_rl_fold_fit_authority_v1",
     "materialize_massive_adaptive_rl_fold_fit_authority_v1",
+    "prepare_massive_adaptive_rl_fold_fit_inputs_v1",
+    "prepare_or_resume_massive_adaptive_rl_fold_fit_inputs_v1",
     "repair_massive_adaptive_rl_fold_fit_generation_v1",
     "run_or_resume_massive_adaptive_rl_fold_fit_v1",
     "run_massive_adaptive_rl_fold_fit_v1",

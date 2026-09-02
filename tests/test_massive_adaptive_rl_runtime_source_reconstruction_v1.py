@@ -659,7 +659,7 @@ def test_missing_reconstruction_file_is_retryable(tmp_path: Path) -> None:
         )
 
 
-def test_runner_reconstructs_before_stopping_at_execution_backend(
+def test_runner_reconstructs_and_executes_four_fold_fit_before_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -722,6 +722,44 @@ def test_runner_reconstructs_before_stopping_at_execution_backend(
         "reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v1",
         lambda **_kwargs: runtime_sources,
     )
+    four_fold_inputs = SimpleNamespace(
+        experiment_id=manifest.experiment_id,
+        manifest_v3_receipt_sha256=manifest.semantic_receipt_sha256,
+        semantic_receipt_sha256=semantic_sha256("four-fold-fit-inputs"),
+        development_stage_authorized=True,
+        validate=lambda: None,
+    )
+    four_fold_fit = SimpleNamespace(
+        experiment_id=manifest.experiment_id,
+        manifest_v3_receipt_sha256=manifest.semantic_receipt_sha256,
+        four_fold_fit_inputs_authority_receipt_sha256=(
+            four_fold_inputs.semantic_receipt_sha256
+        ),
+        semantic_receipt_sha256=semantic_sha256("four-fold-fit"),
+        development_stage_authorized=True,
+        validate=lambda: None,
+    )
+    observed_folds: list[tuple[str, bool]] = []
+
+    def run_fit_inputs(**kwargs: object) -> object:
+        observed_folds.append(("inputs", bool(kwargs["allow_materialize"])))
+        return four_fold_inputs
+
+    def run_fit(**kwargs: object) -> object:
+        assert kwargs["fit_inputs_authority"] is four_fold_inputs
+        observed_folds.append(("fit", bool(kwargs["allow_materialize"])))
+        return four_fold_fit
+
+    monkeypatch.setattr(
+        runner_module,
+        "run_or_resume_massive_adaptive_rl_four_fold_fit_inputs_v1",
+        run_fit_inputs,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "run_or_resume_massive_adaptive_rl_four_fold_fit_v1",
+        run_fit,
+    )
 
     result = run_massive_adaptive_rl_experiment_v2(
         manifest_path=manifest_path,
@@ -731,9 +769,33 @@ def test_runner_reconstructs_before_stopping_at_execution_backend(
         resume=True,
     )
 
-    assert result.blocker_code == "four-fold-execution-backend-required"
+    assert result.blocker_code == "inner-validation-backend-required"
+    assert result.next_required_stage is not None
+    assert result.next_required_stage.value == "inner-validation-completed"
+    assert result.four_fold_fit_inputs_authority_receipt_sha256 == (
+        four_fold_inputs.semantic_receipt_sha256
+    )
+    assert result.four_fold_fit_authority_receipt_sha256 == (
+        four_fold_fit.semantic_receipt_sha256
+    )
+    assert observed_folds == [("inputs", True), ("fit", True)]
     assert result.runtime_source_graph_replayed
     assert result.source_data_qualified
+
+    replayed = run_massive_adaptive_rl_experiment_v2(
+        manifest_path=manifest_path,
+        source_root=tmp_path,
+        artifact_root=artifact_root,
+        device="cpu",
+        resume=True,
+    )
+    assert replayed.semantic_receipt_sha256 == result.semantic_receipt_sha256
+    assert observed_folds == [
+        ("inputs", True),
+        ("fit", True),
+        ("inputs", False),
+        ("fit", False),
+    ]
 
     def temporarily_unavailable(**_kwargs: object) -> object:
         raise reconstruction.MassiveAdaptiveRLRuntimeSourceTemporarilyUnavailable(
