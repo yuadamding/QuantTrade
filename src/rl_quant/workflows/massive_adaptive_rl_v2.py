@@ -720,6 +720,32 @@ def _manifest_v3_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _manifest_v4_command(args: argparse.Namespace) -> int:
+    from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
+        build_massive_adaptive_rl_experiment_manifest_v4,
+        write_massive_adaptive_rl_experiment_manifest_v4,
+    )
+
+    config = MassiveAdaptivePPOConfigV1(
+        rollout_length=args.block_sessions,
+        minibatch_size=args.block_sessions,
+        seed=args.seed,
+    )
+    manifest = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id=args.experiment_id,
+        prequential_block_sessions=args.block_sessions,
+        seeds=(args.seed,),
+        ppo_config=config,
+        execution_device_specification=args.device,
+    )
+    write_massive_adaptive_rl_experiment_manifest_v4(
+        path=args.output,
+        manifest=manifest,
+    )
+    print(manifest.semantic_receipt_sha256)
+    return 0
+
+
 def _manifest_schema(path: str | Path) -> str:
     raw = Path(path).read_bytes()
     value = json.loads(raw)
@@ -731,7 +757,15 @@ def _manifest_schema(path: str | Path) -> str:
 
 
 def _validate_command(args: argparse.Namespace) -> int:
-    if _manifest_schema(args.manifest) == (
+    schema = _manifest_schema(args.manifest)
+    if schema == "rl-quant.massive-adaptive-rl-experiment-manifest-v4":
+        from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
+            load_massive_adaptive_rl_experiment_manifest_v4,
+        )
+
+        manifest_v4 = load_massive_adaptive_rl_experiment_manifest_v4(args.manifest)
+        receipt = manifest_v4.semantic_receipt_sha256
+    elif schema == (
         "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
     ):
         from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
@@ -748,7 +782,12 @@ def _validate_command(args: argparse.Namespace) -> int:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    if _manifest_schema(args.manifest) == (
+    schema = _manifest_schema(args.manifest)
+    if schema == "rl-quant.massive-adaptive-rl-experiment-manifest-v4":
+        raise MassiveAdaptiveRLWorkflowV2Error(
+            "Manifest V4 execution requires the package-owned validation backend"
+        )
+    if schema == (
         "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
     ):
         from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
@@ -781,7 +820,12 @@ def _run_command(args: argparse.Namespace) -> int:
 
 
 def _verify_run_command(args: argparse.Namespace) -> int:
-    if _manifest_schema(args.manifest) == (
+    schema = _manifest_schema(args.manifest)
+    if schema == "rl-quant.massive-adaptive-rl-experiment-manifest-v4":
+        raise MassiveAdaptiveRLWorkflowV2Error(
+            "Manifest V4 verification requires the package-owned validation backend"
+        )
+    if schema == (
         "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
     ):
         from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
@@ -810,7 +854,12 @@ def _verify_run_command(args: argparse.Namespace) -> int:
 
 
 def _verify_ledger_command(args: argparse.Namespace) -> int:
-    if _manifest_schema(args.manifest) != (
+    schema = _manifest_schema(args.manifest)
+    if schema == "rl-quant.massive-adaptive-rl-experiment-manifest-v4":
+        raise MassiveAdaptiveRLWorkflowV2Error(
+            "Manifest V4 ledger verification requires the V4 state runner"
+        )
+    if schema != (
         "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
     ):
         raise MassiveAdaptiveRLWorkflowV2Error(
@@ -853,9 +902,19 @@ def build_parser() -> argparse.ArgumentParser:
     manifest_v3.add_argument("--seed", type=int, default=17)
     manifest_v3.add_argument("--device", default="cpu")
     manifest_v3.set_defaults(handler=_manifest_v3_command)
+    manifest_v4 = commands.add_parser(
+        "manifest-v4",
+        help="Preregister validation selection without opening validation outcomes.",
+    )
+    manifest_v4.add_argument("--experiment-id", required=True)
+    manifest_v4.add_argument("--output", required=True)
+    manifest_v4.add_argument("--block-sessions", type=int, choices=(21, 63), default=63)
+    manifest_v4.add_argument("--seed", type=int, default=17)
+    manifest_v4.add_argument("--device", default="cpu")
+    manifest_v4.set_defaults(handler=_manifest_v4_command)
     validate = commands.add_parser(
         "validate",
-        help="Validate an immutable V2 manifest without opening outcomes.",
+        help="Validate an immutable V2, V3, or V4 manifest without opening outcomes.",
     )
     validate.add_argument("--manifest", required=True)
     validate.set_defaults(handler=_validate_command)
