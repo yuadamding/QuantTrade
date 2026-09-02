@@ -1692,6 +1692,30 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
         return self._loaded_source is not None
 
     @property
+    def source_receipt_sha256(self) -> str | None:
+        """Return the persisted source-object receipt for the registry."""
+
+        if self._loaded_source is None:
+            return None
+        return self._loaded_source.receipt.receipt_sha256
+
+    @property
+    def source_transaction_receipt_sha256(self) -> str | None:
+        """Return the immutable commit receipt for the persisted registry."""
+
+        if self._loaded_source is None:
+            return None
+        return self._loaded_source.commit.receipt_sha256
+
+    @property
+    def source_transaction_committed_at_ms(self) -> int | None:
+        """Return when the canonical registry transaction was committed."""
+
+        if self._loaded_source is None:
+            return None
+        return self._loaded_source.commit.committed_at_ms
+
+    @property
     def development_stage_authorized(self) -> bool:
         return bool(
             self.source_transaction_verified

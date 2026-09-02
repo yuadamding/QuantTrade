@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+from rl_quant.data_sources.massive.source_receipts import (
+    canonical_json_file_bytes,
+    load_massive_source_bundle,
+    publish_massive_source_object,
+)
 
 from rl_quant.evaluation import (
     massive_adaptive_rl_cost_ladder_authority_v1 as cost_ladder_authority_module,
@@ -69,29 +76,33 @@ from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_v1 import (
     evaluate_massive_adaptive_rl_checkpoint_cost_ladder_v1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_authority_v1 import (
+    MassiveAdaptiveRLCostLadderAuthorityV1Error,
     authorize_massive_adaptive_rl_cost_ladder_authority_v1,
     materialize_massive_adaptive_rl_cost_ladder_authority_v1,
     parse_massive_adaptive_rl_cost_ladder_authority_v1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_fixed_control_validation_authority_v1 import (
+    MassiveAdaptiveRLFixedControlValidationAuthorityV1Error,
     materialize_massive_adaptive_rl_fixed_control_validation_authority_v1,
-    parse_massive_adaptive_rl_fixed_control_validation_authority_v1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_fold_validation_authority_v1 import (
-    MassiveAdaptiveRLFoldValidationAuthorityV1Error,
     validate_massive_adaptive_rl_shared_validation_tape_v1,
 )
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_policy_trace_authority_v1 import (
+    MassiveAdaptiveRLPolicyTraceAuthorityV1Error,
     authorize_massive_adaptive_rl_policy_trace_authority_v1,
     materialize_massive_adaptive_rl_policy_trace_authority_v1,
     parse_massive_adaptive_rl_policy_trace_authority_v1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
+    MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET,
+    MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SCHEMA_SHA256,
     MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
     MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    parse_massive_adaptive_rl_validation_environment_registry_v1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
@@ -535,6 +546,94 @@ def _canonical_validation_environment_registry(
     )
     result.validate()
     return result
+
+
+def _persist_validation_environment_registry(
+    root,
+    registry: MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    *,
+    committed_at_ms: int,
+) -> MassiveAdaptiveRLValidationEnvironmentRegistryV1:
+    relative = "test-validation-environment-registry.json"
+    publish_massive_source_object(
+        stream=BytesIO(canonical_json_file_bytes(registry.semantic_unsigned())),
+        root=root,
+        relative_payload_path=relative,
+        dataset_id=MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET,
+        source_object_key=relative,
+        requested_at_ms=committed_at_ms,
+        downloaded_at_ms=committed_at_ms,
+        schema_sha256=(
+            MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SCHEMA_SHA256
+        ),
+        entitlement_receipt_sha256=registry.semantic_receipt_sha256,
+        committed_at_ms=committed_at_ms,
+    )
+    return parse_massive_adaptive_rl_validation_environment_registry_v1(
+        root=root,
+        loaded_source=load_massive_source_bundle(
+            root=root,
+            relative_payload_path=relative,
+            verified_at_ms=committed_at_ms,
+        ),
+    )
+
+
+def _runtime_validation_environment_registry(
+    root,
+    fixture,
+    calibration_values,
+    monkeypatch,
+    *,
+    committed_at_ms: int,
+):
+    event_root = root / "registry-events"
+    event_root.mkdir()
+    event_archive = _empty_event_archive(
+        event_root,
+        identity=fixture.identity,
+        observed_at_ms=1_000,
+    )
+    environments = tuple(
+        _canonical_validation_environment(
+            fixture,
+            calibration_values,
+            event_archive=event_archive,
+            cost_basis_points=cost,
+        )
+        for cost in (10.0, 20.0, 40.0)
+    )
+    authorities = tuple(
+        _canonical_validation_environment_authority(environment)
+        for environment in environments
+    )
+    persisted = _persist_validation_environment_registry(
+        root,
+        _canonical_validation_environment_registry(authorities),
+        committed_at_ms=committed_at_ms,
+    )
+    registry = replace(
+        persisted,
+        runtime_environments_replayed=True,
+        development_validation_environments_authorized=True,
+    )
+    environment_by_cost = dict(zip((10.0, 20.0, 40.0), environments, strict=True))
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+        "validate",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+        "development_stage_authorized",
+        property(lambda _self: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+        "build_environments",
+        lambda _self: dict(environment_by_cost),
+    )
+    return registry, environment_by_cost
 
 
 class _ReceiptProxy:
@@ -1034,8 +1133,10 @@ def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch()
         promoted_run.validate()
 
 
-def test_checkpoint_drives_validation_actions_and_trace_replay(tmp_path) -> None:
-    _, _, environment = _adaptive_env_fixture()
+def test_checkpoint_drives_validation_actions_and_trace_replay(
+    tmp_path, monkeypatch
+) -> None:
+    fixture, calibration_values, environment = _adaptive_env_fixture()
     training_authority = _training_authority(environment)
     chronology = _chronology(environment, training_authority)
     checkpoint_authority = _checkpoint_authority(environment)
@@ -1051,21 +1152,28 @@ def test_checkpoint_drives_validation_actions_and_trace_replay(tmp_path) -> None
     assert tuple(
         row.action_receipt_sha256 for row in evaluated.action_evidence
     ) == tuple(row.action_receipt_sha256 for row in evaluated.transitions)
+    registry, _ = _runtime_validation_environment_registry(
+        tmp_path,
+        fixture,
+        calibration_values,
+        monkeypatch,
+        committed_at_ms=1,
+    )
 
     authority = materialize_massive_adaptive_rl_policy_trace_authority_v1(
         root=tmp_path,
         artifact_id="checkpoint-policy-trace",
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        environment=environment,
         fold_index=0,
         evaluation_role="inner_validation",
-        committed_at_ms=1,
+        committed_at_ms=2,
+        validation_environment_registry=registry,
     )
     assert authority.runtime_trace_replayed
     assert (
         authority.validation_context_receipt_sha256
-        == environment.validation_context_receipt_sha256
+        == registry.validation_context_receipt_sha256
     )
     generic = parse_massive_adaptive_rl_policy_trace_authority_v1(
         root=tmp_path,
@@ -1077,12 +1185,14 @@ def test_checkpoint_drives_validation_actions_and_trace_replay(tmp_path) -> None
         authority=generic,
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        environment=environment,
+        validation_environment_registry=registry,
     )
     assert replayed.policy_trace_receipt_sha256 == authority.policy_trace_receipt_sha256
 
 
-def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
+def test_checkpoint_cost_ladder_replays_exact_primary_targets(
+    tmp_path, monkeypatch
+) -> None:
     fixture, calibration_values, primary_environment = _adaptive_env_fixture()
     training_authority = _training_authority(primary_environment)
     chronology = _chronology(primary_environment, training_authority)
@@ -1113,23 +1223,28 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         )
         == 1
     )
+    registry, _ = _runtime_validation_environment_registry(
+        tmp_path,
+        fixture,
+        calibration_values,
+        monkeypatch,
+        committed_at_ms=1,
+    )
 
     authority = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
         root=tmp_path,
         artifact_id="checkpoint-cost-ladder",
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
-        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
         fold_index=0,
         evaluation_role="inner_validation",
         committed_at_ms=2,
+        validation_environment_registry=registry,
     )
     assert authority.runtime_ladder_replayed
     assert (
         authority.validation_context_receipt_sha256
-        == primary_environment.validation_context_receipt_sha256
+        == registry.validation_context_receipt_sha256
     )
     generic = parse_massive_adaptive_rl_cost_ladder_authority_v1(
         root=tmp_path,
@@ -1141,11 +1256,9 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         authority=generic,
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
-        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
+        validation_environment_registry=registry,
     )
-    assert reopened.cost_ladder_receipt_sha256 == ladder.semantic_receipt_sha256
+    assert reopened.cost_ladder_receipt_sha256 == authority.cost_ladder_receipt_sha256
 
 
 def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
@@ -1155,12 +1268,19 @@ def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
     training_authority = _training_authority(primary_environment)
     chronology = _chronology(primary_environment, training_authority)
     checkpoint_authority = _checkpoint_authority(primary_environment)
+    registry, environments = _runtime_validation_environment_registry(
+        tmp_path,
+        fixture,
+        calibration_values,
+        monkeypatch,
+        committed_at_ms=1,
+    )
     ladder = evaluate_massive_adaptive_rl_checkpoint_cost_ladder_v1(
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
-        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
+        primary_environment=environments[20.0],
+        low_cost_environment=environments[10.0],
+        high_cost_environment=environments[40.0],
         fold_index=0,
         evaluation_role="inner_validation",
     )
@@ -1179,12 +1299,10 @@ def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
         artifact_id="nonmonotone-checkpoint-cost-ladder",
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
-        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
         fold_index=0,
         evaluation_role="inner_validation",
-        committed_at_ms=3,
+        committed_at_ms=2,
+        validation_environment_registry=registry,
     )
     generic = parse_massive_adaptive_rl_cost_ladder_authority_v1(
         root=tmp_path,
@@ -1195,9 +1313,7 @@ def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
         authority=generic,
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        primary_environment=primary_environment,
-        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
-        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
+        validation_environment_registry=registry,
     )
 
     assert reopened.runtime_ladder_replayed
@@ -1206,101 +1322,147 @@ def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
     assert reopened.cost_ladder_receipt_sha256 == nonmonotone.semantic_receipt_sha256
 
 
-def test_replayed_candidate_and_fc06_authorities_share_one_validation_tape(
+def test_inner_validation_leaf_authorities_require_persisted_registry(
     tmp_path,
 ) -> None:
     fixture, calibration_values, primary_environment = _adaptive_env_fixture()
     training_authority = _training_authority(primary_environment)
     chronology = _chronology(primary_environment, training_authority)
     checkpoint_authority = _checkpoint_authority(primary_environment)
-    primary = materialize_massive_adaptive_rl_policy_trace_authority_v1(
-        root=tmp_path,
-        artifact_id="shared-tape-primary",
-        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
-        chronology_authority=chronology,  # type: ignore[arg-type]
-        environment=_environment_at_cost(fixture, calibration_values, 20.0),
-        fold_index=0,
-        evaluation_role="inner_validation",
-        committed_at_ms=10,
-    )
-    ladder = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
-        root=tmp_path,
-        artifact_id="shared-tape-ladder",
-        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
-        chronology_authority=chronology,  # type: ignore[arg-type]
-        primary_environment=_environment_at_cost(fixture, calibration_values, 20.0),
-        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
-        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
-        fold_index=0,
-        evaluation_role="inner_validation",
-        committed_at_ms=11,
-    )
+    with pytest.raises(
+        MassiveAdaptiveRLPolicyTraceAuthorityV1Error,
+        match="persisted validation registry",
+    ):
+        materialize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            artifact_id="unbound-primary",
+            checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            environment=primary_environment,
+            fold_index=0,
+            evaluation_role="inner_validation",
+            committed_at_ms=10,
+        )
+    with pytest.raises(
+        MassiveAdaptiveRLCostLadderAuthorityV1Error,
+        match="persisted validation registry",
+    ):
+        materialize_massive_adaptive_rl_cost_ladder_authority_v1(
+            root=tmp_path,
+            artifact_id="unbound-ladder",
+            checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            primary_environment=primary_environment,
+            low_cost_environment=_environment_at_cost(
+                fixture, calibration_values, 10.0
+            ),
+            high_cost_environment=_environment_at_cost(
+                fixture, calibration_values, 40.0
+            ),
+            fold_index=0,
+            evaluation_role="inner_validation",
+            committed_at_ms=11,
+        )
     fixed_fit, fixed_selection = _fixed_selection_fixture(
         tmp_path,
-        _environment_at_cost(fixture, calibration_values, 20.0),
+        primary_environment,
         chronology,
     )
-    fixed = materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
-        root=tmp_path,
-        artifact_id="shared-tape-fc06",
-        fit_authority=fixed_fit,  # type: ignore[arg-type]
-        selection_authority=fixed_selection,
-        chronology_authority=chronology,  # type: ignore[arg-type]
-        environment=_environment_at_cost(fixture, calibration_values, 20.0),
-        committed_at_ms=12,
-    )
-
-    receipt = validate_massive_adaptive_rl_shared_validation_tape_v1(
-        primary_trace_authorities=(primary,),
-        cost_ladder_authorities=(ladder,),
-        fixed_control_validation_authority=fixed,
-    )
-
-    assert len(receipt) == 64
-    generic_fixed = parse_massive_adaptive_rl_fixed_control_validation_authority_v1(
-        root=tmp_path,
-        loaded_source=fixed.loaded_source,
-    )
-    assert not generic_fixed.runtime_evaluation_replayed
-    assert not generic_fixed.development_stage_authorized
-
-    mismatched_environment = MassiveAdaptiveProfitabilityEnvV1(
-        forecast_archive=fixture.forecast_archive,
-        calibration=calibration_values.calibration,
-        inference_plan=fixture.inference_plan,
-        decision_roots=fixture.roots,
-        context_origins=fixture.contexts,
-        fill_source=fixture.fill_source,
-        daily_input_authority=fixture.daily,
-        identity_authority=fixture.identity,
-        economic_event_archive=None,
-        initial_capital=9_000_000.0,
-        transaction_cost_basis_points=20.0,
-    )
-    mismatched_fixed = (
+    with pytest.raises(
+        MassiveAdaptiveRLFixedControlValidationAuthorityV1Error,
+        match="persisted validation registry",
+    ):
         materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
             root=tmp_path,
-            artifact_id="different-tape-fc06",
+            artifact_id="unbound-fc06",
             fit_authority=fixed_fit,  # type: ignore[arg-type]
             selection_authority=fixed_selection,
             chronology_authority=chronology,  # type: ignore[arg-type]
-            environment=mismatched_environment,
-            committed_at_ms=13,
+            committed_at_ms=12,
+            validation_environment_registry=None,  # type: ignore[arg-type]
         )
+
+
+def test_validation_registry_must_precede_outcomes_and_outer_rejects_it(
+    tmp_path, monkeypatch
+) -> None:
+    fixture, calibration_values, _ = _adaptive_env_fixture()
+    registry, environments = _runtime_validation_environment_registry(
+        tmp_path,
+        fixture,
+        calibration_values,
+        monkeypatch,
+        committed_at_ms=10,
     )
+    unpersisted = replace(registry, _loaded_source=None)
     with pytest.raises(
-        MassiveAdaptiveRLFoldValidationAuthorityV1Error,
-        match="one economic tape",
+        MassiveAdaptiveRLPolicyTraceAuthorityV1Error,
+        match="not precommitted",
     ):
-        validate_massive_adaptive_rl_shared_validation_tape_v1(
-            primary_trace_authorities=(primary,),
-            cost_ladder_authorities=(ladder,),
-            fixed_control_validation_authority=mismatched_fixed,
+        materialize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            artifact_id="unpersisted-registry-primary",
+            checkpoint_authority=None,  # type: ignore[arg-type]
+            chronology_authority=None,  # type: ignore[arg-type]
+            fold_index=0,
+            evaluation_role="inner_validation",
+            committed_at_ms=11,
+            validation_environment_registry=unpersisted,
+        )
+    with pytest.raises(
+        MassiveAdaptiveRLPolicyTraceAuthorityV1Error,
+        match="not precommitted",
+    ):
+        materialize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            artifact_id="late-registry-primary",
+            checkpoint_authority=None,  # type: ignore[arg-type]
+            chronology_authority=None,  # type: ignore[arg-type]
+            fold_index=0,
+            evaluation_role="inner_validation",
+            committed_at_ms=10,
+            validation_environment_registry=registry,
+        )
+    with pytest.raises(
+        MassiveAdaptiveRLPolicyTraceAuthorityV1Error,
+        match="cannot use a validation registry",
+    ):
+        materialize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            artifact_id="outer-with-validation-registry",
+            checkpoint_authority=None,  # type: ignore[arg-type]
+            chronology_authority=None,  # type: ignore[arg-type]
+            environment=environments[20.0],
+            fold_index=0,
+            evaluation_role="outer_test",
+            committed_at_ms=11,
+            validation_environment_registry=registry,
+        )
+
+    wrong_rung_registry = replace(
+        registry,
+        environment_authorities=(
+            registry.environment_authorities[1],
+            registry.environment_authorities[0],
+            registry.environment_authorities[2],
+        ),
+    )
+    with pytest.raises(ValueError, match="environment authority differs"):
+        materialize_massive_adaptive_rl_cost_ladder_authority_v1(
+            root=tmp_path,
+            artifact_id="wrong-registry-rung",
+            checkpoint_authority=None,  # type: ignore[arg-type]
+            chronology_authority=None,  # type: ignore[arg-type]
+            fold_index=0,
+            evaluation_role="inner_validation",
+            committed_at_ms=11,
+            validation_environment_registry=wrong_rung_registry,
         )
 
 
 def test_validation_evidence_binds_static_canonical_environment_separately(
     tmp_path,
+    monkeypatch,
 ) -> None:
     fixture, calibration_values, _ = _adaptive_env_fixture()
     event_root = tmp_path / "events"
@@ -1323,8 +1485,31 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         _canonical_validation_environment_authority(environment)
         for environment in (low, primary_environment, high)
     )
-    environment_registry = _canonical_validation_environment_registry(
-        environment_authorities
+    persisted_registry = _persist_validation_environment_registry(
+        tmp_path,
+        _canonical_validation_environment_registry(environment_authorities),
+        committed_at_ms=19,
+    )
+    environment_registry = replace(
+        persisted_registry,
+        runtime_environments_replayed=True,
+        development_validation_environments_authorized=True,
+    )
+    environment_by_cost = {10.0: low, 20.0: primary_environment, 40.0: high}
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+        "validate",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+        "development_stage_authorized",
+        property(lambda _self: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+        "build_environments",
+        lambda _self: dict(environment_by_cost),
     )
     training_authority = _training_authority(primary_environment)
     chronology = _chronology(primary_environment, training_authority)
@@ -1335,8 +1520,7 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         artifact_id="canonical-environment-primary",
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        environment=primary_environment,
-        validation_environment_authority=environment_authorities[1],
+        validation_environment_registry=environment_registry,
         fold_index=0,
         evaluation_role="inner_validation",
         committed_at_ms=20,
@@ -1346,10 +1530,7 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         artifact_id="canonical-environment-ladder",
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
-        primary_environment=primary_environment,
-        low_cost_environment=low,
-        high_cost_environment=high,
-        validation_environment_authorities=environment_authorities,
+        validation_environment_registry=environment_registry,
         fold_index=0,
         evaluation_role="inner_validation",
         committed_at_ms=21,
@@ -1365,8 +1546,7 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         fit_authority=fixed_fit,  # type: ignore[arg-type]
         selection_authority=fixed_selection,
         chronology_authority=chronology,  # type: ignore[arg-type]
-        environment=primary_environment,
-        validation_environment_authority=environment_authorities[1],
+        validation_environment_registry=environment_registry,
         committed_at_ms=22,
     )
 
@@ -1376,15 +1556,31 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         != primary.environment_source_inventory_sha256
     )
     assert primary.runtime_validation_environment_replayed
+    assert primary.runtime_validation_environment_registry_replayed
+    assert (
+        primary.validation_environment_registry_receipt_sha256
+        == environment_registry.semantic_receipt_sha256
+    )
+    assert (
+        primary.validation_environment_registry_source_receipt_sha256
+        == environment_registry.source_receipt_sha256
+    )
+    assert (
+        primary.validation_environment_registry_commit_receipt_sha256
+        == environment_registry.source_transaction_receipt_sha256
+    )
+    assert primary.validation_environment_registry_committed_at_ms == 19
     assert (
         primary.validation_environment_authority_receipt_sha256
         == environment_authorities[1].semantic_receipt_sha256
     )
     assert ladder.runtime_validation_environments_replayed
+    assert ladder.runtime_validation_environment_registry_replayed
     assert ladder.validation_environment_authority_receipts == tuple(
         row.semantic_receipt_sha256 for row in environment_authorities
     )
     assert fixed.runtime_validation_environment_replayed
+    assert fixed.runtime_validation_environment_registry_replayed
     assert (
         fixed.environment_source_inventory_sha256
         == environment_authorities[1].environment_source_inventory_sha256
@@ -1405,14 +1601,23 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         root=tmp_path,
         loaded_source=primary.loaded_source,
     )
-    with pytest.raises(ValueError, match="validation environment"):
+    assert not generic.runtime_validation_environment_registry_replayed
+    assert not generic.development_policy_evaluation_authorized
+    with pytest.raises(ValueError, match="persisted validation registry"):
+        authorize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            authority=generic,
+            checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+            chronology_authority=chronology,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="validation registry"):
         authorize_massive_adaptive_rl_policy_trace_authority_v1(
             root=tmp_path,
             authority=generic,
             checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
             chronology_authority=chronology,  # type: ignore[arg-type]
             environment=primary_environment,
-            validation_environment_authority=environment_authorities[0],
+            validation_environment_registry=environment_registry,
         )
 
 

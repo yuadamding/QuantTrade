@@ -305,9 +305,27 @@ def _validate_canonical_environment_bindings_v1(
     economic_compatibility_receipts = tuple(
         row.economic_compatibility_receipt_sha256 for row in environment_authorities
     )
+    registry_receipt = registry.semantic_receipt_sha256
+    registry_source_receipt = registry.source_receipt_sha256
+    registry_commit_receipt = registry.source_transaction_receipt_sha256
+    registry_committed_at_ms = registry.source_transaction_committed_at_ms
     if (
-        any(
+        registry_source_receipt is None
+        or registry_commit_receipt is None
+        or registry_committed_at_ms is None
+        or any(
             not row.runtime_validation_environment_replayed
+            or not row.runtime_validation_environment_registry_replayed
+            or row.validation_sources_authority_receipt_sha256
+            != registry.validation_sources_authority_receipt_sha256
+            or row.validation_environment_registry_receipt_sha256
+            != registry_receipt
+            or row.validation_environment_registry_source_receipt_sha256
+            != registry_source_receipt
+            or row.validation_environment_registry_commit_receipt_sha256
+            != registry_commit_receipt
+            or row.validation_environment_registry_committed_at_ms
+            != registry_committed_at_ms
             or row.validation_environment_authority_receipt_sha256
             != primary_environment.semantic_receipt_sha256
             or row.environment_source_inventory_sha256
@@ -318,6 +336,17 @@ def _validate_canonical_environment_bindings_v1(
         )
         or any(
             not row.runtime_validation_environments_replayed
+            or not row.runtime_validation_environment_registry_replayed
+            or row.validation_sources_authority_receipt_sha256
+            != registry.validation_sources_authority_receipt_sha256
+            or row.validation_environment_registry_receipt_sha256
+            != registry_receipt
+            or row.validation_environment_registry_source_receipt_sha256
+            != registry_source_receipt
+            or row.validation_environment_registry_commit_receipt_sha256
+            != registry_commit_receipt
+            or row.validation_environment_registry_committed_at_ms
+            != registry_committed_at_ms
             or row.validation_environment_authority_receipts
             != environment_authority_receipts
             or row.environment_source_inventory_sha256s
@@ -327,6 +356,16 @@ def _validate_canonical_environment_bindings_v1(
             for row in ladders
         )
         or not fixed.runtime_validation_environment_replayed
+        or not fixed.runtime_validation_environment_registry_replayed
+        or fixed.validation_sources_authority_receipt_sha256
+        != registry.validation_sources_authority_receipt_sha256
+        or fixed.validation_environment_registry_receipt_sha256 != registry_receipt
+        or fixed.validation_environment_registry_source_receipt_sha256
+        != registry_source_receipt
+        or fixed.validation_environment_registry_commit_receipt_sha256
+        != registry_commit_receipt
+        or fixed.validation_environment_registry_committed_at_ms
+        != registry_committed_at_ms
         or fixed.validation_environment_authority_receipt_sha256
         != primary_environment.semantic_receipt_sha256
         or fixed.environment_source_inventory_sha256

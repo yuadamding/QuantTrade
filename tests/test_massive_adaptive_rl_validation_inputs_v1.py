@@ -11,6 +11,15 @@ from rl_quant.data_sources.massive.source_receipts import (
     load_massive_source_bundle,
     publish_massive_source_object,
 )
+from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_authority_v1 import (
+    materialize_massive_adaptive_rl_cost_ladder_authority_v1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_fixed_control_validation_authority_v1 import (
+    materialize_massive_adaptive_rl_fixed_control_validation_authority_v1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_policy_trace_authority_v1 import (
+    materialize_massive_adaptive_rl_policy_trace_authority_v1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
     MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET,
     MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SCHEMA_SHA256,
@@ -225,6 +234,16 @@ def test_validation_input_paths_are_manifest_and_fold_canonical() -> None:
     assert "environment" not in registry_parameters
     assert "cost_basis_points" not in registry_parameters
 
+    for materializer in (
+        materialize_massive_adaptive_rl_policy_trace_authority_v1,
+        materialize_massive_adaptive_rl_cost_ladder_authority_v1,
+        materialize_massive_adaptive_rl_fixed_control_validation_authority_v1,
+    ):
+        parameters = inspect.signature(materializer).parameters
+        assert "validation_environment_registry" in parameters
+        assert "validation_environment_authority" not in parameters
+        assert "validation_environment_authorities" not in parameters
+
 
 def test_generic_validation_inputs_are_integrity_only(tmp_path) -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v4(
@@ -289,6 +308,13 @@ def test_generic_validation_inputs_are_integrity_only(tmp_path) -> None:
         ),
     )
     assert generic_registry.source_transaction_verified
+    assert generic_registry.source_receipt_sha256 == (
+        generic_registry._loaded_source.receipt.receipt_sha256  # noqa: SLF001
+    )
+    assert generic_registry.source_transaction_receipt_sha256 == (
+        generic_registry._loaded_source.commit.receipt_sha256  # noqa: SLF001
+    )
+    assert generic_registry.source_transaction_committed_at_ms == 3
     assert not generic_registry.runtime_environments_replayed
     assert not generic_registry.development_stage_authorized
     assert (

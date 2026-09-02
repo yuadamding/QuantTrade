@@ -47,8 +47,8 @@ from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
 if TYPE_CHECKING:
     from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
     )
-
 
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-fixed-control-validation-authority-v1"
@@ -67,8 +67,9 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 =
             ),
             "payload": "canonical-json-replayed-fc06-validation-evaluation",
             "validation_environment": (
-                "canonical-authority-plus-static-environment-identities"
+                "persisted-registry-plus-canonical-authority-and-static-identities"
             ),
+            "temporal_barrier": "registry-commit-strictly-precedes-outcome-commit",
             "dynamic_economic_sources": "transition-derived-separate-inventory",
             "generic_reload": "nonauthorizing",
         }
@@ -79,7 +80,7 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SPEC_SHA256 = semantic
         "controller": "fit-selected-fc06",
         "role": "inner-validation-primary-cost-only",
         "evaluation": "package-owned-economic-replay",
-        "validation_environment": "canonical-20bp-authority",
+        "validation_environment": "precommitted-registry-canonical-20bp-authority",
         "caller_metrics": False,
         "profitability_reporting": False,
         "outer_access": False,
@@ -103,14 +104,16 @@ def _digest(name: str, value: object) -> str:
     return value
 
 
-def _validation_environment_authority_type() -> type[
-    MassiveAdaptiveRLValidationEnvironmentAuthorityV1
-]:
+def _validation_environment_types() -> tuple[type[object], type[object]]:
     from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
     )
 
-    return MassiveAdaptiveRLValidationEnvironmentAuthorityV1
+    return (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    )
 
 
 def _artifact_id(value: object) -> str:
@@ -125,51 +128,86 @@ def _artifact_id(value: object) -> str:
     return value
 
 
-def _validate_validation_environment_binding(
+def _resolve_validation_environment(
     *,
-    environment: MassiveAdaptiveProfitabilityEnvV1,
-    environment_authority: MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None,
+    validation_environment_registry: MassiveAdaptiveRLValidationEnvironmentRegistryV1,
     fold_index: int,
-) -> MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None:
-    if environment_authority is None:
-        return None
-    if type(environment_authority) is not _validation_environment_authority_type():
+    outcome_committed_at_ms: int,
+) -> tuple[
+    MassiveAdaptiveProfitabilityEnvV1,
+    MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+]:
+    environment_type, registry_type = _validation_environment_types()
+    if type(validation_environment_registry) is not registry_type:
+        raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+            "FC06 validation requires its persisted validation registry"
+        )
+    registry = validation_environment_registry
+    registry.validate()
+    registry_committed_at_ms = registry.source_transaction_committed_at_ms
+    if (
+        not registry.source_transaction_verified
+        or not registry.runtime_environments_replayed
+        or not registry.development_stage_authorized
+        or registry.source_receipt_sha256 is None
+        or registry.source_transaction_receipt_sha256 is None
+        or registry_committed_at_ms is None
+        or registry_committed_at_ms >= outcome_committed_at_ms
+        or registry.fold_index != fold_index
+    ):
+        raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+            "FC06 validation registry is not precommitted and authorized"
+        )
+    environment = registry.build_environments()[20.0]
+    environment_authority = registry.environment_authority(20.0)
+    if type(environment_authority) is not environment_type:
         raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
             "FC06 validation environment authority type differs"
         )
-    environment_authority.validate()
     environment_authority.validate_environment(environment)
-    if (
-        environment_authority.fold_index != fold_index
-        or environment_authority.transaction_cost_basis_points != 20.0
-        or not environment_authority.source_data_qualified
-    ):
-        raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
-            "FC06 validation environment authority differs"
-        )
-    return environment_authority
+    return environment, environment_authority
 
 
 def _evaluation_payload(
     evaluation: MassiveAdaptiveRLFixedControlEvaluationV1,
     *,
     environment: MassiveAdaptiveProfitabilityEnvV1,
-    validation_environment_authority: (
-        MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
-    ),
+    validation_environment_registry: MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    validation_environment_authority: MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
 ) -> dict[str, object]:
     evaluation.validate()
-    environment_authority = _validate_validation_environment_binding(
-        environment=environment,
-        environment_authority=validation_environment_authority,
-        fold_index=evaluation.fold_index,
-    )
+    registry = validation_environment_registry
+    environment_authority = validation_environment_authority
+    registry_source_receipt = registry.source_receipt_sha256
+    registry_commit_receipt = registry.source_transaction_receipt_sha256
+    registry_committed_at_ms = registry.source_transaction_committed_at_ms
+    if (
+        registry_source_receipt is None
+        or registry_commit_receipt is None
+        or registry_committed_at_ms is None
+    ):
+        raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+            "FC06 validation registry source transaction is absent"
+        )
     return {
         "evaluation": asdict(evaluation),
+        "validation_sources_authority_receipt_sha256": (
+            registry.validation_sources_authority_receipt_sha256
+        ),
+        "validation_environment_registry_receipt_sha256": (
+            registry.semantic_receipt_sha256
+        ),
+        "validation_environment_registry_source_receipt_sha256": (
+            registry_source_receipt
+        ),
+        "validation_environment_registry_commit_receipt_sha256": (
+            registry_commit_receipt
+        ),
+        "validation_environment_registry_committed_at_ms": (
+            registry_committed_at_ms
+        ),
         "validation_environment_authority_receipt_sha256": (
-            None
-            if environment_authority is None
-            else environment_authority.semantic_receipt_sha256
+            environment_authority.semantic_receipt_sha256
         ),
         "environment_source_inventory_sha256": _digest(
             "FC06 validation environment source inventory",
@@ -222,7 +260,12 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     fixed_control_selection_authority_receipt_sha256: str
     selected_action_receipt_sha256: str
     validation_context_receipt_sha256: str
-    validation_environment_authority_receipt_sha256: str | None
+    validation_sources_authority_receipt_sha256: str
+    validation_environment_registry_receipt_sha256: str
+    validation_environment_registry_source_receipt_sha256: str
+    validation_environment_registry_commit_receipt_sha256: str
+    validation_environment_registry_committed_at_ms: int
+    validation_environment_authority_receipt_sha256: str
     environment_source_inventory_sha256: str
     economic_compatibility_receipt_sha256: str
     evaluation_receipt_sha256: str
@@ -233,6 +276,10 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     loaded_source: LoadedMassiveSourceObject
     runtime_evaluation: MassiveAdaptiveRLFixedControlEvaluationV1 | None
     runtime_evaluation_replayed: bool
+    runtime_validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
+    )
+    runtime_validation_environment_registry_replayed: bool
     runtime_validation_environment_authority: (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
     )
@@ -263,6 +310,21 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
             "selected_action_receipt_sha256": self.selected_action_receipt_sha256,
             "validation_context_receipt_sha256": (
                 self.validation_context_receipt_sha256
+            ),
+            "validation_sources_authority_receipt_sha256": (
+                self.validation_sources_authority_receipt_sha256
+            ),
+            "validation_environment_registry_receipt_sha256": (
+                self.validation_environment_registry_receipt_sha256
+            ),
+            "validation_environment_registry_source_receipt_sha256": (
+                self.validation_environment_registry_source_receipt_sha256
+            ),
+            "validation_environment_registry_commit_receipt_sha256": (
+                self.validation_environment_registry_commit_receipt_sha256
+            ),
+            "validation_environment_registry_committed_at_ms": (
+                self.validation_environment_registry_committed_at_ms
             ),
             "validation_environment_authority_receipt_sha256": (
                 self.validation_environment_authority_receipt_sha256
@@ -301,11 +363,17 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     def validate(self) -> None:
         self.loaded_source.validate()
         runtime = self.runtime_evaluation is not None
+        registry_runtime = self.runtime_validation_environment_registry is not None
         environment_runtime = self.runtime_validation_environment_authority is not None
+        environment_type, registry_type = _validation_environment_types()
+        if self.runtime_validation_environment_registry is not None:
+            if type(self.runtime_validation_environment_registry) is not registry_type:
+                raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+                    "FC06 validation registry type differs"
+                )
+            self.runtime_validation_environment_registry.validate()
         if self.runtime_validation_environment_authority is not None:
-            if type(self.runtime_validation_environment_authority) is not (
-                _validation_environment_authority_type()
-            ):
+            if type(self.runtime_validation_environment_authority) is not environment_type:
                 raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
                     "FC06 validation environment authority type differs"
                 )
@@ -333,14 +401,13 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
             or self.loaded_source.receipt.entitlement_receipt_sha256
             != self.evaluation_receipt_sha256
             or self.runtime_evaluation_replayed != runtime
+            or self.runtime_validation_environment_registry_replayed
+            != registry_runtime
             or self.runtime_validation_environment_replayed != environment_runtime
-            or (environment_runtime and not runtime)
-            or (
-                runtime
-                and self.validation_environment_authority_receipt_sha256 is not None
-                and not environment_runtime
-            )
-            or self.development_validation_authorized != expected_authorized
+            or registry_runtime != environment_runtime
+            or (registry_runtime and not runtime)
+            or self.development_validation_authorized
+            != (expected_authorized and registry_runtime)
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
@@ -378,11 +445,29 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
                     "FC06 validation runtime differs from its authority"
                 )
         if environment_runtime:
+            assert self.runtime_validation_environment_registry is not None
             assert self.runtime_validation_environment_authority is not None
+            registry = self.runtime_validation_environment_registry
             environment_authority = self.runtime_validation_environment_authority
             if (
-                environment_authority.fold_index != self.fold_index
+                not registry.development_stage_authorized
+                or registry.fold_index != self.fold_index
+                or registry.validation_sources_authority_receipt_sha256
+                != self.validation_sources_authority_receipt_sha256
+                or registry.semantic_receipt_sha256
+                != self.validation_environment_registry_receipt_sha256
+                or registry.source_receipt_sha256
+                != self.validation_environment_registry_source_receipt_sha256
+                or registry.source_transaction_receipt_sha256
+                != self.validation_environment_registry_commit_receipt_sha256
+                or registry.source_transaction_committed_at_ms
+                != self.validation_environment_registry_committed_at_ms
+                or registry.source_transaction_committed_at_ms
+                >= self.loaded_source.commit.committed_at_ms
+                or environment_authority.fold_index != self.fold_index
                 or environment_authority.transaction_cost_basis_points != 20.0
+                or environment_authority.semantic_receipt_sha256
+                != registry.environment_authority(20.0).semantic_receipt_sha256
                 or environment_authority.semantic_receipt_sha256
                 != self.validation_environment_authority_receipt_sha256
                 or environment_authority.validation_context_receipt_sha256
@@ -400,6 +485,11 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
             self.fixed_control_selection_authority_receipt_sha256,
             self.selected_action_receipt_sha256,
             self.validation_context_receipt_sha256,
+            self.validation_sources_authority_receipt_sha256,
+            self.validation_environment_registry_receipt_sha256,
+            self.validation_environment_registry_source_receipt_sha256,
+            self.validation_environment_registry_commit_receipt_sha256,
+            self.validation_environment_authority_receipt_sha256,
             self.environment_source_inventory_sha256,
             self.economic_compatibility_receipt_sha256,
             self.evaluation_receipt_sha256,
@@ -411,10 +501,14 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
             self.semantic_receipt_sha256,
         ):
             _digest("FC06 validation authority", value)
-        if self.validation_environment_authority_receipt_sha256 is not None:
-            _digest(
-                "FC06 validation environment authority",
-                self.validation_environment_authority_receipt_sha256,
+        if (
+            isinstance(self.validation_environment_registry_committed_at_ms, bool)
+            or self.validation_environment_registry_committed_at_ms < 0
+            or self.validation_environment_registry_committed_at_ms
+            >= self.loaded_source.commit.committed_at_ms
+        ):
+            raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+                "FC06 validation registry was not committed first"
             )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
@@ -422,7 +516,12 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
 def _authority_body(
     *,
     evaluation: MassiveAdaptiveRLFixedControlEvaluationV1,
-    validation_environment_authority_receipt_sha256: str | None,
+    validation_sources_authority_receipt_sha256: str,
+    validation_environment_registry_receipt_sha256: str,
+    validation_environment_registry_source_receipt_sha256: str,
+    validation_environment_registry_commit_receipt_sha256: str,
+    validation_environment_registry_committed_at_ms: int,
+    validation_environment_authority_receipt_sha256: str,
     environment_source_inventory_sha256: str,
     economic_compatibility_receipt_sha256: str,
 ) -> dict[str, object]:
@@ -438,6 +537,21 @@ def _authority_body(
         "selected_action_receipt_sha256": (evaluation.selected_action_receipt_sha256),
         "validation_context_receipt_sha256": (
             evaluation.validation_context_receipt_sha256
+        ),
+        "validation_sources_authority_receipt_sha256": (
+            validation_sources_authority_receipt_sha256
+        ),
+        "validation_environment_registry_receipt_sha256": (
+            validation_environment_registry_receipt_sha256
+        ),
+        "validation_environment_registry_source_receipt_sha256": (
+            validation_environment_registry_source_receipt_sha256
+        ),
+        "validation_environment_registry_commit_receipt_sha256": (
+            validation_environment_registry_commit_receipt_sha256
+        ),
+        "validation_environment_registry_committed_at_ms": (
+            validation_environment_registry_committed_at_ms
         ),
         "validation_environment_authority_receipt_sha256": (
             validation_environment_authority_receipt_sha256
@@ -472,10 +586,23 @@ def parse_massive_adaptive_rl_fixed_control_validation_authority_v1(
     evaluation = _parse_evaluation(payload["evaluation"])
     body = _authority_body(
         evaluation=evaluation,
+        validation_sources_authority_receipt_sha256=str(
+            payload["validation_sources_authority_receipt_sha256"]
+        ),
+        validation_environment_registry_receipt_sha256=str(
+            payload["validation_environment_registry_receipt_sha256"]
+        ),
+        validation_environment_registry_source_receipt_sha256=str(
+            payload["validation_environment_registry_source_receipt_sha256"]
+        ),
+        validation_environment_registry_commit_receipt_sha256=str(
+            payload["validation_environment_registry_commit_receipt_sha256"]
+        ),
+        validation_environment_registry_committed_at_ms=int(
+            str(payload["validation_environment_registry_committed_at_ms"])
+        ),
         validation_environment_authority_receipt_sha256=(
-            None
-            if payload["validation_environment_authority_receipt_sha256"] is None
-            else str(payload["validation_environment_authority_receipt_sha256"])
+            str(payload["validation_environment_authority_receipt_sha256"])
         ),
         environment_source_inventory_sha256=str(
             payload["environment_source_inventory_sha256"]
@@ -490,6 +617,8 @@ def parse_massive_adaptive_rl_fixed_control_validation_authority_v1(
         loaded_source=loaded_source,
         runtime_evaluation=None,
         runtime_evaluation_replayed=False,
+        runtime_validation_environment_registry=None,
+        runtime_validation_environment_registry_replayed=False,
         runtime_validation_environment_authority=None,
         runtime_validation_environment_replayed=False,
         development_validation_authorized=False,
@@ -505,10 +634,7 @@ def authorize_massive_adaptive_rl_fixed_control_validation_authority_v1(
     fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
     selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
-    environment: MassiveAdaptiveProfitabilityEnvV1,
-    validation_environment_authority: (
-        MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
-    ) = None,
+    validation_environment_registry: MassiveAdaptiveRLValidationEnvironmentRegistryV1,
 ) -> MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     parsed = parse_massive_adaptive_rl_fixed_control_validation_authority_v1(
         root=root,
@@ -516,10 +642,10 @@ def authorize_massive_adaptive_rl_fixed_control_validation_authority_v1(
     )
     committed_payload = _load_payload(root=root, loaded_source=authority.loaded_source)
     committed = _parse_evaluation(committed_payload["evaluation"])
-    environment_authority = _validate_validation_environment_binding(
-        environment=environment,
-        environment_authority=validation_environment_authority,
+    environment, environment_authority = _resolve_validation_environment(
+        validation_environment_registry=validation_environment_registry,
         fold_index=parsed.fold_index,
+        outcome_committed_at_ms=authority.loaded_source.commit.committed_at_ms,
     )
     replayed = evaluate_massive_adaptive_rl_fixed_control_v1(
         registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
@@ -534,6 +660,7 @@ def authorize_massive_adaptive_rl_fixed_control_validation_authority_v1(
         _evaluation_payload(
             replayed,
             environment=environment,
+            validation_environment_registry=validation_environment_registry,
             validation_environment_authority=environment_authority,
         )
     ):
@@ -544,8 +671,10 @@ def authorize_massive_adaptive_rl_fixed_control_validation_authority_v1(
         parsed,
         runtime_evaluation=replayed,
         runtime_evaluation_replayed=True,
+        runtime_validation_environment_registry=validation_environment_registry,
+        runtime_validation_environment_registry_replayed=True,
         runtime_validation_environment_authority=environment_authority,
-        runtime_validation_environment_replayed=environment_authority is not None,
+        runtime_validation_environment_replayed=True,
         development_validation_authorized=replayed.source_data_qualified,
     )
     result.validate()
@@ -559,17 +688,14 @@ def materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
     fit_authority: MassiveAdaptiveRLFixedControlFitAuthorityV1,
     selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
-    environment: MassiveAdaptiveProfitabilityEnvV1,
     committed_at_ms: int,
-    validation_environment_authority: (
-        MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
-    ) = None,
+    validation_environment_registry: MassiveAdaptiveRLValidationEnvironmentRegistryV1,
 ) -> MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     artifact = _artifact_id(artifact_id)
-    environment_authority = _validate_validation_environment_binding(
-        environment=environment,
-        environment_authority=validation_environment_authority,
+    environment, environment_authority = _resolve_validation_environment(
+        validation_environment_registry=validation_environment_registry,
         fold_index=chronology_authority.fold_index,
+        outcome_committed_at_ms=committed_at_ms,
     )
     evaluation = evaluate_massive_adaptive_rl_fixed_control_v1(
         registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
@@ -587,6 +713,7 @@ def materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
                 _evaluation_payload(
                     evaluation,
                     environment=environment,
+                    validation_environment_registry=validation_environment_registry,
                     validation_environment_authority=environment_authority,
                 )
             )
@@ -618,8 +745,7 @@ def materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
         fit_authority=fit_authority,
         selection_authority=selection_authority,
         chronology_authority=chronology_authority,
-        environment=environment,
-        validation_environment_authority=environment_authority,
+        validation_environment_registry=validation_environment_registry,
     )
 
 

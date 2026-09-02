@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from dataclasses import asdict, replace
 
 import pytest
@@ -258,52 +257,21 @@ def test_package_workflow_publishes_resume_and_policy_checkpoints(tmp_path) -> N
         primary,
         _environment_at_cost(fixture, calibration, 40.0),
     )
-    validation = run_massive_adaptive_rl_validation_workflow_v1(
-        manifest=manifest,
-        training_workflow=result,
-        chronology_authority=chronology,  # type: ignore[arg-type]
-        environments={
-            authority.semantic_receipt_sha256: cost_environments
-            for authority in result.policy_checkpoint_authorities
-        },
-        fixed_control_environment=_environment_at_cost(fixture, calibration, 20.0),
-        artifact_root=tmp_path,
-        committed_at_ms=500,
-    )
-    assert len(validation.policy_trace_authorities) == 2
-    assert len(validation.cost_ladder_authorities) == 2
-    assert tuple(
-        row.policy_trace_receipt_sha256 for row in validation.policy_trace_authorities
-    ) == tuple(
-        row.primary_trace_receipt_sha256 for row in validation.cost_ladder_authorities
-    )
-    assert validation.validation_context_receipt_sha256 == (
-        primary.validation_context_receipt_sha256
-    )
-    assert validation.fixed_control_evaluation.policy_trace.evaluation_role == (
-        "inner_validation"
-    )
-
-    mismatched = copy.copy(primary)
-    mismatched.validation_context_receipt_sha256 = semantic_sha256(
-        "different-validation-context"
-    )
-    with pytest.raises(MassiveAdaptiveRLWorkflowV1Error, match="validation context"):
+    with pytest.raises(
+        MassiveAdaptiveRLWorkflowV1Error,
+        match="persisted canonical validation registry",
+    ):
         run_massive_adaptive_rl_validation_workflow_v1(
             manifest=manifest,
             training_workflow=result,
             chronology_authority=chronology,  # type: ignore[arg-type]
             environments={
-                authority.semantic_receipt_sha256: (
-                    cost_environments
-                    if index
-                    else (cost_environments[0], mismatched, cost_environments[2])
-                )
-                for index, authority in enumerate(result.policy_checkpoint_authorities)
+                authority.semantic_receipt_sha256: cost_environments
+                for authority in result.policy_checkpoint_authorities
             },
             fixed_control_environment=_environment_at_cost(fixture, calibration, 20.0),
-            artifact_root=tmp_path / "mismatched",
-            committed_at_ms=700,
+            artifact_root=tmp_path,
+            committed_at_ms=500,
         )
 
     strictly_missing = missing_policy.with_name(

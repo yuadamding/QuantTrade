@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
@@ -38,8 +38,8 @@ from rl_quant.training.massive_adaptive_rl_chronology_authority_v1 import (
 if TYPE_CHECKING:
     from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
     )
-
 
 MASSIVE_ADAPTIVE_RL_COST_LADDER_AUTHORITY_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-cost-ladder-authority-v1"
@@ -54,8 +54,9 @@ MASSIVE_ADAPTIVE_RL_COST_LADDER_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 = semantic_sha
         "payload": "cost-ladder-identities-and-economics",
         "validation_context": "one-cost-excluded-environment-identity",
         "validation_environments": (
-            "canonical-authorities-plus-static-environment-identities"
+            "persisted-registry-plus-canonical-authorities-and-static-identities"
         ),
+        "temporal_barrier": "registry-commit-strictly-precedes-outcome-commit",
         "dynamic_economic_sources": "transition-derived-separate-inventories",
         "promotion": "reload-checkpoint-rerun-primary-and-frozen-target-stresses",
         "generic_reload": "nonauthorizing",
@@ -79,55 +80,93 @@ def _digest(name: str, value: object) -> str:
     return value
 
 
-def _validation_environment_authority_type() -> type[
-    MassiveAdaptiveRLValidationEnvironmentAuthorityV1
-]:
+def _validation_environment_types() -> tuple[type[object], type[object]]:
     from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
     )
 
-    return MassiveAdaptiveRLValidationEnvironmentAuthorityV1
+    return (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    )
 
 
-def _validate_validation_environment_bindings(
+def _resolve_cost_ladder_environments(
     *,
-    environments: tuple[
+    primary_environment: MassiveAdaptiveProfitabilityEnvV1 | None,
+    low_cost_environment: MassiveAdaptiveProfitabilityEnvV1 | None,
+    high_cost_environment: MassiveAdaptiveProfitabilityEnvV1 | None,
+    validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
+    ),
+    fold_index: int,
+    evaluation_role: str,
+    outcome_committed_at_ms: int,
+) -> tuple[
+    tuple[
         MassiveAdaptiveProfitabilityEnvV1,
         MassiveAdaptiveProfitabilityEnvV1,
         MassiveAdaptiveProfitabilityEnvV1,
     ],
-    environment_authorities: (
-        Sequence[MassiveAdaptiveRLValidationEnvironmentAuthorityV1] | None
-    ),
-    fold_index: int,
-    evaluation_role: str,
-) -> tuple[MassiveAdaptiveRLValidationEnvironmentAuthorityV1, ...]:
-    if environment_authorities is None:
-        return ()
-    authorities = tuple(environment_authorities)
-    if not authorities:
-        return ()
-    if (
-        evaluation_role != "inner_validation"
-        or len(authorities) != 3
-        or any(
-            type(row) is not _validation_environment_authority_type()
-            for row in authorities
+    tuple[MassiveAdaptiveRLValidationEnvironmentAuthorityV1, ...],
+]:
+    environment_type, registry_type = _validation_environment_types()
+    supplied = (low_cost_environment, primary_environment, high_cost_environment)
+    if evaluation_role == "outer_test":
+        if validation_environment_registry is not None or any(
+            type(row) is not MassiveAdaptiveProfitabilityEnvV1 for row in supplied
+        ):
+            raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+                "outer adaptive RL cost ladder cannot use a validation registry"
+            )
+        return supplied, ()  # type: ignore[return-value]
+    if evaluation_role != "inner_validation":
+        raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+            "adaptive RL cost-ladder evaluation role differs"
         )
-        or tuple(row.transaction_cost_basis_points for row in authorities)
-        != (10.0, 20.0, 40.0)
+    if any(row is not None for row in supplied) or type(
+        validation_environment_registry
+    ) is not registry_type:
+        raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+            "inner-validation cost ladder requires its persisted validation registry"
+        )
+    registry = cast(
+        "MassiveAdaptiveRLValidationEnvironmentRegistryV1",
+        validation_environment_registry,
+    )
+    registry.validate()
+    registry_committed_at_ms = registry.source_transaction_committed_at_ms
+    if (
+        not registry.source_transaction_verified
+        or not registry.runtime_environments_replayed
+        or not registry.development_stage_authorized
+        or registry.source_receipt_sha256 is None
+        or registry.source_transaction_receipt_sha256 is None
+        or registry_committed_at_ms is None
+        or registry_committed_at_ms >= outcome_committed_at_ms
+        or registry.fold_index != fold_index
     ):
         raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
-            "adaptive RL cost-ladder validation environment authorities differ"
+            "inner-validation cost-ladder registry is not precommitted and authorized"
         )
+    built = registry.build_environments()
+    environments = (built[10.0], built[20.0], built[40.0])
+    authorities = tuple(
+        registry.environment_authority(cost) for cost in (10.0, 20.0, 40.0)
+    )
     for authority, environment in zip(authorities, environments, strict=True):
+        if type(authority) is not environment_type:
+            raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+                "adaptive RL cost-ladder validation environment authorities differ"
+            )
         authority.validate()
         authority.validate_environment(environment)
         if authority.fold_index != fold_index or not authority.source_data_qualified:
             raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
                 "adaptive RL cost-ladder validation environment authorities differ"
             )
-    return authorities
+    return environments, authorities
 
 
 def _payload(
@@ -138,6 +177,9 @@ def _payload(
         MassiveAdaptiveProfitabilityEnvV1,
         MassiveAdaptiveProfitabilityEnvV1,
     ],
+    validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
+    ),
     validation_environment_authorities: tuple[
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1, ...
     ],
@@ -151,6 +193,19 @@ def _payload(
         raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
             "adaptive RL cost-ladder environment order differs"
         )
+    registry = validation_environment_registry
+    if (registry is None) != (not validation_environment_authorities):
+        raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+            "adaptive RL cost-ladder validation registry binding is partial"
+        )
+    if registry is not None and (
+        registry.source_receipt_sha256 is None
+        or registry.source_transaction_receipt_sha256 is None
+        or registry.source_transaction_committed_at_ms is None
+    ):
+        raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+            "adaptive RL cost-ladder registry source transaction is absent"
+        )
     return {
         "fold_index": ladder.fold_index,
         "evaluation_role": ladder.evaluation_role,
@@ -161,6 +216,23 @@ def _payload(
         "validation_context_receipt_sha256": _digest(
             "validation context receipt",
             environments[1].validation_context_receipt_sha256,
+        ),
+        "validation_sources_authority_receipt_sha256": (
+            None
+            if registry is None
+            else registry.validation_sources_authority_receipt_sha256
+        ),
+        "validation_environment_registry_receipt_sha256": (
+            None if registry is None else registry.semantic_receipt_sha256
+        ),
+        "validation_environment_registry_source_receipt_sha256": (
+            None if registry is None else registry.source_receipt_sha256
+        ),
+        "validation_environment_registry_commit_receipt_sha256": (
+            None if registry is None else registry.source_transaction_receipt_sha256
+        ),
+        "validation_environment_registry_committed_at_ms": (
+            None if registry is None else registry.source_transaction_committed_at_ms
         ),
         "validation_environment_authority_receipts": tuple(
             row.semantic_receipt_sha256 for row in validation_environment_authorities
@@ -220,6 +292,11 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
     checkpoint_authority_receipt_sha256: str
     checkpoint_receipt_sha256: str
     validation_context_receipt_sha256: str
+    validation_sources_authority_receipt_sha256: str | None
+    validation_environment_registry_receipt_sha256: str | None
+    validation_environment_registry_source_receipt_sha256: str | None
+    validation_environment_registry_commit_receipt_sha256: str | None
+    validation_environment_registry_committed_at_ms: int | None
     validation_environment_authority_receipts: tuple[str, ...]
     environment_source_inventory_sha256s: tuple[str, ...]
     economic_compatibility_receipt_sha256s: tuple[str, ...]
@@ -233,6 +310,10 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
     loaded_source: LoadedMassiveSourceObject
     runtime_ladder: MassiveAdaptiveRLCostLadderV1 | None
     runtime_ladder_replayed: bool
+    runtime_validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
+    )
+    runtime_validation_environment_registry_replayed: bool
     runtime_validation_environment_authorities: tuple[
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1, ...
     ]
@@ -259,6 +340,21 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
             "validation_context_receipt_sha256": (
                 self.validation_context_receipt_sha256
             ),
+            "validation_sources_authority_receipt_sha256": (
+                self.validation_sources_authority_receipt_sha256
+            ),
+            "validation_environment_registry_receipt_sha256": (
+                self.validation_environment_registry_receipt_sha256
+            ),
+            "validation_environment_registry_source_receipt_sha256": (
+                self.validation_environment_registry_source_receipt_sha256
+            ),
+            "validation_environment_registry_commit_receipt_sha256": (
+                self.validation_environment_registry_commit_receipt_sha256
+            ),
+            "validation_environment_registry_committed_at_ms": (
+                self.validation_environment_registry_committed_at_ms
+            ),
             "validation_environment_authority_receipts": (
                 self.validation_environment_authority_receipts
             ),
@@ -283,14 +379,34 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
     def validate(self) -> None:
         self.loaded_source.validate()
         runtime = self.runtime_ladder is not None
+        registry_runtime = self.runtime_validation_environment_registry is not None
         environment_runtime = bool(self.runtime_validation_environment_authorities)
+        environment_type, registry_type = _validation_environment_types()
+        if self.runtime_validation_environment_registry is not None:
+            if type(self.runtime_validation_environment_registry) is not registry_type:
+                raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+                    "adaptive RL cost-ladder validation registry type differs"
+                )
+            self.runtime_validation_environment_registry.validate()
         for row in self.runtime_validation_environment_authorities:
-            if type(row) is not _validation_environment_authority_type():
+            if type(row) is not environment_type:
                 raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
                     "adaptive RL cost-ladder validation environment type differs"
                 )
             row.validate()
         expected = runtime and self.source_data_qualified
+        registry_fields = (
+            self.validation_sources_authority_receipt_sha256,
+            self.validation_environment_registry_receipt_sha256,
+            self.validation_environment_registry_source_receipt_sha256,
+            self.validation_environment_registry_commit_receipt_sha256,
+            self.validation_environment_registry_committed_at_ms,
+        )
+        registry_fields_present = all(value is not None for value in registry_fields)
+        if any(value is not None for value in registry_fields) != registry_fields_present:
+            raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+                "adaptive RL cost-ladder validation registry binding is partial"
+            )
         if self.runtime_ladder is not None:
             self.runtime_ladder.validate()
         if (
@@ -303,22 +419,27 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
             or self.loaded_source.receipt.entitlement_receipt_sha256
             != self.cost_ladder_receipt_sha256
             or self.runtime_ladder_replayed != runtime
+            or self.runtime_validation_environment_registry_replayed
+            != registry_runtime
             or self.runtime_validation_environments_replayed != environment_runtime
-            or (environment_runtime and not runtime)
+            or registry_runtime != environment_runtime
+            or (registry_runtime and not runtime)
             or (
                 self.evaluation_role == "outer_test"
                 and (
-                    self.validation_environment_authority_receipts
+                    registry_fields_present
+                    or registry_runtime
+                    or self.validation_environment_authority_receipts
                     or environment_runtime
                 )
             )
-            or (
-                runtime
-                and self.validation_environment_authority_receipts
-                and not environment_runtime
-            )
+            or (self.evaluation_role == "inner_validation" and not registry_fields_present)
             or self.development_policy_selection_authorized
-            != (expected and self.evaluation_role == "inner_validation")
+            != (
+                expected
+                and self.evaluation_role == "inner_validation"
+                and registry_runtime
+            )
             or self.outer_evaluation_authorized
             != (expected and self.evaluation_role == "outer_test")
             or self.profitability_reporting_authorized
@@ -354,14 +475,36 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
                 "adaptive runtime cost ladder differs from its authority"
             )
         if environment_runtime:
+            assert self.runtime_validation_environment_registry is not None
+            registry = self.runtime_validation_environment_registry
             authorities = self.runtime_validation_environment_authorities
             if (
                 len(authorities) != 3
+                or not registry.development_stage_authorized
+                or registry.fold_index != self.fold_index
+                or registry.validation_sources_authority_receipt_sha256
+                != self.validation_sources_authority_receipt_sha256
+                or registry.semantic_receipt_sha256
+                != self.validation_environment_registry_receipt_sha256
+                or registry.source_receipt_sha256
+                != self.validation_environment_registry_source_receipt_sha256
+                or registry.source_transaction_receipt_sha256
+                != self.validation_environment_registry_commit_receipt_sha256
+                or registry.source_transaction_committed_at_ms
+                != self.validation_environment_registry_committed_at_ms
+                or registry.source_transaction_committed_at_ms is None
+                or registry.source_transaction_committed_at_ms
+                >= self.loaded_source.commit.committed_at_ms
                 or tuple(row.transaction_cost_basis_points for row in authorities)
                 != (10.0, 20.0, 40.0)
                 or tuple(row.fold_index for row in authorities)
                 != (self.fold_index,) * 3
                 or tuple(row.semantic_receipt_sha256 for row in authorities)
+                != self.validation_environment_authority_receipts
+                or tuple(
+                    registry.environment_authority(cost).semantic_receipt_sha256
+                    for cost in (10.0, 20.0, 40.0)
+                )
                 != self.validation_environment_authority_receipts
                 or tuple(row.environment_source_inventory_sha256 for row in authorities)
                 != self.environment_source_inventory_sha256s
@@ -389,6 +532,23 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
             *self.economic_compatibility_receipt_sha256s,
         ):
             _digest("adaptive RL cost-ladder environment authority", value)
+        for registry_value in (
+            self.validation_sources_authority_receipt_sha256,
+            self.validation_environment_registry_receipt_sha256,
+            self.validation_environment_registry_source_receipt_sha256,
+            self.validation_environment_registry_commit_receipt_sha256,
+        ):
+            if registry_value is not None:
+                _digest("adaptive RL cost-ladder validation registry", registry_value)
+        if self.validation_environment_registry_committed_at_ms is not None and (
+            isinstance(self.validation_environment_registry_committed_at_ms, bool)
+            or self.validation_environment_registry_committed_at_ms < 0
+            or self.validation_environment_registry_committed_at_ms
+            >= self.loaded_source.commit.committed_at_ms
+        ):
+            raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+                "adaptive RL cost-ladder registry was not committed first"
+            )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
         _digest(
             "adaptive RL cost-ladder validation context",
@@ -413,6 +573,36 @@ def parse_massive_adaptive_rl_cost_ladder_authority_v1(
         "checkpoint_receipt_sha256": str(payload["checkpoint_receipt_sha256"]),
         "validation_context_receipt_sha256": str(
             payload["validation_context_receipt_sha256"]
+        ),
+        "validation_sources_authority_receipt_sha256": (
+            None
+            if payload["validation_sources_authority_receipt_sha256"] is None
+            else str(payload["validation_sources_authority_receipt_sha256"])
+        ),
+        "validation_environment_registry_receipt_sha256": (
+            None
+            if payload["validation_environment_registry_receipt_sha256"] is None
+            else str(payload["validation_environment_registry_receipt_sha256"])
+        ),
+        "validation_environment_registry_source_receipt_sha256": (
+            None
+            if payload["validation_environment_registry_source_receipt_sha256"]
+            is None
+            else str(
+                payload["validation_environment_registry_source_receipt_sha256"]
+            )
+        ),
+        "validation_environment_registry_commit_receipt_sha256": (
+            None
+            if payload["validation_environment_registry_commit_receipt_sha256"] is None
+            else str(
+                payload["validation_environment_registry_commit_receipt_sha256"]
+            )
+        ),
+        "validation_environment_registry_committed_at_ms": (
+            None
+            if payload["validation_environment_registry_committed_at_ms"] is None
+            else int(str(payload["validation_environment_registry_committed_at_ms"]))
         ),
         "validation_environment_authority_receipts": tuple(
             str(value)
@@ -447,6 +637,8 @@ def parse_massive_adaptive_rl_cost_ladder_authority_v1(
         loaded_source=loaded_source,
         runtime_ladder=None,
         runtime_ladder_replayed=False,
+        runtime_validation_environment_registry=None,
+        runtime_validation_environment_registry_replayed=False,
         runtime_validation_environment_authorities=(),
         runtime_validation_environments_replayed=False,
         development_policy_selection_authorized=False,
@@ -466,28 +658,27 @@ def authorize_massive_adaptive_rl_cost_ladder_authority_v1(
     authority: MassiveAdaptiveRLCostLadderAuthorityV1,
     checkpoint_authority: MassiveAdaptiveRLCheckpointAuthorityV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
-    primary_environment: MassiveAdaptiveProfitabilityEnvV1,
-    low_cost_environment: MassiveAdaptiveProfitabilityEnvV1,
-    high_cost_environment: MassiveAdaptiveProfitabilityEnvV1,
-    validation_environment_authorities: (
-        Sequence[MassiveAdaptiveRLValidationEnvironmentAuthorityV1] | None
+    primary_environment: MassiveAdaptiveProfitabilityEnvV1 | None = None,
+    low_cost_environment: MassiveAdaptiveProfitabilityEnvV1 | None = None,
+    high_cost_environment: MassiveAdaptiveProfitabilityEnvV1 | None = None,
+    validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
     ) = None,
 ) -> MassiveAdaptiveRLCostLadderAuthorityV1:
     parsed = parse_massive_adaptive_rl_cost_ladder_authority_v1(
         root=root, loaded_source=authority.loaded_source
     )
     committed = _load_payload(root=root, loaded_source=authority.loaded_source)
-    environments = (
-        low_cost_environment,
-        primary_environment,
-        high_cost_environment,
-    )
-    environment_authorities = _validate_validation_environment_bindings(
-        environments=environments,
-        environment_authorities=validation_environment_authorities,
+    environments, environment_authorities = _resolve_cost_ladder_environments(
+        primary_environment=primary_environment,
+        low_cost_environment=low_cost_environment,
+        high_cost_environment=high_cost_environment,
+        validation_environment_registry=validation_environment_registry,
         fold_index=parsed.fold_index,
         evaluation_role=parsed.evaluation_role,
+        outcome_committed_at_ms=authority.loaded_source.commit.committed_at_ms,
     )
+    low_cost_environment, primary_environment, high_cost_environment = environments
     replayed = evaluate_massive_adaptive_rl_checkpoint_cost_ladder_v1(
         checkpoint_authority=checkpoint_authority,
         chronology_authority=chronology_authority,
@@ -501,6 +692,7 @@ def authorize_massive_adaptive_rl_cost_ladder_authority_v1(
         _payload(
             replayed,
             environments=environments,
+            validation_environment_registry=validation_environment_registry,
             validation_environment_authorities=environment_authorities,
         )
     ):
@@ -511,11 +703,16 @@ def authorize_massive_adaptive_rl_cost_ladder_authority_v1(
         parsed,
         runtime_ladder=replayed,
         runtime_ladder_replayed=True,
+        runtime_validation_environment_registry=validation_environment_registry,
+        runtime_validation_environment_registry_replayed=(
+            validation_environment_registry is not None
+        ),
         runtime_validation_environment_authorities=environment_authorities,
         runtime_validation_environments_replayed=bool(environment_authorities),
         development_policy_selection_authorized=(
             parsed.source_data_qualified
             and parsed.evaluation_role == "inner_validation"
+            and validation_environment_registry is not None
         ),
         outer_evaluation_authorized=(
             parsed.source_data_qualified and parsed.evaluation_role == "outer_test"
@@ -531,14 +728,14 @@ def materialize_massive_adaptive_rl_cost_ladder_authority_v1(
     artifact_id: str,
     checkpoint_authority: MassiveAdaptiveRLCheckpointAuthorityV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
-    primary_environment: MassiveAdaptiveProfitabilityEnvV1,
-    low_cost_environment: MassiveAdaptiveProfitabilityEnvV1,
-    high_cost_environment: MassiveAdaptiveProfitabilityEnvV1,
+    primary_environment: MassiveAdaptiveProfitabilityEnvV1 | None = None,
+    low_cost_environment: MassiveAdaptiveProfitabilityEnvV1 | None = None,
+    high_cost_environment: MassiveAdaptiveProfitabilityEnvV1 | None = None,
     fold_index: int,
     evaluation_role: str,
     committed_at_ms: int,
-    validation_environment_authorities: (
-        Sequence[MassiveAdaptiveRLValidationEnvironmentAuthorityV1] | None
+    validation_environment_registry: (
+        MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
     ) = None,
 ) -> MassiveAdaptiveRLCostLadderAuthorityV1:
     if not artifact_id or any(
@@ -547,17 +744,16 @@ def materialize_massive_adaptive_rl_cost_ladder_authority_v1(
         raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
             "adaptive RL cost ladder artifact ID is not path safe"
         )
-    environments = (
-        low_cost_environment,
-        primary_environment,
-        high_cost_environment,
-    )
-    environment_authorities = _validate_validation_environment_bindings(
-        environments=environments,
-        environment_authorities=validation_environment_authorities,
+    environments, environment_authorities = _resolve_cost_ladder_environments(
+        primary_environment=primary_environment,
+        low_cost_environment=low_cost_environment,
+        high_cost_environment=high_cost_environment,
+        validation_environment_registry=validation_environment_registry,
         fold_index=fold_index,
         evaluation_role=evaluation_role,
+        outcome_committed_at_ms=committed_at_ms,
     )
+    low_cost_environment, primary_environment, high_cost_environment = environments
     ladder = evaluate_massive_adaptive_rl_checkpoint_cost_ladder_v1(
         checkpoint_authority=checkpoint_authority,
         chronology_authority=chronology_authority,
@@ -574,6 +770,7 @@ def materialize_massive_adaptive_rl_cost_ladder_authority_v1(
                 _payload(
                     ladder,
                     environments=environments,
+                    validation_environment_registry=validation_environment_registry,
                     validation_environment_authorities=environment_authorities,
                 )
             )
@@ -603,10 +800,16 @@ def materialize_massive_adaptive_rl_cost_ladder_authority_v1(
         ),
         checkpoint_authority=checkpoint_authority,
         chronology_authority=chronology_authority,
-        primary_environment=primary_environment,
-        low_cost_environment=low_cost_environment,
-        high_cost_environment=high_cost_environment,
-        validation_environment_authorities=environment_authorities,
+        primary_environment=(
+            primary_environment if evaluation_role == "outer_test" else None
+        ),
+        low_cost_environment=(
+            low_cost_environment if evaluation_role == "outer_test" else None
+        ),
+        high_cost_environment=(
+            high_cost_environment if evaluation_role == "outer_test" else None
+        ),
+        validation_environment_registry=validation_environment_registry,
     )
 
 

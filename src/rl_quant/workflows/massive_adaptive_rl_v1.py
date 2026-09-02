@@ -32,15 +32,12 @@ from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
 )
 from rl_quant.evaluation.massive_adaptive_rl_fixed_control_evaluator_v1 import (
     MassiveAdaptiveRLFixedControlEvaluationV1,
-    evaluate_massive_adaptive_rl_fixed_control_v1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_authority_v1 import (
     MassiveAdaptiveRLCostLadderAuthorityV1,
-    materialize_massive_adaptive_rl_cost_ladder_authority_v1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_policy_trace_authority_v1 import (
     MassiveAdaptiveRLPolicyTraceAuthorityV1,
-    materialize_massive_adaptive_rl_policy_trace_authority_v1,
 )
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -1426,7 +1423,12 @@ def run_massive_adaptive_rl_validation_workflow_v1(
     artifact_root: str | Path,
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLValidationWorkflowV1:
-    """Rerun every candidate actor and publish its frozen-target cost ladder."""
+    """Reject legacy caller-supplied validation environments.
+
+    Inner-validation outcomes now require the persisted canonical registry
+    owned by the Manifest-V4 validation-input layer.  This V1 workflow accepts
+    caller-provided environments and therefore cannot cross that boundary.
+    """
 
     manifest.validate()
     training_workflow.validate()
@@ -1446,135 +1448,9 @@ def run_massive_adaptive_rl_validation_workflow_v1(
         raise MassiveAdaptiveRLWorkflowV1Error(
             "adaptive RL validation registry differs from training"
         )
-    traces: list[MassiveAdaptiveRLPolicyTraceAuthorityV1] = []
-    ladders: list[MassiveAdaptiveRLCostLadderAuthorityV1] = []
-    shared_validation_context: str | None = None
-    for index, checkpoint_authority in enumerate(
-        training_workflow.policy_checkpoint_authorities
-    ):
-        low, primary, high = environments[checkpoint_authority.semantic_receipt_sha256]
-        context_receipts = {
-            row.validation_context_receipt_sha256 for row in (low, primary, high)
-        }
-        if len(context_receipts) != 1:
-            raise MassiveAdaptiveRLWorkflowV1Error(
-                "adaptive RL cost rungs do not share one validation context"
-            )
-        candidate_context = next(iter(context_receipts))
-        if shared_validation_context is None:
-            shared_validation_context = candidate_context
-        elif candidate_context != shared_validation_context:
-            raise MassiveAdaptiveRLWorkflowV1Error(
-                "adaptive RL candidates do not share one validation context"
-            )
-        if (
-            tuple(row.transaction_cost_basis_points for row in (low, primary, high))
-            != manifest.cost_ladder_basis_points
-            or primary.initial_capital != manifest.primary_capital
-            or any(
-                row.maximum_fill_participation != manifest.maximum_fill_participation
-                for row in (low, primary, high)
-            )
-        ):
-            raise MassiveAdaptiveRLWorkflowV1Error(
-                "adaptive RL validation economics differ from the manifest"
-            )
-        artifact = (
-            f"{manifest.experiment_id}-fold{training_workflow.fold_index}"
-            f"-seed{training_workflow.seed}-candidate{index}"
-        )
-        trace = materialize_massive_adaptive_rl_policy_trace_authority_v1(
-            root=artifact_root,
-            artifact_id=f"{artifact}-primary-trace",
-            checkpoint_authority=checkpoint_authority,
-            chronology_authority=chronology_authority,
-            environment=primary,
-            fold_index=training_workflow.fold_index,
-            evaluation_role="inner_validation",
-            committed_at_ms=committed_at_ms + index * 2,
-        )
-        ladder = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
-            root=artifact_root,
-            artifact_id=f"{artifact}-cost-ladder",
-            checkpoint_authority=checkpoint_authority,
-            chronology_authority=chronology_authority,
-            primary_environment=primary,
-            low_cost_environment=low,
-            high_cost_environment=high,
-            fold_index=training_workflow.fold_index,
-            evaluation_role="inner_validation",
-            committed_at_ms=committed_at_ms + index * 2 + 1,
-        )
-        if trace.policy_trace_receipt_sha256 != ladder.primary_trace_receipt_sha256:
-            raise MassiveAdaptiveRLWorkflowV1Error(
-                "checkpoint-owned primary validation replay is not exact"
-            )
-        traces.append(trace)
-        ladders.append(ladder)
-    if shared_validation_context is None:
-        raise MassiveAdaptiveRLWorkflowV1Error(
-            "adaptive RL validation context is absent"
-        )
-    fixed_control_evaluation = evaluate_massive_adaptive_rl_fixed_control_v1(
-        registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
-        fit_authority=training_workflow.fixed_control_fit_authority,
-        selection_authority=training_workflow.fixed_control_selection_authority,
-        chronology_authority=chronology_authority,
-        environment=fixed_control_environment,
+    raise MassiveAdaptiveRLWorkflowV1Error(
+        "adaptive RL validation requires a persisted canonical validation registry"
     )
-    if (
-        fixed_control_evaluation.validation_context_receipt_sha256
-        != shared_validation_context
-    ):
-        raise MassiveAdaptiveRLWorkflowV1Error(
-            "adaptive RL fixed control does not share the validation context"
-        )
-    source_qualified = bool(
-        training_workflow.development_rl_training_authorized
-        and all(row.development_policy_evaluation_authorized for row in traces)
-        and all(row.development_policy_selection_authorized for row in ladders)
-        and fixed_control_evaluation.development_policy_selection_authorized
-    )
-    body = {
-        "schema": MASSIVE_ADAPTIVE_RL_VALIDATION_WORKFLOW_V1_SCHEMA,
-        "experiment_manifest_receipt_sha256": manifest.semantic_receipt_sha256,
-        "training_workflow_receipt_sha256": training_workflow.semantic_receipt_sha256,
-        "fold_index": training_workflow.fold_index,
-        "checkpoint_authority_receipts": tuple(
-            row.semantic_receipt_sha256
-            for row in training_workflow.policy_checkpoint_authorities
-        ),
-        "validation_context_receipt_sha256": shared_validation_context,
-        "fixed_control_evaluation": fixed_control_evaluation,
-        "policy_trace_authorities": tuple(traces),
-        "cost_ladder_authorities": tuple(ladders),
-        "policy_trace_authority_inventory_sha256": semantic_sha256(
-            tuple(row.semantic_receipt_sha256 for row in traces)
-        ),
-        "cost_ladder_authority_inventory_sha256": semantic_sha256(
-            tuple(row.semantic_receipt_sha256 for row in ladders)
-        ),
-        "source_data_qualified": source_qualified,
-        "profitability_reporting_authorized": False,
-        "outer_evaluation_authorized": False,
-        "lockbox_access_authorized": False,
-        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
-        "specification_sha256": MASSIVE_ADAPTIVE_RL_WORKFLOW_V1_SPEC_SHA256,
-    }
-    provisional = MassiveAdaptiveRLValidationWorkflowV1(
-        **body,  # type: ignore[arg-type]
-        semantic_receipt_sha256="0" * 64,
-        development_policy_evaluation_authorized=source_qualified,
-    )
-    result = MassiveAdaptiveRLValidationWorkflowV1(
-        **{
-            **body,
-            "semantic_receipt_sha256": semantic_sha256(provisional.semantic_unsigned()),
-            "development_policy_evaluation_authorized": source_qualified,
-        }  # type: ignore[arg-type]
-    )
-    result.validate()
-    return result
 
 
 def _manifest_command(args: argparse.Namespace) -> int:
