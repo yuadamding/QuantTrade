@@ -52,6 +52,9 @@ MASSIVE_ADAPTIVE_RL_OUTER_COST_LADDER_V1_SPEC_SHA256 = semantic_sha256(
         "primary": "promoted-frozen-policy-outer-rollout",
         "stress": "same-primary-targets-at-10-and-40-basis-points",
         "policy_or_compiler_stress_rerun": False,
+        "terminal_return_monotonicity": (
+            "observed-report-gate-not-structural-validity"
+        ),
         "duration_semantics": False,
     }
 )
@@ -128,6 +131,16 @@ class MassiveAdaptiveRLOuterCostLadderV1:
             "specification_sha256": self.specification_sha256,
         }
 
+    @property
+    def terminal_return_ladder_monotone(self) -> bool:
+        """Whether the observed cost stress satisfies the reporting gate."""
+
+        return bool(
+            self.low_cost_trace.terminal_liquidation_adjusted_return
+            >= self.primary_trace.terminal_liquidation_adjusted_return
+            >= self.high_cost_trace.terminal_liquidation_adjusted_return
+        )
+
     def validate(self) -> None:
         for trace in (
             self.primary_trace,
@@ -158,9 +171,6 @@ class MassiveAdaptiveRLOuterCostLadderV1:
             != semantic_sha256(
                 tuple(row.semantic_receipt_sha256 for row in self.high_cost_transitions)
             )
-            or not self.low_cost_trace.terminal_liquidation_adjusted_return
-            >= self.primary_trace.terminal_liquidation_adjusted_return
-            >= self.high_cost_trace.terminal_liquidation_adjusted_return
             or self.outer_evaluation_authorized != self.source_data_qualified
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized

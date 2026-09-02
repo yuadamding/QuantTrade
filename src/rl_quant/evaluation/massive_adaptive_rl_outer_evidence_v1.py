@@ -62,6 +62,9 @@ MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_V1_SPEC_SHA256 = semantic_sha256(
         "bootstrap": "same-fold-cluster-nonwrapping-63-session-v1",
         "minimum_positive_folds": 3,
         "maximum_fold_drawdown": 0.25,
+        "cost_ladder_monotonicity": (
+            "derived-report-gate-not-structural-validity"
+        ),
         "profitability_reporting": False,
         "lockbox": False,
     }
@@ -292,6 +295,16 @@ class MassiveAdaptiveRLOuterCostFoldV1:
             if key != "semantic_receipt_sha256"
         }
 
+    @property
+    def terminal_return_ladder_monotone(self) -> bool:
+        """Whether this fold's observed cost ladder satisfies the final gate."""
+
+        return bool(
+            self.low_cost_terminal_return
+            >= self.primary_terminal_return
+            >= self.high_cost_terminal_return
+        )
+
     def validate(self) -> None:
         values = (
             *self.primary_strategy_active_log_returns,
@@ -312,9 +325,6 @@ class MassiveAdaptiveRLOuterCostFoldV1:
             or len(self.primary_ppo_minus_fixed_control_log_returns)
             != MASSIVE_ADAPTIVE_OUTER_TEST_SESSIONS_V1
             or any(not math.isfinite(value) for value in values)
-            or not self.low_cost_terminal_return
-            >= self.primary_terminal_return
-            >= self.high_cost_terminal_return
             or not 0.0 <= self.maximum_drawdown <= 1.0
             or not isinstance(self.source_data_qualified, bool)
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -567,12 +577,7 @@ def build_massive_adaptive_rl_outer_evidence_v1(
     positive_ppo_minus_fixed = sum(
         sum(fold.primary_ppo_minus_fixed_control_log_returns) > 0.0 for fold in ordered
     )
-    ladder = all(
-        fold.low_cost_terminal_return
-        >= fold.primary_terminal_return
-        >= fold.high_cost_terminal_return
-        for fold in ordered
-    )
+    ladder = all(fold.terminal_return_ladder_monotone for fold in ordered)
     maximum_drawdown = max(fold.maximum_drawdown for fold in ordered)
     gates = {
         "strategy-active-lcb-positive": active_lcb > 0.0,

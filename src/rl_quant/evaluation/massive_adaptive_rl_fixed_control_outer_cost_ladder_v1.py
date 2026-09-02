@@ -59,6 +59,9 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_OUTER_COST_LADDER_V1_SPEC_SHA256 = semantic_sh
         "primary": "fit-selected-static-control-outer-rollout",
         "stress": "same-primary-targets-at-10-and-40-basis-points",
         "controller_rerun_on_stress": False,
+        "terminal_return_monotonicity": (
+            "observed-diagnostic-outcome-not-structural-validity"
+        ),
         "duration_semantics": False,
     }
 )
@@ -135,6 +138,16 @@ class MassiveAdaptiveRLFixedControlOuterCostLadderV1:
             "specification_sha256": self.specification_sha256,
         }
 
+    @property
+    def terminal_return_ladder_monotone(self) -> bool:
+        """Whether the observed fixed-control cost stress is monotone."""
+
+        return bool(
+            self.low_cost_trace.terminal_liquidation_adjusted_return
+            >= self.primary_trace.terminal_liquidation_adjusted_return
+            >= self.high_cost_trace.terminal_liquidation_adjusted_return
+        )
+
     def validate(self) -> None:
         for trace in (self.low_cost_trace, self.primary_trace, self.high_cost_trace):
             trace.validate()
@@ -162,9 +175,6 @@ class MassiveAdaptiveRLFixedControlOuterCostLadderV1:
             != semantic_sha256(
                 tuple(row.semantic_receipt_sha256 for row in self.high_cost_transitions)
             )
-            or not self.low_cost_trace.terminal_liquidation_adjusted_return
-            >= self.primary_trace.terminal_liquidation_adjusted_return
-            >= self.high_cost_trace.terminal_liquidation_adjusted_return
             or self.outer_evaluation_authorized != self.source_data_qualified
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized

@@ -44,6 +44,9 @@ MASSIVE_ADAPTIVE_RL_COST_LADDER_V1_SPEC_SHA256 = semantic_sha256(
         "primary": "checkpoint-deterministic-actions-and-compiler",
         "stress": "same-primary-target-weights-no-policy-or-compiler-rerun",
         "economics": "same-fill-event-and-three-book-kernel",
+        "terminal_return_monotonicity": (
+            "observed-eligibility-outcome-not-structural-validity"
+        ),
         "duration_semantics": False,
     }
 )
@@ -245,6 +248,16 @@ class MassiveAdaptiveRLCostLadderV1:
             "specification_sha256": self.specification_sha256,
         }
 
+    @property
+    def terminal_return_ladder_monotone(self) -> bool:
+        """Whether the observed low/primary/high returns satisfy the V4 gate."""
+
+        return bool(
+            self.low_cost_trace.terminal_liquidation_adjusted_return
+            >= self.primary.policy_trace.terminal_liquidation_adjusted_return
+            >= self.high_cost_trace.terminal_liquidation_adjusted_return
+        )
+
     def validate(self) -> None:
         self.primary.validate()
         self.low_cost_trace.validate()
@@ -277,13 +290,6 @@ class MassiveAdaptiveRLCostLadderV1:
             or self.high_cost_transition_inventory_sha256
             != semantic_sha256(
                 tuple(row.semantic_receipt_sha256 for row in self.high_cost_transitions)
-            )
-            or tuple(row.terminal_liquidation_adjusted_return for row in traces)
-            != tuple(
-                sorted(
-                    (row.terminal_liquidation_adjusted_return for row in traces),
-                    reverse=True,
-                )
             )
             or self.development_policy_selection_authorized
             != (expected and self.evaluation_role == "inner_validation")

@@ -65,6 +65,9 @@ MASSIVE_ADAPTIVE_OUTER_EVIDENCE_V1_SPEC_SHA256 = semantic_sha256(
             "positive-primary-folds-at-least-three",
             "all-fold-terminal-cost-ladders-monotone",
         ),
+        "cost_ladder_monotonicity": (
+            "derived-report-gate-not-structural-validity"
+        ),
         "outer_development_conclusion": "conditional",
         "profitability_reporting": False,
         "lockbox": False,
@@ -122,6 +125,16 @@ class MassiveAdaptiveOuterCostFoldV1:
             if key != "semantic_receipt_sha256"
         }
 
+    @property
+    def terminal_return_ladder_monotone(self) -> bool:
+        """Whether this fold's observed cost ladder satisfies the final gate."""
+
+        return bool(
+            self.low_cost_terminal_return
+            >= self.primary_terminal_return
+            >= self.high_cost_terminal_return
+        )
+
     def validate(self) -> None:
         values = (
             *self.primary_net_returns,
@@ -138,9 +151,6 @@ class MassiveAdaptiveOuterCostFoldV1:
             or len(self.primary_active_log_returns)
             != MASSIVE_ADAPTIVE_OUTER_TEST_SESSIONS_V1
             or any(not math.isfinite(value) for value in values)
-            or not self.low_cost_terminal_return
-            >= self.primary_terminal_return
-            >= self.high_cost_terminal_return
             or not isinstance(self.source_data_qualified, bool)
             or self.protocol_receipt_sha256
             != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -430,12 +440,7 @@ def build_massive_adaptive_outer_evidence_v1(
     primary_lcb = _nonwrapping_fold_cluster_lcb(primary)
     active_lcb = _nonwrapping_fold_cluster_lcb(active)
     positive_folds = sum(row.primary_terminal_return > 0.0 for row in ordered)
-    ladder = all(
-        row.low_cost_terminal_return
-        >= row.primary_terminal_return
-        >= row.high_cost_terminal_return
-        for row in ordered
-    )
+    ladder = all(row.terminal_return_ladder_monotone for row in ordered)
     gates = {
         "primary-net-lcb-positive": primary_lcb > 0.0,
         "primary-active-lcb-positive": active_lcb > 0.0,

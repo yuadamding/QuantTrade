@@ -167,7 +167,11 @@ def _authorized_source_bundle(root, manifest, monkeypatch):
     return source_bundle, runtime_graph
 
 
-def _report_inputs(*, daily_mean: float) -> tuple[object, tuple[object, ...]]:
+def _report_inputs(
+    *,
+    daily_mean: float,
+    cost_ladder_monotone: bool = True,
+) -> tuple[object, tuple[object, ...]]:
     folds = []
     authorities = []
     for fold_index in range(4):
@@ -248,8 +252,8 @@ def _report_inputs(*, daily_mean: float) -> tuple[object, tuple[object, ...]]:
             evidence_v2=SimpleNamespace(evidence_v1=evidence_v1)
         ),
         mean_high_cost_ppo_minus_fixed_control_log_return=0.0001,
-        passed_gate_names=("cost-ladder-monotone",),
-        failed_gate_names=(),
+        passed_gate_names=("cost-ladder-monotone",) if cost_ladder_monotone else (),
+        failed_gate_names=() if cost_ladder_monotone else ("cost-ladder-monotone",),
         source_data_qualified=True,
     )
     outer_authority = SimpleNamespace(
@@ -259,7 +263,7 @@ def _report_inputs(*, daily_mean: float) -> tuple[object, tuple[object, ...]]:
         runtime_folds=tuple(folds),
         runtime_evidence_replayed=True,
         source_data_qualified=True,
-        outer_development_conclusion_authorized=True,
+        outer_development_conclusion_authorized=cost_ladder_monotone,
     )
     return outer_authority, tuple(authorities)
 
@@ -310,6 +314,38 @@ def test_absolute_loss_remains_diagnostic_and_blocks_reporting(tmp_path) -> None
     assert not authority.development_profitability_reporting_authorized
     assert "primary-net-log-return-lcb-positive" in authority.report.failed_gate_names
     assert not authority.live_trading_authorized
+
+
+def test_nonmonotone_cost_ladder_completes_as_negative_report(tmp_path) -> None:
+    outer_authority, rollout_authorities = _report_inputs(
+        daily_mean=0.001,
+        cost_ladder_monotone=False,
+    )
+    authority = materialize_massive_adaptive_rl_profitability_report_authority_v1(
+        root=tmp_path,
+        artifact_id="nonmonotone-development-report",
+        outer_evidence_authority_v4=outer_authority,  # type: ignore[arg-type]
+        ppo_outer_rollout_authorities=rollout_authorities,  # type: ignore[arg-type]
+        committed_at_ms=1,
+    )
+
+    assert authority.runtime_report_replayed
+    assert authority.report.primary_net_log_return_lcb95 > 0.0
+    assert authority.report.failed_gate_names == ("cost-ladder-monotone",)
+    assert not authority.development_profitability_reporting_authorized
+    generic = parse_massive_adaptive_rl_profitability_report_authority_v1(
+        root=tmp_path,
+        loaded_source=authority.loaded_source,
+    )
+    replayed = authorize_massive_adaptive_rl_profitability_report_authority_v1(
+        root=tmp_path,
+        authority=generic,
+        outer_evidence_authority_v4=outer_authority,  # type: ignore[arg-type]
+        ppo_outer_rollout_authorities=rollout_authorities,  # type: ignore[arg-type]
+    )
+    assert replayed.runtime_report_replayed
+    assert replayed.report.failed_gate_names == ("cost-ladder-monotone",)
+    assert not replayed.development_profitability_reporting_authorized
 
 
 def test_profitability_report_rejects_nonreconciling_daily_economics(tmp_path) -> None:

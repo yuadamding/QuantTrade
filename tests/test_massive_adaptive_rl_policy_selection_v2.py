@@ -318,6 +318,43 @@ def test_v4_no_eligible_pool_selects_diagnostic_candidate_without_exception() ->
     assert not selected.outer_evaluation_authorized
 
 
+def test_v4_nonmonotone_only_population_completes_diagnostic_selection() -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id="selection-v2-nonmonotone-only"
+    )
+    higher = _candidate(
+        manifest=manifest,
+        ordinal=0,
+        primary_incremental=0.05,
+        low=0.02,
+        primary_terminal=0.03,
+        high=0.01,
+    )
+    lower = _candidate(
+        manifest=manifest,
+        ordinal=1,
+        primary_incremental=0.03,
+        low=0.015,
+        primary_terminal=0.02,
+        high=0.005,
+    )
+    cost_ladder_failure = (
+        "terminal-return-cost-ladder-low-ge-primary-ge-high"
+    )
+    assert higher.validation_eligibility_failures == (cost_ladder_failure,)
+    assert lower.validation_eligibility_failures == (cost_ladder_failure,)
+
+    selected = _select(manifest, higher, lower)
+
+    assert selected.selection_pool_kind == "all-no-eligible"
+    assert selected.selected_candidate_receipt_sha256 == (
+        higher.semantic_receipt_sha256
+    )
+    assert selected.validation_eligibility_failures == (cost_ladder_failure,)
+    assert not selected.selected_candidate_validation_eligible
+    assert not selected.positive_profitability_authorization_eligible
+
+
 def test_v4_numeric_semantics_are_exact_and_canonical() -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v4(
         experiment_id="selection-v2-binary64"
@@ -487,6 +524,47 @@ def test_candidate_v2_derives_exact_v4_failures_from_validated_v1_evidence(
     assert candidate.ppo_minus_fc06_log_wealth < 0.0
     assert candidate.validation_eligibility_failures == (
         "ppo-minus-fc06-log-wealth-strictly-positive",
+    )
+    assert not candidate.economically_eligible
+
+
+def test_candidate_v2_preserves_nonmonotone_ladder_as_eligibility_failure(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id="selection-v2-nonmonotone-evidence"
+    )
+    candidate = build_massive_adaptive_rl_policy_candidate_v2(
+        manifest=manifest,
+        checkpoint_authority_receipt_sha256=_digest("checkpoint-authority"),
+        checkpoint=_checkpoint(),  # type: ignore[arg-type]
+        low_cost_trace=_trace(
+            cost=10.0,
+            terminal_return=0.01,
+            incremental=0.02,
+            active=0.02,
+            frozen=True,
+        ),
+        primary_trace=_trace(
+            cost=20.0,
+            terminal_return=0.02,
+            incremental=0.02,
+            active=0.02,
+            frozen=False,
+        ),
+        high_cost_trace=_trace(
+            cost=40.0,
+            terminal_return=0.001,
+            incremental=0.02,
+            active=0.02,
+            frozen=True,
+        ),
+        fixed_control_selection_authority=_fixed_control_authority(tmp_path),
+        fixed_control_validation_trace=_fixed_validation_trace(),
+    )
+
+    assert candidate.validation_eligibility_failures == (
+        "terminal-return-cost-ladder-low-ge-primary-ge-high",
     )
     assert not candidate.economically_eligible
 

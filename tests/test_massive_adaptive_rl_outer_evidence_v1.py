@@ -105,6 +105,46 @@ def test_rl_outer_evidence_is_paired_deterministic_and_create_only(tmp_path) -> 
     assert replayed.semantic_receipt_sha256 == authority.semantic_receipt_sha256
 
 
+def test_rl_outer_evidence_preserves_nonmonotone_ladder_as_failed_gate(
+    tmp_path,
+) -> None:
+    first_fold = replace(
+        _fold(0),
+        low_cost_terminal_return=0.07,
+        semantic_receipt_sha256="0" * 64,
+    )
+    first_fold = replace(
+        first_fold,
+        semantic_receipt_sha256=semantic_sha256(first_fold.semantic_unsigned()),
+    )
+    first_fold.validate()
+    assert not first_fold.terminal_return_ladder_monotone
+    folds = (first_fold, *tuple(_fold(index) for index in range(1, 4)))
+
+    evidence = build_massive_adaptive_rl_outer_evidence_v1(folds)
+
+    assert not evidence.cost_ladder_monotone
+    assert evidence.failed_gate_names == ("cost-ladder-monotone",)
+    assert "cost-ladder-monotone" not in evidence.passed_gate_names
+    authority = materialize_massive_adaptive_rl_outer_evidence_authority_v1(
+        root=tmp_path,
+        artifact_id="nonmonotone-rl-outer-evidence",
+        folds=folds,
+        committed_at_ms=1,
+    )
+    generic = parse_massive_adaptive_rl_outer_evidence_authority_v1(
+        root=tmp_path,
+        loaded_source=authority.loaded_source,
+    )
+    replayed = authorize_massive_adaptive_rl_outer_evidence_authority_v1(
+        root=tmp_path,
+        authority=generic,
+        folds=folds,
+    )
+    assert replayed.runtime_evidence_replayed
+    assert replayed.evidence.failed_gate_names == ("cost-ladder-monotone",)
+
+
 def test_rl_outer_evidence_rejects_incomplete_or_mutated_folds(tmp_path) -> None:
     folds = tuple(_fold(index) for index in range(4))
     with pytest.raises(

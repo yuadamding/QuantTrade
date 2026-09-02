@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from rl_quant.evaluation import (
+    massive_adaptive_rl_cost_ladder_authority_v1 as cost_ladder_authority_module,
+)
 from rl_quant.evaluation.massive_adaptive_rl_fixed_control_outer_rollout_v1 import (
     authorize_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1,
     materialize_massive_adaptive_rl_fixed_control_outer_rollout_authority_v1,
@@ -147,6 +150,32 @@ from test_massive_adaptive_rl_outer_evidence_v1 import _fold
 
 def _digest(value: object) -> str:
     return semantic_sha256(value)
+
+
+def _nonmonotone_ladder(ladder, primary_trace):
+    low_trace = replace(
+        ladder.low_cost_trace,
+        terminal_liquidation_adjusted_return=(
+            primary_trace.terminal_liquidation_adjusted_return - 0.01
+        ),
+        semantic_receipt_sha256="0" * 64,
+    )
+    low_trace = replace(
+        low_trace,
+        semantic_receipt_sha256=semantic_sha256(low_trace.semantic_unsigned()),
+    )
+    result = replace(
+        ladder,
+        low_cost_trace=low_trace,
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = replace(
+        result,
+        semantic_receipt_sha256=semantic_sha256(result.semantic_unsigned()),
+    )
+    result.validate()
+    assert not result.terminal_return_ladder_monotone
+    return result
 
 
 def _outer_plan_v2_for_test(*, cost_fold, fixed_rollout):
@@ -988,6 +1017,64 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
     assert reopened.cost_ladder_receipt_sha256 == ladder.semantic_receipt_sha256
 
 
+def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
+    tmp_path, monkeypatch
+) -> None:
+    fixture, calibration_values, primary_environment = _adaptive_env_fixture()
+    training_authority = _training_authority(primary_environment)
+    chronology = _chronology(primary_environment, training_authority)
+    checkpoint_authority = _checkpoint_authority(primary_environment)
+    ladder = evaluate_massive_adaptive_rl_checkpoint_cost_ladder_v1(
+        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        primary_environment=primary_environment,
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
+        fold_index=0,
+        evaluation_role="inner_validation",
+    )
+    nonmonotone = _nonmonotone_ladder(
+        ladder,
+        ladder.primary.policy_trace,
+    )
+
+    monkeypatch.setattr(
+        cost_ladder_authority_module,
+        "evaluate_massive_adaptive_rl_checkpoint_cost_ladder_v1",
+        lambda **_kwargs: nonmonotone,
+    )
+    authority = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
+        root=tmp_path,
+        artifact_id="nonmonotone-checkpoint-cost-ladder",
+        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        primary_environment=primary_environment,
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
+        fold_index=0,
+        evaluation_role="inner_validation",
+        committed_at_ms=3,
+    )
+    generic = parse_massive_adaptive_rl_cost_ladder_authority_v1(
+        root=tmp_path,
+        loaded_source=authority.loaded_source,
+    )
+    reopened = authorize_massive_adaptive_rl_cost_ladder_authority_v1(
+        root=tmp_path,
+        authority=generic,
+        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        primary_environment=primary_environment,
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
+    )
+
+    assert reopened.runtime_ladder_replayed
+    assert reopened.runtime_ladder is not None
+    assert not reopened.runtime_ladder.terminal_return_ladder_monotone
+    assert reopened.cost_ladder_receipt_sha256 == nonmonotone.semantic_receipt_sha256
+
+
 def test_replayed_candidate_and_fc06_authorities_share_one_validation_tape(
     tmp_path,
 ) -> None:
@@ -1261,6 +1348,10 @@ def test_frozen_outer_actions_replay_from_attached_policy(tmp_path) -> None:
         replayed_fixed_cost.fixed_control_outer_cost_ladder_receipt_sha256
         == fixed_cost_authority.fixed_control_outer_cost_ladder_receipt_sha256
     )
+    _nonmonotone_ladder(
+        fixed_cost_authority.runtime_ladder,
+        fixed_cost_authority.runtime_ladder.primary_trace,
+    )
 
     low_environment = _environment_at_cost(fixture, calibration_values, 10.0)
     high_environment = _environment_at_cost(fixture, calibration_values, 40.0)
@@ -1293,6 +1384,10 @@ def test_frozen_outer_actions_replay_from_attached_policy(tmp_path) -> None:
     assert (
         reopened_cost.outer_cost_ladder_receipt_sha256
         == cost_authority.outer_cost_ladder_receipt_sha256
+    )
+    _nonmonotone_ladder(
+        cost_authority.runtime_ladder,
+        cost_authority.runtime_ladder.primary_trace,
     )
 
 

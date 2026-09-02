@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from rl_quant.evaluation.massive_adaptive_outer_evidence_v1 import (
@@ -95,6 +97,28 @@ def test_outer_evidence_derives_deterministic_fold_cluster_bounds(tmp_path) -> N
         folds=tuple(reversed(folds)),
     )
     assert replayed.semantic_receipt_sha256 == authority.semantic_receipt_sha256
+
+
+def test_outer_evidence_preserves_nonmonotone_ladder_as_failed_gate() -> None:
+    first_fold = replace(
+        _fold(0),
+        low_cost_terminal_return=0.05,
+        semantic_receipt_sha256="0" * 64,
+    )
+    first_fold = replace(
+        first_fold,
+        semantic_receipt_sha256=semantic_sha256(first_fold.semantic_unsigned()),
+    )
+    first_fold.validate()
+    assert not first_fold.terminal_return_ladder_monotone
+
+    evidence = build_massive_adaptive_outer_evidence_v1(
+        (first_fold, *tuple(_fold(index) for index in range(1, 4)))
+    )
+
+    assert not evidence.cost_ladder_monotone
+    assert evidence.failed_gate_names == ("cost-ladder-monotone",)
+    assert not evidence.outer_development_conclusion_authorized
 
 
 def test_outer_evidence_requires_exact_four_fold_inventory() -> None:
