@@ -25,6 +25,9 @@ from rl_quant.data_sources.massive.source_receipts import (
     publish_massive_source_object,
     read_loaded_massive_source_bytes,
 )
+from rl_quant.evaluation.massive_adaptive_rl_fold_validation_authority_v1 import (
+    MassiveAdaptiveRLFoldValidationAuthorityV1,
+)
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
@@ -602,7 +605,10 @@ class MassiveAdaptiveRLPolicySelectionV2:
             or (self.selection_pool_kind == "eligible")
             != self.selected_candidate_validation_eligible
             or self.positive_profitability_authorization_eligible
-            != self.selected_candidate_validation_eligible
+            != bool(
+                self.source_data_qualified
+                and self.selected_candidate_validation_eligible
+            )
             or not isinstance(self.source_data_qualified, bool)
             or self.validation_selection_specification_sha256
             != MASSIVE_ADAPTIVE_RL_VALIDATION_SELECTION_SPECIFICATION_V1_SHA256
@@ -773,7 +779,8 @@ def select_massive_adaptive_rl_policy_v2(
         ),
         "source_data_qualified": all(row.source_data_qualified for row in ordered),
         "positive_profitability_authorization_eligible": (
-            selected.economically_eligible
+            all(row.source_data_qualified for row in ordered)
+            and selected.economically_eligible
         ),
         "validation_selection_specification_sha256": (
             manifest.validation_selection_specification_sha256
@@ -879,11 +886,105 @@ def _validate_fold_fit_lineage_v2(
                 )
 
 
+def _candidates_from_fold_validation_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV4,
+    validation_authority: MassiveAdaptiveRLFoldValidationAuthorityV1,
+) -> tuple[
+    MassiveAdaptiveRLFoldFitAuthorityV1,
+    tuple[MassiveAdaptiveRLPolicyCandidateV2, ...],
+]:
+    """Derive candidates only from persisted and computationally replayed traces."""
+
+    if type(manifest) is not MassiveAdaptiveRLExperimentManifestV4 or type(
+        validation_authority
+    ) is not MassiveAdaptiveRLFoldValidationAuthorityV1:
+        raise MassiveAdaptiveRLPolicySelectionV2Error(
+            "adaptive RL policy selection V2 validation authority type differs"
+        )
+    manifest.validate()
+    validation_authority.validate()
+    fold_fit_authority = validation_authority.runtime_fold_fit_authority
+    primary_authorities = validation_authority.runtime_primary_trace_authorities
+    ladder_authorities = validation_authority.runtime_cost_ladder_authorities
+    fixed_authority = (
+        validation_authority.runtime_fixed_control_validation_authority
+    )
+    if (
+        not validation_authority.development_stage_authorized
+        or fold_fit_authority is None
+        or primary_authorities is None
+        or ladder_authorities is None
+        or fixed_authority is None
+        or validation_authority.manifest_v4_receipt_sha256
+        != manifest.semantic_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLPolicySelectionV2Error(
+            "adaptive RL policy selection V2 validation evidence is not authorized"
+        )
+    _validate_fold_fit_lineage_v2(
+        manifest=manifest,
+        fold_fit_authority=fold_fit_authority,
+    )
+    workflow = fold_fit_authority.training_workflow.runtime_workflow
+    checkpoint_authorities = workflow.policy_checkpoint_authorities
+    fixed_selection_authority = workflow.fixed_control_selection_authority
+    fixed_evaluation = fixed_authority.runtime_evaluation
+    if (
+        tuple(
+            row.semantic_receipt_sha256 for row in checkpoint_authorities
+        )
+        != validation_authority.expected_checkpoint_authority_receipts
+        or len(primary_authorities) != len(checkpoint_authorities)
+        or len(ladder_authorities) != len(checkpoint_authorities)
+        or fixed_evaluation is None
+    ):
+        raise MassiveAdaptiveRLPolicySelectionV2Error(
+            "adaptive RL policy selection V2 validation inventory differs"
+        )
+    candidates = []
+    for checkpoint_authority, primary_authority, ladder_authority in zip(
+        checkpoint_authorities,
+        primary_authorities,
+        ladder_authorities,
+        strict=True,
+    ):
+        checkpoint = checkpoint_authority.runtime_checkpoint
+        primary = primary_authority.runtime_trace
+        ladder = ladder_authority.runtime_ladder
+        if checkpoint is None or primary is None or ladder is None:
+            raise MassiveAdaptiveRLPolicySelectionV2Error(
+                "adaptive RL policy selection V2 validation trace is absent"
+            )
+        candidates.append(
+            build_massive_adaptive_rl_policy_candidate_v2(
+                manifest=manifest,
+                checkpoint_authority_receipt_sha256=(
+                    checkpoint_authority.semantic_receipt_sha256
+                ),
+                checkpoint=checkpoint,
+                primary_trace=primary.policy_trace,
+                low_cost_trace=ladder.low_cost_trace,
+                high_cost_trace=ladder.high_cost_trace,
+                fixed_control_selection_authority=fixed_selection_authority,
+                fixed_control_validation_trace=fixed_evaluation.policy_trace,
+            )
+        )
+    result = tuple(candidates)
+    _validate_fold_fit_lineage_v2(
+        manifest=manifest,
+        fold_fit_authority=fold_fit_authority,
+        candidates=result,
+    )
+    return fold_fit_authority, result
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveRLPolicySelectionAuthorityV2:
     manifest_v4_receipt_sha256: str
     training_manifest_v3_receipt_sha256: str
     fold_fit_authority_receipt_sha256: str
+    fold_validation_authority_receipt_sha256: str
     selection_receipt_sha256: str
     candidate_inventory_sha256: str
     candidate_checkpoint_inventory_sha256: str
@@ -896,6 +997,9 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV2:
     loaded_source: LoadedMassiveSourceObject
     runtime_manifest: MassiveAdaptiveRLExperimentManifestV4 | None
     runtime_fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1 | None
+    runtime_fold_validation_authority: (
+        MassiveAdaptiveRLFoldValidationAuthorityV1 | None
+    )
     runtime_selection: MassiveAdaptiveRLPolicySelectionV2 | None
     runtime_candidates: tuple[MassiveAdaptiveRLPolicyCandidateV2, ...] | None
     runtime_selection_replayed: bool
@@ -921,6 +1025,9 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV2:
             ),
             "fold_fit_authority_receipt_sha256": (
                 self.fold_fit_authority_receipt_sha256
+            ),
+            "fold_validation_authority_receipt_sha256": (
+                self.fold_validation_authority_receipt_sha256
             ),
             "selection_receipt_sha256": self.selection_receipt_sha256,
             "candidate_inventory_sha256": self.candidate_inventory_sha256,
@@ -952,6 +1059,7 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV2:
         runtime_values = (
             self.runtime_manifest,
             self.runtime_fold_fit_authority,
+            self.runtime_fold_validation_authority,
             self.runtime_selection,
             self.runtime_candidates,
         )
@@ -960,12 +1068,20 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV2:
             raise MassiveAdaptiveRLPolicySelectionV2Error(
                 "adaptive RL policy selection V2 runtime is partial"
             )
-        expected_authorized = bool(runtime and self.source_data_qualified)
+        expected_authorized = bool(
+            runtime
+            and self.source_data_qualified
+            and self.runtime_fold_validation_authority is not None
+            and self.runtime_fold_validation_authority.development_stage_authorized
+        )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V2_SCHEMA
             or not isinstance(self.source_data_qualified, bool)
-            or self.selected_candidate_validation_eligible
-            != self.positive_profitability_authorization_eligible
+            or self.positive_profitability_authorization_eligible
+            != bool(
+                self.source_data_qualified
+                and self.selected_candidate_validation_eligible
+            )
             or self.runtime_selection_replayed != runtime
             or self.development_policy_selection_authorized != expected_authorized
             or self.policy_freezing_authorized != expected_authorized
@@ -1002,6 +1118,7 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV2:
         if runtime:
             assert self.runtime_manifest is not None
             assert self.runtime_fold_fit_authority is not None
+            assert self.runtime_fold_validation_authority is not None
             assert self.runtime_selection is not None
             assert self.runtime_candidates is not None
             if type(self.runtime_manifest) is not MassiveAdaptiveRLExperimentManifestV4:
@@ -1012,8 +1129,31 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV2:
                 raise MassiveAdaptiveRLPolicySelectionV2Error(
                     "adaptive RL runtime fold-fit authority type differs"
                 )
+            if type(self.runtime_fold_validation_authority) is not (
+                MassiveAdaptiveRLFoldValidationAuthorityV1
+            ):
+                raise MassiveAdaptiveRLPolicySelectionV2Error(
+                    "adaptive RL runtime fold-validation authority type differs"
+                )
             self.runtime_manifest.validate()
             self.runtime_fold_fit_authority.validate()
+            self.runtime_fold_validation_authority.validate()
+            derived_fold_fit, derived_candidates = (
+                _candidates_from_fold_validation_v1(
+                    manifest=self.runtime_manifest,
+                    validation_authority=self.runtime_fold_validation_authority,
+                )
+            )
+            if (
+                derived_fold_fit.semantic_receipt_sha256
+                != self.runtime_fold_fit_authority.semantic_receipt_sha256
+                or derived_candidates != self.runtime_candidates
+                or self.runtime_fold_validation_authority.semantic_receipt_sha256
+                != self.fold_validation_authority_receipt_sha256
+            ):
+                raise MassiveAdaptiveRLPolicySelectionV2Error(
+                    "adaptive RL runtime fold-validation selection differs"
+                )
             _validate_fold_fit_lineage_v2(
                 manifest=self.runtime_manifest,
                 fold_fit_authority=self.runtime_fold_fit_authority,
@@ -1053,6 +1193,7 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV2:
             self.manifest_v4_receipt_sha256,
             self.training_manifest_v3_receipt_sha256,
             self.fold_fit_authority_receipt_sha256,
+            self.fold_validation_authority_receipt_sha256,
             self.selection_receipt_sha256,
             self.candidate_inventory_sha256,
             self.candidate_checkpoint_inventory_sha256,
@@ -1071,8 +1212,13 @@ def _authority_payload_v2(
     *,
     selection: MassiveAdaptiveRLPolicySelectionV2,
     candidates: tuple[MassiveAdaptiveRLPolicyCandidateV2, ...],
+    fold_validation_authority_receipt_sha256: str,
 ) -> dict[str, object]:
     return {
+        "fold_validation_authority_receipt_sha256": _digest(
+            "fold-validation authority receipt",
+            fold_validation_authority_receipt_sha256,
+        ),
         "selection": asdict(selection),
         "candidates": tuple(asdict(candidate) for candidate in candidates),
     }
@@ -1083,6 +1229,7 @@ def _load_authority_payload_v2(
 ) -> tuple[
     MassiveAdaptiveRLPolicySelectionV2,
     tuple[MassiveAdaptiveRLPolicyCandidateV2, ...],
+    str,
 ]:
     raw = read_loaded_massive_source_bytes(root=root, loaded_source=loaded_source)
     payload = json.loads(raw)
@@ -1113,13 +1260,17 @@ def _load_authority_payload_v2(
     selection.validate()
     for candidate in candidates:
         candidate.validate()
-    return selection, candidates
+    validation_receipt = _digest(
+        "fold-validation authority receipt",
+        payload.get("fold_validation_authority_receipt_sha256"),
+    )
+    return selection, candidates, validation_receipt
 
 
 def parse_massive_adaptive_rl_policy_selection_authority_v2(
     *, root: str | Path, loaded_source: LoadedMassiveSourceObject
 ) -> MassiveAdaptiveRLPolicySelectionAuthorityV2:
-    selection, _candidates = _load_authority_payload_v2(
+    selection, _candidates, validation_receipt = _load_authority_payload_v2(
         root=root,
         loaded_source=loaded_source,
     )
@@ -1131,6 +1282,9 @@ def parse_massive_adaptive_rl_policy_selection_authority_v2(
         ),
         "fold_fit_authority_receipt_sha256": (
             selection.fold_fit_authority_receipt_sha256
+        ),
+        "fold_validation_authority_receipt_sha256": str(
+            validation_receipt
         ),
         "selection_receipt_sha256": selection.semantic_receipt_sha256,
         "candidate_inventory_sha256": selection.candidate_inventory_sha256,
@@ -1165,6 +1319,7 @@ def parse_massive_adaptive_rl_policy_selection_authority_v2(
         loaded_source=loaded_source,
         runtime_manifest=None,
         runtime_fold_fit_authority=None,
+        runtime_fold_validation_authority=None,
         runtime_selection=None,
         runtime_candidates=None,
         runtime_selection_replayed=False,
@@ -1181,34 +1336,23 @@ def authorize_massive_adaptive_rl_policy_selection_authority_v2(
     root: str | Path,
     authority: MassiveAdaptiveRLPolicySelectionAuthorityV2,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
-    fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
-    candidates: Sequence[MassiveAdaptiveRLPolicyCandidateV2],
+    validation_authority: MassiveAdaptiveRLFoldValidationAuthorityV1,
 ) -> MassiveAdaptiveRLPolicySelectionAuthorityV2:
-    if type(manifest) is not MassiveAdaptiveRLExperimentManifestV4 or type(
-        fold_fit_authority
-    ) is not MassiveAdaptiveRLFoldFitAuthorityV1:
-        raise MassiveAdaptiveRLPolicySelectionV2Error(
-            "adaptive RL policy selection V2 runtime authority type differs"
-        )
-    manifest.validate()
-    fold_fit_authority.validate()
-    _validate_fold_fit_lineage_v2(
+    fold_fit_authority, ordered = _candidates_from_fold_validation_v1(
         manifest=manifest,
-        fold_fit_authority=fold_fit_authority,
+        validation_authority=validation_authority,
     )
     parsed = parse_massive_adaptive_rl_policy_selection_authority_v2(
         root=root,
         loaded_source=authority.loaded_source,
     )
-    committed_selection, committed_candidates = _load_authority_payload_v2(
+    (
+        committed_selection,
+        committed_candidates,
+        committed_validation_receipt,
+    ) = _load_authority_payload_v2(
         root=root,
         loaded_source=authority.loaded_source,
-    )
-    ordered = _ordered_candidates_v2(
-        expected_checkpoint_authority_receipts=(
-            fold_fit_authority.candidate_checkpoint_authority_receipts
-        ),
-        candidates=candidates,
     )
     rebuilt = select_massive_adaptive_rl_policy_v2(
         manifest=manifest,
@@ -1226,7 +1370,14 @@ def authorize_massive_adaptive_rl_policy_selection_authority_v2(
         selection=rebuilt,
         candidates=ordered,
     )
-    if committed_candidates != ordered or committed_selection != rebuilt:
+    if (
+        committed_candidates != ordered
+        or committed_selection != rebuilt
+        or committed_validation_receipt
+        != validation_authority.semantic_receipt_sha256
+        or parsed.fold_validation_authority_receipt_sha256
+        != validation_authority.semantic_receipt_sha256
+    ):
         raise MassiveAdaptiveRLPolicySelectionV2Error(
             "RL policy selection authority V2 does not replay"
         )
@@ -1236,6 +1387,7 @@ def authorize_massive_adaptive_rl_policy_selection_authority_v2(
         loaded_source=parsed.loaded_source,
         runtime_manifest=manifest,
         runtime_fold_fit_authority=fold_fit_authority,
+        runtime_fold_validation_authority=validation_authority,
         runtime_selection=rebuilt,
         runtime_candidates=ordered,
         runtime_selection_replayed=True,
@@ -1252,28 +1404,13 @@ def materialize_massive_adaptive_rl_policy_selection_authority_v2(
     root: str | Path,
     artifact_id: str,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
-    fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
-    candidates: Sequence[MassiveAdaptiveRLPolicyCandidateV2],
+    validation_authority: MassiveAdaptiveRLFoldValidationAuthorityV1,
     committed_at_ms: int,
 ) -> MassiveAdaptiveRLPolicySelectionAuthorityV2:
     artifact = _artifact_id(artifact_id)
-    if type(manifest) is not MassiveAdaptiveRLExperimentManifestV4 or type(
-        fold_fit_authority
-    ) is not MassiveAdaptiveRLFoldFitAuthorityV1:
-        raise MassiveAdaptiveRLPolicySelectionV2Error(
-            "adaptive RL policy selection V2 runtime authority type differs"
-        )
-    manifest.validate()
-    fold_fit_authority.validate()
-    _validate_fold_fit_lineage_v2(
+    fold_fit_authority, ordered = _candidates_from_fold_validation_v1(
         manifest=manifest,
-        fold_fit_authority=fold_fit_authority,
-    )
-    ordered = _ordered_candidates_v2(
-        expected_checkpoint_authority_receipts=(
-            fold_fit_authority.candidate_checkpoint_authority_receipts
-        ),
-        candidates=candidates,
+        validation_authority=validation_authority,
     )
     selection = select_massive_adaptive_rl_policy_v2(
         manifest=manifest,
@@ -1295,7 +1432,13 @@ def materialize_massive_adaptive_rl_policy_selection_authority_v2(
     publish_massive_source_object(
         stream=BytesIO(
             canonical_json_file_bytes(
-                _authority_payload_v2(selection=selection, candidates=ordered)
+                _authority_payload_v2(
+                    selection=selection,
+                    candidates=ordered,
+                    fold_validation_authority_receipt_sha256=(
+                        validation_authority.semantic_receipt_sha256
+                    ),
+                )
             )
         ),
         root=root,
@@ -1323,8 +1466,7 @@ def materialize_massive_adaptive_rl_policy_selection_authority_v2(
             loaded_source=loaded,
         ),
         manifest=manifest,
-        fold_fit_authority=fold_fit_authority,
-        candidates=ordered,
+        validation_authority=validation_authority,
     )
 
 

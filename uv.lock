@@ -1314,7 +1314,9 @@ data = [
 ]
 dev = [
     { name = "mypy" },
+    { name = "pandas" },
     { name = "pandas-stubs" },
+    { name = "pyarrow" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -1335,8 +1337,10 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11,<2" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "pandas", marker = "extra == 'data'", specifier = ">=2.2,<3" },
+    { name = "pandas", marker = "extra == 'dev'", specifier = ">=2.2,<3" },
     { name = "pandas-stubs", marker = "extra == 'dev'" },
     { name = "pyarrow", marker = "extra == 'data'", specifier = ">=16,<23" },
+    { name = "pyarrow", marker = "extra == 'dev'", specifier = ">=16,<23" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<9" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.17" },

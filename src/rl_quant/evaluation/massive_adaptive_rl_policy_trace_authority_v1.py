@@ -54,6 +54,7 @@ MASSIVE_ADAPTIVE_RL_POLICY_TRACE_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 = semantic_sh
     {
         "schema": MASSIVE_ADAPTIVE_RL_POLICY_TRACE_AUTHORITY_V1_SCHEMA,
         "payload": "canonical-policy-trace-and-action-evidence",
+        "validation_context": "cost-excluded-environment-identity",
         "promotion": "reload-checkpoint-rerun-actions-and-economics",
         "generic_reload": "nonauthorizing",
     }
@@ -83,6 +84,7 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
     checkpoint_authority_receipt_sha256: str
     checkpoint_receipt_sha256: str
     model_state_receipt_sha256: str
+    validation_context_receipt_sha256: str
     policy_trace_receipt_sha256: str
     action_evidence_inventory_sha256: str
     transition_inventory_sha256: str
@@ -111,6 +113,9 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
             ),
             "checkpoint_receipt_sha256": self.checkpoint_receipt_sha256,
             "model_state_receipt_sha256": self.model_state_receipt_sha256,
+            "validation_context_receipt_sha256": (
+                self.validation_context_receipt_sha256
+            ),
             "policy_trace_receipt_sha256": self.policy_trace_receipt_sha256,
             "action_evidence_inventory_sha256": self.action_evidence_inventory_sha256,
             "transition_inventory_sha256": self.transition_inventory_sha256,
@@ -172,6 +177,7 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
             self.checkpoint_authority_receipt_sha256,
             self.checkpoint_receipt_sha256,
             self.model_state_receipt_sha256,
+            self.validation_context_receipt_sha256,
             self.policy_trace_receipt_sha256,
             self.action_evidence_inventory_sha256,
             self.transition_inventory_sha256,
@@ -183,7 +189,11 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
-def _payload(trace: MassiveAdaptiveRLCheckpointPolicyTraceV1) -> dict[str, object]:
+def _payload(
+    trace: MassiveAdaptiveRLCheckpointPolicyTraceV1,
+    *,
+    validation_context_receipt_sha256: str,
+) -> dict[str, object]:
     return {
         "fold_index": trace.fold_index,
         "evaluation_role": trace.evaluation_role,
@@ -192,6 +202,10 @@ def _payload(trace: MassiveAdaptiveRLCheckpointPolicyTraceV1) -> dict[str, objec
         ),
         "checkpoint_receipt_sha256": trace.checkpoint_receipt_sha256,
         "model_state_receipt_sha256": trace.model_state_receipt_sha256,
+        "validation_context_receipt_sha256": _digest(
+            "validation context receipt",
+            validation_context_receipt_sha256,
+        ),
         "policy_trace": asdict(trace.policy_trace),
         "action_evidence": tuple(asdict(row) for row in trace.action_evidence),
         "action_evidence_inventory_sha256": trace.action_evidence_inventory_sha256,
@@ -217,7 +231,7 @@ def _trace_metadata(payload: Mapping[str, object]) -> tuple[
     MassiveAdaptiveRLPolicyTraceV1,
     tuple[MassiveAdaptiveRLPolicyActionEvidenceV1, ...],
 ]:
-    trace_payload = dict(payload["policy_trace"])  # type: ignore[arg-type]
+    trace_payload = dict(payload["policy_trace"])  # type: ignore[call-overload]
     for name in (
         "decision_session_dates",
         "transition_receipts",
@@ -233,7 +247,7 @@ def _trace_metadata(payload: Mapping[str, object]) -> tuple[
                 "action_values": tuple(dict(row)["action_values"]),
             }
         )
-        for row in payload["action_evidence"]  # type: ignore[union-attr]
+        for row in payload["action_evidence"]  # type: ignore[attr-defined]
     )
     trace.validate()
     for row in evidence:
@@ -248,13 +262,16 @@ def parse_massive_adaptive_rl_policy_trace_authority_v1(
     trace, evidence = _trace_metadata(payload)
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_POLICY_TRACE_AUTHORITY_V1_SCHEMA,
-        "fold_index": int(payload["fold_index"]),
+        "fold_index": int(str(payload["fold_index"])),
         "evaluation_role": str(payload["evaluation_role"]),
         "checkpoint_authority_receipt_sha256": str(
             payload["checkpoint_authority_receipt_sha256"]
         ),
         "checkpoint_receipt_sha256": str(payload["checkpoint_receipt_sha256"]),
         "model_state_receipt_sha256": str(payload["model_state_receipt_sha256"]),
+        "validation_context_receipt_sha256": str(
+            payload["validation_context_receipt_sha256"]
+        ),
         "policy_trace_receipt_sha256": trace.semantic_receipt_sha256,
         "action_evidence_inventory_sha256": semantic_sha256(
             tuple(row.semantic_receipt_sha256 for row in evidence)
@@ -307,7 +324,12 @@ def authorize_massive_adaptive_rl_policy_trace_authority_v1(
         device=device,
     )
     if canonical_json_file_bytes(committed) != canonical_json_file_bytes(
-        _payload(replayed)
+        _payload(
+            replayed,
+            validation_context_receipt_sha256=(
+                environment.validation_context_receipt_sha256
+            ),
+        )
     ):
         raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
             "adaptive RL policy trace does not replay from its checkpoint"
@@ -355,7 +377,16 @@ def materialize_massive_adaptive_rl_policy_trace_authority_v1(
     )
     relative = f"massive-adaptive/rl-policy-trace-authority-v1/{artifact_id}.json"
     publish_massive_source_object(
-        stream=BytesIO(canonical_json_file_bytes(_payload(trace))),
+        stream=BytesIO(
+            canonical_json_file_bytes(
+                _payload(
+                    trace,
+                    validation_context_receipt_sha256=(
+                        environment.validation_context_receipt_sha256
+                    ),
+                )
+            )
+        ),
         root=root,
         relative_payload_path=relative,
         dataset_id=MASSIVE_ADAPTIVE_RL_POLICY_TRACE_AUTHORITY_V1_DATASET,

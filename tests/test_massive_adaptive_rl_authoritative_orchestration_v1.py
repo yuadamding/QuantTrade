@@ -70,6 +70,14 @@ from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_authority_v1 import (
     materialize_massive_adaptive_rl_cost_ladder_authority_v1,
     parse_massive_adaptive_rl_cost_ladder_authority_v1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_fixed_control_validation_authority_v1 import (
+    materialize_massive_adaptive_rl_fixed_control_validation_authority_v1,
+    parse_massive_adaptive_rl_fixed_control_validation_authority_v1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_fold_validation_authority_v1 import (
+    MassiveAdaptiveRLFoldValidationAuthorityV1Error,
+    validate_massive_adaptive_rl_shared_validation_tape_v1,
+)
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
 )
@@ -895,6 +903,10 @@ def test_checkpoint_drives_validation_actions_and_trace_replay(tmp_path) -> None
         committed_at_ms=1,
     )
     assert authority.runtime_trace_replayed
+    assert (
+        authority.validation_context_receipt_sha256
+        == environment.validation_context_receipt_sha256
+    )
     generic = parse_massive_adaptive_rl_policy_trace_authority_v1(
         root=tmp_path,
         loaded_source=authority.loaded_source,
@@ -955,6 +967,10 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         committed_at_ms=2,
     )
     assert authority.runtime_ladder_replayed
+    assert (
+        authority.validation_context_receipt_sha256
+        == primary_environment.validation_context_receipt_sha256
+    )
     generic = parse_massive_adaptive_rl_cost_ladder_authority_v1(
         root=tmp_path,
         loaded_source=authority.loaded_source,
@@ -970,6 +986,99 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(tmp_path) -> None:
         high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
     )
     assert reopened.cost_ladder_receipt_sha256 == ladder.semantic_receipt_sha256
+
+
+def test_replayed_candidate_and_fc06_authorities_share_one_validation_tape(
+    tmp_path,
+) -> None:
+    fixture, calibration_values, primary_environment = _adaptive_env_fixture()
+    training_authority = _training_authority(primary_environment)
+    chronology = _chronology(primary_environment, training_authority)
+    checkpoint_authority = _checkpoint_authority(primary_environment)
+    primary = materialize_massive_adaptive_rl_policy_trace_authority_v1(
+        root=tmp_path,
+        artifact_id="shared-tape-primary",
+        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environment=_environment_at_cost(fixture, calibration_values, 20.0),
+        fold_index=0,
+        evaluation_role="inner_validation",
+        committed_at_ms=10,
+    )
+    ladder = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
+        root=tmp_path,
+        artifact_id="shared-tape-ladder",
+        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        primary_environment=_environment_at_cost(fixture, calibration_values, 20.0),
+        low_cost_environment=_environment_at_cost(fixture, calibration_values, 10.0),
+        high_cost_environment=_environment_at_cost(fixture, calibration_values, 40.0),
+        fold_index=0,
+        evaluation_role="inner_validation",
+        committed_at_ms=11,
+    )
+    fixed_fit, fixed_selection = _fixed_selection_fixture(
+        tmp_path,
+        _environment_at_cost(fixture, calibration_values, 20.0),
+        chronology,
+    )
+    fixed = materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
+        root=tmp_path,
+        artifact_id="shared-tape-fc06",
+        fit_authority=fixed_fit,  # type: ignore[arg-type]
+        selection_authority=fixed_selection,
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environment=_environment_at_cost(fixture, calibration_values, 20.0),
+        committed_at_ms=12,
+    )
+
+    receipt = validate_massive_adaptive_rl_shared_validation_tape_v1(
+        primary_trace_authorities=(primary,),
+        cost_ladder_authorities=(ladder,),
+        fixed_control_validation_authority=fixed,
+    )
+
+    assert len(receipt) == 64
+    generic_fixed = parse_massive_adaptive_rl_fixed_control_validation_authority_v1(
+        root=tmp_path,
+        loaded_source=fixed.loaded_source,
+    )
+    assert not generic_fixed.runtime_evaluation_replayed
+    assert not generic_fixed.development_stage_authorized
+
+    mismatched_environment = MassiveAdaptiveProfitabilityEnvV1(
+        forecast_archive=fixture.forecast_archive,
+        calibration=calibration_values.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        economic_event_archive=None,
+        initial_capital=9_000_000.0,
+        transaction_cost_basis_points=20.0,
+    )
+    mismatched_fixed = (
+        materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
+            root=tmp_path,
+            artifact_id="different-tape-fc06",
+            fit_authority=fixed_fit,  # type: ignore[arg-type]
+            selection_authority=fixed_selection,
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            environment=mismatched_environment,
+            committed_at_ms=13,
+        )
+    )
+    with pytest.raises(
+        MassiveAdaptiveRLFoldValidationAuthorityV1Error,
+        match="one economic tape",
+    ):
+        validate_massive_adaptive_rl_shared_validation_tape_v1(
+            primary_trace_authorities=(primary,),
+            cost_ladder_authorities=(ladder,),
+            fixed_control_validation_authority=mismatched_fixed,
+        )
 
 
 def test_frozen_outer_actions_replay_from_attached_policy(tmp_path) -> None:

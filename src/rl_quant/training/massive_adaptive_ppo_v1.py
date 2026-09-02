@@ -339,8 +339,11 @@ class MassiveAdaptiveRLCheckpointV1:
             or self.loss_trace_receipt_sha256 != semantic_sha256(self.loss_trace)
             or self.transition_inventory_sha256
             != semantic_sha256(self.transition_receipts)
-            or self.transition_decision_session_dates
-            != tuple(sorted(set(self.transition_decision_session_dates)))
+            or (
+                expected_source_qualified
+                and self.transition_decision_session_dates
+                != tuple(sorted(set(self.transition_decision_session_dates)))
+            )
             or self.fit_environment_authority_receipts
             != tuple(dict.fromkeys(self.fit_environment_authority_receipts))
             or any(

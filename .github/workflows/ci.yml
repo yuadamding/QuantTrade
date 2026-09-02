@@ -63,6 +63,8 @@ jobs:
           tests/test_massive_adaptive_rl_action_v1.py
           tests/test_massive_adaptive_ppo_policy_v1.py
           tests/test_massive_adaptive_rl_policy_selection_v1.py
+          tests/test_massive_adaptive_rl_policy_selection_v2.py
+          tests/test_massive_adaptive_rl_fold_validation_authority_v1.py
           tests/test_massive_adaptive_rl_outer_evidence_v1.py
           tests/test_massive_adaptive_outer_access_commitment_v1.py
           tests/test_massive_adaptive_rl_authoritative_orchestration_v1.py
@@ -76,6 +78,7 @@ jobs:
           tests/test_massive_adaptive_rl_experiment_state_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v2.py
           tests/test_massive_adaptive_rl_manifest_v3.py
+          tests/test_massive_adaptive_rl_manifest_v4.py
           tests/test_adaptive_alpha_supervised_v1.py
           tests/test_massive_adaptive_portfolio_compiler_v1.py
           tests/test_massive_economic_authority_v6.py
@@ -91,6 +94,10 @@ jobs:
           src/rl_quant/evaluation/massive_adaptive_rl_fit_forecast_archive_v1.py
           src/rl_quant/evaluation/massive_adaptive_outer_access_commitment_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_evaluator_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_validation_authority_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_policy_trace_authority_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_cost_ladder_authority_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_authority_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_cost_ladder_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_rollout_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_plan_v2.py
@@ -119,6 +126,8 @@ jobs:
           src/rl_quant/training/massive_adaptive_rl_fixed_control_selection_v1.py
           src/rl_quant/training/massive_adaptive_rl_fixed_control_registry_v1.py
           src/rl_quant/training/massive_adaptive_rl_fixed_control_fit_runner_v1.py
+          src/rl_quant/training/massive_adaptive_rl_policy_selection_v2.py
           src/rl_quant/training/massive_adaptive_rl_training_forecast_authority_v2.py
           src/rl_quant/workflows/massive_adaptive_rl_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_v2.py
+          src/rl_quant/workflows/massive_adaptive_rl_manifest_v4.py

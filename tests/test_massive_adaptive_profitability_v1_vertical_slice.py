@@ -102,6 +102,7 @@ from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
 from rl_quant.training.massive_adaptive_ppo_v1 import (
     MassiveAdaptivePPOConfigV1,
     MassiveAdaptivePPOTrainerV1,
+    MassiveAdaptivePPOV1Error,
 )
 from rl_quant.training.massive_adaptive_rl_checkpoint_authority_v1 import (
     authorize_massive_adaptive_rl_checkpoint_authority_v1,
@@ -1262,6 +1263,28 @@ def test_adaptive_ppo_checkpoint_resume_is_exact() -> None:
         torch.equal(value, resumed_checkpoint.model_state[name])
         for name, value in uninterrupted_checkpoint.model_state.items()
     )
+
+    falsely_qualified_duplicate_dates = replace(
+        uninterrupted_checkpoint,
+        training_forecast_authority_receipt_sha256=_digest(
+            "qualified-training-forecast"
+        ),
+        fit_environment_authority_receipts=(_digest("qualified-fit-environment"),),
+        transition_source_data_qualified=tuple(
+            True for _ in uninterrupted_checkpoint.transition_receipts
+        ),
+        source_data_qualified=True,
+        development_rl_training_authorized=True,
+        semantic_receipt_sha256="0" * 64,
+    )
+    falsely_qualified_duplicate_dates = replace(
+        falsely_qualified_duplicate_dates,
+        semantic_receipt_sha256=semantic_sha256(
+            falsely_qualified_duplicate_dates.semantic_unsigned()
+        ),
+    )
+    with pytest.raises(MassiveAdaptivePPOV1Error, match="checkpoint differs"):
+        falsely_qualified_duplicate_dates.validate()
 
 
 def test_adaptive_ppo_checkpoint_is_durable_and_runtime_stripped(tmp_path) -> None:

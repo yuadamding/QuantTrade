@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from io import BytesIO
+import inspect
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,8 @@ from rl_quant.training.massive_adaptive_rl_policy_selection_v2 import (
     MassiveAdaptiveRLPolicyCandidateV2,
     MassiveAdaptiveRLPolicySelectionV2Error,
     build_massive_adaptive_rl_policy_candidate_v2,
+    authorize_massive_adaptive_rl_policy_selection_authority_v2,
+    materialize_massive_adaptive_rl_policy_selection_authority_v2,
     parse_massive_adaptive_rl_policy_selection_authority_v2,
     select_massive_adaptive_rl_policy_v2,
     validation_rank_key_v1,
@@ -353,6 +356,35 @@ def test_v4_numeric_semantics_are_exact_and_canonical() -> None:
         nonfinite.validate()
 
 
+def test_unqualified_candidate_cannot_claim_positive_authorization_eligibility() -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id="selection-v2-unqualified"
+    )
+    candidate = _candidate(
+        manifest=manifest,
+        ordinal=0,
+        fold_index=0,
+        source_data_qualified=False,
+    )
+
+    selection = _select(manifest, candidate)
+
+    assert selection.selected_candidate_validation_eligible
+    assert not selection.source_data_qualified
+    assert not selection.positive_profitability_authorization_eligible
+
+
+def test_authorizing_selection_api_accepts_only_replayed_fold_validation() -> None:
+    for operation in (
+        materialize_massive_adaptive_rl_policy_selection_authority_v2,
+        authorize_massive_adaptive_rl_policy_selection_authority_v2,
+    ):
+        parameters = inspect.signature(operation).parameters
+        assert "validation_authority" in parameters
+        assert "candidates" not in parameters
+        assert "fold_fit_authority" not in parameters
+
+
 def test_v4_candidate_coverage_schedule_and_lineage_are_exact() -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v4(
         experiment_id="selection-v2-coverage"
@@ -472,6 +504,9 @@ def test_policy_selection_v2_generic_authority_is_persisted_but_nonauthorizing(
         stream=BytesIO(
             canonical_json_file_bytes(
                 {
+                    "fold_validation_authority_receipt_sha256": _digest(
+                        "persisted-fold-validation"
+                    ),
                     "selection": asdict(selection),
                     "candidates": (asdict(candidate),),
                 }
@@ -504,6 +539,9 @@ def test_policy_selection_v2_generic_authority_is_persisted_but_nonauthorizing(
     )
 
     assert generic.selection_receipt_sha256 == selection.semantic_receipt_sha256
+    assert generic.fold_validation_authority_receipt_sha256 == _digest(
+        "persisted-fold-validation"
+    )
     assert generic.source_data_qualified
     assert generic.selected_candidate_validation_eligible
     assert generic.positive_profitability_authorization_eligible

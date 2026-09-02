@@ -48,6 +48,7 @@ MASSIVE_ADAPTIVE_RL_COST_LADDER_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 = semantic_sha
     {
         "schema": MASSIVE_ADAPTIVE_RL_COST_LADDER_AUTHORITY_V1_SCHEMA,
         "payload": "cost-ladder-identities-and-economics",
+        "validation_context": "one-cost-excluded-environment-identity",
         "promotion": "reload-checkpoint-rerun-primary-and-frozen-target-stresses",
         "generic_reload": "nonauthorizing",
     }
@@ -58,7 +59,23 @@ class MassiveAdaptiveRLCostLadderAuthorityV1Error(ValueError):
     """The committed cost ladder did not replay from its checkpoint."""
 
 
-def _payload(ladder: MassiveAdaptiveRLCostLadderV1) -> dict[str, object]:
+def _digest(name: str, value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
+            f"{name} must be a lowercase SHA-256"
+        )
+    return value
+
+
+def _payload(
+    ladder: MassiveAdaptiveRLCostLadderV1,
+    *,
+    validation_context_receipt_sha256: str,
+) -> dict[str, object]:
     ladder.validate()
     return {
         "fold_index": ladder.fold_index,
@@ -67,6 +84,10 @@ def _payload(ladder: MassiveAdaptiveRLCostLadderV1) -> dict[str, object]:
             ladder.checkpoint_authority_receipt_sha256
         ),
         "checkpoint_receipt_sha256": ladder.checkpoint_receipt_sha256,
+        "validation_context_receipt_sha256": _digest(
+            "validation context receipt",
+            validation_context_receipt_sha256,
+        ),
         "primary_receipt_sha256": ladder.primary.semantic_receipt_sha256,
         "primary_trace": asdict(ladder.primary.policy_trace),
         "primary_action_evidence_inventory_sha256": (
@@ -109,6 +130,7 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
     evaluation_role: str
     checkpoint_authority_receipt_sha256: str
     checkpoint_receipt_sha256: str
+    validation_context_receipt_sha256: str
     cost_ladder_receipt_sha256: str
     primary_trace_receipt_sha256: str
     low_cost_trace_receipt_sha256: str
@@ -138,6 +160,9 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
                 self.checkpoint_authority_receipt_sha256
             ),
             "checkpoint_receipt_sha256": self.checkpoint_receipt_sha256,
+            "validation_context_receipt_sha256": (
+                self.validation_context_receipt_sha256
+            ),
             "cost_ladder_receipt_sha256": self.cost_ladder_receipt_sha256,
             "primary_trace_receipt_sha256": self.primary_trace_receipt_sha256,
             "low_cost_trace_receipt_sha256": self.low_cost_trace_receipt_sha256,
@@ -202,23 +227,30 @@ class MassiveAdaptiveRLCostLadderAuthorityV1:
                 "adaptive runtime cost ladder differs from its authority"
             )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+        _digest(
+            "adaptive RL cost-ladder validation context",
+            self.validation_context_receipt_sha256,
+        )
 
 
 def parse_massive_adaptive_rl_cost_ladder_authority_v1(
     *, root: str | Path, loaded_source: LoadedMassiveSourceObject
 ) -> MassiveAdaptiveRLCostLadderAuthorityV1:
     payload = _load_payload(root=root, loaded_source=loaded_source)
-    primary = dict(payload["primary_trace"])  # type: ignore[arg-type]
-    low = dict(payload["low_cost_trace"])  # type: ignore[arg-type]
-    high = dict(payload["high_cost_trace"])  # type: ignore[arg-type]
+    primary = dict(payload["primary_trace"])  # type: ignore[call-overload]
+    low = dict(payload["low_cost_trace"])  # type: ignore[call-overload]
+    high = dict(payload["high_cost_trace"])  # type: ignore[call-overload]
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_COST_LADDER_AUTHORITY_V1_SCHEMA,
-        "fold_index": int(payload["fold_index"]),
+        "fold_index": int(str(payload["fold_index"])),
         "evaluation_role": str(payload["evaluation_role"]),
         "checkpoint_authority_receipt_sha256": str(
             payload["checkpoint_authority_receipt_sha256"]
         ),
         "checkpoint_receipt_sha256": str(payload["checkpoint_receipt_sha256"]),
+        "validation_context_receipt_sha256": str(
+            payload["validation_context_receipt_sha256"]
+        ),
         "cost_ladder_receipt_sha256": str(payload["cost_ladder_receipt_sha256"]),
         "primary_trace_receipt_sha256": str(primary["semantic_receipt_sha256"]),
         "low_cost_trace_receipt_sha256": str(low["semantic_receipt_sha256"]),
@@ -275,7 +307,12 @@ def authorize_massive_adaptive_rl_cost_ladder_authority_v1(
         evaluation_role=parsed.evaluation_role,
     )
     if canonical_json_file_bytes(committed) != canonical_json_file_bytes(
-        _payload(replayed)
+        _payload(
+            replayed,
+            validation_context_receipt_sha256=(
+                primary_environment.validation_context_receipt_sha256
+            ),
+        )
     ):
         raise MassiveAdaptiveRLCostLadderAuthorityV1Error(
             "adaptive RL cost ladder does not replay from its checkpoint"
@@ -326,7 +363,16 @@ def materialize_massive_adaptive_rl_cost_ladder_authority_v1(
     )
     relative = f"massive-adaptive/rl-cost-ladder-authority-v1/{artifact_id}.json"
     publish_massive_source_object(
-        stream=BytesIO(canonical_json_file_bytes(_payload(ladder))),
+        stream=BytesIO(
+            canonical_json_file_bytes(
+                _payload(
+                    ladder,
+                    validation_context_receipt_sha256=(
+                        primary_environment.validation_context_receipt_sha256
+                    ),
+                )
+            )
+        ),
         root=root,
         relative_payload_path=relative,
         dataset_id=MASSIVE_ADAPTIVE_RL_COST_LADDER_AUTHORITY_V1_DATASET,
