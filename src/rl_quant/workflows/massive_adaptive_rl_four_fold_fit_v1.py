@@ -85,6 +85,8 @@ MASSIVE_ADAPTIVE_RL_FOUR_FOLD_FIT_V1_SPEC_SHA256 = semantic_sha256(
         "execution": "package-owned-run-or-resume-per-fold",
         "scientific_environment": "one-cross-worker-fingerprint",
         "physical_worker_compatibility": "one-device-class-and-driver-fingerprint",
+        "nested_witnesses": "exact-types-and-source-transaction-verified",
+        "replay_discovery": "canonical-package-owned-fold-paths",
         "persistence": "create-only-input-and-completed-aggregate-authorities",
         "state_binding": (
             "fit-forecasts-authorized-then-ppo-and-fixed-controls-trained"
@@ -221,6 +223,13 @@ class MassiveAdaptiveRLFourFoldFitInputsAuthorityV1:
         )
 
     def validate(self) -> None:
+        if any(
+            type(authority) is not MassiveAdaptiveRLFoldFitInputsAuthorityV1
+            for authority in self._fold_fit_inputs
+        ):
+            raise MassiveAdaptiveRLFourFoldFitV1Error(
+                "adaptive RL four-fold fit inputs require exact persisted fold-input authorities"
+            )
         for authority in self._fold_fit_inputs:
             authority.validate()
         environments = tuple(
@@ -230,13 +239,8 @@ class MassiveAdaptiveRLFourFoldFitInputsAuthorityV1:
         expected_authorized = bool(
             len(self._fold_fit_inputs) == 4
             and all(
-                authority.source_data_qualified
-                and authority.runtime_inputs_replayed
-                and authority.development_rl_training_inputs_authorized
-                and environment.development_execution_authorized
-                for authority, environment in zip(
-                    self._fold_fit_inputs, environments, strict=True
-                )
+                authority.development_stage_authorized
+                for authority in self._fold_fit_inputs
             )
         )
         fingerprints = tuple(
@@ -419,6 +423,15 @@ class MassiveAdaptiveRLFourFoldFitAuthorityV1:
         )
 
     def validate(self) -> None:
+        if type(self._fit_inputs_authority) is not (
+            MassiveAdaptiveRLFourFoldFitInputsAuthorityV1
+        ) or any(
+            type(authority) is not MassiveAdaptiveRLFoldFitAuthorityV1
+            for authority in self._fold_fits
+        ):
+            raise MassiveAdaptiveRLFourFoldFitV1Error(
+                "adaptive RL four-fold fit requires exact persisted fold authorities"
+            )
         if self._fit_inputs_authority is not None:
             self._fit_inputs_authority.validate()
         for authority in self._fold_fits:
@@ -427,12 +440,10 @@ class MassiveAdaptiveRLFourFoldFitAuthorityV1:
             self._loaded_source.validate()
         expected_authorized = bool(
             self._fit_inputs_authority is not None
-            and self._fit_inputs_authority.development_rl_training_inputs_authorized
+            and self._fit_inputs_authority.development_stage_authorized
             and len(self._fold_fits) == 4
             and all(
-                authority.source_data_qualified
-                and authority.runtime_fit_replayed
-                and authority.development_rl_training_authorized
+                authority.development_stage_authorized
                 for authority in self._fold_fits
             )
         )
@@ -536,9 +547,21 @@ def build_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     fold_fit_inputs: Sequence[MassiveAdaptiveRLFoldFitInputsAuthorityV1],
 ) -> MassiveAdaptiveRLFourFoldFitInputsAuthorityV1:
+    if type(manifest) is not MassiveAdaptiveRLExperimentManifestV3 or type(
+        runtime_sources
+    ) is not MassiveAdaptiveRLRuntimeSourcesV1:
+        raise MassiveAdaptiveRLFourFoldFitV1Error(
+            "adaptive RL four-fold fit inputs require exact manifest and runtime sources"
+        )
     manifest.validate()
     runtime_sources.validate()
     rows = tuple(fold_fit_inputs)
+    if any(
+        type(row) is not MassiveAdaptiveRLFoldFitInputsAuthorityV1 for row in rows
+    ):
+        raise MassiveAdaptiveRLFourFoldFitV1Error(
+            "adaptive RL four-fold fit inputs require exact persisted fold-input authorities"
+        )
     environments = tuple(row.execution_environment_authority for row in rows)
     fingerprint = (
         environments[0].scientific_execution_fingerprint_sha256
@@ -589,9 +612,21 @@ def build_massive_adaptive_rl_four_fold_fit_authority_v1(
     fit_inputs_authority: MassiveAdaptiveRLFourFoldFitInputsAuthorityV1,
     fold_fits: Sequence[MassiveAdaptiveRLFoldFitAuthorityV1],
 ) -> MassiveAdaptiveRLFourFoldFitAuthorityV1:
+    if type(manifest) is not MassiveAdaptiveRLExperimentManifestV3 or type(
+        runtime_sources
+    ) is not MassiveAdaptiveRLRuntimeSourcesV1:
+        raise MassiveAdaptiveRLFourFoldFitV1Error(
+            "adaptive RL four-fold fit requires exact manifest and runtime sources"
+        )
     manifest.validate()
     runtime_sources.validate()
     rows = tuple(fold_fits)
+    if type(fit_inputs_authority) is not (
+        MassiveAdaptiveRLFourFoldFitInputsAuthorityV1
+    ) or any(type(row) is not MassiveAdaptiveRLFoldFitAuthorityV1 for row in rows):
+        raise MassiveAdaptiveRLFourFoldFitV1Error(
+            "adaptive RL four-fold fit requires exact persisted fold authorities"
+        )
     body = {
         "experiment_id": manifest.experiment_id,
         "manifest_v3_receipt_sha256": manifest.semantic_receipt_sha256,
@@ -754,9 +789,21 @@ def load_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
-    fold_fit_inputs: Sequence[MassiveAdaptiveRLFoldFitInputsAuthorityV1],
     verified_at_ms: int,
+    device: torch.device | str | None = None,
 ) -> MassiveAdaptiveRLFourFoldFitInputsAuthorityV1:
+    fold_fit_inputs = tuple(
+        prepare_or_resume_massive_adaptive_rl_fold_fit_inputs_v1(
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            outer_fold_index=fold_index,
+            artifact_root=root,
+            committed_at_ms=verified_at_ms + fold_index,
+            device=device,
+            allow_materialize=False,
+        )
+        for fold_index in _FOUR_FOLD_INDICES
+    )
     rebuilt = build_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
         manifest=manifest,
         runtime_sources=runtime_sources,
@@ -816,10 +863,29 @@ def load_massive_adaptive_rl_four_fold_fit_authority_v1(
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV3,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
-    fit_inputs_authority: MassiveAdaptiveRLFourFoldFitInputsAuthorityV1,
-    fold_fits: Sequence[MassiveAdaptiveRLFoldFitAuthorityV1],
     verified_at_ms: int,
+    device: torch.device | str | None = None,
 ) -> MassiveAdaptiveRLFourFoldFitAuthorityV1:
+    fit_inputs_authority = (
+        load_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
+            root=root,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            verified_at_ms=verified_at_ms,
+            device=device,
+        )
+    )
+    fold_fits = tuple(
+        load_massive_adaptive_rl_fold_fit_authority_v1(
+            root=root,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            outer_fold_index=fold_index,
+            committed_at_ms=verified_at_ms + fold_index,
+            device=device,
+        )
+        for fold_index in _FOUR_FOLD_INDICES
+    )
     rebuilt = build_massive_adaptive_rl_four_fold_fit_authority_v1(
         manifest=manifest,
         runtime_sources=runtime_sources,
@@ -922,7 +988,14 @@ def _run_or_resume_massive_adaptive_rl_four_fold_fit_inputs_v1_unlocked(
         raise MassiveAdaptiveRLFourFoldFitV1Error(
             "completed adaptive RL four-fold fit-input aggregate is absent"
         )
-    nested_materialization_allowed = allow_materialize and not aggregate_exists
+    if aggregate_exists:
+        return load_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
+            root=artifact_root,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            verified_at_ms=committed_at_ms + 4,
+            device=device,
+        )
     fold_inputs = tuple(
         prepare_or_resume_massive_adaptive_rl_fold_fit_inputs_v1(
             manifest=manifest,
@@ -931,18 +1004,10 @@ def _run_or_resume_massive_adaptive_rl_four_fold_fit_inputs_v1_unlocked(
             artifact_root=artifact_root,
             committed_at_ms=committed_at_ms + fold_index,
             device=device,
-            allow_materialize=nested_materialization_allowed,
+            allow_materialize=True,
         )
         for fold_index in _FOUR_FOLD_INDICES
     )
-    if aggregate_exists:
-        return load_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
-            root=artifact_root,
-            manifest=manifest,
-            runtime_sources=runtime_sources,
-            fold_fit_inputs=fold_inputs,
-            verified_at_ms=committed_at_ms + 4,
-        )
     authority = build_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
         manifest=manifest,
         runtime_sources=runtime_sources,
@@ -993,9 +1058,16 @@ def _run_or_resume_massive_adaptive_rl_four_fold_fit_v1_unlocked(
 ) -> MassiveAdaptiveRLFourFoldFitAuthorityV1:
     """Run or strictly replay folds 0-3 and publish their completed aggregate."""
 
+    if type(fit_inputs_authority) is not (
+        MassiveAdaptiveRLFourFoldFitInputsAuthorityV1
+    ):
+        raise MassiveAdaptiveRLFourFoldFitV1Error(
+            "adaptive RL four-fold fit requires an exact persisted input aggregate"
+        )
     fit_inputs_authority.validate()
     if (
-        fit_inputs_authority.experiment_id != manifest.experiment_id
+        not fit_inputs_authority.development_stage_authorized
+        or fit_inputs_authority.experiment_id != manifest.experiment_id
         or fit_inputs_authority.manifest_v3_receipt_sha256
         != manifest.semantic_receipt_sha256
         or fit_inputs_authority.runtime_sources_receipt_sha256
@@ -1004,6 +1076,24 @@ def _run_or_resume_massive_adaptive_rl_four_fold_fit_v1_unlocked(
         raise MassiveAdaptiveRLFourFoldFitV1Error(
             "adaptive RL four-fold fit input roots differ"
         )
+
+    canonical_fit_inputs = (
+        load_massive_adaptive_rl_four_fold_fit_inputs_authority_v1(
+            root=artifact_root,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            verified_at_ms=committed_at_ms,
+            device=device,
+        )
+    )
+    if (
+        canonical_fit_inputs.semantic_receipt_sha256
+        != fit_inputs_authority.semantic_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLFourFoldFitV1Error(
+            "adaptive RL four-fold fit canonical input aggregate differs"
+        )
+    fit_inputs_authority = canonical_fit_inputs
 
     relative = four_fold_fit_authority_relative_path_v1(
         experiment_id=manifest.experiment_id
@@ -1015,7 +1105,15 @@ def _run_or_resume_massive_adaptive_rl_four_fold_fit_v1_unlocked(
         raise MassiveAdaptiveRLFourFoldFitV1Error(
             "completed adaptive RL four-fold fit aggregate is absent"
         )
-    if allow_materialize and not aggregate_exists:
+    if aggregate_exists:
+        return load_massive_adaptive_rl_four_fold_fit_authority_v1(
+            root=artifact_root,
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            verified_at_ms=committed_at_ms + 401,
+            device=device,
+        )
+    if allow_materialize:
         fold_fits = tuple(
             run_or_resume_massive_adaptive_rl_fold_fit_v1(
                 manifest=manifest,
@@ -1028,25 +1126,8 @@ def _run_or_resume_massive_adaptive_rl_four_fold_fit_v1_unlocked(
             for fold_index in _FOUR_FOLD_INDICES
         )
     else:
-        fold_fits = tuple(
-            load_massive_adaptive_rl_fold_fit_authority_v1(
-                root=artifact_root,
-                manifest=manifest,
-                runtime_sources=runtime_sources,
-                outer_fold_index=fold_index,
-                committed_at_ms=committed_at_ms + fold_index * 100,
-                device=device,
-            )
-            for fold_index in _FOUR_FOLD_INDICES
-        )
-    if aggregate_exists:
-        return load_massive_adaptive_rl_four_fold_fit_authority_v1(
-            root=artifact_root,
-            manifest=manifest,
-            runtime_sources=runtime_sources,
-            fit_inputs_authority=fit_inputs_authority,
-            fold_fits=fold_fits,
-            verified_at_ms=committed_at_ms + 401,
+        raise MassiveAdaptiveRLFourFoldFitV1Error(
+            "completed adaptive RL four-fold fit aggregate is absent"
         )
     authority = build_massive_adaptive_rl_four_fold_fit_authority_v1(
         manifest=manifest,

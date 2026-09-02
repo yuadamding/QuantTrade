@@ -191,7 +191,31 @@ class MassiveAdaptiveRLFoldFitInputsAuthorityV1:
             "implementation_source_sha256": self.implementation_source_sha256,
         }
 
+    @property
+    def source_transaction_verified(self) -> bool:
+        """Whether this fold-input authority was reopened from persisted bytes."""
+
+        return self._loaded_source is not None
+
+    @property
+    def development_stage_authorized(self) -> bool:
+        """Whether this persisted fold input may authorize its aggregate stage."""
+
+        return bool(
+            self.development_rl_training_inputs_authorized
+            and self.source_data_qualified
+            and self.runtime_inputs_replayed
+            and self.execution_environment_authority.development_execution_authorized
+            and self.source_transaction_verified
+        )
+
     def validate(self) -> None:
+        if type(self.execution_environment_authority) is not (
+            MassiveAdaptiveRLExecutionEnvironmentAuthorityV1
+        ):
+            raise MassiveAdaptiveRLFoldFitInputsV1Error(
+                "adaptive RL fold-fit inputs require an exact execution authority"
+            )
         self.execution_environment_authority.validate()
         self.training_forecast_authority.validate()
         self.fit_chronology_authority.validate()

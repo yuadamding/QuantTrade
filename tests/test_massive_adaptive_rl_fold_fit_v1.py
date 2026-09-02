@@ -515,6 +515,14 @@ def test_fold_fit_inputs_materialize_and_replay_before_training(
             initial_model_state_receipt_sha256=initial,
             device="cpu",
         )
+        unpersisted = build_massive_adaptive_rl_fold_fit_inputs_authority_v1(
+            manifest=manifest,
+            runtime_sources=runtime_sources,
+            execution_environment_authority=execution,
+            outer_fold_index=0,
+        )
+        assert not unpersisted.source_transaction_verified
+        assert not unpersisted.development_stage_authorized
         materialized = materialize_massive_adaptive_rl_fold_fit_inputs_authority_v1(
             root=tmp_path / "fit-input-artifacts",
             manifest=manifest,
@@ -533,7 +541,11 @@ def test_fold_fit_inputs_materialize_and_replay_before_training(
         )
 
     assert materialized.semantic_receipt_sha256 == replayed.semantic_receipt_sha256
+    assert materialized.source_transaction_verified
+    assert materialized.development_stage_authorized
     assert replayed.execution_environment_authority.source_transaction_verified
+    assert replayed.source_transaction_verified
+    assert replayed.development_stage_authorized
     assert replayed.runtime_inputs_replayed
     assert replayed.development_rl_training_inputs_authorized
     assert replayed.training_forecast_authority.origin_session_dates == (
@@ -675,6 +687,8 @@ def test_package_owned_fold_fit_executes_ppo_and_complete_fixed_grid(
 
     result.validate()
     assert result.source_data_qualified
+    assert result.source_transaction_verified
+    assert result.development_stage_authorized
     assert result.fit_inputs_authority.runtime_inputs_replayed
     assert result.execution_environment_authority.source_data_qualified
     assert result.execution_environment_authority.source_transaction_verified
