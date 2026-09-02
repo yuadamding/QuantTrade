@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
@@ -43,6 +44,11 @@ from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicyTraceV1,
 )
 
+if TYPE_CHECKING:
+    from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+    )
+
 
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-fixed-control-validation-authority-v1"
@@ -50,8 +56,8 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_DATASET = (
     "massive-adaptive-rl-fixed-control-validation-authority-v1"
 )
-MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SOURCE_SHA256 = (
-    file_sha256(Path(__file__))
+MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SOURCE_SHA256 = file_sha256(
+    Path(__file__)
 )
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 = (
     semantic_sha256(
@@ -60,21 +66,24 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 =
                 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SCHEMA
             ),
             "payload": "canonical-json-replayed-fc06-validation-evaluation",
+            "validation_environment": (
+                "canonical-authority-plus-static-environment-identities"
+            ),
+            "dynamic_economic_sources": "transition-derived-separate-inventory",
             "generic_reload": "nonauthorizing",
         }
     )
 )
-MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SPEC_SHA256 = (
-    semantic_sha256(
-        {
-            "controller": "fit-selected-fc06",
-            "role": "inner-validation-primary-cost-only",
-            "evaluation": "package-owned-economic-replay",
-            "caller_metrics": False,
-            "profitability_reporting": False,
-            "outer_access": False,
-        }
-    )
+MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
+    {
+        "controller": "fit-selected-fc06",
+        "role": "inner-validation-primary-cost-only",
+        "evaluation": "package-owned-economic-replay",
+        "validation_environment": "canonical-20bp-authority",
+        "caller_metrics": False,
+        "profitability_reporting": False,
+        "outer_access": False,
+    }
 )
 
 
@@ -94,6 +103,16 @@ def _digest(name: str, value: object) -> str:
     return value
 
 
+def _validation_environment_authority_type() -> type[
+    MassiveAdaptiveRLValidationEnvironmentAuthorityV1
+]:
+    from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+    )
+
+    return MassiveAdaptiveRLValidationEnvironmentAuthorityV1
+
+
 def _artifact_id(value: object) -> str:
     if (
         not isinstance(value, str)
@@ -106,11 +125,61 @@ def _artifact_id(value: object) -> str:
     return value
 
 
+def _validate_validation_environment_binding(
+    *,
+    environment: MassiveAdaptiveProfitabilityEnvV1,
+    environment_authority: MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None,
+    fold_index: int,
+) -> MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None:
+    if environment_authority is None:
+        return None
+    if type(environment_authority) is not _validation_environment_authority_type():
+        raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+            "FC06 validation environment authority type differs"
+        )
+    environment_authority.validate()
+    environment_authority.validate_environment(environment)
+    if (
+        environment_authority.fold_index != fold_index
+        or environment_authority.transaction_cost_basis_points != 20.0
+        or not environment_authority.source_data_qualified
+    ):
+        raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+            "FC06 validation environment authority differs"
+        )
+    return environment_authority
+
+
 def _evaluation_payload(
     evaluation: MassiveAdaptiveRLFixedControlEvaluationV1,
+    *,
+    environment: MassiveAdaptiveProfitabilityEnvV1,
+    validation_environment_authority: (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
+    ),
 ) -> dict[str, object]:
     evaluation.validate()
-    return asdict(evaluation)
+    environment_authority = _validate_validation_environment_binding(
+        environment=environment,
+        environment_authority=validation_environment_authority,
+        fold_index=evaluation.fold_index,
+    )
+    return {
+        "evaluation": asdict(evaluation),
+        "validation_environment_authority_receipt_sha256": (
+            None
+            if environment_authority is None
+            else environment_authority.semantic_receipt_sha256
+        ),
+        "environment_source_inventory_sha256": _digest(
+            "FC06 validation environment source inventory",
+            environment.source_inventory_sha256,
+        ),
+        "economic_compatibility_receipt_sha256": _digest(
+            "FC06 validation economic compatibility receipt",
+            environment.economic_compatibility_receipt_sha256,
+        ),
+    }
 
 
 def _parse_evaluation(value: object) -> MassiveAdaptiveRLFixedControlEvaluationV1:
@@ -134,16 +203,16 @@ def _parse_evaluation(value: object) -> MassiveAdaptiveRLFixedControlEvaluationV
     return result
 
 
-def _load_evaluation(
+def _load_payload(
     *, root: str | Path, loaded_source: LoadedMassiveSourceObject
-) -> MassiveAdaptiveRLFixedControlEvaluationV1:
+) -> dict[str, object]:
     raw = read_loaded_massive_source_bytes(root=root, loaded_source=loaded_source)
     value = json.loads(raw)
     if not isinstance(value, Mapping) or raw != canonical_json_file_bytes(value):
         raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
             "FC06 validation payload is not canonical JSON"
         )
-    return _parse_evaluation(value)
+    return dict(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +222,9 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     fixed_control_selection_authority_receipt_sha256: str
     selected_action_receipt_sha256: str
     validation_context_receipt_sha256: str
+    validation_environment_authority_receipt_sha256: str | None
+    environment_source_inventory_sha256: str
+    economic_compatibility_receipt_sha256: str
     evaluation_receipt_sha256: str
     policy_trace_receipt_sha256: str
     transition_inventory_sha256: str
@@ -161,6 +233,10 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     loaded_source: LoadedMassiveSourceObject
     runtime_evaluation: MassiveAdaptiveRLFixedControlEvaluationV1 | None
     runtime_evaluation_replayed: bool
+    runtime_validation_environment_authority: (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
+    )
+    runtime_validation_environment_replayed: bool
     development_validation_authorized: bool
     profitability_reporting_authorized: bool = False
     outer_evaluation_authorized: bool = False
@@ -187,6 +263,15 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
             "selected_action_receipt_sha256": self.selected_action_receipt_sha256,
             "validation_context_receipt_sha256": (
                 self.validation_context_receipt_sha256
+            ),
+            "validation_environment_authority_receipt_sha256": (
+                self.validation_environment_authority_receipt_sha256
+            ),
+            "environment_source_inventory_sha256": (
+                self.environment_source_inventory_sha256
+            ),
+            "economic_compatibility_receipt_sha256": (
+                self.economic_compatibility_receipt_sha256
             ),
             "evaluation_receipt_sha256": self.evaluation_receipt_sha256,
             "policy_trace_receipt_sha256": self.policy_trace_receipt_sha256,
@@ -216,9 +301,21 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     def validate(self) -> None:
         self.loaded_source.validate()
         runtime = self.runtime_evaluation is not None
+        environment_runtime = self.runtime_validation_environment_authority is not None
+        if self.runtime_validation_environment_authority is not None:
+            if type(self.runtime_validation_environment_authority) is not (
+                _validation_environment_authority_type()
+            ):
+                raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+                    "FC06 validation environment authority type differs"
+                )
+            self.runtime_validation_environment_authority.validate()
         expected_authorized = bool(runtime and self.source_data_qualified)
         if self.runtime_evaluation is not None:
-            if type(self.runtime_evaluation) is not MassiveAdaptiveRLFixedControlEvaluationV1:
+            if (
+                type(self.runtime_evaluation)
+                is not MassiveAdaptiveRLFixedControlEvaluationV1
+            ):
                 raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
                     "FC06 validation runtime type differs"
                 )
@@ -236,6 +333,13 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
             or self.loaded_source.receipt.entitlement_receipt_sha256
             != self.evaluation_receipt_sha256
             or self.runtime_evaluation_replayed != runtime
+            or self.runtime_validation_environment_replayed != environment_runtime
+            or (environment_runtime and not runtime)
+            or (
+                runtime
+                and self.validation_environment_authority_receipt_sha256 is not None
+                and not environment_runtime
+            )
             or self.development_validation_authorized != expected_authorized
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
@@ -263,8 +367,7 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
                 != self.selected_action_receipt_sha256
                 or evaluation.validation_context_receipt_sha256
                 != self.validation_context_receipt_sha256
-                or evaluation.semantic_receipt_sha256
-                != self.evaluation_receipt_sha256
+                or evaluation.semantic_receipt_sha256 != self.evaluation_receipt_sha256
                 or evaluation.policy_trace.semantic_receipt_sha256
                 != self.policy_trace_receipt_sha256
                 or evaluation.transition_inventory_sha256
@@ -274,11 +377,31 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
                 raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
                     "FC06 validation runtime differs from its authority"
                 )
+        if environment_runtime:
+            assert self.runtime_validation_environment_authority is not None
+            environment_authority = self.runtime_validation_environment_authority
+            if (
+                environment_authority.fold_index != self.fold_index
+                or environment_authority.transaction_cost_basis_points != 20.0
+                or environment_authority.semantic_receipt_sha256
+                != self.validation_environment_authority_receipt_sha256
+                or environment_authority.validation_context_receipt_sha256
+                != self.validation_context_receipt_sha256
+                or environment_authority.environment_source_inventory_sha256
+                != self.environment_source_inventory_sha256
+                or environment_authority.economic_compatibility_receipt_sha256
+                != self.economic_compatibility_receipt_sha256
+            ):
+                raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
+                    "FC06 validation runtime environment differs"
+                )
         for value in (
             self.fixed_control_fit_authority_receipt_sha256,
             self.fixed_control_selection_authority_receipt_sha256,
             self.selected_action_receipt_sha256,
             self.validation_context_receipt_sha256,
+            self.environment_source_inventory_sha256,
+            self.economic_compatibility_receipt_sha256,
             self.evaluation_receipt_sha256,
             self.policy_trace_receipt_sha256,
             self.transition_inventory_sha256,
@@ -288,12 +411,20 @@ class MassiveAdaptiveRLFixedControlValidationAuthorityV1:
             self.semantic_receipt_sha256,
         ):
             _digest("FC06 validation authority", value)
+        if self.validation_environment_authority_receipt_sha256 is not None:
+            _digest(
+                "FC06 validation environment authority",
+                self.validation_environment_authority_receipt_sha256,
+            )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
 def _authority_body(
     *,
     evaluation: MassiveAdaptiveRLFixedControlEvaluationV1,
+    validation_environment_authority_receipt_sha256: str | None,
+    environment_source_inventory_sha256: str,
+    economic_compatibility_receipt_sha256: str,
 ) -> dict[str, object]:
     return {
         "schema": MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_SCHEMA,
@@ -304,11 +435,16 @@ def _authority_body(
         "fixed_control_selection_authority_receipt_sha256": (
             evaluation.fixed_control_selection_authority_receipt_sha256
         ),
-        "selected_action_receipt_sha256": (
-            evaluation.selected_action_receipt_sha256
-        ),
+        "selected_action_receipt_sha256": (evaluation.selected_action_receipt_sha256),
         "validation_context_receipt_sha256": (
             evaluation.validation_context_receipt_sha256
+        ),
+        "validation_environment_authority_receipt_sha256": (
+            validation_environment_authority_receipt_sha256
+        ),
+        "environment_source_inventory_sha256": environment_source_inventory_sha256,
+        "economic_compatibility_receipt_sha256": (
+            economic_compatibility_receipt_sha256
         ),
         "evaluation_receipt_sha256": evaluation.semantic_receipt_sha256,
         "policy_trace_receipt_sha256": (
@@ -332,14 +468,30 @@ def _authority_body(
 def parse_massive_adaptive_rl_fixed_control_validation_authority_v1(
     *, root: str | Path, loaded_source: LoadedMassiveSourceObject
 ) -> MassiveAdaptiveRLFixedControlValidationAuthorityV1:
-    evaluation = _load_evaluation(root=root, loaded_source=loaded_source)
-    body = _authority_body(evaluation=evaluation)
+    payload = _load_payload(root=root, loaded_source=loaded_source)
+    evaluation = _parse_evaluation(payload["evaluation"])
+    body = _authority_body(
+        evaluation=evaluation,
+        validation_environment_authority_receipt_sha256=(
+            None
+            if payload["validation_environment_authority_receipt_sha256"] is None
+            else str(payload["validation_environment_authority_receipt_sha256"])
+        ),
+        environment_source_inventory_sha256=str(
+            payload["environment_source_inventory_sha256"]
+        ),
+        economic_compatibility_receipt_sha256=str(
+            payload["economic_compatibility_receipt_sha256"]
+        ),
+    )
     result = MassiveAdaptiveRLFixedControlValidationAuthorityV1(
         **body,  # type: ignore[arg-type]
         semantic_receipt_sha256=semantic_sha256(body),
         loaded_source=loaded_source,
         runtime_evaluation=None,
         runtime_evaluation_replayed=False,
+        runtime_validation_environment_authority=None,
+        runtime_validation_environment_replayed=False,
         development_validation_authorized=False,
     )
     result.validate()
@@ -354,12 +506,21 @@ def authorize_massive_adaptive_rl_fixed_control_validation_authority_v1(
     selection_authority: MassiveAdaptiveRLFixedControlSelectionAuthorityV1,
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environment: MassiveAdaptiveProfitabilityEnvV1,
+    validation_environment_authority: (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
+    ) = None,
 ) -> MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     parsed = parse_massive_adaptive_rl_fixed_control_validation_authority_v1(
         root=root,
         loaded_source=authority.loaded_source,
     )
-    committed = _load_evaluation(root=root, loaded_source=authority.loaded_source)
+    committed_payload = _load_payload(root=root, loaded_source=authority.loaded_source)
+    committed = _parse_evaluation(committed_payload["evaluation"])
+    environment_authority = _validate_validation_environment_binding(
+        environment=environment,
+        environment_authority=validation_environment_authority,
+        fold_index=parsed.fold_index,
+    )
     replayed = evaluate_massive_adaptive_rl_fixed_control_v1(
         registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
         fit_authority=fit_authority,
@@ -367,7 +528,15 @@ def authorize_massive_adaptive_rl_fixed_control_validation_authority_v1(
         chronology_authority=chronology_authority,
         environment=environment,
     )
-    if committed != replayed:
+    if committed != replayed or canonical_json_file_bytes(
+        committed_payload
+    ) != canonical_json_file_bytes(
+        _evaluation_payload(
+            replayed,
+            environment=environment,
+            validation_environment_authority=environment_authority,
+        )
+    ):
         raise MassiveAdaptiveRLFixedControlValidationAuthorityV1Error(
             "FC06 validation evaluation does not replay"
         )
@@ -375,6 +544,8 @@ def authorize_massive_adaptive_rl_fixed_control_validation_authority_v1(
         parsed,
         runtime_evaluation=replayed,
         runtime_evaluation_replayed=True,
+        runtime_validation_environment_authority=environment_authority,
+        runtime_validation_environment_replayed=environment_authority is not None,
         development_validation_authorized=replayed.source_data_qualified,
     )
     result.validate()
@@ -390,8 +561,16 @@ def materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     environment: MassiveAdaptiveProfitabilityEnvV1,
     committed_at_ms: int,
+    validation_environment_authority: (
+        MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
+    ) = None,
 ) -> MassiveAdaptiveRLFixedControlValidationAuthorityV1:
     artifact = _artifact_id(artifact_id)
+    environment_authority = _validate_validation_environment_binding(
+        environment=environment,
+        environment_authority=validation_environment_authority,
+        fold_index=chronology_authority.fold_index,
+    )
     evaluation = evaluate_massive_adaptive_rl_fixed_control_v1(
         registry=build_massive_adaptive_rl_fixed_control_registry_v1(),
         fit_authority=fit_authority,
@@ -400,16 +579,21 @@ def materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
         environment=environment,
     )
     relative = (
-        "massive-adaptive/rl-fixed-control-validation-authority-v1/"
-        f"{artifact}.json"
+        f"massive-adaptive/rl-fixed-control-validation-authority-v1/{artifact}.json"
     )
     publish_massive_source_object(
-        stream=BytesIO(canonical_json_file_bytes(_evaluation_payload(evaluation))),
+        stream=BytesIO(
+            canonical_json_file_bytes(
+                _evaluation_payload(
+                    evaluation,
+                    environment=environment,
+                    validation_environment_authority=environment_authority,
+                )
+            )
+        ),
         root=root,
         relative_payload_path=relative,
-        dataset_id=(
-            MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_DATASET
-        ),
+        dataset_id=(MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_VALIDATION_AUTHORITY_V1_DATASET),
         source_object_key=relative,
         requested_at_ms=committed_at_ms,
         downloaded_at_ms=committed_at_ms,
@@ -435,6 +619,7 @@ def materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
         selection_authority=selection_authority,
         chronology_authority=chronology_authority,
         environment=environment,
+        validation_environment_authority=environment_authority,
     )
 
 

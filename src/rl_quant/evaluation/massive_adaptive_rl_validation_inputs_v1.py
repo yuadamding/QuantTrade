@@ -131,35 +131,31 @@ MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_AUTHORITY_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET = (
     "massive-adaptive-rl-validation-environment-registry-v1"
 )
-MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SHA256 = (
-    file_sha256(Path(__file__))
+MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SHA256 = file_sha256(
+    Path(__file__)
 )
 MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SCHEMA_SHA256 = (
     semantic_sha256(
         {
-            "schema": (
-                MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SCHEMA
-            ),
+            "schema": (MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SCHEMA),
             "payload": "canonical-json-validation-environment-registry",
             "generic_reload": "nonauthorizing",
         }
     )
 )
-MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SPEC_SHA256 = (
-    semantic_sha256(
-        {
-            "source": "persisted-validation-sources-authority-v1",
-            "economics": "runtime-source-graph-owned",
-            "costs_basis_points": (10.0, 20.0, 40.0),
-            "shared_context": "cost-excluded-identical",
-            "mutable_environment": "fresh-construction-only",
-            "caller_environment_or_cost": False,
-            "caller_artifact_id": False,
-            "outcome_access": False,
-            "profitability_reporting": False,
-            "outer_access": False,
-        }
-    )
+MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SPEC_SHA256 = semantic_sha256(
+    {
+        "source": "persisted-validation-sources-authority-v1",
+        "economics": "runtime-source-graph-owned",
+        "costs_basis_points": (10.0, 20.0, 40.0),
+        "shared_context": "cost-excluded-identical",
+        "mutable_environment": "fresh-construction-only",
+        "caller_environment_or_cost": False,
+        "caller_artifact_id": False,
+        "outcome_access": False,
+        "profitability_reporting": False,
+        "outer_access": False,
+    }
 )
 
 
@@ -211,9 +207,7 @@ def validation_generation_key_v1(
 ) -> str:
     manifest.validate()
     if fold_index not in manifest.base_manifest.base_manifest.fold_indices:
-        raise MassiveAdaptiveRLValidationInputsV1Error(
-            "validation fold index differs"
-        )
+        raise MassiveAdaptiveRLValidationInputsV1Error("validation fold index differs")
     return f"v4-{manifest.semantic_receipt_sha256}-fold{fold_index}"
 
 
@@ -235,20 +229,14 @@ def validation_sources_authority_relative_path_v1(
     *, manifest: MassiveAdaptiveRLExperimentManifestV4, fold_index: int
 ) -> str:
     key = validation_generation_key_v1(manifest=manifest, fold_index=fold_index)
-    return (
-        "massive-adaptive/rl-validation-inputs-v1/"
-        f"{key}/validation-sources.json"
-    )
+    return f"massive-adaptive/rl-validation-inputs-v1/{key}/validation-sources.json"
 
 
 def validation_environment_registry_relative_path_v1(
     *, manifest: MassiveAdaptiveRLExperimentManifestV4, fold_index: int
 ) -> str:
     key = validation_generation_key_v1(manifest=manifest, fold_index=fold_index)
-    return (
-        "massive-adaptive/rl-validation-inputs-v1/"
-        f"{key}/environment-registry.json"
-    )
+    return f"massive-adaptive/rl-validation-inputs-v1/{key}/environment-registry.json"
 
 
 def validation_primary_trace_artifact_id_v1(
@@ -319,10 +307,7 @@ def validation_fixed_control_relative_path_v1(
         manifest=manifest,
         fold_index=fold_index,
     )
-    return (
-        "massive-adaptive/rl-fixed-control-validation-authority-v1/"
-        f"{artifact}.json"
-    )
+    return f"massive-adaptive/rl-fixed-control-validation-authority-v1/{artifact}.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,7 +398,10 @@ def _ordered_source_rows(
         sorted(context_origins, key=lambda row: row.decision_session_date)
     )
     if (
-        any(type(row) is not MassiveProfitabilityOriginFeaturesV3 for row in feature_rows)
+        any(
+            type(row) is not MassiveProfitabilityOriginFeaturesV3
+            for row in feature_rows
+        )
         or any(type(row) is not MassiveAdaptiveOriginAuthorityV1 for row in action_rows)
         or any(
             type(row) is not MassiveAdaptiveContextOriginAuthorityV1
@@ -517,9 +505,7 @@ def _validation_sources_facts(
     runtime_sources.validate()
     fold_index = runtime.inference_plan.fold_index
     if fold_index not in range(4):
-        raise MassiveAdaptiveRLValidationInputsV1Error(
-            "validation source fold differs"
-        )
+        raise MassiveAdaptiveRLValidationInputsV1Error("validation source fold differs")
     fold_fit = four_fold.fold_fit(fold_index)
     lineage = runtime_sources.fold(fold_index).supervised_lineage(fold_index)
     lineage.validate()
@@ -618,12 +604,9 @@ def _validation_sources_facts(
         or tuple(row.decision_session_date for row in runtime.context_origins)
         != expected_dates
         or any(
-            root.feature_semantic_receipt_sha256
-            != feature.semantic_receipt_sha256
-            or root.action_origin_receipt_sha256
-            != action.semantic_receipt_sha256
-            or root.context_origin_receipt_sha256
-            != context.semantic_receipt_sha256
+            root.feature_semantic_receipt_sha256 != feature.semantic_receipt_sha256
+            or root.action_origin_receipt_sha256 != action.semantic_receipt_sha256
+            or root.context_origin_receipt_sha256 != context.semantic_receipt_sha256
             for root, feature, action, context in zip(
                 runtime.decision_roots,
                 runtime.features,
@@ -641,8 +624,7 @@ def _validation_sources_facts(
         and lineage.source_data_qualified
         and all(row.source_inputs_data_qualified for row in runtime.features)
         and all(
-            row.action_identity_source_data_qualified
-            for row in runtime.action_origins
+            row.action_identity_source_data_qualified for row in runtime.action_origins
         )
         and all(row.source_data_qualified for row in runtime.context_origins)
         and runtime.decision_tensor.committed_source_data_qualified
@@ -861,9 +843,7 @@ class MassiveAdaptiveRLValidationSourcesAuthorityV1:
             )
             or not isinstance(self.source_data_qualified, bool)
             or not isinstance(self.runtime_inputs_replayed, bool)
-            or not isinstance(
-                self.development_validation_inputs_authorized, bool
-            )
+            or not isinstance(self.development_validation_inputs_authorized, bool)
             or not isinstance(self.profitability_reporting_authorized, bool)
             or not isinstance(self.outer_evaluation_authorized, bool)
             or not isinstance(self.lockbox_access_authorized, bool)
@@ -872,8 +852,7 @@ class MassiveAdaptiveRLValidationSourcesAuthorityV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_VALIDATION_SOURCES_AUTHORITY_V1_SPEC_SHA256
             or self.implementation_source_sha256
@@ -1037,8 +1016,7 @@ def _validation_sources_runtime(
 ) -> _ValidationSourcesRuntimeV1:
     if (
         type(manifest) is not MassiveAdaptiveRLExperimentManifestV4
-        or type(four_fold_fit_authority)
-        is not MassiveAdaptiveRLFourFoldFitAuthorityV1
+        or type(four_fold_fit_authority) is not MassiveAdaptiveRLFourFoldFitAuthorityV1
         or type(runtime_sources) is not MassiveAdaptiveRLRuntimeSourcesV1
     ):
         raise MassiveAdaptiveRLValidationInputsV1Error(
@@ -1060,15 +1038,13 @@ def _validation_sources_runtime(
             "validation source manifest or training lineage differs"
         )
     lineage = runtime_sources.fold(fold_index).supervised_lineage(fold_index)
-    feature_rows, action_rows, context_rows, decision_roots = (
-        _validation_source_roots(
-            runtime_sources=runtime_sources,
-            lineage=lineage,
-            fold_index=fold_index,
-            features=features,
-            action_origins=action_origins,
-            context_origins=context_origins,
-        )
+    feature_rows, action_rows, context_rows, decision_roots = _validation_source_roots(
+        runtime_sources=runtime_sources,
+        lineage=lineage,
+        fold_index=fold_index,
+        features=features,
+        action_origins=action_origins,
+        context_origins=context_origins,
     )
     tensor = _load_canonical_decision_tensor(
         root=root,
@@ -1400,8 +1376,7 @@ class MassiveAdaptiveRLValidationEnvironmentAuthorityV1:
             or not isinstance(self.maximum_fill_participation, float)
             or not 0.0 < self.maximum_fill_participation <= 1.0
             or not isinstance(self.source_data_qualified, bool)
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLValidationInputsV1Error(
                 "validation environment authority differs"
@@ -1456,8 +1431,7 @@ class MassiveAdaptiveRLValidationEnvironmentAuthorityV1:
             or environment.compiler_config.receipt_sha256
             != self.compiler_config_receipt_sha256
             or environment.initial_capital != self.initial_capital
-            or environment.maximum_fill_participation
-            != self.maximum_fill_participation
+            or environment.maximum_fill_participation != self.maximum_fill_participation
             or environment.validation_context_receipt_sha256
             != self.validation_context_receipt_sha256
             or environment.source_inventory_sha256
@@ -1490,9 +1464,9 @@ def _validation_environment(
     economics = manifest.base_manifest.base_manifest
     return MassiveAdaptiveProfitabilityEnvV1(
         forecast_archive=runtime.forecast_archive,
-        calibration=runtime_sources.fold(
-            validation_sources.fold_index
-        ).supervised_lineage(validation_sources.fold_index).calibration,
+        calibration=runtime_sources.fold(validation_sources.fold_index)
+        .supervised_lineage(validation_sources.fold_index)
+        .calibration,
         inference_plan=plan,
         decision_roots=tuple(roots[date] for date in plan_dates),
         context_origins=tuple(contexts[date] for date in plan_dates),
@@ -1569,20 +1543,18 @@ def _validation_environment_authority(
         "runtime_sources_receipt_sha256": runtime_sources.semantic_receipt_sha256,
         "runtime_graph_witness_receipt_sha256": runtime_receipt,
         "fold_index": validation_sources.fold_index,
-        "transaction_cost_basis_points": (
-            environment.transaction_cost_basis_points
-        ),
+        "transaction_cost_basis_points": (environment.transaction_cost_basis_points),
         "forecast_archive_receipt_sha256": (
             environment.forecast_archive.semantic_receipt_sha256
         ),
         "inference_plan_receipt_sha256": (
             environment.inference_plan.semantic_receipt_sha256
         ),
-        "calibration_receipt_sha256": (
-            environment.calibration.semantic_receipt_sha256
-        ),
+        "calibration_receipt_sha256": (environment.calibration.semantic_receipt_sha256),
         "decision_root_inventory_sha256": semantic_sha256(
-            tuple(environment.roots[date].semantic_receipt_sha256 for date in plan_dates)
+            tuple(
+                environment.roots[date].semantic_receipt_sha256 for date in plan_dates
+            )
         ),
         "context_origin_inventory_sha256": semantic_sha256(
             tuple(
@@ -1735,7 +1707,11 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
             self._loaded_source.validate()
         for row in self.environment_authorities:
             row.validate()
-        runtime_values = (self._manifest, self._validation_sources, self._runtime_sources)
+        runtime_values = (
+            self._manifest,
+            self._validation_sources,
+            self._runtime_sources,
+        )
         runtime_present = all(value is not None for value in runtime_values)
         if any(value is not None for value in runtime_values) != runtime_present:
             raise MassiveAdaptiveRLValidationInputsV1Error(
@@ -1760,8 +1736,7 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
             for row in self.environment_authorities
         }
         if (
-            self.schema
-            != MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SCHEMA
+            self.schema != MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SCHEMA
             or not self.experiment_id
             or isinstance(self.fold_index, bool)
             or self.fold_index not in range(4)
@@ -1787,8 +1762,7 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
             or contexts != {self.validation_context_receipt_sha256}
             or any(
                 row.experiment_id != self.experiment_id
-                or row.manifest_v4_receipt_sha256
-                != self.manifest_v4_receipt_sha256
+                or row.manifest_v4_receipt_sha256 != self.manifest_v4_receipt_sha256
                 or row.training_manifest_v3_receipt_sha256
                 != self.training_manifest_v3_receipt_sha256
                 or row.validation_sources_authority_receipt_sha256
@@ -1799,16 +1773,14 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
                 != self.runtime_graph_witness_receipt_sha256
                 or row.fold_index != self.fold_index
                 or row.initial_capital != self.initial_capital
-                or row.maximum_fill_participation
-                != self.maximum_fill_participation
+                or row.maximum_fill_participation != self.maximum_fill_participation
                 for row in self.environment_authorities
             )
             or self.source_data_qualified
             != bool(
                 self.environment_authorities
                 and all(
-                    row.source_data_qualified
-                    for row in self.environment_authorities
+                    row.source_data_qualified for row in self.environment_authorities
                 )
             )
             or not isinstance(self.initial_capital, float)
@@ -1818,9 +1790,7 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
             or not 0.0 < self.maximum_fill_participation <= 1.0
             or not isinstance(self.source_data_qualified, bool)
             or not isinstance(self.runtime_environments_replayed, bool)
-            or not isinstance(
-                self.development_validation_environments_authorized, bool
-            )
+            or not isinstance(self.development_validation_environments_authorized, bool)
             or not isinstance(self.profitability_reporting_authorized, bool)
             or not isinstance(self.outer_evaluation_authorized, bool)
             or not isinstance(self.lockbox_access_authorized, bool)
@@ -1830,14 +1800,12 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
             or self.profitability_reporting_authorized
             or self.outer_evaluation_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLValidationInputsV1Error(
                 "validation environment registry differs"
@@ -1879,15 +1847,38 @@ class MassiveAdaptiveRLValidationEnvironmentRegistryV1:
                 manifest=self._manifest,
                 validation_sources=self._validation_sources,
                 runtime_sources=self._runtime_sources,
-                transaction_cost_basis_points=(
-                    authority.transaction_cost_basis_points
-                ),
+                transaction_cost_basis_points=(authority.transaction_cost_basis_points),
             )
             authority.validate_environment(environment)
             result[authority.transaction_cost_basis_points] = environment
         if tuple(result) != self.cost_basis_points:
             raise MassiveAdaptiveRLValidationInputsV1Error(
                 "validation environment registry coverage differs"
+            )
+        return result
+
+    def environment_authority(
+        self, transaction_cost_basis_points: float
+    ) -> MassiveAdaptiveRLValidationEnvironmentAuthorityV1:
+        """Return the canonical authority for one registered cost rung."""
+
+        self.validate()
+        if (
+            type(transaction_cost_basis_points) is not float
+            or transaction_cost_basis_points not in self.cost_basis_points
+        ):
+            raise MassiveAdaptiveRLValidationInputsV1Error(
+                "validation environment cost rung is absent"
+            )
+        index = self.cost_basis_points.index(transaction_cost_basis_points)
+        result = self.environment_authorities[index]
+        if (
+            result.transaction_cost_basis_points != transaction_cost_basis_points
+            or result.semantic_receipt_sha256
+            != self.environment_authority_receipts[index]
+        ):
+            raise MassiveAdaptiveRLValidationInputsV1Error(
+                "validation environment authority differs"
             )
         return result
 
@@ -1900,8 +1891,7 @@ def _build_validation_environment_registry(
 ) -> MassiveAdaptiveRLValidationEnvironmentRegistryV1:
     if (
         type(manifest) is not MassiveAdaptiveRLExperimentManifestV4
-        or type(validation_sources)
-        is not MassiveAdaptiveRLValidationSourcesAuthorityV1
+        or type(validation_sources) is not MassiveAdaptiveRLValidationSourcesAuthorityV1
         or type(runtime_sources) is not MassiveAdaptiveRLRuntimeSourcesV1
     ):
         raise MassiveAdaptiveRLValidationInputsV1Error(
@@ -1923,8 +1913,7 @@ def _build_validation_environment_registry(
         != manifest.semantic_receipt_sha256
         or validation_sources.runtime_sources_receipt_sha256
         != runtime_sources.semantic_receipt_sha256
-        or validation_sources.runtime_graph_witness_receipt_sha256
-        != runtime_receipt
+        or validation_sources.runtime_graph_witness_receipt_sha256 != runtime_receipt
     ):
         raise MassiveAdaptiveRLValidationInputsV1Error(
             "validation environment registry lineage differs"
@@ -1943,9 +1932,7 @@ def _build_validation_environment_registry(
         )
         for cost in economics.cost_ladder_basis_points
     )
-    context_receipts = {
-        row.validation_context_receipt_sha256 for row in authorities
-    }
+    context_receipts = {row.validation_context_receipt_sha256 for row in authorities}
     if len(context_receipts) != 1:
         raise MassiveAdaptiveRLValidationInputsV1Error(
             "validation cost ladder does not share one context"
@@ -1972,12 +1959,8 @@ def _build_validation_environment_registry(
         ),
         "validation_context_receipt_sha256": next(iter(context_receipts)),
         "initial_capital": float(economics.primary_capital),
-        "maximum_fill_participation": float(
-            economics.maximum_fill_participation
-        ),
-        "source_data_qualified": all(
-            row.source_data_qualified for row in authorities
-        ),
+        "maximum_fill_participation": float(economics.maximum_fill_participation),
+        "source_data_qualified": all(row.source_data_qualified for row in authorities),
     }
     provisional = MassiveAdaptiveRLValidationEnvironmentRegistryV1(
         **body,  # type: ignore[arg-type]
@@ -2138,9 +2121,7 @@ def authorize_massive_adaptive_rl_validation_environment_registry_v1(
     result = replace(
         registry,
         runtime_environments_replayed=True,
-        development_validation_environments_authorized=(
-            registry.source_data_qualified
-        ),
+        development_validation_environments_authorized=(registry.source_data_qualified),
         _manifest=manifest,
         _validation_sources=validation_sources,
         _runtime_sources=runtime_sources,
@@ -2181,9 +2162,7 @@ def materialize_massive_adaptive_rl_validation_environment_registry_v1(
         stream=BytesIO(canonical_json_file_bytes(built.semantic_unsigned())),
         root=root,
         relative_payload_path=relative,
-        dataset_id=(
-            MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET
-        ),
+        dataset_id=(MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET),
         source_object_key=relative,
         requested_at_ms=committed_at_ms,
         downloaded_at_ms=committed_at_ms,

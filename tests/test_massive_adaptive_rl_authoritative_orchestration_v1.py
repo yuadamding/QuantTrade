@@ -89,6 +89,10 @@ from rl_quant.evaluation.massive_adaptive_rl_policy_trace_authority_v1 import (
     materialize_massive_adaptive_rl_policy_trace_authority_v1,
     parse_massive_adaptive_rl_policy_trace_authority_v1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
+    MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
+    MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+)
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.rl.massive_adaptive_ppo_policy_v1 import (
     MassiveAdaptivePPOActorCriticV1,
@@ -144,6 +148,7 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 )
 from test_massive_adaptive_profitability_v1_vertical_slice import (
     _adaptive_env_fixture,
+    _empty_event_archive,
 )
 from test_massive_adaptive_rl_outer_evidence_v1 import _fold
 
@@ -396,6 +401,140 @@ def _environment_at_cost(fixture, calibration_values, cost_basis_points: float):
         initial_capital=10_000_000.0,
         transaction_cost_basis_points=cost_basis_points,
     )
+
+
+def _canonical_validation_environment(
+    fixture,
+    calibration_values,
+    *,
+    event_archive,
+    cost_basis_points: float,
+):
+    return MassiveAdaptiveProfitabilityEnvV1(
+        forecast_archive=fixture.forecast_archive,
+        calibration=calibration_values.calibration,
+        inference_plan=fixture.inference_plan,
+        decision_roots=fixture.roots,
+        context_origins=fixture.contexts,
+        fill_source=fixture.fill_source,
+        daily_input_authority=fixture.daily,
+        identity_authority=fixture.identity,
+        economic_event_archive=event_archive,
+        initial_capital=10_000_000.0,
+        transaction_cost_basis_points=cost_basis_points,
+    )
+
+
+def _canonical_validation_environment_authority(
+    environment: MassiveAdaptiveProfitabilityEnvV1,
+) -> MassiveAdaptiveRLValidationEnvironmentAuthorityV1:
+    plan_dates = tuple(
+        row.decision_session_date for row in environment.inference_plan.rows
+    )
+    assert environment.economic_event_archive is not None
+    values = {
+        "experiment_id": "canonical-environment-binding",
+        "manifest_v4_receipt_sha256": _digest("manifest-v4"),
+        "training_manifest_v3_receipt_sha256": _digest("manifest-v3"),
+        "validation_sources_authority_receipt_sha256": _digest("validation-sources"),
+        "runtime_sources_receipt_sha256": _digest("runtime-sources"),
+        "runtime_graph_witness_receipt_sha256": _digest("runtime-witness"),
+        "fold_index": 0,
+        "transaction_cost_basis_points": (environment.transaction_cost_basis_points),
+        "forecast_archive_receipt_sha256": (
+            environment.forecast_archive.semantic_receipt_sha256
+        ),
+        "inference_plan_receipt_sha256": (
+            environment.inference_plan.semantic_receipt_sha256
+        ),
+        "calibration_receipt_sha256": (environment.calibration.semantic_receipt_sha256),
+        "decision_root_inventory_sha256": semantic_sha256(
+            tuple(
+                environment.roots[date].semantic_receipt_sha256 for date in plan_dates
+            )
+        ),
+        "context_origin_inventory_sha256": semantic_sha256(
+            tuple(
+                environment.contexts[date].semantic_receipt_sha256
+                for date in plan_dates
+            )
+        ),
+        "daily_input_authority_receipt_sha256": (
+            environment.daily_input_authority.semantic_receipt_sha256
+        ),
+        "fill_source_receipt_sha256": (environment.fill_source.semantic_receipt_sha256),
+        "identity_authority_receipt_sha256": (
+            environment.identity_authority.receipt_sha256
+        ),
+        "economic_event_archive_receipt_sha256": (
+            environment.economic_event_archive.receipt_sha256
+        ),
+        "compiler_config_receipt_sha256": (environment.compiler_config.receipt_sha256),
+        "initial_capital": environment.initial_capital,
+        "maximum_fill_participation": environment.maximum_fill_participation,
+        "validation_context_receipt_sha256": (
+            environment.validation_context_receipt_sha256
+        ),
+        "environment_source_inventory_sha256": (environment.source_inventory_sha256),
+        "economic_compatibility_receipt_sha256": (
+            environment.economic_compatibility_receipt_sha256
+        ),
+        "source_data_qualified": True,
+    }
+    provisional = MassiveAdaptiveRLValidationEnvironmentAuthorityV1(
+        **values,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    result.validate_environment(environment)
+    return result
+
+
+def _canonical_validation_environment_registry(
+    authorities: tuple[MassiveAdaptiveRLValidationEnvironmentAuthorityV1, ...],
+) -> MassiveAdaptiveRLValidationEnvironmentRegistryV1:
+    first = authorities[0]
+    values = {
+        "experiment_id": first.experiment_id,
+        "manifest_v4_receipt_sha256": first.manifest_v4_receipt_sha256,
+        "training_manifest_v3_receipt_sha256": (
+            first.training_manifest_v3_receipt_sha256
+        ),
+        "validation_sources_authority_receipt_sha256": (
+            first.validation_sources_authority_receipt_sha256
+        ),
+        "runtime_sources_receipt_sha256": first.runtime_sources_receipt_sha256,
+        "runtime_graph_witness_receipt_sha256": (
+            first.runtime_graph_witness_receipt_sha256
+        ),
+        "fold_index": first.fold_index,
+        "cost_basis_points": (10.0, 20.0, 40.0),
+        "environment_authorities": authorities,
+        "environment_authority_receipts": tuple(
+            row.semantic_receipt_sha256 for row in authorities
+        ),
+        "environment_authority_inventory_sha256": semantic_sha256(
+            tuple(row.semantic_receipt_sha256 for row in authorities)
+        ),
+        "validation_context_receipt_sha256": (first.validation_context_receipt_sha256),
+        "initial_capital": first.initial_capital,
+        "maximum_fill_participation": first.maximum_fill_participation,
+        "source_data_qualified": True,
+    }
+    provisional = MassiveAdaptiveRLValidationEnvironmentRegistryV1(
+        **values,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = replace(
+        provisional,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
 
 
 class _ReceiptProxy:
@@ -764,8 +903,9 @@ def test_prequential_ppo_uses_every_block_and_resumes_across_boundary(
         assert torch.equal(tensor, restarted.ppo_checkpoint.model_state[name])
 
 
-def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch(
-) -> None:
+def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch() -> (
+    None
+):
     _, _, environment = _adaptive_env_fixture()
     training_authority = _training_authority(environment)
     chronology = _chronology(environment, training_authority)
@@ -786,8 +926,7 @@ def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch(
     checkpoint = runner.checkpoint()
     assert checkpoint.transition_receipts
     assert (
-        checkpoint.transition_receipts
-        == checkpoint.ppo_checkpoint.transition_receipts
+        checkpoint.transition_receipts == checkpoint.ppo_checkpoint.transition_receipts
     )
     assert (
         checkpoint.transition_source_data_qualified
@@ -802,18 +941,14 @@ def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch(
         provisional = replace(value, semantic_receipt_sha256="0" * 64)
         return replace(
             provisional,
-            semantic_receipt_sha256=semantic_sha256(
-                provisional.semantic_unsigned()
-            ),
+            semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
         )
 
     def reseal_embedded(value):
         provisional = replace(value, semantic_receipt_sha256="0" * 64)
         result = replace(
             provisional,
-            semantic_receipt_sha256=semantic_sha256(
-                provisional.semantic_unsigned()
-            ),
+            semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
         )
         result.validate()
         return result
@@ -826,9 +961,7 @@ def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch(
         replace(
             checkpoint,
             transition_receipts=changed_outer_transition,
-            transition_inventory_sha256=semantic_sha256(
-                changed_outer_transition
-            ),
+            transition_inventory_sha256=semantic_sha256(changed_outer_transition),
         )
     )
     changed_qualification = (
@@ -892,9 +1025,7 @@ def test_prequential_checkpoint_rejects_outer_and_embedded_provenance_mismatch(
     )
     promoted_run = replace(
         promoted_run,
-        semantic_receipt_sha256=semantic_sha256(
-            promoted_run.semantic_unsigned()
-        ),
+        semantic_receipt_sha256=semantic_sha256(promoted_run.semantic_unsigned()),
     )
     with pytest.raises(
         MassiveAdaptivePrequentialPPORunnerV1Error,
@@ -1165,6 +1296,123 @@ def test_replayed_candidate_and_fc06_authorities_share_one_validation_tape(
             primary_trace_authorities=(primary,),
             cost_ladder_authorities=(ladder,),
             fixed_control_validation_authority=mismatched_fixed,
+        )
+
+
+def test_validation_evidence_binds_static_canonical_environment_separately(
+    tmp_path,
+) -> None:
+    fixture, calibration_values, _ = _adaptive_env_fixture()
+    event_root = tmp_path / "events"
+    event_root.mkdir()
+    event_archive = _empty_event_archive(
+        event_root,
+        identity=fixture.identity,
+        observed_at_ms=1_000,
+    )
+    low, primary_environment, high = tuple(
+        _canonical_validation_environment(
+            fixture,
+            calibration_values,
+            event_archive=event_archive,
+            cost_basis_points=cost,
+        )
+        for cost in (10.0, 20.0, 40.0)
+    )
+    environment_authorities = tuple(
+        _canonical_validation_environment_authority(environment)
+        for environment in (low, primary_environment, high)
+    )
+    environment_registry = _canonical_validation_environment_registry(
+        environment_authorities
+    )
+    training_authority = _training_authority(primary_environment)
+    chronology = _chronology(primary_environment, training_authority)
+    checkpoint_authority = _checkpoint_authority(primary_environment)
+
+    primary = materialize_massive_adaptive_rl_policy_trace_authority_v1(
+        root=tmp_path,
+        artifact_id="canonical-environment-primary",
+        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environment=primary_environment,
+        validation_environment_authority=environment_authorities[1],
+        fold_index=0,
+        evaluation_role="inner_validation",
+        committed_at_ms=20,
+    )
+    ladder = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
+        root=tmp_path,
+        artifact_id="canonical-environment-ladder",
+        checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        primary_environment=primary_environment,
+        low_cost_environment=low,
+        high_cost_environment=high,
+        validation_environment_authorities=environment_authorities,
+        fold_index=0,
+        evaluation_role="inner_validation",
+        committed_at_ms=21,
+    )
+    fixed_fit, fixed_selection = _fixed_selection_fixture(
+        tmp_path,
+        primary_environment,
+        chronology,
+    )
+    fixed = materialize_massive_adaptive_rl_fixed_control_validation_authority_v1(
+        root=tmp_path,
+        artifact_id="canonical-environment-fc06",
+        fit_authority=fixed_fit,  # type: ignore[arg-type]
+        selection_authority=fixed_selection,
+        chronology_authority=chronology,  # type: ignore[arg-type]
+        environment=primary_environment,
+        validation_environment_authority=environment_authorities[1],
+        committed_at_ms=22,
+    )
+
+    assert primary.runtime_trace is not None
+    assert (
+        primary.runtime_trace.policy_trace.economic_source_inventory_sha256
+        != primary.environment_source_inventory_sha256
+    )
+    assert primary.runtime_validation_environment_replayed
+    assert (
+        primary.validation_environment_authority_receipt_sha256
+        == environment_authorities[1].semantic_receipt_sha256
+    )
+    assert ladder.runtime_validation_environments_replayed
+    assert ladder.validation_environment_authority_receipts == tuple(
+        row.semantic_receipt_sha256 for row in environment_authorities
+    )
+    assert fixed.runtime_validation_environment_replayed
+    assert (
+        fixed.environment_source_inventory_sha256
+        == environment_authorities[1].environment_source_inventory_sha256
+    )
+    assert (
+        len(
+            validate_massive_adaptive_rl_shared_validation_tape_v1(
+                primary_trace_authorities=(primary,),
+                cost_ladder_authorities=(ladder,),
+                fixed_control_validation_authority=fixed,
+                validation_environment_registry=environment_registry,
+            )
+        )
+        == 64
+    )
+
+    generic = parse_massive_adaptive_rl_policy_trace_authority_v1(
+        root=tmp_path,
+        loaded_source=primary.loaded_source,
+    )
+    with pytest.raises(ValueError, match="validation environment"):
+        authorize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            authority=generic,
+            checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            environment=primary_environment,
+            validation_environment_authority=environment_authorities[0],
         )
 
 

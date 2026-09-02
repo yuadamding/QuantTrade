@@ -65,16 +65,12 @@ def _generic_sources(manifest) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
         "supervised_training_window_receipt_sha256": _digest("window"),
         "supervised_checkpoint_choice_receipt_sha256": _digest("choice"),
         "supervised_checkpoint_receipt_sha256": _digest("checkpoint"),
-        "supervised_checkpoint_source_receipt_sha256": _digest(
-            "checkpoint-source"
-        ),
+        "supervised_checkpoint_source_receipt_sha256": _digest("checkpoint-source"),
         "supervised_model_state_receipt_sha256": _digest("model-state"),
         "supervised_model_spec_receipt_sha256": _digest("model-spec"),
         "calibration_receipt_sha256": _digest("calibration"),
         "validation_decision_tensor_receipt_sha256": _digest("tensor"),
-        "validation_decision_tensor_source_receipt_sha256": _digest(
-            "tensor-source"
-        ),
+        "validation_decision_tensor_source_receipt_sha256": _digest("tensor-source"),
         "validation_inference_plan_receipt_sha256": _digest("plan"),
         "validation_forecast_archive_receipt_sha256": _digest("forecast"),
         "validation_forecast_source_receipt_sha256": _digest("forecast-source"),
@@ -82,9 +78,7 @@ def _generic_sources(manifest) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
         "validation_tensor_session_dates": ("2023-12-29", "2024-01-02"),
         "validation_decision_session_dates": ("2024-01-02",),
         "validation_full_decision_root_inventory_sha256": _digest("full-roots"),
-        "validation_origin_decision_root_inventory_sha256": _digest(
-            "origin-roots"
-        ),
+        "validation_origin_decision_root_inventory_sha256": _digest("origin-roots"),
         "validation_context_origin_inventory_sha256": _digest("contexts"),
         "source_data_qualified": True,
     }
@@ -149,8 +143,7 @@ def _environment_authority(
 
 def _generic_registry(manifest, sources):
     authorities = tuple(
-        _environment_authority(manifest, sources, cost)
-        for cost in (10.0, 20.0, 40.0)
+        _environment_authority(manifest, sources, cost) for cost in (10.0, 20.0, 40.0)
     )
     values = {
         "experiment_id": manifest.experiment_id,
@@ -194,15 +187,9 @@ def test_validation_input_paths_are_manifest_and_fold_canonical() -> None:
         experiment_id="canonical-validation-inputs"
     )
     paths = (
-        validation_decision_tensor_relative_path_v1(
-            manifest=manifest, fold_index=2
-        ),
-        validation_forecast_archive_relative_path_v1(
-            manifest=manifest, fold_index=2
-        ),
-        validation_sources_authority_relative_path_v1(
-            manifest=manifest, fold_index=2
-        ),
+        validation_decision_tensor_relative_path_v1(manifest=manifest, fold_index=2),
+        validation_forecast_archive_relative_path_v1(manifest=manifest, fold_index=2),
+        validation_sources_authority_relative_path_v1(manifest=manifest, fold_index=2),
         validation_environment_registry_relative_path_v1(
             manifest=manifest, fold_index=2
         ),
@@ -283,9 +270,7 @@ def test_generic_validation_inputs_are_integrity_only(tmp_path) -> None:
         stream=BytesIO(canonical_json_file_bytes(registry.semantic_unsigned())),
         root=tmp_path,
         relative_payload_path=registry_relative,
-        dataset_id=(
-            MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET
-        ),
+        dataset_id=(MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_DATASET),
         source_object_key=registry_relative,
         requested_at_ms=3,
         downloaded_at_ms=3,
@@ -295,19 +280,23 @@ def test_generic_validation_inputs_are_integrity_only(tmp_path) -> None:
         entitlement_receipt_sha256=registry.semantic_receipt_sha256,
         committed_at_ms=3,
     )
-    generic_registry = (
-        parse_massive_adaptive_rl_validation_environment_registry_v1(
+    generic_registry = parse_massive_adaptive_rl_validation_environment_registry_v1(
+        root=tmp_path,
+        loaded_source=load_massive_source_bundle(
             root=tmp_path,
-            loaded_source=load_massive_source_bundle(
-                root=tmp_path,
-                relative_payload_path=registry_relative,
-                verified_at_ms=4,
-            ),
-        )
+            relative_payload_path=registry_relative,
+            verified_at_ms=4,
+        ),
     )
     assert generic_registry.source_transaction_verified
     assert not generic_registry.runtime_environments_replayed
     assert not generic_registry.development_stage_authorized
+    assert (
+        generic_registry.environment_authority(20.0).transaction_cost_basis_points
+        == 20.0
+    )
+    with pytest.raises(MassiveAdaptiveRLValidationInputsV1Error, match="cost rung"):
+        generic_registry.environment_authority(30.0)
     with pytest.raises(MassiveAdaptiveRLValidationInputsV1Error, match="runtime"):
         generic_registry.build_environments()
 
@@ -335,7 +324,10 @@ def test_validation_registry_rejects_a_second_economic_context() -> None:
             changed.semantic_receipt_sha256,
         ),
         environment_authority_inventory_sha256=semantic_sha256(
-            (*registry.environment_authority_receipts[:-1], changed.semantic_receipt_sha256)
+            (
+                *registry.environment_authority_receipts[:-1],
+                changed.semantic_receipt_sha256,
+            )
         ),
         semantic_receipt_sha256="0" * 64,
     )
