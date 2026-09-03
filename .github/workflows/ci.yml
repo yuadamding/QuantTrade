@@ -76,6 +76,7 @@ jobs:
           tests/test_massive_adaptive_rl_runtime_source_graph_authority_v1.py
           tests/test_massive_adaptive_rl_runtime_source_reconstruction_v1.py
           tests/test_massive_adaptive_rl_source_generation_v2.py
+          tests/test_massive_adaptive_rl_validation_generation_v2.py
           tests/test_massive_adaptive_rl_fit_environment_registry_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v2.py
@@ -101,6 +102,9 @@ jobs:
           src/rl_quant/evaluation/massive_adaptive_rl_cost_ladder_authority_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_validation_inputs_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_four_fold_validation_inputs_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_validation_inputs_v2.py
+          src/rl_quant/evaluation/massive_adaptive_rl_four_fold_validation_inputs_v2.py
+          src/rl_quant/evaluation/massive_adaptive_rl_validation_evidence_v2.py
           src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_authority_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_cost_ladder_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_rollout_v1.py
