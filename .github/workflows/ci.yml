@@ -67,6 +67,7 @@ jobs:
           tests/test_massive_adaptive_rl_policy_selection_v3.py
           tests/test_massive_adaptive_rl_fold_validation_executor_v1.py
           tests/test_massive_adaptive_rl_fold_validation_executor_v2.py
+          tests/test_massive_adaptive_rl_four_fold_validation_executor_v1.py
           tests/test_massive_adaptive_rl_validation_inputs_v1.py
           tests/test_massive_adaptive_rl_fold_validation_authority_v1.py
           tests/test_massive_adaptive_rl_outer_evidence_v1.py
@@ -83,6 +84,7 @@ jobs:
           tests/test_massive_adaptive_rl_fit_environment_registry_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v2.py
+          tests/test_massive_adaptive_rl_experiment_runner_v3.py
           tests/test_massive_adaptive_rl_manifest_v3.py
           tests/test_massive_adaptive_rl_manifest_v4.py
           tests/test_adaptive_alpha_supervised_v1.py
@@ -111,6 +113,7 @@ jobs:
           src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_executor_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_executor_v2.py
           src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_execution_authority_v1.py
+          src/rl_quant/evaluation/massive_adaptive_rl_four_fold_validation_executor_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_authority_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_cost_ladder_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_outer_rollout_v1.py
@@ -130,6 +133,7 @@ jobs:
           src/rl_quant/workflows/massive_adaptive_rl_experiment_state_v2.py
           src/rl_quant/workflows/massive_adaptive_rl_manifest_v3.py
           src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v2.py
+          src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_authority_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v4.py
@@ -146,6 +150,7 @@ jobs:
           src/rl_quant/training/massive_adaptive_rl_fixed_control_fit_runner_v1.py
           src/rl_quant/training/massive_adaptive_rl_policy_selection_v2.py
           src/rl_quant/training/massive_adaptive_rl_policy_selection_v3.py
+          src/rl_quant/training/massive_adaptive_rl_four_fold_policy_selection_v1.py
           src/rl_quant/training/massive_adaptive_rl_training_forecast_authority_v2.py
           src/rl_quant/workflows/massive_adaptive_rl_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_v2.py
