@@ -850,6 +850,14 @@ def _fold_validation_execution_lease_v1(
     manifest.validate()
     directory = Path(root) / "massive-adaptive" / "rl-fold-validation-leases-v1"
     descriptor = -1
+
+    def close_after_setup_failure() -> None:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
     try:
         Path(root).mkdir(parents=True, exist_ok=True)
         if Path(root).is_symlink():
@@ -871,17 +879,28 @@ def _fold_validation_execution_lease_v1(
             raise MassiveAdaptiveRLFoldValidationExecutorV1Error(
                 "fold-validation execution lease identity differs"
             )
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise MassiveAdaptiveRLFoldValidationExecutionLeaseUnavailable(
-                "fold-validation execution lease is already held"
-            ) from error
-        yield
     except OSError as error:
+        close_after_setup_failure()
         raise MassiveAdaptiveRLFoldValidationExecutorV1Error(
             "fold-validation execution lease is unavailable"
         ) from error
+    except MassiveAdaptiveRLFoldValidationExecutorV1Error:
+        close_after_setup_failure()
+        raise
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        close_after_setup_failure()
+        raise MassiveAdaptiveRLFoldValidationExecutionLeaseUnavailable(
+            "fold-validation execution lease is already held"
+        ) from error
+    except OSError as error:
+        close_after_setup_failure()
+        raise MassiveAdaptiveRLFoldValidationExecutorV1Error(
+            "fold-validation execution lease is unavailable"
+        ) from error
+    try:
+        yield
     finally:
         if descriptor >= 0:
             try:

@@ -269,6 +269,19 @@ def test_executor_fold_lease_rejects_a_concurrent_owner(tmp_path) -> None:
                 pass
 
 
+def test_executor_fold_lease_does_not_mask_body_oserror(tmp_path) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id="fold-validation-executor-body-oserror"
+    )
+    with pytest.raises(OSError, match="economic artifact write failed"):
+        with _fold_validation_execution_lease_v1(
+            root=tmp_path,
+            manifest=manifest,
+            fold_index=2,
+        ):
+            raise OSError("economic artifact write failed")
+
+
 def test_executor_orders_all_fold3_computations_and_returns_only_selection_v3(
     tmp_path,
     monkeypatch,
