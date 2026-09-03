@@ -19,6 +19,9 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
     build_massive_adaptive_rl_fixed_control_registry_v1,
     registered_massive_adaptive_rl_constant_actions_v1,
 )
+from test_massive_adaptive_rl_policy_selection_v1 import (
+    _authorized_policy_selection_authority_v1,
+)
 
 
 def _d(value: object) -> str:
@@ -47,18 +50,11 @@ def _fixture():
         semantic_receipt_sha256=_d("calibration"),
         development_calibration_authorized=True,
     )
-    policy_selection = SimpleNamespace(
-        fold_index=fold,
-        semantic_receipt_sha256=_d("policy-selection"),
-        selected_checkpoint_receipt_sha256=_d("ppo-checkpoint"),
+    policy_selection_authority = _authorized_policy_selection_authority_v1(
+        fold_index=fold
     )
-    policy_selection_authority = SimpleNamespace(
-        validate=lambda: None,
-        runtime_selection=policy_selection,
-        runtime_selection_replayed=True,
-        semantic_receipt_sha256=_d("policy-selection-authority"),
-        outer_evaluation_authorized=True,
-    )
+    policy_selection = policy_selection_authority.runtime_selection
+    assert policy_selection is not None
     frozen_policy = SimpleNamespace(
         validate=lambda: None,
         fold_index=fold,

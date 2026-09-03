@@ -25,6 +25,9 @@ from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
 )
+from test_massive_adaptive_rl_policy_selection_v1 import (
+    _authorized_policy_selection_authority_v1,
+)
 
 
 def _fold(index: int) -> MassiveAdaptiveRLOuterCostFoldV1:
@@ -32,9 +35,7 @@ def _fold(index: int) -> MassiveAdaptiveRLOuterCostFoldV1:
         "schema": MASSIVE_ADAPTIVE_RL_OUTER_COST_FOLD_V1_SCHEMA,
         "fold_index": index,
         "outer_plan_receipt_sha256": semantic_sha256(("outer-plan", index)),
-        "frozen_rl_policy_receipt_sha256": semantic_sha256(
-            ("frozen-policy", index)
-        ),
+        "frozen_rl_policy_receipt_sha256": semantic_sha256(("frozen-policy", index)),
         "low_cost_trace_receipt_sha256": semantic_sha256(("low", index)),
         "primary_trace_receipt_sha256": semantic_sha256(("primary", index)),
         "high_cost_trace_receipt_sha256": semantic_sha256(("high", index)),
@@ -68,9 +69,7 @@ def test_rl_outer_evidence_is_paired_deterministic_and_create_only(tmp_path) -> 
     assert first.semantic_receipt_sha256 == second.semantic_receipt_sha256
     assert first.strategy_active_log_return_lcb95 == pytest.approx(0.0005)
     assert first.incremental_rl_log_return_lcb95 == pytest.approx(0.0002)
-    assert first.ppo_minus_fixed_control_log_return_lcb95 == pytest.approx(
-        0.0001
-    )
+    assert first.ppo_minus_fixed_control_log_return_lcb95 == pytest.approx(0.0001)
     assert first.positive_strategy_fold_count == 4
     assert first.positive_incremental_fold_count == 4
     assert first.positive_ppo_minus_fixed_control_fold_count == 4
@@ -188,9 +187,6 @@ def test_rl_outer_plan_binds_one_fold_checkpoint_calibration_and_policy() -> Non
     model_state_receipt = semantic_sha256("supervised-model-state")
     training_window_receipt = semantic_sha256("training-window")
     inference_receipt = semantic_sha256("outer-inference")
-    selection_receipt = semantic_sha256("rl-policy-selection")
-    selected_rl_checkpoint = semantic_sha256("selected-rl-checkpoint")
-    policy_authority_receipt = semantic_sha256("rl-policy-authority")
     outer_inference = SimpleNamespace(
         validate=lambda: None,
         fold_index=0,
@@ -217,18 +213,12 @@ def test_rl_outer_plan_binds_one_fold_checkpoint_calibration_and_policy() -> Non
         training_window_plan_receipt_sha256=training_window_receipt,
         development_calibration_authorized=True,
     )
-    selection = SimpleNamespace(
-        fold_index=0,
-        semantic_receipt_sha256=selection_receipt,
-        selected_checkpoint_receipt_sha256=selected_rl_checkpoint,
-    )
-    policy_selection_authority = SimpleNamespace(
-        validate=lambda: None,
-        semantic_receipt_sha256=policy_authority_receipt,
-        runtime_selection=selection,
-        runtime_selection_replayed=True,
-        outer_evaluation_authorized=True,
-    )
+    policy_selection_authority = _authorized_policy_selection_authority_v1(fold_index=0)
+    selection = policy_selection_authority.runtime_selection
+    assert selection is not None
+    selection_receipt = selection.semantic_receipt_sha256
+    selected_rl_checkpoint = selection.selected_checkpoint_receipt_sha256
+    policy_authority_receipt = policy_selection_authority.semantic_receipt_sha256
     frozen_policy = SimpleNamespace(
         validate=lambda: None,
         fold_index=0,

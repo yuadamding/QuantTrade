@@ -35,13 +35,12 @@ from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
 MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SCHEMA = (
     "rl-quant.massive-adaptive-frozen-rl-policy-v1"
 )
-MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_DATASET = (
-    "massive-adaptive-frozen-rl-policy-v1"
-)
+MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_DATASET = "massive-adaptive-frozen-rl-policy-v1"
 MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SOURCE_SCHEMA_SHA256 = semantic_sha256(
     {
         "schema": MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SCHEMA,
         "payload": "weights-only-torch-state-and-metadata",
+        "policy_selection_authority": "exact-v1-only",
         "generic_reload": "nonauthorizing",
     }
 )
@@ -49,6 +48,7 @@ MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SPEC_SHA256 = semantic_sha256(
     {
         "source": "committed-inner-validation-policy-selection",
+        "policy_selection_authority": "exact-v1-only",
         "state": "actor-and-critic-model-state",
         "updates_after_freeze": False,
         "profitability_reporting": False,
@@ -72,10 +72,7 @@ def _tensor_receipt(value: torch.Tensor) -> str:
 
 def _model_state_receipt(value: Mapping[str, torch.Tensor]) -> str:
     return semantic_sha256(
-        tuple(
-            (name, _tensor_receipt(tensor))
-            for name, tensor in sorted(value.items())
-        )
+        tuple((name, _tensor_receipt(tensor)) for name, tensor in sorted(value.items()))
     )
 
 
@@ -153,22 +150,24 @@ class MassiveAdaptiveFrozenRLPolicyV1:
             != MASSIVE_ADAPTIVE_RL_ACTION_SPECIFICATION_V1_SHA256
             or self.reward_specification_sha256
             != MASSIVE_ADAPTIVE_RL_REWARD_SPECIFICATION_V1_SHA256
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveFrozenRLPolicyV1Error(
                 "frozen adaptive RL policy differs"
             )
-        if runtime and self.runtime_model_state is not None and (
-            not self.runtime_model_state
-            or self.frozen_model_state_receipt_sha256
-            != _model_state_receipt(self.runtime_model_state)
+        if (
+            runtime
+            and self.runtime_model_state is not None
+            and (
+                not self.runtime_model_state
+                or self.frozen_model_state_receipt_sha256
+                != _model_state_receipt(self.runtime_model_state)
+            )
         ):
             raise MassiveAdaptiveFrozenRLPolicyV1Error(
                 "frozen adaptive RL model state differs"
@@ -193,6 +192,10 @@ def _metadata(
     checkpoint: MassiveAdaptiveRLCheckpointV1,
     selection_authority: MassiveAdaptiveRLPolicySelectionAuthorityV1,
 ) -> dict[str, object]:
+    if type(selection_authority) is not MassiveAdaptiveRLPolicySelectionAuthorityV1:
+        raise MassiveAdaptiveFrozenRLPolicyV1Error(
+            "frozen policy V1 requires exact policy-selection authority V1"
+        )
     selection_authority.validate()
     checkpoint.validate()
     selection = selection_authority.runtime_selection
@@ -256,7 +259,9 @@ def _load_payload(
             "frozen adaptive RL policy payload is malformed"
         )
     state = cast(dict[str, torch.Tensor], dict(payload["model_state"]))
-    if not state or any(not isinstance(value, torch.Tensor) for value in state.values()):
+    if not state or any(
+        not isinstance(value, torch.Tensor) for value in state.values()
+    ):
         raise MassiveAdaptiveFrozenRLPolicyV1Error(
             "frozen adaptive RL model state is malformed"
         )
@@ -295,7 +300,10 @@ def authorize_massive_adaptive_frozen_rl_policy_v1(
         checkpoint=checkpoint,
         selection_authority=selection_authority,
     )
-    if parsed.semantic_unsigned() != expected or state.keys() != checkpoint.model_state.keys():
+    if (
+        parsed.semantic_unsigned() != expected
+        or state.keys() != checkpoint.model_state.keys()
+    ):
         raise MassiveAdaptiveFrozenRLPolicyV1Error(
             "frozen adaptive RL policy does not replay from its selection"
         )

@@ -71,6 +71,7 @@ MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V3_SOURCE_SCHEMA_SHA256 = (
         {
             "schema": MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V3_SCHEMA,
             "encoding": "canonical-json-source-generation-v2-policy-selection",
+            "positive_profitability_authorization_eligibility": "runtime-derived",
             "generic_reload": "nonauthorizing",
         }
     )
@@ -85,6 +86,7 @@ MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V3_SPEC_SHA256 = semantic_sha256(
             MASSIVE_ADAPTIVE_RL_VALIDATION_EVIDENCE_V2_SOURCE_SHA256
         ),
         "selection_computation": "exact-policy-selection-v2-witness",
+        "selection_v2_authority": "computation-only",
         "selection_v2_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V2_SPEC_SHA256
         ),
@@ -95,6 +97,9 @@ MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V3_SPEC_SHA256 = semantic_sha256(
         "validation_inputs": "exact-v2-source-registry-and-four-fold-barrier",
         "validation_outcomes": "exact-v2-primary-ladder-and-fc06-inventories",
         "candidate_metrics": "derived-only-by-selection-v2-from-base-v1-fold-witness",
+        "positive_profitability_authorization_eligibility": (
+            "runtime-replay-and-selected-candidate-validation-eligibility"
+        ),
         "ordering": "fold-validation-v2-before-selection-v2-before-selection-v3",
         "publication": "manifest-and-fold-derived-create-only",
         "v1_fold_direct_authorization": False,
@@ -209,8 +214,11 @@ def _selection_v3_body(
     base_selection_authority_v2.validate()
     if (
         not validation_authority.development_stage_authorized
-        or not base_selection_authority_v2.development_policy_selection_authorized
-        or not base_selection_authority_v2.policy_freezing_authorized
+        or not base_selection_authority_v2.selection_computation_replayed
+        or not base_selection_authority_v2.development_selection_computation_authorized
+        or base_selection_authority_v2.development_policy_selection_authorized
+        or base_selection_authority_v2.policy_freezing_authorized
+        or base_selection_authority_v2.outer_diagnostic_preparation_authorized
     ):
         raise MassiveAdaptiveRLPolicySelectionV3Error(
             "policy selection V3 evidence is not replay-authorized"
@@ -431,9 +439,6 @@ def _selection_v3_body(
         "validation_eligibility_failures": (selection.validation_eligibility_failures),
         "selection_pool_kind": selection.selection_pool_kind,
         "source_data_qualified": source_data_qualified,
-        "positive_profitability_authorization_eligible": bool(
-            source_data_qualified and selection.selected_candidate_validation_eligible
-        ),
         "validation_selection_specification_sha256": (
             selection.validation_selection_specification_sha256
         ),
@@ -503,7 +508,6 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV3:
     validation_eligibility_failures: tuple[str, ...]
     selection_pool_kind: str
     source_data_qualified: bool
-    positive_profitability_authorization_eligible: bool
     validation_selection_specification_sha256: str
     numerical_comparison_specification_sha256: str
     semantic_receipt_sha256: str
@@ -590,6 +594,13 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV3:
         )
 
     @property
+    def positive_profitability_authorization_eligible(self) -> bool:
+        return bool(
+            self.development_stage_authorized
+            and self.selected_candidate_validation_eligible
+        )
+
+    @property
     def runtime_selection(self) -> MassiveAdaptiveRLPolicySelectionV2:
         if self._runtime_base_selection_authority_v2 is None:
             raise MassiveAdaptiveRLPolicySelectionV3Error(
@@ -631,8 +642,7 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV3:
             and self._runtime_validation_authority is not None
             and self._runtime_validation_authority.development_stage_authorized
             and self._runtime_base_selection_authority_v2 is not None
-            and self._runtime_base_selection_authority_v2.development_policy_selection_authorized
-            and self._runtime_base_selection_authority_v2.policy_freezing_authorized
+            and self._runtime_base_selection_authority_v2.development_selection_computation_authorized
         )
         candidate_count = self.fold_index + 1
         inventories: tuple[Sequence[object], ...] = (
@@ -675,11 +685,6 @@ class MassiveAdaptiveRLPolicySelectionAuthorityV3:
             != self.validation_eligibility_failures
             or not set(self.validation_eligibility_failures).issubset(
                 MASSIVE_ADAPTIVE_RL_VALIDATION_ELIGIBILITY_CRITERIA_V1
-            )
-            or self.positive_profitability_authorization_eligible
-            != bool(
-                self.source_data_qualified
-                and self.selected_candidate_validation_eligible
             )
             or not isinstance(self.source_data_qualified, bool)
             or self.runtime_selection_replayed != runtime

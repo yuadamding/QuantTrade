@@ -62,9 +62,8 @@ MASSIVE_ADAPTIVE_RL_OUTER_EVIDENCE_V1_SPEC_SHA256 = semantic_sha256(
         "bootstrap": "same-fold-cluster-nonwrapping-63-session-v1",
         "minimum_positive_folds": 3,
         "maximum_fold_drawdown": 0.25,
-        "cost_ladder_monotonicity": (
-            "derived-report-gate-not-structural-validity"
-        ),
+        "cost_ladder_monotonicity": ("derived-report-gate-not-structural-validity"),
+        "policy_selection_authority": "exact-v1-only",
         "profitability_reporting": False,
         "lockbox": False,
     }
@@ -169,6 +168,12 @@ def build_massive_adaptive_rl_outer_plan_v1(
 ) -> MassiveAdaptiveRLOuterPlanV1:
     """Freeze every nonmarket input before one outer fold is evaluated."""
 
+    if type(policy_selection_authority) is not (
+        MassiveAdaptiveRLPolicySelectionAuthorityV1
+    ):
+        raise MassiveAdaptiveRLOuterEvidenceV1Error(
+            "outer plan V1 requires exact policy-selection authority V1"
+        )
     for value in (
         outer_inference_plan,
         outer_forecast_archive,

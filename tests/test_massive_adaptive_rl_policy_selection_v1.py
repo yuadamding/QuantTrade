@@ -40,7 +40,14 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
 )
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
+    MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_DATASET,
+    MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_SCHEMA,
+    MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_SOURCE_SCHEMA_SHA256,
+    MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V1_SCHEMA,
+    MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_POLICY_TRACE_V1_SCHEMA,
+    MassiveAdaptiveRLPolicySelectionAuthorityV1,
+    MassiveAdaptiveRLPolicySelectionV1,
     MassiveAdaptiveRLPolicySelectionV1Error,
     MassiveAdaptiveRLPolicyTraceV1,
     authorize_massive_adaptive_rl_policy_selection_authority_v1,
@@ -55,6 +62,69 @@ from test_massive_adaptive_profitability_v1_vertical_slice import (
 
 def _digest(value: object) -> str:
     return semantic_sha256(value)
+
+
+def _authorized_policy_selection_authority_v1(
+    *, fold_index: int = 0
+) -> MassiveAdaptiveRLPolicySelectionAuthorityV1:
+    """Build an exact V1 authority for isolated downstream unit tests."""
+
+    selection_body = {
+        "schema": MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V1_SCHEMA,
+        "fold_index": fold_index,
+        "selected_checkpoint_receipt_sha256": _digest("ppo-checkpoint"),
+        "selected_model_state_receipt_sha256": _digest("ppo-model-state"),
+        "selected_update_index": 0,
+        "training_forecast_authority_receipt_sha256": _digest("training-forecast"),
+        "fixed_control_selection_authority_receipt_sha256": _digest(
+            "fixed-selection-authority"
+        ),
+        "selected_candidate_receipt_sha256": _digest("selected-candidate"),
+        "candidate_inventory_sha256": _digest(("selected-candidate",)),
+        "candidate_count": 1,
+        "source_data_qualified": True,
+        "outer_evaluation_authorized": False,
+        "profitability_reporting_authorized": False,
+        "lockbox_access_authorized": False,
+        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
+        "specification_sha256": MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V1_SPEC_SHA256,
+    }
+    selection = MassiveAdaptiveRLPolicySelectionV1(
+        **selection_body,  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_sha256(selection_body),
+    )
+    authority_body = {
+        "schema": MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_SCHEMA,
+        "selection_receipt_sha256": selection.semantic_receipt_sha256,
+        "candidate_inventory_sha256": selection.candidate_inventory_sha256,
+        "source_data_qualified": True,
+        "profitability_reporting_authorized": False,
+        "lockbox_access_authorized": False,
+        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
+    }
+    loaded_source = SimpleNamespace(
+        validate=lambda: None,
+        receipt=SimpleNamespace(
+            dataset_id=MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_DATASET,
+            schema_sha256=(
+                MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V1_SOURCE_SCHEMA_SHA256
+            ),
+            entitlement_receipt_sha256=selection.semantic_receipt_sha256,
+        ),
+    )
+    authority = MassiveAdaptiveRLPolicySelectionAuthorityV1(
+        **authority_body,  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_sha256(authority_body),
+        loaded_source=loaded_source,
+        runtime_selection=selection,
+        runtime_candidates=(),
+        runtime_selection_replayed=True,
+        development_policy_selection_authorized=True,
+        outer_evaluation_authorized=True,
+        reinforcement_learning_authorized=True,
+    )
+    authority.validate()
+    return authority
 
 
 def _trace(

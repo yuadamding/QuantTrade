@@ -12,11 +12,23 @@ from rl_quant.data_sources.massive.source_receipts import (
     load_massive_source_bundle,
     publish_massive_source_object,
 )
+from rl_quant.evaluation.massive_adaptive_outer_access_commitment_v1 import (
+    MassiveAdaptiveOuterAccessCommitmentV1Error,
+    materialize_massive_adaptive_outer_access_commitment_v1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_evidence_v1 import (
+    MassiveAdaptiveRLOuterEvidenceV1Error,
+    build_massive_adaptive_rl_outer_plan_v1,
+)
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
 )
 from rl_quant.training import massive_adaptive_rl_policy_selection_v2 as selection_v2
+from rl_quant.training.massive_adaptive_frozen_rl_policy_v1 import (
+    MassiveAdaptiveFrozenRLPolicyV1Error,
+    materialize_massive_adaptive_frozen_rl_policy_v1,
+)
 from rl_quant.training.massive_adaptive_rl_policy_selection_v2 import (
     MASSIVE_ADAPTIVE_RL_POLICY_CANDIDATE_V2_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V2_SOURCE_SHA256,
@@ -149,17 +161,13 @@ def _candidate(
         "fc06_validation_trace_receipt_sha256": _digest(
             ("fc06-validation", fold_index)
         ),
-        "legacy_candidate_v1_receipt_sha256": _digest(
-            ("legacy", fold_index, ordinal)
-        ),
+        "legacy_candidate_v1_receipt_sha256": _digest(("legacy", fold_index, ordinal)),
         "fc06_primary_incremental_log_wealth": fc06_incremental,
         "ppo_minus_fc06_log_wealth": derived_ppo_minus_fc06,
         "primary_incremental_rl_log_wealth": float(primary_incremental),
         "primary_strategy_active_log_wealth": float(active),
         "low_cost_terminal_liquidation_adjusted_return": float(low),
-        "primary_cost_terminal_liquidation_adjusted_return": float(
-            primary_terminal
-        ),
+        "primary_cost_terminal_liquidation_adjusted_return": float(primary_terminal),
         "high_cost_terminal_liquidation_adjusted_return": float(high),
         "maximum_drawdown": float(drawdown),
         "validation_eligibility_failures": failures,
@@ -246,7 +254,9 @@ def test_v4_update_and_checkpoint_receipt_complete_the_total_order() -> None:
     )
     earlier = _candidate(manifest=manifest, ordinal=0)
     later = _candidate(manifest=manifest, ordinal=1)
-    assert _select(manifest, later, earlier).selected_update_index == earlier.update_index
+    assert (
+        _select(manifest, later, earlier).selected_update_index == earlier.update_index
+    )
 
     lexical_high = _candidate(
         manifest=manifest,
@@ -338,9 +348,7 @@ def test_v4_nonmonotone_only_population_completes_diagnostic_selection() -> None
         primary_terminal=0.02,
         high=0.005,
     )
-    cost_ladder_failure = (
-        "terminal-return-cost-ladder-low-ge-primary-ge-high"
-    )
+    cost_ladder_failure = "terminal-return-cost-ladder-low-ge-primary-ge-high"
     assert higher.validation_eligibility_failures == (cost_ladder_failure,)
     assert lower.validation_eligibility_failures == (cost_ladder_failure,)
 
@@ -393,7 +401,9 @@ def test_v4_numeric_semantics_are_exact_and_canonical() -> None:
         nonfinite.validate()
 
 
-def test_unqualified_candidate_cannot_claim_positive_authorization_eligibility() -> None:
+def test_unqualified_candidate_cannot_claim_positive_authorization_eligibility() -> (
+    None
+):
     manifest = build_massive_adaptive_rl_experiment_manifest_v4(
         experiment_id="selection-v2-unqualified"
     )
@@ -622,9 +632,67 @@ def test_policy_selection_v2_generic_authority_is_persisted_but_nonauthorizing(
     )
     assert generic.source_data_qualified
     assert generic.selected_candidate_validation_eligible
-    assert generic.positive_profitability_authorization_eligible
+    assert selection.positive_profitability_authorization_eligible
+    assert not generic.positive_profitability_authorization_eligible
     assert not generic.runtime_selection_replayed
+    assert not generic.selection_computation_replayed
+    assert not generic.development_selection_computation_authorized
     assert not generic.development_policy_selection_authorized
     assert not generic.policy_freezing_authorized
     assert not generic.outer_diagnostic_preparation_authorized
     assert not generic.profitability_reporting_authorized
+
+    for authority_flag in (
+        "development_selection_computation_authorized",
+        "development_policy_selection_authorized",
+        "policy_freezing_authorized",
+        "outer_diagnostic_preparation_authorized",
+        "positive_profitability_authorization_eligible",
+    ):
+        with pytest.raises(
+            MassiveAdaptiveRLPolicySelectionV2Error,
+            match="authority V2 differs",
+        ):
+            replace(generic, **{authority_flag: True}).validate()
+
+    with pytest.raises(
+        MassiveAdaptiveFrozenRLPolicyV1Error,
+        match="exact policy-selection authority V1",
+    ):
+        materialize_massive_adaptive_frozen_rl_policy_v1(
+            root=tmp_path,
+            artifact_id="selection-v2-must-not-freeze-v1",
+            checkpoint=None,  # type: ignore[arg-type]
+            selection_authority=generic,  # type: ignore[arg-type]
+            committed_at_ms=3,
+        )
+    with pytest.raises(
+        MassiveAdaptiveOuterAccessCommitmentV1Error,
+        match="exact policy-selection authority V1",
+    ):
+        materialize_massive_adaptive_outer_access_commitment_v1(
+            root=tmp_path,
+            artifact_id="selection-v2-must-not-open-outer-v1",
+            outer_inference_plan=None,  # type: ignore[arg-type]
+            calibration=None,  # type: ignore[arg-type]
+            policy_selection_authority=generic,  # type: ignore[arg-type]
+            frozen_policy=None,  # type: ignore[arg-type]
+            fixed_control_registry=None,  # type: ignore[arg-type]
+            fixed_control_fit_authority=None,  # type: ignore[arg-type]
+            fixed_control_selection_authority=None,  # type: ignore[arg-type]
+            chronology_authority=None,  # type: ignore[arg-type]
+            compiler_config=None,  # type: ignore[arg-type]
+            committed_at_ms=3,
+        )
+    with pytest.raises(
+        MassiveAdaptiveRLOuterEvidenceV1Error,
+        match="exact policy-selection authority V1",
+    ):
+        build_massive_adaptive_rl_outer_plan_v1(
+            outer_inference_plan=None,  # type: ignore[arg-type]
+            outer_forecast_archive=None,  # type: ignore[arg-type]
+            calibration=None,  # type: ignore[arg-type]
+            policy_selection_authority=generic,  # type: ignore[arg-type]
+            frozen_policy=None,  # type: ignore[arg-type]
+            compiler_config=None,  # type: ignore[arg-type]
+        )

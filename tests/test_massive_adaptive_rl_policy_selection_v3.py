@@ -158,7 +158,6 @@ def _generic_authority(
         "validation_eligibility_failures": (),
         "selection_pool_kind": "eligible",
         "source_data_qualified": True,
-        "positive_profitability_authorization_eligible": True,
         "validation_selection_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_VALIDATION_SELECTION_SPECIFICATION_V1_SHA256
         ),
@@ -234,7 +233,10 @@ def test_persisted_policy_selection_v3_binds_v2_lineage_but_reload_is_nonauthori
     assert generic.base_policy_selection_authority_v2_receipt_sha256 == _digest(
         "selection-authority-v2"
     )
-    assert generic.positive_profitability_authorization_eligible
+    assert "positive_profitability_authorization_eligible" not in (
+        generic.semantic_unsigned()
+    )
+    assert not generic.positive_profitability_authorization_eligible
     assert not generic.runtime_selection_replayed
     assert not generic.development_policy_selection_authorized
     assert not generic.policy_freezing_authorized

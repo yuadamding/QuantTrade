@@ -61,13 +61,12 @@ MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_DATASET = (
     "massive-adaptive-outer-access-commitment-v1"
 )
-MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SOURCE_SHA256 = file_sha256(
-    Path(__file__)
-)
+MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SPEC_SHA256 = semantic_sha256(
     {
         "prerequisite": "create-only-before-rl-outer-forecast",
         "policies": ("selected-ppo", "fit-selected-static"),
+        "policy_selection_authority": "exact-v1-only",
         "caller_timestamp_authority": False,
         "outer_forecast_access": "receipt-gated",
         "profitability_reporting": False,
@@ -79,6 +78,7 @@ MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SOURCE_SCHEMA_SHA256 = semantic_sha2
     {
         "schema": MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SCHEMA,
         "payload": "canonical-commitment-metadata",
+        "policy_selection_authority": "exact-v1-only",
         "generic_reload": "nonauthorizing",
         "promotion": "rebuild-from-frozen-policy-and-comparator-authorities",
     }
@@ -147,9 +147,7 @@ class MassiveAdaptiveOuterAccessCommitmentV1:
     profitability_reporting_authorized: bool = False
     lockbox_access_authorized: bool = False
     protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-    specification_sha256: str = (
-        MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SPEC_SHA256
-    )
+    specification_sha256: str = MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SPEC_SHA256
     implementation_source_sha256: str = (
         MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SOURCE_SHA256
     )
@@ -224,14 +222,12 @@ class MassiveAdaptiveOuterAccessCommitmentV1:
             or self.outer_forecast_access_authorized != expected
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveOuterAccessCommitmentV1Error(
                 "adaptive RL outer-access commitment differs"
@@ -284,6 +280,12 @@ def _metadata(
     chronology_authority: MassiveAdaptiveRLChronologyAuthorityV1,
     compiler_config: MassiveAdaptivePortfolioCompilerConfigV1,
 ) -> dict[str, object]:
+    if type(policy_selection_authority) is not (
+        MassiveAdaptiveRLPolicySelectionAuthorityV1
+    ):
+        raise MassiveAdaptiveOuterAccessCommitmentV1Error(
+            "outer-access commitment V1 requires exact policy-selection authority V1"
+        )
     for value in (
         outer_inference_plan,
         calibration,
@@ -514,9 +516,7 @@ def materialize_massive_adaptive_outer_access_commitment_v1(
         requested_at_ms=committed_at_ms,
         downloaded_at_ms=committed_at_ms,
         schema_sha256=MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SOURCE_SCHEMA_SHA256,
-        entitlement_receipt_sha256=(
-            policy_selection_authority.semantic_receipt_sha256
-        ),
+        entitlement_receipt_sha256=(policy_selection_authority.semantic_receipt_sha256),
         committed_at_ms=committed_at_ms,
         request_id=f"ADAPTIVE-OUTER-ACCESS-COMMITMENT-V1-{identifier}",
     )
