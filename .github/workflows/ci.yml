@@ -75,6 +75,7 @@ jobs:
           tests/test_massive_adaptive_rl_source_bundle_v1.py
           tests/test_massive_adaptive_rl_runtime_source_graph_authority_v1.py
           tests/test_massive_adaptive_rl_runtime_source_reconstruction_v1.py
+          tests/test_massive_adaptive_rl_source_generation_v2.py
           tests/test_massive_adaptive_rl_fit_environment_registry_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v1.py
           tests/test_massive_adaptive_rl_experiment_state_v2.py
@@ -110,6 +111,9 @@ jobs:
           src/rl_quant/workflows/massive_adaptive_rl_source_bundle_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_runtime_source_graph_authority_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_runtime_source_reconstruction_v1.py
+          src/rl_quant/workflows/massive_adaptive_rl_source_bundle_v2.py
+          src/rl_quant/workflows/massive_adaptive_rl_runtime_source_graph_authority_v2.py
+          src/rl_quant/workflows/massive_adaptive_rl_runtime_source_reconstruction_v2.py
           src/rl_quant/workflows/massive_adaptive_rl_experiment_state_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_experiment_state_v2.py
