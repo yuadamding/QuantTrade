@@ -19,6 +19,9 @@ from typing import cast
 
 from rl_quant.alpha.pit_universe import PITSecurityUniverseAuthority
 from rl_quant.data_sources.massive.conditions import MassiveConditionAuthority
+from rl_quant.data_sources.massive.decision_clock import (
+    build_massive_decision_clock_authorities,
+)
 from rl_quant.data_sources.massive.finalized_persisted_partitions import (
     MASSIVE_PERSISTED_PARTITION_MANIFEST_V1_SCHEMA,
     MASSIVE_PERSISTED_PARTITION_SPEC_SHA256,
@@ -49,6 +52,11 @@ from rl_quant.features.massive_adaptive_fill_source_v1 import (
     MASSIVE_ADAPTIVE_FILL_SOURCE_V1_SPEC_SHA256,
     MassiveAdaptiveFillSourceV1,
 )
+from rl_quant.features.massive_adaptive_origin_authority_v1 import (
+    MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SCHEMA,
+    MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SPEC_SHA256,
+    MassiveAdaptiveOriginAuthorityV1,
+)
 from rl_quant.features.massive_economic_authority_v6 import (
     MASSIVE_ECONOMIC_AUTHORITY_V6_SPEC_SHA256,
     MassiveProviderEconomicArchiveAuthorityV6,
@@ -56,6 +64,11 @@ from rl_quant.features.massive_economic_authority_v6 import (
 from rl_quant.features.massive_profitability_daily_input_authority_v1 import (
     MASSIVE_PROFITABILITY_DAILY_INPUT_AUTHORITY_V1_SPEC_SHA256,
     MassiveProfitabilityDailyInputAuthorityV1,
+)
+from rl_quant.features.massive_profitability_origin_features_v3 import (
+    MASSIVE_PROFITABILITY_ORIGIN_FEATURES_V3_SCHEMA,
+    MASSIVE_PROFITABILITY_ORIGIN_FEATURES_V3_SPEC_SHA256,
+    MassiveProfitabilityOriginFeaturesV3,
 )
 from rl_quant.protocol.canonical_artifact import (
     canonical_json_file_bytes,
@@ -71,6 +84,7 @@ from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import
     MassiveAdaptiveCausalCheckpointChoiceV1,
 )
 from rl_quant.training.massive_adaptive_split_plan_v1 import (
+    MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
     MASSIVE_ADAPTIVE_MAXIMUM_TARGET_SESSIONS_V1,
     MASSIVE_ADAPTIVE_SPLIT_PLAN_V1_SPEC_SHA256,
     MassiveAdaptiveSplitPlanV1,
@@ -114,7 +128,9 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SPEC_SHA256 = semantic_sha
         "promotion": "complete-concrete-runtime-graph-witness-retained",
         "qualification": "explicit-role-specific-domain-authority-contracts",
         "implementation_identity": "every-domain-type-source-sha256",
-        "inventory_coverage": "logical-keys-and-exact-rl-fit-prefix",
+        "inventory_coverage": (
+            "logical-keys-exact-rl-fit-prefix-and-model-context-plus-validation"
+        ),
         "fit_schedule": "manifest-block-size-and-fold-schedule-bound",
         "graph_edges": "outer-fold-archives-to-exact-source-fold-lineage",
         "lineage_cardinality": "one-window-checkpoint-calibration-per-source-fold",
@@ -173,6 +189,8 @@ _DOMAIN_INVENTORY_ITEM_TYPES: dict[str, type[object]] = {
     "fit-forecast-archive-inventory": MassiveAdaptiveRLFitForecastArchiveV1,
     "decision-root-inventory": MassiveAdaptiveDecisionRootV1,
     "context-origin-inventory": MassiveAdaptiveContextOriginAuthorityV1,
+    "validation-origin-feature-inventory": MassiveProfitabilityOriginFeaturesV3,
+    "validation-origin-action-inventory": MassiveAdaptiveOriginAuthorityV1,
 }
 
 _DOMAIN_INVENTORY_ITEM_SCHEMAS = {
@@ -187,6 +205,10 @@ _DOMAIN_INVENTORY_ITEM_SCHEMAS = {
     ),
     "decision-root-inventory": MASSIVE_ADAPTIVE_DECISION_ROOT_V1_SCHEMA,
     "context-origin-inventory": MASSIVE_ADAPTIVE_CONTEXT_ORIGIN_AUTHORITY_V1_SCHEMA,
+    "validation-origin-feature-inventory": (
+        MASSIVE_PROFITABILITY_ORIGIN_FEATURES_V3_SCHEMA
+    ),
+    "validation-origin-action-inventory": MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SCHEMA,
 }
 
 _DOMAIN_INVENTORY_ITEM_SPECIFICATIONS: dict[str, str | None] = {
@@ -200,6 +222,12 @@ _DOMAIN_INVENTORY_ITEM_SPECIFICATIONS: dict[str, str | None] = {
     "decision-root-inventory": MASSIVE_ADAPTIVE_DECISION_ROOT_V1_SPEC_SHA256,
     "context-origin-inventory": (
         MASSIVE_ADAPTIVE_CONTEXT_ORIGIN_AUTHORITY_V1_SPEC_SHA256
+    ),
+    "validation-origin-feature-inventory": (
+        MASSIVE_PROFITABILITY_ORIGIN_FEATURES_V3_SPEC_SHA256
+    ),
+    "validation-origin-action-inventory": (
+        MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SPEC_SHA256
     ),
 }
 
@@ -217,6 +245,8 @@ def _authority_is_qualified(*, role: str, authority: object) -> bool:
         "fit-forecast-archive-inventory": ("source_data_qualified",),
         "decision-root-inventory": ("source_data_qualified",),
         "context-origin-inventory": ("source_data_qualified",),
+        "validation-origin-feature-inventory": ("source_data_qualified",),
+        "validation-origin-action-inventory": ("source_data_qualified",),
         "daily-input-authority": (
             "source_transport_qualified",
             "daily_input_data_qualified",
@@ -254,6 +284,11 @@ _INVENTORY_QUALIFICATION_FIELDS = {
     "context-origin-inventory": (
         "source_data_qualified",
         "source_paths_replayed",
+    ),
+    "validation-origin-feature-inventory": ("source_inputs_data_qualified",),
+    "validation-origin-action-inventory": (
+        "source_paths_replayed",
+        "action_identity_source_data_qualified",
     ),
 }
 
@@ -294,7 +329,12 @@ def _item_logical_key(*, role: str, item: object) -> str:
             getattr(item, "source_fold_index", None),
             getattr(item, "block_index", None),
         )
-    elif role in {"decision-root-inventory", "context-origin-inventory"}:
+    elif role in {
+        "decision-root-inventory",
+        "context-origin-inventory",
+        "validation-origin-feature-inventory",
+        "validation-origin-action-inventory",
+    }:
         value = getattr(item, "decision_session_date", None)
     else:
         raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
@@ -550,6 +590,8 @@ _DOMAIN_RUNTIME_TYPES: dict[str, type[object]] = {
     "fit-forecast-archive-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
     "decision-root-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
     "context-origin-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
+    "validation-origin-feature-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
+    "validation-origin-action-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
 }
 
 _DIRECT_DOMAIN_SPECIFICATIONS: dict[str, str | None] = {
@@ -1108,7 +1150,7 @@ def _validate_runtime_graph_contract(
     fold_fit_session_counts: tuple[int, ...],
     fold_candidate_schedule_receipts: tuple[str, ...],
 ) -> tuple[tuple[object, ...], tuple[tuple[str, str, str], ...]]:
-    """Validate exact RL-fit coverage and the load-bearing source graph edges."""
+    """Validate exact fit and validation-predictor source-graph coverage."""
 
     schedules = tuple(
         build_massive_adaptive_rl_candidate_schedule_v1(
@@ -1249,10 +1291,26 @@ def _validate_runtime_graph_contract(
             partition_dates,
         ),
     ]
+    validation_feature_receipts_by_date: dict[str, str] = {}
+    validation_action_receipts_by_date: dict[str, str] = {}
     for fold_index in range(4):
         fold = split_plan.outer_folds[fold_index]
         fit_session_count = fold_fit_session_counts[fold_index]
         expected_dates = fold.fit_session_dates[-fit_session_count:]
+        validation_dates = fold.inner_validation_session_dates
+        candidate_dates = split_plan.candidate_session_dates
+        validation_start = candidate_dates.index(validation_dates[0])
+        validation_stop = candidate_dates.index(validation_dates[-1]) + 1
+        validation_context_start = (
+            validation_start - MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1 + 1
+        )
+        if validation_context_start < 0:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL validation predictor context is unavailable"
+            )
+        expected_validation_tensor_dates = candidate_dates[
+            validation_context_start:validation_stop
+        ]
         archives = cast(
             tuple[MassiveAdaptiveRLFitForecastArchiveV1, ...],
             _inventory_items(
@@ -1329,6 +1387,102 @@ def _validate_runtime_graph_contract(
             raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                 "adaptive RL decision or context inventory does not cover the fit prefix"
             )
+
+        validation_features = cast(
+            tuple[MassiveProfitabilityOriginFeaturesV3, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="validation-origin-feature-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        validation_actions = cast(
+            tuple[MassiveAdaptiveOriginAuthorityV1, ...],
+            _inventory_items(
+                runtime_sources=runtime_sources,
+                role="validation-origin-action-inventory",
+                fold_index=fold_index,
+            ),
+        )
+        validation_features_by_date = {
+            row.decision_session_date: row for row in validation_features
+        }
+        validation_actions_by_date = {
+            row.decision_session_date: row for row in validation_actions
+        }
+        if (
+            tuple(sorted(validation_features_by_date))
+            != expected_validation_tensor_dates
+            or len(validation_features_by_date) != len(validation_features)
+            or tuple(sorted(validation_actions_by_date))
+            != expected_validation_tensor_dates
+            or len(validation_actions_by_date) != len(validation_actions)
+        ):
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL validation predictor inventory does not cover the "
+                "model context and validation interval"
+            )
+        for session_date in expected_validation_tensor_dates:
+            feature_receipt = validation_features_by_date[
+                session_date
+            ].semantic_receipt_sha256
+            action_receipt = validation_actions_by_date[
+                session_date
+            ].semantic_receipt_sha256
+            previous_feature = validation_feature_receipts_by_date.setdefault(
+                session_date,
+                feature_receipt,
+            )
+            previous_action = validation_action_receipts_by_date.setdefault(
+                session_date,
+                action_receipt,
+            )
+            if previous_feature != feature_receipt or previous_action != action_receipt:
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL validation predictor date resolves to alternate roots"
+                )
+        sessions_by_date = {row.session_date: row for row in session.sessions}
+        try:
+            validation_sessions = tuple(
+                sessions_by_date[date] for date in expected_validation_tensor_dates
+            )
+        except KeyError as error:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL validation predictor session is absent"
+            ) from error
+        validation_clocks = build_massive_decision_clock_authorities(
+            session_authority=session,
+            sessions=validation_sessions,
+        )
+        for session_date, clock in zip(
+            expected_validation_tensor_dates,
+            validation_clocks,
+            strict=True,
+        ):
+            feature = validation_features_by_date[session_date]
+            action = validation_actions_by_date[session_date]
+            _edge(
+                edges,
+                name=f"validation-feature/daily-input/{fold_index}/{session_date}",
+                observed=feature.daily_input_authority_semantic_receipt_sha256,
+                expected=daily.semantic_receipt_sha256,
+            )
+            _edge(
+                edges,
+                name=f"validation-action/session-authority/{fold_index}/{session_date}",
+                observed=action.session_authority_receipt_sha256,
+                expected=session.receipt_sha256,
+            )
+            _edge(
+                edges,
+                name=f"validation-action/decision-clock/{fold_index}/{session_date}",
+                observed=action.decision_clock_receipt_sha256,
+                expected=clock.receipt_sha256,
+            )
+            if action.decision_at_ms != clock.decision_at_ns // 1_000_000:
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL validation action decision timestamp differs"
+                )
 
         windows = cast(
             tuple[MassiveAdaptiveWindowPlanV1, ...],
@@ -1538,6 +1692,21 @@ def _validate_runtime_graph_contract(
                 tuple(archive.block_index for archive in ordered_archives),
                 tuple(window_receipts),
                 tuple(selected_checkpoint_receipts),
+            )
+        )
+        coverage.append(
+            (
+                "validation-origin-fold",
+                fold_index,
+                expected_validation_tensor_dates,
+                tuple(
+                    validation_features_by_date[date].semantic_receipt_sha256
+                    for date in expected_validation_tensor_dates
+                ),
+                tuple(
+                    validation_actions_by_date[date].semantic_receipt_sha256
+                    for date in expected_validation_tensor_dates
+                ),
             )
         )
     return tuple(coverage), tuple(edges)

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from rl_quant.data_sources.massive.source_receipts import canonical_json_file_bytes
+from rl_quant.data_sources.massive.decision_clock import (
+    build_massive_decision_clock_authorities,
+)
+from rl_quant.data_sources.massive.session_calendar import (
+    MassiveExchangeSession,
+    build_massive_session_authority,
+)
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.workflows import (
     massive_adaptive_rl_runtime_source_graph_authority_v1 as graph_module,
@@ -33,6 +42,7 @@ from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     materialize_massive_adaptive_rl_source_bundle_v1,
 )
 from rl_quant.training.massive_adaptive_split_plan_v1 import (
+    MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1,
     build_massive_adaptive_split_plan_v1,
 )
 from rl_quant.training.massive_adaptive_rl_training_forecast_authority_v1 import (
@@ -63,6 +73,8 @@ _FOLD = {
     "fit-forecast-archive-inventory": "fit-forecast-archive-inventory.json",
     "decision-root-inventory": "decision-root-inventory.json",
     "context-origin-inventory": "context-origin-inventory.json",
+    "validation-origin-feature-inventory": ("validation-origin-feature-inventory.json"),
+    "validation-origin-action-inventory": ("validation-origin-action-inventory.json"),
 }
 
 
@@ -223,7 +235,35 @@ def _unchecked_inventory(
 def _runtime_contract_sources(
     *, block_sessions: int = 63
 ) -> tuple[dict[tuple[str, int | None], object], object]:
-    sessions = _sessions()
+    raw_sessions = _sessions()
+    calendar_source = semantic_sha256("runtime-contract-session-calendar")
+    sessions = build_massive_session_authority(
+        tuple(
+            MassiveExchangeSession(
+                session_date=row.session_date,
+                exchange="XNYS",
+                regular_open_ns=int(
+                    datetime.fromisoformat(row.session_date)
+                    .replace(tzinfo=ZoneInfo("America/New_York"))
+                    .timestamp()
+                    * 1_000_000_000
+                )
+                + 10 * 60 * 60 * 1_000_000_000,
+                regular_close_ns=int(
+                    datetime.fromisoformat(row.session_date)
+                    .replace(tzinfo=ZoneInfo("America/New_York"))
+                    .timestamp()
+                    * 1_000_000_000
+                )
+                + 16 * 60 * 60 * 1_000_000_000,
+                scheduled_five_minute_intervals=72,
+                special_session_reason=None,
+                calendar_source_receipt_sha256=calendar_source,
+            )
+            for row in raw_sessions.sessions
+        ),
+        calendar_source_receipt_sha256=calendar_source,
+    )
     split_plan = build_massive_adaptive_split_plan_v1(
         candidate_session_dates=tuple(
             session.session_date for session in sessions.sessions
@@ -309,6 +349,52 @@ def _runtime_contract_sources(
                 identity_authority_receipt_sha256=identity_receipt,
             )
             for session_date in expected_dates
+        )
+        validation_dates = split_plan.outer_folds[
+            outer_fold_index
+        ].inner_validation_session_dates
+        validation_start = split_plan.candidate_session_dates.index(validation_dates[0])
+        validation_stop = (
+            split_plan.candidate_session_dates.index(validation_dates[-1]) + 1
+        )
+        validation_tensor_dates = split_plan.candidate_session_dates[
+            validation_start
+            - MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1
+            + 1 : validation_stop
+        ]
+        validation_features = tuple(
+            SimpleNamespace(
+                decision_session_date=session_date,
+                daily_input_authority_semantic_receipt_sha256=daily_receipt,
+                semantic_receipt_sha256=semantic_sha256(
+                    ("validation-feature", session_date)
+                ),
+            )
+            for session_date in validation_tensor_dates
+        )
+        sessions_by_date = {row.session_date: row for row in sessions.sessions}
+        validation_clocks = build_massive_decision_clock_authorities(
+            session_authority=sessions,
+            sessions=tuple(
+                sessions_by_date[session_date]
+                for session_date in validation_tensor_dates
+            ),
+        )
+        validation_actions = tuple(
+            SimpleNamespace(
+                decision_session_date=session_date,
+                decision_at_ms=clock.decision_at_ns // 1_000_000,
+                decision_clock_receipt_sha256=clock.receipt_sha256,
+                session_authority_receipt_sha256=sessions.receipt_sha256,
+                semantic_receipt_sha256=semantic_sha256(
+                    ("validation-action", session_date)
+                ),
+            )
+            for session_date, clock in zip(
+                validation_tensor_dates,
+                validation_clocks,
+                strict=True,
+            )
         )
         decision_by_date = {
             decision.decision_session_date: decision for decision in decisions
@@ -428,6 +514,8 @@ def _runtime_contract_sources(
             "fit-forecast-archive-inventory": tuple(archives),
             "decision-root-inventory": decisions,
             "context-origin-inventory": contexts,
+            "validation-origin-feature-inventory": validation_features,
+            "validation-origin-action-inventory": validation_actions,
         }
         for role, items in fold_items.items():
             inventory = _unchecked_inventory(
@@ -517,7 +605,7 @@ def test_runtime_source_graph_generic_reload_is_nonauthorizing_and_replayable(
     assert (
         authorized.source_bundle_receipt_sha256 == source_bundle.semantic_receipt_sha256
     )
-    assert len(authorized.rows) == 32
+    assert len(authorized.rows) == 40
     assert not authorized.profitability_reporting_authorized
     assert not authorized.lockbox_access_authorized
 
@@ -774,6 +862,14 @@ def test_runtime_graph_contract_accepts_all_accumulated_source_folds() -> None:
         archive.source_fold_index for archive in fold_three_inventory.runtime_items
     ) == (0, 0, 1, 1, 2, 2, 3, 3)
     assert any(row[0] == "rl-fit-fold" and row[1] == 3 for row in coverage)
+    validation_coverage = tuple(
+        row for row in coverage if row[0] == "validation-origin-fold"
+    )
+    assert tuple(row[1] for row in validation_coverage) == (0, 1, 2, 3)
+    assert all(
+        len(row[2]) == MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1 + 126 - 1
+        for row in validation_coverage
+    )
     assert any(edge[0] == "fit-forecast/training-window/3/7/3" for edge in edges)
 
 
@@ -787,6 +883,85 @@ def test_runtime_graph_contract_rejects_manifest_block_size_mismatch() -> None:
     with pytest.raises(
         MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
         match="block size differs from Manifest V3",
+    ):
+        graph_module._validate_runtime_graph_contract(
+            runtime_sources=runtime_sources,  # type: ignore[arg-type]
+            prequential_block_sessions=(
+                manifest.base_manifest.prequential_block_sessions
+            ),
+            fold_fit_session_counts=tuple(
+                manifest.base_manifest.schedule(fold_index).rl_fit_session_count
+                for fold_index in manifest.base_manifest.fold_indices
+            ),
+            fold_candidate_schedule_receipts=(
+                manifest.base_manifest.fold_candidate_schedule_receipts
+            ),
+        )
+
+
+def test_runtime_graph_contract_rejects_missing_validation_predictor() -> None:
+    runtime_sources, _split_plan = _runtime_contract_sources(block_sessions=63)
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="runtime-contract-missing-validation-predictor",
+        prequential_block_sessions=63,
+    )
+    key = ("validation-origin-feature-inventory", 2)
+    bound = runtime_sources[key]
+    inventory = bound.authority
+    runtime_sources[key] = replace(
+        bound,
+        authority=replace(
+            inventory,
+            runtime_items=inventory.runtime_items[1:],
+        ),
+    )
+
+    with pytest.raises(
+        MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
+        match="validation predictor inventory does not cover",
+    ):
+        graph_module._validate_runtime_graph_contract(
+            runtime_sources=runtime_sources,  # type: ignore[arg-type]
+            prequential_block_sessions=(
+                manifest.base_manifest.prequential_block_sessions
+            ),
+            fold_fit_session_counts=tuple(
+                manifest.base_manifest.schedule(fold_index).rl_fit_session_count
+                for fold_index in manifest.base_manifest.fold_indices
+            ),
+            fold_candidate_schedule_receipts=(
+                manifest.base_manifest.fold_candidate_schedule_receipts
+            ),
+        )
+
+
+def test_runtime_graph_contract_rejects_cross_fold_validation_alternative() -> None:
+    runtime_sources, _split_plan = _runtime_contract_sources(block_sessions=63)
+    manifest = build_massive_adaptive_rl_experiment_manifest_v3(
+        experiment_id="runtime-contract-alternate-validation-predictor",
+        prequential_block_sessions=63,
+    )
+    key = ("validation-origin-feature-inventory", 1)
+    bound = runtime_sources[key]
+    inventory = bound.authority
+    features = list(inventory.runtime_items)
+    original = features[0]
+    features[0] = SimpleNamespace(
+        **{
+            **vars(original),
+            "semantic_receipt_sha256": semantic_sha256(
+                ("alternate-validation-feature", original.decision_session_date)
+            ),
+        }
+    )
+    runtime_sources[key] = replace(
+        bound,
+        authority=replace(inventory, runtime_items=tuple(features)),
+    )
+
+    with pytest.raises(
+        MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error,
+        match="validation predictor date resolves to alternate roots",
     ):
         graph_module._validate_runtime_graph_contract(
             runtime_sources=runtime_sources,  # type: ignore[arg-type]

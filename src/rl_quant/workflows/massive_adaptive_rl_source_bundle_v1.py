@@ -42,7 +42,10 @@ MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V1_SPEC_SHA256 = semantic_sha256(
         "publication": "fsync-atomic-create-only-no-symlink-ancestors",
         "caller_dates": False,
         "caller_checkpoint_selection": False,
-        "caller_actions_or_economics": False,
+        "caller_evaluation_actions_or_economics": False,
+        "validation_predictors": (
+            "fold-primary-feature-and-action-inventories-before-runtime-replay"
+        ),
         "folds": (0, 1, 2, 3),
         "profitability_reporting": False,
         "lockbox_access": False,
@@ -66,6 +69,8 @@ _FOLD_SOURCE_PATHS = {
     "fit-forecast-archive-inventory": "fit-forecast-archive-inventory.json",
     "decision-root-inventory": "decision-root-inventory.json",
     "context-origin-inventory": "context-origin-inventory.json",
+    "validation-origin-feature-inventory": ("validation-origin-feature-inventory.json"),
+    "validation-origin-action-inventory": ("validation-origin-action-inventory.json"),
 }
 
 
@@ -185,6 +190,12 @@ _SOURCE_ROLE_SCHEMAS = {
     "context-origin-inventory": (
         "rl-quant.massive-adaptive-context-origin-inventory-v1"
     ),
+    "validation-origin-feature-inventory": (
+        "rl-quant.massive-adaptive-validation-origin-feature-inventory-v1"
+    ),
+    "validation-origin-action-inventory": (
+        "rl-quant.massive-adaptive-validation-origin-action-inventory-v1"
+    ),
 }
 
 
@@ -295,6 +306,8 @@ class MassiveAdaptiveRLSourceBundleV1:
     fit_forecast_archive_inventory_sha256: str
     decision_root_inventory_sha256: str
     context_origin_inventory_sha256: str
+    validation_origin_feature_inventory_sha256: str
+    validation_origin_action_inventory_sha256: str
     committed_source_data_qualified: bool
     persisted_source_replayed: bool
     runtime_source_replayed: bool
@@ -404,6 +417,8 @@ class MassiveAdaptiveRLSourceBundleV1:
             self.fit_forecast_archive_inventory_sha256,
             self.decision_root_inventory_sha256,
             self.context_origin_inventory_sha256,
+            self.validation_origin_feature_inventory_sha256,
+            self.validation_origin_action_inventory_sha256,
             self.protocol_receipt_sha256,
             self.specification_sha256,
             self.implementation_source_sha256,
@@ -610,8 +625,9 @@ def materialize_massive_adaptive_rl_source_bundle_v1(
 ) -> MassiveAdaptiveRLSourceBundleV1:
     """Publish the fixed source graph after typed authorities replay.
 
-    Paths and roles are protocol-owned.  The caller supplies no date
-    inventory, checkpoint choice, action, transition, or economic result.
+    Paths and roles are protocol-owned.  The caller supplies no free date
+    inventory, checkpoint choice, evaluation action, transition, or economic
+    result; validation predictor inventories are typed source roles.
     """
 
     manifest.validate()
@@ -708,6 +724,12 @@ def materialize_massive_adaptive_rl_source_bundle_v1(
         ),
         "context_origin_inventory_sha256": _summary_receipt(
             by_key, "context-origin-inventory"
+        ),
+        "validation_origin_feature_inventory_sha256": _summary_receipt(
+            by_key, "validation-origin-feature-inventory"
+        ),
+        "validation_origin_action_inventory_sha256": _summary_receipt(
+            by_key, "validation-origin-action-inventory"
         ),
         "committed_source_data_qualified": True,
         "persisted_source_replayed": False,

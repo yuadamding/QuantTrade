@@ -57,6 +57,7 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_graph_authority_v1 import (
     authorize_massive_adaptive_rl_runtime_source_graph_authority_v1,
+    build_massive_adaptive_rl_typed_authority_inventory_v1,
     materialize_massive_adaptive_rl_runtime_source_graph_authority_v1,
 )
 from test_massive_adaptive_decision_tensor_v1 import _origin
@@ -611,6 +612,18 @@ def test_runtime_sources_rebuild_validation_origins_without_caller_roots(
     context_identity.receipt_sha256 = semantic_sha256(
         "runtime-validation-context-identity"
     )
+    feature_inventory = build_massive_adaptive_rl_typed_authority_inventory_v1(
+        role="validation-origin-feature-inventory",
+        fold_index=0,
+        items=features,
+    )
+    action_inventory = build_massive_adaptive_rl_typed_authority_inventory_v1(
+        role="validation-origin-action-inventory",
+        fold_index=0,
+        items=actions,
+    )
+    assert feature_inventory.runtime_items == tuple(features)
+    assert action_inventory.runtime_items == tuple(actions)
     fold = reconstruction.MassiveAdaptiveRLFoldRuntimeSourcesV1(
         outer_fold_index=0,
         training_windows=(lineage.training_window,),
@@ -619,6 +632,8 @@ def test_runtime_sources_rebuild_validation_origins_without_caller_roots(
         fit_forecast_archives=(block.forecast_archive,),
         decision_roots=block.decision_roots,
         context_origins=block.context_origins,
+        validation_features=tuple(features),
+        validation_action_origins=tuple(actions),
         supervised_lineages=(lineage,),
         fit_blocks=(block,),
     )
@@ -655,8 +670,6 @@ def test_runtime_sources_rebuild_validation_origins_without_caller_roots(
         ),
         source_data_qualified=True,
         semantic_receipt_sha256=semantic_sha256("runtime-sources"),
-        _replay_origin_features=tuple(features),
-        _replay_action_origins=tuple(actions),
         _replay_context_origins=block.context_origins,
         _replay_decision_roots=block.decision_roots,
     )
@@ -666,7 +679,12 @@ def test_runtime_sources_rebuild_validation_origins_without_caller_roots(
     )
     substituted_runtime_sources = replace(
         runtime_sources,
-        _replay_origin_features=runtime_sources._replay_origin_features[1:],
+        folds=(
+            replace(
+                fold,
+                validation_features=fold.validation_features[1:],
+            ),
+        ),
     )
 
     assert substituted_runtime_sources.semantic_receipt_sha256 != semantic_sha256(

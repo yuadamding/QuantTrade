@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -55,9 +56,7 @@ class MassiveDecisionClockAuthority:
 
     def unsigned(self) -> dict[str, object]:
         return {
-            key: value
-            for key, value in asdict(self).items()
-            if key != "receipt_sha256"
+            key: value for key, value in asdict(self).items() if key != "receipt_sha256"
         }
 
     def validate(self) -> None:
@@ -99,26 +98,20 @@ class MassiveDecisionClockAuthority:
         if self.decision_delay_ns != MASSIVE_DECISION_DELAY_NS:
             raise MassiveDecisionClockError("decision clock delay drifted")
         if self.decision_at_ns != self.regular_close_ns + self.decision_delay_ns:
-            raise MassiveDecisionClockError("decision timestamp was not derived from close")
+            raise MassiveDecisionClockError(
+                "decision timestamp was not derived from close"
+            )
         _digest("session authority receipt", self.session_authority_receipt_sha256)
         _digest("decision clock receipt", self.receipt_sha256)
         if self.receipt_sha256 != semantic_sha256(self.unsigned()):
             raise MassiveDecisionClockError("decision clock receipt differs")
 
 
-def build_massive_decision_clock_authority(
+def _build_massive_decision_clock_from_validated_session(
     *,
     session_authority: MassiveSessionAuthority,
     session: MassiveExchangeSession,
 ) -> MassiveDecisionClockAuthority:
-    """Derive the only valid decision timestamp for one exchange session."""
-
-    session_authority.validate()
-    session.validate()
-    if session_authority.resolve(
-        exchange=session.exchange, session_date=session.session_date
-    ) != session:
-        raise MassiveDecisionClockError("session was not resolved by its authority")
     source_day_start_ns = int(
         datetime.fromisoformat(session.session_date)
         .replace(tzinfo=ZoneInfo("America/New_York"))
@@ -157,11 +150,60 @@ def build_massive_decision_clock_authority(
     return value
 
 
+def build_massive_decision_clock_authorities(
+    *,
+    session_authority: MassiveSessionAuthority,
+    sessions: Sequence[MassiveExchangeSession],
+) -> tuple[MassiveDecisionClockAuthority, ...]:
+    """Derive clocks for an exact session inventory after one calendar replay."""
+
+    session_authority.validate()
+    requested = tuple(sessions)
+    if not requested:
+        raise MassiveDecisionClockError("decision clock session inventory is empty")
+    authority_sessions = {
+        (row.exchange, row.session_date): row for row in session_authority.sessions
+    }
+    if len(authority_sessions) != len(session_authority.sessions):
+        raise MassiveDecisionClockError("session authority identity is duplicated")
+    result: list[MassiveDecisionClockAuthority] = []
+    seen: set[tuple[str, str]] = set()
+    for session in requested:
+        session.validate()
+        key = (session.exchange, session.session_date)
+        if key in seen or authority_sessions.get(key) != session:
+            raise MassiveDecisionClockError(
+                "decision clock session inventory is duplicated or unresolved"
+            )
+        seen.add(key)
+        result.append(
+            _build_massive_decision_clock_from_validated_session(
+                session_authority=session_authority,
+                session=session,
+            )
+        )
+    return tuple(result)
+
+
+def build_massive_decision_clock_authority(
+    *,
+    session_authority: MassiveSessionAuthority,
+    session: MassiveExchangeSession,
+) -> MassiveDecisionClockAuthority:
+    """Derive the only valid decision timestamp for one exchange session."""
+
+    return build_massive_decision_clock_authorities(
+        session_authority=session_authority,
+        sessions=(session,),
+    )[0]
+
+
 __all__ = [
     "MASSIVE_DECISION_CLOCK_SCHEMA",
     "MASSIVE_DECISION_DELAY_NS",
     "MASSIVE_OBSERVATION_DOMAIN",
     "MassiveDecisionClockAuthority",
     "MassiveDecisionClockError",
+    "build_massive_decision_clock_authorities",
     "build_massive_decision_clock_authority",
 ]

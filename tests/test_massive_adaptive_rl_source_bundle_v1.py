@@ -51,6 +51,8 @@ _FOLD = {
     "fit-forecast-archive-inventory": "fit-forecast-archive-inventory.json",
     "decision-root-inventory": "decision-root-inventory.json",
     "context-origin-inventory": "context-origin-inventory.json",
+    "validation-origin-feature-inventory": ("validation-origin-feature-inventory.json"),
+    "validation-origin-action-inventory": ("validation-origin-action-inventory.json"),
 }
 
 
