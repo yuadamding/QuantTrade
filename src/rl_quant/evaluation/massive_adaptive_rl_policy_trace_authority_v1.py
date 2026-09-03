@@ -42,6 +42,9 @@ from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
 )
 
 if TYPE_CHECKING:
+    from rl_quant.evaluation.massive_adaptive_rl_four_fold_validation_inputs_v1 import (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1,
+    )
     from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1,
         MassiveAdaptiveRLValidationEnvironmentRegistryV1,
@@ -64,7 +67,9 @@ MASSIVE_ADAPTIVE_RL_POLICY_TRACE_AUTHORITY_V1_SOURCE_SCHEMA_SHA256 = semantic_sh
         "validation_environment": (
             "persisted-registry-plus-canonical-authority-and-static-identities"
         ),
-        "temporal_barrier": "registry-commit-strictly-precedes-outcome-commit",
+        "temporal_barrier": (
+            "all-four-validation-inputs-commit-strictly-precedes-outcome-commit"
+        ),
         "dynamic_economic_sources": "transition-derived-separate-inventory",
         "promotion": "reload-checkpoint-rerun-actions-and-economics",
         "generic_reload": "nonauthorizing",
@@ -106,6 +111,9 @@ def _resolve_evaluation_environment(
     validation_environment_registry: (
         MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
     ),
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1 | None
+    ),
     fold_index: int,
     evaluation_role: str,
     outcome_committed_at_ms: int,
@@ -116,6 +124,7 @@ def _resolve_evaluation_environment(
     if evaluation_role == "outer_test":
         if (
             validation_environment_registry is not None
+            or four_fold_validation_inputs_authority is not None
             or type(environment) is not MassiveAdaptiveProfitabilityEnvV1
         ):
             raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
@@ -127,7 +136,10 @@ def _resolve_evaluation_environment(
             "adaptive RL policy trace evaluation role differs"
         )
     environment_type, registry_type = _validation_environment_types()
-    if environment is not None or type(validation_environment_registry) is not registry_type:
+    if (
+        environment is not None
+        or type(validation_environment_registry) is not registry_type
+    ):
         raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
             "inner-validation policy trace requires its persisted validation registry"
         )
@@ -150,6 +162,24 @@ def _resolve_evaluation_environment(
         raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
             "inner-validation policy trace registry is not precommitted and authorized"
         )
+    from rl_quant.evaluation.massive_adaptive_rl_four_fold_validation_inputs_v1 import (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1,
+        validate_massive_adaptive_rl_validation_outcome_barrier_v1,
+    )
+
+    if (
+        type(four_fold_validation_inputs_authority)
+        is not MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1
+    ):
+        raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
+            "inner-validation policy trace requires the four-fold input authority"
+        )
+    validate_massive_adaptive_rl_validation_outcome_barrier_v1(
+        authority=four_fold_validation_inputs_authority,
+        validation_environment_registry=registry,
+        fold_index=fold_index,
+        outcome_committed_at_ms=outcome_committed_at_ms,
+    )
     environments = registry.build_environments()
     resolved_environment = environments[20.0]
     environment_authority = registry.environment_authority(20.0)
@@ -174,6 +204,10 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
     validation_environment_registry_source_receipt_sha256: str | None
     validation_environment_registry_commit_receipt_sha256: str | None
     validation_environment_registry_committed_at_ms: int | None
+    four_fold_validation_inputs_authority_receipt_sha256: str | None
+    four_fold_validation_inputs_source_receipt_sha256: str | None
+    four_fold_validation_inputs_commit_receipt_sha256: str | None
+    four_fold_validation_inputs_committed_at_ms: int | None
     validation_environment_authority_receipt_sha256: str | None
     environment_source_inventory_sha256: str
     economic_compatibility_receipt_sha256: str
@@ -189,6 +223,10 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
         MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
     )
     runtime_validation_environment_registry_replayed: bool
+    runtime_four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1 | None
+    )
+    runtime_four_fold_validation_inputs_replayed: bool
     runtime_validation_environment_authority: (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
     )
@@ -231,6 +269,18 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
             "validation_environment_registry_committed_at_ms": (
                 self.validation_environment_registry_committed_at_ms
             ),
+            "four_fold_validation_inputs_authority_receipt_sha256": (
+                self.four_fold_validation_inputs_authority_receipt_sha256
+            ),
+            "four_fold_validation_inputs_source_receipt_sha256": (
+                self.four_fold_validation_inputs_source_receipt_sha256
+            ),
+            "four_fold_validation_inputs_commit_receipt_sha256": (
+                self.four_fold_validation_inputs_commit_receipt_sha256
+            ),
+            "four_fold_validation_inputs_committed_at_ms": (
+                self.four_fold_validation_inputs_committed_at_ms
+            ),
             "validation_environment_authority_receipt_sha256": (
                 self.validation_environment_authority_receipt_sha256
             ),
@@ -254,6 +304,7 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
         self.loaded_source.validate()
         runtime = self.runtime_trace is not None
         registry_runtime = self.runtime_validation_environment_registry is not None
+        barrier_runtime = self.runtime_four_fold_validation_inputs_authority is not None
         validation_environment_runtime = (
             self.runtime_validation_environment_authority is not None
         )
@@ -265,7 +316,10 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
                 )
             self.runtime_validation_environment_registry.validate()
         if self.runtime_validation_environment_authority is not None:
-            if type(self.runtime_validation_environment_authority) is not environment_type:
+            if (
+                type(self.runtime_validation_environment_authority)
+                is not environment_type
+            ):
                 raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
                     "adaptive RL policy trace validation environment type differs"
                 )
@@ -280,9 +334,23 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
             self.validation_environment_authority_receipt_sha256,
         )
         registry_fields_present = all(value is not None for value in registry_fields)
-        if any(value is not None for value in registry_fields) != registry_fields_present:
+        if (
+            any(value is not None for value in registry_fields)
+            != registry_fields_present
+        ):
             raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
                 "adaptive RL policy trace validation registry binding is partial"
+            )
+        barrier_fields = (
+            self.four_fold_validation_inputs_authority_receipt_sha256,
+            self.four_fold_validation_inputs_source_receipt_sha256,
+            self.four_fold_validation_inputs_commit_receipt_sha256,
+            self.four_fold_validation_inputs_committed_at_ms,
+        )
+        barrier_fields_present = all(value is not None for value in barrier_fields)
+        if any(value is not None for value in barrier_fields) != barrier_fields_present:
+            raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
+                "adaptive RL policy trace four-fold input binding is partial"
             )
         if self.runtime_trace is not None:
             self.runtime_trace.validate()
@@ -296,26 +364,33 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
             or self.loaded_source.receipt.entitlement_receipt_sha256
             != self.policy_trace_receipt_sha256
             or self.runtime_trace_replayed != runtime
-            or self.runtime_validation_environment_registry_replayed
-            != registry_runtime
+            or self.runtime_validation_environment_registry_replayed != registry_runtime
+            or self.runtime_four_fold_validation_inputs_replayed != barrier_runtime
             or self.runtime_validation_environment_replayed
             != validation_environment_runtime
             or registry_runtime != validation_environment_runtime
+            or barrier_runtime != registry_runtime
             or (registry_runtime and not runtime)
             or (
                 self.evaluation_role == "outer_test"
                 and (
                     registry_fields_present
+                    or barrier_fields_present
                     or registry_runtime
+                    or barrier_runtime
                     or validation_environment_runtime
                 )
             )
-            or (self.evaluation_role == "inner_validation" and not registry_fields_present)
+            or (
+                self.evaluation_role == "inner_validation"
+                and (not registry_fields_present or not barrier_fields_present)
+            )
             or self.development_policy_evaluation_authorized
             != (
                 expected
                 and self.evaluation_role == "inner_validation"
                 and registry_runtime
+                and barrier_runtime
             )
             or self.outer_evaluation_authorized
             != (expected and self.evaluation_role == "outer_test")
@@ -386,6 +461,35 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
                 raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
                     "adaptive runtime policy trace environment differs"
                 )
+        if barrier_runtime:
+            assert self.runtime_four_fold_validation_inputs_authority is not None
+            assert self.runtime_validation_environment_registry is not None
+            barrier = self.runtime_four_fold_validation_inputs_authority
+            from rl_quant.evaluation.massive_adaptive_rl_four_fold_validation_inputs_v1 import (
+                validate_massive_adaptive_rl_validation_outcome_barrier_v1,
+            )
+
+            validate_massive_adaptive_rl_validation_outcome_barrier_v1(
+                authority=barrier,
+                validation_environment_registry=(
+                    self.runtime_validation_environment_registry
+                ),
+                fold_index=self.fold_index,
+                outcome_committed_at_ms=self.loaded_source.commit.committed_at_ms,
+            )
+            if (
+                barrier.semantic_receipt_sha256
+                != self.four_fold_validation_inputs_authority_receipt_sha256
+                or barrier.source_receipt_sha256
+                != self.four_fold_validation_inputs_source_receipt_sha256
+                or barrier.source_transaction_receipt_sha256
+                != self.four_fold_validation_inputs_commit_receipt_sha256
+                or barrier.source_transaction_committed_at_ms
+                != self.four_fold_validation_inputs_committed_at_ms
+            ):
+                raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
+                    "adaptive runtime policy trace four-fold input differs"
+                )
         for value in (
             self.checkpoint_authority_receipt_sha256,
             self.checkpoint_receipt_sha256,
@@ -411,9 +515,21 @@ class MassiveAdaptiveRLPolicyTraceAuthorityV1:
             self.validation_environment_registry_receipt_sha256,
             self.validation_environment_registry_source_receipt_sha256,
             self.validation_environment_registry_commit_receipt_sha256,
+            self.four_fold_validation_inputs_authority_receipt_sha256,
+            self.four_fold_validation_inputs_source_receipt_sha256,
+            self.four_fold_validation_inputs_commit_receipt_sha256,
         ):
             if registry_value is not None:
                 _digest("adaptive RL policy trace validation registry", registry_value)
+        if self.four_fold_validation_inputs_committed_at_ms is not None and (
+            isinstance(self.four_fold_validation_inputs_committed_at_ms, bool)
+            or self.four_fold_validation_inputs_committed_at_ms < 0
+            or self.four_fold_validation_inputs_committed_at_ms
+            >= self.loaded_source.commit.committed_at_ms
+        ):
+            raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
+                "adaptive RL policy trace four-fold inputs were not committed first"
+            )
         if self.validation_environment_registry_committed_at_ms is not None and (
             isinstance(self.validation_environment_registry_committed_at_ms, bool)
             or self.validation_environment_registry_committed_at_ms < 0
@@ -436,10 +552,16 @@ def _payload(
     validation_environment_authority: (
         MassiveAdaptiveRLValidationEnvironmentAuthorityV1 | None
     ),
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1 | None
+    ),
 ) -> dict[str, object]:
     registry = validation_environment_registry
     environment_authority = validation_environment_authority
-    if (registry is None) != (environment_authority is None):
+    barrier = four_fold_validation_inputs_authority
+    if (registry is None) != (environment_authority is None) or (registry is None) != (
+        barrier is None
+    ):
         raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
             "adaptive RL policy trace validation registry binding is partial"
         )
@@ -459,6 +581,14 @@ def _payload(
     ):
         raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
             "adaptive RL policy trace validation registry source transaction is absent"
+        )
+    if barrier is not None and (
+        barrier.source_receipt_sha256 is None
+        or barrier.source_transaction_receipt_sha256 is None
+        or barrier.source_transaction_committed_at_ms is None
+    ):
+        raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
+            "adaptive RL policy trace four-fold input source transaction is absent"
         )
     return {
         "fold_index": trace.fold_index,
@@ -486,8 +616,18 @@ def _payload(
         "validation_environment_registry_commit_receipt_sha256": (
             registry_commit_receipt
         ),
-        "validation_environment_registry_committed_at_ms": (
-            registry_committed_at_ms
+        "validation_environment_registry_committed_at_ms": (registry_committed_at_ms),
+        "four_fold_validation_inputs_authority_receipt_sha256": (
+            None if barrier is None else barrier.semantic_receipt_sha256
+        ),
+        "four_fold_validation_inputs_source_receipt_sha256": (
+            None if barrier is None else barrier.source_receipt_sha256
+        ),
+        "four_fold_validation_inputs_commit_receipt_sha256": (
+            None if barrier is None else barrier.source_transaction_receipt_sha256
+        ),
+        "four_fold_validation_inputs_committed_at_ms": (
+            None if barrier is None else barrier.source_transaction_committed_at_ms
         ),
         "validation_environment_authority_receipt_sha256": (
             None
@@ -582,23 +722,38 @@ def parse_massive_adaptive_rl_policy_trace_authority_v1(
         ),
         "validation_environment_registry_source_receipt_sha256": (
             None
-            if payload["validation_environment_registry_source_receipt_sha256"]
-            is None
-            else str(
-                payload["validation_environment_registry_source_receipt_sha256"]
-            )
+            if payload["validation_environment_registry_source_receipt_sha256"] is None
+            else str(payload["validation_environment_registry_source_receipt_sha256"])
         ),
         "validation_environment_registry_commit_receipt_sha256": (
             None
             if payload["validation_environment_registry_commit_receipt_sha256"] is None
-            else str(
-                payload["validation_environment_registry_commit_receipt_sha256"]
-            )
+            else str(payload["validation_environment_registry_commit_receipt_sha256"])
         ),
         "validation_environment_registry_committed_at_ms": (
             None
             if payload["validation_environment_registry_committed_at_ms"] is None
             else int(str(payload["validation_environment_registry_committed_at_ms"]))
+        ),
+        "four_fold_validation_inputs_authority_receipt_sha256": (
+            None
+            if payload["four_fold_validation_inputs_authority_receipt_sha256"] is None
+            else str(payload["four_fold_validation_inputs_authority_receipt_sha256"])
+        ),
+        "four_fold_validation_inputs_source_receipt_sha256": (
+            None
+            if payload["four_fold_validation_inputs_source_receipt_sha256"] is None
+            else str(payload["four_fold_validation_inputs_source_receipt_sha256"])
+        ),
+        "four_fold_validation_inputs_commit_receipt_sha256": (
+            None
+            if payload["four_fold_validation_inputs_commit_receipt_sha256"] is None
+            else str(payload["four_fold_validation_inputs_commit_receipt_sha256"])
+        ),
+        "four_fold_validation_inputs_committed_at_ms": (
+            None
+            if payload["four_fold_validation_inputs_committed_at_ms"] is None
+            else int(str(payload["four_fold_validation_inputs_committed_at_ms"]))
         ),
         "validation_environment_authority_receipt_sha256": (
             None
@@ -632,6 +787,8 @@ def parse_massive_adaptive_rl_policy_trace_authority_v1(
         runtime_trace_replayed=False,
         runtime_validation_environment_registry=None,
         runtime_validation_environment_registry_replayed=False,
+        runtime_four_fold_validation_inputs_authority=None,
+        runtime_four_fold_validation_inputs_replayed=False,
         runtime_validation_environment_authority=None,
         runtime_validation_environment_replayed=False,
         development_policy_evaluation_authorized=False,
@@ -655,6 +812,9 @@ def authorize_massive_adaptive_rl_policy_trace_authority_v1(
     validation_environment_registry: (
         MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
     ) = None,
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1 | None
+    ) = None,
     device: torch.device | str = "cpu",
 ) -> MassiveAdaptiveRLPolicyTraceAuthorityV1:
     parsed = parse_massive_adaptive_rl_policy_trace_authority_v1(
@@ -664,6 +824,7 @@ def authorize_massive_adaptive_rl_policy_trace_authority_v1(
     resolved_environment, environment_authority = _resolve_evaluation_environment(
         environment=environment,
         validation_environment_registry=validation_environment_registry,
+        four_fold_validation_inputs_authority=(four_fold_validation_inputs_authority),
         fold_index=parsed.fold_index,
         evaluation_role=parsed.evaluation_role,
         outcome_committed_at_ms=authority.loaded_source.commit.committed_at_ms,
@@ -682,6 +843,9 @@ def authorize_massive_adaptive_rl_policy_trace_authority_v1(
             environment=resolved_environment,
             validation_environment_registry=validation_environment_registry,
             validation_environment_authority=environment_authority,
+            four_fold_validation_inputs_authority=(
+                four_fold_validation_inputs_authority
+            ),
         )
     ):
         raise MassiveAdaptiveRLPolicyTraceAuthorityV1Error(
@@ -695,12 +859,19 @@ def authorize_massive_adaptive_rl_policy_trace_authority_v1(
         runtime_validation_environment_registry_replayed=(
             validation_environment_registry is not None
         ),
+        runtime_four_fold_validation_inputs_authority=(
+            four_fold_validation_inputs_authority
+        ),
+        runtime_four_fold_validation_inputs_replayed=(
+            four_fold_validation_inputs_authority is not None
+        ),
         runtime_validation_environment_authority=environment_authority,
         runtime_validation_environment_replayed=environment_authority is not None,
         development_policy_evaluation_authorized=(
             parsed.source_data_qualified
             and parsed.evaluation_role == "inner_validation"
             and validation_environment_registry is not None
+            and four_fold_validation_inputs_authority is not None
         ),
         outer_evaluation_authorized=(
             parsed.source_data_qualified and parsed.evaluation_role == "outer_test"
@@ -723,6 +894,9 @@ def materialize_massive_adaptive_rl_policy_trace_authority_v1(
     validation_environment_registry: (
         MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
     ) = None,
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1 | None
+    ) = None,
     device: torch.device | str = "cpu",
 ) -> MassiveAdaptiveRLPolicyTraceAuthorityV1:
     if not artifact_id or any(
@@ -734,6 +908,7 @@ def materialize_massive_adaptive_rl_policy_trace_authority_v1(
     resolved_environment, environment_authority = _resolve_evaluation_environment(
         environment=environment,
         validation_environment_registry=validation_environment_registry,
+        four_fold_validation_inputs_authority=(four_fold_validation_inputs_authority),
         fold_index=fold_index,
         evaluation_role=evaluation_role,
         outcome_committed_at_ms=committed_at_ms,
@@ -755,6 +930,9 @@ def materialize_massive_adaptive_rl_policy_trace_authority_v1(
                     environment=resolved_environment,
                     validation_environment_registry=validation_environment_registry,
                     validation_environment_authority=environment_authority,
+                    four_fold_validation_inputs_authority=(
+                        four_fold_validation_inputs_authority
+                    ),
                 )
             )
         ),
@@ -783,10 +961,9 @@ def materialize_massive_adaptive_rl_policy_trace_authority_v1(
         ),
         checkpoint_authority=checkpoint_authority,
         chronology_authority=chronology_authority,
-        environment=(
-            resolved_environment if evaluation_role == "outer_test" else None
-        ),
+        environment=(resolved_environment if evaluation_role == "outer_test" else None),
         validation_environment_registry=validation_environment_registry,
+        four_fold_validation_inputs_authority=(four_fold_validation_inputs_authority),
         device=device,
     )
 

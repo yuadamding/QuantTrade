@@ -17,6 +17,15 @@ from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_authority_v1 import (
 from rl_quant.evaluation.massive_adaptive_rl_fixed_control_validation_authority_v1 import (
     materialize_massive_adaptive_rl_fixed_control_validation_authority_v1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_four_fold_validation_inputs_v1 import (
+    MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_DATASET,
+    MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_SOURCE_SCHEMA_SHA256,
+    MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_SOURCE_SHA256,
+    MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_V1_SPEC_SHA256,
+    MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1,
+    four_fold_validation_inputs_authority_relative_path_v1,
+    parse_massive_adaptive_rl_four_fold_validation_inputs_authority_v1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_policy_trace_authority_v1 import (
     materialize_massive_adaptive_rl_policy_trace_authority_v1,
 )
@@ -36,6 +45,7 @@ from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
     authorize_massive_adaptive_rl_validation_sources_authority_v1,
     materialize_massive_adaptive_rl_validation_environment_registry_v1,
     materialize_massive_adaptive_rl_validation_sources_authority_v1,
+    massive_adaptive_rl_validation_downstream_evidence_exists_v1,
     parse_massive_adaptive_rl_validation_environment_registry_v1,
     parse_massive_adaptive_rl_validation_sources_authority_v1,
     prepare_or_resume_massive_adaptive_rl_validation_sources_v1,
@@ -252,8 +262,32 @@ def test_validation_input_paths_are_manifest_and_fold_canonical() -> None:
     ):
         parameters = inspect.signature(materializer).parameters
         assert "validation_environment_registry" in parameters
+        assert "four_fold_validation_inputs_authority" in parameters
         assert "validation_environment_authority" not in parameters
         assert "validation_environment_authorities" not in parameters
+
+
+def test_validation_input_recovery_detects_any_downstream_outcome(tmp_path) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id="validation-input-downstream-guard"
+    )
+    assert not massive_adaptive_rl_validation_downstream_evidence_exists_v1(
+        root=tmp_path,
+        manifest=manifest,
+        fold_index=0,
+    )
+    outcome = tmp_path / validation_primary_trace_relative_path_v1(
+        manifest=manifest,
+        fold_index=0,
+        checkpoint_authority_receipt_sha256=_digest("checkpoint"),
+    )
+    outcome.parent.mkdir(parents=True)
+    outcome.write_bytes(b"partial-outcome")
+    assert massive_adaptive_rl_validation_downstream_evidence_exists_v1(
+        root=tmp_path,
+        manifest=manifest,
+        fold_index=0,
+    )
 
 
 def test_generic_validation_inputs_are_integrity_only(tmp_path) -> None:
@@ -338,6 +372,105 @@ def test_generic_validation_inputs_are_integrity_only(tmp_path) -> None:
         generic_registry.build_environments()
 
 
+def test_generic_four_fold_validation_input_barrier_is_nonauthorizing(
+    tmp_path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id="generic-four-fold-validation-inputs"
+    )
+    values = {
+        "experiment_id": manifest.experiment_id,
+        "manifest_v4_receipt_sha256": manifest.semantic_receipt_sha256,
+        "training_manifest_v3_receipt_sha256": (
+            manifest.base_manifest.semantic_receipt_sha256
+        ),
+        "four_fold_fit_authority_receipt_sha256": _digest("four-fold-fit"),
+        "runtime_sources_receipt_sha256": _digest("runtime-sources"),
+        "runtime_graph_witness_receipt_sha256": _digest("runtime-witness"),
+        "fold_indices": (0, 1, 2, 3),
+        "validation_sources_authority_receipts": tuple(
+            _digest(("validation-sources", index)) for index in range(4)
+        ),
+        "validation_sources_source_receipts": tuple(
+            _digest(("validation-sources-object", index)) for index in range(4)
+        ),
+        "validation_sources_commit_receipts": tuple(
+            _digest(("validation-sources-commit", index)) for index in range(4)
+        ),
+        "validation_sources_committed_at_ms": (1, 2, 3, 4),
+        "validation_environment_registry_receipts": tuple(
+            _digest(("validation-registry", index)) for index in range(4)
+        ),
+        "validation_registry_source_receipts": tuple(
+            _digest(("validation-registry-object", index)) for index in range(4)
+        ),
+        "validation_registry_commit_receipts": tuple(
+            _digest(("validation-registry-commit", index)) for index in range(4)
+        ),
+        "validation_registry_committed_at_ms": (5, 6, 7, 8),
+        "validation_context_receipts": tuple(
+            _digest(("validation-context", index)) for index in range(4)
+        ),
+        "validation_decision_session_date_inventories": (
+            ("2024-01-02",),
+            ("2024-01-03",),
+            ("2024-01-04",),
+            ("2024-01-05",),
+        ),
+        "expected_candidate_checkpoint_authority_receipt_inventories": tuple(
+            tuple(
+                _digest(("candidate-checkpoint", fold_index, candidate_index))
+                for candidate_index in range(fold_index + 1)
+            )
+            for fold_index in range(4)
+        ),
+        "source_data_qualified": True,
+    }
+    provisional = MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1(
+        **values,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+    )
+    authority = replace(
+        provisional,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    authority.validate()
+    relative = four_fold_validation_inputs_authority_relative_path_v1(manifest=manifest)
+    publish_massive_source_object(
+        stream=BytesIO(canonical_json_file_bytes(authority.semantic_unsigned())),
+        root=tmp_path,
+        relative_payload_path=relative,
+        dataset_id=(
+            MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_DATASET
+        ),
+        source_object_key=relative,
+        requested_at_ms=9,
+        downloaded_at_ms=9,
+        schema_sha256=(
+            MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_SOURCE_SCHEMA_SHA256
+        ),
+        entitlement_receipt_sha256=authority.semantic_receipt_sha256,
+        committed_at_ms=9,
+    )
+    generic = parse_massive_adaptive_rl_four_fold_validation_inputs_authority_v1(
+        root=tmp_path,
+        loaded_source=load_massive_source_bundle(
+            root=tmp_path,
+            relative_payload_path=relative,
+            verified_at_ms=10,
+        ),
+    )
+
+    assert generic.source_transaction_verified
+    assert generic.source_transaction_committed_at_ms == 9
+    assert not generic.runtime_inputs_replayed
+    assert not generic.development_stage_authorized
+    assert (
+        generic.expected_candidate_checkpoint_authority_receipt_inventories
+        == (values["expected_candidate_checkpoint_authority_receipt_inventories"])
+    )
+
+
 def test_validation_registry_rejects_a_second_economic_context() -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v4(
         experiment_id="validation-context-substitution"
@@ -382,6 +515,8 @@ def test_validation_input_protocol_hashes_are_bound() -> None:
         MASSIVE_ADAPTIVE_RL_VALIDATION_SOURCES_AUTHORITY_V1_SPEC_SHA256,
         MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SOURCE_SHA256,
         MASSIVE_ADAPTIVE_RL_VALIDATION_ENVIRONMENT_REGISTRY_V1_SPEC_SHA256,
+        MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_SOURCE_SHA256,
+        MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_V1_SPEC_SHA256,
         MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     ):
         assert len(value) == 64

@@ -26,6 +26,10 @@ from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_authority_v1 import (
 from rl_quant.evaluation.massive_adaptive_rl_fixed_control_validation_authority_v1 import (
     MassiveAdaptiveRLFixedControlValidationAuthorityV1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_four_fold_validation_inputs_v1 import (
+    MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1,
+    validate_massive_adaptive_rl_validation_outcome_barrier_v1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_policy_trace_authority_v1 import (
     MassiveAdaptiveRLPolicyTraceAuthorityV1,
 )
@@ -77,6 +81,7 @@ MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "fixed_control": "persisted-fit-selected-fc06-20bp",
         "validation_sources": "single-canonical-create-only-authority-v1",
         "validation_environment": "single-canonical-create-only-registry-v1",
+        "validation_input_barrier": "persisted-all-four-fold-authority-v1",
         "shared_tape": ("dates-forecast-plan-calibration-economic-sources-capital"),
         "caller_candidates": False,
         "caller_metrics": False,
@@ -121,6 +126,10 @@ class _ValidationEvidenceFactsV1:
     four_fold_fit_authority_receipt_sha256: str
     validation_sources_authority_receipt_sha256: str
     validation_environment_registry_receipt_sha256: str
+    four_fold_validation_inputs_authority_receipt_sha256: str
+    four_fold_validation_inputs_source_receipt_sha256: str
+    four_fold_validation_inputs_commit_receipt_sha256: str
+    four_fold_validation_inputs_committed_at_ms: int
     chronology_authority_receipt_sha256: str
     expected_checkpoint_authority_receipts: tuple[str, ...]
     primary_trace_authority_receipts: tuple[str, ...]
@@ -285,6 +294,9 @@ def _validate_canonical_environment_bindings_v1(
     ladders: tuple[MassiveAdaptiveRLCostLadderAuthorityV1, ...],
     fixed: MassiveAdaptiveRLFixedControlValidationAuthorityV1,
     registry: MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1
+    ),
 ) -> None:
     environment_by_cost = {
         row.transaction_cost_basis_points: row
@@ -309,23 +321,38 @@ def _validate_canonical_environment_bindings_v1(
     registry_source_receipt = registry.source_receipt_sha256
     registry_commit_receipt = registry.source_transaction_receipt_sha256
     registry_committed_at_ms = registry.source_transaction_committed_at_ms
+    barrier = four_fold_validation_inputs_authority
+    barrier_source_receipt = barrier.source_receipt_sha256
+    barrier_commit_receipt = barrier.source_transaction_receipt_sha256
+    barrier_committed_at_ms = barrier.source_transaction_committed_at_ms
     if (
         registry_source_receipt is None
         or registry_commit_receipt is None
         or registry_committed_at_ms is None
+        or barrier_source_receipt is None
+        or barrier_commit_receipt is None
+        or barrier_committed_at_ms is None
         or any(
             not row.runtime_validation_environment_replayed
             or not row.runtime_validation_environment_registry_replayed
             or row.validation_sources_authority_receipt_sha256
             != registry.validation_sources_authority_receipt_sha256
-            or row.validation_environment_registry_receipt_sha256
-            != registry_receipt
+            or row.validation_environment_registry_receipt_sha256 != registry_receipt
             or row.validation_environment_registry_source_receipt_sha256
             != registry_source_receipt
             or row.validation_environment_registry_commit_receipt_sha256
             != registry_commit_receipt
             or row.validation_environment_registry_committed_at_ms
             != registry_committed_at_ms
+            or not row.runtime_four_fold_validation_inputs_replayed
+            or row.four_fold_validation_inputs_authority_receipt_sha256
+            != barrier.semantic_receipt_sha256
+            or row.four_fold_validation_inputs_source_receipt_sha256
+            != barrier_source_receipt
+            or row.four_fold_validation_inputs_commit_receipt_sha256
+            != barrier_commit_receipt
+            or row.four_fold_validation_inputs_committed_at_ms
+            != barrier_committed_at_ms
             or row.validation_environment_authority_receipt_sha256
             != primary_environment.semantic_receipt_sha256
             or row.environment_source_inventory_sha256
@@ -339,14 +366,22 @@ def _validate_canonical_environment_bindings_v1(
             or not row.runtime_validation_environment_registry_replayed
             or row.validation_sources_authority_receipt_sha256
             != registry.validation_sources_authority_receipt_sha256
-            or row.validation_environment_registry_receipt_sha256
-            != registry_receipt
+            or row.validation_environment_registry_receipt_sha256 != registry_receipt
             or row.validation_environment_registry_source_receipt_sha256
             != registry_source_receipt
             or row.validation_environment_registry_commit_receipt_sha256
             != registry_commit_receipt
             or row.validation_environment_registry_committed_at_ms
             != registry_committed_at_ms
+            or not row.runtime_four_fold_validation_inputs_replayed
+            or row.four_fold_validation_inputs_authority_receipt_sha256
+            != barrier.semantic_receipt_sha256
+            or row.four_fold_validation_inputs_source_receipt_sha256
+            != barrier_source_receipt
+            or row.four_fold_validation_inputs_commit_receipt_sha256
+            != barrier_commit_receipt
+            or row.four_fold_validation_inputs_committed_at_ms
+            != barrier_committed_at_ms
             or row.validation_environment_authority_receipts
             != environment_authority_receipts
             or row.environment_source_inventory_sha256s
@@ -366,6 +401,14 @@ def _validate_canonical_environment_bindings_v1(
         != registry_commit_receipt
         or fixed.validation_environment_registry_committed_at_ms
         != registry_committed_at_ms
+        or not fixed.runtime_four_fold_validation_inputs_replayed
+        or fixed.four_fold_validation_inputs_authority_receipt_sha256
+        != barrier.semantic_receipt_sha256
+        or fixed.four_fold_validation_inputs_source_receipt_sha256
+        != barrier_source_receipt
+        or fixed.four_fold_validation_inputs_commit_receipt_sha256
+        != barrier_commit_receipt
+        or fixed.four_fold_validation_inputs_committed_at_ms != barrier_committed_at_ms
         or fixed.validation_environment_authority_receipt_sha256
         != primary_environment.semantic_receipt_sha256
         or fixed.environment_source_inventory_sha256
@@ -387,6 +430,9 @@ def validate_massive_adaptive_rl_shared_validation_tape_v1(
     ),
     validation_environment_registry: (
         MassiveAdaptiveRLValidationEnvironmentRegistryV1 | None
+    ) = None,
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1 | None
     ) = None,
 ) -> str:
     """Return the tape receipt only for exact, replayed, shared trace evidence."""
@@ -412,6 +458,12 @@ def validate_massive_adaptive_rl_shared_validation_tape_v1(
     for ladder_row in ladders:
         ladder_row.validate()
     fixed_control_validation_authority.validate()
+    if (validation_environment_registry is None) != (
+        four_fold_validation_inputs_authority is None
+    ):
+        raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
+            "fold-validation registry and four-fold barrier must be supplied together"
+        )
     if validation_environment_registry is not None:
         if type(validation_environment_registry) is not (
             MassiveAdaptiveRLValidationEnvironmentRegistryV1
@@ -420,11 +472,16 @@ def validate_massive_adaptive_rl_shared_validation_tape_v1(
                 "fold-validation environment registry type differs"
             )
         validation_environment_registry.validate()
+        assert four_fold_validation_inputs_authority is not None
+        four_fold_validation_inputs_authority.validate()
         _validate_canonical_environment_bindings_v1(
             primary=primary,
             ladders=ladders,
             fixed=fixed_control_validation_authority,
             registry=validation_environment_registry,
+            four_fold_validation_inputs_authority=(
+                four_fold_validation_inputs_authority
+            ),
         )
     return _shared_validation_tape_facts_v1(
         primary=primary,
@@ -439,6 +496,9 @@ def _validation_evidence_facts_v1(
     fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
     validation_sources_authority: MassiveAdaptiveRLValidationSourcesAuthorityV1,
     validation_environment_registry: (MassiveAdaptiveRLValidationEnvironmentRegistryV1),
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1
+    ),
     primary_trace_authorities: Sequence[MassiveAdaptiveRLPolicyTraceAuthorityV1],
     cost_ladder_authorities: Sequence[MassiveAdaptiveRLCostLadderAuthorityV1],
     fixed_control_validation_authority: (
@@ -452,6 +512,8 @@ def _validation_evidence_facts_v1(
         is not MassiveAdaptiveRLValidationSourcesAuthorityV1
         or type(validation_environment_registry)
         is not MassiveAdaptiveRLValidationEnvironmentRegistryV1
+        or type(four_fold_validation_inputs_authority)
+        is not MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1
     ):
         raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
             "fold-validation root authority type differs"
@@ -476,6 +538,7 @@ def _validation_evidence_facts_v1(
     fold_fit_authority.validate()
     validation_sources_authority.validate()
     validation_environment_registry.validate()
+    four_fold_validation_inputs_authority.validate()
     chronology_authority = validation_sources_authority.runtime_chronology_authority
     chronology_authority.validate()
     for primary_row in primary:
@@ -484,12 +547,43 @@ def _validation_evidence_facts_v1(
         ladder_row.validate()
     fixed_control_validation_authority.validate()
     expected = fold_fit_authority.candidate_checkpoint_authority_receipts
+    fold_index = fold_fit_authority.outer_fold_index
+    aggregate_index = four_fold_validation_inputs_authority.fold_indices.index(
+        fold_index
+    )
+    barrier_source_receipt = four_fold_validation_inputs_authority.source_receipt_sha256
+    barrier_commit_receipt = (
+        four_fold_validation_inputs_authority.source_transaction_receipt_sha256
+    )
+    barrier_committed_at_ms = (
+        four_fold_validation_inputs_authority.source_transaction_committed_at_ms
+    )
     if (
         manifest.base_manifest.semantic_receipt_sha256
         != fold_fit_authority.manifest_v3_receipt_sha256
         or manifest.experiment_id != fold_fit_authority.experiment_id
         or not validation_sources_authority.development_stage_authorized
         or not validation_environment_registry.development_stage_authorized
+        or not four_fold_validation_inputs_authority.development_stage_authorized
+        or four_fold_validation_inputs_authority.manifest_v4_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or four_fold_validation_inputs_authority.four_fold_fit_authority_receipt_sha256
+        != validation_sources_authority.four_fold_fit_authority_receipt_sha256
+        or barrier_source_receipt is None
+        or barrier_commit_receipt is None
+        or barrier_committed_at_ms is None
+        or four_fold_validation_inputs_authority.validation_sources_authority_receipts[
+            aggregate_index
+        ]
+        != validation_sources_authority.semantic_receipt_sha256
+        or four_fold_validation_inputs_authority.validation_environment_registry_receipts[
+            aggregate_index
+        ]
+        != validation_environment_registry.semantic_receipt_sha256
+        or four_fold_validation_inputs_authority.expected_candidate_checkpoint_authority_receipt_inventories[
+            aggregate_index
+        ]
+        != expected
         or validation_sources_authority.manifest_v4_receipt_sha256
         != manifest.semantic_receipt_sha256
         or validation_sources_authority.fold_fit_authority_receipt_sha256
@@ -563,7 +657,20 @@ def _validation_evidence_facts_v1(
         ladders=ladders,
         fixed=fixed_control_validation_authority,
         registry=validation_environment_registry,
+        four_fold_validation_inputs_authority=(four_fold_validation_inputs_authority),
     )
+    outcome_committed_at_ms_values = (
+        *(row.loaded_source.commit.committed_at_ms for row in primary),
+        *(row.loaded_source.commit.committed_at_ms for row in ladders),
+        fixed_control_validation_authority.loaded_source.commit.committed_at_ms,
+    )
+    for outcome_committed_at_ms in outcome_committed_at_ms_values:
+        validate_massive_adaptive_rl_validation_outcome_barrier_v1(
+            authority=four_fold_validation_inputs_authority,
+            validation_environment_registry=validation_environment_registry,
+            fold_index=fold_index,
+            outcome_committed_at_ms=outcome_committed_at_ms,
+        )
     if (
         shared.fold_index != fold_fit_authority.outer_fold_index
         or fixed_runtime.fixed_control_fit_authority_receipt_sha256
@@ -601,6 +708,7 @@ def _validation_evidence_facts_v1(
         fold_fit_authority.development_stage_authorized
         and validation_sources_authority.development_stage_authorized
         and validation_environment_registry.development_stage_authorized
+        and four_fold_validation_inputs_authority.development_stage_authorized
         and chronology_authority.development_policy_selection_authorized
         and shared.nested_source_data_qualified
     )
@@ -621,6 +729,12 @@ def _validation_evidence_facts_v1(
         validation_environment_registry_receipt_sha256=(
             validation_environment_registry.semantic_receipt_sha256
         ),
+        four_fold_validation_inputs_authority_receipt_sha256=(
+            four_fold_validation_inputs_authority.semantic_receipt_sha256
+        ),
+        four_fold_validation_inputs_source_receipt_sha256=(barrier_source_receipt),
+        four_fold_validation_inputs_commit_receipt_sha256=(barrier_commit_receipt),
+        four_fold_validation_inputs_committed_at_ms=barrier_committed_at_ms,
         chronology_authority_receipt_sha256=(
             chronology_authority.semantic_receipt_sha256
         ),
@@ -662,6 +776,10 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
     four_fold_fit_authority_receipt_sha256: str
     validation_sources_authority_receipt_sha256: str
     validation_environment_registry_receipt_sha256: str
+    four_fold_validation_inputs_authority_receipt_sha256: str
+    four_fold_validation_inputs_source_receipt_sha256: str
+    four_fold_validation_inputs_commit_receipt_sha256: str
+    four_fold_validation_inputs_committed_at_ms: int
     chronology_authority_receipt_sha256: str
     expected_checkpoint_authority_receipts: tuple[str, ...]
     primary_trace_authority_receipts: tuple[str, ...]
@@ -698,6 +816,9 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
         compare=False,
         repr=False,
     )
+    runtime_four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1 | None
+    ) = field(default=None, compare=False, repr=False)
     runtime_primary_trace_authorities: (
         tuple[MassiveAdaptiveRLPolicyTraceAuthorityV1, ...] | None
     ) = field(default=None, compare=False, repr=False)
@@ -754,6 +875,7 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
             self.runtime_fold_fit_authority,
             self.runtime_validation_sources_authority,
             self.runtime_validation_environment_registry,
+            self.runtime_four_fold_validation_inputs_authority,
             self.runtime_primary_trace_authorities,
             self.runtime_cost_ladder_authorities,
             self.runtime_fixed_control_validation_authority,
@@ -768,6 +890,7 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
             assert self.runtime_fold_fit_authority is not None
             assert self.runtime_validation_sources_authority is not None
             assert self.runtime_validation_environment_registry is not None
+            assert self.runtime_four_fold_validation_inputs_authority is not None
             assert self.runtime_primary_trace_authorities is not None
             assert self.runtime_cost_ladder_authorities is not None
             assert self.runtime_fixed_control_validation_authority is not None
@@ -779,6 +902,9 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
                 ),
                 validation_environment_registry=(
                     self.runtime_validation_environment_registry
+                ),
+                four_fold_validation_inputs_authority=(
+                    self.runtime_four_fold_validation_inputs_authority
                 ),
                 primary_trace_authorities=self.runtime_primary_trace_authorities,
                 cost_ladder_authorities=self.runtime_cost_ladder_authorities,
@@ -834,6 +960,9 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
             self.four_fold_fit_authority_receipt_sha256,
             self.validation_sources_authority_receipt_sha256,
             self.validation_environment_registry_receipt_sha256,
+            self.four_fold_validation_inputs_authority_receipt_sha256,
+            self.four_fold_validation_inputs_source_receipt_sha256,
+            self.four_fold_validation_inputs_commit_receipt_sha256,
             self.chronology_authority_receipt_sha256,
             *self.expected_checkpoint_authority_receipts,
             *self.primary_trace_authority_receipts,
@@ -855,6 +984,15 @@ class MassiveAdaptiveRLFoldValidationAuthorityV1:
             self.semantic_receipt_sha256,
         ):
             _digest("fold-validation authority", value)
+        if (
+            isinstance(self.four_fold_validation_inputs_committed_at_ms, bool)
+            or self.four_fold_validation_inputs_committed_at_ms < 0
+            or self.four_fold_validation_inputs_committed_at_ms
+            >= self.loaded_source.commit.committed_at_ms
+        ):
+            raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
+                "fold-validation input barrier was not committed first"
+            )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
@@ -919,6 +1057,9 @@ def authorize_massive_adaptive_rl_fold_validation_authority_v1(
     fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
     validation_sources_authority: MassiveAdaptiveRLValidationSourcesAuthorityV1,
     validation_environment_registry: (MassiveAdaptiveRLValidationEnvironmentRegistryV1),
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1
+    ),
     primary_trace_authorities: Sequence[MassiveAdaptiveRLPolicyTraceAuthorityV1],
     cost_ladder_authorities: Sequence[MassiveAdaptiveRLCostLadderAuthorityV1],
     fixed_control_validation_authority: (
@@ -943,6 +1084,7 @@ def authorize_massive_adaptive_rl_fold_validation_authority_v1(
         fold_fit_authority=fold_fit_authority,
         validation_sources_authority=validation_sources_authority,
         validation_environment_registry=validation_environment_registry,
+        four_fold_validation_inputs_authority=(four_fold_validation_inputs_authority),
         primary_trace_authorities=primary,
         cost_ladder_authorities=ladders,
         fixed_control_validation_authority=fixed_control_validation_authority,
@@ -957,6 +1099,9 @@ def authorize_massive_adaptive_rl_fold_validation_authority_v1(
         runtime_fold_fit_authority=fold_fit_authority,
         runtime_validation_sources_authority=validation_sources_authority,
         runtime_validation_environment_registry=validation_environment_registry,
+        runtime_four_fold_validation_inputs_authority=(
+            four_fold_validation_inputs_authority
+        ),
         runtime_primary_trace_authorities=primary,
         runtime_cost_ladder_authorities=ladders,
         runtime_fixed_control_validation_authority=(fixed_control_validation_authority),
@@ -974,6 +1119,9 @@ def materialize_massive_adaptive_rl_fold_validation_authority_v1(
     fold_fit_authority: MassiveAdaptiveRLFoldFitAuthorityV1,
     validation_sources_authority: MassiveAdaptiveRLValidationSourcesAuthorityV1,
     validation_environment_registry: (MassiveAdaptiveRLValidationEnvironmentRegistryV1),
+    four_fold_validation_inputs_authority: (
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1
+    ),
     primary_trace_authorities: Sequence[MassiveAdaptiveRLPolicyTraceAuthorityV1],
     cost_ladder_authorities: Sequence[MassiveAdaptiveRLCostLadderAuthorityV1],
     fixed_control_validation_authority: (
@@ -983,11 +1131,19 @@ def materialize_massive_adaptive_rl_fold_validation_authority_v1(
 ) -> MassiveAdaptiveRLFoldValidationAuthorityV1:
     primary = tuple(primary_trace_authorities)
     ladders = tuple(cost_ladder_authorities)
+    barrier_committed_at_ms = (
+        four_fold_validation_inputs_authority.source_transaction_committed_at_ms
+    )
+    if barrier_committed_at_ms is None or barrier_committed_at_ms >= committed_at_ms:
+        raise MassiveAdaptiveRLFoldValidationAuthorityV1Error(
+            "fold-validation input barrier was not committed first"
+        )
     facts = _validation_evidence_facts_v1(
         manifest=manifest,
         fold_fit_authority=fold_fit_authority,
         validation_sources_authority=validation_sources_authority,
         validation_environment_registry=validation_environment_registry,
+        four_fold_validation_inputs_authority=(four_fold_validation_inputs_authority),
         primary_trace_authorities=primary,
         cost_ladder_authorities=ladders,
         fixed_control_validation_authority=fixed_control_validation_authority,
@@ -1030,6 +1186,7 @@ def materialize_massive_adaptive_rl_fold_validation_authority_v1(
         fold_fit_authority=fold_fit_authority,
         validation_sources_authority=validation_sources_authority,
         validation_environment_registry=validation_environment_registry,
+        four_fold_validation_inputs_authority=(four_fold_validation_inputs_authority),
         primary_trace_authorities=primary,
         cost_ladder_authorities=ladders,
         fixed_control_validation_authority=fixed_control_validation_authority,

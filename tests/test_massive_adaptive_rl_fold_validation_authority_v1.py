@@ -53,23 +53,27 @@ def test_generic_fold_validation_inventory_cannot_authorize_selection(tmp_path) 
         "fold_index": 0,
         "fold_fit_authority_receipt_sha256": _digest("fold-fit"),
         "four_fold_fit_authority_receipt_sha256": _digest("four-fold-fit"),
-        "validation_sources_authority_receipt_sha256": _digest(
-            "validation-sources"
-        ),
+        "validation_sources_authority_receipt_sha256": _digest("validation-sources"),
         "validation_environment_registry_receipt_sha256": _digest(
             "validation-environment-registry"
         ),
+        "four_fold_validation_inputs_authority_receipt_sha256": _digest(
+            "four-fold-validation-inputs"
+        ),
+        "four_fold_validation_inputs_source_receipt_sha256": _digest(
+            "four-fold-validation-inputs-source"
+        ),
+        "four_fold_validation_inputs_commit_receipt_sha256": _digest(
+            "four-fold-validation-inputs-commit"
+        ),
+        "four_fold_validation_inputs_committed_at_ms": 0,
         "chronology_authority_receipt_sha256": _digest("chronology"),
         "expected_checkpoint_authority_receipts": (checkpoint,),
         "primary_trace_authority_receipts": (primary,),
         "cost_ladder_authority_receipts": (ladder,),
-        "fixed_control_validation_authority_receipt_sha256": _digest(
-            "fc06-validation"
-        ),
+        "fixed_control_validation_authority_receipt_sha256": _digest("fc06-validation"),
         "fixed_control_fit_authority_receipt_sha256": _digest("fc06-fit"),
-        "fixed_control_selection_authority_receipt_sha256": _digest(
-            "fc06-selection"
-        ),
+        "fixed_control_selection_authority_receipt_sha256": _digest("fc06-selection"),
         "selected_fc06_action_receipt_sha256": _digest("fc06-action"),
         "validation_context_receipt_sha256": _digest("validation-context"),
         "validation_decision_session_dates": ("2024-01-02",),

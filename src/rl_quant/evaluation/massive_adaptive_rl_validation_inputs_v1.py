@@ -314,6 +314,57 @@ def validation_fixed_control_relative_path_v1(
     return f"massive-adaptive/rl-fixed-control-validation-authority-v1/{artifact}.json"
 
 
+def massive_adaptive_rl_validation_downstream_evidence_exists_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV4,
+    fold_index: int,
+) -> bool:
+    """Detect outcome evidence that forbids reconstructing a missing input."""
+
+    key = validation_generation_key_v1(manifest=manifest, fold_index=fold_index)
+    resolved = Path(root)
+    exact = (
+        resolved
+        / validation_fixed_control_relative_path_v1(
+            manifest=manifest,
+            fold_index=fold_index,
+        ),
+        resolved
+        / "massive-adaptive"
+        / "rl-fold-validation-authority-v1"
+        / f"{key}-fold-validation.json",
+        resolved
+        / "massive-adaptive"
+        / "rl-four-fold-validation-inputs-authority-v1"
+        / f"v4-{manifest.semantic_receipt_sha256}.json",
+    )
+    for payload in exact:
+        if any(
+            path.exists() or path.is_symlink()
+            for path in (
+                payload,
+                payload.with_name(payload.name + ".receipt.json"),
+                payload.with_name(payload.name + ".commit.json"),
+            )
+        ):
+            return True
+    patterns = (
+        (
+            resolved / "massive-adaptive" / "rl-policy-trace-authority-v1",
+            f"{key}-checkpoint-*-primary.json*",
+        ),
+        (
+            resolved / "massive-adaptive" / "rl-cost-ladder-authority-v1",
+            f"{key}-checkpoint-*-cost-ladder.json*",
+        ),
+    )
+    return any(
+        directory.is_dir() and next(directory.glob(pattern), None) is not None
+        for directory, pattern in patterns
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _ValidationSourcesRuntimeV1:
     manifest: MassiveAdaptiveRLExperimentManifestV4
@@ -752,6 +803,30 @@ class MassiveAdaptiveRLValidationSourcesAuthorityV1:
     @property
     def source_transaction_verified(self) -> bool:
         return self._loaded_source is not None
+
+    @property
+    def source_receipt_sha256(self) -> str | None:
+        """Return the persisted source-object receipt for this fold input."""
+
+        if self._loaded_source is None:
+            return None
+        return self._loaded_source.receipt.receipt_sha256
+
+    @property
+    def source_transaction_receipt_sha256(self) -> str | None:
+        """Return the immutable commit receipt for this fold input."""
+
+        if self._loaded_source is None:
+            return None
+        return self._loaded_source.commit.receipt_sha256
+
+    @property
+    def source_transaction_committed_at_ms(self) -> int | None:
+        """Return when this canonical fold input was committed."""
+
+        if self._loaded_source is None:
+            return None
+        return self._loaded_source.commit.committed_at_ms
 
     @property
     def development_stage_authorized(self) -> bool:
@@ -1197,6 +1272,14 @@ def materialize_massive_adaptive_rl_validation_sources_authority_v1(
     if _source_transaction_exists(root=root, relative=relative):
         raise MassiveAdaptiveRLValidationInputsV1Error(
             "canonical validation source authority already exists"
+        )
+    if massive_adaptive_rl_validation_downstream_evidence_exists_v1(
+        root=root,
+        manifest=manifest,
+        fold_index=fold_index,
+    ):
+        raise MassiveAdaptiveRLValidationInputsV1Error(
+            "missing validation source cannot be created after outcome evidence"
         )
     runtime = _validation_sources_runtime(
         root=root,
@@ -2138,6 +2221,14 @@ def materialize_massive_adaptive_rl_validation_environment_registry_v1(
         raise MassiveAdaptiveRLValidationInputsV1Error(
             "canonical validation environment registry already exists"
         )
+    if massive_adaptive_rl_validation_downstream_evidence_exists_v1(
+        root=root,
+        manifest=manifest,
+        fold_index=validation_sources.fold_index,
+    ):
+        raise MassiveAdaptiveRLValidationInputsV1Error(
+            "missing validation registry cannot be created after outcome evidence"
+        )
     built = _build_validation_environment_registry(
         manifest=manifest,
         validation_sources=validation_sources,
@@ -2227,6 +2318,7 @@ __all__ = [
     "authorize_massive_adaptive_rl_validation_sources_authority_v1",
     "load_massive_adaptive_rl_validation_environment_registry_v1",
     "load_massive_adaptive_rl_validation_sources_authority_v1",
+    "massive_adaptive_rl_validation_downstream_evidence_exists_v1",
     "materialize_massive_adaptive_rl_validation_environment_registry_v1",
     "materialize_massive_adaptive_rl_validation_sources_authority_v1",
     "parse_massive_adaptive_rl_validation_environment_registry_v1",

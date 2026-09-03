@@ -85,6 +85,11 @@ from rl_quant.evaluation.massive_adaptive_rl_fixed_control_validation_authority_
     MassiveAdaptiveRLFixedControlValidationAuthorityV1Error,
     materialize_massive_adaptive_rl_fixed_control_validation_authority_v1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_four_fold_validation_inputs_v1 import (
+    MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_DATASET,
+    MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_SOURCE_SCHEMA_SHA256,
+    MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_fold_validation_authority_v1 import (
     validate_massive_adaptive_rl_shared_validation_tape_v1,
 )
@@ -579,6 +584,131 @@ def _persist_validation_environment_registry(
     )
 
 
+def _runtime_four_fold_validation_inputs_authority(
+    root,
+    registry: MassiveAdaptiveRLValidationEnvironmentRegistryV1,
+    decision_dates,
+    monkeypatch,
+    *,
+    committed_at_ms: int,
+) -> MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1:
+    values = {
+        "experiment_id": registry.experiment_id,
+        "manifest_v4_receipt_sha256": registry.manifest_v4_receipt_sha256,
+        "training_manifest_v3_receipt_sha256": (
+            registry.training_manifest_v3_receipt_sha256
+        ),
+        "four_fold_fit_authority_receipt_sha256": _digest("four-fold-fit"),
+        "runtime_sources_receipt_sha256": registry.runtime_sources_receipt_sha256,
+        "runtime_graph_witness_receipt_sha256": (
+            registry.runtime_graph_witness_receipt_sha256
+        ),
+        "fold_indices": (0, 1, 2, 3),
+        "validation_sources_authority_receipts": (
+            registry.validation_sources_authority_receipt_sha256,
+            _digest("validation-source-1"),
+            _digest("validation-source-2"),
+            _digest("validation-source-3"),
+        ),
+        "validation_sources_source_receipts": tuple(
+            _digest(("validation-source-object", index)) for index in range(4)
+        ),
+        "validation_sources_commit_receipts": tuple(
+            _digest(("validation-source-commit", index)) for index in range(4)
+        ),
+        "validation_sources_committed_at_ms": (0, 0, 0, 0),
+        "validation_environment_registry_receipts": (
+            registry.semantic_receipt_sha256,
+            _digest("validation-registry-1"),
+            _digest("validation-registry-2"),
+            _digest("validation-registry-3"),
+        ),
+        "validation_registry_source_receipts": (
+            registry.source_receipt_sha256,
+            _digest("validation-registry-source-1"),
+            _digest("validation-registry-source-2"),
+            _digest("validation-registry-source-3"),
+        ),
+        "validation_registry_commit_receipts": (
+            registry.source_transaction_receipt_sha256,
+            _digest("validation-registry-commit-1"),
+            _digest("validation-registry-commit-2"),
+            _digest("validation-registry-commit-3"),
+        ),
+        "validation_registry_committed_at_ms": (
+            registry.source_transaction_committed_at_ms,
+            registry.source_transaction_committed_at_ms,
+            registry.source_transaction_committed_at_ms,
+            registry.source_transaction_committed_at_ms,
+        ),
+        "validation_context_receipts": (
+            registry.validation_context_receipt_sha256,
+            _digest("validation-context-1"),
+            _digest("validation-context-2"),
+            _digest("validation-context-3"),
+        ),
+        "validation_decision_session_date_inventories": (
+            tuple(decision_dates),
+            ("2020-01-01",),
+            ("2020-01-02",),
+            ("2020-01-03",),
+        ),
+        "expected_candidate_checkpoint_authority_receipt_inventories": (
+            (_digest("checkpoint-authority-0"),),
+            (_digest("checkpoint-authority-1a"), _digest("checkpoint-authority-1b")),
+            tuple(_digest(("checkpoint-authority-2", index)) for index in range(3)),
+            tuple(_digest(("checkpoint-authority-3", index)) for index in range(4)),
+        ),
+        "source_data_qualified": True,
+    }
+    barrier = MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1(
+        **values,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+        runtime_inputs_replayed=True,
+        development_validation_execution_authorized=True,
+    )
+    barrier = replace(
+        barrier,
+        semantic_receipt_sha256=semantic_sha256(barrier.semantic_unsigned()),
+    )
+    relative = "test-four-fold-validation-inputs-authority.json"
+    publish_massive_source_object(
+        stream=BytesIO(canonical_json_file_bytes(barrier.semantic_unsigned())),
+        root=root,
+        relative_payload_path=relative,
+        dataset_id=(
+            MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_DATASET
+        ),
+        source_object_key=relative,
+        requested_at_ms=committed_at_ms,
+        downloaded_at_ms=committed_at_ms,
+        schema_sha256=(
+            MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V1_SOURCE_SCHEMA_SHA256
+        ),
+        entitlement_receipt_sha256=barrier.semantic_receipt_sha256,
+        committed_at_ms=committed_at_ms,
+    )
+    result = replace(
+        barrier,
+        _loaded_source=load_massive_source_bundle(
+            root=root,
+            relative_payload_path=relative,
+            verified_at_ms=committed_at_ms,
+        ),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1,
+        "validate",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLFourFoldValidationInputsAuthorityV1,
+        "development_stage_authorized",
+        property(lambda _self: True),
+    )
+    return result
+
+
 def _runtime_validation_environment_registry(
     root,
     fixture,
@@ -633,7 +763,14 @@ def _runtime_validation_environment_registry(
         "build_environments",
         lambda _self: dict(environment_by_cost),
     )
-    return registry, environment_by_cost
+    barrier = _runtime_four_fold_validation_inputs_authority(
+        root,
+        registry,
+        tuple(row.decision_session_date for row in fixture.inference_plan.rows),
+        monkeypatch,
+        committed_at_ms=committed_at_ms + 1,
+    )
+    return registry, environment_by_cost, barrier
 
 
 class _ReceiptProxy:
@@ -1152,7 +1289,7 @@ def test_checkpoint_drives_validation_actions_and_trace_replay(
     assert tuple(
         row.action_receipt_sha256 for row in evaluated.action_evidence
     ) == tuple(row.action_receipt_sha256 for row in evaluated.transitions)
-    registry, _ = _runtime_validation_environment_registry(
+    registry, _, barrier = _runtime_validation_environment_registry(
         tmp_path,
         fixture,
         calibration_values,
@@ -1167,8 +1304,9 @@ def test_checkpoint_drives_validation_actions_and_trace_replay(
         chronology_authority=chronology,  # type: ignore[arg-type]
         fold_index=0,
         evaluation_role="inner_validation",
-        committed_at_ms=2,
+        committed_at_ms=3,
         validation_environment_registry=registry,
+        four_fold_validation_inputs_authority=barrier,
     )
     assert authority.runtime_trace_replayed
     assert (
@@ -1180,12 +1318,25 @@ def test_checkpoint_drives_validation_actions_and_trace_replay(
         loaded_source=authority.loaded_source,
     )
     assert generic.runtime_trace is None
+    assert not generic.runtime_four_fold_validation_inputs_replayed
+    with pytest.raises(
+        MassiveAdaptiveRLPolicyTraceAuthorityV1Error,
+        match="four-fold input authority",
+    ):
+        authorize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            authority=generic,
+            checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
+            chronology_authority=chronology,  # type: ignore[arg-type]
+            validation_environment_registry=registry,
+        )
     replayed = authorize_massive_adaptive_rl_policy_trace_authority_v1(
         root=tmp_path,
         authority=generic,
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         validation_environment_registry=registry,
+        four_fold_validation_inputs_authority=barrier,
     )
     assert replayed.policy_trace_receipt_sha256 == authority.policy_trace_receipt_sha256
 
@@ -1223,7 +1374,7 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(
         )
         == 1
     )
-    registry, _ = _runtime_validation_environment_registry(
+    registry, _, barrier = _runtime_validation_environment_registry(
         tmp_path,
         fixture,
         calibration_values,
@@ -1238,8 +1389,9 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(
         chronology_authority=chronology,  # type: ignore[arg-type]
         fold_index=0,
         evaluation_role="inner_validation",
-        committed_at_ms=2,
+        committed_at_ms=3,
         validation_environment_registry=registry,
+        four_fold_validation_inputs_authority=barrier,
     )
     assert authority.runtime_ladder_replayed
     assert (
@@ -1257,6 +1409,7 @@ def test_checkpoint_cost_ladder_replays_exact_primary_targets(
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         validation_environment_registry=registry,
+        four_fold_validation_inputs_authority=barrier,
     )
     assert reopened.cost_ladder_receipt_sha256 == authority.cost_ladder_receipt_sha256
 
@@ -1268,7 +1421,7 @@ def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
     training_authority = _training_authority(primary_environment)
     chronology = _chronology(primary_environment, training_authority)
     checkpoint_authority = _checkpoint_authority(primary_environment)
-    registry, environments = _runtime_validation_environment_registry(
+    registry, environments, barrier = _runtime_validation_environment_registry(
         tmp_path,
         fixture,
         calibration_values,
@@ -1301,8 +1454,9 @@ def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
         chronology_authority=chronology,  # type: ignore[arg-type]
         fold_index=0,
         evaluation_role="inner_validation",
-        committed_at_ms=2,
+        committed_at_ms=3,
         validation_environment_registry=registry,
+        four_fold_validation_inputs_authority=barrier,
     )
     generic = parse_massive_adaptive_rl_cost_ladder_authority_v1(
         root=tmp_path,
@@ -1314,6 +1468,7 @@ def test_nonmonotone_checkpoint_cost_ladder_materializes_and_replays(
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         validation_environment_registry=registry,
+        four_fold_validation_inputs_authority=barrier,
     )
 
     assert reopened.runtime_ladder_replayed
@@ -1380,6 +1535,7 @@ def test_inner_validation_leaf_authorities_require_persisted_registry(
             chronology_authority=chronology,  # type: ignore[arg-type]
             committed_at_ms=12,
             validation_environment_registry=None,  # type: ignore[arg-type]
+            four_fold_validation_inputs_authority=None,  # type: ignore[arg-type]
         )
 
 
@@ -1387,7 +1543,7 @@ def test_validation_registry_must_precede_outcomes_and_outer_rejects_it(
     tmp_path, monkeypatch
 ) -> None:
     fixture, calibration_values, _ = _adaptive_env_fixture()
-    registry, environments = _runtime_validation_environment_registry(
+    registry, environments, barrier = _runtime_validation_environment_registry(
         tmp_path,
         fixture,
         calibration_values,
@@ -1424,6 +1580,21 @@ def test_validation_registry_must_precede_outcomes_and_outer_rejects_it(
             validation_environment_registry=registry,
         )
     with pytest.raises(
+        ValueError,
+        match="four-fold validation-input barrier",
+    ):
+        materialize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            artifact_id="late-four-fold-barrier-primary",
+            checkpoint_authority=None,  # type: ignore[arg-type]
+            chronology_authority=None,  # type: ignore[arg-type]
+            fold_index=0,
+            evaluation_role="inner_validation",
+            committed_at_ms=11,
+            validation_environment_registry=registry,
+            four_fold_validation_inputs_authority=barrier,
+        )
+    with pytest.raises(
         MassiveAdaptiveRLPolicyTraceAuthorityV1Error,
         match="cannot use a validation registry",
     ):
@@ -1455,8 +1626,29 @@ def test_validation_registry_must_precede_outcomes_and_outer_rejects_it(
             chronology_authority=None,  # type: ignore[arg-type]
             fold_index=0,
             evaluation_role="inner_validation",
-            committed_at_ms=11,
+            committed_at_ms=12,
             validation_environment_registry=wrong_rung_registry,
+            four_fold_validation_inputs_authority=barrier,
+        )
+
+    wrong_barrier = replace(
+        barrier,
+        validation_environment_registry_receipts=(
+            _digest("wrong-fold-zero-registry"),
+            *barrier.validation_environment_registry_receipts[1:],
+        ),
+    )
+    with pytest.raises(ValueError, match="not a child"):
+        materialize_massive_adaptive_rl_policy_trace_authority_v1(
+            root=tmp_path,
+            artifact_id="wrong-four-fold-barrier-primary",
+            checkpoint_authority=None,  # type: ignore[arg-type]
+            chronology_authority=None,  # type: ignore[arg-type]
+            fold_index=0,
+            evaluation_role="inner_validation",
+            committed_at_ms=12,
+            validation_environment_registry=registry,
+            four_fold_validation_inputs_authority=wrong_barrier,
         )
 
 
@@ -1511,6 +1703,13 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         "build_environments",
         lambda _self: dict(environment_by_cost),
     )
+    barrier = _runtime_four_fold_validation_inputs_authority(
+        tmp_path,
+        environment_registry,
+        tuple(row.decision_session_date for row in fixture.inference_plan.rows),
+        monkeypatch,
+        committed_at_ms=20,
+    )
     training_authority = _training_authority(primary_environment)
     chronology = _chronology(primary_environment, training_authority)
     checkpoint_authority = _checkpoint_authority(primary_environment)
@@ -1521,9 +1720,10 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         validation_environment_registry=environment_registry,
+        four_fold_validation_inputs_authority=barrier,
         fold_index=0,
         evaluation_role="inner_validation",
-        committed_at_ms=20,
+        committed_at_ms=21,
     )
     ladder = materialize_massive_adaptive_rl_cost_ladder_authority_v1(
         root=tmp_path,
@@ -1531,9 +1731,10 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         checkpoint_authority=checkpoint_authority,  # type: ignore[arg-type]
         chronology_authority=chronology,  # type: ignore[arg-type]
         validation_environment_registry=environment_registry,
+        four_fold_validation_inputs_authority=barrier,
         fold_index=0,
         evaluation_role="inner_validation",
-        committed_at_ms=21,
+        committed_at_ms=22,
     )
     fixed_fit, fixed_selection = _fixed_selection_fixture(
         tmp_path,
@@ -1547,7 +1748,8 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
         selection_authority=fixed_selection,
         chronology_authority=chronology,  # type: ignore[arg-type]
         validation_environment_registry=environment_registry,
-        committed_at_ms=22,
+        four_fold_validation_inputs_authority=barrier,
+        committed_at_ms=23,
     )
 
     assert primary.runtime_trace is not None
@@ -1592,6 +1794,7 @@ def test_validation_evidence_binds_static_canonical_environment_separately(
                 cost_ladder_authorities=(ladder,),
                 fixed_control_validation_authority=fixed,
                 validation_environment_registry=environment_registry,
+                four_fold_validation_inputs_authority=barrier,
             )
         )
         == 64
