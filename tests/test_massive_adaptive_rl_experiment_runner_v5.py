@@ -24,6 +24,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     _build_initial_execution_result,
     _build_preimplementation_result,
     _build_result,
+    _record_initial_prequential_execution_v1,
     run_massive_adaptive_rl_experiment_v5,
     verify_massive_adaptive_rl_experiment_v5,
 )
@@ -40,6 +41,13 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 from rl_quant.workflows.massive_adaptive_rl_initial_validation_execution_v1 import (
     MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1,
     MassiveAdaptiveRLInitialValidationExecutionV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+    MassiveAdaptiveRLPrequentialExperimentStateV1,
+    MassiveAdaptiveRLPrequentialStageV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
+    MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
 )
 
 
@@ -288,13 +296,72 @@ def test_v5_result_freezes_implementation_before_initial_inputs(
     monkeypatch.setattr(
         MassiveAdaptiveRLInitialValidationExecutionV1, "validate", lambda _: None
     )
-    advanced = _build_initial_execution_result(boundary=complete, execution=execution)
+    schedules = tuple(
+        _typed_shell(
+            MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+            fold_indices=tuple(range(index + 1)),
+            experiment_id=manifest.experiment_id,
+            manifest_v5_receipt_sha256=manifest.semantic_receipt_sha256,
+            semantic_receipt_sha256=_digest(("schedule", index)),
+            policy_schedule_disposition="policy-prefix-diagnostic-only",
+        )
+        for index in range(2)
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLWalkForwardPolicyScheduleV1, "validate", lambda _: None
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+        "development_stage_authorized",
+        property(lambda _: True),
+    )
+    state_head = _typed_shell(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        stage=MassiveAdaptiveRLPrequentialStageV1.POLICY_1_FROZEN,
+        experiment_id=manifest.experiment_id,
+        manifest_v5_receipt_sha256=manifest.semantic_receipt_sha256,
+        execution_implementation_registration_receipt_sha256=(
+            implementation_registration.semantic_receipt_sha256
+        ),
+        stage_artifact_semantic_receipt_sha256=schedules[-1].semantic_receipt_sha256,
+        policy_schedule_disposition="policy-prefix-diagnostic-only",
+        semantic_receipt_sha256=_digest("state-head"),
+        prequential_execution_authorized=True,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1, "validate", lambda _: None
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        "source_receipt_sha256",
+        property(lambda _: _digest("state-head-source")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        "source_transaction_receipt_sha256",
+        property(lambda _: _digest("state-head-commit")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        "source_transaction_committed_at_ms",
+        property(lambda _: 50),
+    )
+    advanced = _build_initial_execution_result(
+        boundary=complete,
+        execution=execution,
+        policy_schedule_prefixes=schedules,
+        prequential_state_head=state_head,
+    )
     assert advanced.initial_policy_freezing_complete
     assert advanced.outer_zero_preparation_authorized
     assert advanced.initial_policy_schedule_disposition == (
         MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1
     )
     assert advanced.next_required_stage == "outer-fold-0-access-and-seal"
+    assert advanced.initial_policy_schedule_prefix_receipts == tuple(
+        row.semantic_receipt_sha256 for row in schedules
+    )
+    assert advanced.prequential_state_head_stage == "policy-1-frozen"
     assert not advanced.final_policy_freezing_authorized
     assert not advanced.outer_access_authorized
     assert not advanced.positive_profitability_authorization_eligible
@@ -364,6 +431,67 @@ def test_v5_root_registers_before_resuming_training(
         is expected
     )
     assert calls == ["registration", "training", "initial-boundary"]
+
+
+def test_initial_execution_records_schedule_and_state_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="runner-v5-initial-state-prefix"
+    )
+    registration = object()
+    implementation = object()
+    fit = object()
+    release = SimpleNamespace(four_fold_fit_authority=fit)
+    ppo = (object(), object())
+    controls = (object(), object())
+    execution = SimpleNamespace(
+        frozen_ppo_policies=ppo,
+        frozen_fc06_controls=controls,
+    )
+    schedules: list[SimpleNamespace] = []
+    state_artifacts: list[object] = []
+
+    def schedule(**kwargs):
+        assert kwargs["root"] == tmp_path
+        count = len(kwargs["frozen_ppo_policies"])
+        result = SimpleNamespace(
+            fold_indices=tuple(range(count)),
+            semantic_receipt_sha256=_digest(("schedule", count)),
+        )
+        schedules.append(result)
+        return result
+
+    def state(**kwargs):
+        state_artifacts.append(kwargs["stage_artifact"])
+        return SimpleNamespace(
+            stage=MassiveAdaptiveRLPrequentialStageV1.POLICY_1_FROZEN,
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "run_or_resume_massive_adaptive_rl_walk_forward_policy_schedule_v1",
+        schedule,
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1",
+        state,
+    )
+    result_schedules, head = _record_initial_prequential_execution_v1(
+        root=tmp_path,
+        manifest=manifest,
+        registration=registration,  # type: ignore[arg-type]
+        implementation_registration=implementation,  # type: ignore[arg-type]
+        validation_release=release,  # type: ignore[arg-type]
+        execution=execution,  # type: ignore[arg-type]
+        allow_materialize=True,
+    )
+
+    assert result_schedules == tuple(schedules)
+    assert tuple(schedule.fold_indices for schedule in schedules) == ((0,), (0, 1))
+    assert state_artifacts == [fit, implementation, release, *schedules]
+    assert head.stage is MassiveAdaptiveRLPrequentialStageV1.POLICY_1_FROZEN
 
 
 def test_v5_training_blocker_does_not_open_validation(

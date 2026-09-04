@@ -107,7 +107,7 @@ MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256 = semantic_sha256(
         "required_invariants": (
             "one-step-position-return-lag",
             "unchanged-position-zero-turnover-cost",
-            "fixed-trace-cost-monotonicity",
+            "nonmonotone-fixed-target-cost-ladder-remains-reportable",
             "terminal-liquidation-compounding-identity",
             "ppo-fc06-benchmark-shared-economics",
             "outer-zero-seal-before-validation-two-release",
@@ -335,6 +335,7 @@ MASSIVE_ADAPTIVE_RL_OUTER_ROLLOUT_V2_SPEC_SHA256 = semantic_sha256(
         "primary_cost_basis_points": 20.0,
         "stress_cost_basis_points": (10.0, 40.0),
         "stress_replay": "frozen-primary-action-and-target-position-trace",
+        "cost_ladder_monotonicity": "observed-report-gate-not-structural-validity",
         "policy_updates": False,
     }
 )
@@ -343,6 +344,7 @@ MASSIVE_ADAPTIVE_RL_OUTER_FOLD_SEAL_V1_SPEC_SHA256 = semantic_sha256(
         "shared_economics": ("ppo", "fc06", "buy-and-drift-benchmark"),
         "cost_ladder_basis_points": (10.0, 20.0, 40.0),
         "cost_ladder_actions": "frozen-primary-action-and-target-position-trace",
+        "cost_ladder_monotonicity": "observed-report-gate-not-seal-validity",
         "terminal_liquidation": True,
         "release_capabilities": ((0, 2), (1, 3)),
     }
@@ -352,6 +354,7 @@ MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_V2_SPEC_SHA256 = semantic_sha256(
         "economic_witness": MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V1_SPEC_SHA256,
         "inputs": "four-authenticated-outer-fold-seals",
         "qualified_and_diagnostic_schedules_reported": True,
+        "nonmonotone_cost_ladder": "complete-report-with-failed-gate",
         "execution_complete_is_not_profitability": True,
     }
 )
@@ -361,7 +364,11 @@ MASSIVE_ADAPTIVE_RL_PREQUENTIAL_EXPERIMENT_STATE_V1_SPEC_SHA256 = semantic_sha25
         "append_only": True,
         "immediate_predecessor_receipt": True,
         "stage_artifact_source_transaction": True,
+        "stage_artifact_generation": "exact-by-stage",
         "gaps_branches_duplicates": "rejected",
+        "diagnostic_schedule_cannot_become_qualified": True,
+        "failed_profitability_gates": "completed-report-state",
+        "generic_reload": "integrity-only-nonauthorizing",
         "verification": "read-only",
     }
 )

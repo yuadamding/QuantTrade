@@ -147,6 +147,8 @@ class MassiveAdaptiveRLOuterFoldSealAuthorityV1:
     fixed_control_terminal_liquidation_adjusted_return: float
     fixed_control_low_cost_terminal_liquidation_adjusted_return: float
     fixed_control_high_cost_terminal_liquidation_adjusted_return: float
+    ppo_cost_ladder_monotone: bool
+    fixed_control_cost_ladder_monotone: bool
     maximum_drawdown: float
     policy_validation_eligible: bool
     source_data_qualified: bool
@@ -263,12 +265,16 @@ class MassiveAdaptiveRLOuterFoldSealAuthorityV1:
             or any(not math.isfinite(value) for value in economic_values)
             or min(economic_values[:-1]) <= -1.0
             or not 0.0 <= self.maximum_drawdown <= 1.0
-            or not (
+            or not isinstance(self.ppo_cost_ladder_monotone, bool)
+            or self.ppo_cost_ladder_monotone
+            != (
                 self.low_cost_terminal_liquidation_adjusted_return
                 >= self.primary_terminal_liquidation_adjusted_return
                 >= self.high_cost_terminal_liquidation_adjusted_return
             )
-            or not (
+            or not isinstance(self.fixed_control_cost_ladder_monotone, bool)
+            or self.fixed_control_cost_ladder_monotone
+            != (
                 self.fixed_control_low_cost_terminal_liquidation_adjusted_return
                 >= self.fixed_control_terminal_liquidation_adjusted_return
                 >= self.fixed_control_high_cost_terminal_liquidation_adjusted_return
@@ -362,6 +368,10 @@ class MassiveAdaptiveRLOuterFoldSealAuthorityV1:
                 or self._runtime_rollout.fold_index != self.fold_index
                 or self._runtime_rollout.decision_session_dates
                 != self.decision_session_dates
+                or self._runtime_rollout.ppo_cost_ladder_monotone
+                != self.ppo_cost_ladder_monotone
+                or self._runtime_rollout.fixed_control_cost_ladder_monotone
+                != self.fixed_control_cost_ladder_monotone
             ):
                 raise MassiveAdaptiveRLOuterFoldSealAuthorityV1Error(
                     "outer-fold seal runtime lineage differs"
@@ -517,6 +527,10 @@ def build_massive_adaptive_rl_outer_fold_seal_authority_v1(
         ),
         "fixed_control_high_cost_terminal_liquidation_adjusted_return": (
             computation.fixed_control_high_cost_terminal_liquidation_adjusted_return
+        ),
+        "ppo_cost_ladder_monotone": computation.ppo_cost_ladder_monotone,
+        "fixed_control_cost_ladder_monotone": (
+            computation.fixed_control_cost_ladder_monotone
         ),
         "maximum_drawdown": computation.maximum_drawdown,
         "policy_validation_eligible": outer_access.policy_validation_eligible,

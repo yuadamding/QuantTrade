@@ -126,6 +126,8 @@ class MassiveAdaptiveRLProfitabilityFoldReportV2:
     fixed_control_terminal_liquidation_adjusted_return: float
     fixed_control_low_cost_terminal_liquidation_adjusted_return: float
     fixed_control_high_cost_terminal_liquidation_adjusted_return: float
+    ppo_cost_ladder_monotone: bool
+    fixed_control_cost_ladder_monotone: bool
     annualized_net_return: float
     annualized_volatility: float
     net_sharpe_ratio: float
@@ -196,12 +198,16 @@ class MassiveAdaptiveRLProfitabilityFoldReportV2:
             )
             or self.annualized_volatility < 0.0
             or not 0.0 <= self.maximum_drawdown <= 1.0
-            or not (
+            or not isinstance(self.ppo_cost_ladder_monotone, bool)
+            or self.ppo_cost_ladder_monotone
+            != (
                 self.low_cost_terminal_liquidation_adjusted_return
                 >= self.terminal_liquidation_adjusted_return
                 >= self.high_cost_terminal_liquidation_adjusted_return
             )
-            or not (
+            or not isinstance(self.fixed_control_cost_ladder_monotone, bool)
+            or self.fixed_control_cost_ladder_monotone
+            != (
                 self.fixed_control_low_cost_terminal_liquidation_adjusted_return
                 >= self.fixed_control_terminal_liquidation_adjusted_return
                 >= self.fixed_control_high_cost_terminal_liquidation_adjusted_return
@@ -258,6 +264,10 @@ def _fold_report(
         "fixed_control_high_cost_terminal_liquidation_adjusted_return": (
             rollout.fixed_control_high_cost_terminal_liquidation_adjusted_return
         ),
+        "ppo_cost_ladder_monotone": rollout.ppo_cost_ladder_monotone,
+        "fixed_control_cost_ladder_monotone": (
+            rollout.fixed_control_cost_ladder_monotone
+        ),
         "annualized_net_return": math.expm1(252.0 * mean(rows)),
         "annualized_volatility": stdev(rows) * math.sqrt(252.0),
         "net_sharpe_ratio": _annualized_ratio(rows),
@@ -276,6 +286,20 @@ def _fold_report(
     )
     result.validate()
     return result
+
+
+def _cost_ladder_monotonicity_gate(
+    fold_reports: Sequence[MassiveAdaptiveRLProfitabilityFoldReportV2],
+) -> bool:
+    """Treat observed nonmonotonicity as a failed gate, not invalid evidence."""
+
+    return bool(
+        len(fold_reports) == 4
+        and all(
+            row.ppo_cost_ladder_monotone and row.fixed_control_cost_ladder_monotone
+            for row in fold_reports
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -637,12 +661,7 @@ def _build_report_body(
     )
     threshold = manifest.base_manifest.base_manifest.base_manifest.maximum_fold_drawdown
     gate_results = {
-        "cost-ladder-monotone": all(
-            row.low_cost_terminal_liquidation_adjusted_return
-            >= row.terminal_liquidation_adjusted_return
-            >= row.high_cost_terminal_liquidation_adjusted_return
-            for row in fold_reports
-        ),
+        "cost-ladder-monotone": _cost_ladder_monotonicity_gate(fold_reports),
         "high-cost-mean-return-nonnegative": mean(high_cost) >= 0.0,
         "high-cost-ppo-minus-fixed-control-nonnegative": (
             mean(high_cost_ppo_fixed) >= 0.0

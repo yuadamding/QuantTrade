@@ -1,11 +1,12 @@
-"""Manifest-V5 root through the registered initial prequential boundary.
+"""Manifest-V5 root through the initial frozen policy-schedule boundary.
 
 V5 is the unique authoring generation for the prequential experiment.  It
 registers that ownership before resuming training, freezes the qualified
 evaluation implementation after causal training, and only then permits the
-fold-0/1 validation inputs.  Later validation, policy freezing, outer access,
-and profitability reporting remain closed until their manifest-bound authority
-generations exist.
+fold-0/1 validation inputs.  It evaluates and freezes both initial policy pairs,
+publishes schedule prefixes, and records the append-only state through
+``policy-1-frozen``.  Outer access remains closed until the package-owned outer
+input orchestrator can complete and seal fold 0.
 """
 
 from __future__ import annotations
@@ -69,6 +70,14 @@ from rl_quant.workflows.massive_adaptive_rl_initial_validation_execution_v1 impo
     MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_QUALIFIED_V1,
     MassiveAdaptiveRLInitialValidationExecutionV1,
     run_or_resume_massive_adaptive_rl_initial_validation_execution_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+    MassiveAdaptiveRLPrequentialExperimentStateV1,
+    run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
+    MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+    run_or_resume_massive_adaptive_rl_walk_forward_policy_schedule_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
@@ -140,7 +149,13 @@ class MassiveAdaptiveRLPrequentialRunV5:
     initial_policy_selection_authority_receipts: tuple[str, ...]
     initial_frozen_ppo_policy_receipts: tuple[str, ...]
     initial_frozen_fc06_control_receipts: tuple[str, ...]
+    initial_policy_schedule_prefix_receipts: tuple[str, ...]
     initial_policy_schedule_disposition: str | None
+    prequential_state_head_receipt_sha256: str | None
+    prequential_state_head_source_receipt_sha256: str | None
+    prequential_state_head_commit_receipt_sha256: str | None
+    prequential_state_head_committed_at_ms: int | None
+    prequential_state_head_stage: str | None
     released_validation_fold_indices: tuple[int, ...]
     withheld_validation_fold_indices: tuple[int, ...]
     authoritative_writer_generation: str
@@ -231,6 +246,12 @@ class MassiveAdaptiveRLPrequentialRunV5:
         initial_execution_partial = any(initial_execution_inventories) and not (
             initial_execution_present
         )
+        state_head_receipts = (
+            self.prequential_state_head_receipt_sha256,
+            self.prequential_state_head_source_receipt_sha256,
+            self.prequential_state_head_commit_receipt_sha256,
+        )
+        state_head_present = all(value is not None for value in state_head_receipts)
         expected_next_stage = (
             "outer-fold-0-access-and-seal"
             if initial_execution_present
@@ -255,6 +276,18 @@ class MassiveAdaptiveRLPrequentialRunV5:
             and any(
                 len(set(inventory)) != 2 for inventory in initial_execution_inventories
             )
+            or len(self.initial_policy_schedule_prefix_receipts)
+            != (2 if initial_execution_present else 0)
+            or len(set(self.initial_policy_schedule_prefix_receipts))
+            != len(self.initial_policy_schedule_prefix_receipts)
+            or any(value is not None for value in state_head_receipts)
+            != state_head_present
+            or (self.prequential_state_head_stage is not None) != state_head_present
+            or (self.prequential_state_head_committed_at_ms is not None)
+            != state_head_present
+            or state_head_present != initial_execution_present
+            or self.prequential_state_head_stage
+            != ("policy-1-frozen" if initial_execution_present else None)
             or self.initial_policy_schedule_disposition
             not in (
                 None,
@@ -321,6 +354,8 @@ class MassiveAdaptiveRLPrequentialRunV5:
         for inventory in initial_execution_inventories:
             for value in inventory:
                 _digest("initial validation execution inventory", value)
+        for value in self.initial_policy_schedule_prefix_receipts:
+            _digest("initial policy schedule prefix", value)
         _required_timestamp(
             "Manifest V5 registration timestamp",
             self.manifest_v5_registration_committed_at_ms,
@@ -339,6 +374,11 @@ class MassiveAdaptiveRLPrequentialRunV5:
             _required_timestamp(
                 "initial validation-release timestamp",
                 self.initial_validation_release_committed_at_ms,
+            )
+        if self.prequential_state_head_committed_at_ms is not None:
+            _required_timestamp(
+                "prequential state-head timestamp",
+                self.prequential_state_head_committed_at_ms,
             )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
@@ -473,7 +513,13 @@ def _build_preimplementation_result(
         "initial_policy_selection_authority_receipts": (),
         "initial_frozen_ppo_policy_receipts": (),
         "initial_frozen_fc06_control_receipts": (),
+        "initial_policy_schedule_prefix_receipts": (),
         "initial_policy_schedule_disposition": None,
+        "prequential_state_head_receipt_sha256": None,
+        "prequential_state_head_source_receipt_sha256": None,
+        "prequential_state_head_commit_receipt_sha256": None,
+        "prequential_state_head_committed_at_ms": None,
+        "prequential_state_head_stage": None,
         "released_validation_fold_indices": (),
         "withheld_validation_fold_indices": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1
@@ -672,7 +718,13 @@ def _build_result(
         "initial_policy_selection_authority_receipts": (),
         "initial_frozen_ppo_policy_receipts": (),
         "initial_frozen_fc06_control_receipts": (),
+        "initial_policy_schedule_prefix_receipts": (),
         "initial_policy_schedule_disposition": None,
+        "prequential_state_head_receipt_sha256": None,
+        "prequential_state_head_source_receipt_sha256": None,
+        "prequential_state_head_commit_receipt_sha256": None,
+        "prequential_state_head_committed_at_ms": None,
+        "prequential_state_head_stage": None,
         "released_validation_fold_indices": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
         ),
@@ -727,11 +779,27 @@ def _build_initial_execution_result(
     *,
     boundary: MassiveAdaptiveRLPrequentialRunV5,
     execution: MassiveAdaptiveRLInitialValidationExecutionV1,
+    policy_schedule_prefixes: tuple[MassiveAdaptiveRLWalkForwardPolicyScheduleV1, ...],
+    prequential_state_head: MassiveAdaptiveRLPrequentialExperimentStateV1,
 ) -> MassiveAdaptiveRLPrequentialRunV5:
     """Promote the status envelope only after both initial policy pairs replay."""
 
     boundary.validate()
     execution.validate()
+    if (
+        any(
+            type(schedule) is not MassiveAdaptiveRLWalkForwardPolicyScheduleV1
+            for schedule in policy_schedule_prefixes
+        )
+        or type(prequential_state_head)
+        is not MassiveAdaptiveRLPrequentialExperimentStateV1
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "initial V5 schedule or state generation differs"
+        )
+    for schedule in policy_schedule_prefixes:
+        schedule.validate()
+    prequential_state_head.validate()
     if (
         type(execution) is not MassiveAdaptiveRLInitialValidationExecutionV1
         or not execution.initial_policy_freezing_complete
@@ -742,6 +810,26 @@ def _build_initial_execution_result(
         != boundary.initial_validation_release_authority_receipt_sha256
         or execution.execution_implementation_registration_receipt_sha256
         != boundary.execution_implementation_registration_authority_receipt_sha256
+        or tuple(schedule.fold_indices for schedule in policy_schedule_prefixes)
+        != ((0,), (0, 1))
+        or any(
+            not schedule.development_stage_authorized
+            or schedule.experiment_id != boundary.experiment_id
+            or schedule.manifest_v5_receipt_sha256
+            != boundary.manifest_v5_receipt_sha256
+            for schedule in policy_schedule_prefixes
+        )
+        or prequential_state_head.stage.value != "policy-1-frozen"
+        or not prequential_state_head.prequential_execution_authorized
+        or prequential_state_head.experiment_id != boundary.experiment_id
+        or prequential_state_head.manifest_v5_receipt_sha256
+        != boundary.manifest_v5_receipt_sha256
+        or prequential_state_head.execution_implementation_registration_receipt_sha256
+        != boundary.execution_implementation_registration_authority_receipt_sha256
+        or prequential_state_head.stage_artifact_semantic_receipt_sha256
+        != policy_schedule_prefixes[-1].semantic_receipt_sha256
+        or prequential_state_head.policy_schedule_disposition
+        != policy_schedule_prefixes[-1].policy_schedule_disposition
     ):
         raise MassiveAdaptiveRLExperimentRunnerV5Error(
             "initial V5 policy freezes do not replay from the root boundary"
@@ -763,9 +851,28 @@ def _build_initial_execution_result(
             "initial_frozen_fc06_control_receipts": tuple(
                 row.semantic_receipt_sha256 for row in execution.frozen_fc06_controls
             ),
+            "initial_policy_schedule_prefix_receipts": tuple(
+                row.semantic_receipt_sha256 for row in policy_schedule_prefixes
+            ),
             "initial_policy_schedule_disposition": (
                 execution.policy_schedule_disposition
             ),
+            "prequential_state_head_receipt_sha256": (
+                prequential_state_head.semantic_receipt_sha256
+            ),
+            "prequential_state_head_source_receipt_sha256": _required_digest(
+                "prequential state-head source receipt",
+                prequential_state_head.source_receipt_sha256,
+            ),
+            "prequential_state_head_commit_receipt_sha256": _required_digest(
+                "prequential state-head commit receipt",
+                prequential_state_head.source_transaction_receipt_sha256,
+            ),
+            "prequential_state_head_committed_at_ms": _required_timestamp(
+                "prequential state-head timestamp",
+                prequential_state_head.source_transaction_committed_at_ms,
+            ),
+            "prequential_state_head_stage": prequential_state_head.stage.value,
             "initial_policy_freezing_complete": True,
             "outer_zero_preparation_authorized": True,
             "next_required_stage": "outer-fold-0-access-and-seal",
@@ -781,6 +888,77 @@ def _build_initial_execution_result(
     )
     result.validate()
     return result
+
+
+def _record_initial_prequential_execution_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    implementation_registration: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+    validation_release: MassiveAdaptiveRLValidationReleaseAuthorityV1,
+    execution: MassiveAdaptiveRLInitialValidationExecutionV1,
+    allow_materialize: bool,
+) -> tuple[
+    tuple[MassiveAdaptiveRLWalkForwardPolicyScheduleV1, ...],
+    MassiveAdaptiveRLPrequentialExperimentStateV1,
+]:
+    """Persist the two initial schedule prefixes and their exact state chain."""
+
+    initial_stage_artifacts = (
+        validation_release.four_fold_fit_authority,
+        implementation_registration,
+        validation_release,
+    )
+    head: MassiveAdaptiveRLPrequentialExperimentStateV1 | None = None
+    for artifact in initial_stage_artifacts:
+        head = run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
+            root=root,
+            manifest=manifest,
+            manifest_registration=registration,
+            execution_registration=implementation_registration,
+            stage_artifact=artifact,
+            allow_materialize=allow_materialize,
+        )
+    schedule_zero = run_or_resume_massive_adaptive_rl_walk_forward_policy_schedule_v1(
+        root=root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        frozen_ppo_policies=execution.frozen_ppo_policies[:1],
+        frozen_fc06_controls=execution.frozen_fc06_controls[:1],
+        allow_materialize=allow_materialize,
+    )
+    head = run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
+        root=root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        stage_artifact=schedule_zero,
+        allow_materialize=allow_materialize,
+    )
+    schedule_one = run_or_resume_massive_adaptive_rl_walk_forward_policy_schedule_v1(
+        root=root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        frozen_ppo_policies=execution.frozen_ppo_policies,
+        frozen_fc06_controls=execution.frozen_fc06_controls,
+        allow_materialize=allow_materialize,
+    )
+    head = run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
+        root=root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        stage_artifact=schedule_one,
+        allow_materialize=allow_materialize,
+    )
+    if head is None:
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "initial V5 prequential state prefix is absent"
+        )
+    return (schedule_zero, schedule_one), head
 
 
 def _replay_v5_boundary(
@@ -875,7 +1053,21 @@ def _replay_v5_boundary(
         validation_release=validation_release,
         allow_materialize=allow_materialize,
     )
-    return _build_initial_execution_result(boundary=boundary, execution=execution)
+    schedules, state_head = _record_initial_prequential_execution_v1(
+        root=artifact_root,
+        manifest=manifest,
+        registration=registration,
+        implementation_registration=implementation_registration,
+        validation_release=validation_release,
+        execution=execution,
+        allow_materialize=allow_materialize,
+    )
+    return _build_initial_execution_result(
+        boundary=boundary,
+        execution=execution,
+        policy_schedule_prefixes=schedules,
+        prequential_state_head=state_head,
+    )
 
 
 def run_massive_adaptive_rl_experiment_v5(

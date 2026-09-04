@@ -9,6 +9,9 @@ import pytest
 from rl_quant.evaluation import (
     massive_adaptive_outer_access_commitment_v2 as access_module,
 )
+from rl_quant.evaluation import (
+    massive_adaptive_rl_profitability_report_authority_v2 as report_module,
+)
 from rl_quant.evaluation.massive_adaptive_outer_access_commitment_v2 import (
     MassiveAdaptiveOuterAccessCommitmentV2,
     MassiveAdaptiveOuterAccessCommitmentV2Error,
@@ -119,6 +122,8 @@ def _outer_computation() -> MassiveAdaptiveRLOuterRolloutComputationV2:
         fixed_control_terminal_liquidation_adjusted_return=0.0,
         fixed_control_low_cost_terminal_liquidation_adjusted_return=0.0,
         fixed_control_high_cost_terminal_liquidation_adjusted_return=0.0,
+        ppo_cost_ladder_monotone=True,
+        fixed_control_cost_ladder_monotone=True,
         maximum_drawdown=0.0,
         environment_source_inventory_sha256=_digest("environment"),
         source_data_qualified=True,
@@ -192,30 +197,71 @@ def test_outer_environment_is_not_a_public_precommit_input() -> None:
         _ = access.runtime_environment_bundle
 
 
-def test_outer_cost_ladder_must_be_monotone_for_one_trace() -> None:
+def test_outer_cost_ladder_nonmonotonicity_is_reportable_evidence() -> None:
     computation = _outer_computation()
     computation.validate()
     changed = replace(
         computation,
         high_cost_terminal_liquidation_adjusted_return=0.01,
+        ppo_cost_ladder_monotone=False,
         semantic_receipt_sha256="0" * 64,
     )
     changed = replace(
         changed,
         semantic_receipt_sha256=semantic_sha256(changed.semantic_unsigned()),
     )
-    with pytest.raises(
-        MassiveAdaptiveRLOuterRolloutAuthorityV2Error,
-        match="computation differs",
-    ):
-        changed.validate()
+    changed.validate()
+    assert changed.ppo_cost_ladder_monotone is False
 
 
-def test_fixed_control_cost_ladder_must_be_monotone_for_one_trace() -> None:
+def test_fixed_control_cost_ladder_nonmonotonicity_is_reportable_evidence() -> None:
     computation = _outer_computation()
     changed = replace(
         computation,
         fixed_control_high_cost_terminal_liquidation_adjusted_return=0.01,
+        fixed_control_cost_ladder_monotone=False,
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed = replace(
+        changed,
+        semantic_receipt_sha256=semantic_sha256(changed.semantic_unsigned()),
+    )
+    changed.validate()
+    assert changed.fixed_control_cost_ladder_monotone is False
+
+
+def test_nonmonotone_cost_ladder_reaches_a_failed_report_gate() -> None:
+    computation = _outer_computation()
+    changed = replace(
+        computation,
+        high_cost_terminal_liquidation_adjusted_return=0.01,
+        ppo_cost_ladder_monotone=False,
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed = replace(
+        changed,
+        semantic_receipt_sha256=semantic_sha256(changed.semantic_unsigned()),
+    )
+    seal = SimpleNamespace(
+        fold_index=0,
+        semantic_receipt_sha256=_digest("seal"),
+        outer_rollout_authority_receipt_sha256=_digest("rollout"),
+        rollout_authority=SimpleNamespace(rollout=changed),
+        source_data_qualified=True,
+        validate=lambda: None,
+    )
+
+    fold_report = report_module._fold_report(seal)
+
+    assert fold_report.ppo_cost_ladder_monotone is False
+    assert not report_module._cost_ladder_monotonicity_gate((fold_report,) * 4)
+
+
+def test_outer_cost_ladder_observation_cannot_be_forged() -> None:
+    computation = _outer_computation()
+    changed = replace(
+        computation,
+        high_cost_terminal_liquidation_adjusted_return=0.01,
         semantic_receipt_sha256="0" * 64,
     )
     changed = replace(

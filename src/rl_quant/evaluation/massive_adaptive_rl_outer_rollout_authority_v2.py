@@ -232,6 +232,8 @@ class MassiveAdaptiveRLOuterRolloutComputationV2:
     fixed_control_terminal_liquidation_adjusted_return: float
     fixed_control_low_cost_terminal_liquidation_adjusted_return: float
     fixed_control_high_cost_terminal_liquidation_adjusted_return: float
+    ppo_cost_ladder_monotone: bool
+    fixed_control_cost_ladder_monotone: bool
     maximum_drawdown: float
     environment_source_inventory_sha256: str
     source_data_qualified: bool
@@ -333,12 +335,16 @@ class MassiveAdaptiveRLOuterRolloutComputationV2:
             )
             <= -1.0
             or not 0.0 <= self.maximum_drawdown <= 1.0
-            or not (
+            or not isinstance(self.ppo_cost_ladder_monotone, bool)
+            or self.ppo_cost_ladder_monotone
+            != (
                 self.low_cost_terminal_liquidation_adjusted_return
                 >= self.primary_terminal_liquidation_adjusted_return
                 >= self.high_cost_terminal_liquidation_adjusted_return
             )
-            or not (
+            or not isinstance(self.fixed_control_cost_ladder_monotone, bool)
+            or self.fixed_control_cost_ladder_monotone
+            != (
                 self.fixed_control_low_cost_terminal_liquidation_adjusted_return
                 >= self.fixed_control_terminal_liquidation_adjusted_return
                 >= self.fixed_control_high_cost_terminal_liquidation_adjusted_return
@@ -751,6 +757,16 @@ def execute_massive_adaptive_rl_outer_rollout_v2(
         "fixed_control_high_cost_terminal_liquidation_adjusted_return": (
             fixed_high_trace.terminal_liquidation_adjusted_return
         ),
+        "ppo_cost_ladder_monotone": bool(
+            low_trace.terminal_liquidation_adjusted_return
+            >= primary_trace.terminal_liquidation_adjusted_return
+            >= high_trace.terminal_liquidation_adjusted_return
+        ),
+        "fixed_control_cost_ladder_monotone": bool(
+            fixed_low_trace.terminal_liquidation_adjusted_return
+            >= fixed_trace.terminal_liquidation_adjusted_return
+            >= fixed_high_trace.terminal_liquidation_adjusted_return
+        ),
         "maximum_drawdown": primary_trace.maximum_drawdown,
         "environment_source_inventory_sha256": bundle.environment_source_inventory_sha256,
         "source_data_qualified": source_qualified,
@@ -810,6 +826,8 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
     fixed_control_terminal_liquidation_adjusted_return: float
     fixed_control_low_cost_terminal_liquidation_adjusted_return: float
     fixed_control_high_cost_terminal_liquidation_adjusted_return: float
+    ppo_cost_ladder_monotone: bool
+    fixed_control_cost_ladder_monotone: bool
     maximum_drawdown: float
     source_data_qualified: bool
     semantic_receipt_sha256: str
@@ -910,12 +928,16 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
             or any(not math.isfinite(value) for value in economic_values)
             or min(economic_values[:-1]) <= -1.0
             or not 0.0 <= self.maximum_drawdown <= 1.0
-            or not (
+            or not isinstance(self.ppo_cost_ladder_monotone, bool)
+            or self.ppo_cost_ladder_monotone
+            != (
                 self.low_cost_terminal_liquidation_adjusted_return
                 >= self.primary_terminal_liquidation_adjusted_return
                 >= self.high_cost_terminal_liquidation_adjusted_return
             )
-            or not (
+            or not isinstance(self.fixed_control_cost_ladder_monotone, bool)
+            or self.fixed_control_cost_ladder_monotone
+            != (
                 self.fixed_control_low_cost_terminal_liquidation_adjusted_return
                 >= self.fixed_control_terminal_liquidation_adjusted_return
                 >= self.fixed_control_high_cost_terminal_liquidation_adjusted_return
@@ -986,6 +1008,10 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
                 != self.decision_session_dates
                 or self._runtime_rollout.ppo_action_inventory_sha256
                 != self.ppo_action_inventory_sha256
+                or self._runtime_rollout.ppo_cost_ladder_monotone
+                != self.ppo_cost_ladder_monotone
+                or self._runtime_rollout.fixed_control_cost_ladder_monotone
+                != self.fixed_control_cost_ladder_monotone
             ):
                 raise MassiveAdaptiveRLOuterRolloutAuthorityV2Error(
                     "outer rollout runtime lineage differs"
@@ -1102,6 +1128,10 @@ def _authority_body(
         ),
         "fixed_control_high_cost_terminal_liquidation_adjusted_return": (
             rollout.fixed_control_high_cost_terminal_liquidation_adjusted_return
+        ),
+        "ppo_cost_ladder_monotone": rollout.ppo_cost_ladder_monotone,
+        "fixed_control_cost_ladder_monotone": (
+            rollout.fixed_control_cost_ladder_monotone
         ),
         "maximum_drawdown": rollout.maximum_drawdown,
         "source_data_qualified": rollout.source_data_qualified,

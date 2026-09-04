@@ -136,7 +136,7 @@ _VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS = tuple(
     for name in (
         "test_one_step_position_return_lag",
         "test_unchanged_position_has_zero_turnover_cost",
-        "test_fixed_trace_cost_ladder_is_monotone",
+        "test_nonmonotone_fixed_target_cost_ladder_is_reported_as_failed_gate",
         "test_terminal_liquidation_compounding_identity",
         "test_ppo_fc06_and_benchmark_share_outer_economics",
         "test_outer_zero_seal_precedes_validation_two_release",

@@ -295,10 +295,8 @@ def test_execution_registration_requires_complete_v5_native_vertical(
         manifest=manifest,
         manifest_registration=registration,
     )
-    assert body["missing_v5_native_implementation_paths"] == (
-        "src/rl_quant/workflows/massive_adaptive_rl_prequential_experiment_state_v1.py",
-    )
-    assert body["v5_native_vertical_complete"] is False
+    assert body["missing_v5_native_implementation_paths"] == ()
+    assert body["v5_native_vertical_complete"] is True
     assert body["missing_vertical_qualification_test_paths"] == (
         "tests/test_massive_adaptive_rl_v5_vertical.py",
     )
