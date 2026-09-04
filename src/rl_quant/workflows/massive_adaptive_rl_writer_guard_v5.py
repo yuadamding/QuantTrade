@@ -109,7 +109,52 @@ _WRITER_ROLE_FOLD_INVENTORIES = {
     "causal-training": (0, 1, 2, 3),
     "execution-implementation-registration": (0, 1, 2, 3),
     "initial-validation-inputs": (0, 1),
+    "initial-validation-execution": (0, 1),
 }
+_INITIAL_VALIDATION_EXECUTION_DIRECTORIES = frozenset(
+    {
+        "validation-outcome-v3",
+        "fold-validation-v3",
+        "policy-selection-v4",
+        "frozen-policy-v2",
+        "frozen-fc06-v2",
+    }
+)
+
+
+def _initial_validation_execution_path_authorized_v1(
+    *,
+    parts: tuple[str, ...],
+    capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1,
+) -> bool:
+    """Recognize only the canonical V0/V1 economic-publication paths."""
+
+    if (
+        capability.writer_role != "initial-validation-execution"
+        or len(parts) < 4
+        or parts[2] not in _INITIAL_VALIDATION_EXECUTION_DIRECTORIES
+    ):
+        return False
+    allowed_folds = frozenset(
+        f"fold-{fold_index}" for fold_index in capability.allowed_fold_indices
+    )
+    directory = parts[2]
+    if directory == "validation-outcome-v3":
+        if len(parts) != 5 or parts[3] not in allowed_folds:
+            return False
+        name = parts[4]
+        return name == "fc06.json" or bool(
+            name.startswith("ppo-")
+            and name.endswith(".json")
+            and _digest(name.removeprefix("ppo-").removesuffix(".json"))
+        )
+    if len(parts) != 4:
+        return False
+    fold_name = parts[3]
+    suffix = ".pt" if directory == "frozen-policy-v2" else ".json"
+    return bool(
+        fold_name.endswith(suffix) and fold_name.removesuffix(suffix) in allowed_folds
+    )
 
 
 def _digest(value: object) -> bool:
@@ -315,10 +360,16 @@ def _validate_capability_against_persisted_registration_v1(
                 strict=True,
             )
         )
-        or capability.writer_role != "initial-validation-inputs"
+        or capability.writer_role
+        not in {
+            "initial-validation-inputs",
+            "initial-validation-execution",
+        }
         and len(publication_roots) != 1
         or capability.writer_role == "initial-validation-inputs"
         and len(publication_roots) > 2
+        or capability.writer_role == "initial-validation-execution"
+        and len(publication_roots) != 1
     ):
         raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
             "Manifest V5 writer capability registration root differs"
@@ -460,8 +511,17 @@ def authorize_massive_adaptive_rl_source_publication_v5(
                 f"adaptive-rl/{active.experiment_id}/validation-release-v1/initial.json"
             )
         )
+        initial_validation_execution = _initial_validation_execution_path_authorized_v1(
+            parts=parts,
+            capability=active,
+        )
         if not any(
-            (execution_registration, training_state, initial_validation_release)
+            (
+                execution_registration,
+                training_state,
+                initial_validation_release,
+                initial_validation_execution,
+            )
         ):
             raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
                 "Manifest V5 capability does not authorize this scoped source path"
@@ -496,6 +556,50 @@ def authorize_massive_adaptive_rl_source_publication_v5(
         raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
             "Manifest V5 capability does not authorize this unscoped source path"
         )
+
+
+@contextmanager
+def authorize_and_lock_massive_adaptive_rl_source_publication_v5(
+    *, root: str | Path, relative_payload_path: str
+) -> Iterator[None]:
+    """Keep V5 ownership authorization atomic with create-only publication."""
+
+    parts = Path(relative_payload_path).parts
+    if not parts or parts[0] not in {"adaptive-rl", "massive-adaptive"}:
+        yield
+        return
+    active = _ACTIVE_WRITER_CAPABILITY.get()
+    scoped = bool(
+        parts[0] == "adaptive-rl"
+        and len(parts) >= 3
+        and parts[2] in _EXPERIMENT_SCOPED_DIRECTORIES
+    )
+    if scoped:
+        experiment_id = _identifier(parts[1])
+        with massive_adaptive_rl_experiment_materialization_lock_v1(
+            artifact_root=root,
+            experiment_id=experiment_id,
+        ):
+            authorize_massive_adaptive_rl_source_publication_v5(
+                root=root, relative_payload_path=relative_payload_path
+            )
+            yield
+        return
+    if active is not None:
+        with massive_adaptive_rl_experiment_materialization_lock_v1(
+            artifact_root=active._registration_root_resolved,
+            experiment_id=active.experiment_id,
+        ):
+            authorize_massive_adaptive_rl_source_publication_v5(
+                root=root, relative_payload_path=relative_payload_path
+            )
+            yield
+        return
+    with massive_adaptive_rl_artifact_root_writer_lock_v1(artifact_root=root):
+        authorize_massive_adaptive_rl_source_publication_v5(
+            root=root, relative_payload_path=relative_payload_path
+        )
+        yield
 
 
 def _authorize_active_capability_for_publication_root_v1(
@@ -674,6 +778,7 @@ def legacy_unscoped_manifest_v5_rejecting_writer_guard_v1(
 __all__ = [
     "MassiveAdaptiveRLManifestV5WriterCapabilityV1",
     "MassiveAdaptiveRLLegacyWriterRejectedByManifestV5",
+    "authorize_and_lock_massive_adaptive_rl_source_publication_v5",
     "authorize_massive_adaptive_rl_source_publication_v5",
     "authorize_legacy_or_manifest_v5_compatibility_writer_v1",
     "legacy_manifest_v5_rejecting_writer_guard_v1",

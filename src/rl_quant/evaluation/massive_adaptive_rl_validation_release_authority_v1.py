@@ -27,6 +27,10 @@ from rl_quant.data_sources.massive.source_receipts import (
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
     MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v2 import (
+    MassiveAdaptiveRLValidationEnvironmentRegistryV2,
+    MassiveAdaptiveRLValidationSourcesAuthorityV2,
+)
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
@@ -50,6 +54,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_four_fold_fit_v1 import (
+    MassiveAdaptiveRLFourFoldFitAuthorityV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
@@ -256,6 +263,47 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
             and self.development_validation_release_authorized
             and self.source_data_qualified
         )
+
+    @property
+    def initial_validation_inputs(
+        self,
+    ) -> MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
+        """Return the exact replayed input authority for this initial release."""
+
+        self.validate()
+        if not self.development_stage_authorized or self._runtime_initial_inputs is None:
+            raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
+                "validation release inputs have not been exactly replayed"
+            )
+        return self._runtime_initial_inputs
+
+    def validation_sources(
+        self, fold_index: int
+    ) -> MassiveAdaptiveRLValidationSourcesAuthorityV2:
+        """Return one causally released V2 validation-source authority."""
+
+        if fold_index not in self.released_validation_fold_indices:
+            raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
+                "validation fold is not present in this release"
+            )
+        return self.initial_validation_inputs.validation_sources(fold_index)
+
+    def validation_registry(
+        self, fold_index: int
+    ) -> MassiveAdaptiveRLValidationEnvironmentRegistryV2:
+        """Return one causally released V2 validation-environment registry."""
+
+        if fold_index not in self.released_validation_fold_indices:
+            raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
+                "validation fold is not present in this release"
+            )
+        return self.initial_validation_inputs.validation_registry(fold_index)
+
+    @property
+    def four_fold_fit_authority(self) -> MassiveAdaptiveRLFourFoldFitAuthorityV1:
+        """Return the completed fit aggregate that supplies candidate checkpoints."""
+
+        return self.initial_validation_inputs.four_fold_fit_authority
 
     def validate(self) -> None:
         runtime_roots = (

@@ -80,6 +80,10 @@ def _qualified_capture_body(
             ),
             "missing_vertical_qualification_test_paths": (),
             "vertical_qualification_exit_code": 0,
+            "vertical_qualification_passed_node_count": len(
+                implementation._VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS
+            ),
+            "vertical_qualification_nonpass_outcome_labels": (),
             "vertical_qualification_normalized_output_sha256": _digest(
                 "vertical-qualification-normalized-output"
             ),
@@ -295,6 +299,8 @@ def test_execution_registration_requires_complete_v5_native_vertical(
     assert body["v5_native_vertical_complete"] is False
     assert body["missing_vertical_qualification_test_paths"]
     assert body["vertical_qualification_exit_code"] is None
+    assert body["vertical_qualification_passed_node_count"] == 0
+    assert body["vertical_qualification_nonpass_outcome_labels"] == ("not-run",)
     assert body["vertical_qualification_passed"] is False
     assert body["vertical_qualification_receipt_sha256"] == (
         implementation._vertical_qualification_receipt(body)
@@ -309,10 +315,11 @@ def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(
     test_path = tmp_path / "tests" / "test_massive_adaptive_rl_v5_vertical.py"
     test_path.parent.mkdir()
     test_path.write_text("def test_vertical():\n    assert True\n", encoding="utf-8")
-    outputs = iter((b"1 passed in 0.11s\n", b"1 passed in 9.87s\n"))
+    outputs = iter((b"12 passed in 0.11s\n", b"12 passed in 9.87s\n"))
 
     def completed(command, **kwargs):
-        assert command[-3:-1] == ("-p", "no:cacheprovider")
+        assert command[4:6] == ("-p", "no:cacheprovider")
+        assert command[6:] == implementation._VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS
         assert kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
         return implementation.subprocess.CompletedProcess(
             command,
@@ -332,6 +339,8 @@ def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(
     )
 
     assert first["vertical_qualification_passed"] is True
+    assert first["vertical_qualification_passed_node_count"] == 12
+    assert first["vertical_qualification_nonpass_outcome_labels"] == ()
     assert (
         first["vertical_qualification_normalized_output_sha256"]
         == second["vertical_qualification_normalized_output_sha256"]
@@ -340,3 +349,30 @@ def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(
         first["vertical_qualification_receipt_sha256"]
         == second["vertical_qualification_receipt_sha256"]
     )
+
+
+def test_vertical_qualification_rejects_skipped_required_node(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_path = tmp_path / "tests" / "test_massive_adaptive_rl_v5_vertical.py"
+    test_path.parent.mkdir()
+    test_path.write_text("def test_vertical():\n    assert True\n", encoding="utf-8")
+
+    def completed(command, **kwargs):
+        return implementation.subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout=b"11 passed, 1 skipped in 0.10s\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(implementation.subprocess, "run", completed)
+    result = implementation._vertical_qualification(
+        repository_root=tmp_path,
+        v5_native_vertical_complete=True,
+    )
+
+    assert result["vertical_qualification_passed"] is False
+    assert result["vertical_qualification_passed_node_count"] == 11
+    assert result["vertical_qualification_nonpass_outcome_labels"] == ("skipped",)

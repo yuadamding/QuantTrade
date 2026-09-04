@@ -276,7 +276,7 @@ class LoadedMassiveSourceObject:
             raise MassiveSourceObjectError("loaded source receipt differs")
 
 
-def publish_massive_source_object(
+def _publish_massive_source_object_unlocked(
     *,
     stream: BinaryIO,
     root: str | Path,
@@ -298,17 +298,6 @@ def publish_massive_source_object(
     destination_root = Path(root)
     payload_relative = _safe_object_key(relative_payload_path)
     source_key = _safe_object_key(source_object_key)
-    # All adaptive-RL source transactions pass through this primitive.  The
-    # late import avoids coupling the generic Massive source layer to workflow
-    # modules while making V5 ownership structural instead of decorator-only.
-    from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
-        authorize_massive_adaptive_rl_source_publication_v5,
-    )
-
-    authorize_massive_adaptive_rl_source_publication_v5(
-        root=destination_root,
-        relative_payload_path=payload_relative,
-    )
     if isinstance(block_bytes, bool) or not isinstance(block_bytes, int) or block_bytes <= 0:
         raise MassiveSourceObjectError("stream block size must be positive")
     parent_fd, payload_name = _open_parent_directory(
@@ -470,6 +459,54 @@ def publish_massive_source_object(
         raise
     finally:
         os.close(parent_fd)
+
+
+def publish_massive_source_object(
+    *,
+    stream: BinaryIO,
+    root: str | Path,
+    relative_payload_path: str,
+    dataset_id: str,
+    source_object_key: str,
+    requested_at_ms: int,
+    downloaded_at_ms: int,
+    schema_sha256: str,
+    entitlement_receipt_sha256: str,
+    committed_at_ms: int,
+    etag: str | None = None,
+    request_id: str | None = None,
+    expected_physical_sha256: str | None = None,
+    block_bytes: int = 8 * 1024 * 1024,
+) -> tuple[MassiveSourceObjectReceipt, MassiveSourceCommit]:
+    """Authorize and publish one source transaction under the same writer lock."""
+
+    payload_relative = _safe_object_key(relative_payload_path)
+    # The late import preserves the generic source layer while making the V5
+    # ownership decision and the create-only write one atomic lock scope.
+    from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+        authorize_and_lock_massive_adaptive_rl_source_publication_v5,
+    )
+
+    with authorize_and_lock_massive_adaptive_rl_source_publication_v5(
+        root=root,
+        relative_payload_path=payload_relative,
+    ):
+        return _publish_massive_source_object_unlocked(
+            stream=stream,
+            root=root,
+            relative_payload_path=payload_relative,
+            dataset_id=dataset_id,
+            source_object_key=source_object_key,
+            requested_at_ms=requested_at_ms,
+            downloaded_at_ms=downloaded_at_ms,
+            schema_sha256=schema_sha256,
+            entitlement_receipt_sha256=entitlement_receipt_sha256,
+            committed_at_ms=committed_at_ms,
+            etag=etag,
+            request_id=request_id,
+            expected_physical_sha256=expected_physical_sha256,
+            block_bytes=block_bytes,
+        )
 
 
 def load_massive_source_object(

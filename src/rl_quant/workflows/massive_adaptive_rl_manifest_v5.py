@@ -116,9 +116,11 @@ MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256 = semantic_sha256(
             "interruption-resume-receipt-equivalence",
             "predecessor-tamper-rejection",
             "nonmaterializing-cold-replay",
+            "real-v5-vertical-without-economic-mocks",
         ),
         "result": (
-            "exact-test-inventory-command-exit-and-duration-normalized-output-receipt"
+            "exact-node-inventory-command-pass-count-nonpass-outcomes-exit-and-"
+            "duration-normalized-output-receipt"
         ),
     }
 )

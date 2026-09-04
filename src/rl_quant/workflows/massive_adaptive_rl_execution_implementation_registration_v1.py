@@ -109,6 +109,7 @@ _IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/workflows/massive_adaptive_rl_execution_implementation_registration_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_experiment_lock_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v5.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_initial_validation_execution_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5.py",
     "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5_registration.py",
     "src/rl_quant/workflows/massive_adaptive_rl_writer_guard_v5.py",
@@ -130,17 +131,48 @@ _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
 _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS = (
     "tests/test_massive_adaptive_rl_v5_vertical.py",
 )
+_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS = tuple(
+    f"{_VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS[0]}::{name}"
+    for name in (
+        "test_one_step_position_return_lag",
+        "test_unchanged_position_has_zero_turnover_cost",
+        "test_fixed_trace_cost_ladder_is_monotone",
+        "test_terminal_liquidation_compounding_identity",
+        "test_ppo_fc06_and_benchmark_share_outer_economics",
+        "test_outer_zero_seal_precedes_validation_two_release",
+        "test_outer_one_seal_precedes_validation_three_release",
+        "test_diagnostic_schedule_completes_outer_report",
+        "test_every_stage_resumes_to_identical_receipts",
+        "test_predecessor_tampering_blocks_authorization",
+        "test_full_cold_replay_is_nonmaterializing",
+        "test_real_v5_vertical_executes_without_economic_mocks",
+    )
+)
 _VERTICAL_QUALIFICATION_RECEIPT_FIELD_NAMES = (
     "vertical_qualification_specification_sha256",
     "vertical_qualification_test_paths",
     "missing_vertical_qualification_test_paths",
     "vertical_qualification_test_inventory",
     "vertical_qualification_test_inventory_sha256",
+    "vertical_qualification_required_node_ids",
     "vertical_qualification_command",
     "vertical_qualification_exit_code",
+    "vertical_qualification_passed_node_count",
+    "vertical_qualification_nonpass_outcome_labels",
     "vertical_qualification_normalized_output_sha256",
     "vertical_qualification_passed",
 )
+_VERTICAL_QUALIFICATION_NONPASS_PATTERNS = (
+    ("failed", rb"\b[1-9][0-9]* failed\b"),
+    ("error", rb"\b[1-9][0-9]* errors?\b"),
+    ("skipped", rb"\b[1-9][0-9]* skipped\b"),
+    ("xfailed", rb"\b[1-9][0-9]* xfailed\b"),
+    ("xpassed", rb"\b[1-9][0-9]* xpassed\b"),
+    ("deselected", rb"\b[1-9][0-9]* deselected\b"),
+)
+_VERTICAL_QUALIFICATION_NONPASS_LABELS = tuple(
+    row[0] for row in _VERTICAL_QUALIFICATION_NONPASS_PATTERNS
+) + ("not-run",)
 _SCOPED_OUTCOME_DIRECTORY_NAMES = (
     "validation-release-v1",
     "validation-outcome-v3",
@@ -309,13 +341,15 @@ def _vertical_qualification(
         "-q",
         "-p",
         "no:cacheprovider",
-        *_VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS,
+        *_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS,
     )
     if missing or not v5_native_vertical_complete:
         normalized_output_sha256 = hashlib.sha256(
             repr(("not-run", missing, v5_native_vertical_complete)).encode("utf-8")
         ).hexdigest()
         exit_code = None
+        passed_node_count = 0
+        nonpass_outcome_labels: tuple[str, ...] = ("not-run",)
         passed = False
     else:
         try:
@@ -338,7 +372,18 @@ def _vertical_qualification(
         )
         normalized_output_sha256 = hashlib.sha256(normalized_output).hexdigest()
         exit_code = completed.returncode
-        passed = completed.returncode == 0
+        passed_matches = re.findall(rb"\b([0-9]+) passed\b", normalized_output)
+        passed_node_count = int(passed_matches[-1]) if len(passed_matches) == 1 else 0
+        nonpass_outcome_labels = tuple(
+            label
+            for label, pattern in _VERTICAL_QUALIFICATION_NONPASS_PATTERNS
+            if re.search(pattern, normalized_output)
+        )
+        passed = bool(
+            completed.returncode == 0
+            and passed_node_count == len(_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS)
+            and not nonpass_outcome_labels
+        )
     body: dict[str, object] = {
         "vertical_qualification_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256
@@ -349,8 +394,13 @@ def _vertical_qualification(
         "missing_vertical_qualification_test_paths": missing,
         "vertical_qualification_test_inventory": inventory,
         "vertical_qualification_test_inventory_sha256": semantic_sha256(inventory),
+        "vertical_qualification_required_node_ids": (
+            _VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS
+        ),
         "vertical_qualification_command": command,
         "vertical_qualification_exit_code": exit_code,
+        "vertical_qualification_passed_node_count": passed_node_count,
+        "vertical_qualification_nonpass_outcome_labels": nonpass_outcome_labels,
         "vertical_qualification_normalized_output_sha256": (normalized_output_sha256),
         "vertical_qualification_passed": passed,
     }
@@ -510,8 +560,11 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     missing_vertical_qualification_test_paths: tuple[str, ...]
     vertical_qualification_test_inventory: tuple[tuple[str, str], ...]
     vertical_qualification_test_inventory_sha256: str
+    vertical_qualification_required_node_ids: tuple[str, ...]
     vertical_qualification_command: tuple[str, ...]
     vertical_qualification_exit_code: int | None
+    vertical_qualification_passed_node_count: int
+    vertical_qualification_nonpass_outcome_labels: tuple[str, ...]
     vertical_qualification_normalized_output_sha256: str
     vertical_qualification_passed: bool
     vertical_qualification_receipt_sha256: str
@@ -658,6 +711,9 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             and self.vertical_qualification_passed
             and not self.missing_vertical_qualification_test_paths
             and self.vertical_qualification_exit_code == 0
+            and self.vertical_qualification_passed_node_count
+            == len(_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS)
+            and not self.vertical_qualification_nonpass_outcome_labels
             and self.execution_device_specification == "cpu"
             and self.parameter_dtype == "torch.float32"
             and self.observation_dtype == "torch.float32"
@@ -715,6 +771,8 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             )
             or self.vertical_qualification_test_inventory_sha256
             != semantic_sha256(self.vertical_qualification_test_inventory)
+            or self.vertical_qualification_required_node_ids
+            != _VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS
             or self.vertical_qualification_command
             != (
                 "python",
@@ -723,13 +781,16 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
                 "-q",
                 "-p",
                 "no:cacheprovider",
-                *self.vertical_qualification_test_paths,
+                *_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS,
             )
             or self.vertical_qualification_passed
             != (
                 self.v5_native_vertical_complete
                 and not self.missing_vertical_qualification_test_paths
                 and self.vertical_qualification_exit_code == 0
+                and self.vertical_qualification_passed_node_count
+                == len(self.vertical_qualification_required_node_ids)
+                and not self.vertical_qualification_nonpass_outcome_labels
             )
             or self.vertical_qualification_receipt_sha256
             != _vertical_qualification_receipt(self.semantic_unsigned())
@@ -737,6 +798,29 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             and (
                 isinstance(self.vertical_qualification_exit_code, bool)
                 or self.vertical_qualification_exit_code < 0
+            )
+            or isinstance(self.vertical_qualification_passed_node_count, bool)
+            or not isinstance(self.vertical_qualification_passed_node_count, int)
+            or self.vertical_qualification_passed_node_count < 0
+            or self.vertical_qualification_passed_node_count
+            > len(self.vertical_qualification_required_node_ids)
+            or len(set(self.vertical_qualification_nonpass_outcome_labels))
+            != len(self.vertical_qualification_nonpass_outcome_labels)
+            or any(
+                label not in _VERTICAL_QUALIFICATION_NONPASS_LABELS
+                for label in self.vertical_qualification_nonpass_outcome_labels
+            )
+            or (
+                self.vertical_qualification_exit_code is None
+                and (
+                    self.vertical_qualification_passed_node_count != 0
+                    or self.vertical_qualification_nonpass_outcome_labels
+                    != ("not-run",)
+                )
+            )
+            or (
+                self.vertical_qualification_exit_code is not None
+                and "not-run" in self.vertical_qualification_nonpass_outcome_labels
             )
             or tuple(row[0] for row in self.implementation_inventory)
             != _IMPLEMENTATION_RELATIVE_PATHS
@@ -1070,7 +1154,9 @@ def _parse(
         "missing_v5_native_implementation_paths",
         "vertical_qualification_test_paths",
         "missing_vertical_qualification_test_paths",
+        "vertical_qualification_required_node_ids",
         "vertical_qualification_command",
+        "vertical_qualification_nonpass_outcome_labels",
     ):
         value = body.get(name)
         if not isinstance(value, list) or not all(

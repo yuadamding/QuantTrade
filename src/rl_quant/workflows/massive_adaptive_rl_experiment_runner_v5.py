@@ -64,6 +64,12 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     issue_massive_adaptive_rl_manifest_v5_training_capability_v1,
     run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_initial_validation_execution_v1 import (
+    MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1,
+    MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_QUALIFIED_V1,
+    MassiveAdaptiveRLInitialValidationExecutionV1,
+    run_or_resume_massive_adaptive_rl_initial_validation_execution_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
 )
@@ -130,6 +136,11 @@ class MassiveAdaptiveRLPrequentialRunV5:
     execution_implementation_registration_source_receipt_sha256: str | None
     execution_implementation_registration_commit_receipt_sha256: str | None
     execution_implementation_registration_committed_at_ms: int | None
+    initial_fold_validation_authority_receipts: tuple[str, ...]
+    initial_policy_selection_authority_receipts: tuple[str, ...]
+    initial_frozen_ppo_policy_receipts: tuple[str, ...]
+    initial_frozen_fc06_control_receipts: tuple[str, ...]
+    initial_policy_schedule_disposition: str | None
     released_validation_fold_indices: tuple[int, ...]
     withheld_validation_fold_indices: tuple[int, ...]
     authoritative_writer_generation: str
@@ -141,6 +152,8 @@ class MassiveAdaptiveRLPrequentialRunV5:
     execution_implementation_registered: bool
     diagnostic_continuation_registered: bool
     validation_execution_complete: bool
+    initial_policy_freezing_complete: bool
+    outer_zero_preparation_authorized: bool
     next_required_stage: str
     semantic_receipt_sha256: str
     policy_schedule_disposition: str | None = None
@@ -206,8 +219,22 @@ class MassiveAdaptiveRLPrequentialRunV5:
                 and implementation_committed_at_ms >= initial_committed_at_ms
             )
         )
+        initial_execution_inventories = (
+            self.initial_fold_validation_authority_receipts,
+            self.initial_policy_selection_authority_receipts,
+            self.initial_frozen_ppo_policy_receipts,
+            self.initial_frozen_fc06_control_receipts,
+        )
+        initial_execution_present = all(
+            len(inventory) == 2 for inventory in initial_execution_inventories
+        )
+        initial_execution_partial = any(initial_execution_inventories) and not (
+            initial_execution_present
+        )
         expected_next_stage = (
-            "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
+            "outer-fold-0-access-and-seal"
+            if initial_execution_present
+            else "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
             if initial_present
             else "initial-validation-input-commitment"
             if self.execution_implementation_registered
@@ -221,6 +248,21 @@ class MassiveAdaptiveRLPrequentialRunV5:
             != implementation_present
             or any(value is not None for value in release_receipts) != release_present
             or release_present != initial_present
+            or initial_execution_partial
+            or initial_execution_present
+            and not release_present
+            or initial_execution_present
+            and any(
+                len(set(inventory)) != 2 for inventory in initial_execution_inventories
+            )
+            or self.initial_policy_schedule_disposition
+            not in (
+                None,
+                MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_QUALIFIED_V1,
+                MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1,
+            )
+            or (self.initial_policy_schedule_disposition is not None)
+            != initial_execution_present
             or self.released_validation_fold_indices
             != (
                 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
@@ -253,6 +295,8 @@ class MassiveAdaptiveRLPrequentialRunV5:
             != self.execution_implementation_registered
             or implementation_chronology_invalid
             or self.validation_execution_complete
+            or self.initial_policy_freezing_complete != initial_execution_present
+            or self.outer_zero_preparation_authorized != initial_execution_present
             or self.next_required_stage != expected_next_stage
             or self.policy_schedule_disposition is not None
             or self.final_policy_freezing_authorized
@@ -274,6 +318,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
         for name, value in self.semantic_unsigned().items():
             if name.endswith("_sha256") and value is not None:
                 _digest(name, value)
+        for inventory in initial_execution_inventories:
+            for value in inventory:
+                _digest("initial validation execution inventory", value)
         _required_timestamp(
             "Manifest V5 registration timestamp",
             self.manifest_v5_registration_committed_at_ms,
@@ -422,6 +469,11 @@ def _build_preimplementation_result(
             )
         ),
         "execution_implementation_registration_committed_at_ms": implementation_time,
+        "initial_fold_validation_authority_receipts": (),
+        "initial_policy_selection_authority_receipts": (),
+        "initial_frozen_ppo_policy_receipts": (),
+        "initial_frozen_fc06_control_receipts": (),
+        "initial_policy_schedule_disposition": None,
         "released_validation_fold_indices": (),
         "withheld_validation_fold_indices": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1
@@ -435,6 +487,8 @@ def _build_preimplementation_result(
         "execution_implementation_registered": implementation_registration is not None,
         "diagnostic_continuation_registered": True,
         "validation_execution_complete": False,
+        "initial_policy_freezing_complete": False,
+        "outer_zero_preparation_authorized": False,
         "next_required_stage": (
             "execution-implementation-registration"
             if implementation_registration is None
@@ -614,6 +668,11 @@ def _build_result(
                 implementation_registration.source_transaction_committed_at_ms,
             )
         ),
+        "initial_fold_validation_authority_receipts": (),
+        "initial_policy_selection_authority_receipts": (),
+        "initial_frozen_ppo_policy_receipts": (),
+        "initial_frozen_fc06_control_receipts": (),
+        "initial_policy_schedule_disposition": None,
         "released_validation_fold_indices": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
         ),
@@ -633,6 +692,8 @@ def _build_result(
             predecessor.diagnostic_continuation_registered
         ),
         "validation_execution_complete": False,
+        "initial_policy_freezing_complete": False,
+        "outer_zero_preparation_authorized": False,
         "next_required_stage": (
             "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
         ),
@@ -650,6 +711,66 @@ def _build_result(
         ),
         "schema": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RUN_V5_SCHEMA,
     }
+    provisional = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
+def _build_initial_execution_result(
+    *,
+    boundary: MassiveAdaptiveRLPrequentialRunV5,
+    execution: MassiveAdaptiveRLInitialValidationExecutionV1,
+) -> MassiveAdaptiveRLPrequentialRunV5:
+    """Promote the status envelope only after both initial policy pairs replay."""
+
+    boundary.validate()
+    execution.validate()
+    if (
+        type(execution) is not MassiveAdaptiveRLInitialValidationExecutionV1
+        or not execution.initial_policy_freezing_complete
+        or not execution.outer_zero_preparation_authorized
+        or execution.experiment_id != boundary.experiment_id
+        or execution.manifest_v5_receipt_sha256 != boundary.manifest_v5_receipt_sha256
+        or execution.validation_release_authority_receipt_sha256
+        != boundary.initial_validation_release_authority_receipt_sha256
+        or execution.execution_implementation_registration_receipt_sha256
+        != boundary.execution_implementation_registration_authority_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "initial V5 policy freezes do not replay from the root boundary"
+        )
+    body = boundary.semantic_unsigned()
+    body.update(
+        {
+            "initial_fold_validation_authority_receipts": tuple(
+                row.semantic_receipt_sha256
+                for row in execution.fold_validation_authorities
+            ),
+            "initial_policy_selection_authority_receipts": tuple(
+                row.semantic_receipt_sha256
+                for row in execution.policy_selection_authorities
+            ),
+            "initial_frozen_ppo_policy_receipts": tuple(
+                row.semantic_receipt_sha256 for row in execution.frozen_ppo_policies
+            ),
+            "initial_frozen_fc06_control_receipts": tuple(
+                row.semantic_receipt_sha256 for row in execution.frozen_fc06_controls
+            ),
+            "initial_policy_schedule_disposition": (
+                execution.policy_schedule_disposition
+            ),
+            "initial_policy_freezing_complete": True,
+            "outer_zero_preparation_authorized": True,
+            "next_required_stage": "outer-fold-0-access-and-seal",
+        }
+    )
     provisional = MassiveAdaptiveRLPrequentialRunV5(
         **body,  # type: ignore[arg-type]
         semantic_receipt_sha256="0" * 64,
@@ -737,7 +858,7 @@ def _replay_v5_boundary(
             allow_materialize=allow_materialize,
         )
     )
-    return _build_result(
+    boundary = _build_result(
         manifest=manifest,
         registration=registration,
         predecessor=predecessor,
@@ -746,6 +867,15 @@ def _replay_v5_boundary(
         validation_release=validation_release,
         implementation_registration=implementation_registration,
     )
+    execution = run_or_resume_massive_adaptive_rl_initial_validation_execution_v1(
+        root=artifact_root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        validation_release=validation_release,
+        allow_materialize=allow_materialize,
+    )
+    return _build_initial_execution_result(boundary=boundary, execution=execution)
 
 
 def run_massive_adaptive_rl_experiment_v5(

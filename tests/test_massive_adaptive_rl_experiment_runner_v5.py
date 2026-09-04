@@ -21,6 +21,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v4 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     MassiveAdaptiveRLPrequentialRunV5,
+    _build_initial_execution_result,
     _build_preimplementation_result,
     _build_result,
     run_massive_adaptive_rl_experiment_v5,
@@ -35,6 +36,10 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_initial_validation_execution_v1 import (
+    MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1,
+    MassiveAdaptiveRLInitialValidationExecutionV1,
 )
 
 
@@ -255,6 +260,44 @@ def test_v5_result_freezes_implementation_before_initial_inputs(
         complete.next_required_stage
         == "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
     )
+
+    receipt_rows = tuple(
+        SimpleNamespace(semantic_receipt_sha256=_digest(("stage", index)))
+        for index in range(8)
+    )
+    execution = _typed_shell(
+        MassiveAdaptiveRLInitialValidationExecutionV1,
+        experiment_id=manifest.experiment_id,
+        manifest_v5_receipt_sha256=manifest.semantic_receipt_sha256,
+        validation_release_authority_receipt_sha256=(
+            validation_release.semantic_receipt_sha256
+        ),
+        execution_implementation_registration_receipt_sha256=(
+            implementation_registration.semantic_receipt_sha256
+        ),
+        fold_validation_authorities=receipt_rows[:2],
+        policy_selection_authorities=receipt_rows[2:4],
+        frozen_ppo_policies=receipt_rows[4:6],
+        frozen_fc06_controls=receipt_rows[6:8],
+        policy_schedule_disposition=(
+            MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1
+        ),
+        initial_policy_freezing_complete=True,
+        outer_zero_preparation_authorized=True,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLInitialValidationExecutionV1, "validate", lambda _: None
+    )
+    advanced = _build_initial_execution_result(boundary=complete, execution=execution)
+    assert advanced.initial_policy_freezing_complete
+    assert advanced.outer_zero_preparation_authorized
+    assert advanced.initial_policy_schedule_disposition == (
+        MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1
+    )
+    assert advanced.next_required_stage == "outer-fold-0-access-and-seal"
+    assert not advanced.final_policy_freezing_authorized
+    assert not advanced.outer_access_authorized
+    assert not advanced.positive_profitability_authorization_eligible
 
 
 def test_v5_root_registers_before_resuming_training(

@@ -483,6 +483,42 @@ def issue_massive_adaptive_rl_manifest_v5_training_capability_v1(
     )
 
 
+def issue_massive_adaptive_rl_manifest_v5_initial_validation_execution_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue V0/V1 outcome, selection, and freeze publication authority."""
+
+    from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1,
+    )
+
+    manifest = authority._runtime_manifest
+    if manifest is None:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "initial validation execution requires replayed Manifest V5"
+        )
+    implementation = (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+            root=root,
+            manifest=manifest,
+            manifest_registration=authority,
+            allow_materialize=False,
+        )
+    )
+    if not implementation.development_execution_registered:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "initial validation execution requires frozen implementation"
+        )
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
+        writer_role="initial-validation-execution",
+        allowed_fold_indices=(0, 1),
+    )
+
+
 def issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1(
     *,
     root: str | Path,
@@ -647,6 +683,7 @@ __all__ = [
     "build_massive_adaptive_rl_manifest_v5_registration_authority_v1",
     "issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1",
     "issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1",
+    "issue_massive_adaptive_rl_manifest_v5_initial_validation_execution_capability_v1",
     "issue_massive_adaptive_rl_manifest_v5_training_capability_v1",
     "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
     "load_massive_adaptive_rl_manifest_v5_registration_authority_v1",

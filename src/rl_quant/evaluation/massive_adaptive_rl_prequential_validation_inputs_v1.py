@@ -595,6 +595,22 @@ class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
             )
         return self._runtime_plan
 
+    @property
+    def four_fold_fit_authority(
+        self,
+    ) -> MassiveAdaptiveRLFourFoldFitAuthorityV1:
+        """Return the exact replayed fit aggregate bound by this authority."""
+
+        self.validate()
+        if (
+            not self.development_stage_authorized
+            or self._runtime_four_fold_fit is None
+        ):
+            raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
+                "four-fold fit authority has not been exactly replayed"
+            )
+        return self._runtime_four_fold_fit
+
     def validation_sources(
         self, fold_index: int
     ) -> MassiveAdaptiveRLValidationSourcesAuthorityV2:
