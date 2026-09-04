@@ -222,8 +222,14 @@ MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_V1_SPEC_SHA256 = semantic_sha256(
             ),
         },
         "later_releases": (
-            {"fold": 2, "predecessor": "authenticated-outer-fold-0-seal"},
-            {"fold": 3, "predecessor": "authenticated-outer-fold-1-seal"},
+            {
+                "fold": 2,
+                "predecessor": "authenticated-outer-fold-0-seal-and-state-head",
+            },
+            {
+                "fold": 3,
+                "predecessor": "authenticated-outer-fold-1-seal-and-state-head",
+            },
         ),
         "caller_sealed_fold_indices": False,
         "source_transaction_chronology": "strict",

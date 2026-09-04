@@ -6,9 +6,10 @@ persisted prequential-state head, commits access before opening inputs, replays
 the frozen PPO and fixed control, seals the complete fold, and immediately
 advances the append-only state chain.
 
-The first implementation intentionally exposes outer fold zero only.  Later
-folds require their intervening validation-release and policy-freeze stages;
-they cannot be reached by passing a caller-selected fold index.
+This generation exposes outer folds zero and one because both can be derived
+from validation-origin inputs already sealed by their preceding state heads.
+Later folds require a separate package-owned market-input lineage and remain
+closed; no caller selects a fold index.
 """
 
 from __future__ import annotations
@@ -115,7 +116,7 @@ class MassiveAdaptiveRLOuterFoldExecutionV1:
             f"outer-{self.fold_index}-sealed"
         )
         if (
-            self.fold_index != 0
+            self.fold_index not in (0, 1)
             or not access_time < input_time < rollout_time < seal_time < state_time
             or self.outer_access.fold_index != self.fold_index
             or self.outer_inputs.fold_index != self.fold_index
@@ -141,7 +142,8 @@ def _require_exact_current_state_head_v1(
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     predecessor_state: MassiveAdaptiveRLPrequentialExperimentStateV1,
-) -> int:
+    allow_materialize: bool,
+) -> tuple[int, bool]:
     predecessor_state.validate()
     fold_index = _OUTER_FOLD_BY_PREDECESSOR_STAGE.get(predecessor_state.stage)
     if fold_index is None:
@@ -155,23 +157,40 @@ def _require_exact_current_state_head_v1(
         raise MassiveAdaptiveRLOuterFoldExecutionV1Error(
             "prequential state history is absent"
         )
-    head = states[-1]
+    matching_positions = tuple(
+        index
+        for index, state in enumerate(states)
+        if (
+            predecessor_state.semantic_receipt_sha256
+            == state.semantic_receipt_sha256
+            and predecessor_state.source_receipt_sha256 == state.source_receipt_sha256
+            and predecessor_state.source_transaction_receipt_sha256
+            == state.source_transaction_receipt_sha256
+            and predecessor_state.source_transaction_committed_at_ms
+            == state.source_transaction_committed_at_ms
+        )
+    )
     if (
         not predecessor_state.prequential_execution_authorized
         or predecessor_state.experiment_id != manifest.experiment_id
         or predecessor_state.manifest_v5_receipt_sha256
         != manifest.semantic_receipt_sha256
-        or predecessor_state.semantic_receipt_sha256 != head.semantic_receipt_sha256
-        or predecessor_state.source_receipt_sha256 != head.source_receipt_sha256
-        or predecessor_state.source_transaction_receipt_sha256
-        != head.source_transaction_receipt_sha256
-        or predecessor_state.source_transaction_committed_at_ms
-        != head.source_transaction_committed_at_ms
+        or len(matching_positions) != 1
     ):
         raise MassiveAdaptiveRLOuterFoldExecutionV1Error(
-            "outer execution requires the exact persisted state head"
+            "outer execution requires an exact persisted predecessor state"
         )
-    return fold_index
+    position = matching_positions[0]
+    if position == len(states) - 1:
+        return fold_index, allow_materialize
+    expected_completed_stage = MassiveAdaptiveRLPrequentialStageV1(
+        f"outer-{fold_index}-sealed"
+    )
+    if states[position + 1].stage is not expected_completed_stage:
+        raise MassiveAdaptiveRLOuterFoldExecutionV1Error(
+            "historical outer execution has no exact committed successor state"
+        )
+    return fold_index, False
 
 
 def run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
@@ -223,17 +242,19 @@ def run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
     with massive_adaptive_rl_experiment_materialization_lock_v1(
         artifact_root=root, experiment_id=manifest.experiment_id
     ):
-        fold_index = _require_exact_current_state_head_v1(
+        fold_index, stage_allow_materialize = _require_exact_current_state_head_v1(
             root=root,
             manifest=manifest,
             predecessor_state=predecessor_state,
+            allow_materialize=allow_materialize,
         )
-        if fold_index != 0:
+        if fold_index not in (0, 1):
             raise MassiveAdaptiveRLOuterFoldExecutionV1Error(
-                "this vertical slice authorizes only outer fold zero"
+                "this vertical slice authorizes only outer folds zero and one"
             )
+        expected_schedule_folds = tuple(range(fold_index + 2))
         if (
-            policy_schedule.fold_indices != (0, 1)
+            policy_schedule.fold_indices != expected_schedule_folds
             or predecessor_state.stage_artifact_semantic_receipt_sha256
             != policy_schedule.semantic_receipt_sha256
             or predecessor_state.stage_artifact_source_receipt_sha256
@@ -244,7 +265,7 @@ def run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
             != policy_schedule.source_transaction_committed_at_ms
         ):
             raise MassiveAdaptiveRLOuterFoldExecutionV1Error(
-                "outer fold zero requires the persisted policy-(0,1) schedule head"
+                "outer fold requires its persisted causal policy-schedule head"
             )
         frozen_policy = policy_schedule.frozen_policy(fold_index)
         frozen_control = policy_schedule.frozen_control(fold_index)
@@ -257,21 +278,21 @@ def run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
             frozen_policy=frozen_policy,
             frozen_control=frozen_control,
             predecessor_state=predecessor_state,
-            allow_materialize=allow_materialize,
+            allow_materialize=stage_allow_materialize,
         )
         input_execution = run_or_resume_massive_adaptive_rl_outer_inputs_v1(
             root=root,
             manifest=manifest,
             manifest_registration=manifest_registration,
             outer_access=outer_access,
-            allow_materialize=allow_materialize,
+            allow_materialize=stage_allow_materialize,
         )
         outer_rollout = run_or_resume_massive_adaptive_rl_outer_rollout_authority_v2(
             root=root,
             manifest=manifest,
             manifest_registration=manifest_registration,
             outer_access=input_execution.outer_access,
-            allow_materialize=allow_materialize,
+            allow_materialize=stage_allow_materialize,
         )
         outer_fold_seal = (
             run_or_resume_massive_adaptive_rl_outer_fold_seal_authority_v1(
@@ -281,7 +302,7 @@ def run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
                 policy_schedule=policy_schedule,
                 outer_access=input_execution.outer_access,
                 outer_rollout=outer_rollout,
-                allow_materialize=allow_materialize,
+                allow_materialize=stage_allow_materialize,
             )
         )
         state = run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
@@ -290,7 +311,7 @@ def run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
             manifest_registration=manifest_registration,
             execution_registration=execution_registration,
             stage_artifact=outer_fold_seal,
-            allow_materialize=allow_materialize,
+            allow_materialize=stage_allow_materialize,
         )
     result = MassiveAdaptiveRLOuterFoldExecutionV1(
         fold_index=fold_index,

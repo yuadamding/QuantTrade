@@ -1,12 +1,13 @@
-"""Manifest-V5 root through the first sealed outer fold.
+"""Manifest-V5 root through the complete four-policy schedule.
 
 V5 is the unique authoring generation for the prequential experiment.  It
 registers that ownership before resuming training, freezes the qualified
 evaluation implementation after causal training, and only then permits the
 fold-0/1 validation inputs.  It evaluates and freezes both initial policy pairs,
-publishes schedule prefixes, then uses the exact persisted state head to open,
-execute, and seal outer fold zero.  The next causal boundary is the delayed
-release of validation fold two.
+publishes schedule prefixes, seals outer fold zero, releases and freezes policy
+two, seals outer fold one with the already-frozen policy one, then releases and
+freezes policy three.  Outer folds two and three remain closed until their
+package-owned market-input lineage is implemented.
 """
 
 from __future__ import annotations
@@ -69,6 +70,10 @@ from rl_quant.workflows.massive_adaptive_rl_outer_fold_execution_v1 import (
     MassiveAdaptiveRLOuterFoldExecutionV1,
     run_or_resume_massive_adaptive_rl_outer_fold_execution_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_prequential_continuation_v1 import (
+    MassiveAdaptiveRLPrequentialContinuationV1,
+    run_or_resume_massive_adaptive_rl_prequential_continuation_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_initial_validation_execution_v1 import (
     MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1,
     MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_QUALIFIED_V1,
@@ -77,9 +82,12 @@ from rl_quant.workflows.massive_adaptive_rl_initial_validation_execution_v1 impo
 )
 from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
     MassiveAdaptiveRLPrequentialExperimentStateV1,
+    MassiveAdaptiveRLPrequentialStageV1,
     run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
+    MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_DIAGNOSTIC_V1,
+    MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1,
     MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
     run_or_resume_massive_adaptive_rl_walk_forward_policy_schedule_v1,
 )
@@ -155,6 +163,12 @@ class MassiveAdaptiveRLPrequentialRunV5:
     initial_frozen_fc06_control_receipts: tuple[str, ...]
     initial_policy_schedule_prefix_receipts: tuple[str, ...]
     initial_policy_schedule_disposition: str | None
+    delayed_validation_release_authority_receipts: tuple[str, ...]
+    delayed_fold_validation_authority_receipts: tuple[str, ...]
+    delayed_policy_selection_authority_receipts: tuple[str, ...]
+    delayed_frozen_ppo_policy_receipts: tuple[str, ...]
+    delayed_frozen_fc06_control_receipts: tuple[str, ...]
+    delayed_policy_schedule_prefix_receipts: tuple[str, ...]
     outer_access_commitment_receipts: tuple[str, ...]
     outer_input_authority_receipts: tuple[str, ...]
     outer_rollout_authority_receipts: tuple[str, ...]
@@ -179,6 +193,7 @@ class MassiveAdaptiveRLPrequentialRunV5:
     initial_policy_freezing_complete: bool
     outer_zero_preparation_authorized: bool
     outer_zero_execution_complete: bool
+    outer_one_execution_complete: bool
     next_required_stage: str
     semantic_receipt_sha256: str
     policy_schedule_disposition: str | None = None
@@ -256,16 +271,31 @@ class MassiveAdaptiveRLPrequentialRunV5:
         initial_execution_partial = any(initial_execution_inventories) and not (
             initial_execution_present
         )
-        outer_zero_inventories = (
+        delayed_execution_inventories = (
+            self.delayed_validation_release_authority_receipts,
+            self.delayed_fold_validation_authority_receipts,
+            self.delayed_policy_selection_authority_receipts,
+            self.delayed_frozen_ppo_policy_receipts,
+            self.delayed_frozen_fc06_control_receipts,
+            self.delayed_policy_schedule_prefix_receipts,
+        )
+        delayed_execution_present = all(
+            len(inventory) == 2 for inventory in delayed_execution_inventories
+        )
+        delayed_execution_partial = any(delayed_execution_inventories) and not (
+            delayed_execution_present
+        )
+        outer_inventories = (
             self.outer_access_commitment_receipts,
             self.outer_input_authority_receipts,
             self.outer_rollout_authority_receipts,
             self.outer_fold_seal_authority_receipts,
         )
-        outer_zero_present = all(
-            len(inventory) == 1 for inventory in outer_zero_inventories
-        )
-        outer_zero_partial = any(outer_zero_inventories) and not outer_zero_present
+        outer_lengths = tuple(len(inventory) for inventory in outer_inventories)
+        outer_count = outer_lengths[0] if len(set(outer_lengths)) == 1 else -1
+        outer_partial = outer_count not in (0, 1, 2)
+        outer_zero_present = outer_count >= 1
+        outer_one_present = outer_count == 2
         state_head_receipts = (
             self.prequential_state_head_receipt_sha256,
             self.prequential_state_head_source_receipt_sha256,
@@ -273,7 +303,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
         )
         state_head_present = all(value is not None for value in state_head_receipts)
         expected_next_stage = (
-            "validation-fold-2-release-selection-and-freeze"
+            "outer-fold-2-access-and-seal"
+            if delayed_execution_present
+            else "validation-fold-2-release-selection-and-freeze"
             if outer_zero_present
             else "outer-fold-0-access-and-seal"
             if initial_execution_present
@@ -298,10 +330,18 @@ class MassiveAdaptiveRLPrequentialRunV5:
             and any(
                 len(set(inventory)) != 2 for inventory in initial_execution_inventories
             )
-            or outer_zero_partial
+            or delayed_execution_partial
+            or delayed_execution_present
+            and not initial_execution_present
+            or delayed_execution_present
+            and any(
+                len(set(inventory)) != 2 for inventory in delayed_execution_inventories
+            )
+            or outer_partial
             or outer_zero_present
             and not initial_execution_present
-            or self.sealed_outer_fold_indices != ((0,) if outer_zero_present else ())
+            or outer_one_present != delayed_execution_present
+            or self.sealed_outer_fold_indices != tuple(range(max(0, outer_count)))
             or len(self.initial_policy_schedule_prefix_receipts)
             != (2 if initial_execution_present else 0)
             or len(set(self.initial_policy_schedule_prefix_receipts))
@@ -314,7 +354,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or state_head_present != initial_execution_present
             or self.prequential_state_head_stage
             != (
-                "outer-0-sealed"
+                "policy-3-frozen"
+                if delayed_execution_present
+                else "outer-0-sealed"
                 if outer_zero_present
                 else "policy-1-frozen"
                 if initial_execution_present
@@ -328,14 +370,32 @@ class MassiveAdaptiveRLPrequentialRunV5:
             )
             or (self.initial_policy_schedule_disposition is not None)
             != initial_execution_present
+            or self.policy_schedule_disposition
+            not in (
+                None,
+                MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1,
+                MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_DIAGNOSTIC_V1,
+            )
+            or (self.policy_schedule_disposition is not None)
+            != delayed_execution_present
+            or self.initial_policy_schedule_disposition
+            == MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1
+            and self.policy_schedule_disposition
+            == MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1
             or self.released_validation_fold_indices
             != (
-                MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
+                (0, 1, 2, 3)
+                if delayed_execution_present
+                else MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
                 if release_present
                 else ()
             )
             or self.withheld_validation_fold_indices
-            != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1
+            != (
+                ()
+                if delayed_execution_present
+                else MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1
+            )
             or self.authoritative_writer_generation
             != "massive-adaptive-rl-experiment-runner-v5"
             or not self.protocol_registered
@@ -359,14 +419,14 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or (self.execution_implementation_registration_committed_at_ms is not None)
             != self.execution_implementation_registered
             or implementation_chronology_invalid
-            or self.validation_execution_complete
+            or self.validation_execution_complete != delayed_execution_present
             or self.initial_policy_freezing_complete != initial_execution_present
             or self.outer_zero_preparation_authorized
             != bool(initial_execution_present and not outer_zero_present)
             or self.outer_zero_execution_complete != outer_zero_present
+            or self.outer_one_execution_complete != outer_one_present
             or self.next_required_stage != expected_next_stage
-            or self.policy_schedule_disposition is not None
-            or self.final_policy_freezing_authorized
+            or self.final_policy_freezing_authorized != delayed_execution_present
             or self.outer_access_authorized
             or self.profitability_reporting_authorized
             or self.end_to_end_profitability_execution_complete
@@ -388,9 +448,12 @@ class MassiveAdaptiveRLPrequentialRunV5:
         for inventory in initial_execution_inventories:
             for value in inventory:
                 _digest("initial validation execution inventory", value)
-        for inventory in outer_zero_inventories:
+        for inventory in delayed_execution_inventories:
             for value in inventory:
-                _digest("outer-fold-zero execution inventory", value)
+                _digest("delayed validation execution inventory", value)
+        for inventory in outer_inventories:
+            for value in inventory:
+                _digest("outer-fold execution inventory", value)
         for value in self.initial_policy_schedule_prefix_receipts:
             _digest("initial policy schedule prefix", value)
         _required_timestamp(
@@ -552,6 +615,12 @@ def _build_preimplementation_result(
         "initial_frozen_fc06_control_receipts": (),
         "initial_policy_schedule_prefix_receipts": (),
         "initial_policy_schedule_disposition": None,
+        "delayed_validation_release_authority_receipts": (),
+        "delayed_fold_validation_authority_receipts": (),
+        "delayed_policy_selection_authority_receipts": (),
+        "delayed_frozen_ppo_policy_receipts": (),
+        "delayed_frozen_fc06_control_receipts": (),
+        "delayed_policy_schedule_prefix_receipts": (),
         "outer_access_commitment_receipts": (),
         "outer_input_authority_receipts": (),
         "outer_rollout_authority_receipts": (),
@@ -578,6 +647,7 @@ def _build_preimplementation_result(
         "initial_policy_freezing_complete": False,
         "outer_zero_preparation_authorized": False,
         "outer_zero_execution_complete": False,
+        "outer_one_execution_complete": False,
         "next_required_stage": (
             "execution-implementation-registration"
             if implementation_registration is None
@@ -763,6 +833,12 @@ def _build_result(
         "initial_frozen_fc06_control_receipts": (),
         "initial_policy_schedule_prefix_receipts": (),
         "initial_policy_schedule_disposition": None,
+        "delayed_validation_release_authority_receipts": (),
+        "delayed_fold_validation_authority_receipts": (),
+        "delayed_policy_selection_authority_receipts": (),
+        "delayed_frozen_ppo_policy_receipts": (),
+        "delayed_frozen_fc06_control_receipts": (),
+        "delayed_policy_schedule_prefix_receipts": (),
         "outer_access_commitment_receipts": (),
         "outer_input_authority_receipts": (),
         "outer_rollout_authority_receipts": (),
@@ -795,6 +871,7 @@ def _build_result(
         "initial_policy_freezing_complete": False,
         "outer_zero_preparation_authorized": False,
         "outer_zero_execution_complete": False,
+        "outer_one_execution_complete": False,
         "next_required_stage": (
             "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
         ),
@@ -1015,6 +1092,115 @@ def _build_outer_zero_result(
     return result
 
 
+def _build_delayed_policy_result(
+    *,
+    boundary: MassiveAdaptiveRLPrequentialRunV5,
+    continuation: MassiveAdaptiveRLPrequentialContinuationV1,
+) -> MassiveAdaptiveRLPrequentialRunV5:
+    """Promote the root after V2/O1/V3 produce the complete policy schedule."""
+
+    boundary.validate()
+    continuation.validate()
+    release_two, release_three = continuation.validation_releases
+    execution_two, execution_three = continuation.released_fold_executions
+    schedule_two, schedule_three = continuation.policy_schedules
+    outer_one = continuation.outer_one_execution
+    state = continuation.prequential_state
+    if (
+        not boundary.outer_zero_execution_complete
+        or boundary.prequential_state_head_receipt_sha256
+        != release_two.predecessor_state_receipt_sha256
+        or boundary.outer_fold_seal_authority_receipts[-1]
+        != release_two.predecessor_outer_fold_seal_receipt_sha256
+        or outer_one.prequential_state.semantic_receipt_sha256
+        != release_three.predecessor_state_receipt_sha256
+        or outer_one.outer_fold_seal.semantic_receipt_sha256
+        != release_three.predecessor_outer_fold_seal_receipt_sha256
+        or schedule_three.fold_indices != (0, 1, 2, 3)
+        or state.stage is not MassiveAdaptiveRLPrequentialStageV1.POLICY_3_FROZEN
+        or state.immediate_predecessor_state_receipt_sha256 is None
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "delayed policy sequence does not descend from outer fold zero"
+        )
+    body = boundary.semantic_unsigned()
+    body.update(
+        {
+            "delayed_validation_release_authority_receipts": (
+                release_two.semantic_receipt_sha256,
+                release_three.semantic_receipt_sha256,
+            ),
+            "delayed_fold_validation_authority_receipts": (
+                execution_two.fold_validation_authority.semantic_receipt_sha256,
+                execution_three.fold_validation_authority.semantic_receipt_sha256,
+            ),
+            "delayed_policy_selection_authority_receipts": (
+                execution_two.policy_selection_authority.semantic_receipt_sha256,
+                execution_three.policy_selection_authority.semantic_receipt_sha256,
+            ),
+            "delayed_frozen_ppo_policy_receipts": (
+                execution_two.frozen_ppo_policy.semantic_receipt_sha256,
+                execution_three.frozen_ppo_policy.semantic_receipt_sha256,
+            ),
+            "delayed_frozen_fc06_control_receipts": (
+                execution_two.frozen_fc06_control.semantic_receipt_sha256,
+                execution_three.frozen_fc06_control.semantic_receipt_sha256,
+            ),
+            "delayed_policy_schedule_prefix_receipts": (
+                schedule_two.semantic_receipt_sha256,
+                schedule_three.semantic_receipt_sha256,
+            ),
+            "outer_access_commitment_receipts": (
+                *boundary.outer_access_commitment_receipts,
+                outer_one.outer_access.semantic_receipt_sha256,
+            ),
+            "outer_input_authority_receipts": (
+                *boundary.outer_input_authority_receipts,
+                outer_one.outer_inputs.semantic_receipt_sha256,
+            ),
+            "outer_rollout_authority_receipts": (
+                *boundary.outer_rollout_authority_receipts,
+                outer_one.outer_rollout.semantic_receipt_sha256,
+            ),
+            "outer_fold_seal_authority_receipts": (
+                *boundary.outer_fold_seal_authority_receipts,
+                outer_one.outer_fold_seal.semantic_receipt_sha256,
+            ),
+            "sealed_outer_fold_indices": (0, 1),
+            "prequential_state_head_receipt_sha256": state.semantic_receipt_sha256,
+            "prequential_state_head_source_receipt_sha256": _required_digest(
+                "policy-three state-head source receipt", state.source_receipt_sha256
+            ),
+            "prequential_state_head_commit_receipt_sha256": _required_digest(
+                "policy-three state-head commit receipt",
+                state.source_transaction_receipt_sha256,
+            ),
+            "prequential_state_head_committed_at_ms": _required_timestamp(
+                "policy-three state-head timestamp",
+                state.source_transaction_committed_at_ms,
+            ),
+            "prequential_state_head_stage": state.stage.value,
+            "released_validation_fold_indices": (0, 1, 2, 3),
+            "withheld_validation_fold_indices": (),
+            "validation_execution_complete": True,
+            "outer_one_execution_complete": True,
+            "next_required_stage": "outer-fold-2-access-and-seal",
+            "policy_schedule_disposition": schedule_three.policy_schedule_disposition,
+            "final_policy_freezing_authorized": True,
+        }
+    )
+    provisional = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
 def _record_initial_prequential_execution_v1(
     *,
     root: str | Path,
@@ -1202,10 +1388,25 @@ def _replay_v5_boundary(
         predecessor_state=state_head,
         allow_materialize=allow_materialize,
     )
-    return _build_outer_zero_result(
+    outer_zero_result = _build_outer_zero_result(
         boundary=initial_result,
         policy_schedule=schedules[-1],
         execution=outer_zero,
+    )
+    continuation = run_or_resume_massive_adaptive_rl_prequential_continuation_v1(
+        root=artifact_root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        initial_inputs=initial_inputs,
+        initial_execution=execution,
+        initial_policy_schedule=schedules[-1],
+        outer_zero_execution=outer_zero,
+        allow_materialize=allow_materialize,
+    )
+    return _build_delayed_policy_result(
+        boundary=outer_zero_result,
+        continuation=continuation,
     )
 
 

@@ -148,7 +148,11 @@ def _roots(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         MassiveAdaptiveRLPrequentialExperimentStateV1,
         "source_transaction_committed_at_ms",
-        property(lambda state: 140 if state.stage.value == "outer-0-sealed" else 95),
+        property(
+            lambda state: (
+                140 if state.stage.value.startswith("outer-") else 95
+            )
+        ),
     )
     return manifest, registration, execution, schedule, predecessor
 
@@ -169,22 +173,49 @@ def test_outer_fold_public_surface_has_no_caller_economic_inputs() -> None:
     }
 
 
-def test_outer_zero_executes_and_seals_in_package_owned_order(
+@pytest.mark.parametrize(
+    ("fold_index", "predecessor_stage", "sealed_stage", "schedule_folds"),
+    (
+        (
+            0,
+            MassiveAdaptiveRLPrequentialStageV1.POLICY_1_FROZEN,
+            MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+            (0, 1),
+        ),
+        (
+            1,
+            MassiveAdaptiveRLPrequentialStageV1.POLICY_2_FROZEN,
+            MassiveAdaptiveRLPrequentialStageV1.OUTER_1_SEALED,
+            (0, 1, 2),
+        ),
+    ),
+)
+def test_outer_zero_and_one_execute_and_seal_in_package_owned_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fold_index: int,
+    predecessor_stage: MassiveAdaptiveRLPrequentialStageV1,
+    sealed_stage: MassiveAdaptiveRLPrequentialStageV1,
+    schedule_folds: tuple[int, ...],
 ) -> None:
     manifest, registration, implementation, schedule, predecessor = _roots(monkeypatch)
+    object.__setattr__(predecessor, "stage", predecessor_stage)
+    object.__setattr__(schedule, "fold_indices", schedule_folds)
     frozen_policy = object()
     frozen_control = object()
     monkeypatch.setattr(
         MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
         "frozen_policy",
-        lambda _, fold_index: frozen_policy if fold_index == 0 else None,
+        lambda _, requested_fold: (
+            frozen_policy if requested_fold == fold_index else None
+        ),
     )
     monkeypatch.setattr(
         MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
         "frozen_control",
-        lambda _, fold_index: frozen_control if fold_index == 0 else None,
+        lambda _, requested_fold: (
+            frozen_control if requested_fold == fold_index else None
+        ),
     )
     monkeypatch.setattr(
         outer,
@@ -199,32 +230,32 @@ def test_outer_zero_executes_and_seals_in_package_owned_order(
     calls: list[str] = []
     access = _typed_shell(
         MassiveAdaptiveOuterAccessCommitmentV2,
-        fold_index=0,
+        fold_index=fold_index,
         semantic_receipt_sha256=_digest("access"),
         predecessor_state_receipt_sha256=predecessor.semantic_receipt_sha256,
         policy_schedule_receipt_sha256=schedule.semantic_receipt_sha256,
     )
     inputs = _typed_shell(
         MassiveAdaptiveRLOuterInputAuthorityV1,
-        fold_index=0,
+        fold_index=fold_index,
         semantic_receipt_sha256=_digest("inputs"),
         outer_access_commitment_receipt_sha256=access.semantic_receipt_sha256,
     )
     rollout = _typed_shell(
         MassiveAdaptiveRLOuterRolloutAuthorityV2,
-        fold_index=0,
+        fold_index=fold_index,
         semantic_receipt_sha256=_digest("rollout"),
         outer_access_commitment_receipt_sha256=access.semantic_receipt_sha256,
     )
     seal = _typed_shell(
         MassiveAdaptiveRLOuterFoldSealAuthorityV1,
-        fold_index=0,
+        fold_index=fold_index,
         semantic_receipt_sha256=_digest("seal"),
         outer_rollout_authority_receipt_sha256=rollout.semantic_receipt_sha256,
     )
     state = _typed_shell(
         MassiveAdaptiveRLPrequentialExperimentStateV1,
-        stage=MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+        stage=sealed_stage,
         semantic_receipt_sha256=_digest("outer-state"),
         stage_artifact_semantic_receipt_sha256=seal.semantic_receipt_sha256,
         immediate_predecessor_state_receipt_sha256=(
@@ -306,6 +337,7 @@ def test_outer_zero_executes_and_seals_in_package_owned_order(
     )
 
     assert isinstance(result, MassiveAdaptiveRLOuterFoldExecutionV1)
+    assert result.fold_index == fold_index
     assert calls == ["access", "inputs", "rollout", "seal", "state"]
 
 
@@ -343,7 +375,7 @@ def test_outer_three_cannot_open_from_policy_three_state(
 
     with pytest.raises(
         MassiveAdaptiveRLOuterFoldExecutionV1Error,
-        match="only outer fold zero",
+        match="only outer folds zero and one",
     ):
         run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
             root=tmp_path,
@@ -354,3 +386,29 @@ def test_outer_three_cannot_open_from_policy_three_state(
             predecessor_state=predecessor,
         )
     assert not called
+
+
+def test_historical_outer_predecessor_forces_read_only_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, _, _, _, predecessor = _roots(monkeypatch)
+    completed = _typed_shell(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        experiment_id=manifest.experiment_id,
+        manifest_v5_receipt_sha256=manifest.semantic_receipt_sha256,
+        stage=MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+        semantic_receipt_sha256=_digest("completed-outer-state"),
+    )
+    monkeypatch.setattr(
+        outer,
+        "load_massive_adaptive_rl_prequential_experiment_states_v1",
+        lambda **_: (predecessor, completed),
+    )
+
+    assert outer._require_exact_current_state_head_v1(
+        root=tmp_path,
+        manifest=manifest,
+        predecessor_state=predecessor,
+        allow_materialize=True,
+    ) == (0, False)

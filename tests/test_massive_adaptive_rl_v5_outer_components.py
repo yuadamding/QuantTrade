@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -26,13 +27,33 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_rollout_authority_v2 import (
 from rl_quant.evaluation.massive_adaptive_rl_outer_inputs_v1 import (
     run_or_resume_massive_adaptive_rl_outer_inputs_v1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
+    MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_fold_seal_authority_v1 import (
+    MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_validation_release_authority_v1 import (
+    MassiveAdaptiveRLValidationReleaseAuthorityV1Error,
     run_or_resume_massive_adaptive_rl_delayed_validation_release_v1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.workflows import massive_adaptive_rl_writer_guard_v5 as writer_guard
+from rl_quant.workflows import (
+    massive_adaptive_rl_prequential_experiment_state_v1 as state_module,
+)
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     build_massive_adaptive_rl_experiment_manifest_v5,
+)
+from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+    MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
+    MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+    MassiveAdaptiveRLPrequentialExperimentStateV1,
+    MassiveAdaptiveRLPrequentialStageV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
     walk_forward_policy_schedule_relative_path_v1,
@@ -164,6 +185,147 @@ def test_outer_public_surfaces_do_not_accept_economic_outcomes() -> None:
         "predecessor_state",
         "allow_materialize",
     }
+
+
+def test_delayed_release_rejects_a_state_that_is_not_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="delayed-release-state-gate"
+    )
+    registration = object.__new__(MassiveAdaptiveRLManifestV5RegistrationAuthorityV1)
+    object.__setattr__(
+        registration, "manifest_v5_receipt_sha256", manifest.semantic_receipt_sha256
+    )
+    object.__setattr__(registration, "semantic_receipt_sha256", _digest("registration"))
+    implementation = object.__new__(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1
+    )
+    object.__setattr__(
+        implementation, "manifest_v5_receipt_sha256", manifest.semantic_receipt_sha256
+    )
+    object.__setattr__(
+        implementation,
+        "manifest_v5_registration_authority_receipt_sha256",
+        registration.semantic_receipt_sha256,
+    )
+    object.__setattr__(implementation, "semantic_receipt_sha256", _digest("implementation"))
+    object.__setattr__(
+        implementation, "four_fold_fit_authority_receipt_sha256", _digest("fit")
+    )
+    initial_inputs = object.__new__(MassiveAdaptiveRLInitialValidationInputsAuthorityV1)
+    object.__setattr__(
+        initial_inputs,
+        "manifest_v4_receipt_sha256",
+        manifest.base_manifest.semantic_receipt_sha256,
+    )
+    object.__setattr__(
+        initial_inputs,
+        "four_fold_fit_authority_receipt_sha256",
+        implementation.four_fold_fit_authority_receipt_sha256,
+    )
+    seal = object.__new__(MassiveAdaptiveRLOuterFoldSealAuthorityV1)
+    object.__setattr__(seal, "fold_index", 0)
+    object.__setattr__(seal, "semantic_receipt_sha256", _digest("seal"))
+    object.__setattr__(
+        seal, "manifest_v5_receipt_sha256", manifest.semantic_receipt_sha256
+    )
+    object.__setattr__(
+        seal,
+        "execution_implementation_registration_receipt_sha256",
+        implementation.semantic_receipt_sha256,
+    )
+    supplied = object.__new__(MassiveAdaptiveRLPrequentialExperimentStateV1)
+    object.__setattr__(
+        supplied, "stage", MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED
+    )
+    object.__setattr__(supplied, "semantic_receipt_sha256", _digest("supplied"))
+    object.__setattr__(
+        supplied,
+        "execution_implementation_registration_receipt_sha256",
+        implementation.semantic_receipt_sha256,
+    )
+    object.__setattr__(
+        supplied, "stage_artifact_semantic_receipt_sha256", seal.semantic_receipt_sha256
+    )
+    persisted = object.__new__(MassiveAdaptiveRLPrequentialExperimentStateV1)
+    object.__setattr__(
+        persisted, "stage", MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED
+    )
+    object.__setattr__(persisted, "semantic_receipt_sha256", _digest("persisted"))
+
+    monkeypatch.setattr(
+        MassiveAdaptiveRLOuterFoldSealAuthorityV1, "validate", lambda _: None
+    )
+    for authority_type in (
+        MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+    ):
+        monkeypatch.setattr(authority_type, "validate", lambda _: None)
+    monkeypatch.setattr(
+        MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+        "development_protocol_registered",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        "development_execution_registered",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+        "development_stage_authorized",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+        "validation_release_authorized",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1, "validate", lambda _: None
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        "prequential_execution_authorized",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        "source_receipt_sha256",
+        property(lambda state: _digest((state.semantic_receipt_sha256, "source"))),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        "source_transaction_receipt_sha256",
+        property(lambda state: _digest((state.semantic_receipt_sha256, "commit"))),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        "source_transaction_committed_at_ms",
+        property(lambda _: 20),
+    )
+    monkeypatch.setattr(
+        state_module,
+        "load_massive_adaptive_rl_prequential_experiment_states_v1",
+        lambda **_: (persisted,),
+    )
+
+    with pytest.raises(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1Error,
+        match="exact persisted state",
+    ):
+        run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
+            root=tmp_path,
+            manifest=manifest,
+            manifest_registration=registration,
+            execution_registration=implementation,
+            initial_inputs=initial_inputs,
+            predecessor_outer_fold_seal=seal,
+            predecessor_state=supplied,
+        )
     assert set(
         inspect.signature(run_or_resume_massive_adaptive_rl_outer_inputs_v1).parameters
     ) == {
@@ -198,10 +360,11 @@ def test_outer_public_surfaces_do_not_accept_economic_outcomes() -> None:
         "manifest",
         "manifest_registration",
         "execution_registration",
-        "initial_inputs",
-        "predecessor_outer_fold_seal",
-        "allow_materialize",
-    }
+            "initial_inputs",
+            "predecessor_outer_fold_seal",
+            "predecessor_state",
+            "allow_materialize",
+        }
 
 
 def test_outer_environment_is_not_a_public_precommit_input() -> None:

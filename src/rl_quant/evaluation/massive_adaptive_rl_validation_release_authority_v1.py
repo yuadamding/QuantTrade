@@ -62,6 +62,9 @@ if TYPE_CHECKING:
     from rl_quant.evaluation.massive_adaptive_rl_outer_fold_seal_authority_v1 import (
         MassiveAdaptiveRLOuterFoldSealAuthorityV1,
     )
+    from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+    )
 
 
 MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_AUTHORITY_V1_DATASET = (
@@ -204,6 +207,11 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
     predecessor_outer_fold_seal_source_receipt_sha256: str | None = None
     predecessor_outer_fold_seal_commit_receipt_sha256: str | None = None
     predecessor_outer_fold_seal_committed_at_ms: int | None = None
+    predecessor_state_receipt_sha256: str | None = None
+    predecessor_state_source_receipt_sha256: str | None = None
+    predecessor_state_commit_receipt_sha256: str | None = None
+    predecessor_state_committed_at_ms: int | None = None
+    predecessor_state_stage: str | None = None
     runtime_lineage_replayed: bool = False
     development_validation_release_authorized: bool = False
     outer_access_authorized: bool = False
@@ -236,6 +244,9 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
     ] = field(default=(), compare=False, repr=False)
     _runtime_predecessor_outer_seal: (
         MassiveAdaptiveRLOuterFoldSealAuthorityV1 | None
+    ) = field(default=None, compare=False, repr=False)
+    _runtime_predecessor_state: (
+        MassiveAdaptiveRLPrequentialExperimentStateV1 | None
     ) = field(default=None, compare=False, repr=False)
     _loaded_source: LoadedMassiveSourceObject | None = field(
         default=None, compare=False, repr=False
@@ -373,16 +384,19 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
             and len(self._runtime_validation_registries) == expected_count
         )
         predecessor_runtime = self._runtime_predecessor_outer_seal is not None
+        predecessor_state_runtime = self._runtime_predecessor_state is not None
         runtime_present = bool(
             all(value is not None for value in base_runtime_roots)
             and rows_runtime
             and predecessor_runtime == delayed
+            and predecessor_state_runtime == delayed
         )
         any_runtime = bool(
             any(value is not None for value in base_runtime_roots)
             or self._runtime_validation_sources
             or self._runtime_validation_registries
             or predecessor_runtime
+            or predecessor_state_runtime
         )
         if any_runtime != runtime_present:
             raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
@@ -413,6 +427,13 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
             self.predecessor_outer_fold_seal_commit_receipt_sha256,
             self.predecessor_outer_fold_seal_committed_at_ms,
         )
+        predecessor_state_fields = (
+            self.predecessor_state_receipt_sha256,
+            self.predecessor_state_source_receipt_sha256,
+            self.predecessor_state_commit_receipt_sha256,
+            self.predecessor_state_committed_at_ms,
+            self.predecessor_state_stage,
+        )
         initial_chronology = bool(
             release_spec is not None
             and not delayed
@@ -424,13 +445,17 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
             < self.initial_validation_inputs_committed_at_ms
         )
         predecessor_time = self.predecessor_outer_fold_seal_committed_at_ms
+        predecessor_state_time = self.predecessor_state_committed_at_ms
         delayed_chronology = bool(
             release_spec is not None
             and delayed
             and isinstance(predecessor_time, int)
             and not isinstance(predecessor_time, bool)
+            and isinstance(predecessor_state_time, int)
+            and not isinstance(predecessor_state_time, bool)
             and self.initial_validation_inputs_committed_at_ms < predecessor_time
-            and predecessor_time
+            and predecessor_time < predecessor_state_time
+            and predecessor_state_time
             < min(self.validation_sources_v2_committed_at_ms, default=-1)
             and max(self.validation_sources_v2_committed_at_ms, default=-1)
             < min(self.validation_registry_v2_committed_at_ms, default=-1)
@@ -444,6 +469,11 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
             or self.predecessor_outer_fold_index != release_spec[2]
             or (delayed and any(value is None for value in predecessor_fields))
             or (not delayed and any(value is not None for value in predecessor_fields))
+            or (delayed and any(value is None for value in predecessor_state_fields))
+            or (
+                not delayed
+                and any(value is not None for value in predecessor_state_fields)
+            )
             or set(lengths) != {expected_count}
             or tuple(
                 len(row)
@@ -522,6 +552,7 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
                     self.initial_validation_inputs_committed_at_ms,
                     max(self.validation_registry_v2_committed_at_ms),
                     self.predecessor_outer_fold_seal_committed_at_ms or 0,
+                    self.predecessor_state_committed_at_ms or 0,
                 )
             ):
                 raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
@@ -616,13 +647,30 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
                 from rl_quant.evaluation.massive_adaptive_rl_outer_fold_seal_authority_v1 import (
                     MassiveAdaptiveRLOuterFoldSealAuthorityV1,
                 )
+                from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+                    MassiveAdaptiveRLPrequentialExperimentStateV1,
+                    MassiveAdaptiveRLPrequentialStageV1,
+                )
 
                 seal = self._runtime_predecessor_outer_seal
+                predecessor_state = self._runtime_predecessor_state
                 if type(seal) is not MassiveAdaptiveRLOuterFoldSealAuthorityV1:
                     raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
                         "validation release predecessor seal type differs"
                     )
+                if (
+                    type(predecessor_state)
+                    is not MassiveAdaptiveRLPrequentialExperimentStateV1
+                ):
+                    raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
+                        "validation release predecessor state type differs"
+                    )
                 seal.validate()
+                predecessor_state.validate()
+                expected_state = {
+                    0: MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+                    1: MassiveAdaptiveRLPrequentialStageV1.OUTER_1_SEALED,
+                }[seal.fold_index]
                 if (
                     seal.fold_index != self.predecessor_outer_fold_index
                     or seal.semantic_receipt_sha256
@@ -641,9 +689,28 @@ class MassiveAdaptiveRLValidationReleaseAuthorityV1:
                     != self.scientific_execution_fingerprint_sha256
                     or not seal.development_outer_fold_sealed
                     or not seal.validation_release_authorized
+                    or not predecessor_state.prequential_execution_authorized
+                    or predecessor_state.stage is not expected_state
+                    or predecessor_state.semantic_receipt_sha256
+                    != self.predecessor_state_receipt_sha256
+                    or predecessor_state.source_receipt_sha256
+                    != self.predecessor_state_source_receipt_sha256
+                    or predecessor_state.source_transaction_receipt_sha256
+                    != self.predecessor_state_commit_receipt_sha256
+                    or predecessor_state.source_transaction_committed_at_ms
+                    != self.predecessor_state_committed_at_ms
+                    or predecessor_state.stage.value != self.predecessor_state_stage
+                    or predecessor_state.stage_artifact_semantic_receipt_sha256
+                    != seal.semantic_receipt_sha256
+                    or predecessor_state.stage_artifact_source_receipt_sha256
+                    != seal.source_receipt_sha256
+                    or predecessor_state.stage_artifact_commit_receipt_sha256
+                    != seal.source_transaction_receipt_sha256
+                    or predecessor_state.stage_artifact_committed_at_ms
+                    != seal.source_transaction_committed_at_ms
                 ):
                     raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
-                        "validation release predecessor seal differs"
+                        "validation release predecessor seal or state differs"
                     )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
@@ -786,6 +853,11 @@ def build_massive_adaptive_rl_initial_validation_release_authority_v1(
         "predecessor_outer_fold_seal_source_receipt_sha256": None,
         "predecessor_outer_fold_seal_commit_receipt_sha256": None,
         "predecessor_outer_fold_seal_committed_at_ms": None,
+        "predecessor_state_receipt_sha256": None,
+        "predecessor_state_source_receipt_sha256": None,
+        "predecessor_state_commit_receipt_sha256": None,
+        "predecessor_state_committed_at_ms": None,
+        "predecessor_state_stage": None,
         "initial_validation_inputs_authority_receipt_sha256": (
             initial_inputs.semantic_receipt_sha256
         ),
@@ -887,6 +959,7 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
     ),
     initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
     predecessor_outer_fold_seal: MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+    predecessor_state: MassiveAdaptiveRLPrequentialExperimentStateV1,
     validation_sources: MassiveAdaptiveRLValidationSourcesAuthorityV2,
     validation_registry: MassiveAdaptiveRLValidationEnvironmentRegistryV2,
 ) -> MassiveAdaptiveRLValidationReleaseAuthorityV1:
@@ -895,6 +968,10 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
     from rl_quant.evaluation.massive_adaptive_rl_outer_fold_seal_authority_v1 import (
         MassiveAdaptiveRLOuterFoldSealAuthorityV1 as OuterSeal,
     )
+    from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        MassiveAdaptiveRLPrequentialStageV1,
+    )
 
     authorities = (
         manifest,
@@ -902,6 +979,7 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
         execution_registration,
         initial_inputs,
         predecessor_outer_fold_seal,
+        predecessor_state,
         validation_sources,
         validation_registry,
     )
@@ -918,6 +996,8 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
         or type(initial_inputs)
         is not MassiveAdaptiveRLInitialValidationInputsAuthorityV1
         or type(predecessor_outer_fold_seal) is not OuterSeal
+        or type(predecessor_state)
+        is not MassiveAdaptiveRLPrequentialExperimentStateV1
         or type(validation_sources) is not MassiveAdaptiveRLValidationSourcesAuthorityV2
         or type(validation_registry)
         is not MassiveAdaptiveRLValidationEnvironmentRegistryV2
@@ -926,6 +1006,25 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
         or validation_sources.fold_index != released_fold
         or validation_registry.fold_index != released_fold
         or not predecessor_outer_fold_seal.validation_release_authorized
+        or not predecessor_state.prequential_execution_authorized
+        or predecessor_state.experiment_id != manifest.experiment_id
+        or predecessor_state.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or predecessor_state.execution_implementation_registration_receipt_sha256
+        != execution_registration.semantic_receipt_sha256
+        or predecessor_state.stage
+        is not {
+            0: MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+            1: MassiveAdaptiveRLPrequentialStageV1.OUTER_1_SEALED,
+        }[predecessor]
+        or predecessor_state.stage_artifact_semantic_receipt_sha256
+        != predecessor_outer_fold_seal.semantic_receipt_sha256
+        or predecessor_state.stage_artifact_source_receipt_sha256
+        != predecessor_outer_fold_seal.source_receipt_sha256
+        or predecessor_state.stage_artifact_commit_receipt_sha256
+        != predecessor_outer_fold_seal.source_transaction_receipt_sha256
+        or predecessor_state.stage_artifact_committed_at_ms
+        != predecessor_outer_fold_seal.source_transaction_committed_at_ms
         or predecessor_outer_fold_seal.manifest_v5_receipt_sha256
         != manifest.semantic_receipt_sha256
         or validation_sources.manifest_v4_receipt_sha256
@@ -971,6 +1070,16 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
         "predecessor outer-fold seal time",
         predecessor_outer_fold_seal.source_transaction_committed_at_ms,
     )
+    predecessor_state_source = _required_digest(
+        "predecessor state source", predecessor_state.source_receipt_sha256
+    )
+    predecessor_state_commit = _required_digest(
+        "predecessor state commit",
+        predecessor_state.source_transaction_receipt_sha256,
+    )
+    predecessor_state_time = _required_timestamp(
+        "predecessor state time", predecessor_state.source_transaction_committed_at_ms
+    )
     validation_source_receipt = _required_digest(
         "delayed validation source", validation_sources.source_receipt_sha256
     )
@@ -997,7 +1106,13 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
         "initial validation-input time",
         initial_inputs.source_transaction_committed_at_ms,
     )
-    if not initial_time < predecessor_time < validation_source_time < registry_time:
+    if not (
+        initial_time
+        < predecessor_time
+        < predecessor_state_time
+        < validation_source_time
+        < registry_time
+    ):
         raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
             "delayed validation release chronology differs"
         )
@@ -1113,12 +1228,18 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
             execution_registration.source_data_qualified
             and initial_inputs.source_data_qualified
             and predecessor_outer_fold_seal.source_data_qualified
+            and predecessor_state.source_data_qualified
             and validation_sources.source_data_qualified
             and validation_registry.source_data_qualified
         ),
         "predecessor_outer_fold_seal_source_receipt_sha256": predecessor_source,
         "predecessor_outer_fold_seal_commit_receipt_sha256": predecessor_commit,
         "predecessor_outer_fold_seal_committed_at_ms": predecessor_time,
+        "predecessor_state_receipt_sha256": predecessor_state.semantic_receipt_sha256,
+        "predecessor_state_source_receipt_sha256": predecessor_state_source,
+        "predecessor_state_commit_receipt_sha256": predecessor_state_commit,
+        "predecessor_state_committed_at_ms": predecessor_state_time,
+        "predecessor_state_stage": predecessor_state.stage.value,
         "outer_access_authorized": False,
         "profitability_reporting_authorized": False,
         "lockbox_access_authorized": False,
@@ -1142,6 +1263,7 @@ def build_massive_adaptive_rl_delayed_validation_release_authority_v1(
         _runtime_validation_sources=(validation_sources,),
         _runtime_validation_registries=(validation_registry,),
         _runtime_predecessor_outer_seal=predecessor_outer_fold_seal,
+        _runtime_predecessor_state=predecessor_state,
     )
     result = replace(
         provisional,
@@ -1272,6 +1394,7 @@ def authorize_massive_adaptive_rl_delayed_validation_release_authority_v1(
     ),
     initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
     predecessor_outer_fold_seal: MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+    predecessor_state: MassiveAdaptiveRLPrequentialExperimentStateV1,
     validation_sources: MassiveAdaptiveRLValidationSourcesAuthorityV2,
     validation_registry: MassiveAdaptiveRLValidationEnvironmentRegistryV2,
 ) -> MassiveAdaptiveRLValidationReleaseAuthorityV1:
@@ -1282,6 +1405,7 @@ def authorize_massive_adaptive_rl_delayed_validation_release_authority_v1(
         execution_registration=execution_registration,
         initial_inputs=initial_inputs,
         predecessor_outer_fold_seal=predecessor_outer_fold_seal,
+        predecessor_state=predecessor_state,
         validation_sources=validation_sources,
         validation_registry=validation_registry,
     )
@@ -1308,6 +1432,7 @@ def authorize_massive_adaptive_rl_delayed_validation_release_authority_v1(
         _runtime_validation_sources=(validation_sources,),
         _runtime_validation_registries=(validation_registry,),
         _runtime_predecessor_outer_seal=predecessor_outer_fold_seal,
+        _runtime_predecessor_state=predecessor_state,
     )
     result.validate()
     return result
@@ -1323,15 +1448,71 @@ def run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
     ),
     initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
     predecessor_outer_fold_seal: MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+    predecessor_state: MassiveAdaptiveRLPrequentialExperimentStateV1,
     allow_materialize: bool = True,
 ) -> MassiveAdaptiveRLValidationReleaseAuthorityV1:
     """Release V2 or V3 from the exact authenticated O0 or O1 seal."""
 
-    predecessor_outer_fold_seal.validate()
+    from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        MassiveAdaptiveRLPrequentialStageV1,
+        load_massive_adaptive_rl_prequential_experiment_states_v1,
+    )
+    from rl_quant.evaluation.massive_adaptive_rl_outer_fold_seal_authority_v1 import (
+        MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+    )
+
+    for authority in (
+        manifest,
+        manifest_registration,
+        execution_registration,
+        initial_inputs,
+        predecessor_outer_fold_seal,
+        predecessor_state,
+    ):
+        authority.validate()
     if (
         type(allow_materialize) is not bool
+        or type(manifest) is not MassiveAdaptiveRLExperimentManifestV5
+        or type(manifest_registration)
+        is not MassiveAdaptiveRLManifestV5RegistrationAuthorityV1
+        or type(execution_registration)
+        is not MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1
+        or type(initial_inputs)
+        is not MassiveAdaptiveRLInitialValidationInputsAuthorityV1
+        or type(predecessor_outer_fold_seal)
+        is not MassiveAdaptiveRLOuterFoldSealAuthorityV1
+        or type(predecessor_state)
+        is not MassiveAdaptiveRLPrequentialExperimentStateV1
+        or not manifest_registration.development_protocol_registered
+        or not execution_registration.development_execution_registered
+        or not initial_inputs.development_stage_authorized
         or predecessor_outer_fold_seal.fold_index not in (0, 1)
         or not predecessor_outer_fold_seal.validation_release_authorized
+        or not predecessor_state.prequential_execution_authorized
+        or predecessor_state.stage
+        is not {
+            0: MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+            1: MassiveAdaptiveRLPrequentialStageV1.OUTER_1_SEALED,
+        }[predecessor_outer_fold_seal.fold_index]
+        or predecessor_state.stage_artifact_semantic_receipt_sha256
+        != predecessor_outer_fold_seal.semantic_receipt_sha256
+        or manifest_registration.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or execution_registration.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or execution_registration.manifest_v5_registration_authority_receipt_sha256
+        != manifest_registration.semantic_receipt_sha256
+        or initial_inputs.manifest_v4_receipt_sha256
+        != manifest.base_manifest.semantic_receipt_sha256
+        or initial_inputs.four_fold_fit_authority_receipt_sha256
+        != execution_registration.four_fold_fit_authority_receipt_sha256
+        or predecessor_outer_fold_seal.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or predecessor_outer_fold_seal.execution_implementation_registration_receipt_sha256
+        != execution_registration.semantic_receipt_sha256
+        or predecessor_state.execution_implementation_registration_receipt_sha256
+        != execution_registration.semantic_receipt_sha256
     ):
         raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
             "delayed validation release predecessor differs"
@@ -1344,6 +1525,43 @@ def run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
         with massive_adaptive_rl_experiment_materialization_lock_v1(
             artifact_root=root, experiment_id=manifest.experiment_id
         ):
+            states = load_massive_adaptive_rl_prequential_experiment_states_v1(
+                root=root, manifest=manifest
+            )
+            if not states:
+                raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
+                    "delayed validation release state history is absent"
+                )
+            matching_positions = tuple(
+                index
+                for index, state in enumerate(states)
+                if (
+                    predecessor_state.semantic_receipt_sha256
+                    == state.semantic_receipt_sha256
+                    and predecessor_state.source_receipt_sha256
+                    == state.source_receipt_sha256
+                    and predecessor_state.source_transaction_receipt_sha256
+                    == state.source_transaction_receipt_sha256
+                    and predecessor_state.source_transaction_committed_at_ms
+                    == state.source_transaction_committed_at_ms
+                )
+            )
+            if len(matching_positions) != 1:
+                raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
+                    "delayed validation release requires an exact persisted state"
+                )
+            position = matching_positions[0]
+            stage_allow_materialize = allow_materialize
+            if position != len(states) - 1:
+                expected_release_stage = {
+                    2: MassiveAdaptiveRLPrequentialStageV1.VALIDATION_2_RELEASED,
+                    3: MassiveAdaptiveRLPrequentialStageV1.VALIDATION_3_RELEASED,
+                }[released_fold]
+                if states[position + 1].stage is not expected_release_stage:
+                    raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
+                        "historical validation release has no exact successor state"
+                    )
+                stage_allow_materialize = False
             complete, partial = _transaction_state(root=root, relative=relative)
             if partial:
                 raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
@@ -1352,6 +1570,10 @@ def run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
             seal_time = _required_timestamp(
                 "predecessor outer-fold seal time",
                 predecessor_outer_fold_seal.source_transaction_committed_at_ms,
+            )
+            state_time = _required_timestamp(
+                "predecessor state time",
+                predecessor_state.source_transaction_committed_at_ms,
             )
             capability = issue_massive_adaptive_rl_manifest_v5_delayed_validation_release_capability_v1(
                 root=root,
@@ -1368,8 +1590,8 @@ def run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
                         four_fold_fit_authority=initial_inputs.four_fold_fit_authority,
                         runtime_sources_v2=initial_inputs.runtime_sources_v2,
                         fold_index=released_fold,
-                        committed_at_ms=max(_wall_clock_ms(), seal_time) + 1,
-                        allow_materialize=allow_materialize,
+                        committed_at_ms=max(_wall_clock_ms(), seal_time, state_time) + 1,
+                        allow_materialize=stage_allow_materialize,
                         v5_writer_capability=capability,
                     )
                 )
@@ -1383,7 +1605,7 @@ def run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
                     runtime_sources_v2=initial_inputs.runtime_sources_v2,
                     validation_sources_v2=validation_sources,
                     committed_at_ms=source_time + 1,
-                    allow_materialize=allow_materialize,
+                    allow_materialize=stage_allow_materialize,
                     v5_writer_capability=capability,
                 )
                 expected = (
@@ -1393,12 +1615,13 @@ def run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
                         execution_registration=execution_registration,
                         initial_inputs=initial_inputs,
                         predecessor_outer_fold_seal=predecessor_outer_fold_seal,
+                        predecessor_state=predecessor_state,
                         validation_sources=validation_sources,
                         validation_registry=validation_registry,
                     )
                 )
                 if not complete:
-                    if not allow_materialize:
+                    if not stage_allow_materialize:
                         raise MassiveAdaptiveRLValidationReleaseAuthorityV1Error(
                             "delayed validation release is absent"
                         )
@@ -1440,6 +1663,7 @@ def run_or_resume_massive_adaptive_rl_delayed_validation_release_v1(
                     execution_registration=execution_registration,
                     initial_inputs=initial_inputs,
                     predecessor_outer_fold_seal=predecessor_outer_fold_seal,
+                    predecessor_state=predecessor_state,
                     validation_sources=validation_sources,
                     validation_registry=validation_registry,
                 )

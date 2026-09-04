@@ -21,6 +21,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v4 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     MassiveAdaptiveRLPrequentialRunV5,
+    _build_delayed_policy_result,
     _build_initial_execution_result,
     _build_outer_zero_result,
     _build_preimplementation_result,
@@ -31,6 +32,9 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_outer_fold_execution_v1 import (
     MassiveAdaptiveRLOuterFoldExecutionV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_prequential_continuation_v1 import (
+    MassiveAdaptiveRLPrequentialContinuationV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
     MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
@@ -45,6 +49,7 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 from rl_quant.workflows.massive_adaptive_rl_initial_validation_execution_v1 import (
     MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1,
     MassiveAdaptiveRLInitialValidationExecutionV1,
+    MassiveAdaptiveRLReleasedFoldValidationExecutionV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
     MassiveAdaptiveRLPrequentialExperimentStateV1,
@@ -405,6 +410,104 @@ def test_v5_result_freezes_implementation_before_initial_inputs(
         sealed.next_required_stage == "validation-fold-2-release-selection-and-freeze"
     )
     assert not sealed.positive_profitability_authorization_eligible
+
+    release_two = _typed_shell(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        semantic_receipt_sha256=_digest("release-two"),
+        predecessor_state_receipt_sha256=outer_state.semantic_receipt_sha256,
+        predecessor_outer_fold_seal_receipt_sha256=(
+            outer_execution.outer_fold_seal.semantic_receipt_sha256
+        ),
+    )
+    release_three = _typed_shell(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        semantic_receipt_sha256=_digest("release-three"),
+        predecessor_state_receipt_sha256=_digest("outer-one-state"),
+        predecessor_outer_fold_seal_receipt_sha256=_digest("outer-one-seal"),
+    )
+    delayed_rows = tuple(
+        _typed_shell(
+            MassiveAdaptiveRLReleasedFoldValidationExecutionV1,
+            fold_index=index,
+            fold_validation_authority=SimpleNamespace(
+                semantic_receipt_sha256=_digest(("delayed-validation", index))
+            ),
+            policy_selection_authority=SimpleNamespace(
+                semantic_receipt_sha256=_digest(("delayed-selection", index))
+            ),
+            frozen_ppo_policy=SimpleNamespace(
+                semantic_receipt_sha256=_digest(("delayed-ppo", index))
+            ),
+            frozen_fc06_control=SimpleNamespace(
+                semantic_receipt_sha256=_digest(("delayed-control", index))
+            ),
+        )
+        for index in (2, 3)
+    )
+    delayed_schedules = tuple(
+        _typed_shell(
+            MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+            fold_indices=tuple(range(index + 1)),
+            semantic_receipt_sha256=_digest(("delayed-schedule", index)),
+            policy_schedule_disposition="policy-prefix-diagnostic-only",
+        )
+        for index in (2, 3)
+    )
+    outer_one_state = _typed_shell(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        stage=MassiveAdaptiveRLPrequentialStageV1.OUTER_1_SEALED,
+        semantic_receipt_sha256=release_three.predecessor_state_receipt_sha256,
+    )
+    outer_one_execution = _typed_shell(
+        MassiveAdaptiveRLOuterFoldExecutionV1,
+        fold_index=1,
+        outer_access=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-one-access")
+        ),
+        outer_inputs=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-one-inputs")
+        ),
+        outer_rollout=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-one-rollout")
+        ),
+        outer_fold_seal=SimpleNamespace(
+            semantic_receipt_sha256=(
+                release_three.predecessor_outer_fold_seal_receipt_sha256
+            )
+        ),
+        prequential_state=outer_one_state,
+    )
+    policy_three_state = _typed_shell(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        stage=MassiveAdaptiveRLPrequentialStageV1.POLICY_3_FROZEN,
+        semantic_receipt_sha256=_digest("policy-three-state"),
+        immediate_predecessor_state_receipt_sha256=_digest("validation-three-state"),
+        prequential_execution_authorized=True,
+    )
+    continuation = _typed_shell(
+        MassiveAdaptiveRLPrequentialContinuationV1,
+        validation_releases=(release_two, release_three),
+        released_fold_executions=delayed_rows,
+        policy_schedules=delayed_schedules,
+        outer_one_execution=outer_one_execution,
+        prequential_state=policy_three_state,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLPrequentialContinuationV1, "validate", lambda _: None
+    )
+    completed_schedule = _build_delayed_policy_result(
+        boundary=sealed,
+        continuation=continuation,
+    )
+    assert completed_schedule.validation_execution_complete
+    assert completed_schedule.final_policy_freezing_authorized
+    assert completed_schedule.outer_one_execution_complete
+    assert completed_schedule.sealed_outer_fold_indices == (0, 1)
+    assert completed_schedule.released_validation_fold_indices == (0, 1, 2, 3)
+    assert completed_schedule.withheld_validation_fold_indices == ()
+    assert completed_schedule.prequential_state_head_stage == "policy-3-frozen"
+    assert completed_schedule.next_required_stage == "outer-fold-2-access-and-seal"
+    assert not completed_schedule.positive_profitability_authorization_eligible
 
 
 def test_v5_root_registers_before_resuming_training(
