@@ -12,7 +12,6 @@ from typing import cast
 
 from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
-    canonical_json_file_bytes,
     load_massive_source_bundle,
     publish_massive_source_object,
     read_loaded_massive_source_bytes,
@@ -20,7 +19,11 @@ from rl_quant.data_sources.massive.source_receipts import (
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
 )
-from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256,
+)
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
@@ -45,6 +48,10 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     issue_massive_adaptive_rl_manifest_v5_prequential_outer_execution_capability_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+    MassiveAdaptiveRLPrequentialExperimentStateV1,
+    MassiveAdaptiveRLPrequentialStageV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
     MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
@@ -427,6 +434,15 @@ class MassiveAdaptiveOuterAccessCommitmentV2:
     frozen_fc06_source_receipt_sha256: str
     frozen_fc06_commit_receipt_sha256: str
     frozen_fc06_committed_at_ms: int
+    predecessor_state_receipt_sha256: str
+    predecessor_state_source_receipt_sha256: str
+    predecessor_state_commit_receipt_sha256: str
+    predecessor_state_committed_at_ms: int
+    predecessor_state_stage: str
+    predecessor_stage_artifact_receipt_sha256: str
+    predecessor_stage_artifact_source_receipt_sha256: str
+    predecessor_stage_artifact_commit_receipt_sha256: str
+    predecessor_stage_artifact_committed_at_ms: int
     outer_fold_receipt_sha256: str
     outer_decision_session_dates: tuple[str, ...]
     outer_decision_inventory_sha256: str
@@ -453,6 +469,9 @@ class MassiveAdaptiveOuterAccessCommitmentV2:
     )
     _runtime_frozen_control: MassiveAdaptiveRLFrozenFC06V2 | None = field(
         default=None, compare=False, repr=False
+    )
+    _runtime_predecessor_state: MassiveAdaptiveRLPrequentialExperimentStateV1 | None = (
+        field(default=None, compare=False, repr=False)
     )
     _runtime_environment_bundle: MassiveAdaptiveRLOuterEnvironmentBundleV2 | None = (
         field(default=None, compare=False, repr=False)
@@ -541,6 +560,7 @@ class MassiveAdaptiveOuterAccessCommitmentV2:
             self._runtime_schedule,
             self._runtime_frozen_policy,
             self._runtime_frozen_control,
+            self._runtime_predecessor_state,
         )
         runtime = all(value is not None for value in runtime_roots)
         any_runtime = any(value is not None for value in runtime_roots)
@@ -592,6 +612,7 @@ class MassiveAdaptiveOuterAccessCommitmentV2:
                     self.policy_schedule_committed_at_ms,
                     self.frozen_ppo_committed_at_ms,
                     self.frozen_fc06_committed_at_ms,
+                    self.predecessor_state_committed_at_ms,
                 )
             ):
                 raise MassiveAdaptiveOuterAccessCommitmentV2Error(
@@ -601,6 +622,13 @@ class MassiveAdaptiveOuterAccessCommitmentV2:
             assert self._runtime_schedule is not None
             assert self._runtime_frozen_policy is not None
             assert self._runtime_frozen_control is not None
+            assert self._runtime_predecessor_state is not None
+            expected_predecessor_stage = {
+                0: MassiveAdaptiveRLPrequentialStageV1.POLICY_1_FROZEN,
+                1: MassiveAdaptiveRLPrequentialStageV1.POLICY_2_FROZEN,
+                2: MassiveAdaptiveRLPrequentialStageV1.POLICY_3_FROZEN,
+                3: MassiveAdaptiveRLPrequentialStageV1.OUTER_2_SEALED,
+            }[self.fold_index]
             for value in runtime_roots:
                 getattr(value, "validate")()
             if (
@@ -658,6 +686,37 @@ class MassiveAdaptiveOuterAccessCommitmentV2:
                 != self.frozen_fc06_commit_receipt_sha256
                 or self._runtime_frozen_control.source_transaction_committed_at_ms
                 != self.frozen_fc06_committed_at_ms
+                or not self._runtime_predecessor_state.prequential_execution_authorized
+                or self._runtime_predecessor_state.stage
+                is not expected_predecessor_stage
+                or self._runtime_predecessor_state.experiment_id != self.experiment_id
+                or self._runtime_predecessor_state.manifest_v5_receipt_sha256
+                != self.manifest_v5_receipt_sha256
+                or self._runtime_predecessor_state.execution_implementation_registration_receipt_sha256
+                != self.execution_implementation_registration_receipt_sha256
+                or self._runtime_predecessor_state.semantic_receipt_sha256
+                != self.predecessor_state_receipt_sha256
+                or self._runtime_predecessor_state.source_receipt_sha256
+                != self.predecessor_state_source_receipt_sha256
+                or self._runtime_predecessor_state.source_transaction_receipt_sha256
+                != self.predecessor_state_commit_receipt_sha256
+                or self._runtime_predecessor_state.source_transaction_committed_at_ms
+                != self.predecessor_state_committed_at_ms
+                or self._runtime_predecessor_state.stage.value
+                != self.predecessor_state_stage
+                or self._runtime_predecessor_state.stage_artifact_semantic_receipt_sha256
+                != self.predecessor_stage_artifact_receipt_sha256
+                or self._runtime_predecessor_state.stage_artifact_source_receipt_sha256
+                != self.predecessor_stage_artifact_source_receipt_sha256
+                or self._runtime_predecessor_state.stage_artifact_commit_receipt_sha256
+                != self.predecessor_stage_artifact_commit_receipt_sha256
+                or self._runtime_predecessor_state.stage_artifact_committed_at_ms
+                != self.predecessor_stage_artifact_committed_at_ms
+                or self.predecessor_state_committed_at_ms
+                <= self.predecessor_stage_artifact_committed_at_ms
+                or self.fold_index in (0, 1, 2)
+                and self.predecessor_stage_artifact_receipt_sha256
+                != self.policy_schedule_receipt_sha256
             ):
                 raise MassiveAdaptiveOuterAccessCommitmentV2Error(
                     "outer-access runtime lineage differs"
@@ -683,6 +742,7 @@ def _build(
     policy_schedule: MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
     frozen_policy: MassiveAdaptiveFrozenRLPolicyV2,
     frozen_control: MassiveAdaptiveRLFrozenFC06V2,
+    predecessor_state: MassiveAdaptiveRLPrequentialExperimentStateV1,
 ) -> MassiveAdaptiveOuterAccessCommitmentV2:
     if (
         type(manifest) is not MassiveAdaptiveRLExperimentManifestV5
@@ -693,6 +753,7 @@ def _build(
         or type(policy_schedule) is not MassiveAdaptiveRLWalkForwardPolicyScheduleV1
         or type(frozen_policy) is not MassiveAdaptiveFrozenRLPolicyV2
         or type(frozen_control) is not MassiveAdaptiveRLFrozenFC06V2
+        or type(predecessor_state) is not MassiveAdaptiveRLPrequentialExperimentStateV1
     ):
         raise MassiveAdaptiveOuterAccessCommitmentV2Error(
             "outer access requires exact Manifest-V5 authority generations"
@@ -704,14 +765,31 @@ def _build(
         policy_schedule,
         frozen_policy,
         frozen_control,
+        predecessor_state,
     ):
         authority.validate()
     fold_index = frozen_policy.fold_index
+    expected_predecessor_stage = {
+        0: MassiveAdaptiveRLPrequentialStageV1.POLICY_1_FROZEN,
+        1: MassiveAdaptiveRLPrequentialStageV1.POLICY_2_FROZEN,
+        2: MassiveAdaptiveRLPrequentialStageV1.POLICY_3_FROZEN,
+        3: MassiveAdaptiveRLPrequentialStageV1.OUTER_2_SEALED,
+    }[fold_index]
     outer_fold_receipt = policy_schedule.outer_fold_receipts[fold_index]
     outer_session_dates = policy_schedule.outer_session_date_inventories[fold_index]
     if (
         frozen_control.fold_index != fold_index
         or not policy_schedule.authorizes_outer_fold(fold_index)
+        or not predecessor_state.prequential_execution_authorized
+        or predecessor_state.stage is not expected_predecessor_stage
+        or predecessor_state.experiment_id != manifest.experiment_id
+        or predecessor_state.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or predecessor_state.execution_implementation_registration_receipt_sha256
+        != execution_registration.semantic_receipt_sha256
+        or fold_index in (0, 1, 2)
+        and predecessor_state.stage_artifact_semantic_receipt_sha256
+        != policy_schedule.semantic_receipt_sha256
         or not manifest_registration.development_protocol_registered
         or not execution_registration.development_execution_registered
         or manifest_registration.experiment_id != manifest.experiment_id
@@ -787,6 +865,31 @@ def _build(
         "frozen_fc06_committed_at_ms": _required_time(
             "frozen FC06 time", frozen_control.source_transaction_committed_at_ms
         ),
+        "predecessor_state_receipt_sha256": predecessor_state.semantic_receipt_sha256,
+        "predecessor_state_source_receipt_sha256": _required_digest(
+            "predecessor state source", predecessor_state.source_receipt_sha256
+        ),
+        "predecessor_state_commit_receipt_sha256": _required_digest(
+            "predecessor state commit",
+            predecessor_state.source_transaction_receipt_sha256,
+        ),
+        "predecessor_state_committed_at_ms": _required_time(
+            "predecessor state time",
+            predecessor_state.source_transaction_committed_at_ms,
+        ),
+        "predecessor_state_stage": predecessor_state.stage.value,
+        "predecessor_stage_artifact_receipt_sha256": (
+            predecessor_state.stage_artifact_semantic_receipt_sha256
+        ),
+        "predecessor_stage_artifact_source_receipt_sha256": (
+            predecessor_state.stage_artifact_source_receipt_sha256
+        ),
+        "predecessor_stage_artifact_commit_receipt_sha256": (
+            predecessor_state.stage_artifact_commit_receipt_sha256
+        ),
+        "predecessor_stage_artifact_committed_at_ms": (
+            predecessor_state.stage_artifact_committed_at_ms
+        ),
         "outer_fold_receipt_sha256": outer_fold_receipt,
         "outer_decision_session_dates": outer_session_dates,
         "outer_decision_inventory_sha256": semantic_sha256(outer_session_dates),
@@ -796,6 +899,7 @@ def _build(
             and policy_schedule.source_data_qualified
             and frozen_policy.source_data_qualified
             and frozen_control.source_data_qualified
+            and predecessor_state.source_data_qualified
         ),
         "profitability_reporting_authorized": False,
         "lockbox_access_authorized": False,
@@ -813,6 +917,7 @@ def _build(
         _runtime_schedule=policy_schedule,
         _runtime_frozen_policy=frozen_policy,
         _runtime_frozen_control=frozen_control,
+        _runtime_predecessor_state=predecessor_state,
     )
     result = replace(
         provisional,
@@ -837,7 +942,7 @@ def _parse(
         for item in cast(Sequence[object], body["outer_decision_session_dates"])
     )
     result = MassiveAdaptiveOuterAccessCommitmentV2(
-        **body,  # type: ignore[arg-type]
+        **body,
         semantic_receipt_sha256=semantic_sha256(body),
         _loaded_source=loaded,
     )
@@ -854,6 +959,7 @@ def run_or_resume_massive_adaptive_outer_access_commitment_v2(
     policy_schedule: MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
     frozen_policy: MassiveAdaptiveFrozenRLPolicyV2,
     frozen_control: MassiveAdaptiveRLFrozenFC06V2,
+    predecessor_state: MassiveAdaptiveRLPrequentialExperimentStateV1,
     allow_materialize: bool = True,
 ) -> MassiveAdaptiveOuterAccessCommitmentV2:
     expected = _build(
@@ -863,6 +969,7 @@ def run_or_resume_massive_adaptive_outer_access_commitment_v2(
         policy_schedule=policy_schedule,
         frozen_policy=frozen_policy,
         frozen_control=frozen_control,
+        predecessor_state=predecessor_state,
     )
     relative = outer_access_commitment_relative_path_v2(
         manifest=manifest, fold_index=expected.fold_index
@@ -894,6 +1001,7 @@ def run_or_resume_massive_adaptive_outer_access_commitment_v2(
                     expected.policy_schedule_committed_at_ms,
                     expected.frozen_ppo_committed_at_ms,
                     expected.frozen_fc06_committed_at_ms,
+                    expected.predecessor_state_committed_at_ms,
                 )
                 + 1
             )
@@ -937,6 +1045,7 @@ def run_or_resume_massive_adaptive_outer_access_commitment_v2(
             _runtime_schedule=policy_schedule,
             _runtime_frozen_policy=frozen_policy,
             _runtime_frozen_control=frozen_control,
+            _runtime_predecessor_state=predecessor_state,
         )
         result.validate()
         return result

@@ -19,12 +19,15 @@ from typing import cast
 
 from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
-    canonical_json_file_bytes,
     load_massive_source_bundle,
     publish_massive_source_object,
     read_loaded_massive_source_bytes,
 )
-from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256,
+)
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
@@ -502,6 +505,7 @@ def _stage_artifact_facts(
 
     if type(artifact) is MassiveAdaptiveRLFourFoldFitAuthorityV1:
         stage = MassiveAdaptiveRLPrequentialStageV1.TRAINED
+        runtime_authorized = bool(getattr(artifact, "development_stage_authorized"))
         disposition = None
         schedule_qualified = None
         gates = None
@@ -510,10 +514,12 @@ def _stage_artifact_facts(
         is MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1
     ):
         stage = MassiveAdaptiveRLPrequentialStageV1.EXECUTION_IMPLEMENTATION_REGISTERED
+        runtime_authorized = bool(getattr(artifact, "development_execution_registered"))
         disposition = None
         schedule_qualified = None
         gates = None
     elif type(artifact) is MassiveAdaptiveRLValidationReleaseAuthorityV1:
+        runtime_authorized = bool(getattr(artifact, "development_stage_authorized"))
         release_kind = getattr(artifact, "release_kind", None)
         stage_by_release = {
             "initial-folds-0-1": MassiveAdaptiveRLPrequentialStageV1.INITIAL_VALIDATION_INPUTS_COMMITTED,
@@ -530,6 +536,7 @@ def _stage_artifact_facts(
         schedule_qualified = None
         gates = None
     elif type(artifact) is MassiveAdaptiveRLWalkForwardPolicyScheduleV1:
+        runtime_authorized = bool(getattr(artifact, "development_stage_authorized"))
         stage_by_folds = {
             (0,): MassiveAdaptiveRLPrequentialStageV1.POLICY_0_FROZEN,
             (0, 1): MassiveAdaptiveRLPrequentialStageV1.POLICY_1_FROZEN,
@@ -546,6 +553,7 @@ def _stage_artifact_facts(
         schedule_qualified = disposition == "policy-prefix-qualified"
         gates = None
     elif type(artifact) is MassiveAdaptiveRLOuterFoldSealAuthorityV1:
+        runtime_authorized = bool(getattr(artifact, "development_outer_fold_sealed"))
         fold_index = getattr(artifact, "fold_index", None)
         stage_by_fold = {
             0: MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
@@ -563,6 +571,9 @@ def _stage_artifact_facts(
         schedule_qualified = None
         gates = None
     elif type(artifact) is MassiveAdaptiveRLProfitabilityReportAuthorityV2:
+        runtime_authorized = bool(
+            getattr(artifact, "development_profitability_reporting_authorized")
+        )
         stage = MassiveAdaptiveRLPrequentialStageV1.PROFITABILITY_REPORT_PUBLISHED
         disposition = cast(str, getattr(artifact, "policy_schedule_disposition"))
         schedule_qualified = bool(getattr(artifact, "policy_schedule_qualified"))
@@ -572,6 +583,10 @@ def _stage_artifact_facts(
             "prequential stage artifact generation differs"
         )
     getattr(artifact, "validate")()
+    if not runtime_authorized:
+        raise MassiveAdaptiveRLPrequentialExperimentStateV1Error(
+            "prequential stage artifact has not been exactly replay-authorized"
+        )
     artifact_manifest = getattr(artifact, "manifest_v5_receipt_sha256", None)
     if stage is MassiveAdaptiveRLPrequentialStageV1.TRAINED:
         artifact_manifest = manifest_receipt
@@ -651,7 +666,7 @@ def _parse_state(
     body = dict(value)
     body["stage"] = MassiveAdaptiveRLPrequentialStageV1(str(body["stage"]))
     result = MassiveAdaptiveRLPrequentialExperimentStateV1(
-        **body,  # type: ignore[arg-type]
+        **body,
         semantic_receipt_sha256=semantic_sha256(body),
         _loaded_source=loaded,
     )

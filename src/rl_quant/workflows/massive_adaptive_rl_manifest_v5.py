@@ -137,6 +137,8 @@ MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256 = (
             "vertical_qualification": (
                 MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256
             ),
+            "vertical_qualification_execution": "once-before-publication",
+            "replay": "identity-check-without-pytest-execution",
             "publication": "create-only-source-transaction",
             "generic_reload": "nonauthorizing",
             "mutation_after_registration": "new-experiment-required",
@@ -318,6 +320,13 @@ MASSIVE_ADAPTIVE_RL_WALK_FORWARD_POLICY_SCHEDULE_V1_SPEC_SHA256 = semantic_sha25
 MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V2_SPEC_SHA256 = semantic_sha256(
     {
         "input": "exact-frozen-rl-policy-v2-and-fold-fixed-control",
+        "predecessor": "exact-replay-authorized-prequential-state-head",
+        "outer_stage_order": (
+            "policy-1-frozen",
+            "policy-2-frozen",
+            "policy-3-frozen",
+            "outer-2-sealed",
+        ),
         "policy_freeze_precedes_outer_input": True,
         "fold_local": True,
         "one_time_access": True,
@@ -365,6 +374,7 @@ MASSIVE_ADAPTIVE_RL_PREQUENTIAL_EXPERIMENT_STATE_V1_SPEC_SHA256 = semantic_sha25
         "immediate_predecessor_receipt": True,
         "stage_artifact_source_transaction": True,
         "stage_artifact_generation": "exact-by-stage",
+        "stage_artifact_runtime_authorization": "required-before-transition",
         "gaps_branches_duplicates": "rejected",
         "diagnostic_schedule_cannot_become_qualified": True,
         "failed_profitability_gates": "completed-report-state",

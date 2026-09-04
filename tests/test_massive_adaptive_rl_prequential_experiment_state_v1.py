@@ -19,6 +19,7 @@ from rl_quant.workflows.massive_adaptive_rl_four_fold_fit_v1 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA,
+    MASSIVE_ADAPTIVE_RL_OUTER_FOLD_SEAL_AUTHORITY_V1_SCHEMA,
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1,
     MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V2_SCHEMA,
     MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_AUTHORITY_V1_SCHEMA,
@@ -46,6 +47,12 @@ from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registratio
 )
 from rl_quant.evaluation.massive_adaptive_rl_validation_release_authority_v1 import (
     MassiveAdaptiveRLValidationReleaseAuthorityV1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_fold_seal_authority_v1 import (
+    MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v2 import (
+    MassiveAdaptiveRLProfitabilityReportAuthorityV2,
 )
 from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
     MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
@@ -199,6 +206,138 @@ def test_generic_state_is_integrity_valid_but_nonauthorizing() -> None:
     assert not state.prequential_execution_authorized
     assert not state.development_profitability_reporting_authorized
     assert not state.positive_profitability_authorization_eligible
+
+
+@pytest.mark.parametrize(
+    ("authority_type", "authorization_property", "expected_stage", "values"),
+    (
+        (
+            MassiveAdaptiveRLFourFoldFitAuthorityV1,
+            "development_stage_authorized",
+            MassiveAdaptiveRLPrequentialStageV1.TRAINED,
+            {},
+        ),
+        (
+            MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+            "development_execution_registered",
+            MassiveAdaptiveRLPrequentialStageV1.EXECUTION_IMPLEMENTATION_REGISTERED,
+            {},
+        ),
+        (
+            MassiveAdaptiveRLValidationReleaseAuthorityV1,
+            "development_stage_authorized",
+            MassiveAdaptiveRLPrequentialStageV1.INITIAL_VALIDATION_INPUTS_COMMITTED,
+            {"release_kind": "initial-folds-0-1"},
+        ),
+        (
+            MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+            "development_stage_authorized",
+            MassiveAdaptiveRLPrequentialStageV1.POLICY_0_FROZEN,
+            {
+                "fold_indices": (0,),
+                "policy_schedule_disposition": "policy-prefix-qualified",
+            },
+        ),
+        (
+            MassiveAdaptiveRLOuterFoldSealAuthorityV1,
+            "development_outer_fold_sealed",
+            MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+            {"fold_index": 0},
+        ),
+        (
+            MassiveAdaptiveRLProfitabilityReportAuthorityV2,
+            "development_profitability_reporting_authorized",
+            MassiveAdaptiveRLPrequentialStageV1.PROFITABILITY_REPORT_PUBLISHED,
+            {
+                "policy_schedule_disposition": "policy-prefix-qualified",
+                "policy_schedule_qualified": True,
+                "profitability_gates_passed": True,
+            },
+        ),
+    ),
+)
+def test_state_transition_rejects_integrity_only_and_accepts_replayed_artifact(
+    authority_type: type[object],
+    authorization_property: str,
+    expected_stage: MassiveAdaptiveRLPrequentialStageV1,
+    values: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_receipt = _receipt("manifest")
+    execution_receipt = _receipt("execution")
+    schema_by_type = {
+        MassiveAdaptiveRLFourFoldFitAuthorityV1: (
+            MASSIVE_ADAPTIVE_RL_FOUR_FOLD_FIT_AUTHORITY_V1_SCHEMA
+        ),
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1: (
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA
+        ),
+        MassiveAdaptiveRLValidationReleaseAuthorityV1: (
+            MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_AUTHORITY_V1_SCHEMA
+        ),
+        MassiveAdaptiveRLWalkForwardPolicyScheduleV1: (
+            MASSIVE_ADAPTIVE_RL_WALK_FORWARD_POLICY_SCHEDULE_V1_SCHEMA
+        ),
+        MassiveAdaptiveRLOuterFoldSealAuthorityV1: (
+            MASSIVE_ADAPTIVE_RL_OUTER_FOLD_SEAL_AUTHORITY_V1_SCHEMA
+        ),
+        MassiveAdaptiveRLProfitabilityReportAuthorityV2: (
+            MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V2_SCHEMA
+        ),
+    }
+    common: dict[str, object] = {
+        "semantic_receipt_sha256": _receipt((authority_type.__name__, "artifact")),
+        "source_data_qualified": True,
+        "schema": schema_by_type[authority_type],
+    }
+    field_names = set(getattr(authority_type, "__dataclass_fields__", {}))
+    if "manifest_v5_receipt_sha256" in field_names:
+        common["manifest_v5_receipt_sha256"] = manifest_receipt
+    if "execution_implementation_registration_receipt_sha256" in field_names:
+        common["execution_implementation_registration_receipt_sha256"] = (
+            execution_receipt
+        )
+    if (
+        authority_type
+        is MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1
+    ):
+        common["semantic_receipt_sha256"] = execution_receipt
+    if authority_type is MassiveAdaptiveRLValidationReleaseAuthorityV1:
+        common["execution_implementation_registration_authority_receipt_sha256"] = (
+            execution_receipt
+        )
+    artifact = _typed_shell(authority_type, **common, **values)
+    monkeypatch.setattr(authority_type, "validate", lambda _: None)
+    runtime_authorized = [False]
+    monkeypatch.setattr(
+        authority_type,
+        authorization_property,
+        property(lambda _: runtime_authorized[0]),
+    )
+    monkeypatch.setattr(
+        state_module,
+        "_source_transaction_facts",
+        lambda _: (_receipt("source"), _receipt("commit"), 10),
+    )
+
+    with pytest.raises(
+        MassiveAdaptiveRLPrequentialExperimentStateV1Error,
+        match="exactly replay-authorized",
+    ):
+        state_module._stage_artifact_facts(
+            manifest_receipt=manifest_receipt,
+            execution_registration_receipt=execution_receipt,
+            artifact=artifact,
+        )
+
+    runtime_authorized[0] = True
+    facts = state_module._stage_artifact_facts(
+        manifest_receipt=manifest_receipt,
+        execution_registration_receipt=execution_receipt,
+        artifact=artifact,
+    )
+    assert facts.stage is expected_stage
+    assert facts.source_data_qualified
 
 
 def test_transition_builder_rejects_a_skipped_stage() -> None:
@@ -416,6 +555,21 @@ def test_create_only_state_prefix_replays_exactly(
     monkeypatch.setattr(
         MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
         "development_execution_registered",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLFourFoldFitAuthorityV1,
+        "development_stage_authorized",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        "development_stage_authorized",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+        "development_stage_authorized",
         property(lambda _: True),
     )
     monkeypatch.setattr(

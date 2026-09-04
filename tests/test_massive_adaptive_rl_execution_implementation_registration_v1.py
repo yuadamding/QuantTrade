@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
@@ -119,7 +120,13 @@ def test_execution_registration_is_separate_create_only_and_replay_bound(
         manifest=manifest,
         registration=registration,
     )
-    monkeypatch.setattr(implementation, "_capture_body", lambda **_: dict(body))
+    replay_roots: list[object | None] = []
+
+    def capture(**kwargs):
+        replay_roots.append(kwargs.get("registered_authority"))
+        return dict(body)
+
+    monkeypatch.setattr(implementation, "_capture_body", capture)
 
     authority = (
         run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
@@ -163,6 +170,8 @@ def test_execution_registration_is_separate_create_only_and_replay_bound(
     )
     assert resumed.semantic_receipt_sha256 == authority.semantic_receipt_sha256
     assert resumed.development_execution_registered
+    assert replay_roots[0] is None
+    assert all(root is not None for root in replay_roots[1:])
 
 
 def test_execution_registration_rejects_untracked_source_and_late_outcomes(
@@ -351,6 +360,49 @@ def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(
         first["vertical_qualification_receipt_sha256"]
         == second["vertical_qualification_receipt_sha256"]
     )
+
+
+def test_registered_qualification_replay_does_not_launch_pytest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_path = tmp_path / "tests" / "test_massive_adaptive_rl_v5_vertical.py"
+    test_path.parent.mkdir()
+    test_path.write_text("def test_vertical():\n    assert True\n", encoding="utf-8")
+    qualification = implementation._vertical_qualification(
+        repository_root=tmp_path,
+        v5_native_vertical_complete=False,
+    )
+    qualification.update(
+        {
+            "missing_vertical_qualification_test_paths": (),
+            "vertical_qualification_exit_code": 0,
+            "vertical_qualification_passed_node_count": len(
+                implementation._VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS
+            ),
+            "vertical_qualification_nonpass_outcome_labels": (),
+            "vertical_qualification_normalized_output_sha256": _digest(
+                "qualified-output"
+            ),
+            "vertical_qualification_passed": True,
+        }
+    )
+    qualification["vertical_qualification_receipt_sha256"] = (
+        implementation._vertical_qualification_receipt(qualification)
+    )
+    authority = SimpleNamespace(**qualification)
+    monkeypatch.setattr(
+        implementation.subprocess,
+        "run",
+        lambda *_, **__: (_ for _ in ()).throw(AssertionError("pytest reran")),
+    )
+
+    replayed = implementation._replay_registered_vertical_qualification(
+        repository_root=tmp_path,
+        authority=authority,
+    )
+
+    assert replayed == qualification
 
 
 def test_vertical_qualification_rejects_skipped_required_node(

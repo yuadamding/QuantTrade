@@ -15,7 +15,6 @@ import torch
 
 from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
-    canonical_json_file_bytes,
     load_massive_source_bundle,
     publish_massive_source_object,
     read_loaded_massive_source_bytes,
@@ -26,6 +25,9 @@ from rl_quant.evaluation.massive_adaptive_outer_access_commitment_v2 import (
 from rl_quant.evaluation.massive_adaptive_profitability_env_v1 import (
     MassiveAdaptiveProfitabilityEnvV1,
     MassiveAdaptiveRLTransitionV1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_outer_inputs_v1 import (
+    MassiveAdaptiveRLOuterInputAuthorityV1,
 )
 from rl_quant.evaluation.massive_adaptive_rl_cost_ladder_v1 import (
     replay_massive_adaptive_rl_frozen_target_transitions_v1,
@@ -38,7 +40,11 @@ from rl_quant.evaluation.massive_adaptive_rl_policy_evaluator_v1 import (
     _policy_from_state,
     _tensor_receipt,
 )
-from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
+from rl_quant.protocol.canonical_artifact import (
+    canonical_json_file_bytes,
+    file_sha256,
+    semantic_sha256,
+)
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
     assert_no_adaptive_hold_semantics,
@@ -803,6 +809,10 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
     outer_access_source_receipt_sha256: str
     outer_access_commit_receipt_sha256: str
     outer_access_committed_at_ms: int
+    outer_input_authority_receipt_sha256: str
+    outer_input_source_receipt_sha256: str
+    outer_input_commit_receipt_sha256: str
+    outer_input_committed_at_ms: int
     outer_rollout_receipt_sha256: str
     decision_session_dates: tuple[str, ...]
     ppo_action_inventory_sha256: str
@@ -908,6 +918,7 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
             self._runtime_outer_access is not None or self._runtime_rollout is not None
         )
         _required_time("outer access time", self.outer_access_committed_at_ms)
+        _required_time("outer input time", self.outer_input_committed_at_ms)
         economic_values = (
             self.primary_terminal_liquidation_adjusted_return,
             self.low_cost_terminal_liquidation_adjusted_return,
@@ -974,7 +985,10 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
                 or self._loaded_source.receipt.entitlement_receipt_sha256
                 != self.outer_rollout_receipt_sha256
                 or self._loaded_source.commit.committed_at_ms
-                <= self.outer_access_committed_at_ms
+                <= max(
+                    self.outer_access_committed_at_ms,
+                    self.outer_input_committed_at_ms,
+                )
             ):
                 raise MassiveAdaptiveRLOuterRolloutAuthorityV2Error(
                     "outer rollout source transaction differs"
@@ -984,6 +998,7 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
             assert self._runtime_rollout is not None
             self._runtime_outer_access.validate()
             self._runtime_rollout.validate()
+            outer_inputs = self._runtime_outer_access.runtime_environment_bundle.primary_environment.forecast_archive
             if (
                 not self._runtime_outer_access.outer_input_access_authorized
                 or self._runtime_outer_access.semantic_receipt_sha256
@@ -1001,6 +1016,16 @@ class MassiveAdaptiveRLOuterRolloutAuthorityV2:
                 != self.execution_implementation_registration_receipt_sha256
                 or self._runtime_outer_access.scientific_execution_fingerprint_sha256
                 != self.scientific_execution_fingerprint_sha256
+                or type(outer_inputs) is not MassiveAdaptiveRLOuterInputAuthorityV1
+                or not outer_inputs.outer_forecast_authorized
+                or outer_inputs.semantic_receipt_sha256
+                != self.outer_input_authority_receipt_sha256
+                or outer_inputs.source_receipt_sha256
+                != self.outer_input_source_receipt_sha256
+                or outer_inputs.source_transaction_receipt_sha256
+                != self.outer_input_commit_receipt_sha256
+                or outer_inputs.source_transaction_committed_at_ms
+                != self.outer_input_committed_at_ms
                 or self._runtime_rollout.semantic_receipt_sha256
                 != self.outer_rollout_receipt_sha256
                 or self._runtime_rollout.fold_index != self.fold_index
@@ -1050,6 +1075,9 @@ def _authority_body(
     manifest.validate()
     access.validate()
     rollout.validate()
+    outer_inputs = (
+        access.runtime_environment_bundle.primary_environment.forecast_archive
+    )
     if (
         manifest.experiment_id != access.experiment_id
         or manifest.semantic_receipt_sha256 != access.manifest_v5_receipt_sha256
@@ -1059,6 +1087,10 @@ def _authority_body(
         or rollout.outer_access_commitment_receipt_sha256
         != access.semantic_receipt_sha256
         or rollout.decision_session_dates != access.outer_decision_session_dates
+        or type(outer_inputs) is not MassiveAdaptiveRLOuterInputAuthorityV1
+        or not outer_inputs.outer_forecast_authorized
+        or outer_inputs.outer_access_commitment_receipt_sha256
+        != access.semantic_receipt_sha256
     ):
         raise MassiveAdaptiveRLOuterRolloutAuthorityV2Error(
             "outer rollout authority roots differ"
@@ -1083,6 +1115,16 @@ def _authority_body(
         ),
         "outer_access_committed_at_ms": _required_time(
             "outer access time", access.source_transaction_committed_at_ms
+        ),
+        "outer_input_authority_receipt_sha256": outer_inputs.semantic_receipt_sha256,
+        "outer_input_source_receipt_sha256": _digest(
+            "outer input source", outer_inputs.source_receipt_sha256
+        ),
+        "outer_input_commit_receipt_sha256": _digest(
+            "outer input commit", outer_inputs.source_transaction_receipt_sha256
+        ),
+        "outer_input_committed_at_ms": _required_time(
+            "outer input time", outer_inputs.source_transaction_committed_at_ms
         ),
         "outer_rollout_receipt_sha256": rollout.semantic_receipt_sha256,
         "decision_session_dates": rollout.decision_session_dates,
@@ -1159,7 +1201,7 @@ def _parse(
         str(item) for item in cast(Sequence[object], body["decision_session_dates"])
     )
     result = MassiveAdaptiveRLOuterRolloutAuthorityV2(
-        **body,  # type: ignore[arg-type]
+        **body,
         semantic_receipt_sha256=semantic_sha256(body),
         _loaded_source=loaded,
     )
@@ -1244,7 +1286,14 @@ def run_or_resume_massive_adaptive_rl_outer_rollout_authority_v2(
                 raise MassiveAdaptiveRLOuterRolloutAuthorityV2Error(
                     "outer access commit time is absent"
                 )
-            committed_at_ms = max(time.time_ns() // 1_000_000, access_time) + 1
+            committed_at_ms = (
+                max(
+                    time.time_ns() // 1_000_000,
+                    access_time,
+                    expected.outer_input_committed_at_ms,
+                )
+                + 1
+            )
             capability = issue_massive_adaptive_rl_manifest_v5_prequential_outer_execution_capability_v1(
                 root=root, authority=manifest_registration
             )

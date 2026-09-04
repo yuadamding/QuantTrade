@@ -30,11 +30,11 @@ import torch
 
 from rl_quant.data_sources.massive.source_receipts import (
     LoadedMassiveSourceObject,
-    canonical_json_file_bytes,
     load_massive_source_bundle,
     publish_massive_source_object,
     read_loaded_massive_source_bytes,
 )
+from rl_quant.protocol.canonical_artifact import canonical_json_file_bytes
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
     initial_validation_inputs_authority_relative_path_v1,
     massive_adaptive_rl_forbidden_prequential_artifacts_v1,
@@ -123,10 +123,12 @@ _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/training/massive_adaptive_rl_frozen_fc06_v2.py",
     "src/rl_quant/workflows/massive_adaptive_rl_walk_forward_policy_schedule_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_outer_access_commitment_v2.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_outer_inputs_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_outer_rollout_authority_v2.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_outer_fold_seal_authority_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_profitability_report_authority_v2.py",
     "src/rl_quant/workflows/massive_adaptive_rl_prequential_experiment_state_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_outer_fold_execution_v1.py",
 )
 _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS = (
     "tests/test_massive_adaptive_rl_v5_vertical.py",
@@ -182,6 +184,7 @@ _SCOPED_OUTCOME_DIRECTORY_NAMES = (
     "frozen-fc06-v2",
     "walk-forward-policy-schedule-v1",
     "outer-access-commitment-v2",
+    "outer-input-authority-v1",
     "outer-rollout-authority-v2",
     "outer-fold-seal-authority-v1",
     "profitability-report-authority-v2",
@@ -407,6 +410,51 @@ def _vertical_qualification(
     return {
         **body,
         "vertical_qualification_receipt_sha256": _vertical_qualification_receipt(body),
+    }
+
+
+def _replay_registered_vertical_qualification(
+    *,
+    repository_root: Path,
+    authority: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+) -> dict[str, object]:
+    """Verify the frozen qualification identity without launching pytest again."""
+
+    missing = tuple(
+        name
+        for name in _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS
+        if not (repository_root / name).is_file()
+        or (repository_root / name).is_symlink()
+    )
+    present = tuple(
+        name
+        for name in _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS
+        if name not in missing
+    )
+    inventory = _source_inventory(repository_root, present)
+    body = {
+        name: getattr(authority, name)
+        for name in _VERTICAL_QUALIFICATION_RECEIPT_FIELD_NAMES
+    }
+    if (
+        missing != authority.missing_vertical_qualification_test_paths
+        or inventory != authority.vertical_qualification_test_inventory
+        or authority.vertical_qualification_test_paths
+        != _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS
+        or authority.vertical_qualification_required_node_ids
+        != _VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS
+        or authority.vertical_qualification_receipt_sha256
+        != _vertical_qualification_receipt(body)
+        or not authority.vertical_qualification_passed
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "registered V5 vertical qualification identity differs"
+        )
+    return {
+        **body,
+        "vertical_qualification_receipt_sha256": (
+            authority.vertical_qualification_receipt_sha256
+        ),
     }
 
 
@@ -929,6 +977,9 @@ def _capture_body(
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    registered_authority: (
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1 | None
+    ) = None,
 ) -> dict[str, object]:
     manifest.validate()
     manifest_registration.validate()
@@ -978,9 +1029,16 @@ def _capture_body(
         repository,
         _IMPLEMENTATION_RELATIVE_PATHS + present_v5_native,
     )
-    qualification = _vertical_qualification(
-        repository_root=repository,
-        v5_native_vertical_complete=not missing_v5_native,
+    qualification = (
+        _vertical_qualification(
+            repository_root=repository,
+            v5_native_vertical_complete=not missing_v5_native,
+        )
+        if registered_authority is None
+        else _replay_registered_vertical_qualification(
+            repository_root=repository,
+            authority=registered_authority,
+        )
     )
     status = tuple(
         row
@@ -1077,17 +1135,12 @@ def _capture_body(
     }
 
 
-def capture_massive_adaptive_rl_execution_implementation_registration_v1(
+def _authority_from_captured_body(
     *,
-    root: str | Path,
+    body: dict[str, object],
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
 ) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
-    body = _capture_body(
-        root=root,
-        manifest=manifest,
-        manifest_registration=manifest_registration,
-    )
     training_lineage = (
         cast(str, body["training_state_receipt_sha256"]),
         cast(str, body["four_fold_fit_authority_receipt_sha256"]),
@@ -1102,6 +1155,25 @@ def capture_massive_adaptive_rl_execution_implementation_registration_v1(
     )
     result.validate()
     return result
+
+
+def capture_massive_adaptive_rl_execution_implementation_registration_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    """Run qualification once while capturing a new implementation freeze."""
+
+    return _authority_from_captured_body(
+        body=_capture_body(
+            root=root,
+            manifest=manifest,
+            manifest_registration=manifest_registration,
+        ),
+        manifest=manifest,
+        manifest_registration=manifest_registration,
+    )
 
 
 def _payload(
@@ -1219,8 +1291,13 @@ def authorize_massive_adaptive_rl_execution_implementation_registration_v1(
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "execution implementation registration is not persisted"
         )
-    active = capture_massive_adaptive_rl_execution_implementation_registration_v1(
-        root=root,
+    active = _authority_from_captured_body(
+        body=_capture_body(
+            root=root,
+            manifest=manifest,
+            manifest_registration=manifest_registration,
+            registered_authority=authority,
+        ),
         manifest=manifest,
         manifest_registration=manifest_registration,
     )

@@ -97,6 +97,7 @@ _EXPERIMENT_SCOPED_DIRECTORIES = frozenset(
         "manifest-v5-registration-v1",
         "outer-access-commitment-v2",
         "outer-fold-seal-authority-v1",
+        "outer-input-authority-v1",
         "outer-rollout-authority-v2",
         "policy-selection-v4",
         "prequential-experiment-state-v1",
@@ -132,6 +133,7 @@ _PREQUENTIAL_OUTER_EXECUTION_DIRECTORIES = frozenset(
         "outer-access-commitment-v2",
         "outer-rollout-authority-v2",
         "outer-fold-seal-authority-v1",
+        "outer-input-authority-v1",
         "walk-forward-policy-schedule-v1",
         "profitability-report-authority-v2",
         "prequential-experiment-state-v1",
@@ -320,6 +322,7 @@ def _prequential_scoped_path_authorized_v1(
     name = parts[3] if len(parts) == 4 else ""
     if directory in {
         "outer-access-commitment-v2",
+        "outer-input-authority-v1",
         "outer-rollout-authority-v2",
         "outer-fold-seal-authority-v1",
     }:
@@ -786,6 +789,8 @@ def authorize_massive_adaptive_rl_source_publication_v5(
         allowed = (
             _TRAINING_SOURCE_DIRECTORIES
             if active.writer_role == "causal-training"
+            else frozenset({"decision-tensor-v1"})
+            if active.writer_role == "prequential-outer-execution"
             else _INITIAL_INPUT_SOURCE_DIRECTORIES
             if active.writer_role
             in {

@@ -22,11 +22,15 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v4 import (
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     MassiveAdaptiveRLPrequentialRunV5,
     _build_initial_execution_result,
+    _build_outer_zero_result,
     _build_preimplementation_result,
     _build_result,
     _record_initial_prequential_execution_v1,
     run_massive_adaptive_rl_experiment_v5,
     verify_massive_adaptive_rl_experiment_v5,
+)
+from rl_quant.workflows.massive_adaptive_rl_outer_fold_execution_v1 import (
+    MassiveAdaptiveRLOuterFoldExecutionV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
     MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
@@ -365,6 +369,42 @@ def test_v5_result_freezes_implementation_before_initial_inputs(
     assert not advanced.final_policy_freezing_authorized
     assert not advanced.outer_access_authorized
     assert not advanced.positive_profitability_authorization_eligible
+
+    outer_state = _typed_shell(
+        MassiveAdaptiveRLPrequentialExperimentStateV1,
+        stage=MassiveAdaptiveRLPrequentialStageV1.OUTER_0_SEALED,
+        semantic_receipt_sha256=_digest("outer-zero-state"),
+        immediate_predecessor_state_receipt_sha256=(state_head.semantic_receipt_sha256),
+        prequential_execution_authorized=True,
+    )
+    outer_execution = MassiveAdaptiveRLOuterFoldExecutionV1(
+        fold_index=0,
+        outer_access=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-access"),
+            predecessor_state_receipt_sha256=state_head.semantic_receipt_sha256,
+            policy_schedule_receipt_sha256=schedules[-1].semantic_receipt_sha256,
+        ),  # type: ignore[arg-type]
+        outer_inputs=SimpleNamespace(semantic_receipt_sha256=_digest("outer-inputs")),  # type: ignore[arg-type]
+        outer_rollout=SimpleNamespace(semantic_receipt_sha256=_digest("outer-rollout")),  # type: ignore[arg-type]
+        outer_fold_seal=SimpleNamespace(semantic_receipt_sha256=_digest("outer-seal")),  # type: ignore[arg-type]
+        prequential_state=outer_state,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLOuterFoldExecutionV1, "validate", lambda _: None
+    )
+    sealed = _build_outer_zero_result(
+        boundary=advanced,
+        policy_schedule=schedules[-1],
+        execution=outer_execution,
+    )
+    assert sealed.outer_zero_execution_complete
+    assert not sealed.outer_zero_preparation_authorized
+    assert sealed.sealed_outer_fold_indices == (0,)
+    assert sealed.prequential_state_head_stage == "outer-0-sealed"
+    assert (
+        sealed.next_required_stage == "validation-fold-2-release-selection-and-freeze"
+    )
+    assert not sealed.positive_profitability_authorization_eligible
 
 
 def test_v5_root_registers_before_resuming_training(

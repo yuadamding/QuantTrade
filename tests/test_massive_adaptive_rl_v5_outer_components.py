@@ -23,6 +23,9 @@ from rl_quant.evaluation.massive_adaptive_rl_outer_rollout_authority_v2 import (
     execute_massive_adaptive_rl_outer_rollout_v2,
     run_or_resume_massive_adaptive_rl_outer_rollout_authority_v2,
 )
+from rl_quant.evaluation.massive_adaptive_rl_outer_inputs_v1 import (
+    run_or_resume_massive_adaptive_rl_outer_inputs_v1,
+)
 from rl_quant.evaluation.massive_adaptive_rl_validation_release_authority_v1 import (
     run_or_resume_massive_adaptive_rl_delayed_validation_release_v1,
 )
@@ -66,6 +69,15 @@ def _generic_outer_access() -> MassiveAdaptiveOuterAccessCommitmentV2:
         frozen_fc06_source_receipt_sha256=_digest("fc06-source"),
         frozen_fc06_commit_receipt_sha256=_digest("fc06-commit"),
         frozen_fc06_committed_at_ms=9,
+        predecessor_state_receipt_sha256=_digest("predecessor-state"),
+        predecessor_state_source_receipt_sha256=_digest("predecessor-state-source"),
+        predecessor_state_commit_receipt_sha256=_digest("predecessor-state-commit"),
+        predecessor_state_committed_at_ms=11,
+        predecessor_state_stage="policy-1-frozen",
+        predecessor_stage_artifact_receipt_sha256=_digest("schedule"),
+        predecessor_stage_artifact_source_receipt_sha256=_digest("schedule-source"),
+        predecessor_stage_artifact_commit_receipt_sha256=_digest("schedule-commit"),
+        predecessor_stage_artifact_committed_at_ms=10,
         outer_fold_receipt_sha256=_digest("outer-fold"),
         outer_decision_session_dates=dates,
         outer_decision_inventory_sha256=semantic_sha256(dates),
@@ -149,6 +161,16 @@ def test_outer_public_surfaces_do_not_accept_economic_outcomes() -> None:
         "policy_schedule",
         "frozen_policy",
         "frozen_control",
+        "predecessor_state",
+        "allow_materialize",
+    }
+    assert set(
+        inspect.signature(run_or_resume_massive_adaptive_rl_outer_inputs_v1).parameters
+    ) == {
+        "root",
+        "manifest",
+        "manifest_registration",
+        "outer_access",
         "allow_materialize",
     }
     rollout_parameters = set(
