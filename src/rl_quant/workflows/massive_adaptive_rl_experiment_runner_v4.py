@@ -89,7 +89,10 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V4_SPEC_SHA256 = semantic_sha256(
         ),
         "initial_validation_folds": (0, 1),
         "withheld_validation_folds": (2, 3),
-        "release_edges": ("outer-0-sealed->validation-2", "outer-1-sealed->validation-3"),
+        "release_edges": (
+            "outer-0-sealed->validation-2",
+            "outer-1-sealed->validation-3",
+        ),
         "no_eligible_candidate_policy": (
             MASSIVE_ADAPTIVE_RL_NO_ELIGIBLE_CANDIDATE_POLICY_V1
         ),
@@ -195,7 +198,8 @@ class MassiveAdaptiveRLPrequentialRunV4:
             self.schema != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RUN_V4_SCHEMA
             or not self.experiment_id
             or not self.training_state_receipts
-            or len(set(self.training_state_receipts)) != len(self.training_state_receipts)
+            or len(set(self.training_state_receipts))
+            != len(self.training_state_receipts)
             or self.released_validation_fold_indices != (0, 1)
             or self.withheld_validation_fold_indices != (2, 3)
             or not self.training_evidence_adopted
@@ -212,8 +216,7 @@ class MassiveAdaptiveRLPrequentialRunV4:
             or self.end_to_end_profitability_execution_complete
             or self.lockbox_access_authorized
             or self.live_trading_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V4_SPEC_SHA256
             or self.implementation_source_sha256
@@ -308,8 +311,7 @@ def _build_result(
         source_receipt is None
         or commit_receipt is None
         or not initial_inputs.development_stage_authorized
-        or initial_inputs.manifest_v4_receipt_sha256
-        != manifest.semantic_receipt_sha256
+        or initial_inputs.manifest_v4_receipt_sha256 != manifest.semantic_receipt_sha256
         or initial_inputs.training_manifest_v3_receipt_sha256
         != manifest.base_manifest.semantic_receipt_sha256
         or initial_inputs.runtime_sources_v2_receipt_sha256
@@ -378,6 +380,33 @@ def _replay_prequential_root(
     allow_materialize: bool,
     v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLPrequentialRunV4:
+    result, _initial_inputs = _replay_prequential_root_with_inputs(
+        manifest=manifest,
+        source_root=source_root,
+        artifact_root=artifact_root,
+        device=device,
+        states=states,
+        allow_materialize=allow_materialize,
+        v5_writer_capability=v5_writer_capability,
+    )
+    return result
+
+
+def _replay_prequential_root_with_inputs(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV4,
+    source_root: str | Path,
+    artifact_root: str | Path,
+    device: object,
+    states: tuple[MassiveAdaptiveRLExperimentStateV2, ...],
+    allow_materialize: bool,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
+) -> tuple[
+    MassiveAdaptiveRLPrequentialRunV4,
+    MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+]:
+    """Replay the boundary and retain its runtime-authorized input authority."""
+
     fit_receipt = _validate_training_handoff(manifest=manifest, states=states)
     runtime_sources_v2 = (
         reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v2(
@@ -407,21 +436,22 @@ def _replay_prequential_root(
             allow_materialize=allow_materialize,
         )
     else:
-        initial_inputs = (
-            _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1(
-                root=artifact_root,
-                manifest=manifest,
-                runtime_sources_v2=runtime_sources_v2,
-                four_fold_fit_authority=four_fold_fit,
-                allow_materialize=allow_materialize,
-                v5_writer_capability=v5_writer_capability,
-            )
+        initial_inputs = _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1(
+            root=artifact_root,
+            manifest=manifest,
+            runtime_sources_v2=runtime_sources_v2,
+            four_fold_fit_authority=four_fold_fit,
+            allow_materialize=allow_materialize,
+            v5_writer_capability=v5_writer_capability,
         )
-    return _build_result(
-        manifest=manifest,
-        states=states,
-        runtime_sources_v2=runtime_sources_v2,
-        initial_inputs=initial_inputs,
+    return (
+        _build_result(
+            manifest=manifest,
+            states=states,
+            runtime_sources_v2=runtime_sources_v2,
+            initial_inputs=initial_inputs,
+        ),
+        initial_inputs,
     )
 
 

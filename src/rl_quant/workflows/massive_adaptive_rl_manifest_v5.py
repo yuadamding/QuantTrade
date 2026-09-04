@@ -6,8 +6,8 @@ the prequential interpretation its own receipt.  It freezes the release
 edges, stage order, diagnostic continuation rule, and exact authority
 generations that future stages must implement.  Constructing this manifest
 opens no validation, outer, or lockbox outcome.  Physical code, dependency,
-and numerical-runtime identities are frozen separately immediately before the
-first validation outcome, so completing the preregistered writer does not
+and numerical-runtime identities are frozen separately before any validation
+input is materialized, so completing the preregistered writer does not
 silently change the scientific protocol receipt.
 """
 
@@ -36,6 +36,9 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
     assert_no_adaptive_hold_semantics,
 )
 from rl_quant.training.massive_adaptive_ppo_v1 import MassiveAdaptivePPOConfigV1
+from rl_quant.training.massive_adaptive_rl_fixed_control_registry_v1 import (
+    massive_adaptive_rl_fixed_control_scientific_inventory_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
     MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256,
@@ -96,16 +99,42 @@ MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256 = semantic_sha256(
         "profitability_reporting": False,
     }
 )
+MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256 = semantic_sha256(
+    {
+        "scope": "exact-v5-native-tree-dependency-lock-and-runtime",
+        "suite": "package-owned-real-synthetic-market-vertical",
+        "economic_mocks": False,
+        "required_invariants": (
+            "one-step-position-return-lag",
+            "unchanged-position-zero-turnover-cost",
+            "fixed-trace-cost-monotonicity",
+            "terminal-liquidation-compounding-identity",
+            "ppo-fc06-benchmark-shared-economics",
+            "outer-zero-seal-before-validation-two-release",
+            "outer-one-seal-before-validation-three-release",
+            "diagnostic-continuation-without-positive-authorization",
+            "interruption-resume-receipt-equivalence",
+            "predecessor-tamper-rejection",
+            "nonmaterializing-cold-replay",
+        ),
+        "result": (
+            "exact-test-inventory-command-exit-and-duration-normalized-output-receipt"
+        ),
+    }
+)
 MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256 = (
     semantic_sha256(
         {
             "manifest": "exact-scientific-manifest-v5",
             "manifest_registration": "exact-source-transaction-replayed",
-            "chronology": "after-initial-inputs-before-first-validation-outcome",
+            "chronology": "after-training-before-any-validation-input",
             "source": "clean-git-commit-tree-and-complete-runtime-source-inventory",
             "dependency_lock": "exact-physical-sha256",
             "runtime": "python-pytorch-numpy-cpu-and-thread-attestation",
             "implementation_inventory": "fixed-package-owned-relative-paths",
+            "vertical_qualification": (
+                MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256
+            ),
             "publication": "create-only-source-transaction",
             "generic_reload": "nonauthorizing",
             "mutation_after_registration": "new-experiment-required",
@@ -117,14 +146,17 @@ MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256 = (
 
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1 = (0, 1)
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1 = (2, 3)
-MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_PREREQUISITES_V1: tuple[
-    int | None, ...
-] = (None, None, 0, 1)
+MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_PREREQUISITES_V1: tuple[int | None, ...] = (
+    None,
+    None,
+    0,
+    1,
+)
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_EDGES_V1 = ((0, 2), (1, 3))
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1 = (
     "trained",
-    "initial-validation-inputs-committed",
     "execution-implementation-registered",
+    "initial-validation-inputs-committed",
     "policy-0-frozen",
     "policy-1-frozen",
     "outer-0-sealed",
@@ -180,7 +212,10 @@ MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_V1_SPEC_SHA256 = semantic_sha256(
     {
         "initial_release": {
             "folds": (0, 1),
-            "predecessor": "completed-four-fold-fit",
+            "predecessors": (
+                "completed-four-fold-fit",
+                "execution-implementation-registration",
+            ),
         },
         "later_releases": (
             {"fold": 2, "predecessor": "authenticated-outer-fold-0-seal"},
@@ -348,9 +383,7 @@ MASSIVE_ADAPTIVE_RL_PREQUENTIAL_AUTHORITY_GENERATIONS_V1 = (
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256 = semantic_sha256(
     {
         "manifest": "exact-manifest-v5",
-        "registration": (
-            MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
-        ),
+        "registration": (MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256),
         "execution_implementation_registration": (
             MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
         ),
@@ -362,6 +395,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256 = semantic_sha256(
             MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
         ),
         "initial_inputs": MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256,
+        "initial_inputs_prerequisite": (
+            "exact-replayed-execution-implementation-registration"
+        ),
         "initial_folds": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1,
         "withheld_folds": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1,
         "legacy_writers_after_registration": "rejected",
@@ -416,12 +452,16 @@ def massive_adaptive_rl_scientific_protocol_projection_v1(
 
     The nested V2--V4 manifests remain persisted compatibility witnesses, but
     their implementation and source identities must not determine the V5
-    scientific receipt.  This projection deliberately names the fixed-control
-    protocol instead of inheriting its implementation-bearing registry receipt.
+    scientific receipt.  This projection commits the numerical fixed-control
+    inventory directly instead of inheriting its implementation-bearing
+    registry receipt.
     """
 
     base_v3 = base_manifest.base_manifest
     base_v2 = base_v3.base_manifest
+    fixed_control_inventory = (
+        massive_adaptive_rl_fixed_control_scientific_inventory_v1()
+    )
     return {
         "schema": MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SCHEMA,
         "specification_sha256": (
@@ -444,8 +484,9 @@ def massive_adaptive_rl_scientific_protocol_projection_v1(
             "cost_ladder_basis_points": base_v2.cost_ladder_basis_points,
             "primary_cost_basis_points": base_v2.primary_cost_basis_points,
             "maximum_fill_participation": base_v2.maximum_fill_participation,
-            "fixed_control_protocol": (
-                "fc00-through-fc12-with-training-selected-fc06-v1"
+            "fixed_control_scientific_inventory": fixed_control_inventory,
+            "fixed_control_scientific_inventory_sha256": semantic_sha256(
+                fixed_control_inventory
             ),
             "policy_specification_sha256": base_v2.policy_specification_sha256,
             "action_specification_sha256": base_v2.action_specification_sha256,
@@ -465,12 +506,8 @@ def massive_adaptive_rl_scientific_protocol_projection_v1(
             "bootstrap_block_sessions": base_v3.bootstrap_block_sessions,
             "bootstrap_seed": base_v3.bootstrap_seed,
             "annualization_sessions": base_v3.annualization_sessions,
-            "risk_free_return_specification": (
-                base_v3.risk_free_return_specification
-            ),
-            "execution_device_specification": (
-                base_v3.execution_device_specification
-            ),
+            "risk_free_return_specification": (base_v3.risk_free_return_specification),
+            "execution_device_specification": (base_v3.execution_device_specification),
         },
         "selection": {
             "validation_selection_specification_sha256": (
@@ -727,12 +764,10 @@ class MassiveAdaptiveRLExperimentManifestV5:
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
             or self.live_trading_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLExperimentManifestV5Error(
                 "adaptive RL experiment Manifest V5 differs"
@@ -995,6 +1030,7 @@ __all__ = [
     "MASSIVE_ADAPTIVE_RL_VALIDATION_ECONOMIC_CORE_V1_SPEC_SHA256",
     "MASSIVE_ADAPTIVE_RL_VALIDATION_OUTCOME_AUTHORITY_V3_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_VALIDATION_OUTCOME_V3_SPEC_SHA256",
+    "MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256",
     "MASSIVE_ADAPTIVE_RL_WALK_FORWARD_POLICY_SCHEDULE_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_WALK_FORWARD_POLICY_SCHEDULE_V1_SPEC_SHA256",
     "MassiveAdaptiveRLExperimentManifestV5",

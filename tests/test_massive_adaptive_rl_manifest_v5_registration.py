@@ -8,6 +8,9 @@ import pytest
 
 from rl_quant.data_sources.massive.source_receipts import publish_massive_source_object
 from rl_quant.protocol.canonical_artifact import semantic_sha256
+from rl_quant.workflows import (
+    massive_adaptive_rl_execution_implementation_registration_v1 as implementation_registration,
+)
 
 from rl_quant.evaluation.massive_adaptive_outer_access_commitment_v1 import (
     materialize_massive_adaptive_outer_access_commitment_v1,
@@ -145,9 +148,7 @@ def test_missing_read_only_registration_creates_nothing(tmp_path: Path) -> None:
         experiment_id="registration-read-only"
     )
     root = tmp_path / "absent"
-    with pytest.raises(
-        MassiveAdaptiveRLManifestV5RegistrationError, match="is absent"
-    ):
+    with pytest.raises(MassiveAdaptiveRLManifestV5RegistrationError, match="is absent"):
         run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
             root=root,
             manifest=manifest,
@@ -285,6 +286,7 @@ def test_registered_v5_disables_all_legacy_root_writers(tmp_path: Path) -> None:
 
 def test_registered_v5_disables_direct_legacy_child_materializers(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v5(
         experiment_id="registration-child-guards"
@@ -300,9 +302,15 @@ def test_registered_v5_disables_direct_legacy_child_materializers(
         manifest=manifest,
         allow_materialize=False,
     )
+    monkeypatch.setattr(
+        implementation_registration,
+        "run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1",
+        lambda **_: type(
+            "Implementation", (), {"development_execution_registered": True}
+        )(),
+    )
     capability = issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
-        root=artifact_root,
-        authority=registration
+        root=artifact_root, authority=registration
     )
 
     calls = (
@@ -399,8 +407,30 @@ def test_registered_v5_disables_direct_legacy_child_materializers(
         )
 
 
+def test_initial_input_capability_requires_execution_registration(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="registration-inputs-require-implementation"
+    )
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+
+    with pytest.raises(
+        implementation_registration.MassiveAdaptiveRLExecutionImplementationRegistrationV1Error,
+        match="registration is absent",
+    ):
+        issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+            root=tmp_path,
+            authority=registration,
+        )
+
+
 def test_writer_capability_replays_registration_and_is_role_scoped(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v5(
         experiment_id="registration-capability-replay"
@@ -408,6 +438,13 @@ def test_writer_capability_replays_registration_and_is_role_scoped(
     registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
         root=tmp_path,
         manifest=manifest,
+    )
+    monkeypatch.setattr(
+        implementation_registration,
+        "run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1",
+        lambda **_: type(
+            "Implementation", (), {"development_execution_registered": True}
+        )(),
     )
     capability = issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
         root=tmp_path,
@@ -421,9 +458,7 @@ def test_writer_capability_replays_registration_and_is_role_scoped(
         authorize_legacy_or_manifest_v5_compatibility_writer_v1(
             root=tmp_path,
             experiment_id=manifest.experiment_id,
-            manifest_v4_receipt_sha256=(
-                manifest.base_manifest.semantic_receipt_sha256
-            ),
+            manifest_v4_receipt_sha256=(manifest.base_manifest.semantic_receipt_sha256),
             writer_role="initial-validation-inputs",
             fold_index=0,
             capability=forged,
@@ -470,6 +505,7 @@ def test_writer_capability_replays_registration_and_is_role_scoped(
 
 def test_writer_capability_binds_separate_source_publication_root(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v5(
         experiment_id="registration-source-root"
@@ -482,6 +518,13 @@ def test_writer_capability_binds_separate_source_publication_root(
     registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
         root=artifact_root,
         manifest=manifest,
+    )
+    monkeypatch.setattr(
+        implementation_registration,
+        "run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1",
+        lambda **_: type(
+            "Implementation", (), {"development_execution_registered": True}
+        )(),
     )
     capability = issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
         root=artifact_root,

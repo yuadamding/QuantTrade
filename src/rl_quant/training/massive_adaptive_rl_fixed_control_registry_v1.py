@@ -44,6 +44,9 @@ MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_REGISTRY_V1_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_REGISTRY_V1_SOURCE_SHA256 = file_sha256(
     Path(__file__)
 )
+MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_SCIENTIFIC_INVENTORY_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-fixed-control-scientific-inventory-v1"
+)
 
 
 class MassiveAdaptiveRLFixedControlRegistryV1Error(ValueError):
@@ -244,6 +247,42 @@ def registered_massive_adaptive_rl_constant_actions_v1() -> tuple[
         ("FC11", long_high_hurdle),
         ("FC12", low_risk_low_hurdle),
     )
+
+
+def massive_adaptive_rl_fixed_control_scientific_inventory_v1() -> dict[str, object]:
+    """Return the source-free comparator choices that affect the experiment.
+
+    Action receipts intentionally include implementation identities.  Manifest
+    V5 instead commits the numerical controls and the FC06 fit-only selection
+    rule directly, so a source refactor cannot change the scientific protocol
+    while a changed comparator cannot hide behind the same descriptive label.
+    """
+
+    controls = tuple(
+        {
+            "control_id": control_id,
+            "controller_kind": "constant",
+            "bucket_controls": action.bucket_controls,
+            "uncertainty_control": action.uncertainty_control,
+            "risk_control": action.risk_control,
+            "trade_cost_control": action.trade_cost_control,
+        }
+        for control_id, action in registered_massive_adaptive_rl_constant_actions_v1()
+    )
+    return {
+        "schema": MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_SCIENTIFIC_INVENTORY_V1_SCHEMA,
+        "constant_controls": controls,
+        "fc06": {
+            "control_id": "FC06",
+            "controller_kind": "training-selected-constant",
+            "candidate_control_ids": tuple(row["control_id"] for row in controls),
+            "selection_data": "registered-fold-rl-fit-only",
+            "primary_cost_basis_points": 20.0,
+            "objective": "maximum-training-incremental-log-wealth",
+            "tie_breaking": "lexicographically-greatest-control-id",
+            "missing_or_invalid_candidate": "selection-invalid",
+        },
+    }
 
 
 def build_massive_adaptive_rl_fixed_control_registry_v1() -> (
@@ -455,10 +494,12 @@ def build_massive_adaptive_rl_policy_candidate_with_registry_v1(
 
 
 __all__ = [
+    "MASSIVE_ADAPTIVE_RL_FIXED_CONTROL_SCIENTIFIC_INVENTORY_V1_SCHEMA",
     "MassiveAdaptiveRLFixedControlRegistryV1",
     "MassiveAdaptiveRLFixedControlRegistryV1Error",
     "MassiveAdaptiveRLFixedControlSpecV1",
     "build_massive_adaptive_rl_fixed_control_registry_v1",
+    "massive_adaptive_rl_fixed_control_scientific_inventory_v1",
     "build_massive_adaptive_rl_policy_candidate_with_registry_v1",
     "registered_massive_adaptive_rl_constant_actions_v1",
     "validate_massive_adaptive_rl_fixed_control_registry_coverage_v1",

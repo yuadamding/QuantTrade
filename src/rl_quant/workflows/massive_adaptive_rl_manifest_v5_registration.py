@@ -56,14 +56,12 @@ from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
 MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_DATASET = (
     "massive-adaptive-rl-manifest-v5-registration-v1"
 )
-MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SCHEMA_SHA256 = (
-    semantic_sha256(
-        {
-            "schema": MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SCHEMA,
-            "encoding": "canonical-json-one-experiment-one-v5-writer-generation",
-            "generic_reload": "nonauthorizing",
-        }
-    )
+MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SCHEMA_SHA256 = semantic_sha256(
+    {
+        "schema": MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SCHEMA,
+        "encoding": "canonical-json-one-experiment-one-v5-writer-generation",
+        "generic_reload": "nonauthorizing",
+    }
 )
 
 
@@ -236,14 +234,12 @@ class MassiveAdaptiveRLManifestV5RegistrationAuthorityV1:
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
             or self.live_trading_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
             or self._loaded_source is not None
             and (
                 self._loaded_source.receipt.dataset_id
@@ -343,7 +339,9 @@ def _parse_registration(
         body[name] = tuple(cast(Sequence[object], body[name]))
     body["outer_to_validation_release_edges"] = tuple(
         tuple(cast(Sequence[int], row))
-        for row in cast(Sequence[Sequence[int]], body["outer_to_validation_release_edges"])
+        for row in cast(
+            Sequence[Sequence[int]], body["outer_to_validation_release_edges"]
+        )
     )
     result = MassiveAdaptiveRLManifestV5RegistrationAuthorityV1(
         **body,  # type: ignore[arg-type]
@@ -437,7 +435,29 @@ def issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
     authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     source_root: str | Path | None = None,
 ) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
-    """Issue the fold-0/1 compatibility capability before outcomes."""
+    """Issue fold-0/1 access only after the evaluator was frozen exactly."""
+
+    from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1,
+    )
+
+    manifest = authority._runtime_manifest
+    if manifest is None:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "initial-input capability requires replayed Manifest V5"
+        )
+    implementation = (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+            root=root,
+            manifest=manifest,
+            manifest_registration=authority,
+            allow_materialize=False,
+        )
+    )
+    if not implementation.development_execution_registered:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "initial-input capability requires frozen execution implementation"
+        )
 
     return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
         root=root,
@@ -493,7 +513,7 @@ def _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked(
     if type(manifest) is not MassiveAdaptiveRLExperimentManifestV5:
         raise MassiveAdaptiveRLManifestV5RegistrationError(
             "Manifest V5 registration requires exact Manifest V5"
-    )
+        )
     manifest.validate()
     registration_root = Path(root)
     if registration_root.is_symlink():
@@ -594,9 +614,7 @@ def run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
             allow_materialize=False,
         )
     try:
-        with massive_adaptive_rl_artifact_root_writer_lock_v1(
-            artifact_root=root
-        ):
+        with massive_adaptive_rl_artifact_root_writer_lock_v1(artifact_root=root):
             with massive_adaptive_rl_experiment_orchestration_lock_v1(
                 artifact_root=root,
                 experiment_id=manifest.experiment_id,

@@ -11,6 +11,9 @@ import pytest
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
     MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
 )
+from rl_quant.evaluation.massive_adaptive_rl_validation_release_authority_v1 import (
+    MassiveAdaptiveRLValidationReleaseAuthorityV1,
+)
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.workflows import massive_adaptive_rl_experiment_runner_v5 as runner
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v4 import (
@@ -18,6 +21,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v4 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     MassiveAdaptiveRLPrequentialRunV5,
+    _build_preimplementation_result,
     _build_result,
     run_massive_adaptive_rl_experiment_v5,
     verify_massive_adaptive_rl_experiment_v5,
@@ -48,7 +52,7 @@ def _typed_shell(authority_type: type[_T], /, **values: object) -> _T:
     return result
 
 
-def test_v5_result_binds_registration_before_initial_inputs(
+def test_v5_result_freezes_implementation_before_initial_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v5(
@@ -57,24 +61,10 @@ def test_v5_result_binds_registration_before_initial_inputs(
     registration = _typed_shell(
         MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
         semantic_receipt_sha256=_digest("registration"),
+        manifest_v5_receipt_sha256=manifest.semantic_receipt_sha256,
     )
-    predecessor = _typed_shell(
-        MassiveAdaptiveRLPrequentialRunV4,
-        semantic_receipt_sha256=_digest("run-v4"),
-        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
-        initial_validation_inputs_authority_receipt_sha256=_digest("initial"),
-        initial_validation_inputs_source_receipt_sha256=_digest("initial-source"),
-        initial_validation_inputs_commit_receipt_sha256=_digest("initial-commit"),
-        training_evidence_adopted=True,
-        source_generation_v2_replayed=True,
-        initial_validation_inputs_replayed=True,
-        diagnostic_continuation_registered=True,
-    )
-    initial = _typed_shell(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        semantic_receipt_sha256=_digest("initial"),
-        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
-    )
+    training_state_receipt = _digest("training-state")
+    fit_receipt = _digest("fit")
     monkeypatch.setattr(
         MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
         "validate",
@@ -100,37 +90,20 @@ def test_v5_result_binds_registration_before_initial_inputs(
         "source_transaction_committed_at_ms",
         property(lambda _: 10),
     )
-    monkeypatch.setattr(MassiveAdaptiveRLPrequentialRunV4, "validate", lambda _: None)
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "source_receipt_sha256",
-        property(lambda _: _digest("initial-source")),
-    )
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "source_transaction_receipt_sha256",
-        property(lambda _: _digest("initial-commit")),
-    )
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "source_transaction_committed_at_ms",
-        property(lambda _: 20),
-    )
     monkeypatch.setattr(
         runner,
-        "load_massive_adaptive_rl_initial_validation_inputs_authority_v1",
-        lambda **_: initial,
+        "_training_receipts",
+        lambda **_: (training_state_receipt, fit_receipt),
     )
-    result = _build_result(
+    result = _build_preimplementation_result(
         manifest=manifest,
         registration=registration,
-        predecessor=predecessor,
-        artifact_root=tmp_path,
+        states=(),
     )
     assert isinstance(result, MassiveAdaptiveRLPrequentialRunV5)
     assert result.manifest_v5_registration_committed_at_ms == 10
-    assert result.initial_validation_inputs_committed_at_ms == 20
-    assert result.released_validation_fold_indices == (0, 1)
+    assert result.initial_validation_inputs_committed_at_ms is None
+    assert result.released_validation_fold_indices == ()
     assert result.withheld_validation_fold_indices == (2, 3)
     assert result.protocol_registered
     assert not result.validation_execution_complete
@@ -146,9 +119,8 @@ def test_v5_result_binds_registration_before_initial_inputs(
         manifest_v5_registration_authority_receipt_sha256=(
             registration.semantic_receipt_sha256
         ),
-        initial_validation_inputs_authority_receipt_sha256=(
-            initial.semantic_receipt_sha256
-        ),
+        training_state_receipt_sha256=training_state_receipt,
+        four_fold_fit_authority_receipt_sha256=fit_receipt,
     )
     monkeypatch.setattr(
         MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
@@ -173,19 +145,114 @@ def test_v5_result_binds_registration_before_initial_inputs(
     monkeypatch.setattr(
         MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
         "source_transaction_committed_at_ms",
-        property(lambda _: 30),
+        property(lambda _: 20),
     )
-    registered = _build_result(
+    registered = _build_preimplementation_result(
         manifest=manifest,
         registration=registration,
-        predecessor=predecessor,
-        artifact_root=tmp_path,
+        states=(),
         implementation_registration=implementation_registration,
     )
     assert registered.execution_implementation_registered
-    assert registered.execution_implementation_registration_committed_at_ms == 30
+    assert registered.execution_implementation_registration_committed_at_ms == 20
+    assert registered.initial_validation_inputs_committed_at_ms is None
+    assert registered.next_required_stage == "initial-validation-input-commitment"
+
+    predecessor = _typed_shell(
+        MassiveAdaptiveRLPrequentialRunV4,
+        semantic_receipt_sha256=_digest("run-v4"),
+        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
+        four_fold_fit_authority_receipt_sha256=fit_receipt,
+        initial_validation_inputs_authority_receipt_sha256=_digest("initial"),
+        initial_validation_inputs_source_receipt_sha256=_digest("initial-source"),
+        initial_validation_inputs_commit_receipt_sha256=_digest("initial-commit"),
+        training_evidence_adopted=True,
+        source_generation_v2_replayed=True,
+        initial_validation_inputs_replayed=True,
+        diagnostic_continuation_registered=True,
+    )
+    initial = _typed_shell(
+        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+        semantic_receipt_sha256=_digest("initial"),
+        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
+    )
+    monkeypatch.setattr(MassiveAdaptiveRLPrequentialRunV4, "validate", lambda _: None)
+    monkeypatch.setattr(
+        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+        "source_receipt_sha256",
+        property(lambda _: _digest("initial-source")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+        "source_transaction_receipt_sha256",
+        property(lambda _: _digest("initial-commit")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+        "source_transaction_committed_at_ms",
+        property(lambda _: 30),
+    )
+    validation_release = _typed_shell(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        semantic_receipt_sha256=_digest("validation-release"),
+        manifest_v5_receipt_sha256=manifest.semantic_receipt_sha256,
+        manifest_v5_registration_authority_receipt_sha256=(
+            registration.semantic_receipt_sha256
+        ),
+        execution_implementation_registration_authority_receipt_sha256=(
+            implementation_registration.semantic_receipt_sha256
+        ),
+        initial_validation_inputs_authority_receipt_sha256=(
+            initial.semantic_receipt_sha256
+        ),
+        training_state_receipt_sha256=training_state_receipt,
+        four_fold_fit_authority_receipt_sha256=fit_receipt,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+        "validate",
+        lambda _: None,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        "validate",
+        lambda _: None,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        "development_stage_authorized",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        "source_receipt_sha256",
+        property(lambda _: _digest("validation-release-source")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        "source_transaction_receipt_sha256",
+        property(lambda _: _digest("validation-release-commit")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLValidationReleaseAuthorityV1,
+        "source_transaction_committed_at_ms",
+        property(lambda _: 40),
+    )
+    complete = _build_result(
+        manifest=manifest,
+        registration=registration,
+        predecessor=predecessor,
+        training_state_receipt_sha256=training_state_receipt,
+        initial_inputs=initial,
+        validation_release=validation_release,
+        implementation_registration=implementation_registration,
+    )
+    assert complete.released_validation_fold_indices == (0, 1)
+    assert complete.initial_validation_inputs_committed_at_ms == 30
+    assert complete.initial_validation_release_committed_at_ms == 40
+    assert complete.initial_validation_release_replayed
     assert (
-        registered.next_required_stage
+        complete.next_required_stage
         == "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
     )
 
@@ -348,7 +415,9 @@ def test_v5_verify_is_strictly_nonmaterializing(
 
 
 def test_v5_root_api_has_no_validation_or_outer_choice_surface() -> None:
-    assert tuple(inspect.signature(run_massive_adaptive_rl_experiment_v5).parameters) == (
+    assert tuple(
+        inspect.signature(run_massive_adaptive_rl_experiment_v5).parameters
+    ) == (
         "manifest_path",
         "source_root",
         "artifact_root",

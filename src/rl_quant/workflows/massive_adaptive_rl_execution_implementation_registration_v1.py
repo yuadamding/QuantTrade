@@ -1,22 +1,27 @@
-"""Freeze the exact executable V5 implementation before validation outcomes.
+"""Freeze the exact executable V5 implementation before validation inputs.
 
 Manifest V5 owns scientific choices.  This separate create-only authority owns
 the code, dependency, and numerical-runtime identity used to generate economic
 outcomes.  Keeping the two registrations separate lets the scientific manifest
-remain stable while the package-owned vertical implementation is completed;
-once this authority exists, a code change requires a new experiment.
+remain stable while the package-owned vertical implementation is completed.
+The implementation and its fixed real-economic qualification suite must be
+registered before any validation tape is materialized; afterward, a code
+change requires a new experiment.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
+import hashlib
 from io import BytesIO
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
+import sys
 import time
 from typing import cast
 
@@ -31,8 +36,18 @@ from rl_quant.data_sources.massive.source_receipts import (
     read_loaded_massive_source_bytes,
 )
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
-    MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+    initial_validation_inputs_authority_relative_path_v1,
     massive_adaptive_rl_forbidden_prequential_artifacts_v1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v1 import (
+    validation_decision_tensor_relative_path_v1,
+    validation_environment_registry_relative_path_v1,
+    validation_forecast_archive_relative_path_v1,
+    validation_sources_authority_relative_path_v1,
+)
+from rl_quant.evaluation.massive_adaptive_rl_validation_inputs_v2 import (
+    validation_environment_registry_relative_path_v2,
+    validation_sources_authority_relative_path_v2,
 )
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -44,9 +59,14 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
     MassiveAdaptiveRLExperimentLockV1Unavailable,
     massive_adaptive_rl_experiment_orchestration_lock_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
+    MassiveAdaptiveRLExperimentStageV2,
+    load_massive_adaptive_rl_experiment_states_v2,
+)
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA,
     MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256,
+    MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256,
     MassiveAdaptiveRLExperimentManifestV5,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
@@ -82,6 +102,8 @@ _IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_evaluator_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_policy_evaluator_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_prequential_validation_inputs_v1.py",
+    "src/rl_quant/training/massive_adaptive_rl_fixed_control_registry_v1.py",
+    "src/rl_quant/training/massive_adaptive_rl_fixed_control_selection_v1.py",
     "src/rl_quant/training/massive_adaptive_rl_policy_selection_v2.py",
     "src/rl_quant/training/massive_adaptive_rl_policy_selection_v3.py",
     "src/rl_quant/workflows/massive_adaptive_rl_execution_implementation_registration_v1.py",
@@ -105,7 +127,22 @@ _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/evaluation/massive_adaptive_rl_profitability_report_authority_v2.py",
     "src/rl_quant/workflows/massive_adaptive_rl_prequential_experiment_state_v1.py",
 )
+_VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS = (
+    "tests/test_massive_adaptive_rl_v5_vertical.py",
+)
+_VERTICAL_QUALIFICATION_RECEIPT_FIELD_NAMES = (
+    "vertical_qualification_specification_sha256",
+    "vertical_qualification_test_paths",
+    "missing_vertical_qualification_test_paths",
+    "vertical_qualification_test_inventory",
+    "vertical_qualification_test_inventory_sha256",
+    "vertical_qualification_command",
+    "vertical_qualification_exit_code",
+    "vertical_qualification_normalized_output_sha256",
+    "vertical_qualification_passed",
+)
 _SCOPED_OUTCOME_DIRECTORY_NAMES = (
+    "validation-release-v1",
     "validation-outcome-v3",
     "fold-validation-v3",
     "policy-selection-v4",
@@ -242,6 +279,87 @@ def _source_inventory(
     return tuple(rows)
 
 
+def _vertical_qualification_receipt(values: Mapping[str, object]) -> str:
+    return semantic_sha256(
+        {name: values[name] for name in _VERTICAL_QUALIFICATION_RECEIPT_FIELD_NAMES}
+    )
+
+
+def _vertical_qualification(
+    *, repository_root: Path, v5_native_vertical_complete: bool
+) -> dict[str, object]:
+    """Run the fixed real-vertical suite for the exact checkout being frozen."""
+
+    missing = tuple(
+        name
+        for name in _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS
+        if not (repository_root / name).is_file()
+        or (repository_root / name).is_symlink()
+    )
+    present = tuple(
+        name
+        for name in _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS
+        if name not in missing
+    )
+    inventory = _source_inventory(repository_root, present)
+    command = (
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        *_VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS,
+    )
+    if missing or not v5_native_vertical_complete:
+        normalized_output_sha256 = hashlib.sha256(
+            repr(("not-run", missing, v5_native_vertical_complete)).encode("utf-8")
+        ).hexdigest()
+        exit_code = None
+        passed = False
+    else:
+        try:
+            completed = subprocess.run(
+                (sys.executable, *command[1:]),
+                cwd=repository_root,
+                check=False,
+                capture_output=True,
+                timeout=1_800,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                "V5 vertical qualification could not execute"
+            ) from error
+        normalized_output = re.sub(
+            rb"\bin [0-9]+(?:\.[0-9]+)?s\b",
+            b"in <duration>",
+            completed.stdout + b"\0" + completed.stderr,
+        )
+        normalized_output_sha256 = hashlib.sha256(normalized_output).hexdigest()
+        exit_code = completed.returncode
+        passed = completed.returncode == 0
+    body: dict[str, object] = {
+        "vertical_qualification_specification_sha256": (
+            MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256
+        ),
+        "vertical_qualification_test_paths": (
+            _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS
+        ),
+        "missing_vertical_qualification_test_paths": missing,
+        "vertical_qualification_test_inventory": inventory,
+        "vertical_qualification_test_inventory_sha256": semantic_sha256(inventory),
+        "vertical_qualification_command": command,
+        "vertical_qualification_exit_code": exit_code,
+        "vertical_qualification_normalized_output_sha256": (normalized_output_sha256),
+        "vertical_qualification_passed": passed,
+    }
+    return {
+        **body,
+        "vertical_qualification_receipt_sha256": _vertical_qualification_receipt(body),
+    }
+
+
 def _transaction_state(*, root: str | Path, relative: str) -> tuple[bool, bool]:
     payload = Path(root) / relative
     paths = (
@@ -292,6 +410,35 @@ def massive_adaptive_rl_preimplementation_economic_evidence_v1(
         resolved_root / "massive-adaptive" / name
         for name in _LEGACY_OUTCOME_DIRECTORY_NAMES
     )
+    preaccess_relatives = [
+        initial_validation_inputs_authority_relative_path_v1(
+            manifest=manifest.base_manifest
+        )
+    ]
+    for fold_index in (0, 1):
+        preaccess_relatives.extend(
+            (
+                validation_decision_tensor_relative_path_v1(
+                    manifest=manifest.base_manifest, fold_index=fold_index
+                ),
+                validation_forecast_archive_relative_path_v1(
+                    manifest=manifest.base_manifest, fold_index=fold_index
+                ),
+                validation_sources_authority_relative_path_v1(
+                    manifest=manifest.base_manifest, fold_index=fold_index
+                ),
+                validation_environment_registry_relative_path_v1(
+                    manifest=manifest.base_manifest, fold_index=fold_index
+                ),
+                validation_sources_authority_relative_path_v2(
+                    manifest=manifest.base_manifest, fold_index=fold_index
+                ),
+                validation_environment_registry_relative_path_v2(
+                    manifest=manifest.base_manifest, fold_index=fold_index
+                ),
+            )
+        )
+    candidates += tuple(resolved_root / relative for relative in preaccess_relatives)
     found = {
         str(path.relative_to(resolved_root))
         for path in candidates
@@ -306,6 +453,37 @@ def massive_adaptive_rl_preimplementation_economic_evidence_v1(
     return tuple(sorted(found))
 
 
+def _training_lineage_v1(
+    *, root: str | Path, manifest: MassiveAdaptiveRLExperimentManifestV5
+) -> tuple[str, str]:
+    """Derive the exact completed training state and four-fold fit receipts."""
+
+    states = load_massive_adaptive_rl_experiment_states_v2(
+        artifact_root=root,
+        experiment_id=manifest.experiment_id,
+    )
+    matches = tuple(
+        state
+        for state in states
+        if state.stage
+        is MassiveAdaptiveRLExperimentStageV2.PPO_AND_FIXED_CONTROLS_TRAINED
+    )
+    if (
+        len(matches) != 1
+        or matches[0].manifest_receipt_sha256
+        != manifest.base_manifest.base_manifest.semantic_receipt_sha256
+        or not matches[0].source_data_qualified
+        or not matches[0].stage_artifact_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration requires exact completed training"
+        )
+    return (
+        matches[0].semantic_receipt_sha256,
+        matches[0].stage_artifact_receipt_sha256,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     experiment_id: str
@@ -314,10 +492,8 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     manifest_v5_registration_source_receipt_sha256: str
     manifest_v5_registration_commit_receipt_sha256: str
     manifest_v5_registration_committed_at_ms: int
-    initial_validation_inputs_authority_receipt_sha256: str
-    initial_validation_inputs_source_receipt_sha256: str
-    initial_validation_inputs_commit_receipt_sha256: str
-    initial_validation_inputs_committed_at_ms: int
+    training_state_receipt_sha256: str
+    four_fold_fit_authority_receipt_sha256: str
     git_commit: str
     git_tree: str
     source_worktree_clean: bool
@@ -329,6 +505,16 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     required_v5_native_implementation_paths: tuple[str, ...]
     missing_v5_native_implementation_paths: tuple[str, ...]
     v5_native_vertical_complete: bool
+    vertical_qualification_specification_sha256: str
+    vertical_qualification_test_paths: tuple[str, ...]
+    missing_vertical_qualification_test_paths: tuple[str, ...]
+    vertical_qualification_test_inventory: tuple[tuple[str, str], ...]
+    vertical_qualification_test_inventory_sha256: str
+    vertical_qualification_command: tuple[str, ...]
+    vertical_qualification_exit_code: int | None
+    vertical_qualification_normalized_output_sha256: str
+    vertical_qualification_passed: bool
+    vertical_qualification_receipt_sha256: str
     python_version: str
     python_implementation: str
     pytorch_version: str
@@ -366,8 +552,8 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     _runtime_manifest_registration: (
         MassiveAdaptiveRLManifestV5RegistrationAuthorityV1 | None
     ) = field(default=None, compare=False, repr=False)
-    _runtime_initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1 | None = (
-        field(default=None, compare=False, repr=False)
+    _runtime_training_lineage: tuple[str, str] | None = field(
+        default=None, compare=False, repr=False
     )
     _loaded_source: LoadedMassiveSourceObject | None = field(
         default=None, compare=False, repr=False
@@ -419,6 +605,9 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
                 "tracked_source_inventory_sha256": self.tracked_source_inventory_sha256,
                 "dependency_lock_sha256": self.dependency_lock_sha256,
                 "implementation_inventory_sha256": self.implementation_inventory_sha256,
+                "vertical_qualification_receipt_sha256": (
+                    self.vertical_qualification_receipt_sha256
+                ),
                 "python_version": self.python_version,
                 "python_implementation": self.python_implementation,
                 "pytorch_version": self.pytorch_version,
@@ -450,7 +639,7 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
         runtime_roots = (
             self._runtime_manifest,
             self._runtime_manifest_registration,
-            self._runtime_initial_inputs,
+            self._runtime_training_lineage,
         )
         runtime_present = all(value is not None for value in runtime_roots)
         if any(value is not None for value in runtime_roots) != runtime_present:
@@ -466,6 +655,9 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             and not self.source_worktree_status
             and self.v5_native_vertical_complete
             and not self.missing_v5_native_implementation_paths
+            and self.vertical_qualification_passed
+            and not self.missing_vertical_qualification_test_paths
+            and self.vertical_qualification_exit_code == 0
             and self.execution_device_specification == "cpu"
             and self.parameter_dtype == "torch.float32"
             and self.observation_dtype == "torch.float32"
@@ -504,6 +696,48 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             )
             or self.v5_native_vertical_complete
             != (not self.missing_v5_native_implementation_paths)
+            or self.vertical_qualification_specification_sha256
+            != MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256
+            or self.vertical_qualification_test_paths
+            != _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS
+            or self.missing_vertical_qualification_test_paths
+            != tuple(
+                name
+                for name in self.vertical_qualification_test_paths
+                if name
+                not in {row[0] for row in self.vertical_qualification_test_inventory}
+            )
+            or tuple(row[0] for row in self.vertical_qualification_test_inventory)
+            != tuple(
+                name
+                for name in self.vertical_qualification_test_paths
+                if name not in self.missing_vertical_qualification_test_paths
+            )
+            or self.vertical_qualification_test_inventory_sha256
+            != semantic_sha256(self.vertical_qualification_test_inventory)
+            or self.vertical_qualification_command
+            != (
+                "python",
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                *self.vertical_qualification_test_paths,
+            )
+            or self.vertical_qualification_passed
+            != (
+                self.v5_native_vertical_complete
+                and not self.missing_vertical_qualification_test_paths
+                and self.vertical_qualification_exit_code == 0
+            )
+            or self.vertical_qualification_receipt_sha256
+            != _vertical_qualification_receipt(self.semantic_unsigned())
+            or self.vertical_qualification_exit_code is not None
+            and (
+                isinstance(self.vertical_qualification_exit_code, bool)
+                or self.vertical_qualification_exit_code < 0
+            )
             or tuple(row[0] for row in self.implementation_inventory)
             != _IMPLEMENTATION_RELATIVE_PATHS
             + tuple(
@@ -525,9 +759,6 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             )
             or isinstance(self.manifest_v5_registration_committed_at_ms, bool)
             or self.manifest_v5_registration_committed_at_ms < 0
-            or isinstance(self.initial_validation_inputs_committed_at_ms, bool)
-            or self.initial_validation_inputs_committed_at_ms
-            <= self.manifest_v5_registration_committed_at_ms
             or isinstance(self.torch_cpu_threads, bool)
             or self.torch_cpu_threads <= 0
             or isinstance(self.torch_interop_threads, bool)
@@ -538,14 +769,12 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
             or self.live_trading_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
                 "execution implementation registration differs"
@@ -558,24 +787,24 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             or self._loaded_source.receipt.entitlement_receipt_sha256
             != self.semantic_receipt_sha256
             or self._loaded_source.commit.committed_at_ms
-            <= self.initial_validation_inputs_committed_at_ms
+            <= self.manifest_v5_registration_committed_at_ms
         ):
             raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
                 "execution implementation source transaction differs"
             )
         if runtime_present:
-            manifest = cast(MassiveAdaptiveRLExperimentManifestV5, self._runtime_manifest)
+            manifest = cast(
+                MassiveAdaptiveRLExperimentManifestV5, self._runtime_manifest
+            )
             registration = cast(
                 MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
                 self._runtime_manifest_registration,
             )
-            initial = cast(
-                MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-                self._runtime_initial_inputs,
-            )
             manifest.validate()
             registration.validate()
-            initial.validate()
+            training_state_receipt, fit_receipt = cast(
+                tuple[str, str], self._runtime_training_lineage
+            )
             if (
                 manifest.semantic_receipt_sha256 != self.manifest_v5_receipt_sha256
                 or registration.semantic_receipt_sha256
@@ -587,15 +816,8 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
                 or registration.source_transaction_committed_at_ms
                 != self.manifest_v5_registration_committed_at_ms
                 or not registration.development_protocol_registered
-                or initial.semantic_receipt_sha256
-                != self.initial_validation_inputs_authority_receipt_sha256
-                or initial.source_receipt_sha256
-                != self.initial_validation_inputs_source_receipt_sha256
-                or initial.source_transaction_receipt_sha256
-                != self.initial_validation_inputs_commit_receipt_sha256
-                or initial.source_transaction_committed_at_ms
-                != self.initial_validation_inputs_committed_at_ms
-                or not initial.development_stage_authorized
+                or training_state_receipt != self.training_state_receipt_sha256
+                or fit_receipt != self.four_fold_fit_authority_receipt_sha256
             ):
                 raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
                     "execution implementation runtime lineage differs"
@@ -609,25 +831,27 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
                     "execution implementation source name is absent"
                 )
             _digest("execution implementation source", value)
+        for name, value in self.vertical_qualification_test_inventory:
+            if not name:
+                raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                    "V5 vertical qualification test name is absent"
+                )
+            _digest("V5 vertical qualification test", value)
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
 def _capture_body(
     *,
+    root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
-    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
 ) -> dict[str, object]:
     manifest.validate()
     manifest_registration.validate()
-    initial_inputs.validate()
     if (
         not manifest_registration.development_protocol_registered
-        or not initial_inputs.development_stage_authorized
         or manifest_registration.manifest_v5_receipt_sha256
         != manifest.semantic_receipt_sha256
-        or initial_inputs.manifest_v4_receipt_sha256
-        != manifest.base_manifest.semantic_receipt_sha256
     ):
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "execution implementation registration roots differ"
@@ -635,23 +859,20 @@ def _capture_body(
     registration_source = manifest_registration.source_receipt_sha256
     registration_commit = manifest_registration.source_transaction_receipt_sha256
     registration_time = manifest_registration.source_transaction_committed_at_ms
-    initial_source = initial_inputs.source_receipt_sha256
-    initial_commit = initial_inputs.source_transaction_receipt_sha256
-    initial_time = initial_inputs.source_transaction_committed_at_ms
     if any(
         value is None
         for value in (
             registration_source,
             registration_commit,
             registration_time,
-            initial_source,
-            initial_commit,
-            initial_time,
         )
     ):
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "execution implementation registration source lineage is absent"
         )
+    training_state_receipt, four_fold_fit_receipt = _training_lineage_v1(
+        root=root, manifest=manifest
+    )
     repository = _repository_root()
     tracked_names = tuple(
         name
@@ -673,10 +894,15 @@ def _capture_body(
         repository,
         _IMPLEMENTATION_RELATIVE_PATHS + present_v5_native,
     )
+    qualification = _vertical_qualification(
+        repository_root=repository,
+        v5_native_vertical_complete=not missing_v5_native,
+    )
     status = tuple(
         row
-        for row in _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
-        .splitlines()
+        for row in _git(
+            repository, "status", "--porcelain=v1", "--untracked-files=all"
+        ).splitlines()
         if row
     )
     lock_path = repository / "uv.lock"
@@ -691,6 +917,7 @@ def _capture_body(
     source_qualified = bool(
         not status
         and not missing_v5_native
+        and bool(qualification["vertical_qualification_passed"])
         and torch.are_deterministic_algorithms_enabled()
         and not torch.is_deterministic_algorithms_warn_only_enabled()
         and not torch.backends.cuda.matmul.allow_tf32
@@ -719,12 +946,8 @@ def _capture_body(
             str, registration_commit
         ),
         "manifest_v5_registration_committed_at_ms": cast(int, registration_time),
-        "initial_validation_inputs_authority_receipt_sha256": (
-            initial_inputs.semantic_receipt_sha256
-        ),
-        "initial_validation_inputs_source_receipt_sha256": cast(str, initial_source),
-        "initial_validation_inputs_commit_receipt_sha256": cast(str, initial_commit),
-        "initial_validation_inputs_committed_at_ms": cast(int, initial_time),
+        "training_state_receipt_sha256": training_state_receipt,
+        "four_fold_fit_authority_receipt_sha256": four_fold_fit_receipt,
         "git_commit": _git(repository, "rev-parse", "HEAD"),
         "git_tree": _git(repository, "rev-parse", "HEAD^{tree}"),
         "source_worktree_clean": not status,
@@ -738,6 +961,7 @@ def _capture_body(
         ),
         "missing_v5_native_implementation_paths": missing_v5_native,
         "v5_native_vertical_complete": not missing_v5_native,
+        **qualification,
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
         "pytorch_version": torch.__version__,
@@ -771,14 +995,18 @@ def _capture_body(
 
 def capture_massive_adaptive_rl_execution_implementation_registration_v1(
     *,
+    root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
-    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
 ) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     body = _capture_body(
+        root=root,
         manifest=manifest,
         manifest_registration=manifest_registration,
-        initial_inputs=initial_inputs,
+    )
+    training_lineage = (
+        cast(str, body["training_state_receipt_sha256"]),
+        cast(str, body["four_fold_fit_authority_receipt_sha256"]),
     )
     result = MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1(
         **body,  # type: ignore[arg-type]
@@ -786,7 +1014,7 @@ def capture_massive_adaptive_rl_execution_implementation_registration_v1(
         runtime_implementation_replayed=True,
         _runtime_manifest=manifest,
         _runtime_manifest_registration=manifest_registration,
-        _runtime_initial_inputs=initial_inputs,
+        _runtime_training_lineage=training_lineage,
     )
     result.validate()
     return result
@@ -840,6 +1068,9 @@ def _parse(
     for name in (
         "required_v5_native_implementation_paths",
         "missing_v5_native_implementation_paths",
+        "vertical_qualification_test_paths",
+        "missing_vertical_qualification_test_paths",
+        "vertical_qualification_command",
     ):
         value = body.get(name)
         if not isinstance(value, list) or not all(
@@ -849,7 +1080,11 @@ def _parse(
                 f"execution {name.replace('_', ' ')} differs"
             )
         body[name] = tuple(value)
-    for name in ("implementation_inventory", "process_thread_environment"):
+    for name in (
+        "implementation_inventory",
+        "vertical_qualification_test_inventory",
+        "process_thread_environment",
+    ):
         body[name] = _tuple_rows(body.get(name), name=name.replace("_", " "))
     try:
         result = MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1(
@@ -888,10 +1123,10 @@ def load_massive_adaptive_rl_execution_implementation_registration_v1(
 
 def authorize_massive_adaptive_rl_execution_implementation_registration_v1(
     *,
+    root: str | Path,
     authority: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
-    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
 ) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     authority.validate()
     if not authority.source_transaction_verified:
@@ -899,9 +1134,9 @@ def authorize_massive_adaptive_rl_execution_implementation_registration_v1(
             "execution implementation registration is not persisted"
         )
     active = capture_massive_adaptive_rl_execution_implementation_registration_v1(
+        root=root,
         manifest=manifest,
         manifest_registration=manifest_registration,
-        initial_inputs=initial_inputs,
     )
     if active.semantic_unsigned() != authority.semantic_unsigned():
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
@@ -912,7 +1147,10 @@ def authorize_massive_adaptive_rl_execution_implementation_registration_v1(
         runtime_implementation_replayed=True,
         _runtime_manifest=manifest,
         _runtime_manifest_registration=manifest_registration,
-        _runtime_initial_inputs=initial_inputs,
+        _runtime_training_lineage=(
+            authority.training_state_receipt_sha256,
+            authority.four_fold_fit_authority_receipt_sha256,
+        ),
     )
     result.validate()
     return result
@@ -923,7 +1161,6 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
-    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
     allow_materialize: bool,
 ) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     relative = execution_implementation_registration_relative_path_v1(
@@ -937,6 +1174,7 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
     verified_at_ms = _wall_clock_ms()
     if complete:
         return authorize_massive_adaptive_rl_execution_implementation_registration_v1(
+            root=root,
             authority=load_massive_adaptive_rl_execution_implementation_registration_v1(
                 root=root,
                 experiment_id=manifest.experiment_id,
@@ -944,7 +1182,6 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
             ),
             manifest=manifest,
             manifest_registration=manifest_registration,
-            initial_inputs=initial_inputs,
         )
     if not allow_materialize:
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
@@ -955,23 +1192,21 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
         manifest=manifest,
     ):
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
-            "execution implementation must precede every validation outcome"
+            "execution implementation must precede every validation input"
         )
     captured = capture_massive_adaptive_rl_execution_implementation_registration_v1(
+        root=root,
         manifest=manifest,
         manifest_registration=manifest_registration,
-        initial_inputs=initial_inputs,
     )
     if not captured.source_data_qualified:
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "active execution implementation is not scientifically qualified"
         )
-    initial_time = initial_inputs.source_transaction_committed_at_ms
-    if initial_time is None:
-        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
-            "initial validation-input chronology is absent"
-        )
-    committed_at_ms = max(verified_at_ms, initial_time + 1)
+    committed_at_ms = max(
+        verified_at_ms,
+        captured.manifest_v5_registration_committed_at_ms + 1,
+    )
     capability = (
         issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1(
             root=root,
@@ -1002,6 +1237,7 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
             ),
         )
     return authorize_massive_adaptive_rl_execution_implementation_registration_v1(
+        root=root,
         authority=load_massive_adaptive_rl_execution_implementation_registration_v1(
             root=root,
             experiment_id=manifest.experiment_id,
@@ -1009,7 +1245,6 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
         ),
         manifest=manifest,
         manifest_registration=manifest_registration,
-        initial_inputs=initial_inputs,
     )
 
 
@@ -1018,7 +1253,6 @@ def run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
-    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
     allow_materialize: bool = True,
 ) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     """Freeze or replay the exact executable implementation under the global lock."""
@@ -1032,7 +1266,6 @@ def run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
             root=root,
             manifest=manifest,
             manifest_registration=manifest_registration,
-            initial_inputs=initial_inputs,
             allow_materialize=False,
         )
     try:
@@ -1044,7 +1277,6 @@ def run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
                 root=root,
                 manifest=manifest,
                 manifest_registration=manifest_registration,
-                initial_inputs=initial_inputs,
                 allow_materialize=True,
             )
     except MassiveAdaptiveRLExperimentLockV1Unavailable as error:

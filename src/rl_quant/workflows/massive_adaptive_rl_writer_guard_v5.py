@@ -200,9 +200,7 @@ def _issue_manifest_v5_writer_capability_v1(
         experiment_id=_identifier(experiment_id),
         manifest_v5_receipt_sha256=manifest_v5_receipt_sha256,
         base_manifest_v4_receipt_sha256=base_manifest_v4_receipt_sha256,
-        registration_authority_receipt_sha256=(
-            registration_authority_receipt_sha256
-        ),
+        registration_authority_receipt_sha256=(registration_authority_receipt_sha256),
         registration_source_receipt_sha256=registration_source_receipt_sha256,
         registration_commit_receipt_sha256=registration_commit_receipt_sha256,
         writer_role=writer_role,
@@ -248,8 +246,7 @@ def _validate_manifest_v5_writer_capability_v1(
             )
         )
         or capability.writer_role != writer_role
-        or capability.base_manifest_v4_receipt_sha256
-        != manifest_v4_receipt_sha256
+        or capability.base_manifest_v4_receipt_sha256 != manifest_v4_receipt_sha256
         or not capability.allowed_fold_indices
         or len(set(capability.allowed_fold_indices))
         != len(capability.allowed_fold_indices)
@@ -283,7 +280,9 @@ def _validate_capability_against_persisted_registration_v1(
     )
 
     registration_root = Path(capability._registration_root_resolved)
-    publication_roots = tuple(Path(value) for value in capability._publication_roots_resolved)
+    publication_roots = tuple(
+        Path(value) for value in capability._publication_roots_resolved
+    )
     expected_folds = _WRITER_ROLE_FOLD_INVENTORIES.get(capability.writer_role)
     if (
         capability._seal is not _CAPABILITY_SEAL
@@ -309,8 +308,7 @@ def _validate_capability_against_persisted_registration_v1(
         != capability._publication_roots_resolved
         or registration_root not in publication_roots
         or any(
-            not path.is_dir()
-            or str(path.resolve(strict=True)) != raw
+            not path.is_dir() or str(path.resolve(strict=True)) != raw
             for path, raw in zip(
                 publication_roots,
                 capability._publication_roots_resolved,
@@ -338,8 +336,7 @@ def _validate_capability_against_persisted_registration_v1(
         ) from error
     if (
         authority.experiment_id != capability.experiment_id
-        or authority.manifest_v5_receipt_sha256
-        != capability.manifest_v5_receipt_sha256
+        or authority.manifest_v5_receipt_sha256 != capability.manifest_v5_receipt_sha256
         or authority.base_manifest_v4_receipt_sha256
         != capability.base_manifest_v4_receipt_sha256
         or authority.semantic_receipt_sha256
@@ -456,7 +453,16 @@ def authorize_massive_adaptive_rl_source_publication_v5(
             and len(parts) >= 3
             and parts[2] == "state-v2"
         )
-        if not execution_registration and not training_state:
+        initial_validation_release = bool(
+            active.writer_role == "initial-validation-inputs"
+            and relative_payload_path
+            == (
+                f"adaptive-rl/{active.experiment_id}/validation-release-v1/initial.json"
+            )
+        )
+        if not any(
+            (execution_registration, training_state, initial_validation_release)
+        ):
             raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
                 "Manifest V5 capability does not authorize this scoped source path"
             )
@@ -470,9 +476,7 @@ def authorize_massive_adaptive_rl_source_publication_v5(
             root=root
         )
         return
-    _authorize_active_capability_for_publication_root_v1(
-        root=root, capability=active
-    )
+    _authorize_active_capability_for_publication_root_v1(root=root, capability=active)
     directory = parts[1] if len(parts) >= 2 else ""
     if parts[0] == "adaptive-rl":
         allowed = (
@@ -541,9 +545,7 @@ def manifest_v5_compatibility_writer_guard_v1(
                     "guarded adaptive RL writer requires keyword-only roots"
                 )
             experiment_id = _identifier(getattr(manifest, "experiment_id", None))
-            manifest_receipt_value = getattr(
-                manifest, "semantic_receipt_sha256", None
-            )
+            manifest_receipt_value = getattr(manifest, "semantic_receipt_sha256", None)
             if not _digest(manifest_receipt_value):
                 raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
                     "guarded adaptive RL writer manifest receipt differs"

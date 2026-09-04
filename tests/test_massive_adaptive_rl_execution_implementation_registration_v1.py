@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TypeVar
-
 import pytest
 
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
-    MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+    initial_validation_inputs_authority_relative_path_v1,
 )
 from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.workflows import (
@@ -19,6 +17,7 @@ from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registratio
     run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
+    MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256,
     build_massive_adaptive_rl_experiment_manifest_v5,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
@@ -26,74 +25,29 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 )
 
 
-_T = TypeVar("_T")
-
-
 def _digest(value: object) -> str:
     return semantic_sha256(value)
 
 
-def _typed_shell(authority_type: type[_T], /, **values: object) -> _T:
-    result = object.__new__(authority_type)
-    for name, value in values.items():
-        object.__setattr__(result, name, value)
-    return result
-
-
-def _initial_inputs_shell(
-    *,
-    manifest_v4_receipt_sha256: str,
-    committed_at_ms: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
-    initial = _typed_shell(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        semantic_receipt_sha256=_digest("initial-inputs"),
-        manifest_v4_receipt_sha256=manifest_v4_receipt_sha256,
-    )
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "validate",
-        lambda _: None,
-    )
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "development_stage_authorized",
-        property(lambda _: True),
-    )
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "source_receipt_sha256",
-        property(lambda _: _digest("initial-source")),
-    )
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "source_transaction_receipt_sha256",
-        property(lambda _: _digest("initial-commit")),
-    )
-    monkeypatch.setattr(
-        MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
-        "source_transaction_committed_at_ms",
-        property(lambda _: committed_at_ms),
-    )
-    return initial
-
-
 def _qualified_capture_body(
     *,
+    root: Path,
     manifest,
     registration,
-    initial_inputs,
 ) -> dict[str, object]:
     body = implementation._capture_body(
+        root=root,
         manifest=manifest,
         manifest_registration=registration,
-        initial_inputs=initial_inputs,
     )
-    required = body["required_v5_native_implementation_paths"]
-    assert isinstance(required, tuple)
+    missing = body["missing_v5_native_implementation_paths"]
+    assert isinstance(missing, tuple)
     implementation_inventory = tuple(body["implementation_inventory"]) + tuple(
-        (name, _digest(("v5-native", name))) for name in required
+        (name, _digest(("v5-native", name))) for name in missing
+    )
+    test_inventory = tuple(
+        (name, _digest(("vertical-test", name)))
+        for name in body["vertical_qualification_test_paths"]
     )
     body.update(
         {
@@ -120,8 +74,21 @@ def _qualified_capture_body(
             ),
             "missing_v5_native_implementation_paths": (),
             "v5_native_vertical_complete": True,
+            "vertical_qualification_test_inventory": test_inventory,
+            "vertical_qualification_test_inventory_sha256": semantic_sha256(
+                test_inventory
+            ),
+            "missing_vertical_qualification_test_paths": (),
+            "vertical_qualification_exit_code": 0,
+            "vertical_qualification_normalized_output_sha256": _digest(
+                "vertical-qualification-normalized-output"
+            ),
+            "vertical_qualification_passed": True,
             "source_data_qualified": True,
         }
+    )
+    body["vertical_qualification_receipt_sha256"] = (
+        implementation._vertical_qualification_receipt(body)
     )
     return body
 
@@ -139,15 +106,14 @@ def test_execution_registration_is_separate_create_only_and_replay_bound(
     )
     registration_time = registration.source_transaction_committed_at_ms
     assert registration_time is not None
-    initial = _initial_inputs_shell(
-        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
-        committed_at_ms=registration_time + 1,
-        monkeypatch=monkeypatch,
+    training_lineage = (_digest("training-state"), _digest("four-fold-fit"))
+    monkeypatch.setattr(
+        implementation, "_training_lineage_v1", lambda **_: training_lineage
     )
     body = _qualified_capture_body(
+        root=tmp_path,
         manifest=manifest,
         registration=registration,
-        initial_inputs=initial,
     )
     monkeypatch.setattr(implementation, "_capture_body", lambda **_: dict(body))
 
@@ -156,20 +122,21 @@ def test_execution_registration_is_separate_create_only_and_replay_bound(
             root=tmp_path,
             manifest=manifest,
             manifest_registration=registration,
-            initial_inputs=initial,
         )
     )
     assert authority.development_execution_registered
     assert authority.manifest_v5_registration_committed_at_ms == registration_time
+    assert authority.training_state_receipt_sha256 == training_lineage[0]
+    assert authority.four_fold_fit_authority_receipt_sha256 == training_lineage[1]
     assert (
-        authority.initial_validation_inputs_committed_at_ms
-        == registration_time + 1
+        authority.vertical_qualification_specification_sha256
+        == MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256
+    )
+    assert authority.vertical_qualification_receipt_sha256 == (
+        implementation._vertical_qualification_receipt(authority.semantic_unsigned())
     )
     assert authority.source_transaction_committed_at_ms is not None
-    assert (
-        authority.source_transaction_committed_at_ms
-        > authority.initial_validation_inputs_committed_at_ms
-    )
+    assert authority.source_transaction_committed_at_ms > registration_time
     assert not authority.outer_access_authorized
     assert not authority.profitability_reporting_authorized
 
@@ -187,7 +154,6 @@ def test_execution_registration_is_separate_create_only_and_replay_bound(
             root=tmp_path,
             manifest=manifest,
             manifest_registration=registration,
-            initial_inputs=initial,
             allow_materialize=False,
         )
     )
@@ -208,15 +174,15 @@ def test_execution_registration_rejects_untracked_source_and_late_outcomes(
     )
     registration_time = registration.source_transaction_committed_at_ms
     assert registration_time is not None
-    initial = _initial_inputs_shell(
-        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
-        committed_at_ms=registration_time + 1,
-        monkeypatch=monkeypatch,
+    monkeypatch.setattr(
+        implementation,
+        "_training_lineage_v1",
+        lambda **_: (_digest("training-state"), _digest("four-fold-fit")),
     )
     body = _qualified_capture_body(
+        root=tmp_path,
         manifest=manifest,
         registration=registration,
-        initial_inputs=initial,
     )
     body.update(
         {
@@ -234,15 +200,9 @@ def test_execution_registration_rejects_untracked_source_and_late_outcomes(
             root=tmp_path,
             manifest=manifest,
             manifest_registration=registration,
-            initial_inputs=initial,
         )
 
-    late = (
-        tmp_path
-        / "adaptive-rl"
-        / manifest.experiment_id
-        / "validation-outcome-v3"
-    )
+    late = tmp_path / "adaptive-rl" / manifest.experiment_id / "validation-outcome-v3"
     late.mkdir(parents=True)
     body.update(
         {
@@ -253,19 +213,19 @@ def test_execution_registration_rejects_untracked_source_and_late_outcomes(
     )
     with pytest.raises(
         MassiveAdaptiveRLExecutionImplementationRegistrationV1Error,
-        match="must precede every validation outcome",
+        match="must precede every validation input",
     ):
         run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
             root=tmp_path,
             manifest=manifest,
             manifest_registration=registration,
-            initial_inputs=initial,
         )
 
 
 @pytest.mark.parametrize(
     "relative",
     (
+        "adaptive-rl/{experiment}/validation-release-v1",
         "adaptive-rl/{experiment}/frozen-fc06-v2",
         "adaptive-rl/{experiment}/outer-access-commitment-v2",
         "adaptive-rl/{experiment}/prequential-state-v1",
@@ -290,6 +250,24 @@ def test_execution_registration_scan_covers_future_and_legacy_evidence(
     assert str(path.relative_to(tmp_path)) in found
 
 
+def test_execution_registration_scan_rejects_initial_validation_input(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="execution-registration-initial-input-scan"
+    )
+    relative = initial_validation_inputs_authority_relative_path_v1(
+        manifest=manifest.base_manifest
+    )
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.touch()
+    assert relative in massive_adaptive_rl_preimplementation_economic_evidence_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+
+
 def test_execution_registration_requires_complete_v5_native_vertical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -303,16 +281,62 @@ def test_execution_registration_requires_complete_v5_native_vertical(
     )
     registration_time = registration.source_transaction_committed_at_ms
     assert registration_time is not None
-    initial = _initial_inputs_shell(
-        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
-        committed_at_ms=registration_time + 1,
-        monkeypatch=monkeypatch,
+    monkeypatch.setattr(
+        implementation,
+        "_training_lineage_v1",
+        lambda **_: (_digest("training-state"), _digest("four-fold-fit")),
     )
     body = implementation._capture_body(
+        root=tmp_path,
         manifest=manifest,
         manifest_registration=registration,
-        initial_inputs=initial,
     )
     assert body["missing_v5_native_implementation_paths"]
     assert body["v5_native_vertical_complete"] is False
+    assert body["missing_vertical_qualification_test_paths"]
+    assert body["vertical_qualification_exit_code"] is None
+    assert body["vertical_qualification_passed"] is False
+    assert body["vertical_qualification_receipt_sha256"] == (
+        implementation._vertical_qualification_receipt(body)
+    )
     assert body["source_data_qualified"] is False
+
+
+def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_path = tmp_path / "tests" / "test_massive_adaptive_rl_v5_vertical.py"
+    test_path.parent.mkdir()
+    test_path.write_text("def test_vertical():\n    assert True\n", encoding="utf-8")
+    outputs = iter((b"1 passed in 0.11s\n", b"1 passed in 9.87s\n"))
+
+    def completed(command, **kwargs):
+        assert command[-3:-1] == ("-p", "no:cacheprovider")
+        assert kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+        return implementation.subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout=next(outputs),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(implementation.subprocess, "run", completed)
+    first = implementation._vertical_qualification(
+        repository_root=tmp_path,
+        v5_native_vertical_complete=True,
+    )
+    second = implementation._vertical_qualification(
+        repository_root=tmp_path,
+        v5_native_vertical_complete=True,
+    )
+
+    assert first["vertical_qualification_passed"] is True
+    assert (
+        first["vertical_qualification_normalized_output_sha256"]
+        == second["vertical_qualification_normalized_output_sha256"]
+    )
+    assert (
+        first["vertical_qualification_receipt_sha256"]
+        == second["vertical_qualification_receipt_sha256"]
+    )

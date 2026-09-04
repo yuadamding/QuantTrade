@@ -798,9 +798,7 @@ def _validate_command(args: argparse.Namespace) -> int:
 
         manifest_v4 = load_massive_adaptive_rl_experiment_manifest_v4(args.manifest)
         receipt = manifest_v4.semantic_receipt_sha256
-    elif schema == (
-        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
-    ):
+    elif schema == ("rl-quant.massive-adaptive-rl-experiment-manifest-v3"):
         from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
             load_massive_adaptive_rl_experiment_manifest_v3,
         )
@@ -811,6 +809,55 @@ def _validate_command(args: argparse.Namespace) -> int:
         manifest_v2 = load_massive_adaptive_rl_experiment_manifest_v2(args.manifest)
         receipt = manifest_v2.semantic_receipt_sha256
     print(receipt)
+    return 0
+
+
+def _register_implementation_command(args: argparse.Namespace) -> int:
+    """Freeze the exact V5 evaluator before any validation input is opened."""
+
+    from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1,
+    )
+    from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
+        load_massive_adaptive_rl_experiment_manifest_v5,
+    )
+    from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
+        run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1,
+    )
+
+    manifest = load_massive_adaptive_rl_experiment_manifest_v5(args.manifest)
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=args.artifact_root,
+        manifest=manifest,
+        allow_materialize=False,
+    )
+    authority = (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+            root=args.artifact_root,
+            manifest=manifest,
+            manifest_registration=registration,
+            allow_materialize=True,
+        )
+    )
+    output = {
+        **authority.semantic_unsigned(),
+        "semantic_receipt_sha256": authority.semantic_receipt_sha256,
+        "source_receipt_sha256": authority.source_receipt_sha256,
+        "source_transaction_receipt_sha256": (
+            authority.source_transaction_receipt_sha256
+        ),
+        "source_transaction_committed_at_ms": (
+            authority.source_transaction_committed_at_ms
+        ),
+        "scientific_execution_fingerprint_sha256": (
+            authority.scientific_execution_fingerprint_sha256
+        ),
+        "runtime_implementation_replayed": authority.runtime_implementation_replayed,
+        "development_execution_registered": (
+            authority.development_execution_registered
+        ),
+    }
+    print(canonical_json_file_bytes(output).decode("utf-8"), end="")
     return 0
 
 
@@ -840,9 +887,7 @@ def _run_command(args: argparse.Namespace) -> int:
         raise MassiveAdaptiveRLWorkflowV2Error(
             "Manifest V4 execution requires the package-owned validation backend"
         )
-    if schema == (
-        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
-    ):
+    if schema == ("rl-quant.massive-adaptive-rl-experiment-manifest-v3"):
         from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
             run_massive_adaptive_rl_experiment_v2,
         )
@@ -891,9 +936,7 @@ def _verify_run_command(args: argparse.Namespace) -> int:
         raise MassiveAdaptiveRLWorkflowV2Error(
             "Manifest V4 verification requires the package-owned validation backend"
         )
-    if schema == (
-        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
-    ):
+    if schema == ("rl-quant.massive-adaptive-rl-experiment-manifest-v3"):
         from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
             verify_massive_adaptive_rl_experiment_v2,
         )
@@ -929,9 +972,7 @@ def _verify_ledger_command(args: argparse.Namespace) -> int:
         raise MassiveAdaptiveRLWorkflowV2Error(
             "Manifest V4 ledger verification requires the V4 state runner"
         )
-    if schema != (
-        "rl-quant.massive-adaptive-rl-experiment-manifest-v3"
-    ):
+    if schema != ("rl-quant.massive-adaptive-rl-experiment-manifest-v3"):
         raise MassiveAdaptiveRLWorkflowV2Error(
             "ledger-only verification requires Manifest V3"
         )
@@ -998,6 +1039,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--manifest", required=True)
     validate.set_defaults(handler=_validate_command)
+    register_implementation = commands.add_parser(
+        "register-implementation",
+        help="Freeze a qualified Manifest-V5 evaluator before validation access.",
+    )
+    register_implementation.add_argument("--manifest", required=True)
+    register_implementation.add_argument("--artifact-root", required=True)
+    register_implementation.set_defaults(handler=_register_implementation_command)
     for name, resume in (("run", False), ("resume", True)):
         command = commands.add_parser(
             name,
