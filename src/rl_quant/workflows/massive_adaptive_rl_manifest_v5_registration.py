@@ -38,6 +38,19 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1,
     MassiveAdaptiveRLExperimentManifestV5,
 )
+from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
+    MassiveAdaptiveRLExperimentLockV1Error,
+    MassiveAdaptiveRLExperimentLockV1Unavailable,
+    massive_adaptive_rl_artifact_root_writer_lock_v1,
+    massive_adaptive_rl_experiment_orchestration_lock_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    MassiveAdaptiveRLManifestV5WriterCapabilityV1,
+    MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+    _issue_manifest_v5_writer_capability_v1,
+    manifest_v5_registration_relative_path_v1,
+    reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration,
+)
 
 
 MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_DATASET = (
@@ -56,12 +69,6 @@ MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SCHEMA_SHA256 = (
 
 class MassiveAdaptiveRLManifestV5RegistrationError(ValueError):
     """Manifest V5 cannot be adopted or replayed exactly."""
-
-
-class MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
-    MassiveAdaptiveRLManifestV5RegistrationError
-):
-    """A legacy writer attempted to mutate a V5-owned experiment."""
 
 
 def _digest(name: str, value: object) -> str:
@@ -95,14 +102,6 @@ def _wall_clock_ms() -> int:
             "adaptive RL registration clock differs"
         )
     return value
-
-
-def manifest_v5_registration_relative_path_v1(*, experiment_id: str) -> str:
-    return (
-        "adaptive-rl/"
-        f"{_identifier(experiment_id)}/"
-        "manifest-v5-registration-v1/registration.json"
-    )
 
 
 def _transaction_state(*, root: str | Path, relative: str) -> tuple[bool, bool]:
@@ -399,7 +398,35 @@ def authorize_massive_adaptive_rl_manifest_v5_registration_authority_v1(
     return result
 
 
-def run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+def issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+    *, authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue the only compatibility capability available before outcomes."""
+
+    authority.validate()
+    source_receipt = authority.source_receipt_sha256
+    commit_receipt = authority.source_transaction_receipt_sha256
+    if (
+        not authority.development_protocol_registered
+        or source_receipt is None
+        or commit_receipt is None
+    ):
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "initial-input writer capability requires replayed V5 registration"
+        )
+    return _issue_manifest_v5_writer_capability_v1(
+        experiment_id=authority.experiment_id,
+        manifest_v5_receipt_sha256=authority.manifest_v5_receipt_sha256,
+        base_manifest_v4_receipt_sha256=authority.base_manifest_v4_receipt_sha256,
+        registration_authority_receipt_sha256=authority.semantic_receipt_sha256,
+        registration_source_receipt_sha256=source_receipt,
+        registration_commit_receipt_sha256=commit_receipt,
+        writer_role="initial-validation-inputs",
+        allowed_fold_indices=(0, 1),
+    )
+
+
+def _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked(
     *,
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
@@ -494,19 +521,47 @@ def run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
     )
 
 
-def reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration(
-    *, root: str | Path, experiment_id: str
-) -> None:
-    """Fail closed when any complete or partial V5 adoption marker exists."""
+def run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    allow_materialize: bool = True,
+) -> MassiveAdaptiveRLManifestV5RegistrationAuthorityV1:
+    """Adopt V5 under the experiment-global lock.
 
-    relative = manifest_v5_registration_relative_path_v1(
-        experiment_id=experiment_id
-    )
-    complete, partial = _transaction_state(root=root, relative=relative)
-    if complete or partial:
-        raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
-            "Manifest V5 owns this experiment; legacy materialization is prohibited"
+    The authoritative V5 root already owns this lock and therefore calls the
+    private unlocked implementation.  Direct materializing callers must pass
+    through this wrapper, closing the registration-versus-legacy-writer race.
+    Read-only replay does not create a lock path.
+    """
+
+    if not allow_materialize:
+        return _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked(
+            root=root,
+            manifest=manifest,
+            allow_materialize=False,
         )
+    try:
+        with massive_adaptive_rl_artifact_root_writer_lock_v1(
+            artifact_root=root
+        ):
+            with massive_adaptive_rl_experiment_orchestration_lock_v1(
+                artifact_root=root,
+                experiment_id=manifest.experiment_id,
+            ):
+                return _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked(
+                    root=root,
+                    manifest=manifest,
+                    allow_materialize=True,
+                )
+    except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "Manifest V5 registration is already owned"
+        ) from error
+    except MassiveAdaptiveRLExperimentLockV1Error as error:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "Manifest V5 registration lock is invalid"
+        ) from error
 
 
 __all__ = [
@@ -520,6 +575,8 @@ __all__ = [
     "MassiveAdaptiveRLManifestV5RegistrationError",
     "authorize_massive_adaptive_rl_manifest_v5_registration_authority_v1",
     "build_massive_adaptive_rl_manifest_v5_registration_authority_v1",
+    "issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1",
+    "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
     "load_massive_adaptive_rl_manifest_v5_registration_authority_v1",
     "manifest_v5_registration_relative_path_v1",
     "reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration",

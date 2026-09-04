@@ -23,6 +23,11 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_state_v1 import (
     load_massive_adaptive_rl_experiment_states_v1,
     register_massive_adaptive_rl_experiment_state_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
+    MassiveAdaptiveRLExperimentLockV1Error,
+    MassiveAdaptiveRLExperimentLockV1Unavailable,
+    massive_adaptive_rl_experiment_orchestration_lock_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
     MassiveAdaptiveRLSourceBundleV1,
     MassiveAdaptiveRLSourceBundleV1Error,
@@ -31,6 +36,10 @@ from rl_quant.workflows.massive_adaptive_rl_source_bundle_v1 import (
 from rl_quant.workflows.massive_adaptive_rl_v2 import (
     MassiveAdaptiveRLExperimentManifestV2,
     load_massive_adaptive_rl_experiment_manifest_v2,
+)
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+    reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration,
 )
 
 
@@ -196,7 +205,7 @@ def _load_or_register(
     return (registered,)
 
 
-def run_massive_adaptive_rl_experiment_v1(
+def _run_massive_adaptive_rl_experiment_v1_unlocked(
     *,
     manifest_path: str | Path,
     source_root: str | Path,
@@ -276,6 +285,48 @@ def run_massive_adaptive_rl_experiment_v1(
     raise MassiveAdaptiveRLExperimentRunnerV1Error(
         "typed source replay exists but the four-fold execution backend is not installed"
     )
+
+
+def run_massive_adaptive_rl_experiment_v1(
+    *,
+    manifest_path: str | Path,
+    source_root: str | Path,
+    artifact_root: str | Path,
+    device: object,
+    resume: bool = True,
+) -> MassiveAdaptiveRLEndToEndRunV1:
+    """Run V1 only while no complete or partial V5 registration exists."""
+
+    manifest = load_massive_adaptive_rl_experiment_manifest_v2(manifest_path)
+    try:
+        with massive_adaptive_rl_experiment_orchestration_lock_v1(
+            artifact_root=artifact_root,
+            experiment_id=manifest.experiment_id,
+        ):
+            try:
+                reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration(
+                    root=artifact_root,
+                    experiment_id=manifest.experiment_id,
+                )
+            except MassiveAdaptiveRLLegacyWriterRejectedByManifestV5 as error:
+                raise MassiveAdaptiveRLExperimentRunnerV1Error(
+                    "Manifest V5 owns this experiment; the V1 writer is disabled"
+                ) from error
+            return _run_massive_adaptive_rl_experiment_v1_unlocked(
+                manifest_path=manifest_path,
+                source_root=source_root,
+                artifact_root=artifact_root,
+                device=device,
+                resume=resume,
+            )
+    except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
+        raise MassiveAdaptiveRLExperimentRunnerV1Error(
+            "adaptive RL V1 execution is already owned"
+        ) from error
+    except MassiveAdaptiveRLExperimentLockV1Error as error:
+        raise MassiveAdaptiveRLExperimentRunnerV1Error(
+            "adaptive RL V1 experiment-global lock is invalid"
+        ) from error
 
 
 def verify_massive_adaptive_rl_experiment_v1(

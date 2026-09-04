@@ -58,6 +58,9 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v2 imp
     MassiveAdaptiveRLRuntimeSourcesV2,
     validate_massive_adaptive_rl_runtime_sources_v2_training_compatibility,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    legacy_manifest_v5_rejecting_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_INPUTS_AUTHORITY_V2_SCHEMA = (
@@ -1034,6 +1037,9 @@ def _four_fold_validation_inputs_v2_lease(
             os.close(descriptor)
 
 
+@legacy_manifest_v5_rejecting_writer_guard_v1(
+    materialize_parameter="allow_materialize"
+)
 def run_or_resume_massive_adaptive_rl_four_fold_validation_inputs_v2(
     *,
     root: str | Path,

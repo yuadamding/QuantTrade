@@ -5,7 +5,10 @@ all-four validation root and the causally correct prequential root.  V5 gives
 the prequential interpretation its own receipt.  It freezes the release
 edges, stage order, diagnostic continuation rule, and exact authority
 generations that future stages must implement.  Constructing this manifest
-opens no validation, outer, or lockbox outcome.
+opens no validation, outer, or lockbox outcome.  Physical code, dependency,
+and numerical-runtime identities are frozen separately immediately before the
+first validation outcome, so completing the preregistered writer does not
+silently change the scientific protocol receipt.
 """
 
 from __future__ import annotations
@@ -18,7 +21,6 @@ from typing import cast
 
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
     MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256,
-    MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_INPUTS_V1_SOURCE_SHA256,
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_PLAN_V1_SPEC_SHA256,
 )
 from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v1 import (
@@ -36,8 +38,9 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 )
 from rl_quant.training.massive_adaptive_ppo_v1 import MassiveAdaptivePPOConfigV1
 from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
-    MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SOURCE_SHA256,
+    MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256,
+    MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     MASSIVE_ADAPTIVE_RL_CANDIDATE_RANKING_SPECIFICATION_V1_SHA256,
@@ -49,7 +52,6 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     build_massive_adaptive_rl_experiment_manifest_v4,
 )
 from rl_quant.workflows.massive_adaptive_rl_validation_execution_environment_v1 import (
-    MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SHA256,
     MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256,
 )
 
@@ -60,6 +62,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SCHEMA = (
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SCHEMA = (
     "rl-quant.massive-adaptive-rl-manifest-v5-registration-v1"
+)
+MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-execution-implementation-registration-v1"
 )
 MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SHA256 = file_sha256(
     Path(__file__).with_name("massive_adaptive_rl_manifest_v5_registration.py")
@@ -83,6 +88,24 @@ MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256 = semantic_sha256(
         "outer_access": False,
         "profitability_reporting": False,
     }
+)
+MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256 = (
+    semantic_sha256(
+        {
+            "manifest": "exact-scientific-manifest-v5",
+            "manifest_registration": "exact-source-transaction-replayed",
+            "chronology": "after-initial-inputs-before-first-validation-outcome",
+            "source": "clean-git-commit-tree-and-complete-runtime-source-inventory",
+            "dependency_lock": "exact-physical-sha256",
+            "runtime": "python-pytorch-numpy-cpu-and-thread-attestation",
+            "implementation_inventory": "fixed-package-owned-relative-paths",
+            "publication": "create-only-source-transaction",
+            "generic_reload": "nonauthorizing",
+            "mutation_after_registration": "new-experiment-required",
+            "outer_access": False,
+            "profitability_reporting": False,
+        }
+    )
 )
 
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1 = (0, 1)
@@ -302,6 +325,7 @@ MASSIVE_ADAPTIVE_RL_PREQUENTIAL_EXPERIMENT_STATE_V1_SPEC_SHA256 = semantic_sha25
 )
 
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_AUTHORITY_GENERATIONS_V1 = (
+    MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA,
     MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_AUTHORITY_V1_SCHEMA,
     MASSIVE_ADAPTIVE_RL_VALIDATION_OUTCOME_AUTHORITY_V3_SCHEMA,
     MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_AUTHORITY_V3_SCHEMA,
@@ -322,18 +346,22 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256 = semantic_sha256(
         "registration": (
             MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
         ),
-        "registration_source": (
-            MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SHA256
+        "execution_implementation_registration": (
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
         ),
         "experiment_global_lock": MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256,
-        "initial_inputs": MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256,
-        "initial_boundary_predecessor_source": (
-            MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256
+        "artifact_root_writer_lock": (
+            MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
         ),
+        "direct_materialization_lock": (
+            MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
+        ),
+        "initial_inputs": MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256,
         "initial_folds": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1,
         "withheld_folds": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1,
         "legacy_writers_after_registration": "rejected",
-        "stop": "before-validation-outcomes-policy-freeze-and-outer-access",
+        "progression": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1,
+        "outcome_implementation": "must-match-execution-registration",
         "verification": "read-only",
     }
 )
@@ -355,21 +383,18 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256 = semantic_sha256(
         "authoritative_writer_specification": (
             MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
         ),
-        "authoritative_writer_source": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256
-        ),
-        "initial_boundary_predecessor_source": (
-            MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256
+        "execution_implementation_registration": (
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
         ),
         "manifest_registration": (
             MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
         ),
-        "manifest_registration_source": (
-            MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SHA256
-        ),
         "experiment_global_lock": MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256,
-        "experiment_global_lock_source": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SOURCE_SHA256
+        "artifact_root_writer_lock": (
+            MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
+        ),
+        "direct_materialization_lock": (
+            MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
         ),
         "validation_environment": (
             MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256
@@ -419,13 +444,11 @@ class MassiveAdaptiveRLExperimentManifestV5:
     base_manifest: MassiveAdaptiveRLExperimentManifestV4
     prequential_validation_plan_specification_sha256: str
     initial_validation_inputs_specification_sha256: str
-    initial_validation_inputs_implementation_source_sha256: str
     validation_execution_environment_specification_sha256: str
-    validation_execution_environment_implementation_source_sha256: str
     experiment_global_lock_specification_sha256: str
-    experiment_global_lock_implementation_source_sha256: str
+    artifact_root_writer_lock_specification_sha256: str
+    direct_materialization_lock_specification_sha256: str
     manifest_v5_registration_specification_sha256: str
-    manifest_v5_registration_implementation_source_sha256: str
     initial_validation_fold_indices: tuple[int, ...]
     withheld_validation_fold_indices: tuple[int, ...]
     validation_release_prerequisite_outer_fold_indices: tuple[int | None, ...]
@@ -450,8 +473,7 @@ class MassiveAdaptiveRLExperimentManifestV5:
     legacy_manifest_v4_materialization_authorized: bool
     authoritative_writer_generation: str
     authoritative_writer_specification_sha256: str
-    authoritative_writer_implementation_source_sha256: str
-    initial_boundary_predecessor_implementation_source_sha256: str
+    execution_implementation_registration_specification_sha256: str
     semantic_receipt_sha256: str
     validation_outcome_access_authorized: bool = False
     outer_access_authorized: bool = False
@@ -460,9 +482,6 @@ class MassiveAdaptiveRLExperimentManifestV5:
     live_trading_authorized: bool = False
     protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
     specification_sha256: str = MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256
-    implementation_source_sha256: str = (
-        MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256
-    )
     schema: str = MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SCHEMA
 
     @property
@@ -503,20 +522,16 @@ class MassiveAdaptiveRLExperimentManifestV5:
             != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_PLAN_V1_SPEC_SHA256
             or self.initial_validation_inputs_specification_sha256
             != MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256
-            or self.initial_validation_inputs_implementation_source_sha256
-            != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_INPUTS_V1_SOURCE_SHA256
             or self.validation_execution_environment_specification_sha256
             != MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256
-            or self.validation_execution_environment_implementation_source_sha256
-            != MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SHA256
             or self.experiment_global_lock_specification_sha256
             != MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256
-            or self.experiment_global_lock_implementation_source_sha256
-            != MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SOURCE_SHA256
+            or self.artifact_root_writer_lock_specification_sha256
+            != MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
+            or self.direct_materialization_lock_specification_sha256
+            != MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
             or self.manifest_v5_registration_specification_sha256
             != MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
-            or self.manifest_v5_registration_implementation_source_sha256
-            != MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SHA256
             or self.initial_validation_fold_indices
             != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
             or self.withheld_validation_fold_indices
@@ -563,10 +578,8 @@ class MassiveAdaptiveRLExperimentManifestV5:
             != "massive-adaptive-rl-experiment-runner-v5"
             or self.authoritative_writer_specification_sha256
             != MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
-            or self.authoritative_writer_implementation_source_sha256
-            != MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256
-            or self.initial_boundary_predecessor_implementation_source_sha256
-            != MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256
+            or self.execution_implementation_registration_specification_sha256
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
             or self.validation_outcome_access_authorized
             or self.outer_access_authorized
             or self.profitability_reporting_authorized
@@ -576,8 +589,6 @@ class MassiveAdaptiveRLExperimentManifestV5:
             != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256
-            or self.implementation_source_sha256
-            != MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256
             or self.semantic_receipt_sha256
             != semantic_sha256(self.semantic_unsigned())
         ):
@@ -614,26 +625,20 @@ def build_massive_adaptive_rl_experiment_manifest_v5(
         "initial_validation_inputs_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256
         ),
-        "initial_validation_inputs_implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_INPUTS_V1_SOURCE_SHA256
-        ),
         "validation_execution_environment_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256
-        ),
-        "validation_execution_environment_implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_AUTHORITY_V1_SOURCE_SHA256
         ),
         "experiment_global_lock_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256
         ),
-        "experiment_global_lock_implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SOURCE_SHA256
+        "artifact_root_writer_lock_specification_sha256": (
+            MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
+        ),
+        "direct_materialization_lock_specification_sha256": (
+            MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
         ),
         "manifest_v5_registration_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
-        ),
-        "manifest_v5_registration_implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SHA256
         ),
         "initial_validation_fold_indices": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
@@ -699,11 +704,8 @@ def build_massive_adaptive_rl_experiment_manifest_v5(
         "authoritative_writer_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
         ),
-        "authoritative_writer_implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256
-        ),
-        "initial_boundary_predecessor_implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256
+        "execution_implementation_registration_specification_sha256": (
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
         ),
         "validation_outcome_access_authorized": False,
         "outer_access_authorized": False,
@@ -712,9 +714,6 @@ def build_massive_adaptive_rl_experiment_manifest_v5(
         "live_trading_authorized": False,
         "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
         "specification_sha256": MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256,
-        "implementation_source_sha256": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256
-        ),
     }
     provisional = MassiveAdaptiveRLExperimentManifestV5(
         **body,  # type: ignore[arg-type]
@@ -799,6 +798,8 @@ __all__ = [
     "MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256",
     "MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256",
+    "MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA",
+    "MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256",
     "MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256",
     "MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256",
     "MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SCHEMA",

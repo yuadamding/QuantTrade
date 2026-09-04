@@ -53,6 +53,9 @@ from rl_quant.training.massive_adaptive_rl_fixed_control_selection_v1 import (
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicySelectionAuthorityV1,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    legacy_unscoped_manifest_v5_rejecting_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V1_SCHEMA = (
@@ -476,6 +479,7 @@ def authorize_massive_adaptive_outer_access_commitment_v1(
     return result
 
 
+@legacy_unscoped_manifest_v5_rejecting_writer_guard_v1
 def materialize_massive_adaptive_outer_access_commitment_v1(
     *,
     root: str | Path,

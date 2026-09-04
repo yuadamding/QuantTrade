@@ -77,6 +77,10 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v2 imp
     MassiveAdaptiveRLRuntimeSourcesV2,
     validate_massive_adaptive_rl_runtime_sources_v2_training_compatibility,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    MassiveAdaptiveRLManifestV5WriterCapabilityV1,
+    manifest_v5_compatibility_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_PLAN_V1_SCHEMA = (
@@ -1006,12 +1010,14 @@ def authorize_massive_adaptive_rl_initial_validation_inputs_authority_v1(
     return result
 
 
+@manifest_v5_compatibility_writer_guard_v1(writer_role="initial-validation-inputs")
 def materialize_massive_adaptive_rl_initial_validation_inputs_authority_v1(
     *,
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     authority: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
     committed_at_ms: int,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
     authority.validate()
     relative = initial_validation_inputs_authority_relative_path_v1(manifest=manifest)
@@ -1112,13 +1118,18 @@ def _initial_inputs_lease(
             os.close(descriptor)
 
 
-def run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
+@manifest_v5_compatibility_writer_guard_v1(
+    writer_role="initial-validation-inputs",
+    materialize_parameter="allow_materialize",
+)
+def _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1(
     *,
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     runtime_sources_v2: MassiveAdaptiveRLRuntimeSourcesV2,
     four_fold_fit_authority: MassiveAdaptiveRLFourFoldFitAuthorityV1,
     allow_materialize: bool = True,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
     """Commit only folds 0 and 1; never materialize folds 2 or 3."""
 
@@ -1153,6 +1164,7 @@ def run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
                 fold_index=fold_index,
                 committed_at_ms=cursor,
                 allow_materialize=allow_materialize,
+                v5_writer_capability=v5_writer_capability,
             )
             sources.append(source)
             cursor = _next_publication_ms(
@@ -1167,6 +1179,7 @@ def run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
                 validation_sources_v2=source,
                 committed_at_ms=cursor,
                 allow_materialize=allow_materialize,
+                v5_writer_capability=v5_writer_capability,
             )
             registries.append(registry)
             cursor = _next_publication_ms(
@@ -1202,7 +1215,28 @@ def run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
                 cursor,
                 max(authority.validation_registry_v2_committed_at_ms) + 1,
             ),
+            v5_writer_capability=v5_writer_capability,
         )
+
+
+def run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV4,
+    runtime_sources_v2: MassiveAdaptiveRLRuntimeSourcesV2,
+    four_fold_fit_authority: MassiveAdaptiveRLFourFoldFitAuthorityV1,
+    allow_materialize: bool = True,
+) -> MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
+    """Run the legacy initial boundary without a V5 writer capability."""
+
+    return _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1(
+        root=root,
+        manifest=manifest,
+        runtime_sources_v2=runtime_sources_v2,
+        four_fold_fit_authority=four_fold_fit_authority,
+        allow_materialize=allow_materialize,
+        v5_writer_capability=None,
+    )
 
 
 __all__ = [

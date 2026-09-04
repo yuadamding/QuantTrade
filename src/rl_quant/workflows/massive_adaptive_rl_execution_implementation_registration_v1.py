@@ -1,0 +1,921 @@
+"""Freeze the exact executable V5 implementation before validation outcomes.
+
+Manifest V5 owns scientific choices.  This separate create-only authority owns
+the code, dependency, and numerical-runtime identity used to generate economic
+outcomes.  Keeping the two registrations separate lets the scientific manifest
+remain stable while the package-owned vertical implementation is completed;
+once this authority exists, a code change requires a new experiment.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, fields, replace
+from io import BytesIO
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import time
+from typing import cast
+
+import numpy as np
+import torch
+
+from rl_quant.data_sources.massive.source_receipts import (
+    LoadedMassiveSourceObject,
+    canonical_json_file_bytes,
+    load_massive_source_bundle,
+    publish_massive_source_object,
+    read_loaded_massive_source_bytes,
+)
+from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
+    MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+)
+from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
+from rl_quant.protocol.massive_adaptive_alpha_v1 import (
+    MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
+    assert_no_adaptive_hold_semantics,
+)
+from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
+    MassiveAdaptiveRLExperimentLockV1Error,
+    MassiveAdaptiveRLExperimentLockV1Unavailable,
+    massive_adaptive_rl_experiment_orchestration_lock_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
+    MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA,
+    MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256,
+    MassiveAdaptiveRLExperimentManifestV5,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
+    MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+)
+
+
+MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_DATASET = (
+    "massive-adaptive-rl-execution-implementation-registration-v1"
+)
+MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SHA256 = (
+    file_sha256(Path(__file__))
+)
+MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SCHEMA_SHA256 = (
+    semantic_sha256(
+        {
+            "schema": (
+                MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA
+            ),
+            "encoding": "canonical-json-exact-v5-execution-implementation",
+            "generic_reload": "nonauthorizing",
+        }
+    )
+)
+
+_IMPLEMENTATION_RELATIVE_PATHS = (
+    "src/rl_quant/evaluation/massive_adaptive_profitability_env_v1.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_cost_ladder_v1.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_evaluator_v1.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_policy_evaluator_v1.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_prequential_validation_inputs_v1.py",
+    "src/rl_quant/training/massive_adaptive_rl_policy_selection_v2.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_execution_implementation_registration_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_experiment_lock_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v5.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5_registration.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_writer_guard_v5.py",
+)
+_THREAD_ENVIRONMENT_NAMES = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "PYTHONHASHSEED",
+)
+
+
+class MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(ValueError):
+    """The V5 executable implementation cannot be frozen or replayed."""
+
+
+def _digest(name: str, value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            f"{name} must be a lowercase SHA-256"
+        )
+    return value
+
+
+def _identifier(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(not (character.isalnum() or character in "-_") for character in value)
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation experiment ID is not path safe"
+        )
+    return value
+
+
+def _wall_clock_ms() -> int:
+    value = time.time_ns() // 1_000_000
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration clock differs"
+        )
+    return value
+
+
+def _git(repository_root: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ("/usr/bin/git", "-C", str(repository_root), *arguments),
+            check=False,
+            capture_output=True,
+            timeout=30,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation source identity could not be captured"
+        ) from error
+    if completed.returncode != 0:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation source identity command failed"
+        )
+    return completed.stdout.decode("utf-8").strip()
+
+
+def _repository_root() -> Path:
+    root = Path(
+        _git(Path(__file__).resolve().parent, "rev-parse", "--show-toplevel")
+    ).resolve(strict=True)
+    if not Path(__file__).resolve().is_relative_to(root):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation is outside its repository"
+        )
+    return root
+
+
+def _source_inventory(
+    repository_root: Path, names: Sequence[str]
+) -> tuple[tuple[str, str], ...]:
+    rows: list[tuple[str, str]] = []
+    for name in names:
+        unresolved = repository_root / name
+        if unresolved.is_symlink():
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                "execution implementation source path is a symlink"
+            )
+        path = unresolved.resolve(strict=True)
+        if not path.is_relative_to(repository_root) or not path.is_file():
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                "execution implementation source path differs"
+            )
+        rows.append((name, file_sha256(path)))
+    return tuple(rows)
+
+
+def _transaction_state(*, root: str | Path, relative: str) -> tuple[bool, bool]:
+    payload = Path(root) / relative
+    paths = (
+        payload,
+        payload.with_name(payload.name + ".receipt.json"),
+        payload.with_name(payload.name + ".commit.json"),
+    )
+    present = tuple(path.exists() or path.is_symlink() for path in paths)
+    return all(present), any(present) and not all(present)
+
+
+def execution_implementation_registration_relative_path_v1(
+    *, experiment_id: str
+) -> str:
+    return (
+        "adaptive-rl/"
+        f"{_identifier(experiment_id)}/"
+        "execution-implementation-registration-v1/registration.json"
+    )
+
+
+def _outcome_or_freeze_evidence_exists(
+    *, root: str | Path, experiment_id: str
+) -> bool:
+    experiment = _identifier(experiment_id)
+    directories = (
+        Path(root) / "adaptive-rl" / experiment / "validation-outcome-v3",
+        Path(root) / "adaptive-rl" / experiment / "fold-validation-v3",
+        Path(root) / "adaptive-rl" / experiment / "policy-selection-v4",
+        Path(root) / "adaptive-rl" / experiment / "frozen-policy-v2",
+    )
+    return any(
+        directory.exists()
+        or directory.is_symlink()
+        for directory in directories
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    experiment_id: str
+    manifest_v5_receipt_sha256: str
+    manifest_v5_registration_authority_receipt_sha256: str
+    manifest_v5_registration_source_receipt_sha256: str
+    manifest_v5_registration_commit_receipt_sha256: str
+    manifest_v5_registration_committed_at_ms: int
+    initial_validation_inputs_authority_receipt_sha256: str
+    initial_validation_inputs_source_receipt_sha256: str
+    initial_validation_inputs_commit_receipt_sha256: str
+    initial_validation_inputs_committed_at_ms: int
+    git_commit: str
+    git_tree: str
+    source_worktree_clean: bool
+    source_worktree_status: tuple[str, ...]
+    tracked_source_inventory_sha256: str
+    dependency_lock_sha256: str
+    implementation_inventory: tuple[tuple[str, str], ...]
+    implementation_inventory_sha256: str
+    python_version: str
+    python_implementation: str
+    pytorch_version: str
+    numpy_version: str
+    execution_device_specification: str
+    parameter_dtype: str
+    observation_dtype: str
+    deterministic_algorithms: bool
+    deterministic_warn_only: bool
+    float32_matmul_tf32: bool
+    cudnn_tf32: bool
+    cudnn_benchmark: bool
+    cudnn_deterministic: bool
+    torch_cpu_threads: int
+    torch_interop_threads: int
+    process_thread_environment: tuple[tuple[str, str], ...]
+    source_data_qualified: bool
+    semantic_receipt_sha256: str
+    runtime_implementation_replayed: bool = False
+    outer_access_authorized: bool = False
+    profitability_reporting_authorized: bool = False
+    lockbox_access_authorized: bool = False
+    live_trading_authorized: bool = False
+    protocol_receipt_sha256: str = MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+    specification_sha256: str = (
+        MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
+    )
+    implementation_source_sha256: str = (
+        MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SHA256
+    )
+    schema: str = MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA
+    _runtime_manifest: MassiveAdaptiveRLExperimentManifestV5 | None = field(
+        default=None, compare=False, repr=False
+    )
+    _runtime_manifest_registration: (
+        MassiveAdaptiveRLManifestV5RegistrationAuthorityV1 | None
+    ) = field(default=None, compare=False, repr=False)
+    _runtime_initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1 | None = (
+        field(default=None, compare=False, repr=False)
+    )
+    _loaded_source: LoadedMassiveSourceObject | None = field(
+        default=None, compare=False, repr=False
+    )
+
+    def semantic_unsigned(self) -> dict[str, object]:
+        return {
+            descriptor.name: getattr(self, descriptor.name)
+            for descriptor in fields(self)
+            if not descriptor.name.startswith("_")
+            and descriptor.name
+            not in {"semantic_receipt_sha256", "runtime_implementation_replayed"}
+        }
+
+    @property
+    def source_transaction_verified(self) -> bool:
+        return self._loaded_source is not None
+
+    @property
+    def source_receipt_sha256(self) -> str | None:
+        return (
+            None
+            if self._loaded_source is None
+            else self._loaded_source.receipt.receipt_sha256
+        )
+
+    @property
+    def source_transaction_receipt_sha256(self) -> str | None:
+        return (
+            None
+            if self._loaded_source is None
+            else self._loaded_source.commit.receipt_sha256
+        )
+
+    @property
+    def source_transaction_committed_at_ms(self) -> int | None:
+        return (
+            None
+            if self._loaded_source is None
+            else self._loaded_source.commit.committed_at_ms
+        )
+
+    @property
+    def scientific_execution_fingerprint_sha256(self) -> str:
+        return semantic_sha256(
+            {
+                "git_commit": self.git_commit,
+                "git_tree": self.git_tree,
+                "tracked_source_inventory_sha256": self.tracked_source_inventory_sha256,
+                "dependency_lock_sha256": self.dependency_lock_sha256,
+                "implementation_inventory_sha256": self.implementation_inventory_sha256,
+                "python_version": self.python_version,
+                "python_implementation": self.python_implementation,
+                "pytorch_version": self.pytorch_version,
+                "numpy_version": self.numpy_version,
+                "execution_device_specification": self.execution_device_specification,
+                "parameter_dtype": self.parameter_dtype,
+                "observation_dtype": self.observation_dtype,
+                "deterministic_algorithms": self.deterministic_algorithms,
+                "deterministic_warn_only": self.deterministic_warn_only,
+                "float32_matmul_tf32": self.float32_matmul_tf32,
+                "cudnn_tf32": self.cudnn_tf32,
+                "cudnn_benchmark": self.cudnn_benchmark,
+                "cudnn_deterministic": self.cudnn_deterministic,
+                "torch_cpu_threads": self.torch_cpu_threads,
+                "torch_interop_threads": self.torch_interop_threads,
+                "process_thread_environment": self.process_thread_environment,
+            }
+        )
+
+    @property
+    def development_execution_registered(self) -> bool:
+        return bool(
+            self.source_transaction_verified
+            and self.runtime_implementation_replayed
+            and self.source_data_qualified
+        )
+
+    def validate(self) -> None:
+        runtime_roots = (
+            self._runtime_manifest,
+            self._runtime_manifest_registration,
+            self._runtime_initial_inputs,
+        )
+        runtime_present = all(value is not None for value in runtime_roots)
+        if any(value is not None for value in runtime_roots) != runtime_present:
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                "execution implementation runtime lineage is partial"
+            )
+        if self._loaded_source is not None:
+            self._loaded_source.validate()
+        environment_names = tuple(row[0] for row in self.process_thread_environment)
+        environment_values = dict(self.process_thread_environment)
+        expected_qualified = bool(
+            self.source_worktree_clean
+            and not self.source_worktree_status
+            and self.execution_device_specification == "cpu"
+            and self.parameter_dtype == "torch.float32"
+            and self.observation_dtype == "torch.float32"
+            and self.deterministic_algorithms
+            and not self.deterministic_warn_only
+            and not self.float32_matmul_tf32
+            and not self.cudnn_tf32
+            and not self.cudnn_benchmark
+            and self.cudnn_deterministic
+            and self.torch_cpu_threads == 1
+            and self.torch_interop_threads == 1
+            and all(
+                environment_values.get(name) == "1"
+                for name in _THREAD_ENVIRONMENT_NAMES[:-1]
+            )
+            and environment_values.get("PYTHONHASHSEED", "unset").isdigit()
+        )
+        if (
+            self.schema
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA
+            or _identifier(self.experiment_id) != self.experiment_id
+            or len(self.git_commit) != 40
+            or len(self.git_tree) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.git_commit + self.git_tree
+            )
+            or self.source_worktree_clean != (not self.source_worktree_status)
+            or tuple(row[0] for row in self.implementation_inventory)
+            != _IMPLEMENTATION_RELATIVE_PATHS
+            or self.implementation_inventory_sha256
+            != semantic_sha256(self.implementation_inventory)
+            or environment_names != _THREAD_ENVIRONMENT_NAMES
+            or not all(
+                isinstance(value, str) and value
+                for value in (
+                    self.python_version,
+                    self.python_implementation,
+                    self.pytorch_version,
+                    self.numpy_version,
+                )
+            )
+            or isinstance(self.manifest_v5_registration_committed_at_ms, bool)
+            or self.manifest_v5_registration_committed_at_ms < 0
+            or isinstance(self.initial_validation_inputs_committed_at_ms, bool)
+            or self.initial_validation_inputs_committed_at_ms
+            <= self.manifest_v5_registration_committed_at_ms
+            or isinstance(self.torch_cpu_threads, bool)
+            or self.torch_cpu_threads <= 0
+            or isinstance(self.torch_interop_threads, bool)
+            or self.torch_interop_threads <= 0
+            or self.source_data_qualified != expected_qualified
+            or self.runtime_implementation_replayed != runtime_present
+            or self.outer_access_authorized
+            or self.profitability_reporting_authorized
+            or self.lockbox_access_authorized
+            or self.live_trading_authorized
+            or self.protocol_receipt_sha256
+            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.specification_sha256
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
+            or self.implementation_source_sha256
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SHA256
+            or self.semantic_receipt_sha256
+            != semantic_sha256(self.semantic_unsigned())
+        ):
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                "execution implementation registration differs"
+            )
+        if self._loaded_source is not None and (
+            self._loaded_source.receipt.dataset_id
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_DATASET
+            or self._loaded_source.receipt.schema_sha256
+            != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SCHEMA_SHA256
+            or self._loaded_source.receipt.entitlement_receipt_sha256
+            != self.semantic_receipt_sha256
+            or self._loaded_source.commit.committed_at_ms
+            <= self.initial_validation_inputs_committed_at_ms
+        ):
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                "execution implementation source transaction differs"
+            )
+        if runtime_present:
+            manifest = cast(MassiveAdaptiveRLExperimentManifestV5, self._runtime_manifest)
+            registration = cast(
+                MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+                self._runtime_manifest_registration,
+            )
+            initial = cast(
+                MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+                self._runtime_initial_inputs,
+            )
+            manifest.validate()
+            registration.validate()
+            initial.validate()
+            if (
+                manifest.semantic_receipt_sha256 != self.manifest_v5_receipt_sha256
+                or registration.semantic_receipt_sha256
+                != self.manifest_v5_registration_authority_receipt_sha256
+                or registration.source_receipt_sha256
+                != self.manifest_v5_registration_source_receipt_sha256
+                or registration.source_transaction_receipt_sha256
+                != self.manifest_v5_registration_commit_receipt_sha256
+                or registration.source_transaction_committed_at_ms
+                != self.manifest_v5_registration_committed_at_ms
+                or not registration.development_protocol_registered
+                or initial.semantic_receipt_sha256
+                != self.initial_validation_inputs_authority_receipt_sha256
+                or initial.source_receipt_sha256
+                != self.initial_validation_inputs_source_receipt_sha256
+                or initial.source_transaction_receipt_sha256
+                != self.initial_validation_inputs_commit_receipt_sha256
+                or initial.source_transaction_committed_at_ms
+                != self.initial_validation_inputs_committed_at_ms
+                or not initial.development_stage_authorized
+            ):
+                raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                    "execution implementation runtime lineage differs"
+                )
+        for name, value in self.semantic_unsigned().items():
+            if name.endswith("_sha256"):
+                _digest(name, value)
+        for name, value in self.implementation_inventory:
+            if not name:
+                raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                    "execution implementation source name is absent"
+                )
+            _digest("execution implementation source", value)
+        assert_no_adaptive_hold_semantics(self.semantic_unsigned())
+
+
+def _capture_body(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+) -> dict[str, object]:
+    manifest.validate()
+    manifest_registration.validate()
+    initial_inputs.validate()
+    if (
+        not manifest_registration.development_protocol_registered
+        or not initial_inputs.development_stage_authorized
+        or manifest_registration.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or initial_inputs.manifest_v4_receipt_sha256
+        != manifest.base_manifest.semantic_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration roots differ"
+        )
+    registration_source = manifest_registration.source_receipt_sha256
+    registration_commit = manifest_registration.source_transaction_receipt_sha256
+    registration_time = manifest_registration.source_transaction_committed_at_ms
+    initial_source = initial_inputs.source_receipt_sha256
+    initial_commit = initial_inputs.source_transaction_receipt_sha256
+    initial_time = initial_inputs.source_transaction_committed_at_ms
+    if any(
+        value is None
+        for value in (
+            registration_source,
+            registration_commit,
+            registration_time,
+            initial_source,
+            initial_commit,
+            initial_time,
+        )
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration source lineage is absent"
+        )
+    repository = _repository_root()
+    tracked_names = tuple(
+        name
+        for name in _git(repository, "ls-files", "src/rl_quant").splitlines()
+        if name
+    )
+    tracked = _source_inventory(repository, tracked_names)
+    implementation = _source_inventory(repository, _IMPLEMENTATION_RELATIVE_PATHS)
+    status = tuple(
+        row
+        for row in _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
+        .splitlines()
+        if row
+    )
+    lock_path = repository / "uv.lock"
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution dependency lock differs"
+        )
+    process_environment = tuple(
+        (name, os.environ.get(name, "unset")) for name in _THREAD_ENVIRONMENT_NAMES
+    )
+    environment_values = dict(process_environment)
+    source_qualified = bool(
+        not status
+        and torch.are_deterministic_algorithms_enabled()
+        and not torch.is_deterministic_algorithms_warn_only_enabled()
+        and not torch.backends.cuda.matmul.allow_tf32
+        and not torch.backends.cudnn.allow_tf32
+        and not torch.backends.cudnn.benchmark
+        and torch.backends.cudnn.deterministic
+        and torch.get_num_threads() == 1
+        and torch.get_num_interop_threads() == 1
+        and all(
+            environment_values.get(name) == "1"
+            for name in _THREAD_ENVIRONMENT_NAMES[:-1]
+        )
+        and environment_values.get("PYTHONHASHSEED", "unset").isdigit()
+    )
+    return {
+        "schema": MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA,
+        "experiment_id": manifest.experiment_id,
+        "manifest_v5_receipt_sha256": manifest.semantic_receipt_sha256,
+        "manifest_v5_registration_authority_receipt_sha256": (
+            manifest_registration.semantic_receipt_sha256
+        ),
+        "manifest_v5_registration_source_receipt_sha256": cast(
+            str, registration_source
+        ),
+        "manifest_v5_registration_commit_receipt_sha256": cast(
+            str, registration_commit
+        ),
+        "manifest_v5_registration_committed_at_ms": cast(int, registration_time),
+        "initial_validation_inputs_authority_receipt_sha256": (
+            initial_inputs.semantic_receipt_sha256
+        ),
+        "initial_validation_inputs_source_receipt_sha256": cast(str, initial_source),
+        "initial_validation_inputs_commit_receipt_sha256": cast(str, initial_commit),
+        "initial_validation_inputs_committed_at_ms": cast(int, initial_time),
+        "git_commit": _git(repository, "rev-parse", "HEAD"),
+        "git_tree": _git(repository, "rev-parse", "HEAD^{tree}"),
+        "source_worktree_clean": not status,
+        "source_worktree_status": status,
+        "tracked_source_inventory_sha256": semantic_sha256(tracked),
+        "dependency_lock_sha256": file_sha256(lock_path),
+        "implementation_inventory": implementation,
+        "implementation_inventory_sha256": semantic_sha256(implementation),
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "pytorch_version": torch.__version__,
+        "numpy_version": np.__version__,
+        "execution_device_specification": "cpu",
+        "parameter_dtype": str(torch.float32),
+        "observation_dtype": str(torch.float32),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "deterministic_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+        "float32_matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_tf32": torch.backends.cudnn.allow_tf32,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "torch_cpu_threads": torch.get_num_threads(),
+        "torch_interop_threads": torch.get_num_interop_threads(),
+        "process_thread_environment": process_environment,
+        "source_data_qualified": source_qualified,
+        "outer_access_authorized": False,
+        "profitability_reporting_authorized": False,
+        "lockbox_access_authorized": False,
+        "live_trading_authorized": False,
+        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
+        "specification_sha256": (
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
+        ),
+        "implementation_source_sha256": (
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SHA256
+        ),
+    }
+
+
+def capture_massive_adaptive_rl_execution_implementation_registration_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    body = _capture_body(
+        manifest=manifest,
+        manifest_registration=manifest_registration,
+        initial_inputs=initial_inputs,
+    )
+    result = MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_sha256(body),
+        runtime_implementation_replayed=True,
+        _runtime_manifest=manifest,
+        _runtime_manifest_registration=manifest_registration,
+        _runtime_initial_inputs=initial_inputs,
+    )
+    result.validate()
+    return result
+
+
+def _payload(
+    authority: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+) -> dict[str, object]:
+    authority.validate()
+    return {
+        **authority.semantic_unsigned(),
+        "semantic_receipt_sha256": authority.semantic_receipt_sha256,
+    }
+
+
+def _tuple_rows(value: object, *, name: str) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            f"execution {name} is not a JSON row inventory"
+        )
+    rows: list[tuple[str, str]] = []
+    for row in value:
+        if (
+            not isinstance(row, list)
+            or len(row) != 2
+            or not all(isinstance(item, str) for item in row)
+        ):
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                f"execution {name} row differs"
+            )
+        rows.append((row[0], row[1]))
+    return tuple(rows)
+
+
+def _parse(
+    *, root: str | Path, loaded_source: LoadedMassiveSourceObject
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    raw = read_loaded_massive_source_bytes(root=root, loaded_source=loaded_source)
+    value = json.loads(raw)
+    if not isinstance(value, Mapping) or raw != canonical_json_file_bytes(value):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration is not canonical JSON"
+        )
+    body = dict(cast(Mapping[str, object], value))
+    status = body.get("source_worktree_status")
+    if not isinstance(status, list) or not all(isinstance(row, str) for row in status):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution tracked worktree status differs"
+        )
+    body["source_worktree_status"] = tuple(status)
+    for name in ("implementation_inventory", "process_thread_environment"):
+        body[name] = _tuple_rows(body.get(name), name=name.replace("_", " "))
+    try:
+        result = MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1(
+            **body,  # type: ignore[arg-type]
+            runtime_implementation_replayed=False,
+            _loaded_source=loaded_source,
+        )
+    except TypeError as error:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration fields differ"
+        ) from error
+    result.validate()
+    if raw != canonical_json_file_bytes(_payload(result)):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration did not round trip"
+        )
+    return result
+
+
+def load_massive_adaptive_rl_execution_implementation_registration_v1(
+    *, root: str | Path, experiment_id: str, verified_at_ms: int
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    return _parse(
+        root=root,
+        loaded_source=load_massive_source_bundle(
+            root=root,
+            relative_payload_path=(
+                execution_implementation_registration_relative_path_v1(
+                    experiment_id=experiment_id
+                )
+            ),
+            verified_at_ms=verified_at_ms,
+        ),
+    )
+
+
+def authorize_massive_adaptive_rl_execution_implementation_registration_v1(
+    *,
+    authority: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    authority.validate()
+    if not authority.source_transaction_verified:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration is not persisted"
+        )
+    active = capture_massive_adaptive_rl_execution_implementation_registration_v1(
+        manifest=manifest,
+        manifest_registration=manifest_registration,
+        initial_inputs=initial_inputs,
+    )
+    if active.semantic_unsigned() != authority.semantic_unsigned():
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "active execution implementation did not replay"
+        )
+    result = replace(
+        authority,
+        runtime_implementation_replayed=True,
+        _runtime_manifest=manifest,
+        _runtime_manifest_registration=manifest_registration,
+        _runtime_initial_inputs=initial_inputs,
+    )
+    result.validate()
+    return result
+
+
+def _run_or_resume_execution_implementation_registration_v1_unlocked(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+    allow_materialize: bool,
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    relative = execution_implementation_registration_relative_path_v1(
+        experiment_id=manifest.experiment_id
+    )
+    complete, partial = _transaction_state(root=root, relative=relative)
+    if partial:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration transaction is incomplete"
+        )
+    verified_at_ms = _wall_clock_ms()
+    if complete:
+        return authorize_massive_adaptive_rl_execution_implementation_registration_v1(
+            authority=load_massive_adaptive_rl_execution_implementation_registration_v1(
+                root=root,
+                experiment_id=manifest.experiment_id,
+                verified_at_ms=verified_at_ms,
+            ),
+            manifest=manifest,
+            manifest_registration=manifest_registration,
+            initial_inputs=initial_inputs,
+        )
+    if not allow_materialize:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration is absent"
+        )
+    if _outcome_or_freeze_evidence_exists(
+        root=root, experiment_id=manifest.experiment_id
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation must precede every validation outcome"
+        )
+    captured = capture_massive_adaptive_rl_execution_implementation_registration_v1(
+        manifest=manifest,
+        manifest_registration=manifest_registration,
+        initial_inputs=initial_inputs,
+    )
+    if not captured.source_data_qualified:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "active execution implementation is not scientifically qualified"
+        )
+    initial_time = initial_inputs.source_transaction_committed_at_ms
+    if initial_time is None:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "initial validation-input chronology is absent"
+        )
+    committed_at_ms = max(verified_at_ms, initial_time + 1)
+    publish_massive_source_object(
+        stream=BytesIO(canonical_json_file_bytes(_payload(captured))),
+        root=root,
+        relative_payload_path=relative,
+        dataset_id=(
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_DATASET
+        ),
+        source_object_key=relative,
+        requested_at_ms=committed_at_ms,
+        downloaded_at_ms=committed_at_ms,
+        schema_sha256=(
+            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SCHEMA_SHA256
+        ),
+        entitlement_receipt_sha256=captured.semantic_receipt_sha256,
+        committed_at_ms=committed_at_ms,
+        request_id=f"ADAPTIVE-RL-EXECUTION-IMPLEMENTATION-{manifest.experiment_id}",
+    )
+    return authorize_massive_adaptive_rl_execution_implementation_registration_v1(
+        authority=load_massive_adaptive_rl_execution_implementation_registration_v1(
+            root=root,
+            experiment_id=manifest.experiment_id,
+            verified_at_ms=committed_at_ms,
+        ),
+        manifest=manifest,
+        manifest_registration=manifest_registration,
+        initial_inputs=initial_inputs,
+    )
+
+
+def run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    initial_inputs: MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+    allow_materialize: bool = True,
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    """Freeze or replay the exact executable implementation under the global lock."""
+
+    if type(allow_materialize) is not bool:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation materialization mode differs"
+        )
+    if not allow_materialize:
+        return _run_or_resume_execution_implementation_registration_v1_unlocked(
+            root=root,
+            manifest=manifest,
+            manifest_registration=manifest_registration,
+            initial_inputs=initial_inputs,
+            allow_materialize=False,
+        )
+    try:
+        with massive_adaptive_rl_experiment_orchestration_lock_v1(
+            artifact_root=root,
+            experiment_id=manifest.experiment_id,
+        ):
+            return _run_or_resume_execution_implementation_registration_v1_unlocked(
+                root=root,
+                manifest=manifest,
+                manifest_registration=manifest_registration,
+                initial_inputs=initial_inputs,
+                allow_materialize=True,
+            )
+    except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration is already owned"
+        ) from error
+    except MassiveAdaptiveRLExperimentLockV1Error as error:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration lock is invalid"
+        ) from error
+
+
+__all__ = [
+    "MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_DATASET",
+    "MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SCHEMA_SHA256",
+    "MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SHA256",
+    "MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1",
+    "MassiveAdaptiveRLExecutionImplementationRegistrationV1Error",
+    "_run_or_resume_execution_implementation_registration_v1_unlocked",
+    "authorize_massive_adaptive_rl_execution_implementation_registration_v1",
+    "capture_massive_adaptive_rl_execution_implementation_registration_v1",
+    "execution_implementation_registration_relative_path_v1",
+    "load_massive_adaptive_rl_execution_implementation_registration_v1",
+    "run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1",
+]

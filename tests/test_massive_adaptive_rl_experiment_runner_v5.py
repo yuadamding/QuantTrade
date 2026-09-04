@@ -173,7 +173,7 @@ def test_v5_root_registers_before_resuming_training(
 
     monkeypatch.setattr(
         runner,
-        "run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1",
+        "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
         register,
     )
     monkeypatch.setattr(
@@ -210,7 +210,7 @@ def test_v5_training_blocker_does_not_open_validation(
     )
     monkeypatch.setattr(
         runner,
-        "run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1",
+        "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
         lambda **_: object(),
     )
     monkeypatch.setattr(

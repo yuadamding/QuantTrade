@@ -30,6 +30,9 @@ from rl_quant.training.massive_adaptive_ppo_v1 import (
 from rl_quant.training.massive_adaptive_rl_policy_selection_v1 import (
     MassiveAdaptiveRLPolicySelectionAuthorityV1,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    legacy_unscoped_manifest_v5_rejecting_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V1_SCHEMA = (
@@ -323,6 +326,7 @@ def authorize_massive_adaptive_frozen_rl_policy_v1(
     return result
 
 
+@legacy_unscoped_manifest_v5_rejecting_writer_guard_v1
 def materialize_massive_adaptive_frozen_rl_policy_v1(
     *,
     root: str | Path,

@@ -87,6 +87,10 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v1 imp
     MassiveAdaptiveRLRuntimeSourcesV1,
     MassiveAdaptiveRLValidationOriginInputsV1,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    MassiveAdaptiveRLManifestV5WriterCapabilityV1,
+    manifest_v5_compatibility_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_VALIDATION_SOURCES_AUTHORITY_V1_SCHEMA = (
@@ -1256,6 +1260,10 @@ def authorize_massive_adaptive_rl_validation_sources_authority_v1(
     return result
 
 
+@manifest_v5_compatibility_writer_guard_v1(
+    writer_role="initial-validation-inputs",
+    fold_parameter="fold_index",
+)
 def materialize_massive_adaptive_rl_validation_sources_authority_v1(
     *,
     root: str | Path,
@@ -1264,6 +1272,7 @@ def materialize_massive_adaptive_rl_validation_sources_authority_v1(
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     fold_index: int,
     committed_at_ms: int,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
     relative = validation_sources_authority_relative_path_v1(
         manifest=manifest,
@@ -1333,6 +1342,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v1(
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     fold_index: int,
     committed_at_ms: int,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationSourcesAuthorityV1:
     """Create the canonical validation lineage, or strictly replay it."""
 
@@ -1348,6 +1358,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v1(
             runtime_sources=runtime_sources,
             fold_index=fold_index,
             committed_at_ms=committed_at_ms,
+            v5_writer_capability=v5_writer_capability,
         )
     return authorize_massive_adaptive_rl_validation_sources_authority_v1(
         root=root,
@@ -2205,6 +2216,10 @@ def authorize_massive_adaptive_rl_validation_environment_registry_v1(
     return result
 
 
+@manifest_v5_compatibility_writer_guard_v1(
+    writer_role="initial-validation-inputs",
+    fold_attribute_parameter="validation_sources",
+)
 def materialize_massive_adaptive_rl_validation_environment_registry_v1(
     *,
     root: str | Path,
@@ -2212,6 +2227,7 @@ def materialize_massive_adaptive_rl_validation_environment_registry_v1(
     validation_sources: MassiveAdaptiveRLValidationSourcesAuthorityV1,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     committed_at_ms: int,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationEnvironmentRegistryV1:
     relative = validation_environment_registry_relative_path_v1(
         manifest=manifest,
@@ -2273,6 +2289,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_environment_registry_v1(
     validation_sources: MassiveAdaptiveRLValidationSourcesAuthorityV1,
     runtime_sources: MassiveAdaptiveRLRuntimeSourcesV1,
     committed_at_ms: int,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationEnvironmentRegistryV1:
     """Create the canonical economic registry, or strictly replay it."""
 
@@ -2287,6 +2304,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_environment_registry_v1(
             validation_sources=validation_sources,
             runtime_sources=runtime_sources,
             committed_at_ms=committed_at_ms,
+            v5_writer_capability=v5_writer_capability,
         )
     return authorize_massive_adaptive_rl_validation_environment_registry_v1(
         root=root,

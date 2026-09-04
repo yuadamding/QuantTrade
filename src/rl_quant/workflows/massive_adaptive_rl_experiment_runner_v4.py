@@ -19,6 +19,7 @@ from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 im
     MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_INPUTS_V1_SOURCE_SHA256,
     MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+    _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1,
     run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1,
 )
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
@@ -51,6 +52,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     MASSIVE_ADAPTIVE_RL_NO_ELIGIBLE_CANDIDATE_POLICY_V1,
     MassiveAdaptiveRLExperimentManifestV4,
     load_massive_adaptive_rl_experiment_manifest_v4,
+)
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    MassiveAdaptiveRLManifestV5WriterCapabilityV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
@@ -372,6 +376,7 @@ def _replay_prequential_root(
     device: object,
     states: tuple[MassiveAdaptiveRLExperimentStateV2, ...],
     allow_materialize: bool,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLPrequentialRunV4:
     fit_receipt = _validate_training_handoff(manifest=manifest, states=states)
     runtime_sources_v2 = (
@@ -393,13 +398,25 @@ def _replay_prequential_root(
         raise MassiveAdaptiveRLExperimentRunnerV4Error(
             "adaptive RL prequential root fit adoption differs"
         )
-    initial_inputs = run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
-        root=artifact_root,
-        manifest=manifest,
-        runtime_sources_v2=runtime_sources_v2,
-        four_fold_fit_authority=four_fold_fit,
-        allow_materialize=allow_materialize,
-    )
+    if v5_writer_capability is None:
+        initial_inputs = run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
+            root=artifact_root,
+            manifest=manifest,
+            runtime_sources_v2=runtime_sources_v2,
+            four_fold_fit_authority=four_fold_fit,
+            allow_materialize=allow_materialize,
+        )
+    else:
+        initial_inputs = (
+            _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1(
+                root=artifact_root,
+                manifest=manifest,
+                runtime_sources_v2=runtime_sources_v2,
+                four_fold_fit_authority=four_fold_fit,
+                allow_materialize=allow_materialize,
+                v5_writer_capability=v5_writer_capability,
+            )
+        )
     return _build_result(
         manifest=manifest,
         states=states,

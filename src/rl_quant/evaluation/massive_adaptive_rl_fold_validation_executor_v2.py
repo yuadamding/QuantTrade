@@ -64,6 +64,9 @@ from rl_quant.workflows.massive_adaptive_rl_validation_execution_environment_v1 
     run_or_resume_massive_adaptive_rl_validation_execution_environment_v1,
     validation_execution_environment_relative_path_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    legacy_manifest_v5_rejecting_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_EXECUTOR_V2_SOURCE_SHA256 = file_sha256(
@@ -180,6 +183,9 @@ def _existing_stage_prefix(
     return loaded
 
 
+@legacy_manifest_v5_rejecting_writer_guard_v1(
+    materialize_parameter="allow_materialize"
+)
 def run_or_resume_massive_adaptive_rl_fold_validation_and_selection_v2(
     *,
     root: str | Path,

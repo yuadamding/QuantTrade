@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from rl_quant.workflows import massive_adaptive_rl_manifest_v5 as manifest_module
+from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
+    MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256,
+    MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256,
+)
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
+    MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256,
@@ -79,7 +85,7 @@ def test_manifest_v5_rejects_changed_release_or_stop_semantics() -> None:
         replace(manifest, legacy_manifest_v4_materialization_authorized=True).validate()
 
 
-def test_manifest_v5_binds_protocol_and_writer_hashes() -> None:
+def test_manifest_v5_binds_scientific_protocol_and_defers_physical_implementation() -> None:
     manifest = build_massive_adaptive_rl_experiment_manifest_v5(
         experiment_id="manifest-v5-hashes"
     )
@@ -88,30 +94,56 @@ def test_manifest_v5_binds_protocol_and_writer_hashes() -> None:
         == MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256
     )
     assert (
-        manifest.implementation_source_sha256
-        == MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256
-    )
-    assert (
         manifest.authoritative_writer_specification_sha256
         == MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
     )
     assert (
-        manifest.authoritative_writer_implementation_source_sha256
-        == MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256
+        manifest.execution_implementation_registration_specification_sha256
+        == MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
     )
     assert (
-        manifest.initial_boundary_predecessor_implementation_source_sha256
-        == MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256
+        manifest.artifact_root_writer_lock_specification_sha256
+        == MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
     )
+    assert (
+        manifest.direct_materialization_lock_specification_sha256
+        == MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
+    )
+    payload = manifest.semantic_unsigned()
+    assert "implementation_source_sha256" not in payload
+    assert "authoritative_writer_implementation_source_sha256" not in payload
+    assert "initial_boundary_predecessor_implementation_source_sha256" not in payload
+    assert "initial_validation_inputs_implementation_source_sha256" not in payload
+    assert "validation_execution_environment_implementation_source_sha256" not in payload
+    assert "experiment_global_lock_implementation_source_sha256" not in payload
+    assert "manifest_v5_registration_implementation_source_sha256" not in payload
     for value in (
         MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256,
         MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256,
         MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256,
         MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256,
         MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256,
+        MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256,
     ):
         assert len(value) == 64
         int(value, 16)
+
+
+def test_manifest_v5_receipt_does_not_depend_on_runner_source_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="manifest-v5-implementation-decoupling"
+    )
+    monkeypatch.setattr(
+        manifest_module,
+        "MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256",
+        "f" * 64,
+    )
+    after = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="manifest-v5-implementation-decoupling"
+    )
+    assert after.semantic_receipt_sha256 == before.semantic_receipt_sha256
 
 
 def test_manifest_v5_cli_creates_validates_and_uses_only_v5_runner(

@@ -72,6 +72,10 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v2 imp
     MassiveAdaptiveRLRuntimeSourcesV2,
     validate_massive_adaptive_rl_runtime_sources_v2_training_compatibility,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    MassiveAdaptiveRLManifestV5WriterCapabilityV1,
+    manifest_v5_compatibility_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_VALIDATION_SOURCES_AUTHORITY_V2_SCHEMA = (
@@ -761,12 +765,17 @@ def authorize_massive_adaptive_rl_validation_sources_authority_v2(
     return result
 
 
+@manifest_v5_compatibility_writer_guard_v1(
+    writer_role="initial-validation-inputs",
+    fold_attribute_parameter="authority",
+)
 def materialize_massive_adaptive_rl_validation_sources_authority_v2(
     *,
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     authority: MassiveAdaptiveRLValidationSourcesAuthorityV2,
     committed_at_ms: int,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationSourcesAuthorityV2:
     manifest.validate()
     authority.validate()
@@ -844,6 +853,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v2(
     fold_index: int,
     committed_at_ms: int,
     allow_materialize: bool = True,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationSourcesAuthorityV2:
     runtime_sources_v2.validate()
     validate_massive_adaptive_rl_runtime_sources_v2_training_compatibility(
@@ -881,6 +891,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v2(
             runtime_sources=base_runtime,
             fold_index=fold_index,
             committed_at_ms=committed_at_ms,
+            v5_writer_capability=v5_writer_capability,
         )
     relative = validation_sources_authority_relative_path_v2(
         manifest=manifest,
@@ -918,6 +929,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_sources_v2(
             base_authority_v1=base,
         ),
         committed_at_ms=max(committed_at_ms + 1, base_time + 1, index_time + 1),
+        v5_writer_capability=v5_writer_capability,
     )
 
 
@@ -1417,12 +1429,17 @@ def authorize_massive_adaptive_rl_validation_environment_registry_v2(
     return result
 
 
+@manifest_v5_compatibility_writer_guard_v1(
+    writer_role="initial-validation-inputs",
+    fold_attribute_parameter="registry",
+)
 def materialize_massive_adaptive_rl_validation_environment_registry_v2(
     *,
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV4,
     registry: MassiveAdaptiveRLValidationEnvironmentRegistryV2,
     committed_at_ms: int,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationEnvironmentRegistryV2:
     manifest.validate()
     registry.validate()
@@ -1499,6 +1516,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_environment_registry_v2(
     validation_sources_v2: MassiveAdaptiveRLValidationSourcesAuthorityV2,
     committed_at_ms: int,
     allow_materialize: bool = True,
+    v5_writer_capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1 | None = None,
 ) -> MassiveAdaptiveRLValidationEnvironmentRegistryV2:
     base_runtime = runtime_sources_v2.base_runtime_sources_v1
     base_source = validation_sources_v2.base_authority_v1
@@ -1531,6 +1549,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_environment_registry_v2(
             validation_sources=base_source,
             runtime_sources=base_runtime,
             committed_at_ms=committed_at_ms,
+            v5_writer_capability=v5_writer_capability,
         )
     relative = validation_environment_registry_relative_path_v2(
         manifest=manifest,
@@ -1565,6 +1584,7 @@ def prepare_or_resume_massive_adaptive_rl_validation_environment_registry_v2(
             base_registry_v1=base,
         ),
         committed_at_ms=max(committed_at_ms + 1, source_time + 1, base_time + 1),
+        v5_writer_capability=v5_writer_capability,
     )
 
 

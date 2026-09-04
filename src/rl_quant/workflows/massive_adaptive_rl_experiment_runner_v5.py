@@ -24,6 +24,7 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
     MassiveAdaptiveRLExperimentLockV1Error,
     MassiveAdaptiveRLExperimentLockV1Unavailable,
+    massive_adaptive_rl_artifact_root_writer_lock_v1,
     massive_adaptive_rl_experiment_orchestration_lock_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
@@ -47,6 +48,8 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked,
+    issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1,
     run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1,
 )
 
@@ -335,6 +338,11 @@ def _replay_v5_boundary(
         device=device,
         states=states,
         allow_materialize=allow_materialize,
+        v5_writer_capability=(
+            issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+                authority=registration
+            )
+        ),
     )
     return _build_result(
         manifest=manifest,
@@ -360,34 +368,37 @@ def run_massive_adaptive_rl_experiment_v5(
             "requested device differs from the Manifest-V5 training device"
         )
     try:
-        with massive_adaptive_rl_experiment_orchestration_lock_v1(
-            artifact_root=artifact_root,
-            experiment_id=manifest.experiment_id,
+        with massive_adaptive_rl_artifact_root_writer_lock_v1(
+            artifact_root=artifact_root
         ):
-            registration = (
-                run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
-                    root=artifact_root,
+            with massive_adaptive_rl_experiment_orchestration_lock_v1(
+                artifact_root=artifact_root,
+                experiment_id=manifest.experiment_id,
+            ):
+                registration = (
+                    _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked(
+                        root=artifact_root,
+                        manifest=manifest,
+                        allow_materialize=True,
+                    )
+                )
+                training = _run_massive_adaptive_rl_experiment_v2_unlocked(
+                    manifest=manifest.base_manifest.base_manifest,
+                    source_root=source_root,
+                    artifact_root=artifact_root,
+                    device=device,
+                    resume=resume,
+                )
+                if training.four_fold_fit_authority_receipt_sha256 is None:
+                    return training
+                return _replay_v5_boundary(
                     manifest=manifest,
+                    registration=registration,
+                    source_root=source_root,
+                    artifact_root=artifact_root,
+                    device=device,
                     allow_materialize=True,
                 )
-            )
-            training = _run_massive_adaptive_rl_experiment_v2_unlocked(
-                manifest=manifest.base_manifest.base_manifest,
-                source_root=source_root,
-                artifact_root=artifact_root,
-                device=device,
-                resume=resume,
-            )
-            if training.four_fold_fit_authority_receipt_sha256 is None:
-                return training
-            return _replay_v5_boundary(
-                manifest=manifest,
-                registration=registration,
-                source_root=source_root,
-                artifact_root=artifact_root,
-                device=device,
-                allow_materialize=True,
-            )
     except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
         raise MassiveAdaptiveRLExperimentRunnerV5LeaseUnavailable(
             "adaptive RL V5 execution is already owned"

@@ -93,6 +93,7 @@ jobs:
           tests/test_massive_adaptive_rl_manifest_v4.py
           tests/test_massive_adaptive_rl_manifest_v5.py
           tests/test_massive_adaptive_rl_manifest_v5_registration.py
+          tests/test_massive_adaptive_rl_execution_implementation_registration_v1.py
           tests/test_adaptive_alpha_supervised_v1.py
           tests/test_massive_adaptive_portfolio_compiler_v1.py
           tests/test_massive_economic_authority_v6.py
@@ -146,6 +147,8 @@ jobs:
           src/rl_quant/workflows/massive_adaptive_rl_experiment_lock_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_manifest_v5.py
           src/rl_quant/workflows/massive_adaptive_rl_manifest_v5_registration.py
+          src/rl_quant/workflows/massive_adaptive_rl_execution_implementation_registration_v1.py
+          src/rl_quant/workflows/massive_adaptive_rl_writer_guard_v5.py
           src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v5.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_authority_v3.py
@@ -166,5 +169,4 @@ jobs:
           src/rl_quant/training/massive_adaptive_rl_four_fold_policy_selection_v1.py
           src/rl_quant/training/massive_adaptive_rl_training_forecast_authority_v2.py
           src/rl_quant/workflows/massive_adaptive_rl_v1.py
-          src/rl_quant/workflows/massive_adaptive_rl_v2.py
           src/rl_quant/workflows/massive_adaptive_rl_manifest_v4.py

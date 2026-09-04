@@ -32,6 +32,9 @@ from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v2 imp
     MassiveAdaptiveRLRuntimeSourcesV2,
     validate_massive_adaptive_rl_runtime_sources_v2_training_compatibility,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    legacy_manifest_v5_rejecting_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_FOUR_FOLD_VALIDATION_EXECUTOR_V1_SOURCE_SHA256 = file_sha256(
@@ -164,6 +167,9 @@ def _validate_roots(
         )
 
 
+@legacy_manifest_v5_rejecting_writer_guard_v1(
+    materialize_parameter="allow_materialize"
+)
 def run_or_resume_massive_adaptive_rl_four_fold_validation_and_selection_v1(
     *,
     root: str | Path,
