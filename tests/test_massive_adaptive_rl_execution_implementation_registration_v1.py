@@ -15,6 +15,7 @@ from rl_quant.workflows import (
 from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
     MassiveAdaptiveRLExecutionImplementationRegistrationV1Error,
     load_massive_adaptive_rl_execution_implementation_registration_v1,
+    massive_adaptive_rl_preimplementation_economic_evidence_v1,
     run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
@@ -89,6 +90,11 @@ def _qualified_capture_body(
         manifest_registration=registration,
         initial_inputs=initial_inputs,
     )
+    required = body["required_v5_native_implementation_paths"]
+    assert isinstance(required, tuple)
+    implementation_inventory = tuple(body["implementation_inventory"]) + tuple(
+        (name, _digest(("v5-native", name))) for name in required
+    )
     body.update(
         {
             "source_worktree_clean": True,
@@ -108,6 +114,12 @@ def _qualified_capture_body(
                 ("NUMEXPR_NUM_THREADS", "1"),
                 ("PYTHONHASHSEED", "0"),
             ),
+            "implementation_inventory": implementation_inventory,
+            "implementation_inventory_sha256": semantic_sha256(
+                implementation_inventory
+            ),
+            "missing_v5_native_implementation_paths": (),
+            "v5_native_vertical_complete": True,
             "source_data_qualified": True,
         }
     )
@@ -249,3 +261,58 @@ def test_execution_registration_rejects_untracked_source_and_late_outcomes(
             manifest_registration=registration,
             initial_inputs=initial,
         )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "adaptive-rl/{experiment}/frozen-fc06-v2",
+        "adaptive-rl/{experiment}/outer-access-commitment-v2",
+        "adaptive-rl/{experiment}/prequential-state-v1",
+        "massive-adaptive/rl-policy-selection-authority-v3",
+        "massive-adaptive/rl-outer-evidence-authority-v4",
+        "massive-adaptive/rl-profitability-report-authority-v1",
+    ),
+)
+def test_execution_registration_scan_covers_future_and_legacy_evidence(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="execution-registration-evidence-scan"
+    )
+    path = tmp_path / relative.format(experiment=manifest.experiment_id)
+    path.mkdir(parents=True)
+    found = massive_adaptive_rl_preimplementation_economic_evidence_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+    assert str(path.relative_to(tmp_path)) in found
+
+
+def test_execution_registration_requires_complete_v5_native_vertical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="execution-registration-native-inventory"
+    )
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+    registration_time = registration.source_transaction_committed_at_ms
+    assert registration_time is not None
+    initial = _initial_inputs_shell(
+        manifest_v4_receipt_sha256=manifest.base_manifest.semantic_receipt_sha256,
+        committed_at_ms=registration_time + 1,
+        monkeypatch=monkeypatch,
+    )
+    body = implementation._capture_body(
+        manifest=manifest,
+        manifest_registration=registration,
+        initial_inputs=initial,
+    )
+    assert body["missing_v5_native_implementation_paths"]
+    assert body["v5_native_vertical_complete"] is False
+    assert body["source_data_qualified"] is False

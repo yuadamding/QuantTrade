@@ -298,6 +298,17 @@ def publish_massive_source_object(
     destination_root = Path(root)
     payload_relative = _safe_object_key(relative_payload_path)
     source_key = _safe_object_key(source_object_key)
+    # All adaptive-RL source transactions pass through this primitive.  The
+    # late import avoids coupling the generic Massive source layer to workflow
+    # modules while making V5 ownership structural instead of decorator-only.
+    from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+        authorize_massive_adaptive_rl_source_publication_v5,
+    )
+
+    authorize_massive_adaptive_rl_source_publication_v5(
+        root=destination_root,
+        relative_payload_path=payload_relative,
+    )
     if isinstance(block_bytes, bool) or not isinstance(block_bytes, int) or block_bytes <= 0:
         raise MassiveSourceObjectError("stream block size must be positive")
     parent_fd, payload_name = _open_parent_directory(

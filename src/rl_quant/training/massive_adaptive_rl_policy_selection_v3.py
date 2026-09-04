@@ -55,6 +55,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     MASSIVE_ADAPTIVE_RL_VALIDATION_SELECTION_SPECIFICATION_V1_SHA256,
     MassiveAdaptiveRLExperimentManifestV4,
 )
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    legacy_manifest_v5_rejecting_writer_guard_v1,
+)
 
 
 MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_AUTHORITY_V3_SCHEMA = (
@@ -904,6 +907,7 @@ def authorize_massive_adaptive_rl_policy_selection_authority_v3(
     return result
 
 
+@legacy_manifest_v5_rejecting_writer_guard_v1()
 def materialize_massive_adaptive_rl_policy_selection_authority_v3(
     *,
     root: str | Path,

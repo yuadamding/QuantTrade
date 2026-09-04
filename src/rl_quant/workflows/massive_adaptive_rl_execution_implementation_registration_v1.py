@@ -32,6 +32,7 @@ from rl_quant.data_sources.massive.source_receipts import (
 )
 from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 import (
     MassiveAdaptiveRLInitialValidationInputsAuthorityV1,
+    massive_adaptive_rl_forbidden_prequential_artifacts_v1,
 )
 from rl_quant.protocol.canonical_artifact import file_sha256, semantic_sha256
 from rl_quant.protocol.massive_adaptive_alpha_v1 import (
@@ -50,6 +51,10 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    massive_adaptive_rl_manifest_v5_writer_scope_v1,
 )
 
 
@@ -78,12 +83,68 @@ _IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/evaluation/massive_adaptive_rl_policy_evaluator_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_prequential_validation_inputs_v1.py",
     "src/rl_quant/training/massive_adaptive_rl_policy_selection_v2.py",
+    "src/rl_quant/training/massive_adaptive_rl_policy_selection_v3.py",
     "src/rl_quant/workflows/massive_adaptive_rl_execution_implementation_registration_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_experiment_lock_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v5.py",
     "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5.py",
     "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5_registration.py",
     "src/rl_quant/workflows/massive_adaptive_rl_writer_guard_v5.py",
+)
+_REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
+    "src/rl_quant/evaluation/massive_adaptive_rl_validation_release_authority_v1.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_validation_outcome_authority_v3.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_fold_validation_authority_v3.py",
+    "src/rl_quant/training/massive_adaptive_rl_policy_selection_v4.py",
+    "src/rl_quant/training/massive_adaptive_frozen_rl_policy_v2.py",
+    "src/rl_quant/training/massive_adaptive_rl_frozen_fc06_v2.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_walk_forward_policy_schedule_v1.py",
+    "src/rl_quant/evaluation/massive_adaptive_outer_access_commitment_v2.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_outer_rollout_authority_v2.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_outer_fold_seal_authority_v1.py",
+    "src/rl_quant/evaluation/massive_adaptive_rl_profitability_report_authority_v2.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_prequential_experiment_state_v1.py",
+)
+_SCOPED_OUTCOME_DIRECTORY_NAMES = (
+    "validation-outcome-v3",
+    "fold-validation-v3",
+    "policy-selection-v4",
+    "frozen-policy-v2",
+    "frozen-fc06-v2",
+    "walk-forward-policy-schedule-v1",
+    "outer-access-commitment-v2",
+    "outer-rollout-v2",
+    "outer-fold-seal-v1",
+    "profitability-report-v2",
+    "prequential-state-v1",
+)
+_LEGACY_OUTCOME_DIRECTORY_NAMES = (
+    "frozen-rl-policy-v1",
+    "outer-access-commitment-v1",
+    "outer-evidence-v1",
+    "outer-forecast-archive-v1",
+    "profit-trace-v1",
+    "profit-trace-v2",
+    "rl-cost-ladder-authority-v1",
+    "rl-fixed-control-outer-cost-ladder-v1",
+    "rl-fixed-control-outer-rollout-v1",
+    "rl-fixed-control-validation-authority-v1",
+    "rl-fold-validation-authority-v1",
+    "rl-fold-validation-authority-v2",
+    "rl-fold-validation-execution-authority-v1",
+    "rl-four-fold-policy-selection-authority-v1",
+    "rl-outer-cost-ladder-authority-v1",
+    "rl-outer-evidence-authority-v4",
+    "rl-outer-evidence-v1",
+    "rl-outer-evidence-v3",
+    "rl-outer-forecast-archive-v1",
+    "rl-outer-rollout-v1",
+    "rl-policy-selection-authority-v3",
+    "rl-policy-selection-v1",
+    "rl-policy-selection-v2",
+    "rl-policy-trace-authority-v1",
+    "rl-profitability-report-authority-v1",
+    "rl-validation-outcome-authority-v2",
 )
 _THREAD_ENVIRONMENT_NAMES = (
     "OMP_NUM_THREADS",
@@ -202,21 +263,47 @@ def execution_implementation_registration_relative_path_v1(
     )
 
 
-def _outcome_or_freeze_evidence_exists(
+def execution_implementation_registration_transaction_state_v1(
     *, root: str | Path, experiment_id: str
-) -> bool:
+) -> tuple[bool, bool]:
+    return _transaction_state(
+        root=root,
+        relative=execution_implementation_registration_relative_path_v1(
+            experiment_id=experiment_id
+        ),
+    )
+
+
+def massive_adaptive_rl_preimplementation_economic_evidence_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+) -> tuple[str, ...]:
+    """Return every current, future, partial, or legacy outcome namespace."""
+
+    manifest.validate()
+    experiment_id = manifest.experiment_id
     experiment = _identifier(experiment_id)
-    directories = (
-        Path(root) / "adaptive-rl" / experiment / "validation-outcome-v3",
-        Path(root) / "adaptive-rl" / experiment / "fold-validation-v3",
-        Path(root) / "adaptive-rl" / experiment / "policy-selection-v4",
-        Path(root) / "adaptive-rl" / experiment / "frozen-policy-v2",
+    resolved_root = Path(root)
+    candidates = tuple(
+        resolved_root / "adaptive-rl" / experiment / name
+        for name in _SCOPED_OUTCOME_DIRECTORY_NAMES
+    ) + tuple(
+        resolved_root / "massive-adaptive" / name
+        for name in _LEGACY_OUTCOME_DIRECTORY_NAMES
     )
-    return any(
-        directory.exists()
-        or directory.is_symlink()
-        for directory in directories
+    found = {
+        str(path.relative_to(resolved_root))
+        for path in candidates
+        if path.exists() or path.is_symlink()
+    }
+    found.update(
+        massive_adaptive_rl_forbidden_prequential_artifacts_v1(
+            root=root,
+            manifest=manifest.base_manifest,
+        )
     )
+    return tuple(sorted(found))
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +326,9 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     dependency_lock_sha256: str
     implementation_inventory: tuple[tuple[str, str], ...]
     implementation_inventory_sha256: str
+    required_v5_native_implementation_paths: tuple[str, ...]
+    missing_v5_native_implementation_paths: tuple[str, ...]
+    v5_native_vertical_complete: bool
     python_version: str
     python_implementation: str
     pytorch_version: str
@@ -374,6 +464,8 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
         expected_qualified = bool(
             self.source_worktree_clean
             and not self.source_worktree_status
+            and self.v5_native_vertical_complete
+            and not self.missing_v5_native_implementation_paths
             and self.execution_device_specification == "cpu"
             and self.parameter_dtype == "torch.float32"
             and self.observation_dtype == "torch.float32"
@@ -402,8 +494,23 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
                 for character in self.git_commit + self.git_tree
             )
             or self.source_worktree_clean != (not self.source_worktree_status)
+            or self.required_v5_native_implementation_paths
+            != _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS
+            or self.missing_v5_native_implementation_paths
+            != tuple(
+                name
+                for name in self.required_v5_native_implementation_paths
+                if name not in {row[0] for row in self.implementation_inventory}
+            )
+            or self.v5_native_vertical_complete
+            != (not self.missing_v5_native_implementation_paths)
             or tuple(row[0] for row in self.implementation_inventory)
             != _IMPLEMENTATION_RELATIVE_PATHS
+            + tuple(
+                name
+                for name in self.required_v5_native_implementation_paths
+                if name not in self.missing_v5_native_implementation_paths
+            )
             or self.implementation_inventory_sha256
             != semantic_sha256(self.implementation_inventory)
             or environment_names != _THREAD_ENVIRONMENT_NAMES
@@ -552,7 +659,20 @@ def _capture_body(
         if name
     )
     tracked = _source_inventory(repository, tracked_names)
-    implementation = _source_inventory(repository, _IMPLEMENTATION_RELATIVE_PATHS)
+    missing_v5_native = tuple(
+        name
+        for name in _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS
+        if not (repository / name).is_file() or (repository / name).is_symlink()
+    )
+    present_v5_native = tuple(
+        name
+        for name in _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS
+        if name not in missing_v5_native
+    )
+    implementation = _source_inventory(
+        repository,
+        _IMPLEMENTATION_RELATIVE_PATHS + present_v5_native,
+    )
     status = tuple(
         row
         for row in _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
@@ -570,6 +690,7 @@ def _capture_body(
     environment_values = dict(process_environment)
     source_qualified = bool(
         not status
+        and not missing_v5_native
         and torch.are_deterministic_algorithms_enabled()
         and not torch.is_deterministic_algorithms_warn_only_enabled()
         and not torch.backends.cuda.matmul.allow_tf32
@@ -612,6 +733,11 @@ def _capture_body(
         "dependency_lock_sha256": file_sha256(lock_path),
         "implementation_inventory": implementation,
         "implementation_inventory_sha256": semantic_sha256(implementation),
+        "required_v5_native_implementation_paths": (
+            _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS
+        ),
+        "missing_v5_native_implementation_paths": missing_v5_native,
+        "v5_native_vertical_complete": not missing_v5_native,
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
         "pytorch_version": torch.__version__,
@@ -711,6 +837,18 @@ def _parse(
             "execution tracked worktree status differs"
         )
     body["source_worktree_status"] = tuple(status)
+    for name in (
+        "required_v5_native_implementation_paths",
+        "missing_v5_native_implementation_paths",
+    ):
+        value = body.get(name)
+        if not isinstance(value, list) or not all(
+            isinstance(row, str) for row in value
+        ):
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                f"execution {name.replace('_', ' ')} differs"
+            )
+        body[name] = tuple(value)
     for name in ("implementation_inventory", "process_thread_environment"):
         body[name] = _tuple_rows(body.get(name), name=name.replace("_", " "))
     try:
@@ -812,8 +950,9 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "execution implementation registration is absent"
         )
-    if _outcome_or_freeze_evidence_exists(
-        root=root, experiment_id=manifest.experiment_id
+    if massive_adaptive_rl_preimplementation_economic_evidence_v1(
+        root=root,
+        manifest=manifest,
     ):
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "execution implementation must precede every validation outcome"
@@ -833,23 +972,35 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
             "initial validation-input chronology is absent"
         )
     committed_at_ms = max(verified_at_ms, initial_time + 1)
-    publish_massive_source_object(
-        stream=BytesIO(canonical_json_file_bytes(_payload(captured))),
-        root=root,
-        relative_payload_path=relative,
-        dataset_id=(
-            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_DATASET
-        ),
-        source_object_key=relative,
-        requested_at_ms=committed_at_ms,
-        downloaded_at_ms=committed_at_ms,
-        schema_sha256=(
-            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SCHEMA_SHA256
-        ),
-        entitlement_receipt_sha256=captured.semantic_receipt_sha256,
-        committed_at_ms=committed_at_ms,
-        request_id=f"ADAPTIVE-RL-EXECUTION-IMPLEMENTATION-{manifest.experiment_id}",
+    capability = (
+        issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1(
+            root=root,
+            authority=manifest_registration,
+        )
     )
+    with massive_adaptive_rl_manifest_v5_writer_scope_v1(
+        root=root,
+        capability=capability,
+    ):
+        publish_massive_source_object(
+            stream=BytesIO(canonical_json_file_bytes(_payload(captured))),
+            root=root,
+            relative_payload_path=relative,
+            dataset_id=(
+                MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_DATASET
+            ),
+            source_object_key=relative,
+            requested_at_ms=committed_at_ms,
+            downloaded_at_ms=committed_at_ms,
+            schema_sha256=(
+                MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SCHEMA_SHA256
+            ),
+            entitlement_receipt_sha256=captured.semantic_receipt_sha256,
+            committed_at_ms=committed_at_ms,
+            request_id=(
+                f"ADAPTIVE-RL-EXECUTION-IMPLEMENTATION-{manifest.experiment_id}"
+            ),
+        )
     return authorize_massive_adaptive_rl_execution_implementation_registration_v1(
         authority=load_massive_adaptive_rl_execution_implementation_registration_v1(
             root=root,
@@ -916,6 +1067,8 @@ __all__ = [
     "authorize_massive_adaptive_rl_execution_implementation_registration_v1",
     "capture_massive_adaptive_rl_execution_implementation_registration_v1",
     "execution_implementation_registration_relative_path_v1",
+    "execution_implementation_registration_transaction_state_v1",
     "load_massive_adaptive_rl_execution_implementation_registration_v1",
+    "massive_adaptive_rl_preimplementation_economic_evidence_v1",
     "run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1",
 ]

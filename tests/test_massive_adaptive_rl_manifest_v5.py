@@ -5,17 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from rl_quant.protocol.canonical_artifact import semantic_sha256
 from rl_quant.workflows import massive_adaptive_rl_manifest_v5 as manifest_module
-from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
-    MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256,
-    MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256,
-)
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256,
-    MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256,
+    MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SPEC_SHA256,
     MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256,
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_AUTHORITY_GENERATIONS_V1,
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_EDGES_V1,
@@ -93,22 +90,7 @@ def test_manifest_v5_binds_scientific_protocol_and_defers_physical_implementatio
         manifest.specification_sha256
         == MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256
     )
-    assert (
-        manifest.authoritative_writer_specification_sha256
-        == MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
-    )
-    assert (
-        manifest.execution_implementation_registration_specification_sha256
-        == MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
-    )
-    assert (
-        manifest.artifact_root_writer_lock_specification_sha256
-        == MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
-    )
-    assert (
-        manifest.direct_materialization_lock_specification_sha256
-        == MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
-    )
+    assert len(manifest.scientific_protocol_projection_sha256) == 64
     payload = manifest.semantic_unsigned()
     assert "implementation_source_sha256" not in payload
     assert "authoritative_writer_implementation_source_sha256" not in payload
@@ -117,13 +99,16 @@ def test_manifest_v5_binds_scientific_protocol_and_defers_physical_implementatio
     assert "validation_execution_environment_implementation_source_sha256" not in payload
     assert "experiment_global_lock_implementation_source_sha256" not in payload
     assert "manifest_v5_registration_implementation_source_sha256" not in payload
+    assert "base_manifest_v4_receipt_sha256" not in payload
+    assert "authoritative_writer_specification_sha256" not in payload
+    assert "execution_implementation_registration_specification_sha256" not in payload
     for value in (
         MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256,
         MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256,
         MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256,
-        MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256,
         MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256,
         MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256,
+        MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SPEC_SHA256,
     ):
         assert len(value) == 64
         int(value, 16)
@@ -144,6 +129,49 @@ def test_manifest_v5_receipt_does_not_depend_on_runner_source_hash(
         experiment_id="manifest-v5-implementation-decoupling"
     )
     assert after.semantic_receipt_sha256 == before.semantic_receipt_sha256
+
+
+def test_manifest_v5_receipt_ignores_nested_compatibility_source_hashes() -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="manifest-v5-nested-source-decoupling"
+    )
+    base_v4 = manifest.base_manifest
+    base_v3 = base_v4.base_manifest
+    base_v2 = base_v3.base_manifest
+
+    changed_v2 = replace(
+        base_v2,
+        workflow_implementation_source_sha256="a" * 64,
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed_v2 = replace(
+        changed_v2,
+        semantic_receipt_sha256=semantic_sha256(changed_v2.semantic_unsigned()),
+    )
+    changed_v3 = replace(
+        base_v3,
+        base_manifest=changed_v2,
+        profitability_report_implementation_source_sha256="b" * 64,
+        implementation_source_sha256="c" * 64,
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed_v3 = replace(
+        changed_v3,
+        semantic_receipt_sha256=semantic_sha256(changed_v3.semantic_unsigned()),
+    )
+    changed_v4 = replace(
+        base_v4,
+        base_manifest=changed_v3,
+        implementation_source_sha256="d" * 64,
+        semantic_receipt_sha256="0" * 64,
+    )
+    changed_v4 = replace(
+        changed_v4,
+        semantic_receipt_sha256=semantic_sha256(changed_v4.semantic_unsigned()),
+    )
+    changed = replace(manifest, base_manifest=changed_v4)
+    changed.validate()
+    assert changed.semantic_receipt_sha256 == manifest.semantic_receipt_sha256
 
 
 def test_manifest_v5_cli_creates_validates_and_uses_only_v5_runner(

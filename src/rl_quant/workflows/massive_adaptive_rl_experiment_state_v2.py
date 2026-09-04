@@ -458,6 +458,19 @@ def _write_state(
     *, artifact_root: str | Path, state: MassiveAdaptiveRLExperimentStateV2
 ) -> MassiveAdaptiveRLExperimentStateV2:
     state.validate()
+    from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+        authorize_massive_adaptive_rl_source_publication_v5,
+    )
+
+    authorize_massive_adaptive_rl_source_publication_v5(
+        root=artifact_root,
+        relative_payload_path=str(
+            Path("adaptive-rl")
+            / state.experiment_id
+            / "state-v2"
+            / f"{state.sequence_index:03d}-{state.stage.value}.json"
+        ),
+    )
     with _state_publication_lock(
         artifact_root=artifact_root,
         experiment_id=state.experiment_id,

@@ -24,8 +24,12 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
     MassiveAdaptiveRLExperimentLockV1Error,
     MassiveAdaptiveRLExperimentLockV1Unavailable,
-    massive_adaptive_rl_artifact_root_writer_lock_v1,
     massive_adaptive_rl_experiment_orchestration_lock_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+    MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+    execution_implementation_registration_transaction_state_v1,
+    run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
     MassiveAdaptiveRLEndToEndRunV2,
@@ -48,9 +52,12 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
-    _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked,
     issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1,
+    issue_massive_adaptive_rl_manifest_v5_training_capability_v1,
     run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    massive_adaptive_rl_manifest_v5_writer_scope_v1,
 )
 
 
@@ -109,6 +116,10 @@ class MassiveAdaptiveRLPrequentialRunV5:
     initial_validation_inputs_source_receipt_sha256: str
     initial_validation_inputs_commit_receipt_sha256: str
     initial_validation_inputs_committed_at_ms: int
+    execution_implementation_registration_authority_receipt_sha256: str | None
+    execution_implementation_registration_source_receipt_sha256: str | None
+    execution_implementation_registration_commit_receipt_sha256: str | None
+    execution_implementation_registration_committed_at_ms: int | None
     released_validation_fold_indices: tuple[int, ...]
     withheld_validation_fold_indices: tuple[int, ...]
     authoritative_writer_generation: str
@@ -116,6 +127,7 @@ class MassiveAdaptiveRLPrequentialRunV5:
     training_evidence_adopted: bool
     source_generation_v2_replayed: bool
     initial_validation_inputs_replayed: bool
+    execution_implementation_registered: bool
     diagnostic_continuation_registered: bool
     validation_execution_complete: bool
     next_required_stage: str
@@ -146,6 +158,26 @@ class MassiveAdaptiveRLPrequentialRunV5:
         return False
 
     def validate(self) -> None:
+        implementation_receipts = (
+            self.execution_implementation_registration_authority_receipt_sha256,
+            self.execution_implementation_registration_source_receipt_sha256,
+            self.execution_implementation_registration_commit_receipt_sha256,
+        )
+        implementation_present = all(value is not None for value in implementation_receipts)
+        implementation_committed_at_ms = (
+            self.execution_implementation_registration_committed_at_ms
+        )
+        implementation_chronology_invalid = bool(
+            self.execution_implementation_registered
+            and implementation_committed_at_ms is not None
+            and implementation_committed_at_ms
+            <= self.initial_validation_inputs_committed_at_ms
+        )
+        expected_next_stage = (
+            "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
+            if self.execution_implementation_registered
+            else "execution-implementation-registration"
+        )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RUN_V5_SCHEMA
             or not self.experiment_id
@@ -162,9 +194,12 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or not self.diagnostic_continuation_registered
             or self.manifest_v5_registration_committed_at_ms
             >= self.initial_validation_inputs_committed_at_ms
+            or self.execution_implementation_registered != implementation_present
+            or (self.execution_implementation_registration_committed_at_ms is not None)
+            != self.execution_implementation_registered
+            or implementation_chronology_invalid
             or self.validation_execution_complete
-            or self.next_required_stage
-            != "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
+            or self.next_required_stage != expected_next_stage
             or self.policy_schedule_disposition is not None
             or self.final_policy_freezing_authorized
             or self.outer_access_authorized
@@ -185,7 +220,7 @@ class MassiveAdaptiveRLPrequentialRunV5:
                 "adaptive RL prequential run V5 differs"
             )
         for name, value in self.semantic_unsigned().items():
-            if name.endswith("_sha256"):
+            if name.endswith("_sha256") and value is not None:
                 _digest(name, value)
         for name, value in (
             (
@@ -198,6 +233,11 @@ class MassiveAdaptiveRLPrequentialRunV5:
             ),
         ):
             _required_timestamp(name, value)
+        if self.execution_implementation_registration_committed_at_ms is not None:
+            _required_timestamp(
+                "execution implementation registration timestamp",
+                self.execution_implementation_registration_committed_at_ms,
+            )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
@@ -207,10 +247,15 @@ def _build_result(
     registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     predecessor: MassiveAdaptiveRLPrequentialRunV4,
     artifact_root: str | Path,
+    implementation_registration: (
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1 | None
+    ) = None,
 ) -> MassiveAdaptiveRLPrequentialRunV5:
     manifest.validate()
     registration.validate()
     predecessor.validate()
+    if implementation_registration is not None:
+        implementation_registration.validate()
     initial = load_massive_adaptive_rl_initial_validation_inputs_authority_v1(
         root=artifact_root,
         manifest=manifest.base_manifest,
@@ -237,6 +282,16 @@ def _build_result(
         or initial.manifest_v4_receipt_sha256
         != manifest.base_manifest.semantic_receipt_sha256
         or registration_committed_at_ms >= initial_committed_at_ms
+        or implementation_registration is not None
+        and (
+            not implementation_registration.development_execution_registered
+            or implementation_registration.manifest_v5_receipt_sha256
+            != manifest.semantic_receipt_sha256
+            or implementation_registration.manifest_v5_registration_authority_receipt_sha256
+            != registration.semantic_receipt_sha256
+            or implementation_registration.initial_validation_inputs_authority_receipt_sha256
+            != initial.semantic_receipt_sha256
+        )
     ):
         raise MassiveAdaptiveRLExperimentRunnerV5Error(
             "Manifest V5 initial prequential boundary did not replay"
@@ -272,6 +327,35 @@ def _build_result(
             initial.source_transaction_receipt_sha256,
         ),
         "initial_validation_inputs_committed_at_ms": initial_committed_at_ms,
+        "execution_implementation_registration_authority_receipt_sha256": (
+            None
+            if implementation_registration is None
+            else implementation_registration.semantic_receipt_sha256
+        ),
+        "execution_implementation_registration_source_receipt_sha256": (
+            None
+            if implementation_registration is None
+            else _required_digest(
+                "execution implementation registration source receipt",
+                implementation_registration.source_receipt_sha256,
+            )
+        ),
+        "execution_implementation_registration_commit_receipt_sha256": (
+            None
+            if implementation_registration is None
+            else _required_digest(
+                "execution implementation registration commit receipt",
+                implementation_registration.source_transaction_receipt_sha256,
+            )
+        ),
+        "execution_implementation_registration_committed_at_ms": (
+            None
+            if implementation_registration is None
+            else _required_timestamp(
+                "execution implementation registration timestamp",
+                implementation_registration.source_transaction_committed_at_ms,
+            )
+        ),
         "released_validation_fold_indices": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
         ),
@@ -285,12 +369,15 @@ def _build_result(
         "initial_validation_inputs_replayed": (
             predecessor.initial_validation_inputs_replayed
         ),
+        "execution_implementation_registered": implementation_registration is not None,
         "diagnostic_continuation_registered": (
             predecessor.diagnostic_continuation_registered
         ),
         "validation_execution_complete": False,
         "next_required_stage": (
-            "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
+            "execution-implementation-registration"
+            if implementation_registration is None
+            else "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
         ),
         "policy_schedule_disposition": None,
         "final_policy_freezing_authorized": False,
@@ -331,24 +418,58 @@ def _replay_v5_boundary(
         artifact_root=artifact_root,
         experiment_id=manifest.experiment_id,
     )
-    predecessor = _replay_prequential_root(
-        manifest=manifest.base_manifest,
-        source_root=source_root,
-        artifact_root=artifact_root,
-        device=device,
-        states=states,
-        allow_materialize=allow_materialize,
-        v5_writer_capability=(
-            issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
-                authority=registration
-            )
-        ),
+    initial_inputs_capability = (
+        issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+            root=artifact_root,
+            authority=registration,
+            source_root=source_root,
+        )
     )
+    with massive_adaptive_rl_manifest_v5_writer_scope_v1(
+        root=artifact_root,
+        capability=initial_inputs_capability,
+    ):
+        predecessor = _replay_prequential_root(
+            manifest=manifest.base_manifest,
+            source_root=source_root,
+            artifact_root=artifact_root,
+            device=device,
+            states=states,
+            allow_materialize=allow_materialize,
+            v5_writer_capability=initial_inputs_capability,
+        )
+    complete, partial = execution_implementation_registration_transaction_state_v1(
+        root=artifact_root,
+        experiment_id=manifest.experiment_id,
+    )
+    if partial:
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "execution implementation registration transaction is incomplete"
+        )
+    implementation_registration: (
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1 | None
+    ) = None
+    if complete:
+        initial = load_massive_adaptive_rl_initial_validation_inputs_authority_v1(
+            root=artifact_root,
+            manifest=manifest.base_manifest,
+            verified_at_ms=_wall_clock_ms(),
+        )
+        implementation_registration = (
+            run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+                root=artifact_root,
+                manifest=manifest,
+                manifest_registration=registration,
+                initial_inputs=initial,
+                allow_materialize=False,
+            )
+        )
     return _build_result(
         manifest=manifest,
         registration=registration,
         predecessor=predecessor,
         artifact_root=artifact_root,
+        implementation_registration=implementation_registration,
     )
 
 
@@ -368,20 +489,25 @@ def run_massive_adaptive_rl_experiment_v5(
             "requested device differs from the Manifest-V5 training device"
         )
     try:
-        with massive_adaptive_rl_artifact_root_writer_lock_v1(
-            artifact_root=artifact_root
+        registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+            root=artifact_root,
+            manifest=manifest,
+            allow_materialize=True,
+        )
+        with massive_adaptive_rl_experiment_orchestration_lock_v1(
+            artifact_root=artifact_root,
+            experiment_id=manifest.experiment_id,
         ):
-            with massive_adaptive_rl_experiment_orchestration_lock_v1(
-                artifact_root=artifact_root,
-                experiment_id=manifest.experiment_id,
-            ):
-                registration = (
-                    _run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked(
-                        root=artifact_root,
-                        manifest=manifest,
-                        allow_materialize=True,
-                    )
+            training_capability = (
+                issue_massive_adaptive_rl_manifest_v5_training_capability_v1(
+                    root=artifact_root,
+                    authority=registration,
                 )
+            )
+            with massive_adaptive_rl_manifest_v5_writer_scope_v1(
+                root=artifact_root,
+                capability=training_capability,
+            ):
                 training = _run_massive_adaptive_rl_experiment_v2_unlocked(
                     manifest=manifest.base_manifest.base_manifest,
                     source_root=source_root,
@@ -389,16 +515,16 @@ def run_massive_adaptive_rl_experiment_v5(
                     device=device,
                     resume=resume,
                 )
-                if training.four_fold_fit_authority_receipt_sha256 is None:
-                    return training
-                return _replay_v5_boundary(
-                    manifest=manifest,
-                    registration=registration,
-                    source_root=source_root,
-                    artifact_root=artifact_root,
-                    device=device,
-                    allow_materialize=True,
-                )
+            if training.four_fold_fit_authority_receipt_sha256 is None:
+                return training
+            return _replay_v5_boundary(
+                manifest=manifest,
+                registration=registration,
+                source_root=source_root,
+                artifact_root=artifact_root,
+                device=device,
+                allow_materialize=True,
+            )
     except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
         raise MassiveAdaptiveRLExperimentRunnerV5LeaseUnavailable(
             "adaptive RL V5 execution is already owned"

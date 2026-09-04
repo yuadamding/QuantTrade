@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+
+from rl_quant.data_sources.massive.source_receipts import publish_massive_source_object
+from rl_quant.protocol.canonical_artifact import semantic_sha256
 
 from rl_quant.evaluation.massive_adaptive_outer_access_commitment_v1 import (
     materialize_massive_adaptive_outer_access_commitment_v1,
@@ -70,6 +75,11 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 )
 from rl_quant.workflows.massive_adaptive_rl_v2 import (
     write_massive_adaptive_rl_experiment_manifest_v2,
+)
+from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
+    authorize_legacy_or_manifest_v5_compatibility_writer_v1,
+    authorize_massive_adaptive_rl_source_publication_v5,
+    massive_adaptive_rl_manifest_v5_writer_scope_v1,
 )
 
 
@@ -291,6 +301,7 @@ def test_registered_v5_disables_direct_legacy_child_materializers(
         allow_materialize=False,
     )
     capability = issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+        root=artifact_root,
         authority=registration
     )
 
@@ -386,3 +397,117 @@ def test_registered_v5_disables_direct_legacy_child_materializers(
             committed_at_ms=1,
             v5_writer_capability=capability,
         )
+
+
+def test_writer_capability_replays_registration_and_is_role_scoped(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="registration-capability-replay"
+    )
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+    capability = issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+        root=tmp_path,
+        authority=registration,
+    )
+    forged = replace(capability, registration_commit_receipt_sha256="f" * 64)
+    with pytest.raises(
+        MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+        match="persisted registration",
+    ):
+        authorize_legacy_or_manifest_v5_compatibility_writer_v1(
+            root=tmp_path,
+            experiment_id=manifest.experiment_id,
+            manifest_v4_receipt_sha256=(
+                manifest.base_manifest.semantic_receipt_sha256
+            ),
+            writer_role="initial-validation-inputs",
+            fold_index=0,
+            capability=forged,
+        )
+
+    with massive_adaptive_rl_manifest_v5_writer_scope_v1(
+        root=tmp_path,
+        capability=capability,
+    ):
+        authorize_massive_adaptive_rl_source_publication_v5(
+            root=tmp_path,
+            relative_payload_path=(
+                "massive-adaptive/rl-validation-inputs-v1/allowed.json"
+            ),
+        )
+        with pytest.raises(
+            MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+            match="does not authorize",
+        ):
+            authorize_massive_adaptive_rl_source_publication_v5(
+                root=tmp_path,
+                relative_payload_path=(
+                    "massive-adaptive/rl-policy-selection-authority-v3/forbidden.json"
+                ),
+            )
+
+    relative = "massive-adaptive/rl-policy-selection-authority-v3/blocked.json"
+    with pytest.raises(MassiveAdaptiveRLLegacyWriterRejectedByManifestV5):
+        publish_massive_source_object(
+            stream=BytesIO(b"{}"),
+            root=tmp_path,
+            relative_payload_path=relative,
+            dataset_id="guard-test",
+            source_object_key=relative,
+            requested_at_ms=1,
+            downloaded_at_ms=1,
+            schema_sha256=semantic_sha256("schema"),
+            entitlement_receipt_sha256=semantic_sha256("entitlement"),
+            committed_at_ms=1,
+            request_id="GUARD-TEST",
+        )
+    assert not (tmp_path / relative).exists()
+
+
+def test_writer_capability_binds_separate_source_publication_root(
+    tmp_path: Path,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="registration-source-root"
+    )
+    artifact_root = tmp_path / "artifacts"
+    source_root = tmp_path / "source"
+    other_root = tmp_path / "other"
+    source_root.mkdir()
+    other_root.mkdir()
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=artifact_root,
+        manifest=manifest,
+    )
+    capability = issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+        root=artifact_root,
+        authority=registration,
+        source_root=source_root,
+    )
+
+    with pytest.raises(MassiveAdaptiveRLLegacyWriterRejectedByManifestV5):
+        authorize_massive_adaptive_rl_source_publication_v5(
+            root=artifact_root,
+            relative_payload_path="adaptive-rl/source-bundle-v2/unguarded.json",
+        )
+
+    with massive_adaptive_rl_manifest_v5_writer_scope_v1(
+        root=artifact_root,
+        capability=capability,
+    ):
+        authorize_massive_adaptive_rl_source_publication_v5(
+            root=source_root,
+            relative_payload_path="adaptive-rl/source-bundle-v2/allowed.json",
+        )
+        with pytest.raises(
+            MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+            match="publication root",
+        ):
+            authorize_massive_adaptive_rl_source_publication_v5(
+                root=other_root,
+                relative_payload_path="adaptive-rl/source-bundle-v2/forbidden.json",
+            )

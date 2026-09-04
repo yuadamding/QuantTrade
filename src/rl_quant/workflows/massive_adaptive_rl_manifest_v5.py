@@ -24,7 +24,6 @@ from rl_quant.evaluation.massive_adaptive_rl_prequential_validation_inputs_v1 im
     MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_PLAN_V1_SPEC_SHA256,
 )
 from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v1 import (
-    MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V1_SOURCE_SHA256,
     MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V1_SPEC_SHA256,
 )
 from rl_quant.protocol.canonical_artifact import (
@@ -48,8 +47,13 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     MASSIVE_ADAPTIVE_RL_NO_ELIGIBLE_CANDIDATE_POLICY_V1,
     MASSIVE_ADAPTIVE_RL_VALIDATION_SELECTION_SPECIFICATION_V1_SHA256,
     MassiveAdaptiveRLExperimentManifestV4,
-    _parse_base_manifest_v3,
     build_massive_adaptive_rl_experiment_manifest_v4,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
+    MassiveAdaptiveRLExperimentManifestV3,
+)
+from rl_quant.workflows.massive_adaptive_rl_v2 import (
+    MassiveAdaptiveRLExperimentManifestV2,
 )
 from rl_quant.workflows.massive_adaptive_rl_validation_execution_environment_v1 import (
     MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256,
@@ -58,6 +62,9 @@ from rl_quant.workflows.massive_adaptive_rl_validation_execution_environment_v1 
 
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SCHEMA = (
     "rl-quant.massive-adaptive-rl-experiment-manifest-v5"
+)
+MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SCHEMA = (
+    "rl-quant.massive-adaptive-rl-scientific-protocol-v1"
 )
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SOURCE_SHA256 = file_sha256(Path(__file__))
 MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SCHEMA = (
@@ -117,6 +124,7 @@ MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_EDGES_V1 = ((0, 2), (1, 3))
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1 = (
     "trained",
     "initial-validation-inputs-committed",
+    "execution-implementation-registered",
     "policy-0-frozen",
     "policy-1-frozen",
     "outer-0-sealed",
@@ -305,9 +313,6 @@ MASSIVE_ADAPTIVE_RL_OUTER_FOLD_SEAL_V1_SPEC_SHA256 = semantic_sha256(
 MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_V2_SPEC_SHA256 = semantic_sha256(
     {
         "economic_witness": MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V1_SPEC_SHA256,
-        "economic_witness_source": (
-            MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V1_SOURCE_SHA256
-        ),
         "inputs": "four-authenticated-outer-fold-seals",
         "qualified_and_diagnostic_schedules_reported": True,
         "execution_complete_is_not_profitability": True,
@@ -368,57 +373,22 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256 = semantic_sha256(
 
 MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SPEC_SHA256 = semantic_sha256(
     {
-        "base_manifest": "exact-validation-selection-v4",
-        "prequential_plan": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_PLAN_V1_SPEC_SHA256,
-        "initial_inputs": MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256,
-        "initial_validation_folds": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1,
-        "withheld_validation_folds": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1,
-        "release_prerequisites": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_PREREQUISITES_V1,
-        "release_edges": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_EDGES_V1,
-        "stage_sequence": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1,
-        "authority_generations": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_AUTHORITY_GENERATIONS_V1,
-        "no_eligible_candidate_policy": MASSIVE_ADAPTIVE_RL_NO_ELIGIBLE_CANDIDATE_POLICY_V1,
-        "legacy_manifest_v4_writer": False,
-        "authoritative_writer": "massive-adaptive-rl-experiment-runner-v5",
-        "authoritative_writer_specification": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
-        ),
-        "execution_implementation_registration": (
-            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
-        ),
-        "manifest_registration": (
-            MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
-        ),
-        "experiment_global_lock": MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256,
-        "artifact_root_writer_lock": (
-            MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
-        ),
-        "direct_materialization_lock": (
-            MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
-        ),
-        "validation_environment": (
-            MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256
-        ),
-        "validation_release": MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_V1_SPEC_SHA256,
-        "validation_economic_core": (
-            MASSIVE_ADAPTIVE_RL_VALIDATION_ECONOMIC_CORE_V1_SPEC_SHA256
-        ),
-        "validation_outcome": MASSIVE_ADAPTIVE_RL_VALIDATION_OUTCOME_V3_SPEC_SHA256,
-        "fold_validation": MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_V3_SPEC_SHA256,
-        "policy_selection": MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V4_SPEC_SHA256,
-        "frozen_policy": MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V2_SPEC_SHA256,
-        "frozen_fc06": MASSIVE_ADAPTIVE_RL_FROZEN_FC06_V2_SPEC_SHA256,
-        "walk_forward_policy_schedule": (
-            MASSIVE_ADAPTIVE_RL_WALK_FORWARD_POLICY_SCHEDULE_V1_SPEC_SHA256
-        ),
-        "outer_access": MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V2_SPEC_SHA256,
-        "outer_rollout": MASSIVE_ADAPTIVE_RL_OUTER_ROLLOUT_V2_SPEC_SHA256,
-        "outer_fold_seal": MASSIVE_ADAPTIVE_RL_OUTER_FOLD_SEAL_V1_SPEC_SHA256,
-        "profitability_report": MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_V2_SPEC_SHA256,
-        "state": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_EXPERIMENT_STATE_V1_SPEC_SHA256,
+        "scientific_protocol": MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SCHEMA,
+        "base_v2_v3_v4": "compatibility-witness-not-semantic-identity",
+        "physical_implementation": "separate-create-only-registration",
         "profitability_reporting": False,
         "lockbox": False,
         "live_trading": False,
+    }
+)
+
+MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SPEC_SHA256 = semantic_sha256(
+    {
+        "schema": MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SCHEMA,
+        "projection": "explicit-v2-through-v5-scientific-choices",
+        "source_hashes": False,
+        "implementation_receipts": False,
+        "compatibility_manifest_receipts": False,
     }
 )
 
@@ -439,16 +409,205 @@ def _digest(name: str, value: object) -> str:
     return value
 
 
+def massive_adaptive_rl_scientific_protocol_projection_v1(
+    base_manifest: MassiveAdaptiveRLExperimentManifestV4,
+) -> dict[str, object]:
+    """Return the source-hash-free scientific choices witnessed by V2--V5.
+
+    The nested V2--V4 manifests remain persisted compatibility witnesses, but
+    their implementation and source identities must not determine the V5
+    scientific receipt.  This projection deliberately names the fixed-control
+    protocol instead of inheriting its implementation-bearing registry receipt.
+    """
+
+    base_v3 = base_manifest.base_manifest
+    base_v2 = base_v3.base_manifest
+    return {
+        "schema": MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SCHEMA,
+        "specification_sha256": (
+            MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SPEC_SHA256
+        ),
+        "experiment_id": base_v2.experiment_id,
+        "training": {
+            "fold_indices": base_v2.fold_indices,
+            "prequential_block_sessions": base_v2.prequential_block_sessions,
+            "candidate_elapsed_sessions": base_v2.candidate_elapsed_sessions,
+            "seeds": base_v2.seeds,
+            "seed_policy": base_v2.seed_policy,
+            "ppo_config": asdict(base_v2.ppo_config),
+            "fold_candidate_schedule_receipts": (
+                base_v2.fold_candidate_schedule_receipts
+            ),
+        },
+        "economics": {
+            "primary_capital": base_v2.primary_capital,
+            "cost_ladder_basis_points": base_v2.cost_ladder_basis_points,
+            "primary_cost_basis_points": base_v2.primary_cost_basis_points,
+            "maximum_fill_participation": base_v2.maximum_fill_participation,
+            "fixed_control_protocol": (
+                "fc00-through-fc12-with-training-selected-fc06-v1"
+            ),
+            "policy_specification_sha256": base_v2.policy_specification_sha256,
+            "action_specification_sha256": base_v2.action_specification_sha256,
+            "reward_specification_sha256": base_v2.reward_specification_sha256,
+            "benchmark_specification": base_v2.benchmark_specification,
+            "initial_book_specification": base_v2.initial_book_specification,
+            "maximum_fold_drawdown": base_v2.maximum_fold_drawdown,
+            "outer_gate_names": base_v2.outer_gate_names,
+        },
+        "reporting": {
+            "profitability_report_specification_sha256": (
+                base_v3.profitability_report_specification_sha256
+            ),
+            "final_gate_names_v3": base_v3.final_gate_names,
+            "bootstrap_specification": base_v3.bootstrap_specification,
+            "bootstrap_replicates": base_v3.bootstrap_replicates,
+            "bootstrap_block_sessions": base_v3.bootstrap_block_sessions,
+            "bootstrap_seed": base_v3.bootstrap_seed,
+            "annualization_sessions": base_v3.annualization_sessions,
+            "risk_free_return_specification": (
+                base_v3.risk_free_return_specification
+            ),
+            "execution_device_specification": (
+                base_v3.execution_device_specification
+            ),
+        },
+        "selection": {
+            "validation_selection_specification_sha256": (
+                base_manifest.validation_selection_specification_sha256
+            ),
+            "candidate_ranking_specification_sha256": (
+                base_manifest.candidate_ranking_specification_sha256
+            ),
+            "candidate_ranking_metric_names": (
+                base_manifest.candidate_ranking_metric_names
+            ),
+            "candidate_tie_breaking_specification_sha256": (
+                base_manifest.candidate_tie_breaking_specification_sha256
+            ),
+            "candidate_tie_breaking_rule_names": (
+                base_manifest.candidate_tie_breaking_rule_names
+            ),
+            "validation_eligibility_criteria": (
+                base_manifest.validation_eligibility_criteria
+            ),
+            "no_eligible_candidate_policy": (
+                base_manifest.no_eligible_candidate_policy
+            ),
+            "validation_gate_names": base_manifest.validation_gate_names,
+            "final_gate_names_v4": base_manifest.final_gate_names,
+        },
+        "prequential": {
+            "initial_validation_fold_indices": (
+                MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
+            ),
+            "withheld_validation_fold_indices": (
+                MASSIVE_ADAPTIVE_RL_PREQUENTIAL_WITHHELD_VALIDATION_FOLDS_V1
+            ),
+            "validation_release_prerequisite_outer_fold_indices": (
+                MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_PREREQUISITES_V1
+            ),
+            "outer_to_validation_release_edges": (
+                MASSIVE_ADAPTIVE_RL_PREQUENTIAL_RELEASE_EDGES_V1
+            ),
+            "stage_sequence": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1,
+            "authority_generations": (
+                MASSIVE_ADAPTIVE_RL_PREQUENTIAL_AUTHORITY_GENERATIONS_V1
+            ),
+            "validation_release_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_VALIDATION_RELEASE_V1_SPEC_SHA256
+            ),
+            "validation_economic_core_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_VALIDATION_ECONOMIC_CORE_V1_SPEC_SHA256
+            ),
+            "validation_outcome_v3_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_VALIDATION_OUTCOME_V3_SPEC_SHA256
+            ),
+            "fold_validation_v3_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_V3_SPEC_SHA256
+            ),
+            "policy_selection_v4_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_POLICY_SELECTION_V4_SPEC_SHA256
+            ),
+            "frozen_policy_v2_specification_sha256": (
+                MASSIVE_ADAPTIVE_FROZEN_RL_POLICY_V2_SPEC_SHA256
+            ),
+            "frozen_fc06_v2_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_FROZEN_FC06_V2_SPEC_SHA256
+            ),
+            "walk_forward_policy_schedule_v1_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_WALK_FORWARD_POLICY_SCHEDULE_V1_SPEC_SHA256
+            ),
+            "outer_access_v2_specification_sha256": (
+                MASSIVE_ADAPTIVE_OUTER_ACCESS_COMMITMENT_V2_SPEC_SHA256
+            ),
+            "outer_rollout_v2_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_OUTER_ROLLOUT_V2_SPEC_SHA256
+            ),
+            "outer_fold_seal_v1_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_OUTER_FOLD_SEAL_V1_SPEC_SHA256
+            ),
+            "profitability_report_v2_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_V2_SPEC_SHA256
+            ),
+            "prequential_state_v1_specification_sha256": (
+                MASSIVE_ADAPTIVE_RL_PREQUENTIAL_EXPERIMENT_STATE_V1_SPEC_SHA256
+            ),
+            "diagnostic_only_continuation_required": True,
+        },
+        "protocol_receipt_sha256": MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256,
+    }
+
+
+def _validate_base_manifest_v4_compatibility_witness(
+    base_manifest: MassiveAdaptiveRLExperimentManifestV4,
+) -> None:
+    """Verify persisted V2--V4 receipts without consulting current source hashes."""
+
+    if type(base_manifest) is not MassiveAdaptiveRLExperimentManifestV4:
+        raise MassiveAdaptiveRLExperimentManifestV5Error(
+            "adaptive RL Manifest V5 requires exact Manifest V4"
+        )
+    base_v3 = base_manifest.base_manifest
+    if type(base_v3) is not MassiveAdaptiveRLExperimentManifestV3:
+        raise MassiveAdaptiveRLExperimentManifestV5Error(
+            "adaptive RL Manifest V5 compatibility Manifest V3 differs"
+        )
+    base_v2 = base_v3.base_manifest
+    if type(base_v2) is not MassiveAdaptiveRLExperimentManifestV2:
+        raise MassiveAdaptiveRLExperimentManifestV5Error(
+            "adaptive RL Manifest V5 compatibility Manifest V2 differs"
+        )
+    base_v2.ppo_config.validate()
+    if any(
+        authority.semantic_receipt_sha256
+        != semantic_sha256(authority.semantic_unsigned())
+        for authority in (base_v2, base_v3, base_manifest)
+    ):
+        raise MassiveAdaptiveRLExperimentManifestV5Error(
+            "adaptive RL Manifest V5 compatibility receipt chain differs"
+        )
+    expected = build_massive_adaptive_rl_experiment_manifest_v4(
+        experiment_id=base_v2.experiment_id,
+        prequential_block_sessions=base_v2.prequential_block_sessions,
+        seeds=base_v2.seeds,
+        ppo_config=base_v2.ppo_config,
+        execution_device_specification=base_v3.execution_device_specification,
+    )
+    if massive_adaptive_rl_scientific_protocol_projection_v1(
+        base_manifest
+    ) != massive_adaptive_rl_scientific_protocol_projection_v1(expected):
+        raise MassiveAdaptiveRLExperimentManifestV5Error(
+            "adaptive RL Manifest V5 compatibility scientific choices differ"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveRLExperimentManifestV5:
     base_manifest: MassiveAdaptiveRLExperimentManifestV4
+    scientific_protocol_projection_sha256: str
     prequential_validation_plan_specification_sha256: str
     initial_validation_inputs_specification_sha256: str
-    validation_execution_environment_specification_sha256: str
-    experiment_global_lock_specification_sha256: str
-    artifact_root_writer_lock_specification_sha256: str
-    direct_materialization_lock_specification_sha256: str
-    manifest_v5_registration_specification_sha256: str
     initial_validation_fold_indices: tuple[int, ...]
     withheld_validation_fold_indices: tuple[int, ...]
     validation_release_prerequisite_outer_fold_indices: tuple[int | None, ...]
@@ -472,8 +631,6 @@ class MassiveAdaptiveRLExperimentManifestV5:
     diagnostic_only_continuation_required: bool
     legacy_manifest_v4_materialization_authorized: bool
     authoritative_writer_generation: str
-    authoritative_writer_specification_sha256: str
-    execution_implementation_registration_specification_sha256: str
     semantic_receipt_sha256: str
     validation_outcome_access_authorized: bool = False
     outer_access_authorized: bool = False
@@ -495,43 +652,32 @@ class MassiveAdaptiveRLExperimentManifestV5:
     def semantic_unsigned(self) -> dict[str, object]:
         return {
             "schema": self.schema,
-            "base_manifest_v4_receipt_sha256": (
-                self.base_manifest.semantic_receipt_sha256
+            "experiment_id": self.experiment_id,
+            "scientific_protocol_projection_sha256": (
+                self.scientific_protocol_projection_sha256
             ),
-            **{
-                key: value
-                for key, value in asdict(self).items()
-                if key
-                not in {
-                    "schema",
-                    "base_manifest",
-                    "semantic_receipt_sha256",
-                }
-            },
+            "validation_outcome_access_authorized": False,
+            "outer_access_authorized": False,
+            "profitability_reporting_authorized": False,
+            "lockbox_access_authorized": False,
+            "live_trading_authorized": False,
+            "protocol_receipt_sha256": self.protocol_receipt_sha256,
+            "specification_sha256": self.specification_sha256,
         }
 
     def validate(self) -> None:
-        if type(self.base_manifest) is not MassiveAdaptiveRLExperimentManifestV4:
-            raise MassiveAdaptiveRLExperimentManifestV5Error(
-                "adaptive RL Manifest V5 requires exact Manifest V4"
-            )
-        self.base_manifest.validate()
+        _validate_base_manifest_v4_compatibility_witness(self.base_manifest)
+        expected_projection = massive_adaptive_rl_scientific_protocol_projection_v1(
+            self.base_manifest
+        )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SCHEMA
+            or self.scientific_protocol_projection_sha256
+            != semantic_sha256(expected_projection)
             or self.prequential_validation_plan_specification_sha256
             != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_PLAN_V1_SPEC_SHA256
             or self.initial_validation_inputs_specification_sha256
             != MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256
-            or self.validation_execution_environment_specification_sha256
-            != MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256
-            or self.experiment_global_lock_specification_sha256
-            != MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256
-            or self.artifact_root_writer_lock_specification_sha256
-            != MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
-            or self.direct_materialization_lock_specification_sha256
-            != MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
-            or self.manifest_v5_registration_specification_sha256
-            != MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
             or self.initial_validation_fold_indices
             != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
             or self.withheld_validation_fold_indices
@@ -576,10 +722,6 @@ class MassiveAdaptiveRLExperimentManifestV5:
             or self.legacy_manifest_v4_materialization_authorized
             or self.authoritative_writer_generation
             != "massive-adaptive-rl-experiment-runner-v5"
-            or self.authoritative_writer_specification_sha256
-            != MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
-            or self.execution_implementation_registration_specification_sha256
-            != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
             or self.validation_outcome_access_authorized
             or self.outer_access_authorized
             or self.profitability_reporting_authorized
@@ -619,26 +761,14 @@ def build_massive_adaptive_rl_experiment_manifest_v5(
     body = {
         "schema": MASSIVE_ADAPTIVE_RL_EXPERIMENT_MANIFEST_V5_SCHEMA,
         "base_manifest": base,
+        "scientific_protocol_projection_sha256": semantic_sha256(
+            massive_adaptive_rl_scientific_protocol_projection_v1(base)
+        ),
         "prequential_validation_plan_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_PLAN_V1_SPEC_SHA256
         ),
         "initial_validation_inputs_specification_sha256": (
             MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256
-        ),
-        "validation_execution_environment_specification_sha256": (
-            MASSIVE_ADAPTIVE_RL_VALIDATION_EXECUTION_ENVIRONMENT_V1_SPEC_SHA256
-        ),
-        "experiment_global_lock_specification_sha256": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256
-        ),
-        "artifact_root_writer_lock_specification_sha256": (
-            MASSIVE_ADAPTIVE_RL_ARTIFACT_ROOT_WRITER_LOCK_V1_SPEC_SHA256
-        ),
-        "direct_materialization_lock_specification_sha256": (
-            MASSIVE_ADAPTIVE_RL_MATERIALIZATION_LOCK_V1_SPEC_SHA256
-        ),
-        "manifest_v5_registration_specification_sha256": (
-            MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256
         ),
         "initial_validation_fold_indices": (
             MASSIVE_ADAPTIVE_RL_PREQUENTIAL_INITIAL_VALIDATION_FOLDS_V1
@@ -701,12 +831,6 @@ def build_massive_adaptive_rl_experiment_manifest_v5(
         "diagnostic_only_continuation_required": True,
         "legacy_manifest_v4_materialization_authorized": False,
         "authoritative_writer_generation": "massive-adaptive-rl-experiment-runner-v5",
-        "authoritative_writer_specification_sha256": (
-            MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256
-        ),
-        "execution_implementation_registration_specification_sha256": (
-            MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256
-        ),
         "validation_outcome_access_authorized": False,
         "outer_access_authorized": False,
         "profitability_reporting_authorized": False,
@@ -742,13 +866,53 @@ def write_massive_adaptive_rl_experiment_manifest_v5(
         ) from error
 
 
+def _parse_base_manifest_v2_compatibility(
+    value: object,
+) -> MassiveAdaptiveRLExperimentManifestV2:
+    if not isinstance(value, Mapping):
+        raise MassiveAdaptiveRLExperimentManifestV5Error(
+            "adaptive RL Manifest V5 base Manifest V2 is malformed"
+        )
+    payload = dict(value)
+    for name in (
+        "fold_indices",
+        "candidate_elapsed_sessions",
+        "seeds",
+        "cost_ladder_basis_points",
+        "outer_gate_names",
+        "fold_candidate_schedule_receipts",
+    ):
+        payload[name] = tuple(cast(list[object], payload[name]))
+    payload["ppo_config"] = MassiveAdaptivePPOConfigV1(
+        **cast(dict[str, object], payload["ppo_config"])  # type: ignore[arg-type]
+    )
+    return MassiveAdaptiveRLExperimentManifestV2(**payload)  # type: ignore[arg-type]
+
+
+def _parse_base_manifest_v3_compatibility(
+    value: object,
+) -> MassiveAdaptiveRLExperimentManifestV3:
+    if not isinstance(value, Mapping):
+        raise MassiveAdaptiveRLExperimentManifestV5Error(
+            "adaptive RL Manifest V5 base Manifest V3 is malformed"
+        )
+    payload = dict(value)
+    payload["base_manifest"] = _parse_base_manifest_v2_compatibility(
+        payload["base_manifest"]
+    )
+    payload["final_gate_names"] = tuple(cast(list[str], payload["final_gate_names"]))
+    return MassiveAdaptiveRLExperimentManifestV3(**payload)  # type: ignore[arg-type]
+
+
 def _parse_base_manifest_v4(value: object) -> MassiveAdaptiveRLExperimentManifestV4:
     if not isinstance(value, Mapping):
         raise MassiveAdaptiveRLExperimentManifestV5Error(
             "adaptive RL Manifest V5 base Manifest V4 is malformed"
         )
     payload = dict(value)
-    payload["base_manifest"] = _parse_base_manifest_v3(payload["base_manifest"])
+    payload["base_manifest"] = _parse_base_manifest_v3_compatibility(
+        payload["base_manifest"]
+    )
     for name in (
         "candidate_ranking_metric_names",
         "candidate_tie_breaking_rule_names",
@@ -757,9 +921,7 @@ def _parse_base_manifest_v4(value: object) -> MassiveAdaptiveRLExperimentManifes
         "final_gate_names",
     ):
         payload[name] = tuple(cast(list[str], payload[name]))
-    result = MassiveAdaptiveRLExperimentManifestV4(**payload)
-    result.validate()
-    return result
+    return MassiveAdaptiveRLExperimentManifestV4(**payload)  # type: ignore[arg-type]
 
 
 def load_massive_adaptive_rl_experiment_manifest_v5(
@@ -805,6 +967,8 @@ __all__ = [
     "MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SOURCE_SHA256",
     "MASSIVE_ADAPTIVE_RL_MANIFEST_V5_REGISTRATION_V1_SPEC_SHA256",
+    "MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SCHEMA",
+    "MASSIVE_ADAPTIVE_RL_SCIENTIFIC_PROTOCOL_V1_SPEC_SHA256",
     "MASSIVE_ADAPTIVE_RL_INITIAL_BOUNDARY_PREDECESSOR_V4_SOURCE_SHA256",
     "MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_AUTHORITY_V3_SCHEMA",
     "MASSIVE_ADAPTIVE_RL_FOLD_VALIDATION_V3_SPEC_SHA256",
@@ -837,5 +1001,6 @@ __all__ = [
     "MassiveAdaptiveRLExperimentManifestV5Error",
     "build_massive_adaptive_rl_experiment_manifest_v5",
     "load_massive_adaptive_rl_experiment_manifest_v5",
+    "massive_adaptive_rl_scientific_protocol_projection_v1",
     "write_massive_adaptive_rl_experiment_manifest_v5",
 ]

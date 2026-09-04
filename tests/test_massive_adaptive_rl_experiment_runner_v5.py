@@ -22,6 +22,9 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     run_massive_adaptive_rl_experiment_v5,
     verify_massive_adaptive_rl_experiment_v5,
 )
+from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+    MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+)
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     build_massive_adaptive_rl_experiment_manifest_v5,
     write_massive_adaptive_rl_experiment_manifest_v5,
@@ -131,9 +134,60 @@ def test_v5_result_binds_registration_before_initial_inputs(
     assert result.withheld_validation_fold_indices == (2, 3)
     assert result.protocol_registered
     assert not result.validation_execution_complete
+    assert result.next_required_stage == "execution-implementation-registration"
     assert not result.positive_profitability_authorization_eligible
     assert not result.outer_access_authorized
     assert not result.end_to_end_profitability_execution_complete
+
+    implementation_registration = _typed_shell(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        semantic_receipt_sha256=_digest("implementation-registration"),
+        manifest_v5_receipt_sha256=manifest.semantic_receipt_sha256,
+        manifest_v5_registration_authority_receipt_sha256=(
+            registration.semantic_receipt_sha256
+        ),
+        initial_validation_inputs_authority_receipt_sha256=(
+            initial.semantic_receipt_sha256
+        ),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        "validate",
+        lambda _: None,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        "development_execution_registered",
+        property(lambda _: True),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        "source_receipt_sha256",
+        property(lambda _: _digest("implementation-source")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        "source_transaction_receipt_sha256",
+        property(lambda _: _digest("implementation-commit")),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+        "source_transaction_committed_at_ms",
+        property(lambda _: 30),
+    )
+    registered = _build_result(
+        manifest=manifest,
+        registration=registration,
+        predecessor=predecessor,
+        artifact_root=tmp_path,
+        implementation_registration=implementation_registration,
+    )
+    assert registered.execution_implementation_registered
+    assert registered.execution_implementation_registration_committed_at_ms == 30
+    assert (
+        registered.next_required_stage
+        == "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
+    )
 
 
 def test_v5_root_registers_before_resuming_training(
@@ -173,8 +227,18 @@ def test_v5_root_registers_before_resuming_training(
 
     monkeypatch.setattr(
         runner,
-        "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
+        "run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1",
         register,
+    )
+    monkeypatch.setattr(
+        runner,
+        "issue_massive_adaptive_rl_manifest_v5_training_capability_v1",
+        lambda **_: object(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "massive_adaptive_rl_manifest_v5_writer_scope_v1",
+        lambda **_: nullcontext(),
     )
     monkeypatch.setattr(
         runner, "_run_massive_adaptive_rl_experiment_v2_unlocked", train
@@ -210,8 +274,18 @@ def test_v5_training_blocker_does_not_open_validation(
     )
     monkeypatch.setattr(
         runner,
-        "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
+        "run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1",
         lambda **_: object(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "issue_massive_adaptive_rl_manifest_v5_training_capability_v1",
+        lambda **_: object(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "massive_adaptive_rl_manifest_v5_writer_scope_v1",
+        lambda **_: nullcontext(),
     )
     monkeypatch.setattr(
         runner,

@@ -398,11 +398,14 @@ def authorize_massive_adaptive_rl_manifest_v5_registration_authority_v1(
     return result
 
 
-def issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
-    *, authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1
+def _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    writer_role: str,
+    allowed_fold_indices: tuple[int, ...],
+    publication_roots: tuple[str | Path, ...] = (),
 ) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
-    """Issue the only compatibility capability available before outcomes."""
-
     authority.validate()
     source_receipt = authority.source_receipt_sha256
     commit_receipt = authority.source_transaction_receipt_sha256
@@ -415,14 +418,63 @@ def issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
             "initial-input writer capability requires replayed V5 registration"
         )
     return _issue_manifest_v5_writer_capability_v1(
+        root=root,
         experiment_id=authority.experiment_id,
         manifest_v5_receipt_sha256=authority.manifest_v5_receipt_sha256,
         base_manifest_v4_receipt_sha256=authority.base_manifest_v4_receipt_sha256,
         registration_authority_receipt_sha256=authority.semantic_receipt_sha256,
         registration_source_receipt_sha256=source_receipt,
         registration_commit_receipt_sha256=commit_receipt,
+        writer_role=writer_role,
+        allowed_fold_indices=allowed_fold_indices,
+        publication_roots=publication_roots,
+    )
+
+
+def issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    source_root: str | Path | None = None,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue the fold-0/1 compatibility capability before outcomes."""
+
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
         writer_role="initial-validation-inputs",
         allowed_fold_indices=(0, 1),
+        publication_roots=() if source_root is None else (source_root,),
+    )
+
+
+def issue_massive_adaptive_rl_manifest_v5_training_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue the capability used by the V5-owned causal training delegation."""
+
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
+        writer_role="causal-training",
+        allowed_fold_indices=(0, 1, 2, 3),
+    )
+
+
+def issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue the capability for the physical implementation registration."""
+
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
+        writer_role="execution-implementation-registration",
+        allowed_fold_indices=(0, 1, 2, 3),
     )
 
 
@@ -575,7 +627,9 @@ __all__ = [
     "MassiveAdaptiveRLManifestV5RegistrationError",
     "authorize_massive_adaptive_rl_manifest_v5_registration_authority_v1",
     "build_massive_adaptive_rl_manifest_v5_registration_authority_v1",
+    "issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1",
     "issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1",
+    "issue_massive_adaptive_rl_manifest_v5_training_capability_v1",
     "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
     "load_massive_adaptive_rl_manifest_v5_registration_authority_v1",
     "manifest_v5_registration_relative_path_v1",
