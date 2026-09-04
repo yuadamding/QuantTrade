@@ -182,10 +182,10 @@ _SCOPED_OUTCOME_DIRECTORY_NAMES = (
     "frozen-fc06-v2",
     "walk-forward-policy-schedule-v1",
     "outer-access-commitment-v2",
-    "outer-rollout-v2",
-    "outer-fold-seal-v1",
-    "profitability-report-v2",
-    "prequential-state-v1",
+    "outer-rollout-authority-v2",
+    "outer-fold-seal-authority-v1",
+    "profitability-report-authority-v2",
+    "prequential-experiment-state-v1",
 )
 _LEGACY_OUTCOME_DIRECTORY_NAMES = (
     "frozen-rl-policy-v1",

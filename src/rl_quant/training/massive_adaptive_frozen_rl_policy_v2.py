@@ -275,6 +275,17 @@ class MassiveAdaptiveFrozenRLPolicyV2:
             name: value.clone() for name, value in self._runtime_model_state.items()
         }
 
+    @property
+    def policy_selection_authority(self) -> MassiveAdaptiveRLPolicySelectionAuthorityV4:
+        """Return the exact replayed Selection V4 bound by this frozen policy."""
+
+        self.validate()
+        if self._runtime_selection is None or not self.development_stage_authorized:
+            raise MassiveAdaptiveFrozenRLPolicyV2Error(
+                "frozen PPO selection has not been exactly replayed"
+            )
+        return self._runtime_selection
+
     def validate(self) -> None:
         runtime_present = (
             self._runtime_selection is not None

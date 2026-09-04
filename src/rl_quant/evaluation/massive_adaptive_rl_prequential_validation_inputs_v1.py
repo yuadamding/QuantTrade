@@ -178,9 +178,7 @@ def policy_schedule_disposition_v1(
             "policy-schedule eligibility inventory differs"
         )
     if all(values):
-        return (
-            MassiveAdaptiveRLPolicyScheduleDispositionV1.FOUR_FOLD_POLICY_SCHEDULE_QUALIFIED
-        )
+        return MassiveAdaptiveRLPolicyScheduleDispositionV1.FOUR_FOLD_POLICY_SCHEDULE_QUALIFIED
     return MassiveAdaptiveRLPolicyScheduleDispositionV1.DIAGNOSTIC_ONLY_POLICY_SCHEDULE
 
 
@@ -239,7 +237,9 @@ class MassiveAdaptiveRLPrequentialValidationPlanV1:
             or validation[3] != outer[1]
             or any(set(validation[index]).intersection(outer[0]) for index in (0, 1))
             or any(set(validation[index]).intersection(outer[1]) for index in (0, 1))
-            or any(set(left).intersection(right) for left, right in zip(outer, outer[1:]))
+            or any(
+                set(left).intersection(right) for left, right in zip(outer, outer[1:])
+            )
             or self.execution_stage_names != _PREQUENTIAL_STAGE_NAMES
             or self.no_eligible_candidate_policy
             != MASSIVE_ADAPTIVE_RL_NO_ELIGIBLE_CANDIDATE_POLICY_V1
@@ -249,10 +249,8 @@ class MassiveAdaptiveRLPrequentialValidationPlanV1:
             != MassiveAdaptiveRLPolicyScheduleDispositionV1.DIAGNOSTIC_ONLY_POLICY_SCHEDULE.value
             or self.invalid_evidence_disposition
             != MassiveAdaptiveRLPolicyScheduleDispositionV1.INVALID_FOUR_FOLD_EVIDENCE.value
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
                 "prequential validation plan differs"
@@ -272,10 +270,9 @@ class MassiveAdaptiveRLPrequentialValidationPlanV1:
         """Return the validation folds causally released by a sealed prefix."""
 
         sealed = tuple(sealed_outer_fold_indices)
-        if (
-            any(isinstance(value, bool) or value not in _FOLD_INDICES for value in sealed)
-            or sealed != tuple(range(len(sealed)))
-        ):
+        if any(
+            isinstance(value, bool) or value not in _FOLD_INDICES for value in sealed
+        ) or sealed != tuple(range(len(sealed))):
             raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
                 "sealed outer-fold inventory is not a canonical prefix"
             )
@@ -602,14 +599,33 @@ class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
         """Return the exact replayed fit aggregate bound by this authority."""
 
         self.validate()
-        if (
-            not self.development_stage_authorized
-            or self._runtime_four_fold_fit is None
-        ):
+        if not self.development_stage_authorized or self._runtime_four_fold_fit is None:
             raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
                 "four-fold fit authority has not been exactly replayed"
             )
         return self._runtime_four_fold_fit
+
+    @property
+    def runtime_sources_v2(self) -> MassiveAdaptiveRLRuntimeSourcesV2:
+        """Return the exact replayed V2 roots for a causally delayed release."""
+
+        self.validate()
+        if not self.development_stage_authorized or self._runtime_sources_v2 is None:
+            raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
+                "runtime sources V2 have not been exactly replayed"
+            )
+        return self._runtime_sources_v2
+
+    @property
+    def manifest_v4(self) -> MassiveAdaptiveRLExperimentManifestV4:
+        """Return the exact replayed V4 compatibility witness and economics."""
+
+        self.validate()
+        if not self.development_stage_authorized or self._runtime_manifest is None:
+            raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
+                "Manifest V4 has not been exactly replayed"
+            )
+        return self._runtime_manifest
 
     def validation_sources(
         self, fold_index: int
@@ -622,7 +638,9 @@ class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
             raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
                 "validation fold is not released by the initial authority"
             )
-        return self._validation_sources_v2[self.validation_fold_indices.index(fold_index)]
+        return self._validation_sources_v2[
+            self.validation_fold_indices.index(fold_index)
+        ]
 
     def validation_registry(
         self, fold_index: int
@@ -640,17 +658,19 @@ class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
         ]
 
     def validate(self) -> None:
-        runtime_present = all(
-            value is not None
-            for value in (
-                self._runtime_manifest,
-                self._runtime_sources_v2,
-                self._runtime_four_fold_fit,
-                self._runtime_plan,
+        runtime_present = (
+            all(
+                value is not None
+                for value in (
+                    self._runtime_manifest,
+                    self._runtime_sources_v2,
+                    self._runtime_four_fold_fit,
+                    self._runtime_plan,
+                )
             )
-        ) and len(self._validation_sources_v2) == len(
-            self.validation_fold_indices
-        ) and len(self._validation_registries_v2) == len(self.validation_fold_indices)
+            and len(self._validation_sources_v2) == len(self.validation_fold_indices)
+            and len(self._validation_registries_v2) == len(self.validation_fold_indices)
+        )
         expected_runtime_flags = bool(runtime_present and self.source_data_qualified)
         lengths = tuple(
             len(value)
@@ -676,9 +696,7 @@ class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
             or self.withheld_validation_fold_indices != _WITHHELD_FOLD_INDICES
             or set(lengths) != {2}
             or any(
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
                 for value in (
                     *self.validation_sources_v2_committed_at_ms,
                     *self.validation_registry_v2_committed_at_ms,
@@ -714,14 +732,12 @@ class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
             or self.outer_access_authorized
             or self.profitability_reporting_authorized
             or self.lockbox_access_authorized
-            or self.protocol_receipt_sha256
-            != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
+            or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
             or self.specification_sha256
             != MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_INPUTS_V1_SPEC_SHA256
             or self.implementation_source_sha256
             != MASSIVE_ADAPTIVE_RL_PREQUENTIAL_VALIDATION_INPUTS_V1_SOURCE_SHA256
-            or self.semantic_receipt_sha256
-            != semantic_sha256(self.semantic_unsigned())
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
         ):
             raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
                 "initial prequential validation-input authority differs"
@@ -759,9 +775,7 @@ class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
 
-def _required_transaction(
-    value: str | int | None, *, name: str
-) -> str | int:
+def _required_transaction(value: str | int | None, *, name: str) -> str | int:
     if value is None:
         raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
             f"{name} source transaction is absent"
@@ -792,7 +806,10 @@ def build_massive_adaptive_rl_initial_validation_inputs_authority_v1(
     if (
         len(sources) != 2
         or len(registries) != 2
-        or any(type(row) is not MassiveAdaptiveRLValidationSourcesAuthorityV2 for row in sources)
+        or any(
+            type(row) is not MassiveAdaptiveRLValidationSourcesAuthorityV2
+            for row in sources
+        )
         or any(
             type(row) is not MassiveAdaptiveRLValidationEnvironmentRegistryV2
             for row in registries
@@ -824,7 +841,10 @@ def build_massive_adaptive_rl_initial_validation_inputs_authority_v1(
             for source, registry in zip(sources, registries, strict=True)
         )
         or tuple(row.validation_decision_session_dates for row in sources)
-        != tuple(plan.validation_session_date_inventories[index] for index in _INITIAL_FOLD_INDICES)
+        != tuple(
+            plan.validation_session_date_inventories[index]
+            for index in _INITIAL_FOLD_INDICES
+        )
     ):
         raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
             "initial validation inputs do not match the prequential plan"
@@ -849,35 +869,69 @@ def build_massive_adaptive_rl_initial_validation_inputs_authority_v1(
         "validation_source_projection_sha256": runtime_sources_v2.validation_source_projection_sha256,
         "validation_fold_indices": _INITIAL_FOLD_INDICES,
         "withheld_validation_fold_indices": _WITHHELD_FOLD_INDICES,
-        "validation_sources_v2_receipts": tuple(row.semantic_receipt_sha256 for row in sources),
+        "validation_sources_v2_receipts": tuple(
+            row.semantic_receipt_sha256 for row in sources
+        ),
         "validation_sources_v2_source_receipts": tuple(
-            cast(str, _required_transaction(row.source_receipt_sha256, name="validation source"))
+            cast(
+                str,
+                _required_transaction(
+                    row.source_receipt_sha256, name="validation source"
+                ),
+            )
             for row in sources
         ),
         "validation_sources_v2_commit_receipts": tuple(
-            cast(str, _required_transaction(row.source_transaction_receipt_sha256, name="validation source"))
+            cast(
+                str,
+                _required_transaction(
+                    row.source_transaction_receipt_sha256, name="validation source"
+                ),
+            )
             for row in sources
         ),
         "validation_sources_v2_committed_at_ms": tuple(
-            cast(int, _required_transaction(row.source_transaction_committed_at_ms, name="validation source"))
+            cast(
+                int,
+                _required_transaction(
+                    row.source_transaction_committed_at_ms, name="validation source"
+                ),
+            )
             for row in sources
         ),
         "validation_environment_registry_v2_receipts": tuple(
             row.semantic_receipt_sha256 for row in registries
         ),
         "validation_registry_v2_source_receipts": tuple(
-            cast(str, _required_transaction(row.source_receipt_sha256, name="validation registry"))
+            cast(
+                str,
+                _required_transaction(
+                    row.source_receipt_sha256, name="validation registry"
+                ),
+            )
             for row in registries
         ),
         "validation_registry_v2_commit_receipts": tuple(
-            cast(str, _required_transaction(row.source_transaction_receipt_sha256, name="validation registry"))
+            cast(
+                str,
+                _required_transaction(
+                    row.source_transaction_receipt_sha256, name="validation registry"
+                ),
+            )
             for row in registries
         ),
         "validation_registry_v2_committed_at_ms": tuple(
-            cast(int, _required_transaction(row.source_transaction_committed_at_ms, name="validation registry"))
+            cast(
+                int,
+                _required_transaction(
+                    row.source_transaction_committed_at_ms, name="validation registry"
+                ),
+            )
             for row in registries
         ),
-        "validation_context_receipts": tuple(row.validation_context_receipt_sha256 for row in registries),
+        "validation_context_receipts": tuple(
+            row.validation_context_receipt_sha256 for row in registries
+        ),
         "validation_decision_session_date_inventories": tuple(
             row.validation_decision_session_dates for row in sources
         ),
@@ -998,9 +1052,7 @@ def authorize_massive_adaptive_rl_initial_validation_inputs_authority_v1(
         runtime_sources_v2=runtime_sources_v2,
         four_fold_fit_authority=four_fold_fit_authority,
         validation_sources_v2=validation_sources_v2,
-        validation_environment_registries_v2=(
-            validation_environment_registries_v2
-        ),
+        validation_environment_registries_v2=(validation_environment_registries_v2),
     )
     relative = initial_validation_inputs_authority_relative_path_v1(manifest=manifest)
     if (
@@ -1161,7 +1213,11 @@ def _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability
         four_fold_fit_authority=four_fold_fit_authority,
     )
     relative = initial_validation_inputs_authority_relative_path_v1(manifest=manifest)
-    lease = _initial_inputs_lease(root=root, manifest=manifest) if allow_materialize else nullcontext()
+    lease = (
+        _initial_inputs_lease(root=root, manifest=manifest)
+        if allow_materialize
+        else nullcontext()
+    )
     with lease:
         forbidden = _forbidden_prequential_artifacts(root=root, manifest=manifest)
         if forbidden:
@@ -1245,13 +1301,15 @@ def run_or_resume_massive_adaptive_rl_initial_validation_inputs_v1(
 ) -> MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
     """Run the legacy initial boundary without a V5 writer capability."""
 
-    return _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1(
-        root=root,
-        manifest=manifest,
-        runtime_sources_v2=runtime_sources_v2,
-        four_fold_fit_authority=four_fold_fit_authority,
-        allow_materialize=allow_materialize,
-        v5_writer_capability=None,
+    return (
+        _run_or_resume_massive_adaptive_rl_initial_validation_inputs_with_capability_v1(
+            root=root,
+            manifest=manifest,
+            runtime_sources_v2=runtime_sources_v2,
+            four_fold_fit_authority=four_fold_fit_authority,
+            allow_materialize=allow_materialize,
+            v5_writer_capability=None,
+        )
     )
 
 

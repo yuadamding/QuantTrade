@@ -11,8 +11,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import wraps
+import json
+import os
 from pathlib import Path
 import time
 from typing import Callable, ParamSpec, TypeVar, cast
@@ -94,11 +96,11 @@ _EXPERIMENT_SCOPED_DIRECTORIES = frozenset(
         "frozen-policy-v2",
         "manifest-v5-registration-v1",
         "outer-access-commitment-v2",
-        "outer-fold-seal-v1",
-        "outer-rollout-v2",
+        "outer-fold-seal-authority-v1",
+        "outer-rollout-authority-v2",
         "policy-selection-v4",
-        "prequential-state-v1",
-        "profitability-report-v2",
+        "prequential-experiment-state-v1",
+        "profitability-report-authority-v2",
         "state-v2",
         "validation-outcome-v3",
         "validation-release-v1",
@@ -109,7 +111,12 @@ _WRITER_ROLE_FOLD_INVENTORIES = {
     "causal-training": (0, 1, 2, 3),
     "execution-implementation-registration": (0, 1, 2, 3),
     "initial-validation-inputs": (0, 1),
+    "initial-validation-release": (0, 1),
     "initial-validation-execution": (0, 1),
+    "post-outer-0-validation-release": (2,),
+    "post-outer-1-validation-release": (3,),
+    "prequential-validation-execution": (2, 3),
+    "prequential-outer-execution": (0, 1, 2, 3),
 }
 _INITIAL_VALIDATION_EXECUTION_DIRECTORIES = frozenset(
     {
@@ -120,6 +127,124 @@ _INITIAL_VALIDATION_EXECUTION_DIRECTORIES = frozenset(
         "frozen-fc06-v2",
     }
 )
+_PREQUENTIAL_OUTER_EXECUTION_DIRECTORIES = frozenset(
+    {
+        "outer-access-commitment-v2",
+        "outer-rollout-authority-v2",
+        "outer-fold-seal-authority-v1",
+        "walk-forward-policy-schedule-v1",
+        "profitability-report-authority-v2",
+        "prequential-experiment-state-v1",
+    }
+)
+_PUBLICATION_ROOT_OWNERSHIP_DIRECTORY = ".quanttrade/adaptive-rl-v5-writer-ownership"
+
+
+def _ownership_marker_path_v1(*, root: str | Path, experiment_id: str) -> Path:
+    return (
+        Path(root)
+        / _PUBLICATION_ROOT_OWNERSHIP_DIRECTORY
+        / f"{_identifier(experiment_id)}.json"
+    )
+
+
+def _ownership_marker_body_v1(
+    capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1,
+) -> dict[str, str]:
+    return {
+        "schema": "rl-quant.massive-adaptive-rl-v5-publication-root-owner-v1",
+        "experiment_id": capability.experiment_id,
+        "manifest_v5_receipt_sha256": capability.manifest_v5_receipt_sha256,
+        "registration_authority_receipt_sha256": (
+            capability.registration_authority_receipt_sha256
+        ),
+        "registration_source_receipt_sha256": (
+            capability.registration_source_receipt_sha256
+        ),
+        "registration_commit_receipt_sha256": (
+            capability.registration_commit_receipt_sha256
+        ),
+        "registration_root_resolved": capability._registration_root_resolved,
+    }
+
+
+def _canonical_marker_bytes_v1(body: dict[str, str]) -> bytes:
+    return (json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _ensure_publication_root_ownership_marker_v1(
+    *, root: str | Path, capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1
+) -> None:
+    """Persist V5 ownership in every writable derived-publication root."""
+
+    publication_root = Path(root).resolve(strict=True)
+    registration_root = Path(capability._registration_root_resolved)
+    if publication_root == registration_root:
+        return
+    marker = _ownership_marker_path_v1(
+        root=publication_root, experiment_id=capability.experiment_id
+    )
+    body = _ownership_marker_body_v1(capability)
+    encoded = _canonical_marker_bytes_v1(body)
+    with massive_adaptive_rl_artifact_root_writer_lock_v1(
+        artifact_root=publication_root
+    ):
+        marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if marker.is_symlink():
+            raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+                "Manifest V5 publication-root ownership marker is a symlink"
+            )
+        if marker.exists():
+            try:
+                existing = marker.read_bytes()
+            except OSError as error:
+                raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+                    "Manifest V5 publication-root ownership marker is unreadable"
+                ) from error
+            if existing != encoded:
+                raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+                    "publication root is already owned by a different V5 registration"
+                )
+            return
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                marker,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = -1
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            directory_descriptor = os.open(marker.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as error:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+                "Manifest V5 publication-root ownership marker cannot be committed"
+            ) from error
+
+
+def _publication_root_ownership_markers_v1(*, root: str | Path) -> tuple[Path, ...]:
+    directory = Path(root) / _PUBLICATION_ROOT_OWNERSHIP_DIRECTORY
+    if not directory.exists():
+        return ()
+    if directory.is_symlink() or not directory.is_dir():
+        raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+            "Manifest V5 publication-root ownership directory is invalid"
+        )
+    return tuple(
+        sorted(
+            (path for path in directory.iterdir() if path.name.endswith(".json")),
+            key=lambda path: path.name,
+        )
+    )
 
 
 def _initial_validation_execution_path_authorized_v1(
@@ -155,6 +280,68 @@ def _initial_validation_execution_path_authorized_v1(
     return bool(
         fold_name.endswith(suffix) and fold_name.removesuffix(suffix) in allowed_folds
     )
+
+
+def _prequential_scoped_path_authorized_v1(
+    *,
+    parts: tuple[str, ...],
+    capability: MassiveAdaptiveRLManifestV5WriterCapabilityV1,
+) -> bool:
+    if len(parts) < 4:
+        return False
+    directory = parts[2]
+    allowed_folds = frozenset(
+        f"fold-{fold_index}" for fold_index in capability.allowed_fold_indices
+    )
+    if capability.writer_role in {
+        "post-outer-0-validation-release",
+        "post-outer-1-validation-release",
+    }:
+        expected = (
+            "post-outer-0-fold-2.json"
+            if capability.writer_role == "post-outer-0-validation-release"
+            else "post-outer-1-fold-3.json"
+        )
+        return bool(
+            directory == "validation-release-v1"
+            and len(parts) == 4
+            and parts[3] == expected
+        )
+    if capability.writer_role == "prequential-validation-execution":
+        return _initial_validation_execution_path_authorized_v1(
+            parts=parts,
+            capability=replace(capability, writer_role="initial-validation-execution"),
+        )
+    if (
+        capability.writer_role != "prequential-outer-execution"
+        or directory not in _PREQUENTIAL_OUTER_EXECUTION_DIRECTORIES
+    ):
+        return False
+    name = parts[3] if len(parts) == 4 else ""
+    if directory in {
+        "outer-access-commitment-v2",
+        "outer-rollout-authority-v2",
+        "outer-fold-seal-authority-v1",
+    }:
+        return bool(
+            name.endswith(".json") and name.removesuffix(".json") in allowed_folds
+        )
+    if directory == "walk-forward-policy-schedule-v1":
+        return name in {
+            "prefix-through-fold-0.json",
+            "prefix-through-fold-1.json",
+            "prefix-through-fold-2.json",
+            "prefix-through-fold-3.json",
+        }
+    if directory == "profitability-report-authority-v2":
+        return name == "report.json"
+    if directory == "prequential-experiment-state-v1":
+        return bool(
+            name.endswith(".json")
+            and len(name.split("-", 1)[0]) == 3
+            and name.split("-", 1)[0].isdigit()
+        )
+    return False
 
 
 def _digest(value: object) -> bool:
@@ -254,6 +441,11 @@ def _issue_manifest_v5_writer_capability_v1(
         _publication_roots_resolved=resolved_publication_roots,
         _seal=_CAPABILITY_SEAL,
     )
+    for publication_root in resolved_publication_roots:
+        _ensure_publication_root_ownership_marker_v1(
+            root=publication_root,
+            capability=capability,
+        )
     _validate_manifest_v5_writer_capability_v1(
         root=root,
         capability=capability,
@@ -274,6 +466,15 @@ def _validate_manifest_v5_writer_capability_v1(
     writer_role: str,
     fold_index: int | None,
 ) -> None:
+    compatible_role = bool(
+        capability.writer_role == writer_role
+        or writer_role == "initial-validation-inputs"
+        and capability.writer_role
+        in {
+            "post-outer-0-validation-release",
+            "post-outer-1-validation-release",
+        }
+    )
     if (
         type(capability) is not MassiveAdaptiveRLManifestV5WriterCapabilityV1
         or capability._seal is not _CAPABILITY_SEAL
@@ -290,7 +491,7 @@ def _validate_manifest_v5_writer_capability_v1(
                 capability.registration_commit_receipt_sha256,
             )
         )
-        or capability.writer_role != writer_role
+        or not compatible_role
         or capability.base_manifest_v4_receipt_sha256 != manifest_v4_receipt_sha256
         or not capability.allowed_fold_indices
         or len(set(capability.allowed_fold_indices))
@@ -400,6 +601,25 @@ def _validate_capability_against_persisted_registration_v1(
         raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
             "Manifest V5 writer capability is not derived from the persisted registration"
         )
+    for publication_root in publication_roots:
+        if publication_root == registration_root:
+            continue
+        marker = _ownership_marker_path_v1(
+            root=publication_root,
+            experiment_id=capability.experiment_id,
+        )
+        try:
+            raw = marker.read_bytes()
+        except OSError as error:
+            raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+                "Manifest V5 publication-root ownership marker is absent"
+            ) from error
+        if marker.is_symlink() or raw != _canonical_marker_bytes_v1(
+            _ownership_marker_body_v1(capability)
+        ):
+            raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+                "Manifest V5 publication-root ownership marker differs"
+            )
 
 
 def authorize_legacy_or_manifest_v5_compatibility_writer_v1(
@@ -481,7 +701,10 @@ def authorize_massive_adaptive_rl_source_publication_v5(
             root=root,
             experiment_id=experiment_id,
         )
-        if not complete and not partial:
+        marker_owned = _ownership_marker_path_v1(
+            root=root, experiment_id=experiment_id
+        ).exists()
+        if not complete and not partial and not marker_owned:
             if active is not None:
                 raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
                     "Manifest V5 capability cannot publish outside its registered experiment"
@@ -505,7 +728,7 @@ def authorize_massive_adaptive_rl_source_publication_v5(
             and parts[2] == "state-v2"
         )
         initial_validation_release = bool(
-            active.writer_role == "initial-validation-inputs"
+            active.writer_role == "initial-validation-release"
             and relative_payload_path
             == (
                 f"adaptive-rl/{active.experiment_id}/validation-release-v1/initial.json"
@@ -515,12 +738,17 @@ def authorize_massive_adaptive_rl_source_publication_v5(
             parts=parts,
             capability=active,
         )
+        prequential_publication = _prequential_scoped_path_authorized_v1(
+            parts=parts,
+            capability=active,
+        )
         if not any(
             (
                 execution_registration,
                 training_state,
                 initial_validation_release,
                 initial_validation_execution,
+                prequential_publication,
             )
         ):
             raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
@@ -532,6 +760,11 @@ def authorize_massive_adaptive_rl_source_publication_v5(
     # experiment ID.  Once any V5 registration exists at this artifact root,
     # they may be written only inside an active V5 compatibility scope.
     if active is None:
+        markers = _publication_root_ownership_markers_v1(root=root)
+        if markers:
+            raise MassiveAdaptiveRLLegacyWriterRejectedByManifestV5(
+                "Manifest V5 owns this publication root; an exact active capability is required"
+            )
         reject_legacy_massive_adaptive_rl_writer_after_any_manifest_v5_registration(
             root=root
         )
@@ -541,7 +774,12 @@ def authorize_massive_adaptive_rl_source_publication_v5(
     if parts[0] == "adaptive-rl":
         allowed = (
             _INITIAL_INPUT_ADAPTIVE_RL_DIRECTORIES
-            if active.writer_role == "initial-validation-inputs"
+            if active.writer_role
+            in {
+                "initial-validation-inputs",
+                "post-outer-0-validation-release",
+                "post-outer-1-validation-release",
+            }
             else frozenset()
         )
     else:
@@ -549,7 +787,12 @@ def authorize_massive_adaptive_rl_source_publication_v5(
             _TRAINING_SOURCE_DIRECTORIES
             if active.writer_role == "causal-training"
             else _INITIAL_INPUT_SOURCE_DIRECTORIES
-            if active.writer_role == "initial-validation-inputs"
+            if active.writer_role
+            in {
+                "initial-validation-inputs",
+                "post-outer-0-validation-release",
+                "post-outer-1-validation-release",
+            }
             else frozenset()
         )
     if directory not in allowed:

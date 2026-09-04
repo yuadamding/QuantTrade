@@ -42,6 +42,7 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     issue_massive_adaptive_rl_manifest_v5_initial_validation_execution_capability_v1,
+    issue_massive_adaptive_rl_manifest_v5_prequential_validation_execution_capability_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
@@ -72,6 +73,65 @@ MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_DIAGNOSTIC_V1 = (
 
 class MassiveAdaptiveRLInitialValidationExecutionV1Error(ValueError):
     """The initial release, selection, or paired frozen artifacts differ."""
+
+
+@dataclass(frozen=True, slots=True)
+class MassiveAdaptiveRLReleasedFoldValidationExecutionV1:
+    """One causally delayed fold evaluated, selected, and frozen."""
+
+    fold_index: int
+    fold_validation_authority: MassiveAdaptiveRLFoldValidationAuthorityV3
+    policy_selection_authority: MassiveAdaptiveRLPolicySelectionAuthorityV4
+    frozen_ppo_policy: MassiveAdaptiveFrozenRLPolicyV2
+    frozen_fc06_control: MassiveAdaptiveRLFrozenFC06V2
+    source_data_qualified: bool
+    semantic_receipt_sha256: str
+
+    def semantic_unsigned(self) -> dict[str, object]:
+        return {
+            "fold_index": self.fold_index,
+            "fold_validation_authority_receipt_sha256": (
+                self.fold_validation_authority.semantic_receipt_sha256
+            ),
+            "policy_selection_authority_receipt_sha256": (
+                self.policy_selection_authority.semantic_receipt_sha256
+            ),
+            "frozen_ppo_policy_receipt_sha256": (
+                self.frozen_ppo_policy.semantic_receipt_sha256
+            ),
+            "frozen_fc06_control_receipt_sha256": (
+                self.frozen_fc06_control.semantic_receipt_sha256
+            ),
+            "source_data_qualified": self.source_data_qualified,
+        }
+
+    def validate(self) -> None:
+        authorities = (
+            self.fold_validation_authority,
+            self.policy_selection_authority,
+            self.frozen_ppo_policy,
+            self.frozen_fc06_control,
+        )
+        for authority in authorities:
+            authority.validate()
+        if (
+            isinstance(self.fold_index, bool)
+            or self.fold_index not in (2, 3)
+            or any(row.fold_index != self.fold_index for row in authorities)
+            or any(not row.development_stage_authorized for row in authorities)
+            or self.policy_selection_authority.fold_validation_authority_receipt_sha256
+            != self.fold_validation_authority.semantic_receipt_sha256
+            or self.frozen_ppo_policy.policy_selection_authority_receipt_sha256
+            != self.policy_selection_authority.semantic_receipt_sha256
+            or self.frozen_fc06_control.policy_selection_authority_receipt_sha256
+            != self.policy_selection_authority.semantic_receipt_sha256
+            or self.source_data_qualified
+            != all(row.source_data_qualified for row in authorities)
+            or self.semantic_receipt_sha256 != semantic_sha256(self.semantic_unsigned())
+        ):
+            raise MassiveAdaptiveRLInitialValidationExecutionV1Error(
+                "released-fold V5 validation execution differs"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +432,126 @@ def run_or_resume_massive_adaptive_rl_initial_validation_execution_v1(
     return result
 
 
+def run_or_resume_massive_adaptive_rl_released_fold_validation_execution_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    execution_registration: (
+        MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1
+    ),
+    validation_release: MassiveAdaptiveRLValidationReleaseAuthorityV1,
+    allow_materialize: bool = True,
+) -> MassiveAdaptiveRLReleasedFoldValidationExecutionV1:
+    """Run one post-O0/O1 validation release through paired freezes."""
+
+    for authority in (
+        manifest,
+        manifest_registration,
+        execution_registration,
+        validation_release,
+    ):
+        authority.validate()
+    if (
+        type(allow_materialize) is not bool
+        or type(manifest) is not MassiveAdaptiveRLExperimentManifestV5
+        or type(manifest_registration)
+        is not MassiveAdaptiveRLManifestV5RegistrationAuthorityV1
+        or type(execution_registration)
+        is not MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1
+        or type(validation_release) is not MassiveAdaptiveRLValidationReleaseAuthorityV1
+        or validation_release.released_validation_fold_indices not in ((2,), (3,))
+        or not manifest_registration.development_protocol_registered
+        or not execution_registration.development_execution_registered
+        or not validation_release.development_stage_authorized
+        or manifest_registration.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or execution_registration.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or execution_registration.manifest_v5_registration_authority_receipt_sha256
+        != manifest_registration.semantic_receipt_sha256
+        or validation_release.manifest_v5_receipt_sha256
+        != manifest.semantic_receipt_sha256
+        or validation_release.manifest_v5_registration_authority_receipt_sha256
+        != manifest_registration.semantic_receipt_sha256
+        or validation_release.execution_implementation_registration_authority_receipt_sha256
+        != execution_registration.semantic_receipt_sha256
+        or validation_release.scientific_execution_fingerprint_sha256
+        != execution_registration.scientific_execution_fingerprint_sha256
+    ):
+        raise MassiveAdaptiveRLInitialValidationExecutionV1Error(
+            "released-fold V5 validation execution roots differ"
+        )
+    fold_index = validation_release.released_validation_fold_indices[0]
+    capability = issue_massive_adaptive_rl_manifest_v5_prequential_validation_execution_capability_v1(
+        root=root, authority=manifest_registration
+    )
+    with (
+        massive_adaptive_rl_experiment_materialization_lock_v1(
+            artifact_root=root, experiment_id=manifest.experiment_id
+        ),
+        massive_adaptive_rl_manifest_v5_writer_scope_v1(
+            root=root, capability=capability
+        ),
+    ):
+        validation = run_or_resume_massive_adaptive_rl_fold_validation_v3(
+            root=root,
+            manifest=manifest,
+            release=validation_release,
+            fold_index=fold_index,
+            allow_materialize=allow_materialize,
+        )
+        selection = run_or_resume_massive_adaptive_rl_policy_selection_authority_v4(
+            root=root,
+            manifest=manifest,
+            fold_validation=validation,
+            allow_materialize=allow_materialize,
+        )
+        frozen_ppo = run_or_resume_massive_adaptive_frozen_rl_policy_v2(
+            root=root,
+            manifest=manifest,
+            selection=selection,
+            allow_materialize=allow_materialize,
+        )
+        frozen_fc06 = run_or_resume_massive_adaptive_rl_frozen_fc06_v2(
+            root=root,
+            manifest=manifest,
+            selection=selection,
+            allow_materialize=allow_materialize,
+        )
+    qualified = all(
+        row.source_data_qualified
+        for row in (
+            execution_registration,
+            validation_release,
+            validation,
+            selection,
+            frozen_ppo,
+            frozen_fc06,
+        )
+    )
+    provisional = MassiveAdaptiveRLReleasedFoldValidationExecutionV1(
+        fold_index=fold_index,
+        fold_validation_authority=validation,
+        policy_selection_authority=selection,
+        frozen_ppo_policy=frozen_ppo,
+        frozen_fc06_control=frozen_fc06,
+        source_data_qualified=qualified,
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = MassiveAdaptiveRLReleasedFoldValidationExecutionV1(
+        fold_index=fold_index,
+        fold_validation_authority=validation,
+        policy_selection_authority=selection,
+        frozen_ppo_policy=frozen_ppo,
+        frozen_fc06_control=frozen_fc06,
+        source_data_qualified=qualified,
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
 __all__ = [
     "MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_EXECUTION_V1_SOURCE_SHA256",
     "MASSIVE_ADAPTIVE_RL_INITIAL_VALIDATION_EXECUTION_V1_SPEC_SHA256",
@@ -379,5 +559,7 @@ __all__ = [
     "MASSIVE_ADAPTIVE_RL_INITIAL_POLICY_PAIR_QUALIFIED_V1",
     "MassiveAdaptiveRLInitialValidationExecutionV1",
     "MassiveAdaptiveRLInitialValidationExecutionV1Error",
+    "MassiveAdaptiveRLReleasedFoldValidationExecutionV1",
     "run_or_resume_massive_adaptive_rl_initial_validation_execution_v1",
+    "run_or_resume_massive_adaptive_rl_released_fold_validation_execution_v1",
 ]

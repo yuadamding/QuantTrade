@@ -232,7 +232,7 @@ def test_execution_registration_rejects_untracked_source_and_late_outcomes(
         "adaptive-rl/{experiment}/validation-release-v1",
         "adaptive-rl/{experiment}/frozen-fc06-v2",
         "adaptive-rl/{experiment}/outer-access-commitment-v2",
-        "adaptive-rl/{experiment}/prequential-state-v1",
+        "adaptive-rl/{experiment}/prequential-experiment-state-v1",
         "massive-adaptive/rl-policy-selection-authority-v3",
         "massive-adaptive/rl-outer-evidence-authority-v4",
         "massive-adaptive/rl-profitability-report-authority-v1",
@@ -295,9 +295,13 @@ def test_execution_registration_requires_complete_v5_native_vertical(
         manifest=manifest,
         manifest_registration=registration,
     )
-    assert body["missing_v5_native_implementation_paths"]
+    assert body["missing_v5_native_implementation_paths"] == (
+        "src/rl_quant/workflows/massive_adaptive_rl_prequential_experiment_state_v1.py",
+    )
     assert body["v5_native_vertical_complete"] is False
-    assert body["missing_vertical_qualification_test_paths"]
+    assert body["missing_vertical_qualification_test_paths"] == (
+        "tests/test_massive_adaptive_rl_v5_vertical.py",
+    )
     assert body["vertical_qualification_exit_code"] is None
     assert body["vertical_qualification_passed_node_count"] == 0
     assert body["vertical_qualification_nonpass_outcome_labels"] == ("not-run",)

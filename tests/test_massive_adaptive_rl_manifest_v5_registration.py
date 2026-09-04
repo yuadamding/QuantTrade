@@ -554,3 +554,27 @@ def test_writer_capability_binds_separate_source_publication_root(
                 root=other_root,
                 relative_payload_path="adaptive-rl/source-bundle-v2/forbidden.json",
             )
+
+    ownership_markers = tuple(
+        (source_root / ".quanttrade" / "adaptive-rl-v5-writer-ownership").glob("*.json")
+    )
+    assert len(ownership_markers) == 1
+    relative = "adaptive-rl/source-bundle-v2/unscoped-after-v5.json"
+    with pytest.raises(
+        MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+        match="owns this publication root",
+    ):
+        publish_massive_source_object(
+            stream=BytesIO(b"{}"),
+            root=source_root,
+            relative_payload_path=relative,
+            dataset_id="guard-test",
+            source_object_key=relative,
+            requested_at_ms=1,
+            downloaded_at_ms=1,
+            schema_sha256=semantic_sha256("schema"),
+            entitlement_receipt_sha256=semantic_sha256("entitlement"),
+            committed_at_ms=1,
+            request_id="SOURCE-ROOT-GUARD-TEST",
+        )
+    assert not (source_root / relative).exists()

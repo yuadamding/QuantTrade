@@ -483,6 +483,24 @@ def issue_massive_adaptive_rl_manifest_v5_training_capability_v1(
     )
 
 
+def issue_massive_adaptive_rl_manifest_v5_initial_validation_release_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue only the canonical initial V0/V1 release publication."""
+
+    _require_massive_adaptive_rl_manifest_v5_execution_registration_v1(
+        root=root, authority=authority
+    )
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
+        writer_role="initial-validation-release",
+        allowed_fold_indices=(0, 1),
+    )
+
+
 def issue_massive_adaptive_rl_manifest_v5_initial_validation_execution_capability_v1(
     *,
     root: str | Path,
@@ -517,6 +535,97 @@ def issue_massive_adaptive_rl_manifest_v5_initial_validation_execution_capabilit
         writer_role="initial-validation-execution",
         allowed_fold_indices=(0, 1),
     )
+
+
+def issue_massive_adaptive_rl_manifest_v5_delayed_validation_release_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    fold_index: int,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue exactly one post-seal validation-release writer capability."""
+
+    if isinstance(fold_index, bool) or fold_index not in (2, 3):
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "delayed validation release is available only for fold 2 or 3"
+        )
+    _require_massive_adaptive_rl_manifest_v5_execution_registration_v1(
+        root=root, authority=authority
+    )
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
+        writer_role=(
+            "post-outer-0-validation-release"
+            if fold_index == 2
+            else "post-outer-1-validation-release"
+        ),
+        allowed_fold_indices=(fold_index,),
+    )
+
+
+def issue_massive_adaptive_rl_manifest_v5_prequential_validation_execution_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue fold-2/3 outcome, selection, and freeze publication authority."""
+
+    _require_massive_adaptive_rl_manifest_v5_execution_registration_v1(
+        root=root, authority=authority
+    )
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
+        writer_role="prequential-validation-execution",
+        allowed_fold_indices=(2, 3),
+    )
+
+
+def issue_massive_adaptive_rl_manifest_v5_prequential_outer_execution_capability_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> MassiveAdaptiveRLManifestV5WriterCapabilityV1:
+    """Issue the exact V5 schedule, outer, report, and state writer."""
+
+    _require_massive_adaptive_rl_manifest_v5_execution_registration_v1(
+        root=root, authority=authority
+    )
+    return _issue_massive_adaptive_rl_manifest_v5_capability_v1(
+        root=root,
+        authority=authority,
+        writer_role="prequential-outer-execution",
+        allowed_fold_indices=(0, 1, 2, 3),
+    )
+
+
+def _require_massive_adaptive_rl_manifest_v5_execution_registration_v1(
+    *,
+    root: str | Path,
+    authority: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+) -> None:
+    from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1,
+    )
+
+    manifest = authority._runtime_manifest
+    if manifest is None:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "prequential writer requires replayed Manifest V5"
+        )
+    implementation = (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+            root=root,
+            manifest=manifest,
+            manifest_registration=authority,
+            allow_materialize=False,
+        )
+    )
+    if not implementation.development_execution_registered:
+        raise MassiveAdaptiveRLManifestV5RegistrationError(
+            "prequential writer requires frozen execution implementation"
+        )
 
 
 def issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1(
@@ -682,8 +791,12 @@ __all__ = [
     "authorize_massive_adaptive_rl_manifest_v5_registration_authority_v1",
     "build_massive_adaptive_rl_manifest_v5_registration_authority_v1",
     "issue_massive_adaptive_rl_manifest_v5_execution_registration_capability_v1",
+    "issue_massive_adaptive_rl_manifest_v5_delayed_validation_release_capability_v1",
     "issue_massive_adaptive_rl_manifest_v5_initial_inputs_capability_v1",
+    "issue_massive_adaptive_rl_manifest_v5_initial_validation_release_capability_v1",
     "issue_massive_adaptive_rl_manifest_v5_initial_validation_execution_capability_v1",
+    "issue_massive_adaptive_rl_manifest_v5_prequential_outer_execution_capability_v1",
+    "issue_massive_adaptive_rl_manifest_v5_prequential_validation_execution_capability_v1",
     "issue_massive_adaptive_rl_manifest_v5_training_capability_v1",
     "_run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1_unlocked",
     "load_massive_adaptive_rl_manifest_v5_registration_authority_v1",
