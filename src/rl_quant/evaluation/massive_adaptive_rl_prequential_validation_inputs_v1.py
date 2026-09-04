@@ -450,6 +450,19 @@ def _forbidden_prequential_artifacts(
     return tuple(sorted(set(found)))
 
 
+def massive_adaptive_rl_forbidden_prequential_artifacts_v1(
+    *, root: str | Path, manifest: MassiveAdaptiveRLExperimentManifestV4
+) -> tuple[str, ...]:
+    """Expose the fail-closed legacy/later-evidence inventory to root protocols."""
+
+    if type(manifest) is not MassiveAdaptiveRLExperimentManifestV4:
+        raise MassiveAdaptiveRLPrequentialValidationInputsV1Error(
+            "prequential artifact scan requires exact Manifest V4"
+        )
+    manifest.validate()
+    return _forbidden_prequential_artifacts(root=root, manifest=manifest)
+
+
 @dataclass(frozen=True, slots=True)
 class MassiveAdaptiveRLInitialValidationInputsAuthorityV1:
     experiment_id: str
@@ -1210,6 +1223,7 @@ __all__ = [
     "build_massive_adaptive_rl_prequential_validation_plan_v1",
     "initial_validation_inputs_authority_relative_path_v1",
     "load_massive_adaptive_rl_initial_validation_inputs_authority_v1",
+    "massive_adaptive_rl_forbidden_prequential_artifacts_v1",
     "materialize_massive_adaptive_rl_initial_validation_inputs_authority_v1",
     "parse_massive_adaptive_rl_initial_validation_inputs_authority_v1",
     "policy_schedule_disposition_v1",

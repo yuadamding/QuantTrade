@@ -41,6 +41,10 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v3 import (
     MassiveAdaptiveRLExperimentManifestV3,
     load_massive_adaptive_rl_experiment_manifest_v3,
 )
+from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
+    MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+    reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration,
+)
 from rl_quant.workflows.massive_adaptive_rl_four_fold_fit_v1 import (
     MassiveAdaptiveRLFourFoldFitExecutionLeaseUnavailable,
     advance_massive_adaptive_rl_four_fold_fit_inputs_state_v1,
@@ -88,6 +92,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V2_SPEC_SHA256 = semantic_sha256(
         "runtime_reconstruction_unavailability": "retryable-blocker",
         "four_fold_fit": "package-owned-input-first-run-or-resume-v1",
         "current_runtime_boundary": "inner-validation-backend-required",
+        "future_protocol_ownership": (
+            "manifest-v5-registration-disables-legacy-materialization"
+        ),
         "completed_resume": "terminal-idempotent",
         "state_verification": "entire-chain-manifest-bound",
         "verification_surface": "ledger-replay-distinct-from-deep-verification",
@@ -977,6 +984,15 @@ def run_massive_adaptive_rl_experiment_v2(
             artifact_root=artifact_root,
             experiment_id=manifest.experiment_id,
         ):
+            try:
+                reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration(
+                    root=artifact_root,
+                    experiment_id=manifest.experiment_id,
+                )
+            except MassiveAdaptiveRLLegacyWriterRejectedByManifestV5 as error:
+                raise MassiveAdaptiveRLExperimentRunnerV2Error(
+                    "Manifest V5 owns this experiment; the V2 writer is disabled"
+                ) from error
             return _run_massive_adaptive_rl_experiment_v2_unlocked(
                 manifest=manifest,
                 source_root=source_root,

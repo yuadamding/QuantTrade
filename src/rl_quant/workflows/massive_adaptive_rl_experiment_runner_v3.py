@@ -51,6 +51,10 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     MassiveAdaptiveRLExperimentManifestV4,
     load_massive_adaptive_rl_experiment_manifest_v4,
 )
+from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
+    MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+    reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration,
+)
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v2 import (
     MassiveAdaptiveRLRuntimeSourcesV2,
     reconstruct_and_authorize_massive_adaptive_rl_runtime_sources_v2,
@@ -84,6 +88,9 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V3_SPEC_SHA256 = semantic_sha256(
         "qualified_handoff": "selection-v3-aware-walk-forward-policy-freeze-required",
         "ineligible_terminal": "no-qualified-policy",
         "invalid_evidence": "raise-without-outer-access",
+        "future_protocol_ownership": (
+            "manifest-v5-registration-disables-legacy-materialization"
+        ),
         "verification": "read-only-cold-replay",
         "final_policy_freezing": False,
         "outer_access": False,
@@ -442,6 +449,15 @@ def run_massive_adaptive_rl_experiment_v3(
         artifact_root=artifact_root,
         experiment_id=manifest.experiment_id,
     ):
+        try:
+            reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration(
+                root=artifact_root,
+                experiment_id=manifest.experiment_id,
+            )
+        except MassiveAdaptiveRLLegacyWriterRejectedByManifestV5 as error:
+            raise MassiveAdaptiveRLExperimentRunnerV3Error(
+                "Manifest V5 owns this experiment; the V3 writer is disabled"
+            ) from error
         training = _run_massive_adaptive_rl_experiment_v2_unlocked(
             manifest=manifest.base_manifest,
             source_root=source_root,

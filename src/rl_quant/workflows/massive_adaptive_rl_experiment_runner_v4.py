@@ -11,10 +11,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-import fcntl
-import os
 from pathlib import Path
-import stat
 import time
 from typing import Iterator
 
@@ -35,6 +32,13 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v2 import (
     MassiveAdaptiveRLEndToEndRunV2,
     _run_massive_adaptive_rl_experiment_v2_unlocked,
 )
+from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
+    MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SOURCE_SHA256,
+    MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256,
+    MassiveAdaptiveRLExperimentLockV1Error,
+    MassiveAdaptiveRLExperimentLockV1Unavailable,
+    massive_adaptive_rl_experiment_orchestration_lock_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     MassiveAdaptiveRLExperimentStageV2,
     MassiveAdaptiveRLExperimentStateV2,
@@ -47,6 +51,10 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v4 import (
     MASSIVE_ADAPTIVE_RL_NO_ELIGIBLE_CANDIDATE_POLICY_V1,
     MassiveAdaptiveRLExperimentManifestV4,
     load_massive_adaptive_rl_experiment_manifest_v4,
+)
+from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
+    MassiveAdaptiveRLLegacyWriterRejectedByManifestV5,
+    reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration,
 )
 from rl_quant.workflows.massive_adaptive_rl_runtime_source_reconstruction_v2 import (
     MassiveAdaptiveRLRuntimeSourcesV2,
@@ -83,6 +91,15 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V4_SPEC_SHA256 = semantic_sha256(
         ),
         "diagnostic_continuation": True,
         "legacy_all_four_validation": "rejected-by-initial-input-boundary",
+        "future_protocol_ownership": (
+            "manifest-v5-registration-disables-legacy-materialization"
+        ),
+        "experiment_global_lock_specification_sha256": (
+            MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SPEC_SHA256
+        ),
+        "experiment_global_lock_implementation_source_sha256": (
+            MASSIVE_ADAPTIVE_RL_EXPERIMENT_LOCK_V1_SOURCE_SHA256
+        ),
         "next_stage": "prequential-fold-0-and-fold-1-validation-selection-and-freeze",
         "verification": "read-only-cold-replay",
         "validation_outcomes": False,
@@ -214,46 +231,24 @@ class MassiveAdaptiveRLPrequentialRunV4:
 def _experiment_v4_orchestration_lease(
     *, artifact_root: str | Path, experiment_id: str
 ) -> Iterator[None]:
-    directory = (
-        Path(artifact_root)
-        / "adaptive-rl"
-        / experiment_id
-        / "prequential-orchestration-lease-v1"
+    lease = massive_adaptive_rl_experiment_orchestration_lock_v1(
+        artifact_root=artifact_root,
+        experiment_id=experiment_id,
     )
-    descriptor = -1
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        if directory.is_symlink():
-            raise MassiveAdaptiveRLExperimentRunnerV4Error(
-                "adaptive RL V4 orchestration lease directory is a symlink"
-            )
-        descriptor = os.open(
-            directory / "orchestration.lock",
-            os.O_CLOEXEC | os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR,
-            0o600,
-        )
-        details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
-            raise MassiveAdaptiveRLExperimentRunnerV4Error(
-                "adaptive RL V4 orchestration lease identity differs"
-            )
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise MassiveAdaptiveRLExperimentRunnerV4LeaseUnavailable(
-                "adaptive RL V4 execution is already owned"
-            ) from error
-    except (MassiveAdaptiveRLExperimentRunnerV4Error, OSError):
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
+        lease.__enter__()
+    except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
+        raise MassiveAdaptiveRLExperimentRunnerV4LeaseUnavailable(
+            "adaptive RL V4 execution is already owned"
+        ) from error
+    except (MassiveAdaptiveRLExperimentLockV1Error, OSError) as error:
+        raise MassiveAdaptiveRLExperimentRunnerV4Error(
+            "adaptive RL V4 orchestration lease is invalid"
+        ) from error
     try:
         yield
     finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        lease.__exit__(None, None, None)
 
 
 def _validate_training_handoff(
@@ -432,6 +427,15 @@ def run_massive_adaptive_rl_experiment_v4(
         artifact_root=artifact_root,
         experiment_id=manifest.experiment_id,
     ):
+        try:
+            reject_legacy_massive_adaptive_rl_writer_after_manifest_v5_registration(
+                root=artifact_root,
+                experiment_id=manifest.experiment_id,
+            )
+        except MassiveAdaptiveRLLegacyWriterRejectedByManifestV5 as error:
+            raise MassiveAdaptiveRLExperimentRunnerV4Error(
+                "Manifest V5 owns this experiment; the V4 writer is disabled"
+            ) from error
         training = _run_massive_adaptive_rl_experiment_v2_unlocked(
             manifest=manifest.base_manifest,
             source_root=source_root,
