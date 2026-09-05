@@ -51,6 +51,9 @@ from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 impo
     MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1,
     MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
 )
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 import (
+    massive_adaptive_rl_vertical_qualification_experiment_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
 )
@@ -404,6 +407,9 @@ class MassiveAdaptiveRLProfitabilityReportAuthorityV2:
             == MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1
         )
         expected_gates = not self.failed_gate_names
+        production_experiment = not (
+            massive_adaptive_rl_vertical_qualification_experiment_v1(self.experiment_id)
+        )
         if (
             self.schema != MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V2_SCHEMA
             or not self.experiment_id
@@ -455,6 +461,7 @@ class MassiveAdaptiveRLProfitabilityReportAuthorityV2:
             != bool(
                 runtime
                 and self.source_data_qualified
+                and production_experiment
                 and expected_schedule_qualified
                 and expected_gates
             )
@@ -787,6 +794,9 @@ def build_massive_adaptive_rl_profitability_report_authority_v2(
         profitability_gates_passed=gates_pass,
         positive_profitability_authorization_eligible=bool(
             body["source_data_qualified"]
+            and not massive_adaptive_rl_vertical_qualification_experiment_v1(
+                manifest.experiment_id
+            )
             and body["policy_schedule_qualified"]
             and gates_pass
         ),
@@ -970,6 +980,9 @@ def run_or_resume_massive_adaptive_rl_profitability_report_authority_v2(
             profitability_gates_passed=gates_pass,
             positive_profitability_authorization_eligible=bool(
                 parsed.source_data_qualified
+                and not massive_adaptive_rl_vertical_qualification_experiment_v1(
+                    parsed.experiment_id
+                )
                 and parsed.policy_schedule_qualified
                 and gates_pass
             ),

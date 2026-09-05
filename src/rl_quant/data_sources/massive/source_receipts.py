@@ -305,12 +305,19 @@ def _publish_massive_source_object_unlocked(
     )
     receipt_name = payload_name + ".receipt.json"
     commit_name = payload_name + ".commit.json"
+    temporary_prefix = f".{payload_name}."
+    interrupted_temporary_exists = any(
+        name.startswith(temporary_prefix) and name.endswith(".partial")
+        for name in os.listdir(parent_fd)
+    )
     if any(
         _exists_at(parent_fd, name)
         for name in (payload_name, receipt_name, commit_name)
-    ):
+    ) or interrupted_temporary_exists:
         os.close(parent_fd)
-        raise MassiveSourceObjectError("source publication target already exists")
+        raise MassiveSourceObjectError(
+            "source publication target already exists or is incomplete"
+        )
 
     temporary_name: str | None = None
     temporary_identity: tuple[int, int] | None = None

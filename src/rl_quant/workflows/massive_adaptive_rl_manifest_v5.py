@@ -138,6 +138,9 @@ MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SPEC_SHA256 = (
                 MASSIVE_ADAPTIVE_RL_VERTICAL_QUALIFICATION_V1_SPEC_SHA256
             ),
             "vertical_qualification_execution": "once-before-publication",
+            "qualification_bootstrap": (
+                "reserved-synthetic-experiment-process-local-and-nonproduction"
+            ),
             "replay": "identity-check-without-pytest-execution",
             "publication": "create-only-source-transaction",
             "generic_reload": "nonauthorizing",

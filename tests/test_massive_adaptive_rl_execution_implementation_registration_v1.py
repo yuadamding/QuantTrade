@@ -24,6 +24,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
     run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 import (
+    massive_adaptive_rl_vertical_qualification_scope_v1,
+)
 
 
 def _digest(value: object) -> str:
@@ -35,7 +38,17 @@ def _qualified_capture_body(
     root: Path,
     manifest,
     registration,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, object]:
+    run_qualification = implementation._vertical_qualification
+    monkeypatch.setattr(
+        implementation,
+        "_vertical_qualification",
+        lambda *, repository_root, v5_native_vertical_complete: run_qualification(
+            repository_root=repository_root,
+            v5_native_vertical_complete=False,
+        ),
+    )
     body = implementation._capture_body(
         root=root,
         manifest=manifest,
@@ -119,6 +132,7 @@ def test_execution_registration_is_separate_create_only_and_replay_bound(
         root=tmp_path,
         manifest=manifest,
         registration=registration,
+        monkeypatch=monkeypatch,
     )
     replay_roots: list[object | None] = []
 
@@ -196,6 +210,7 @@ def test_execution_registration_rejects_untracked_source_and_late_outcomes(
         root=tmp_path,
         manifest=manifest,
         registration=registration,
+        monkeypatch=monkeypatch,
     )
     body.update(
         {
@@ -299,24 +314,114 @@ def test_execution_registration_requires_complete_v5_native_vertical(
         "_training_lineage_v1",
         lambda **_: (_digest("training-state"), _digest("four-fold-fit")),
     )
-    body = implementation._capture_body(
-        root=tmp_path,
-        manifest=manifest,
-        manifest_registration=registration,
+    result = implementation._vertical_qualification(
+        repository_root=tmp_path,
+        v5_native_vertical_complete=True,
     )
-    assert body["missing_v5_native_implementation_paths"] == ()
-    assert body["v5_native_vertical_complete"] is True
-    assert body["missing_vertical_qualification_test_paths"] == (
+    assert result["missing_vertical_qualification_test_paths"] == (
         "tests/test_massive_adaptive_rl_v5_vertical.py",
     )
-    assert body["vertical_qualification_exit_code"] is None
-    assert body["vertical_qualification_passed_node_count"] == 0
-    assert body["vertical_qualification_nonpass_outcome_labels"] == ("not-run",)
-    assert body["vertical_qualification_passed"] is False
-    assert body["vertical_qualification_receipt_sha256"] == (
+    assert result["vertical_qualification_exit_code"] is None
+    assert result["vertical_qualification_passed_node_count"] == 0
+    assert result["vertical_qualification_nonpass_outcome_labels"] == ("not-run",)
+    assert result["vertical_qualification_passed"] is False
+    assert result["vertical_qualification_receipt_sha256"] == (
+        implementation._vertical_qualification_receipt(result)
+    )
+
+
+def test_synthetic_qualification_registration_is_scoped_and_nonrecursive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="v5-vertical-qualification-bootstrap"
+    )
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+    monkeypatch.setattr(
+        implementation,
+        "_training_lineage_v1",
+        lambda **_: (_digest("training-state"), _digest("four-fold-fit")),
+    )
+    body = _qualified_capture_body(
+        root=tmp_path,
+        manifest=manifest,
+        registration=registration,
+        monkeypatch=monkeypatch,
+    )
+    body.update(
+        {
+            "registration_mode": "synthetic-vertical-qualification",
+            "missing_vertical_qualification_test_paths": (),
+            "vertical_qualification_exit_code": None,
+            "vertical_qualification_passed_node_count": 0,
+            "vertical_qualification_nonpass_outcome_labels": ("not-run",),
+            "vertical_qualification_normalized_output_sha256": _digest(
+                "synthetic-qualification-not-run"
+            ),
+            "vertical_qualification_passed": False,
+            "source_data_qualified": True,
+        }
+    )
+    body["vertical_qualification_receipt_sha256"] = (
         implementation._vertical_qualification_receipt(body)
     )
-    assert body["source_data_qualified"] is False
+
+    def capture(**kwargs):
+        assert kwargs["registration_mode"] == "synthetic-vertical-qualification"
+        return dict(body)
+
+    monkeypatch.setattr(implementation, "_capture_body", capture)
+
+    with massive_adaptive_rl_vertical_qualification_scope_v1():
+        authority = (
+            run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+                root=tmp_path,
+                manifest=manifest,
+                manifest_registration=registration,
+            )
+        )
+        assert authority.registration_mode == "synthetic-vertical-qualification"
+        assert authority.development_execution_registered
+        assert not authority.vertical_qualification_passed
+        assert authority.vertical_qualification_nonpass_outcome_labels == ("not-run",)
+
+    assert not authority.development_execution_registered
+
+
+def test_synthetic_qualification_registration_rejects_unreserved_experiment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="not-a-qualification-experiment"
+    )
+    registration = run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1(
+        root=tmp_path,
+        manifest=manifest,
+    )
+    monkeypatch.setattr(
+        implementation,
+        "_training_lineage_v1",
+        lambda **_: (_digest("training-state"), _digest("four-fold-fit")),
+    )
+
+    with (
+        massive_adaptive_rl_vertical_qualification_scope_v1(),
+        pytest.raises(
+            MassiveAdaptiveRLExecutionImplementationRegistrationV1Error,
+            match="package-owned synthetic qualification process",
+        ),
+    ):
+        implementation._capture_body(
+            root=tmp_path,
+            manifest=manifest,
+            manifest_registration=registration,
+            registration_mode="synthetic-vertical-qualification",
+        )
 
 
 def test_vertical_qualification_receipt_redacts_duration_and_disables_caches(

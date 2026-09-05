@@ -59,6 +59,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 import (
+    massive_adaptive_rl_vertical_qualification_experiment_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_full_cold_replay_v1 import (
     MASSIVE_ADAPTIVE_RL_FULL_COLD_REPLAY_AUTHORITY_V1_SCHEMA,
 )
@@ -331,6 +334,9 @@ class MassiveAdaptiveRLPrequentialExperimentStateV1:
             runtime
             and cold
             and self.source_data_qualified
+            and not massive_adaptive_rl_vertical_qualification_experiment_v1(
+                self.experiment_id
+            )
             and self.policy_schedule_qualified
             and self.profitability_gates_passed
         )
@@ -902,7 +908,9 @@ def run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
 
     if (
         type(stage_artifact) is MassiveAdaptiveRLFourFoldFitAuthorityV1
-        and stage_artifact.semantic_receipt_sha256
+        and cast(
+            MassiveAdaptiveRLFourFoldFitAuthorityV1, stage_artifact
+        ).semantic_receipt_sha256
         != execution_registration.four_fold_fit_authority_receipt_sha256
     ):
         raise MassiveAdaptiveRLPrequentialExperimentStateV1Error(
@@ -1034,6 +1042,9 @@ def run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
                 parsed.source_data_qualified
                 and parsed.stage
                 is MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED
+                and not massive_adaptive_rl_vertical_qualification_experiment_v1(
+                    parsed.experiment_id
+                )
                 and parsed.policy_schedule_qualified
                 and parsed.profitability_gates_passed
             ),

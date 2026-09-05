@@ -59,9 +59,9 @@ MASSIVE_ADAPTIVE_RL_FULL_COLD_REPLAY_V1_SPEC_SHA256 = semantic_sha256(
         "input": "complete-replay-authorized-profitability-report-prefix",
         "reconstruction": "package-owned-full-v5-report-boundary",
         "publication_during_reconstruction": False,
-        "protected_evidence_inventory": (
-            "identical-before-and-after-reconstruction"
-        ),
+        "protected_evidence_inventory": ("identical-before-and-after-reconstruction"),
+        "proof_issuance": "package-verifier-owned-opaque-replay-evidence",
+        "caller_supplied_replay_evidence": False,
         "completion_proof": "distinct-create-only-implementation-authority",
         "generic_reload": "integrity-only-nonauthorizing",
         "execution_complete_is_not_profitability": True,
@@ -106,9 +106,7 @@ def _required_digest(name: str, value: object) -> str:
 
 def _timestamp(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise MassiveAdaptiveRLFullColdReplayV1Error(
-            f"{name} is absent or invalid"
-        )
+        raise MassiveAdaptiveRLFullColdReplayV1Error(f"{name} is absent or invalid")
     return value
 
 
@@ -149,9 +147,7 @@ class MassiveAdaptiveRLProtectedEvidenceFileV1:
         _digest("protected evidence content", self.content_sha256)
 
 
-def _completion_evidence_excluded(
-    *, relative: Path, experiment_id: str
-) -> bool:
+def _completion_evidence_excluded(*, relative: Path, experiment_id: str) -> bool:
     parts = relative.parts
     if parts[:2] != ("adaptive-rl", experiment_id):
         return False
@@ -217,9 +213,7 @@ def _root_inventory(
                 if candidate.is_symlink() and _path_belongs_to_experiment(
                     relative=relative,
                     experiment_id=experiment_id,
-                    base_manifest_v4_receipt_sha256=(
-                        base_manifest_v4_receipt_sha256
-                    ),
+                    base_manifest_v4_receipt_sha256=(base_manifest_v4_receipt_sha256),
                 ):
                     raise MassiveAdaptiveRLFullColdReplayV1Error(
                         "protected evidence contains a directory symlink"
@@ -235,9 +229,7 @@ def _root_inventory(
                 if not _path_belongs_to_experiment(
                     relative=relative,
                     experiment_id=experiment_id,
-                    base_manifest_v4_receipt_sha256=(
-                        base_manifest_v4_receipt_sha256
-                    ),
+                    base_manifest_v4_receipt_sha256=(base_manifest_v4_receipt_sha256),
                 ):
                     continue
                 details = path.lstat()
@@ -548,7 +540,11 @@ class MassiveAdaptiveRLFullColdReplayAuthorityV1:
 
 
 def _validate_replayed_run(
-    *, run: object, experiment_id: str, manifest_receipt: str, execution_registration_receipt: str
+    *,
+    run: object,
+    experiment_id: str,
+    manifest_receipt: str,
+    execution_registration_receipt: str,
 ) -> None:
     # Local import avoids a module cycle: the authoritative runner owns replay.
     from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
@@ -576,14 +572,94 @@ def _validate_replayed_run(
         )
 
 
+_VERIFIED_REPLAY_EVIDENCE_SEAL_V1 = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _MassiveAdaptiveRLVerifiedReplayEvidenceV1:
+    """Opaque evidence issued only after the package verifier reconstructs V5."""
+
+    expected_run_receipt_sha256: str
+    replayed_run: object
+    evidence_inventory_before: tuple[MassiveAdaptiveRLProtectedEvidenceFileV1, ...]
+    evidence_inventory_after: tuple[MassiveAdaptiveRLProtectedEvidenceFileV1, ...]
+    _seal: object = field(compare=False, repr=False)
+
+    def validate(self) -> None:
+        if self._seal is not _VERIFIED_REPLAY_EVIDENCE_SEAL_V1:
+            raise MassiveAdaptiveRLFullColdReplayV1Error(
+                "cold-replay evidence was not issued by the package verifier"
+            )
+        _digest("expected report-boundary receipt", self.expected_run_receipt_sha256)
+        replayed_receipt = getattr(self.replayed_run, "semantic_receipt_sha256", None)
+        if replayed_receipt != self.expected_run_receipt_sha256:
+            raise MassiveAdaptiveRLFullColdReplayV1Error(
+                "cold replay did not reproduce the expected report boundary"
+            )
+        before_receipt = _inventory_receipt(self.evidence_inventory_before)
+        after_receipt = _inventory_receipt(self.evidence_inventory_after)
+        if (
+            not self.evidence_inventory_before
+            or self.evidence_inventory_before != self.evidence_inventory_after
+            or before_receipt != after_receipt
+        ):
+            raise MassiveAdaptiveRLFullColdReplayV1Error(
+                "cold replay changed protected experiment evidence"
+            )
+
+
+def _issue_massive_adaptive_rl_verified_replay_evidence_v1(
+    *,
+    expected_run: object,
+    replayed_run: object,
+    evidence_inventory_before: Sequence[MassiveAdaptiveRLProtectedEvidenceFileV1],
+    evidence_inventory_after: Sequence[MassiveAdaptiveRLProtectedEvidenceFileV1],
+) -> _MassiveAdaptiveRLVerifiedReplayEvidenceV1:
+    """Bind a verifier-owned reconstruction to its immutable evidence snapshots."""
+
+    # Local import avoids the module cycle: the authoritative runner owns both
+    # the expected report boundary and the reconstruction that must reproduce it.
+    from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
+        MassiveAdaptiveRLPrequentialRunV5,
+    )
+
+    if (
+        type(expected_run) is not MassiveAdaptiveRLPrequentialRunV5
+        or type(replayed_run) is not MassiveAdaptiveRLPrequentialRunV5
+    ):
+        raise MassiveAdaptiveRLFullColdReplayV1Error(
+            "cold replay requires exact V5 report-boundary results"
+        )
+    expected_run.validate()
+    replayed_run.validate()
+    expected_receipt = _required_digest(
+        "expected report-boundary receipt",
+        expected_run.semantic_receipt_sha256,
+    )
+    if (
+        expected_run.semantic_unsigned() != replayed_run.semantic_unsigned()
+        or expected_receipt != replayed_run.semantic_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLFullColdReplayV1Error(
+            "cold replay did not reproduce the expected report boundary"
+        )
+    evidence = _MassiveAdaptiveRLVerifiedReplayEvidenceV1(
+        expected_run_receipt_sha256=expected_receipt,
+        replayed_run=replayed_run,
+        evidence_inventory_before=tuple(evidence_inventory_before),
+        evidence_inventory_after=tuple(evidence_inventory_after),
+        _seal=_VERIFIED_REPLAY_EVIDENCE_SEAL_V1,
+    )
+    evidence.validate()
+    return evidence
+
+
 def _build_body(
     *,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     execution_registration: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
-    replayed_run: object,
-    evidence_inventory_before: Sequence[MassiveAdaptiveRLProtectedEvidenceFileV1],
-    evidence_inventory_after: Sequence[MassiveAdaptiveRLProtectedEvidenceFileV1],
+    verified_replay: _MassiveAdaptiveRLVerifiedReplayEvidenceV1,
 ) -> dict[str, object]:
     manifest.validate()
     manifest_registration.validate()
@@ -601,14 +677,20 @@ def _build_body(
         raise MassiveAdaptiveRLFullColdReplayV1Error(
             "full cold-replay registration lineage differs"
         )
+    if type(verified_replay) is not _MassiveAdaptiveRLVerifiedReplayEvidenceV1:
+        raise MassiveAdaptiveRLFullColdReplayV1Error(
+            "full cold replay requires verifier-issued evidence"
+        )
+    verified_replay.validate()
+    replayed_run = verified_replay.replayed_run
     _validate_replayed_run(
         run=replayed_run,
         experiment_id=manifest.experiment_id,
         manifest_receipt=manifest.semantic_receipt_sha256,
         execution_registration_receipt=execution_registration.semantic_receipt_sha256,
     )
-    before = tuple(evidence_inventory_before)
-    after = tuple(evidence_inventory_after)
+    before = verified_replay.evidence_inventory_before
+    after = verified_replay.evidence_inventory_after
     before_receipt = _inventory_receipt(before)
     after_receipt = _inventory_receipt(after)
     if not before or before != after or before_receipt != after_receipt:
@@ -625,9 +707,7 @@ def _build_body(
         "execution_implementation_registration_receipt_sha256": (
             execution_registration.semantic_receipt_sha256
         ),
-        "replayed_run_receipt_sha256": getattr(
-            replayed_run, "semantic_receipt_sha256"
-        ),
+        "replayed_run_receipt_sha256": getattr(replayed_run, "semantic_receipt_sha256"),
         "profitability_report_authority_receipt_sha256": getattr(
             replayed_run, "profitability_report_authority_receipt_sha256"
         ),
@@ -741,18 +821,16 @@ def load_massive_adaptive_rl_full_cold_replay_authority_v1(
     )
 
 
-def run_or_resume_massive_adaptive_rl_full_cold_replay_v1(
+def _persist_or_replay_massive_adaptive_rl_full_cold_replay_v1(
     *,
     root: str | Path,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     execution_registration: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
-    replayed_run: object,
-    evidence_inventory_before: Sequence[MassiveAdaptiveRLProtectedEvidenceFileV1],
-    evidence_inventory_after: Sequence[MassiveAdaptiveRLProtectedEvidenceFileV1],
+    verified_replay: _MassiveAdaptiveRLVerifiedReplayEvidenceV1,
     allow_materialize: bool = True,
 ) -> MassiveAdaptiveRLFullColdReplayAuthorityV1:
-    """Persist or exactly replay the proof produced by a no-write reconstruction."""
+    """Internal persistence for proof issued by the package-owned verifier."""
 
     if type(allow_materialize) is not bool:
         raise MassiveAdaptiveRLFullColdReplayV1Error(
@@ -762,10 +840,9 @@ def run_or_resume_massive_adaptive_rl_full_cold_replay_v1(
         manifest=manifest,
         manifest_registration=manifest_registration,
         execution_registration=execution_registration,
-        replayed_run=replayed_run,
-        evidence_inventory_before=evidence_inventory_before,
-        evidence_inventory_after=evidence_inventory_after,
+        verified_replay=verified_replay,
     )
+    replayed_run = verified_replay.replayed_run
     provisional = MassiveAdaptiveRLFullColdReplayAuthorityV1(
         **body,  # type: ignore[arg-type]
         semantic_receipt_sha256="0" * 64,
@@ -827,8 +904,7 @@ def run_or_resume_massive_adaptive_rl_full_cold_replay_v1(
                     entitlement_receipt_sha256=expected.semantic_receipt_sha256,
                     committed_at_ms=committed_at_ms,
                     request_id=(
-                        "ADAPTIVE-RL-FULL-COLD-REPLAY-V1-"
-                        f"{manifest.experiment_id}"
+                        f"ADAPTIVE-RL-FULL-COLD-REPLAY-V1-{manifest.experiment_id}"
                     ),
                 )
         parsed = load_massive_adaptive_rl_full_cold_replay_authority_v1(
@@ -860,5 +936,4 @@ __all__ = [
     "full_cold_replay_authority_relative_path_v1",
     "load_massive_adaptive_rl_full_cold_replay_authority_v1",
     "massive_adaptive_rl_protected_evidence_inventory_v1",
-    "run_or_resume_massive_adaptive_rl_full_cold_replay_v1",
 ]

@@ -103,6 +103,93 @@ def test_receipt_write_failure_rolls_back_the_linked_payload(
     assert tuple(tmp_path.rglob("*.*")) == ()
 
 
+def test_interruption_after_sidecar_install_is_preserved_and_never_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_write_once = source_receipts._canonical_write_once_at
+    installed_sidecar: Path | None = None
+
+    def install_then_interrupt(directory_fd: int, name: str, payload: object):
+        nonlocal installed_sidecar
+        result = real_write_once(directory_fd, name, payload)
+        if installed_sidecar is None:
+            installed_sidecar = (
+                tmp_path / "bronze/trades/2026/08" / name
+            )
+            raise OSError("injected interruption after sidecar install")
+        return result
+
+    monkeypatch.setattr(
+        source_receipts, "_canonical_write_once_at", install_then_interrupt
+    )
+    with pytest.raises(OSError, match="after sidecar install"):
+        _publish(tmp_path)
+
+    assert installed_sidecar is not None
+    assert installed_sidecar.is_file()
+    preserved = installed_sidecar.read_bytes()
+    assert not (
+        tmp_path / "bronze/trades/2026/08/2026-08-20.csv.gz"
+    ).exists()
+    assert not installed_sidecar.with_name(
+        "2026-08-20.csv.gz.commit.json"
+    ).exists()
+
+    monkeypatch.setattr(
+        source_receipts, "_canonical_write_once_at", real_write_once
+    )
+    with pytest.raises(MassiveSourceObjectError, match="already exists"):
+        _publish(tmp_path)
+    assert installed_sidecar.read_bytes() == preserved
+
+
+@pytest.mark.parametrize(
+    "present_suffixes",
+    (("",), ("", ".receipt.json"), (".receipt.json", ".commit.json")),
+)
+def test_source_publication_never_repairs_preexisting_partial_transaction(
+    tmp_path: Path, present_suffixes: tuple[str, ...]
+) -> None:
+    payload = tmp_path / "bronze/trades/2026/08/2026-08-20.csv.gz"
+    payload.parent.mkdir(parents=True)
+    for suffix in present_suffixes:
+        payload.with_name(payload.name + suffix).write_bytes(
+            f"partial:{suffix}".encode()
+        )
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(MassiveSourceObjectError, match="already exists"):
+        _publish(tmp_path)
+
+    after = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_source_publication_rejects_an_orphaned_temporary_payload(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "bronze/trades/2026/08"
+    parent.mkdir(parents=True)
+    orphan = parent / ".2026-08-20.csv.gz.interrupted.partial"
+    orphan.write_bytes(b"uncommitted payload fragment")
+
+    with pytest.raises(MassiveSourceObjectError, match="incomplete"):
+        _publish(tmp_path)
+
+    assert orphan.read_bytes() == b"uncommitted payload fragment"
+    assert not (parent / "2026-08-20.csv.gz").exists()
+    assert not (parent / "2026-08-20.csv.gz.receipt.json").exists()
+    assert not (parent / "2026-08-20.csv.gz.commit.json").exists()
+
+
 def test_source_publication_rejects_intermediate_symlink(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()

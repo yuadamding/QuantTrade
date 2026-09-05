@@ -60,8 +60,9 @@ from rl_quant.workflows.massive_adaptive_rl_final_outer_execution_v1 import (
 from rl_quant.workflows.massive_adaptive_rl_full_cold_replay_v1 import (
     MassiveAdaptiveRLFullColdReplayAuthorityV1,
     MassiveAdaptiveRLProtectedEvidenceFileV1,
+    _issue_massive_adaptive_rl_verified_replay_evidence_v1,
+    _persist_or_replay_massive_adaptive_rl_full_cold_replay_v1,
     massive_adaptive_rl_protected_evidence_inventory_v1,
-    run_or_resume_massive_adaptive_rl_full_cold_replay_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256,
@@ -104,6 +105,9 @@ from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 impo
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 import (
+    massive_adaptive_rl_vertical_qualification_experiment_v1,
 )
 
 
@@ -384,7 +388,8 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or any(value is not None for value in report_receipts) != report_present
             or any(value is not None for value in cold_replay_receipts)
             != cold_replay_present
-            or cold_replay_present and not report_present
+            or cold_replay_present
+            and not report_present
             or (self.full_cold_replay_committed_at_ms is not None)
             != cold_replay_present
             or (self.profitability_report_committed_at_ms is not None) != report_present
@@ -489,11 +494,13 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or self.outer_access_authorized
             or self.profitability_reporting_authorized != report_present
             or self.full_cold_replay_verified != cold_replay_present
-            or self.end_to_end_profitability_execution_complete
-            != cold_replay_present
+            or self.end_to_end_profitability_execution_complete != cold_replay_present
             or self.positive_profitability_authorization_eligible
             != bool(
                 cold_replay_present
+                and not massive_adaptive_rl_vertical_qualification_experiment_v1(
+                    self.experiment_id
+                )
                 and self.policy_schedule_disposition
                 == MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1
                 and self.profitability_gates_passed
@@ -1415,12 +1422,10 @@ def _build_full_cold_replay_result(
         or boundary.end_to_end_profitability_execution_complete
         or not cold_replay.development_full_cold_replay_verified
         or cold_replay.experiment_id != boundary.experiment_id
-        or cold_replay.manifest_v5_receipt_sha256
-        != boundary.manifest_v5_receipt_sha256
+        or cold_replay.manifest_v5_receipt_sha256 != boundary.manifest_v5_receipt_sha256
         or cold_replay.execution_implementation_registration_receipt_sha256
         != boundary.execution_implementation_registration_authority_receipt_sha256
-        or cold_replay.replayed_run_receipt_sha256
-        != boundary.semantic_receipt_sha256
+        or cold_replay.replayed_run_receipt_sha256 != boundary.semantic_receipt_sha256
         or cold_replay.profitability_report_authority_receipt_sha256
         != boundary.profitability_report_authority_receipt_sha256
         or cold_replay.profitability_report_state_receipt_sha256
@@ -1480,7 +1485,10 @@ def _build_full_cold_replay_result(
             "next_required_stage": "development-profitability-execution-complete",
             "end_to_end_profitability_execution_complete": True,
             "positive_profitability_authorization_eligible": bool(
-                boundary.policy_schedule_disposition
+                not massive_adaptive_rl_vertical_qualification_experiment_v1(
+                    boundary.experiment_id
+                )
+                and boundary.policy_schedule_disposition
                 == MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1
                 and boundary.profitability_gates_passed
             ),
@@ -1505,12 +1513,8 @@ def _finalize_full_cold_replay_v1(
     artifact_root: str | Path,
     report_boundary: MassiveAdaptiveRLPrequentialRunV5,
     replayed_boundary: MassiveAdaptiveRLPrequentialRunV5,
-    evidence_inventory_before: tuple[
-        MassiveAdaptiveRLProtectedEvidenceFileV1, ...
-    ],
-    evidence_inventory_after: tuple[
-        MassiveAdaptiveRLProtectedEvidenceFileV1, ...
-    ],
+    evidence_inventory_before: tuple[MassiveAdaptiveRLProtectedEvidenceFileV1, ...],
+    evidence_inventory_after: tuple[MassiveAdaptiveRLProtectedEvidenceFileV1, ...],
     allow_materialize: bool,
 ) -> MassiveAdaptiveRLPrequentialRunV5:
     """Persist/replay the completion proof and its final ledger transition."""
@@ -1533,14 +1537,18 @@ def _finalize_full_cold_replay_v1(
             allow_materialize=False,
         )
     )
-    cold_replay = run_or_resume_massive_adaptive_rl_full_cold_replay_v1(
+    verified_replay = _issue_massive_adaptive_rl_verified_replay_evidence_v1(
+        expected_run=report_boundary,
+        replayed_run=replayed_boundary,
+        evidence_inventory_before=evidence_inventory_before,
+        evidence_inventory_after=evidence_inventory_after,
+    )
+    cold_replay = _persist_or_replay_massive_adaptive_rl_full_cold_replay_v1(
         root=artifact_root,
         manifest=manifest,
         manifest_registration=registration,
         execution_registration=implementation_registration,
-        replayed_run=replayed_boundary,
-        evidence_inventory_before=evidence_inventory_before,
-        evidence_inventory_after=evidence_inventory_after,
+        verified_replay=verified_replay,
         allow_materialize=allow_materialize,
     )
     final_state = run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
@@ -1894,11 +1902,10 @@ def verify_massive_adaptive_rl_experiment_v5(
         manifest=manifest,
         allow_materialize=False,
     )
-    lock_path = (
-        Path(artifact_root)
-        / massive_adaptive_rl_experiment_lock_relative_path_v1(
-            experiment_id=manifest.experiment_id
-        )
+    lock_path = Path(
+        artifact_root
+    ) / massive_adaptive_rl_experiment_lock_relative_path_v1(
+        experiment_id=manifest.experiment_id
     )
     if lock_path.is_symlink() or not lock_path.is_file():
         raise MassiveAdaptiveRLExperimentRunnerV5Error(

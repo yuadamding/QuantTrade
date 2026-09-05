@@ -59,6 +59,9 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
     MassiveAdaptiveRLExperimentLockV1Unavailable,
     massive_adaptive_rl_experiment_orchestration_lock_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_deterministic_runtime_v1 import (
+    massive_adaptive_rl_deterministic_environment_v1,
+)
 from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     MassiveAdaptiveRLExperimentStageV2,
     load_massive_adaptive_rl_experiment_states_v2,
@@ -75,6 +78,10 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 )
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_vertical_qualification_scope_v1 import (
+    massive_adaptive_rl_vertical_qualification_scope_active_v1,
+    require_massive_adaptive_rl_vertical_qualification_experiment_v1,
 )
 
 
@@ -97,6 +104,7 @@ MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SOURCE_SCHEMA_SHA25
 )
 
 _IMPLEMENTATION_RELATIVE_PATHS = (
+    "src/rl_quant/data_sources/massive/source_receipts.py",
     "src/rl_quant/evaluation/massive_adaptive_profitability_env_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_cost_ladder_v1.py",
     "src/rl_quant/evaluation/massive_adaptive_rl_fixed_control_evaluator_v1.py",
@@ -107,6 +115,8 @@ _IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/training/massive_adaptive_rl_policy_selection_v2.py",
     "src/rl_quant/training/massive_adaptive_rl_policy_selection_v3.py",
     "src/rl_quant/workflows/massive_adaptive_rl_execution_implementation_registration_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_cli_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_deterministic_runtime_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_experiment_lock_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_experiment_runner_v5.py",
     "src/rl_quant/workflows/massive_adaptive_rl_initial_validation_execution_v1.py",
@@ -119,6 +129,8 @@ _IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/workflows/massive_adaptive_rl_source_bundle_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_source_bundle_v2.py",
     "src/rl_quant/workflows/massive_adaptive_rl_writer_guard_v5.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_vertical_qualification_runner_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_vertical_qualification_scope_v1.py",
 )
 _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/evaluation/massive_adaptive_rl_validation_release_authority_v1.py",
@@ -236,6 +248,13 @@ _THREAD_ENVIRONMENT_NAMES = (
     "PYTHONHASHSEED",
 )
 
+_REGISTRATION_MODE_PRODUCTION = "production"
+_REGISTRATION_MODE_SYNTHETIC_QUALIFICATION = "synthetic-vertical-qualification"
+_REGISTRATION_MODES = (
+    _REGISTRATION_MODE_PRODUCTION,
+    _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION,
+)
+
 
 class MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(ValueError):
     """The V5 executable implementation cannot be frozen or replayed."""
@@ -350,7 +369,7 @@ def _vertical_qualification(
     command = (
         "python",
         "-m",
-        "pytest",
+        "rl_quant.workflows.massive_adaptive_rl_vertical_qualification_runner_v1",
         "-q",
         "-p",
         "no:cacheprovider",
@@ -372,7 +391,7 @@ def _vertical_qualification(
                 check=False,
                 capture_output=True,
                 timeout=1_800,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                env=massive_adaptive_rl_deterministic_environment_v1(os.environ),
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
@@ -642,6 +661,7 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     torch_cpu_threads: int
     torch_interop_threads: int
     process_thread_environment: tuple[tuple[str, str], ...]
+    registration_mode: str
     source_data_qualified: bool
     semantic_receipt_sha256: str
     runtime_implementation_replayed: bool = False
@@ -735,6 +755,7 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
                 "torch_cpu_threads": self.torch_cpu_threads,
                 "torch_interop_threads": self.torch_interop_threads,
                 "process_thread_environment": self.process_thread_environment,
+                "registration_mode": self.registration_mode,
             }
         )
 
@@ -744,6 +765,13 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             self.source_transaction_verified
             and self.runtime_implementation_replayed
             and self.source_data_qualified
+            and (
+                self.registration_mode == _REGISTRATION_MODE_PRODUCTION
+                or (
+                    self.registration_mode == _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION
+                    and massive_adaptive_rl_vertical_qualification_scope_active_v1()
+                )
+            )
         )
 
     def validate(self) -> None:
@@ -761,17 +789,9 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             self._loaded_source.validate()
         environment_names = tuple(row[0] for row in self.process_thread_environment)
         environment_values = dict(self.process_thread_environment)
-        expected_qualified = bool(
-            self.source_worktree_clean
-            and not self.source_worktree_status
-            and self.v5_native_vertical_complete
+        deterministic_runtime = bool(
+            self.v5_native_vertical_complete
             and not self.missing_v5_native_implementation_paths
-            and self.vertical_qualification_passed
-            and not self.missing_vertical_qualification_test_paths
-            and self.vertical_qualification_exit_code == 0
-            and self.vertical_qualification_passed_node_count
-            == len(_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS)
-            and not self.vertical_qualification_nonpass_outcome_labels
             and self.execution_device_specification == "cpu"
             and self.parameter_dtype == "torch.float32"
             and self.observation_dtype == "torch.float32"
@@ -789,6 +809,31 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             )
             and environment_values.get("PYTHONHASHSEED", "unset").isdigit()
         )
+        expected_qualified = bool(
+            deterministic_runtime
+            and (
+                (
+                    self.registration_mode == _REGISTRATION_MODE_PRODUCTION
+                    and self.source_worktree_clean
+                    and not self.source_worktree_status
+                    and self.vertical_qualification_passed
+                    and not self.missing_vertical_qualification_test_paths
+                    and self.vertical_qualification_exit_code == 0
+                    and self.vertical_qualification_passed_node_count
+                    == len(_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS)
+                    and not self.vertical_qualification_nonpass_outcome_labels
+                )
+                or (
+                    self.registration_mode == _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION
+                    and self.experiment_id.startswith("v5-vertical-qualification-")
+                    and not self.vertical_qualification_passed
+                    and self.vertical_qualification_exit_code is None
+                    and self.vertical_qualification_passed_node_count == 0
+                    and self.vertical_qualification_nonpass_outcome_labels
+                    == ("not-run",)
+                )
+            )
+        )
         if (
             self.schema
             != MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA
@@ -800,6 +845,7 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
                 for character in self.git_commit + self.git_tree
             )
             or self.source_worktree_clean != (not self.source_worktree_status)
+            or self.registration_mode not in _REGISTRATION_MODES
             or self.required_v5_native_implementation_paths
             != _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS
             or self.missing_v5_native_implementation_paths
@@ -835,20 +881,27 @@ class MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
             != (
                 "python",
                 "-m",
-                "pytest",
+                "rl_quant.workflows.massive_adaptive_rl_vertical_qualification_runner_v1",
                 "-q",
                 "-p",
                 "no:cacheprovider",
                 *_VERTICAL_QUALIFICATION_REQUIRED_NODE_IDS,
             )
-            or self.vertical_qualification_passed
-            != (
-                self.v5_native_vertical_complete
-                and not self.missing_vertical_qualification_test_paths
-                and self.vertical_qualification_exit_code == 0
-                and self.vertical_qualification_passed_node_count
-                == len(self.vertical_qualification_required_node_ids)
-                and not self.vertical_qualification_nonpass_outcome_labels
+            or (
+                self.registration_mode == _REGISTRATION_MODE_PRODUCTION
+                and self.vertical_qualification_passed
+                != (
+                    self.v5_native_vertical_complete
+                    and not self.missing_vertical_qualification_test_paths
+                    and self.vertical_qualification_exit_code == 0
+                    and self.vertical_qualification_passed_node_count
+                    == len(self.vertical_qualification_required_node_ids)
+                    and not self.vertical_qualification_nonpass_outcome_labels
+                )
+            )
+            or (
+                self.registration_mode == _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION
+                and self.vertical_qualification_passed
             )
             or self.vertical_qualification_receipt_sha256
             != _vertical_qualification_receipt(self.semantic_unsigned())
@@ -990,9 +1043,30 @@ def _capture_body(
     registered_authority: (
         MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1 | None
     ) = None,
+    registration_mode: str = _REGISTRATION_MODE_PRODUCTION,
 ) -> dict[str, object]:
     manifest.validate()
     manifest_registration.validate()
+    if registration_mode not in _REGISTRATION_MODES:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "execution implementation registration mode differs"
+        )
+    if registration_mode == _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION:
+        try:
+            require_massive_adaptive_rl_vertical_qualification_experiment_v1(
+                manifest.experiment_id
+            )
+        except RuntimeError as error:
+            raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                str(error)
+            ) from error
+    if (
+        registered_authority is not None
+        and registered_authority.registration_mode != registration_mode
+    ):
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            "registered execution implementation mode differs"
+        )
     if (
         not manifest_registration.development_protocol_registered
         or manifest_registration.manifest_v5_receipt_sha256
@@ -1039,17 +1113,37 @@ def _capture_body(
         repository,
         _IMPLEMENTATION_RELATIVE_PATHS + present_v5_native,
     )
-    qualification = (
-        _vertical_qualification(
+    if registration_mode == _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION:
+        qualification = _vertical_qualification(
             repository_root=repository,
-            v5_native_vertical_complete=not missing_v5_native,
+            v5_native_vertical_complete=False,
         )
-        if registered_authority is None
-        else _replay_registered_vertical_qualification(
-            repository_root=repository,
-            authority=registered_authority,
+        if registered_authority is not None:
+            frozen_qualification = {
+                **{
+                    name: getattr(registered_authority, name)
+                    for name in _VERTICAL_QUALIFICATION_RECEIPT_FIELD_NAMES
+                },
+                "vertical_qualification_receipt_sha256": (
+                    registered_authority.vertical_qualification_receipt_sha256
+                ),
+            }
+            if qualification != frozen_qualification:
+                raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+                    "registered synthetic qualification identity differs"
+                )
+    else:
+        qualification = (
+            _vertical_qualification(
+                repository_root=repository,
+                v5_native_vertical_complete=not missing_v5_native,
+            )
+            if registered_authority is None
+            else _replay_registered_vertical_qualification(
+                repository_root=repository,
+                authority=registered_authority,
+            )
         )
-    )
     status = tuple(
         row
         for row in _git(
@@ -1066,10 +1160,8 @@ def _capture_body(
         (name, os.environ.get(name, "unset")) for name in _THREAD_ENVIRONMENT_NAMES
     )
     environment_values = dict(process_environment)
-    source_qualified = bool(
-        not status
-        and not missing_v5_native
-        and bool(qualification["vertical_qualification_passed"])
+    deterministic_runtime = bool(
+        not missing_v5_native
         and torch.are_deterministic_algorithms_enabled()
         and not torch.is_deterministic_algorithms_warn_only_enabled()
         and not torch.backends.cuda.matmul.allow_tf32
@@ -1083,6 +1175,17 @@ def _capture_body(
             for name in _THREAD_ENVIRONMENT_NAMES[:-1]
         )
         and environment_values.get("PYTHONHASHSEED", "unset").isdigit()
+    )
+    source_qualified = bool(
+        deterministic_runtime
+        and (
+            (
+                registration_mode == _REGISTRATION_MODE_PRODUCTION
+                and not status
+                and bool(qualification["vertical_qualification_passed"])
+            )
+            or registration_mode == _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION
+        )
     )
     return {
         "schema": MASSIVE_ADAPTIVE_RL_EXECUTION_IMPLEMENTATION_REGISTRATION_V1_SCHEMA,
@@ -1130,6 +1233,7 @@ def _capture_body(
         "torch_cpu_threads": torch.get_num_threads(),
         "torch_interop_threads": torch.get_num_interop_threads(),
         "process_thread_environment": process_environment,
+        "registration_mode": registration_mode,
         "source_data_qualified": source_qualified,
         "outer_access_authorized": False,
         "profitability_reporting_authorized": False,
@@ -1295,6 +1399,7 @@ def authorize_massive_adaptive_rl_execution_implementation_registration_v1(
     authority: MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    registration_mode: str = _REGISTRATION_MODE_PRODUCTION,
 ) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     authority.validate()
     if not authority.source_transaction_verified:
@@ -1307,6 +1412,7 @@ def authorize_massive_adaptive_rl_execution_implementation_registration_v1(
             manifest=manifest,
             manifest_registration=manifest_registration,
             registered_authority=authority,
+            registration_mode=registration_mode,
         ),
         manifest=manifest,
         manifest_registration=manifest_registration,
@@ -1335,6 +1441,7 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
     manifest: MassiveAdaptiveRLExperimentManifestV5,
     manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
     allow_materialize: bool,
+    registration_mode: str = _REGISTRATION_MODE_PRODUCTION,
 ) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
     relative = execution_implementation_registration_relative_path_v1(
         experiment_id=manifest.experiment_id
@@ -1355,6 +1462,7 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
             ),
             manifest=manifest,
             manifest_registration=manifest_registration,
+            registration_mode=registration_mode,
         )
     if not allow_materialize:
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
@@ -1367,8 +1475,13 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "execution implementation must precede every validation input"
         )
-    captured = capture_massive_adaptive_rl_execution_implementation_registration_v1(
-        root=root,
+    captured = _authority_from_captured_body(
+        body=_capture_body(
+            root=root,
+            manifest=manifest,
+            manifest_registration=manifest_registration,
+            registration_mode=registration_mode,
+        ),
         manifest=manifest,
         manifest_registration=manifest_registration,
     )
@@ -1418,7 +1531,44 @@ def _run_or_resume_execution_implementation_registration_v1_unlocked(
         ),
         manifest=manifest,
         manifest_registration=manifest_registration,
+        registration_mode=registration_mode,
     )
+
+
+def _run_or_resume_massive_adaptive_rl_qualification_bootstrap_registration_v1(
+    *,
+    root: str | Path,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    manifest_registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    allow_materialize: bool = True,
+) -> MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1:
+    """Persist/replay the nonproduction registration used by the real vertical."""
+
+    try:
+        require_massive_adaptive_rl_vertical_qualification_experiment_v1(
+            manifest.experiment_id
+        )
+    except RuntimeError as error:
+        raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
+            str(error)
+        ) from error
+    return run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+        root=root,
+        manifest=manifest,
+        manifest_registration=manifest_registration,
+        allow_materialize=allow_materialize,
+    )
+
+
+def _registration_mode_for_manifest_v1(
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+) -> str:
+    if (
+        massive_adaptive_rl_vertical_qualification_scope_active_v1()
+        and manifest.experiment_id.startswith("v5-vertical-qualification-")
+    ):
+        return _REGISTRATION_MODE_SYNTHETIC_QUALIFICATION
+    return _REGISTRATION_MODE_PRODUCTION
 
 
 def run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
@@ -1434,12 +1584,14 @@ def run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
             "execution implementation materialization mode differs"
         )
+    registration_mode = _registration_mode_for_manifest_v1(manifest)
     if not allow_materialize:
         return _run_or_resume_execution_implementation_registration_v1_unlocked(
             root=root,
             manifest=manifest,
             manifest_registration=manifest_registration,
             allow_materialize=False,
+            registration_mode=registration_mode,
         )
     try:
         with massive_adaptive_rl_experiment_orchestration_lock_v1(
@@ -1451,6 +1603,7 @@ def run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
                 manifest=manifest,
                 manifest_registration=manifest_registration,
                 allow_materialize=True,
+                registration_mode=registration_mode,
             )
     except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
         raise MassiveAdaptiveRLExecutionImplementationRegistrationV1Error(
