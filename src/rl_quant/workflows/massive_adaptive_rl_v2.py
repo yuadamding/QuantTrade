@@ -931,7 +931,13 @@ def _verify_run_command(args: argparse.Namespace) -> int:
             device=args.device,
         )
         print(canonical_json_file_bytes(asdict(result_v5)).decode("utf-8"), end="")
-        return 0
+        return (
+            0
+            if bool(
+                getattr(result_v5, "end_to_end_profitability_execution_complete", False)
+            )
+            else 2
+        )
     if schema == "rl-quant.massive-adaptive-rl-experiment-manifest-v4":
         raise MassiveAdaptiveRLWorkflowV2Error(
             "Manifest V4 verification requires the package-owned validation backend"
@@ -965,9 +971,42 @@ def _verify_run_command(args: argparse.Namespace) -> int:
 def _verify_ledger_command(args: argparse.Namespace) -> int:
     schema = _manifest_schema(args.manifest)
     if schema == "rl-quant.massive-adaptive-rl-experiment-manifest-v5":
-        raise MassiveAdaptiveRLWorkflowV2Error(
-            "Manifest V5 ledger verification requires prequential state V1"
+        from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
+            load_massive_adaptive_rl_experiment_manifest_v5,
         )
+        from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
+            load_massive_adaptive_rl_prequential_experiment_states_v1,
+        )
+
+        manifest_v5 = load_massive_adaptive_rl_experiment_manifest_v5(args.manifest)
+        states_v5 = load_massive_adaptive_rl_prequential_experiment_states_v1(
+            root=args.artifact_root,
+            manifest=manifest_v5,
+        )
+        if not states_v5:
+            raise MassiveAdaptiveRLWorkflowV2Error(
+                "Manifest V5 prequential state ledger is absent"
+            )
+        head_v5 = states_v5[-1]
+        output_v5 = {
+            "schema": "rl-quant.massive-adaptive-rl-prequential-ledger-verification-v1",
+            "manifest_v5_receipt_sha256": manifest_v5.semantic_receipt_sha256,
+            "state_receipts": tuple(
+                state.semantic_receipt_sha256 for state in states_v5
+            ),
+            "state_source_receipts": tuple(
+                state.source_receipt_sha256 for state in states_v5
+            ),
+            "state_commit_receipts": tuple(
+                state.source_transaction_receipt_sha256 for state in states_v5
+            ),
+            "current_stage": head_v5.stage.value,
+            "ledger_replayed": True,
+            "full_cold_replay_verified": False,
+            "end_to_end_profitability_execution_complete": False,
+        }
+        print(canonical_json_file_bytes(output_v5).decode("utf-8"), end="")
+        return 0
     if schema == "rl-quant.massive-adaptive-rl-experiment-manifest-v4":
         raise MassiveAdaptiveRLWorkflowV2Error(
             "Manifest V4 ledger verification requires the V4 state runner"
@@ -1067,6 +1106,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--manifest", required=True)
     verify.add_argument("--source-root", required=True)
     verify.add_argument("--artifact-root", required=True)
+    verify.add_argument("--device", default="cpu")
     verify.set_defaults(handler=_verify_run_command)
     verify_ledger = commands.add_parser(
         "verify-ledger",

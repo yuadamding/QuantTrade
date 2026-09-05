@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +29,11 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     write_massive_adaptive_rl_experiment_manifest_v5,
 )
 from rl_quant.workflows.massive_adaptive_rl_v2 import main
+
+
+@dataclass(frozen=True)
+class _V5VerificationStatus:
+    end_to_end_profitability_execution_complete: bool
 
 
 def test_manifest_v5_preregisters_one_prequential_writer(tmp_path: Path) -> None:
@@ -301,3 +306,70 @@ def test_manifest_v5_cli_creates_validates_and_uses_only_v5_runner(
                 str(tmp_path / "artifacts"),
             ]
         )
+
+    verify_result = _V5VerificationStatus(
+        end_to_end_profitability_execution_complete=False
+    )
+    monkeypatch.setattr(
+        runner,
+        "verify_massive_adaptive_rl_experiment_v5",
+        lambda **_: verify_result,
+    )
+    verify_args = [
+        "verify",
+        "--manifest",
+        str(path),
+        "--source-root",
+        str(tmp_path / "sources"),
+        "--artifact-root",
+        str(tmp_path / "artifacts"),
+    ]
+    assert main(verify_args) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "end_to_end_profitability_execution_complete": False
+    }
+    verify_result = _V5VerificationStatus(
+        end_to_end_profitability_execution_complete=True
+    )
+    assert main(verify_args) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "end_to_end_profitability_execution_complete": True
+    }
+
+    from rl_quant.workflows import (
+        massive_adaptive_rl_prequential_experiment_state_v1 as state_module,
+    )
+
+    state_receipt = semantic_sha256("state")
+    source_receipt = semantic_sha256("state-source")
+    commit_receipt = semantic_sha256("state-commit")
+    state = SimpleNamespace(
+        semantic_receipt_sha256=state_receipt,
+        source_receipt_sha256=source_receipt,
+        source_transaction_receipt_sha256=commit_receipt,
+        stage=SimpleNamespace(value="policy-1-frozen"),
+    )
+    monkeypatch.setattr(
+        state_module,
+        "load_massive_adaptive_rl_prequential_experiment_states_v1",
+        lambda **_: (state,),
+    )
+    assert (
+        main(
+            [
+                "verify-ledger",
+                "--manifest",
+                str(path),
+                "--artifact-root",
+                str(tmp_path / "artifacts"),
+            ]
+        )
+        == 0
+    )
+    ledger = json.loads(capsys.readouterr().out)
+    assert ledger["current_stage"] == "policy-1-frozen"
+    assert ledger["state_receipts"] == [state_receipt]
+    assert ledger["state_source_receipts"] == [source_receipt]
+    assert ledger["state_commit_receipts"] == [commit_receipt]
+    assert ledger["ledger_replayed"] is True
+    assert ledger["full_cold_replay_verified"] is False

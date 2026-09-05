@@ -5,8 +5,9 @@ predictor inventories.  Those inventories were temporarily added to the V1
 implementation while the validation boundary was being built.  This module
 creates an explicit V2 envelope around that transitional bundle.  A V1 bundle
 cannot be promoted merely because it parses: promotion requires the complete
-validation feature/action role inventory and binds both the fit-only and
-validation-only projections.
+validation feature/action role inventory, the global development-origin
+inventories used by state-gated outer evaluation, and both the nonvalidation
+and validation projections.
 
 The V2 envelope is create-only and generic reload remains nonauthorizing.
 Manifest V5 and later runners can therefore require V2 without treating older
@@ -67,7 +68,12 @@ MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V2_SPEC_SHA256 = semantic_sha256(
             MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V1_SOURCE_SHA256
         ),
         "roles": "complete-fixed-source-role-inventory",
-        "training_projection": "all-nonvalidation-source-roles",
+        "nonvalidation_projection": (
+            "training-plus-global-development-origin-source-roles"
+        ),
+        "development_origin_projection": (
+            "global-feature-and-action-inventories-for-four-outer-contexts"
+        ),
         "validation_projection": (
             "four-feature-and-four-action-origin-primary-inventories"
         ),

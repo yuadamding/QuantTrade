@@ -99,6 +99,7 @@ jobs:
           tests/test_massive_adaptive_rl_v5_outer_components.py
           tests/test_massive_adaptive_rl_outer_fold_execution_v1.py
           tests/test_massive_adaptive_rl_prequential_continuation_v1.py
+          tests/test_massive_adaptive_rl_final_outer_execution_v1.py
           tests/test_massive_adaptive_rl_prequential_experiment_state_v1.py
           tests/test_adaptive_alpha_supervised_v1.py
           tests/test_massive_adaptive_portfolio_compiler_v1.py
@@ -168,6 +169,7 @@ jobs:
           src/rl_quant/workflows/massive_adaptive_rl_walk_forward_policy_schedule_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_outer_fold_execution_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_prequential_continuation_v1.py
+          src/rl_quant/workflows/massive_adaptive_rl_final_outer_execution_v1.py
           src/rl_quant/workflows/massive_adaptive_rl_prequential_experiment_state_v1.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_v3.py
           src/rl_quant/evaluation/massive_adaptive_rl_outer_evidence_authority_v3.py

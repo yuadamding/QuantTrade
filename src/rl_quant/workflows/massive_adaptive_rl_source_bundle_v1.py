@@ -46,6 +46,13 @@ MASSIVE_ADAPTIVE_RL_SOURCE_BUNDLE_V1_SPEC_SHA256 = semantic_sha256(
         "validation_predictors": (
             "fold-primary-feature-and-action-inventories-before-runtime-replay"
         ),
+        "development_predictors": (
+            "global-primary-feature-and-action-inventories-covering-the-exact-"
+            "four-outer-fold-context-union"
+        ),
+        "development_predictor_authorization": (
+            "source-only-nonauthorizing-until-state-gated-outer-access"
+        ),
         "folds": (0, 1, 2, 3),
         "profitability_reporting": False,
         "lockbox_access": False,
@@ -61,6 +68,12 @@ _GLOBAL_SOURCE_PATHS = {
     "daily-input-authority": "authorities/daily-input-authority.json",
     "fill-source-authority": "authorities/fill-source-authority.json",
     "split-plan": "authorities/adaptive-split-plan.json",
+    "development-origin-feature-inventory": (
+        "authorities/development-origin-feature-inventory.json"
+    ),
+    "development-origin-action-inventory": (
+        "authorities/development-origin-action-inventory.json"
+    ),
 }
 _FOLD_SOURCE_PATHS = {
     "training-window-inventory": "training-window-inventory.json",
@@ -196,6 +209,12 @@ _SOURCE_ROLE_SCHEMAS = {
     "validation-origin-action-inventory": (
         "rl-quant.massive-adaptive-validation-origin-action-inventory-v1"
     ),
+    "development-origin-feature-inventory": (
+        "rl-quant.massive-adaptive-development-origin-feature-inventory-v1"
+    ),
+    "development-origin-action-inventory": (
+        "rl-quant.massive-adaptive-development-origin-action-inventory-v1"
+    ),
 }
 
 
@@ -308,6 +327,8 @@ class MassiveAdaptiveRLSourceBundleV1:
     context_origin_inventory_sha256: str
     validation_origin_feature_inventory_sha256: str
     validation_origin_action_inventory_sha256: str
+    development_origin_feature_inventory_sha256: str
+    development_origin_action_inventory_sha256: str
     committed_source_data_qualified: bool
     persisted_source_replayed: bool
     runtime_source_replayed: bool
@@ -419,6 +440,8 @@ class MassiveAdaptiveRLSourceBundleV1:
             self.context_origin_inventory_sha256,
             self.validation_origin_feature_inventory_sha256,
             self.validation_origin_action_inventory_sha256,
+            self.development_origin_feature_inventory_sha256,
+            self.development_origin_action_inventory_sha256,
             self.protocol_receipt_sha256,
             self.specification_sha256,
             self.implementation_source_sha256,
@@ -731,6 +754,12 @@ def materialize_massive_adaptive_rl_source_bundle_v1(
         "validation_origin_action_inventory_sha256": _summary_receipt(
             by_key, "validation-origin-action-inventory"
         ),
+        "development_origin_feature_inventory_sha256": by_key[
+            ("development-origin-feature-inventory", None)
+        ].semantic_receipt_sha256,
+        "development_origin_action_inventory_sha256": by_key[
+            ("development-origin-action-inventory", None)
+        ].semantic_receipt_sha256,
         "committed_source_data_qualified": True,
         "persisted_source_replayed": False,
         "runtime_source_replayed": False,

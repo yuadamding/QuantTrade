@@ -129,7 +129,11 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SPEC_SHA256 = semantic_sha
         "qualification": "explicit-role-specific-domain-authority-contracts",
         "implementation_identity": "every-domain-type-source-sha256",
         "inventory_coverage": (
-            "logical-keys-exact-rl-fit-prefix-and-model-context-plus-validation"
+            "logical-keys-exact-rl-fit-prefix-validation-context-and-four-outer-"
+            "fold-context-union"
+        ),
+        "development_predictors": (
+            "global-primary-feature-action-inventories-with-overlap-identity"
         ),
         "fit_schedule": "manifest-block-size-and-fold-schedule-bound",
         "graph_edges": "outer-fold-archives-to-exact-source-fold-lineage",
@@ -191,6 +195,8 @@ _DOMAIN_INVENTORY_ITEM_TYPES: dict[str, type[object]] = {
     "context-origin-inventory": MassiveAdaptiveContextOriginAuthorityV1,
     "validation-origin-feature-inventory": MassiveProfitabilityOriginFeaturesV3,
     "validation-origin-action-inventory": MassiveAdaptiveOriginAuthorityV1,
+    "development-origin-feature-inventory": MassiveProfitabilityOriginFeaturesV3,
+    "development-origin-action-inventory": MassiveAdaptiveOriginAuthorityV1,
 }
 
 _DOMAIN_INVENTORY_ITEM_SCHEMAS = {
@@ -209,6 +215,10 @@ _DOMAIN_INVENTORY_ITEM_SCHEMAS = {
         MASSIVE_PROFITABILITY_ORIGIN_FEATURES_V3_SCHEMA
     ),
     "validation-origin-action-inventory": MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SCHEMA,
+    "development-origin-feature-inventory": (
+        MASSIVE_PROFITABILITY_ORIGIN_FEATURES_V3_SCHEMA
+    ),
+    "development-origin-action-inventory": MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SCHEMA,
 }
 
 _DOMAIN_INVENTORY_ITEM_SPECIFICATIONS: dict[str, str | None] = {
@@ -229,6 +239,12 @@ _DOMAIN_INVENTORY_ITEM_SPECIFICATIONS: dict[str, str | None] = {
     "validation-origin-action-inventory": (
         MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SPEC_SHA256
     ),
+    "development-origin-feature-inventory": (
+        MASSIVE_PROFITABILITY_ORIGIN_FEATURES_V3_SPEC_SHA256
+    ),
+    "development-origin-action-inventory": (
+        MASSIVE_ADAPTIVE_ORIGIN_AUTHORITY_V1_SPEC_SHA256
+    ),
 }
 
 
@@ -247,6 +263,8 @@ def _authority_is_qualified(*, role: str, authority: object) -> bool:
         "context-origin-inventory": ("source_data_qualified",),
         "validation-origin-feature-inventory": ("source_data_qualified",),
         "validation-origin-action-inventory": ("source_data_qualified",),
+        "development-origin-feature-inventory": ("source_data_qualified",),
+        "development-origin-action-inventory": ("source_data_qualified",),
         "daily-input-authority": (
             "source_transport_qualified",
             "daily_input_data_qualified",
@@ -287,6 +305,11 @@ _INVENTORY_QUALIFICATION_FIELDS = {
     ),
     "validation-origin-feature-inventory": ("source_inputs_data_qualified",),
     "validation-origin-action-inventory": (
+        "source_paths_replayed",
+        "action_identity_source_data_qualified",
+    ),
+    "development-origin-feature-inventory": ("source_inputs_data_qualified",),
+    "development-origin-action-inventory": (
         "source_paths_replayed",
         "action_identity_source_data_qualified",
     ),
@@ -334,6 +357,8 @@ def _item_logical_key(*, role: str, item: object) -> str:
         "context-origin-inventory",
         "validation-origin-feature-inventory",
         "validation-origin-action-inventory",
+        "development-origin-feature-inventory",
+        "development-origin-action-inventory",
     }:
         value = getattr(item, "decision_session_date", None)
     else:
@@ -592,6 +617,8 @@ _DOMAIN_RUNTIME_TYPES: dict[str, type[object]] = {
     "context-origin-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
     "validation-origin-feature-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
     "validation-origin-action-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
+    "development-origin-feature-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
+    "development-origin-action-inventory": MassiveAdaptiveRLTypedAuthorityInventoryV1,
 }
 
 _DIRECT_DOMAIN_SPECIFICATIONS: dict[str, str | None] = {
@@ -1291,6 +1318,112 @@ def _validate_runtime_graph_contract(
             partition_dates,
         ),
     ]
+    candidate_dates = split_plan.candidate_session_dates
+    outer_tensor_date_set: set[str] = set()
+    for fold in split_plan.outer_folds:
+        outer_dates = fold.outer_test_session_dates
+        outer_start = candidate_dates.index(outer_dates[0])
+        outer_stop = candidate_dates.index(outer_dates[-1]) + 1
+        outer_context_start = (
+            outer_start - MASSIVE_ADAPTIVE_MAXIMUM_CONTEXT_SESSIONS_V1 + 1
+        )
+        if outer_context_start < 0:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL development predictor context is unavailable"
+            )
+        outer_tensor_date_set.update(candidate_dates[outer_context_start:outer_stop])
+    expected_development_tensor_dates = tuple(
+        date for date in candidate_dates if date in outer_tensor_date_set
+    )
+    development_features = cast(
+        tuple[MassiveProfitabilityOriginFeaturesV3, ...],
+        _inventory_items(
+            runtime_sources=runtime_sources,
+            role="development-origin-feature-inventory",
+            fold_index=None,
+        ),
+    )
+    development_actions = cast(
+        tuple[MassiveAdaptiveOriginAuthorityV1, ...],
+        _inventory_items(
+            runtime_sources=runtime_sources,
+            role="development-origin-action-inventory",
+            fold_index=None,
+        ),
+    )
+    development_features_by_date = {
+        row.decision_session_date: row for row in development_features
+    }
+    development_actions_by_date = {
+        row.decision_session_date: row for row in development_actions
+    }
+    if (
+        tuple(sorted(development_features_by_date)) != expected_development_tensor_dates
+        or len(development_features_by_date) != len(development_features)
+        or tuple(sorted(development_actions_by_date))
+        != expected_development_tensor_dates
+        or len(development_actions_by_date) != len(development_actions)
+    ):
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL development predictor inventory does not cover the exact "
+            "four-fold outer context union"
+        )
+    sessions_by_date = {row.session_date: row for row in session.sessions}
+    try:
+        development_sessions = tuple(
+            sessions_by_date[date] for date in expected_development_tensor_dates
+        )
+    except KeyError as error:
+        raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+            "adaptive RL development predictor session is absent"
+        ) from error
+    development_clocks = build_massive_decision_clock_authorities(
+        session_authority=session,
+        sessions=development_sessions,
+    )
+    for session_date, clock in zip(
+        expected_development_tensor_dates,
+        development_clocks,
+        strict=True,
+    ):
+        feature = development_features_by_date[session_date]
+        action = development_actions_by_date[session_date]
+        _edge(
+            edges,
+            name=f"development-feature/daily-input/{session_date}",
+            observed=feature.daily_input_authority_semantic_receipt_sha256,
+            expected=daily.semantic_receipt_sha256,
+        )
+        _edge(
+            edges,
+            name=f"development-action/session-authority/{session_date}",
+            observed=action.session_authority_receipt_sha256,
+            expected=session.receipt_sha256,
+        )
+        _edge(
+            edges,
+            name=f"development-action/decision-clock/{session_date}",
+            observed=action.decision_clock_receipt_sha256,
+            expected=clock.receipt_sha256,
+        )
+        if action.decision_at_ms != clock.decision_at_ns // 1_000_000:
+            raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                "adaptive RL development action decision timestamp differs"
+            )
+    coverage.append(
+        (
+            "development-origin-four-fold-outer-context",
+            expected_development_tensor_dates,
+            tuple(
+                development_features_by_date[date].semantic_receipt_sha256
+                for date in expected_development_tensor_dates
+            ),
+            tuple(
+                development_actions_by_date[date].semantic_receipt_sha256
+                for date in expected_development_tensor_dates
+            ),
+        )
+    )
     validation_feature_receipts_by_date: dict[str, str] = {}
     validation_action_receipts_by_date: dict[str, str] = {}
     for fold_index in range(4):
@@ -1298,7 +1431,6 @@ def _validate_runtime_graph_contract(
         fit_session_count = fold_fit_session_counts[fold_index]
         expected_dates = fold.fit_session_dates[-fit_session_count:]
         validation_dates = fold.inner_validation_session_dates
-        candidate_dates = split_plan.candidate_session_dates
         validation_start = candidate_dates.index(validation_dates[0])
         validation_stop = candidate_dates.index(validation_dates[-1]) + 1
         validation_context_start = (
@@ -1441,7 +1573,17 @@ def _validate_runtime_graph_contract(
                 raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
                     "adaptive RL validation predictor date resolves to alternate roots"
                 )
-        sessions_by_date = {row.session_date: row for row in session.sessions}
+            development_feature = development_features_by_date.get(session_date)
+            development_action = development_actions_by_date.get(session_date)
+            if development_feature is not None and (
+                development_feature.semantic_receipt_sha256 != feature_receipt
+                or development_action is None
+                or development_action.semantic_receipt_sha256 != action_receipt
+            ):
+                raise MassiveAdaptiveRLRuntimeSourceGraphAuthorityV1Error(
+                    "adaptive RL validation and development predictors resolve to "
+                    "alternate roots"
+                )
         try:
             validation_sessions = tuple(
                 sessions_by_date[date] for date in expected_validation_tensor_dates

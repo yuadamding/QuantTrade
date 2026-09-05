@@ -112,6 +112,12 @@ _IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/workflows/massive_adaptive_rl_initial_validation_execution_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5.py",
     "src/rl_quant/workflows/massive_adaptive_rl_manifest_v5_registration.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_runtime_source_graph_authority_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_runtime_source_graph_authority_v2.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_runtime_source_reconstruction_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_runtime_source_reconstruction_v2.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_source_bundle_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_source_bundle_v2.py",
     "src/rl_quant/workflows/massive_adaptive_rl_writer_guard_v5.py",
 )
 _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
@@ -130,6 +136,7 @@ _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/workflows/massive_adaptive_rl_prequential_experiment_state_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_outer_fold_execution_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_prequential_continuation_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_final_outer_execution_v1.py",
 )
 _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS = (
     "tests/test_massive_adaptive_rl_v5_vertical.py",

@@ -33,7 +33,6 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 )
 from rl_quant.workflows.massive_adaptive_rl_outer_fold_execution_v1 import (
     MassiveAdaptiveRLOuterFoldExecutionV1,
-    MassiveAdaptiveRLOuterFoldExecutionV1Error,
     run_or_resume_massive_adaptive_rl_outer_fold_execution_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_prequential_experiment_state_v1 import (
@@ -148,11 +147,7 @@ def _roots(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         MassiveAdaptiveRLPrequentialExperimentStateV1,
         "source_transaction_committed_at_ms",
-        property(
-            lambda state: (
-                140 if state.stage.value.startswith("outer-") else 95
-            )
-        ),
+        property(lambda state: 140 if state.stage.value.startswith("outer-") else 95),
     )
     return manifest, registration, execution, schedule, predecessor
 
@@ -188,9 +183,21 @@ def test_outer_fold_public_surface_has_no_caller_economic_inputs() -> None:
             MassiveAdaptiveRLPrequentialStageV1.OUTER_1_SEALED,
             (0, 1, 2),
         ),
+        (
+            2,
+            MassiveAdaptiveRLPrequentialStageV1.POLICY_3_FROZEN,
+            MassiveAdaptiveRLPrequentialStageV1.OUTER_2_SEALED,
+            (0, 1, 2, 3),
+        ),
+        (
+            3,
+            MassiveAdaptiveRLPrequentialStageV1.OUTER_2_SEALED,
+            MassiveAdaptiveRLPrequentialStageV1.OUTER_3_SEALED,
+            (0, 1, 2, 3),
+        ),
     ),
 )
-def test_outer_zero_and_one_execute_and_seal_in_package_owned_order(
+def test_all_outer_folds_execute_and_seal_in_package_owned_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fold_index: int,
@@ -341,7 +348,7 @@ def test_outer_zero_and_one_execute_and_seal_in_package_owned_order(
     assert calls == ["access", "inputs", "rollout", "seal", "state"]
 
 
-def test_outer_three_cannot_open_from_policy_three_state(
+def test_policy_three_state_selects_outer_two_before_outer_three(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -362,21 +369,32 @@ def test_outer_three_cannot_open_from_policy_three_state(
         "load_massive_adaptive_rl_prequential_experiment_states_v1",
         lambda **_: (predecessor,),
     )
-    called = False
+    observed_fold: int | None = None
 
     def access(**kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("outer access should remain closed")
+        nonlocal observed_fold
+        observed_fold = kwargs["frozen_policy"].fold_index
+        raise RuntimeError("stop after fold selection")
+
+    frozen_policy = SimpleNamespace(fold_index=2)
+    monkeypatch.setattr(
+        MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+        "frozen_policy",
+        lambda _, requested_fold: (
+            frozen_policy if requested_fold == 2 else SimpleNamespace(fold_index=-1)
+        ),
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
+        "frozen_control",
+        lambda _, requested_fold: SimpleNamespace(fold_index=requested_fold),
+    )
 
     monkeypatch.setattr(
         outer, "run_or_resume_massive_adaptive_outer_access_commitment_v2", access
     )
 
-    with pytest.raises(
-        MassiveAdaptiveRLOuterFoldExecutionV1Error,
-        match="only outer folds zero and one",
-    ):
+    with pytest.raises(RuntimeError, match="stop after fold selection"):
         run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
             root=tmp_path,
             manifest=manifest,
@@ -385,7 +403,7 @@ def test_outer_three_cannot_open_from_policy_three_state(
             policy_schedule=schedule,
             predecessor_state=predecessor,
         )
-    assert not called
+    assert observed_fold == 2
 
 
 def test_historical_outer_predecessor_forces_read_only_replay(

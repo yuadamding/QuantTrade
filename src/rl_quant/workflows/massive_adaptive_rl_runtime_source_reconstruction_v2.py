@@ -4,8 +4,10 @@ This generation deliberately retains the exact V1 objects used by the current
 training implementation as private replay witnesses.  The public V2 identity
 adds the missing generation boundary: it binds the V2 source bundle and graph,
 an explicit V2 dependency-index transaction, and the complete per-fold
-validation feature/action inventories.  Legacy or mixed V1 artifacts cannot
-be promoted by name or parameter equivalence.
+validation feature/action inventories.  The exact base V1 graph also binds the
+global development-origin feature/action inventories used to reconstruct all
+four outer folds.  Legacy or mixed V1 artifacts cannot be promoted by name or
+parameter equivalence.
 """
 
 from __future__ import annotations
@@ -96,6 +98,9 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_RECONSTRUCTION_V2_SPEC_SHA256 = semantic_sha2
         "dependency_index": "exact-persisted-replay-dependency-index-v2",
         "validation_dependencies": (
             "all-fold-feature-and-action-origin-receipts-are-index-members"
+        ),
+        "development_origin_dependencies": (
+            "global-four-outer-context-feature-and-action-inventories-bound-by-base-v1"
         ),
         "training_compatibility": (
             "four-fold-fit-must-bind-exact-base-v1-runtime-and-witness"

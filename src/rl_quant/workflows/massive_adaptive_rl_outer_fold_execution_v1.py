@@ -6,10 +6,9 @@ persisted prequential-state head, commits access before opening inputs, replays
 the frozen PPO and fixed control, seals the complete fold, and immediately
 advances the append-only state chain.
 
-This generation exposes outer folds zero and one because both can be derived
-from validation-origin inputs already sealed by their preceding state heads.
-Later folds require a separate package-owned market-input lineage and remain
-closed; no caller selects a fold index.
+All four folds derive their predictor roots from the global development-origin
+inventories committed in the runtime-source graph.  No caller selects a fold
+index: the exact current state head determines the only legal transition.
 """
 
 from __future__ import annotations
@@ -116,7 +115,7 @@ class MassiveAdaptiveRLOuterFoldExecutionV1:
             f"outer-{self.fold_index}-sealed"
         )
         if (
-            self.fold_index not in (0, 1)
+            self.fold_index not in range(4)
             or not access_time < input_time < rollout_time < seal_time < state_time
             or self.outer_access.fold_index != self.fold_index
             or self.outer_inputs.fold_index != self.fold_index
@@ -161,8 +160,7 @@ def _require_exact_current_state_head_v1(
         index
         for index, state in enumerate(states)
         if (
-            predecessor_state.semantic_receipt_sha256
-            == state.semantic_receipt_sha256
+            predecessor_state.semantic_receipt_sha256 == state.semantic_receipt_sha256
             and predecessor_state.source_receipt_sha256 == state.source_receipt_sha256
             and predecessor_state.source_transaction_receipt_sha256
             == state.source_transaction_receipt_sha256
@@ -248,21 +246,20 @@ def run_or_resume_massive_adaptive_rl_outer_fold_execution_v1(
             predecessor_state=predecessor_state,
             allow_materialize=allow_materialize,
         )
-        if fold_index not in (0, 1):
-            raise MassiveAdaptiveRLOuterFoldExecutionV1Error(
-                "this vertical slice authorizes only outer folds zero and one"
-            )
-        expected_schedule_folds = tuple(range(fold_index + 2))
+        expected_schedule_folds = tuple(range((2, 3, 4, 4)[fold_index]))
         if (
             policy_schedule.fold_indices != expected_schedule_folds
-            or predecessor_state.stage_artifact_semantic_receipt_sha256
-            != policy_schedule.semantic_receipt_sha256
-            or predecessor_state.stage_artifact_source_receipt_sha256
-            != policy_schedule.source_receipt_sha256
-            or predecessor_state.stage_artifact_commit_receipt_sha256
-            != policy_schedule.source_transaction_receipt_sha256
-            or predecessor_state.stage_artifact_committed_at_ms
-            != policy_schedule.source_transaction_committed_at_ms
+            or fold_index in (0, 1, 2)
+            and (
+                predecessor_state.stage_artifact_semantic_receipt_sha256
+                != policy_schedule.semantic_receipt_sha256
+                or predecessor_state.stage_artifact_source_receipt_sha256
+                != policy_schedule.source_receipt_sha256
+                or predecessor_state.stage_artifact_commit_receipt_sha256
+                != policy_schedule.source_transaction_receipt_sha256
+                or predecessor_state.stage_artifact_committed_at_ms
+                != policy_schedule.source_transaction_committed_at_ms
+            )
         ):
             raise MassiveAdaptiveRLOuterFoldExecutionV1Error(
                 "outer fold requires its persisted causal policy-schedule head"

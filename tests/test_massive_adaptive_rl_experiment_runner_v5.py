@@ -25,6 +25,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     _build_initial_execution_result,
     _build_outer_zero_result,
     _build_preimplementation_result,
+    _build_profitability_report_result,
     _build_result,
     _record_initial_prequential_execution_v1,
     run_massive_adaptive_rl_experiment_v5,
@@ -38,6 +39,9 @@ from rl_quant.workflows.massive_adaptive_rl_prequential_continuation_v1 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
     MassiveAdaptiveRLExecutionImplementationRegistrationAuthorityV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_final_outer_execution_v1 import (
+    MassiveAdaptiveRLFinalOuterExecutionV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     build_massive_adaptive_rl_experiment_manifest_v5,
@@ -508,6 +512,89 @@ def test_v5_result_freezes_implementation_before_initial_inputs(
     assert completed_schedule.prequential_state_head_stage == "policy-3-frozen"
     assert completed_schedule.next_required_stage == "outer-fold-2-access-and-seal"
     assert not completed_schedule.positive_profitability_authorization_eligible
+
+    outer_two_state = SimpleNamespace(
+        semantic_receipt_sha256=_digest("outer-two-state")
+    )
+    outer_two_execution = SimpleNamespace(
+        outer_access=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-two-access"),
+            predecessor_state_receipt_sha256=(
+                policy_three_state.semantic_receipt_sha256
+            ),
+        ),
+        outer_inputs=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-two-inputs")
+        ),
+        outer_rollout=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-two-rollout")
+        ),
+        outer_fold_seal=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-two-seal")
+        ),
+        prequential_state=outer_two_state,
+    )
+    outer_three_execution = SimpleNamespace(
+        outer_access=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-three-access"),
+            predecessor_state_receipt_sha256=(outer_two_state.semantic_receipt_sha256),
+        ),
+        outer_inputs=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-three-inputs")
+        ),
+        outer_rollout=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-three-rollout")
+        ),
+        outer_fold_seal=SimpleNamespace(
+            semantic_receipt_sha256=_digest("outer-three-seal")
+        ),
+    )
+    report = SimpleNamespace(
+        semantic_receipt_sha256=_digest("report"),
+        source_receipt_sha256=_digest("report-source"),
+        source_transaction_receipt_sha256=_digest("report-commit"),
+        source_transaction_committed_at_ms=80,
+        profitability_gates_passed=False,
+    )
+    report_state = SimpleNamespace(
+        stage=MassiveAdaptiveRLPrequentialStageV1.PROFITABILITY_REPORT_PUBLISHED,
+        stage_artifact_semantic_receipt_sha256=report.semantic_receipt_sha256,
+        semantic_receipt_sha256=_digest("report-state"),
+        source_receipt_sha256=_digest("report-state-source"),
+        source_transaction_receipt_sha256=_digest("report-state-commit"),
+        source_transaction_committed_at_ms=90,
+        development_profitability_reporting_authorized=True,
+    )
+    final_execution = _typed_shell(
+        MassiveAdaptiveRLFinalOuterExecutionV1,
+        outer_executions=(outer_two_execution, outer_three_execution),
+        outer_fold_seals=(
+            outer_execution.outer_fold_seal,
+            outer_one_execution.outer_fold_seal,
+            outer_two_execution.outer_fold_seal,
+            outer_three_execution.outer_fold_seal,
+        ),
+        profitability_report=report,
+        prequential_state=report_state,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLFinalOuterExecutionV1,
+        "validate",
+        lambda _: None,
+    )
+    reported = _build_profitability_report_result(
+        boundary=completed_schedule,
+        execution=final_execution,
+    )
+    assert reported.sealed_outer_fold_indices == (0, 1, 2, 3)
+    assert reported.outer_two_execution_complete
+    assert reported.outer_three_execution_complete
+    assert reported.profitability_reporting_authorized
+    assert reported.profitability_gates_passed is False
+    assert reported.prequential_state_head_stage == "profitability-report-published"
+    assert reported.next_required_stage == "full-cold-replay-verification"
+    assert not reported.end_to_end_profitability_execution_complete
+    assert not reported.positive_profitability_authorization_eligible
 
 
 def test_v5_root_registers_before_resuming_training(

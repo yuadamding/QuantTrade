@@ -717,6 +717,53 @@ def test_runtime_sources_rebuild_validation_origins_without_caller_roots(
             feature_inventory_sha256=semantic_sha256("tampered-features"),
         ).validate()
 
+    development_feature_inventory = (
+        build_massive_adaptive_rl_typed_authority_inventory_v1(
+            role="development-origin-feature-inventory",
+            fold_index=None,
+            items=features,
+        )
+    )
+    development_action_inventory = (
+        build_massive_adaptive_rl_typed_authority_inventory_v1(
+            role="development-origin-action-inventory",
+            fold_index=None,
+            items=actions,
+        )
+    )
+    development_by_role = {
+        ("development-origin-feature-inventory", None): (development_feature_inventory),
+        ("development-origin-action-inventory", None): development_action_inventory,
+    }
+    outer_runtime_sources = replace(
+        runtime_sources,
+        runtime_source_graph_authority=SimpleNamespace(
+            runtime_authority=lambda *, role, fold_index: development_by_role[
+                (role, fold_index)
+            ],
+            runtime_authority_receipt_sha256=semantic_sha256("runtime-witness"),
+        ),  # type: ignore[arg-type]
+        split_plan=SimpleNamespace(
+            candidate_session_dates=candidate_dates,
+            outer_folds=(SimpleNamespace(outer_test_session_dates=validation_dates),),
+        ),  # type: ignore[arg-type]
+        _replay_origin_features=tuple(features),
+        _replay_action_origins=tuple(actions),
+    )
+
+    outer_inputs = outer_runtime_sources.outer_origin_inputs(0)
+
+    assert outer_inputs.tensor_session_dates == tensor_dates
+    assert outer_inputs.features == tuple(features)
+    assert outer_inputs.action_origins == tuple(actions)
+    assert outer_inputs.feature_authority_receipt_sha256 == (
+        development_feature_inventory.semantic_receipt_sha256
+    )
+    assert outer_inputs.action_origin_authority_receipt_sha256 == (
+        development_action_inventory.semantic_receipt_sha256
+    )
+    assert outer_inputs.source_data_qualified
+
 
 def test_runtime_source_reconstruction_rejects_alternate_same_date_feature() -> None:
     history = (

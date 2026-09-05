@@ -6,9 +6,11 @@ outer chronology from the retained runtime-source graph, commits the decision
 tensor after access, deterministically rebuilds the target-free forecast, and
 returns the access authority with its private economic environments attached.
 
-Fold zero and fold one deliberately reuse the predictor roots that later
-become validation folds two and three.  The inputs are opened here in their
-outer role only; no delayed validation-release artifact is created.
+All four folds use the exact global development-origin inventories committed
+by the runtime-source graph.  Their overlap with the fold-two/fold-three
+validation roots is identity-checked when that graph is authorized.  This
+operation opens only the requested state-gated outer role; no delayed
+validation-release artifact is created.
 """
 
 from __future__ import annotations
@@ -96,6 +98,9 @@ MASSIVE_ADAPTIVE_RL_OUTER_INPUT_AUTHORITY_V1_SPEC_SHA256 = semantic_sha256(
         "prerequisite": "persisted-state-gated-outer-access-v2",
         "predictor": "exact-causal-supervised-lineage-for-outer-fold",
         "chronology": "complete-126-session-outer-role-with-causal-context",
+        "predictor_roots": (
+            "global-development-inventories-bound-before-state-gated-access"
+        ),
         "forecast": "cpu-float32-eval-no-grad-deterministic-replay",
         "persistence": "decision-tensor-plus-forecast-row-receipt-authority",
         "caller_environment": False,
@@ -733,7 +738,7 @@ def run_or_resume_massive_adaptive_rl_outer_inputs_v1(
         or outer_access.manifest_v5_receipt_sha256 != manifest.semantic_receipt_sha256
         or outer_access.manifest_v5_registration_receipt_sha256
         != manifest_registration.semantic_receipt_sha256
-        or outer_access.fold_index not in (0, 1)
+        or outer_access.fold_index not in range(4)
     ):
         raise MassiveAdaptiveRLOuterInputsV1Error(
             "outer inputs are not causally available from this access commitment"
@@ -744,9 +749,7 @@ def run_or_resume_massive_adaptive_rl_outer_inputs_v1(
     runtime_sources.validate()
     fold_index = outer_access.fold_index
     lineage = runtime_sources.fold(fold_index).supervised_lineage(fold_index)
-    # Under the registered split, O0 == V2 and O1 == V3.  Reuse the retained
-    # predictor roots without publishing either delayed validation release.
-    origins = runtime_sources.validation_origin_inputs(fold_index + 2)
+    origins = runtime_sources.outer_origin_inputs(fold_index)
     expected_dates = outer_access.outer_decision_session_dates
     maximum_context = min(
         lineage.model_spec.maximum_context_sessions,

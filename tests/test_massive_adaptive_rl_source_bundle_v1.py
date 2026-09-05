@@ -43,6 +43,12 @@ _GLOBAL = {
     "daily-input-authority": "authorities/daily-input-authority.json",
     "fill-source-authority": "authorities/fill-source-authority.json",
     "split-plan": "authorities/adaptive-split-plan.json",
+    "development-origin-feature-inventory": (
+        "authorities/development-origin-feature-inventory.json"
+    ),
+    "development-origin-action-inventory": (
+        "authorities/development-origin-action-inventory.json"
+    ),
 }
 _FOLD = {
     "training-window-inventory": "training-window-inventory.json",

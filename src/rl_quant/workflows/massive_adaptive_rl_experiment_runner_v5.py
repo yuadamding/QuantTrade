@@ -1,13 +1,13 @@
-"""Manifest-V5 root through the complete four-policy schedule.
+"""Manifest-V5 root through the complete development profitability report.
 
 V5 is the unique authoring generation for the prequential experiment.  It
 registers that ownership before resuming training, freezes the qualified
 evaluation implementation after causal training, and only then permits the
 fold-0/1 validation inputs.  It evaluates and freezes both initial policy pairs,
-publishes schedule prefixes, seals outer fold zero, releases and freezes policy
-two, seals outer fold one with the already-frozen policy one, then releases and
-freezes policy three.  Outer folds two and three remain closed until their
-package-owned market-input lineage is implemented.
+publishes schedule prefixes, executes all four causally ordered outer folds,
+releases delayed validations only after their predecessor seals, and publishes
+the four-fold profitability report.  Full end-to-end completion remains false
+until the separate nonmaterializing cold-replay finalizer verifies that report.
 """
 
 from __future__ import annotations
@@ -51,6 +51,10 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
     MassiveAdaptiveRLExperimentStageV2,
     MassiveAdaptiveRLExperimentStateV2,
     load_massive_adaptive_rl_experiment_states_v2,
+)
+from rl_quant.workflows.massive_adaptive_rl_final_outer_execution_v1 import (
+    MassiveAdaptiveRLFinalOuterExecutionV1,
+    run_or_resume_massive_adaptive_rl_final_outer_execution_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256,
@@ -174,6 +178,11 @@ class MassiveAdaptiveRLPrequentialRunV5:
     outer_rollout_authority_receipts: tuple[str, ...]
     outer_fold_seal_authority_receipts: tuple[str, ...]
     sealed_outer_fold_indices: tuple[int, ...]
+    profitability_report_authority_receipt_sha256: str | None
+    profitability_report_source_receipt_sha256: str | None
+    profitability_report_commit_receipt_sha256: str | None
+    profitability_report_committed_at_ms: int | None
+    profitability_gates_passed: bool | None
     prequential_state_head_receipt_sha256: str | None
     prequential_state_head_source_receipt_sha256: str | None
     prequential_state_head_commit_receipt_sha256: str | None
@@ -194,6 +203,8 @@ class MassiveAdaptiveRLPrequentialRunV5:
     outer_zero_preparation_authorized: bool
     outer_zero_execution_complete: bool
     outer_one_execution_complete: bool
+    outer_two_execution_complete: bool
+    outer_three_execution_complete: bool
     next_required_stage: str
     semantic_receipt_sha256: str
     policy_schedule_disposition: str | None = None
@@ -293,9 +304,17 @@ class MassiveAdaptiveRLPrequentialRunV5:
         )
         outer_lengths = tuple(len(inventory) for inventory in outer_inventories)
         outer_count = outer_lengths[0] if len(set(outer_lengths)) == 1 else -1
-        outer_partial = outer_count not in (0, 1, 2)
+        outer_partial = outer_count not in (0, 1, 2, 4)
         outer_zero_present = outer_count >= 1
-        outer_one_present = outer_count == 2
+        outer_one_present = outer_count >= 2
+        outer_two_present = outer_count == 4
+        outer_three_present = outer_count == 4
+        report_receipts = (
+            self.profitability_report_authority_receipt_sha256,
+            self.profitability_report_source_receipt_sha256,
+            self.profitability_report_commit_receipt_sha256,
+        )
+        report_present = all(value is not None for value in report_receipts)
         state_head_receipts = (
             self.prequential_state_head_receipt_sha256,
             self.prequential_state_head_source_receipt_sha256,
@@ -303,7 +322,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
         )
         state_head_present = all(value is not None for value in state_head_receipts)
         expected_next_stage = (
-            "outer-fold-2-access-and-seal"
+            "full-cold-replay-verification"
+            if report_present
+            else "outer-fold-2-access-and-seal"
             if delayed_execution_present
             else "validation-fold-2-release-selection-and-freeze"
             if outer_zero_present
@@ -341,7 +362,17 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or outer_zero_present
             and not initial_execution_present
             or outer_one_present != delayed_execution_present
+            or outer_two_present != report_present
+            or outer_three_present != report_present
+            or any(value is not None for value in report_receipts) != report_present
+            or (self.profitability_report_committed_at_ms is not None) != report_present
+            or (self.profitability_gates_passed is not None) != report_present
+            or report_present
+            and not isinstance(self.profitability_gates_passed, bool)
             or self.sealed_outer_fold_indices != tuple(range(max(0, outer_count)))
+            or any(
+                len(set(inventory)) != outer_count for inventory in outer_inventories
+            )
             or len(self.initial_policy_schedule_prefix_receipts)
             != (2 if initial_execution_present else 0)
             or len(set(self.initial_policy_schedule_prefix_receipts))
@@ -354,7 +385,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or state_head_present != initial_execution_present
             or self.prequential_state_head_stage
             != (
-                "policy-3-frozen"
+                "profitability-report-published"
+                if report_present
+                else "policy-3-frozen"
                 if delayed_execution_present
                 else "outer-0-sealed"
                 if outer_zero_present
@@ -425,10 +458,12 @@ class MassiveAdaptiveRLPrequentialRunV5:
             != bool(initial_execution_present and not outer_zero_present)
             or self.outer_zero_execution_complete != outer_zero_present
             or self.outer_one_execution_complete != outer_one_present
+            or self.outer_two_execution_complete != outer_two_present
+            or self.outer_three_execution_complete != outer_three_present
             or self.next_required_stage != expected_next_stage
             or self.final_policy_freezing_authorized != delayed_execution_present
             or self.outer_access_authorized
-            or self.profitability_reporting_authorized
+            or self.profitability_reporting_authorized != report_present
             or self.end_to_end_profitability_execution_complete
             or self.lockbox_access_authorized
             or self.live_trading_authorized
@@ -454,6 +489,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
         for inventory in outer_inventories:
             for value in inventory:
                 _digest("outer-fold execution inventory", value)
+        for value in report_receipts:
+            if value is not None:
+                _digest("profitability report receipt", value)
         for value in self.initial_policy_schedule_prefix_receipts:
             _digest("initial policy schedule prefix", value)
         _required_timestamp(
@@ -479,6 +517,11 @@ class MassiveAdaptiveRLPrequentialRunV5:
             _required_timestamp(
                 "prequential state-head timestamp",
                 self.prequential_state_head_committed_at_ms,
+            )
+        if self.profitability_report_committed_at_ms is not None:
+            _required_timestamp(
+                "profitability report timestamp",
+                self.profitability_report_committed_at_ms,
             )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
@@ -626,6 +669,11 @@ def _build_preimplementation_result(
         "outer_rollout_authority_receipts": (),
         "outer_fold_seal_authority_receipts": (),
         "sealed_outer_fold_indices": (),
+        "profitability_report_authority_receipt_sha256": None,
+        "profitability_report_source_receipt_sha256": None,
+        "profitability_report_commit_receipt_sha256": None,
+        "profitability_report_committed_at_ms": None,
+        "profitability_gates_passed": None,
         "prequential_state_head_receipt_sha256": None,
         "prequential_state_head_source_receipt_sha256": None,
         "prequential_state_head_commit_receipt_sha256": None,
@@ -648,6 +696,8 @@ def _build_preimplementation_result(
         "outer_zero_preparation_authorized": False,
         "outer_zero_execution_complete": False,
         "outer_one_execution_complete": False,
+        "outer_two_execution_complete": False,
+        "outer_three_execution_complete": False,
         "next_required_stage": (
             "execution-implementation-registration"
             if implementation_registration is None
@@ -844,6 +894,11 @@ def _build_result(
         "outer_rollout_authority_receipts": (),
         "outer_fold_seal_authority_receipts": (),
         "sealed_outer_fold_indices": (),
+        "profitability_report_authority_receipt_sha256": None,
+        "profitability_report_source_receipt_sha256": None,
+        "profitability_report_commit_receipt_sha256": None,
+        "profitability_report_committed_at_ms": None,
+        "profitability_gates_passed": None,
         "prequential_state_head_receipt_sha256": None,
         "prequential_state_head_source_receipt_sha256": None,
         "prequential_state_head_commit_receipt_sha256": None,
@@ -872,6 +927,8 @@ def _build_result(
         "outer_zero_preparation_authorized": False,
         "outer_zero_execution_complete": False,
         "outer_one_execution_complete": False,
+        "outer_two_execution_complete": False,
+        "outer_three_execution_complete": False,
         "next_required_stage": (
             "prequential-fold-0-and-fold-1-validation-selection-and-freeze"
         ),
@@ -1201,6 +1258,106 @@ def _build_delayed_policy_result(
     return result
 
 
+def _build_profitability_report_result(
+    *,
+    boundary: MassiveAdaptiveRLPrequentialRunV5,
+    execution: MassiveAdaptiveRLFinalOuterExecutionV1,
+) -> MassiveAdaptiveRLPrequentialRunV5:
+    """Promote the root envelope after O2, O3, and Report V2 replay."""
+
+    boundary.validate()
+    execution.validate()
+    outer_two, outer_three = execution.outer_executions
+    report = execution.profitability_report
+    state = execution.prequential_state
+    if (
+        not boundary.final_policy_freezing_authorized
+        or not boundary.outer_one_execution_complete
+        or boundary.prequential_state_head_receipt_sha256
+        != outer_two.outer_access.predecessor_state_receipt_sha256
+        or outer_three.outer_access.predecessor_state_receipt_sha256
+        != outer_two.prequential_state.semantic_receipt_sha256
+        or tuple(row.semantic_receipt_sha256 for row in execution.outer_fold_seals[:2])
+        != boundary.outer_fold_seal_authority_receipts
+        or state.stage
+        is not MassiveAdaptiveRLPrequentialStageV1.PROFITABILITY_REPORT_PUBLISHED
+        or state.stage_artifact_semantic_receipt_sha256
+        != report.semantic_receipt_sha256
+        or not state.development_profitability_reporting_authorized
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "profitability report does not descend from the policy-three state"
+        )
+    body = boundary.semantic_unsigned()
+    body.update(
+        {
+            "outer_access_commitment_receipts": (
+                *boundary.outer_access_commitment_receipts,
+                outer_two.outer_access.semantic_receipt_sha256,
+                outer_three.outer_access.semantic_receipt_sha256,
+            ),
+            "outer_input_authority_receipts": (
+                *boundary.outer_input_authority_receipts,
+                outer_two.outer_inputs.semantic_receipt_sha256,
+                outer_three.outer_inputs.semantic_receipt_sha256,
+            ),
+            "outer_rollout_authority_receipts": (
+                *boundary.outer_rollout_authority_receipts,
+                outer_two.outer_rollout.semantic_receipt_sha256,
+                outer_three.outer_rollout.semantic_receipt_sha256,
+            ),
+            "outer_fold_seal_authority_receipts": tuple(
+                row.semantic_receipt_sha256 for row in execution.outer_fold_seals
+            ),
+            "sealed_outer_fold_indices": (0, 1, 2, 3),
+            "profitability_report_authority_receipt_sha256": (
+                report.semantic_receipt_sha256
+            ),
+            "profitability_report_source_receipt_sha256": _required_digest(
+                "profitability report source receipt",
+                report.source_receipt_sha256,
+            ),
+            "profitability_report_commit_receipt_sha256": _required_digest(
+                "profitability report commit receipt",
+                report.source_transaction_receipt_sha256,
+            ),
+            "profitability_report_committed_at_ms": _required_timestamp(
+                "profitability report timestamp",
+                report.source_transaction_committed_at_ms,
+            ),
+            "profitability_gates_passed": report.profitability_gates_passed,
+            "prequential_state_head_receipt_sha256": state.semantic_receipt_sha256,
+            "prequential_state_head_source_receipt_sha256": _required_digest(
+                "report state-head source receipt",
+                state.source_receipt_sha256,
+            ),
+            "prequential_state_head_commit_receipt_sha256": _required_digest(
+                "report state-head commit receipt",
+                state.source_transaction_receipt_sha256,
+            ),
+            "prequential_state_head_committed_at_ms": _required_timestamp(
+                "report state-head timestamp",
+                state.source_transaction_committed_at_ms,
+            ),
+            "prequential_state_head_stage": state.stage.value,
+            "outer_two_execution_complete": True,
+            "outer_three_execution_complete": True,
+            "next_required_stage": "full-cold-replay-verification",
+            "profitability_reporting_authorized": True,
+        }
+    )
+    provisional = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
 def _record_initial_prequential_execution_v1(
     *,
     root: str | Path,
@@ -1404,9 +1561,22 @@ def _replay_v5_boundary(
         outer_zero_execution=outer_zero,
         allow_materialize=allow_materialize,
     )
-    return _build_delayed_policy_result(
+    delayed_result = _build_delayed_policy_result(
         boundary=outer_zero_result,
         continuation=continuation,
+    )
+    final_outer = run_or_resume_massive_adaptive_rl_final_outer_execution_v1(
+        root=artifact_root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        outer_zero_execution=outer_zero,
+        continuation=continuation,
+        allow_materialize=allow_materialize,
+    )
+    return _build_profitability_report_result(
+        boundary=delayed_result,
+        execution=final_outer,
     )
 
 

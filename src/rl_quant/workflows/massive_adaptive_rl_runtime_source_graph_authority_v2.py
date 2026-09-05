@@ -2,10 +2,11 @@
 
 V2 binds the exact V2 source-bundle transaction to the witnessed V1 graph
 used by the existing training implementation.  Promotion is deliberately
-strict: all eight validation predictor rows must exist, their artifact
-receipts must equal the V2 source projections, and the V1 graph must be the
-one that witnessed the V1 bundle wrapped by the V2 bundle.  This makes legacy
-or mixed source generations explicit rather than silently compatible.
+strict: all eight validation predictor rows and both global development-origin
+inventories must exist, their artifact receipts must equal the V2 source
+projections, and the V1 graph must be the one that witnessed the V1 bundle
+wrapped by the V2 bundle.  This makes legacy or mixed source generations
+explicit rather than silently compatible.
 """
 
 from __future__ import annotations
@@ -74,7 +75,9 @@ MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V2_SPEC_SHA256 = semantic_sha
             MASSIVE_ADAPTIVE_RL_RUNTIME_SOURCE_GRAPH_AUTHORITY_V1_SOURCE_SHA256
         ),
         "validation_rows": "four-feature-plus-four-action-primary-inventories",
-        "training_projection": "bound-through-source-bundle-v2",
+        "nonvalidation_projection": (
+            "training-plus-global-development-origins-bound-through-source-bundle-v2"
+        ),
         "legacy_or_mixed_generation": "rejected",
         "publication": "manifest-derived-create-only-source-transaction",
         "generic_reload": "nonauthorizing",
