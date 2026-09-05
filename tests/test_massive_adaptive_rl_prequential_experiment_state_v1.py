@@ -57,6 +57,10 @@ from rl_quant.evaluation.massive_adaptive_rl_profitability_report_authority_v2 i
 from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
     MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
 )
+from rl_quant.workflows.massive_adaptive_rl_full_cold_replay_v1 import (
+    MASSIVE_ADAPTIVE_RL_FULL_COLD_REPLAY_AUTHORITY_V1_SCHEMA,
+    MassiveAdaptiveRLFullColdReplayAuthorityV1,
+)
 
 
 def _receipt(value: object) -> str:
@@ -85,6 +89,9 @@ _SCHEMA_BY_STAGE = {
     ),
     MassiveAdaptiveRLPrequentialStageV1.PROFITABILITY_REPORT_PUBLISHED: (
         MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V2_SCHEMA
+    ),
+    MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED: (
+        MASSIVE_ADAPTIVE_RL_FULL_COLD_REPLAY_AUTHORITY_V1_SCHEMA
     ),
 }
 
@@ -254,6 +261,16 @@ def test_generic_state_is_integrity_valid_but_nonauthorizing() -> None:
                 "profitability_gates_passed": True,
             },
         ),
+        (
+            MassiveAdaptiveRLFullColdReplayAuthorityV1,
+            "development_full_cold_replay_verified",
+            MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED,
+            {
+                "policy_schedule_disposition": "policy-prefix-qualified",
+                "policy_schedule_qualified": True,
+                "profitability_gates_passed": True,
+            },
+        ),
     ),
 )
 def test_state_transition_rejects_integrity_only_and_accepts_replayed_artifact(
@@ -283,6 +300,9 @@ def test_state_transition_rejects_integrity_only_and_accepts_replayed_artifact(
         ),
         MassiveAdaptiveRLProfitabilityReportAuthorityV2: (
             MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V2_SCHEMA
+        ),
+        MassiveAdaptiveRLFullColdReplayAuthorityV1: (
+            MASSIVE_ADAPTIVE_RL_FULL_COLD_REPLAY_AUTHORITY_V1_SCHEMA
         ),
     }
     common: dict[str, object] = {

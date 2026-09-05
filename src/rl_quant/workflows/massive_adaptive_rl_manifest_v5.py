@@ -428,7 +428,7 @@ MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SPEC_SHA256 = semantic_sha256(
         "legacy_writers_after_registration": "rejected",
         "progression": MASSIVE_ADAPTIVE_RL_PREQUENTIAL_STAGE_SEQUENCE_V1,
         "outcome_implementation": "must-match-execution-registration",
-        "verification": "read-only",
+        "verification": "package-owned-nonmaterializing-completion-proof",
     }
 )
 

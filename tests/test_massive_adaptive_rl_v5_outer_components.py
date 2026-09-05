@@ -492,6 +492,15 @@ def test_writer_guard_recognizes_only_canonical_outer_paths() -> None:
         ),
         capability=capability,
     )
+    assert writer_guard._prequential_scoped_path_authorized_v1(
+        parts=(
+            "adaptive-rl",
+            "experiment",
+            "full-cold-replay-authority-v1",
+            "completion.json",
+        ),
+        capability=capability,
+    )
     assert not writer_guard._prequential_scoped_path_authorized_v1(
         parts=(
             "adaptive-rl",

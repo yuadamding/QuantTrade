@@ -6,8 +6,8 @@ evaluation implementation after causal training, and only then permits the
 fold-0/1 validation inputs.  It evaluates and freezes both initial policy pairs,
 publishes schedule prefixes, executes all four causally ordered outer folds,
 releases delayed validations only after their predecessor seals, and publishes
-the four-fold profitability report.  Full end-to-end completion remains false
-until the separate nonmaterializing cold-replay finalizer verifies that report.
+the four-fold profitability report, reconstructs that complete report boundary
+without writes, and persists a distinct completion proof and final state.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from rl_quant.protocol.massive_adaptive_alpha_v1 import (
 from rl_quant.workflows.massive_adaptive_rl_experiment_lock_v1 import (
     MassiveAdaptiveRLExperimentLockV1Error,
     MassiveAdaptiveRLExperimentLockV1Unavailable,
+    massive_adaptive_rl_experiment_lock_relative_path_v1,
     massive_adaptive_rl_experiment_orchestration_lock_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registration_v1 import (
@@ -55,6 +56,12 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_state_v2 import (
 from rl_quant.workflows.massive_adaptive_rl_final_outer_execution_v1 import (
     MassiveAdaptiveRLFinalOuterExecutionV1,
     run_or_resume_massive_adaptive_rl_final_outer_execution_v1,
+)
+from rl_quant.workflows.massive_adaptive_rl_full_cold_replay_v1 import (
+    MassiveAdaptiveRLFullColdReplayAuthorityV1,
+    MassiveAdaptiveRLProtectedEvidenceFileV1,
+    massive_adaptive_rl_protected_evidence_inventory_v1,
+    run_or_resume_massive_adaptive_rl_full_cold_replay_v1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     MASSIVE_ADAPTIVE_RL_EXPERIMENT_RUNNER_V5_SOURCE_SHA256,
@@ -207,6 +214,12 @@ class MassiveAdaptiveRLPrequentialRunV5:
     outer_three_execution_complete: bool
     next_required_stage: str
     semantic_receipt_sha256: str
+    full_cold_replay_authority_receipt_sha256: str | None = None
+    full_cold_replay_source_receipt_sha256: str | None = None
+    full_cold_replay_commit_receipt_sha256: str | None = None
+    full_cold_replay_committed_at_ms: int | None = None
+    full_cold_replay_verified: bool = False
+    positive_profitability_authorization_eligible: bool = False
     policy_schedule_disposition: str | None = None
     final_policy_freezing_authorized: bool = False
     outer_access_authorized: bool = False
@@ -227,10 +240,6 @@ class MassiveAdaptiveRLPrequentialRunV5:
             for key, value in asdict(self).items()
             if key != "semantic_receipt_sha256"
         }
-
-    @property
-    def positive_profitability_authorization_eligible(self) -> bool:
-        return False
 
     def validate(self) -> None:
         initial_receipts = (
@@ -315,6 +324,12 @@ class MassiveAdaptiveRLPrequentialRunV5:
             self.profitability_report_commit_receipt_sha256,
         )
         report_present = all(value is not None for value in report_receipts)
+        cold_replay_receipts = (
+            self.full_cold_replay_authority_receipt_sha256,
+            self.full_cold_replay_source_receipt_sha256,
+            self.full_cold_replay_commit_receipt_sha256,
+        )
+        cold_replay_present = all(value is not None for value in cold_replay_receipts)
         state_head_receipts = (
             self.prequential_state_head_receipt_sha256,
             self.prequential_state_head_source_receipt_sha256,
@@ -322,7 +337,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
         )
         state_head_present = all(value is not None for value in state_head_receipts)
         expected_next_stage = (
-            "full-cold-replay-verification"
+            "development-profitability-execution-complete"
+            if cold_replay_present
+            else "full-cold-replay-verification"
             if report_present
             else "outer-fold-2-access-and-seal"
             if delayed_execution_present
@@ -365,6 +382,11 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or outer_two_present != report_present
             or outer_three_present != report_present
             or any(value is not None for value in report_receipts) != report_present
+            or any(value is not None for value in cold_replay_receipts)
+            != cold_replay_present
+            or cold_replay_present and not report_present
+            or (self.full_cold_replay_committed_at_ms is not None)
+            != cold_replay_present
             or (self.profitability_report_committed_at_ms is not None) != report_present
             or (self.profitability_gates_passed is not None) != report_present
             or report_present
@@ -385,7 +407,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or state_head_present != initial_execution_present
             or self.prequential_state_head_stage
             != (
-                "profitability-report-published"
+                "full-cold-replay-verified"
+                if cold_replay_present
+                else "profitability-report-published"
                 if report_present
                 else "policy-3-frozen"
                 if delayed_execution_present
@@ -464,7 +488,16 @@ class MassiveAdaptiveRLPrequentialRunV5:
             or self.final_policy_freezing_authorized != delayed_execution_present
             or self.outer_access_authorized
             or self.profitability_reporting_authorized != report_present
+            or self.full_cold_replay_verified != cold_replay_present
             or self.end_to_end_profitability_execution_complete
+            != cold_replay_present
+            or self.positive_profitability_authorization_eligible
+            != bool(
+                cold_replay_present
+                and self.policy_schedule_disposition
+                == MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1
+                and self.profitability_gates_passed
+            )
             or self.lockbox_access_authorized
             or self.live_trading_authorized
             or self.protocol_receipt_sha256 != MASSIVE_ADAPTIVE_ALPHA_V1_RECEIPT_SHA256
@@ -492,6 +525,9 @@ class MassiveAdaptiveRLPrequentialRunV5:
         for value in report_receipts:
             if value is not None:
                 _digest("profitability report receipt", value)
+        for value in cold_replay_receipts:
+            if value is not None:
+                _digest("full cold-replay receipt", value)
         for value in self.initial_policy_schedule_prefix_receipts:
             _digest("initial policy schedule prefix", value)
         _required_timestamp(
@@ -522,6 +558,11 @@ class MassiveAdaptiveRLPrequentialRunV5:
             _required_timestamp(
                 "profitability report timestamp",
                 self.profitability_report_committed_at_ms,
+            )
+        if self.full_cold_replay_committed_at_ms is not None:
+            _required_timestamp(
+                "full cold-replay timestamp",
+                self.full_cold_replay_committed_at_ms,
             )
         assert_no_adaptive_hold_semantics(self.semantic_unsigned())
 
@@ -1358,6 +1399,165 @@ def _build_profitability_report_result(
     return result
 
 
+def _build_full_cold_replay_result(
+    *,
+    boundary: MassiveAdaptiveRLPrequentialRunV5,
+    cold_replay: MassiveAdaptiveRLFullColdReplayAuthorityV1,
+    prequential_state_head: MassiveAdaptiveRLPrequentialExperimentStateV1,
+) -> MassiveAdaptiveRLPrequentialRunV5:
+    """Promote a report-stage result only after its full replay is proven."""
+
+    boundary.validate()
+    cold_replay.validate()
+    prequential_state_head.validate()
+    if (
+        not boundary.profitability_reporting_authorized
+        or boundary.end_to_end_profitability_execution_complete
+        or not cold_replay.development_full_cold_replay_verified
+        or cold_replay.experiment_id != boundary.experiment_id
+        or cold_replay.manifest_v5_receipt_sha256
+        != boundary.manifest_v5_receipt_sha256
+        or cold_replay.execution_implementation_registration_receipt_sha256
+        != boundary.execution_implementation_registration_authority_receipt_sha256
+        or cold_replay.replayed_run_receipt_sha256
+        != boundary.semantic_receipt_sha256
+        or cold_replay.profitability_report_authority_receipt_sha256
+        != boundary.profitability_report_authority_receipt_sha256
+        or cold_replay.profitability_report_state_receipt_sha256
+        != boundary.prequential_state_head_receipt_sha256
+        or cold_replay.outer_fold_seal_receipts
+        != boundary.outer_fold_seal_authority_receipts
+        or prequential_state_head.stage
+        is not MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED
+        or not prequential_state_head.full_cold_replay_verified
+        or prequential_state_head.stage_artifact_semantic_receipt_sha256
+        != cold_replay.semantic_receipt_sha256
+        or prequential_state_head.immediate_predecessor_state_receipt_sha256
+        != boundary.prequential_state_head_receipt_sha256
+        or prequential_state_head.policy_schedule_disposition
+        != boundary.policy_schedule_disposition
+        or prequential_state_head.profitability_gates_passed
+        != boundary.profitability_gates_passed
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "full cold replay does not descend from the profitability report"
+        )
+    body = boundary.semantic_unsigned()
+    body.update(
+        {
+            "full_cold_replay_authority_receipt_sha256": (
+                cold_replay.semantic_receipt_sha256
+            ),
+            "full_cold_replay_source_receipt_sha256": _required_digest(
+                "full cold-replay source receipt",
+                cold_replay.source_receipt_sha256,
+            ),
+            "full_cold_replay_commit_receipt_sha256": _required_digest(
+                "full cold-replay commit receipt",
+                cold_replay.source_transaction_receipt_sha256,
+            ),
+            "full_cold_replay_committed_at_ms": _required_timestamp(
+                "full cold-replay timestamp",
+                cold_replay.source_transaction_committed_at_ms,
+            ),
+            "full_cold_replay_verified": True,
+            "prequential_state_head_receipt_sha256": (
+                prequential_state_head.semantic_receipt_sha256
+            ),
+            "prequential_state_head_source_receipt_sha256": _required_digest(
+                "final state-head source receipt",
+                prequential_state_head.source_receipt_sha256,
+            ),
+            "prequential_state_head_commit_receipt_sha256": _required_digest(
+                "final state-head commit receipt",
+                prequential_state_head.source_transaction_receipt_sha256,
+            ),
+            "prequential_state_head_committed_at_ms": _required_timestamp(
+                "final state-head timestamp",
+                prequential_state_head.source_transaction_committed_at_ms,
+            ),
+            "prequential_state_head_stage": prequential_state_head.stage.value,
+            "next_required_stage": "development-profitability-execution-complete",
+            "end_to_end_profitability_execution_complete": True,
+            "positive_profitability_authorization_eligible": bool(
+                boundary.policy_schedule_disposition
+                == MASSIVE_ADAPTIVE_RL_POLICY_PREFIX_QUALIFIED_V1
+                and boundary.profitability_gates_passed
+            ),
+        }
+    )
+    provisional = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256="0" * 64,
+    )
+    result = MassiveAdaptiveRLPrequentialRunV5(
+        **body,  # type: ignore[arg-type]
+        semantic_receipt_sha256=semantic_sha256(provisional.semantic_unsigned()),
+    )
+    result.validate()
+    return result
+
+
+def _finalize_full_cold_replay_v1(
+    *,
+    manifest: MassiveAdaptiveRLExperimentManifestV5,
+    registration: MassiveAdaptiveRLManifestV5RegistrationAuthorityV1,
+    artifact_root: str | Path,
+    report_boundary: MassiveAdaptiveRLPrequentialRunV5,
+    replayed_boundary: MassiveAdaptiveRLPrequentialRunV5,
+    evidence_inventory_before: tuple[
+        MassiveAdaptiveRLProtectedEvidenceFileV1, ...
+    ],
+    evidence_inventory_after: tuple[
+        MassiveAdaptiveRLProtectedEvidenceFileV1, ...
+    ],
+    allow_materialize: bool,
+) -> MassiveAdaptiveRLPrequentialRunV5:
+    """Persist/replay the completion proof and its final ledger transition."""
+
+    report_boundary.validate()
+    replayed_boundary.validate()
+    if (
+        report_boundary.semantic_unsigned() != replayed_boundary.semantic_unsigned()
+        or report_boundary.semantic_receipt_sha256
+        != replayed_boundary.semantic_receipt_sha256
+    ):
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "cold replay did not reproduce the profitability report boundary"
+        )
+    implementation_registration = (
+        run_or_resume_massive_adaptive_rl_execution_implementation_registration_v1(
+            root=artifact_root,
+            manifest=manifest,
+            manifest_registration=registration,
+            allow_materialize=False,
+        )
+    )
+    cold_replay = run_or_resume_massive_adaptive_rl_full_cold_replay_v1(
+        root=artifact_root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        replayed_run=replayed_boundary,
+        evidence_inventory_before=evidence_inventory_before,
+        evidence_inventory_after=evidence_inventory_after,
+        allow_materialize=allow_materialize,
+    )
+    final_state = run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
+        root=artifact_root,
+        manifest=manifest,
+        manifest_registration=registration,
+        execution_registration=implementation_registration,
+        stage_artifact=cold_replay,
+        allow_materialize=allow_materialize,
+    )
+    return _build_full_cold_replay_result(
+        boundary=report_boundary,
+        cold_replay=cold_replay,
+        prequential_state_head=final_state,
+    )
+
+
 def _record_initial_prequential_execution_v1(
     *,
     root: str | Path,
@@ -1588,7 +1788,7 @@ def run_massive_adaptive_rl_experiment_v5(
     device: object,
     resume: bool = True,
 ) -> MassiveAdaptiveRLPrequentialRunV5 | MassiveAdaptiveRLEndToEndRunV2:
-    """Register V5, train, and stop at the next causally authorized boundary."""
+    """Run or resume the complete causally ordered V5 development experiment."""
 
     manifest = load_massive_adaptive_rl_experiment_manifest_v5(manifest_path)
     if str(device) != manifest.execution_device_specification:
@@ -1624,12 +1824,45 @@ def run_massive_adaptive_rl_experiment_v5(
                 )
             if training.four_fold_fit_authority_receipt_sha256 is None:
                 return training
-            return _replay_v5_boundary(
+            boundary = _replay_v5_boundary(
                 manifest=manifest,
                 registration=registration,
                 source_root=source_root,
                 artifact_root=artifact_root,
                 device=device,
+                allow_materialize=True,
+            )
+            if (
+                type(boundary) is not MassiveAdaptiveRLPrequentialRunV5
+                or not boundary.profitability_reporting_authorized
+            ):
+                return boundary
+            evidence_before = massive_adaptive_rl_protected_evidence_inventory_v1(
+                artifact_root=artifact_root,
+                source_root=source_root,
+                manifest=manifest,
+            )
+            replayed = _replay_v5_boundary(
+                manifest=manifest,
+                registration=registration,
+                source_root=source_root,
+                artifact_root=artifact_root,
+                device=device,
+                allow_materialize=False,
+            )
+            evidence_after = massive_adaptive_rl_protected_evidence_inventory_v1(
+                artifact_root=artifact_root,
+                source_root=source_root,
+                manifest=manifest,
+            )
+            return _finalize_full_cold_replay_v1(
+                manifest=manifest,
+                registration=registration,
+                artifact_root=artifact_root,
+                report_boundary=boundary,
+                replayed_boundary=replayed,
+                evidence_inventory_before=evidence_before,
+                evidence_inventory_after=evidence_after,
                 allow_materialize=True,
             )
     except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
@@ -1649,7 +1882,7 @@ def verify_massive_adaptive_rl_experiment_v5(
     artifact_root: str | Path,
     device: object,
 ) -> MassiveAdaptiveRLPrequentialRunV5:
-    """Cold-replay the registered causal prefix without creating artifacts."""
+    """Cold-replay the complete registered run without creating artifacts."""
 
     manifest = load_massive_adaptive_rl_experiment_manifest_v5(manifest_path)
     if str(device) != manifest.execution_device_specification:
@@ -1661,14 +1894,62 @@ def verify_massive_adaptive_rl_experiment_v5(
         manifest=manifest,
         allow_materialize=False,
     )
-    return _replay_v5_boundary(
-        manifest=manifest,
-        registration=registration,
-        source_root=source_root,
-        artifact_root=artifact_root,
-        device=device,
-        allow_materialize=False,
+    lock_path = (
+        Path(artifact_root)
+        / massive_adaptive_rl_experiment_lock_relative_path_v1(
+            experiment_id=manifest.experiment_id
+        )
     )
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "cold verification requires the existing experiment lock"
+        )
+    try:
+        with massive_adaptive_rl_experiment_orchestration_lock_v1(
+            artifact_root=artifact_root,
+            experiment_id=manifest.experiment_id,
+        ):
+            evidence_before = massive_adaptive_rl_protected_evidence_inventory_v1(
+                artifact_root=artifact_root,
+                source_root=source_root,
+                manifest=manifest,
+            )
+            boundary = _replay_v5_boundary(
+                manifest=manifest,
+                registration=registration,
+                source_root=source_root,
+                artifact_root=artifact_root,
+                device=device,
+                allow_materialize=False,
+            )
+            if (
+                type(boundary) is not MassiveAdaptiveRLPrequentialRunV5
+                or not boundary.profitability_reporting_authorized
+            ):
+                return boundary
+            evidence_after = massive_adaptive_rl_protected_evidence_inventory_v1(
+                artifact_root=artifact_root,
+                source_root=source_root,
+                manifest=manifest,
+            )
+            return _finalize_full_cold_replay_v1(
+                manifest=manifest,
+                registration=registration,
+                artifact_root=artifact_root,
+                report_boundary=boundary,
+                replayed_boundary=boundary,
+                evidence_inventory_before=evidence_before,
+                evidence_inventory_after=evidence_after,
+                allow_materialize=False,
+            )
+    except MassiveAdaptiveRLExperimentLockV1Unavailable as error:
+        raise MassiveAdaptiveRLExperimentRunnerV5LeaseUnavailable(
+            "adaptive RL V5 verification is already owned"
+        ) from error
+    except MassiveAdaptiveRLExperimentLockV1Error as error:
+        raise MassiveAdaptiveRLExperimentRunnerV5Error(
+            "adaptive RL V5 verification lock is invalid"
+        ) from error
 
 
 __all__ = [

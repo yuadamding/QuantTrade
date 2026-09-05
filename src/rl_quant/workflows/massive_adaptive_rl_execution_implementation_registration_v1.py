@@ -137,6 +137,7 @@ _REQUIRED_V5_NATIVE_IMPLEMENTATION_RELATIVE_PATHS = (
     "src/rl_quant/workflows/massive_adaptive_rl_outer_fold_execution_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_prequential_continuation_v1.py",
     "src/rl_quant/workflows/massive_adaptive_rl_final_outer_execution_v1.py",
+    "src/rl_quant/workflows/massive_adaptive_rl_full_cold_replay_v1.py",
 )
 _VERTICAL_QUALIFICATION_TEST_RELATIVE_PATHS = (
     "tests/test_massive_adaptive_rl_v5_vertical.py",
@@ -196,6 +197,7 @@ _SCOPED_OUTCOME_DIRECTORY_NAMES = (
     "outer-rollout-authority-v2",
     "outer-fold-seal-authority-v1",
     "profitability-report-authority-v2",
+    "full-cold-replay-authority-v1",
     "prequential-experiment-state-v1",
 )
 _LEGACY_OUTCOME_DIRECTORY_NAMES = (

@@ -59,6 +59,9 @@ from rl_quant.workflows.massive_adaptive_rl_manifest_v5_registration import (
 from rl_quant.workflows.massive_adaptive_rl_writer_guard_v5 import (
     massive_adaptive_rl_manifest_v5_writer_scope_v1,
 )
+from rl_quant.workflows.massive_adaptive_rl_full_cold_replay_v1 import (
+    MASSIVE_ADAPTIVE_RL_FULL_COLD_REPLAY_AUTHORITY_V1_SCHEMA,
+)
 
 
 MASSIVE_ADAPTIVE_RL_PREQUENTIAL_EXPERIMENT_STATE_V1_DATASET = (
@@ -145,7 +148,7 @@ _STAGE_ARTIFACT_SCHEMAS = {
         MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V2_SCHEMA
     ),
     MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED: (
-        MASSIVE_ADAPTIVE_RL_PROFITABILITY_REPORT_AUTHORITY_V2_SCHEMA
+        MASSIVE_ADAPTIVE_RL_FULL_COLD_REPLAY_AUTHORITY_V1_SCHEMA
     ),
 }
 
@@ -499,6 +502,9 @@ def _stage_artifact_facts(
     from rl_quant.workflows.massive_adaptive_rl_four_fold_fit_v1 import (
         MassiveAdaptiveRLFourFoldFitAuthorityV1,
     )
+    from rl_quant.workflows.massive_adaptive_rl_full_cold_replay_v1 import (
+        MassiveAdaptiveRLFullColdReplayAuthorityV1,
+    )
     from rl_quant.workflows.massive_adaptive_rl_walk_forward_policy_schedule_v1 import (
         MassiveAdaptiveRLWalkForwardPolicyScheduleV1,
     )
@@ -575,6 +581,14 @@ def _stage_artifact_facts(
             getattr(artifact, "development_profitability_reporting_authorized")
         )
         stage = MassiveAdaptiveRLPrequentialStageV1.PROFITABILITY_REPORT_PUBLISHED
+        disposition = cast(str, getattr(artifact, "policy_schedule_disposition"))
+        schedule_qualified = bool(getattr(artifact, "policy_schedule_qualified"))
+        gates = bool(getattr(artifact, "profitability_gates_passed"))
+    elif type(artifact) is MassiveAdaptiveRLFullColdReplayAuthorityV1:
+        runtime_authorized = bool(
+            getattr(artifact, "development_full_cold_replay_verified")
+        )
+        stage = MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED
         disposition = cast(str, getattr(artifact, "policy_schedule_disposition"))
         schedule_qualified = bool(getattr(artifact, "policy_schedule_qualified"))
         gates = bool(getattr(artifact, "profitability_gates_passed"))
@@ -899,10 +913,6 @@ def run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
         execution_registration_receipt=execution_registration.semantic_receipt_sha256,
         artifact=stage_artifact,
     )
-    if facts.stage is MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED:
-        raise MassiveAdaptiveRLPrequentialExperimentStateV1Error(
-            "full cold replay requires the future package-owned finalizer"
-        )
     relative = _state_relative_path(
         experiment_id=manifest.experiment_id, stage=facts.stage
     )
@@ -1015,8 +1025,18 @@ def run_or_resume_massive_adaptive_rl_prequential_experiment_state_v1(
                     MassiveAdaptiveRLPrequentialStageV1.PROFITABILITY_REPORT_PUBLISHED
                 )
             ),
-            full_cold_replay_verified=False,
-            positive_profitability_authorization_eligible=False,
+            full_cold_replay_verified=bool(
+                parsed.source_data_qualified
+                and parsed.stage
+                is MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED
+            ),
+            positive_profitability_authorization_eligible=bool(
+                parsed.source_data_qualified
+                and parsed.stage
+                is MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED
+                and parsed.policy_schedule_qualified
+                and parsed.profitability_gates_passed
+            ),
             _runtime_stage_artifact=stage_artifact,
         )
         result.validate()

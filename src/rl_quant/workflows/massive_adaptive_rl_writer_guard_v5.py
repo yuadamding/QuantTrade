@@ -92,6 +92,7 @@ _EXPERIMENT_SCOPED_DIRECTORIES = frozenset(
     {
         "execution-implementation-registration-v1",
         "fold-validation-v3",
+        "full-cold-replay-authority-v1",
         "frozen-fc06-v2",
         "frozen-policy-v2",
         "manifest-v5-registration-v1",
@@ -130,6 +131,7 @@ _INITIAL_VALIDATION_EXECUTION_DIRECTORIES = frozenset(
 )
 _PREQUENTIAL_OUTER_EXECUTION_DIRECTORIES = frozenset(
     {
+        "full-cold-replay-authority-v1",
         "outer-access-commitment-v2",
         "outer-rollout-authority-v2",
         "outer-fold-seal-authority-v1",
@@ -338,6 +340,8 @@ def _prequential_scoped_path_authorized_v1(
         }
     if directory == "profitability-report-authority-v2":
         return name == "report.json"
+    if directory == "full-cold-replay-authority-v1":
+        return name == "completion.json"
     if directory == "prequential-experiment-state-v1":
         return bool(
             name.endswith(".json")

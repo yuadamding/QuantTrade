@@ -21,6 +21,7 @@ from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v4 import (
 )
 from rl_quant.workflows.massive_adaptive_rl_experiment_runner_v5 import (
     MassiveAdaptiveRLPrequentialRunV5,
+    _build_full_cold_replay_result,
     _build_delayed_policy_result,
     _build_initial_execution_result,
     _build_outer_zero_result,
@@ -42,6 +43,9 @@ from rl_quant.workflows.massive_adaptive_rl_execution_implementation_registratio
 )
 from rl_quant.workflows.massive_adaptive_rl_final_outer_execution_v1 import (
     MassiveAdaptiveRLFinalOuterExecutionV1,
+)
+from rl_quant.workflows.massive_adaptive_rl_full_cold_replay_v1 import (
+    MassiveAdaptiveRLFullColdReplayAuthorityV1,
 )
 from rl_quant.workflows.massive_adaptive_rl_manifest_v5 import (
     build_massive_adaptive_rl_experiment_manifest_v5,
@@ -596,6 +600,66 @@ def test_v5_result_freezes_implementation_before_initial_inputs(
     assert not reported.end_to_end_profitability_execution_complete
     assert not reported.positive_profitability_authorization_eligible
 
+    cold_replay = _typed_shell(
+        MassiveAdaptiveRLFullColdReplayAuthorityV1,
+        experiment_id=reported.experiment_id,
+        manifest_v5_receipt_sha256=reported.manifest_v5_receipt_sha256,
+        execution_implementation_registration_receipt_sha256=(
+            reported.execution_implementation_registration_authority_receipt_sha256
+        ),
+        replayed_run_receipt_sha256=reported.semantic_receipt_sha256,
+        profitability_report_authority_receipt_sha256=(
+            reported.profitability_report_authority_receipt_sha256
+        ),
+        profitability_report_state_receipt_sha256=(
+            reported.prequential_state_head_receipt_sha256
+        ),
+        outer_fold_seal_receipts=reported.outer_fold_seal_authority_receipts,
+        policy_schedule_disposition=reported.policy_schedule_disposition,
+        profitability_gates_passed=reported.profitability_gates_passed,
+        semantic_receipt_sha256=_digest("cold-replay"),
+        development_full_cold_replay_verified=True,
+        _loaded_source=SimpleNamespace(
+            receipt=SimpleNamespace(receipt_sha256=_digest("cold-replay-source")),
+            commit=SimpleNamespace(
+                receipt_sha256=_digest("cold-replay-commit"),
+                committed_at_ms=100,
+            ),
+        ),
+    )
+    final_state = SimpleNamespace(
+        stage=MassiveAdaptiveRLPrequentialStageV1.FULL_COLD_REPLAY_VERIFIED,
+        full_cold_replay_verified=True,
+        stage_artifact_semantic_receipt_sha256=(cold_replay.semantic_receipt_sha256),
+        immediate_predecessor_state_receipt_sha256=(
+            reported.prequential_state_head_receipt_sha256
+        ),
+        policy_schedule_disposition=reported.policy_schedule_disposition,
+        profitability_gates_passed=reported.profitability_gates_passed,
+        semantic_receipt_sha256=_digest("final-state"),
+        source_receipt_sha256=_digest("final-state-source"),
+        source_transaction_receipt_sha256=_digest("final-state-commit"),
+        source_transaction_committed_at_ms=110,
+        validate=lambda: None,
+    )
+    monkeypatch.setattr(
+        MassiveAdaptiveRLFullColdReplayAuthorityV1,
+        "validate",
+        lambda _: None,
+    )
+    completed = _build_full_cold_replay_result(
+        boundary=reported,
+        cold_replay=cold_replay,
+        prequential_state_head=final_state,
+    )
+    assert completed.full_cold_replay_verified
+    assert completed.end_to_end_profitability_execution_complete
+    assert completed.prequential_state_head_stage == "full-cold-replay-verified"
+    assert completed.next_required_stage == (
+        "development-profitability-execution-complete"
+    )
+    assert not completed.positive_profitability_authorization_eligible
+
 
 def test_v5_root_registers_before_resuming_training(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -788,6 +852,12 @@ def test_v5_verify_is_strictly_nonmaterializing(
     )
     registration = object()
     expected = object()
+    artifact_root = tmp_path / "artifacts"
+    lock_path = artifact_root / runner.massive_adaptive_rl_experiment_lock_relative_path_v1(
+        experiment_id=manifest.experiment_id
+    )
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("")
 
     def register(**kwargs):
         assert kwargs["allow_materialize"] is False
@@ -803,15 +873,96 @@ def test_v5_verify_is_strictly_nonmaterializing(
         "run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1",
         register,
     )
+    monkeypatch.setattr(
+        runner,
+        "massive_adaptive_rl_protected_evidence_inventory_v1",
+        lambda **_: (),
+    )
+    monkeypatch.setattr(
+        runner,
+        "massive_adaptive_rl_experiment_orchestration_lock_v1",
+        lambda **_: nullcontext(),
+    )
     monkeypatch.setattr(runner, "_replay_v5_boundary", boundary)
     assert (
         verify_massive_adaptive_rl_experiment_v5(
             manifest_path=manifest_path,
             source_root=tmp_path / "source",
-            artifact_root=tmp_path / "artifacts",
+            artifact_root=artifact_root,
             device="cpu",
         )
         is expected
+    )
+
+
+def test_v5_verify_requires_persisted_cold_replay_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = build_massive_adaptive_rl_experiment_manifest_v5(
+        experiment_id="runner-v5-complete-verify"
+    )
+    manifest_path = tmp_path / "manifest-v5.json"
+    write_massive_adaptive_rl_experiment_manifest_v5(
+        path=manifest_path, manifest=manifest
+    )
+    artifact_root = tmp_path / "artifacts"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    lock_path = artifact_root / runner.massive_adaptive_rl_experiment_lock_relative_path_v1(
+        experiment_id=manifest.experiment_id
+    )
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("")
+    registration = object()
+    report_boundary = _typed_shell(
+        MassiveAdaptiveRLPrequentialRunV5,
+        profitability_reporting_authorized=True,
+    )
+    completed = object()
+    inventory = (object(),)
+
+    monkeypatch.setattr(
+        runner,
+        "run_or_resume_massive_adaptive_rl_manifest_v5_registration_v1",
+        lambda **_: registration,
+    )
+    monkeypatch.setattr(
+        runner,
+        "massive_adaptive_rl_experiment_orchestration_lock_v1",
+        lambda **_: nullcontext(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "massive_adaptive_rl_protected_evidence_inventory_v1",
+        lambda **_: inventory,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_replay_v5_boundary",
+        lambda **kwargs: (
+            report_boundary
+            if kwargs["allow_materialize"] is False
+            else pytest.fail("verify cannot materialize the report boundary")
+        ),
+    )
+
+    def finalize(**kwargs):
+        assert kwargs["report_boundary"] is report_boundary
+        assert kwargs["replayed_boundary"] is report_boundary
+        assert kwargs["evidence_inventory_before"] is inventory
+        assert kwargs["evidence_inventory_after"] is inventory
+        assert kwargs["allow_materialize"] is False
+        return completed
+
+    monkeypatch.setattr(runner, "_finalize_full_cold_replay_v1", finalize)
+    assert (
+        verify_massive_adaptive_rl_experiment_v5(
+            manifest_path=manifest_path,
+            source_root=source_root,
+            artifact_root=artifact_root,
+            device="cpu",
+        )
+        is completed
     )
 
 
